@@ -84,7 +84,10 @@ Goldilocks challenge field and requires at least 128 proven bits under
 Plonky3's component-security model, but this is not the missing aggregate
 union-bound report. The legacy one-block backend and the
 new custom tree AIR both require independent algebraic review. There is still
-no production streaming prover, raw-model-byte link, consensus tag, complete
+now a bounded row-at-a-time main-trace generation seam, including early sink
+failure propagation, but the current Plonky3 PCS immediately collects those
+rows and materializes the full LDE in memory. There is still no production
+out-of-core PCS/FRI prover, raw-model-byte link, consensus tag, complete
 soundness report, or audit. The aggregate remains feature-gated research
 scaffolding with no consensus or wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).

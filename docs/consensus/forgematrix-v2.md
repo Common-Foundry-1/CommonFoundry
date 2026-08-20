@@ -437,15 +437,19 @@ canonical cross-process circuit artifact. The wrapper's 384 MiB cap and panic
 containment are research safeguards, not acceptable network-parser bounds.
 There is no proof wire tag or `ChainState` integration for this feature.
 
-The repository does not yet implement the production streaming prover,
-raw-byte-to-PCS model-link certificate, final aggregate soundness report, or a
-full production-size BLAKE3 proof benchmark. The exact tree relation and
-bounded compressed component transport are implemented, but only smaller and
-intermediate shapes have been proved below 256 KiB; the 1,048,576-row production
-shape remains an activation measurement. The aggregate proof has no consensus
-wire tag and the WHIR and BLAKE3 backends remain unaudited research code. The CUDA
-fixture is a differential harness, not a tensor-core succinct
-prover, low-VRAM proof benchmark, or evidence of residency.
+The main-trace generator now exposes a bounded row-at-a-time sink and
+propagates an early sink failure without generating the remaining rows. This
+does not make the current Plonky3 PCS/FRI prover streaming: it still collects
+the complete trace and materializes the LDE in memory. The repository does not
+yet implement that production out-of-core prover, the raw-byte-to-PCS
+model-link certificate, the final aggregate soundness report, or a full
+production-size BLAKE3 proof benchmark. The exact tree relation and bounded
+compressed component transport are implemented, but only smaller and
+intermediate shapes have been proved below 256 KiB; the 1,048,576-row
+production shape remains an activation measurement. The aggregate proof has
+no consensus wire tag and the WHIR and BLAKE3 backends remain unaudited
+research code. The CUDA fixture is a differential harness, not a tensor-core
+succinct prover, low-VRAM proof benchmark, or evidence of residency.
 The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;
 an independent challenge-to-coefficient implementation and a broader vector
 corpus remain required.

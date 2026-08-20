@@ -885,7 +885,24 @@ pub(crate) fn generate_main_trace(
     statement: &StructuredBlake3Statement,
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
 ) -> RowMajorMatrix<F> {
-    let mut values = F::zero_vec(air.trace_rows * MAIN_WIDTH);
+    let mut values = Vec::with_capacity(air.trace_rows * MAIN_WIDTH);
+    for_each_main_trace_row(air, statement, witness, |row_index, row| {
+        debug_assert_eq!(values.len(), row_index * MAIN_WIDTH);
+        values.extend_from_slice(row);
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .expect("infallible in-memory trace sink");
+    RowMajorMatrix::new(values, MAIN_WIDTH)
+}
+
+/// Generates one canonical trace row at a time so a future PCS can consume or
+/// spill the witness without retaining the full base trace in memory.
+pub(crate) fn for_each_main_trace_row<E>(
+    air: &NarrowBlake3Air,
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    mut emit: impl FnMut(usize, &[F]) -> Result<(), E>,
+) -> Result<(), E> {
     let point = statement
         .final_activation_point
         .iter()
@@ -893,6 +910,7 @@ pub(crate) fn generate_main_trace(
         .collect::<Vec<_>>();
     let mut evaluation_acc = crate::structured_sumcheck::ExtensionField::ZERO;
     let mut stack = [[0_u32; CV_WORDS]; MAX_STACK_DEPTH];
+    let mut row_values = F::zero_vec(MAIN_WIDTH);
     let dummy = dummy_operation();
     for operation_index in 0..air.trace_rows.div_ceil(ROWS_PER_COMPRESSION) {
         let operation = witness.operations.get(operation_index).unwrap_or(&dummy);
@@ -902,8 +920,8 @@ pub(crate) fn generate_main_trace(
             if row_index == air.trace_rows {
                 break;
             }
-            let row: &mut MainCols<F> =
-                values[row_index * MAIN_WIDTH..(row_index + 1) * MAIN_WIDTH].borrow_mut();
+            row_values.fill(F::ZERO);
+            let row: &mut MainCols<F> = row_values.as_mut_slice().borrow_mut();
             set_ext(&mut row.evaluation_accumulator, evaluation_acc);
             row.stack = stack.map(|entry| entry.map(F::from_u32));
             row.state = state_cols(step, &states, operation);
@@ -979,9 +997,10 @@ pub(crate) fn generate_main_trace(
                     stack[slot] = output_values;
                 }
             }
+            emit(row_index, &row_values)?;
         }
     }
-    RowMajorMatrix::new(values, MAIN_WIDTH)
+    Ok(())
 }
 
 fn operation_trace(
@@ -1577,6 +1596,32 @@ mod tests {
             build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
         let trace = generate_main_trace(&air, &statement, &witness);
         p3_air::check_constraints(&air, &trace, &public_values(&statement).unwrap());
+    }
+
+    #[test]
+    fn trace_rows_can_be_consumed_incrementally_and_stop_early() {
+        let activation = (0..2_048)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let air = NarrowBlake3Air::new(&statement).unwrap();
+        let witness =
+            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+        let mut emitted = 0_usize;
+        let stopped = for_each_main_trace_row(
+            &air,
+            &statement,
+            &witness,
+            |row_index, row| -> Result<(), &'static str> {
+                assert_eq!(row_index, emitted);
+                assert_eq!(row.len(), MAIN_WIDTH);
+                emitted += 1;
+                if emitted == 17 { Err("stop") } else { Ok(()) }
+            },
+        );
+        assert_eq!(stopped, Err("stop"));
+        assert_eq!(emitted, 17);
+        assert!(air.trace_rows > emitted);
     }
 
     #[test]

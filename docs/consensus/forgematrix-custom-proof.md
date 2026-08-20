@@ -279,6 +279,12 @@ machine-checks at least 128 proven bits under Plonky3's security model, but that
 is not an aggregate union-bound report.
 Independent algebraic review remains mandatory.
 
+The main trace can now be emitted through a bounded row-at-a-time sink, and a
+sink failure stops generation immediately. This is the required boundary for
+a disk-backed consumer, but the pinned Plonky3 PCS API still requires an owned
+`RowMajorMatrix` and materializes its LDE in memory. Replacing that PCS/FRI
+stage, not merely streaming witness construction, is the remaining memory task.
+
 ## 6. Transparent PCS boundary
 
 The PCS must support batched multilinear openings over the cubic Goldilocks

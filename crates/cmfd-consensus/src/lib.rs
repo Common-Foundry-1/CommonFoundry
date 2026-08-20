@@ -69,7 +69,8 @@ pub use structured_proof::{
     MAX_STRUCTURED_AGGREGATE_PROOF_BYTES, MAX_STRUCTURED_OPENING_CLAIMS,
     MAX_STRUCTURED_OPENING_VARIABLES, MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION,
     StructuredForgeMatrixProof, StructuredForgeMatrixStatement, StructuredPcsOpeningClaim,
-    StructuredPcsVerifier, StructuredProofError, verify_structured_forgematrix_proof,
+    StructuredPcsVerifier, StructuredProofError, collect_structured_forgematrix_openings,
+    verify_structured_forgematrix_proof,
 };
 pub use structured_sumcheck::{
     ExtensionElement, MAX_STRUCTURED_MATRIX_ELEMENTS, MAX_STRUCTURED_SUMCHECK_PROOF_BYTES,
@@ -77,6 +78,10 @@ pub use structured_sumcheck::{
     StructuredMatrixProof, StructuredMatrixRound, StructuredMatrixStatement,
     StructuredSumcheckError, prove_structured_matrix_product, verify_structured_matrix_product,
     verify_structured_matrix_sumcheck,
+};
+#[cfg(feature = "whir-prototype")]
+pub use structured_sumcheck::{
+    prove_structured_matrix_product_with_commitments, structured_matrix_whir_tables,
 };
 pub use structured_transition::{
     MAX_STRUCTURED_TRANSITION_ELEMENTS, MAX_STRUCTURED_TRANSITION_PROOF_BYTES,
@@ -88,12 +93,20 @@ pub use structured_transition::{
     prove_structured_transition, verify_structured_transition,
     verify_structured_transition_sumcheck,
 };
+#[cfg(feature = "whir-prototype")]
+pub use structured_transition::{
+    prove_structured_transition_with_commitments, structured_transition_whir_tables,
+};
 pub use structured_wiring::{
     MAX_STRUCTURED_WIRING_BANKS, MAX_STRUCTURED_WIRING_ELEMENTS, MAX_STRUCTURED_WIRING_PROOF_BYTES,
     STRUCTURED_WIRING_VERSION, StructuredWiringError, StructuredWiringOpeningClaim,
     StructuredWiringOpeningClaims, StructuredWiringProof, StructuredWiringStatement,
     prove_structured_wiring, verify_structured_wiring,
     verify_structured_wiring_component_commitments, verify_structured_wiring_openings,
+};
+#[cfg(feature = "whir-prototype")]
+pub use structured_wiring::{
+    prove_structured_wiring_with_commitments, structured_wiring_whir_tables,
 };
 pub use sumcheck::{
     GOLDILOCKS_MODULUS, MAX_TOY_MATRIX_ELEMENTS, MatrixProductSumcheckProof, SumcheckError,
@@ -105,7 +118,9 @@ pub use whir_proof::{
     EXPLICIT_WHIR_SECURITY_BITS, EXPLICIT_WHIR_VERSION, ExplicitWhirCommitment, ExplicitWhirError,
     ExplicitWhirOpening, ExplicitWhirProof, MAX_EXPLICIT_WHIR_BINDING_BYTES,
     MAX_EXPLICIT_WHIR_OPENINGS, MAX_EXPLICIT_WHIR_PROOF_BYTES, MAX_EXPLICIT_WHIR_VARIABLES,
-    prove_explicit_whir_openings, verify_explicit_whir_openings,
+    MAX_STRUCTURED_WHIR_ELEMENTS, MAX_STRUCTURED_WHIR_TABLES, StructuredWhirCommitmentSet,
+    StructuredWhirPcsVerifier, prove_explicit_whir_openings, prove_structured_whir_openings,
+    verify_explicit_whir_openings, verify_structured_whir_openings,
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,

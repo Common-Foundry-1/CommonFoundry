@@ -275,6 +275,64 @@ pub fn prove_structured_wiring(
         .iter()
         .map(|bank| table_commitment(bank))
         .collect::<Vec<_>>();
+    prove_structured_wiring_fields(
+        binding,
+        statement,
+        initial_values,
+        input_banks,
+        output_banks,
+        initial_commitment,
+        input_commitments,
+        output_commitments,
+    )
+}
+
+/// Builds the wiring transcript using commitments supplied by an aggregate
+/// PCS. The PCS must later authenticate all returned activation openings.
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_structured_wiring_with_commitments(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    initial_commitment: [u8; 32],
+    input_commitments: Vec<[u8; 32]>,
+    output_commitments: Vec<[u8; 32]>,
+) -> Result<StructuredWiringProof, StructuredWiringError> {
+    validate_tables(statement, initial, inputs, outputs)?;
+    validate_successors(statement, initial, inputs, outputs)?;
+    if input_commitments.len() != statement.banks || output_commitments.len() != statement.banks {
+        return Err(StructuredWiringError::ComponentCount);
+    }
+    prove_structured_wiring_fields(
+        binding,
+        statement,
+        initial
+            .iter()
+            .copied()
+            .map(ExtensionField::from_signed)
+            .collect(),
+        bank_field_values(statement, inputs)?,
+        bank_field_values(statement, outputs)?,
+        initial_commitment,
+        input_commitments,
+        output_commitments,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_structured_wiring_fields(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial_values: Vec<ExtensionField>,
+    input_banks: Vec<Vec<ExtensionField>>,
+    output_banks: Vec<Vec<ExtensionField>>,
+    initial_commitment: [u8; 32],
+    input_commitments: Vec<[u8; 32]>,
+    output_commitments: Vec<[u8; 32]>,
+) -> Result<StructuredWiringProof, StructuredWiringError> {
     let mut transcript = WiringTranscript::new(
         binding,
         statement,
@@ -305,6 +363,42 @@ pub fn prove_structured_wiring(
     };
     verify_structured_wiring_openings(binding, statement, &proof)?;
     Ok(proof)
+}
+
+/// Returns initial, input-bank, and output-bank tables in wiring transcript
+/// order for the experimental aggregate WHIR backend.
+#[cfg(feature = "whir-prototype")]
+pub fn structured_wiring_whir_tables(
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+) -> Result<Vec<Vec<u64>>, StructuredWiringError> {
+    validate_tables(statement, initial, inputs, outputs)?;
+    validate_successors(statement, initial, inputs, outputs)?;
+    let initial_values = initial
+        .iter()
+        .copied()
+        .map(ExtensionField::from_signed)
+        .collect::<Vec<_>>();
+    let input_banks = bank_field_values(statement, inputs)?;
+    let output_banks = bank_field_values(statement, outputs)?;
+    Ok(
+        std::iter::once(crate::structured_sumcheck::base_table_values(
+            &initial_values,
+        ))
+        .chain(
+            input_banks
+                .iter()
+                .map(|bank| crate::structured_sumcheck::base_table_values(bank)),
+        )
+        .chain(
+            output_banks
+                .iter()
+                .map(|bank| crate::structured_sumcheck::base_table_values(bank)),
+        )
+        .collect(),
+    )
 }
 
 pub fn verify_structured_wiring(

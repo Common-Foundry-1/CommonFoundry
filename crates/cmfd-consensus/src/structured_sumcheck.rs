@@ -307,6 +307,57 @@ pub fn prove_structured_matrix_product(
     let activation_commitment = table_commitment(&activation_values);
     let weight_commitment = table_commitment(&weight_values);
     let accumulator_commitment = table_commitment(&accumulator_values);
+    prove_structured_matrix_product_fields(
+        binding,
+        statement,
+        activation_values,
+        weight_values,
+        accumulator_values,
+        [
+            activation_commitment,
+            weight_commitment,
+            accumulator_commitment,
+        ],
+    )
+}
+
+/// Builds the matrix transcript using commitments supplied by an aggregate
+/// PCS. The PCS must later authenticate all returned terminal openings.
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+pub fn prove_structured_matrix_product_with_commitments(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+    commitments: [[u8; 32]; 3],
+) -> Result<StructuredMatrixProof, StructuredSumcheckError> {
+    validate_tables(statement, activations, weights, accumulators)?;
+    prove_structured_matrix_product_fields(
+        binding,
+        statement,
+        field_values(activations),
+        field_values(weights),
+        field_values(accumulators),
+        commitments,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_structured_matrix_product_fields(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    activation_values: Vec<ExtensionField>,
+    weight_values: Vec<ExtensionField>,
+    accumulator_values: Vec<ExtensionField>,
+    commitments: [[u8; 32]; 3],
+) -> Result<StructuredMatrixProof, StructuredSumcheckError> {
+    let [
+        activation_commitment,
+        weight_commitment,
+        accumulator_commitment,
+    ] = commitments;
     let mut transcript = MatrixTranscript::new(
         binding,
         statement,
@@ -413,6 +464,23 @@ pub fn prove_structured_matrix_product(
         weight_evaluation: ExtensionElement::from_field(weight_partial[0]),
         transcript_digest,
     })
+}
+
+/// Returns the canonical base-field tables committed by the experimental
+/// aggregate WHIR backend, in activation/weight/accumulator order.
+#[cfg(feature = "whir-prototype")]
+pub fn structured_matrix_whir_tables(
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+) -> Result<Vec<Vec<u64>>, StructuredSumcheckError> {
+    validate_tables(statement, activations, weights, accumulators)?;
+    Ok(vec![
+        base_table_values(&field_values(activations)),
+        base_table_values(&field_values(weights)),
+        base_table_values(&field_values(accumulators)),
+    ])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -623,6 +691,18 @@ fn field_values(values: &[i64]) -> Vec<ExtensionField> {
         .iter()
         .copied()
         .map(ExtensionField::from_signed)
+        .collect()
+}
+
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn base_table_values(values: &[ExtensionField]) -> Vec<u64> {
+    values
+        .iter()
+        .map(|value| {
+            debug_assert_eq!(value.0[1].0, 0);
+            debug_assert_eq!(value.0[2].0, 0);
+            value.0[0].0
+        })
         .collect()
 }
 

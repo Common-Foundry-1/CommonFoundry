@@ -855,6 +855,7 @@ dependencies = [
  "clap",
  "cmfd-marketplace",
  "enum-ordinalize",
+ "flate2",
  "frontend",
  "hex",
  "k256",

@@ -217,13 +217,32 @@ pub fn verify_structured_forgematrix_proof(
     proof: &StructuredForgeMatrixProof,
     pcs: &dyn StructuredPcsVerifier,
 ) -> Result<(), StructuredProofError> {
-    validate_component_shapes(statement, proof)?;
-    if proof.protocol_version != STRUCTURED_AGGREGATE_VERSION {
-        return Err(StructuredProofError::ProtocolVersion);
+    if proof.pcs_proof.is_empty() {
+        return Err(StructuredProofError::MissingPcsProof);
     }
     // Enforce all in-memory resource and canonical-field checks as well as the
     // byte parser does for an untrusted wire proof.
     proof.encode()?;
+    let openings = collect_structured_forgematrix_openings(statement, proof)?;
+    if !pcs.verify_openings(&statement.public_binding, &openings, &proof.pcs_proof) {
+        return Err(StructuredProofError::PcsRejected);
+    }
+    Ok(())
+}
+
+/// Checks every algebraic component and commitment link, returning the exact
+/// terminal claims that an aggregate PCS must authenticate.
+///
+/// This is the prover/verifier seam used by experimental PCS backends. It does
+/// not accept a ForgeMatrix proof by itself.
+pub fn collect_structured_forgematrix_openings(
+    statement: &StructuredForgeMatrixStatement,
+    proof: &StructuredForgeMatrixProof,
+) -> Result<Vec<StructuredPcsOpeningClaim>, StructuredProofError> {
+    validate_component_shapes(statement, proof)?;
+    if proof.protocol_version != STRUCTURED_AGGREGATE_VERSION {
+        return Err(StructuredProofError::ProtocolVersion);
+    }
 
     verify_structured_wiring_component_commitments(
         statement.wiring_statement,
@@ -308,11 +327,7 @@ pub fn verify_structured_forgematrix_proof(
             }),
     );
 
-    let openings = canonical_openings(openings)?;
-    if !pcs.verify_openings(binding, &openings, &proof.pcs_proof) {
-        return Err(StructuredProofError::PcsRejected);
-    }
-    Ok(())
+    canonical_openings(openings)
 }
 
 fn validate_component_shapes(
@@ -382,7 +397,7 @@ fn append_transition_openings(
     Ok(())
 }
 
-fn canonical_openings(
+pub(crate) fn canonical_openings(
     openings: Vec<StructuredPcsOpeningClaim>,
 ) -> Result<Vec<StructuredPcsOpeningClaim>, StructuredProofError> {
     if openings.len() > MAX_STRUCTURED_OPENING_CLAIMS {
@@ -487,6 +502,15 @@ mod tests {
         structured_sumcheck::ExtensionField, structured_sumcheck::table_commitment,
         v2_test_reference,
     };
+    #[cfg(feature = "whir-prototype")]
+    use crate::{
+        StructuredWhirCommitmentSet, StructuredWhirPcsVerifier,
+        prove_structured_matrix_product_with_commitments,
+        prove_structured_transition_with_commitments, prove_structured_whir_openings,
+        prove_structured_wiring_with_commitments, structured_matrix_whir_tables,
+        structured_transition_whir_tables, structured_wiring_whir_tables,
+        verify_structured_whir_openings,
+    };
 
     struct TestPcs {
         accept: bool,
@@ -552,7 +576,25 @@ mod tests {
         }
     }
 
-    fn fixture() -> (StructuredForgeMatrixStatement, StructuredForgeMatrixProof) {
+    struct FixtureData {
+        binding: [u8; 32],
+        initial: Vec<i64>,
+        inputs: Vec<i64>,
+        outputs: Vec<i64>,
+        weights: Vec<i64>,
+        accumulators: Vec<i64>,
+        base_input: Vec<i64>,
+        initialization_witness: StructuredTransitionWitness,
+        transition_witness: StructuredTransitionWitness,
+        initialization_statement: StructuredTransitionStatement,
+        initialization_mask: StructuredMaskPolynomial,
+        matrix_statement: StructuredMatrixStatement,
+        transition_statement: StructuredTransitionStatement,
+        transition_mask: StructuredMaskPolynomial,
+        wiring_statement: StructuredWiringStatement,
+    }
+
+    fn fixture_data() -> FixtureData {
         let block = BlockChallenge {
             network_id: [0x63; 32],
             previous_block: [0x11; 32],
@@ -602,15 +644,6 @@ mod tests {
             max_abs_weight: 125,
             max_abs_accumulator: 64_000_000,
         };
-        let matrix_proof = prove_structured_matrix_product(
-            &trace.challenge_digest,
-            matrix_statement,
-            &inputs,
-            &weights,
-            &accumulators,
-        )
-        .unwrap();
-
         let base_input = model
             .base_input()
             .iter()
@@ -634,21 +667,6 @@ mod tests {
         let initialization_mask =
             StructuredMaskPolynomial::from_virtual_challenge(&trace.challenge_digest, rows, cols)
                 .unwrap();
-        let initialization_proof = prove_structured_transition(
-            &trace.challenge_digest,
-            initialization_statement,
-            &initialization_mask,
-            &initialization_witness,
-        )
-        .unwrap();
-        let base_input_commitment = table_commitment(
-            &base_input
-                .iter()
-                .copied()
-                .map(ExtensionField::from_signed)
-                .collect::<Vec<_>>(),
-        );
-
         let mut transition_witness = empty_witness();
         for layer in &trace.layers {
             for ((accumulator, reduction), activation) in layer
@@ -675,14 +693,6 @@ mod tests {
         let transition_mask =
             StructuredMaskPolynomial::from_challenge(&trace.challenge_digest, layers, rows, cols)
                 .unwrap();
-        let transition_proof = prove_structured_transition(
-            &trace.challenge_digest,
-            transition_statement,
-            &transition_mask,
-            &transition_witness,
-        )
-        .unwrap();
-
         let wiring_statement = StructuredWiringStatement {
             banks: 1,
             layers_per_bank: layers,
@@ -690,25 +700,76 @@ mod tests {
             cols,
             max_abs_activation: 125,
         };
-        let wiring_proof = prove_structured_wiring(
-            &trace.challenge_digest,
+        FixtureData {
+            binding: trace.challenge_digest,
+            initial,
+            inputs,
+            outputs,
+            weights,
+            accumulators,
+            base_input,
+            initialization_witness,
+            transition_witness,
+            initialization_statement,
+            initialization_mask,
+            matrix_statement,
+            transition_statement,
+            transition_mask,
             wiring_statement,
-            &initial,
-            &inputs,
-            &outputs,
+        }
+    }
+
+    fn fixture() -> (StructuredForgeMatrixStatement, StructuredForgeMatrixProof) {
+        let data = fixture_data();
+        let matrix_proof = prove_structured_matrix_product(
+            &data.binding,
+            data.matrix_statement,
+            &data.inputs,
+            &data.weights,
+            &data.accumulators,
         )
         .unwrap();
+        let initialization_proof = prove_structured_transition(
+            &data.binding,
+            data.initialization_statement,
+            &data.initialization_mask,
+            &data.initialization_witness,
+        )
+        .unwrap();
+        let transition_proof = prove_structured_transition(
+            &data.binding,
+            data.transition_statement,
+            &data.transition_mask,
+            &data.transition_witness,
+        )
+        .unwrap();
+        let wiring_proof = prove_structured_wiring(
+            &data.binding,
+            data.wiring_statement,
+            &data.initial,
+            &data.inputs,
+            &data.outputs,
+        )
+        .unwrap();
+        let base_input_commitment = table_commitment(
+            &data
+                .base_input
+                .iter()
+                .copied()
+                .map(ExtensionField::from_signed)
+                .collect::<Vec<_>>(),
+        );
         let statement = StructuredForgeMatrixStatement {
-            public_binding: trace.challenge_digest,
+            public_binding: data.binding,
             base_input_commitment,
             weight_commitments: vec![matrix_proof.weight_commitment],
             final_bank_output_commitment: *wiring_proof.output_commitments.last().unwrap(),
-            initialization_statement,
-            initialization_mask,
-            matrix_statements: vec![matrix_statement],
-            transition_statements: vec![transition_statement],
-            transition_masks: vec![transition_mask],
-            wiring_statement,
+            initialization_statement: data.initialization_statement,
+            initialization_mask: data.initialization_mask,
+            matrix_statements: vec![data.matrix_statement],
+            transition_statements: vec![data.transition_statement],
+            transition_masks: vec![data.transition_mask],
+            wiring_statement: data.wiring_statement,
         };
         let proof = StructuredForgeMatrixProof {
             protocol_version: STRUCTURED_AGGREGATE_VERSION,
@@ -718,6 +779,114 @@ mod tests {
             wiring_proof,
             pcs_proof: b"authenticated-openings".to_vec(),
         };
+        (statement, proof)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn whir_fixture() -> (StructuredForgeMatrixStatement, StructuredForgeMatrixProof) {
+        let data = fixture_data();
+        let matrix_tables = structured_matrix_whir_tables(
+            data.matrix_statement,
+            &data.inputs,
+            &data.weights,
+            &data.accumulators,
+        )
+        .unwrap();
+        let initialization_tables = structured_transition_whir_tables(
+            data.initialization_statement,
+            &data.initialization_witness,
+        )
+        .unwrap();
+        let transition_tables =
+            structured_transition_whir_tables(data.transition_statement, &data.transition_witness)
+                .unwrap();
+        let wiring_tables = structured_wiring_whir_tables(
+            data.wiring_statement,
+            &data.initial,
+            &data.inputs,
+            &data.outputs,
+        )
+        .unwrap();
+        let commitment_set = StructuredWhirCommitmentSet::new(
+            matrix_tables
+                .iter()
+                .chain(&initialization_tables)
+                .chain(&transition_tables)
+                .chain(&wiring_tables)
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        let aliases = |tables: &[Vec<u64>]| {
+            tables
+                .iter()
+                .map(|table| commitment_set.commitment_for(table).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let matrix_aliases: [[u8; 32]; 3] = aliases(&matrix_tables).try_into().unwrap();
+        let initialization_aliases = aliases(&initialization_tables);
+        let transition_aliases = aliases(&transition_tables);
+        let wiring_aliases = aliases(&wiring_tables);
+
+        let matrix_proof = prove_structured_matrix_product_with_commitments(
+            &data.binding,
+            data.matrix_statement,
+            &data.inputs,
+            &data.weights,
+            &data.accumulators,
+            matrix_aliases,
+        )
+        .unwrap();
+        let initialization_proof = prove_structured_transition_with_commitments(
+            &data.binding,
+            data.initialization_statement,
+            &data.initialization_mask,
+            &data.initialization_witness,
+            initialization_aliases.clone(),
+        )
+        .unwrap();
+        let transition_proof = prove_structured_transition_with_commitments(
+            &data.binding,
+            data.transition_statement,
+            &data.transition_mask,
+            &data.transition_witness,
+            transition_aliases,
+        )
+        .unwrap();
+        let wiring_proof = prove_structured_wiring_with_commitments(
+            &data.binding,
+            data.wiring_statement,
+            &data.initial,
+            &data.inputs,
+            &data.outputs,
+            wiring_aliases[0],
+            vec![wiring_aliases[1]],
+            vec![wiring_aliases[2]],
+        )
+        .unwrap();
+        let statement = StructuredForgeMatrixStatement {
+            public_binding: data.binding,
+            base_input_commitment: initialization_aliases[0],
+            weight_commitments: vec![matrix_aliases[1]],
+            final_bank_output_commitment: wiring_aliases[2],
+            initialization_statement: data.initialization_statement,
+            initialization_mask: data.initialization_mask,
+            matrix_statements: vec![data.matrix_statement],
+            transition_statements: vec![data.transition_statement],
+            transition_masks: vec![data.transition_mask],
+            wiring_statement: data.wiring_statement,
+        };
+        let mut proof = StructuredForgeMatrixProof {
+            protocol_version: STRUCTURED_AGGREGATE_VERSION,
+            initialization_proof,
+            matrix_proofs: vec![matrix_proof],
+            transition_proofs: vec![transition_proof],
+            wiring_proof,
+            pcs_proof: Vec::new(),
+        };
+        let openings = collect_structured_forgematrix_openings(&statement, &proof).unwrap();
+        proof.pcs_proof =
+            prove_structured_whir_openings(&data.binding, &commitment_set, &openings).unwrap();
         (statement, proof)
     }
 
@@ -807,6 +976,48 @@ mod tests {
                 assert_eq!(decoded.encode().unwrap(), mutated);
             }
         }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn aggregate_whir_openings_round_trip_and_fail_closed() {
+        let (statement, proof) = whir_fixture();
+        let encoded = proof.encode().unwrap();
+        let decoded = StructuredForgeMatrixProof::decode(&encoded).unwrap();
+        let openings = collect_structured_forgematrix_openings(&statement, &decoded).unwrap();
+        verify_structured_whir_openings(&statement.public_binding, &openings, &decoded.pcs_proof)
+            .unwrap();
+        verify_structured_forgematrix_proof(&statement, &decoded, &StructuredWhirPcsVerifier)
+            .unwrap();
+
+        let mut wrong_root = proof.clone();
+        wrong_root.pcs_proof[12] ^= 1;
+        assert_eq!(
+            verify_structured_forgematrix_proof(
+                &statement,
+                &wrong_root,
+                &StructuredWhirPcsVerifier,
+            ),
+            Err(StructuredProofError::PcsRejected)
+        );
+
+        let mut wrong_opening = proof.clone();
+        wrong_opening.matrix_proofs[0].activation_evaluation.limbs[0] ^= 1;
+        assert!(
+            verify_structured_forgematrix_proof(
+                &statement,
+                &wrong_opening,
+                &StructuredWhirPcsVerifier,
+            )
+            .is_err()
+        );
+
+        let mut truncated = proof.clone();
+        truncated.pcs_proof.pop();
+        assert_eq!(
+            verify_structured_forgematrix_proof(&statement, &truncated, &StructuredWhirPcsVerifier,),
+            Err(StructuredProofError::PcsRejected)
+        );
     }
 
     #[test]

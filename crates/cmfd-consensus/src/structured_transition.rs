@@ -463,8 +463,47 @@ pub fn prove_structured_transition(
     witness: &StructuredTransitionWitness,
 ) -> Result<StructuredTransitionProof, StructuredTransitionError> {
     mask_polynomial.validate(statement)?;
-    let mut oracles = build_oracles(statement, witness)?;
+    let oracles = build_oracles(statement, witness)?;
     let oracle_commitments = oracle_commitments(statement, &oracles);
+    prove_structured_transition_oracles(
+        binding,
+        statement,
+        mask_polynomial,
+        oracles,
+        oracle_commitments,
+    )
+}
+
+/// Builds the transition transcript using commitments supplied by an
+/// aggregate PCS. The PCS must later authenticate every oracle opening.
+#[cfg(feature = "whir-prototype")]
+pub fn prove_structured_transition_with_commitments(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    witness: &StructuredTransitionWitness,
+    oracle_commitments: Vec<[u8; 32]>,
+) -> Result<StructuredTransitionProof, StructuredTransitionError> {
+    mask_polynomial.validate(statement)?;
+    if oracle_commitments.len() != STRUCTURED_TRANSITION_ORACLES {
+        return Err(StructuredTransitionError::Commitment);
+    }
+    prove_structured_transition_oracles(
+        binding,
+        statement,
+        mask_polynomial,
+        build_oracles(statement, witness)?,
+        oracle_commitments,
+    )
+}
+
+fn prove_structured_transition_oracles(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    mut oracles: Vec<Vec<ExtensionField>>,
+    oracle_commitments: Vec<[u8; 32]>,
+) -> Result<StructuredTransitionProof, StructuredTransitionError> {
     let mut transcript = TransitionTranscript::new(
         binding,
         statement,
@@ -520,6 +559,18 @@ pub fn prove_structured_transition(
             .collect(),
         transcript_digest: transcript.digest(),
     })
+}
+
+/// Returns all transition and range-check oracle tables in transcript order.
+#[cfg(feature = "whir-prototype")]
+pub fn structured_transition_whir_tables(
+    statement: StructuredTransitionStatement,
+    witness: &StructuredTransitionWitness,
+) -> Result<Vec<Vec<u64>>, StructuredTransitionError> {
+    Ok(build_oracles(statement, witness)?
+        .iter()
+        .map(|oracle| crate::structured_sumcheck::base_table_values(oracle))
+        .collect())
 }
 
 pub fn verify_structured_transition(

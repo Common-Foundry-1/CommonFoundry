@@ -844,7 +844,12 @@ fn challenge_digest(
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn mask_coefficients(challenge: &[u8; 32], layer: u32, rows: usize, width: usize) -> Vec<u8> {
+pub(crate) fn mask_coefficients(
+    challenge: &[u8; 32],
+    layer: u32,
+    rows: usize,
+    width: usize,
+) -> Vec<u8> {
     let count = 1 + rows.ilog2() as usize + width.ilog2() as usize;
     let mut hasher = Hasher::new_derive_key(MASK_DOMAIN);
     hasher.update(challenge);

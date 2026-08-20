@@ -351,6 +351,13 @@ comparison. The v2 research code now implements:
 - a standalone Fiat--Shamir matrix-multiplication sumcheck skeleton with
   canonical Goldilocks field representatives in transcript hashing,
   commitment/transcript mutation tests, and a hard 4096-element research cap;
+- custom bank-batched matrix and transition/range sumchecks in the cubic
+  Goldilocks extension. They prove every matrix product and all 121 local
+  transition/range constraints over the actual ForgeMatrix trace, with
+  canonical bounded encodings and exact no-wrap bounds. Their current
+  full-table opening adapters are not a transparent PCS or a succinct
+  verifier; the frozen protocol and remaining work are in
+  [forgematrix-custom-proof.md](forgematrix-custom-proof.md);
 - an optional, feature-gated Remainder CE GKR/Ligero proof of the complete tiny
   2x4x4 relation. It binds the fixed model, public statement, target, nonce,
   masks, all matrix products, every nonlinear reduction and range, final public

@@ -8,6 +8,8 @@ pub mod network;
 pub mod pow;
 #[cfg(feature = "remainder-prototype")]
 pub mod remainder_proof;
+pub mod structured_sumcheck;
+pub mod structured_transition;
 pub mod sumcheck;
 pub mod wire;
 
@@ -58,6 +60,22 @@ pub use remainder_proof::{
     ForgeMatrixV2RemainderProof, MAX_REMAINDER_PROTOTYPE_PROOF_BYTES, REMAINDER_BACKEND_REVISION,
     REMAINDER_PROTOTYPE_VERSION, RemainderPrototypeError, prove_remainder_prototype,
     verify_remainder_prototype,
+};
+pub use structured_sumcheck::{
+    ExtensionElement, MAX_STRUCTURED_MATRIX_ELEMENTS, MAX_STRUCTURED_SUMCHECK_PROOF_BYTES,
+    STRUCTURED_SUMCHECK_CHALLENGE_BITS, STRUCTURED_SUMCHECK_VERSION, StructuredMatrixOpeningClaims,
+    StructuredMatrixProof, StructuredMatrixRound, StructuredMatrixStatement,
+    StructuredSumcheckError, prove_structured_matrix_product, verify_structured_matrix_product,
+    verify_structured_matrix_sumcheck,
+};
+pub use structured_transition::{
+    MAX_STRUCTURED_TRANSITION_ELEMENTS, MAX_STRUCTURED_TRANSITION_PROOF_BYTES,
+    STRUCTURED_TRANSITION_CONSTRAINTS, STRUCTURED_TRANSITION_MAX_DEGREE,
+    STRUCTURED_TRANSITION_ORACLES, STRUCTURED_TRANSITION_VERSION, StructuredMaskPolynomial,
+    StructuredTransitionError, StructuredTransitionOpeningClaims, StructuredTransitionProof,
+    StructuredTransitionRound, StructuredTransitionStatement, StructuredTransitionWitness,
+    prove_structured_transition, verify_structured_transition,
+    verify_structured_transition_sumcheck,
 };
 pub use sumcheck::{
     GOLDILOCKS_MODULUS, MAX_TOY_MATRIX_ELEMENTS, MatrixProductSumcheckProof, SumcheckError,

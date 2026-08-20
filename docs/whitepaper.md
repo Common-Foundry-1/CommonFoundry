@@ -603,15 +603,11 @@ flowchart TD
     B --> V[Fast validator verification]
 ```
 
-### 8.6 The unresolved final-digest binding
+### 8.6 The final-digest proof checkpoint
 
-A proof of matrix and transition relations is incomplete if the final BLAKE3 digest is accepted as an unproved miner-supplied field. Production must choose one of:
+A proof of matrix and transition relations is incomplete if the final BLAKE3 digest is accepted as an unproved miner-supplied field. The feature-gated research aggregate now arithmetizes the exact one-block derive-key BLAKE3 computation used by the tiny Devnet profile. Its private hash input is bound to the PCS-authenticated final-layer table through the same transcript-derived cubic-Goldilocks MLE point, so the aggregate no longer carries the final activation bytes.
 
-1. arithmetize BLAKE3 inside the proof;
-2. publish all 524,288 final bytes so validators hash them directly;
-3. introduce a reviewed proof-native digest under a new algorithm version.
-
-Option 2 adds 512 KiB to every block before proof overhead. No option is currently selected or implemented. This is a production blocker.
+This checkpoint does not solve the production case. The deterministic one-block hash proof is 3,223,045 bytes and the complete tiny-profile aggregate is 3,435,854 bytes, above the 256 KiB activation gate. Production also needs authenticated chunk and parent-tree wiring for all 524,288 final bytes. The current BLAKE3 AIR is used over Goldilocks outside its upstream documented field-size range and therefore requires independent algebraic review. A narrower argument or recursive compression, complete tree wiring, a soundness report, and audits remain production blockers.
 
 ## 9. GPU memory and hardware economics
 
@@ -942,7 +938,7 @@ an SBOM, signed provenance, or an attestation.
 | Devnet proof | 177-byte payload, 193-byte standalone frame, plus full tiny replay | Succinct transparent all-layer proof |
 | Model bank | Seedless format, lengths, roots, byte checks | Published 6 GiB artifact, ceremony, PCS, byte-to-PCS link |
 | Matrix sumcheck | Standalone small educational skeleton | Batched GKR, openings, ranges, 128-bit aggregate soundness |
-| Final digest | Fully replayed on tiny profile | In-proof hash, public bytes, or new proof-native digest |
+| Final digest | Tiny full replay plus feature-gated one-block BLAKE3 STARK bound to the final WHIR opening | Production BLAKE3 tree argument and compression below the payload gate |
 | CUDA | Tiny arithmetic differential smoke fixture | Independent optimized miner/prover and hardware matrix |
 | P2P | Bounded static private pull plus thin-miner template/submission messages | Authenticated public discovery/gossip and DoS defenses |
 | Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |
@@ -1028,8 +1024,8 @@ server recomputation all execute today at research scale.
 
 The most important work is unfinished. Production needs a transparent succinct
 proof for the entire 384-layer relation, a published and linked seedless model
-bank, a sound final-digest construction, optimized independent miners and
-provers, evidence across low- and high-memory hardware, public-network
+bank, a production-scale and compressed final-digest argument, optimized
+independent miners and provers, evidence across low- and high-memory hardware, public-network
 hardening, secure custody, durable pool payouts and share-proof DoS defenses,
 marketplace transport, governance disclosure, and external audits.
 

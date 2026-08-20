@@ -264,39 +264,40 @@ each encoded as one byte in `0..=250`. `work_digest` is compared as an unsigned
 256-bit big-endian integer with the chain-derived target.
 
 The verifier cannot safely accept `final_activation_digest` as an unproved
-miner claim. The structured research proof now closes that correctness gap as
-follows:
+miner claim. The feature-gated structured research proof now closes that gap
+for the current one-block Devnet output as follows:
 
-1. the proof envelope carries the canonical row-major `final_raw` table, capped
-   at 524,288 bytes;
-2. the verifier hashes those exact bytes with the formula above and recomputes
-   `work_digest` from the pinned byte and PCS model roots;
-3. the final digest, work digest, target, challenge, model roots, and table
+1. a BLAKE3 STARK privately authenticates the exact row-major `final_raw` bytes
+   under the formula above, so those bytes are no longer carried in the
+   aggregate envelope;
+2. the final digest, work digest, target, challenge, model roots, and table
    length are absorbed into the public transcript binding before the wiring
    verifier samples its cell point;
-4. the verifier evaluates the supplied final table at that cell point and
-   requires equality with the PCS-authenticated opening of the last layer in
-   the last output bank; and
-5. the recomputed work digest must meet the block target.
+3. the STARK proves that the private bytes' cubic-Goldilocks multilinear
+   evaluation at that point equals the PCS-authenticated opening of the last
+   layer in the last output bank; and
+4. the verifier recomputes `work_digest` from the proven final digest and
+   pinned model roots and requires it to meet the block target.
 
 This prevents a prover from substituting another final table or mining digest
 without either breaking BLAKE3 or the sumcheck/PCS soundness. Proof or PCS
 randomness is not included in `work_digest`, so it cannot provide a second
 grinding surface.
 
-The current bridge is complete for correctness but not succinct in total
-payload: the production table adds 512 KiB to every winning block. A production
-release should therefore replace the public table with one of the following:
+The public-table bridge has therefore been removed from the aggregate format,
+but the first BLAKE3 backend is not production-succinct. Its deterministic
+one-block vector is 3,223,045 bytes; the complete tiny-profile aggregate is
+3,435,854 bytes. It supports only messages whose activation portion is a
+nonempty power of two fitting the remaining 24 bytes of one compression block.
+The production 524,288-byte output still needs authenticated BLAKE3 chunk and
+parent-tree wiring, followed by compression or a substantially narrower proof.
+The current Plonky3 AIR is also being used over Goldilocks outside its documented
+field-size range, so independent algebraic review is an explicit gate.
 
-1. arithmetize BLAKE3 and prove that the final activation bytes hash to the
-   digest;
-2. adopt a reviewed proof-native final digest in a later algorithm revision and
-   define the target calculation around it.
-
-The 512 KiB bridge remains feature-gated research code, has no consensus proof
-tag, and does not by itself satisfy the production proof-size, streaming,
-soundness, or audit gates. A proof of the matrix and cubic relations that omits
-this binding is not a valid block proof.
+The feature has no consensus proof tag and does not satisfy the production
+proof-size, streaming, soundness, or audit gates. A proof of the matrix and
+cubic relations that omits a sound final-digest binding is not a valid block
+proof.
 
 ## What the proof cannot establish
 
@@ -384,10 +385,10 @@ comparison. The v2 research code now implements:
   per-table commitment aliases to every component before transcript sampling,
   and verifies the complete canonical opening set under a requested 128-bit
   unique-decoding WHIR configuration;
-- a version-2 structured envelope that carries the bounded canonical final
-  table, recomputes the exact final and work BLAKE3 digests, absorbs the
-  challenge/model roots/digests/target/length before sampling, checks the final
-  table against the authenticated last-layer opening, and rejects high work;
+- a version-3 structured envelope that replaces the bounded public final table
+  with a one-block BLAKE3 STARK, absorbs the challenge/model
+  roots/digests/target/length before sampling, links the private hash input to
+  the authenticated last-layer opening, recomputes work, and rejects high work;
 - an optional, feature-gated Remainder CE GKR/Ligero proof of the complete tiny
   2x4x4 relation. It binds the fixed model, public statement, target, nonce,
   masks, all matrix products, every nonlinear reduction and range, final public
@@ -422,10 +423,12 @@ containment are research safeguards, not acceptable network-parser bounds.
 There is no proof wire tag or `ChainState` integration for this feature.
 
 The repository does not yet implement the production streaming prover,
-raw-byte-to-PCS model-link certificate, final soundness report, or a succinct
-BLAKE3 subargument that removes the 512 KiB final-table bridge. The aggregate
-proof has no consensus wire tag and the WHIR backend remains unaudited research
-code. The CUDA fixture is a differential harness, not a tensor-core succinct
+raw-byte-to-PCS model-link certificate, final soundness report, production
+BLAKE3 tree argument, or proof compression below the 256 KiB gate. The
+one-block research hash argument removes the public table only for the tiny
+profile and measures about 3.2 MB. The aggregate proof has no consensus wire
+tag and the WHIR and BLAKE3 backends remain unaudited research code. The CUDA
+fixture is a differential harness, not a tensor-core succinct
 prover, low-VRAM proof benchmark, or evidence of residency.
 The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;
 an independent challenge-to-coefficient implementation and a broader vector

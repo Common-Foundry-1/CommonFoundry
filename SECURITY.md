@@ -48,23 +48,37 @@ opening claims, and checks that its activation commitments are the same
 commitments used by the matrix and transition components. The aggregate
 research verifier now also requires the matrix accumulator to equal the
 transition input, pins the base table and model-weight commitments, binds the
-declared final-bank output commitment, strictly parses a 1 MiB-capped envelope,
-and fails closed unless a configured PCS verifier authenticates every
-canonical opening claim. An optional `whir-prototype` feature now commits one
+declared final-bank output commitment, strictly parses a 5 MiB-capped envelope,
+and fails closed unless configured PCS and final-hash verifiers authenticate
+every canonical opening claim. An optional `whir-prototype` feature now commits one
 or more bounded Goldilocks tables under one transparent BLAKE3 Merkle/WHIR root
 and authenticates the exact independent cubic-extension MLE points emitted by
 the custom sumchecks. Its proof bytes are bounded, canonically re-encoded,
-trailing data is rejected, and verification panics are contained. The
-structured aggregate now also carries a capped canonical final activation
-table, recomputes the exact output and work BLAKE3 digests, binds the challenge,
-model roots, target, digests, and table length before sampling, and checks the
-table against the PCS-authenticated last-layer output opening. This closes the
-untrusted-final-digest correctness gap without adding proof randomness to the
-mining digest. It is not a succinct production solution: the production table
-adds 512 KiB, and there is still no production streaming prover, raw-model-byte
-link, consensus tag, independent soundness report, audit, or benchmark. The
-aggregate proof remains feature-gated research scaffolding with no consensus or
-wire tag. See
+trailing data is rejected, and verification panics are contained. The same
+feature now replaces the aggregate's public final-activation table with a
+Plonky3 STARK for the exact one-block derive-key BLAKE3 computation used by the
+tiny Devnet profile. The STARK privately hashes the final bytes and proves that
+their cubic-Goldilocks multilinear evaluation equals the PCS-authenticated
+last-layer opening. The challenge, model roots, target, digests, and table
+length are bound before that opening point is sampled. This closes the
+tiny-profile untrusted-final-digest gap without adding proof randomness to the
+mining digest.
+
+This is not yet a production succinct solution. The deterministic test vector
+produces a 3,223,045-byte BLAKE3 proof and a 3,435,854-byte complete research
+aggregate, both well above the 256 KiB gate. A release-mode local checkpoint
+generated the hash proof in 174 ms and verified it in 15 ms; those are
+development measurements, not production benchmarks. The backend supports only one
+BLAKE3 block; the production 524,288-byte output requires authenticated chunk
+and parent-tree wiring. A test derives the AIR constraint count and degree and
+requires at least 128 proven bits under Plonky3's component-security model; this
+is not the missing aggregate union-bound report. The backend also uses the
+upstream BLAKE3 AIR over Goldilocks, which is outside that crate's documented
+field-size range and therefore needs
+independent algebraic review even though the current tests pass. There is still
+no production streaming prover, raw-model-byte link, consensus tag, complete
+soundness report, or audit. The aggregate remains feature-gated research
+scaffolding with no consensus or wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
 
 Mainnet remains disabled until all of the following are complete:

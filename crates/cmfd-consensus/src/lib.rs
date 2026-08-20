@@ -8,6 +8,8 @@ pub mod network;
 pub mod pow;
 #[cfg(feature = "remainder-prototype")]
 pub mod remainder_proof;
+#[cfg(feature = "whir-prototype")]
+pub mod structured_blake3;
 pub mod structured_proof;
 pub mod structured_sumcheck;
 pub mod structured_transition;
@@ -65,10 +67,16 @@ pub use remainder_proof::{
     REMAINDER_PROTOTYPE_VERSION, RemainderPrototypeError, prove_remainder_prototype,
     verify_remainder_prototype,
 };
+#[cfg(feature = "whir-prototype")]
+pub use structured_blake3::{
+    STRUCTURED_BLAKE3_VERSION, StructuredBlake3Error, StructuredBlake3StarkVerifier,
+    prove_structured_blake3, verify_structured_blake3,
+};
 pub use structured_proof::{
-    MAX_STRUCTURED_AGGREGATE_PROOF_BYTES, MAX_STRUCTURED_FINAL_ACTIVATION_BYTES,
-    MAX_STRUCTURED_OPENING_CLAIMS, MAX_STRUCTURED_OPENING_VARIABLES,
-    MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION, StructuredForgeMatrixProof,
+    MAX_STRUCTURED_AGGREGATE_PROOF_BYTES, MAX_STRUCTURED_BLAKE3_PROOF_BYTES,
+    MAX_STRUCTURED_FINAL_ACTIVATION_BYTES, MAX_STRUCTURED_OPENING_CLAIMS,
+    MAX_STRUCTURED_OPENING_VARIABLES, MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION,
+    StructuredBlake3Statement, StructuredBlake3Verifier, StructuredForgeMatrixProof,
     StructuredForgeMatrixStatement, StructuredPcsOpeningClaim, StructuredPcsVerifier,
     StructuredProofError, collect_structured_forgematrix_openings,
     structured_forgematrix_public_binding, verify_structured_forgematrix_proof,

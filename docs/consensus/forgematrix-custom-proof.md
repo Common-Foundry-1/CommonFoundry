@@ -252,14 +252,24 @@ weight commitment and the final bank-output commitment. Integration verifiers
 and mutation tests enforce those identities under the same public statement
 binding.
 
-The aggregate v2 envelope now carries the canonical row-major final activation
+The aggregate v3 envelope no longer carries the row-major final activation
 table. Its digest, deterministic work digest, target, challenge, model roots,
 and length are committed into the public transcript binding before the wiring
-cell challenge is sampled. The verifier recomputes both BLAKE3 digests and
-requires the public table's multilinear evaluation to equal the
-PCS-authenticated last-layer opening of the final output bank. This makes a
-different table or work digest fail closed. It is a correctness bridge, not the
-final succinct hash argument: the production table is a 512 KiB public witness.
+cell challenge is sampled. A separate BLAKE3 STARK proves the exact one-block
+derive-key hash and proves that its private activation bytes have the same
+cubic-Goldilocks multilinear evaluation as the PCS-authenticated last-layer
+opening. The aggregate verifier accepts only when both the hash argument and
+all PCS openings verify.
+
+This removes the public bytes for the current eight-byte Devnet output, not the
+production proof blocker. The measured hash argument is 3,223,045 bytes and the
+complete aggregate is 3,435,854 bytes. A release-mode development run generated
+the hash proof in 174 ms and verified it in 15 ms. The backend rejects the production
+524,288-byte BLAKE3 tree until authenticated chunk and parent wiring exists. It
+machine-checks at least 128 proven bits under Plonky3's component-security
+model, but that is not an aggregate union-bound report. It also applies the
+upstream BLAKE3 AIR over Goldilocks outside the crate's
+documented field-size range, so independent algebraic review is mandatory.
 
 ## 6. Transparent PCS boundary
 
@@ -275,13 +285,14 @@ itself an unaudited academic prototype, so integrating it is evidence-gathering
 work, not a production selection or audit substitute.
 
 `structured_proof` now provides the fail-closed boundary for that integration.
-It parses a canonical aggregate envelope capped at 1 MiB, validates component
+It parses a canonical aggregate envelope capped at 5 MiB, validates component
 counts and dimensions, checks every component transcript and cross-component
 commitment identity, pins the base table and model weights, binds the declared
 final bank-output commitment, canonicalizes and deduplicates all terminal
-opening claims, and then requires a `StructuredPcsVerifier` to authenticate the
-complete claim set. A missing, empty, malformed, oversized, conflicting, or
-rejected PCS proof is a hard error. There is no accept-without-PCS path.
+opening claims, and then requires both `StructuredPcsVerifier` and
+`StructuredBlake3Verifier` to authenticate the complete claim set and final
+digest. A missing, empty, malformed, oversized, conflicting, or rejected proof
+is a hard error. There is no accept-without-verification path.
 
 The optional `whir-prototype` feature now implements an accepting aggregate
 research adapter beneath that boundary. It stacks bounded base-field tables
@@ -350,8 +361,8 @@ Before a production proof tag can exist:
 1. harden and independently review the aggregate transparent PCS backend,
    canonical parameters, parser, and explicit-point transcript;
 2. link the raw model bytes to the pinned PCS commitment;
-3. arithmetize or replace the final BLAKE3 binding so the 512 KiB public-table
-   bridge can be removed within the payload cap;
+3. extend the one-block BLAKE3 argument with authenticated production chunk and
+   parent-tree wiring, then compress it below the total payload cap;
 4. fuzz the implemented bounded aggregate parser and add a bounded,
    panic-contained network verifier queue;
 5. demonstrate production-size streaming proving within the memory, proof-size,

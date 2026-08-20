@@ -859,17 +859,21 @@ dependencies = [
  "frontend",
  "hex",
  "k256",
+ "p3-air",
  "p3-blake3",
+ "p3-blake3-air",
  "p3-challenger",
  "p3-commit",
  "p3-dft",
  "p3-field",
+ "p3-fri",
  "p3-goldilocks",
  "p3-matrix",
  "p3-merkle-tree",
  "p3-multilinear-util",
  "p3-sumcheck",
  "p3-symmetric",
+ "p3-uni-stark",
  "p3-whir",
  "primitive-types",
  "remainder",
@@ -3699,6 +3703,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "p3-air"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddb1be05c0d6f691afe0c9f468018a9a37cfa904dee78a8081ec96eb3cdd88e8"
+dependencies = [
+ "p3-field",
+ "p3-matrix",
+ "tracing",
+]
+
+[[package]]
 name = "p3-blake3"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3707,6 +3722,21 @@ dependencies = [
  "blake3",
  "p3-symmetric",
  "p3-util",
+]
+
+[[package]]
+name = "p3-blake3-air"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "904cf93aa1cdcfbf351713cde004dfd3b1a593aaeacff276c0a0df933896a9de"
+dependencies = [
+ "itertools 0.15.0",
+ "p3-air",
+ "p3-field",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "rand 0.10.2",
+ "tracing",
 ]
 
 [[package]]
@@ -3767,6 +3797,27 @@ dependencies = [
  "paste",
  "rand 0.10.2",
  "serde",
+ "tracing",
+]
+
+[[package]]
+name = "p3-fri"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6207d9c658afdad926ebc6a5a344c98cfea59baa2eaaf7cd4a528ba02304bae9"
+dependencies = [
+ "itertools 0.15.0",
+ "p3-challenger",
+ "p3-commit",
+ "p3-dft",
+ "p3-field",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-util",
+ "rand 0.10.2",
+ "serde",
+ "spin 0.12.3",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -3942,6 +3993,27 @@ dependencies = [
  "p3-field",
  "p3-util",
  "serde",
+]
+
+[[package]]
+name = "p3-uni-stark"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efdbf6d4d0bc9f56d6535518a4d2ff6df956572c02b3df9ef9f0aff5a827d522"
+dependencies = [
+ "itertools 0.15.0",
+ "libm",
+ "p3-air",
+ "p3-challenger",
+ "p3-commit",
+ "p3-field",
+ "p3-fri",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-util",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

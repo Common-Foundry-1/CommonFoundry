@@ -605,9 +605,11 @@ flowchart TD
 
 ### 8.6 The final-digest proof checkpoint
 
-A proof of matrix and transition relations is incomplete if the final BLAKE3 digest is accepted as an unproved miner-supplied field. The feature-gated research aggregate now arithmetizes the exact one-block derive-key BLAKE3 computation used by the tiny Devnet profile. Its private hash input is bound to the PCS-authenticated final-layer table through the same transcript-derived cubic-Goldilocks MLE point, so the aggregate no longer carries the final activation bytes.
+A proof of matrix and transition relations is incomplete if the final BLAKE3 digest is accepted as an unproved miner-supplied field. The feature-gated research aggregate now arithmetizes the exact derive-key BLAKE3 computation and binds its private hash input to the PCS-authenticated final-layer table through the same transcript-derived cubic-Goldilocks MLE point, so the aggregate no longer carries the final activation bytes.
 
-This checkpoint does not solve the production case. The deterministic one-block hash proof is 3,223,045 bytes and the complete tiny-profile aggregate is 3,435,854 bytes, above the 256 KiB activation gate. Production also needs authenticated chunk and parent-tree wiring for all 524,288 final bytes. The current BLAKE3 AIR is used over Goldilocks outside its upstream documented field-size range and therefore requires independent algebraic review. A narrower argument or recursive compression, complete tree wiring, a soundness report, and audits remain production blockers.
+Small inputs retain the original one-block research AIR. Power-of-two tables from 32 through 524,288 bytes use a narrow tree AIR that authenticates every chunk compression, deterministic parent merge, root compression, counter, flag, chaining-value stack edge, and final-table opening. The schedule is checked against upstream derive-key BLAKE3. A canonical transport deduplicates repeated Merkle authentication nodes and then applies canonical zlib compression, with strict parsing and a 256 KiB component-envelope cap. Release-mode vectors measure 165,039 bytes for 64 activation bytes and 222,555 bytes for a 2,048-byte multi-chunk input. A 32,768-row checkpoint measured a 233,382-byte compressed payload, or 233,399 bytes with the outer envelope, at about 12.22 GiB peak memory and 266.25 seconds proving time.
+
+This checkpoint still does not solve the production case. The complete production AIR has 1,048,576 rows and has not yet been proved end to end, so its final size, memory, proving latency, and verification latency remain unmeasured. The production-shape component uses a cubic Goldilocks challenge field and its security test requires at least 128 proven bits, but the aggregate union-bound report, streaming prover, independent algebraic review, consensus integration, and audits remain production blockers. Passing the hash component's 256 KiB cap also does not prove that the complete aggregate fits its total payload cap.
 
 ## 9. GPU memory and hardware economics
 
@@ -938,7 +940,7 @@ an SBOM, signed provenance, or an attestation.
 | Devnet proof | 177-byte payload, 193-byte standalone frame, plus full tiny replay | Succinct transparent all-layer proof |
 | Model bank | Seedless format, lengths, roots, byte checks | Published 6 GiB artifact, ceremony, PCS, byte-to-PCS link |
 | Matrix sumcheck | Standalone small educational skeleton | Batched GKR, openings, ranges, 128-bit aggregate soundness |
-| Final digest | Tiny full replay plus feature-gated one-block BLAKE3 STARK bound to the final WHIR opening | Production BLAKE3 tree argument and compression below the payload gate |
+| Final digest | Feature-gated exact BLAKE3 chunk/parent/root tree STARK bound to the final WHIR opening; canonical compressed component vectors below 256 KiB | Full 1,048,576-row benchmark, streaming prover, aggregate payload fit, soundness report, consensus integration, and audits |
 | CUDA | Tiny arithmetic differential smoke fixture | Independent optimized miner/prover and hardware matrix |
 | P2P | Bounded static private pull plus thin-miner template/submission messages | Authenticated public discovery/gossip and DoS defenses |
 | Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |

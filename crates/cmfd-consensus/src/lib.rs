@@ -10,6 +10,10 @@ pub mod pow;
 pub mod remainder_proof;
 #[cfg(feature = "whir-prototype")]
 pub mod structured_blake3;
+#[cfg(feature = "whir-prototype")]
+mod structured_blake3_narrow;
+#[cfg(feature = "whir-prototype")]
+mod structured_blake3_tree;
 pub mod structured_proof;
 pub mod structured_sumcheck;
 pub mod structured_transition;

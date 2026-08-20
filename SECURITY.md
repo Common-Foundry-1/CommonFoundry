@@ -56,26 +56,34 @@ and authenticates the exact independent cubic-extension MLE points emitted by
 the custom sumchecks. Its proof bytes are bounded, canonically re-encoded,
 trailing data is rejected, and verification panics are contained. The same
 feature now replaces the aggregate's public final-activation table with a
-Plonky3 STARK for the exact one-block derive-key BLAKE3 computation used by the
-tiny Devnet profile. The STARK privately hashes the final bytes and proves that
-their cubic-Goldilocks multilinear evaluation equals the PCS-authenticated
-last-layer opening. The challenge, model roots, target, digests, and table
-length are bound before that opening point is sampled. This closes the
-tiny-profile untrusted-final-digest gap without adding proof randomness to the
-mining digest.
+BLAKE3 STARK. Small inputs retain the original one-block research AIR; larger
+power-of-two tables use an exact chunk/parent/root tree AIR that matches the
+upstream derive-key result through the production 524,288-byte shape. The tree
+proof privately hashes the final bytes and proves that their cubic-Goldilocks
+multilinear evaluation equals the PCS-authenticated last-layer opening. The
+challenge, model roots, target, digests, and table length are bound before that
+opening point is sampled. This closes the research aggregate's
+untrusted-final-digest gap without adding proof randomness to the mining digest.
 
-This is not yet a production succinct solution. The deterministic test vector
-produces a 3,223,045-byte BLAKE3 proof and a 3,435,854-byte complete research
-aggregate, both well above the 256 KiB gate. A release-mode local checkpoint
-generated the hash proof in 174 ms and verified it in 15 ms; those are
-development measurements, not production benchmarks. The backend supports only one
-BLAKE3 block; the production 524,288-byte output requires authenticated chunk
-and parent-tree wiring. A test derives the AIR constraint count and degree and
-requires at least 128 proven bits under Plonky3's component-security model; this
-is not the missing aggregate union-bound report. The backend also uses the
-upstream BLAKE3 AIR over Goldilocks, which is outside that crate's documented
-field-size range and therefore needs
-independent algebraic review even though the current tests pass. There is still
+The tree transport deduplicates repeated Merkle authentication nodes using a
+canonical first-reference dictionary and then applies canonical zlib
+compression. It rejects noncanonical dictionaries, malformed lengths,
+out-of-range references, trailing bytes, noncanonical compression, and
+decompression beyond the bounded native-proof limit. The complete component
+envelope is capped at 256 KiB. Deterministic release-mode vectors measure
+165,039 bytes for a 64-byte activation and 222,555 bytes for a 2,048-byte
+multi-chunk activation. A 32,768-row resource checkpoint measured a 233,382-byte
+compressed payload (233,399 bytes with the outer envelope), about 12.22 GiB
+peak memory, and 266.25 seconds proving time.
+
+This is still not a production succinct solution. The full production AIR has
+1,048,576 rows and has not yet been proved end to end; its final proof size,
+peak memory, proving time, and verification time remain unmeasured. A test
+derives the production-shape AIR constraint count and degree over a cubic
+Goldilocks challenge field and requires at least 128 proven bits under
+Plonky3's component-security model, but this is not the missing aggregate
+union-bound report. The legacy one-block backend and the
+new custom tree AIR both require independent algebraic review. There is still
 no production streaming prover, raw-model-byte link, consensus tag, complete
 soundness report, or audit. The aggregate remains feature-gated research
 scaffolding with no consensus or wire tag. See

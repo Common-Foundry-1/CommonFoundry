@@ -1,21 +1,24 @@
-//! Succinct one-block BLAKE3 argument for the structured ForgeMatrix proof.
+//! BLAKE3 argument for the structured ForgeMatrix proof.
 //!
 //! This research component proves the exact derive-key BLAKE3 compression used
 //! by `forgematrix_v2::output_digest` without carrying the final activation
 //! bytes in the aggregate envelope. The private activation bytes are linked to
 //! the authenticated last-layer table through its cubic-Goldilocks MLE value.
 //!
-//! Only one-block messages are accepted. Production's multi-chunk BLAKE3 tree
-//! remains disabled until every chunk and parent edge has an authenticated
-//! wiring argument.
+//! Small messages use the upstream one-row Plonky3 AIR. Larger power-of-two
+//! activation tables use the narrow multi-row tree AIR, which authenticates
+//! every chunk compression, parent compression, final digest, and final-table
+//! multilinear opening.
 
 use std::{
     array,
     borrow::{Borrow, BorrowMut},
+    io::{Read, Write},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
 use bincode::Options;
+use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use p3_air::utils::{pack_bits_le, u32_to_bits_le};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_blake3::Blake3;
@@ -37,11 +40,15 @@ use thiserror::Error;
 use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement, StructuredBlake3Verifier,
     forgematrix_v2::output_digest,
+    structured_blake3_narrow::{NarrowBlake3Error, prove_narrow_blake3, verify_narrow_blake3},
 };
 
-pub const STRUCTURED_BLAKE3_VERSION: u32 = 1;
+pub const STRUCTURED_BLAKE3_VERSION: u32 = 2;
 
-const PROOF_MAGIC: &[u8; 8] = b"CMFDB3S1";
+const PROOF_MAGIC: &[u8; 8] = b"CMFDB3S2";
+const BACKEND_ONE_BLOCK: u8 = 0;
+const BACKEND_TREE: u8 = 1;
+const MAX_COMPRESSED_TREE_PROOF_BYTES: usize = 256 * 1024;
 const PROOF_TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/BLAKE3-STARK/V1";
 const OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
 const BLOCK_BYTES: usize = 64;
@@ -90,7 +97,7 @@ impl StructuredBlake3Verifier for StructuredBlake3StarkVerifier {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StructuredBlake3Error {
     #[error(
-        "BLAKE3 argument supports one nonempty power-of-two activation table of at most 24 bytes"
+        "BLAKE3 argument requires a nonempty power-of-two activation table of at most 524288 bytes"
     )]
     UnsupportedShape,
     #[error("BLAKE3 argument activation is not canonically encoded in 0..=250")]
@@ -109,6 +116,20 @@ pub enum StructuredBlake3Error {
     Verification,
     #[error("BLAKE3 STARK backend panicked while handling proof data")]
     BackendPanic,
+}
+
+impl From<NarrowBlake3Error> for StructuredBlake3Error {
+    fn from(error: NarrowBlake3Error) -> Self {
+        match error {
+            NarrowBlake3Error::UnsupportedShape => Self::UnsupportedShape,
+            NarrowBlake3Error::NonCanonicalField => Self::NonCanonicalField,
+            NarrowBlake3Error::Tree(_) => Self::Digest,
+            NarrowBlake3Error::Opening => Self::ActivationOpening,
+            NarrowBlake3Error::Encoding => Self::InvalidEncoding,
+            NarrowBlake3Error::Verification => Self::Verification,
+            NarrowBlake3Error::BackendPanic => Self::BackendPanic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -300,6 +321,15 @@ pub fn prove_structured_blake3(
     statement: &StructuredBlake3Statement,
     final_activation: &[u8],
 ) -> Result<Vec<u8>, StructuredBlake3Error> {
+    if statement.final_activation_len > MAX_ONE_BLOCK_ACTIVATION_BYTES {
+        let backend = BACKEND_TREE;
+        let payload = prove_narrow_blake3(statement, final_activation)?;
+        let compressed = compress_tree_proof(&payload)?;
+        if 17 + compressed.len() > MAX_COMPRESSED_TREE_PROOF_BYTES {
+            return Err(StructuredBlake3Error::ProofTooLarge);
+        }
+        return encode_proof(backend, &compressed);
+    }
     let air = BoundBlake3Air::new(statement)?;
     validate_activation(statement, final_activation)?;
     if output_digest(statement.challenge_digest, final_activation)
@@ -319,15 +349,30 @@ pub fn prove_structured_blake3(
     let native = bincode_options()
         .serialize(&proof)
         .map_err(|_| StructuredBlake3Error::InvalidEncoding)?;
-    encode_proof(&native)
+    encode_proof(BACKEND_ONE_BLOCK, &native)
 }
 
 pub fn verify_structured_blake3(
     statement: &StructuredBlake3Statement,
     encoded: &[u8],
 ) -> Result<(), StructuredBlake3Error> {
+    let (backend, native) = decode_proof(encoded)?;
+    if backend == BACKEND_TREE {
+        if statement.final_activation_len <= MAX_ONE_BLOCK_ACTIVATION_BYTES {
+            return Err(StructuredBlake3Error::InvalidEncoding);
+        }
+        if encoded.len() > MAX_COMPRESSED_TREE_PROOF_BYTES {
+            return Err(StructuredBlake3Error::ProofTooLarge);
+        }
+        let decompressed = decompress_tree_proof(native)?;
+        return verify_narrow_blake3(statement, &decompressed).map_err(Into::into);
+    }
+    if backend != BACKEND_ONE_BLOCK
+        || statement.final_activation_len > MAX_ONE_BLOCK_ACTIVATION_BYTES
+    {
+        return Err(StructuredBlake3Error::InvalidEncoding);
+    }
     let air = BoundBlake3Air::new(statement)?;
-    let native = decode_proof(encoded)?;
     let proof: NativeProof = bincode_options()
         .deserialize(native)
         .map_err(|_| StructuredBlake3Error::InvalidEncoding)?;
@@ -473,11 +518,12 @@ fn bincode_options() -> impl Options {
         .with_limit(crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES as u64)
 }
 
-fn encode_proof(native: &[u8]) -> Result<Vec<u8>, StructuredBlake3Error> {
+fn encode_proof(backend: u8, native: &[u8]) -> Result<Vec<u8>, StructuredBlake3Error> {
     let length = u32::try_from(native.len()).map_err(|_| StructuredBlake3Error::ProofTooLarge)?;
-    let mut encoded = Vec::with_capacity(16 + native.len());
+    let mut encoded = Vec::with_capacity(17 + native.len());
     encoded.extend_from_slice(PROOF_MAGIC);
     encoded.extend_from_slice(&STRUCTURED_BLAKE3_VERSION.to_le_bytes());
+    encoded.push(backend);
     encoded.extend_from_slice(&length.to_le_bytes());
     encoded.extend_from_slice(native);
     if encoded.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES {
@@ -486,8 +532,8 @@ fn encode_proof(native: &[u8]) -> Result<Vec<u8>, StructuredBlake3Error> {
     Ok(encoded)
 }
 
-fn decode_proof(encoded: &[u8]) -> Result<&[u8], StructuredBlake3Error> {
-    if encoded.len() < 16 || encoded.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES {
+fn decode_proof(encoded: &[u8]) -> Result<(u8, &[u8]), StructuredBlake3Error> {
+    if encoded.len() < 17 || encoded.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES {
         return Err(StructuredBlake3Error::ProofTooLarge);
     }
     if encoded.get(..8) != Some(PROOF_MAGIC.as_slice()) {
@@ -502,14 +548,39 @@ fn decode_proof(encoded: &[u8]) -> Result<&[u8], StructuredBlake3Error> {
         return Err(StructuredBlake3Error::InvalidEncoding);
     }
     let length = u32::from_le_bytes(
-        encoded[12..16]
+        encoded[13..17]
             .try_into()
             .map_err(|_| StructuredBlake3Error::InvalidEncoding)?,
     ) as usize;
-    if 16usize.checked_add(length) != Some(encoded.len()) {
+    if 17usize.checked_add(length) != Some(encoded.len()) {
         return Err(StructuredBlake3Error::InvalidEncoding);
     }
-    Ok(&encoded[16..])
+    Ok((encoded[12], &encoded[17..]))
+}
+
+fn compress_tree_proof(native: &[u8]) -> Result<Vec<u8>, StructuredBlake3Error> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(native)
+        .map_err(|_| StructuredBlake3Error::InvalidEncoding)?;
+    encoder
+        .finish()
+        .map_err(|_| StructuredBlake3Error::InvalidEncoding)
+}
+
+fn decompress_tree_proof(encoded: &[u8]) -> Result<Vec<u8>, StructuredBlake3Error> {
+    let decoder = ZlibDecoder::new(encoded);
+    let mut bounded = decoder.take((crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES + 1) as u64);
+    let mut native = Vec::new();
+    bounded
+        .read_to_end(&mut native)
+        .map_err(|_| StructuredBlake3Error::InvalidEncoding)?;
+    if native.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES
+        || compress_tree_proof(&native)? != encoded
+    {
+        return Err(StructuredBlake3Error::InvalidEncoding);
+    }
+    Ok(native)
 }
 
 fn input_byte<AB: AirBuilder>(local: &Blake3Cols<AB::Var>, index: usize) -> AB::Expr {
@@ -754,11 +825,15 @@ mod tests {
 
     fn statement(final_activation: &[u8]) -> StructuredBlake3Statement {
         let challenge = [0x42; 32];
-        let point = vec![
-            crate::ExtensionElement { limbs: [3, 4, 5] },
-            crate::ExtensionElement { limbs: [6, 7, 8] },
-            crate::ExtensionElement { limbs: [9, 10, 11] },
-        ];
+        let point = (0..final_activation.len().ilog2())
+            .map(|index| crate::ExtensionElement {
+                limbs: [
+                    3 * u64::from(index) + 3,
+                    3 * u64::from(index) + 4,
+                    3 * u64::from(index) + 5,
+                ],
+            })
+            .collect::<Vec<_>>();
         let native_point = point
             .iter()
             .copied()
@@ -787,7 +862,7 @@ mod tests {
         let activation = [1, 2, 3, 4, 200, 210, 220, 230];
         let statement = statement(&activation);
         let proof = prove_structured_blake3(&statement, &activation).unwrap();
-        assert_eq!(proof.len(), 3_223_045);
+        assert_eq!(proof.len(), 3_223_046);
         verify_structured_blake3(&statement, &proof).unwrap();
 
         let mut wrong_digest = statement.clone();
@@ -847,8 +922,66 @@ mod tests {
         production.final_activation_point = vec![crate::ExtensionElement { limbs: [1, 0, 0] }; 19];
         assert_eq!(
             verify_structured_blake3(&production, &[0; 16]),
-            Err(StructuredBlake3Error::UnsupportedShape)
+            Err(StructuredBlake3Error::ProofTooLarge)
         );
+    }
+
+    #[test]
+    fn multi_block_tree_argument_uses_the_canonical_envelope() {
+        let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let proof = prove_structured_blake3(&statement, &activation).unwrap();
+        assert_eq!(proof.len(), 165_039);
+        assert!(proof.len() < MAX_COMPRESSED_TREE_PROOF_BYTES);
+        assert_eq!(proof[12], BACKEND_TREE);
+        verify_structured_blake3(&statement, &proof).unwrap();
+
+        let mut wrong_digest = statement.clone();
+        wrong_digest.final_activation_digest[0] ^= 1;
+        assert!(verify_structured_blake3(&wrong_digest, &proof).is_err());
+
+        for index in [0, 8, 12, 17, proof.len() / 2, proof.len() - 1] {
+            let mut mutated = proof.clone();
+            mutated[index] ^= 0x80;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                verify_structured_blake3(&statement, &mutated)
+            }));
+            assert!(
+                result.is_ok(),
+                "tree verifier panicked for mutation at {index}"
+            );
+            assert!(result.unwrap().is_err());
+        }
+        for length in [0, 16, proof.len() - 1] {
+            assert!(verify_structured_blake3(&statement, &proof[..length]).is_err());
+        }
+        let mut trailing = proof.clone();
+        trailing.push(0);
+        assert!(verify_structured_blake3(&statement, &trailing).is_err());
+
+        let (_, compressed) = decode_proof(&proof).unwrap();
+        let native = decompress_tree_proof(compressed).unwrap();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&native).unwrap();
+        let alternative = encoder.finish().unwrap();
+        assert_ne!(alternative, compressed);
+        let noncanonical = encode_proof(BACKEND_TREE, &alternative).unwrap();
+        assert_eq!(
+            verify_structured_blake3(&statement, &noncanonical),
+            Err(StructuredBlake3Error::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn multi_chunk_tree_argument_remains_below_the_component_cap() {
+        let activation = (0..2_048)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let proof = prove_structured_blake3(&statement, &activation).unwrap();
+        assert_eq!(proof.len(), 222_555);
+        assert!(proof.len() < MAX_COMPRESSED_TREE_PROOF_BYTES);
+        verify_structured_blake3(&statement, &proof).unwrap();
     }
 
     #[test]

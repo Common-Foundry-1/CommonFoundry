@@ -265,11 +265,13 @@ each encoded as one byte in `0..=250`. `work_digest` is compared as an unsigned
 
 The verifier cannot safely accept `final_activation_digest` as an unproved
 miner claim. The feature-gated structured research proof now closes that gap
-for the current one-block Devnet output as follows:
+for both the current one-block Devnet output and power-of-two activation tables
+through the production 524,288-byte shape as follows:
 
 1. a BLAKE3 STARK privately authenticates the exact row-major `final_raw` bytes
-   under the formula above, so those bytes are no longer carried in the
-   aggregate envelope;
+   under the formula above, including every chunk compression, deterministic
+   parent merge, root compression, and stack edge, so those bytes are no
+   longer carried in the aggregate envelope;
 2. the final digest, work digest, target, challenge, model roots, and table
    length are absorbed into the public transcript binding before the wiring
    verifier samples its cell point;
@@ -284,15 +286,24 @@ without either breaking BLAKE3 or the sumcheck/PCS soundness. Proof or PCS
 randomness is not included in `work_digest`, so it cannot provide a second
 grinding surface.
 
-The public-table bridge has therefore been removed from the aggregate format,
-but the first BLAKE3 backend is not production-succinct. Its deterministic
-one-block vector is 3,223,045 bytes; the complete tiny-profile aggregate is
-3,435,854 bytes. It supports only messages whose activation portion is a
-nonempty power of two fitting the remaining 24 bytes of one compression block.
-The production 524,288-byte output still needs authenticated BLAKE3 chunk and
-parent-tree wiring, followed by compression or a substantially narrower proof.
-The current Plonky3 AIR is also being used over Goldilocks outside its documented
-field-size range, so independent algebraic review is an explicit gate.
+The public-table bridge has therefore been removed from the aggregate format.
+The tree backend uses a 120-row exact compression schedule, a deterministic
+10-entry chaining-value stack, and a canonical transport that deduplicates
+repeated Merkle authentication nodes before canonical zlib compression. The
+complete tree-component envelope is capped at 256 KiB and rejects malformed or
+noncanonical archives and compression streams. Deterministic release-mode
+vectors measure 165,039 bytes for a 64-byte activation and 222,555 bytes for a
+2,048-byte multi-chunk activation. A 32,768-row resource checkpoint measured a
+233,382-byte compressed payload (233,399 bytes with its outer envelope), about
+12.22 GiB peak memory, and 266.25 seconds proving time.
+
+This does not establish production readiness. The production shape is
+1,048,576 trace rows, and its complete proof size, peak memory, proving latency,
+and verification latency have not yet been measured. The configured
+production-shape component uses a cubic Goldilocks challenge field and its
+security test requires at least 128 proven bits,
+but the aggregate union-bound report, independent algebraic review, streaming
+prover, consensus wire tag, and audits remain explicit gates.
 
 The feature has no consensus proof tag and does not satisfy the production
 proof-size, streaming, soundness, or audit gates. A proof of the matrix and
@@ -386,9 +397,13 @@ comparison. The v2 research code now implements:
   and verifies the complete canonical opening set under a requested 128-bit
   unique-decoding WHIR configuration;
 - a version-3 structured envelope that replaces the bounded public final table
-  with a one-block BLAKE3 STARK, absorbs the challenge/model
+  with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to
   the authenticated last-layer opening, recomputes work, and rejects high work;
+- exact BLAKE3 chunk, parent, root, counter, flag, and chaining-value-stack
+  constraints through the 524,288-byte production output shape, plus a
+  canonical Merkle-path dictionary and canonical compressed component envelope
+  capped at 256 KiB;
 - an optional, feature-gated Remainder CE GKR/Ligero proof of the complete tiny
   2x4x4 relation. It binds the fixed model, public statement, target, nonce,
   masks, all matrix products, every nonlinear reduction and range, final public
@@ -423,11 +438,12 @@ containment are research safeguards, not acceptable network-parser bounds.
 There is no proof wire tag or `ChainState` integration for this feature.
 
 The repository does not yet implement the production streaming prover,
-raw-byte-to-PCS model-link certificate, final soundness report, production
-BLAKE3 tree argument, or proof compression below the 256 KiB gate. The
-one-block research hash argument removes the public table only for the tiny
-profile and measures about 3.2 MB. The aggregate proof has no consensus wire
-tag and the WHIR and BLAKE3 backends remain unaudited research code. The CUDA
+raw-byte-to-PCS model-link certificate, final aggregate soundness report, or a
+full production-size BLAKE3 proof benchmark. The exact tree relation and
+bounded compressed component transport are implemented, but only smaller and
+intermediate shapes have been proved below 256 KiB; the 1,048,576-row production
+shape remains an activation measurement. The aggregate proof has no consensus
+wire tag and the WHIR and BLAKE3 backends remain unaudited research code. The CUDA
 fixture is a differential harness, not a tensor-core succinct
 prover, low-VRAM proof benchmark, or evidence of residency.
 The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;

@@ -255,21 +255,29 @@ binding.
 The aggregate v3 envelope no longer carries the row-major final activation
 table. Its digest, deterministic work digest, target, challenge, model roots,
 and length are committed into the public transcript binding before the wiring
-cell challenge is sampled. A separate BLAKE3 STARK proves the exact one-block
-derive-key hash and proves that its private activation bytes have the same
+cell challenge is sampled. A separate BLAKE3 STARK proves the exact derive-key
+hash and proves that its private activation bytes have the same
 cubic-Goldilocks multilinear evaluation as the PCS-authenticated last-layer
 opening. The aggregate verifier accepts only when both the hash argument and
 all PCS openings verify.
 
-This removes the public bytes for the current eight-byte Devnet output, not the
-production proof blocker. The measured hash argument is 3,223,045 bytes and the
-complete aggregate is 3,435,854 bytes. A release-mode development run generated
-the hash proof in 174 ms and verified it in 15 ms. The backend rejects the production
-524,288-byte BLAKE3 tree until authenticated chunk and parent wiring exists. It
-machine-checks at least 128 proven bits under Plonky3's component-security
-model, but that is not an aggregate union-bound report. It also applies the
-upstream BLAKE3 AIR over Goldilocks outside the crate's
-documented field-size range, so independent algebraic review is mandatory.
+For larger tables, a custom narrow AIR authenticates every BLAKE3 chunk,
+deterministic parent merge, root compression, counter, flag, chaining-value
+edge, and final-table opening. Its schedule matches upstream derive-key BLAKE3
+through the production 524,288-byte output shape. Its native transport removes
+repeated Merkle paths into a canonical first-reference dictionary and then
+uses canonical zlib compression under a 256 KiB component-envelope cap.
+Release-mode vectors measure 165,039 bytes for a 64-byte activation and 222,555
+bytes for a 2,048-byte multi-chunk activation. A 32,768-row checkpoint measured
+233,382 compressed bytes (233,399 bytes with the outer envelope), about 12.22
+GiB peak memory, and 266.25 seconds proving time.
+
+The full production AIR has 1,048,576 rows and has not yet been proved end to
+end. Its final size and resource use therefore remain activation gates. The
+production-shape component uses a cubic Goldilocks challenge field and
+machine-checks at least 128 proven bits under Plonky3's security model, but that
+is not an aggregate union-bound report.
+Independent algebraic review remains mandatory.
 
 ## 6. Transparent PCS boundary
 
@@ -361,8 +369,9 @@ Before a production proof tag can exist:
 1. harden and independently review the aggregate transparent PCS backend,
    canonical parameters, parser, and explicit-point transcript;
 2. link the raw model bytes to the pinned PCS commitment;
-3. extend the one-block BLAKE3 argument with authenticated production chunk and
-   parent-tree wiring, then compress it below the total payload cap;
+3. run the exact BLAKE3 tree argument at the complete production shape and
+   demonstrate that the full aggregate, not only the hash component, remains
+   below its total payload cap;
 4. fuzz the implemented bounded aggregate parser and add a bounded,
    panic-contained network verifier queue;
 5. demonstrate production-size streaming proving within the memory, proof-size,

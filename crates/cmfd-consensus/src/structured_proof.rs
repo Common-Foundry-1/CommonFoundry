@@ -1408,7 +1408,7 @@ mod tests {
     fn aggregate_whir_openings_round_trip_and_fail_closed() {
         let (statement, proof) = whir_fixture();
         let encoded = proof.encode().unwrap();
-        assert_eq!(encoded.len(), 3_435_854);
+        assert_eq!(encoded.len(), 3_435_855);
         assert!(proof.blake3_proof.len() < MAX_STRUCTURED_BLAKE3_PROOF_BYTES);
         let decoded = StructuredForgeMatrixProof::decode(&encoded).unwrap();
         let openings = collect_structured_forgematrix_openings(&statement, &decoded).unwrap();

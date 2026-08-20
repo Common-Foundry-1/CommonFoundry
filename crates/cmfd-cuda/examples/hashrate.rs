@@ -146,7 +146,10 @@ fn run() -> Result<(), String> {
         println!("saturating kernel loop, no CPU stages");
         println!("nonces evaluated  {nonces}");
         println!("wall time         {elapsed:.2} s");
-        println!("kernel only       {:.2} MH/s", nonces as f64 / elapsed / 1e6);
+        println!(
+            "kernel only       {:.2} MH/s",
+            nonces as f64 / elapsed / 1e6
+        );
         return Ok(());
     }
 
@@ -189,10 +192,7 @@ fn run() -> Result<(), String> {
     println!();
     println!("nonces evaluated  {nonces}");
     println!("wall time         {elapsed:.2} s");
-    println!(
-        "end-to-end        {:.2} MH/s",
-        nonces_f64 / elapsed / 1e6
-    );
+    println!("end-to-end        {:.2} MH/s", nonces_f64 / elapsed / 1e6);
     println!(
         "kernel only       {:.2} MH/s",
         nonces_f64 / evaluate_time.as_secs_f64() / 1e6

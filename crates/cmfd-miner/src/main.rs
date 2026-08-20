@@ -473,7 +473,11 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
         "Common Foundry thin CUDA miner v{}",
         env!("CARGO_PKG_VERSION")
     );
-    println!("{} library: {}", cuda.backend().name(), cuda.path().display());
+    println!(
+        "{} library: {}",
+        cuda.backend().name(),
+        cuda.path().display()
+    );
     println!("Payout: {}", hex::encode(payout));
     println!("Configured node(s):");
     for peer in &options.peers {
@@ -782,7 +786,11 @@ fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
         "Common Foundry standalone CUDA miner v{}",
         env!("CARGO_PKG_VERSION")
     );
-    println!("{} library: {}", cuda.backend().name(), cuda.path().display());
+    println!(
+        "{} library: {}",
+        cuda.backend().name(),
+        cuda.path().display()
+    );
     println!("P2P listener: {p2p_address}");
     println!("Payout: {}", hex::encode(payout));
     println!("Using {} GPU(s):", devices.len());

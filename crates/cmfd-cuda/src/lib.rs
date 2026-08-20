@@ -537,7 +537,10 @@ mod tests {
             compute_minor: 0,
             total_memory_bytes: 1,
         };
-        assert_eq!(device.label(), "Intel(R) Arc(TM) A770 Graphics (OpenCL 3.0)");
+        assert_eq!(
+            device.label(),
+            "Intel(R) Arc(TM) A770 Graphics (OpenCL 3.0)"
+        );
         assert!(device.is_supported());
         assert_eq!(device.requirement(), "requires OpenCL 1.2+");
 

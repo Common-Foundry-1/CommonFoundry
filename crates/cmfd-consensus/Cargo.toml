@@ -17,6 +17,18 @@ frontend = { git = "https://github.com/worldcoin/Remainder_CE", rev = "5687fe7f3
 hex.workspace = true
 k256.workspace = true
 primitive-types.workspace = true
+p3-blake3 = { version = "=0.6.3", optional = true }
+p3-challenger = { version = "=0.6.3", optional = true }
+p3-commit = { version = "=0.6.3", optional = true }
+p3-dft = { version = "=0.6.3", optional = true }
+p3-field = { version = "=0.6.3", optional = true }
+p3-goldilocks = { version = "=0.6.3", optional = true }
+p3-matrix = { version = "=0.6.3", optional = true }
+p3-merkle-tree = { version = "=0.6.3", optional = true }
+p3-multilinear-util = { version = "=0.6.3", optional = true }
+p3-sumcheck = { version = "=0.6.3", optional = true }
+p3-symmetric = { version = "=0.6.3", optional = true }
+p3-whir = { version = "=0.6.3", optional = true }
 remainder = { git = "https://github.com/worldcoin/Remainder_CE", rev = "5687fe7f3a077c75c374422ef79f22e3860de9c1", optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -31,6 +43,20 @@ remainder-prototype = [
     "dep:frontend",
     "dep:remainder",
     "dep:shared-types",
+]
+whir-prototype = [
+    "dep:p3-blake3",
+    "dep:p3-challenger",
+    "dep:p3-commit",
+    "dep:p3-dft",
+    "dep:p3-field",
+    "dep:p3-goldilocks",
+    "dep:p3-matrix",
+    "dep:p3-merkle-tree",
+    "dep:p3-multilinear-util",
+    "dep:p3-sumcheck",
+    "dep:p3-symmetric",
+    "dep:p3-whir",
 ]
 
 [lib]

@@ -274,16 +274,29 @@ opening claims, and then requires a `StructuredPcsVerifier` to authenticate the
 complete claim set. A missing, empty, malformed, oversized, conflicting, or
 rejected PCS proof is a hard error. There is no accept-without-PCS path.
 
-The repository intentionally does not provide an accepting production
-implementation of that trait yet. Test implementations only exercise the
-composition boundary. In particular, the current `p3-whir` high-level layout
-samples structured univariate-power opening points, while the existing matrix,
-transition, and wiring sumchecks end at independently sampled multilinear
-points. Treating those as interchangeable would leave the terminal claims
-unauthenticated. Integration therefore requires either an audited explicit-
-point WHIR layout/adapter with matching verifier constraints or a different
-transparent PCS that natively authenticates arbitrary MLE points. This protocol
-choice must be reviewed before code is accepted as a production backend.
+The optional `whir-prototype` feature now implements the first accepting
+research adapter beneath that boundary. It commits one bounded base-field
+table with Plonky3 WHIR 0.6.3, records caller-supplied points in the cubic
+Goldilocks extension, builds their equality constraints directly, and verifies
+those exact points through the lower-level WHIR verifier. It does not replace
+the independent coordinates with the high-level layout's structured
+univariate-power points. Its BLAKE3 transcript binds a caller-supplied public
+statement, all points and evaluations, and the commitment before batching.
+The prototype uses WHIR's non-conjectural unique-decoding parameter mode at a
+requested 128-bit level. A 1 MiB proof cap, a 4 KiB public-binding cap,
+canonical field checks, canonical JSON re-encoding, exact envelope exhaustion,
+and panic containment bound its current parser surface.
+
+This is not yet an implementation of the aggregate `StructuredPcsVerifier`.
+The component proofs still carry placeholder vector-content hashes, whereas a
+WHIR verifier must receive the actual WHIR commitment for each oracle. Changing
+those identities requires proof construction to commit every oracle through
+the same PCS before any component transcript samples challenges. The adapter
+also retains whole bounded tables in memory and has no production model-byte
+link or streaming 6 GiB prover. The upstream backend is an unaudited academic
+prototype. These gaps must be closed before the adapter can authenticate the
+aggregate claim set, and the result still requires review, benchmarks, fuzzing,
+and independent audits before any production selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded

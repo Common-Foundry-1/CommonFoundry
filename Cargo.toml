@@ -7,6 +7,7 @@ members = [
     "crates/cmfd-miner",
     "crates/cmfd-node",
 ]
+exclude = ["third_party/p3-util-0.6.3-msrv"]
 resolver = "2"
 
 [workspace.package]
@@ -27,3 +28,8 @@ primitive-types = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+
+[patch.crates-io]
+# Plonky3 0.6.3 uses slice::assume_init_ref, which stabilized after our Rust 1.88 MSRV.
+# This is the exact 0.6.3 source with only its former equivalent conversion restored.
+p3-util = { path = "third_party/p3-util-0.6.3-msrv" }

@@ -358,6 +358,11 @@ comparison. The v2 research code now implements:
   full-table opening adapters are not a transparent PCS or a succinct
   verifier; the frozen protocol and remaining work are in
   [forgematrix-custom-proof.md](forgematrix-custom-proof.md);
+- an optional `whir-prototype` explicit-point PCS experiment. It transparently
+  commits one bounded Goldilocks table and verifies multiple exact
+  cubic-extension MLE openings under a requested 128-bit unique-decoding WHIR
+  configuration. It is not connected to the aggregate component commitments,
+  a production streaming prover, the model-byte link, or consensus;
 - an optional, feature-gated Remainder CE GKR/Ligero proof of the complete tiny
   2x4x4 relation. It binds the fixed model, public statement, target, nonce,
   masks, all matrix products, every nonlinear reduction and range, final public

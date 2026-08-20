@@ -13,6 +13,8 @@ pub mod structured_sumcheck;
 pub mod structured_transition;
 pub mod structured_wiring;
 pub mod sumcheck;
+#[cfg(feature = "whir-prototype")]
+pub mod whir_proof;
 pub mod wire;
 
 pub use chain::{
@@ -97,6 +99,13 @@ pub use sumcheck::{
     GOLDILOCKS_MODULUS, MAX_TOY_MATRIX_ELEMENTS, MatrixProductSumcheckProof, SumcheckError,
     TOY_SUMCHECK_RAW_CHALLENGE_BITS, prove_toy_matrix_product, reference_matrix_product,
     verify_toy_matrix_product,
+};
+#[cfg(feature = "whir-prototype")]
+pub use whir_proof::{
+    EXPLICIT_WHIR_SECURITY_BITS, EXPLICIT_WHIR_VERSION, ExplicitWhirCommitment, ExplicitWhirError,
+    ExplicitWhirOpening, ExplicitWhirProof, MAX_EXPLICIT_WHIR_BINDING_BYTES,
+    MAX_EXPLICIT_WHIR_OPENINGS, MAX_EXPLICIT_WHIR_PROOF_BYTES, MAX_EXPLICIT_WHIR_VARIABLES,
+    prove_explicit_whir_openings, verify_explicit_whir_openings,
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,

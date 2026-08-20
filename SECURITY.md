@@ -50,9 +50,19 @@ research verifier now also requires the matrix accumulator to equal the
 transition input, pins the base table and model-weight commitments, binds the
 declared final-bank output commitment, strictly parses a 1 MiB-capped envelope,
 and fails closed unless a configured PCS verifier authenticates every
-canonical opening claim. No production PCS implementation is configured, so
-the complete-table adapters and test PCS remain research scaffolding rather
-than a succinct proof. The aggregate proof has no consensus or wire tag. See
+canonical opening claim. An optional `whir-prototype` feature now commits one
+bounded Goldilocks table with a transparent BLAKE3 Merkle/WHIR commitment and
+authenticates multiple caller-supplied cubic-extension MLE points. This closes
+the earlier high-level-layout mismatch: the prototype verifies the exact
+independent points emitted by the custom sumchecks, not substituted
+univariate-power points. Its proof bytes are bounded, canonically re-encoded,
+trailing data is rejected, and verification panics are contained. It remains a
+single-table research adapter and is not yet the aggregate backend: existing
+component commitments are placeholder content hashes rather than WHIR roots,
+and there is no production streaming prover, model-byte link, final-digest
+argument, consensus tag, audit, or benchmark. The complete-table adapters and
+test PCS therefore remain research scaffolding rather than an activated
+succinct proof. The aggregate proof has no consensus or wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
 
 Mainnet remains disabled until all of the following are complete:

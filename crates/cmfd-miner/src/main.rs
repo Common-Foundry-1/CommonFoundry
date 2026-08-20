@@ -31,6 +31,8 @@ const DEFAULT_MINER_DATA_DIR: &str = "commonfoundry-miner-devnet0";
 const DEFAULT_MINER_P2P_ADDRESS: &str = "127.0.0.1:19444";
 const DEFAULT_BATCH_SIZE: u32 = 8_192;
 const MAX_BATCH_SIZE: u32 = 65_536;
+const AUTO_WORKERS_PER_GPU: usize = 0;
+const MAX_WORKERS_PER_GPU: usize = 16;
 const DEFAULT_STATS_SECONDS: u64 = 5;
 const PEER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -70,6 +72,9 @@ enum Command {
         /// Nonces evaluated per CUDA launch, from 1 through 65536.
         #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: u32,
+        /// CPU preparation workers per GPU; 0 automatically divides host threads across GPUs.
+        #[arg(long, default_value_t = AUTO_WORKERS_PER_GPU)]
+        workers_per_gpu: usize,
         /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
         #[arg(long)]
         miner: Option<String>,
@@ -98,6 +103,9 @@ enum Command {
         /// Nonces evaluated per CUDA launch, from 1 through 65536.
         #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: u32,
+        /// CPU preparation workers per GPU; 0 automatically divides host threads across GPUs.
+        #[arg(long, default_value_t = AUTO_WORKERS_PER_GPU)]
+        workers_per_gpu: usize,
         /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
         #[arg(long)]
         miner: Option<String>,
@@ -111,6 +119,7 @@ enum Command {
 enum WorkerMessage {
     Ready {
         device: i32,
+        lane: usize,
     },
     Progress {
         device: i32,
@@ -123,6 +132,7 @@ enum WorkerMessage {
     },
     Failed {
         device: i32,
+        lane: usize,
         error: String,
     },
 }
@@ -150,6 +160,7 @@ struct WorkerSpec {
     cuda: CudaLibrary,
     device: CudaDevice,
     ordinal: usize,
+    lane: usize,
     worker_count: usize,
     work: MiningWork,
     batch_size: u32,
@@ -176,6 +187,7 @@ fn main() -> Result<()> {
             devices,
             cuda_library,
             batch_size,
+            workers_per_gpu,
             miner,
             stats_seconds,
         } => run_thin_miner(ThinMinerOptions {
@@ -184,6 +196,7 @@ fn main() -> Result<()> {
             requested_devices: devices,
             cuda_library,
             batch_size,
+            workers_per_gpu,
             miner,
             stats_seconds,
         }),
@@ -195,6 +208,7 @@ fn main() -> Result<()> {
             devices,
             cuda_library,
             batch_size,
+            workers_per_gpu,
             miner,
             stats_seconds,
         } => run_full_node_miner(FullNodeMinerOptions {
@@ -205,6 +219,7 @@ fn main() -> Result<()> {
             requested_devices: devices,
             cuda_library,
             batch_size,
+            workers_per_gpu,
             miner,
             stats_seconds,
         }),
@@ -248,6 +263,7 @@ struct ThinMinerOptions {
     requested_devices: Vec<i32>,
     cuda_library: Option<PathBuf>,
     batch_size: u32,
+    workers_per_gpu: usize,
     miner: Option<String>,
     stats_seconds: u64,
 }
@@ -260,6 +276,7 @@ struct FullNodeMinerOptions {
     requested_devices: Vec<i32>,
     cuda_library: Option<PathBuf>,
     batch_size: u32,
+    workers_per_gpu: usize,
     miner: Option<String>,
     stats_seconds: u64,
 }
@@ -268,12 +285,14 @@ struct ContinuousMiningConfig {
     payout: [u8; 32],
     peers: StaticPeerConfig,
     batch_size: u32,
+    workers_per_gpu: usize,
     stats_interval: Duration,
 }
 
 #[derive(Clone, Copy)]
 struct JobMiningConfig {
     batch_size: u32,
+    workers_per_gpu: usize,
     stats_interval: Duration,
 }
 
@@ -433,7 +452,11 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
-    validate_mining_controls(options.batch_size, options.stats_seconds)?;
+    validate_mining_controls(
+        options.batch_size,
+        options.workers_per_gpu,
+        options.stats_seconds,
+    )?;
     if options.peers.is_empty() {
         bail!("thin mining requires at least one --peer node address");
     }
@@ -459,6 +482,7 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
     let cuda = load_cuda(options.cuda_library.as_deref())?;
     let available = cuda.devices().map_err(anyhow::Error::msg)?;
     let devices = select_devices(&available, &options.requested_devices)?;
+    let workers_per_gpu = resolve_workers_per_gpu(options.workers_per_gpu, devices.len())?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_handler = Arc::clone(&shutdown);
     ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Release))?;
@@ -473,7 +497,11 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
     for peer in &options.peers {
         println!("  {peer}");
     }
-    println!("Using {} GPU(s):", devices.len());
+    println!(
+        "Using {} GPU(s) with {workers_per_gpu} worker(s) per GPU ({} total):",
+        devices.len(),
+        devices.len().saturating_mul(workers_per_gpu)
+    );
     for device in &devices {
         println!("  GPU {}: {}", device.index, device.label());
     }
@@ -511,6 +539,7 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
             work,
             JobMiningConfig {
                 batch_size: options.batch_size,
+                workers_per_gpu,
                 stats_interval: Duration::from_secs(options.stats_seconds),
             },
             Arc::clone(&shutdown),
@@ -602,14 +631,42 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
     Ok(())
 }
 
-fn validate_mining_controls(batch_size: u32, stats_seconds: u64) -> Result<()> {
+fn validate_mining_controls(
+    batch_size: u32,
+    workers_per_gpu: usize,
+    stats_seconds: u64,
+) -> Result<()> {
     if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
         bail!("--batch-size must be between 1 and {MAX_BATCH_SIZE}");
+    }
+    if workers_per_gpu > MAX_WORKERS_PER_GPU {
+        bail!("--workers-per-gpu must be between 0 and {MAX_WORKERS_PER_GPU}");
     }
     if stats_seconds == 0 {
         bail!("--stats-seconds must be greater than zero");
     }
     Ok(())
+}
+
+fn resolve_workers_per_gpu(requested: usize, device_count: usize) -> Result<usize> {
+    let host_threads = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    resolve_workers_per_gpu_for_host(requested, device_count, host_threads)
+}
+
+fn resolve_workers_per_gpu_for_host(
+    requested: usize,
+    device_count: usize,
+    host_threads: usize,
+) -> Result<usize> {
+    if device_count == 0 {
+        bail!("cannot size mining workers without a selected GPU");
+    }
+    if requested != AUTO_WORKERS_PER_GPU {
+        return Ok(requested);
+    }
+    Ok((host_threads.max(1) / device_count).clamp(1, MAX_WORKERS_PER_GPU))
 }
 
 fn ordered_peers(peers: &[SocketAddr], preferred: Option<SocketAddr>) -> Vec<SocketAddr> {
@@ -732,11 +789,16 @@ fn interruptible_wait(duration: Duration, shutdown: &AtomicBool) -> bool {
 }
 
 fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
-    validate_mining_controls(options.batch_size, options.stats_seconds)?;
+    validate_mining_controls(
+        options.batch_size,
+        options.workers_per_gpu,
+        options.stats_seconds,
+    )?;
 
     let cuda = load_cuda(options.cuda_library.as_deref())?;
     let available = cuda.devices().map_err(anyhow::Error::msg)?;
     let devices = select_devices(&available, &options.requested_devices)?;
+    let workers_per_gpu = resolve_workers_per_gpu(options.workers_per_gpu, devices.len())?;
     let address_policy = if options.allow_public_peers {
         PeerAddressPolicy::AllowPublic
     } else {
@@ -779,7 +841,11 @@ fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
     println!("CUDA library: {}", cuda.path().display());
     println!("P2P listener: {p2p_address}");
     println!("Payout: {}", hex::encode(payout));
-    println!("Using {} GPU(s):", devices.len());
+    println!(
+        "Using {} GPU(s) with {workers_per_gpu} worker(s) per GPU ({} total):",
+        devices.len(),
+        devices.len().saturating_mul(workers_per_gpu)
+    );
     for device in &devices {
         println!("  GPU {}: {}", device.index, device.label());
     }
@@ -810,6 +876,7 @@ fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
             payout,
             peers: peer_config,
             batch_size: options.batch_size,
+            workers_per_gpu,
             stats_interval: Duration::from_secs(options.stats_seconds),
         },
         shutdown,
@@ -931,6 +998,7 @@ fn continuous_mining(
             job.work(),
             JobMiningConfig {
                 batch_size: config.batch_size,
+                workers_per_gpu: config.workers_per_gpu,
                 stats_interval: config.stats_interval,
             },
             Arc::clone(&shutdown),
@@ -1033,25 +1101,29 @@ fn mine_work(
     check_status: &mut dyn FnMut() -> Result<WorkStatus>,
 ) -> Result<JobOutcome> {
     let worker_cancel = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::sync_channel(devices.len().saturating_mul(4).max(4));
-    let handles = devices
-        .iter()
-        .enumerate()
-        .map(|(ordinal, device)| {
-            spawn_worker(
+    let worker_count = devices
+        .len()
+        .checked_mul(config.workers_per_gpu)
+        .ok_or_else(|| anyhow!("CUDA worker count overflow"))?;
+    let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(4).max(4));
+    let mut handles = Vec::with_capacity(worker_count);
+    for (device_ordinal, device) in devices.iter().enumerate() {
+        for lane in 0..config.workers_per_gpu {
+            handles.push(spawn_worker(
                 WorkerSpec {
                     cuda: cuda.clone(),
                     device: device.clone(),
-                    ordinal,
-                    worker_count: devices.len(),
+                    ordinal: device_ordinal * config.workers_per_gpu + lane,
+                    lane,
+                    worker_count,
                     work: work.clone(),
                     batch_size: config.batch_size,
                 },
                 Arc::clone(&worker_cancel),
                 sender.clone(),
-            )
-        })
-        .collect();
+            ));
+        }
+    }
     drop(sender);
     let workers = WorkerSet {
         cancel: Arc::clone(&worker_cancel),
@@ -1067,6 +1139,7 @@ fn mine_work(
             shutdown,
             worker_cancel,
         },
+        config.workers_per_gpu,
         statistics,
         check_status,
     );
@@ -1080,12 +1153,13 @@ fn spawn_worker(
     sender: SyncSender<WorkerMessage>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
-        .name(format!("cmfd-gpu-{}", spec.device.index))
+        .name(format!("cmfd-gpu-{}-lane-{}", spec.device.index, spec.lane))
         .spawn(move || {
             if let Err(error) = run_worker(&spec, &cancel, &sender) {
                 cancel.store(true, Ordering::Release);
                 let _ = sender.send(WorkerMessage::Failed {
                     device: spec.device.index,
+                    lane: spec.lane,
                     error,
                 });
             }
@@ -1119,6 +1193,7 @@ fn run_worker(
     sender
         .send(WorkerMessage::Ready {
             device: spec.device.index,
+            lane: spec.lane,
         })
         .map_err(|_| "miner coordinator closed during startup".to_owned())?;
 
@@ -1171,6 +1246,7 @@ fn monitor_workers(
     work: &MiningWork,
     receiver: &Receiver<WorkerMessage>,
     control: MonitorControl,
+    workers_per_gpu: usize,
     statistics: &mut SessionStatistics,
     check_status: &mut dyn FnMut() -> Result<WorkStatus>,
 ) -> Result<JobOutcome> {
@@ -1182,13 +1258,19 @@ fn monitor_workers(
             return Ok(JobOutcome::Shutdown);
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(WorkerMessage::Ready { device }) => {
-                ready.insert(device);
-                println!(
-                    "GPU {device} initialized ({}/{})",
-                    ready.len(),
-                    devices.len()
-                );
+            Ok(WorkerMessage::Ready { device, lane }) => {
+                ready.insert((device, lane));
+                let device_ready = ready
+                    .iter()
+                    .filter(|(ready_device, _)| *ready_device == device)
+                    .count();
+                if device_ready == workers_per_gpu {
+                    println!(
+                        "GPU {device} initialized with {workers_per_gpu} worker(s) ({}/{})",
+                        ready.len(),
+                        devices.len().saturating_mul(workers_per_gpu)
+                    );
+                }
             }
             Ok(WorkerMessage::Progress { device, attempts }) => {
                 statistics.record_attempts(device, attempts);
@@ -1202,9 +1284,13 @@ fn monitor_workers(
                 control.worker_cancel.store(true, Ordering::Release);
                 return Ok(JobOutcome::Found { device, proof });
             }
-            Ok(WorkerMessage::Failed { device, error }) => {
+            Ok(WorkerMessage::Failed {
+                device,
+                lane,
+                error,
+            }) => {
                 control.worker_cancel.store(true, Ordering::Release);
-                bail!("GPU {device} failed: {error}");
+                bail!("GPU {device} worker {lane} failed: {error}");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1321,7 +1407,7 @@ mod tests {
     #[test]
     fn gpu_nonce_ranges_do_not_overlap() {
         let batch_size = 4_u32;
-        let workers = 3_usize;
+        let workers = 48_usize;
         let stride = nonce_stride(batch_size, workers);
         let mut observed = BTreeSet::new();
         for round in 0..1_000_u64 {
@@ -1332,7 +1418,23 @@ mod tests {
                 }
             }
         }
-        assert_eq!(observed.len(), 12_000);
+        assert_eq!(observed.len(), 192_000);
+    }
+
+    #[test]
+    fn automatic_workers_use_host_capacity_and_respect_the_cap() {
+        assert_eq!(resolve_workers_per_gpu_for_host(0, 1, 32).unwrap(), 16);
+        assert_eq!(resolve_workers_per_gpu_for_host(0, 4, 32).unwrap(), 8);
+        assert_eq!(resolve_workers_per_gpu_for_host(0, 8, 4).unwrap(), 1);
+        assert_eq!(resolve_workers_per_gpu_for_host(3, 8, 4).unwrap(), 3);
+        assert!(resolve_workers_per_gpu_for_host(0, 0, 32).is_err());
+    }
+
+    #[test]
+    fn mining_controls_reject_excessive_worker_counts() {
+        assert!(validate_mining_controls(8_192, 0, 5).is_ok());
+        assert!(validate_mining_controls(8_192, 16, 5).is_ok());
+        assert!(validate_mining_controls(8_192, 17, 5).is_err());
     }
 
     #[test]
@@ -1405,6 +1507,7 @@ mod tests {
             assert_eq!(launcher.matches("--peer").count(), 2);
             assert!(launcher.contains("--allow-public-peers"));
             assert!(launcher.contains("--stats-seconds"));
+            assert!(launcher.contains("--workers-per-gpu"));
             assert!(launcher.contains("PAYOUT_ADDRESS"));
             assert!(!launcher.contains("--data-dir"));
             assert!(!launcher.contains("--p2p-bind"));

@@ -78,6 +78,9 @@ Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`
 launchers. Its live console reports per-GPU and rig hashrate, power, hashes per
 watt, temperature, fan, utilization, clocks, VRAM use, uptime, and work counts.
+Automatic multi-worker scheduling divides host preparation threads across the
+selected GPUs to keep more CUDA batches in flight; operators can override the
+worker count per GPU when tuning power use.
 Normal standalone mining is a thin client: the selected wallet/node supplies a
 complete payout-bound template and remains responsible for chain sync and block
 acceptance. The rig stores no separate chain database and reports a block only

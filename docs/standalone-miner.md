@@ -4,8 +4,8 @@
 rigs. Normal `mine` mode is a thin client: it asks a configured Devnet node for
 a complete mining template, searches the immutable proof-of-work challenge,
 and returns the finished block to that node. It does not download the chain or
-maintain a second node database. One independent CUDA worker runs on every
-selected GPU.
+maintain a second node database. Multiple independent preparation workers keep
+each selected GPU supplied with nonce batches.
 
 ## Supported GPUs
 
@@ -30,9 +30,13 @@ to install the CUDA Toolkit.
 - With no `--device` options, every detected GPU with compute capability 7.0
   or newer is selected.
 - Repeat `--device` to choose a subset, for example `--device 0 --device 2`.
-- Every GPU owns a separate CUDA context, model allocation, and worker thread.
-- GPU `i` begins at batch `i`; later batches advance by `GPU count × batch
-  size`. This keeps nonce ranges disjoint across the rig.
+- Each worker owns a separate CUDA context and model allocation on its assigned
+  GPU. By default, the miner divides available host threads across the selected
+  GPUs, capped at 16 workers per GPU.
+- `--workers-per-gpu 0` selects that automatic mode. Set an explicit value from
+  1 through 16 to reduce host power use or tune a particular rig.
+- Worker `i` begins at batch `i`; later batches advance by `total worker count ×
+  batch size`. This keeps nonce ranges disjoint across every GPU and worker.
 - The displayed rig rate is the sum of complete ForgeMatrix nonce evaluations
   from every worker.
 - Every statistics report includes rig and per-GPU hashrate, NVIDIA-reported
@@ -62,7 +66,8 @@ wallet on the same computer first and the community bootstrap second, so the
 peer settings normally need no editing. Leave `GPU_INDEXES` blank to use every
 supported card automatically. Copy the 64-character address from the wallet's
 **Receive** page into `PAYOUT_ADDRESS` before starting. The connected node owns
-the chain and creates each payout-bound template.
+the chain and creates each payout-bound template. `WORKERS_PER_GPU=0` is the
+recommended automatic high-throughput setting.
 
 ## Direct commands
 
@@ -88,6 +93,12 @@ Change the live-statistics interval from its five-second default:
 
 ```text
 cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --stats-seconds 10
+```
+
+Limit host preparation to four workers per selected GPU:
+
+```text
+cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --workers-per-gpu 4
 ```
 
 The standalone miner currently performs continuous solo mining. The node

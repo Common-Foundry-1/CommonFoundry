@@ -22,8 +22,10 @@ Supported native CUDA targets:
   Ada sm_89: RTX 40 series
   Blackwell sm_120: RTX 50 series
 
-The miner keeps one CUDA context and one worker on each selected GPU. Work
-ranges are separated so GPUs in the same rig do not repeat one another.
+The miner automatically divides host preparation workers across selected GPUs,
+up to 16 workers per GPU. Work ranges are separated so no worker in the rig
+repeats another. Set WORKERS_PER_GPU to 1-16 to tune CPU/power use, or leave it
+at 0 for the recommended automatic setting.
 
 Every five seconds the miner prints rig and per-GPU hashrate, power draw,
 hashes per watt, temperature, fan, utilization, clocks, VRAM use, uptime,

@@ -9,6 +9,10 @@ pub(super) struct NodeRuntimeConfig {
     pub(super) p2p_bind: SocketAddr,
     pub(super) peers: Vec<SocketAddr>,
     pub(super) allow_public_peers: bool,
+    /// `-v` count: 0 = silent, 1 = warn, 2 = info, 3 = debug, 4+ = trace on
+    /// the console. The file log under the node's data directory is always
+    /// debug level, regardless of this count.
+    pub(super) verbose: u8,
 }
 
 impl NodeRuntimeConfig {
@@ -34,6 +38,7 @@ impl NodeRuntimeConfig {
         let mut p2p_bind = None;
         let mut peers = Vec::new();
         let mut allow_public_peers = false;
+        let mut verbose: u8 = 0;
         let mut arguments = arguments.into_iter().map(Into::into);
 
         while let Some(argument) = arguments.next() {
@@ -59,6 +64,10 @@ impl NodeRuntimeConfig {
                     }
                     allow_public_peers = true;
                 }
+                "--verbose" => verbose = verbose.saturating_add(1),
+                _ if is_short_verbose_flag(&argument) => {
+                    verbose = verbose.saturating_add(argument.len() as u8 - 1);
+                }
                 _ if argument.starts_with("--p2p-bind=") => {
                     if p2p_bind.is_some() {
                         return Err(ConfigError::DuplicateOption("--p2p-bind"));
@@ -82,6 +91,7 @@ impl NodeRuntimeConfig {
             p2p_bind: p2p_bind.unwrap_or(default_bind),
             peers,
             allow_public_peers,
+            verbose,
         };
         config.static_peers(PeerLimits::default()).validate()?;
         Ok(config)
@@ -103,6 +113,16 @@ impl NodeRuntimeConfig {
             PeerAddressPolicy::PrivateOnly
         }
     }
+}
+
+/// Matches `-v`, `-vv`, `-vvv`, etc. — clap-style bundled short verbosity
+/// flags, so `cmfd-node run -vvv` and the wallet launched with `-vvv` parse
+/// the same way.
+fn is_short_verbose_flag(argument: &str) -> bool {
+    argument.len() >= 2
+        && argument.starts_with('-')
+        && !argument.starts_with("--")
+        && argument[1..].bytes().all(|byte| byte == b'v')
 }
 
 fn parse_address(option: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
@@ -167,6 +187,21 @@ mod tests {
         assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
         assert!(config.peers.is_empty());
         assert!(!config.allow_public_peers);
+        assert_eq!(config.verbose, 0);
+    }
+
+    #[test]
+    fn verbosity_counts_repeated_and_bundled_short_flags() {
+        assert_eq!(NodeRuntimeConfig::parse(["--verbose"]).unwrap().verbose, 1);
+        assert_eq!(NodeRuntimeConfig::parse(["-v"]).unwrap().verbose, 1);
+        assert_eq!(NodeRuntimeConfig::parse(["-vv"]).unwrap().verbose, 2);
+        assert_eq!(NodeRuntimeConfig::parse(["-vvv"]).unwrap().verbose, 3);
+        assert_eq!(
+            NodeRuntimeConfig::parse(["-v", "--verbose", "-vv"])
+                .unwrap()
+                .verbose,
+            4
+        );
     }
 
     #[test]

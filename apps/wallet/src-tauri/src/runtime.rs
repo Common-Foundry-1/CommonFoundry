@@ -33,6 +33,9 @@ pub struct RuntimeState {
     node: NodeAvailability,
     mining: Option<Arc<MiningManager>>,
     services: Mutex<Option<ServiceHandles>>,
+    // Held for the life of the process: dropping it stops the non-blocking
+    // file writer from flushing buffered log lines.
+    _log_guard: Option<cmfd_node::logging::WorkerGuard>,
 }
 
 impl RuntimeState {
@@ -44,19 +47,22 @@ impl RuntimeState {
                     node: NodeAvailability::Failed(configuration_error(error)),
                     mining: None,
                     services: Mutex::new(None),
+                    _log_guard: None,
                 };
             }
         };
         match start_embedded_node(app, config) {
-            Ok((node, services)) => Self {
+            Ok((node, services, log_guard)) => Self {
                 mining: Some(Arc::new(MiningManager::new(Arc::clone(&node)))),
                 node: NodeAvailability::Ready(node),
                 services: Mutex::new(Some(services)),
+                _log_guard: Some(log_guard),
             },
             Err(error) => Self {
                 node: NodeAvailability::Failed(error),
                 mining: None,
                 services: Mutex::new(None),
+                _log_guard: None,
             },
         }
     }
@@ -106,6 +112,7 @@ impl RuntimeState {
             node: NodeAvailability::Failed(error),
             mining: None,
             services: Mutex::new(None),
+            _log_guard: None,
         }
     }
 }
@@ -113,7 +120,14 @@ impl RuntimeState {
 fn start_embedded_node<R: Runtime>(
     app: &App<R>,
     config: NodeRuntimeConfig,
-) -> Result<(Arc<Mutex<Node>>, ServiceHandles), NodeClientError> {
+) -> Result<
+    (
+        Arc<Mutex<Node>>,
+        ServiceHandles,
+        cmfd_node::logging::WorkerGuard,
+    ),
+    NodeClientError,
+> {
     let data_dir = app
         .path()
         .app_local_data_dir()
@@ -125,7 +139,8 @@ fn start_embedded_node<R: Runtime>(
             )
         })?
         .join("devnet-0");
-    let mut node = Node::open(data_dir).map_err(|error| error.client_error())?;
+    let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
+    let mut node = Node::open(&data_dir).map_err(|error| error.client_error())?;
     node.set_public_peer_mode(config.allow_public_peers);
     let shared = Arc::new(Mutex::new(node));
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
@@ -186,6 +201,7 @@ fn start_embedded_node<R: Runtime>(
             static_peer_poller,
             inbound,
         },
+        log_guard,
     ))
 }
 

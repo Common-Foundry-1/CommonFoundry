@@ -242,6 +242,7 @@ fn sync_from_peer_once_inner(
     )
 }
 
+#[tracing::instrument(skip_all, fields(peer = %address, direction = "outbound"))]
 fn sync_from_peer_once_inner_with_policy(
     shared: Arc<Mutex<Node>>,
     address: SocketAddr,
@@ -269,6 +270,9 @@ fn sync_from_peer_once_inner_with_policy(
             observation_address.clone(),
             report.remote_hello,
         );
+    }
+    if let Err(error) = &result {
+        tracing::warn!(%error, "outbound sync from peer failed");
     }
     record_peer_ended(
         &shared,
@@ -438,6 +442,7 @@ pub fn relay_blocks_to_peer_once_with_policy(
     relay_blocks_to_peer_once_inner_with_policy(shared, address, limits, address_policy, None)
 }
 
+#[tracing::instrument(skip_all, fields(peer = %address, direction = "outbound"))]
 fn relay_blocks_to_peer_once_inner_with_policy(
     shared: Arc<Mutex<Node>>,
     address: SocketAddr,
@@ -465,6 +470,9 @@ fn relay_blocks_to_peer_once_inner_with_policy(
             observation_address.clone(),
             report.remote_hello,
         );
+    }
+    if let Err(error) = &result {
+        tracing::warn!(%error, "outbound relay to peer failed");
     }
     record_peer_ended(
         &shared,
@@ -581,6 +589,9 @@ fn respond_to_peer_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
 ) -> Result<(), P2pError> {
     let remote_address = stream.peer_addr().map_err(P2pError::ListenerIo)?;
+    let span =
+        tracing::info_span!("respond_to_peer", peer = %remote_address, direction = "inbound");
+    let _entered = span.enter();
     let observation_address = observed_address(PeerDirection::Inbound, remote_address);
     record_peer_started(&shared, PeerDirection::Inbound, observation_address.clone());
     let result = perform_respond_to_peer_inner_with_policy(
@@ -591,6 +602,9 @@ fn respond_to_peer_inner_with_policy(
         nonce_override,
         observation_address.clone(),
     );
+    if let Err(error) = &result {
+        tracing::warn!(%error, "inbound peer session ended with error");
+    }
     record_peer_ended(
         &shared,
         PeerDirection::Inbound,
@@ -905,17 +919,16 @@ fn listener_loop(
                 workers.push(thread::spawn(move || {
                     let _guard = ActiveConnectionGuard(worker_active);
                     // A malformed or incompatible peer closes only its own
-                    // connection; it must not stop the listener.
-                    if let Err(_error) = respond_to_peer_inner_with_policy(
+                    // connection; it must not stop the listener. The error is
+                    // already logged via tracing inside
+                    // respond_to_peer_inner_with_policy.
+                    let _ = respond_to_peer_inner_with_policy(
                         worker_node,
                         stream,
                         limits,
                         address_policy,
                         nonce_override,
-                    ) {
-                        #[cfg(test)]
-                        eprintln!("inbound peer ended with error: {_error}");
-                    }
+                    );
                 }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1041,6 +1054,8 @@ fn static_peer_poll_loop(
             if poll_stopped(&stop) {
                 return;
             }
+            // Errors are already logged via tracing inside these calls;
+            // a failure with one peer must not stop later peers or rounds.
             let _ = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 *peer,

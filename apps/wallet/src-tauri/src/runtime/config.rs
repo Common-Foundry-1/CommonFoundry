@@ -1,18 +1,29 @@
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use cmfd_node::DEFAULT_P2P_ADDRESS;
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct NodeRuntimeConfig {
+pub(crate) enum ProcessCommand {
+    Help,
+    Version,
+    Run(NodeRuntimeConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeRuntimeConfig {
     pub(super) p2p_bind: SocketAddr,
     pub(super) peers: Vec<SocketAddr>,
     pub(super) allow_public_peers: bool,
+    pub(super) verbosity: u8,
 }
 
+pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(107, 214, 187, 2)), 18444);
+
 impl NodeRuntimeConfig {
-    pub(super) fn from_process_args() -> Result<Self, ConfigError> {
+    pub(crate) fn from_process_args() -> Result<ProcessCommand, ConfigError> {
         let mut args = Vec::new();
         for argument in std::env::args_os().skip(1) {
             let argument = argument
@@ -23,7 +34,7 @@ impl NodeRuntimeConfig {
         Self::parse(args)
     }
 
-    fn parse<I, S>(arguments: I) -> Result<Self, ConfigError>
+    fn parse<I, S>(arguments: I) -> Result<ProcessCommand, ConfigError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -31,14 +42,62 @@ impl NodeRuntimeConfig {
         let default_bind = DEFAULT_P2P_ADDRESS
             .parse()
             .map_err(|_| ConfigError::InvalidBuiltInDefault)?;
+
+        let mut asked_for_help = false;
+        let mut asked_for_version = false;
+        let mut has_control_arg = false;
+
         let mut p2p_bind = None;
         let mut peers = Vec::new();
         let mut allow_public_peers = false;
+        let mut verbosity = 0;
+
         let mut arguments = arguments.into_iter().map(Into::into);
 
         while let Some(argument) = arguments.next() {
+            if asked_for_help {
+                return Err(ConfigError::HelpWithArguments);
+            }
+            if asked_for_version {
+                return Err(ConfigError::VersionWithArguments);
+            }
+
             match argument.as_str() {
+                "-h" | "--help" => {
+                    asked_for_help = true;
+                }
+                "-V" | "--version" => {
+                    asked_for_version = true;
+                }
+                "-v" => {
+                    has_control_arg = true;
+                    if verbosity == 0 {
+                        verbosity = 1;
+                    } else {
+                        return Err(ConfigError::DuplicateVerbosity);
+                    }
+                }
+                "-vv" => {
+                    has_control_arg = true;
+                    if verbosity == 0 {
+                        verbosity = 2;
+                    } else {
+                        return Err(ConfigError::DuplicateVerbosity);
+                    }
+                }
+                "-vvv" => {
+                    has_control_arg = true;
+                    if verbosity == 0 {
+                        verbosity = 3;
+                    } else {
+                        return Err(ConfigError::DuplicateVerbosity);
+                    }
+                }
+                "-vvvv" | "--verbose" => {
+                    return Err(ConfigError::InvalidVerbosity(argument));
+                }
                 "--p2p-bind" => {
+                    has_control_arg = true;
                     if p2p_bind.is_some() {
                         return Err(ConfigError::DuplicateOption("--p2p-bind"));
                     }
@@ -48,18 +107,21 @@ impl NodeRuntimeConfig {
                     p2p_bind = Some(parse_address("--p2p-bind", &value)?);
                 }
                 "--peer" => {
+                    has_control_arg = true;
                     let value = arguments
                         .next()
                         .ok_or(ConfigError::MissingValue("--peer"))?;
                     peers.push(parse_address("--peer", &value)?);
                 }
                 "--allow-public-peers" => {
+                    has_control_arg = true;
                     if allow_public_peers {
                         return Err(ConfigError::DuplicateOption("--allow-public-peers"));
                     }
                     allow_public_peers = true;
                 }
                 _ if argument.starts_with("--p2p-bind=") => {
+                    has_control_arg = true;
                     if p2p_bind.is_some() {
                         return Err(ConfigError::DuplicateOption("--p2p-bind"));
                     }
@@ -69,22 +131,54 @@ impl NodeRuntimeConfig {
                     p2p_bind = Some(parse_address("--p2p-bind", value)?);
                 }
                 _ if argument.starts_with("--peer=") => {
+                    has_control_arg = true;
                     let value = argument
                         .strip_prefix("--peer=")
                         .expect("prefix was checked");
                     peers.push(parse_address("--peer", value)?);
                 }
+                _ if argument.starts_with("--peer") => {
+                    return Err(ConfigError::InvalidPeerConfiguration(
+                        "did you mean --peer <ip:port>?".to_owned(),
+                    ));
+                }
                 _ => return Err(ConfigError::UnknownArgument(argument)),
             }
+        }
+
+        if asked_for_help {
+            if has_control_arg {
+                return Err(ConfigError::HelpWithArguments);
+            }
+            return Ok(ProcessCommand::Help);
+        }
+
+        if asked_for_version {
+            if has_control_arg {
+                return Err(ConfigError::VersionWithArguments);
+            }
+            return Ok(ProcessCommand::Version);
         }
 
         let config = Self {
             p2p_bind: p2p_bind.unwrap_or(default_bind),
             peers,
             allow_public_peers,
-        };
+            verbosity,
+        }
+        .with_default_bootstrap();
+
         config.static_peers(PeerLimits::default()).validate()?;
-        Ok(config)
+
+        Ok(ProcessCommand::Run(config))
+    }
+
+    fn with_default_bootstrap(mut self) -> Self {
+        if self.peers.is_empty() {
+            self.peers.push(DEFAULT_BOOTSTRAP_PEER);
+            self.allow_public_peers = true;
+        }
+        self
     }
 
     pub(super) fn static_peers(&self, limits: PeerLimits) -> StaticPeerConfig {
@@ -113,7 +207,7 @@ fn parse_address(option: &'static str, value: &str) -> Result<SocketAddr, Config
 }
 
 #[derive(Debug)]
-pub(super) enum ConfigError {
+pub(crate) enum ConfigError {
     NonUnicodeArgument,
     InvalidBuiltInDefault,
     UnknownArgument(String),
@@ -121,6 +215,10 @@ pub(super) enum ConfigError {
     DuplicateOption(&'static str),
     InvalidAddress { option: &'static str, value: String },
     InvalidPeerConfiguration(String),
+    HelpWithArguments,
+    VersionWithArguments,
+    DuplicateVerbosity,
+    InvalidVerbosity(String),
 }
 
 impl From<cmfd_node::peer::PeerError> for ConfigError {
@@ -152,6 +250,21 @@ impl fmt::Display for ConfigError {
                 )
             }
             Self::InvalidPeerConfiguration(message) => formatter.write_str(message),
+            Self::HelpWithArguments => {
+                formatter.write_str("--help cannot be combined with other arguments")
+            }
+            Self::VersionWithArguments => {
+                formatter.write_str("--version cannot be combined with other arguments")
+            }
+            Self::DuplicateVerbosity => {
+                formatter.write_str("verbosity was specified multiple times")
+            }
+            Self::InvalidVerbosity(argument) => {
+                write!(
+                    formatter,
+                    "{argument} is not supported; use -v, -vv, or -vvv"
+                )
+            }
         }
     }
 }
@@ -160,25 +273,74 @@ impl fmt::Display for ConfigError {
 mod tests {
     use super::*;
 
+    fn parse_command(arguments: impl IntoIterator<Item = &'static str>) -> ProcessCommand {
+        NodeRuntimeConfig::parse(arguments).unwrap()
+    }
+
+    fn parsed_run_config(arguments: impl IntoIterator<Item = &'static str>) -> NodeRuntimeConfig {
+        match parse_command(arguments) {
+            ProcessCommand::Run(config) => config,
+            ProcessCommand::Help => {
+                panic!("expected run configuration, got help")
+            }
+            ProcessCommand::Version => {
+                panic!("expected run configuration, got version")
+            }
+        }
+    }
+
     #[test]
-    fn double_click_defaults_to_loopback_without_outbound_peers() {
-        let config = NodeRuntimeConfig::parse(Vec::<String>::new()).unwrap();
+    fn double_click_defaults_to_loopback_with_public_bootstrap_peer() {
+        let config = parsed_run_config(Vec::<&str>::new());
 
         assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
-        assert!(config.peers.is_empty());
-        assert!(!config.allow_public_peers);
+        assert_eq!(config.peers, vec![DEFAULT_BOOTSTRAP_PEER]);
+        assert!(config.allow_public_peers);
+        assert_eq!(config.verbosity, 0);
+    }
+
+    #[test]
+    fn verbosity_levels_are_supported() {
+        assert_eq!(
+            match parse_command(["-v"]) {
+                ProcessCommand::Run(config) => config.verbosity,
+                ProcessCommand::Help | ProcessCommand::Version => 0,
+            },
+            1
+        );
+        assert_eq!(
+            match parse_command(["-vv"]) {
+                ProcessCommand::Run(config) => config.verbosity,
+                ProcessCommand::Help | ProcessCommand::Version => 0,
+            },
+            2
+        );
+        assert_eq!(
+            match parse_command(["-vvv"]) {
+                ProcessCommand::Run(config) => config.verbosity,
+                ProcessCommand::Help | ProcessCommand::Version => 0,
+            },
+            3
+        );
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["-vvvv"]),
+            Err(ConfigError::InvalidVerbosity(_))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["-v", "-vv"]),
+            Err(ConfigError::DuplicateVerbosity)
+        ));
     }
 
     #[test]
     fn private_bind_and_repeatable_peers_are_accepted() {
-        let config = NodeRuntimeConfig::parse([
+        let config = parsed_run_config([
             "--p2p-bind",
             "192.168.50.10:18444",
             "--peer=192.168.50.11:18444",
             "--peer",
             "[fd12:3456::12]:18444",
-        ])
-        .unwrap();
+        ]);
 
         assert_eq!(config.p2p_bind, "192.168.50.10:18444".parse().unwrap());
         assert_eq!(
@@ -188,36 +350,33 @@ mod tests {
                 "[fd12:3456::12]:18444".parse().unwrap(),
             ]
         );
+        assert!(!config.allow_public_peers);
     }
 
     #[test]
     fn public_unspecified_duplicate_and_self_addresses_are_rejected() {
         for arguments in [
-            vec!["--peer", "8.8.8.8:18444"],
-            vec!["--p2p-bind", "0.0.0.0:18444"],
-            vec!["--peer", "127.0.0.1:18444"],
-            vec!["--peer", "127.0.0.1:18454", "--peer", "127.0.0.1:18454"],
+            ["--peer", "8.8.8.8:18444"].as_slice(),
+            ["--p2p-bind", "0.0.0.0:18444"].as_slice(),
+            ["--peer", "127.0.0.1:18444"].as_slice(),
+            ["--peer", "127.0.0.1:18454", "--peer", "127.0.0.1:18454"].as_slice(),
         ] {
-            assert!(
-                matches!(
-                    NodeRuntimeConfig::parse(arguments),
-                    Err(ConfigError::InvalidPeerConfiguration(_))
-                ),
-                "configuration unexpectedly passed validation"
-            );
+            assert!(matches!(
+                NodeRuntimeConfig::parse(arguments.iter().copied()),
+                Err(ConfigError::InvalidPeerConfiguration(_))
+            ));
         }
     }
 
     #[test]
     fn public_peers_require_explicit_opt_in_and_unsafe_binds_stay_rejected() {
-        let config = NodeRuntimeConfig::parse([
+        let config = parsed_run_config([
             "--allow-public-peers",
             "--p2p-bind",
             "192.168.50.10:18444",
             "--peer",
             "8.8.8.8:18444",
-        ])
-        .unwrap();
+        ]);
         assert!(config.allow_public_peers);
         assert_eq!(config.peers, ["8.8.8.8:18444".parse().unwrap()]);
 
@@ -255,6 +414,26 @@ mod tests {
         assert!(matches!(
             NodeRuntimeConfig::parse(["--unknown"]),
             Err(ConfigError::UnknownArgument(_))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--help", "--peer", "8.8.8.8:18444"]),
+            Err(ConfigError::HelpWithArguments)
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--version", "--peer", "8.8.8.8:18444"]),
+            Err(ConfigError::VersionWithArguments)
+        ));
+    }
+
+    #[test]
+    fn command_flags_are_exclusive_and_printable() {
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["-h"]),
+            Ok(ProcessCommand::Help)
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--version"]),
+            Ok(ProcessCommand::Version)
         ));
     }
 }

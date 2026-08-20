@@ -9,6 +9,27 @@ use tauri::{Manager, RunEvent};
 use runtime::RuntimeState;
 
 pub fn run() -> i32 {
+    let command = match runtime::parse_command() {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("Common Foundry Wallet: {error}");
+            eprintln!("Try --help for supported arguments.");
+            return 2;
+        }
+    };
+
+    let node_config = match command {
+        runtime::ProcessCommand::Help => {
+            println!("{}", runtime::command_help_text());
+            return 0;
+        }
+        runtime::ProcessCommand::Version => {
+            println!(env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+        runtime::ProcessCommand::Run(config) => config,
+    };
+
     let app = match tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -18,7 +39,7 @@ pub fn run() -> i32 {
             }
         }))
         .setup(|app| {
-            app.manage(RuntimeState::start(app));
+            app.manage(RuntimeState::start(app, node_config));
 
             let window_config = app
                 .config()

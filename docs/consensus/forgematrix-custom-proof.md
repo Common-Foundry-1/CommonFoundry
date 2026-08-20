@@ -250,7 +250,16 @@ commitment, while that transition's input commitment is required to equal the
 fixed base table. The aggregate public statement separately pins each model
 weight commitment and the final bank-output commitment. Integration verifiers
 and mutation tests enforce those identities under the same public statement
-binding. The final activation digest is not yet proven.
+binding.
+
+The aggregate v2 envelope now carries the canonical row-major final activation
+table. Its digest, deterministic work digest, target, challenge, model roots,
+and length are committed into the public transcript binding before the wiring
+cell challenge is sampled. The verifier recomputes both BLAKE3 digests and
+requires the public table's multilinear evaluation to equal the
+PCS-authenticated last-layer opening of the final output bank. This makes a
+different table or work digest fail closed. It is a correctness bridge, not the
+final succinct hash argument: the production table is a 512 KiB public witness.
 
 ## 6. Transparent PCS boundary
 
@@ -274,29 +283,27 @@ opening claims, and then requires a `StructuredPcsVerifier` to authenticate the
 complete claim set. A missing, empty, malformed, oversized, conflicting, or
 rejected PCS proof is a hard error. There is no accept-without-PCS path.
 
-The optional `whir-prototype` feature now implements the first accepting
-research adapter beneath that boundary. It commits one bounded base-field
-table with Plonky3 WHIR 0.6.3, records caller-supplied points in the cubic
-Goldilocks extension, builds their equality constraints directly, and verifies
-those exact points through the lower-level WHIR verifier. It does not replace
-the independent coordinates with the high-level layout's structured
-univariate-power points. Its BLAKE3 transcript binds a caller-supplied public
-statement, all points and evaluations, and the commitment before batching.
+The optional `whir-prototype` feature now implements an accepting aggregate
+research adapter beneath that boundary. It stacks bounded base-field tables
+under one Plonky3 WHIR 0.6.3 commitment, exposes deterministic per-table
+aliases, records caller-supplied points in the cubic Goldilocks extension,
+builds their equality constraints directly, and verifies those exact points
+through the lower-level WHIR verifier. It does not replace the independent
+coordinates with the high-level layout's structured univariate-power points.
+Its BLAKE3 transcript binds the public statement, all points and evaluations,
+and the aggregate commitment before batching.
 The prototype uses WHIR's non-conjectural unique-decoding parameter mode at a
 requested 128-bit level. A 1 MiB proof cap, a 4 KiB public-binding cap,
 canonical field checks, canonical JSON re-encoding, exact envelope exhaustion,
 and panic containment bound its current parser surface.
 
-This is not yet an implementation of the aggregate `StructuredPcsVerifier`.
-The component proofs still carry placeholder vector-content hashes, whereas a
-WHIR verifier must receive the actual WHIR commitment for each oracle. Changing
-those identities requires proof construction to commit every oracle through
-the same PCS before any component transcript samples challenges. The adapter
-also retains whole bounded tables in memory and has no production model-byte
-link or streaming 6 GiB prover. The upstream backend is an unaudited academic
-prototype. These gaps must be closed before the adapter can authenticate the
-aggregate claim set, and the result still requires review, benchmarks, fuzzing,
-and independent audits before any production selection.
+The component proof constructors can now receive the WHIR aliases before any
+component transcript samples challenges, and `StructuredWhirPcsVerifier`
+authenticates the resulting aggregate claim set. The adapter still retains
+whole bounded tables in memory and has no production model-byte link or
+streaming 6 GiB prover. The upstream backend is an unaudited academic
+prototype. Review, benchmarks, fuzzing, a complete soundness report, and
+independent audits remain mandatory before any production selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded
@@ -340,15 +347,15 @@ mathematically impossible."
 
 Before a production proof tag can exist:
 
-1. implement and harden the aggregate verifier's transparent PCS backend with
-   canonical parameters and explicit-point openings under one PCS transcript;
+1. harden and independently review the aggregate transparent PCS backend,
+   canonical parameters, parser, and explicit-point transcript;
 2. link the raw model bytes to the pinned PCS commitment;
-3. prove the terminal activation's final digest and work-digest binding;
-4. prove or replace the final BLAKE3 binding within the payload cap;
-5. fuzz the implemented bounded aggregate parser and add a bounded,
+3. arithmetize or replace the final BLAKE3 binding so the 512 KiB public-table
+   bridge can be removed within the payload cap;
+4. fuzz the implemented bounded aggregate parser and add a bounded,
    panic-contained network verifier queue;
-6. demonstrate production-size streaming proving within the memory, proof-size,
+5. demonstrate production-size streaming proving within the memory, proof-size,
    proving-time, and verification-time gates;
-7. publish independent prover/verifier implementations and canonical vectors;
-8. complete cryptanalysis, fuzzing, an adversarial testnet, and two external
+6. publish independent prover/verifier implementations and canonical vectors;
+7. complete cryptanalysis, fuzzing, an adversarial testnet, and two external
    audits.

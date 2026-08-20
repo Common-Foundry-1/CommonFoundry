@@ -244,7 +244,7 @@ whose work digest meets the target; requiring a full succinct proof for every
 losing nonce would make the proof system, rather than the matrix work, the
 mining bottleneck.
 
-## Final-activation BLAKE3 gap
+## Final-activation BLAKE3 binding
 
 The proposed mining digest retains a cheap pre-proof target test:
 
@@ -263,20 +263,40 @@ work_digest =
 each encoded as one byte in `0..=250`. `work_digest` is compared as an unsigned
 256-bit big-endian integer with the chain-derived target.
 
-The succinct verifier cannot safely accept `final_activation_digest` as an
-unproved miner claim. Production must do one of the following:
+The verifier cannot safely accept `final_activation_digest` as an unproved
+miner claim. The structured research proof now closes that correctness gap as
+follows:
+
+1. the proof envelope carries the canonical row-major `final_raw` table, capped
+   at 524,288 bytes;
+2. the verifier hashes those exact bytes with the formula above and recomputes
+   `work_digest` from the pinned byte and PCS model roots;
+3. the final digest, work digest, target, challenge, model roots, and table
+   length are absorbed into the public transcript binding before the wiring
+   verifier samples its cell point;
+4. the verifier evaluates the supplied final table at that cell point and
+   requires equality with the PCS-authenticated opening of the last layer in
+   the last output bank; and
+5. the recomputed work digest must meet the block target.
+
+This prevents a prover from substituting another final table or mining digest
+without either breaking BLAKE3 or the sumcheck/PCS soundness. Proof or PCS
+randomness is not included in `work_digest`, so it cannot provide a second
+grinding surface.
+
+The current bridge is complete for correctness but not succinct in total
+payload: the production table adds 512 KiB to every winning block. A production
+release should therefore replace the public table with one of the following:
 
 1. arithmetize BLAKE3 and prove that the final activation bytes hash to the
    digest;
-2. give the verifier all 524,288 final bytes to hash, which adds 512 KiB to
-   every block and violates the preferred total proof-plus-public-witness
-   payload gate; or
-3. adopt a reviewed proof-native final digest in a later algorithm revision and
+2. adopt a reviewed proof-native final digest in a later algorithm revision and
    define the target calculation around it.
 
-The repository does not yet close this gap. A proof of the matrix and cubic
-relations that leaves the final BLAKE3 digest unbound is not a valid block
-proof.
+The 512 KiB bridge remains feature-gated research code, has no consensus proof
+tag, and does not by itself satisfy the production proof-size, streaming,
+soundness, or audit gates. A proof of the matrix and cubic relations that omits
+this binding is not a valid block proof.
 
 ## What the proof cannot establish
 
@@ -354,15 +374,20 @@ comparison. The v2 research code now implements:
 - custom bank-batched matrix and transition/range sumchecks in the cubic
   Goldilocks extension. They prove every matrix product and all 121 local
   transition/range constraints over the actual ForgeMatrix trace, with
-  canonical bounded encodings and exact no-wrap bounds. Their current
-  full-table opening adapters are not a transparent PCS or a succinct
-  verifier; the frozen protocol and remaining work are in
+  canonical bounded encodings and exact no-wrap bounds. A successor-wiring
+  argument and fail-closed aggregate verifier bind initialization, every layer
+  edge, bank boundaries, fixed model commitments, and the final bank output;
+  the frozen protocol and remaining work are in
   [forgematrix-custom-proof.md](forgematrix-custom-proof.md);
-- an optional `whir-prototype` explicit-point PCS experiment. It transparently
-  commits one bounded Goldilocks table and verifies multiple exact
-  cubic-extension MLE openings under a requested 128-bit unique-decoding WHIR
-  configuration. It is not connected to the aggregate component commitments,
-  a production streaming prover, the model-byte link, or consensus;
+- an optional `whir-prototype` aggregate explicit-point PCS experiment. It
+  stacks bounded Goldilocks tables under one transparent commitment, supplies
+  per-table commitment aliases to every component before transcript sampling,
+  and verifies the complete canonical opening set under a requested 128-bit
+  unique-decoding WHIR configuration;
+- a version-2 structured envelope that carries the bounded canonical final
+  table, recomputes the exact final and work BLAKE3 digests, absorbs the
+  challenge/model roots/digests/target/length before sampling, checks the final
+  table against the authenticated last-layer opening, and rejects high work;
 - an optional, feature-gated Remainder CE GKR/Ligero proof of the complete tiny
   2x4x4 relation. It binds the fixed model, public statement, target, nonce,
   masks, all matrix products, every nonlinear reduction and range, final public
@@ -396,11 +421,12 @@ canonical cross-process circuit artifact. The wrapper's 384 MiB cap and panic
 containment are research safeguards, not acceptable network-parser bounds.
 There is no proof wire tag or `ChainState` integration for this feature.
 
-The repository does not yet implement the production transparent PCS and
-byte-link certificate, custom batched all-layer matrix/transition sumchecks,
->=192-bit extension-field transcript, or production final-digest binding. The CUDA fixture
-is a differential harness, not a tensor-core miner, succinct prover, low-VRAM
-benchmark, or evidence of residency.
+The repository does not yet implement the production streaming prover,
+raw-byte-to-PCS model-link certificate, final soundness report, or a succinct
+BLAKE3 subargument that removes the 512 KiB final-table bridge. The aggregate
+proof has no consensus wire tag and the WHIR backend remains unaudited research
+code. The CUDA fixture is a differential harness, not a tensor-core succinct
+prover, low-VRAM proof benchmark, or evidence of residency.
 The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;
 an independent challenge-to-coefficient implementation and a broader vector
 corpus remain required.

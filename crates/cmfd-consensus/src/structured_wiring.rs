@@ -117,6 +117,8 @@ pub struct StructuredWiringOpeningClaim {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredWiringOpeningClaims {
     pub openings: Vec<StructuredWiringOpeningClaim>,
+    /// Authenticated opening of the last layer in the last output bank.
+    pub final_output: StructuredWiringOpeningClaim,
 }
 
 impl StructuredWiringProof {
@@ -705,7 +707,15 @@ fn opening_claims(
             evaluation: ExtensionElement::from_field(evaluations.input_first[bank]),
         });
     }
-    StructuredWiringOpeningClaims { openings }
+    let final_output = StructuredWiringOpeningClaim {
+        commitment: proof.output_commitments[statement.banks - 1],
+        point: encode_fields(&points.output_last()),
+        evaluation: ExtensionElement::from_field(evaluations.output_last[statement.banks - 1]),
+    };
+    StructuredWiringOpeningClaims {
+        openings,
+        final_output,
+    }
 }
 
 fn validate_tables(

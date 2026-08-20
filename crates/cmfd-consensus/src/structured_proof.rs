@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    forgematrix_v2::{output_digest, work_digest_from_roots},
     structured_sumcheck::{
-        ExtensionElement, StructuredMatrixProof, StructuredMatrixStatement,
-        StructuredSumcheckError, verify_structured_matrix_sumcheck,
+        ExtensionElement, ExtensionField, StructuredMatrixProof, StructuredMatrixStatement,
+        StructuredSumcheckError, evaluate_mle, verify_structured_matrix_sumcheck,
     },
     structured_transition::{
         StructuredMaskPolynomial, StructuredTransitionError, StructuredTransitionProof,
@@ -30,19 +31,27 @@ use crate::{
     },
 };
 
-pub const STRUCTURED_AGGREGATE_VERSION: u32 = 1;
+pub const STRUCTURED_AGGREGATE_VERSION: u32 = 2;
 pub const MAX_STRUCTURED_AGGREGATE_PROOF_BYTES: usize = 1024 * 1024;
 pub const MAX_STRUCTURED_PCS_PROOF_BYTES: usize = 512 * 1024;
+pub const MAX_STRUCTURED_FINAL_ACTIVATION_BYTES: usize = 512 * 1024;
 pub const MAX_STRUCTURED_OPENING_CLAIMS: usize = 4096;
 pub const MAX_STRUCTURED_OPENING_VARIABLES: usize = 64;
 
-const PROOF_MAGIC: &[u8; 8] = b"CMFDSA01";
+const PROOF_MAGIC: &[u8; 8] = b"CMFDSA02";
+const PUBLIC_BINDING_DOMAIN: &str = "CMFD/FORGEMATRIX/STRUCTURED-PUBLIC/V2";
 
 /// Public data that fixes every component interpretation and fixed model
 /// commitment in one ForgeMatrix execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredForgeMatrixStatement {
+    pub challenge_digest: [u8; 32],
     pub public_binding: [u8; 32],
+    pub model_byte_root: [u8; 32],
+    pub model_pcs_root: [u8; 32],
+    pub final_activation_digest: [u8; 32],
+    pub work_digest: [u8; 32],
+    pub work_target: [u8; 32],
     pub base_input_commitment: [u8; 32],
     pub weight_commitments: Vec<[u8; 32]>,
     pub final_bank_output_commitment: [u8; 32],
@@ -63,6 +72,11 @@ pub struct StructuredForgeMatrixProof {
     pub matrix_proofs: Vec<StructuredMatrixProof>,
     pub transition_proofs: Vec<StructuredTransitionProof>,
     pub wiring_proof: StructuredWiringProof,
+    /// Canonical row-major final activation representatives in `0..=250`.
+    ///
+    /// This closes the digest relation without arithmetizing BLAKE3, at the
+    /// cost of a 512 KiB public witness for the production shape.
+    pub final_activation: Vec<u8>,
     pub pcs_proof: Vec<u8>,
 }
 
@@ -89,6 +103,33 @@ pub trait StructuredPcsVerifier: Send + Sync {
     ) -> bool;
 }
 
+/// Derives the transcript binding that commits the algebraic proof challenges
+/// to the exact mining challenge, model identities, final digest, work digest,
+/// target, and final-table length before any random opening point is sampled.
+#[allow(clippy::too_many_arguments)]
+pub fn structured_forgematrix_public_binding(
+    challenge_digest: [u8; 32],
+    model_byte_root: [u8; 32],
+    model_pcs_root: [u8; 32],
+    final_activation_digest: [u8; 32],
+    work_digest: [u8; 32],
+    work_target: [u8; 32],
+    final_activation_len: usize,
+) -> Result<[u8; 32], StructuredProofError> {
+    let final_activation_len = u64::try_from(final_activation_len)
+        .map_err(|_| StructuredProofError::FinalActivationShape)?;
+    let mut hasher = blake3::Hasher::new_derive_key(PUBLIC_BINDING_DOMAIN);
+    hasher.update(&STRUCTURED_AGGREGATE_VERSION.to_le_bytes());
+    hasher.update(&challenge_digest);
+    hasher.update(&model_byte_root);
+    hasher.update(&model_pcs_root);
+    hasher.update(&final_activation_digest);
+    hasher.update(&work_digest);
+    hasher.update(&work_target);
+    hasher.update(&final_activation_len.to_le_bytes());
+    Ok(*hasher.finalize().as_bytes())
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StructuredProofError {
     #[error("aggregate proof protocol version mismatch")]
@@ -101,6 +142,22 @@ pub enum StructuredProofError {
     WeightCommitment,
     #[error("wiring proof does not bind the declared final-bank output commitment")]
     FinalBankOutputCommitment,
+    #[error("aggregate public binding does not match its challenge, model, digest, and target")]
+    PublicBinding,
+    #[error("final activation has the wrong shape")]
+    FinalActivationShape,
+    #[error("final activation is not canonically encoded in 0..=250")]
+    FinalActivationEncoding,
+    #[error("final activation does not match the authenticated final output opening")]
+    FinalActivationOpening,
+    #[error("final activation digest mismatch")]
+    FinalActivationDigest,
+    #[error("work digest mismatch")]
+    WorkDigest,
+    #[error("work digest does not meet the block target")]
+    HighHash,
+    #[error("model digest roots are not committed")]
+    ModelBinding,
     #[error("aggregate proof is missing its authenticated PCS opening proof")]
     MissingPcsProof,
     #[error("aggregate proof contains too many PCS opening claims")]
@@ -136,6 +193,7 @@ impl StructuredForgeMatrixProof {
         if self.pcs_proof.len() > MAX_STRUCTURED_PCS_PROOF_BYTES {
             return Err(StructuredProofError::ProofTooLarge);
         }
+        validate_final_activation_encoding(&self.final_activation)?;
 
         let initialization = self.initialization_proof.encode()?;
         let matrices = self
@@ -157,6 +215,7 @@ impl StructuredForgeMatrixProof {
         encode_blobs(&mut output, &matrices)?;
         encode_blobs(&mut output, &transitions)?;
         encode_blob(&mut output, &wiring)?;
+        encode_blob(&mut output, &self.final_activation)?;
         encode_blob(&mut output, &self.pcs_proof)?;
         if output.len() > MAX_STRUCTURED_AGGREGATE_PROOF_BYTES {
             return Err(StructuredProofError::ProofTooLarge);
@@ -192,6 +251,8 @@ impl StructuredForgeMatrixProof {
         }
         let wiring_proof =
             StructuredWiringProof::decode(reader.blob(crate::MAX_STRUCTURED_WIRING_PROOF_BYTES)?)?;
+        let final_activation = reader.blob(MAX_STRUCTURED_FINAL_ACTIVATION_BYTES)?.to_vec();
+        validate_final_activation_encoding(&final_activation)?;
         let pcs_proof = reader.blob(MAX_STRUCTURED_PCS_PROOF_BYTES)?.to_vec();
         if pcs_proof.is_empty() {
             return Err(StructuredProofError::MissingPcsProof);
@@ -205,6 +266,7 @@ impl StructuredForgeMatrixProof {
             matrix_proofs,
             transition_proofs,
             wiring_proof,
+            final_activation,
             pcs_proof,
         })
     }
@@ -243,6 +305,7 @@ pub fn collect_structured_forgematrix_openings(
     if proof.protocol_version != STRUCTURED_AGGREGATE_VERSION {
         return Err(StructuredProofError::ProtocolVersion);
     }
+    validate_final_output_metadata(statement, proof)?;
 
     verify_structured_wiring_component_commitments(
         statement.wiring_statement,
@@ -316,6 +379,7 @@ pub fn collect_structured_forgematrix_openings(
         statement.wiring_statement,
         &proof.wiring_proof,
     )?;
+    verify_final_output_opening(statement, proof, &wiring.final_output)?;
     openings.extend(
         wiring
             .openings
@@ -328,6 +392,99 @@ pub fn collect_structured_forgematrix_openings(
     );
 
     canonical_openings(openings)
+}
+
+fn validate_final_activation_encoding(bytes: &[u8]) -> Result<(), StructuredProofError> {
+    if bytes.is_empty() {
+        return Err(StructuredProofError::FinalActivationShape);
+    }
+    if bytes.len() > MAX_STRUCTURED_FINAL_ACTIVATION_BYTES {
+        return Err(StructuredProofError::ProofTooLarge);
+    }
+    if bytes.iter().any(|value| *value > 250) {
+        return Err(StructuredProofError::FinalActivationEncoding);
+    }
+    Ok(())
+}
+
+fn validate_final_output_metadata(
+    statement: &StructuredForgeMatrixStatement,
+    proof: &StructuredForgeMatrixProof,
+) -> Result<(), StructuredProofError> {
+    validate_final_activation_encoding(&proof.final_activation)?;
+    let expected_len = statement
+        .wiring_statement
+        .rows
+        .checked_mul(statement.wiring_statement.cols)
+        .ok_or(StructuredProofError::FinalActivationShape)?;
+    if proof.final_activation.len() != expected_len {
+        return Err(StructuredProofError::FinalActivationShape);
+    }
+    if statement.model_byte_root == [0; 32] || statement.model_pcs_root == [0; 32] {
+        return Err(StructuredProofError::ModelBinding);
+    }
+    let expected_final_digest = output_digest(statement.challenge_digest, &proof.final_activation);
+    if statement.final_activation_digest != expected_final_digest {
+        return Err(StructuredProofError::FinalActivationDigest);
+    }
+    let expected_work_digest = work_digest_from_roots(
+        statement.challenge_digest,
+        statement.model_byte_root,
+        statement.model_pcs_root,
+        expected_final_digest,
+    );
+    if statement.work_digest != expected_work_digest {
+        return Err(StructuredProofError::WorkDigest);
+    }
+    if statement.work_digest > statement.work_target {
+        return Err(StructuredProofError::HighHash);
+    }
+    let expected_binding = structured_forgematrix_public_binding(
+        statement.challenge_digest,
+        statement.model_byte_root,
+        statement.model_pcs_root,
+        statement.final_activation_digest,
+        statement.work_digest,
+        statement.work_target,
+        proof.final_activation.len(),
+    )?;
+    if statement.public_binding != expected_binding {
+        return Err(StructuredProofError::PublicBinding);
+    }
+    Ok(())
+}
+
+fn verify_final_output_opening(
+    statement: &StructuredForgeMatrixStatement,
+    proof: &StructuredForgeMatrixProof,
+    final_output: &crate::StructuredWiringOpeningClaim,
+) -> Result<(), StructuredProofError> {
+    let wiring = statement.wiring_statement;
+    let cell_variables = wiring.cols.ilog2() as usize + wiring.rows.ilog2() as usize;
+    let layer_variables = wiring.layers_per_bank.ilog2() as usize;
+    if final_output.commitment != statement.final_bank_output_commitment
+        || final_output.point.len() != cell_variables + layer_variables
+        || final_output.point[cell_variables..]
+            .iter()
+            .any(|coordinate| *coordinate != ExtensionElement::from_field(ExtensionField::ONE))
+    {
+        return Err(StructuredProofError::FinalActivationOpening);
+    }
+    let point = final_output.point[..cell_variables]
+        .iter()
+        .copied()
+        .map(ExtensionElement::to_field)
+        .collect::<Result<Vec<_>, _>>()?;
+    let table = proof
+        .final_activation
+        .iter()
+        .map(|value| ExtensionField::from_signed(i64::from(*value) - 125))
+        .collect::<Vec<_>>();
+    let expected = ExtensionElement::from_field(evaluate_mle(&table, &point));
+    if final_output.evaluation != expected {
+        return Err(StructuredProofError::FinalActivationOpening);
+    }
+    Ok(())
 }
 
 fn validate_component_shapes(
@@ -577,7 +734,14 @@ mod tests {
     }
 
     struct FixtureData {
+        challenge_digest: [u8; 32],
         binding: [u8; 32],
+        model_byte_root: [u8; 32],
+        model_pcs_root: [u8; 32],
+        final_activation: Vec<u8>,
+        final_activation_digest: [u8; 32],
+        work_digest: [u8; 32],
+        work_target: [u8; 32],
         initial: Vec<i64>,
         inputs: Vec<i64>,
         outputs: Vec<i64>,
@@ -609,6 +773,25 @@ mod tests {
         let rows = model.rows() as usize;
         let cols = model.width() as usize;
         let layers = model.layers() as usize;
+        let descriptor = reference.descriptor();
+        let final_activation = trace
+            .layers
+            .last()
+            .unwrap()
+            .output
+            .iter()
+            .map(|value| u8::try_from(*value + 125).unwrap())
+            .collect::<Vec<_>>();
+        let binding = structured_forgematrix_public_binding(
+            trace.challenge_digest,
+            descriptor.model.raw_blake3_root,
+            descriptor.model.pcs_commitment_root,
+            trace.final_activation_digest,
+            trace.work_digest,
+            block.target,
+            final_activation.len(),
+        )
+        .unwrap();
 
         let initial = trace
             .initial_activation
@@ -701,7 +884,14 @@ mod tests {
             max_abs_activation: 125,
         };
         FixtureData {
-            binding: trace.challenge_digest,
+            challenge_digest: trace.challenge_digest,
+            binding,
+            model_byte_root: descriptor.model.raw_blake3_root,
+            model_pcs_root: descriptor.model.pcs_commitment_root,
+            final_activation,
+            final_activation_digest: trace.final_activation_digest,
+            work_digest: trace.work_digest,
+            work_target: block.target,
             initial,
             inputs,
             outputs,
@@ -760,7 +950,13 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let statement = StructuredForgeMatrixStatement {
+            challenge_digest: data.challenge_digest,
             public_binding: data.binding,
+            model_byte_root: data.model_byte_root,
+            model_pcs_root: data.model_pcs_root,
+            final_activation_digest: data.final_activation_digest,
+            work_digest: data.work_digest,
+            work_target: data.work_target,
             base_input_commitment,
             weight_commitments: vec![matrix_proof.weight_commitment],
             final_bank_output_commitment: *wiring_proof.output_commitments.last().unwrap(),
@@ -777,6 +973,7 @@ mod tests {
             matrix_proofs: vec![matrix_proof],
             transition_proofs: vec![transition_proof],
             wiring_proof,
+            final_activation: data.final_activation,
             pcs_proof: b"authenticated-openings".to_vec(),
         };
         (statement, proof)
@@ -865,7 +1062,13 @@ mod tests {
         )
         .unwrap();
         let statement = StructuredForgeMatrixStatement {
+            challenge_digest: data.challenge_digest,
             public_binding: data.binding,
+            model_byte_root: data.model_byte_root,
+            model_pcs_root: data.model_pcs_root,
+            final_activation_digest: data.final_activation_digest,
+            work_digest: data.work_digest,
+            work_target: data.work_target,
             base_input_commitment: initialization_aliases[0],
             weight_commitments: vec![matrix_aliases[1]],
             final_bank_output_commitment: wiring_aliases[2],
@@ -882,6 +1085,7 @@ mod tests {
             matrix_proofs: vec![matrix_proof],
             transition_proofs: vec![transition_proof],
             wiring_proof,
+            final_activation: data.final_activation,
             pcs_proof: Vec::new(),
         };
         let openings = collect_structured_forgematrix_openings(&statement, &proof).unwrap();
@@ -943,6 +1147,157 @@ mod tests {
     }
 
     #[test]
+    fn final_activation_and_work_digest_are_bound_fail_closed() {
+        let (statement, proof) = fixture();
+
+        let mut wrong_activation = proof.clone();
+        wrong_activation.final_activation[0] ^= 1;
+        assert_eq!(
+            verify_structured_forgematrix_proof(
+                &statement,
+                &wrong_activation,
+                &TestPcs { accept: true },
+            ),
+            Err(StructuredProofError::FinalActivationDigest)
+        );
+
+        let mut rebound_forgery = statement.clone();
+        rebound_forgery.final_activation_digest = output_digest(
+            rebound_forgery.challenge_digest,
+            &wrong_activation.final_activation,
+        );
+        rebound_forgery.work_digest = work_digest_from_roots(
+            rebound_forgery.challenge_digest,
+            rebound_forgery.model_byte_root,
+            rebound_forgery.model_pcs_root,
+            rebound_forgery.final_activation_digest,
+        );
+        rebound_forgery.public_binding = structured_forgematrix_public_binding(
+            rebound_forgery.challenge_digest,
+            rebound_forgery.model_byte_root,
+            rebound_forgery.model_pcs_root,
+            rebound_forgery.final_activation_digest,
+            rebound_forgery.work_digest,
+            rebound_forgery.work_target,
+            wrong_activation.final_activation.len(),
+        )
+        .unwrap();
+        assert!(
+            verify_structured_forgematrix_proof(
+                &rebound_forgery,
+                &wrong_activation,
+                &TestPcs { accept: true },
+            )
+            .is_err(),
+            "rebinding a substituted final table must invalidate the algebraic transcript"
+        );
+
+        let mut wrong_digest = statement.clone();
+        wrong_digest.final_activation_digest[0] ^= 1;
+        assert_eq!(
+            verify_structured_forgematrix_proof(&wrong_digest, &proof, &TestPcs { accept: true },),
+            Err(StructuredProofError::FinalActivationDigest)
+        );
+
+        let mut wrong_work = statement.clone();
+        wrong_work.work_digest[0] ^= 1;
+        assert_eq!(
+            verify_structured_forgematrix_proof(&wrong_work, &proof, &TestPcs { accept: true }),
+            Err(StructuredProofError::WorkDigest)
+        );
+
+        let mut impossible_target = statement.clone();
+        impossible_target.work_target = [0; 32];
+        assert_eq!(
+            verify_structured_forgematrix_proof(
+                &impossible_target,
+                &proof,
+                &TestPcs { accept: true },
+            ),
+            Err(StructuredProofError::HighHash)
+        );
+
+        let mut missing_model = statement.clone();
+        missing_model.model_byte_root = [0; 32];
+        assert_eq!(
+            verify_structured_forgematrix_proof(&missing_model, &proof, &TestPcs { accept: true },),
+            Err(StructuredProofError::ModelBinding)
+        );
+
+        let mut different_challenge = statement.clone();
+        different_challenge.challenge_digest[0] ^= 1;
+        different_challenge.final_activation_digest = output_digest(
+            different_challenge.challenge_digest,
+            &proof.final_activation,
+        );
+        different_challenge.work_digest = work_digest_from_roots(
+            different_challenge.challenge_digest,
+            different_challenge.model_byte_root,
+            different_challenge.model_pcs_root,
+            different_challenge.final_activation_digest,
+        );
+        different_challenge.public_binding = structured_forgematrix_public_binding(
+            different_challenge.challenge_digest,
+            different_challenge.model_byte_root,
+            different_challenge.model_pcs_root,
+            different_challenge.final_activation_digest,
+            different_challenge.work_digest,
+            different_challenge.work_target,
+            proof.final_activation.len(),
+        )
+        .unwrap();
+        assert!(
+            verify_structured_forgematrix_proof(
+                &different_challenge,
+                &proof,
+                &TestPcs { accept: true },
+            )
+            .is_err(),
+            "a proof transcript must not replay under a different block challenge"
+        );
+
+        let mut different_valid_target = statement.clone();
+        different_valid_target.work_target = different_valid_target.work_digest;
+        assert_ne!(different_valid_target.work_target, statement.work_target);
+        different_valid_target.public_binding = structured_forgematrix_public_binding(
+            different_valid_target.challenge_digest,
+            different_valid_target.model_byte_root,
+            different_valid_target.model_pcs_root,
+            different_valid_target.final_activation_digest,
+            different_valid_target.work_digest,
+            different_valid_target.work_target,
+            proof.final_activation.len(),
+        )
+        .unwrap();
+        assert!(
+            verify_structured_forgematrix_proof(
+                &different_valid_target,
+                &proof,
+                &TestPcs { accept: true },
+            )
+            .is_err(),
+            "a proof transcript must not replay under a different valid target"
+        );
+    }
+
+    #[test]
+    fn final_activation_must_equal_the_committed_last_layer() {
+        let (statement, proof) = fixture();
+        let wiring = verify_structured_wiring_openings(
+            &statement.public_binding,
+            statement.wiring_statement,
+            &proof.wiring_proof,
+        )
+        .unwrap();
+        let mut different_table = proof.clone();
+        different_table.final_activation[0] ^= 1;
+        assert_eq!(
+            verify_final_output_opening(&statement, &different_table, &wiring.final_output),
+            Err(StructuredProofError::FinalActivationOpening)
+        );
+    }
+
+    #[test]
     fn aggregate_parser_is_bounded_and_exact() {
         let (_, proof) = fixture();
         let canonical = proof.encode().unwrap();
@@ -960,6 +1315,12 @@ mod tests {
         assert_eq!(
             missing_pcs.encode(),
             Err(StructuredProofError::MissingPcsProof)
+        );
+        let mut noncanonical_activation = proof.clone();
+        noncanonical_activation.final_activation[0] = 251;
+        assert_eq!(
+            noncanonical_activation.encode(),
+            Err(StructuredProofError::FinalActivationEncoding)
         );
         assert_eq!(
             StructuredForgeMatrixProof::decode(&vec![0; MAX_STRUCTURED_AGGREGATE_PROOF_BYTES + 1]),

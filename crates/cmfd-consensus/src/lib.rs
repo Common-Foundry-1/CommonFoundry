@@ -66,11 +66,12 @@ pub use remainder_proof::{
     verify_remainder_prototype,
 };
 pub use structured_proof::{
-    MAX_STRUCTURED_AGGREGATE_PROOF_BYTES, MAX_STRUCTURED_OPENING_CLAIMS,
-    MAX_STRUCTURED_OPENING_VARIABLES, MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION,
-    StructuredForgeMatrixProof, StructuredForgeMatrixStatement, StructuredPcsOpeningClaim,
-    StructuredPcsVerifier, StructuredProofError, collect_structured_forgematrix_openings,
-    verify_structured_forgematrix_proof,
+    MAX_STRUCTURED_AGGREGATE_PROOF_BYTES, MAX_STRUCTURED_FINAL_ACTIVATION_BYTES,
+    MAX_STRUCTURED_OPENING_CLAIMS, MAX_STRUCTURED_OPENING_VARIABLES,
+    MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION, StructuredForgeMatrixProof,
+    StructuredForgeMatrixStatement, StructuredPcsOpeningClaim, StructuredPcsVerifier,
+    StructuredProofError, collect_structured_forgematrix_openings,
+    structured_forgematrix_public_binding, verify_structured_forgematrix_proof,
 };
 pub use structured_sumcheck::{
     ExtensionElement, MAX_STRUCTURED_MATRIX_ELEMENTS, MAX_STRUCTURED_SUMCHECK_PROOF_BYTES,

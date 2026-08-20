@@ -998,7 +998,7 @@ fn activation_bytes(values: &[i16]) -> Result<Vec<u8>, ForgeMatrixV2Error> {
         .collect()
 }
 
-fn output_digest(challenge: [u8; 32], final_bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn output_digest(challenge: [u8; 32], final_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new_derive_key(OUTPUT_DOMAIN);
     hasher.update(&challenge);
     hasher.update(&(final_bytes.len() as u64).to_le_bytes());
@@ -1011,10 +1011,24 @@ fn work_digest(
     challenge: [u8; 32],
     final_activation_digest: [u8; 32],
 ) -> [u8; 32] {
+    work_digest_from_roots(
+        challenge,
+        descriptor.model.raw_blake3_root,
+        descriptor.model.pcs_commitment_root,
+        final_activation_digest,
+    )
+}
+
+pub(crate) fn work_digest_from_roots(
+    challenge: [u8; 32],
+    model_byte_root: [u8; 32],
+    model_pcs_root: [u8; 32],
+    final_activation_digest: [u8; 32],
+) -> [u8; 32] {
     let mut hasher = Hasher::new_derive_key(WORK_DOMAIN);
     hasher.update(&challenge);
-    hasher.update(&descriptor.model.raw_blake3_root);
-    hasher.update(&descriptor.model.pcs_commitment_root);
+    hasher.update(&model_byte_root);
+    hasher.update(&model_pcs_root);
     hasher.update(&final_activation_digest);
     *hasher.finalize().as_bytes()
 }

@@ -584,6 +584,10 @@ Goldilocks supplies about 64 bits per base-field challenge, which is insufficien
 
 The current repository sumcheck is only a test skeleton: the verifier API is given all three matrices in full, each capped at 4,096 elements; it recomputes multilinear openings, uses base-field challenges, and is not connected to block validation. It demonstrates algebra and transcript testing, not succinctness or production soundness.
 
+The repository also contains a feature-gated experiment using the exact pinned Remainder CE GKR/Ligero backend. Unlike the skeleton, it proves the complete tiny 2 by 4 by 4 relation: fixed model and masks, all four matrix products, signed encoding, quotient/remainder equations, packed range checks, successor activations, final public activation, block statement, nonce, target, and work digest. Model, block, target, nonce, output, digest, statement, and transcript mutations are rejected. This demonstrates end-to-end constraint coverage, but not deployable succinctness. A release-mode local run produced a 302,726,694-byte transcript in 49.76 seconds and verified it in 122.63 seconds. The backend is therefore explicitly rejected for consensus. It is unaudited, retains internal panic paths, and lacks a canonical cross-process circuit artifact and the production model-link proof. The active Devnet verifier continues to recompute the tiny relation.
+
+This negative benchmark narrows the implementation path: production requires a custom batched matrix and transition sumcheck whose prover streams the committed model and trace, followed by a transparent PCS opening and a hardened, canonically encoded verifier. Merely placing the production relation into a generic GKR frontend does not satisfy the size, latency, memory, or denial-of-service requirements.
+
 ### 8.5 Winner-only proving
 
 Generating a full proof for every losing nonce would make proof construction, not matrix evaluation, the effective mining function. The intended mining loop evaluates the deterministic relation and work digest for each nonce, then constructs one expensive proof only after finding a winner.
@@ -893,11 +897,11 @@ It does not assume miners follow a reference kernel. Any implementation computin
 
 | Threat or shortcut | Control | Current status |
 |---|---|---|
-| Skip a layer or bank | Bind all sequential transitions and bank boundaries | Tiny Devnet fully replays four layers; production proof absent |
+| Skip a layer or bank | Bind all sequential transitions and bank boundaries | Tiny Devnet fully replays four layers; optional full tiny proof rejects omission; production proof absent |
 | Use another model | Manifest, raw root, PCS root, and link certificate | Raw format exists; PCS and link absent |
 | Regenerate from a short seed | Seedless activated bytes | V2 format implemented; production ceremony absent |
 | Compress the bank | Structural review and competing implementations | Cannot be prohibited by consensus |
-| Retain only low accumulator bits | Exact signed interval plus canonical prime residue | Relation implemented at tiny scale; production range proof absent |
+| Retain only low accumulator bits | Exact signed interval plus canonical prime residue | Tiny reference and optional proof enforce exact ranges; production range proof absent |
 | Substitute final output | Prove final digest or publish bytes | Unresolved production blocker |
 | Reuse proof on another block | Challenge binds network, model, parent, root, height, time, target, nonce | Implemented in reference path |
 | Claim an easier target | Chain independently derives target before proof verification | Implemented |
@@ -907,7 +911,7 @@ It does not assume miners follow a reference kernel. Any implementation computin
 | Cross-network replay | Full network ID in objects and fingerprint handshake | Implemented |
 | Forge polynomial openings | Transparent PCS with canonical openings | Not implemented |
 | Fake raw-to-PCS equivalence | Verifiable link certificate | Not implemented |
-| Transcript grinding | Canonical transcript, post-commit challenges, large extension field | Only toy transcript exists |
+| Transcript grinding | Canonical transcript, post-commit challenges, large extension field | Tiny Remainder experiment is pinned and canonicalized externally but is not production-sound or deployable |
 | Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; production proof parser absent |
 | False remote height or work | Treat advertisement as hint and recompute locally | Implemented |
 | Peer spoofing, eclipse, MITM | Authenticated encrypted peer layer, discovery, reputation | Not implemented; private static peers only |
@@ -1028,6 +1032,12 @@ bank, a sound final-digest construction, optimized independent miners and
 provers, evidence across low- and high-memory hardware, public-network
 hardening, secure custody, durable pool payouts and share-proof DoS defenses,
 marketplace transport, governance disclosure, and external audits.
+
+The complete tiny Remainder experiment usefully falsified one shortcut: a
+generic GKR/Ligero frontend yielded a roughly 302.7 MB proof with two-minute
+verification, so it cannot be relabeled as the production proof. The next proof
+milestone is the specialized batched matrix/transition sumcheck and transparent
+PCS prototype, measured against the activation gates from its first revision.
 
 That honesty is part of the design. Common Foundry should become valuable only after its central claims are independently demonstrated, not because a white paper treats proposals as facts.
 

@@ -13,6 +13,26 @@ tiny v2 compact claim through network-parameter-bound `Block`/`ChainState`
 validation. That claim is not a succinct argument: the verifier recomputes
 every layer of the tiny pinned model. The production profile remains disabled.
 
+An optional `remainder-prototype` feature now proves the complete tiny 2x4x4
+relation with the exact pinned Remainder CE revision
+`5687fe7f3a077c75c374422ef79f22e3860de9c1`. It binds the fixed model, block
+challenge, target, nonce, masks, all matrix products, every nonlinear
+transition and range, the final activation, and the work digest. A release-mode
+local benchmark produced a 302,726,694-byte transcript in 49.76 seconds and
+verified it in 122.63 seconds. Those results disqualify this generic backend
+from consensus: they exceed the 256 KiB proof gate and 100 ms verification gate
+by orders of magnitude. The feature is a research and adversarial-correctness
+oracle only; it has no wire proof tag and is not accepted by `ChainState`.
+
+The pinned backend is unaudited, contains panic paths, does not provide a
+canonical cross-process circuit artifact, and exposes the tiny fixed model as
+verifier-known public input rather than proving the production raw-byte-to-PCS
+link. The wrapper imposes a research-only byte cap, rejects trailing and
+noncanonical encodings, pins the proof configuration, and contains backend
+panics, but those mitigations do not make it a network-safe verifier. Production
+work must use a custom batched matrix/transition sumcheck with a transparent
+PCS and a separately hardened bounded parser.
+
 Mainnet remains disabled until all of the following are complete:
 
 1. A frozen production ForgeMatrix specification, a canonical bounded parser
@@ -36,6 +56,11 @@ Mainnet remains disabled until all of the following are complete:
    partial-layer execution, sparse/zero inputs, transcript substitution,
    replay, proof malleability, target confusion, and CPU/GPU arithmetic
    divergence.
+
+No production proof tag may be recognized by consensus until every gate above
+is met. There must be no fallback that trusts miner-supplied activations,
+digests, targets, model commitments, or partial-layer claims when proof
+verification is unavailable or fails.
 
 Devnet-0 now has bounded static-peer sessions, full block
 validation before indexing, cumulative-chainwork fork choice and reorgs, a
@@ -144,7 +169,7 @@ arithmetic proof or any gate above.
 
 Report vulnerabilities through GitHub's private advisory form:
 
-<https://github.com/JustAResearcher/CommonFoundry/security/advisories/new>
+<https://github.com/Common-Foundry-1/CommonFoundry/security/advisories/new>
 
 Do not place working consensus bypasses, wallet exploits, private keys, or
 mainnet exploit instructions in public issues. Include affected versions,

@@ -6,6 +6,8 @@ pub mod forgematrix_v2;
 pub mod model_bank;
 pub mod network;
 pub mod pow;
+#[cfg(feature = "remainder-prototype")]
+pub mod remainder_proof;
 pub mod sumcheck;
 pub mod wire;
 
@@ -50,6 +52,12 @@ pub use network::{
 pub use pow::{
     BlockProof, ConsensusPowVerifier, POW_TYPE_V1_LEGACY, POW_TYPE_V2_REFERENCE, PowError,
     PowParameters,
+};
+#[cfg(feature = "remainder-prototype")]
+pub use remainder_proof::{
+    ForgeMatrixV2RemainderProof, MAX_REMAINDER_PROTOTYPE_PROOF_BYTES, REMAINDER_BACKEND_REVISION,
+    REMAINDER_PROTOTYPE_VERSION, RemainderPrototypeError, prove_remainder_prototype,
+    verify_remainder_prototype,
 };
 pub use sumcheck::{
     GOLDILOCKS_MODULUS, MAX_TOY_MATRIX_ELEMENTS, MatrixProductSumcheckProof, SumcheckError,

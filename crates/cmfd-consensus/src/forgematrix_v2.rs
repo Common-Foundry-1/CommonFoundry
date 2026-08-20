@@ -316,11 +316,12 @@ impl ForgeMatrixV2AcceleratorBatch {
         (index < self.count as usize).then(|| self.start_nonce.wrapping_add(index as u64))
     }
 
-    /// Computes the digest claimed by one untrusted accelerator output.
-    ///
-    /// This is a fast target prefilter only. A below-target result must be
-    /// recomputed with [`ForgeMatrixV2Reference::prove_compact`] before use.
-    pub fn candidate_work_digest(
+    #[cfg(feature = "remainder-prototype")]
+    pub(crate) fn challenge_at(&self, index: usize) -> Option<[u8; 32]> {
+        self.challenges.get(index).copied()
+    }
+
+    pub(crate) fn candidate_output_digest(
         &self,
         index: usize,
         final_activation: &[u8],
@@ -331,8 +332,20 @@ impl ForgeMatrixV2AcceleratorBatch {
         if final_activation.iter().any(|value| *value > 250) {
             return Err(ForgeMatrixV2Error::ActivationEncoding);
         }
+        Ok(output_digest(self.challenges[index], final_activation))
+    }
+
+    /// Computes the digest claimed by one untrusted accelerator output.
+    ///
+    /// This is a fast target prefilter only. A below-target result must be
+    /// recomputed with [`ForgeMatrixV2Reference::prove_compact`] before use.
+    pub fn candidate_work_digest(
+        &self,
+        index: usize,
+        final_activation: &[u8],
+    ) -> Result<[u8; 32], ForgeMatrixV2Error> {
+        let output = self.candidate_output_digest(index, final_activation)?;
         let challenge = self.challenges[index];
-        let output = output_digest(challenge, final_activation);
         Ok(work_digest(&self.descriptor, challenge, output))
     }
 
@@ -1354,6 +1367,10 @@ mod tests {
         let final_bytes = activation_bytes(&proof.layers.last().unwrap().output).unwrap();
         let claimed = batch.candidate_work_digest(0, &final_bytes).unwrap();
         assert_eq!(claimed, proof.work_digest);
+        assert!(matches!(
+            batch.candidate_work_digest(3, &final_bytes),
+            Err(ForgeMatrixV2Error::AcceleratorOutputShape)
+        ));
         oracle
             .verify_accelerator_candidate(&block(), &batch, 0, claimed)
             .unwrap();

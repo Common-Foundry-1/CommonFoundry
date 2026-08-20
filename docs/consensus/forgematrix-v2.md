@@ -351,6 +351,11 @@ comparison. The v2 research code now implements:
 - a standalone Fiat--Shamir matrix-multiplication sumcheck skeleton with
   canonical Goldilocks field representatives in transcript hashing,
   commitment/transcript mutation tests, and a hard 4096-element research cap;
+- an optional, feature-gated Remainder CE GKR/Ligero proof of the complete tiny
+  2x4x4 relation. It binds the fixed model, public statement, target, nonce,
+  masks, all matrix products, every nonlinear reduction and range, final public
+  activation, and work digest. Tampering with those fields or the transcript is
+  rejected;
 - Rust and CUDA v2 arithmetic smoke vectors that compare initialization and
   every layer after applying fixture-supplied mask coefficients.
 
@@ -369,9 +374,19 @@ receives the full matrices to recompute multilinear openings, uses only the
 is neither succinct nor production-sound. The production-sized v2 constructor
 is hard-disabled.
 
-The repository does not yet implement the transparent PCS and byte-link
-certificate, batched all-layer GKR, transition/range sumchecks, >=192-bit
-extension-field transcript, or in-proof final BLAKE3 binding. The CUDA fixture
+The complete tiny Remainder experiment is also not a candidate consensus
+backend. With release optimizations on the development host it produced a
+302,726,694-byte transcript in 49.76 seconds and took 122.63 seconds to verify.
+It therefore fails both the 256 KiB proof-size gate and the 100 ms verification
+gate by orders of magnitude. Its pinned research backend is unaudited, retains
+panic paths, and assigns circuit identities at runtime rather than providing a
+canonical cross-process circuit artifact. The wrapper's 384 MiB cap and panic
+containment are research safeguards, not acceptable network-parser bounds.
+There is no proof wire tag or `ChainState` integration for this feature.
+
+The repository does not yet implement the production transparent PCS and
+byte-link certificate, custom batched all-layer matrix/transition sumchecks,
+>=192-bit extension-field transcript, or production final-digest binding. The CUDA fixture
 is a differential harness, not a tensor-core miner, succinct prover, low-VRAM
 benchmark, or evidence of residency.
 The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;

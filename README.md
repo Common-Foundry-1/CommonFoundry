@@ -26,6 +26,13 @@ proof, model-link certificate, soundness analysis, benchmarks, independent
 implementations, adversarial public testnet, and two audits are still required;
 the full gates are in [SECURITY.md](SECURITY.md).
 
+The optional `remainder-prototype` feature is a complete proof experiment for
+the tiny 2x4x4 relation, not an activated block proof. Its measured transcript
+is about 302.7 MB and takes about 123 seconds to verify, so the generic backend
+has been rejected for production use. It remains useful only for checking that
+the proposed matrix, transition, range, block, nonce, target, and output
+bindings are expressible end to end.
+
 ## What ForgeMatrix proves
 
 ForgeMatrix v1 evaluates a fixed, committed sequence of dense integer matrices.

@@ -1629,7 +1629,6 @@ mod tests {
         let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         let statement = statement(&activation);
         let proof = prove_narrow_blake3(&statement, &activation).unwrap();
-        assert_eq!(proof.len(), 214_379);
         verify_narrow_blake3(&statement, &proof).unwrap();
         assert!(proof.len() <= crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES);
 

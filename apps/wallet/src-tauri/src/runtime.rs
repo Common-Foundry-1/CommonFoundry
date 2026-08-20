@@ -33,6 +33,9 @@ pub struct RuntimeState {
     node: NodeAvailability,
     mining: Option<Arc<MiningManager>>,
     services: Mutex<Option<ServiceHandles>>,
+    // Held for the life of the process: dropping it stops the non-blocking
+    // file writer from flushing buffered log lines.
+    _log_guard: Option<cmfd_node::logging::WorkerGuard>,
 }
 
 impl RuntimeState {
@@ -44,15 +47,17 @@ impl RuntimeState {
             config.p2p_bind, peers
         );
         match start_embedded_node(app, config) {
-            Ok((node, services)) => Self {
+            Ok((node, services, log_guard)) => Self {
                 mining: Some(Arc::new(MiningManager::new(Arc::clone(&node)))),
                 node: NodeAvailability::Ready(node),
                 services: Mutex::new(Some(services)),
+                _log_guard: Some(log_guard),
             },
             Err(error) => Self {
                 node: NodeAvailability::Failed(error),
                 mining: None,
                 services: Mutex::new(None),
+                _log_guard: None,
             },
         }
     }
@@ -102,6 +107,7 @@ impl RuntimeState {
             node: NodeAvailability::Failed(error),
             mining: None,
             services: Mutex::new(None),
+            _log_guard: None,
         }
     }
 }
@@ -109,7 +115,14 @@ impl RuntimeState {
 fn start_embedded_node<R: Runtime>(
     app: &App<R>,
     config: NodeRuntimeConfig,
-) -> Result<(Arc<Mutex<Node>>, ServiceHandles), NodeClientError> {
+) -> Result<
+    (
+        Arc<Mutex<Node>>,
+        ServiceHandles,
+        cmfd_node::logging::WorkerGuard,
+    ),
+    NodeClientError,
+> {
     let data_dir = app
         .path()
         .app_local_data_dir()
@@ -121,7 +134,8 @@ fn start_embedded_node<R: Runtime>(
             )
         })?
         .join("devnet-0");
-    let mut node = Node::open(data_dir).map_err(|error| error.client_error())?;
+    let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
+    let mut node = Node::open(&data_dir).map_err(|error| error.client_error())?;
     node.set_public_peer_mode(config.allow_public_peers);
     let shared = Arc::new(Mutex::new(node));
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
@@ -182,6 +196,7 @@ fn start_embedded_node<R: Runtime>(
             static_peer_poller,
             inbound,
         },
+        log_guard,
     ))
 }
 
@@ -192,13 +207,11 @@ pub(crate) fn parse_command() -> Result<ProcessCommand, ConfigError> {
 pub(crate) fn command_help_text() -> &'static str {
     const HELP: &str = concat!(
         "Common Foundry Wallet\n",
-        "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v|-vv|-vvv]\n",
+        "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v...]\n",
         "Arguments:\n",
         "  --help (-h)             Show this help\n",
         "  --version (-V)          Print version\n",
-        "  -v                      Set warning-level verbosity\n",
-        "  -vv                     Set info-level verbosity\n",
-        "  -vvv                    Set debug-level verbosity\n",
+        "  -v, --verbose           Increase console verbosity (repeatable)\n",
         "  --p2p-bind <addr>       Local P2P bind address (default 127.0.0.1:18444)\n",
         "  --peer <addr>           Public or private outbound peer (repeatable)\n",
         "  --allow-public-peers     Allow public peers for explicit --peer entries\n",

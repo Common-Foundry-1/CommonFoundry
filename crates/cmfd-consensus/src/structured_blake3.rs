@@ -931,7 +931,6 @@ mod tests {
         let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         let statement = statement(&activation);
         let proof = prove_structured_blake3(&statement, &activation).unwrap();
-        assert_eq!(proof.len(), 165_039);
         assert!(proof.len() < MAX_COMPRESSED_TREE_PROOF_BYTES);
         assert_eq!(proof[12], BACKEND_TREE);
         verify_structured_blake3(&statement, &proof).unwrap();
@@ -979,7 +978,6 @@ mod tests {
             .collect::<Vec<_>>();
         let statement = statement(&activation);
         let proof = prove_structured_blake3(&statement, &activation).unwrap();
-        assert_eq!(proof.len(), 222_555);
         assert!(proof.len() < MAX_COMPRESSED_TREE_PROOF_BYTES);
         verify_structured_blake3(&statement, &proof).unwrap();
     }

@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
+pub mod logging;
 pub mod p2p;
 pub mod peer;
 pub mod pool;

@@ -227,17 +227,23 @@ fn main() -> Result<()> {
 }
 
 fn load_cuda(path: Option<&Path>) -> Result<CudaLibrary> {
-    CudaLibrary::load(path)
-        .map_err(anyhow::Error::msg)?
-        .ok_or_else(|| anyhow!("ForgeMatrix CUDA library was not found beside cmfd-miner"))
+    CudaLibrary::load(path).map_err(anyhow::Error::msg)?.ok_or_else(|| {
+        anyhow!(
+            "no ForgeMatrix GPU library was found beside cmfd-miner: expected              cmfd-forgematrix-v2-miner (CUDA) or cmfd-forgematrix-v2-opencl (Intel Arc              and other OpenCL GPUs)"
+        )
+    })
 }
 
 fn list_devices(path: Option<&Path>) -> Result<()> {
     let library = load_cuda(path)?;
     let devices = library.devices().map_err(anyhow::Error::msg)?;
-    println!("CUDA library: {}", library.path().display());
+    println!(
+        "{} library: {}",
+        library.backend().name(),
+        library.path().display()
+    );
     if devices.is_empty() {
-        println!("No NVIDIA CUDA devices found.");
+        println!("No {} devices found.", library.backend().name());
         return Ok(());
     }
     for device in devices {
@@ -248,9 +254,9 @@ fn list_devices(path: Option<&Path>) -> Result<()> {
             device.label(),
             memory_gib,
             if device.is_supported() {
-                "supported"
+                "supported".to_owned()
             } else {
-                "requires CUDA compute capability 7.0+"
+                device.requirement()
             }
         );
     }
@@ -491,7 +497,11 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
         "Common Foundry thin CUDA miner v{}",
         env!("CARGO_PKG_VERSION")
     );
-    println!("CUDA library: {}", cuda.path().display());
+    println!(
+        "{} library: {}",
+        cuda.backend().name(),
+        cuda.path().display()
+    );
     println!("Payout: {}", hex::encode(payout));
     println!("Configured node(s):");
     for peer in &options.peers {
@@ -838,7 +848,11 @@ fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
         "Common Foundry standalone CUDA miner v{}",
         env!("CARGO_PKG_VERSION")
     );
-    println!("CUDA library: {}", cuda.path().display());
+    println!(
+        "{} library: {}",
+        cuda.backend().name(),
+        cuda.path().display()
+    );
     println!("P2P listener: {p2p_address}");
     println!("Payout: {}", hex::encode(payout));
     println!(
@@ -1369,6 +1383,7 @@ mod tests {
 
     fn device(index: i32, major: u32, minor: u32) -> CudaDevice {
         CudaDevice {
+            backend: cmfd_cuda::GpuBackend::Cuda,
             index,
             name: format!("GPU {index}"),
             compute_major: major,

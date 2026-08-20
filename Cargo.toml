@@ -28,6 +28,9 @@ primitive-types = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [patch.crates-io]
 # Plonky3 0.6.3 uses slice::assume_init_ref, which stabilized after our Rust 1.88 MSRV.

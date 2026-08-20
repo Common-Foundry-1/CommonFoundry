@@ -16,7 +16,10 @@ pub(crate) struct NodeRuntimeConfig {
     pub(super) p2p_bind: SocketAddr,
     pub(super) peers: Vec<SocketAddr>,
     pub(super) allow_public_peers: bool,
-    pub(super) verbosity: u8,
+    /// `-v` count: 0 = silent, 1 = warn, 2 = info, 3 = debug, 4+ = trace on
+    /// the console. The file log under the node's data directory is always
+    /// debug level, regardless of this count.
+    pub(super) verbose: u8,
 }
 
 pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr =
@@ -50,8 +53,7 @@ impl NodeRuntimeConfig {
         let mut p2p_bind = None;
         let mut peers = Vec::new();
         let mut allow_public_peers = false;
-        let mut verbosity = 0;
-
+        let mut verbose: u8 = 0;
         let mut arguments = arguments.into_iter().map(Into::into);
 
         while let Some(argument) = arguments.next() {
@@ -68,33 +70,6 @@ impl NodeRuntimeConfig {
                 }
                 "-V" | "--version" => {
                     asked_for_version = true;
-                }
-                "-v" => {
-                    has_control_arg = true;
-                    if verbosity == 0 {
-                        verbosity = 1;
-                    } else {
-                        return Err(ConfigError::DuplicateVerbosity);
-                    }
-                }
-                "-vv" => {
-                    has_control_arg = true;
-                    if verbosity == 0 {
-                        verbosity = 2;
-                    } else {
-                        return Err(ConfigError::DuplicateVerbosity);
-                    }
-                }
-                "-vvv" => {
-                    has_control_arg = true;
-                    if verbosity == 0 {
-                        verbosity = 3;
-                    } else {
-                        return Err(ConfigError::DuplicateVerbosity);
-                    }
-                }
-                "-vvvv" | "--verbose" => {
-                    return Err(ConfigError::InvalidVerbosity(argument));
                 }
                 "--p2p-bind" => {
                     has_control_arg = true;
@@ -119,6 +94,14 @@ impl NodeRuntimeConfig {
                         return Err(ConfigError::DuplicateOption("--allow-public-peers"));
                     }
                     allow_public_peers = true;
+                }
+                "--verbose" => {
+                    has_control_arg = true;
+                    verbose = verbose.saturating_add(1);
+                }
+                _ if is_short_verbose_flag(&argument) => {
+                    has_control_arg = true;
+                    verbose = verbose.saturating_add(argument.len() as u8 - 1);
                 }
                 _ if argument.starts_with("--p2p-bind=") => {
                     has_control_arg = true;
@@ -164,10 +147,9 @@ impl NodeRuntimeConfig {
             p2p_bind: p2p_bind.unwrap_or(default_bind),
             peers,
             allow_public_peers,
-            verbosity,
+            verbose,
         }
         .with_default_bootstrap();
-
         config.static_peers(PeerLimits::default()).validate()?;
 
         Ok(ProcessCommand::Run(config))
@@ -199,6 +181,16 @@ impl NodeRuntimeConfig {
     }
 }
 
+/// Matches `-v`, `-vv`, `-vvv`, etc. — clap-style bundled short verbosity
+/// flags, so `cmfd-node run -vvv` and the wallet launched with `-vvv` parse
+/// the same way.
+fn is_short_verbose_flag(argument: &str) -> bool {
+    argument.len() >= 2
+        && argument.starts_with('-')
+        && !argument.starts_with("--")
+        && argument[1..].bytes().all(|byte| byte == b'v')
+}
+
 fn parse_address(option: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
     value.parse().map_err(|_| ConfigError::InvalidAddress {
         option,
@@ -217,8 +209,6 @@ pub(crate) enum ConfigError {
     InvalidPeerConfiguration(String),
     HelpWithArguments,
     VersionWithArguments,
-    DuplicateVerbosity,
-    InvalidVerbosity(String),
 }
 
 impl From<cmfd_node::peer::PeerError> for ConfigError {
@@ -256,15 +246,6 @@ impl fmt::Display for ConfigError {
             Self::VersionWithArguments => {
                 formatter.write_str("--version cannot be combined with other arguments")
             }
-            Self::DuplicateVerbosity => {
-                formatter.write_str("verbosity was specified multiple times")
-            }
-            Self::InvalidVerbosity(argument) => {
-                write!(
-                    formatter,
-                    "{argument} is not supported; use -v, -vv, or -vvv"
-                )
-            }
         }
     }
 }
@@ -296,40 +277,32 @@ mod tests {
         assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
         assert_eq!(config.peers, vec![DEFAULT_BOOTSTRAP_PEER]);
         assert!(config.allow_public_peers);
-        assert_eq!(config.verbosity, 0);
+        assert_eq!(config.verbose, 0);
     }
 
     #[test]
-    fn verbosity_levels_are_supported() {
+    fn verbosity_counts_repeated_and_bundled_short_flags() {
         assert_eq!(
-            match parse_command(["-v"]) {
-                ProcessCommand::Run(config) => config.verbosity,
+            match parse_command(["--verbose"]) {
+                ProcessCommand::Run(config) => config.verbose,
                 ProcessCommand::Help | ProcessCommand::Version => 0,
             },
             1
         );
         assert_eq!(
             match parse_command(["-vv"]) {
-                ProcessCommand::Run(config) => config.verbosity,
+                ProcessCommand::Run(config) => config.verbose,
                 ProcessCommand::Help | ProcessCommand::Version => 0,
             },
             2
         );
         assert_eq!(
-            match parse_command(["-vvv"]) {
-                ProcessCommand::Run(config) => config.verbosity,
+            match parse_command(["-v", "--verbose", "-vv"]) {
+                ProcessCommand::Run(config) => config.verbose,
                 ProcessCommand::Help | ProcessCommand::Version => 0,
             },
-            3
+            4
         );
-        assert!(matches!(
-            NodeRuntimeConfig::parse(["-vvvv"]),
-            Err(ConfigError::InvalidVerbosity(_))
-        ));
-        assert!(matches!(
-            NodeRuntimeConfig::parse(["-v", "-vv"]),
-            Err(ConfigError::DuplicateVerbosity)
-        ));
     }
 
     #[test]

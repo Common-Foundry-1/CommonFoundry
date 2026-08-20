@@ -26,6 +26,11 @@ use serde_json::json;
 struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
+    /// Increase log verbosity: -v = warn, -vv = info, -vvv = debug, -vvvv =
+    /// trace. With no flag, console logging is silent. The file log under
+    /// `<data_dir>/logs` is always captured at debug level regardless.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
     #[command(subcommand)]
     command: Command,
 }
@@ -93,6 +98,7 @@ enum Command {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::Run {
             bind,

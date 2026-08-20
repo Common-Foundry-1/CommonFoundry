@@ -10,6 +10,7 @@ pub mod pow;
 pub mod remainder_proof;
 pub mod structured_sumcheck;
 pub mod structured_transition;
+pub mod structured_wiring;
 pub mod sumcheck;
 pub mod wire;
 
@@ -70,12 +71,20 @@ pub use structured_sumcheck::{
 };
 pub use structured_transition::{
     MAX_STRUCTURED_TRANSITION_ELEMENTS, MAX_STRUCTURED_TRANSITION_PROOF_BYTES,
-    STRUCTURED_TRANSITION_CONSTRAINTS, STRUCTURED_TRANSITION_MAX_DEGREE,
+    STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_CONSTRAINTS,
+    STRUCTURED_TRANSITION_INPUT_ORACLE, STRUCTURED_TRANSITION_MAX_DEGREE,
     STRUCTURED_TRANSITION_ORACLES, STRUCTURED_TRANSITION_VERSION, StructuredMaskPolynomial,
     StructuredTransitionError, StructuredTransitionOpeningClaims, StructuredTransitionProof,
     StructuredTransitionRound, StructuredTransitionStatement, StructuredTransitionWitness,
     prove_structured_transition, verify_structured_transition,
     verify_structured_transition_sumcheck,
+};
+pub use structured_wiring::{
+    MAX_STRUCTURED_WIRING_BANKS, MAX_STRUCTURED_WIRING_ELEMENTS, MAX_STRUCTURED_WIRING_PROOF_BYTES,
+    STRUCTURED_WIRING_VERSION, StructuredWiringError, StructuredWiringOpeningClaim,
+    StructuredWiringOpeningClaims, StructuredWiringProof, StructuredWiringStatement,
+    prove_structured_wiring, verify_structured_wiring,
+    verify_structured_wiring_component_commitments, verify_structured_wiring_openings,
 };
 pub use sumcheck::{
     GOLDILOCKS_MODULUS, MAX_TOY_MATRIX_ELEMENTS, MatrixProductSumcheckProof, SumcheckError,

@@ -830,8 +830,9 @@ impl BaseField {
     }
 }
 
-/// Goldilocks cubic extension with `u^3 = 2`, matching the WHIR field
-/// construction selected for the later transparent-PCS adapter.
+/// Goldilocks cubic extension with `u^3 = u + 1`, matching Plonky3's
+/// `CubicTrinomialExtensionField<Goldilocks>` selected for the transparent-PCS
+/// adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExtensionField([BaseField; 3]);
 
@@ -851,6 +852,14 @@ impl ExtensionField {
         ])
     }
 
+    pub(crate) fn from_canonical_limbs(limbs: [u64; 3]) -> Result<Self, StructuredSumcheckError> {
+        Ok(Self([
+            BaseField::canonical(limbs[0])?,
+            BaseField::canonical(limbs[1])?,
+            BaseField::canonical(limbs[2])?,
+        ]))
+    }
+
     pub(crate) fn add(self, rhs: Self) -> Self {
         Self([
             self.0[0].add(rhs.0[0]),
@@ -868,22 +877,20 @@ impl ExtensionField {
     }
 
     pub(crate) fn mul(self, rhs: Self) -> Self {
-        let two = BaseField::from_u64(2);
+        let cross_three = self.0[1].mul(rhs.0[2]).add(self.0[2].mul(rhs.0[1]));
+        let degree_four = self.0[2].mul(rhs.0[2]);
         Self([
-            self.0[0].mul(rhs.0[0]).add(
-                self.0[1]
-                    .mul(rhs.0[2])
-                    .add(self.0[2].mul(rhs.0[1]))
-                    .mul(two),
-            ),
+            self.0[0].mul(rhs.0[0]).add(cross_three),
             self.0[0]
                 .mul(rhs.0[1])
                 .add(self.0[1].mul(rhs.0[0]))
-                .add(self.0[2].mul(rhs.0[2]).mul(two)),
+                .add(cross_three)
+                .add(degree_four),
             self.0[0]
                 .mul(rhs.0[2])
                 .add(self.0[1].mul(rhs.0[1]))
-                .add(self.0[2].mul(rhs.0[0])),
+                .add(self.0[2].mul(rhs.0[0]))
+                .add(degree_four),
         ])
     }
 
@@ -1111,6 +1118,12 @@ mod tests {
             }
         }
         (statement, activations, weights, accumulators)
+    }
+
+    #[test]
+    fn cubic_extension_uses_plonky3_goldilocks_polynomial() {
+        let u = ExtensionField([BaseField::ZERO, BaseField::ONE, BaseField::ZERO]);
+        assert_eq!(u.mul(u).mul(u), u.add(ExtensionField::ONE));
     }
 
     #[test]

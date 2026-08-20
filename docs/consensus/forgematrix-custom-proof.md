@@ -37,7 +37,8 @@ The structured sumchecks use the Goldilocks base field
 p = 2^64 - 2^32 + 1
 ```
 
-and the cubic extension `Fp[u] / (u^3 - 2)`. An extension element is encoded as
+and the cubic extension `Fp[u] / (u^3 - u - 1)`, matching Plonky3's canonical
+Goldilocks cubic extension. An extension element is encoded as
 three canonical little-endian `u64` coefficients. Every coefficient must be
 strictly less than `p`. This gives roughly 192 bits of challenge space; the
 implementation conservatively advertises 191 bits.
@@ -193,14 +194,64 @@ the matrix and transition arguments produce the same commitment for their
 shared accumulator oracle. An executable integration test locks that identity.
 The eventual PCS must preserve this shared-oracle binding under one transcript.
 
+The same transition argument now covers the virtual input layer with
+`layers=1`, an accumulator bound of 125, and the reserved mask-layer tag
+`u32_le(0xffffffff)`. This proves the exact base-input reduction without
+confusing it with real layer zero. Its input commitment is required to equal
+the fixed base-table commitment; its activation commitment is linked to the
+first matrix input by the wiring argument below.
+
 A later reviewed lookup argument may replace this construction only if it
 preserves the exact ranges and improves measured proof cost.
 
-Successor wiring must prove every `X_out[l] = X_in[l+1]` edge and both bank
-boundaries. Initialization and terminal activation are separate public
-identities. Sampling cells or checking only selected layers is not acceptable.
+## 5. Successor-wiring argument
 
-## 5. Transparent PCS boundary
+`structured_wiring` commits separately to each bank's matrix-input activation
+table and transition-output activation table. Both use points ordered as
+`[column bits, row bits, layer bits]`. The transcript samples one extension-
+field cell point `c` and layer point `r` after all commitments.
+
+For an `m`-bit layer axis, the multilinear extension of the output table with
+its last layer removed is
+
+```text
+Xout(r,c) - product_j(r_j) * Xout(1,...,1,c).
+```
+
+The extension of the input table shifted left by one layer is
+
+```text
+sum for t=0..m-1 of
+  (product for j<t of r_j) * (1-r_t) * Xin(d_t(r),c),
+```
+
+where `d_t(r)` fixes destination bits below `t` to zero, bit `t` to one, and
+leaves higher bits equal to `r`. Equality of these polynomials checks all
+within-bank successor edges; it is not a sampled subset of layers. Two more
+fixed-layer identities compare each bank's final output with the next bank's
+first input at the random cell point.
+
+The proof also commits to the virtual transition's initial activation table.
+At the same random cell point, it checks that table against bank zero's first
+matrix-input layer. The production shape therefore needs 31 batched PCS
+openings: ten per bank plus the initial-activation opening. Its canonical
+wiring transcript is 1,036 bytes before PCS data. The actual one-bank,
+four-layer Devnet trace uses six openings and a 308-byte transcript. The
+current full-table adapter checks initialization and all successors exactly
+and authenticates its placeholder openings by recomputation. Its research
+element cap still rejects production tables.
+
+The wiring proof's input commitment is required to equal the matrix proof's
+activation commitment. Its output commitment is required to equal the
+transition proof's centered-activation commitment. Its initial commitment is
+required to equal the virtual transition's output commitment, while that
+transition's input commitment is required to equal the fixed base table. An
+integration verifier and test enforce those identities under the same public
+statement binding. The eventual PCS transcript must preserve them while
+authenticating every returned opening. The terminal activation is bound as the
+last output table, but its final digest is not yet proven.
+
+## 6. Transparent PCS boundary
 
 The PCS must support batched multilinear openings over the cubic Goldilocks
 extension, deterministic canonical parameters, BLAKE3 commitments, and at
@@ -218,7 +269,7 @@ model byte into an in-memory 32-byte field object, retaining duplicate encoded
 matrices, or padding smaller trace tables to the 6 GiB model shape is an
 automatic rejection for the 16 GiB target.
 
-## 6. Soundness accounting
+## 7. Soundness accounting
 
 For one matrix bank, the raw sumcheck error is bounded by
 
@@ -236,7 +287,12 @@ collision assumptions, and any proof-of-work grinding term. A machine-generated
 report must show total error at most `2^-128`; quoting the extension-field size
 alone is insufficient.
 
-## 7. Miner shortcut boundary
+The successor argument contributes numerator 135 for the production shape:
+three 26-variable within-bank identities, two 19-variable bank-boundary
+identities, and one 19-variable initialization identity. This is accounted
+before PCS binding error and Fiat-Shamir grinding.
+
+## 8. Miner shortcut boundary
 
 The proof prevents acceptance of a false relation; it does not force a miner
 to use the reference kernel, CUDA, tensor cores, a GPU, or physical VRAM.
@@ -246,16 +302,16 @@ layer binding are intended to remove known relation shortcuts, but the claim
 must remain "no known bypass after review and testing," never "cheating is
 mathematically impossible."
 
-## 8. Remaining activation work
+## 9. Remaining activation work
 
 Before a production proof tag can exist:
 
-1. implement and test the successor-wiring sumcheck and join the matrix and
-   transition components under one PCS transcript;
-2. integrate and harden a transparent PCS with canonical parameters;
-3. link the raw model bytes to the pinned PCS commitment;
+1. integrate and harden a transparent PCS with canonical parameters and join
+   the matrix, transition, and successor openings under one PCS transcript;
+2. link the raw model bytes to the pinned PCS commitment;
+3. prove the terminal activation's final digest and work-digest binding;
 4. prove or replace the final BLAKE3 binding within the payload cap;
-5. implement a bounded, panic-free proof parser and verifier queue;
+5. implement a bounded, panic-free aggregate proof parser and verifier queue;
 6. demonstrate production-size streaming proving within the memory, proof-size,
    proving-time, and verification-time gates;
 7. publish independent prover/verifier implementations and canonical vectors;

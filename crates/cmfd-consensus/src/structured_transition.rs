@@ -22,6 +22,8 @@ use crate::{
 pub const STRUCTURED_TRANSITION_VERSION: u32 = 1;
 pub const STRUCTURED_TRANSITION_CONSTRAINTS: usize = 121;
 pub const STRUCTURED_TRANSITION_ORACLES: usize = 110;
+pub const STRUCTURED_TRANSITION_INPUT_ORACLE: usize = 0;
+pub const STRUCTURED_TRANSITION_ACTIVATION_ORACLE: usize = 10;
 pub const STRUCTURED_TRANSITION_MAX_DEGREE: usize = 17;
 pub const MAX_STRUCTURED_TRANSITION_ELEMENTS: usize = 1 << 20;
 pub const MAX_STRUCTURED_TRANSITION_PROOF_BYTES: usize = 256 * 1024;
@@ -34,7 +36,7 @@ const OUTPUT_CENTER: i64 = 125;
 const REGULAR_ORACLES: usize = 12;
 const MAX_SUMCHECK_ROUNDS: usize = 64;
 
-const ACCUMULATOR: usize = 0;
+const ACCUMULATOR: usize = STRUCTURED_TRANSITION_INPUT_ORACLE;
 const MASK: usize = 1;
 const ENCODED: usize = 2;
 const SQUARE_QUOTIENT: usize = 3;
@@ -44,7 +46,7 @@ const CUBE_REMAINDER: usize = 6;
 const OUTPUT_QUOTIENT: usize = 7;
 const OUTPUT_REMAINDER: usize = 8;
 const NEGATIVE: usize = 9;
-const ACTIVATION: usize = 10;
+const ACTIVATION: usize = STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
 const SHIFTED_ACCUMULATOR: usize = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +104,28 @@ impl StructuredMaskPolynomial {
             row_bits,
             col_bits,
             coefficients,
+        })
+    }
+
+    /// Builds the mask polynomial for the virtual input layer.
+    ///
+    /// ForgeMatrix reserves `u32::MAX` for this layer so it cannot be confused
+    /// with real layer zero under the challenge-derived mask expander.
+    pub fn from_virtual_challenge(
+        challenge: &[u8; 32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, StructuredTransitionError> {
+        if rows == 0 || cols == 0 || !rows.is_power_of_two() || !cols.is_power_of_two() {
+            return Err(StructuredTransitionError::InvalidDimensions);
+        }
+        let row_bits = rows.ilog2();
+        let col_bits = cols.ilog2();
+        Ok(Self {
+            layers: 1,
+            row_bits,
+            col_bits,
+            coefficients: mask_coefficients(challenge, u32::MAX, rows, cols),
         })
     }
 
@@ -1315,6 +1339,24 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(mask.evaluate(&point), ExtensionField::from_u64(expected));
         }
+    }
+
+    #[test]
+    fn virtual_input_mask_uses_the_reserved_layer_tag() {
+        let challenge = [0x42; 32];
+        let virtual_mask =
+            StructuredMaskPolynomial::from_virtual_challenge(&challenge, 2, 4).unwrap();
+        let layer_zero = StructuredMaskPolynomial::from_challenge(&challenge, 1, 2, 4).unwrap();
+        assert_eq!(virtual_mask.layers, 1);
+        assert_eq!(
+            virtual_mask.coefficients,
+            mask_coefficients(&challenge, u32::MAX, 2, 4)
+        );
+        assert_eq!(
+            layer_zero.coefficients,
+            mask_coefficients(&challenge, 0, 2, 4)
+        );
+        assert_ne!(virtual_mask.digest(), layer_zero.digest());
     }
 
     #[test]

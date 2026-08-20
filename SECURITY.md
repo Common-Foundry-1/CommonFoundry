@@ -33,16 +33,22 @@ panics, but those mitigations do not make it a network-safe verifier. Production
 work must use a custom batched matrix/transition sumcheck with a transparent
 PCS and a separately hardened bounded parser.
 
-The replacement custom path now has bank-batched matrix and transition/range
-sumchecks over the cubic Goldilocks extension. They reduce the actual four-
-layer Devnet matrix trace to a 556-byte canonical matrix transcript and an
-8,381-byte transition transcript before PCS openings. The transition argument
+The replacement custom path now has bank-batched matrix, transition/range, and
+successor-wiring arguments over the cubic Goldilocks extension. They reduce the
+actual four-layer Devnet trace to a 556-byte canonical matrix transcript, an
+8,381-byte transition transcript, and a 308-byte wiring transcript before PCS
+openings. The transition argument
 mixes 121 equations over 110 regular/range-digit oracles, range-proves the
 signed accumulator, checks the challenge-derived mask polynomial, and rejects
 incorrect quotients, signs, ranges, activations, rounds, bindings, and
-encodings. Both verifiers still receive the complete tables to check terminal
-openings. They are algebraic components, not yet a succinct proof, and have no
-consensus or wire integration. See
+encodings. The transition argument also covers the reserved virtual-input
+layer. The wiring argument binds its initialized activation, every within-bank
+successor, and both production bank boundaries through logarithmically many
+opening claims, and checks that its activation commitments are the same
+commitments used by the matrix and transition components. The verifiers still
+receive the complete tables to check terminal openings. They are algebraic
+components, not yet a succinct proof, and have no consensus or wire
+integration. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
 
 Mainnet remains disabled until all of the following are complete:

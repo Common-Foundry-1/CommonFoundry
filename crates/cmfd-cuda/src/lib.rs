@@ -114,8 +114,61 @@ unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &[u8]) -> Result<T, St
     }
 }
 
+/// Which vendor runtime a loaded backend library drives. Both expose the same
+/// versioned C ABI; only device naming and the support floor differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackend {
+    Cuda,
+    OpenCl,
+}
+
+impl GpuBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cuda => "CUDA",
+            Self::OpenCl => "OpenCL",
+        }
+    }
+
+    fn library_stem(self) -> &'static str {
+        match self {
+            Self::Cuda => "cmfd-forgematrix-v2-miner",
+            Self::OpenCl => "cmfd-forgematrix-v2-opencl",
+        }
+    }
+
+    fn library_environment(self) -> &'static str {
+        match self {
+            Self::Cuda => "CMFD_CUDA_MINER_LIBRARY",
+            Self::OpenCl => "CMFD_OPENCL_MINER_LIBRARY",
+        }
+    }
+
+    /// The oldest capability pair the backend accepts: CUDA compute capability
+    /// 7.0 for the INT8 dot-product path, OpenCL 1.2 for the portable kernel.
+    fn minimum_version(self) -> (u32, u32) {
+        match self {
+            Self::Cuda => (7, 0),
+            Self::OpenCl => (1, 2),
+        }
+    }
+
+    fn from_library_path(path: &Path) -> Self {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if name.contains("opencl") {
+            Self::OpenCl
+        } else {
+            Self::Cuda
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaDevice {
+    pub backend: GpuBackend,
     pub index: i32,
     pub name: String,
     pub compute_major: u32,
@@ -126,13 +179,27 @@ pub struct CudaDevice {
 impl CudaDevice {
     pub fn label(&self) -> String {
         format!(
-            "{} (CUDA {}.{})",
-            self.name, self.compute_major, self.compute_minor
+            "{} ({} {}.{})",
+            self.name,
+            self.backend.name(),
+            self.compute_major,
+            self.compute_minor
         )
     }
 
     pub fn is_supported(&self) -> bool {
-        (self.compute_major, self.compute_minor) >= (7, 0)
+        (self.compute_major, self.compute_minor) >= self.backend.minimum_version()
+    }
+
+    /// Human-readable reason a device is rejected, used by device listings.
+    pub fn requirement(&self) -> String {
+        let (major, minor) = self.backend.minimum_version();
+        match self.backend {
+            GpuBackend::Cuda => {
+                format!("requires CUDA compute capability {major}.{minor}+")
+            }
+            GpuBackend::OpenCl => format!("requires OpenCL {major}.{minor}+"),
+        }
     }
 }
 
@@ -140,20 +207,41 @@ impl CudaDevice {
 pub struct CudaLibrary {
     api: Arc<CudaApi>,
     path: PathBuf,
+    backend: GpuBackend,
 }
 
 impl CudaLibrary {
-    /// Loads the CUDA backend. An explicit path or environment override must
-    /// exist; absence from default locations returns `Ok(None)`.
+    /// Loads a GPU backend. `CMFD_GPU_BACKEND` may pin `cuda` or `opencl`;
+    /// otherwise CUDA is preferred and the OpenCL library, which covers Intel
+    /// Arc, is used when no CUDA library is present. Absence of every default
+    /// candidate returns `Ok(None)`.
     pub fn load(explicit: Option<&Path>) -> Result<Option<Self>, String> {
-        let environment = env::var_os("CMFD_CUDA_MINER_LIBRARY").map(PathBuf::from);
+        for backend in requested_backends()? {
+            if let Some(library) = Self::load_backend(backend, explicit)? {
+                return Ok(Some(library));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Loads one named backend, ignoring the `CMFD_GPU_BACKEND` preference.
+    pub fn load_backend(
+        backend: GpuBackend,
+        explicit: Option<&Path>,
+    ) -> Result<Option<Self>, String> {
+        let environment = env::var_os(backend.library_environment()).map(PathBuf::from);
         let requested = explicit.map(Path::to_path_buf).or(environment);
-        let candidates = library_candidates(requested.as_deref());
+        let backend = requested
+            .as_deref()
+            .map(GpuBackend::from_library_path)
+            .unwrap_or(backend);
+        let candidates = library_candidates(backend, requested.as_deref());
         let path = candidates.iter().find(|candidate| candidate.is_file());
         let Some(path) = path else {
             if let Some(path) = requested {
                 return Err(format!(
-                    "CUDA miner library does not name a file: {}",
+                    "{} miner library does not name a file: {}",
+                    backend.name(),
                     path.display()
                 ));
             }
@@ -162,7 +250,12 @@ impl CudaLibrary {
         Ok(Some(Self {
             api: Arc::new(CudaApi::load(path)?),
             path: path.clone(),
+            backend,
         }))
+    }
+
+    pub fn backend(&self) -> GpuBackend {
+        self.backend
     }
 
     pub fn path(&self) -> &Path {
@@ -172,7 +265,7 @@ impl CudaLibrary {
     pub fn devices(&self) -> Result<Vec<CudaDevice>, String> {
         let count = device_count(&self.api)?;
         (0..count)
-            .map(|device_index| read_device(&self.api, device_index))
+            .map(|device_index| read_device(&self.api, self.backend, device_index))
             .collect()
     }
 
@@ -181,11 +274,15 @@ impl CudaLibrary {
         model: &ForgeMatrixV2AcceleratorModel,
         device_index: i32,
     ) -> Result<CudaMiner, String> {
-        let device = read_device(&self.api, device_index)?;
+        let device = read_device(&self.api, self.backend, device_index)?;
         if !device.is_supported() {
+            let (major, minor) = self.backend.minimum_version();
             return Err(format!(
-                "{} has compute capability {}.{}, but ForgeMatrix requires 7.0 or newer",
-                device.name, device.compute_major, device.compute_minor
+                "{} reports {} {}.{}, but ForgeMatrix requires {major}.{minor} or newer",
+                device.name,
+                self.backend.name(),
+                device.compute_major,
+                device.compute_minor
             ));
         }
         let mut context = std::ptr::null_mut();
@@ -283,7 +380,11 @@ fn device_count(api: &CudaApi) -> Result<i32, String> {
     Ok(count)
 }
 
-fn read_device(api: &CudaApi, device_index: i32) -> Result<CudaDevice, String> {
+fn read_device(
+    api: &CudaApi,
+    backend: GpuBackend,
+    device_index: i32,
+) -> Result<CudaDevice, String> {
     let count = device_count(api)?;
     if device_index < 0 || device_index >= count {
         return Err(format!(
@@ -298,13 +399,17 @@ fn read_device(api: &CudaApi, device_index: i32) -> Result<CudaDevice, String> {
         unsafe { (api.device_info)(device_index, &mut raw, error.as_mut_ptr(), error.len()) };
     check_result(result, &error)?;
     if raw.api_version != CUDA_API_VERSION {
-        return Err("CUDA device response has the wrong API version".to_owned());
+        return Err(format!(
+            "{} device response has the wrong API version",
+            backend.name()
+        ));
     }
     // SAFETY: the backend promises a zero-filled, nul-terminated name buffer.
     let name = unsafe { CStr::from_ptr(raw.name.as_ptr()) }
         .to_string_lossy()
         .into_owned();
     Ok(CudaDevice {
+        backend,
         index: raw.device_index,
         name,
         compute_major: raw.compute_major,
@@ -325,16 +430,33 @@ fn selected_device() -> Result<i32, String> {
     }
 }
 
-fn library_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
+/// Backends to try, in order. `CMFD_GPU_BACKEND` pins one of them.
+fn requested_backends() -> Result<Vec<GpuBackend>, String> {
+    match env::var("CMFD_GPU_BACKEND") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "cuda" | "nvidia" => Ok(vec![GpuBackend::Cuda]),
+            "opencl" | "intel" | "arc" => Ok(vec![GpuBackend::OpenCl]),
+            "auto" | "" => Ok(vec![GpuBackend::Cuda, GpuBackend::OpenCl]),
+            _ => Err("CMFD_GPU_BACKEND must be cuda, opencl, or auto".to_owned()),
+        },
+        Err(env::VarError::NotPresent) => Ok(vec![GpuBackend::Cuda, GpuBackend::OpenCl]),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("CMFD_GPU_BACKEND is not valid Unicode".to_owned())
+        }
+    }
+}
+
+fn library_candidates(backend: GpuBackend, explicit: Option<&Path>) -> Vec<PathBuf> {
     if let Some(explicit) = explicit {
         return vec![explicit.to_path_buf()];
     }
 
     let name = if cfg!(target_os = "windows") {
-        "cmfd-forgematrix-v2-miner.dll"
+        format!("{}.dll", backend.library_stem())
     } else {
-        "cmfd-forgematrix-v2-miner.so"
+        format!("{}.so", backend.library_stem())
     };
+    let name = name.as_str();
     let mut paths = Vec::new();
     if let Ok(executable) = env::current_exe()
         && let Some(parent) = executable.parent()
@@ -374,12 +496,66 @@ mod tests {
     #[test]
     fn explicit_library_path_is_the_only_candidate() {
         let path = Path::new("custom-cuda-backend.dll");
-        assert_eq!(library_candidates(Some(path)), vec![path]);
+        assert_eq!(library_candidates(GpuBackend::Cuda, Some(path)), vec![path]);
+    }
+
+    #[test]
+    fn default_candidates_are_named_per_backend() {
+        let named = |backend| {
+            library_candidates(backend, None)
+                .iter()
+                .all(|path: &PathBuf| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(GpuBackend::library_stem(backend))
+                })
+        };
+        assert!(named(GpuBackend::Cuda));
+        assert!(named(GpuBackend::OpenCl));
+    }
+
+    #[test]
+    fn backend_is_inferred_from_an_explicit_library_name() {
+        assert_eq!(
+            GpuBackend::from_library_path(Path::new("cmfd-forgematrix-v2-opencl.dll")),
+            GpuBackend::OpenCl
+        );
+        assert_eq!(
+            GpuBackend::from_library_path(Path::new("cmfd-forgematrix-v2-miner.dll")),
+            GpuBackend::Cuda
+        );
+    }
+
+    #[test]
+    fn opencl_devices_are_supported_from_version_one_point_two() {
+        let device = CudaDevice {
+            backend: GpuBackend::OpenCl,
+            index: 0,
+            name: "Intel(R) Arc(TM) A770 Graphics".to_owned(),
+            compute_major: 3,
+            compute_minor: 0,
+            total_memory_bytes: 1,
+        };
+        assert_eq!(
+            device.label(),
+            "Intel(R) Arc(TM) A770 Graphics (OpenCL 3.0)"
+        );
+        assert!(device.is_supported());
+        assert_eq!(device.requirement(), "requires OpenCL 1.2+");
+
+        let legacy = CudaDevice {
+            compute_major: 1,
+            compute_minor: 1,
+            ..device
+        };
+        assert!(!legacy.is_supported());
     }
 
     #[test]
     fn device_label_and_support_cover_volta_through_blackwell() {
         let mut device = CudaDevice {
+            backend: GpuBackend::Cuda,
             index: 0,
             name: "NVIDIA Tesla V100".to_owned(),
             compute_major: 7,

@@ -72,8 +72,17 @@ canary with:
 .\scripts\build-cuda-miner.ps1
 ```
 
+Intel Arc and other OpenCL GPUs use a second backend library that speaks the
+same ABI:
+
+```powershell
+.\scripts\build-opencl-miner.ps1
+```
+
 See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
-boundary, supported architectures, wallet packaging, and tester procedure.
+boundary, supported architectures, wallet packaging, and tester procedure, and
+[ForgeMatrix v2 OpenCL miner](docs/opencl-miner.md) for the Intel Arc backend,
+its backend-selection variables, and its known limits.
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`
 launchers. Its live console reports per-GPU and rig hashrate, power, hashes per

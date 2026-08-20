@@ -2,7 +2,9 @@
 param(
     [string]$OutputDirectory,
     [string]$CudaBuildDirectory,
-    [string]$CudaToolkit
+    [string]$CudaToolkit,
+    [string]$OpenClBuildDirectory,
+    [switch]$SkipOpenCl
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +25,22 @@ if (-not (Test-Path -LiteralPath $cudaLibrary)) {
     & (Join-Path $PSScriptRoot 'build-cuda-miner.ps1') `
         -BuildDirectory $CudaBuildDirectory `
         -CudaToolkit $CudaToolkit
+}
+
+# The OpenCL backend covers Intel Arc. It is packaged beside the CUDA library
+# so one ZIP serves both vendors; -SkipOpenCl produces a CUDA-only package.
+$openClLibrary = $null
+if (-not $SkipOpenCl) {
+    if (-not $OpenClBuildDirectory) {
+        $OpenClBuildDirectory = Join-Path $projectRoot 'target\gpu-opencl-build'
+    }
+    $OpenClBuildDirectory = [System.IO.Path]::GetFullPath($OpenClBuildDirectory)
+    $openClLibrary = Join-Path $OpenClBuildDirectory 'cmfd-forgematrix-v2-opencl.dll'
+    if (-not (Test-Path -LiteralPath $openClLibrary)) {
+        & (Join-Path $PSScriptRoot 'build-opencl-miner.ps1') `
+            -BuildDirectory $OpenClBuildDirectory `
+            -SkipDifferentialTest
+    }
 }
 
 $previousRustFlags = $env:RUSTFLAGS
@@ -56,10 +74,16 @@ if (Test-Path -LiteralPath $archive) {
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot 'target\release\cmfd-miner.exe') -Destination $stage
 Copy-Item -LiteralPath $cudaLibrary -Destination $stage
+if ($openClLibrary) {
+    Copy-Item -LiteralPath $openClLibrary -Destination $stage
+}
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\standalone-miner\windows\START-MINER.bat') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\standalone-miner\windows\LIST-GPUS.bat') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\standalone-miner\windows\README.txt') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\standalone-miner.md') -Destination $stage
+if ($openClLibrary) {
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\opencl-miner.md') -Destination $stage
+}
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $stage
 
 Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal

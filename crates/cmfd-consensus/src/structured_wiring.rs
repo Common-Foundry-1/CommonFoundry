@@ -395,11 +395,16 @@ pub fn verify_structured_wiring_component_commitments(
         return Err(StructuredWiringError::Commitment);
     }
     for bank in 0..statement.banks {
+        let transition_input = transition_proofs[bank]
+            .oracle_commitments
+            .get(STRUCTURED_TRANSITION_INPUT_ORACLE)
+            .ok_or(StructuredWiringError::ComponentCount)?;
         let transition_output = transition_proofs[bank]
             .oracle_commitments
             .get(STRUCTURED_TRANSITION_ACTIVATION_ORACLE)
             .ok_or(StructuredWiringError::ComponentCount)?;
         if matrix_proofs[bank].activation_commitment != wiring_proof.input_commitments[bank]
+            || matrix_proofs[bank].accumulator_commitment != *transition_input
             || *transition_output != wiring_proof.output_commitments[bank]
         {
             return Err(StructuredWiringError::Commitment);
@@ -1304,6 +1309,19 @@ mod tests {
                 base_input_commitment,
                 &wrong_initialization,
                 std::slice::from_ref(&matrix),
+                std::slice::from_ref(&transition),
+                &wiring,
+            ),
+            Err(StructuredWiringError::Commitment)
+        );
+        let mut wrong_accumulator = matrix.clone();
+        wrong_accumulator.accumulator_commitment[0] ^= 1;
+        assert_eq!(
+            verify_structured_wiring_component_commitments(
+                wiring_statement,
+                base_input_commitment,
+                &initialization,
+                &[wrong_accumulator],
                 std::slice::from_ref(&transition),
                 &wiring,
             ),

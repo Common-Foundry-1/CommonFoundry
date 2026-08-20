@@ -242,14 +242,15 @@ and authenticates its placeholder openings by recomputation. Its research
 element cap still rejects production tables.
 
 The wiring proof's input commitment is required to equal the matrix proof's
-activation commitment. Its output commitment is required to equal the
-transition proof's centered-activation commitment. Its initial commitment is
-required to equal the virtual transition's output commitment, while that
-transition's input commitment is required to equal the fixed base table. An
-integration verifier and test enforce those identities under the same public
-statement binding. The eventual PCS transcript must preserve them while
-authenticating every returned opening. The terminal activation is bound as the
-last output table, but its final digest is not yet proven.
+activation commitment. The matrix accumulator commitment is required to equal
+the transition proof's input commitment. The wiring output commitment is
+required to equal the transition proof's centered-activation commitment. Its
+initial commitment is required to equal the virtual transition's output
+commitment, while that transition's input commitment is required to equal the
+fixed base table. The aggregate public statement separately pins each model
+weight commitment and the final bank-output commitment. Integration verifiers
+and mutation tests enforce those identities under the same public statement
+binding. The final activation digest is not yet proven.
 
 ## 6. Transparent PCS boundary
 
@@ -263,6 +264,26 @@ openings, Goldilocks cubic-extension challenges, BLAKE3 Merkle commitments, and
 provable decoding regimes. Its upstream Rust implementation explicitly labels
 itself an unaudited academic prototype, so integrating it is evidence-gathering
 work, not a production selection or audit substitute.
+
+`structured_proof` now provides the fail-closed boundary for that integration.
+It parses a canonical aggregate envelope capped at 1 MiB, validates component
+counts and dimensions, checks every component transcript and cross-component
+commitment identity, pins the base table and model weights, binds the declared
+final bank-output commitment, canonicalizes and deduplicates all terminal
+opening claims, and then requires a `StructuredPcsVerifier` to authenticate the
+complete claim set. A missing, empty, malformed, oversized, conflicting, or
+rejected PCS proof is a hard error. There is no accept-without-PCS path.
+
+The repository intentionally does not provide an accepting production
+implementation of that trait yet. Test implementations only exercise the
+composition boundary. In particular, the current `p3-whir` high-level layout
+samples structured univariate-power opening points, while the existing matrix,
+transition, and wiring sumchecks end at independently sampled multilinear
+points. Treating those as interchangeable would leave the terminal claims
+unauthenticated. Integration therefore requires either an audited explicit-
+point WHIR layout/adapter with matching verifier constraints or a different
+transparent PCS that natively authenticates arbitrary MLE points. This protocol
+choice must be reviewed before code is accepted as a production backend.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded
@@ -306,12 +327,13 @@ mathematically impossible."
 
 Before a production proof tag can exist:
 
-1. integrate and harden a transparent PCS with canonical parameters and join
-   the matrix, transition, and successor openings under one PCS transcript;
+1. implement and harden the aggregate verifier's transparent PCS backend with
+   canonical parameters and explicit-point openings under one PCS transcript;
 2. link the raw model bytes to the pinned PCS commitment;
 3. prove the terminal activation's final digest and work-digest binding;
 4. prove or replace the final BLAKE3 binding within the payload cap;
-5. implement a bounded, panic-free aggregate proof parser and verifier queue;
+5. fuzz the implemented bounded aggregate parser and add a bounded,
+   panic-contained network verifier queue;
 6. demonstrate production-size streaming proving within the memory, proof-size,
    proving-time, and verification-time gates;
 7. publish independent prover/verifier implementations and canonical vectors;

@@ -8,6 +8,7 @@ pub mod network;
 pub mod pow;
 #[cfg(feature = "remainder-prototype")]
 pub mod remainder_proof;
+pub mod structured_proof;
 pub mod structured_sumcheck;
 pub mod structured_transition;
 pub mod structured_wiring;
@@ -61,6 +62,12 @@ pub use remainder_proof::{
     ForgeMatrixV2RemainderProof, MAX_REMAINDER_PROTOTYPE_PROOF_BYTES, REMAINDER_BACKEND_REVISION,
     REMAINDER_PROTOTYPE_VERSION, RemainderPrototypeError, prove_remainder_prototype,
     verify_remainder_prototype,
+};
+pub use structured_proof::{
+    MAX_STRUCTURED_AGGREGATE_PROOF_BYTES, MAX_STRUCTURED_OPENING_CLAIMS,
+    MAX_STRUCTURED_OPENING_VARIABLES, MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION,
+    StructuredForgeMatrixProof, StructuredForgeMatrixStatement, StructuredPcsOpeningClaim,
+    StructuredPcsVerifier, StructuredProofError, verify_structured_forgematrix_proof,
 };
 pub use structured_sumcheck::{
     ExtensionElement, MAX_STRUCTURED_MATRIX_ELEMENTS, MAX_STRUCTURED_SUMCHECK_PROOF_BYTES,

@@ -45,16 +45,20 @@ encodings. The transition argument also covers the reserved virtual-input
 layer. The wiring argument binds its initialized activation, every within-bank
 successor, and both production bank boundaries through logarithmically many
 opening claims, and checks that its activation commitments are the same
-commitments used by the matrix and transition components. The verifiers still
-receive the complete tables to check terminal openings. They are algebraic
-components, not yet a succinct proof, and have no consensus or wire
-integration. See
+commitments used by the matrix and transition components. The aggregate
+research verifier now also requires the matrix accumulator to equal the
+transition input, pins the base table and model-weight commitments, binds the
+declared final-bank output commitment, strictly parses a 1 MiB-capped envelope,
+and fails closed unless a configured PCS verifier authenticates every
+canonical opening claim. No production PCS implementation is configured, so
+the complete-table adapters and test PCS remain research scaffolding rather
+than a succinct proof. The aggregate proof has no consensus or wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
 
 Mainnet remains disabled until all of the following are complete:
 
-1. A frozen production ForgeMatrix specification, a canonical bounded parser
-   for the eventual production proof and public inputs, and concrete total
+1. A frozen production ForgeMatrix specification, a frozen canonical encoding
+   for the production public inputs, and concrete total
    soundness of at least 128 bits after all union bounds and Fiat-Shamir
    grinding assumptions.
 2. A transparent-PCS succinct proof whose verifier binds every layer, matrix

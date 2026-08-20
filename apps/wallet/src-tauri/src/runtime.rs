@@ -14,7 +14,7 @@ use crate::mining::MiningManager;
 
 mod config;
 
-use config::{ConfigError, NodeRuntimeConfig};
+pub(crate) use config::{ConfigError, NodeRuntimeConfig, ProcessCommand};
 
 const STATIC_PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -39,18 +39,13 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
-    pub fn start<R: Runtime>(app: &App<R>) -> Self {
-        let config = match NodeRuntimeConfig::from_process_args() {
-            Ok(config) => config,
-            Err(error) => {
-                return Self {
-                    node: NodeAvailability::Failed(configuration_error(error)),
-                    mining: None,
-                    services: Mutex::new(None),
-                    _log_guard: None,
-                };
-            }
-        };
+    pub fn start<R: Runtime>(app: &App<R>, config: NodeRuntimeConfig) -> Self {
+        let allow = config.allow_public_peers;
+        let peers = config.peers.len();
+        eprintln!(
+            "Common Foundry Wallet node starting on {} with {} configured peer(s), allow_public_peers={allow}",
+            config.p2p_bind, peers
+        );
         match start_embedded_node(app, config) {
             Ok((node, services, log_guard)) => Self {
                 mining: Some(Arc::new(MiningManager::new(Arc::clone(&node)))),
@@ -205,13 +200,26 @@ fn start_embedded_node<R: Runtime>(
     ))
 }
 
-fn configuration_error(error: ConfigError) -> NodeClientError {
-    NodeClientError {
-        code: "invalid_p2p_configuration",
-        status: 400,
-        retryable: false,
-        message: format!("Invalid desktop P2P configuration: {error}"),
-    }
+pub(crate) fn parse_command() -> Result<ProcessCommand, ConfigError> {
+    NodeRuntimeConfig::from_process_args()
+}
+
+pub(crate) fn command_help_text() -> &'static str {
+    const HELP: &str = concat!(
+        "Common Foundry Wallet\n",
+        "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v|-vv|-vvv]\n",
+        "Arguments:\n",
+        "  --help (-h)             Show this help\n",
+        "  --version (-V)          Print version\n",
+        "  -v                      Set warning-level verbosity\n",
+        "  -vv                     Set info-level verbosity\n",
+        "  -vvv                    Set debug-level verbosity\n",
+        "  --p2p-bind <addr>       Local P2P bind address (default 127.0.0.1:18444)\n",
+        "  --peer <addr>           Public or private outbound peer (repeatable)\n",
+        "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
+        "                          (the default bootstrap peer is always added if no --peer is configured)\n"
+    );
+    HELP
 }
 
 pub fn startup_error(
@@ -246,7 +254,13 @@ mod tests {
 
     #[test]
     fn invalid_operator_configuration_is_a_stable_client_error() {
-        let error = configuration_error(ConfigError::UnknownArgument("--public-peer".to_owned()));
+        let error = NodeClientError {
+            code: "invalid_p2p_configuration",
+            status: 400,
+            retryable: false,
+            message: "Invalid desktop P2P configuration: unknown wallet argument: --public-peer"
+                .to_string(),
+        };
 
         assert_eq!(error.code, "invalid_p2p_configuration");
         assert_eq!(error.status, 400);

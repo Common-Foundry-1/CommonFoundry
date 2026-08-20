@@ -9,6 +9,8 @@ GPU_INDEXES=""
 # PAYOUT_ADDRESS is your wallet's 64-character receive address.
 PAYOUT_ADDRESS=""
 BATCH_SIZE="8192"
+# 0 automatically divides host CPU threads across the selected GPUs (maximum 16 each).
+WORKERS_PER_GPU="0"
 STATS_SECONDS="5"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
@@ -17,7 +19,7 @@ if [[ -z "$PAYOUT_ADDRESS" ]]; then
   exit 1
 fi
 
-ARGS=(mine --miner "$PAYOUT_ADDRESS" --batch-size "$BATCH_SIZE" --stats-seconds "$STATS_SECONDS")
+ARGS=(mine --miner "$PAYOUT_ADDRESS" --batch-size "$BATCH_SIZE" --workers-per-gpu "$WORKERS_PER_GPU" --stats-seconds "$STATS_SECONDS")
 if [[ -n "$LOCAL_PEER" ]]; then
   ARGS+=(--peer "$LOCAL_PEER")
 fi

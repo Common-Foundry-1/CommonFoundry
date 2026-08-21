@@ -19,6 +19,11 @@ pub const MAX_STRUCTURED_MATRIX_ELEMENTS: usize = 1 << 20;
 pub const MAX_STRUCTURED_SUMCHECK_PROOF_BYTES: usize = 64 * 1024;
 pub const STRUCTURED_SUMCHECK_CHALLENGE_BITS: u32 = 191;
 
+pub(crate) const MAX_STRUCTURED_MATRIX_LAYERS: usize = 128;
+pub(crate) const MAX_STRUCTURED_MATRIX_ROWS: usize = 128;
+pub(crate) const MAX_STRUCTURED_MATRIX_INNER: usize = 4096;
+pub(crate) const MAX_STRUCTURED_MATRIX_COLS: usize = 4096;
+
 pub(crate) const GOLDILOCKS_MODULUS: u64 = 0xffff_ffff_0000_0001;
 const PROOF_MAGIC: &[u8; 8] = b"CMFDSM01";
 const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/STRUCTURED-MATRIX/V1";
@@ -39,11 +44,11 @@ pub struct StructuredMatrixStatement {
 
 impl StructuredMatrixStatement {
     pub fn sumcheck_error_numerator(&self) -> Result<u32, StructuredSumcheckError> {
-        self.validate_dimensions()?;
+        self.validate_verifier_shape()?;
         Ok(2 * self.inner.ilog2() + 3 * self.layers.ilog2())
     }
 
-    fn validate_dimensions(&self) -> Result<(), StructuredSumcheckError> {
+    pub(crate) fn validate_verifier_shape(&self) -> Result<(), StructuredSumcheckError> {
         if self.layers == 0
             || self.rows == 0
             || self.inner == 0
@@ -55,12 +60,11 @@ impl StructuredMatrixStatement {
         {
             return Err(StructuredSumcheckError::InvalidDimensions);
         }
-        let activation_len = checked_product(&[self.layers, self.rows, self.inner])?;
-        let weight_len = checked_product(&[self.layers, self.inner, self.cols])?;
-        let accumulator_len = checked_product(&[self.layers, self.rows, self.cols])?;
-        if activation_len > MAX_STRUCTURED_MATRIX_ELEMENTS
-            || weight_len > MAX_STRUCTURED_MATRIX_ELEMENTS
-            || accumulator_len > MAX_STRUCTURED_MATRIX_ELEMENTS
+        self.table_lengths()?;
+        if self.layers > MAX_STRUCTURED_MATRIX_LAYERS
+            || self.rows > MAX_STRUCTURED_MATRIX_ROWS
+            || self.inner > MAX_STRUCTURED_MATRIX_INNER
+            || self.cols > MAX_STRUCTURED_MATRIX_COLS
         {
             return Err(StructuredSumcheckError::ResearchCap);
         }
@@ -84,6 +88,26 @@ impl StructuredMatrixStatement {
             return Err(StructuredSumcheckError::UnsafeIntegerBounds);
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_materialized_shape(&self) -> Result<(), StructuredSumcheckError> {
+        self.validate_verifier_shape()?;
+        let [activation_len, weight_len, accumulator_len] = self.table_lengths()?;
+        if activation_len > MAX_STRUCTURED_MATRIX_ELEMENTS
+            || weight_len > MAX_STRUCTURED_MATRIX_ELEMENTS
+            || accumulator_len > MAX_STRUCTURED_MATRIX_ELEMENTS
+        {
+            return Err(StructuredSumcheckError::ResearchCap);
+        }
+        Ok(())
+    }
+
+    fn table_lengths(&self) -> Result<[usize; 3], StructuredSumcheckError> {
+        Ok([
+            checked_product(&[self.layers, self.rows, self.inner])?,
+            checked_product(&[self.layers, self.inner, self.cols])?,
+            checked_product(&[self.layers, self.rows, self.cols])?,
+        ])
     }
 }
 
@@ -544,7 +568,7 @@ pub fn verify_structured_matrix_sumcheck(
     statement: StructuredMatrixStatement,
     proof: &StructuredMatrixProof,
 ) -> Result<StructuredMatrixOpeningClaims, StructuredSumcheckError> {
-    statement.validate_dimensions()?;
+    statement.validate_verifier_shape()?;
     if proof.protocol_version != STRUCTURED_SUMCHECK_VERSION {
         return Err(StructuredSumcheckError::ProtocolVersion);
     }
@@ -655,10 +679,8 @@ fn validate_tables(
     weights: &[i64],
     accumulators: &[i64],
 ) -> Result<(), StructuredSumcheckError> {
-    statement.validate_dimensions()?;
-    let activation_len = checked_product(&[statement.layers, statement.rows, statement.inner])?;
-    let weight_len = checked_product(&[statement.layers, statement.inner, statement.cols])?;
-    let accumulator_len = checked_product(&[statement.layers, statement.rows, statement.cols])?;
+    statement.validate_materialized_shape()?;
+    let [activation_len, weight_len, accumulator_len] = statement.table_lengths()?;
     if activations.len() != activation_len
         || weights.len() != weight_len
         || accumulators.len() != accumulator_len
@@ -1198,6 +1220,137 @@ mod tests {
             }
         }
         (statement, activations, weights, accumulators)
+    }
+
+    fn production_statement() -> StructuredMatrixStatement {
+        StructuredMatrixStatement {
+            layers: MAX_STRUCTURED_MATRIX_LAYERS,
+            rows: MAX_STRUCTURED_MATRIX_ROWS,
+            inner: MAX_STRUCTURED_MATRIX_INNER,
+            cols: MAX_STRUCTURED_MATRIX_COLS,
+            max_abs_activation: 125,
+            max_abs_weight: 125,
+            max_abs_accumulator: 64_000_000,
+        }
+    }
+
+    fn zero_envelope(statement: StructuredMatrixStatement) -> StructuredMatrixProof {
+        let zero = ExtensionElement { limbs: [0; 3] };
+        let common_rounds = (0..statement.inner.ilog2()).map(|_| StructuredMatrixRound {
+            evaluations: vec![zero; 3],
+        });
+        let layer_rounds = (0..statement.layers.ilog2()).map(|_| StructuredMatrixRound {
+            evaluations: vec![zero; 4],
+        });
+        StructuredMatrixProof {
+            protocol_version: STRUCTURED_SUMCHECK_VERSION,
+            activation_commitment: [0; 32],
+            weight_commitment: [0; 32],
+            accumulator_commitment: [0; 32],
+            accumulator_evaluation: zero,
+            rounds: common_rounds.chain(layer_rounds).collect(),
+            activation_evaluation: zero,
+            weight_evaluation: zero,
+            transcript_digest: [0; 32],
+        }
+    }
+
+    #[test]
+    fn production_shape_is_verifier_safe_but_not_materializable() {
+        let statement = production_statement();
+        statement.validate_verifier_shape().unwrap();
+        assert_eq!(statement.sumcheck_error_numerator().unwrap(), 45);
+        assert!(matches!(
+            verify_structured_matrix_sumcheck(b"binding", statement, &zero_envelope(statement)),
+            Err(StructuredSumcheckError::Transcript)
+        ));
+
+        assert!(matches!(
+            statement.validate_materialized_shape(),
+            Err(StructuredSumcheckError::ResearchCap)
+        ));
+        assert!(matches!(
+            prove_structured_matrix_product(b"binding", statement, &[], &[], &[]),
+            Err(StructuredSumcheckError::ResearchCap)
+        ));
+        assert!(matches!(
+            verify_structured_matrix_product(
+                b"binding",
+                statement,
+                &[],
+                &[],
+                &[],
+                &zero_envelope(statement),
+            ),
+            Err(StructuredSumcheckError::ResearchCap)
+        ));
+        #[cfg(feature = "whir-prototype")]
+        assert!(matches!(
+            structured_matrix_whir_tables(statement, &[], &[], &[]),
+            Err(StructuredSumcheckError::ResearchCap)
+        ));
+    }
+
+    #[test]
+    fn verifier_shape_rejects_invalid_over_max_and_overflowing_dimensions() {
+        for invalid in [0, 3] {
+            for (layers, rows, inner, cols) in [
+                (invalid, 1, 1, 1),
+                (1, invalid, 1, 1),
+                (1, 1, invalid, 1),
+                (1, 1, 1, invalid),
+            ] {
+                let statement = StructuredMatrixStatement {
+                    layers,
+                    rows,
+                    inner,
+                    cols,
+                    ..production_statement()
+                };
+                assert!(matches!(
+                    statement.validate_verifier_shape(),
+                    Err(StructuredSumcheckError::InvalidDimensions)
+                ));
+            }
+        }
+
+        for (layers, rows, inner, cols) in [
+            (MAX_STRUCTURED_MATRIX_LAYERS * 2, 1, 1, 1),
+            (1, MAX_STRUCTURED_MATRIX_ROWS * 2, 1, 1),
+            (1, 1, MAX_STRUCTURED_MATRIX_INNER * 2, 1),
+            (1, 1, 1, MAX_STRUCTURED_MATRIX_COLS * 2),
+        ] {
+            let statement = StructuredMatrixStatement {
+                layers,
+                rows,
+                inner,
+                cols,
+                ..production_statement()
+            };
+            assert!(matches!(
+                statement.validate_verifier_shape(),
+                Err(StructuredSumcheckError::ResearchCap)
+            ));
+        }
+
+        let high_bit = 1_usize << (usize::BITS - 1);
+        for (layers, rows, inner, cols) in [
+            (high_bit, 2, 1, 1),
+            (1, 1, 2, high_bit),
+            (1, 2, 1, high_bit),
+        ] {
+            let statement = StructuredMatrixStatement {
+                layers,
+                rows,
+                inner,
+                cols,
+                ..production_statement()
+            };
+            assert!(matches!(
+                statement.validate_verifier_shape(),
+                Err(StructuredSumcheckError::ArithmeticOverflow)
+            ));
+        }
     }
 
     #[test]

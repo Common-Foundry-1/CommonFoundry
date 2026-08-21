@@ -28,6 +28,11 @@ pub const STRUCTURED_TRANSITION_MAX_DEGREE: usize = 17;
 pub const MAX_STRUCTURED_TRANSITION_ELEMENTS: usize = 1 << 20;
 pub const MAX_STRUCTURED_TRANSITION_PROOF_BYTES: usize = 256 * 1024;
 
+pub(crate) const MAX_STRUCTURED_TRANSITION_LAYERS: usize = 128;
+pub(crate) const MAX_STRUCTURED_TRANSITION_ROWS: usize = 128;
+pub(crate) const MAX_STRUCTURED_TRANSITION_COLS: usize = 4096;
+const MAX_STRUCTURED_TRANSITION_VERIFIER_ELEMENTS: usize = 1 << 26;
+
 const PROOF_MAGIC: &[u8; 8] = b"CMFDST01";
 const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/STRUCTURED-TRANSITION/V1";
 const OUTPUT_MODULUS: u64 = 251;
@@ -88,6 +93,12 @@ impl StructuredMaskPolynomial {
         {
             return Err(StructuredTransitionError::InvalidDimensions);
         }
+        if layers > MAX_STRUCTURED_TRANSITION_LAYERS
+            || rows > MAX_STRUCTURED_TRANSITION_ROWS
+            || cols > MAX_STRUCTURED_TRANSITION_COLS
+        {
+            return Err(StructuredTransitionError::ResearchCap);
+        }
         let row_bits = rows.ilog2();
         let col_bits = cols.ilog2();
         let coefficient_count = 1 + row_bits as usize + col_bits as usize;
@@ -119,6 +130,9 @@ impl StructuredMaskPolynomial {
         if rows == 0 || cols == 0 || !rows.is_power_of_two() || !cols.is_power_of_two() {
             return Err(StructuredTransitionError::InvalidDimensions);
         }
+        if rows > MAX_STRUCTURED_TRANSITION_ROWS || cols > MAX_STRUCTURED_TRANSITION_COLS {
+            return Err(StructuredTransitionError::ResearchCap);
+        }
         let row_bits = rows.ilog2();
         let col_bits = cols.ilog2();
         Ok(Self {
@@ -133,7 +147,7 @@ impl StructuredMaskPolynomial {
         &self,
         statement: StructuredTransitionStatement,
     ) -> Result<(), StructuredTransitionError> {
-        statement.validate()?;
+        statement.validate_verifier_shape()?;
         let coefficient_count = 1 + self.row_bits as usize + self.col_bits as usize;
         let expected = self
             .layers
@@ -199,7 +213,7 @@ impl StructuredMaskPolynomial {
 
 impl StructuredTransitionStatement {
     pub fn sumcheck_error_numerator(&self) -> Result<u32, StructuredTransitionError> {
-        self.validate()?;
+        self.validate_verifier_shape()?;
         let variables = self
             .layers
             .checked_mul(self.rows)
@@ -209,7 +223,7 @@ impl StructuredTransitionStatement {
         Ok((STRUCTURED_TRANSITION_MAX_DEGREE as u32) * variables)
     }
 
-    fn validate(&self) -> Result<(), StructuredTransitionError> {
+    pub(crate) fn validate_verifier_shape(&self) -> Result<(), StructuredTransitionError> {
         if self.layers == 0
             || self.rows == 0
             || self.cols == 0
@@ -224,7 +238,11 @@ impl StructuredTransitionStatement {
             .checked_mul(self.rows)
             .and_then(|value| value.checked_mul(self.cols))
             .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
-        if elements > MAX_STRUCTURED_TRANSITION_ELEMENTS {
+        if self.layers > MAX_STRUCTURED_TRANSITION_LAYERS
+            || self.rows > MAX_STRUCTURED_TRANSITION_ROWS
+            || self.cols > MAX_STRUCTURED_TRANSITION_COLS
+            || elements > MAX_STRUCTURED_TRANSITION_VERIFIER_ELEMENTS
+        {
             return Err(StructuredTransitionError::ResearchCap);
         }
         if self.max_abs_accumulator == 0
@@ -240,6 +258,14 @@ impl StructuredTransitionStatement {
                 .is_none_or(|bound| bound >= u64::from(V2_TRANSITION_MODULUS))
         {
             return Err(StructuredTransitionError::UnsafeIntegerBounds);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_materialized_shape(&self) -> Result<(), StructuredTransitionError> {
+        self.validate_verifier_shape()?;
+        if self.elements()? > MAX_STRUCTURED_TRANSITION_ELEMENTS {
+            return Err(StructuredTransitionError::ResearchCap);
         }
         Ok(())
     }
@@ -616,7 +642,7 @@ pub fn verify_structured_transition_sumcheck(
     mask_polynomial: &StructuredMaskPolynomial,
     proof: &StructuredTransitionProof,
 ) -> Result<StructuredTransitionOpeningClaims, StructuredTransitionError> {
-    statement.validate()?;
+    statement.validate_verifier_shape()?;
     mask_polynomial.validate(statement)?;
     proof.validate_shape()?;
     if proof.protocol_version != STRUCTURED_TRANSITION_VERSION {
@@ -787,7 +813,7 @@ fn validate_witness(
     statement: StructuredTransitionStatement,
     witness: &StructuredTransitionWitness,
 ) -> Result<(), StructuredTransitionError> {
-    statement.validate()?;
+    statement.validate_materialized_shape()?;
     let elements = statement.elements()?;
     let lengths = [
         witness.accumulators.len(),
@@ -1193,14 +1219,8 @@ mod tests {
         }
     }
 
-    fn fixture() -> (
-        StructuredTransitionStatement,
-        StructuredMaskPolynomial,
-        StructuredTransitionWitness,
-    ) {
-        let reference = v2_test_reference().unwrap();
-        let proof = reference.prove_reference(&block(), 7).unwrap();
-        let mut witness = StructuredTransitionWitness {
+    fn empty_witness() -> StructuredTransitionWitness {
+        StructuredTransitionWitness {
             accumulators: Vec::new(),
             masks: Vec::new(),
             encoded: Vec::new(),
@@ -1212,7 +1232,42 @@ mod tests {
             output_remainders: Vec::new(),
             negative: Vec::new(),
             activations: Vec::new(),
-        };
+        }
+    }
+
+    fn production_statement() -> StructuredTransitionStatement {
+        StructuredTransitionStatement {
+            layers: MAX_STRUCTURED_TRANSITION_LAYERS,
+            rows: MAX_STRUCTURED_TRANSITION_ROWS,
+            cols: MAX_STRUCTURED_TRANSITION_COLS,
+            max_abs_accumulator: 64_000_000,
+            max_mask: 5_000,
+        }
+    }
+
+    fn zero_envelope(statement: StructuredTransitionStatement) -> StructuredTransitionProof {
+        let zero = ExtensionElement { limbs: [0; 3] };
+        StructuredTransitionProof {
+            protocol_version: STRUCTURED_TRANSITION_VERSION,
+            oracle_commitments: vec![[0; 32]; STRUCTURED_TRANSITION_ORACLES],
+            rounds: (0..statement.elements().unwrap().ilog2())
+                .map(|_| StructuredTransitionRound {
+                    evaluations: vec![zero; STRUCTURED_TRANSITION_MAX_DEGREE + 1],
+                })
+                .collect(),
+            terminal_evaluations: vec![zero; STRUCTURED_TRANSITION_ORACLES],
+            transcript_digest: [0; 32],
+        }
+    }
+
+    fn fixture() -> (
+        StructuredTransitionStatement,
+        StructuredMaskPolynomial,
+        StructuredTransitionWitness,
+    ) {
+        let reference = v2_test_reference().unwrap();
+        let proof = reference.prove_reference(&block(), 7).unwrap();
+        let mut witness = empty_witness();
         for layer in &proof.layers {
             for ((accumulator, reduction), activation) in layer
                 .accumulators
@@ -1262,6 +1317,121 @@ mod tests {
         )
         .unwrap();
         (statement, mask, witness)
+    }
+
+    #[test]
+    fn production_shape_is_verifier_safe_but_not_materializable() {
+        let statement = production_statement();
+        let mask = StructuredMaskPolynomial::from_challenge(
+            &[0x42; 32],
+            statement.layers,
+            statement.rows,
+            statement.cols,
+        )
+        .unwrap();
+        let witness = empty_witness();
+        let proof = zero_envelope(statement);
+
+        statement.validate_verifier_shape().unwrap();
+        assert_eq!(statement.elements().unwrap(), 1 << 26);
+        assert_eq!(statement.sumcheck_error_numerator().unwrap(), 442);
+        assert!(matches!(
+            verify_structured_transition_sumcheck(b"binding", statement, &mask, &proof),
+            Err(StructuredTransitionError::MaskPolynomial)
+        ));
+
+        assert!(matches!(
+            statement.validate_materialized_shape(),
+            Err(StructuredTransitionError::ResearchCap)
+        ));
+        assert!(matches!(
+            prove_structured_transition(b"binding", statement, &mask, &witness),
+            Err(StructuredTransitionError::ResearchCap)
+        ));
+        assert!(matches!(
+            verify_structured_transition(b"binding", statement, &mask, &witness, &proof),
+            Err(StructuredTransitionError::ResearchCap)
+        ));
+        #[cfg(feature = "whir-prototype")]
+        assert!(matches!(
+            structured_transition_whir_tables(statement, &witness),
+            Err(StructuredTransitionError::ResearchCap)
+        ));
+    }
+
+    #[test]
+    fn verifier_shape_rejects_invalid_over_max_and_overflowing_dimensions() {
+        for invalid in [0, 3] {
+            for (layers, rows, cols) in [(invalid, 1, 1), (1, invalid, 1), (1, 1, invalid)] {
+                let statement = StructuredTransitionStatement {
+                    layers,
+                    rows,
+                    cols,
+                    ..production_statement()
+                };
+                assert!(matches!(
+                    statement.validate_verifier_shape(),
+                    Err(StructuredTransitionError::InvalidDimensions)
+                ));
+            }
+        }
+
+        for (layers, rows, cols) in [
+            (MAX_STRUCTURED_TRANSITION_LAYERS * 2, 1, 1),
+            (1, MAX_STRUCTURED_TRANSITION_ROWS * 2, 1),
+            (1, 1, MAX_STRUCTURED_TRANSITION_COLS * 2),
+        ] {
+            let statement = StructuredTransitionStatement {
+                layers,
+                rows,
+                cols,
+                ..production_statement()
+            };
+            assert!(matches!(
+                statement.validate_verifier_shape(),
+                Err(StructuredTransitionError::ResearchCap)
+            ));
+        }
+        assert_eq!(
+            StructuredMaskPolynomial::from_challenge(
+                &[0; 32],
+                MAX_STRUCTURED_TRANSITION_LAYERS * 2,
+                1,
+                1,
+            ),
+            Err(StructuredTransitionError::ResearchCap)
+        );
+        assert_eq!(
+            StructuredMaskPolynomial::from_virtual_challenge(
+                &[0; 32],
+                MAX_STRUCTURED_TRANSITION_ROWS * 2,
+                1,
+            ),
+            Err(StructuredTransitionError::ResearchCap)
+        );
+
+        let high_bit = 1_usize << (usize::BITS - 1);
+        for (layers, rows, cols) in [(high_bit, 2, 1), (1, high_bit, 2), (1, 2, high_bit)] {
+            let statement = StructuredTransitionStatement {
+                layers,
+                rows,
+                cols,
+                ..production_statement()
+            };
+            assert!(matches!(
+                statement.validate_verifier_shape(),
+                Err(StructuredTransitionError::ArithmeticOverflow)
+            ));
+        }
+
+        let unsafe_bounds = StructuredTransitionStatement {
+            max_abs_accumulator: u64::from(V2_TRANSITION_MODULUS),
+            ..production_statement()
+        };
+        assert!(matches!(
+            unsafe_bounds.validate_verifier_shape(),
+            Err(StructuredTransitionError::UnsafeIntegerBounds)
+        ));
     }
 
     #[test]

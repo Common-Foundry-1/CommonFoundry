@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    forgematrix_v2::work_digest_from_roots,
+    forgematrix_v2::{
+        PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
+        PRODUCTION_V2_LAYERS_PER_BANK, work_digest_from_roots,
+    },
     structured_sumcheck::{
         ExtensionElement, ExtensionField, StructuredMatrixProof, StructuredMatrixStatement,
         StructuredSumcheckError, verify_structured_matrix_sumcheck,
@@ -42,6 +45,13 @@ pub const MAX_STRUCTURED_OPENING_VARIABLES: usize = 64;
 
 const PROOF_MAGIC: &[u8; 8] = b"CMFDSA03";
 const PUBLIC_BINDING_DOMAIN: &str = "CMFD/FORGEMATRIX/STRUCTURED-PUBLIC/V3";
+const PRODUCTION_BANKS: usize = PRODUCTION_V2_BANKS as usize;
+const PRODUCTION_BATCH: usize = PRODUCTION_V2_BATCH as usize;
+const PRODUCTION_DIMENSION: usize = PRODUCTION_V2_DIMENSION as usize;
+const PRODUCTION_LAYERS_PER_BANK: usize = PRODUCTION_V2_LAYERS_PER_BANK as usize;
+const _: () =
+    assert!(PRODUCTION_V2_LAYERS as usize == PRODUCTION_BANKS * PRODUCTION_LAYERS_PER_BANK);
+const _: () = assert!(MAX_STRUCTURED_WIRING_BANKS == PRODUCTION_BANKS);
 
 /// Public data that fixes every component interpretation and fixed model
 /// commitment in one ForgeMatrix execution.
@@ -63,6 +73,87 @@ pub struct StructuredForgeMatrixStatement {
     pub transition_statements: Vec<StructuredTransitionStatement>,
     pub transition_masks: Vec<StructuredMaskPolynomial>,
     pub wiring_statement: StructuredWiringStatement,
+}
+
+/// Exact component shape of the proposed production research aggregate.
+///
+/// This only admits verifier-side statement validation. It does not select a
+/// production proof tag or make the materializing research provers capable of
+/// constructing these tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredForgeMatrixResearchShape {
+    pub initialization_statement: StructuredTransitionStatement,
+    pub matrix_statements: [StructuredMatrixStatement; PRODUCTION_BANKS],
+    pub transition_statements: [StructuredTransitionStatement; PRODUCTION_BANKS],
+    pub wiring_statement: StructuredWiringStatement,
+}
+
+impl StructuredForgeMatrixResearchShape {
+    pub const fn production_candidate() -> Self {
+        let matrix = StructuredMatrixStatement {
+            layers: PRODUCTION_LAYERS_PER_BANK,
+            rows: PRODUCTION_BATCH,
+            inner: PRODUCTION_DIMENSION,
+            cols: PRODUCTION_DIMENSION,
+            max_abs_activation: 125,
+            max_abs_weight: 125,
+            max_abs_accumulator: 64_000_000,
+        };
+        let transition = StructuredTransitionStatement {
+            layers: PRODUCTION_LAYERS_PER_BANK,
+            rows: PRODUCTION_BATCH,
+            cols: PRODUCTION_DIMENSION,
+            max_abs_accumulator: 64_000_000,
+            max_mask: 5_000,
+        };
+        Self {
+            initialization_statement: StructuredTransitionStatement {
+                layers: 1,
+                rows: PRODUCTION_BATCH,
+                cols: PRODUCTION_DIMENSION,
+                max_abs_accumulator: 125,
+                max_mask: 5_000,
+            },
+            matrix_statements: [matrix; PRODUCTION_BANKS],
+            transition_statements: [transition; PRODUCTION_BANKS],
+            wiring_statement: StructuredWiringStatement {
+                banks: PRODUCTION_BANKS,
+                layers_per_bank: PRODUCTION_LAYERS_PER_BANK,
+                rows: PRODUCTION_BATCH,
+                cols: PRODUCTION_DIMENSION,
+                max_abs_activation: 125,
+            },
+        }
+    }
+
+    pub fn validate_verifier_shape(&self) -> Result<(), StructuredProofError> {
+        self.initialization_statement.validate_verifier_shape()?;
+        for statement in &self.matrix_statements {
+            statement.validate_verifier_shape()?;
+        }
+        for statement in &self.transition_statements {
+            statement.validate_verifier_shape()?;
+        }
+        self.wiring_statement.validate_verifier_shape()?;
+        if *self != Self::production_candidate() {
+            return Err(StructuredProofError::ComponentShape);
+        }
+        Ok(())
+    }
+
+    pub fn validate_materialized_shape(&self) -> Result<(), StructuredProofError> {
+        self.validate_verifier_shape()?;
+        self.initialization_statement
+            .validate_materialized_shape()?;
+        for statement in &self.matrix_statements {
+            statement.validate_materialized_shape()?;
+        }
+        for statement in &self.transition_statements {
+            statement.validate_materialized_shape()?;
+        }
+        self.wiring_statement.validate_materialized_shape()?;
+        Ok(())
+    }
 }
 
 /// Canonical aggregate research envelope. The opaque hash and PCS proofs are
@@ -1130,6 +1221,201 @@ mod tests {
         proof.blake3_proof =
             crate::prove_structured_blake3(&hash_statement, &data.final_activation).unwrap();
         (statement, proof)
+    }
+
+    fn canonical_matrix_envelope(statement: StructuredMatrixStatement) -> StructuredMatrixProof {
+        let common_rounds = statement.inner.ilog2() as usize;
+        let layer_rounds = statement.layers.ilog2() as usize;
+        let mut rounds = vec![
+            crate::StructuredMatrixRound {
+                evaluations: vec![ExtensionElement { limbs: [0; 3] }; 3],
+            };
+            common_rounds
+        ];
+        rounds.extend(vec![
+            crate::StructuredMatrixRound {
+                evaluations: vec![ExtensionElement { limbs: [0; 3] }; 4],
+            };
+            layer_rounds
+        ]);
+        StructuredMatrixProof {
+            protocol_version: crate::STRUCTURED_SUMCHECK_VERSION,
+            activation_commitment: [0; 32],
+            weight_commitment: [0; 32],
+            accumulator_commitment: [0; 32],
+            accumulator_evaluation: ExtensionElement { limbs: [0; 3] },
+            rounds,
+            activation_evaluation: ExtensionElement { limbs: [0; 3] },
+            weight_evaluation: ExtensionElement { limbs: [0; 3] },
+            transcript_digest: [0; 32],
+        }
+    }
+
+    fn canonical_transition_envelope(
+        statement: StructuredTransitionStatement,
+    ) -> StructuredTransitionProof {
+        let rounds = (statement.layers * statement.rows * statement.cols).ilog2() as usize;
+        StructuredTransitionProof {
+            protocol_version: crate::STRUCTURED_TRANSITION_VERSION,
+            oracle_commitments: vec![[0; 32]; crate::STRUCTURED_TRANSITION_ORACLES],
+            rounds: vec![
+                crate::StructuredTransitionRound {
+                    evaluations: vec![
+                        ExtensionElement { limbs: [0; 3] };
+                        crate::STRUCTURED_TRANSITION_MAX_DEGREE + 1
+                    ],
+                };
+                rounds
+            ],
+            terminal_evaluations: vec![
+                ExtensionElement { limbs: [0; 3] };
+                crate::STRUCTURED_TRANSITION_ORACLES
+            ],
+            transcript_digest: [0; 32],
+        }
+    }
+
+    fn canonical_wiring_envelope(statement: StructuredWiringStatement) -> StructuredWiringProof {
+        let zero = ExtensionElement { limbs: [0; 3] };
+        StructuredWiringProof {
+            protocol_version: crate::STRUCTURED_WIRING_VERSION,
+            initial_commitment: [0; 32],
+            input_commitments: vec![[0; 32]; statement.banks],
+            output_commitments: vec![[0; 32]; statement.banks],
+            initial_evaluation: zero,
+            input_shift_evaluations: vec![
+                zero;
+                statement.banks
+                    * statement.layers_per_bank.ilog2() as usize
+            ],
+            input_first_evaluations: vec![zero; statement.banks],
+            output_random_evaluations: vec![zero; statement.banks],
+            output_last_evaluations: vec![zero; statement.banks],
+            transcript_digest: [0; 32],
+        }
+    }
+
+    #[test]
+    fn production_candidate_is_verifier_only_and_exact() {
+        let shape = StructuredForgeMatrixResearchShape::production_candidate();
+        shape.validate_verifier_shape().unwrap();
+        assert_eq!(
+            PRODUCTION_V2_LAYERS as usize,
+            shape.wiring_statement.banks * shape.wiring_statement.layers_per_bank
+        );
+        assert_eq!(
+            shape.validate_materialized_shape(),
+            Err(StructuredProofError::Matrix(
+                StructuredSumcheckError::ResearchCap
+            ))
+        );
+        for statement in shape.matrix_statements {
+            assert_eq!(
+                statement.validate_materialized_shape(),
+                Err(StructuredSumcheckError::ResearchCap)
+            );
+        }
+        for statement in shape.transition_statements {
+            assert_eq!(
+                statement.validate_materialized_shape(),
+                Err(StructuredTransitionError::ResearchCap)
+            );
+        }
+        assert_eq!(
+            shape.wiring_statement.validate_materialized_shape(),
+            Err(StructuredWiringError::ResearchCap)
+        );
+
+        let mut malformed = shape;
+        malformed.matrix_statements[1].rows = 64;
+        assert_eq!(
+            malformed.validate_verifier_shape(),
+            Err(StructuredProofError::ComponentShape)
+        );
+
+        let mut invalid = shape;
+        invalid.transition_statements[2].layers = 3;
+        assert_eq!(
+            invalid.validate_verifier_shape(),
+            Err(StructuredProofError::Transition(
+                StructuredTransitionError::InvalidDimensions
+            ))
+        );
+    }
+
+    #[test]
+    fn production_component_floor_leaves_too_little_for_blake3() {
+        let shape = StructuredForgeMatrixResearchShape::production_candidate();
+        shape.validate_verifier_shape().unwrap();
+
+        let initialization_proof = canonical_transition_envelope(shape.initialization_statement);
+        let matrix_proof = canonical_matrix_envelope(shape.matrix_statements[0]);
+        let transition_proof = canonical_transition_envelope(shape.transition_statements[0]);
+        let wiring_proof = canonical_wiring_envelope(shape.wiring_statement);
+        assert_eq!(initialization_proof.canonical_size(), 14_443);
+        assert_eq!(initialization_proof.encode().unwrap().len(), 14_443);
+        assert_eq!(matrix_proof.canonical_size(), 1_771);
+        assert_eq!(matrix_proof.encode().unwrap().len(), 1_771);
+        assert_eq!(transition_proof.canonical_size(), 17_474);
+        assert_eq!(transition_proof.encode().unwrap().len(), 17_474);
+        assert_eq!(wiring_proof.canonical_size(), 1_036);
+        assert_eq!(wiring_proof.encode().unwrap().len(), 1_036);
+
+        let aggregate = StructuredForgeMatrixProof {
+            protocol_version: STRUCTURED_AGGREGATE_VERSION,
+            initialization_proof,
+            matrix_proofs: vec![matrix_proof; PRODUCTION_BANKS],
+            transition_proofs: vec![transition_proof; PRODUCTION_BANKS],
+            wiring_proof,
+            blake3_proof: vec![0],
+            pcs_proof: vec![0],
+        };
+        // The two one-byte payloads make the envelope encodable; subtracting
+        // them retains their canonical u32 length prefixes in the floor.
+        let component_envelope_floor = aggregate.encode().unwrap().len() - 2;
+        assert_eq!(component_envelope_floor, 73_274);
+
+        let current_v2_frame = crate::encode_forgematrix_proof(
+            &crate::BlockProof::V2Reference(crate::ForgeMatrixV2CompactProof {
+                algorithm_version: 0,
+                proof_version: 0,
+                nonce: 0,
+                model_manifest_digest: [0; 32],
+                challenge_digest: [0; 32],
+                final_activation_digest: [0; 32],
+                work_digest: [0; 32],
+            }),
+            [0; 32],
+        )
+        .unwrap();
+        assert_eq!(current_v2_frame.len(), 193);
+        assert_eq!(current_v2_frame.len() - crate::wire::WIRE_HEADER_BYTES, 177);
+
+        // A future payload that preserves the current V2 identity fields and
+        // appends one canonical sized aggregate needs this u32 length prefix.
+        // MAX_PROOF_BYTES caps the complete frame, so the 16-byte wire header
+        // and the 177 existing payload bytes must both remain in the budget.
+        let aggregate_length_prefix = std::mem::size_of::<u32>();
+        let blake3_and_pcs_budget = crate::wire::MAX_PROOF_BYTES
+            - current_v2_frame.len()
+            - aggregate_length_prefix
+            - component_envelope_floor;
+        assert_eq!(blake3_and_pcs_budget, 188_673);
+
+        const CURRENT_32768_ROW_BLAKE3_ZLIB_BYTES: usize = 232_050;
+        const STRUCTURED_BLAKE3_ENVELOPE_BYTES: usize = 8 + 4 + 1 + 4;
+        let current_blake3_checkpoint_bytes =
+            CURRENT_32768_ROW_BLAKE3_ZLIB_BYTES + STRUCTURED_BLAKE3_ENVELOPE_BYTES;
+        assert_eq!(current_blake3_checkpoint_bytes, 232_067);
+        assert!(current_blake3_checkpoint_bytes > blake3_and_pcs_budget);
+        let total_before_pcs_payload = current_v2_frame.len()
+            + aggregate_length_prefix
+            + component_envelope_floor
+            + current_blake3_checkpoint_bytes;
+        assert_eq!(total_before_pcs_payload, 305_538);
+        let minimum_encodable_total = total_before_pcs_payload + 1;
+        assert_eq!(minimum_encodable_total, 305_539);
+        assert!(minimum_encodable_total > crate::wire::MAX_PROOF_BYTES);
     }
 
     #[test]

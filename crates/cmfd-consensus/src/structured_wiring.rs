@@ -21,9 +21,14 @@ use crate::structured_transition::{
 };
 
 pub const STRUCTURED_WIRING_VERSION: u32 = 1;
-pub const MAX_STRUCTURED_WIRING_BANKS: usize = 16;
+pub const MAX_STRUCTURED_WIRING_BANKS: usize = 3;
 pub const MAX_STRUCTURED_WIRING_ELEMENTS: usize = 1 << 20;
 pub const MAX_STRUCTURED_WIRING_PROOF_BYTES: usize = 64 * 1024;
+
+pub(crate) const MAX_STRUCTURED_WIRING_LAYERS_PER_BANK: usize = 128;
+pub(crate) const MAX_STRUCTURED_WIRING_ROWS: usize = 128;
+pub(crate) const MAX_STRUCTURED_WIRING_COLS: usize = 4096;
+const MAX_STRUCTURED_WIRING_VERIFIER_ELEMENTS: usize = 3 * (1 << 26);
 
 const PROOF_MAGIC: &[u8; 8] = b"CMFDSW01";
 const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/STRUCTURED-WIRING/V1";
@@ -40,7 +45,7 @@ pub struct StructuredWiringStatement {
 
 impl StructuredWiringStatement {
     pub fn soundness_error_numerator(&self) -> Result<u32, StructuredWiringError> {
-        self.validate()?;
+        self.validate_verifier_shape()?;
         let cell_variables = self.cell_variables();
         let all_variables = cell_variables
             .checked_add(self.layers_per_bank.ilog2())
@@ -58,24 +63,36 @@ impl StructuredWiringStatement {
             .ok_or(StructuredWiringError::ArithmeticOverflow)
     }
 
-    fn validate(&self) -> Result<(), StructuredWiringError> {
+    pub(crate) fn validate_verifier_shape(&self) -> Result<(), StructuredWiringError> {
         if self.banks == 0
-            || self.banks > MAX_STRUCTURED_WIRING_BANKS
             || self.layers_per_bank < 2
             || self.rows == 0
             || self.cols == 0
             || !self.layers_per_bank.is_power_of_two()
             || !self.rows.is_power_of_two()
             || !self.cols.is_power_of_two()
-            || self.layers_per_bank.ilog2() as usize > MAX_LAYER_BITS
         {
             return Err(StructuredWiringError::InvalidDimensions);
         }
-        if self.elements()? > MAX_STRUCTURED_WIRING_ELEMENTS {
+        let elements = self.elements()?;
+        if self.banks > MAX_STRUCTURED_WIRING_BANKS
+            || self.layers_per_bank > MAX_STRUCTURED_WIRING_LAYERS_PER_BANK
+            || self.rows > MAX_STRUCTURED_WIRING_ROWS
+            || self.cols > MAX_STRUCTURED_WIRING_COLS
+            || elements > MAX_STRUCTURED_WIRING_VERIFIER_ELEMENTS
+        {
             return Err(StructuredWiringError::ResearchCap);
         }
         if self.max_abs_activation == 0 || self.max_abs_activation >= GOLDILOCKS_MODULUS {
             return Err(StructuredWiringError::UnsafeIntegerBounds);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_materialized_shape(&self) -> Result<(), StructuredWiringError> {
+        self.validate_verifier_shape()?;
+        if self.elements()? > MAX_STRUCTURED_WIRING_ELEMENTS {
+            return Err(StructuredWiringError::ResearchCap);
         }
         Ok(())
     }
@@ -469,7 +486,7 @@ pub fn verify_structured_wiring_component_commitments(
     transition_proofs: &[StructuredTransitionProof],
     wiring_proof: &StructuredWiringProof,
 ) -> Result<(), StructuredWiringError> {
-    statement.validate()?;
+    statement.validate_verifier_shape()?;
     if matrix_proofs.len() != statement.banks
         || transition_proofs.len() != statement.banks
         || wiring_proof.input_commitments.len() != statement.banks
@@ -518,7 +535,7 @@ pub fn verify_structured_wiring_openings(
     statement: StructuredWiringStatement,
     proof: &StructuredWiringProof,
 ) -> Result<StructuredWiringOpeningClaims, StructuredWiringError> {
-    statement.validate()?;
+    statement.validate_verifier_shape()?;
     proof.validate_shape()?;
     if proof.protocol_version != STRUCTURED_WIRING_VERSION {
         return Err(StructuredWiringError::ProtocolVersion);
@@ -724,7 +741,7 @@ fn validate_tables(
     inputs: &[i64],
     outputs: &[i64],
 ) -> Result<(), StructuredWiringError> {
-    statement.validate()?;
+    statement.validate_materialized_shape()?;
     let elements = statement.elements()?;
     let cells = checked_product(&[statement.rows, statement.cols])?;
     if initial.len() != cells || inputs.len() != elements || outputs.len() != elements {
@@ -1052,6 +1069,35 @@ mod tests {
         }
     }
 
+    fn production_statement() -> StructuredWiringStatement {
+        StructuredWiringStatement {
+            banks: MAX_STRUCTURED_WIRING_BANKS,
+            layers_per_bank: MAX_STRUCTURED_WIRING_LAYERS_PER_BANK,
+            rows: MAX_STRUCTURED_WIRING_ROWS,
+            cols: MAX_STRUCTURED_WIRING_COLS,
+            max_abs_activation: 125,
+        }
+    }
+
+    fn empty_proof(statement: StructuredWiringStatement) -> StructuredWiringProof {
+        let layer_bits = statement.layers_per_bank.ilog2() as usize;
+        StructuredWiringProof {
+            protocol_version: STRUCTURED_WIRING_VERSION,
+            initial_commitment: [0; 32],
+            input_commitments: vec![[0; 32]; statement.banks],
+            output_commitments: vec![[0; 32]; statement.banks],
+            initial_evaluation: ExtensionElement { limbs: [0; 3] },
+            input_shift_evaluations: vec![
+                ExtensionElement { limbs: [0; 3] };
+                statement.banks * layer_bits
+            ],
+            input_first_evaluations: vec![ExtensionElement { limbs: [0; 3] }; statement.banks],
+            output_random_evaluations: vec![ExtensionElement { limbs: [0; 3] }; statement.banks],
+            output_last_evaluations: vec![ExtensionElement { limbs: [0; 3] }; statement.banks],
+            transcript_digest: [0; 32],
+        }
+    }
+
     fn synthetic_fixture(banks: usize) -> (Vec<i64>, Vec<i64>) {
         let statement = statement(banks);
         let cells = statement.rows * statement.cols;
@@ -1066,6 +1112,102 @@ mod tests {
         let inputs = states[..total_layers].concat();
         let outputs = states[1..].concat();
         (inputs, outputs)
+    }
+
+    #[test]
+    fn production_shape_is_verifier_safe_but_not_materializable() {
+        let statement = production_statement();
+        let proof = empty_proof(statement);
+
+        statement.validate_verifier_shape().unwrap();
+        assert_eq!(statement.elements().unwrap(), 3 * (1 << 26));
+        assert_eq!(statement.soundness_error_numerator().unwrap(), 135);
+        assert!(matches!(
+            verify_structured_wiring_openings(b"binding", statement, &proof),
+            Err(StructuredWiringError::Transcript)
+        ));
+
+        assert!(matches!(
+            statement.validate_materialized_shape(),
+            Err(StructuredWiringError::ResearchCap)
+        ));
+        assert!(matches!(
+            prove_structured_wiring(b"binding", statement, &[], &[], &[]),
+            Err(StructuredWiringError::ResearchCap)
+        ));
+        assert!(matches!(
+            verify_structured_wiring(b"binding", statement, &[], &[], &[], &proof),
+            Err(StructuredWiringError::ResearchCap)
+        ));
+        #[cfg(feature = "whir-prototype")]
+        assert!(matches!(
+            structured_wiring_whir_tables(statement, &[], &[], &[]),
+            Err(StructuredWiringError::ResearchCap)
+        ));
+    }
+
+    #[test]
+    fn verifier_shape_rejects_invalid_over_max_and_overflowing_dimensions() {
+        for (banks, layers_per_bank, rows, cols) in [(0, 2, 1, 1), (1, 0, 1, 1), (1, 3, 1, 1)] {
+            let statement = StructuredWiringStatement {
+                banks,
+                layers_per_bank,
+                rows,
+                cols,
+                ..production_statement()
+            };
+            assert!(matches!(
+                statement.validate_verifier_shape(),
+                Err(StructuredWiringError::InvalidDimensions)
+            ));
+        }
+
+        for (banks, layers_per_bank, rows, cols) in [
+            (MAX_STRUCTURED_WIRING_BANKS + 1, 2, 1, 1),
+            (1, MAX_STRUCTURED_WIRING_LAYERS_PER_BANK * 2, 1, 1),
+            (1, 2, MAX_STRUCTURED_WIRING_ROWS * 2, 1),
+            (1, 2, 1, MAX_STRUCTURED_WIRING_COLS * 2),
+        ] {
+            let statement = StructuredWiringStatement {
+                banks,
+                layers_per_bank,
+                rows,
+                cols,
+                ..production_statement()
+            };
+            assert!(matches!(
+                statement.validate_verifier_shape(),
+                Err(StructuredWiringError::ResearchCap)
+            ));
+        }
+
+        let high_bit = 1_usize << (usize::BITS - 1);
+        for (banks, layers_per_bank, rows, cols) in [
+            (high_bit, 2, 1, 1),
+            (1, high_bit, 2, 1),
+            (1, 2, 2, high_bit),
+        ] {
+            let statement = StructuredWiringStatement {
+                banks,
+                layers_per_bank,
+                rows,
+                cols,
+                ..production_statement()
+            };
+            assert!(matches!(
+                statement.validate_verifier_shape(),
+                Err(StructuredWiringError::ArithmeticOverflow)
+            ));
+        }
+
+        let unsafe_bounds = StructuredWiringStatement {
+            max_abs_activation: GOLDILOCKS_MODULUS,
+            ..production_statement()
+        };
+        assert!(matches!(
+            unsafe_bounds.validate_verifier_shape(),
+            Err(StructuredWiringError::UnsafeIntegerBounds)
+        ));
     }
 
     #[test]

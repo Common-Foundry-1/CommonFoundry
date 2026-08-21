@@ -223,6 +223,55 @@ impl StructuredMaskPolynomial {
             },
         )
     }
+
+    /// Evaluate the challenge-derived mask at one canonical Boolean cell.
+    ///
+    /// Cells are ordered column-first, then row, then layer, matching the
+    /// multilinear table order used by the transition witness. This is the
+    /// verifier-side source for a fixed preprocessed mask column; a prover must
+    /// never supply a replacement table.
+    pub fn value_at_boolean_index(
+        &self,
+        statement: StructuredTransitionStatement,
+        index: usize,
+    ) -> Result<u64, StructuredTransitionError> {
+        self.validate(statement)?;
+        let cells_per_layer = statement
+            .rows
+            .checked_mul(statement.cols)
+            .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
+        let elements = statement
+            .layers
+            .checked_mul(cells_per_layer)
+            .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
+        if index >= elements {
+            return Err(StructuredTransitionError::InvalidDimensions);
+        }
+
+        let layer = index / cells_per_layer;
+        let within_layer = index % cells_per_layer;
+        let row = within_layer / statement.cols;
+        let col = within_layer % statement.cols;
+        let coefficient_count = 1 + self.row_bits as usize + self.col_bits as usize;
+        let coefficients =
+            &self.coefficients[layer * coefficient_count..(layer + 1) * coefficient_count];
+        let mut value = u64::from(coefficients[0]);
+        for bit in 0..self.row_bits as usize {
+            if (row >> bit) & 1 == 1 {
+                value = value
+                    .checked_add(u64::from(coefficients[1 + bit]))
+                    .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
+            }
+        }
+        for bit in 0..self.col_bits as usize {
+            if (col >> bit) & 1 == 1 {
+                value = value
+                    .checked_add(u64::from(coefficients[1 + self.row_bits as usize + bit]))
+                    .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
+            }
+        }
+        Ok(value)
+    }
 }
 
 impl StructuredTransitionStatement {
@@ -1572,7 +1621,15 @@ mod tests {
                 .map(|bit| ExtensionField::from_u64(((index >> bit) & 1) as u64))
                 .collect::<Vec<_>>();
             assert_eq!(mask.evaluate(&point), ExtensionField::from_u64(expected));
+            assert_eq!(
+                mask.value_at_boolean_index(statement, index).unwrap(),
+                expected
+            );
         }
+        assert_eq!(
+            mask.value_at_boolean_index(statement, statement.elements().unwrap()),
+            Err(StructuredTransitionError::InvalidDimensions)
+        );
     }
 
     #[test]

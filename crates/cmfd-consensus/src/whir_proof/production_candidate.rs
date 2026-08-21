@@ -70,6 +70,27 @@ pub const PRODUCTION_TRACE_INITIALIZATION_RANGE_VARIABLES: usize =
     PRODUCTION_TRACE_INITIALIZATION_VARIABLES + PRODUCTION_TRACE_RANGE_ROW_VARIABLES;
 pub const PRODUCTION_TRACE_BANK_RANGE_VARIABLES: usize =
     PRODUCTION_TRACE_BANK_VARIABLES + PRODUCTION_TRACE_RANGE_ROW_VARIABLES;
+pub const PRODUCTION_TRACE_PACKED_LAYOUT_VERSION: u32 = 2;
+pub const PRODUCTION_TRACE_PACKED_ROWS_PER_CELL: usize = 4;
+pub const PRODUCTION_TRACE_PACKED_ROW_VARIABLES: usize = 2;
+pub const PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS: usize = 28;
+pub const PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP: usize = 4;
+pub const PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS: usize =
+    PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS / PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP;
+pub const PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS: usize =
+    PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS;
+pub const PRODUCTION_TRACE_PACKED_MAIN_COLUMNS: usize = crate::STRUCTURED_TRANSITION_REGULAR_ORACLES
+    + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS
+    + PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS;
+pub const PRODUCTION_TRACE_PACKED_INITIALIZATION_VARIABLES: usize =
+    PRODUCTION_TRACE_INITIALIZATION_VARIABLES + PRODUCTION_TRACE_PACKED_ROW_VARIABLES;
+pub const PRODUCTION_TRACE_PACKED_BANK_VARIABLES: usize =
+    PRODUCTION_TRACE_BANK_VARIABLES + PRODUCTION_TRACE_PACKED_ROW_VARIABLES;
+pub const PRODUCTION_TRACE_PACKED_FRI_LOG_BLOWUP: usize = 4;
+pub const PRODUCTION_TRACE_PACKED_BANK_LDE_VARIABLES: usize =
+    PRODUCTION_TRACE_PACKED_BANK_VARIABLES + PRODUCTION_TRACE_PACKED_FRI_LOG_BLOWUP;
+pub const PRODUCTION_TRACE_PACKED_SPEC_ROWS: [usize;
+    crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT] = [0, 0, 1, 1, 2, 2, 3, 3];
 pub const PRODUCTION_TRACE_PRACTICAL_MAX_GRINDING_BITS: usize = 16;
 pub const PRODUCTION_TRACE_JOHNSON_REFERENCE_GRINDING_BITS: usize = 48;
 pub const PRODUCTION_TRACE_TERMINAL_SECTION: usize =
@@ -97,6 +118,7 @@ const BATCHED_MODEL_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-BATCHED
 const PROOF_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-PROOF-COMMITMENT/V1";
 const TRACE_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-LAYOUT/V1";
 const TRACE_COMPACT_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-COMPACT-LAYOUT/V1";
+const TRACE_PACKED_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-PACKED-LAYOUT/V2";
 const TRACE_PADDING_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-PADDING/V1";
 const TRACE_COLUMN_ALIAS_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-COLUMN/V1";
 const TRACE_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-ROOT/V1";
@@ -282,6 +304,44 @@ pub struct ProductionTraceRangeRowV1 {
     pub slack_accumulator: u64,
 }
 
+/// Four-row production range layout that leaves room for the FRI blowup.
+///
+/// Two complete range specifications share each row. Their value digits are
+/// followed by their slack digits, using at most 28 witness columns. Seven
+/// four-query nibble buses amortize the fixed-table multiplicities while
+/// keeping the LogUp denominator product bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTracePackedLayoutV2 {
+    pub version: u32,
+    pub rows_per_cell: usize,
+    pub row_variables: usize,
+    pub digit_columns: usize,
+    pub digits_per_lookup: usize,
+    pub digit_lookups: usize,
+    pub table_multiplicity_columns: usize,
+    pub main_columns: usize,
+    pub initialization_variables: usize,
+    pub bank_variables: usize,
+    pub fri_log_blowup: usize,
+    pub bank_lde_variables: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTracePackedDigitSlotV2 {
+    pub active: bool,
+    pub spec_index: u8,
+    pub slack: bool,
+    pub digit_index: u8,
+    pub radix: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTracePackedRowV2 {
+    pub cell_index: u64,
+    pub row_in_cell: u8,
+    pub digits: [u8; PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS],
+}
+
 impl ProductionTraceBatchWireBudgetV1 {
     /// A direct wide-row opening fails even if canonical padding is omitted
     /// and all Merkle paths, roots, headers, and sumcheck messages are free.
@@ -319,8 +379,23 @@ impl ProductionTraceWhirAssumptionBudgetV1 {
 }
 
 impl ProductionTraceCompactLayoutV1 {
+    /// The raw trace fits, but this does not include any low-degree-extension
+    /// blowup required by a sound FRI proof.
     pub const fn fits_goldilocks_two_adicity(&self) -> bool {
         self.bank_range_variables <= 32
+    }
+
+    pub const fn fits_goldilocks_fri_domain(&self, log_blowup: usize) -> bool {
+        match self.bank_range_variables.checked_add(log_blowup) {
+            Some(variables) => variables <= 32,
+            None => false,
+        }
+    }
+}
+
+impl ProductionTracePackedLayoutV2 {
+    pub const fn fits_goldilocks_fri_domain(&self) -> bool {
+        self.bank_lde_variables <= 32
     }
 }
 
@@ -340,6 +415,162 @@ pub const fn production_trace_compact_layout_v1() -> ProductionTraceCompactLayou
         initialization_range_variables: PRODUCTION_TRACE_INITIALIZATION_RANGE_VARIABLES,
         bank_range_variables: PRODUCTION_TRACE_BANK_RANGE_VARIABLES,
     }
+}
+
+pub const fn production_trace_packed_layout_v2() -> ProductionTracePackedLayoutV2 {
+    ProductionTracePackedLayoutV2 {
+        version: PRODUCTION_TRACE_PACKED_LAYOUT_VERSION,
+        rows_per_cell: PRODUCTION_TRACE_PACKED_ROWS_PER_CELL,
+        row_variables: PRODUCTION_TRACE_PACKED_ROW_VARIABLES,
+        digit_columns: PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS,
+        digits_per_lookup: PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP,
+        digit_lookups: PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS,
+        table_multiplicity_columns: PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS,
+        main_columns: PRODUCTION_TRACE_PACKED_MAIN_COLUMNS,
+        initialization_variables: PRODUCTION_TRACE_PACKED_INITIALIZATION_VARIABLES,
+        bank_variables: PRODUCTION_TRACE_PACKED_BANK_VARIABLES,
+        fri_log_blowup: PRODUCTION_TRACE_PACKED_FRI_LOG_BLOWUP,
+        bank_lde_variables: PRODUCTION_TRACE_PACKED_BANK_LDE_VARIABLES,
+    }
+}
+
+pub fn production_trace_packed_digit_slot_v2(
+    row_in_cell: usize,
+    column: usize,
+) -> Result<ProductionTracePackedDigitSlotV2, ProductionWhirCandidateError> {
+    if row_in_cell >= PRODUCTION_TRACE_PACKED_ROWS_PER_CELL
+        || column >= PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS
+    {
+        return Err(ProductionWhirCandidateError::InvalidRangeWitness);
+    }
+
+    let mut cursor = 0_usize;
+    for (spec_index, (&spec_row, &digits)) in PRODUCTION_TRACE_PACKED_SPEC_ROWS
+        .iter()
+        .zip(crate::STRUCTURED_TRANSITION_RANGE_DIGITS.iter())
+        .enumerate()
+    {
+        if spec_row != row_in_cell {
+            continue;
+        }
+        let segment_end = cursor + 2 * digits;
+        if (cursor..segment_end).contains(&column) {
+            let within = column - cursor;
+            let slack = within >= digits;
+            let digit_index = if slack { within - digits } else { within };
+            return Ok(ProductionTracePackedDigitSlotV2 {
+                active: true,
+                spec_index: spec_index as u8,
+                slack,
+                digit_index: digit_index as u8,
+                radix: 1_u64 << (4 * digit_index),
+            });
+        }
+        cursor = segment_end;
+    }
+
+    Ok(ProductionTracePackedDigitSlotV2 {
+        active: false,
+        spec_index: 0,
+        slack: false,
+        digit_index: 0,
+        radix: 0,
+    })
+}
+
+pub fn production_trace_packed_row_v2(
+    statement: crate::StructuredTransitionStatement,
+    regular_values: &[u64],
+    packed_row: u64,
+) -> Result<ProductionTracePackedRowV2, ProductionWhirCandidateError> {
+    if regular_values.len() != crate::STRUCTURED_TRANSITION_REGULAR_ORACLES {
+        return Err(ProductionWhirCandidateError::InvalidRangeWitness);
+    }
+    let specs = crate::structured_transition_range_specs(statement)
+        .map_err(|_| ProductionWhirCandidateError::InvalidRangeWitness)?;
+    for spec in specs {
+        if regular_values
+            .get(spec.oracle)
+            .is_none_or(|value| *value > spec.maximum)
+        {
+            return Err(ProductionWhirCandidateError::InvalidRangeWitness);
+        }
+    }
+    let cells = statement
+        .layers
+        .checked_mul(statement.rows)
+        .and_then(|value| value.checked_mul(statement.cols))
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let rows_per_cell = PRODUCTION_TRACE_PACKED_ROWS_PER_CELL as u64;
+    let total_rows = cells
+        .checked_mul(rows_per_cell)
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    if packed_row >= total_rows {
+        return Err(ProductionWhirCandidateError::InvalidRangeWitness);
+    }
+
+    let cell_index = packed_row / rows_per_cell;
+    let row_in_cell = (packed_row % rows_per_cell) as usize;
+    let mut digits = [0_u8; PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS];
+    for (column, target) in digits.iter_mut().enumerate() {
+        let slot = production_trace_packed_digit_slot_v2(row_in_cell, column)?;
+        if !slot.active {
+            continue;
+        }
+        let spec = specs[usize::from(slot.spec_index)];
+        let value = regular_values[spec.oracle];
+        let source = if slot.slack {
+            spec.maximum - value
+        } else {
+            value
+        };
+        *target = ((source >> (4 * slot.digit_index)) & 0xf) as u8;
+    }
+
+    Ok(ProductionTracePackedRowV2 {
+        cell_index,
+        row_in_cell: row_in_cell as u8,
+        digits,
+    })
+}
+
+pub fn production_trace_packed_layout_digest_v2() -> Result<[u8; 32], ProductionWhirCandidateError>
+{
+    let layout = production_trace_packed_layout_v2();
+    let mut hasher = Blake3Hasher::new_derive_key(TRACE_PACKED_LAYOUT_DOMAIN);
+    for value in [
+        layout.version as usize,
+        layout.rows_per_cell,
+        layout.row_variables,
+        layout.digit_columns,
+        layout.digits_per_lookup,
+        layout.digit_lookups,
+        layout.table_multiplicity_columns,
+        layout.main_columns,
+        layout.initialization_variables,
+        layout.bank_variables,
+        layout.fri_log_blowup,
+        layout.bank_lde_variables,
+    ] {
+        hasher.update(&(value as u64).to_le_bytes());
+    }
+    for row in PRODUCTION_TRACE_PACKED_SPEC_ROWS {
+        hasher.update(&(row as u32).to_le_bytes());
+    }
+    for row in 0..PRODUCTION_TRACE_PACKED_ROWS_PER_CELL {
+        for column in 0..PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS {
+            let slot = production_trace_packed_digit_slot_v2(row, column)?;
+            hasher.update(&[
+                u8::from(slot.active),
+                slot.spec_index,
+                u8::from(slot.slack),
+                slot.digit_index,
+            ]);
+            hasher.update(&slot.radix.to_le_bytes());
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// Ordered subset retained in the compact core trace.
@@ -2668,6 +2899,7 @@ mod tests {
         assert_eq!(layout.initialization_range_variables, 25);
         assert_eq!(layout.bank_range_variables, 32);
         assert!(layout.fits_goldilocks_two_adicity());
+        assert!(!layout.fits_goldilocks_fri_domain(4));
         assert_eq!(
             hex::encode(production_trace_compact_layout_digest_v1().unwrap()),
             "6c7ccc9e63cae28907ae173372ddf33a3526f2ea2cc46b514510e4b330082769"
@@ -2752,6 +2984,96 @@ mod tests {
         oversized[specs[0].oracle] = specs[0].maximum + 1;
         assert_eq!(
             production_trace_range_row_v1(statement, &oversized, 0),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+    }
+
+    #[test]
+    fn packed_trace_v2_leaves_fri_headroom_and_reconstructs_every_range_source() {
+        let layout = production_trace_packed_layout_v2();
+        assert_eq!(layout.version, 2);
+        assert_eq!(layout.rows_per_cell, 4);
+        assert_eq!(layout.row_variables, 2);
+        assert_eq!(layout.digit_columns, 28);
+        assert_eq!(layout.digits_per_lookup, 4);
+        assert_eq!(layout.digit_lookups, 7);
+        assert_eq!(layout.table_multiplicity_columns, 7);
+        assert_eq!(layout.main_columns, 47);
+        assert_eq!(layout.initialization_variables, 21);
+        assert_eq!(layout.bank_variables, 28);
+        assert_eq!(layout.fri_log_blowup, 4);
+        assert_eq!(layout.bank_lde_variables, 32);
+        assert!(layout.fits_goldilocks_fri_domain());
+        assert_eq!(
+            hex::encode(production_trace_packed_layout_digest_v2().unwrap()),
+            "6d06a004f3e57dd57159e24f9c656a76bdcecf214f15bc07cdec5797392e272e"
+        );
+
+        let active_by_row = (0..4)
+            .map(|row| {
+                (0..28)
+                    .filter(|column| {
+                        production_trace_packed_digit_slot_v2(row, *column)
+                            .unwrap()
+                            .active
+                    })
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(active_by_row, [28, 28, 24, 18]);
+
+        let statement = crate::StructuredTransitionStatement {
+            layers: 1,
+            rows: 2,
+            cols: 4,
+            max_abs_accumulator: 1_000,
+            max_mask: 100,
+        };
+        let specs = crate::structured_transition_range_specs(statement).unwrap();
+        let mut values = [0_u64; crate::STRUCTURED_TRANSITION_REGULAR_ORACLES];
+        for (index, spec) in specs.into_iter().enumerate() {
+            values[spec.oracle] = (0x12_345 + index as u64 * 0x111).min(spec.maximum);
+        }
+        let mut reconstructed = [[0_u64; 2]; crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT];
+        for row in 0..4 {
+            let packed = production_trace_packed_row_v2(statement, &values, row as u64).unwrap();
+            assert_eq!(packed.cell_index, 0);
+            assert_eq!(usize::from(packed.row_in_cell), row);
+            for (column, digit) in packed.digits.into_iter().enumerate() {
+                let slot = production_trace_packed_digit_slot_v2(row, column).unwrap();
+                if slot.active {
+                    reconstructed[usize::from(slot.spec_index)][usize::from(slot.slack)] +=
+                        u64::from(digit) * slot.radix;
+                } else {
+                    assert_eq!(digit, 0);
+                }
+            }
+        }
+        for (index, spec) in specs.into_iter().enumerate() {
+            assert_eq!(reconstructed[index][0], values[spec.oracle]);
+            assert_eq!(reconstructed[index][1], spec.maximum - values[spec.oracle]);
+        }
+
+        assert_eq!(
+            production_trace_packed_digit_slot_v2(4, 0),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+        assert_eq!(
+            production_trace_packed_digit_slot_v2(0, 28),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+        assert_eq!(
+            production_trace_packed_row_v2(statement, &values[..11], 0),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+        assert_eq!(
+            production_trace_packed_row_v2(statement, &values, 32),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+        let mut oversized = values;
+        oversized[specs[0].oracle] = specs[0].maximum + 1;
+        assert_eq!(
+            production_trace_packed_row_v2(statement, &oversized, 0),
             Err(ProductionWhirCandidateError::InvalidRangeWitness)
         );
     }

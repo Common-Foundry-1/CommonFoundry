@@ -196,28 +196,31 @@ change disguised as completion.
 
 The next non-conjectural layout is now fixed in code. It keeps only the 12
 algebraic transition values in each core table (11 for initialization because
-its input is fixed), giving 47 semantic columns and 64 padded slots across all
-components. The 98 nibble witnesses per cell move into 49 active rows of a
-64-row auxiliary block with four witness columns: digit, slack digit, and two
-running accumulators. Initialization and bank auxiliary tables have exactly 25
-and 32 variables, so the largest remains within Goldilocks two-adicity. The
-canonical row generator, padding, lookup IDs, source bounds, accumulators,
-ordered core mapping, and layout digest are tested. A production-sized batch-
-STARK/LogUp proof that authenticates these rows is still required before this
-layout can mint a verified production trace.
+its input is fixed), giving 47 semantic columns. An earlier four-column,
+64-row transpose was rejected after exact FRI accounting: its bank trace had
+`n=32`, so log blowup four would require an impossible `n=36` Goldilocks LDE.
+The replacement packs two range specifications into each of four rows per
+cell, using 28 digit columns and seven table-multiplicity columns. Its bank
+trace is `n=28`; the FRI LDE is exactly `n=32`, within Goldilocks two-adicity.
+The canonical row generator, padding, lookup topology, source bounds, ordered
+core mapping, and V2 layout digest are tested. A production-sized batch-
+STARK/LogUp proof and aggregate payload measurement are still required before
+this layout can mint a verified production trace.
 
-A test-only eight-cell batch-STARK now proves that missing range handoff end to
-end. Eight independent LogUp buses bind each core source/slack pair to its final
-auxiliary accumulators, and two more bind the value and slack digits to a fixed
-`0..15` table. Splitting the relations keeps the maximum constraint degree at
-three: the pinned prototype has 52 constraints, one quotient split, 33 base-
-field lookup auxiliary openings at each evaluation row, and 128-bit computed
-list-decoding security with one FRI query above the measured minimum. Its
-single-pair LogUp challenge error is bounded below `2^-172`. Digit, slack,
-accumulator, core-source, padding, multiplicity, preprocessing, and degree-shape
-mutations are rejected. Production-sized table construction, the arithmetic
-core AIR, native encoding and aggregate payload measurement remain required;
-the fixture is evidence for the reduction, not an activation proof.
+A test-only 128-cell batch-STARK proves that packed range handoff and the
+transition arithmetic end to end. The core mask is rederived from the
+challenge polynomial, all seven ForgeMatrix transition equations are enforced,
+eight independent LogUp buses bind each core source/slack pair, and seven
+nibble buses range-check four packed digit columns apiece against the fixed
+`0..15` table. The pinned prototype has maximum degree six, 119 constraints,
+three quotient splits, 48 base-field lookup auxiliary openings at each local
+and next evaluation, and 128-bit computed list-decoding security with one FRI
+query above the measured minimum. Its shared-pair LogUp challenge error is
+bounded below `2^-163`. Every core column, active digit, padding,
+multiplicity, preprocessing, and degree-shape mutation is rejected.
+Production-sized component construction, fixed initialization-input and cross-
+component wiring, native encoding, and aggregate payload measurement remain
+required; the fixture proves the reduction, not activation readiness.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

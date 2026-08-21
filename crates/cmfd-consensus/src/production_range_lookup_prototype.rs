@@ -1,13 +1,16 @@
 //! Batch-STARK/LogUp prototype for the compact production range layout.
 //!
-//! This test-only argument proves the two relations required by the row-
-//! transposed range witness:
+//! This test-only argument proves the transition core together with the two
+//! relations required by the four-row packed range witness:
 //!
+//! - the mask equals the challenge-derived, verifier-fixed mask column;
+//! - all seven ForgeMatrix transition equations hold on each core row;
 //! - each core source value and its fixed slack equal the final auxiliary
 //!   accumulators carrying the same verifier-fixed lookup ID;
 //! - each value and slack digit belongs to the verifier-fixed `0..15` table.
 //!
-//! The prototype uses eight transition cells so adversarial tests remain fast.
+//! The prototype uses 128 transition cells so the pinned FRI configuration has
+//! a valid minimum domain while adversarial tests remain bounded.
 //! It is not a production proof type and does not activate the compact layout.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -18,6 +21,7 @@ use p3_batch_stark::symbolic::{
     get_constraint_layout, get_log_num_quotient_chunks, get_max_constraint_degree,
 };
 use p3_batch_stark::{ProverData, StarkInstance, prove_batch, verify_batch};
+use p3_field::integers::QuotientMap;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_fri::FriParameters;
 use p3_lookup::{Count, InteractionBuilder, LogUpGadget};
@@ -30,39 +34,46 @@ use crate::structured_blake3_narrow::{
     FRI_QUERIES, FRI_QUERY_POW_BITS, build_config,
 };
 use crate::{
-    PRODUCTION_TRACE_RANGE_ACTIVE_ROWS_PER_CELL, PRODUCTION_TRACE_RANGE_ROWS_PER_CELL,
-    STRUCTURED_TRANSITION_RANGE_SPEC_COUNT, STRUCTURED_TRANSITION_REGULAR_ORACLES,
-    StructuredTransitionStatement, production_trace_range_row_v1,
+    PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS, PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS,
+    PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP, PRODUCTION_TRACE_PACKED_ROWS_PER_CELL,
+    PRODUCTION_TRACE_PACKED_SPEC_ROWS, STRUCTURED_TRANSITION_RANGE_SPEC_COUNT,
+    STRUCTURED_TRANSITION_REGULAR_ORACLES, StructuredMaskPolynomial, StructuredTransitionStatement,
+    V2_TRANSITION_MODULUS, production_trace_packed_digit_slot_v2, production_trace_packed_row_v2,
     structured_transition_range_specs,
 };
 
-const CELLS: usize = 8;
-const TRACE_ROWS: usize = CELLS * PRODUCTION_TRACE_RANGE_ROWS_PER_CELL;
+const CELLS: usize = 128;
+const TRACE_ROWS: usize = CELLS * PRODUCTION_TRACE_PACKED_ROWS_PER_CELL;
 
 const CORE_START: usize = 0;
-const DIGIT: usize = CORE_START + STRUCTURED_TRANSITION_REGULAR_ORACLES;
-const SLACK_DIGIT: usize = DIGIT + 1;
-const VALUE_ACCUMULATOR: usize = SLACK_DIGIT + 1;
-const SLACK_ACCUMULATOR: usize = VALUE_ACCUMULATOR + 1;
-const VALUE_TABLE_MULTIPLICITY: usize = SLACK_ACCUMULATOR + 1;
-const SLACK_TABLE_MULTIPLICITY: usize = VALUE_TABLE_MULTIPLICITY + 1;
-const MAIN_WIDTH: usize = SLACK_TABLE_MULTIPLICITY + 1;
+const CORE_ACCUMULATOR: usize = CORE_START;
+const CORE_MASK: usize = CORE_START + 1;
+const CORE_ENCODED: usize = CORE_START + 2;
+const CORE_SQUARE_QUOTIENT: usize = CORE_START + 3;
+const CORE_SQUARE_REMAINDER: usize = CORE_START + 4;
+const CORE_CUBE_QUOTIENT: usize = CORE_START + 5;
+const CORE_CUBE_REMAINDER: usize = CORE_START + 6;
+const CORE_OUTPUT_QUOTIENT: usize = CORE_START + 7;
+const CORE_OUTPUT_REMAINDER: usize = CORE_START + 8;
+const CORE_NEGATIVE: usize = CORE_START + 9;
+const CORE_ACTIVATION: usize = CORE_START + 10;
+const CORE_SHIFTED_ACCUMULATOR: usize = CORE_START + 11;
+const DIGIT_START: usize = CORE_START + STRUCTURED_TRANSITION_REGULAR_ORACLES;
+const TABLE_MULTIPLICITY_START: usize = DIGIT_START + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
+const MAIN_WIDTH: usize = TABLE_MULTIPLICITY_START + PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS;
 
-const RANGE_ACTIVE: usize = 0;
-const RANGE_FIRST: usize = 1;
-const RANGE_LAST: usize = 2;
-const RANGE_LOOKUP_ID: usize = 3;
-const RANGE_MAXIMUM: usize = 4;
-const RANGE_RADIX: usize = 5;
-const CORE_ACTIVE: usize = 6;
-const CORE_LOOKUP_ID_START: usize = 7;
-const TABLE_ACTIVE: usize = 8;
-const TABLE_VALUE: usize = 9;
-const RANGE_LAST_SPEC_START: usize = 10;
-const PREPROCESSED_WIDTH: usize = RANGE_LAST_SPEC_START + STRUCTURED_TRANSITION_RANGE_SPEC_COUNT;
+const CORE_ACTIVE: usize = 0;
+const CELL_LOOKUP_ID_START: usize = 1;
+const FIXED_CORE_MASK: usize = 2;
+const TABLE_ACTIVE: usize = 3;
+const TABLE_VALUE: usize = 4;
+const SOURCE_ACTIVE_START: usize = 5;
+const DIGIT_ACTIVE_START: usize = SOURCE_ACTIVE_START + STRUCTURED_TRANSITION_RANGE_SPEC_COUNT;
+const PREPROCESSED_WIDTH: usize = DIGIT_ACTIVE_START + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
 
-const LOOKUP_COUNT: usize = STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + 2;
-const LOOKUP_MAX_COMBO: usize = 2;
+const LOOKUP_COUNT: usize =
+    STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS;
+const LOOKUP_MAX_COMBO: usize = PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP + 1;
 const LOOKUP_AUX_EXTENSION_WIDTH: usize = LOOKUP_COUNT + 1;
 const LOOKUP_AUX_BASE_WIDTH: usize = LOOKUP_AUX_EXTENSION_WIDTH * 3;
 
@@ -74,13 +85,22 @@ enum VerificationShapeError {
 #[derive(Clone, Debug)]
 struct ProductionRangeLookupAir {
     statement: StructuredTransitionStatement,
+    mask: StructuredMaskPolynomial,
     preprocessed_deltas: Vec<(usize, usize, u64)>,
 }
 
 impl ProductionRangeLookupAir {
     fn canonical() -> Self {
+        let statement = fixture_statement();
         Self {
-            statement: fixture_statement(),
+            statement,
+            mask: StructuredMaskPolynomial::from_challenge(
+                &[0x42; 32],
+                statement.layers,
+                statement.rows,
+                statement.cols,
+            )
+            .unwrap(),
             preprocessed_deltas: Vec::new(),
         }
     }
@@ -95,31 +115,30 @@ impl ProductionRangeLookupAir {
     }
 
     fn core_values(&self) -> [[u64; STRUCTURED_TRANSITION_REGULAR_ORACLES]; CELLS] {
-        let specs = structured_transition_range_specs(self.statement).unwrap();
         std::array::from_fn(|cell| {
-            let mut values = [0_u64; STRUCTURED_TRANSITION_REGULAR_ORACLES];
-            values[0] = 7 + cell as u64;
-            values[1] = 17 + cell as u64;
-            values[9] = 27 + cell as u64;
-            values[10] = 37 + cell as u64;
-            for (spec_index, spec) in specs.into_iter().enumerate() {
-                let seed = (cell as u64 + 1) * (spec_index as u64 + 3) * 0x1_2345;
-                values[spec.oracle] = seed % (spec.maximum + 1);
-            }
-            values
+            let mask = self
+                .mask
+                .value_at_boolean_index(self.statement, cell)
+                .unwrap();
+            let z = if cell % 2 == 0 {
+                -((cell as i64) + 1)
+            } else {
+                mask as i64 + (cell as i64) * 3
+            };
+            let accumulator = z - mask as i64;
+            transition_core_values(self.statement, accumulator, mask)
         })
     }
 
     fn valid_trace(&self) -> RowMajorMatrix<F> {
         let core_values = self.core_values();
         let mut values = F::zero_vec(TRACE_ROWS * MAIN_WIDTH);
-        let mut value_multiplicities = [0_u64; 16];
-        let mut slack_multiplicities = [0_u64; 16];
+        let mut multiplicities = [[0_u64; 16]; PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS];
 
         for row in 0..TRACE_ROWS {
-            let cell = row / PRODUCTION_TRACE_RANGE_ROWS_PER_CELL;
+            let cell = row / PRODUCTION_TRACE_PACKED_ROWS_PER_CELL;
             let local = &mut values[row * MAIN_WIDTH..(row + 1) * MAIN_WIDTH];
-            if row % PRODUCTION_TRACE_RANGE_ROWS_PER_CELL == 0 {
+            if row % PRODUCTION_TRACE_PACKED_ROWS_PER_CELL == 0 {
                 for (target, value) in local
                     [CORE_START..CORE_START + STRUCTURED_TRANSITION_REGULAR_ORACLES]
                     .iter_mut()
@@ -129,67 +148,65 @@ impl ProductionRangeLookupAir {
                 }
             }
 
-            let auxiliary =
-                production_trace_range_row_v1(self.statement, &core_values[cell], row as u64)
+            let packed =
+                production_trace_packed_row_v2(self.statement, &core_values[cell], row as u64)
                     .unwrap();
-            if auxiliary.active {
-                local[DIGIT] = F::from_u8(auxiliary.digit);
-                local[SLACK_DIGIT] = F::from_u8(auxiliary.slack_digit);
-                local[VALUE_ACCUMULATOR] = F::from_u64(auxiliary.value_accumulator);
-                local[SLACK_ACCUMULATOR] = F::from_u64(auxiliary.slack_accumulator);
-                value_multiplicities[usize::from(auxiliary.digit)] += 1;
-                slack_multiplicities[usize::from(auxiliary.slack_digit)] += 1;
+            for (column, digit) in packed.digits.into_iter().enumerate() {
+                local[DIGIT_START + column] = F::from_u8(digit);
+                let slot =
+                    production_trace_packed_digit_slot_v2(usize::from(packed.row_in_cell), column)
+                        .unwrap();
+                if slot.active {
+                    multiplicities[column / PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP]
+                        [usize::from(digit)] += 1;
+                }
             }
         }
         for row in 0..16 {
-            values[row * MAIN_WIDTH + VALUE_TABLE_MULTIPLICITY] =
-                F::from_u64(value_multiplicities[row]);
-            values[row * MAIN_WIDTH + SLACK_TABLE_MULTIPLICITY] =
-                F::from_u64(slack_multiplicities[row]);
+            for group in 0..PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS {
+                values[row * MAIN_WIDTH + TABLE_MULTIPLICITY_START + group] =
+                    F::from_u64(multiplicities[group][row]);
+            }
         }
 
         RowMajorMatrix::new(values, MAIN_WIDTH)
     }
 
     fn canonical_preprocessed(&self) -> RowMajorMatrix<F> {
-        let specs = structured_transition_range_specs(self.statement).unwrap();
         let mut values = F::zero_vec(TRACE_ROWS * PREPROCESSED_WIDTH);
 
         for row in 0..TRACE_ROWS {
-            let cell = row / PRODUCTION_TRACE_RANGE_ROWS_PER_CELL;
-            let slot = row % PRODUCTION_TRACE_RANGE_ROWS_PER_CELL;
+            let cell = row / PRODUCTION_TRACE_PACKED_ROWS_PER_CELL;
+            let row_in_cell = row % PRODUCTION_TRACE_PACKED_ROWS_PER_CELL;
             let local = &mut values[row * PREPROCESSED_WIDTH..(row + 1) * PREPROCESSED_WIDTH];
 
-            if slot == 0 {
+            local[CELL_LOOKUP_ID_START] =
+                F::from_u64((cell * STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + 1) as u64);
+            if row_in_cell == 0 {
                 local[CORE_ACTIVE] = F::ONE;
-                local[CORE_LOOKUP_ID_START] =
-                    F::from_u64((cell * STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + 1) as u64);
+                local[FIXED_CORE_MASK] = F::from_u64(
+                    self.mask
+                        .value_at_boolean_index(self.statement, cell)
+                        .unwrap(),
+                );
             }
             if row < 16 {
                 local[TABLE_ACTIVE] = F::ONE;
                 local[TABLE_VALUE] = F::from_u64(row as u64);
             }
-            if slot >= PRODUCTION_TRACE_RANGE_ACTIVE_ROWS_PER_CELL {
-                continue;
-            }
-
-            let mut offset = slot;
-            for (spec_index, spec) in specs.into_iter().enumerate() {
-                if offset < spec.digits {
-                    local[RANGE_ACTIVE] = F::ONE;
-                    local[RANGE_FIRST] = F::from_bool(offset == 0);
-                    local[RANGE_LAST] = F::from_bool(offset + 1 == spec.digits);
-                    local[RANGE_LOOKUP_ID] = F::from_u64(
-                        (cell * STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + spec_index + 1) as u64,
-                    );
-                    local[RANGE_MAXIMUM] = F::from_u64(spec.maximum);
-                    local[RANGE_RADIX] = F::from_u64(1_u64 << (4 * offset));
-                    if offset + 1 == spec.digits {
-                        local[RANGE_LAST_SPEC_START + spec_index] = F::ONE;
-                    }
-                    break;
+            for (spec_index, spec_row) in PRODUCTION_TRACE_PACKED_SPEC_ROWS.into_iter().enumerate()
+            {
+                if spec_row == row_in_cell {
+                    local[SOURCE_ACTIVE_START + spec_index] = F::ONE;
                 }
-                offset -= spec.digits;
+            }
+            for column in 0..PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS {
+                if production_trace_packed_digit_slot_v2(row_in_cell, column)
+                    .unwrap()
+                    .active
+                {
+                    local[DIGIT_ACTIVE_START + column] = F::ONE;
+                }
             }
         }
 
@@ -214,7 +231,7 @@ impl BaseAir<F> for ProductionRangeLookupAir {
     }
 
     fn main_next_row_columns(&self) -> Vec<usize> {
-        vec![DIGIT, SLACK_DIGIT, VALUE_ACCUMULATOR, SLACK_ACCUMULATOR]
+        Vec::new()
     }
 
     fn preprocessed_next_row_columns(&self) -> Vec<usize> {
@@ -222,7 +239,7 @@ impl BaseAir<F> for ProductionRangeLookupAir {
     }
 
     fn max_constraint_degree(&self) -> Option<usize> {
-        Some(3)
+        Some(6)
     }
 }
 
@@ -231,90 +248,111 @@ where
     AB: PermutationAirBuilder<F = F> + InteractionBuilder,
 {
     fn eval(&self, builder: &mut AB) {
-        let (local, next, prep) = {
+        let (local, prep) = {
             let main = builder.main();
             (
                 main.current_slice().to_vec(),
-                main.next_slice().to_vec(),
                 builder.preprocessed().current_slice().to_vec(),
             )
         };
 
-        let active: AB::Expr = prep[RANGE_ACTIVE].into();
-        let first: AB::Expr = prep[RANGE_FIRST].into();
-        let last: AB::Expr = prep[RANGE_LAST].into();
         let core_active: AB::Expr = prep[CORE_ACTIVE].into();
         let table_active: AB::Expr = prep[TABLE_ACTIVE].into();
 
-        builder.assert_bool(prep[RANGE_ACTIVE]);
-        builder.assert_bool(prep[RANGE_FIRST]);
-        builder.assert_bool(prep[RANGE_LAST]);
         builder.assert_bool(prep[CORE_ACTIVE]);
         builder.assert_bool(prep[TABLE_ACTIVE]);
-        builder.assert_zero(first.clone() * (AB::Expr::ONE - active.clone()));
-        builder.assert_zero(last.clone() * (AB::Expr::ONE - active.clone()));
-        let mut last_spec_sum = AB::Expr::ZERO;
-        for selector in &prep
-            [RANGE_LAST_SPEC_START..RANGE_LAST_SPEC_START + STRUCTURED_TRANSITION_RANGE_SPEC_COUNT]
+        for selector in
+            &prep[SOURCE_ACTIVE_START..SOURCE_ACTIVE_START + STRUCTURED_TRANSITION_RANGE_SPEC_COUNT]
         {
             builder.assert_bool(*selector);
-            last_spec_sum += *selector;
         }
-        builder.assert_eq(last_spec_sum, last.clone());
-
-        let range_inactive = AB::Expr::ONE - active.clone();
-        for column in [DIGIT, SLACK_DIGIT, VALUE_ACCUMULATOR, SLACK_ACCUMULATOR] {
+        for column in 0..PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS {
+            let active: AB::Expr = prep[DIGIT_ACTIVE_START + column].into();
+            builder.assert_bool(prep[DIGIT_ACTIVE_START + column]);
             builder
-                .when(range_inactive.clone())
-                .assert_zero(local[column]);
+                .when(AB::Expr::ONE - active)
+                .assert_zero(local[DIGIT_START + column]);
         }
         let core_inactive = AB::Expr::ONE - core_active.clone();
         for value in &local[CORE_START..CORE_START + STRUCTURED_TRANSITION_REGULAR_ORACLES] {
             builder.when(core_inactive.clone()).assert_zero(*value);
         }
+        let modulus = AB::Expr::from_u64(u64::from(V2_TRANSITION_MODULUS));
+        let encoded: AB::Expr = local[CORE_ENCODED].into();
+        let square_remainder: AB::Expr = local[CORE_SQUARE_REMAINDER].into();
+        let cube_remainder: AB::Expr = local[CORE_CUBE_REMAINDER].into();
+        builder
+            .when(core_active.clone())
+            .assert_eq(local[CORE_MASK], prep[FIXED_CORE_MASK]);
+        builder.when(core_active.clone()).assert_eq(
+            local[CORE_ENCODED],
+            AB::Expr::from(local[CORE_ACCUMULATOR])
+                + local[CORE_MASK]
+                + AB::Expr::from(local[CORE_NEGATIVE]) * modulus.clone(),
+        );
+        builder.when(core_active.clone()).assert_eq(
+            encoded.clone() * encoded.clone(),
+            AB::Expr::from(local[CORE_SQUARE_QUOTIENT]) * modulus.clone()
+                + square_remainder.clone(),
+        );
+        builder.when(core_active.clone()).assert_eq(
+            square_remainder * encoded,
+            AB::Expr::from(local[CORE_CUBE_QUOTIENT]) * modulus + cube_remainder.clone(),
+        );
+        builder.when(core_active.clone()).assert_eq(
+            cube_remainder,
+            AB::Expr::from(local[CORE_OUTPUT_QUOTIENT]) * F::from_u64(251)
+                + local[CORE_OUTPUT_REMAINDER],
+        );
+        builder.when(core_active.clone()).assert_eq(
+            local[CORE_ACTIVATION],
+            AB::Expr::from(local[CORE_OUTPUT_REMAINDER]) - F::from_u64(125),
+        );
+        builder
+            .when(core_active.clone())
+            .assert_bool(local[CORE_NEGATIVE]);
+        builder.when(core_active.clone()).assert_eq(
+            local[CORE_SHIFTED_ACCUMULATOR],
+            AB::Expr::from(local[CORE_ACCUMULATOR])
+                + AB::Expr::from_u64(self.statement.max_abs_accumulator),
+        );
         let table_inactive = AB::Expr::ONE - table_active;
-        builder
-            .when(table_inactive.clone())
-            .assert_zero(local[VALUE_TABLE_MULTIPLICITY]);
-        builder
-            .when(table_inactive)
-            .assert_zero(local[SLACK_TABLE_MULTIPLICITY]);
-
-        builder
-            .when(first.clone())
-            .assert_eq(local[VALUE_ACCUMULATOR], local[DIGIT]);
-        builder
-            .when(first.clone())
-            .assert_eq(local[SLACK_ACCUMULATOR], local[SLACK_DIGIT]);
-
-        let continuation = active.clone() - last.clone();
-        let next_radix = AB::Expr::from(prep[RANGE_RADIX]) * F::from_u64(16);
-        builder
-            .when_transition()
-            .when(continuation.clone())
-            .assert_eq(
-                next[VALUE_ACCUMULATOR],
-                AB::Expr::from(local[VALUE_ACCUMULATOR])
-                    + AB::Expr::from(next[DIGIT]) * next_radix.clone(),
-            );
-        builder.when_transition().when(continuation).assert_eq(
-            next[SLACK_ACCUMULATOR],
-            AB::Expr::from(local[SLACK_ACCUMULATOR])
-                + AB::Expr::from(next[SLACK_DIGIT]) * next_radix,
-        );
-        builder.when(last.clone()).assert_eq(
-            AB::Expr::from(local[VALUE_ACCUMULATOR]) + local[SLACK_ACCUMULATOR],
-            prep[RANGE_MAXIMUM],
-        );
+        for group in 0..PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS {
+            builder
+                .when(table_inactive.clone())
+                .assert_zero(local[TABLE_MULTIPLICITY_START + group]);
+        }
 
         let specs = structured_transition_range_specs(self.statement).unwrap();
         for (spec_index, spec) in specs.into_iter().enumerate() {
             let source: AB::Expr = local[CORE_START + spec.oracle].into();
-            let last_for_spec: AB::Expr = prep[RANGE_LAST_SPEC_START + spec_index].into();
+            let source_active: AB::Expr = prep[SOURCE_ACTIVE_START + spec_index].into();
+            let mut reconstructed = AB::Expr::ZERO;
+            let mut reconstructed_slack = AB::Expr::ZERO;
+            for column in 0..PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS {
+                let slot = production_trace_packed_digit_slot_v2(
+                    PRODUCTION_TRACE_PACKED_SPEC_ROWS[spec_index],
+                    column,
+                )
+                .unwrap();
+                if slot.active && usize::from(slot.spec_index) == spec_index {
+                    let term =
+                        AB::Expr::from(local[DIGIT_START + column]) * F::from_u64(slot.radix);
+                    if slot.slack {
+                        reconstructed_slack += term;
+                    } else {
+                        reconstructed += term;
+                    }
+                }
+            }
+            builder.when(source_active.clone()).assert_eq(
+                reconstructed.clone() + reconstructed_slack.clone(),
+                AB::Expr::from_u64(spec.maximum),
+            );
             builder.push_local_interaction([
                 (
                     vec![
-                        AB::Expr::from(prep[CORE_LOOKUP_ID_START])
+                        AB::Expr::from(prep[CELL_LOOKUP_ID_START])
                             + AB::Expr::from_u64(spec_index as u64),
                         source.clone(),
                         AB::Expr::from_u64(spec.maximum) - source,
@@ -323,39 +361,84 @@ where
                 ),
                 (
                     vec![
-                        prep[RANGE_LOOKUP_ID].into(),
-                        local[VALUE_ACCUMULATOR].into(),
-                        local[SLACK_ACCUMULATOR].into(),
+                        AB::Expr::from(prep[CELL_LOOKUP_ID_START])
+                            + AB::Expr::from_u64(spec_index as u64),
+                        reconstructed,
+                        reconstructed_slack,
                     ],
-                    Count::provided(-last_for_spec),
+                    Count::provided(-source_active),
                 ),
             ]);
         }
 
-        builder.push_local_interaction([
-            (vec![local[DIGIT].into()], Count::bounded(active.clone(), 1)),
-            (
+        for group in 0..PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS {
+            let start = group * PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP;
+            let mut terms = Vec::with_capacity(PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP + 1);
+            for column in start..start + PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP {
+                terms.push((
+                    vec![local[DIGIT_START + column].into()],
+                    Count::bounded(prep[DIGIT_ACTIVE_START + column].into(), 1),
+                ));
+            }
+            terms.push((
                 vec![prep[TABLE_VALUE].into()],
-                Count::provided(-AB::Expr::from(local[VALUE_TABLE_MULTIPLICITY])),
-            ),
-        ]);
-        builder.push_local_interaction([
-            (vec![local[SLACK_DIGIT].into()], Count::bounded(active, 1)),
-            (
-                vec![prep[TABLE_VALUE].into()],
-                Count::provided(-AB::Expr::from(local[SLACK_TABLE_MULTIPLICITY])),
-            ),
-        ]);
+                Count::provided(-AB::Expr::from(local[TABLE_MULTIPLICITY_START + group])),
+            ));
+            builder.push_local_interaction(terms);
+        }
     }
+}
+
+fn transition_core_values(
+    statement: StructuredTransitionStatement,
+    accumulator: i64,
+    mask: u64,
+) -> [u64; STRUCTURED_TRANSITION_REGULAR_ORACLES] {
+    let z = accumulator + mask as i64;
+    let modulus = u64::from(V2_TRANSITION_MODULUS);
+    assert!(z.unsigned_abs() < modulus);
+    assert!(accumulator.unsigned_abs() <= statement.max_abs_accumulator);
+    assert!(mask <= statement.max_mask);
+
+    let encoded = if z >= 0 {
+        z as u64
+    } else {
+        modulus - z.unsigned_abs()
+    };
+    let square = encoded * encoded;
+    let square_quotient = square / modulus;
+    let square_remainder = square % modulus;
+    let cube_product = square_remainder * encoded;
+    let cube_quotient = cube_product / modulus;
+    let cube_remainder = cube_product % modulus;
+    let output_quotient = cube_remainder / 251;
+    let output_remainder = cube_remainder % 251;
+    let activation = output_remainder as i64 - 125;
+    let shifted_accumulator = (accumulator + statement.max_abs_accumulator as i64) as u64;
+
+    [
+        F::from_int(accumulator).as_canonical_u64(),
+        mask,
+        encoded,
+        square_quotient,
+        square_remainder,
+        cube_quotient,
+        cube_remainder,
+        output_quotient,
+        output_remainder,
+        u64::from(z < 0),
+        F::from_int(activation).as_canonical_u64(),
+        shifted_accumulator,
+    ]
 }
 
 fn fixture_statement() -> StructuredTransitionStatement {
     StructuredTransitionStatement {
-        layers: 1,
-        rows: 2,
-        cols: 4,
-        max_abs_accumulator: 1_000,
-        max_mask: 100,
+        layers: 4,
+        rows: 4,
+        cols: 8,
+        max_abs_accumulator: 5_000,
+        max_mask: 5_000,
     }
 }
 
@@ -416,7 +499,7 @@ fn invalid_trace_is_rejected(air: ProductionRangeLookupAir, trace: RowMajorMatri
 }
 
 #[test]
-fn compact_range_batch_logup_proves_core_and_nibble_bindings() {
+fn compact_transition_batch_logup_proves_arithmetic_core_and_range_bindings() {
     let air = ProductionRangeLookupAir::canonical();
     let trace = air.valid_trace();
     let config = build_config();
@@ -456,14 +539,16 @@ fn compact_range_batch_logup_proves_core_and_nibble_bindings() {
 fn compact_range_witness_mutations_are_rejected() {
     let air = ProductionRangeLookupAir::canonical();
 
-    for (row, column) in [
-        (0, DIGIT),
-        (1, SLACK_DIGIT),
-        (6, VALUE_ACCUMULATOR),
-        (0, CORE_START + 2),
-        (PRODUCTION_TRACE_RANGE_ACTIVE_ROWS_PER_CELL, DIGIT),
-        (0, VALUE_TABLE_MULTIPLICITY),
-    ] {
+    let mut mutations = (CORE_START..CORE_START + STRUCTURED_TRANSITION_REGULAR_ORACLES)
+        .map(|column| (0, column))
+        .collect::<Vec<_>>();
+    mutations.extend([
+        (0, DIGIT_START),
+        (1, DIGIT_START + 7),
+        (2, DIGIT_START + 24),
+        (0, TABLE_MULTIPLICITY_START),
+    ]);
+    for (row, column) in mutations {
         let mut trace = air.valid_trace();
         trace.values[row * MAIN_WIDTH + column] += F::ONE;
         assert!(
@@ -487,11 +572,11 @@ fn verifier_rederives_compact_range_topology() {
     let proof = prove_batch(&config, &instances, &prover_data);
 
     for changed in [
-        air.with_preprocessed_delta(6, RANGE_LOOKUP_ID, 1),
-        air.with_preprocessed_delta(6, RANGE_MAXIMUM, 1),
-        air.with_preprocessed_delta(1, RANGE_RADIX, 1),
-        air.with_preprocessed_delta(49, RANGE_ACTIVE, 1),
+        air.with_preprocessed_delta(0, CELL_LOOKUP_ID_START, 1),
+        air.with_preprocessed_delta(1, SOURCE_ACTIVE_START, 1),
+        air.with_preprocessed_delta(2, DIGIT_ACTIVE_START + 24, 1),
         air.with_preprocessed_delta(3, TABLE_VALUE, 1),
+        air.with_preprocessed_delta(0, FIXED_CORE_MASK, 1),
     ] {
         let verifier_data = trusted_verifier_data(&config, &changed, &proof.degree_bits).unwrap();
         assert!(
@@ -516,11 +601,11 @@ fn compact_range_verifier_rejects_untrusted_degree_bits() {
         Err(VerificationShapeError::DegreeBits)
     ));
     assert!(matches!(
-        trusted_verifier_data(&config, &air, &[8]),
+        trusted_verifier_data(&config, &air, &[4]),
         Err(VerificationShapeError::DegreeBits)
     ));
     assert!(matches!(
-        trusted_verifier_data(&config, &air, &[9, 9]),
+        trusted_verifier_data(&config, &air, &[5, 5]),
         Err(VerificationShapeError::DegreeBits)
     ));
 }
@@ -546,14 +631,14 @@ fn compact_range_constraint_layout_is_pinned() {
         get_log_num_quotient_chunks::<F, EF, _, _>(&air, base_layout, lookups, 0, &gadget);
 
     assert_eq!(lookups.len(), LOOKUP_COUNT);
-    assert_eq!(lookups.total_count_weight(), 10);
-    assert_eq!(constraint_layout.base_indices.len(), 39);
-    assert_eq!(constraint_layout.ext_indices.len(), 13);
-    assert_eq!(constraint_layout.total_constraints(), 52);
-    assert_eq!(LOOKUP_AUX_EXTENSION_WIDTH, 11);
-    assert_eq!(LOOKUP_AUX_BASE_WIDTH, 33);
-    assert_eq!(max_degree, 3);
-    assert_eq!(log_chunks, 1);
+    assert_eq!(lookups.total_count_weight(), 36);
+    assert_eq!(constraint_layout.base_indices.len(), 101);
+    assert_eq!(constraint_layout.ext_indices.len(), 18);
+    assert_eq!(constraint_layout.total_constraints(), 119);
+    assert_eq!(LOOKUP_AUX_EXTENSION_WIDTH, 16);
+    assert_eq!(LOOKUP_AUX_BASE_WIDTH, 48);
+    assert_eq!(max_degree, 6);
+    assert_eq!(log_chunks, 3);
 
     let fri = FriParameters {
         log_blowup: FRI_LOG_BLOWUP,
@@ -589,41 +674,69 @@ fn compact_range_constraint_layout_is_pinned() {
 }
 
 #[test]
-fn compact_range_lookup_challenge_error_is_below_two_to_the_minus_172() {
-    // All ten buses share one (alpha, beta) pair. The maximum payload width is
+fn packed_transition_lookup_challenge_error_is_below_two_to_the_minus_163() {
+    // All fifteen buses share one (alpha, beta) pair. The maximum payload width is
     // three, so different bus prefixes are separated at beta^3. Count roots
     // for collisions within each bus, across buses, a false rational sum, and
     // every denominator evaluated by the prover.
     let core_terms = (CELLS * 2) as u64;
-    let nibble_terms = (CELLS * PRODUCTION_TRACE_RANGE_ACTIVE_ROWS_PER_CELL + 16) as u64;
+    let mut nibble_terms = [0_u64; PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS];
+    for row in 0..PRODUCTION_TRACE_PACKED_ROWS_PER_CELL {
+        for column in 0..PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS {
+            if production_trace_packed_digit_slot_v2(row, column)
+                .unwrap()
+                .active
+            {
+                nibble_terms[column / PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP] += CELLS as u64;
+            }
+        }
+    }
+    for terms in &mut nibble_terms {
+        *terms += 16;
+    }
+    assert_eq!(
+        nibble_terms,
+        [2_064, 2_064, 2_064, 2_064, 1_808, 1_552, 1_040]
+    );
     let choose_two = |n: u64| n * (n - 1) / 2;
 
     let within_core_roots =
         STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64 * 2 * choose_two(core_terms);
     let core_bus_pairs = choose_two(STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64);
     let cross_core_roots = 3 * core_bus_pairs * core_terms * core_terms;
+    let total_nibble_terms = nibble_terms.into_iter().sum::<u64>();
     let cross_core_nibble_roots =
-        3 * STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64 * 2 * core_terms * nibble_terms;
-    let cross_nibble_roots = 3 * nibble_terms * nibble_terms;
+        3 * STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64 * core_terms * total_nibble_terms;
+    let cross_nibble_roots = 3 * nibble_terms
+        .iter()
+        .enumerate()
+        .flat_map(|(left, terms)| {
+            nibble_terms[left + 1..]
+                .iter()
+                .map(move |other| terms * other)
+        })
+        .sum::<u64>();
     let beta_collision_roots =
         within_core_roots + cross_core_roots + cross_core_nibble_roots + cross_nibble_roots;
     let false_sum_roots =
-        STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64 * core_terms + 2 * nibble_terms - 1;
-    let denominator_roots = (LOOKUP_COUNT * 2 * TRACE_ROWS) as u64;
+        STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64 * core_terms + total_nibble_terms - 1;
+    let denominators_per_row = STRUCTURED_TRANSITION_RANGE_SPEC_COUNT * 2
+        + PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS * (PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP + 1);
+    let denominator_roots = (denominators_per_row * TRACE_ROWS) as u64;
     let lookup_error_roots = beta_collision_roots + false_sum_roots + denominator_roots;
 
-    assert_eq!(within_core_roots, 1_920);
-    assert_eq!(cross_core_roots, 21_504);
-    assert_eq!(cross_core_nibble_roots, 313_344);
-    assert_eq!(cross_nibble_roots, 499_392);
-    assert_eq!(beta_collision_roots, 836_160);
-    assert_eq!(false_sum_roots, 943);
-    assert_eq!(denominator_roots, 10_240);
-    assert_eq!(lookup_error_roots, 847_343);
+    assert_eq!(within_core_roots, 522_240);
+    assert_eq!(cross_core_roots, 5_505_024);
+    assert_eq!(cross_core_nibble_roots, 77_758_464);
+    assert_eq!(cross_nibble_roots, 204_562_176);
+    assert_eq!(beta_collision_roots, 288_347_904);
+    assert_eq!(false_sum_roots, 14_703);
+    assert_eq!(denominator_roots, 26_112);
+    assert_eq!(lookup_error_roots, 288_388_719);
 
     let field_order = U256::from(F::ORDER_U64);
     let extension_field_size = field_order * field_order * field_order;
     let numerator = U256::from(lookup_error_roots);
-    assert!(numerator << 172usize <= extension_field_size);
-    assert!(numerator << 173usize > extension_field_size);
+    assert!(numerator << 163usize <= extension_field_size);
+    assert!(numerator << 164usize > extension_field_size);
 }

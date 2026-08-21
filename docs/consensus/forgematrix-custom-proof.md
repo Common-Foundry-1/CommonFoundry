@@ -705,49 +705,47 @@ vendored WHIR constructor also now rejects a later folded domain above the
 base field's two-adicity instead of reaching an asserting field-generator call;
 the same guard covers the final fold.
 
-The implemented successor layout attacks width rather than soundness. Of the
-110 transition oracles, 12 carry the actual algebraic values and 98 are paired
-base-16 digits for eight value/slack range checks. Initialization retains 11
-core columns because its input is fixed; the three banks retain 12 each. The
-ordered production core is therefore 47 semantic columns padded to 64 slots.
-Range witnesses are transposed row-wise: each original cell owns 64 auxiliary
-rows, the first 49 enumerate digit counts `[7,7,7,7,7,5,2,7]`, and the final 15
-are canonical zero padding. Each active row carries only digit, slack digit,
-value accumulator, and slack accumulator. Its lookup ID, source oracle, bound,
-radix, and first/last selectors are verifier-fixed. The final accumulator row
-can consequently be linked to the corresponding core source through LogUp,
-while both digits query a fixed 16-value table.
+The implemented successor attacks width rather than soundness. Of the 110
+transition oracles, 12 carry algebraic values and 98 are paired base-16 digits
+for eight value/slack range checks. Initialization retains 11 core columns
+because its input is fixed; the three banks retain 12 each, for 47 ordered core
+columns. The first V1 range layout transposed each cell into 49 active plus 15
+zero rows with four witness columns. Exact FRI accounting rejected that layout:
+its bank trace is `n=32`, but log blowup four needs an `n=36` LDE, beyond the
+Goldilocks field. The V1 digest
+`6c7ccc9e63cae28907ae173372ddf33a3526f2ea2cc46b514510e4b330082769`
+therefore pins a no-go checkpoint, not an activation candidate.
 
-This makes the initialization auxiliary table `n=25` and each bank auxiliary
-table `n=32`, exactly at rather than above Goldilocks two-adicity. The code now
-generates every canonical row, rejects out-of-range sources and rows, pins the
-47-column order, and commits the complete structural plan under digest
-`6c7ccc9e63cae28907ae173372ddf33a3526f2ea2cc46b514510e4b330082769`.
-It is a layout and witness checkpoint, not yet a production-sized batch-
-STARK/LogUp verifier or evidence that the complete aggregate fits the network
-frame.
+V2 packs two range specifications into each of four rows per cell. It uses 28
+digit columns split among seven four-query nibble buses, plus seven fixed-table
+multiplicity columns. The active digit counts per row are `[28, 28, 24, 18]`;
+unused slots are canonical zero. Lookup IDs, source oracles, bounds, digits, and
+selectors are verifier-derived. Initialization is `n=21`, each bank is `n=28`,
+and the log-four LDE is exactly `n=32`. Canonical generation, reconstruction,
+padding, and column order are committed under digest
+`6d06a004f3e57dd57159e24f9c656a76bdcecf214f15bc07cdec5797392e272e`.
 
-The first batch-STARK reduction for this layout is now executable on an
-eight-cell, 512-row fixture. Each of the eight range specifications gets a
-separate local LogUp bus binding `(lookup ID, source, maximum - source)` from
-the core row to `(lookup ID, value accumulator, slack accumulator)` on the
-final digit row. Two additional buses bind value and slack digits separately
-to the verifier-fixed `0..15` table. Separate buses avoid the degree-ten
-quotient caused by multiplying nine denominators on one bus: the pinned AIR
-has maximum degree three, 52 total constraints, one quotient split, and 33
-base-field lookup auxiliary openings at each local and next evaluation.
+The first batch-STARK reduction for V2 is executable on a 128-cell, 512-row
+fixture. Its core mask is the verifier-fixed Boolean table of the
+challenge-derived mask polynomial, and the AIR enforces the encoded input,
+square reduction, cube reduction, output reduction, centered activation,
+negative-bit, and shifted-accumulator equations. Eight source buses bind every
+`(lookup ID, source, maximum - source)` tuple. Seven nibble buses each bind four
+packed digit columns to the verifier-fixed `0..15` table. The pinned AIR has
+maximum degree six, 119 constraints, three quotient splits, and 48 base-field
+lookup auxiliary openings at each local and next evaluation.
 
 With the configured 33 FRI queries, the library's executable estimator reports
 128 list-decoding bits; 32 is the first query count reaching that target. A
 separate root count covers same-bus and cross-bus beta collisions, false
 rational sums, and all denominators under the single shared `(alpha, beta)`
-pair. Its 847,343 roots over the cubic Goldilocks extension give an error below
-`2^-172`. Tests reject changed value/slack digits, accumulators, core sources,
-padding, table multiplicities, lookup IDs, bounds, radices, active rows, table
+pair. Its 288,388,719 roots over the cubic Goldilocks extension give an error
+below `2^-163`. Tests mutate every core column and reject changed arithmetic,
+mask, active digits, padding, table multiplicities, lookup topology, table
 values, and untrusted degree vectors. This remains test-only: the production
-argument still needs the transition arithmetic AIR, production-sized
-preprocessed-key construction, native canonical encoding, aggregate size and
-latency measurements, and verifier integration.
+argument still needs exact initialization input and cross-component wiring,
+production-sized preprocessed-key construction, native canonical encoding,
+aggregate size and latency measurements, and verifier integration.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

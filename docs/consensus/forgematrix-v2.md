@@ -487,22 +487,30 @@ only by accepting an explicit Reed-Solomon capacity/correlated-agreement
 conjecture, while the fitting JohnsonBound comparison requires 48-bit
 grinding. Both remain rejected activation paths.
 
-The current replacement layout removes the principal width source without
-weakening that policy. It retains 47 ordered core columns padded to 64 and
-transposes the 98 nibble witnesses into four-column auxiliary tables with 49
-active plus 15 zero rows per transition cell. The largest auxiliary bank is
-`n=32`, within Goldilocks two-adicity. Canonical row generation and layout
-binding are implemented; the production-sized cross-table LogUp interactions
-and batch-STARK payload still have to be proved and measured before activation.
+The replacement layout removes the principal width source without weakening
+that policy. It retains 47 ordered core columns. The first four-column,
+64-row transpose is now an explicit rejected V1: its raw bank trace reaches
+`n=32`, but FRI log blowup four requires an `n=36` LDE, beyond Goldilocks
+two-adicity. V2 instead packs two range specifications into each of four rows
+per cell. Twenty-eight digit columns are divided among seven four-query nibble
+buses, with seven table-multiplicity columns. The bank trace is `n=28` and its
+FRI LDE is exactly `n=32`. Canonical row generation and layout binding under
+digest `6d06a004f3e57dd57159e24f9c656a76bdcecf214f15bc07cdec5797392e272e`
+are implemented; the production-sized payload still has to be proved and
+measured before activation.
 
-The cross-table range reduction now has a bounded test-only proof. On eight
-cells, ten narrow LogUp buses bind all eight core source/slack pairs to their
-final row accumulators and both digit columns to the fixed nibble table. The
-AIR stays at degree three with 52 constraints, reaches the configured 128-bit
-list-decoding target, and bounds lookup-challenge error below `2^-172`.
-Adversarial witness, topology, table, and degree mutations fail. This validates
-the range-check reduction only; the production arithmetic AIR, full geometry,
-canonical codec, payload measurement, and aggregate verifier remain gates.
+The transition and range reduction now has a bounded test-only proof. On 128
+cells, the AIR binds the challenge-derived mask and enforces all seven
+transition equations. Eight source buses bind every core source/slack pair,
+and seven nibble buses range-check four packed digit columns apiece against the
+fixed table. The pinned proof has maximum degree six, 119 constraints, three
+quotient splits, and 48 base-field lookup auxiliary openings at each local and
+next evaluation. It reaches the configured 128-bit list-decoding target with
+33 FRI queries, one above the measured minimum, and bounds the shared-pair
+lookup-challenge error below `2^-163` from 288,388,719 counted bad roots. Every
+core column plus adversarial packed-witness, topology, table, and degree
+mutation fails. Production component wiring, full geometry, canonical codec,
+payload measurement, and aggregate verification remain gates.
 
 Implementing any subset of those components must not make the v2 profile
 activatable. Activation is a separate consensus change after every gate above

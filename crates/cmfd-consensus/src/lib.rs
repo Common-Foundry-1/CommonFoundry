@@ -53,9 +53,12 @@ pub use forgematrix_v2::{
 pub use model_bank::{
     BuiltModelBankFixture, MAX_MODEL_BYTE, MAX_MODEL_PCS_WEIGHT_BANKS,
     MAX_SMALL_FIXTURE_PAYLOAD_BYTES, MODEL_BANK_FORMAT_VERSION, MODEL_BANK_HEADER_BYTES,
-    MODEL_BANK_MAGIC, MODEL_PCS_BASE_INPUT_AXIS_ORDER, MODEL_PCS_IDENTITY_VERSION,
-    MODEL_PCS_VALUE_ENCODING, MODEL_PCS_WEIGHT_BANK_AXIS_ORDER, ModelBankError, ModelBankManifest,
-    ModelPcsIdentity, SmallModelBankFixture, build_small_model_bank, verify_model_bank,
+    MODEL_BANK_MAGIC, MODEL_FIELD_CHUNK_ELEMENTS, MODEL_PCS_BASE_INPUT_AXIS_ORDER,
+    MODEL_PCS_IDENTITY_VERSION, MODEL_PCS_VALUE_ENCODING, MODEL_PCS_WEIGHT_BANK_AXIS_ORDER,
+    ModelBankError, ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk,
+    ModelPcsIdentity, ModelPcsRole, ModelPcsRoleLayout, SmallModelBankFixture,
+    StagedModelFieldSink, VerifiedModelBankReceipt, build_small_model_bank, verify_model_bank,
+    verify_model_bank_into_staged_field_sink,
 };
 pub use network::{
     BlockValidationContext, CONSENSUS_SIGNATURE_BYTES, FixedRewardDestinations,

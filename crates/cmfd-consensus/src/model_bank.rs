@@ -12,7 +12,7 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::forgematrix_v2::PRODUCTION_V2_BANKS;
+use crate::{forgematrix_v2::PRODUCTION_V2_BANKS, sumcheck::GOLDILOCKS_MODULUS};
 
 pub const MODEL_BANK_MAGIC: [u8; 8] = *b"CMFDBNK2";
 pub const MODEL_BANK_FORMAT_VERSION: u32 = 2;
@@ -22,6 +22,9 @@ pub const MAX_MODEL_BYTE: u8 = 250;
 /// The writer is intentionally limited to test/research fixtures. Production
 /// banks must be produced by a separately reviewed, reproducible ceremony.
 pub const MAX_SMALL_FIXTURE_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum number of canonical Goldilocks elements exposed to a staged sink
+/// in one call. The reusable field buffer is therefore bounded at 64 KiB.
+pub const MODEL_FIELD_CHUNK_ELEMENTS: usize = 8 * 1024;
 
 /// Canonical encoding revision for the model PCS identity.
 pub const MODEL_PCS_IDENTITY_VERSION: u32 = 1;
@@ -44,6 +47,86 @@ const MANIFEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MANIFEST";
 const MODEL_PCS_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-PCS-COMMITMENTS/V1";
 const MODEL_PCS_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-PCS-IDENTITY/V1";
 const VERIFY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Consensus-significant partition of the model layers into ordered PCS roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPcsRoleLayout {
+    layers_per_bank: u32,
+    weight_bank_count: u32,
+}
+
+impl ModelPcsRoleLayout {
+    pub const fn layers_per_bank(&self) -> u32 {
+        self.layers_per_bank
+    }
+
+    pub const fn weight_bank_count(&self) -> u32 {
+        self.weight_bank_count
+    }
+}
+
+/// Fixed-model role receiving a contiguous canonical field-element stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModelPcsRole {
+    BaseInput,
+    WeightBank { index: u32 },
+}
+
+/// One bounded, ordered slice of a fixed-model polynomial.
+///
+/// `role_offset` is measured in field elements. Chunks for each role are
+/// contiguous, begin at zero, and end exactly at `role_elements`.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelFieldChunk<'a> {
+    pub role: ModelPcsRole,
+    pub role_offset: u64,
+    pub role_elements: u64,
+    pub elements: &'a [u64],
+}
+
+/// Capability passed only after the complete bank has authenticated on the
+/// same reader that supplied the staged field chunks.
+///
+/// Its fields are private so callers cannot forge the publication barrier.
+#[derive(Debug)]
+pub struct VerifiedModelBankReceipt {
+    manifest: ModelBankManifest,
+    layout: ModelPcsRoleLayout,
+    identity: ModelPcsIdentity,
+}
+
+impl VerifiedModelBankReceipt {
+    pub const fn manifest(&self) -> &ModelBankManifest {
+        &self.manifest
+    }
+
+    pub const fn layout(&self) -> ModelPcsRoleLayout {
+        self.layout
+    }
+
+    pub const fn identity(&self) -> &ModelPcsIdentity {
+        &self.identity
+    }
+}
+
+/// Transactional consumer for canonical model-field chunks.
+///
+/// `write_chunk` must only stage provisional state. The sink is owned by the
+/// streaming verifier and is dropped on every read, authentication, encoding,
+/// or sink failure. Implementations must not publish their result from `Drop`;
+/// publication belongs in `finish_verified`, which is called only after the
+/// trusted roots, exact length, and EOF have all been checked.
+pub trait StagedModelFieldSink: Sized {
+    type Error: std::error::Error + 'static;
+    type Output;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error>;
+
+    fn finish_verified(
+        self,
+        receipt: VerifiedModelBankReceipt,
+    ) -> Result<Self::Output, Self::Error>;
+}
 
 /// Canonical identity of the fixed model polynomials used by the structured
 /// proof research path.
@@ -318,6 +401,17 @@ pub enum ModelBankError {
     Io(#[from] io::Error),
 }
 
+#[derive(Debug, Error)]
+pub enum ModelBankFieldStreamError<E>
+where
+    E: std::error::Error + 'static,
+{
+    #[error("model-bank verification failed: {0}")]
+    ModelBank(#[from] ModelBankError),
+    #[error("staged model-field sink failed: {0}")]
+    Sink(#[source] E),
+}
+
 /// Explicit bytes for a small test/research model bank.
 ///
 /// `base_input` is `batch * dimension` row-major bytes. Every entry in
@@ -425,52 +519,110 @@ pub fn build_small_model_bank(
 /// Verifies a bank against a trusted, consensus-selected manifest while using
 /// at most a fixed 64 KiB payload buffer.
 pub fn verify_model_bank<R: Read>(
-    mut reader: R,
+    reader: R,
     expected: &ModelBankManifest,
 ) -> Result<(), ModelBankError> {
-    expected.validate_shape()?;
-    let actual = read_header(&mut reader)?;
-    compare_manifests(expected, &actual)?;
+    verify_model_bank_with_consumer(reader, expected, |_| Ok::<(), ModelBankError>(())).map_err(
+        |error| match error {
+            ModelBankConsumerError::ModelBank(error) | ModelBankConsumerError::Consumer(error) => {
+                error
+            }
+        },
+    )
+}
 
-    let mut raw_hasher = Hasher::new();
-    let mut payload_offset = 0_u64;
-    stream_section(
-        &mut reader,
-        actual.base_input_bytes,
-        &mut payload_offset,
-        &mut raw_hasher,
-        None,
-    )?;
+/// Verifies and field-encodes one canonical bank on a single reader while
+/// feeding an owned, provisional sink in exact PCS role order.
+///
+/// The current model-bank format authenticates the complete payload, not each
+/// prefix. Consequently, every `write_chunk` call is provisional and
+/// `finish_verified` is the only publication point. The full trusted identity
+/// pins the PCS suite, commitment root, and otherwise ambiguous bank partition
+/// before the reader is touched.
+pub fn verify_model_bank_into_staged_field_sink<R, S>(
+    reader: R,
+    expected: &ModelBankManifest,
+    trusted_identity: &ModelPcsIdentity,
+    mut sink: S,
+) -> Result<S::Output, ModelBankFieldStreamError<S::Error>>
+where
+    R: Read,
+    S: StagedModelFieldSink,
+{
+    expected.verify_pcs_identity(trusted_identity)?;
+    let layout = ModelPcsRoleLayout {
+        layers_per_bank: trusted_identity.layers_per_bank,
+        weight_bank_count: u32::try_from(trusted_identity.weight_bank_commitments.len())
+            .map_err(|_| ModelBankError::InvalidPcsBankCount)?,
+    };
+    let bank_elements = u64::from(layout.layers_per_bank)
+        .checked_mul(expected.bytes_per_layer)
+        .ok_or(ModelBankError::SizeOverflow)?;
+    let mut field_elements = Vec::with_capacity(MODEL_FIELD_CHUNK_ELEMENTS);
 
-    let mut layer_aggregate = start_layer_aggregate(actual.layers);
-    for layer_index in 0..actual.layers {
-        let mut layer_hasher = Hasher::new();
-        stream_section(
-            &mut reader,
-            actual.bytes_per_layer,
-            &mut payload_offset,
-            &mut raw_hasher,
-            Some(&mut layer_hasher),
-        )?;
-        add_layer_root(&mut layer_aggregate, layer_index, layer_hasher.finalize());
+    let verified = verify_model_bank_with_consumer(reader, expected, |chunk| {
+        let (role, role_offset, role_elements) = match chunk.section {
+            ModelBankByteSection::BaseInput => (
+                ModelPcsRole::BaseInput,
+                chunk.section_offset,
+                expected.base_input_bytes,
+            ),
+            ModelBankByteSection::Layer { index } => {
+                let bank_index = index / layout.layers_per_bank;
+                let layer_within_bank = index % layout.layers_per_bank;
+                let layer_offset = u64::from(layer_within_bank)
+                    .checked_mul(expected.bytes_per_layer)
+                    .and_then(|offset| offset.checked_add(chunk.section_offset))
+                    .ok_or(ModelBankFieldStreamError::ModelBank(
+                        ModelBankError::SizeOverflow,
+                    ))?;
+                (
+                    ModelPcsRole::WeightBank { index: bank_index },
+                    layer_offset,
+                    bank_elements,
+                )
+            }
+        };
+
+        for (subchunk_index, bytes) in chunk.bytes.chunks(MODEL_FIELD_CHUNK_ELEMENTS).enumerate() {
+            field_elements.clear();
+            field_elements.extend(bytes.iter().copied().map(centered_model_field_element));
+            let subchunk_offset = u64::try_from(
+                subchunk_index
+                    .checked_mul(MODEL_FIELD_CHUNK_ELEMENTS)
+                    .ok_or(ModelBankFieldStreamError::ModelBank(
+                        ModelBankError::SizeOverflow,
+                    ))?,
+            )
+            .map_err(|_| ModelBankFieldStreamError::ModelBank(ModelBankError::SizeOverflow))?;
+            let offset = role_offset.checked_add(subchunk_offset).ok_or(
+                ModelBankFieldStreamError::ModelBank(ModelBankError::SizeOverflow),
+            )?;
+            sink.write_chunk(ModelFieldChunk {
+                role,
+                role_offset: offset,
+                role_elements,
+                elements: &field_elements,
+            })
+            .map_err(ModelBankFieldStreamError::Sink)?;
+        }
+        Ok(())
+    });
+
+    match verified {
+        Ok(()) => {}
+        Err(ModelBankConsumerError::ModelBank(error)) => {
+            return Err(ModelBankFieldStreamError::ModelBank(error));
+        }
+        Err(ModelBankConsumerError::Consumer(error)) => return Err(error),
     }
 
-    if payload_offset != actual.payload_bytes {
-        return Err(ModelBankError::NonCanonicalLengths);
-    }
-    if *raw_hasher.finalize().as_bytes() != actual.raw_blake3_root {
-        return Err(ModelBankError::RawRootMismatch);
-    }
-    if *layer_aggregate.finalize().as_bytes() != actual.layer_roots_aggregate {
-        return Err(ModelBankError::LayerRootsAggregateMismatch);
-    }
-
-    let mut trailing = [0_u8; 1];
-    match reader.read(&mut trailing) {
-        Ok(0) => Ok(()),
-        Ok(_) => Err(ModelBankError::TrailingBytes),
-        Err(error) => Err(ModelBankError::Io(error)),
-    }
+    sink.finish_verified(VerifiedModelBankReceipt {
+        manifest: *expected,
+        layout,
+        identity: trusted_identity.clone(),
+    })
+    .map_err(ModelBankFieldStreamError::Sink)
 }
 
 fn compare_manifests(
@@ -489,30 +641,149 @@ fn compare_manifests(
     Ok(())
 }
 
-fn stream_section<R: Read>(
+#[derive(Debug, Clone, Copy)]
+enum ModelBankByteSection {
+    BaseInput,
+    Layer { index: u32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelBankByteChunk<'a> {
+    section: ModelBankByteSection,
+    section_offset: u64,
+    bytes: &'a [u8],
+}
+
+#[derive(Debug)]
+enum ModelBankConsumerError<E> {
+    ModelBank(ModelBankError),
+    Consumer(E),
+}
+
+fn verify_model_bank_with_consumer<R, F, E>(
+    mut reader: R,
+    expected: &ModelBankManifest,
+    mut consume: F,
+) -> Result<(), ModelBankConsumerError<E>>
+where
+    R: Read,
+    F: FnMut(ModelBankByteChunk<'_>) -> Result<(), E>,
+{
+    expected
+        .validate_shape()
+        .map_err(ModelBankConsumerError::ModelBank)?;
+    let actual = read_header(&mut reader).map_err(ModelBankConsumerError::ModelBank)?;
+    compare_manifests(expected, &actual).map_err(ModelBankConsumerError::ModelBank)?;
+
+    let mut raw_hasher = Hasher::new();
+    let mut payload_offset = 0_u64;
+    stream_section(
+        &mut reader,
+        actual.base_input_bytes,
+        &mut payload_offset,
+        &mut raw_hasher,
+        None,
+        ModelBankByteSection::BaseInput,
+        &mut consume,
+    )?;
+
+    let mut layer_aggregate = start_layer_aggregate(actual.layers);
+    for layer_index in 0..actual.layers {
+        let mut layer_hasher = Hasher::new();
+        stream_section(
+            &mut reader,
+            actual.bytes_per_layer,
+            &mut payload_offset,
+            &mut raw_hasher,
+            Some(&mut layer_hasher),
+            ModelBankByteSection::Layer { index: layer_index },
+            &mut consume,
+        )?;
+        add_layer_root(&mut layer_aggregate, layer_index, layer_hasher.finalize());
+    }
+
+    if payload_offset != actual.payload_bytes {
+        return Err(ModelBankConsumerError::ModelBank(
+            ModelBankError::NonCanonicalLengths,
+        ));
+    }
+    if *raw_hasher.finalize().as_bytes() != actual.raw_blake3_root {
+        return Err(ModelBankConsumerError::ModelBank(
+            ModelBankError::RawRootMismatch,
+        ));
+    }
+    if *layer_aggregate.finalize().as_bytes() != actual.layer_roots_aggregate {
+        return Err(ModelBankConsumerError::ModelBank(
+            ModelBankError::LayerRootsAggregateMismatch,
+        ));
+    }
+
+    let mut trailing = [0_u8; 1];
+    match reader.read(&mut trailing) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(ModelBankConsumerError::ModelBank(
+            ModelBankError::TrailingBytes,
+        )),
+        Err(error) => Err(ModelBankConsumerError::ModelBank(ModelBankError::Io(error))),
+    }
+}
+
+fn stream_section<R, F, E>(
     reader: &mut R,
     bytes: u64,
     payload_offset: &mut u64,
     raw_hasher: &mut Hasher,
     mut section_hasher: Option<&mut Hasher>,
-) -> Result<(), ModelBankError> {
+    section: ModelBankByteSection,
+    consume: &mut F,
+) -> Result<(), ModelBankConsumerError<E>>
+where
+    R: Read,
+    F: FnMut(ModelBankByteChunk<'_>) -> Result<(), E>,
+{
     let mut remaining = bytes;
+    let mut section_offset = 0_u64;
     let mut buffer = [0_u8; VERIFY_CHUNK_BYTES];
     while remaining != 0 {
         let take = usize::try_from(remaining.min(VERIFY_CHUNK_BYTES as u64))
-            .map_err(|_| ModelBankError::SizeOverflow)?;
-        read_exact(reader, &mut buffer[..take])?;
-        validate_values(&buffer[..take], *payload_offset)?;
+            .map_err(|_| ModelBankConsumerError::ModelBank(ModelBankError::SizeOverflow))?;
+        read_exact(reader, &mut buffer[..take]).map_err(ModelBankConsumerError::ModelBank)?;
+        validate_values(&buffer[..take], *payload_offset)
+            .map_err(ModelBankConsumerError::ModelBank)?;
         raw_hasher.update(&buffer[..take]);
         if let Some(hasher) = section_hasher.as_deref_mut() {
             hasher.update(&buffer[..take]);
         }
-        *payload_offset = payload_offset
-            .checked_add(take as u64)
-            .ok_or(ModelBankError::SizeOverflow)?;
+        consume(ModelBankByteChunk {
+            section,
+            section_offset,
+            bytes: &buffer[..take],
+        })
+        .map_err(ModelBankConsumerError::Consumer)?;
+        *payload_offset =
+            payload_offset
+                .checked_add(take as u64)
+                .ok_or(ModelBankConsumerError::ModelBank(
+                    ModelBankError::SizeOverflow,
+                ))?;
+        section_offset =
+            section_offset
+                .checked_add(take as u64)
+                .ok_or(ModelBankConsumerError::ModelBank(
+                    ModelBankError::SizeOverflow,
+                ))?;
         remaining -= take as u64;
     }
     Ok(())
+}
+
+pub(crate) fn centered_model_field_element(value: u8) -> u64 {
+    debug_assert!(value <= MAX_MODEL_BYTE);
+    if value >= 125 {
+        u64::from(value - 125)
+    } else {
+        GOLDILOCKS_MODULUS - u64::from(125 - value)
+    }
 }
 
 fn validate_values(bytes: &[u8], start_offset: u64) -> Result<(), ModelBankError> {
@@ -646,7 +917,12 @@ fn read_exact<R: Read>(reader: &mut R, bytes: &mut [u8]) -> Result<(), ModelBank
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        cell::{Cell, RefCell},
+        fmt,
+        io::{Cursor, Read},
+        rc::Rc,
+    };
 
     use super::*;
     use crate::forgematrix_v2::{
@@ -658,6 +934,148 @@ mod tests {
     const BASE_LENGTH_OFFSET: usize = 32;
     const PCS_PARAMETER_OFFSET: usize = 120;
     const PCS_COMMITMENT_OFFSET: usize = 152;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedFieldChunk {
+        role: ModelPcsRole,
+        role_offset: u64,
+        role_elements: u64,
+        elements: Vec<u64>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSinkState {
+        chunks: Vec<RecordedFieldChunk>,
+        finish_attempts: usize,
+        published: bool,
+        drops: usize,
+        receipt_manifest: Option<ModelBankManifest>,
+        receipt_layout: Option<ModelPcsRoleLayout>,
+        receipt_identity: Option<ModelPcsIdentity>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RecordingSinkError {
+        Write,
+        Finish,
+    }
+
+    impl fmt::Display for RecordingSinkError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Write => formatter.write_str("injected staged write failure"),
+                Self::Finish => formatter.write_str("injected staged finish failure"),
+            }
+        }
+    }
+
+    impl std::error::Error for RecordingSinkError {}
+
+    struct RecordingSink {
+        state: Rc<RefCell<RecordingSinkState>>,
+        fail_write_at: Option<usize>,
+        fail_finish: bool,
+        writes: usize,
+    }
+
+    impl RecordingSink {
+        fn new(state: Rc<RefCell<RecordingSinkState>>) -> Self {
+            Self {
+                state,
+                fail_write_at: None,
+                fail_finish: false,
+                writes: 0,
+            }
+        }
+    }
+
+    impl Drop for RecordingSink {
+        fn drop(&mut self) {
+            self.state.borrow_mut().drops += 1;
+        }
+    }
+
+    impl StagedModelFieldSink for RecordingSink {
+        type Error = RecordingSinkError;
+        type Output = ();
+
+        fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+            if self.fail_write_at == Some(self.writes) {
+                return Err(RecordingSinkError::Write);
+            }
+            self.writes += 1;
+            self.state.borrow_mut().chunks.push(RecordedFieldChunk {
+                role: chunk.role,
+                role_offset: chunk.role_offset,
+                role_elements: chunk.role_elements,
+                elements: chunk.elements.to_vec(),
+            });
+            Ok(())
+        }
+
+        fn finish_verified(
+            self,
+            receipt: VerifiedModelBankReceipt,
+        ) -> Result<Self::Output, Self::Error> {
+            let mut state = self.state.borrow_mut();
+            state.finish_attempts += 1;
+            if self.fail_finish {
+                return Err(RecordingSinkError::Finish);
+            }
+            state.published = true;
+            state.receipt_manifest = Some(*receipt.manifest());
+            state.receipt_layout = Some(receipt.layout());
+            state.receipt_identity = Some(receipt.identity().clone());
+            Ok(())
+        }
+    }
+
+    fn staged_fixture() -> (BuiltModelBankFixture, ModelPcsIdentity) {
+        let base = [0, 125, 250, 126];
+        let layers = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ];
+        let layer_slices = layers
+            .iter()
+            .map(|layer| layer.as_slice())
+            .collect::<Vec<_>>();
+        let suite = [0x51; 32];
+        let provisional = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: [0x52; 32],
+        })
+        .unwrap();
+        let identity = ModelPcsIdentity {
+            model_version: 2,
+            batch: 2,
+            dimension: 2,
+            layers_per_bank: 2,
+            model_byte_root: provisional.manifest.raw_blake3_root,
+            pcs_suite_parameter_digest: suite,
+            base_input_commitment: [0x61; 32],
+            weight_bank_commitments: vec![[0x71; 32], [0x72; 32]],
+        };
+        let built = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        })
+        .unwrap();
+        built.manifest.verify_pcs_identity(&identity).unwrap();
+        (built, identity)
+    }
 
     fn fixture() -> BuiltModelBankFixture {
         let base = [0, 1, 2, 3, 4, 5];
@@ -896,6 +1314,372 @@ mod tests {
             manifest.verify_pcs_identity(&reordered),
             Err(ModelBankError::PcsCommitmentRootMismatch)
         ));
+    }
+
+    #[test]
+    fn staged_field_stream_preserves_canonical_role_axis_and_encoding_order() {
+        let (built, identity) = staged_fixture();
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+
+        verify_model_bank_into_staged_field_sink(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            &identity,
+            RecordingSink::new(Rc::clone(&state)),
+        )
+        .unwrap();
+
+        let state = state.borrow();
+        assert!(state.published);
+        assert_eq!(state.finish_attempts, 1);
+        assert_eq!(state.drops, 1);
+        assert_eq!(state.receipt_manifest, Some(built.manifest));
+        assert_eq!(state.receipt_identity.as_ref(), Some(&identity));
+        let layout = state.receipt_layout.unwrap();
+        assert_eq!(layout.layers_per_bank(), 2);
+        assert_eq!(layout.weight_bank_count(), 2);
+
+        assert_eq!(state.chunks.len(), 5);
+        assert_eq!(state.chunks[0].role, ModelPcsRole::BaseInput);
+        assert_eq!(state.chunks[0].role_offset, 0);
+        assert_eq!(state.chunks[0].role_elements, 4);
+        assert_eq!(
+            state.chunks[0].elements,
+            [GOLDILOCKS_MODULUS - 125, 0, 125, 1]
+        );
+        assert_eq!(
+            state.chunks[1..]
+                .iter()
+                .map(|chunk| (chunk.role, chunk.role_offset, chunk.role_elements))
+                .collect::<Vec<_>>(),
+            [
+                (ModelPcsRole::WeightBank { index: 0 }, 0, 8),
+                (ModelPcsRole::WeightBank { index: 0 }, 4, 8),
+                (ModelPcsRole::WeightBank { index: 1 }, 0, 8),
+                (ModelPcsRole::WeightBank { index: 1 }, 4, 8),
+            ]
+        );
+        let weights = state.chunks[1..]
+            .iter()
+            .flat_map(|chunk| chunk.elements.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            weights,
+            (1_u64..=16)
+                .map(|value| GOLDILOCKS_MODULUS - (125 - value))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn staged_field_stream_is_one_pass_and_bounds_each_field_chunk() {
+        struct CountingReader {
+            cursor: Cursor<Vec<u8>>,
+            bytes_read: Rc<Cell<usize>>,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.cursor.read(buffer)?;
+                self.bytes_read.set(self.bytes_read.get() + read);
+                Ok(read)
+            }
+        }
+
+        let dimension = 128_u32;
+        let batch = 64_u32;
+        let base = (0..usize::try_from(dimension * batch).unwrap())
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let layer = (0..usize::try_from(dimension * dimension).unwrap())
+            .map(|index| ((index + 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let suite = [0x31; 32];
+        let provisional = build_small_model_bank(SmallModelBankFixture {
+            model_version: 3,
+            dimension,
+            batch,
+            base_input: &base,
+            layers: &[&layer],
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: [0x32; 32],
+        })
+        .unwrap();
+        let identity = ModelPcsIdentity {
+            model_version: 3,
+            batch,
+            dimension,
+            layers_per_bank: 1,
+            model_byte_root: provisional.manifest.raw_blake3_root,
+            pcs_suite_parameter_digest: suite,
+            base_input_commitment: [0x33; 32],
+            weight_bank_commitments: vec![[0x34; 32]],
+        };
+        let built = build_small_model_bank(SmallModelBankFixture {
+            model_version: 3,
+            dimension,
+            batch,
+            base_input: &base,
+            layers: &[&layer],
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        })
+        .unwrap();
+        let bytes_read = Rc::new(Cell::new(0));
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+
+        verify_model_bank_into_staged_field_sink(
+            CountingReader {
+                cursor: Cursor::new(built.bytes.clone()),
+                bytes_read: Rc::clone(&bytes_read),
+            },
+            &built.manifest,
+            &identity,
+            RecordingSink::new(Rc::clone(&state)),
+        )
+        .unwrap();
+
+        assert_eq!(bytes_read.get(), built.bytes.len());
+        let state = state.borrow();
+        assert!(
+            state
+                .chunks
+                .iter()
+                .all(|chunk| chunk.elements.len() <= MODEL_FIELD_CHUNK_ELEMENTS)
+        );
+        assert_eq!(
+            state
+                .chunks
+                .iter()
+                .filter(|chunk| matches!(chunk.role, ModelPcsRole::WeightBank { index: 0 }))
+                .map(|chunk| (chunk.role_offset, chunk.elements.len()))
+                .collect::<Vec<_>>(),
+            [
+                (0, MODEL_FIELD_CHUNK_ELEMENTS),
+                (8192, MODEL_FIELD_CHUNK_ELEMENTS)
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_field_stream_never_publishes_failed_authentication() {
+        let (built, identity) = staged_fixture();
+
+        let mut bad_header = built.bytes.clone();
+        bad_header[0] ^= 1;
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(bad_header),
+                &built.manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::InvalidMagic
+            ))
+        ));
+        assert!(state.borrow().chunks.is_empty());
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+
+        let mut out_of_range = built.bytes.clone();
+        out_of_range[MODEL_BANK_HEADER_BYTES] = 251;
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(out_of_range),
+                &built.manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::OutOfRange {
+                    offset: 0,
+                    value: 251
+                }
+            ))
+        ));
+        assert!(state.borrow().chunks.is_empty());
+        assert!(!state.borrow().published);
+
+        let mut wrong_payload = built.bytes.clone();
+        wrong_payload[MODEL_BANK_HEADER_BYTES + 5] ^= 1;
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(wrong_payload),
+                &built.manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::RawRootMismatch
+            ))
+        ));
+        assert!(!state.borrow().chunks.is_empty());
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+
+        let mut truncated = built.bytes.clone();
+        truncated.pop();
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(truncated),
+                &built.manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::Truncated
+            ))
+        ));
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+
+        let mut wrong_layer_manifest = built.manifest;
+        wrong_layer_manifest.layer_roots_aggregate[0] ^= 1;
+        let mut wrong_layer_header = built.bytes.clone();
+        wrong_layer_header[..MODEL_BANK_HEADER_BYTES]
+            .copy_from_slice(&encode_header(&wrong_layer_manifest));
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(wrong_layer_header),
+                &wrong_layer_manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::LayerRootsAggregateMismatch
+            ))
+        ));
+        assert!(!state.borrow().chunks.is_empty());
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+
+        let mut trailing = built.bytes.clone();
+        trailing.push(0);
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(trailing),
+                &built.manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::TrailingBytes
+            ))
+        ));
+        assert!(!state.borrow().chunks.is_empty());
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+    }
+
+    #[test]
+    fn staged_field_stream_surfaces_reader_and_sink_failures() {
+        struct FailingReader {
+            bytes: Vec<u8>,
+            position: usize,
+            fail_at: usize,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.position >= self.fail_at {
+                    return Err(io::Error::other("injected reader failure"));
+                }
+                let end = self
+                    .bytes
+                    .len()
+                    .min(self.fail_at)
+                    .min(self.position + buffer.len());
+                let read = end - self.position;
+                buffer[..read].copy_from_slice(&self.bytes[self.position..end]);
+                self.position = end;
+                Ok(read)
+            }
+        }
+
+        let (built, identity) = staged_fixture();
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                FailingReader {
+                    bytes: built.bytes.clone(),
+                    position: 0,
+                    fail_at: MODEL_BANK_HEADER_BYTES + built.manifest.base_input_bytes as usize,
+                },
+                &built.manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(ModelBankError::Io(_)))
+        ));
+        assert!(!state.borrow().chunks.is_empty());
+        assert!(!state.borrow().published);
+
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        let mut sink = RecordingSink::new(Rc::clone(&state));
+        sink.fail_write_at = Some(1);
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(&built.bytes),
+                &built.manifest,
+                &identity,
+                sink,
+            ),
+            Err(ModelBankFieldStreamError::Sink(RecordingSinkError::Write))
+        ));
+        assert_eq!(state.borrow().chunks.len(), 1);
+        assert_eq!(state.borrow().finish_attempts, 0);
+        assert!(!state.borrow().published);
+
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        let mut sink = RecordingSink::new(Rc::clone(&state));
+        sink.fail_finish = true;
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                Cursor::new(&built.bytes),
+                &built.manifest,
+                &identity,
+                sink,
+            ),
+            Err(ModelBankFieldStreamError::Sink(RecordingSinkError::Finish))
+        ));
+        assert_eq!(state.borrow().finish_attempts, 1);
+        assert!(!state.borrow().published);
+    }
+
+    #[test]
+    fn staged_field_stream_rejects_repartition_before_reading() {
+        struct PanicReader;
+
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                panic!("trusted identity mismatch must reject before reading")
+            }
+        }
+
+        let (built, mut identity) = staged_fixture();
+        identity.layers_per_bank = 4;
+        identity.weight_bank_commitments.pop();
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_sink(
+                PanicReader,
+                &built.manifest,
+                &identity,
+                RecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::PcsCommitmentRootMismatch
+            ))
+        ));
+        assert!(state.borrow().chunks.is_empty());
+        assert_eq!(state.borrow().finish_attempts, 0);
     }
 
     #[test]

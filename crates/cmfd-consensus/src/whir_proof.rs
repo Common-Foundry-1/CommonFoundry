@@ -47,7 +47,8 @@ use crate::{
     StructuredPcsVerifier,
     model_bank::{
         MAX_MODEL_PCS_WEIGHT_BANKS, MAX_SMALL_FIXTURE_PAYLOAD_BYTES, MODEL_BANK_HEADER_BYTES,
-        ModelBankError, ModelBankManifest, ModelPcsIdentity, verify_model_bank,
+        ModelBankError, ModelBankManifest, ModelPcsIdentity, centered_model_field_element,
+        verify_model_bank,
     },
 };
 
@@ -423,7 +424,7 @@ impl StructuredWhirModelCommitmentSet {
             .ok_or(VerifiedModelBankWhirError::IdentityMismatch)?
             .iter()
             .copied()
-            .map(centered_model_byte)
+            .map(centered_model_field_element)
             .collect();
         let mut weight_banks = Vec::with_capacity(bank_count);
         for bank_index in 0..bank_count {
@@ -443,7 +444,7 @@ impl StructuredWhirModelCommitmentSet {
                     .ok_or(VerifiedModelBankWhirError::IdentityMismatch)?
                     .iter()
                     .copied()
-                    .map(centered_model_byte)
+                    .map(centered_model_field_element)
                     .collect(),
             );
         }
@@ -477,15 +478,6 @@ fn bounded_model_table_len(elements: u64) -> Result<usize, VerifiedModelBankWhir
         return Err(VerifiedModelBankWhirError::ResearchLimit);
     }
     Ok(elements)
-}
-
-fn centered_model_byte(value: u8) -> u64 {
-    debug_assert!(value <= crate::model_bank::MAX_MODEL_BYTE);
-    if value >= 125 {
-        u64::from(value - 125)
-    } else {
-        GOLDILOCKS_MODULUS - u64::from(125 - value)
-    }
 }
 
 /// Digest of every cryptographic and canonical-encoding choice made by the
@@ -2052,7 +2044,10 @@ mod tests {
     }
 
     fn manual_centered_table(bytes: impl IntoIterator<Item = u8>) -> Vec<u64> {
-        bytes.into_iter().map(centered_model_byte).collect()
+        bytes
+            .into_iter()
+            .map(centered_model_field_element)
+            .collect()
     }
 
     fn decode_hex_32(value: &str) -> [u8; 32] {
@@ -2359,11 +2354,11 @@ mod tests {
 
     #[test]
     fn verified_model_bank_centered_byte_boundaries_are_canonical() {
-        assert_eq!(centered_model_byte(0), GOLDILOCKS_MODULUS - 125);
-        assert_eq!(centered_model_byte(124), GOLDILOCKS_MODULUS - 1);
-        assert_eq!(centered_model_byte(125), 0);
-        assert_eq!(centered_model_byte(126), 1);
-        assert_eq!(centered_model_byte(250), 125);
+        assert_eq!(centered_model_field_element(0), GOLDILOCKS_MODULUS - 125);
+        assert_eq!(centered_model_field_element(124), GOLDILOCKS_MODULUS - 1);
+        assert_eq!(centered_model_field_element(125), 0);
+        assert_eq!(centered_model_field_element(126), 1);
+        assert_eq!(centered_model_field_element(250), 125);
     }
 
     #[test]

@@ -10,6 +10,8 @@ use thiserror::Error;
 
 use crate::merkle_store::GOLDILOCKS_MODULUS;
 
+const NATURAL_DFT_CANCEL_POLL_ROWS: usize = 256;
+
 #[derive(Debug, Error)]
 pub(crate) enum ExternalRadix2Error {
     #[error("invalid external radix-2 DFT: {0}")]
@@ -194,11 +196,33 @@ pub(crate) fn dft_goldilocks_rows_in_place(
 /// The complete rows are first permuted into bit-reversed order, then the same
 /// radix-2 butterfly core used by the file-backed transform produces natural
 /// row-order evaluations. Validation completes before any input value changes.
+#[cfg(test)]
 pub(crate) fn dft_goldilocks_natural_rows_in_place(
     values: &mut [u64],
     height: usize,
     width: usize,
 ) -> Result<(), ExternalRadix2Error> {
+    let cancelled =
+        dft_goldilocks_natural_rows_in_place_cancellable(values, height, width, || false)?;
+    debug_assert!(!cancelled);
+    Ok(())
+}
+
+/// Cancellable sibling of [`dft_goldilocks_natural_rows_in_place`].
+///
+/// The callback is polled before mutation and after each fixed-size group of
+/// bit-reversal or butterfly rows. After `Ok(true)`, the caller must discard
+/// the current buffer state. All input validation still completes before the
+/// first callback or mutation.
+pub(crate) fn dft_goldilocks_natural_rows_in_place_cancellable<F>(
+    values: &mut [u64],
+    height: usize,
+    width: usize,
+    mut should_cancel: F,
+) -> Result<bool, ExternalRadix2Error>
+where
+    F: FnMut() -> bool,
+{
     if width == 0 {
         return Err(ExternalRadix2Error::Invalid(
             "DFT row width must be nonzero",
@@ -230,6 +254,9 @@ pub(crate) fn dft_goldilocks_natural_rows_in_place(
 
     let bits = height.ilog2();
     for natural_row in 0..height {
+        if natural_row.is_multiple_of(NATURAL_DFT_CANCEL_POLL_ROWS) && should_cancel() {
+            return Ok(true);
+        }
         let reversed_row = natural_row.reverse_bits() >> (usize::BITS - bits);
         if natural_row < reversed_row {
             for column in 0..width {
@@ -237,8 +264,10 @@ pub(crate) fn dft_goldilocks_natural_rows_in_place(
             }
         }
     }
-    dft_local_block_in_place(values, height, width);
-    Ok(())
+    if dft_local_block_in_place_cancellable(values, height, width, &mut should_cancel) {
+        return Ok(true);
+    }
+    Ok(should_cancel())
 }
 
 fn fused_block_rows(height: usize, buffer_rows: usize) -> usize {
@@ -247,8 +276,22 @@ fn fused_block_rows(height: usize, buffer_rows: usize) -> usize {
 }
 
 fn dft_local_block_in_place(values: &mut [u64], rows: usize, width: usize) {
+    let cancelled = dft_local_block_in_place_cancellable(values, rows, width, &mut || false);
+    debug_assert!(!cancelled);
+}
+
+fn dft_local_block_in_place_cancellable<F>(
+    values: &mut [u64],
+    rows: usize,
+    width: usize,
+    should_cancel: &mut F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
     debug_assert!(rows.is_power_of_two());
     debug_assert_eq!(values.len(), rows * width);
+    let mut rows_until_poll = 0_usize;
     let mut len = 2_usize;
     while len <= rows {
         let half = len / 2;
@@ -256,6 +299,12 @@ fn dft_local_block_in_place(values: &mut [u64], rows: usize, width: usize) {
         for block in (0..rows).step_by(len) {
             let mut twiddle = root.exp_u64(0);
             for row in 0..half {
+                if rows_until_poll == 0 {
+                    if should_cancel() {
+                        return true;
+                    }
+                    rows_until_poll = NATURAL_DFT_CANCEL_POLL_ROWS;
+                }
                 let left_row = (block + row) * width;
                 let right_row = (block + half + row) * width;
                 for column in 0..width {
@@ -267,10 +316,12 @@ fn dft_local_block_in_place(values: &mut [u64], rows: usize, width: usize) {
                     values[right_index] = (a - b).as_canonical_u64();
                 }
                 twiddle *= root;
+                rows_until_poll -= 1;
             }
         }
         len *= 2;
     }
+    false
 }
 
 fn allocate_buffer(values: usize) -> Result<Vec<u64>, ExternalRadix2Error> {
@@ -526,6 +577,87 @@ mod tests {
             dft_goldilocks_natural_rows_in_place(&mut actual, height, width).unwrap();
             assert_eq!(actual, expected, "height={height}, width={width}");
         }
+    }
+
+    #[test]
+    fn cancellable_natural_rows_match_the_existing_wrapper() {
+        for (height, width) in [(2, 1), (64, 5), (512, 4), (1_024, 3)] {
+            let mut expected = input(height, width);
+            let mut actual = expected.clone();
+            dft_goldilocks_natural_rows_in_place(&mut expected, height, width).unwrap();
+
+            let mut polls = 0_usize;
+            let cancelled = dft_goldilocks_natural_rows_in_place_cancellable(
+                &mut actual,
+                height,
+                width,
+                || {
+                    polls += 1;
+                    false
+                },
+            )
+            .unwrap();
+
+            let bit_reversal_polls = height.div_ceil(NATURAL_DFT_CANCEL_POLL_ROWS);
+            let butterfly_rows = (height / 2) * height.ilog2() as usize;
+            let butterfly_polls = butterfly_rows.div_ceil(NATURAL_DFT_CANCEL_POLL_ROWS);
+            assert!(!cancelled);
+            assert_eq!(actual, expected, "height={height}, width={width}");
+            assert_eq!(
+                polls,
+                bit_reversal_polls + butterfly_polls + 1,
+                "height={height}, width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellable_natural_rows_stop_during_butterflies() {
+        const HEIGHT: usize = 1_024;
+        const WIDTH: usize = 4;
+
+        let original = input(HEIGHT, WIDTH);
+        let mut completed = original.clone();
+        dft_goldilocks_natural_rows_in_place(&mut completed, HEIGHT, WIDTH).unwrap();
+
+        let bit_reversal_polls = HEIGHT.div_ceil(NATURAL_DFT_CANCEL_POLL_ROWS);
+        let cancel_at = bit_reversal_polls + 3;
+        let mut polls = 0_usize;
+        let mut partial = original.clone();
+        let cancelled =
+            dft_goldilocks_natural_rows_in_place_cancellable(&mut partial, HEIGHT, WIDTH, || {
+                polls += 1;
+                polls == cancel_at
+            })
+            .unwrap();
+
+        assert!(cancelled);
+        assert_eq!(polls, cancel_at);
+        assert_ne!(partial, original);
+        assert_ne!(partial, completed);
+    }
+
+    #[test]
+    fn cancellable_natural_rows_validate_before_polling_and_cancel_before_mutation() {
+        let mut values = vec![1, GOLDILOCKS_MODULUS];
+        let original = values.clone();
+        let mut polls = 0_usize;
+        assert!(matches!(
+            dft_goldilocks_natural_rows_in_place_cancellable(&mut values, 2, 1, || {
+                polls += 1;
+                true
+            }),
+            Err(ExternalRadix2Error::Invalid(_))
+        ));
+        assert_eq!(polls, 0);
+        assert_eq!(values, original);
+
+        let mut values = input(8, 3);
+        let original = values.clone();
+        assert!(
+            dft_goldilocks_natural_rows_in_place_cancellable(&mut values, 8, 3, || true).unwrap()
+        );
+        assert_eq!(values, original);
     }
 
     #[test]

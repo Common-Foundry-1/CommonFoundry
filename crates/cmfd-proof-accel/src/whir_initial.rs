@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use blake3::Hasher;
 use p3_field::{PrimeCharacteristicRing, PrimeField64, TwoAdicField};
@@ -24,7 +24,8 @@ use crate::blake3_merkle_store::{
     BLAKE3_LEAF_BATCH_ROWS, Blake3DigestSource, Blake3MerkleDigest, Blake3MerkleStoreError,
 };
 use crate::external_radix2::{
-    ExternalRadix2Error, dft_goldilocks_natural_rows_in_place, dft_goldilocks_rows_in_place,
+    ExternalRadix2Error, dft_goldilocks_natural_rows_in_place_cancellable,
+    dft_goldilocks_rows_in_place,
 };
 use crate::merkle_store::{GOLDILOCKS_MODULUS, MerkleRowSource, MerkleStoreError};
 use crate::whir_initial_source::{
@@ -67,6 +68,7 @@ const N31_VARIABLES: u32 = 31;
 const N31_SIDE: usize = 1 << 15;
 const N31_TRANSPOSE_TILE: usize = 2 * 1024;
 const N31_FFT_STRIP: usize = 256;
+const N31_PROGRESS_REPORT_BYTES: u64 = 256 * 1024 * 1024;
 const PRODUCTION_STAGING_ATTEMPTS: usize = 256;
 
 static NEXT_PRODUCTION_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
@@ -86,6 +88,198 @@ pub struct WhirInitialN31Plan {
     pub codeword_and_tree_bytes: u64,
     pub persistent_source_codeword_tree_bytes: u64,
     pub max_transform_memory_bytes: u64,
+}
+
+/// Deterministic stage of one exact 31-variable initial-codeword build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhirInitialN31Stage {
+    Transpose,
+    FirstFft,
+    SecondFft,
+    Seal,
+    Verify,
+}
+
+/// Logical bytes completed within one exact n31 build stage.
+///
+/// These counters describe deterministic logical data processed, not physical
+/// disk traffic or a wall-clock estimate. They reset to zero at each stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WhirInitialN31Progress {
+    pub stage: WhirInitialN31Stage,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Result of a cooperatively controlled exact n31 build.
+#[derive(Debug)]
+// Boxing the normal success path would add an allocation to every production build.
+#[allow(clippy::large_enum_variant)]
+pub enum WhirInitialN31Outcome {
+    Published(AuthenticatedWhirInitialCodeword),
+    Cancelled(WhirInitialN31Progress),
+}
+
+enum ControlledSixStepError {
+    Encoding(WhirInitialEncodingError),
+    Cancelled(WhirInitialN31Progress),
+}
+
+impl From<WhirInitialEncodingError> for ControlledSixStepError {
+    fn from(error: WhirInitialEncodingError) -> Self {
+        Self::Encoding(error)
+    }
+}
+
+type ControlledSixStepResult<T> = Result<T, ControlledSixStepError>;
+
+struct N31ProgressController<'a> {
+    cancelled: &'a AtomicBool,
+    observe: &'a mut dyn FnMut(WhirInitialN31Progress),
+    progress: Option<WhirInitialN31Progress>,
+    last_reported_bytes: u64,
+    stage_work_complete: bool,
+}
+
+impl<'a> N31ProgressController<'a> {
+    fn new(cancelled: &'a AtomicBool, observe: &'a mut dyn FnMut(WhirInitialN31Progress)) -> Self {
+        Self {
+            cancelled,
+            observe,
+            progress: None,
+            last_reported_bytes: 0,
+            stage_work_complete: false,
+        }
+    }
+
+    fn start_stage(
+        &mut self,
+        stage: WhirInitialN31Stage,
+        total_bytes: u64,
+    ) -> ControlledSixStepResult<()> {
+        if total_bytes == 0
+            || self
+                .progress
+                .is_some_and(|previous| previous.completed_bytes != previous.total_bytes)
+            || self
+                .progress
+                .is_some_and(|previous| next_n31_stage(previous.stage) != Some(stage))
+            || self.progress.is_none() && stage != WhirInitialN31Stage::Transpose
+        {
+            return Err(WhirInitialEncodingError::Invalid(
+                "n31 progress stage transition is invalid",
+            )
+            .into());
+        }
+        self.progress = Some(WhirInitialN31Progress {
+            stage,
+            completed_bytes: 0,
+            total_bytes,
+        });
+        self.last_reported_bytes = 0;
+        self.stage_work_complete = false;
+        self.check_cancelled()?;
+        self.report()
+    }
+
+    fn checkpoint(&self) -> ControlledSixStepResult<()> {
+        self.check_cancelled()
+    }
+
+    fn advance(&mut self, bytes: u64) -> ControlledSixStepResult<()> {
+        if self.stage_work_complete {
+            return Err(WhirInitialEncodingError::Invalid(
+                "n31 progress advanced after stage work completed",
+            )
+            .into());
+        }
+        let (completed_bytes, total_bytes) = {
+            let progress = self.progress.as_mut().ok_or_else(|| {
+                ControlledSixStepError::from(WhirInitialEncodingError::Invalid(
+                    "n31 progress stage has not started",
+                ))
+            })?;
+            let completed_bytes = progress.completed_bytes.checked_add(bytes).ok_or_else(|| {
+                ControlledSixStepError::from(WhirInitialEncodingError::Invalid(
+                    "n31 progress byte count overflow",
+                ))
+            })?;
+            if completed_bytes > progress.total_bytes {
+                return Err(WhirInitialEncodingError::Invalid(
+                    "n31 progress exceeds its stage total",
+                )
+                .into());
+            }
+            (completed_bytes, progress.total_bytes)
+        };
+        if completed_bytes == total_bytes {
+            self.stage_work_complete = true;
+            return self.check_cancelled();
+        }
+        self.progress
+            .as_mut()
+            .expect("n31 progress stage exists while advancing")
+            .completed_bytes = completed_bytes;
+        self.check_cancelled()?;
+        if completed_bytes - self.last_reported_bytes >= N31_PROGRESS_REPORT_BYTES {
+            self.report()?;
+        }
+        Ok(())
+    }
+
+    fn finish_stage(&mut self) -> ControlledSixStepResult<()> {
+        if self.progress.is_none() {
+            return Err(
+                WhirInitialEncodingError::Invalid("n31 progress stage has not started").into(),
+            );
+        }
+        if !self.stage_work_complete {
+            return Err(
+                WhirInitialEncodingError::Invalid("n31 progress stage is incomplete").into(),
+            );
+        }
+        self.check_cancelled()?;
+        let progress = self
+            .progress
+            .as_mut()
+            .expect("n31 progress stage exists while finishing");
+        progress.completed_bytes = progress.total_bytes;
+        self.report()
+    }
+
+    fn check_cancelled(&self) -> ControlledSixStepResult<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(self.cancellation_error());
+        }
+        Ok(())
+    }
+
+    fn cancellation_error(&self) -> ControlledSixStepError {
+        ControlledSixStepError::Cancelled(
+            self.progress.expect("n31 cancellation follows stage start"),
+        )
+    }
+
+    fn report(&mut self) -> ControlledSixStepResult<()> {
+        let progress = self.progress.ok_or_else(|| {
+            ControlledSixStepError::from(WhirInitialEncodingError::Invalid(
+                "n31 progress stage has not started",
+            ))
+        })?;
+        (self.observe)(progress);
+        self.last_reported_bytes = progress.completed_bytes;
+        self.check_cancelled()
+    }
+}
+
+const fn next_n31_stage(stage: WhirInitialN31Stage) -> Option<WhirInitialN31Stage> {
+    match stage {
+        WhirInitialN31Stage::Transpose => Some(WhirInitialN31Stage::FirstFft),
+        WhirInitialN31Stage::FirstFft => Some(WhirInitialN31Stage::SecondFft),
+        WhirInitialN31Stage::SecondFft => Some(WhirInitialN31Stage::Seal),
+        WhirInitialN31Stage::Seal => Some(WhirInitialN31Stage::Verify),
+        WhirInitialN31Stage::Verify => None,
+    }
 }
 
 /// Return the exact 31-variable source, codeword, tree, disk, and transform
@@ -316,6 +510,26 @@ impl AuthenticatedWhirInitialCodeword {
     }
 
     fn open_integrity_only(path: &Path) -> Result<Self, WhirInitialEncodingError> {
+        match Self::open_integrity_only_inner(path, None) {
+            Ok(artifact) => Ok(artifact),
+            Err(ControlledSixStepError::Encoding(error)) => Err(error),
+            Err(ControlledSixStepError::Cancelled(_)) => {
+                unreachable!("integrity verification without control cannot be cancelled")
+            }
+        }
+    }
+
+    fn open_integrity_only_with_control(
+        path: &Path,
+        controller: &mut N31ProgressController<'_>,
+    ) -> ControlledSixStepResult<Self> {
+        Self::open_integrity_only_inner(path, Some(controller))
+    }
+
+    fn open_integrity_only_inner(
+        path: &Path,
+        mut controller: Option<&mut N31ProgressController<'_>>,
+    ) -> ControlledSixStepResult<Self> {
         let path = path.to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
@@ -339,24 +553,30 @@ impl AuthenticatedWhirInitialCodeword {
             .map_err(|source| io_error("reading metadata for", &path, source))?
             .len();
         if actual_bytes != total_bytes {
-            return Err(WhirInitialEncodingError::Invalid(
-                "artifact length does not match header",
-            ));
+            return Err(
+                WhirInitialEncodingError::Invalid("artifact length does not match header").into(),
+            );
         }
 
         let auth_count = usize::try_from(decoded.auth_count)
             .map_err(|_| WhirInitialEncodingError::ResearchLimit("authentication table"))?;
         file.seek(SeekFrom::Start(HEADER_BYTES as u64 + decoded.data_bytes))
             .map_err(|source| io_error("reading authentication table from", &path, source))?;
-        let auth_digests = read_auth_digests(&mut file, &path, auth_count)?;
+        let auth_digests = read_auth_digests_with_control(
+            &mut file,
+            &path,
+            auth_count,
+            controller.as_deref_mut(),
+        )?;
 
-        authenticate_complete(
+        authenticate_complete_with_control(
             &mut file,
             &path,
             &prefix,
             decoded.height,
             &auth_digests,
             stored_digest,
+            controller,
         )?;
         Ok(Self {
             file: Mutex::new(file),
@@ -600,6 +820,43 @@ pub fn encode_whir_initial_suffix_n31(
     expected_source: &WhirInitialSourceArtifactIdentity,
     source: &AuthenticatedWhirInitialSourceFile,
 ) -> Result<AuthenticatedWhirInitialCodeword, WhirInitialEncodingError> {
+    let cancelled = AtomicBool::new(false);
+    match encode_whir_initial_suffix_n31_with_control(
+        final_path,
+        artifact_id,
+        expected_source,
+        source,
+        &cancelled,
+        |_| {},
+    )? {
+        WhirInitialN31Outcome::Published(artifact) => Ok(artifact),
+        WhirInitialN31Outcome::Cancelled(_) => {
+            unreachable!("a false n31 cancellation token cannot cancel encoding")
+        }
+    }
+}
+
+/// Encode the exact 31-variable initial WHIR codeword with deterministic
+/// progress reporting and cooperative cross-thread cancellation.
+///
+/// The observer runs synchronously on the encoding thread at stage start,
+/// approximately every 256 MiB of logical progress, and stage completion. A
+/// panic in the observer unwinds through the existing owned-staging cleanup.
+/// `cancelled` is read with acquire ordering at bounded work checkpoints and
+/// must be treated as a one-way token. Cancellation after the final
+/// pre-publication check is intentionally ignored so the hard-link and
+/// directory-synchronization commit sequence remains indivisible.
+pub fn encode_whir_initial_suffix_n31_with_control<F>(
+    final_path: impl AsRef<Path>,
+    artifact_id: [u8; 32],
+    expected_source: &WhirInitialSourceArtifactIdentity,
+    source: &AuthenticatedWhirInitialSourceFile,
+    cancelled: &AtomicBool,
+    mut observe: F,
+) -> Result<WhirInitialN31Outcome, WhirInitialEncodingError>
+where
+    F: FnMut(WhirInitialN31Progress),
+{
     #[cfg(not(target_pointer_width = "64"))]
     return Err(WhirInitialEncodingError::ResearchLimit(
         "n31 encoder requires a 64-bit target",
@@ -616,16 +873,25 @@ pub fn encode_whir_initial_suffix_n31(
     if source.artifact_identity() != expected_source {
         return Err(WhirInitialEncodingError::IdentityMismatch);
     }
-    encode_six_step_suffix(
+    let mut controller = N31ProgressController::new(cancelled, &mut observe);
+    match encode_six_step_suffix_with_control(
         final_path.as_ref(),
         artifact_id,
         &expected_source.source,
         source,
         N31_TRANSPOSE_TILE,
         N31_FFT_STRIP,
-    )
+        &mut controller,
+    ) {
+        Ok(artifact) => Ok(WhirInitialN31Outcome::Published(artifact)),
+        Err(ControlledSixStepError::Cancelled(progress)) => {
+            Ok(WhirInitialN31Outcome::Cancelled(progress))
+        }
+        Err(ControlledSixStepError::Encoding(error)) => Err(error),
+    }
 }
 
+#[cfg(test)]
 fn encode_six_step_suffix(
     final_path: &Path,
     artifact_id: [u8; 32],
@@ -634,12 +900,42 @@ fn encode_six_step_suffix(
     transpose_tile: usize,
     fft_strip: usize,
 ) -> Result<AuthenticatedWhirInitialCodeword, WhirInitialEncodingError> {
+    let cancelled = AtomicBool::new(false);
+    let mut observe = |_| {};
+    let mut controller = N31ProgressController::new(&cancelled, &mut observe);
+    match encode_six_step_suffix_with_control(
+        final_path,
+        artifact_id,
+        expected_source,
+        source,
+        transpose_tile,
+        fft_strip,
+        &mut controller,
+    ) {
+        Ok(artifact) => Ok(artifact),
+        Err(ControlledSixStepError::Encoding(error)) => Err(error),
+        Err(ControlledSixStepError::Cancelled(_)) => {
+            unreachable!("a false six-step cancellation token cannot cancel encoding")
+        }
+    }
+}
+
+fn encode_six_step_suffix_with_control(
+    final_path: &Path,
+    artifact_id: [u8; 32],
+    expected_source: &WhirInitialSourceIdentity,
+    source: &dyn AuthenticatedWhirInitialSource,
+    transpose_tile: usize,
+    fft_strip: usize,
+    controller: &mut N31ProgressController<'_>,
+) -> ControlledSixStepResult<AuthenticatedWhirInitialCodeword> {
     let geometry = validate_geometry(artifact_id, expected_source)?;
     let height_log = geometry.height.ilog2() as usize;
     if !height_log.is_multiple_of(2) {
         return Err(WhirInitialEncodingError::Invalid(
             "six-step codeword height must have an even logarithm",
-        ));
+        )
+        .into());
     }
     let side = 1_usize.checked_shl((height_log / 2) as u32).ok_or(
         WhirInitialEncodingError::ResearchLimit("six-step matrix side"),
@@ -658,15 +954,17 @@ fn encode_six_step_suffix(
     {
         return Err(WhirInitialEncodingError::Invalid(
             "six-step geometry or buffer partition is invalid",
-        ));
+        )
+        .into());
     }
     if source.identity() != expected_source {
-        return Err(WhirInitialEncodingError::IdentityMismatch);
+        return Err(WhirInitialEncodingError::IdentityMismatch.into());
     }
     if source.len() != geometry.source_elements {
         return Err(WhirInitialEncodingError::Invalid(
             "source length does not match num_variables",
-        ));
+        )
+        .into());
     }
 
     let parent = production_artifact_parent(final_path)?;
@@ -674,9 +972,7 @@ fn encode_six_step_suffix(
         .try_exists()
         .map_err(|source| io_error("checking publication target", final_path, source))?
     {
-        return Err(WhirInitialEncodingError::AlreadyExists(
-            final_path.to_path_buf(),
-        ));
+        return Err(WhirInitialEncodingError::AlreadyExists(final_path.to_path_buf()).into());
     }
     let required = geometry
         .data_bytes
@@ -686,6 +982,21 @@ fn encode_six_step_suffix(
             "six-step scratch byte length",
         ))?;
     require_available_space(&parent, required)?;
+
+    let source_data_bytes = u64::try_from(geometry.source_elements)
+        .ok()
+        .and_then(|elements| elements.checked_mul(8))
+        .ok_or(WhirInitialEncodingError::ResearchLimit(
+            "six-step source progress byte length",
+        ))?;
+    let sealed_bytes = geometry
+        .auth_count
+        .checked_mul(DIGEST_BYTES as u64)
+        .and_then(|auth_bytes| geometry.data_bytes.checked_add(auth_bytes))
+        .ok_or(WhirInitialEncodingError::ResearchLimit(
+            "six-step sealed progress byte length",
+        ))?;
+    controller.start_stage(WhirInitialN31Stage::Transpose, source_data_bytes)?;
 
     let (first_path, first_file) = create_unique_production_staging(final_path, "transpose-1")?;
     let mut first = OwnedProductionFile::new(first_path.clone(), first_file);
@@ -701,11 +1012,14 @@ fn encode_six_step_suffix(
         &geometry,
         side,
         transpose_tile,
+        controller,
     )?;
     first
         .file_mut()
         .sync_data()
         .map_err(|source| io_error("synchronizing", &first_path, source))?;
+    controller.finish_stage()?;
+    controller.start_stage(WhirInitialN31Stage::FirstFft, geometry.data_bytes)?;
 
     let (second_path, second_file) = create_unique_production_staging(final_path, "transpose-2")?;
     let mut second = OwnedProductionFile::new(second_path.clone(), second_file);
@@ -720,12 +1034,16 @@ fn encode_six_step_suffix(
         &second_path,
         side,
         fft_strip,
+        controller,
     )?;
     second
         .file_mut()
         .sync_data()
         .map_err(|source| io_error("synchronizing", &second_path, source))?;
+    controller.finish_stage()?;
     first.remove()?;
+
+    controller.start_stage(WhirInitialN31Stage::SecondFft, geometry.data_bytes)?;
 
     let (output_path, output_file) = create_unique_production_staging(final_path, "codeword")?;
     let mut output = OwnedProductionFile::new(output_path.clone(), output_file);
@@ -747,18 +1065,35 @@ fn encode_six_step_suffix(
         &output_path,
         side,
         fft_strip,
+        controller,
     )?;
     output
         .file_mut()
         .sync_data()
         .map_err(|source| io_error("synchronizing", &output_path, source))?;
+    controller.finish_stage()?;
     second.remove()?;
 
-    let (_, artifact_digest) =
-        seal_data(output.file_mut(), &output_path, &prefix, geometry.height)?;
-    let staged = AuthenticatedWhirInitialCodeword::open_integrity_only(&output_path)?;
+    controller.start_stage(WhirInitialN31Stage::Seal, sealed_bytes)?;
+    let (_, artifact_digest) = seal_data_with_control(
+        output.file_mut(),
+        &output_path,
+        &prefix,
+        geometry.height,
+        controller,
+    )?;
+    controller.finish_stage()?;
+
+    controller.start_stage(WhirInitialN31Stage::Verify, sealed_bytes)?;
+    let staged = AuthenticatedWhirInitialCodeword::open_integrity_only_with_control(
+        &output_path,
+        controller,
+    )?;
+    controller.finish_stage()?;
     debug_assert_eq!(staged.identity.artifact_digest, artifact_digest);
+    controller.checkpoint()?;
     publish_verified_production_artifact(output, final_path, &parent, staged)
+        .map_err(ControlledSixStepError::from)
 }
 
 fn encode_with_limits(
@@ -915,6 +1250,9 @@ fn validate_geometry(
     })
 }
 
+// These parameters mirror the authenticated source, scratch-file, geometry,
+// and controller boundary; grouping them would add a single-use abstraction.
+#[allow(clippy::too_many_arguments)]
 fn transpose_source_into_first(
     output: &mut File,
     output_path: &Path,
@@ -923,7 +1261,8 @@ fn transpose_source_into_first(
     geometry: &Geometry,
     side: usize,
     tile_side: usize,
-) -> Result<(), WhirInitialEncodingError> {
+    controller: &mut N31ProgressController<'_>,
+) -> ControlledSixStepResult<()> {
     let populated_rows = side / 2;
     let tile_cells = tile_side
         .checked_mul(tile_side)
@@ -940,6 +1279,7 @@ fn transpose_source_into_first(
         let tile_rows = (populated_rows - row_base).min(tile_side);
         for column_base in (0..side).step_by(tile_side) {
             for local_row in 0..tile_rows {
+                controller.checkpoint()?;
                 let source_cell = (row_base + local_row)
                     .checked_mul(side)
                     .and_then(|cell| cell.checked_add(column_base))
@@ -949,25 +1289,31 @@ fn transpose_source_into_first(
                 let source_start = source_cell.checked_mul(WHIR_INITIAL_WIDTH).ok_or(
                     WhirInitialEncodingError::Invalid("six-step source offset overflow"),
                 )?;
-                let values = source.read_elements(source_start, segment_values)?;
+                let values = source
+                    .read_elements(source_start, segment_values)
+                    .map_err(WhirInitialEncodingError::from)?;
+                controller.checkpoint()?;
                 if source.identity() != expected_source
                     || source.len() != geometry.source_elements
                     || values.len() != segment_values
                 {
                     return Err(WhirInitialEncodingError::Invalid(
                         "source geometry changed while reading",
-                    ));
+                    )
+                    .into());
                 }
                 if values.iter().any(|value| *value >= GOLDILOCKS_MODULUS) {
                     return Err(WhirInitialEncodingError::Invalid(
                         "source returned a noncanonical Goldilocks value",
-                    ));
+                    )
+                    .into());
                 }
                 let tile_start = local_row * segment_values;
                 tile[tile_start..tile_start + segment_values].copy_from_slice(&values);
             }
 
             for local_column in 0..tile_side {
+                controller.checkpoint()?;
                 for local_row in 0..tile_rows {
                     let tile_cell = (local_row * tile_side + local_column) * WHIR_INITIAL_WIDTH;
                     let output_cell = local_row * WHIR_INITIAL_WIDTH;
@@ -985,12 +1331,20 @@ fn transpose_source_into_first(
                     &encoded[..tile_rows * WHIR_INITIAL_WIDTH * 8],
                 )?;
             }
+            let completed_bytes = tile_rows
+                .checked_mul(tile_side)
+                .and_then(|cells| cells.checked_mul(WHIR_INITIAL_WIDTH * 8))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(WhirInitialEncodingError::Invalid(
+                    "six-step transpose progress byte count overflow",
+                ))?;
+            controller.advance(completed_bytes)?;
         }
     }
     if source.identity() != expected_source || source.len() != geometry.source_elements {
-        return Err(WhirInitialEncodingError::Invalid(
-            "source geometry changed after reading",
-        ));
+        return Err(
+            WhirInitialEncodingError::Invalid("source geometry changed after reading").into(),
+        );
     }
     Ok(())
 }
@@ -1002,7 +1356,8 @@ fn six_step_first_fft(
     output_path: &Path,
     side: usize,
     strip_rows: usize,
-) -> Result<(), WhirInitialEncodingError> {
+    controller: &mut N31ProgressController<'_>,
+) -> ControlledSixStepResult<()> {
     let strip_width = strip_rows.checked_mul(WHIR_INITIAL_WIDTH).ok_or(
         WhirInitialEncodingError::ResearchLimit("six-step FFT strip width"),
     )?;
@@ -1019,6 +1374,7 @@ fn six_step_first_fft(
 
     for row_base in (0..side).step_by(strip_rows) {
         for local_row in 0..strip_rows {
+            controller.checkpoint()?;
             read_raw_cells(
                 input,
                 input_path,
@@ -1027,6 +1383,7 @@ fn six_step_first_fft(
                 0,
                 &mut encoded_row,
             )?;
+            controller.checkpoint()?;
             for (column_index, bytes) in encoded_row.chunks_exact(8).enumerate() {
                 let value = decode_canonical_limb(bytes)?;
                 let cell = column_index / WHIR_INITIAL_WIDTH;
@@ -1035,11 +1392,19 @@ fn six_step_first_fft(
             }
         }
 
-        dft_goldilocks_natural_rows_in_place(&mut strip, side, strip_width)?;
+        let cancelled =
+            dft_goldilocks_natural_rows_in_place_cancellable(&mut strip, side, strip_width, || {
+                controller.cancelled.load(Ordering::Acquire)
+            })
+            .map_err(WhirInitialEncodingError::from)?;
+        if cancelled {
+            return Err(controller.cancellation_error());
+        }
         let row_base_step = root.exp_u64(row_base as u64);
         let mut frequency_start = Goldilocks::ONE;
         let mut frequency_step = Goldilocks::ONE;
         for frequency in 0..side {
+            controller.checkpoint()?;
             let row_start = frequency * strip_width;
             let mut twiddle = frequency_start;
             for local_row in 0..strip_rows {
@@ -1063,6 +1428,14 @@ fn six_step_first_fft(
                 encoded_segment,
             )?;
         }
+        let completed_bytes = side
+            .checked_mul(strip_rows)
+            .and_then(|rows| rows.checked_mul(WHIR_INITIAL_WIDTH * 8))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(WhirInitialEncodingError::Invalid(
+                "six-step first FFT progress byte count overflow",
+            ))?;
+        controller.advance(completed_bytes)?;
     }
     Ok(())
 }
@@ -1074,7 +1447,8 @@ fn six_step_second_fft(
     output_path: &Path,
     side: usize,
     strip_rows: usize,
-) -> Result<(), WhirInitialEncodingError> {
+    controller: &mut N31ProgressController<'_>,
+) -> ControlledSixStepResult<()> {
     let strip_width = strip_rows.checked_mul(WHIR_INITIAL_WIDTH).ok_or(
         WhirInitialEncodingError::ResearchLimit("six-step FFT strip width"),
     )?;
@@ -1090,6 +1464,7 @@ fn six_step_second_fft(
 
     for row_base in (0..side).step_by(strip_rows) {
         for local_row in 0..strip_rows {
+            controller.checkpoint()?;
             read_raw_cells(
                 input,
                 input_path,
@@ -1098,6 +1473,7 @@ fn six_step_second_fft(
                 0,
                 &mut encoded_row,
             )?;
+            controller.checkpoint()?;
             for (column_index, bytes) in encoded_row.chunks_exact(8).enumerate() {
                 let value = decode_canonical_limb(bytes)?;
                 let cell = column_index / WHIR_INITIAL_WIDTH;
@@ -1106,8 +1482,16 @@ fn six_step_second_fft(
             }
         }
 
-        dft_goldilocks_natural_rows_in_place(&mut strip, side, strip_width)?;
+        let cancelled =
+            dft_goldilocks_natural_rows_in_place_cancellable(&mut strip, side, strip_width, || {
+                controller.cancelled.load(Ordering::Acquire)
+            })
+            .map_err(WhirInitialEncodingError::from)?;
+        if cancelled {
+            return Err(controller.cancellation_error());
+        }
         for output_row in 0..side {
+            controller.checkpoint()?;
             let strip_start = output_row * strip_width;
             let encoded_segment = &mut encoded_row[..strip_width * 8];
             encode_canonical_limbs(
@@ -1125,6 +1509,14 @@ fn six_step_second_fft(
                 .and_then(|_| output.write_all(encoded_segment))
                 .map_err(|source| io_error("writing six-step codeword to", output_path, source))?;
         }
+        let completed_bytes = side
+            .checked_mul(strip_rows)
+            .and_then(|rows| rows.checked_mul(WHIR_INITIAL_WIDTH * 8))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(WhirInitialEncodingError::Invalid(
+                "six-step second FFT progress byte count overflow",
+            ))?;
+        controller.advance(completed_bytes)?;
     }
     Ok(())
 }
@@ -1284,8 +1676,40 @@ fn seal_data(
     prefix: &[u8; PREFIX_BYTES],
     height: usize,
 ) -> Result<(Vec<[u8; 32]>, [u8; 32]), WhirInitialEncodingError> {
+    match seal_data_inner(file, path, prefix, height, None) {
+        Ok(sealed) => Ok(sealed),
+        Err(ControlledSixStepError::Encoding(error)) => Err(error),
+        Err(ControlledSixStepError::Cancelled(_)) => {
+            unreachable!("sealing without control cannot be cancelled")
+        }
+    }
+}
+
+fn seal_data_with_control(
+    file: &mut File,
+    path: &Path,
+    prefix: &[u8; PREFIX_BYTES],
+    height: usize,
+    controller: &mut N31ProgressController<'_>,
+) -> ControlledSixStepResult<(Vec<[u8; 32]>, [u8; 32])> {
+    seal_data_inner(file, path, prefix, height, Some(controller))
+}
+
+fn seal_data_inner(
+    file: &mut File,
+    path: &Path,
+    prefix: &[u8; PREFIX_BYTES],
+    height: usize,
+    mut controller: Option<&mut N31ProgressController<'_>>,
+) -> ControlledSixStepResult<(Vec<[u8; 32]>, [u8; 32])> {
+    if let Some(controller) = controller.as_deref_mut() {
+        controller.checkpoint()?;
+    }
     file.sync_data()
         .map_err(|source| io_error("synchronizing staged data for", path, source))?;
+    if let Some(controller) = controller.as_deref_mut() {
+        controller.checkpoint()?;
+    }
     let mut global = Hasher::new();
     global.update(prefix);
     let mut auth_digests = Vec::new();
@@ -1293,12 +1717,21 @@ fn seal_data(
         .try_reserve_exact(height.div_ceil(AUTH_CHUNK_ROWS))
         .map_err(|_| WhirInitialEncodingError::ResearchLimit("authentication table"))?;
     for batch_start in (0..height).step_by(AUTH_SCAN_ROWS) {
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+        }
         let rows = (height - batch_start).min(AUTH_SCAN_ROWS);
         let bytes = read_encoded_rows(file, path, batch_start, rows)?;
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+        }
         validate_encoded_rows(&bytes)?;
         global.update(&bytes);
         for chunk in bytes.chunks(AUTH_CHUNK_ROWS * WHIR_INITIAL_WIDTH * 8) {
             auth_digests.push(auth_digest(prefix, auth_digests.len(), chunk));
+        }
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.advance(bytes.len() as u64)?;
         }
     }
     file.seek(SeekFrom::End(0))
@@ -1306,7 +1739,7 @@ fn seal_data(
     for digest in &auth_digests {
         global.update(digest);
     }
-    write_auth_digests(file, path, &auth_digests)?;
+    write_auth_digests_with_control(file, path, &auth_digests, controller)?;
     let digest = *global.finalize().as_bytes();
     file.seek(SeekFrom::Start(PREFIX_BYTES as u64))
         .and_then(|_| file.write_all(&digest))
@@ -1315,48 +1748,60 @@ fn seal_data(
     Ok((auth_digests, digest))
 }
 
-fn authenticate_complete(
+fn authenticate_complete_with_control(
     file: &mut File,
     path: &Path,
     prefix: &[u8; PREFIX_BYTES],
     height: usize,
     auth_digests: &[[u8; 32]],
     expected_global: [u8; 32],
-) -> Result<(), WhirInitialEncodingError> {
+    mut controller: Option<&mut N31ProgressController<'_>>,
+) -> ControlledSixStepResult<()> {
     if auth_digests.len() != height.div_ceil(AUTH_CHUNK_ROWS) {
         return Err(WhirInitialEncodingError::Invalid(
             "authentication count does not match height",
-        ));
+        )
+        .into());
     }
     let mut global = Hasher::new();
     global.update(prefix);
     let mut chunk_index = 0_usize;
     for batch_start in (0..height).step_by(AUTH_SCAN_ROWS) {
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+        }
         let rows = (height - batch_start).min(AUTH_SCAN_ROWS);
         let bytes = read_encoded_rows(file, path, batch_start, rows)?;
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+        }
         validate_encoded_rows(&bytes)?;
         for chunk in bytes.chunks(AUTH_CHUNK_ROWS * WHIR_INITIAL_WIDTH * 8) {
             if auth_digest(prefix, chunk_index, chunk) != auth_digests[chunk_index] {
-                return Err(WhirInitialEncodingError::ChecksumMismatch);
+                return Err(WhirInitialEncodingError::ChecksumMismatch.into());
             }
             chunk_index += 1;
         }
         global.update(&bytes);
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.advance(bytes.len() as u64)?;
+        }
     }
     for digest in auth_digests {
         global.update(digest);
     }
     if *global.finalize().as_bytes() != expected_global {
-        return Err(WhirInitialEncodingError::ChecksumMismatch);
+        return Err(WhirInitialEncodingError::ChecksumMismatch.into());
     }
     Ok(())
 }
 
-fn read_auth_digests(
+fn read_auth_digests_with_control(
     file: &mut File,
     path: &Path,
     count: usize,
-) -> Result<Vec<[u8; DIGEST_BYTES]>, WhirInitialEncodingError> {
+    mut controller: Option<&mut N31ProgressController<'_>>,
+) -> ControlledSixStepResult<Vec<[u8; DIGEST_BYTES]>> {
     let mut digests = Vec::new();
     digests
         .try_reserve_exact(count)
@@ -1367,10 +1812,16 @@ fn read_auth_digests(
         "authentication table I/O buffer",
     )?;
     while remaining != 0 {
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+        }
         let batch = remaining.min(AUTH_DIGEST_IO_COUNT);
         let byte_count = batch * DIGEST_BYTES;
         file.read_exact(&mut bytes[..byte_count])
             .map_err(|source| io_error("reading authentication table from", path, source))?;
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+        }
         digests.extend(
             bytes[..byte_count]
                 .chunks_exact(DIGEST_BYTES)
@@ -1380,20 +1831,27 @@ fn read_auth_digests(
                 }),
         );
         remaining -= batch;
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.advance(byte_count as u64)?;
+        }
     }
     Ok(digests)
 }
 
-fn write_auth_digests(
+fn write_auth_digests_with_control(
     file: &mut File,
     path: &Path,
     digests: &[[u8; DIGEST_BYTES]],
-) -> Result<(), WhirInitialEncodingError> {
+    mut controller: Option<&mut N31ProgressController<'_>>,
+) -> ControlledSixStepResult<()> {
     let mut bytes = allocate_byte_buffer(
         AUTH_DIGEST_IO_COUNT * DIGEST_BYTES,
         "authentication table I/O buffer",
     )?;
     for batch in digests.chunks(AUTH_DIGEST_IO_COUNT) {
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+        }
         let byte_count = batch.len() * DIGEST_BYTES;
         for (digest, output) in batch
             .iter()
@@ -1403,6 +1861,10 @@ fn write_auth_digests(
         }
         file.write_all(&bytes[..byte_count])
             .map_err(|source| io_error("writing authentication table to", path, source))?;
+        if let Some(controller) = controller.as_deref_mut() {
+            controller.checkpoint()?;
+            controller.advance(byte_count as u64)?;
+        }
     }
     Ok(())
 }
@@ -1818,6 +2280,7 @@ mod tests {
     use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
 
     use super::*;
+    use crate::whir_initial_source::WhirInitialSourceArtifactWriter;
 
     static NEXT_PATH: AtomicUsize = AtomicUsize::new(0);
 
@@ -1856,6 +2319,34 @@ mod tests {
                 fail_at: None,
                 change_len_after_read: false,
             }
+        }
+    }
+
+    struct CancelAfterFirstReadSource<'a> {
+        inner: &'a dyn AuthenticatedWhirInitialSource,
+        cancelled: &'a AtomicBool,
+        reads: AtomicUsize,
+    }
+
+    impl AuthenticatedWhirInitialSource for CancelAfterFirstReadSource<'_> {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            self.inner.identity()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn read_elements(
+            &self,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            let values = self.inner.read_elements(start, count)?;
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.cancelled.store(true, Ordering::Release);
+            }
+            Ok(values)
         }
     }
 
@@ -1967,6 +2458,80 @@ mod tests {
             values.extend(artifact.read_canonical_rows(start, rows).unwrap());
         }
         values
+    }
+
+    fn run_controlled_six_step<F>(
+        path: &Path,
+        artifact_id: [u8; 32],
+        expected_source: &WhirInitialSourceIdentity,
+        source: &dyn AuthenticatedWhirInitialSource,
+        cancelled: &AtomicBool,
+        mut observe: F,
+    ) -> Result<WhirInitialN31Outcome, WhirInitialEncodingError>
+    where
+        F: FnMut(WhirInitialN31Progress),
+    {
+        let variables = expected_source.num_variables as usize;
+        let side = 1 << ((variables - 1) / 2);
+        let mut controller = N31ProgressController::new(cancelled, &mut observe);
+        match encode_six_step_suffix_with_control(
+            path,
+            artifact_id,
+            expected_source,
+            source,
+            side.min(N31_TRANSPOSE_TILE),
+            side.min(N31_FFT_STRIP),
+            &mut controller,
+        ) {
+            Ok(artifact) => Ok(WhirInitialN31Outcome::Published(artifact)),
+            Err(ControlledSixStepError::Cancelled(progress)) => {
+                Ok(WhirInitialN31Outcome::Cancelled(progress))
+            }
+            Err(ControlledSixStepError::Encoding(error)) => Err(error),
+        }
+    }
+
+    fn expected_small_six_step_progress(variables: usize) -> Vec<WhirInitialN31Progress> {
+        let (source_bytes, codeword_bytes, sealed_bytes) = match variables {
+            5 => (256, 512, 544),
+            9 => (4_096, 8_192, 8_224),
+            17 => (1_048_576, 2_097_152, 2_105_344),
+            _ => panic!("unexpected six-step test geometry"),
+        };
+        let mut progress = Vec::with_capacity(10);
+        for (stage, total_bytes) in [
+            (WhirInitialN31Stage::Transpose, source_bytes),
+            (WhirInitialN31Stage::FirstFft, codeword_bytes),
+            (WhirInitialN31Stage::SecondFft, codeword_bytes),
+            (WhirInitialN31Stage::Seal, sealed_bytes),
+            (WhirInitialN31Stage::Verify, sealed_bytes),
+        ] {
+            progress.push(WhirInitialN31Progress {
+                stage,
+                completed_bytes: 0,
+                total_bytes,
+            });
+            progress.push(WhirInitialN31Progress {
+                stage,
+                completed_bytes: total_bytes,
+                total_bytes,
+            });
+        }
+        progress
+    }
+
+    fn assert_no_six_step_output(path: &Path) {
+        assert!(!path.exists());
+        let staging_prefix = format!("{}.n31.", path.file_name().unwrap().to_string_lossy());
+        assert!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&staging_prefix))
+        );
     }
 
     #[test]
@@ -2139,6 +2704,13 @@ mod tests {
         assert_eq!(plan.codeword_and_tree_bytes, 103_213_433_216);
         assert_eq!(plan.persistent_source_codeword_tree_bytes, 120_401_691_168);
         assert_eq!(plan.max_transform_memory_bytes, 269_484_032);
+        assert_eq!(plan.source_elements * 8, 17_179_869_184);
+        let codeword_data_bytes = plan.codeword_height * WHIR_INITIAL_WIDTH as u64 * 8;
+        let codeword_auth_bytes =
+            plan.codeword_artifact_bytes - HEADER_BYTES as u64 - codeword_data_bytes;
+        assert_eq!(codeword_data_bytes, 34_359_738_368);
+        assert_eq!(codeword_auth_bytes, 134_217_728);
+        assert_eq!(codeword_data_bytes + codeword_auth_bytes, 34_493_956_096);
         assert!(matches!(
             require_space(plan.encoder_peak_bytes, plan.encoder_peak_bytes - 1),
             Err(WhirInitialEncodingError::InsufficientSpace { .. })
@@ -2183,6 +2755,320 @@ mod tests {
                 fs::read(&reference_path).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn controlled_six_step_matches_frozen_bytes_and_exact_ordered_progress() {
+        for variables in [5, 9, 17] {
+            let values = table(variables);
+            let expected_source = identity(variables);
+            let artifact_id = [0x5d; 32];
+            let reference_path = test_path("controlled-reference");
+            let reference_source = DenseSource::new(values.clone());
+            let reference = encode_whir_initial_suffix(
+                &reference_path,
+                artifact_id,
+                &expected_source,
+                &reference_source,
+            )
+            .unwrap()
+            .remove_on_drop();
+
+            let controlled_path = test_path("controlled-six-step");
+            let controlled_source = DenseSource::new(values);
+            let cancelled = AtomicBool::new(false);
+            let mut progress = Vec::new();
+            let controlled = match run_controlled_six_step(
+                &controlled_path,
+                artifact_id,
+                &expected_source,
+                &controlled_source,
+                &cancelled,
+                |update| progress.push(update),
+            )
+            .unwrap()
+            {
+                WhirInitialN31Outcome::Published(artifact) => artifact.remove_on_drop(),
+                WhirInitialN31Outcome::Cancelled(update) => {
+                    panic!("never-cancelled build stopped at {update:?}")
+                }
+            };
+
+            assert_eq!(controlled.identity(), reference.identity());
+            assert_eq!(
+                fs::read(&controlled_path).unwrap(),
+                fs::read(&reference_path).unwrap()
+            );
+            assert_eq!(progress, expected_small_six_step_progress(variables));
+        }
+    }
+
+    #[test]
+    fn controlled_progress_withholds_completion_until_the_stage_boundary() {
+        let cancelled = AtomicBool::new(false);
+        let mut observed = Vec::new();
+        let result = {
+            let mut observe = |update| observed.push(update);
+            let mut controller = N31ProgressController::new(&cancelled, &mut observe);
+            assert!(
+                controller
+                    .start_stage(WhirInitialN31Stage::Transpose, 16)
+                    .is_ok()
+            );
+            assert!(controller.advance(16).is_ok());
+            cancelled.store(true, Ordering::Release);
+            controller.finish_stage()
+        };
+
+        assert!(matches!(
+            result,
+            Err(ControlledSixStepError::Cancelled(WhirInitialN31Progress {
+                stage: WhirInitialN31Stage::Transpose,
+                completed_bytes: 0,
+                total_bytes: 16,
+            }))
+        ));
+        assert_eq!(
+            observed,
+            vec![WhirInitialN31Progress {
+                stage: WhirInitialN31Stage::Transpose,
+                completed_bytes: 0,
+                total_bytes: 16,
+            }]
+        );
+
+        let cancelled = AtomicBool::new(false);
+        let mut observed = Vec::new();
+        let result = {
+            let mut observe = |update| observed.push(update);
+            let mut controller = N31ProgressController::new(&cancelled, &mut observe);
+            assert!(
+                controller
+                    .start_stage(WhirInitialN31Stage::Transpose, 16)
+                    .is_ok()
+            );
+            assert!(controller.advance(16).is_ok());
+            controller.finish_stage()
+        };
+        assert!(result.is_ok());
+        assert_eq!(
+            observed,
+            vec![
+                WhirInitialN31Progress {
+                    stage: WhirInitialN31Stage::Transpose,
+                    completed_bytes: 0,
+                    total_bytes: 16,
+                },
+                WhirInitialN31Progress {
+                    stage: WhirInitialN31Stage::Transpose,
+                    completed_bytes: 16,
+                    total_bytes: 16,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn controlled_six_step_pre_cancel_reads_and_creates_nothing() {
+        let variables = 5;
+        let expected_source = identity(variables);
+        let source = DenseSource::new(table(variables));
+        let path = test_path("controlled-pre-cancel");
+        let cancelled = AtomicBool::new(true);
+        let mut progress = Vec::new();
+        let outcome = run_controlled_six_step(
+            &path,
+            [0x5e; 32],
+            &expected_source,
+            &source,
+            &cancelled,
+            |update| progress.push(update),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WhirInitialN31Outcome::Cancelled(WhirInitialN31Progress {
+                stage: WhirInitialN31Stage::Transpose,
+                completed_bytes: 0,
+                total_bytes: 256,
+            })
+        ));
+        assert!(progress.is_empty());
+        assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+        assert_no_six_step_output(&path);
+    }
+
+    #[test]
+    fn controlled_six_step_cancels_immediately_after_first_authenticated_read() {
+        let variables = 5;
+        let expected_source = identity(variables);
+        let source_path = test_path("controlled-first-read-source");
+        let mut writer =
+            WhirInitialSourceArtifactWriter::create(&source_path, expected_source.clone()).unwrap();
+        writer.write_elements(&table(variables)).unwrap();
+        let authenticated_source = writer.finish().unwrap().remove_on_drop();
+        let cancelled = AtomicBool::new(false);
+        let source = CancelAfterFirstReadSource {
+            inner: &authenticated_source,
+            cancelled: &cancelled,
+            reads: AtomicUsize::new(0),
+        };
+        let path = test_path("controlled-first-read-cancel");
+        let mut progress = Vec::new();
+        let outcome = run_controlled_six_step(
+            &path,
+            [0x5f; 32],
+            &expected_source,
+            &source,
+            &cancelled,
+            |update| progress.push(update),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WhirInitialN31Outcome::Cancelled(WhirInitialN31Progress {
+                stage: WhirInitialN31Stage::Transpose,
+                completed_bytes: 0,
+                total_bytes: 256,
+            })
+        ));
+        assert_eq!(
+            progress,
+            vec![WhirInitialN31Progress {
+                stage: WhirInitialN31Stage::Transpose,
+                completed_bytes: 0,
+                total_bytes: 256,
+            }]
+        );
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+        assert_no_six_step_output(&path);
+    }
+
+    #[test]
+    fn controlled_six_step_cancellation_at_each_stage_cleans_owned_files() {
+        for (index, stage) in [
+            WhirInitialN31Stage::Transpose,
+            WhirInitialN31Stage::FirstFft,
+            WhirInitialN31Stage::SecondFft,
+            WhirInitialN31Stage::Seal,
+            WhirInitialN31Stage::Verify,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let variables = 5;
+            let expected_source = identity(variables);
+            let source = DenseSource::new(table(variables));
+            let path = test_path("controlled-stage-cancel");
+            let cancelled = AtomicBool::new(false);
+            let outcome = run_controlled_six_step(
+                &path,
+                [0x70 + index as u8; 32],
+                &expected_source,
+                &source,
+                &cancelled,
+                |update| {
+                    if update.stage == stage && update.completed_bytes == 0 {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                },
+            )
+            .unwrap();
+
+            assert!(matches!(
+                outcome,
+                WhirInitialN31Outcome::Cancelled(update)
+                    if update.stage == stage && update.completed_bytes == 0
+            ));
+            assert_no_six_step_output(&path);
+        }
+    }
+
+    #[test]
+    fn controlled_six_step_verify_completion_can_cancel_before_publication() {
+        let variables = 5;
+        let expected_source = identity(variables);
+        let source = DenseSource::new(table(variables));
+        let path = test_path("controlled-verified-cancel");
+        let cancelled = AtomicBool::new(false);
+        let outcome = run_controlled_six_step(
+            &path,
+            [0x76; 32],
+            &expected_source,
+            &source,
+            &cancelled,
+            |update| {
+                if update.stage == WhirInitialN31Stage::Verify
+                    && update.completed_bytes == update.total_bytes
+                {
+                    cancelled.store(true, Ordering::Release);
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WhirInitialN31Outcome::Cancelled(WhirInitialN31Progress {
+                stage: WhirInitialN31Stage::Verify,
+                completed_bytes: 544,
+                total_bytes: 544,
+            })
+        ));
+        assert_no_six_step_output(&path);
+    }
+
+    #[test]
+    fn controlled_six_step_already_exists_precedes_cancellation() {
+        let variables = 5;
+        let expected_source = identity(variables);
+        let source = DenseSource::new(table(variables));
+        let path = test_path("controlled-existing-target");
+        fs::write(&path, b"preserve").unwrap();
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            run_controlled_six_step(
+                &path,
+                [0x77; 32],
+                &expected_source,
+                &source,
+                &cancelled,
+                |_| panic!("preflight failure must not report progress"),
+            ),
+            Err(WhirInitialEncodingError::AlreadyExists(existing)) if existing == path
+        ));
+        assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&path).unwrap(), b"preserve");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn controlled_six_step_observer_panic_unwinds_owned_staging_cleanup() {
+        let variables = 5;
+        let expected_source = identity(variables);
+        let source = DenseSource::new(table(variables));
+        let path = test_path("controlled-observer-panic");
+        let cancelled = AtomicBool::new(false);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_controlled_six_step(
+                &path,
+                [0x78; 32],
+                &expected_source,
+                &source,
+                &cancelled,
+                |update| {
+                    if update.stage == WhirInitialN31Stage::FirstFft && update.completed_bytes == 0
+                    {
+                        panic!("injected observer panic");
+                    }
+                },
+            );
+        }));
+
+        assert!(unwind.is_err());
+        assert_no_six_step_output(&path);
     }
 
     #[test]

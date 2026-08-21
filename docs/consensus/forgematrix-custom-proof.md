@@ -490,6 +490,20 @@ set, 68,719,476,896 bytes of encoder scratch/output space, and 269,484,032
 bytes of requested transform-buffer payload. No complete 31-variable run or
 production timing benchmark is claimed.
 
+The exact-31 encoder also has a controlled entry point for operator progress
+and cooperative cancellation. It reports deterministic logical bytes, rather
+than physical I/O or elapsed-time estimates, across transpose, first FFT,
+second FFT, sealing, and complete verification; a stage reaches 100 percent
+only after its durability or checksum boundary succeeds. Cancellation is
+checked between bounded authenticated reads, transform work units, writes, and
+verification batches, unwinds through ownership-checked staging cleanup, and
+never publishes a partial result. The final cancellation check occurs before
+the no-overwrite hard-link publication barrier. Once that barrier begins, the
+observer is not called and cancellation is ignored until the indivisible
+hard-link, directory-sync, staging-removal, and directory-sync sequence either
+succeeds or returns an error. Cancellation discards the attempt; resumable
+checkpoints remain separate future work.
+
 The original natural-order table is stored in its own authenticated source
 artifact, whose separately retained whole-artifact digest is the provenance
 check; `source_id` remains only a cross-artifact label. The independently

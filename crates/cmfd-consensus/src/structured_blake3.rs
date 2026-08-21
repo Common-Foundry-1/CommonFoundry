@@ -43,14 +43,14 @@ use crate::structured_blake3_narrow::prove_narrow_blake3_with_cuda_in_spill_dir 
 use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement, StructuredBlake3Verifier,
     forgematrix_v2::output_digest,
+    structured_blake3_identity::STRUCTURED_BLAKE3_PROOF_MAGIC,
     structured_blake3_narrow::{
         NarrowBlake3Error, NarrowDft, prove_narrow_blake3_with_dft, verify_narrow_blake3,
     },
 };
 
-pub const STRUCTURED_BLAKE3_VERSION: u32 = 2;
+pub use crate::structured_blake3_identity::STRUCTURED_BLAKE3_VERSION;
 
-const PROOF_MAGIC: &[u8; 8] = b"CMFDB3S2";
 const BACKEND_ONE_BLOCK: u8 = 0;
 const BACKEND_TREE: u8 = 1;
 const MAX_COMPRESSED_TREE_PROOF_BYTES: usize = 256 * 1024;
@@ -119,6 +119,10 @@ pub enum StructuredBlake3Error {
     InvalidEncoding,
     #[error("BLAKE3 STARK verifier rejected the proof")]
     Verification,
+    #[error("BLAKE3 STARK pinned preprocessed key is missing or malformed")]
+    PinnedPreprocessedKeyInvalid,
+    #[error("BLAKE3 STARK preprocessed commitment does not match the pinned key")]
+    PinnedPreprocessedKeyMismatch,
     #[error("BLAKE3 STARK accelerator setup failed: {0}")]
     Accelerator(String),
     #[error("BLAKE3 STARK backend panicked while handling proof data")]
@@ -134,6 +138,8 @@ impl From<NarrowBlake3Error> for StructuredBlake3Error {
             NarrowBlake3Error::Opening => Self::ActivationOpening,
             NarrowBlake3Error::Encoding => Self::InvalidEncoding,
             NarrowBlake3Error::Verification => Self::Verification,
+            NarrowBlake3Error::PinnedPreprocessedKeyInvalid => Self::PinnedPreprocessedKeyInvalid,
+            NarrowBlake3Error::PinnedPreprocessedKeyMismatch => Self::PinnedPreprocessedKeyMismatch,
             #[cfg(feature = "gpu-proof-prover")]
             NarrowBlake3Error::Accelerator(message) => Self::Accelerator(message),
             NarrowBlake3Error::BackendPanic => Self::BackendPanic,
@@ -645,7 +651,7 @@ fn bincode_options() -> impl Options {
 fn encode_proof(backend: u8, native: &[u8]) -> Result<Vec<u8>, StructuredBlake3Error> {
     let length = u32::try_from(native.len()).map_err(|_| StructuredBlake3Error::ProofTooLarge)?;
     let mut encoded = Vec::with_capacity(17 + native.len());
-    encoded.extend_from_slice(PROOF_MAGIC);
+    encoded.extend_from_slice(STRUCTURED_BLAKE3_PROOF_MAGIC);
     encoded.extend_from_slice(&STRUCTURED_BLAKE3_VERSION.to_le_bytes());
     encoded.push(backend);
     encoded.extend_from_slice(&length.to_le_bytes());
@@ -660,7 +666,7 @@ fn decode_proof(encoded: &[u8]) -> Result<(u8, &[u8]), StructuredBlake3Error> {
     if encoded.len() < 17 || encoded.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES {
         return Err(StructuredBlake3Error::ProofTooLarge);
     }
-    if encoded.get(..8) != Some(PROOF_MAGIC.as_slice()) {
+    if encoded.get(..8) != Some(STRUCTURED_BLAKE3_PROOF_MAGIC.as_slice()) {
         return Err(StructuredBlake3Error::InvalidEncoding);
     }
     let version = u32::from_le_bytes(
@@ -979,6 +985,42 @@ mod tests {
                 crate::structured_sumcheck::evaluate_mle(&table, &native_point),
             ),
         }
+    }
+
+    #[test]
+    fn legacy_outer_proof_envelope_is_rejected() {
+        let proof = encode_proof(BACKEND_TREE, b"canonical-body").unwrap();
+        assert_eq!(&proof[..8], STRUCTURED_BLAKE3_PROOF_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(proof[8..12].try_into().unwrap()),
+            STRUCTURED_BLAKE3_VERSION
+        );
+
+        let mut legacy_magic = proof.clone();
+        legacy_magic[..8].copy_from_slice(b"CMFDB3S2");
+        assert_eq!(
+            decode_proof(&legacy_magic).unwrap_err(),
+            StructuredBlake3Error::InvalidEncoding
+        );
+
+        let mut legacy_version = proof;
+        legacy_version[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            decode_proof(&legacy_version).unwrap_err(),
+            StructuredBlake3Error::InvalidEncoding
+        );
+    }
+
+    #[test]
+    fn pinned_preprocessed_key_failures_preserve_their_diagnosis() {
+        assert_eq!(
+            StructuredBlake3Error::from(NarrowBlake3Error::PinnedPreprocessedKeyInvalid),
+            StructuredBlake3Error::PinnedPreprocessedKeyInvalid
+        );
+        assert_eq!(
+            StructuredBlake3Error::from(NarrowBlake3Error::PinnedPreprocessedKeyMismatch),
+            StructuredBlake3Error::PinnedPreprocessedKeyMismatch
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use blake3::Hasher;
+use p3_maybe_rayon::prelude::*;
 use thiserror::Error;
 
 /// The four canonical Goldilocks words used by Common Foundry's input MMCS.
@@ -594,6 +595,15 @@ fn build_authenticated_merkle_store_inner(
 
     let mut reader = File::open(&partial_path)
         .map_err(|source| io_error("opening construction reader for", &partial_path, source))?;
+    let max_parent_chunk = AUTH_CHUNK_DIGESTS as usize;
+    let mut children = Vec::new();
+    children
+        .try_reserve_exact(max_parent_chunk * 2)
+        .map_err(|_| MerkleStoreError::Invalid("child digest allocation failed"))?;
+    let mut parents = Vec::new();
+    parents
+        .try_reserve_exact(max_parent_chunk)
+        .map_err(|_| MerkleStoreError::Invalid("parent digest allocation failed"))?;
     for layer_index in 1..layers.len() {
         let previous = &layers[layer_index - 1];
         let current = &layers[layer_index];
@@ -622,14 +632,30 @@ fn build_authenticated_merkle_store_inner(
                     hash,
                 )?)
             };
-            for offset in 0..row_count {
-                let left = read_raw_digest(&mut reader, &partial_path)?;
-                let right = read_raw_digest(&mut reader, &partial_path)?;
-                let mut digest = checked_hash_digest(hash.compress([left, right]))?;
-                if let Some(injected) = &injected {
-                    digest = checked_hash_digest(hash.compress([digest, injected[offset]]))?;
-                }
-                data_writer.write_digest(digest)?;
+            let child_count = row_count
+                .checked_mul(2)
+                .ok_or(MerkleStoreError::Invalid("child digest count overflow"))?;
+            children.clear();
+            for _ in 0..child_count {
+                children.push(read_raw_digest(&mut reader, &partial_path)?);
+            }
+            parents.clear();
+            parents.resize(row_count, [0_u64; 4]);
+            parents.par_iter_mut().enumerate().try_for_each(
+                |(offset, parent)| -> Result<(), MerkleStoreError> {
+                    let child_offset = offset * 2;
+                    let mut digest = checked_hash_digest(
+                        hash.compress([children[child_offset], children[child_offset + 1]]),
+                    )?;
+                    if let Some(injected) = &injected {
+                        digest = checked_hash_digest(hash.compress([digest, injected[offset]]))?;
+                    }
+                    *parent = digest;
+                    Ok(())
+                },
+            )?;
+            for digest in &parents {
+                data_writer.write_digest(*digest)?;
             }
         }
         for _ in current.logical_len..current.stored_len {
@@ -1649,6 +1675,39 @@ mod tests {
             ],
             2,
         );
+    }
+
+    #[test]
+    fn parallel_upper_layers_match_dense_order_across_chunk_boundaries() {
+        let directory = test_dir("parallel-chunks");
+        let path = directory.join("tree.merkle");
+        let hash = PoseidonHash::new();
+        let matrices = vec![
+            DenseRows::fixture(1_025, 2, 40),
+            DenseRows::fixture(513, 1, 4_000),
+            DenseRows::fixture(257, 3, 40_000),
+        ];
+        let expected = dense_reference(&matrices, 3, &hash);
+        let sources = matrices
+            .iter()
+            .map(|matrix| matrix as &dyn MerkleRowSource)
+            .collect::<Vec<_>>();
+
+        let store =
+            build_authenticated_merkle_store(&path, [0x6c; 32], &sources, 3, &hash).unwrap();
+
+        assert_eq!(store.root().unwrap(), expected.root());
+        assert_eq!(store.cap().unwrap(), expected.cap());
+        for index in [0, 1, 255, 256, 511, 512, 1_024] {
+            assert_eq!(store.opening_path(index).unwrap(), expected.path(index));
+            assert_eq!(
+                store.matrix_row_indices(index).unwrap(),
+                expected.row_indices(index)
+            );
+        }
+
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

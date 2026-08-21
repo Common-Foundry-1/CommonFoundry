@@ -7,11 +7,15 @@ use crate::difficulty::{DGW_WINDOW, TARGET_SPACING_SECONDS};
 use crate::economics::{EconomicsError, MonetaryPolicy};
 use crate::forgematrix::ForgeMatrixError;
 use crate::pow::{PowError, PowParameters};
+use crate::structured_blake3_identity::{
+    NARROW_BLAKE3_PROOF_VERSION, PINNED_PREPROCESSED_REGISTRY_VERSION, STRUCTURED_BLAKE3_VERSION,
+    pinned_preprocessed_registry_digest,
+};
 use crate::wire::{
     MAX_BLOCK_BYTES, MAX_PROOF_BYTES, MAX_TRANSACTION_BYTES, WIRE_HEADER_BYTES, WIRE_VERSION,
 };
 
-const NETWORK_PARAMS_DOMAIN: &str = "CMFD/NETWORK/PARAMS/V1";
+const NETWORK_PARAMS_DOMAIN: &str = "CMFD/NETWORK/PARAMS/V2";
 
 pub const NETWORK_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FUTURE_OFFSET_SECS: u64 = 24 * 60 * 60;
@@ -88,6 +92,21 @@ impl NetworkParams {
     }
 
     pub fn fingerprint(&self) -> Result<[u8; 32], NetworkError> {
+        self.fingerprint_with_structured_blake3_identity(
+            STRUCTURED_BLAKE3_VERSION,
+            NARROW_BLAKE3_PROOF_VERSION,
+            PINNED_PREPROCESSED_REGISTRY_VERSION,
+            pinned_preprocessed_registry_digest(),
+        )
+    }
+
+    fn fingerprint_with_structured_blake3_identity(
+        &self,
+        structured_blake3_version: u32,
+        narrow_blake3_version: u32,
+        pinned_keys_version: u32,
+        pinned_keys_digest: [u8; 32],
+    ) -> Result<[u8; 32], NetworkError> {
         self.validate_without_pow()?;
         let mut hasher = Hasher::new_derive_key(NETWORK_PARAMS_DOMAIN);
         hasher.update(&self.network_id);
@@ -99,6 +118,11 @@ impl NetworkParams {
         self.pow
             .absorb(self.network_id, &mut hasher)
             .map_err(map_pow_parameter_error)?;
+
+        hasher.update(&structured_blake3_version.to_le_bytes());
+        hasher.update(&narrow_blake3_version.to_le_bytes());
+        hasher.update(&pinned_keys_version.to_le_bytes());
+        hasher.update(&pinned_keys_digest);
 
         hasher.update(&self.monetary_policy.initial_subsidy.to_le_bytes());
         hasher.update(&self.monetary_policy.tail_height.to_le_bytes());
@@ -349,6 +373,54 @@ mod tests {
         let baseline = params();
         let fingerprint = baseline.fingerprint().unwrap();
         assert_eq!(fingerprint, baseline.fingerprint().unwrap());
+
+        let registry_digest = pinned_preprocessed_registry_digest();
+        assert_ne!(
+            baseline
+                .fingerprint_with_structured_blake3_identity(
+                    STRUCTURED_BLAKE3_VERSION + 1,
+                    NARROW_BLAKE3_PROOF_VERSION,
+                    PINNED_PREPROCESSED_REGISTRY_VERSION,
+                    registry_digest,
+                )
+                .unwrap(),
+            fingerprint
+        );
+        assert_ne!(
+            baseline
+                .fingerprint_with_structured_blake3_identity(
+                    STRUCTURED_BLAKE3_VERSION,
+                    NARROW_BLAKE3_PROOF_VERSION + 1,
+                    PINNED_PREPROCESSED_REGISTRY_VERSION,
+                    registry_digest,
+                )
+                .unwrap(),
+            fingerprint
+        );
+        assert_ne!(
+            baseline
+                .fingerprint_with_structured_blake3_identity(
+                    STRUCTURED_BLAKE3_VERSION,
+                    NARROW_BLAKE3_PROOF_VERSION,
+                    PINNED_PREPROCESSED_REGISTRY_VERSION + 1,
+                    registry_digest,
+                )
+                .unwrap(),
+            fingerprint
+        );
+        let mut wrong_registry_digest = registry_digest;
+        wrong_registry_digest[0] ^= 1;
+        assert_ne!(
+            baseline
+                .fingerprint_with_structured_blake3_identity(
+                    STRUCTURED_BLAKE3_VERSION,
+                    NARROW_BLAKE3_PROOF_VERSION,
+                    PINNED_PREPROCESSED_REGISTRY_VERSION,
+                    wrong_registry_digest,
+                )
+                .unwrap(),
+            fingerprint
+        );
 
         let mut variants = Vec::new();
 

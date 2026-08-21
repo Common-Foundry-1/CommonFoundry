@@ -49,15 +49,20 @@ use p3_matrix::{
 };
 use p3_merkle_tree::MerkleTreeMmcs;
 #[cfg(feature = "gpu-proof-prover")]
-use p3_symmetric::{CryptographicHasher, MerkleCap, PseudoCompressionFunction};
-use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+use p3_symmetric::{MerkleCap, PaddingFreeSponge, TruncatedPermutation};
 use p3_uni_stark::{
-    Proof, StarkConfig, prove_with_preprocessed, setup_preprocessed, verify_with_preprocessed,
+    PreprocessedVerifierKey, Proof, StarkConfig, prove_with_preprocessed, setup_preprocessed,
+    verify_with_preprocessed,
 };
 use thiserror::Error;
 
 use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement,
+    structured_blake3_identity::{
+        NARROW_BLAKE3_PROOF_MAGIC, NARROW_BLAKE3_PROOF_VERSION, PINNED_PREPROCESSED_WIDTH,
+        pinned_preprocessed_key,
+    },
     structured_blake3_tree::{
         Blake3TreeError, Blake3TreeWitness, CompressionKind, CompressionOp, build_tree_witness,
     },
@@ -81,9 +86,6 @@ const ACTIVATION_HIGH_WEIGHT_WIDTH: usize = 3;
 const WORD_BITS: usize = 32;
 const MESSAGE_WORDS: usize = 16;
 const CV_WORDS: usize = 8;
-const NARROW_PROOF_MAGIC: &[u8; 8] = b"CMFDB3N2";
-const NARROW_PROOF_VERSION: u32 = 2;
-
 const FRI_LOG_BLOWUP: usize = 7;
 const FRI_QUERIES: usize = 33;
 const FRI_QUERY_POW_BITS: usize = 18;
@@ -93,6 +95,13 @@ const STREAM_CHUNK_ROWS: usize = 1 << 16;
 static NEXT_STREAM_ARTIFACT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-proof-prover")]
 static NEXT_MERKLE_ARTIFACT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static PREPROCESSED_TRACE_FORBIDDEN: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
 
 const IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
@@ -1134,6 +1143,10 @@ pub(crate) enum NarrowBlake3Error {
     Encoding,
     #[error("narrow BLAKE3 tree verifier rejected the proof")]
     Verification,
+    #[error("narrow BLAKE3 tree pinned preprocessed key is missing or malformed")]
+    PinnedPreprocessedKeyInvalid,
+    #[error("narrow BLAKE3 tree preprocessed commitment does not match the pinned key")]
+    PinnedPreprocessedKeyMismatch,
     #[cfg(feature = "gpu-proof-prover")]
     #[error("narrow BLAKE3 tree accelerator setup failed: {0}")]
     Accelerator(String),
@@ -1300,6 +1313,13 @@ impl BaseAir<F> for NarrowBlake3Air {
     }
 
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
+        #[cfg(test)]
+        PREPROCESSED_TRACE_FORBIDDEN.with(|forbidden| {
+            assert!(
+                !forbidden.get(),
+                "verifier must not materialize the preprocessed trace"
+            );
+        });
         Some(generate_preprocessed(
             self.activation_len,
             self.trace_rows,
@@ -1309,6 +1329,10 @@ impl BaseAir<F> for NarrowBlake3Air {
 
     fn preprocessed_width(&self) -> usize {
         PREP_WIDTH
+    }
+
+    fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+        Vec::new()
     }
 
     fn num_periodic_columns(&self) -> usize {
@@ -1354,6 +1378,46 @@ impl BaseAir<F> for NarrowBlake3Air {
 
     fn max_constraint_degree(&self) -> Option<usize> {
         Some(16)
+    }
+}
+
+fn pinned_preprocessed_verifier_key(
+    air: &NarrowBlake3Air,
+) -> Result<PreprocessedVerifierKey<Config>, NarrowBlake3Error> {
+    let entry = pinned_preprocessed_key(air.activation_len, air.trace_rows)
+        .ok_or(NarrowBlake3Error::PinnedPreprocessedKeyInvalid)?;
+    if entry.activation_len != air.activation_len
+        || entry.trace_rows != air.trace_rows
+        || PINNED_PREPROCESSED_WIDTH != PREP_WIDTH
+    {
+        return Err(NarrowBlake3Error::PinnedPreprocessedKeyInvalid);
+    }
+
+    let mut root = [F::ZERO; 4];
+    for (field_word, canonical_word) in root.iter_mut().zip(entry.root) {
+        *field_word = F::from_canonical_checked(canonical_word)
+            .ok_or(NarrowBlake3Error::PinnedPreprocessedKeyInvalid)?;
+    }
+    let commitment: <Pcs as PcsTrait<EF, Challenger>>::Commitment = MerkleCap::new(vec![root]);
+
+    Ok(PreprocessedVerifierKey {
+        width: PINNED_PREPROCESSED_WIDTH,
+        degree_bits: air.trace_rows.ilog2() as usize,
+        commitment,
+    })
+}
+
+fn require_matching_preprocessed_key(
+    generated: &PreprocessedVerifierKey<Config>,
+    pinned: &PreprocessedVerifierKey<Config>,
+) -> Result<(), NarrowBlake3Error> {
+    if generated.width == pinned.width
+        && generated.degree_bits == pinned.degree_bits
+        && generated.commitment == pinned.commitment
+    {
+        Ok(())
+    } else {
+        Err(NarrowBlake3Error::PinnedPreprocessedKeyMismatch)
     }
 }
 
@@ -1425,6 +1489,7 @@ fn prove_narrow_blake3_with_backends(
     commit_backend: NarrowCommitBackend,
 ) -> Result<Vec<u8>, NarrowBlake3Error> {
     let air = NarrowBlake3Air::new(statement)?;
+    let pinned_key = pinned_preprocessed_verifier_key(&air)?;
     if activation.len() != statement.final_activation_len || activation.iter().any(|v| *v > 250) {
         return Err(NarrowBlake3Error::UnsupportedShape);
     }
@@ -1437,12 +1502,21 @@ fn prove_narrow_blake3_with_backends(
     let public = public_values(statement)?;
     let config = build_config_with_backends(dft, commit_backend);
     let log_rows = air.trace_rows.ilog2() as usize;
-    let proof = catch_unwind(AssertUnwindSafe(|| {
-        let (prep, _) = setup_preprocessed(&config, &air, log_rows)
-            .expect("narrow BLAKE3 AIR has preprocessed columns");
-        prove_with_preprocessed(&config, &air, trace, &public, Some(&prep))
-    }))
-    .map_err(|_| NarrowBlake3Error::BackendPanic)?;
+    let proof = catch_unwind(AssertUnwindSafe(
+        || -> Result<NativeProof, NarrowBlake3Error> {
+            let (prep, generated_key) = setup_preprocessed(&config, &air, log_rows)
+                .expect("narrow BLAKE3 AIR has preprocessed columns");
+            require_matching_preprocessed_key(&generated_key, &pinned_key)?;
+            Ok(prove_with_preprocessed(
+                &config,
+                &air,
+                trace,
+                &public,
+                Some(&prep),
+            ))
+        },
+    ))
+    .map_err(|_| NarrowBlake3Error::BackendPanic)??;
     encode_native_proof(proof)
 }
 
@@ -1453,11 +1527,9 @@ pub(crate) fn verify_narrow_blake3(
     let air = NarrowBlake3Air::new(statement)?;
     let proof = decode_native_proof(bytes)?;
     let config = build_config();
-    let log_rows = air.trace_rows.ilog2() as usize;
+    let verifier_key = pinned_preprocessed_verifier_key(&air)?;
     let public = public_values(statement)?;
     catch_unwind(AssertUnwindSafe(|| {
-        let (_, verifier_key) = setup_preprocessed(&config, &air, log_rows)
-            .expect("narrow BLAKE3 AIR has preprocessed columns");
         verify_with_preprocessed(&config, &air, &proof, &public, Some(&verifier_key))
     }))
     .map_err(|_| NarrowBlake3Error::BackendPanic)?
@@ -2353,8 +2425,8 @@ fn encode_native_proof(mut proof: NativeProof) -> Result<Vec<u8>, NarrowBlake3Er
     let archive_len =
         u32::try_from(archive_bytes.len()).map_err(|_| NarrowBlake3Error::Encoding)?;
     let mut encoded = Vec::with_capacity(20 + proof_bytes.len() + archive_bytes.len());
-    encoded.extend_from_slice(NARROW_PROOF_MAGIC);
-    encoded.extend_from_slice(&NARROW_PROOF_VERSION.to_le_bytes());
+    encoded.extend_from_slice(NARROW_BLAKE3_PROOF_MAGIC);
+    encoded.extend_from_slice(&NARROW_BLAKE3_PROOF_VERSION.to_le_bytes());
     encoded.extend_from_slice(&proof_len.to_le_bytes());
     encoded.extend_from_slice(&archive_len.to_le_bytes());
     encoded.extend_from_slice(&proof_bytes);
@@ -2363,7 +2435,7 @@ fn encode_native_proof(mut proof: NativeProof) -> Result<Vec<u8>, NarrowBlake3Er
 }
 
 pub(crate) fn decode_native_proof(bytes: &[u8]) -> Result<NativeProof, NarrowBlake3Error> {
-    if bytes.len() < 20 || bytes.get(..8) != Some(NARROW_PROOF_MAGIC.as_slice()) {
+    if bytes.len() < 20 || bytes.get(..8) != Some(NARROW_BLAKE3_PROOF_MAGIC.as_slice()) {
         return Err(NarrowBlake3Error::Encoding);
     }
     let version = u32::from_le_bytes(
@@ -2387,7 +2459,7 @@ pub(crate) fn decode_native_proof(bytes: &[u8]) -> Result<NativeProof, NarrowBla
     let archive_end = proof_end
         .checked_add(archive_len)
         .ok_or(NarrowBlake3Error::Encoding)?;
-    if version != NARROW_PROOF_VERSION || archive_end != bytes.len() {
+    if version != NARROW_BLAKE3_PROOF_VERSION || archive_end != bytes.len() {
         return Err(NarrowBlake3Error::Encoding);
     }
     let proof_bytes = &bytes[20..proof_end];
@@ -2705,28 +2777,14 @@ impl<E: Clone + PrimeCharacteristicRing> ExtExpr<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structured_blake3_identity::{
+        PINNED_PREPROCESSED_KEYS, PINNED_PREPROCESSED_LOG_BLOWUP,
+        PINNED_PREPROCESSED_REGISTRY_VERSION,
+    };
     use p3_air::AirLayout;
     use p3_commit::PeriodicEvaluator;
     use p3_matrix::Matrix;
     use p3_uni_stark::{ProvenSecurity, StarkSecurityParams};
-
-    const PINNED_PREP_ACTIVATION_LENGTHS: [usize; 15] = [
-        1 << 5,
-        1 << 6,
-        1 << 7,
-        1 << 8,
-        1 << 9,
-        1 << 10,
-        1 << 11,
-        1 << 12,
-        1 << 13,
-        1 << 14,
-        1 << 15,
-        1 << 16,
-        1 << 17,
-        1 << 18,
-        1 << 19,
-    ];
 
     fn statement(activation: &[u8]) -> StructuredBlake3Statement {
         let challenge = [0x42; 32];
@@ -2763,7 +2821,11 @@ mod tests {
     }
 
     fn preprocessed_air(activation_len: usize) -> NarrowBlake3Air {
-        assert!(PINNED_PREP_ACTIVATION_LENGTHS.contains(&activation_len));
+        assert!(
+            PINNED_PREPROCESSED_KEYS
+                .iter()
+                .any(|key| key.activation_len == activation_len)
+        );
         let challenge_digest = [0x42; 32];
         let activation = vec![125; activation_len];
         let statement = StructuredBlake3Statement {
@@ -2800,6 +2862,20 @@ mod tests {
         // value. Release them before the generator advances to the next shape.
         drop(prover_key);
         root
+    }
+
+    struct PreprocessedTraceForbidGuard;
+
+    impl Drop for PreprocessedTraceForbidGuard {
+        fn drop(&mut self) {
+            PREPROCESSED_TRACE_FORBIDDEN.with(|forbidden| forbidden.set(false));
+        }
+    }
+
+    fn with_preprocessed_trace_forbidden<T>(operation: impl FnOnce() -> T) -> T {
+        PREPROCESSED_TRACE_FORBIDDEN.with(|forbidden| assert!(!forbidden.replace(true)));
+        let _guard = PreprocessedTraceForbidGuard;
+        operation()
     }
 
     fn legacy_activation_high_weight(
@@ -2946,11 +3022,36 @@ mod tests {
     }
 
     #[test]
-    fn small_preprocessed_keys_have_the_production_shape_and_distinct_roots() {
+    fn pinned_preprocessed_registry_matches_every_supported_air_shape() {
+        assert_eq!(NARROW_BLAKE3_PROOF_VERSION, 3);
+        assert_eq!(NARROW_BLAKE3_PROOF_MAGIC, b"CMFDB3N3");
+        assert_eq!(PINNED_PREPROCESSED_REGISTRY_VERSION, 1);
+        assert_eq!(PINNED_PREPROCESSED_WIDTH, PREP_WIDTH);
+        assert_eq!(PINNED_PREPROCESSED_LOG_BLOWUP, FRI_LOG_BLOWUP);
+        assert_eq!(PINNED_PREPROCESSED_KEYS.len(), 15);
+
+        let mut roots = std::collections::BTreeSet::new();
+        for key in &PINNED_PREPROCESSED_KEYS {
+            let air = preprocessed_air(key.activation_len);
+            assert_eq!(air.trace_rows, key.trace_rows);
+            assert!(key.root.into_iter().all(|word| word < GOLDILOCKS_MODULUS));
+            assert!(roots.insert(key.root));
+            assert_eq!(
+                pinned_preprocessed_key(key.activation_len, key.trace_rows),
+                Some(key)
+            );
+        }
+    }
+
+    #[test]
+    fn small_preprocessed_keys_match_the_pinned_roots() {
         let config = build_config();
         let roots = [32, 64].map(|activation_len| {
             let air = preprocessed_air(activation_len);
-            preprocessed_root_and_drop(&config, &air)
+            let root = preprocessed_root_and_drop(&config, &air);
+            let pinned = pinned_preprocessed_key(activation_len, air.trace_rows).unwrap();
+            assert_eq!(root, pinned.root);
+            root
         });
 
         assert_ne!(roots[0], roots[1]);
@@ -2960,6 +3061,29 @@ mod tests {
                 .flatten()
                 .all(|word| word < GOLDILOCKS_MODULUS)
         );
+    }
+
+    #[test]
+    fn prover_rejects_a_mutated_pinned_preprocessed_key() {
+        let config = build_config();
+        let air = preprocessed_air(32);
+        let degree_bits = air.trace_rows.ilog2() as usize;
+        let (prover_key, generated_key) = setup_preprocessed(&config, &air, degree_bits).unwrap();
+        let pinned_key = pinned_preprocessed_verifier_key(&air).unwrap();
+        require_matching_preprocessed_key(&generated_key, &pinned_key).unwrap();
+
+        let mut mutated_root = pinned_key.commitment.roots()[0];
+        mutated_root[0] += F::ONE;
+        let mutated_key = PreprocessedVerifierKey {
+            width: pinned_key.width,
+            degree_bits: pinned_key.degree_bits,
+            commitment: MerkleCap::new(vec![mutated_root]),
+        };
+        assert_eq!(
+            require_matching_preprocessed_key(&generated_key, &mutated_key),
+            Err(NarrowBlake3Error::PinnedPreprocessedKeyMismatch)
+        );
+        drop(prover_key);
     }
 
     #[test]
@@ -2996,33 +3120,53 @@ mod tests {
             "CMFD_TEST_PROOF_CUDA_DEVICE must be nonnegative"
         );
 
-        let activation_lengths = match std::env::var("CMFD_PINNED_PREP_ACTIVATION_LEN") {
+        let selected_keys = match std::env::var("CMFD_PINNED_PREP_ACTIVATION_LEN") {
             Ok(value) => {
                 let activation_len = value
                     .parse::<usize>()
                     .expect("CMFD_PINNED_PREP_ACTIVATION_LEN must be a decimal usize");
-                assert!(
-                    PINNED_PREP_ACTIVATION_LENGTHS.contains(&activation_len),
-                    "CMFD_PINNED_PREP_ACTIVATION_LEN must be one of {PINNED_PREP_ACTIVATION_LENGTHS:?}"
-                );
-                vec![activation_len]
+                vec![*PINNED_PREPROCESSED_KEYS
+                    .iter()
+                    .find(|key| key.activation_len == activation_len)
+                    .expect("CMFD_PINNED_PREP_ACTIVATION_LEN must name a registry activation length")]
             }
-            Err(std::env::VarError::NotPresent) => PINNED_PREP_ACTIVATION_LENGTHS.to_vec(),
+            Err(std::env::VarError::NotPresent) => PINNED_PREPROCESSED_KEYS.to_vec(),
             Err(std::env::VarError::NotUnicode(_)) => {
                 panic!("CMFD_PINNED_PREP_ACTIVATION_LEN must be valid Unicode")
             }
         };
 
+        let spill_dir =
+            std::env::var_os("CMFD_PINNED_PREP_SPILL_DIR").map(std::path::PathBuf::from);
+        if let Some(spill_dir) = &spill_dir {
+            assert!(
+                spill_dir.is_absolute() && spill_dir.is_dir(),
+                "CMFD_PINNED_PREP_SPILL_DIR must name an existing absolute directory"
+            );
+        }
+
         let dft = NarrowDft::load_cuda(&library_path, device_index).unwrap();
-        let commit_backend = NarrowCommitBackend::load_cuda(&library_path, device_index).unwrap();
+        let commit_backend = match spill_dir {
+            Some(spill_dir) => {
+                NarrowCommitBackend::load_cuda_in_spill_dir(&library_path, device_index, spill_dir)
+                    .unwrap()
+            }
+            None => NarrowCommitBackend::load_cuda(&library_path, device_index).unwrap(),
+        };
         let config = build_config_with_backends(dft, commit_backend);
 
-        for activation_len in activation_lengths {
-            let air = preprocessed_air(activation_len);
+        for key in selected_keys {
+            let air = preprocessed_air(key.activation_len);
+            assert_eq!(air.trace_rows, key.trace_rows);
             let degree_bits = air.trace_rows.ilog2() as usize;
             let root = preprocessed_root_and_drop(&config, &air);
+            assert_eq!(
+                root, key.root,
+                "generated preprocessed root does not match the pinned registry entry"
+            );
             println!(
-                "activation_len={activation_len} degree_bits={degree_bits} prep_width={PREP_WIDTH} preprocessed_root_u64={root:?}"
+                "activation_len={} degree_bits={degree_bits} prep_width={PREP_WIDTH} preprocessed_root_u64={root:?}",
+                key.activation_len
             );
         }
     }
@@ -3238,8 +3382,23 @@ mod tests {
         let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         let statement = statement(&activation);
         let proof = prove_narrow_blake3(&statement, &activation).unwrap();
-        verify_narrow_blake3(&statement, &proof).unwrap();
+        assert_eq!(&proof[..8], NARROW_BLAKE3_PROOF_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(proof[8..12].try_into().unwrap()),
+            NARROW_BLAKE3_PROOF_VERSION
+        );
+        let native = decode_native_proof(&proof).unwrap();
+        assert!(native.opened_values.preprocessed_next.is_none());
+        with_preprocessed_trace_forbidden(|| verify_narrow_blake3(&statement, &proof)).unwrap();
         assert!(proof.len() <= crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES);
+
+        let mut legacy_v2 = proof.clone();
+        legacy_v2[..8].copy_from_slice(b"CMFDB3N2");
+        legacy_v2[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            decode_native_proof(&legacy_v2).err(),
+            Some(NarrowBlake3Error::Encoding)
+        );
 
         let mut wrong_digest = statement.clone();
         wrong_digest.final_activation_digest[0] ^= 1;

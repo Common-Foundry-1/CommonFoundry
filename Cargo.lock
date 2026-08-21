@@ -950,6 +950,7 @@ dependencies = [
  "p3-field",
  "p3-goldilocks",
  "p3-matrix",
+ "p3-maybe-rayon",
  "p3-symmetric",
  "thiserror 2.0.20",
 ]

@@ -161,6 +161,12 @@ still production gates.
 The aggregate remains feature-gated research scaffolding with no consensus or
 wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
+The optional `dory-bls12-381-prototype` feature now exercises a real BLS12-381
+Dory opening with deterministic, role-separated hash-to-curve setup generators
+and a pinned setup identity. Its n=8 compressed opening payload is 16,909 bytes,
+and tests reject statement, setup, and proof mutations. It remains a sequential,
+unaudited backend checkpoint; it is not wired to the full aggregate or accepted
+by consensus.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

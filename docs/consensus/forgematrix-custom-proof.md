@@ -792,17 +792,26 @@ bytes. An n=8 three-claim fixture is exactly 12,063 bytes. Using compressed
 BLS12-381 element sizes, the same n=31 grammar projects to 66,559 bytes for this
 sumcheck and opening aggregate. This is not a complete production proof-size
 claim. The implemented backend is BN254 with random setup vectors and the module's
-production gate always returns an error. Dory also works over the pairing scalar
-field, while the packed AIR uses the cubic Goldilocks extension. A direct field
-embedding is impossible because the characteristics differ. Cross-field tests do
-show that the canonical bounded-integer witness makes all 121 local transition
-constraints vanish in both fields across signed boundary cases, while altered
-reductions and digits fail in both. The selected route is therefore native
-scalar-field re-arithmetization; this checkpoint does not yet port the sumcheck
-transcript or LogUp. A 128-bit BLS12-381 backend,
-domain-separated deterministic hash-to-curve generators, streaming n=31 proving,
-complete soundness accounting, full aggregate measurement, and independent audit
-remain mandatory activation gates.
+production gate always returns an error. A separate
+`dory-bls12-381-prototype` feature now implements the generic Dory field, group,
+pairing, polynomial, and transcript adapters on BLS12-381. It deterministically
+derives role-separated setup points with IETF hash-to-curve, binds the complete
+setup to a pinned BLAKE3 identity, and produces and verifies a real n=8 opening.
+Its canonical compressed Dory payload is 16,909 bytes. Statement, setup, and
+proof mutations are rejected. This executable checkpoint confirms the curve and
+setup route; it is still a sequential, unaudited reference and is not connected
+to the aggregation wrapper or consensus.
+
+Dory works over the pairing scalar field, while the packed AIR uses the cubic
+Goldilocks extension. A direct field embedding is impossible because the
+characteristics differ. Cross-field tests do show that the canonical
+bounded-integer witness makes all 121 local transition constraints vanish in
+both fields across signed boundary cases, while altered reductions and digits
+fail in both. The selected route is therefore native scalar-field
+re-arithmetization; this checkpoint does not yet port the sumcheck transcript or
+LogUp. Integrating the BLS12-381 backend with that re-arithmetized aggregate,
+streaming n=31 proving, complete soundness accounting, full aggregate
+measurement, and independent audit remain mandatory activation gates.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

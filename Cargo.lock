@@ -131,6 +131,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ark-bls12-381"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3df4dcc01ff89867cd86b0da835f23c3f02738353aaee7dde7495af71363b8d5"
+dependencies = [
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+]
+
+[[package]]
 name = "ark-bn254"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -860,6 +872,9 @@ name = "cmfd-consensus"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ark-bls12-381",
+ "ark-ec",
+ "ark-ff",
  "ark-serialize",
  "bincode",
  "blake3",
@@ -892,9 +907,11 @@ dependencies = [
  "p3-uni-stark",
  "p3-whir",
  "primitive-types",
+ "rand_core 0.6.4",
  "remainder",
  "serde",
  "serde_json",
+ "sha2",
  "shared-types",
  "thiserror 2.0.20",
 ]

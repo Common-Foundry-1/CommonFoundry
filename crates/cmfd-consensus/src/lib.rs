@@ -1,5 +1,7 @@
 pub mod chain;
 pub mod difficulty;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_bls12_381_prototype;
 #[cfg(all(test, feature = "dory-opening-prototype"))]
 mod dory_field_portability;
 #[cfg(feature = "dory-opening-prototype")]

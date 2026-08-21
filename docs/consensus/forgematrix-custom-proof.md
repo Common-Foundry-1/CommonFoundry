@@ -720,14 +720,21 @@ V2 packs two range specifications into each of four rows per cell. It uses 28
 digit columns split among seven four-query nibble buses, plus seven fixed-table
 multiplicity columns. The active digit counts per row are `[28, 28, 24, 18]`;
 unused slots are canonical zero. Lookup IDs, source oracles, bounds, digits, and
-selectors are verifier-derived. Initialization is `n=21`, each bank is `n=28`,
-and the log-four LDE is exactly `n=32`. Canonical generation, reconstruction,
-padding, and column order are committed under digest
-`6d06a004f3e57dd57159e24f9c656a76bdcecf214f15bc07cdec5797392e272e`.
+selectors are verifier-derived. Main widths are 46 for initialization and 47
+for a bank. Initialization is `n=21`, each bank is `n=28`, and the log-four LDE
+is exactly `n=32`. Canonical generation, reconstruction, padding, and column
+order are committed under digest
+`88f2f31f6f9d4aca4a69bc2ac6dfd88bcf670c3ed803e0fb24a241f791372cb3`.
+The reusable preprocessing plan has width 40 and explicitly contains no
+challenge-dependent mask column. Its initialization and bank structural
+digests are
+`8fbef0d70eb794140226b98c61dfe22b9a17c81f86ca2989f27ce248118b9467`
+and `3ddd191feaafac0b09ff2d982cc2b0fa0253dad7d1607e56b0ade964437cde30`;
+actual pinned PCS roots remain to be generated.
 
 The first batch-STARK reduction for V2 is executable on a 128-cell, 512-row
-fixture. Its core mask is the verifier-fixed Boolean table of the
-challenge-derived mask polynomial, and the AIR enforces the encoded input,
+fixture. Its extra fixed-mask column is generated from the challenge-derived
+mask polynomial solely for this bounded test, and the AIR enforces the encoded input,
 square reduction, cube reduction, output reduction, centered activation,
 negative-bit, and shifted-accumulator equations. Eight source buses bind every
 `(lookup ID, source, maximum - source)` tuple. Seven nibble buses each bind four
@@ -740,12 +747,16 @@ With the configured 33 FRI queries, the library's executable estimator reports
 separate root count covers same-bus and cross-bus beta collisions, false
 rational sums, and all denominators under the single shared `(alpha, beta)`
 pair. Its 288,388,719 roots over the cubic Goldilocks extension give an error
-below `2^-163`. Tests mutate every core column and reject changed arithmetic,
+below `2^-163`. The 512-row fixture serializes to a 141,528-byte fixed-width
+bincode baseline. Two best-zlib runs measured 111,818 and 112,603 bytes; tests
+enforce a 115,000-byte ceiling. These are diagnostic fixture sizes, not the
+production native codec or production-shape bound. Tests mutate every core column and reject changed arithmetic,
 mask, active digits, padding, table multiplicities, lookup topology, table
 values, and untrusted degree vectors. This remains test-only: the production
-argument still needs exact initialization input and cross-component wiring,
-production-sized preprocessed-key construction, native canonical encoding,
-aggregate size and latency measurements, and verifier integration.
+argument still needs a mask-polynomial opening bridge, exact initialization
+input and cross-component wiring, actual pinned preprocessing roots, native
+canonical encoding, aggregate size and latency measurements, and verifier
+integration.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

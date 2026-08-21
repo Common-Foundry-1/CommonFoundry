@@ -493,11 +493,17 @@ that policy. It retains 47 ordered core columns. The first four-column,
 `n=32`, but FRI log blowup four requires an `n=36` LDE, beyond Goldilocks
 two-adicity. V2 instead packs two range specifications into each of four rows
 per cell. Twenty-eight digit columns are divided among seven four-query nibble
-buses, with seven table-multiplicity columns. The bank trace is `n=28` and its
-FRI LDE is exactly `n=32`. Canonical row generation and layout binding under
-digest `6d06a004f3e57dd57159e24f9c656a76bdcecf214f15bc07cdec5797392e272e`
-are implemented; the production-sized payload still has to be proved and
-measured before activation.
+buses, with seven table-multiplicity columns. Main widths are 46 for
+initialization and 47 for each bank. The bank trace is `n=28` and its FRI LDE
+is exactly `n=32`. Canonical row generation and layout binding under digest
+`88f2f31f6f9d4aca4a69bc2ac6dfd88bcf670c3ed803e0fb24a241f791372cb3`
+are implemented. The reusable preprocessing topology has width 40 and zero
+challenge-dependent columns; its initialization and bank plan digests are
+`8fbef0d70eb794140226b98c61dfe22b9a17c81f86ca2989f27ce248118b9467`
+and `3ddd191feaafac0b09ff2d982cc2b0fa0253dad7d1607e56b0ade964437cde30`.
+Those are structural identities, not PCS roots. The mask remains a main-trace
+column requiring a separate opening bridge to the challenge polynomial, and
+the production-sized payload still has to be proved and measured.
 
 The transition and range reduction now has a bounded test-only proof. On 128
 cells, the AIR binds the challenge-derived mask and enforces all seven
@@ -509,8 +515,11 @@ next evaluation. It reaches the configured 128-bit list-decoding target with
 33 FRI queries, one above the measured minimum, and bounds the shared-pair
 lookup-challenge error below `2^-163` from 288,388,719 counted bad roots. Every
 core column plus adversarial packed-witness, topology, table, and degree
-mutation fails. Production component wiring, full geometry, canonical codec,
-payload measurement, and aggregate verification remain gates.
+mutation fails. Its 512-row bincode baseline is 141,528 bytes; observed
+best-zlib encodings are 111,818 and 112,603 bytes under a tested 115,000-byte
+ceiling. That diagnostic is neither a production codec nor a production-shape
+bound. Production component wiring, full geometry, canonical codec, payload
+measurement, and aggregate verification remain gates.
 
 Implementing any subset of those components must not make the v2 profile
 activatable. Activation is a separate consensus change after every gate above

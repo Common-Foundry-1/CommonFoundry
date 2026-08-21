@@ -200,12 +200,15 @@ its input is fixed), giving 47 semantic columns. An earlier four-column,
 64-row transpose was rejected after exact FRI accounting: its bank trace had
 `n=32`, so log blowup four would require an impossible `n=36` Goldilocks LDE.
 The replacement packs two range specifications into each of four rows per
-cell, using 28 digit columns and seven table-multiplicity columns. Its bank
-trace is `n=28`; the FRI LDE is exactly `n=32`, within Goldilocks two-adicity.
-The canonical row generator, padding, lookup topology, source bounds, ordered
-core mapping, and V2 layout digest are tested. A production-sized batch-
-STARK/LogUp proof and aggregate payload measurement are still required before
-this layout can mint a verified production trace.
+cell, using 28 digit columns and seven table-multiplicity columns. Main widths
+are 46 for initialization and 47 for a bank. Its bank trace is `n=28`; the FRI
+LDE is exactly `n=32`, within Goldilocks two-adicity. The reusable 40-column
+preprocessing plan contains only selectors, lookup IDs, and the fixed nibble
+table; it explicitly excludes the per-block mask. The canonical row generator,
+padding, lookup topology, source bounds, ordered core mapping, and V2 layout
+digest are tested. Actual production PCS roots, a mask-polynomial opening
+bridge, and aggregate payload measurement are still required before this
+layout can mint a verified production trace.
 
 A test-only 128-cell batch-STARK proves that packed range handoff and the
 transition arithmetic end to end. The core mask is rederived from the
@@ -216,7 +219,10 @@ nibble buses range-check four packed digit columns apiece against the fixed
 three quotient splits, 48 base-field lookup auxiliary openings at each local
 and next evaluation, and 128-bit computed list-decoding security with one FRI
 query above the measured minimum. Its shared-pair LogUp challenge error is
-bounded below `2^-163`. Every core column, active digit, padding,
+bounded below `2^-163`. The 512-row proof has a 141,528-byte fixed-width
+bincode baseline; two best-zlib runs measured 111,818 and 112,603 bytes, and a
+115,000-byte regression ceiling is tested. This is not the production native
+codec or a production-shape size result. Every core column, active digit, padding,
 multiplicity, preprocessing, and degree-shape mutation is rejected.
 Production-sized component construction, fixed initialization-input and cross-
 component wiring, native encoding, and aggregate payload measurement remain

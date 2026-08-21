@@ -11,9 +11,15 @@
 //!
 //! The prototype uses 128 transition cells so the pinned FRI configuration has
 //! a valid minimum domain while adversarial tests remain bounded.
+//! Its extra fixed-mask column is fixture-only. The production preprocessing
+//! plan excludes challenge-dependent columns and requires a separate
+//! mask-polynomial opening bridge.
 //! It is not a production proof type and does not activate the compact layout.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use bincode::Options;
+use flate2::{Compression, write::ZlibEncoder};
 
 use p3_air::symbolic::AirLayout;
 use p3_air::{Air, AirBuilder, BaseAir, PermutationAirBuilder, WindowAccess};
@@ -35,10 +41,11 @@ use crate::structured_blake3_narrow::{
 };
 use crate::{
     PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS, PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS,
-    PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP, PRODUCTION_TRACE_PACKED_ROWS_PER_CELL,
-    PRODUCTION_TRACE_PACKED_SPEC_ROWS, STRUCTURED_TRANSITION_RANGE_SPEC_COUNT,
-    STRUCTURED_TRANSITION_REGULAR_ORACLES, StructuredMaskPolynomial, StructuredTransitionStatement,
-    V2_TRANSITION_MODULUS, production_trace_packed_digit_slot_v2, production_trace_packed_row_v2,
+    PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP, PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH,
+    PRODUCTION_TRACE_PACKED_ROWS_PER_CELL, PRODUCTION_TRACE_PACKED_SPEC_ROWS,
+    STRUCTURED_TRANSITION_RANGE_SPEC_COUNT, STRUCTURED_TRANSITION_REGULAR_ORACLES,
+    StructuredMaskPolynomial, StructuredTransitionStatement, V2_TRANSITION_MODULUS,
+    production_trace_packed_digit_slot_v2, production_trace_packed_row_v2,
     structured_transition_range_specs,
 };
 
@@ -64,12 +71,12 @@ const MAIN_WIDTH: usize = TABLE_MULTIPLICITY_START + PRODUCTION_TRACE_PACKED_DIG
 
 const CORE_ACTIVE: usize = 0;
 const CELL_LOOKUP_ID_START: usize = 1;
-const FIXED_CORE_MASK: usize = 2;
-const TABLE_ACTIVE: usize = 3;
-const TABLE_VALUE: usize = 4;
-const SOURCE_ACTIVE_START: usize = 5;
+const TABLE_ACTIVE: usize = 2;
+const TABLE_VALUE: usize = 3;
+const SOURCE_ACTIVE_START: usize = 4;
 const DIGIT_ACTIVE_START: usize = SOURCE_ACTIVE_START + STRUCTURED_TRANSITION_RANGE_SPEC_COUNT;
-const PREPROCESSED_WIDTH: usize = DIGIT_ACTIVE_START + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
+const FIXED_CORE_MASK: usize = DIGIT_ACTIVE_START + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
+const PREPROCESSED_WIDTH: usize = FIXED_CORE_MASK + 1;
 
 const LOOKUP_COUNT: usize =
     STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS;
@@ -527,12 +534,40 @@ fn compact_transition_batch_logup_proves_arithmetic_core_and_range_bindings() {
     let verifier_data = trusted_verifier_data(&config, &air, &proof.degree_bits).unwrap();
     verify_batch(
         &config,
-        &[air],
+        std::slice::from_ref(&air),
         &proof,
         &[Vec::new()],
         &verifier_data.common,
     )
     .expect("honest compact range proof must verify");
+
+    let native = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .reject_trailing_bytes()
+        .serialize(&proof)
+        .unwrap();
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    std::io::Write::write_all(&mut encoder, &native).unwrap();
+    let compressed = encoder.finish().unwrap();
+    assert_eq!(native.len(), 141_528);
+    assert!(compressed.len() < native.len());
+    assert!(compressed.len() <= 115_000);
+
+    let decoded: p3_batch_stark::BatchProof<Config> = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .reject_trailing_bytes()
+        .deserialize(&native)
+        .unwrap();
+    verify_batch(
+        &config,
+        &[air],
+        &decoded,
+        &[Vec::new()],
+        &verifier_data.common,
+    )
+    .expect("the measured bincode baseline must still verify");
 }
 
 #[test]
@@ -637,6 +672,10 @@ fn compact_range_constraint_layout_is_pinned() {
     assert_eq!(constraint_layout.total_constraints(), 119);
     assert_eq!(LOOKUP_AUX_EXTENSION_WIDTH, 16);
     assert_eq!(LOOKUP_AUX_BASE_WIDTH, 48);
+    assert_eq!(
+        PREPROCESSED_WIDTH,
+        PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH + 1
+    );
     assert_eq!(max_degree, 6);
     assert_eq!(log_chunks, 3);
 

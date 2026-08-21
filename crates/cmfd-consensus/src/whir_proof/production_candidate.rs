@@ -79,9 +79,17 @@ pub const PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS: usize =
     PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS / PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP;
 pub const PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS: usize =
     PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS;
-pub const PRODUCTION_TRACE_PACKED_MAIN_COLUMNS: usize = crate::STRUCTURED_TRANSITION_REGULAR_ORACLES
+pub const PRODUCTION_TRACE_PACKED_INITIALIZATION_MAIN_COLUMNS: usize =
+    PRODUCTION_TRACE_CORE_INITIALIZATION_COLUMNS
+        + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS
+        + PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS;
+pub const PRODUCTION_TRACE_PACKED_BANK_MAIN_COLUMNS: usize = PRODUCTION_TRACE_CORE_BANK_COLUMNS
     + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS
     + PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS;
+pub const PRODUCTION_TRACE_PACKED_MAIN_COLUMNS: usize = PRODUCTION_TRACE_PACKED_BANK_MAIN_COLUMNS;
+pub const PRODUCTION_TRACE_PACKED_PREPROCESSED_VERSION: u32 = 1;
+pub const PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH: usize =
+    4 + crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
 pub const PRODUCTION_TRACE_PACKED_INITIALIZATION_VARIABLES: usize =
     PRODUCTION_TRACE_INITIALIZATION_VARIABLES + PRODUCTION_TRACE_PACKED_ROW_VARIABLES;
 pub const PRODUCTION_TRACE_PACKED_BANK_VARIABLES: usize =
@@ -119,6 +127,8 @@ const PROOF_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-PROOF-CO
 const TRACE_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-LAYOUT/V1";
 const TRACE_COMPACT_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-COMPACT-LAYOUT/V1";
 const TRACE_PACKED_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-PACKED-LAYOUT/V2";
+const TRACE_PACKED_PREPROCESSED_DOMAIN: &str =
+    "CMFD/FORGEMATRIX/PRODUCTION-TRACE-PACKED-PREPROCESSED/V1";
 const TRACE_PADDING_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-PADDING/V1";
 const TRACE_COLUMN_ALIAS_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-COLUMN/V1";
 const TRACE_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-ROOT/V1";
@@ -319,6 +329,9 @@ pub struct ProductionTracePackedLayoutV2 {
     pub digits_per_lookup: usize,
     pub digit_lookups: usize,
     pub table_multiplicity_columns: usize,
+    pub initialization_main_columns: usize,
+    pub bank_main_columns: usize,
+    /// Maximum main width, equal to `bank_main_columns`.
     pub main_columns: usize,
     pub initialization_variables: usize,
     pub bank_variables: usize,
@@ -340,6 +353,38 @@ pub struct ProductionTracePackedRowV2 {
     pub cell_index: u64,
     pub row_in_cell: u8,
     pub digits: [u8; PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProductionTracePackedComponentV2 {
+    Initialization,
+    Bank,
+}
+
+/// Challenge-independent topology committed by a reusable preprocessing key.
+///
+/// The challenge-derived mask is intentionally absent. It remains a main-trace
+/// column and must be authenticated against `StructuredMaskPolynomial` by the
+/// cross-component opening argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTracePackedPreprocessedPlanV2 {
+    pub version: u32,
+    pub component: ProductionTracePackedComponentV2,
+    pub trace_variables: usize,
+    pub trace_rows: u64,
+    pub width: usize,
+    pub challenge_dependent_columns: usize,
+    pub layout_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTracePackedPreprocessedRowV2 {
+    pub core_active: bool,
+    pub cell_lookup_id_start: u64,
+    pub table_active: bool,
+    pub table_value: u8,
+    pub source_active: [bool; crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT],
+    pub digit_active: [bool; PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS],
 }
 
 impl ProductionTraceBatchWireBudgetV1 {
@@ -426,12 +471,100 @@ pub const fn production_trace_packed_layout_v2() -> ProductionTracePackedLayoutV
         digits_per_lookup: PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP,
         digit_lookups: PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS,
         table_multiplicity_columns: PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS,
+        initialization_main_columns: PRODUCTION_TRACE_PACKED_INITIALIZATION_MAIN_COLUMNS,
+        bank_main_columns: PRODUCTION_TRACE_PACKED_BANK_MAIN_COLUMNS,
         main_columns: PRODUCTION_TRACE_PACKED_MAIN_COLUMNS,
         initialization_variables: PRODUCTION_TRACE_PACKED_INITIALIZATION_VARIABLES,
         bank_variables: PRODUCTION_TRACE_PACKED_BANK_VARIABLES,
         fri_log_blowup: PRODUCTION_TRACE_PACKED_FRI_LOG_BLOWUP,
         bank_lde_variables: PRODUCTION_TRACE_PACKED_BANK_LDE_VARIABLES,
     }
+}
+
+pub fn production_trace_packed_preprocessed_plan_v2(
+    component: ProductionTracePackedComponentV2,
+) -> Result<ProductionTracePackedPreprocessedPlanV2, ProductionWhirCandidateError> {
+    let trace_variables = match component {
+        ProductionTracePackedComponentV2::Initialization => {
+            PRODUCTION_TRACE_PACKED_INITIALIZATION_VARIABLES
+        }
+        ProductionTracePackedComponentV2::Bank => PRODUCTION_TRACE_PACKED_BANK_VARIABLES,
+    };
+    let trace_rows = 1_u64
+        .checked_shl(trace_variables as u32)
+        .ok_or(ProductionWhirCandidateError::InvalidTraceRow)?;
+    Ok(ProductionTracePackedPreprocessedPlanV2 {
+        version: PRODUCTION_TRACE_PACKED_PREPROCESSED_VERSION,
+        component,
+        trace_variables,
+        trace_rows,
+        width: PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH,
+        challenge_dependent_columns: 0,
+        layout_digest: production_trace_packed_layout_digest_v2()?,
+    })
+}
+
+pub fn production_trace_packed_preprocessed_row_v2(
+    plan: ProductionTracePackedPreprocessedPlanV2,
+    packed_row: u64,
+) -> Result<ProductionTracePackedPreprocessedRowV2, ProductionWhirCandidateError> {
+    if plan != production_trace_packed_preprocessed_plan_v2(plan.component)?
+        || packed_row >= plan.trace_rows
+    {
+        return Err(ProductionWhirCandidateError::InvalidTraceRow);
+    }
+    let row_in_cell = (packed_row % PRODUCTION_TRACE_PACKED_ROWS_PER_CELL as u64) as usize;
+    let cell_index = packed_row / PRODUCTION_TRACE_PACKED_ROWS_PER_CELL as u64;
+    let cell_lookup_id_start = cell_index
+        .checked_mul(crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(ProductionWhirCandidateError::InvalidTraceRow)?;
+    let source_active =
+        std::array::from_fn(|index| PRODUCTION_TRACE_PACKED_SPEC_ROWS[index] == row_in_cell);
+    let mut digit_active = [false; PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS];
+    for (column, active) in digit_active.iter_mut().enumerate() {
+        *active = production_trace_packed_digit_slot_v2(row_in_cell, column)?.active;
+    }
+    let table_active = packed_row < 16;
+    Ok(ProductionTracePackedPreprocessedRowV2 {
+        core_active: row_in_cell == 0,
+        cell_lookup_id_start,
+        table_active,
+        table_value: if table_active { packed_row as u8 } else { 0 },
+        source_active,
+        digit_active,
+    })
+}
+
+pub fn production_trace_packed_preprocessed_plan_digest_v2(
+    component: ProductionTracePackedComponentV2,
+) -> Result<[u8; 32], ProductionWhirCandidateError> {
+    let plan = production_trace_packed_preprocessed_plan_v2(component)?;
+    let mut hasher = Blake3Hasher::new_derive_key(TRACE_PACKED_PREPROCESSED_DOMAIN);
+    hasher.update(&plan.version.to_le_bytes());
+    hasher.update(&[match plan.component {
+        ProductionTracePackedComponentV2::Initialization => 0,
+        ProductionTracePackedComponentV2::Bank => 1,
+    }]);
+    hasher.update(&(plan.trace_variables as u64).to_le_bytes());
+    hasher.update(&plan.trace_rows.to_le_bytes());
+    hasher.update(&(plan.width as u64).to_le_bytes());
+    hasher.update(&(plan.challenge_dependent_columns as u64).to_le_bytes());
+    hasher.update(&plan.layout_digest);
+    hasher.update(b"core-active;cell-lookup-id-start;table-active;table-value");
+    hasher.update(b"source-active[8];digit-active[28];no-mask-column");
+    for row_in_cell in 0..PRODUCTION_TRACE_PACKED_ROWS_PER_CELL {
+        hasher.update(&(row_in_cell as u32).to_le_bytes());
+        for spec_row in PRODUCTION_TRACE_PACKED_SPEC_ROWS {
+            hasher.update(&[u8::from(spec_row == row_in_cell)]);
+        }
+        for column in 0..PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS {
+            hasher.update(&[u8::from(
+                production_trace_packed_digit_slot_v2(row_in_cell, column)?.active,
+            )]);
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 pub fn production_trace_packed_digit_slot_v2(
@@ -547,6 +680,8 @@ pub fn production_trace_packed_layout_digest_v2() -> Result<[u8; 32], Production
         layout.digits_per_lookup,
         layout.digit_lookups,
         layout.table_multiplicity_columns,
+        layout.initialization_main_columns,
+        layout.bank_main_columns,
         layout.main_columns,
         layout.initialization_variables,
         layout.bank_variables,
@@ -2998,6 +3133,8 @@ mod tests {
         assert_eq!(layout.digits_per_lookup, 4);
         assert_eq!(layout.digit_lookups, 7);
         assert_eq!(layout.table_multiplicity_columns, 7);
+        assert_eq!(layout.initialization_main_columns, 46);
+        assert_eq!(layout.bank_main_columns, 47);
         assert_eq!(layout.main_columns, 47);
         assert_eq!(layout.initialization_variables, 21);
         assert_eq!(layout.bank_variables, 28);
@@ -3006,7 +3143,7 @@ mod tests {
         assert!(layout.fits_goldilocks_fri_domain());
         assert_eq!(
             hex::encode(production_trace_packed_layout_digest_v2().unwrap()),
-            "6d06a004f3e57dd57159e24f9c656a76bdcecf214f15bc07cdec5797392e272e"
+            "88f2f31f6f9d4aca4a69bc2ac6dfd88bcf670c3ed803e0fb24a241f791372cb3"
         );
 
         let active_by_row = (0..4)
@@ -3076,6 +3213,94 @@ mod tests {
             production_trace_packed_row_v2(statement, &oversized, 0),
             Err(ProductionWhirCandidateError::InvalidRangeWitness)
         );
+    }
+
+    #[test]
+    fn packed_preprocessing_is_challenge_independent_and_exact() {
+        let initialization = production_trace_packed_preprocessed_plan_v2(
+            ProductionTracePackedComponentV2::Initialization,
+        )
+        .unwrap();
+        let bank =
+            production_trace_packed_preprocessed_plan_v2(ProductionTracePackedComponentV2::Bank)
+                .unwrap();
+        assert_eq!(initialization.trace_variables, 21);
+        assert_eq!(initialization.trace_rows, 1 << 21);
+        assert_eq!(bank.trace_variables, 28);
+        assert_eq!(bank.trace_rows, 1 << 28);
+        for plan in [initialization, bank] {
+            assert_eq!(plan.width, 40);
+            assert_eq!(plan.challenge_dependent_columns, 0);
+            assert_eq!(
+                plan.layout_digest,
+                production_trace_packed_layout_digest_v2().unwrap()
+            );
+
+            let first = production_trace_packed_preprocessed_row_v2(plan, 0).unwrap();
+            assert!(first.core_active);
+            assert_eq!(first.cell_lookup_id_start, 1);
+            assert!(first.table_active);
+            assert_eq!(first.table_value, 0);
+            assert_eq!(
+                first.source_active,
+                [true, true, false, false, false, false, false, false]
+            );
+            assert_eq!(
+                first.digit_active.iter().filter(|active| **active).count(),
+                28
+            );
+
+            let fourth = production_trace_packed_preprocessed_row_v2(plan, 3).unwrap();
+            assert!(!fourth.core_active);
+            assert_eq!(fourth.cell_lookup_id_start, 1);
+            assert_eq!(
+                fourth.source_active,
+                [false, false, false, false, false, false, true, true]
+            );
+            assert_eq!(
+                fourth.digit_active.iter().filter(|active| **active).count(),
+                18
+            );
+
+            let second_cell = production_trace_packed_preprocessed_row_v2(plan, 4).unwrap();
+            assert!(second_cell.core_active);
+            assert_eq!(second_cell.cell_lookup_id_start, 9);
+            let table_end = production_trace_packed_preprocessed_row_v2(plan, 15).unwrap();
+            assert!(table_end.table_active);
+            assert_eq!(table_end.table_value, 15);
+            let after_table = production_trace_packed_preprocessed_row_v2(plan, 16).unwrap();
+            assert!(!after_table.table_active);
+            assert_eq!(after_table.table_value, 0);
+            assert!(production_trace_packed_preprocessed_row_v2(plan, plan.trace_rows - 1).is_ok());
+            assert_eq!(
+                production_trace_packed_preprocessed_row_v2(plan, plan.trace_rows),
+                Err(ProductionWhirCandidateError::InvalidTraceRow)
+            );
+        }
+
+        let mut malformed = bank;
+        malformed.challenge_dependent_columns = 1;
+        assert_eq!(
+            production_trace_packed_preprocessed_row_v2(malformed, 0),
+            Err(ProductionWhirCandidateError::InvalidTraceRow)
+        );
+        let initialization_digest = production_trace_packed_preprocessed_plan_digest_v2(
+            ProductionTracePackedComponentV2::Initialization,
+        )
+        .unwrap();
+        let bank_digest = production_trace_packed_preprocessed_plan_digest_v2(
+            ProductionTracePackedComponentV2::Bank,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(initialization_digest),
+            "8fbef0d70eb794140226b98c61dfe22b9a17c81f86ca2989f27ce248118b9467"
+        );
+        assert_eq!(
+            hex::encode(bank_digest),
+            "3ddd191feaafac0b09ff2d982cc2b0fa0253dad7d1607e56b0ade964437cde30"
+        );
+        assert_ne!(initialization_digest, bank_digest);
     }
 
     #[test]

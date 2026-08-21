@@ -16,8 +16,8 @@ use thiserror::Error;
 
 use crate::merkle_store::GOLDILOCKS_MODULUS;
 use crate::whir_initial::{
-    AuthenticatedWhirInitialSource, WHIR_INITIAL_MAX_SOURCE_READ_LIMBS, WHIR_INITIAL_MAX_VARIABLES,
-    WHIR_INITIAL_MIN_VARIABLES, WhirInitialSourceError, WhirInitialSourceIdentity,
+    AuthenticatedWhirInitialSource, WHIR_INITIAL_MAX_SOURCE_READ_LIMBS, WHIR_INITIAL_MIN_VARIABLES,
+    WhirInitialSourceError, WhirInitialSourceIdentity,
 };
 
 const MAGIC: &[u8; 8] = b"CMFDWIS1";
@@ -33,6 +33,10 @@ const AUTH_DOMAIN: &str = "Common Foundry WHIR initial source chunk v1";
 
 /// Byte offset of the first canonical source limb.
 pub const WHIR_INITIAL_SOURCE_HEADER_BYTES: usize = HEADER_BYTES;
+/// Largest original table that may be staged before a production codeword
+/// implementation exists. The current codeword/oracle path remains capped at
+/// [`crate::whir_initial::WHIR_INITIAL_MAX_VARIABLES`] (`n = 19`).
+pub const WHIR_INITIAL_SOURCE_MAX_VARIABLES: usize = 31;
 
 /// Externally retained provenance for one exact original source artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +78,7 @@ pub struct WhirInitialSourceArtifactWriter {
     source: WhirInitialSourceIdentity,
     geometry: Geometry,
     written_elements: usize,
+    authentication: StreamingAuthentication,
     poisoned: bool,
     cleanup: PartialCleanup,
 }
@@ -102,6 +107,7 @@ impl WhirInitialSourceArtifactWriter {
         }
         let partial_path = partial_path_for(&final_path)?;
         let prefix = encode_prefix(&source, &geometry);
+        let authentication = StreamingAuthentication::new(&prefix, &geometry)?;
         let mut cleanup = PartialCleanup(None);
         let mut file = OpenOptions::new()
             .read(true)
@@ -118,7 +124,6 @@ impl WhirInitialSourceArtifactWriter {
         cleanup.0 = Some(partial_path.clone());
         file.write_all(&prefix)
             .and_then(|()| file.write_all(&[0_u8; DIGEST_BYTES]))
-            .and_then(|()| file.set_len(HEADER_BYTES as u64 + geometry.data_bytes))
             .map_err(|source| io_error("initializing", &partial_path, source))?;
         Ok(Self {
             final_path,
@@ -128,6 +133,7 @@ impl WhirInitialSourceArtifactWriter {
             source,
             geometry,
             written_elements: 0,
+            authentication,
             poisoned: false,
             cleanup,
         })
@@ -176,6 +182,7 @@ impl WhirInitialSourceArtifactWriter {
             self.poisoned = true;
             return Err(io_error("writing", &self.partial_path, source));
         }
+        self.authentication.update(&self.prefix, &encoded);
         self.written_elements = next;
         Ok(())
     }
@@ -198,8 +205,12 @@ impl WhirInitialSourceArtifactWriter {
             .file
             .take()
             .expect("unfinished source writer owns its file");
-        let artifact_global_digest =
-            seal_data(&mut file, &self.partial_path, &self.prefix, &self.geometry)?;
+        let artifact_global_digest = seal_data(
+            &mut file,
+            &self.partial_path,
+            &self.geometry,
+            &mut self.authentication,
+        )?;
         drop(file);
 
         let expected = WhirInitialSourceArtifactIdentity {
@@ -259,14 +270,13 @@ impl AuthenticatedWhirInitialSourceFile {
         path: impl AsRef<Path>,
         expected: &WhirInitialSourceArtifactIdentity,
     ) -> Result<Self, WhirInitialSourceArtifactError> {
-        let artifact = Self::open_integrity_only(path.as_ref())?;
-        if &artifact.artifact_identity != expected {
-            return Err(WhirInitialSourceArtifactError::IdentityMismatch);
-        }
-        Ok(artifact)
+        Self::open_expected(path.as_ref(), expected)
     }
 
-    fn open_integrity_only(path: &Path) -> Result<Self, WhirInitialSourceArtifactError> {
+    fn open_expected(
+        path: &Path,
+        expected: &WhirInitialSourceArtifactIdentity,
+    ) -> Result<Self, WhirInitialSourceArtifactError> {
         let path = path.to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
@@ -284,6 +294,14 @@ impl AuthenticatedWhirInitialSourceFile {
             ));
         }
         let decoded = decode_prefix(&prefix)?;
+        let actual_identity = WhirInitialSourceArtifactIdentity {
+            source: decoded.source.clone(),
+            element_count: decoded.element_count,
+            artifact_global_digest: stored_global,
+        };
+        if &actual_identity != expected {
+            return Err(WhirInitialSourceArtifactError::IdentityMismatch);
+        }
         let total_bytes = total_file_bytes(&decoded)?;
         let actual_bytes = file
             .metadata()
@@ -324,11 +342,7 @@ impl AuthenticatedWhirInitialSourceFile {
             file: Mutex::new(file),
             path,
             prefix,
-            artifact_identity: WhirInitialSourceArtifactIdentity {
-                source: decoded.source,
-                element_count: decoded.element_count,
-                artifact_global_digest: stored_global,
-            },
+            artifact_identity: actual_identity,
             element_count,
             data_bytes: decoded.data_bytes,
             auth_digests,
@@ -470,6 +484,77 @@ impl AuthenticatedWhirInitialSource for AuthenticatedWhirInitialSourceFile {
     }
 }
 
+struct StreamingAuthentication {
+    global: Hasher,
+    current_chunk: Hasher,
+    current_chunk_elements: usize,
+    next_chunk_index: usize,
+    total_elements: usize,
+    auth_digests: Vec<[u8; DIGEST_BYTES]>,
+}
+
+impl StreamingAuthentication {
+    fn new(
+        prefix: &[u8; PREFIX_BYTES],
+        geometry: &Geometry,
+    ) -> Result<Self, WhirInitialSourceArtifactError> {
+        let mut global = Hasher::new_derive_key(GLOBAL_DOMAIN);
+        global.update(prefix);
+        let auth_count = usize::try_from(geometry.auth_count)
+            .map_err(|_| WhirInitialSourceArtifactError::ResearchLimit("authentication table"))?;
+        let mut auth_digests = Vec::new();
+        auth_digests
+            .try_reserve_exact(auth_count)
+            .map_err(|_| WhirInitialSourceArtifactError::ResearchLimit("authentication table"))?;
+        Ok(Self {
+            global,
+            current_chunk: start_auth_hasher(prefix, 0),
+            current_chunk_elements: 0,
+            next_chunk_index: 0,
+            total_elements: 0,
+            auth_digests,
+        })
+    }
+
+    fn update(&mut self, prefix: &[u8; PREFIX_BYTES], mut bytes: &[u8]) {
+        debug_assert!(bytes.len().is_multiple_of(8));
+        self.global.update(bytes);
+        self.total_elements += bytes.len() / 8;
+        while !bytes.is_empty() {
+            let remaining_elements = AUTH_CHUNK_ELEMENTS - self.current_chunk_elements;
+            let take_bytes = bytes.len().min(remaining_elements * 8);
+            self.current_chunk.update(&bytes[..take_bytes]);
+            self.current_chunk_elements += take_bytes / 8;
+            bytes = &bytes[take_bytes..];
+            if self.current_chunk_elements == AUTH_CHUNK_ELEMENTS {
+                self.auth_digests
+                    .push(*self.current_chunk.finalize().as_bytes());
+                self.next_chunk_index += 1;
+                self.current_chunk = start_auth_hasher(prefix, self.next_chunk_index);
+                self.current_chunk_elements = 0;
+            }
+        }
+    }
+
+    fn finish(&mut self, geometry: &Geometry) -> Result<(), WhirInitialSourceArtifactError> {
+        if self.current_chunk_elements != 0 {
+            self.auth_digests
+                .push(*self.current_chunk.finalize().as_bytes());
+            self.next_chunk_index += 1;
+            self.current_chunk_elements = 0;
+        }
+        if self.total_elements != geometry.element_count
+            || u64::try_from(self.auth_digests.len()).ok() != Some(geometry.auth_count)
+            || self.next_chunk_index != self.auth_digests.len()
+        {
+            return Err(WhirInitialSourceArtifactError::Invalid(
+                "streamed authentication geometry is incomplete",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Geometry {
     element_count: usize,
@@ -492,17 +577,17 @@ fn validate_source_identity(
             "num_variables is smaller than folding",
         ));
     }
-    if variables > WHIR_INITIAL_MAX_VARIABLES {
+    if variables > WHIR_INITIAL_SOURCE_MAX_VARIABLES {
         return Err(WhirInitialSourceArtifactError::ResearchLimit(
-            "num_variables exceeds 19",
+            "num_variables exceeds 31",
         ));
     }
     let element_count = 1_usize.checked_shl(source.num_variables).ok_or(
         WhirInitialSourceArtifactError::ResearchLimit("source element count"),
     )?;
-    let data_bytes = element_count
-        .checked_mul(8)
-        .and_then(|bytes| u64::try_from(bytes).ok())
+    let data_bytes = u64::try_from(element_count)
+        .ok()
+        .and_then(|elements| elements.checked_mul(8))
         .ok_or(WhirInitialSourceArtifactError::ResearchLimit(
             "source artifact byte length",
         ))?;
@@ -518,37 +603,21 @@ fn validate_source_identity(
 fn seal_data(
     file: &mut File,
     path: &Path,
-    prefix: &[u8; PREFIX_BYTES],
     geometry: &Geometry,
+    authentication: &mut StreamingAuthentication,
 ) -> Result<[u8; 32], WhirInitialSourceArtifactError> {
     file.sync_data()
         .map_err(|source| io_error("synchronizing staged data for", path, source))?;
-    let mut global = Hasher::new_derive_key(GLOBAL_DOMAIN);
-    global.update(prefix);
-    let auth_count = usize::try_from(geometry.auth_count)
-        .map_err(|_| WhirInitialSourceArtifactError::ResearchLimit("authentication table"))?;
-    let mut auth_digests = Vec::new();
-    auth_digests
-        .try_reserve_exact(auth_count)
-        .map_err(|_| WhirInitialSourceArtifactError::ResearchLimit("authentication table"))?;
-    for (chunk_index, start) in (0..geometry.element_count)
-        .step_by(AUTH_CHUNK_ELEMENTS)
-        .enumerate()
-    {
-        let count = (geometry.element_count - start).min(AUTH_CHUNK_ELEMENTS);
-        let bytes = read_data_elements(file, path, start, count)?;
-        validate_encoded_elements(&bytes)?;
-        global.update(&bytes);
-        auth_digests.push(auth_digest(prefix, chunk_index, &bytes));
-    }
+    authentication.finish(geometry)?;
     file.seek(SeekFrom::Start(HEADER_BYTES as u64 + geometry.data_bytes))
         .map_err(|source| io_error("seeking in", path, source))?;
-    for digest in &auth_digests {
-        file.write_all(digest)
+    for index in 0..authentication.auth_digests.len() {
+        let digest = authentication.auth_digests[index];
+        file.write_all(&digest)
             .map_err(|source| io_error("writing authentication table to", path, source))?;
-        global.update(digest);
+        authentication.global.update(&digest);
     }
-    let global_digest = *global.finalize().as_bytes();
+    let global_digest = *authentication.global.finalize().as_bytes();
     file.seek(SeekFrom::Start(PREFIX_BYTES as u64))
         .and_then(|_| file.write_all(&global_digest))
         .and_then(|()| file.sync_all())
@@ -592,11 +661,16 @@ fn authenticate_complete(
 }
 
 fn auth_digest(prefix: &[u8; PREFIX_BYTES], chunk_index: usize, bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = start_auth_hasher(prefix, chunk_index);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn start_auth_hasher(prefix: &[u8; PREFIX_BYTES], chunk_index: usize) -> Hasher {
     let mut hasher = Hasher::new_derive_key(AUTH_DOMAIN);
     hasher.update(prefix);
     hasher.update(&(chunk_index as u64).to_le_bytes());
-    hasher.update(bytes);
-    *hasher.finalize().as_bytes()
+    hasher
 }
 
 fn read_data_elements(
@@ -623,9 +697,15 @@ fn read_auth_digest(
     data_bytes: u64,
     chunk_index: usize,
 ) -> Result<[u8; DIGEST_BYTES], WhirInitialSourceArtifactError> {
+    let digest_offset = u64::try_from(chunk_index)
+        .ok()
+        .and_then(|index| index.checked_mul(DIGEST_BYTES as u64))
+        .ok_or(WhirInitialSourceArtifactError::Invalid(
+            "authentication digest offset overflow",
+        ))?;
     let offset = (HEADER_BYTES as u64)
         .checked_add(data_bytes)
-        .and_then(|value| value.checked_add((chunk_index * DIGEST_BYTES) as u64))
+        .and_then(|value| value.checked_add(digest_offset))
         .ok_or(WhirInitialSourceArtifactError::Invalid(
             "authentication digest offset overflow",
         ))?;
@@ -653,10 +733,10 @@ fn validate_encoded_elements(bytes: &[u8]) -> Result<(), WhirInitialSourceArtifa
 }
 
 fn data_offset(element: usize) -> Result<u64, WhirInitialSourceArtifactError> {
-    element
-        .checked_mul(8)
-        .and_then(|offset| offset.checked_add(HEADER_BYTES))
-        .and_then(|offset| u64::try_from(offset).ok())
+    u64::try_from(element)
+        .ok()
+        .and_then(|offset| offset.checked_mul(8))
+        .and_then(|offset| offset.checked_add(HEADER_BYTES as u64))
         .ok_or(WhirInitialSourceArtifactError::Invalid(
             "source offset overflow",
         ))
@@ -873,6 +953,64 @@ mod tests {
     }
 
     #[test]
+    fn streamed_authentication_is_independent_of_write_partitioning() {
+        let first_path = test_path("partition-a");
+        let second_path = test_path("partition-b");
+        let source = source_identity(14, 0x22);
+        let expected_values = values(14, 19);
+        let first = build(&first_path, source.clone(), &expected_values);
+
+        let mut writer = WhirInitialSourceArtifactWriter::create(&second_path, source).unwrap();
+        let partitions = [1, 8_192, 3, 257, 4_096, 997];
+        let mut offset = 0;
+        let mut partition = 0;
+        while offset < expected_values.len() {
+            let count =
+                partitions[partition % partitions.len()].min(expected_values.len() - offset);
+            writer
+                .write_elements(&expected_values[offset..offset + count])
+                .unwrap();
+            offset += count;
+            partition += 1;
+        }
+        let second = writer.finish().unwrap();
+        assert_eq!(first.artifact_identity(), second.artifact_identity());
+        assert_eq!(
+            fs::read(&first_path).unwrap(),
+            fs::read(&second_path).unwrap()
+        );
+        drop(first);
+        drop(second);
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn streaming_writer_preserves_the_v1_artifact_known_answer() {
+        let path = test_path("v1-known-answer");
+        let source = source_identity(14, 0x5a);
+        let artifact = build(&path, source, &values(14, 19));
+        assert_eq!(
+            artifact.artifact_identity().artifact_global_digest,
+            [
+                0x17, 0xd7, 0xe4, 0x5c, 0x0d, 0x34, 0xbe, 0xed, 0x42, 0xa3, 0xad, 0x03, 0xad, 0x25,
+                0x76, 0x8f, 0x02, 0x56, 0xad, 0xe0, 0x8a, 0xf5, 0x92, 0x69, 0xb5, 0x06, 0xa5, 0x5b,
+                0x38, 0xa7, 0x28, 0xe5,
+            ]
+        );
+        assert_eq!(
+            *blake3::hash(&fs::read(&path).unwrap()).as_bytes(),
+            [
+                0x8f, 0xe6, 0x72, 0x41, 0x3e, 0x9d, 0x8f, 0x09, 0x08, 0xe1, 0x19, 0x97, 0xa5, 0xc6,
+                0xad, 0xf0, 0xc9, 0x01, 0x27, 0x73, 0x6a, 0x55, 0xeb, 0x8f, 0xed, 0x3a, 0x5c, 0x7d,
+                0xb4, 0xc0, 0xf0, 0x1e,
+            ]
+        );
+        drop(artifact);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn retained_digest_rejects_same_label_whole_source_substitution() {
         let original_path = test_path("original");
         let substitute_path = test_path("substitute");
@@ -988,6 +1126,31 @@ mod tests {
     }
 
     #[test]
+    fn expected_identity_rejects_large_self_description_before_length_or_data_work() {
+        let path = test_path("large-identity-preflight");
+        let claimed_source = source_identity(31, 0x4b);
+        let geometry = validate_source_identity(&claimed_source).unwrap();
+        let prefix = encode_prefix(&claimed_source, &geometry);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&prefix).unwrap();
+        file.write_all(&[0x7a; DIGEST_BYTES]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let expected = WhirInitialSourceArtifactIdentity {
+            source: source_identity(2, 0x4c),
+            element_count: 4,
+            artifact_global_digest: [0x7b; DIGEST_BYTES],
+        };
+        assert!(matches!(
+            AuthenticatedWhirInitialSourceFile::open(&path, &expected),
+            Err(WhirInitialSourceArtifactError::IdentityMismatch)
+        ));
+        assert_eq!(fs::metadata(&path).unwrap().len(), HEADER_BYTES as u64);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn invalid_writes_reads_and_existing_targets_are_rejected_before_mutation() {
         let path = test_path("invalid");
         fs::write(&path, b"keep").unwrap();
@@ -1010,7 +1173,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert!(matches!(
-            WhirInitialSourceArtifactWriter::create(&path, source_identity(20, 0x52)),
+            WhirInitialSourceArtifactWriter::create(&path, source_identity(32, 0x52)),
             Err(WhirInitialSourceArtifactError::ResearchLimit(_))
         ));
         assert!(!path.exists());
@@ -1051,5 +1214,14 @@ mod tests {
             artifact.read_authenticated_elements(15, 2),
             Err(WhirInitialSourceArtifactError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn production_weight_source_geometry_is_admitted_without_lowering_codeword_caps() {
+        let geometry = validate_source_identity(&source_identity(31, 0x56)).unwrap();
+        assert_eq!(geometry.element_count, 1_usize << 31);
+        assert_eq!(geometry.data_bytes, 1_u64 << 34);
+        assert_eq!(geometry.auth_count, 1_u64 << 18);
+        assert_eq!(crate::whir_initial::WHIR_INITIAL_MAX_VARIABLES, 19);
     }
 }

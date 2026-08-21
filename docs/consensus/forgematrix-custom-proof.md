@@ -438,8 +438,27 @@ current 184-byte format authenticates the complete payload rather than each
 prefix, so sink writes remain provisional: the sink receives an unforgeable
 completion receipt and may publish only after the raw root, indexed layer-root
 aggregate, exact payload length, and EOF all match. Reader and sink failures
-abort before that publication barrier. This establishes the byte/order/field
-interface; it does not yet implement a production WHIR commitment sink.
+abort before that publication barrier. The feature-gated WHIR sink now writes
+one authenticated source artifact for the base input and each ordered weight
+bank. It seals them in an unpublished attempt directory, binds their exact digests,
+roles, expected commitment aliases, model identity, and manifest into a
+canonical bundle, and publishes one no-overwrite hard-linked manifest pointer
+last. Concurrent identical publishers converge; a process crash before the
+pointer can leave unreachable objects but cannot expose a partial bundle.
+The builder also returns a canonical 108-byte bundle identity that must be
+retained outside the publication tree. Reopening checks that independent
+identity before trusting any artifact digest from the replaceable pointer, so
+a self-consistent pointer-and-object substitution fails closed. Before reading
+the model, publication preflight exercises the actual staging-to-object and
+object-to-pointer-parent hard-link edges without deleting pre-existing files.
+Hard-link namespace updates are not portably directory-synchronized on every
+supported Windows/Linux filesystem, so sudden power-loss durability is not yet
+claimed; reopening fails closed if any object is missing. Killed attempts can
+also strand up to roughly 48 GiB under staging, and content-addressed objects
+created by a losing publication can be unreachable. Production operation still
+needs lock/lease-aware stale-attempt and unreferenced-object recovery that never
+deletes a live concurrent publisher. This closes the raw-model-byte-to-WHIR-
+source boundary, not the later source-to-commitment boundary.
 
 The proof-acceleration crate now has a bounded external-memory encoder for the
 initial suffix-order WHIR codeword. It consumes an already authenticated,
@@ -458,7 +477,18 @@ prover identity binds that exact source digest to the exact codeword/tree
 oracle identity. Reopening checks the caller context before file I/O, fully
 authenticates all three files, and reauthenticates the affected source chunks,
 codeword rows, and Merkle chunks on later reads. A self-consistent replacement
-with the same `source_id` is rejected by the retained source digest.
+with the same `source_id` is rejected by the retained source digest. Source
+staging now admits the production 31-variable weight-bank geometry without
+preallocating its 16 GiB canonical-`u64` file. The codeword encoder and prover
+oracle remain capped at 19 variables, so a 31-variable source is explicitly a
+staging artifact and cannot yet become an `InitialWhirProverIdentity`. Three
+production weight sources occupy about 48 GiB, and sealing currently rereads
+each artifact twice for staged and published verification. The immediately
+anchored bundle reopen performs a third full read. Authentication digests are
+accumulated during the one-pass write, so the former pre-seal data scan is gone,
+but a complete build still performs about 48 GiB of verification reads per
+16 GiB weight role, or about 144 GiB across all three. Reusing an authenticated
+handle across same-inode hard links remains a ceremony-throughput optimization.
 
 The initial fold-two sumcheck also streams that source in chunks of at most
 8,192 canonical `u64` values. It keeps four suffix partials per claim and
@@ -475,13 +505,14 @@ The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
 `StructuredWhirPcsVerifier` authenticates both scoped claim sets. This closes
 commitment selection and bank-order substitution in the research boundary; it
-does not make the bounded byte linker production-capable. The production base
-table has 19 variables and each weight bank has 31, while this adapter admits at
-most 16 variables per table. It still retains whole bounded tables in memory
-and has no streaming 6 GiB commitment path. The upstream backend is an
-unaudited academic prototype. Review, benchmarks, fuzzing, a complete soundness
-report, and independent audits remain mandatory before any production
-selection.
+does not make the commitment/proof adapter production-capable. The production
+base table has 19 variables and each weight bank has 31. Source staging admits
+both, but the explicit proof adapter admits at most 16 variables per table and
+the codeword/oracle path admits at most 19. It still has no streaming
+31-variable commitment, residual sumcheck, or later-folding path. The upstream
+backend is an unaudited academic prototype. Review, benchmarks, fuzzing, a
+complete soundness report, and independent audits remain mandatory before any
+production selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded

@@ -142,9 +142,22 @@ generation, the CUDA row stream, and sealed spill storage now exist, but the
 current WHIR adapter consumes only an authenticated initial source,
 codeword/tree commitment, and streamed fold-two initial sumcheck. Later folded
 rounds, FRI, and opening generation are not yet fully out of core. There is
-also no production raw-model-byte-to-PCS artifact link, consensus tag,
-complete soundness report, or audit. The aggregate remains feature-gated
-research scaffolding with no consensus or wire tag. See
+now a fail-closed raw-model-byte-to-authenticated-source bundle: one verified
+stream stages the production `n = 19` base role and `n = 31` weight roles and
+publishes a single manifest pointer only after every role seals. It does not
+yet derive the corresponding codeword/tree roots or prove that they equal the
+pinned PCS commitment aliases. There is therefore still no complete
+raw-model-byte-to-PCS link, consensus tag, complete soundness report, or audit.
+The publication pointer is untrusted storage: a separately retained canonical
+bundle identity pins the exact bundle and every source-artifact digest on each
+reopen, including after restart. A self-consistent pointer/object replacement
+without that retained identity is rejected.
+Abnormal termination can leave roughly 48 GiB of unreachable staging/object
+data, and portable directory-entry power-loss durability is not implemented;
+reopening is fail-closed, but lock-aware recovery and filesystem durability are
+still production gates.
+The aggregate remains feature-gated research scaffolding with no consensus or
+wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
 
 Mainnet remains disabled until all of the following are complete:

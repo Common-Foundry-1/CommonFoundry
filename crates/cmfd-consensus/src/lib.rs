@@ -4,6 +4,8 @@ pub mod economics;
 pub mod forgematrix;
 pub mod forgematrix_v2;
 pub mod model_bank;
+#[cfg(feature = "gpu-proof-prover")]
+pub mod model_whir_sources;
 pub mod network;
 pub mod pow;
 #[cfg(feature = "remainder-prototype")]
@@ -59,6 +61,12 @@ pub use model_bank::{
     ModelPcsIdentity, ModelPcsRole, ModelPcsRoleLayout, SmallModelBankFixture,
     StagedModelFieldSink, VerifiedModelBankReceipt, build_small_model_bank, verify_model_bank,
     verify_model_bank_into_staged_field_sink,
+};
+#[cfg(feature = "gpu-proof-prover")]
+pub use model_whir_sources::{
+    MODEL_WHIR_SOURCE_BUNDLE_IDENTITY_BYTES, ModelWhirSourceBundleIdentity, ModelWhirSourceError,
+    PublishedModelWhirSourceBundle, PublishedModelWhirSourceRole,
+    build_verified_model_whir_sources, open_published_model_whir_sources,
 };
 pub use network::{
     BlockValidationContext, CONSENSUS_SIGNATURE_BYTES, FixedRewardDestinations,

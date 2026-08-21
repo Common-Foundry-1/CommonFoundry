@@ -450,12 +450,26 @@ artifact. The current checkpoint admits at most 19 table variables: this
 covers the proposed production `2^18 x 4` base-input codeword, while rejecting
 a production weight bank before reading its source or creating a file.
 
-That codeword feeds a bounded authenticated BLAKE3 Merkle store whose root and
-opening paths match the unchanged WHIR MMCS. Reopening either artifact requires
-an exact identity retained outside the file; checksums embedded in the same
-file are integrity checks, not provenance. The checkpoint does not yet replace
-WHIR's in-memory `Poly`, extension-polynomial, or sumcheck state and does not
-support the production `2^30 x 4` weight-bank codeword.
+The original natural-order table can now be written sequentially to its own
+authenticated source artifact before codeword encoding. Its separately
+retained whole-artifact digest is the provenance check; the existing
+`source_id` remains only a caller-selected cross-artifact label. A fixed-width
+prover identity binds that exact source digest to the exact codeword/tree
+oracle identity. Reopening checks the caller context before file I/O, fully
+authenticates all three files, and reauthenticates the affected source chunks,
+codeword rows, and Merkle chunks on later reads. A self-consistent replacement
+with the same `source_id` is rejected by the retained source digest.
+
+The initial fold-two sumcheck also streams that source in chunks of at most
+8,192 canonical `u64` values. It keeps four suffix partials per claim and
+materializes only the residual `N/4` evaluation and weight vectors before
+continuing through the ordinary WHIR prover. Exact tests match the dense
+commitment, openings, transcript, and serialized proof bytes at 2, 8, and 9
+variables and match the initial sumcheck state above the parallel threshold at
+15 variables. Completed proofs still pass the unchanged CPU verifier. Later
+WHIR folding rounds remain in memory, the explicit adapter remains capped at
+16 variables, and the production `2^30 x 4` weight-bank codeword remains
+unsupported.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and

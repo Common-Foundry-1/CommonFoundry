@@ -27,9 +27,16 @@ use crate::whir_initial::{
     WHIR_INITIAL_WIDTH, WhirInitialCodewordIdentity, WhirInitialEncodingError,
     WhirInitialSourceIdentity,
 };
+use crate::whir_initial_source::{
+    AuthenticatedWhirInitialSourceFile, WhirInitialSourceArtifactError,
+    WhirInitialSourceArtifactIdentity,
+};
 
 /// Canonical byte length of [`InitialWhirOracleIdentity`].
 pub const INITIAL_WHIR_ORACLE_IDENTITY_BYTES: usize = 296;
+
+/// Canonical byte length of [`InitialWhirProverIdentity`].
+pub const INITIAL_WHIR_PROVER_IDENTITY_BYTES: usize = 416;
 
 /// Pinned initial-commitment folding factor.
 pub const INITIAL_WHIR_FOLDING: u8 = 2;
@@ -57,6 +64,18 @@ const TREE_ROOT_OFFSET: usize = 200;
 const TREE_GLOBAL_DIGEST_OFFSET: usize = 232;
 const BINDING_OFFSET: usize = 264;
 const IDENTITY_DOMAIN: &str = "Common Foundry initial WHIR oracle identity v1";
+const PROVER_MAGIC: &[u8; 8] = b"CMFDWIP1";
+const PROVER_ORACLE_OFFSET: usize = 8;
+const PROVER_SOURCE_ID_OFFSET: usize = 304;
+const PROVER_NUM_VARIABLES_OFFSET: usize = 336;
+const PROVER_LAYOUT_OFFSET: usize = 340;
+const PROVER_ENCODING_OFFSET: usize = 341;
+const PROVER_ELEMENT_COUNT_OFFSET: usize = 344;
+const PROVER_SOURCE_DIGEST_OFFSET: usize = 352;
+const PROVER_BINDING_OFFSET: usize = 384;
+const PROVER_NATURAL_MLE_LAYOUT: u8 = 1;
+const PROVER_CANONICAL_U64_LE_ENCODING: u8 = 1;
+const PROVER_IDENTITY_DOMAIN: &str = "Common Foundry initial WHIR prover identity v1";
 
 /// One externally retained, canonical identity for an initial WHIR oracle.
 ///
@@ -284,6 +303,167 @@ impl InitialWhirOracleIdentity {
     }
 }
 
+/// Prover-only identity binding the exact original source artifact to one
+/// already retained initial-codeword/tree oracle identity.
+///
+/// The existing `source_id` remains a caller-selected cross-artifact label.
+/// `artifact_global_digest` is the cryptographic provenance check for the
+/// original source file. This identity is not part of the proof transcript or
+/// consensus wire format.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InitialWhirProverIdentity {
+    encoded: [u8; INITIAL_WHIR_PROVER_IDENTITY_BYTES],
+}
+
+impl std::fmt::Debug for InitialWhirProverIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitialWhirProverIdentity")
+            .field("binding_digest", &self.binding_digest())
+            .field("oracle", &self.oracle_identity())
+            .field("source_artifact", &self.source_artifact_identity())
+            .finish()
+    }
+}
+
+impl InitialWhirProverIdentity {
+    /// Bind one exact authenticated source artifact to an exact oracle.
+    pub fn bind(
+        oracle: &InitialWhirOracleIdentity,
+        source_artifact: &WhirInitialSourceArtifactIdentity,
+    ) -> Result<Self, InitialWhirProverError> {
+        validate_source_artifact_identity(source_artifact)?;
+        if source_artifact.source != oracle.codeword_identity().source {
+            return Err(InitialWhirProverError::SourceIdentityMismatch);
+        }
+
+        let mut encoded = [0_u8; INITIAL_WHIR_PROVER_IDENTITY_BYTES];
+        encoded[..8].copy_from_slice(PROVER_MAGIC);
+        encoded[PROVER_ORACLE_OFFSET..PROVER_ORACLE_OFFSET + INITIAL_WHIR_ORACLE_IDENTITY_BYTES]
+            .copy_from_slice(oracle.as_bytes());
+        encoded[PROVER_SOURCE_ID_OFFSET..PROVER_SOURCE_ID_OFFSET + 32]
+            .copy_from_slice(&source_artifact.source.source_id);
+        put_u32(
+            &mut encoded,
+            PROVER_NUM_VARIABLES_OFFSET,
+            source_artifact.source.num_variables,
+        );
+        encoded[PROVER_LAYOUT_OFFSET] = PROVER_NATURAL_MLE_LAYOUT;
+        encoded[PROVER_ENCODING_OFFSET] = PROVER_CANONICAL_U64_LE_ENCODING;
+        put_u64(
+            &mut encoded,
+            PROVER_ELEMENT_COUNT_OFFSET,
+            source_artifact.element_count,
+        );
+        encoded[PROVER_SOURCE_DIGEST_OFFSET..PROVER_SOURCE_DIGEST_OFFSET + 32]
+            .copy_from_slice(&source_artifact.artifact_global_digest);
+        let binding = prover_identity_binding(&encoded);
+        encoded[PROVER_BINDING_OFFSET..].copy_from_slice(&binding);
+        Self::from_bytes(encoded)
+    }
+
+    /// Decode and validate a canonical fixed-width prover identity.
+    pub fn from_bytes(
+        encoded: [u8; INITIAL_WHIR_PROVER_IDENTITY_BYTES],
+    ) -> Result<Self, InitialWhirProverError> {
+        let identity = Self { encoded };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; INITIAL_WHIR_PROVER_IDENTITY_BYTES] {
+        &self.encoded
+    }
+
+    pub const fn to_bytes(self) -> [u8; INITIAL_WHIR_PROVER_IDENTITY_BYTES] {
+        self.encoded
+    }
+
+    pub fn binding_digest(&self) -> [u8; 32] {
+        read_digest(&self.encoded, PROVER_BINDING_OFFSET)
+    }
+
+    pub fn oracle_identity(&self) -> InitialWhirOracleIdentity {
+        let encoded = self.encoded
+            [PROVER_ORACLE_OFFSET..PROVER_ORACLE_OFFSET + INITIAL_WHIR_ORACLE_IDENTITY_BYTES]
+            .try_into()
+            .expect("fixed initial WHIR oracle identity slice");
+        InitialWhirOracleIdentity::from_bytes(encoded)
+            .expect("validated initial WHIR prover identity contains a valid oracle")
+    }
+
+    pub fn source_artifact_identity(&self) -> WhirInitialSourceArtifactIdentity {
+        WhirInitialSourceArtifactIdentity {
+            source: WhirInitialSourceIdentity {
+                source_id: read_digest(&self.encoded, PROVER_SOURCE_ID_OFFSET),
+                num_variables: read_u32(&self.encoded, PROVER_NUM_VARIABLES_OFFSET),
+            },
+            element_count: read_u64(&self.encoded, PROVER_ELEMENT_COUNT_OFFSET),
+            artifact_global_digest: read_digest(&self.encoded, PROVER_SOURCE_DIGEST_OFFSET),
+        }
+    }
+
+    fn validate(&self) -> Result<(), InitialWhirProverError> {
+        if &self.encoded[..8] != PROVER_MAGIC {
+            return Err(InitialWhirProverError::InvalidIdentity("wrong magic"));
+        }
+        if self.binding_digest() != prover_identity_binding(&self.encoded) {
+            return Err(InitialWhirProverError::InvalidIdentity(
+                "binding digest does not match",
+            ));
+        }
+        if self.encoded[PROVER_LAYOUT_OFFSET] != PROVER_NATURAL_MLE_LAYOUT
+            || self.encoded[PROVER_ENCODING_OFFSET] != PROVER_CANONICAL_U64_LE_ENCODING
+            || self.encoded[342..344] != [0_u8; 2]
+        {
+            return Err(InitialWhirProverError::InvalidIdentity(
+                "source layout or encoding is not canonical",
+            ));
+        }
+        let oracle_encoded = self.encoded
+            [PROVER_ORACLE_OFFSET..PROVER_ORACLE_OFFSET + INITIAL_WHIR_ORACLE_IDENTITY_BYTES]
+            .try_into()
+            .expect("fixed initial WHIR oracle identity slice");
+        let oracle = InitialWhirOracleIdentity::from_bytes(oracle_encoded)
+            .map_err(InitialWhirProverError::Oracle)?;
+        let source_artifact = self.source_artifact_identity();
+        validate_source_artifact_identity(&source_artifact)?;
+        if source_artifact.source != oracle.codeword_identity().source {
+            return Err(InitialWhirProverError::SourceIdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn validate_source_artifact_identity(
+    source_artifact: &WhirInitialSourceArtifactIdentity,
+) -> Result<(), InitialWhirProverError> {
+    if source_artifact.source.source_id == [0_u8; 32]
+        || source_artifact.artifact_global_digest == [0_u8; 32]
+    {
+        return Err(InitialWhirProverError::InvalidIdentity(
+            "source IDs and digests must be nonzero",
+        ));
+    }
+    let expected_elements = 1_u64
+        .checked_shl(source_artifact.source.num_variables)
+        .ok_or(InitialWhirProverError::InvalidIdentity(
+            "source element count is not representable",
+        ))?;
+    if source_artifact.element_count != expected_elements {
+        return Err(InitialWhirProverError::InvalidIdentity(
+            "source element count does not match num_variables",
+        ));
+    }
+    Ok(())
+}
+
+fn prover_identity_binding(encoded: &[u8; INITIAL_WHIR_PROVER_IDENTITY_BYTES]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(PROVER_IDENTITY_DOMAIN);
+    hasher.update(&encoded[..PROVER_BINDING_OFFSET]);
+    *hasher.finalize().as_bytes()
+}
+
 #[derive(Debug, Error)]
 pub enum InitialWhirOracleError {
     #[error("invalid initial WHIR oracle identity: {0}")]
@@ -302,6 +482,22 @@ pub enum InitialWhirOracleError {
     Codeword(#[source] WhirInitialEncodingError),
     #[error("initial WHIR Merkle access failed: {0}")]
     Merkle(#[source] Blake3MerkleStoreError),
+}
+
+#[derive(Debug, Error)]
+pub enum InitialWhirProverError {
+    #[error("invalid initial WHIR prover identity: {0}")]
+    InvalidIdentity(&'static str),
+    #[error("initial WHIR source identity does not match the oracle identity")]
+    SourceIdentityMismatch,
+    #[error("initial WHIR source artifact identity does not match")]
+    SourceArtifactIdentityMismatch,
+    #[error("initial WHIR oracle identity does not match the prover identity")]
+    OracleIdentityMismatch,
+    #[error("initial WHIR source artifact access failed: {0}")]
+    SourceArtifact(#[source] WhirInitialSourceArtifactError),
+    #[error("initial WHIR oracle access failed: {0}")]
+    Oracle(#[source] InitialWhirOracleError),
 }
 
 /// One authenticated natural codeword row and its leaf-to-root sibling path.
@@ -432,6 +628,114 @@ impl InitialWhirOracle {
     }
 }
 
+/// Authenticated access to one original source, initial codeword, and Merkle
+/// tree under a single externally retained prover identity.
+pub struct InitialWhirProverOracle {
+    identity: InitialWhirProverIdentity,
+    source: AuthenticatedWhirInitialSourceFile,
+    oracle: InitialWhirOracle,
+}
+
+impl std::fmt::Debug for InitialWhirProverOracle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InitialWhirProverOracle")
+            .field("identity", &self.identity)
+            .field("source_path", &self.source.path())
+            .field("oracle", &self.oracle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InitialWhirProverOracle {
+    /// Reopen all three artifacts against one retained identity.
+    ///
+    /// The caller context and fixed identity are checked before any path is
+    /// opened. No partially validated capability is returned.
+    pub fn reopen(
+        caller_context_digest: [u8; 32],
+        expected: &InitialWhirProverIdentity,
+        source_path: impl AsRef<Path>,
+        codeword_path: impl AsRef<Path>,
+        tree_path: impl AsRef<Path>,
+    ) -> Result<Self, InitialWhirProverError> {
+        expected.validate()?;
+        let oracle_identity = expected.oracle_identity();
+        oracle_identity
+            .require_context(caller_context_digest)
+            .map_err(InitialWhirProverError::Oracle)?;
+        let source_identity = expected.source_artifact_identity();
+        let source = AuthenticatedWhirInitialSourceFile::open(source_path, &source_identity)
+            .map_err(map_source_artifact_open_error)?;
+        let oracle = InitialWhirOracle::reopen(
+            caller_context_digest,
+            &oracle_identity,
+            codeword_path,
+            tree_path,
+        )
+        .map_err(InitialWhirProverError::Oracle)?;
+        Self::adopt_validated(expected, source, oracle)
+    }
+
+    /// Adopt already-open authenticated components under one retained identity.
+    pub fn adopt(
+        caller_context_digest: [u8; 32],
+        expected: &InitialWhirProverIdentity,
+        source: AuthenticatedWhirInitialSourceFile,
+        oracle: InitialWhirOracle,
+    ) -> Result<Self, InitialWhirProverError> {
+        expected.validate()?;
+        expected
+            .oracle_identity()
+            .require_context(caller_context_digest)
+            .map_err(InitialWhirProverError::Oracle)?;
+        Self::adopt_validated(expected, source, oracle)
+    }
+
+    fn adopt_validated(
+        expected: &InitialWhirProverIdentity,
+        source: AuthenticatedWhirInitialSourceFile,
+        oracle: InitialWhirOracle,
+    ) -> Result<Self, InitialWhirProverError> {
+        if source.artifact_identity() != &expected.source_artifact_identity() {
+            return Err(InitialWhirProverError::SourceArtifactIdentityMismatch);
+        }
+        if oracle.identity() != &expected.oracle_identity() {
+            return Err(InitialWhirProverError::OracleIdentityMismatch);
+        }
+        Ok(Self {
+            identity: *expected,
+            source,
+            oracle,
+        })
+    }
+
+    pub const fn identity(&self) -> &InitialWhirProverIdentity {
+        &self.identity
+    }
+
+    pub const fn source(&self) -> &AuthenticatedWhirInitialSourceFile {
+        &self.source
+    }
+
+    pub const fn oracle(&self) -> &InitialWhirOracle {
+        &self.oracle
+    }
+
+    pub fn into_parts(self) -> (AuthenticatedWhirInitialSourceFile, InitialWhirOracle) {
+        (self.source, self.oracle)
+    }
+}
+
+fn map_source_artifact_open_error(error: WhirInitialSourceArtifactError) -> InitialWhirProverError {
+    match error {
+        WhirInitialSourceArtifactError::IdentityMismatch => {
+            InitialWhirProverError::SourceArtifactIdentityMismatch
+        }
+        other => InitialWhirProverError::SourceArtifact(other),
+    }
+}
+
 fn map_codeword_open_error(error: WhirInitialEncodingError) -> InitialWhirOracleError {
     match error {
         WhirInitialEncodingError::IdentityMismatch => {
@@ -530,6 +834,7 @@ mod tests {
     use crate::whir_initial::{
         AuthenticatedWhirInitialSource, WhirInitialSourceError, encode_whir_initial_suffix,
     };
+    use crate::whir_initial_source::WhirInitialSourceArtifactWriter;
 
     use super::*;
 
@@ -566,6 +871,7 @@ mod tests {
     }
 
     struct TestPaths {
+        source: PathBuf,
         codeword: PathBuf,
         tree: PathBuf,
     }
@@ -578,6 +884,7 @@ mod tests {
                 std::process::id()
             ));
             Self {
+                source: base.with_extension("source"),
                 codeword: base.with_extension("codeword"),
                 tree: base.with_extension("tree"),
             }
@@ -586,6 +893,7 @@ mod tests {
 
     impl Drop for TestPaths {
         fn drop(&mut self) {
+            let _ = fs::remove_file(&self.source);
             let _ = fs::remove_file(&self.codeword);
             let _ = fs::remove_file(&self.tree);
         }
@@ -640,6 +948,64 @@ mod tests {
             paths,
             codeword,
             tree,
+            identity,
+        }
+    }
+
+    struct BuiltTriple {
+        paths: TestPaths,
+        prover: InitialWhirProverOracle,
+        identity: InitialWhirProverIdentity,
+    }
+
+    fn build_triple(label: &str, content_seed: u64, identity_seed: u8) -> BuiltTriple {
+        let paths = TestPaths::new(label);
+        let variables = 5_u32;
+        let source_identity = WhirInitialSourceIdentity {
+            source_id: [identity_seed; 32],
+            num_variables: variables,
+        };
+        let values = (0..1_usize << variables)
+            .map(|index| {
+                content_seed.wrapping_add((index as u64).wrapping_mul(0x9e37_79b9))
+                    % GOLDILOCKS_MODULUS
+            })
+            .collect::<Vec<_>>();
+        let mut source_writer =
+            WhirInitialSourceArtifactWriter::create(&paths.source, source_identity.clone())
+                .unwrap();
+        for chunk in values.chunks(7) {
+            source_writer.write_elements(chunk).unwrap();
+        }
+        let source = source_writer.finish().unwrap();
+        let codeword = encode_whir_initial_suffix(
+            &paths.codeword,
+            [identity_seed.wrapping_add(1); 32],
+            &source_identity,
+            &source,
+        )
+        .unwrap();
+        let tree = build_authenticated_blake3_merkle_store(
+            &paths.tree,
+            [identity_seed.wrapping_add(2); 32],
+            &[&codeword],
+        )
+        .unwrap();
+        let tree_identity = tree.identity().unwrap();
+        let oracle_identity = InitialWhirOracleIdentity::bind(
+            CONTEXT,
+            codeword.identity(),
+            &tree_identity,
+            tree_identity.tree_root,
+        )
+        .unwrap();
+        let identity =
+            InitialWhirProverIdentity::bind(&oracle_identity, source.artifact_identity()).unwrap();
+        let oracle = InitialWhirOracle::adopt(CONTEXT, &oracle_identity, codeword, tree).unwrap();
+        let prover = InitialWhirProverOracle::adopt(CONTEXT, &identity, source, oracle).unwrap();
+        BuiltTriple {
+            paths,
+            prover,
             identity,
         }
     }
@@ -847,6 +1213,123 @@ mod tests {
                 Err(InitialWhirOracleError::InvalidIdentity(_))
             ));
         }
+    }
+
+    #[test]
+    fn prover_identity_binds_the_exact_source_artifact() {
+        let pair = build_pair("prover-identity", 0x601, 0x81);
+        let source = pair.identity.codeword_identity().source;
+        let source_artifact = WhirInitialSourceArtifactIdentity {
+            source: source.clone(),
+            element_count: 1_u64 << source.num_variables,
+            artifact_global_digest: [0x91; 32],
+        };
+        let identity = InitialWhirProverIdentity::bind(&pair.identity, &source_artifact).unwrap();
+        assert_eq!(
+            identity.as_bytes().len(),
+            INITIAL_WHIR_PROVER_IDENTITY_BYTES
+        );
+        assert_eq!(
+            InitialWhirProverIdentity::from_bytes(identity.to_bytes()).unwrap(),
+            identity
+        );
+        assert_eq!(identity.oracle_identity(), pair.identity);
+        assert_eq!(identity.source_artifact_identity(), source_artifact);
+
+        let mut replacement = source_artifact.clone();
+        replacement.artifact_global_digest[0] ^= 1;
+        assert_ne!(
+            InitialWhirProverIdentity::bind(&pair.identity, &replacement).unwrap(),
+            identity
+        );
+
+        let mut wrong_source = source_artifact.clone();
+        wrong_source.source.source_id[0] ^= 1;
+        assert!(matches!(
+            InitialWhirProverIdentity::bind(&pair.identity, &wrong_source),
+            Err(InitialWhirProverError::SourceIdentityMismatch)
+        ));
+
+        let mut wrong_count = source_artifact;
+        wrong_count.element_count -= 1;
+        assert!(matches!(
+            InitialWhirProverIdentity::bind(&pair.identity, &wrong_count),
+            Err(InitialWhirProverError::InvalidIdentity(_))
+        ));
+
+        let mut mutated = identity.to_bytes();
+        mutated[PROVER_SOURCE_DIGEST_OFFSET] ^= 1;
+        assert!(matches!(
+            InitialWhirProverIdentity::from_bytes(mutated),
+            Err(InitialWhirProverError::InvalidIdentity(_))
+        ));
+    }
+
+    #[test]
+    fn prover_oracle_reopens_three_components_and_rejects_cross_pairing() {
+        let first = build_triple("prover-first", 0x701, 0xa1);
+        let second = build_triple("prover-second", 0x702, 0xa1);
+        assert_ne!(
+            first
+                .identity
+                .source_artifact_identity()
+                .artifact_global_digest,
+            second
+                .identity
+                .source_artifact_identity()
+                .artifact_global_digest
+        );
+        assert_eq!(
+            first.identity.source_artifact_identity().source,
+            second.identity.source_artifact_identity().source
+        );
+        assert_eq!(first.prover.source().read_elements(3, 5).unwrap().len(), 5);
+        assert_eq!(first.prover.oracle().opening(2).unwrap().row_index(), 2);
+
+        let first_identity = first.identity;
+        let first_source_path = first.paths.source.clone();
+        let first_codeword_path = first.paths.codeword.clone();
+        let first_tree_path = first.paths.tree.clone();
+        let second_source_path = second.paths.source.clone();
+        drop(first.prover);
+        drop(second.prover);
+
+        let reopened = InitialWhirProverOracle::reopen(
+            CONTEXT,
+            &first_identity,
+            &first_source_path,
+            &first_codeword_path,
+            &first_tree_path,
+        )
+        .unwrap();
+        assert_eq!(reopened.identity(), &first_identity);
+        assert_eq!(reopened.source().read_elements(1, 2).unwrap().len(), 2);
+        drop(reopened);
+
+        assert!(matches!(
+            InitialWhirProverOracle::reopen(
+                CONTEXT,
+                &first_identity,
+                &second_source_path,
+                &first_codeword_path,
+                &first_tree_path,
+            ),
+            Err(InitialWhirProverError::SourceArtifactIdentityMismatch)
+        ));
+
+        let missing = first_source_path.with_extension("missing");
+        assert!(matches!(
+            InitialWhirProverOracle::reopen(
+                [0xff; 32],
+                &first_identity,
+                &missing,
+                &missing,
+                &missing,
+            ),
+            Err(InitialWhirProverError::Oracle(
+                InitialWhirOracleError::CallerContextMismatch
+            ))
+        ));
     }
 
     fn mutate_byte(path: &Path, offset: u64) {

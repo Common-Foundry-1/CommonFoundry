@@ -16,7 +16,10 @@ use std::{
 
 use blake3::Hasher as Blake3Hasher;
 #[cfg(feature = "gpu-proof-prover")]
-use cmfd_proof_accel::initial_whir_oracle::{InitialWhirOracle, InitialWhirOracleIdentity};
+use cmfd_proof_accel::initial_whir_oracle::{
+    InitialWhirOracle, InitialWhirOracleIdentity, InitialWhirProverIdentity,
+    InitialWhirProverOracle,
+};
 #[cfg(feature = "gpu-proof-prover")]
 use cmfd_proof_accel::whir_initial::AuthenticatedWhirInitialSource;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -1479,6 +1482,41 @@ pub fn prove_explicit_whir_openings_with_initial_source(
     Ok((commitment, openings, proof))
 }
 
+/// Prove from one concrete source/codeword/tree capability whose exact source
+/// artifact digest is bound to the exact initial WHIR oracle identity.
+///
+/// This is the preferred disk-backed entry point. All three artifacts must
+/// already have been reopened or adopted under `expected_prover_identity`;
+/// identity checks remain transcript-silent, and any later authenticated read
+/// failure aborts without a dense fallback.
+#[cfg(feature = "gpu-proof-prover")]
+pub fn prove_explicit_whir_openings_with_prover_oracle(
+    transcript_binding: &[u8],
+    points: &[Vec<ExtensionElement>],
+    expected_prover_identity: &InitialWhirProverIdentity,
+    prover_oracle: InitialWhirProverOracle,
+) -> Result<
+    (
+        ExplicitWhirCommitment,
+        Vec<ExplicitWhirOpening>,
+        ExplicitWhirProof,
+    ),
+    ExplicitWhirError,
+> {
+    if prover_oracle.identity() != expected_prover_identity {
+        return Err(ExplicitWhirError::ProverStorage);
+    }
+    let expected_oracle_identity = expected_prover_identity.oracle_identity();
+    let (source, oracle) = prover_oracle.into_parts();
+    prove_explicit_whir_openings_with_initial_source(
+        transcript_binding,
+        points,
+        &expected_oracle_identity,
+        &source,
+        oracle,
+    )
+}
+
 pub fn verify_explicit_whir_openings(
     transcript_binding: &[u8],
     commitment: ExplicitWhirCommitment,
@@ -2316,11 +2354,18 @@ mod tests {
     #[cfg(feature = "gpu-proof-prover")]
     use cmfd_proof_accel::blake3_merkle_store::build_authenticated_blake3_merkle_store;
     #[cfg(feature = "gpu-proof-prover")]
-    use cmfd_proof_accel::initial_whir_oracle::{InitialWhirOracle, InitialWhirOracleIdentity};
+    use cmfd_proof_accel::initial_whir_oracle::{
+        InitialWhirOracle, InitialWhirOracleIdentity, InitialWhirProverIdentity,
+        InitialWhirProverOracle,
+    };
     #[cfg(feature = "gpu-proof-prover")]
     use cmfd_proof_accel::whir_initial::{
         AuthenticatedWhirInitialSource, WHIR_INITIAL_MAX_SOURCE_READ_LIMBS, WhirInitialSourceError,
         WhirInitialSourceIdentity, encode_whir_initial_suffix,
+    };
+    #[cfg(feature = "gpu-proof-prover")]
+    use cmfd_proof_accel::whir_initial_source::{
+        WHIR_INITIAL_SOURCE_HEADER_BYTES, WhirInitialSourceArtifactWriter,
     };
     #[cfg(feature = "gpu-proof-prover")]
     use std::fs::OpenOptions;
@@ -2643,6 +2688,53 @@ mod tests {
             oracle: InitialWhirOracle::adopt(context, &identity, codeword, tree).unwrap(),
             identity,
             codeword_path,
+        }
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    struct TestProverOracle {
+        prover: InitialWhirProverOracle,
+        identity: InitialWhirProverIdentity,
+        source_path: std::path::PathBuf,
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    fn test_prover_oracle(values: &[u64], context: [u8; 32]) -> TestProverOracle {
+        let descriptor = ExactTableSource::new(values.to_vec());
+        let base = whir_initial_test_path();
+        let source_path = base.with_extension("source");
+        let codeword_path = base.with_extension("codeword");
+        let tree_path = base.with_extension("tree");
+        let mut writer =
+            WhirInitialSourceArtifactWriter::create(&source_path, descriptor.identity().clone())
+                .unwrap();
+        for chunk in values.chunks(127) {
+            writer.write_elements(chunk).unwrap();
+        }
+        let source = writer.finish().unwrap().remove_on_drop();
+        let codeword =
+            encode_whir_initial_suffix(&codeword_path, [0xc6; 32], descriptor.identity(), &source)
+                .unwrap()
+                .remove_on_drop();
+        let tree = build_authenticated_blake3_merkle_store(&tree_path, [0xd7; 32], &[&codeword])
+            .unwrap()
+            .remove_on_drop();
+        let tree_identity = tree.identity().unwrap();
+        let oracle_identity = InitialWhirOracleIdentity::bind(
+            context,
+            codeword.identity(),
+            &tree_identity,
+            tree_identity.tree_root,
+        )
+        .unwrap();
+        let identity =
+            InitialWhirProverIdentity::bind(&oracle_identity, source.artifact_identity()).unwrap();
+        let oracle = InitialWhirOracle::adopt(context, &oracle_identity, codeword, tree).unwrap();
+        let prover = InitialWhirProverOracle::adopt(context, &identity, source, oracle).unwrap();
+        TestProverOracle {
+            prover,
+            identity,
+            source_path,
         }
     }
 
@@ -3174,6 +3266,80 @@ mod tests {
             assert!(source.max_read.load(Ordering::Relaxed) <= WHIR_INITIAL_MAX_SOURCE_READ_LIMBS);
             assert!(source.reads.load(Ordering::Relaxed) >= 2);
         }
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn concrete_source_bundle_matches_dense_proof_bytes_across_round_shapes() {
+        for variables in [2_usize, 8, 9] {
+            let binding = format!("forge-matrix-concrete-source-{variables}");
+            let values = (0..1_usize << variables)
+                .map(|index| (index * index + 9 * index + 41) as u64)
+                .collect::<Vec<_>>();
+            let points = (0..2)
+                .map(|point_index| {
+                    (0..variables)
+                        .map(|index| ExtensionElement {
+                            limbs: [
+                                (index * 3 + point_index + 2) as u64,
+                                (index * 7 + point_index + 3) as u64,
+                                (index * 13 + point_index + 5) as u64,
+                            ],
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let dense = prove_explicit_whir_openings(binding.as_bytes(), &values, &points).unwrap();
+            let built = test_prover_oracle(&values, [variables as u8 + 0x60; 32]);
+            let streamed = prove_explicit_whir_openings_with_prover_oracle(
+                binding.as_bytes(),
+                &points,
+                &built.identity,
+                built.prover,
+            )
+            .unwrap();
+            assert_eq!(streamed, dense);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn concrete_source_mutation_aborts_without_dense_fallback() {
+        let binding = b"forge-matrix-concrete-source-mutation";
+        let values = (0..256)
+            .map(|index| (index * index + 11 * index + 43) as u64)
+            .collect::<Vec<_>>();
+        let points = vec![
+            (0..8)
+                .map(|index| ExtensionElement {
+                    limbs: [
+                        (index * 3 + 2) as u64,
+                        (index * 5 + 3) as u64,
+                        (index * 7 + 5) as u64,
+                    ],
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let built = test_prover_oracle(&values, [0x8a; 32]);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&built.source_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(WHIR_INITIAL_SOURCE_HEADER_BYTES as u64 + 8))
+            .unwrap();
+        file.write_all(&123_u64.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+
+        assert_eq!(
+            prove_explicit_whir_openings_with_prover_oracle(
+                binding,
+                &points,
+                &built.identity,
+                built.prover,
+            ),
+            Err(ExplicitWhirError::ProverStorage)
+        );
     }
 
     #[test]

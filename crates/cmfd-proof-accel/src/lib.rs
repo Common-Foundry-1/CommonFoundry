@@ -10,6 +10,7 @@ pub mod merkle_store;
 mod poseidon2;
 pub mod spill;
 pub mod whir_initial;
+pub mod whir_initial_source;
 
 pub use poseidon2::{
     CUDA_POSEIDON2_API_VERSION, CUDA_POSEIDON2_MAX_MATRICES, CUDA_POSEIDON2_MAX_ROW_WIDTH,

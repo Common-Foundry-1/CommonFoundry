@@ -139,9 +139,10 @@ Plonky3's component-security model, but this is not the missing aggregate
 union-bound report. The legacy one-block backend and the
 new custom tree AIR both require independent algebraic review. Bounded trace
 generation, the CUDA row stream, and sealed spill storage now exist, but the
-current Plonky3 PCS does not consume those artifacts. Full out-of-core PCS,
-FRI, Merkle-level storage/construction, and opening generation are still not
-complete. There is also no production raw-model-byte link, consensus tag,
+current WHIR adapter consumes only an authenticated initial source,
+codeword/tree commitment, and streamed fold-two initial sumcheck. Later folded
+rounds, FRI, and opening generation are not yet fully out of core. There is
+also no production raw-model-byte-to-PCS artifact link, consensus tag,
 complete soundness report, or audit. The aggregate remains feature-gated
 research scaffolding with no consensus or wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).

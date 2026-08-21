@@ -151,13 +151,50 @@ where
         Challenger: CanObserve<MT::Commitment>,
     {
         assert_eq!(self.round_folding_factor(0), layout.folding());
-        let variable_order = L::variable_order();
 
         let (sumcheck_prover, folding_randomness) = layout.into_sumcheck(
             &mut proof.initial_sumcheck,
             self.starting_folding_pow_bits,
             challenger,
         );
+
+        self.prove_from_sumcheck(
+            proof,
+            challenger,
+            sumcheck_prover,
+            folding_randomness,
+            prover_data,
+        );
+    }
+
+    /// Continue proving from an already completed initial sumcheck batch.
+    ///
+    /// This is the fallible-storage seam for layouts that prepare WHIR's
+    /// initial fold without materialising the full extension-field product
+    /// polynomial. The caller must have observed the initial commitment and
+    /// every opening claim in the ordinary order, and must have written the
+    /// exact initial sumcheck messages into `proof` before calling this method.
+    /// No additional transcript element is observed here before the first
+    /// ordinary WHIR round.
+    pub fn prove_from_sumcheck<M: Matrix<F>>(
+        &self,
+        proof: &mut WhirProof<F, EF, MT>,
+        challenger: &mut Challenger,
+        sumcheck_prover: SumcheckProver<F, EF>,
+        folding_randomness: Point<EF>,
+        prover_data: MT::ProverData<M>,
+    ) where
+        Dft: TwoAdicSubgroupDft<F>,
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let initial_folding = self.round_folding_factor(0);
+        assert_eq!(proof.initial_sumcheck.num_rounds(), initial_folding);
+        assert_eq!(folding_randomness.num_variables(), initial_folding);
+        assert_eq!(
+            sumcheck_prover.num_variables(),
+            self.num_variables - initial_folding
+        );
+        let variable_order = L::variable_order();
 
         let mut round_state = RoundState {
             sumcheck_prover,

@@ -11,11 +11,15 @@ Upstream SHA-256 values before modification:
 - `Cargo.toml`:
   `5e2edbae11fbf3754a30085389e68a38c7087a704d14371460c6d4e070afbb2c`
 
-The functional patch makes only the prover's initial MMCS matrix type generic
-inside `WhirProver::prove` and its private round state. Later folded-round
-matrices remain the upstream dense extension-field type. The existing
-`MultilinearPcs` adapter and its `WhirProverData` remain explicitly
-`DenseMatrix<F>`, so current callers retain the same commit/open behavior.
+The functional patch makes the prover's initial MMCS matrix type generic
+inside `WhirProver::prove` and its private round state. It also exposes
+`WhirProver::prove_from_sumcheck`, a checked continuation seam for an initial
+sumcheck prepared from authenticated external storage. The ordinary `prove`
+entry point delegates to that seam after running the unchanged layout code.
+Later folded-round matrices remain the upstream dense extension-field type.
+The existing `MultilinearPcs` adapter and its `WhirProverData` remain
+explicitly `DenseMatrix<F>`, so current callers retain the same commit/open
+behavior.
 
 Commitments, verifier types, proof structs, transcript order, and serialized
 proof bytes are unchanged. A focused dense-adapter test exercises both prefix

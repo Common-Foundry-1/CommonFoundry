@@ -17,6 +17,8 @@ use std::{
 use blake3::Hasher as Blake3Hasher;
 #[cfg(feature = "gpu-proof-prover")]
 use cmfd_proof_accel::initial_whir_oracle::{InitialWhirOracle, InitialWhirOracleIdentity};
+#[cfg(feature = "gpu-proof-prover")]
+use cmfd_proof_accel::whir_initial::AuthenticatedWhirInitialSource;
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use p3_blake3::Blake3;
 use p3_challenger::{
@@ -50,6 +52,10 @@ use thiserror::Error;
 mod disk_mmcs;
 #[cfg(feature = "gpu-proof-prover")]
 use disk_mmcs::{DiskWhirMmcs, DiskWhirOpeningPanic};
+#[cfg(feature = "gpu-proof-prover")]
+mod disk_sumcheck;
+#[cfg(feature = "gpu-proof-prover")]
+use disk_sumcheck::{evaluate_claims, prepare_sumcheck};
 
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredPcsOpeningClaim, StructuredPcsOpeningSet,
@@ -585,7 +591,7 @@ pub fn structured_whir_suite_parameter_digest() -> [u8; 32] {
     update_suite_descriptor(
         &mut hasher,
         b"p3-whir-source",
-        b"0.6.3+cmfd-generic-initial-matrix-v1",
+        b"0.6.3+cmfd-generic-initial-matrix-preprocessed-sumcheck-v2",
     );
     update_suite_descriptor(&mut hasher, b"blake3-crate", b"1.8.6");
     update_suite_descriptor(&mut hasher, b"flate2-crate", b"1.1.9");
@@ -965,7 +971,6 @@ pub enum ExplicitWhirError {
 #[derive(Debug, Clone)]
 struct ExplicitPointLayout {
     poly: Poly<F>,
-    extension_poly: Poly<EF>,
     folding: usize,
     statement: EqStatement<EF>,
     table_variables: Vec<usize>,
@@ -976,10 +981,8 @@ impl ExplicitPointLayout {
     fn from_poly_and_shapes(poly: Poly<F>, folding: usize, table_variables: Vec<usize>) -> Self {
         let num_variables = poly.num_variables();
         let selectors = plan_selectors(&table_variables, num_variables);
-        let extension_poly = extend_poly(&poly);
         Self {
             poly,
-            extension_poly,
             folding,
             statement: EqStatement::initialize(num_variables),
             table_variables,
@@ -1012,6 +1015,11 @@ impl ExplicitPointLayout {
         challenger.observe_algebra_slice(point.as_slice());
         challenger.observe_algebra_element(evaluation);
         self.statement.add_evaluated_constraint(point, evaluation);
+    }
+
+    fn eval_table(&self, table_index: usize, point: &Point<EF>) -> EF {
+        assert_eq!(point.num_variables(), self.table_variables[table_index]);
+        self.poly.eval_base(&self.lift_point(table_index, point))
     }
 }
 
@@ -1095,7 +1103,7 @@ impl Layout<F, EF> for ExplicitPointLayout {
             self.table_variables[table_idx],
         );
         let lifted = self.lift_point(table_idx, &point);
-        let evaluation = self.extension_poly.eval_ext::<F>(&lifted);
+        let evaluation = self.poly.eval_base(&lifted);
         challenger.observe_algebra_element(evaluation);
         self.statement.add_evaluated_constraint(lifted, evaluation);
         vec![evaluation]
@@ -1109,7 +1117,7 @@ impl Layout<F, EF> for ExplicitPointLayout {
             challenger.sample_algebra_element(),
             self.poly.num_variables(),
         );
-        let evaluation = self.extension_poly.eval_ext::<F>(&point);
+        let evaluation = self.poly.eval_base(&point);
         challenger.observe_algebra_element(evaluation);
         self.statement.add_evaluated_constraint(point, evaluation);
         evaluation
@@ -1124,22 +1132,26 @@ impl Layout<F, EF> for ExplicitPointLayout {
     where
         Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
-        assert!(!self.statement.is_empty());
+        let Self {
+            poly,
+            folding,
+            statement,
+            table_variables: _,
+            selectors: _,
+        } = self;
+        assert!(!statement.is_empty());
         let alpha = challenger.sample_algebra_element();
-        let mut weights = Poly::<EF>::zero(self.poly.num_variables());
+        let num_variables = poly.num_variables();
+        let extension_poly = extend_poly(&poly);
+        drop(poly);
+        let mut weights = Poly::<EF>::zero(num_variables);
         let mut sum = EF::ZERO;
-        self.statement
-            .combine_hypercube::<F, false>(&mut weights, &mut sum, alpha);
+        statement.combine_hypercube::<F, false>(&mut weights, &mut sum, alpha);
         let product =
-            ProductPolynomial::new_unpacked(VariableOrder::Suffix, self.extension_poly, weights);
+            ProductPolynomial::new_unpacked(VariableOrder::Suffix, extension_poly, weights);
         let mut prover = SumcheckProver::new(product, sum);
-        let randomness = prover.compute_sumcheck_polynomials(
-            sumcheck_data,
-            challenger,
-            self.folding,
-            pow_bits,
-            None,
-        );
+        let randomness =
+            prover.compute_sumcheck_polynomials(sumcheck_data, challenger, folding, pow_bits, None);
         (prover, randomness)
     }
 }
@@ -1165,10 +1177,9 @@ pub fn prove_explicit_whir_openings(
         .collect::<Result<Vec<_>, _>>()?;
     let native_points = convert_points(points)?;
     let poly = Poly::<F>::new(native_table);
-    let extension_poly = extend_poly(&poly);
     let evaluations = native_points
         .iter()
-        .map(|point| extension_poly.eval_ext::<F>(point))
+        .map(|point| poly.eval_base(point))
         .collect::<Vec<_>>();
     let (pcs, mut challenger) = build_pcs(num_variables, transcript_binding)?;
     let witness =
@@ -1267,10 +1278,9 @@ pub fn prove_explicit_whir_openings_with_initial_oracle(
         .collect::<Result<Vec<_>, _>>()?;
     let native_points = convert_points(points)?;
     let poly = Poly::<F>::new(native_table);
-    let extension_poly = extend_poly(&poly);
     let evaluations = native_points
         .iter()
-        .map(|point| extension_poly.eval_ext::<F>(point))
+        .map(|point| poly.eval_base(point))
         .collect::<Vec<_>>();
 
     let (ordinary_pcs, mut challenger) = build_pcs(num_variables, transcript_binding)?;
@@ -1301,6 +1311,144 @@ pub fn prove_explicit_whir_openings_with_initial_oracle(
 
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
         pcs.prove(&mut native_proof, &mut challenger, layout, prover_data);
+    })) {
+        if let Some(storage) = payload.downcast_ref::<DiskWhirOpeningPanic>() {
+            let _ = storage.message();
+            return Err(ExplicitWhirError::ProverStorage);
+        }
+        return Err(ExplicitWhirError::BackendPanic);
+    }
+
+    let proof_bytes =
+        serde_json::to_vec(&native_proof).map_err(|_| ExplicitWhirError::Serialization)?;
+    if proof_bytes.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES {
+        return Err(ExplicitWhirError::ProofTooLarge);
+    }
+    let openings = points
+        .iter()
+        .cloned()
+        .zip(evaluations.into_iter().map(external_extension))
+        .map(|(point, evaluation)| ExplicitWhirOpening { point, evaluation })
+        .collect::<Vec<_>>();
+    let commitment = ExplicitWhirCommitment(commitment.roots()[0]);
+    let proof = ExplicitWhirProof {
+        protocol_version: EXPLICIT_WHIR_VERSION,
+        num_variables: num_variables as u32,
+        proof_bytes,
+    };
+
+    verify_explicit_whir_openings(transcript_binding, commitment, &openings, &proof)?;
+    Ok((commitment, openings, proof))
+}
+
+/// Prove from the authenticated source table and its already committed initial
+/// WHIR oracle without materialising the full base or extension-field table.
+///
+/// The source identity must be the exact identity retained inside
+/// `expected_oracle_identity`. Source reads are bounded, canonical, and
+/// reauthenticated by the source implementation. Any source or oracle failure
+/// aborts the proof; this path never falls back to the caller-provided dense
+/// prover. The completed bytes are accepted by the unchanged CPU verifier
+/// before they are returned.
+#[cfg(feature = "gpu-proof-prover")]
+pub fn prove_explicit_whir_openings_with_initial_source(
+    transcript_binding: &[u8],
+    points: &[Vec<ExtensionElement>],
+    expected_oracle_identity: &InitialWhirOracleIdentity,
+    source: &dyn AuthenticatedWhirInitialSource,
+    oracle: InitialWhirOracle,
+) -> Result<
+    (
+        ExplicitWhirCommitment,
+        Vec<ExplicitWhirOpening>,
+        ExplicitWhirProof,
+    ),
+    ExplicitWhirError,
+> {
+    if oracle.identity() != expected_oracle_identity {
+        return Err(ExplicitWhirError::ProverStorage);
+    }
+    let expected_source = &expected_oracle_identity.codeword_identity().source;
+    if source.identity() != expected_source {
+        return Err(ExplicitWhirError::ProverStorage);
+    }
+    let num_variables = usize::try_from(expected_source.num_variables)
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    validate_num_variables(num_variables)?;
+    validate_points(points, num_variables)?;
+    let native_points = convert_points(points)?;
+
+    let (ordinary_pcs, mut challenger) = build_pcs(num_variables, transcript_binding)?;
+    let folding = ordinary_pcs.round_folding_factor(0);
+    if folding != EXPLICIT_WHIR_FOLDING {
+        return Err(ExplicitWhirError::Configuration(
+            "streamed initial sumcheck requires fold two".to_owned(),
+        ));
+    }
+    let disk_mmcs = DiskWhirMmcs::new(ordinary_pcs.mmcs);
+    let pcs = DiskPcs::new(ordinary_pcs.config, ordinary_pcs.dft, disk_mmcs);
+    let (commitment, prover_data) = pcs
+        .mmcs
+        .adopt_initial(num_variables, Arc::new(oracle))
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    if commitment.num_roots() != 1 {
+        return Err(ExplicitWhirError::Configuration(
+            "WHIR commitment cap must contain exactly one root".to_owned(),
+        ));
+    }
+
+    challenger.observe(commitment.clone());
+    let mut native_proof = empty_disk_proof(&pcs.config);
+    let mut streamed_claims = Vec::with_capacity(pcs.commitment_ood_samples + points.len());
+    for _ in 0..pcs.commitment_ood_samples {
+        let point =
+            Point::expand_from_univariate(challenger.sample_algebra_element(), num_variables);
+        let mut claim = catch_unwind(AssertUnwindSafe(|| {
+            evaluate_claims(expected_source, source, &[point])
+        }))
+        .map_err(|_| ExplicitWhirError::BackendPanic)??;
+        let claim = claim.pop().ok_or(ExplicitWhirError::ProverStorage)?;
+        let evaluation = claim.evaluation();
+        challenger.observe_algebra_element(evaluation);
+        native_proof.initial_ood_answers.push(evaluation);
+        streamed_claims.push(claim);
+    }
+
+    let explicit_claims = catch_unwind(AssertUnwindSafe(|| {
+        evaluate_claims(expected_source, source, &native_points)
+    }))
+    .map_err(|_| ExplicitWhirError::BackendPanic)??;
+    let evaluations = explicit_claims
+        .iter()
+        .map(|claim| claim.evaluation())
+        .collect::<Vec<_>>();
+    for ((point, &evaluation), claim) in native_points.iter().zip(&evaluations).zip(explicit_claims)
+    {
+        challenger.observe_algebra_slice(point.as_slice());
+        challenger.observe_algebra_element(evaluation);
+        streamed_claims.push(claim);
+    }
+
+    let prepared = catch_unwind(AssertUnwindSafe(|| {
+        prepare_sumcheck(
+            expected_source,
+            source,
+            streamed_claims,
+            &mut native_proof.initial_sumcheck,
+            pcs.starting_folding_pow_bits,
+            &mut challenger,
+        )
+    }))
+    .map_err(|_| ExplicitWhirError::BackendPanic)??;
+
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+        pcs.prove_from_sumcheck(
+            &mut native_proof,
+            &mut challenger,
+            prepared.prover,
+            prepared.randomness,
+            prover_data,
+        );
     })) {
         if let Some(storage) = payload.downcast_ref::<DiskWhirOpeningPanic>() {
             let _ = storage.message();
@@ -1467,7 +1615,6 @@ fn prove_structured_whir_section(
                 .map(Poly::<F>::new)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let extension_tables = native_tables.iter().map(extend_poly).collect::<Vec<_>>();
     let (pcs, mut challenger) = build_pcs(stacked_variables, transcript_binding)?;
     let witness = ExplicitPointLayout::new_witness(
         native_tables
@@ -1502,7 +1649,7 @@ fn prove_structured_whir_section(
         }
         let point = convert_structured_point(&claim.point)?;
         let evaluation = convert_extension(claim.evaluation)?;
-        if extension_tables[table_index].eval_ext::<F>(&point) != evaluation {
+        if layout.eval_table(table_index, &point) != evaluation {
             return Err(ExplicitWhirError::ClaimMismatch);
         }
         layout.record_explicit_claim(table_index, point, evaluation, &mut challenger);
@@ -2172,8 +2319,8 @@ mod tests {
     use cmfd_proof_accel::initial_whir_oracle::{InitialWhirOracle, InitialWhirOracleIdentity};
     #[cfg(feature = "gpu-proof-prover")]
     use cmfd_proof_accel::whir_initial::{
-        AuthenticatedWhirInitialSource, WhirInitialSourceError, WhirInitialSourceIdentity,
-        encode_whir_initial_suffix,
+        AuthenticatedWhirInitialSource, WHIR_INITIAL_MAX_SOURCE_READ_LIMBS, WhirInitialSourceError,
+        WhirInitialSourceIdentity, encode_whir_initial_suffix,
     };
     #[cfg(feature = "gpu-proof-prover")]
     use std::fs::OpenOptions;
@@ -2366,6 +2513,8 @@ mod tests {
     struct ExactTableSource {
         identity: WhirInitialSourceIdentity,
         values: Vec<u64>,
+        reads: AtomicUsize,
+        max_read: AtomicUsize,
     }
 
     #[cfg(feature = "gpu-proof-prover")]
@@ -2381,6 +2530,8 @@ mod tests {
                     num_variables: values.len().ilog2(),
                 },
                 values,
+                reads: AtomicUsize::new(0),
+                max_read: AtomicUsize::new(0),
             }
         }
     }
@@ -2400,6 +2551,43 @@ mod tests {
             start: usize,
             count: usize,
         ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.max_read.fetch_max(count, Ordering::Relaxed);
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| WhirInitialSourceError::new("table range overflow"))?;
+            self.values
+                .get(start..end)
+                .map(<[u64]>::to_vec)
+                .ok_or_else(|| WhirInitialSourceError::new("table range is out of bounds"))
+        }
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    struct InjectedTableSource {
+        identity: WhirInitialSourceIdentity,
+        values: Vec<u64>,
+        fail_reads: bool,
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    impl AuthenticatedWhirInitialSource for InjectedTableSource {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            &self.identity
+        }
+
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn read_elements(
+            &self,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            if self.fail_reads {
+                return Err(WhirInitialSourceError::new("injected source failure"));
+            }
             let end = start
                 .checked_add(count)
                 .ok_or_else(|| WhirInitialSourceError::new("table range overflow"))?;
@@ -2464,8 +2652,8 @@ mod tests {
             "434d4644424e4b3202000000b800000001000000020000000200000006000000",
             "040000000000000004000000000000001c00000000000000921f746e64fb0502",
             "2fe53c5ddcf048c74d79604680d5716a7299929750744c539a37a20d1bc3e472",
-            "41e63ac491185f80f717049e4982c922715b96f44943690e0292317d478a8808",
-            "b00f2dd6124a33486c3391b38c42e73e2a93574e475a9f6b993745b234219cb7",
+            "41e63ac491185f80f717049e4982c922715b96f44943690e8509efcbad60e644",
+            "69c5a0208b59e517d4a0a968becd879acfedd35bb965398b993745b234219cb7",
             "bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff007dfa0102030405",
             "060708090a0b0c0d0e0f10111213141516171819"
         ))
@@ -2485,7 +2673,7 @@ mod tests {
                 "9a37a20d1bc3e47241e63ac491185f80f717049e4982c922715b96f44943690e",
             ),
             pcs_parameter_digest: decode_hex_32(
-                "0292317d478a8808b00f2dd6124a33486c3391b38c42e73e2a93574e475a9f6b",
+                "8509efcbad60e64469c5a0208b59e517d4a0a968becd879acfedd35bb965398b",
             ),
             pcs_commitment_root: decode_hex_32(
                 "993745b234219cb7bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff",
@@ -2586,7 +2774,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(fixture.identity.digest().unwrap()),
-            "b91513ea22742cfdbdc64260055b0efb4dd1c4282ed160fdbbb0bdd69fb1ab44"
+            "7668cf0552d25b3b00924cfeb8d9ba03540b6788f57e1797a259cf5e04ad7324"
         );
         let derived = StructuredWhirModelCommitmentSet::from_verified_model_bank(
             Cursor::new(&fixture.bytes),
@@ -2943,6 +3131,184 @@ mod tests {
         assert_eq!(commitment, dense_commitment);
         assert_eq!(disk_openings, openings);
         assert_eq!(disk_proof, dense_proof);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_source_matches_dense_proof_bytes_across_round_shapes() {
+        for variables in [2_usize, 8, 9] {
+            let binding = format!("forge-matrix-streamed-sumcheck-{variables}");
+            let values = (0..1_usize << variables)
+                .map(|index| (index * index + 5 * index + 31) as u64)
+                .collect::<Vec<_>>();
+            let points = (0..2)
+                .map(|point_index| {
+                    (0..variables)
+                        .map(|index| ExtensionElement {
+                            limbs: [
+                                (index * 5 + point_index + 2) as u64,
+                                (index * 7 + point_index + 3) as u64,
+                                (index * 11 + point_index + 5) as u64,
+                            ],
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let dense = prove_explicit_whir_openings(binding.as_bytes(), &values, &points).unwrap();
+            let source = ExactTableSource::new(values.clone());
+            let built = test_initial_oracle(&values, [variables as u8 + 0x40; 32]);
+            assert_eq!(
+                source.identity(),
+                &built.identity.codeword_identity().source
+            );
+            let streamed = prove_explicit_whir_openings_with_initial_source(
+                binding.as_bytes(),
+                &points,
+                &built.identity,
+                &source,
+                built.oracle,
+            )
+            .unwrap();
+
+            assert_eq!(streamed, dense);
+            assert!(source.max_read.load(Ordering::Relaxed) <= WHIR_INITIAL_MAX_SOURCE_READ_LIMBS);
+            assert!(source.reads.load(Ordering::Relaxed) >= 2);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_source_initial_sumcheck_matches_dense_above_parallel_threshold() {
+        let variables = 15;
+        let values = (0..1_usize << variables)
+            .map(|index| (index * index + 7 * index + 37) as u64)
+            .collect::<Vec<_>>();
+        let external_points = (0..3)
+            .map(|point_index| {
+                (0..variables)
+                    .map(|index| ExtensionElement {
+                        limbs: [
+                            (index * 3 + point_index + 2) as u64,
+                            (index * 5 + point_index + 3) as u64,
+                            (index * 7 + point_index + 5) as u64,
+                        ],
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let points = convert_points(&external_points).unwrap();
+        let poly = Poly::new(values.iter().copied().map(F::new).collect());
+        let source = ExactTableSource::new(values);
+        let (pcs, mut dense_challenger) =
+            build_pcs(variables, b"streamed-initial-threshold").unwrap();
+        let (_, mut streamed_challenger) =
+            build_pcs(variables, b"streamed-initial-threshold").unwrap();
+        let mut layout = ExplicitPointLayout::from_poly_and_shapes(
+            poly.clone(),
+            EXPLICIT_WHIR_FOLDING,
+            vec![variables],
+        );
+        for point in &points {
+            let evaluation = poly.eval_base(point);
+            layout.record_explicit_claim(0, point.clone(), evaluation, &mut dense_challenger);
+        }
+        let streamed_claims = evaluate_claims(source.identity(), &source, &points).unwrap();
+        for (point, claim) in points.iter().zip(&streamed_claims) {
+            streamed_challenger.observe_algebra_slice(point.as_slice());
+            streamed_challenger.observe_algebra_element(claim.evaluation());
+        }
+
+        let mut dense_data = SumcheckData::default();
+        let (dense_prover, dense_randomness) = layout.into_sumcheck(
+            &mut dense_data,
+            pcs.starting_folding_pow_bits,
+            &mut dense_challenger,
+        );
+        let mut streamed_data = SumcheckData::default();
+        let streamed = prepare_sumcheck(
+            source.identity(),
+            &source,
+            streamed_claims,
+            &mut streamed_data,
+            pcs.starting_folding_pow_bits,
+            &mut streamed_challenger,
+        )
+        .unwrap();
+
+        assert_eq!(
+            streamed_data.polynomial_evaluations,
+            dense_data.polynomial_evaluations
+        );
+        assert_eq!(streamed_data.pow_witnesses, dense_data.pow_witnesses);
+        assert_eq!(streamed.randomness, dense_randomness);
+        assert_eq!(streamed.prover.claimed_sum(), dense_prover.claimed_sum());
+        assert_eq!(streamed.prover.evals(), dense_prover.evals());
+        assert_eq!(streamed.prover.weights(), dense_prover.weights());
+        let dense_next: EF = dense_challenger.sample_algebra_element();
+        let streamed_next: EF = streamed_challenger.sample_algebra_element();
+        assert_eq!(streamed_next, dense_next);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_source_failures_abort_without_dense_fallback() {
+        let binding = b"forge-matrix-streamed-source-failure";
+        let values = vec![3, 5, 7, 11];
+        let points = vec![vec![
+            ExtensionElement { limbs: [2, 3, 5] },
+            ExtensionElement { limbs: [7, 11, 13] },
+        ]];
+
+        let built = test_initial_oracle(&values, [0x7a; 32]);
+        let mut wrong_identity = ExactTableSource::new(values.clone());
+        wrong_identity.identity.source_id[0] ^= 1;
+        assert_eq!(
+            prove_explicit_whir_openings_with_initial_source(
+                binding,
+                &points,
+                &built.identity,
+                &wrong_identity,
+                built.oracle,
+            ),
+            Err(ExplicitWhirError::ProverStorage)
+        );
+        assert_eq!(wrong_identity.reads.load(Ordering::Relaxed), 0);
+
+        let built = test_initial_oracle(&values, [0x7b; 32]);
+        let failing = InjectedTableSource {
+            identity: built.identity.codeword_identity().source.clone(),
+            values: values.clone(),
+            fail_reads: true,
+        };
+        assert_eq!(
+            prove_explicit_whir_openings_with_initial_source(
+                binding,
+                &points,
+                &built.identity,
+                &failing,
+                built.oracle,
+            ),
+            Err(ExplicitWhirError::ProverStorage)
+        );
+
+        let built = test_initial_oracle(&values, [0x7c; 32]);
+        let mut noncanonical_values = values;
+        noncanonical_values[1] = GOLDILOCKS_MODULUS;
+        let noncanonical = InjectedTableSource {
+            identity: built.identity.codeword_identity().source.clone(),
+            values: noncanonical_values,
+            fail_reads: false,
+        };
+        assert_eq!(
+            prove_explicit_whir_openings_with_initial_source(
+                binding,
+                &points,
+                &built.identity,
+                &noncanonical,
+                built.oracle,
+            ),
+            Err(ExplicitWhirError::ProverStorage)
+        );
     }
 
     #[test]
@@ -3359,7 +3725,7 @@ mod tests {
     fn structured_model_and_trace_openings_are_separate_and_bound() {
         assert_eq!(
             hex::encode(structured_whir_suite_parameter_digest()),
-            "0292317d478a8808b00f2dd6124a33486c3391b38c42e73e2a93574e475a9f6b"
+            "8509efcbad60e64469c5a0208b59e517d4a0a968becd879acfedd35bb965398b"
         );
         let base = vec![3, 5, 7, 11];
         let weight_0 = vec![13, 17, 19, 23, 29, 31, 37, 41];

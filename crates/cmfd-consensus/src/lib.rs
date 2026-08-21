@@ -136,8 +136,6 @@ pub use sumcheck::{
     TOY_SUMCHECK_RAW_CHALLENGE_BITS, prove_toy_matrix_product, reference_matrix_product,
     verify_toy_matrix_product,
 };
-#[cfg(feature = "gpu-proof-prover")]
-pub use whir_proof::prove_explicit_whir_openings_with_initial_oracle;
 #[cfg(feature = "whir-prototype")]
 pub use whir_proof::{
     EXPLICIT_WHIR_SECURITY_BITS, EXPLICIT_WHIR_VERSION, ExplicitWhirCommitment, ExplicitWhirError,
@@ -148,6 +146,11 @@ pub use whir_proof::{
     StructuredWhirPcsVerifier, VerifiedModelBankWhirError, prove_explicit_whir_openings,
     prove_structured_whir_openings, structured_whir_suite_parameter_digest,
     verify_explicit_whir_openings, verify_structured_whir_openings,
+};
+#[cfg(feature = "gpu-proof-prover")]
+pub use whir_proof::{
+    prove_explicit_whir_openings_with_initial_oracle,
+    prove_explicit_whir_openings_with_initial_source,
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,

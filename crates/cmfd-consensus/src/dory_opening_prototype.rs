@@ -37,7 +37,7 @@ pub const DORY_PROTOTYPE_BACKEND: &str = "BN254 test backend";
 pub const DORY_PROTOTYPE_PRODUCTION_BLOCKERS: [&str; 6] = [
     "BN254 is not the accepted 128-bit production curve",
     "setup generators are random rather than domain-separated hash-to-curve outputs",
-    "the cubic Goldilocks AIR is not yet bridged to the pairing scalar field",
+    "the bounded AIR is not yet re-arithmetized in the production pairing scalar field",
     "the production n=31 polynomial is not streamed by this in-memory prototype",
     "the aggregate soundness bound has not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",

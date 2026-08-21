@@ -1,5 +1,7 @@
 pub mod chain;
 pub mod difficulty;
+#[cfg(all(test, feature = "dory-opening-prototype"))]
+mod dory_field_portability;
 #[cfg(feature = "dory-opening-prototype")]
 pub mod dory_opening_prototype;
 pub mod economics;

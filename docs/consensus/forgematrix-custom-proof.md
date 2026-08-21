@@ -793,9 +793,13 @@ BLS12-381 element sizes, the same n=31 grammar projects to 66,559 bytes for this
 sumcheck and opening aggregate. This is not a complete production proof-size
 claim. The implemented backend is BN254 with random setup vectors and the module's
 production gate always returns an error. Dory also works over the pairing scalar
-field, while the packed AIR uses the cubic Goldilocks extension; replacement
-therefore requires either an arithmetization migration or a proved conversion
-bridge. A 128-bit BLS12-381 backend,
+field, while the packed AIR uses the cubic Goldilocks extension. A direct field
+embedding is impossible because the characteristics differ. Cross-field tests do
+show that the canonical bounded-integer witness makes all 121 local transition
+constraints vanish in both fields across signed boundary cases, while altered
+reductions and digits fail in both. The selected route is therefore native
+scalar-field re-arithmetization; this checkpoint does not yet port the sumcheck
+transcript or LogUp. A 128-bit BLS12-381 backend,
 domain-separated deterministic hash-to-curve generators, streaming n=31 proving,
 complete soundness accounting, full aggregate measurement, and independent audit
 remain mandatory activation gates.

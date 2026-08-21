@@ -194,7 +194,6 @@ impl StructuredMaskPolynomial {
         *hasher.finalize().as_bytes()
     }
 
-    #[cfg(test)]
     #[cfg(all(test, feature = "production-whir-candidate"))]
     pub(crate) fn affine_coefficients(
         &self,

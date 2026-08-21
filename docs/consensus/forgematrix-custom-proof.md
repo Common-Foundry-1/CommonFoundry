@@ -466,38 +466,54 @@ claimed; reopening fails closed if any object is missing. Killed attempts can
 also strand up to roughly 48 GiB under staging, and content-addressed objects
 created by a losing publication can be unreachable. Production operation still
 needs lock/lease-aware stale-attempt and unreferenced-object recovery that never
-deletes a live concurrent publisher. This closes the raw-model-byte-to-WHIR-
-source boundary, not the later source-to-commitment boundary.
+deletes a live concurrent publisher.
 
-The proof-acceleration crate now has a bounded external-memory encoder for the
-initial suffix-order WHIR codeword. It consumes an already authenticated,
-externally identified canonical Goldilocks source, scatters the source into the
-exact bit-reversed coefficient positions, runs the radix-2 butterflies with
-fixed bounded buffers, and publishes only a fully authenticated natural-row
-artifact. The current checkpoint admits at most 19 table variables: this
-covers the proposed production `2^18 x 4` base-input codeword, while rejecting
-a production weight bank before reading its source or creating a file.
+This closes the raw-model-byte-to-authenticated-WHIR-source boundary. The
+source bundle alone does not establish the role's expected WHIR commitment.
+`PublishedModelWhirSourceBundle::into_roles` transfers the already authenticated
+source handles into later preparation without another reopen or proportional
+rescan; the typed role join below closes the later source-to-initial-commitment
+identity boundary only after an authenticated codeword and typed initial demand
+tree have been built.
 
-The original natural-order table can now be written sequentially to its own
-authenticated source artifact before codeword encoding. Its separately
-retained whole-artifact digest is the provenance check; the existing
-`source_id` remains only a caller-selected cross-artifact label. A fixed-width
-prover identity binds that exact source digest to the exact codeword/tree
-oracle identity. Reopening checks the caller context before file I/O, fully
-authenticates all three files, and reauthenticates the affected source chunks,
-codeword rows, and Merkle chunks on later reads. A self-consistent replacement
-with the same `source_id` is rejected by the retained source digest. Source
-staging now admits the production 31-variable weight-bank geometry without
-preallocating its 16 GiB canonical-`u64` file. The codeword encoder and prover
-oracle remain capped at 19 variables, so a 31-variable source is explicitly a
-staging artifact and cannot yet become an `InitialWhirProverIdentity`. Three
-production weight sources occupy about 48 GiB, and sealing currently rereads
-each artifact twice for staged and published verification. The immediately
-anchored bundle reopen performs a third full read. Authentication digests are
-accumulated during the one-pass write, so the former pre-seal data scan is gone,
-but a complete build still performs about 48 GiB of verification reads per
-16 GiB weight role, or about 144 GiB across all three. Reusing an authenticated
-handle across same-inode hard links remains a ceremony-throughput optimization.
+The proof-acceleration crate has two bounded external-memory encoders for the
+initial suffix-order WHIR codeword. The reference encoder admits at most 19
+table variables and covers the proposed production `2^18 x 4` base-input
+codeword. A distinct exact-31-variable six-step encoder consumes only an
+authenticated 31-variable source artifact, preserves the frozen `CMFDWIH1`
+bytes, and accepts exactly 31 variables. Its underlying generic six-step
+transform matches the reference encoder byte-for-byte at 5, 9, and 17
+variables. The nonallocating plan pins a 17,188,257,952-byte source artifact, a
+34,493,956,256-byte codeword artifact, a 68,719,476,960-byte initial demand
+tree, 120,401,691,168 persistent bytes for one source/codeword/tree artifact
+set, 68,719,476,896 bytes of encoder scratch/output space, and 269,484,032
+bytes of requested transform-buffer payload. No complete 31-variable run or
+production timing benchmark is claimed.
+
+The original natural-order table is stored in its own authenticated source
+artifact, whose separately retained whole-artifact digest is the provenance
+check; `source_id` remains only a cross-artifact label. The independently
+versioned initial demand-tree suite is fixed at width four, admits power-of-two
+heights from `2` through `2^30`, and derives its codeword binding from the
+complete authenticated codeword identity rather than a caller-supplied digest.
+The V2 oracle and prover identities admit 2 through 31 variables and bind the
+exact codeword, typed tree, caller context, and source-artifact digest.
+`adopt_published_model_whir_role_v2` consumes one published role, codeword, and
+tree; checks the trusted suite, role, source identity, and geometry; derives the
+existing one-table structured commitment alias from the tree root and variable
+count; requires that alias to equal the role and `ModelPcsIdentity` commitment;
+derives a versioned role context; and returns a `PreparedModelWhirRoleV2`. Only
+the ordinary Merkle root enters the unchanged WHIR transcript. The join performs
+no encoding and raises no proof-size or variable limit.
+
+Three production weight sources occupy about 48 GiB. Sealing currently rereads
+each artifact twice for staged and published verification, and the builder's
+immediately anchored bundle reopen performs a third full read. Authentication
+digests are accumulated during the one-pass write, so the former pre-seal data
+scan is gone, but a complete build still performs about 48 GiB of verification
+reads per 16 GiB role, or about 144 GiB across all three. `into_roles` prevents
+a further reopen/rescan before the typed join. Reusing an authenticated handle
+across same-inode hard links remains a ceremony-throughput optimization.
 
 The initial fold-two sumcheck also streams that source in chunks of at most
 8,192 canonical `u64` values. It keeps four suffix partials per claim. An
@@ -621,41 +637,49 @@ returns `ProofTooLarge`; those shapes are not represented as wire-ready.
 
 This result is one direct WHIR proof, not the complete production block proof;
 the split PCS envelope contains multiple child proofs and the aggregate also
-contains the arithmetic and BLAKE3 arguments. A blocked or GPU production
-transform and the 31-variable initial weight-bank commitment remain required.
-The explicit adapter stays capped at 16 variables, the initial codeword/oracle
-path at 19, and the production `2^30 x 4` weight-bank codeword remains
-unsupported.
+contains the arithmetic and BLAKE3 arguments. Exact 31-variable codeword
+construction, the typed initial demand tree, V2 oracle identities, and the
+typed role join now cover initial artifact preparation, but they do not make a
+31-variable proof executable. The public explicit prover/verifier remains
+capped at 16 variables. Configuration-derived synthetic codec tests reach a
+20-variable stacked geometry, but that is not a public n=20 proof path. The
+reference extension-codeword encoder remains capped at `2^20` rows. Production
+still requires a separately versioned 31-variable proof configuration and
+verifier path, a byte-identical blocked or GPU extension transform, and
+complete production execution and benchmarks.
 
-For the complete tiny structured fixture, the same geometry gives a 154,252-byte
-maximum for the split WHIR proof. The canonical one-block BLAKE3 proof is bounded
-at 87,556 bytes, and the remaining aggregate components are exactly 16,804
-bytes. The aggregate maximum is therefore 258,612 bytes. Retaining the current
-193-byte V2 proof frame and adding a four-byte aggregate length gives a
-258,809-byte full-wire maximum, leaving 3,335 bytes below the 256 KiB cap. This
-bound does not use the smaller path dictionaries observed in individual prover
-runs and applies only to the tiny research fixture, not the production shape.
+For the complete tiny structured fixture, the enforced component bounds give a
+154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
+proof is bounded at 87,556 bytes, and the remaining aggregate components are
+exactly 16,804 bytes. The aggregate maximum is therefore 258,612 bytes.
+Retaining the current 193-byte V2 proof frame and adding a four-byte aggregate
+length gives a 258,809-byte full-wire maximum, leaving 3,335 bytes below the
+256 KiB cap. This bound does not use the smaller path dictionaries observed in
+individual prover runs and applies only to the tiny research fixture, not the
+production shape.
 
-Native proof v2, aggregate v2, split v3, and the revised suite identity are a
-hard cutover for research artifacts. Older explicit proofs, structured proofs,
-model bundles, and source pointers must be regenerated. This does not fork the
-current Devnet block format because succinct WHIR is not yet a block-proof
-variant; activation requires a new proof tag rather than reusing the compact
-reference tag.
+Native proof v2, structured aggregate v3, split v3, and the revised suite
+identity are a hard cutover for research artifacts. Older explicit proofs,
+structured proofs, model bundles, and source pointers must be regenerated. This
+does not fork the current Devnet block format because succinct WHIR is not yet a
+block-proof variant; activation requires a new proof tag rather than reusing
+the compact reference tag.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
 `StructuredWhirPcsVerifier` authenticates both scoped claim sets. This closes
 commitment selection and bank-order substitution in the research boundary; it
 does not make the commitment/proof adapter production-capable. The production
-base table has 19 variables and each weight bank has 31. Source staging admits
-both, but the explicit proof adapter admits at most 16 variables per table and
-the codeword/oracle path admits at most 19. It now has bounded, authenticated
-residual generation and artifact-consuming later folds, but no streaming
-31-variable initial commitment or production-geometry extension transform. The
-upstream backend is an unaudited academic prototype. Review, benchmarks,
-fuzzing, a complete soundness report, and independent audits remain mandatory
-before any production selection.
+base table has 19 variables and each weight bank has 31. Source staging, exact
+initial-codeword construction, typed initial trees, and V2 oracle preparation
+now admit both geometries; the typed role join binds each prepared artifact set
+to the corresponding structured alias, model identity, and role. The explicit
+proof adapter still admits at most 16 variables per table, and the
+production-geometry extension transform is not executable through the current
+`2^20`-row reference encoder. No complete 31-variable preparation or proof run
+has been benchmarked. The upstream backend is an unaudited academic prototype.
+Review, benchmarks, fuzzing, a complete soundness report, and independent audits
+remain mandatory before any production selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded
@@ -701,8 +725,11 @@ Before a production proof tag can exist:
 
 1. harden and independently review the aggregate transparent PCS backend,
    canonical parameters, parser, and explicit-point transcript;
-2. reproduce the pinned PCS identity from the complete production model bytes
-   with an audited streaming/out-of-core commitment path;
+2. execute, independently reproduce, benchmark, and audit the complete
+   production model path from the published source bundle through the exact
+   initial codewords, typed demand trees, and typed role joins, retaining the
+   V2 identities and verifying every structured commitment alias against the
+   pinned `ModelPcsIdentity`;
 3. run the exact BLAKE3 tree argument at the complete production shape and
    demonstrate that the full aggregate, not only the hash component, remains
    below its total payload cap;

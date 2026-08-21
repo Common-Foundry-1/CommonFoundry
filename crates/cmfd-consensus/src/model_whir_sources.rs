@@ -16,7 +16,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use blake3::Hasher;
-use cmfd_proof_accel::whir_initial::{WHIR_INITIAL_MIN_VARIABLES, WhirInitialSourceIdentity};
+use cmfd_proof_accel::demand_blake3_tree::AuthenticatedInitialDemandBlake3Tree;
+use cmfd_proof_accel::initial_whir_oracle_v2::{
+    InitialWhirOracleIdentityV2, InitialWhirOracleV2, InitialWhirOracleV2Error,
+    InitialWhirProverIdentityV2, InitialWhirProverOracleV2, InitialWhirProverV2Error,
+};
+use cmfd_proof_accel::whir_initial::{
+    AuthenticatedWhirInitialCodeword, WHIR_INITIAL_MIN_VARIABLES, WHIR_INITIAL_WIDTH,
+    WhirInitialSourceIdentity,
+};
 use cmfd_proof_accel::whir_initial_source::{
     AuthenticatedWhirInitialSourceFile, WHIR_INITIAL_SOURCE_MAX_VARIABLES,
     WhirInitialSourceArtifactError, WhirInitialSourceArtifactIdentity,
@@ -29,10 +37,14 @@ use crate::model_bank::{
     ModelFieldChunk, ModelPcsIdentity, ModelPcsRole, StagedModelFieldSink,
     VerifiedModelBankReceipt, verify_model_bank_into_staged_field_sink,
 };
-use crate::whir_proof::structured_whir_suite_parameter_digest;
+use crate::whir_proof::{
+    ExplicitWhirError, structured_whir_single_table_alias, structured_whir_suite_parameter_digest,
+};
 
 const SOURCE_ID_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-WHIR-SOURCE/V1";
 const BUNDLE_DIGEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-WHIR-SOURCE-BUNDLE/V1";
+const ROLE_CONTEXT_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-WHIR-ROLE-CONTEXT/V1";
+const ROLE_CONTEXT_VERSION: u32 = 1;
 const BUNDLE_MAGIC: &[u8; 8] = b"CMFDMWS1";
 const BUNDLE_IDENTITY_MAGIC: &[u8; 8] = b"CMFDMWI1";
 const BUNDLE_VERSION: u32 = 1;
@@ -58,6 +70,20 @@ pub enum ModelWhirSourceError {
     SuiteMismatch,
     #[error("published model WHIR source bundle does not match this verified model")]
     PublishedBundleMismatch,
+    #[error("published model WHIR source role does not match the trusted model identity")]
+    RoleMismatch,
+    #[error("published model WHIR source role has the wrong geometry")]
+    RoleGeometryMismatch,
+    #[error("initial WHIR codeword does not identify the exact published model source")]
+    CodewordSourceMismatch,
+    #[error("initial WHIR tree root does not derive the trusted model commitment alias")]
+    CommitmentMismatch,
+    #[error("model WHIR commitment derivation failed: {0}")]
+    Commitment(#[from] ExplicitWhirError),
+    #[error("initial WHIR V2 oracle preparation failed: {0}")]
+    InitialOracle(#[from] InitialWhirOracleV2Error),
+    #[error("initial WHIR V2 prover preparation failed: {0}")]
+    InitialProver(#[from] InitialWhirProverV2Error),
     #[error("model WHIR source bundle I/O failed while {operation} {path}: {source}")]
     Io {
         operation: &'static str,
@@ -130,6 +156,7 @@ impl ModelWhirSourceBundleIdentity {
 
 /// One authenticated role in a published fixed-model source bundle.
 pub struct PublishedModelWhirSourceRole {
+    model_digest: [u8; 32],
     role: ModelPcsRole,
     expected_commitment: [u8; 32],
     source: AuthenticatedWhirInitialSourceFile,
@@ -139,6 +166,7 @@ impl std::fmt::Debug for PublishedModelWhirSourceRole {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PublishedModelWhirSourceRole")
+            .field("model_digest", &self.model_digest)
             .field("role", &self.role)
             .field("expected_commitment", &self.expected_commitment)
             .field("artifact_identity", self.source.artifact_identity())
@@ -171,11 +199,73 @@ impl PublishedModelWhirSourceRole {
     }
 }
 
+/// One fixed-model role joined to its exact initial codeword and typed demand
+/// tree under independently retained V2 identities.
+///
+/// The context and identities are prover-local metadata. Only the ordinary
+/// Merkle root is observed by the unchanged WHIR transcript.
+pub struct PreparedModelWhirRoleV2 {
+    role: ModelPcsRole,
+    expected_commitment: [u8; 32],
+    prover_identity: InitialWhirProverIdentityV2,
+    prover_oracle: InitialWhirProverOracleV2,
+}
+
+impl std::fmt::Debug for PreparedModelWhirRoleV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedModelWhirRoleV2")
+            .field("role", &self.role)
+            .field("expected_commitment", &self.expected_commitment)
+            .field("prover_identity", &self.prover_identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedModelWhirRoleV2 {
+    pub const fn role(&self) -> ModelPcsRole {
+        self.role
+    }
+
+    pub const fn expected_commitment(&self) -> [u8; 32] {
+        self.expected_commitment
+    }
+
+    pub const fn prover_identity(&self) -> &InitialWhirProverIdentityV2 {
+        &self.prover_identity
+    }
+
+    pub fn context_digest(&self) -> [u8; 32] {
+        self.prover_identity.oracle_identity().context_digest()
+    }
+
+    pub const fn prover_oracle(&self) -> &InitialWhirProverOracleV2 {
+        &self.prover_oracle
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ModelPcsRole,
+        [u8; 32],
+        InitialWhirProverIdentityV2,
+        InitialWhirProverOracleV2,
+    ) {
+        (
+            self.role,
+            self.expected_commitment,
+            self.prover_identity,
+            self.prover_oracle,
+        )
+    }
+}
+
 /// Fully authenticated bundle selected by one atomically published manifest.
 ///
-/// This is a source-staging capability, not an `InitialWhirProverIdentity`.
-/// In particular, `n = 31` weight sources remain unusable until the later
-/// codeword, tree, sumcheck, and folding stages support that geometry.
+/// This is a source-staging capability, not an initial prover identity. An
+/// owned role can now be joined to an already-built codeword and typed tree as
+/// an `InitialWhirProverIdentityV2`, including at `n = 31`; the legacy V1 join
+/// remains capped at 19 and the explicit proof path remains capped at 16.
 pub struct PublishedModelWhirSourceBundle {
     publication_path: PathBuf,
     bundle_identity: ModelWhirSourceBundleIdentity,
@@ -220,6 +310,13 @@ impl PublishedModelWhirSourceBundle {
 
     pub fn roles(&self) -> &[PublishedModelWhirSourceRole] {
         &self.roles
+    }
+
+    /// Transfer the authenticated source handles into later preparation
+    /// without reopening and rescanning their potentially production-sized
+    /// artifacts.
+    pub fn into_roles(self) -> Vec<PublishedModelWhirSourceRole> {
+        self.roles
     }
 }
 
@@ -287,6 +384,7 @@ pub fn open_published_model_whir_sources(
         };
         let source = AuthenticatedWhirInitialSourceFile::open(path, &expected)?;
         roles.push(PublishedModelWhirSourceRole {
+            model_digest,
             role: plan.role,
             expected_commitment: plan.expected_commitment,
             source,
@@ -299,6 +397,157 @@ pub fn open_published_model_whir_sources(
         manifest: *trusted_manifest,
         identity: trusted_identity.clone(),
         roles,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ModelWhirRoleGeometry {
+    role_tag: u32,
+    expected_commitment: [u8; 32],
+    source_elements: u64,
+    num_variables: u32,
+    codeword_height: u64,
+}
+
+/// Derive the canonical local context for one fixed-model WHIR role.
+///
+/// The versioned digest binds the current suite, exact trusted model identity,
+/// ordered role, expected structured commitment alias, and source/codeword
+/// geometry. It is retained and recomputed by the prover, but never enters the
+/// Fiat-Shamir transcript.
+pub fn model_whir_role_context_digest(
+    trusted_model: &ModelPcsIdentity,
+    role: ModelPcsRole,
+) -> Result<[u8; 32], ModelWhirSourceError> {
+    let geometry = model_whir_role_geometry(trusted_model, role)?;
+    let suite = structured_whir_suite_parameter_digest();
+    let model_digest = trusted_model.digest()?;
+    let mut hasher = Hasher::new_derive_key(ROLE_CONTEXT_DOMAIN);
+    hasher.update(&ROLE_CONTEXT_VERSION.to_le_bytes());
+    hasher.update(&suite);
+    hasher.update(&model_digest);
+    hasher.update(&geometry.role_tag.to_le_bytes());
+    hasher.update(&geometry.expected_commitment);
+    hasher.update(&geometry.source_elements.to_le_bytes());
+    hasher.update(&geometry.num_variables.to_le_bytes());
+    hasher.update(&geometry.codeword_height.to_le_bytes());
+    hasher.update(&(WHIR_INITIAL_WIDTH as u32).to_le_bytes());
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Join an authenticated published source to an already-built initial
+/// codeword and typed demand tree.
+///
+/// This function performs no encoding and raises no proof limit. In
+/// particular, an admitted 31-variable storage capability is not proof-ready
+/// while the explicit WHIR prover and verifier remain capped at 16 variables.
+pub fn adopt_published_model_whir_role_v2(
+    trusted_model: &ModelPcsIdentity,
+    published_role: PublishedModelWhirSourceRole,
+    codeword: AuthenticatedWhirInitialCodeword,
+    tree: AuthenticatedInitialDemandBlake3Tree,
+) -> Result<PreparedModelWhirRoleV2, ModelWhirSourceError> {
+    let geometry = model_whir_role_geometry(trusted_model, published_role.role)?;
+    if published_role.model_digest != trusted_model.digest()? {
+        return Err(ModelWhirSourceError::RoleMismatch);
+    }
+    if published_role.expected_commitment != geometry.expected_commitment {
+        return Err(ModelWhirSourceError::RoleMismatch);
+    }
+    let source_identity = published_role.source.artifact_identity();
+    if source_identity.element_count != geometry.source_elements
+        || source_identity.source.num_variables != geometry.num_variables
+    {
+        return Err(ModelWhirSourceError::RoleGeometryMismatch);
+    }
+    if codeword.identity().source != source_identity.source {
+        return Err(ModelWhirSourceError::CodewordSourceMismatch);
+    }
+    if codeword.identity().height != geometry.codeword_height
+        || codeword.identity().width != WHIR_INITIAL_WIDTH as u32
+        || tree.identity().height != geometry.codeword_height
+        || tree.identity().width() != WHIR_INITIAL_WIDTH as u32
+    {
+        return Err(ModelWhirSourceError::RoleGeometryMismatch);
+    }
+
+    let derived_alias = structured_whir_single_table_alias(
+        tree.identity().tree_root,
+        usize::try_from(geometry.num_variables)
+            .map_err(|_| ModelWhirSourceError::RoleGeometryMismatch)?,
+    )?;
+    if derived_alias != geometry.expected_commitment {
+        return Err(ModelWhirSourceError::CommitmentMismatch);
+    }
+
+    let context_digest = model_whir_role_context_digest(trusted_model, published_role.role)?;
+    let oracle_identity =
+        InitialWhirOracleIdentityV2::bind(context_digest, codeword.identity(), tree.identity())?;
+    let prover_identity = InitialWhirProverIdentityV2::bind(&oracle_identity, source_identity)?;
+    let oracle = InitialWhirOracleV2::adopt(context_digest, &oracle_identity, codeword, tree)?;
+    let PublishedModelWhirSourceRole {
+        model_digest: _,
+        role,
+        expected_commitment,
+        source,
+    } = published_role;
+    let prover_oracle =
+        InitialWhirProverOracleV2::adopt(context_digest, &prover_identity, source, oracle)?;
+    Ok(PreparedModelWhirRoleV2 {
+        role,
+        expected_commitment,
+        prover_identity,
+        prover_oracle,
+    })
+}
+
+fn model_whir_role_geometry(
+    trusted_model: &ModelPcsIdentity,
+    role: ModelPcsRole,
+) -> Result<ModelWhirRoleGeometry, ModelWhirSourceError> {
+    trusted_model.validate()?;
+    if trusted_model.pcs_suite_parameter_digest != structured_whir_suite_parameter_digest() {
+        return Err(ModelWhirSourceError::SuiteMismatch);
+    }
+    let dimension = u64::from(trusted_model.dimension);
+    let (expected_commitment, source_elements) = match role {
+        ModelPcsRole::BaseInput => (
+            trusted_model.base_input_commitment,
+            u64::from(trusted_model.batch)
+                .checked_mul(dimension)
+                .ok_or(ModelWhirSourceError::Invalid("base source length overflow"))?,
+        ),
+        ModelPcsRole::WeightBank { index } => {
+            let index = usize::try_from(index).map_err(|_| ModelWhirSourceError::RoleMismatch)?;
+            let expected_commitment = trusted_model
+                .weight_bank_commitments
+                .get(index)
+                .copied()
+                .ok_or(ModelWhirSourceError::RoleMismatch)?;
+            let source_elements = u64::from(trusted_model.layers_per_bank)
+                .checked_mul(dimension)
+                .and_then(|elements| elements.checked_mul(dimension))
+                .ok_or(ModelWhirSourceError::Invalid(
+                    "weight-bank source length overflow",
+                ))?;
+            (expected_commitment, source_elements)
+        }
+    };
+    if !source_elements.is_power_of_two() {
+        return Err(ModelWhirSourceError::RoleGeometryMismatch);
+    }
+    let num_variables = source_elements.ilog2();
+    if !(WHIR_INITIAL_MIN_VARIABLES as u32..=WHIR_INITIAL_SOURCE_MAX_VARIABLES as u32)
+        .contains(&num_variables)
+    {
+        return Err(ModelWhirSourceError::RoleGeometryMismatch);
+    }
+    Ok(ModelWhirRoleGeometry {
+        role_tag: role_tag(role)?,
+        expected_commitment,
+        source_elements,
+        num_variables,
+        codeword_height: source_elements / 2,
     })
 }
 
@@ -1024,7 +1273,10 @@ mod tests {
     use std::io::Cursor;
     use std::sync::{Arc, Barrier};
 
-    use cmfd_proof_accel::whir_initial::AuthenticatedWhirInitialSource;
+    use cmfd_proof_accel::demand_blake3_tree::build_whir_initial_demand_blake3_tree;
+    use cmfd_proof_accel::whir_initial::{
+        AuthenticatedWhirInitialSource, encode_whir_initial_suffix,
+    };
 
     use super::*;
     use crate::forgematrix_v2::{
@@ -1035,6 +1287,7 @@ mod tests {
         MODEL_BANK_HEADER_BYTES, SmallModelBankFixture, build_small_model_bank,
     };
     use crate::sumcheck::GOLDILOCKS_MODULUS;
+    use crate::whir_proof::{StructuredWhirModelCommitmentSet, StructuredWhirModelMetadata};
 
     fn test_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1090,6 +1343,122 @@ mod tests {
         })
         .unwrap();
         (built, identity)
+    }
+
+    fn committed_fixture() -> (crate::model_bank::BuiltModelBankFixture, ModelPcsIdentity) {
+        let base = [0, 125, 250, 126];
+        let layers = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ];
+        let layer_slices = layers
+            .iter()
+            .map(|layer| layer.as_slice())
+            .collect::<Vec<_>>();
+        let suite = structured_whir_suite_parameter_digest();
+        let provisional = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: [0x52; 32],
+        })
+        .unwrap();
+        let centered = |value: u8| {
+            let value = u64::from(value);
+            if value >= 125 {
+                value - 125
+            } else {
+                GOLDILOCKS_MODULUS - (125 - value)
+            }
+        };
+        let commitments = StructuredWhirModelCommitmentSet::new(
+            StructuredWhirModelMetadata {
+                model_version: 2,
+                batch: 2,
+                dimension: 2,
+                layers_per_bank: 2,
+                model_byte_root: provisional.manifest.raw_blake3_root,
+            },
+            base.into_iter().map(centered).collect(),
+            vec![
+                layers[..2]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .map(centered)
+                    .collect(),
+                layers[2..]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .map(centered)
+                    .collect(),
+            ],
+        )
+        .unwrap();
+        let identity = commitments.identity().clone();
+        let built = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        })
+        .unwrap();
+        (built, identity)
+    }
+
+    fn committed_roles(
+        label: &str,
+    ) -> (
+        PathBuf,
+        crate::model_bank::BuiltModelBankFixture,
+        ModelPcsIdentity,
+        Vec<PublishedModelWhirSourceRole>,
+    ) {
+        let root = test_root(label);
+        let pointer = root.join("model.sources");
+        let (built, identity) = committed_fixture();
+        let roles = build_verified_model_whir_sources(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            &identity,
+            pointer,
+        )
+        .unwrap()
+        .into_roles();
+        (root, built, identity, roles)
+    }
+
+    fn build_role_artifacts(
+        root: &Path,
+        label: &str,
+        role: &PublishedModelWhirSourceRole,
+    ) -> (
+        AuthenticatedWhirInitialCodeword,
+        AuthenticatedInitialDemandBlake3Tree,
+    ) {
+        let codeword = encode_whir_initial_suffix(
+            root.join(format!("{label}.codeword")),
+            *blake3::hash(format!("{label}-codeword").as_bytes()).as_bytes(),
+            &role.artifact_identity().source,
+            role.source(),
+        )
+        .unwrap();
+        let tree = build_whir_initial_demand_blake3_tree(
+            root.join(format!("{label}.tree")),
+            *blake3::hash(format!("{label}-tree").as_bytes()).as_bytes(),
+            &codeword,
+        )
+        .unwrap();
+        (codeword, tree)
     }
 
     #[test]
@@ -1182,6 +1551,173 @@ mod tests {
         .unwrap();
         assert_eq!(repeated.bundle_digest(), first_digest);
         drop(repeated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_role_joins_exact_source_codeword_tree_and_model_alias() {
+        let (root, _built, identity, mut roles) = committed_roles("role-v2-join");
+        let role = roles.remove(1);
+        let role_kind = role.role();
+        let expected_commitment = role.expected_commitment();
+        let context = model_whir_role_context_digest(&identity, role_kind).unwrap();
+        let (codeword, tree) = build_role_artifacts(&root, "joined", &role);
+        assert_eq!(
+            structured_whir_single_table_alias(
+                tree.identity().tree_root,
+                role.artifact_identity().source.num_variables as usize,
+            )
+            .unwrap(),
+            expected_commitment
+        );
+
+        let prepared = adopt_published_model_whir_role_v2(&identity, role, codeword, tree).unwrap();
+        assert_eq!(prepared.role(), role_kind);
+        assert_eq!(prepared.expected_commitment(), expected_commitment);
+        assert_eq!(prepared.context_digest(), context);
+        assert_eq!(
+            prepared
+                .prover_oracle()
+                .oracle()
+                .opening(0)
+                .unwrap()
+                .row_index(),
+            0
+        );
+        let (returned_role, returned_commitment, retained, capability) = prepared.into_parts();
+        assert_eq!(returned_role, role_kind);
+        assert_eq!(returned_commitment, expected_commitment);
+        assert_eq!(capability.identity(), &retained);
+        drop(capability);
+        drop(roles);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consuming_bundle_roles_transfers_live_source_handles() {
+        let root = test_root("consume-roles");
+        let pointer = root.join("model.sources");
+        let (built, identity) = committed_fixture();
+        let bundle = build_verified_model_whir_sources(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            &identity,
+            pointer,
+        )
+        .unwrap();
+        let first_path = bundle.roles()[0].path().to_path_buf();
+        let roles = bundle.into_roles();
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles[0].path(), first_path);
+        assert_eq!(roles[0].source().read_elements(0, 4).unwrap().len(), 4);
+        drop(roles);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn role_join_rejects_wrong_alias_and_cross_paired_source() {
+        let (root, _built, identity, mut roles) = committed_roles("role-v2-reject");
+        let other_role = roles.remove(2);
+        let role = roles.remove(1);
+        let (other_codeword, other_tree) = build_role_artifacts(&root, "other", &other_role);
+        assert!(matches!(
+            adopt_published_model_whir_role_v2(&identity, role, other_codeword, other_tree),
+            Err(ModelWhirSourceError::CodewordSourceMismatch)
+        ));
+
+        let role = other_role;
+        let source_identity = role.artifact_identity().source.clone();
+        let alternate_source_path = root.join("alternate.source");
+        let mut writer = WhirInitialSourceArtifactWriter::create(
+            &alternate_source_path,
+            source_identity.clone(),
+        )
+        .unwrap();
+        writer
+            .write_elements(&vec![7; role.artifact_identity().element_count as usize])
+            .unwrap();
+        let alternate_source = writer.finish().unwrap();
+        let alternate_codeword = encode_whir_initial_suffix(
+            root.join("alternate.codeword"),
+            [0xa1; 32],
+            &source_identity,
+            &alternate_source,
+        )
+        .unwrap();
+        let alternate_tree = build_whir_initial_demand_blake3_tree(
+            root.join("alternate.tree"),
+            [0xa2; 32],
+            &alternate_codeword,
+        )
+        .unwrap();
+        drop(alternate_source);
+        assert!(matches!(
+            adopt_published_model_whir_role_v2(&identity, role, alternate_codeword, alternate_tree,),
+            Err(ModelWhirSourceError::CommitmentMismatch)
+        ));
+        drop(roles);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn role_join_rejects_a_role_from_a_different_model_identity() {
+        let (root, _built, identity, mut roles) = committed_roles("role-v2-model-replay");
+        let role = roles.remove(1);
+        let (codeword, tree) = build_role_artifacts(&root, "model-replay", &role);
+        let mut other_model = identity.clone();
+        other_model.model_version += 1;
+        assert!(matches!(
+            adopt_published_model_whir_role_v2(&other_model, role, codeword, tree),
+            Err(ModelWhirSourceError::RoleMismatch)
+        ));
+
+        let role = roles.remove(1);
+        let (codeword, tree) = build_role_artifacts(&root, "wrong-suite", &role);
+        let mut wrong_suite = identity;
+        wrong_suite.pcs_suite_parameter_digest[0] ^= 1;
+        assert!(matches!(
+            adopt_published_model_whir_role_v2(&wrong_suite, role, codeword, tree),
+            Err(ModelWhirSourceError::SuiteMismatch)
+        ));
+        drop(roles);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn role_context_binds_model_role_alias_and_geometry_and_is_enforced() {
+        let (root, _built, identity, mut roles) = committed_roles("role-v2-context");
+        let role = roles.remove(1);
+        let role_kind = role.role();
+        let context = model_whir_role_context_digest(&identity, role_kind).unwrap();
+        assert_eq!(
+            hex::encode(context),
+            "9e7fab4f1067b4e95d3e2475acebcf02130a73cad12f97bfcded0f02fa7ab7f3"
+        );
+        let mut changed_model = identity.clone();
+        changed_model.model_version += 1;
+        assert_ne!(
+            model_whir_role_context_digest(&changed_model, role_kind).unwrap(),
+            context
+        );
+        assert_ne!(
+            model_whir_role_context_digest(&identity, ModelPcsRole::WeightBank { index: 1 })
+                .unwrap(),
+            context
+        );
+
+        let (codeword, tree) = build_role_artifacts(&root, "context", &role);
+        let prepared = adopt_published_model_whir_role_v2(&identity, role, codeword, tree).unwrap();
+        let (_, _, retained, capability) = prepared.into_parts();
+        let (source, oracle) = capability.into_parts();
+        let mut wrong_context = context;
+        wrong_context[0] ^= 1;
+        assert!(matches!(
+            InitialWhirProverOracleV2::adopt(wrong_context, &retained, source, oracle),
+            Err(InitialWhirProverV2Error::Oracle(
+                InitialWhirOracleV2Error::CallerContextMismatch
+            ))
+        ));
+        drop(roles);
         fs::remove_dir_all(root).unwrap();
     }
 

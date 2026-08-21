@@ -67,8 +67,9 @@ pub use model_bank::{
 #[cfg(feature = "gpu-proof-prover")]
 pub use model_whir_sources::{
     MODEL_WHIR_SOURCE_BUNDLE_IDENTITY_BYTES, ModelWhirSourceBundleIdentity, ModelWhirSourceError,
-    PublishedModelWhirSourceBundle, PublishedModelWhirSourceRole,
-    build_verified_model_whir_sources, open_published_model_whir_sources,
+    PreparedModelWhirRoleV2, PublishedModelWhirSourceBundle, PublishedModelWhirSourceRole,
+    adopt_published_model_whir_role_v2, build_verified_model_whir_sources,
+    model_whir_role_context_digest, open_published_model_whir_sources,
 };
 pub use network::{
     BlockValidationContext, CONSENSUS_SIGNATURE_BYTES, FixedRewardDestinations,
@@ -163,6 +164,8 @@ pub use whir_proof::{
     prove_explicit_whir_openings_with_initial_source,
     prove_explicit_whir_openings_with_prover_oracle,
     prove_explicit_whir_openings_with_prover_oracle_in_spill_dir,
+    prove_explicit_whir_openings_with_prover_oracle_v2,
+    prove_explicit_whir_openings_with_prover_oracle_v2_in_spill_dir,
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,

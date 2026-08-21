@@ -28,7 +28,9 @@ use cmfd_proof_accel::initial_whir_oracle_v2::{
     InitialWhirProverOracleV2,
 };
 #[cfg(feature = "gpu-proof-prover")]
-use cmfd_proof_accel::whir_initial::AuthenticatedWhirInitialSource;
+use cmfd_proof_accel::whir_initial::{
+    AuthenticatedWhirInitialSource, WHIR_INITIAL_ARTIFACT_MAX_VARIABLES,
+};
 use p3_blake3::Blake3;
 use p3_challenger::{
     CanObserve, FieldChallenger, GrindingChallenger, HashChallenger, SerializingChallenger64,
@@ -1800,6 +1802,9 @@ fn prove_explicit_whir_openings_with_initial_source_v2_inner(
 /// V2 prover identity. Their local identities are never observed by the
 /// challenger; only the ordinary BLAKE3 Merkle root occupies the existing
 /// transcript position, and the unchanged CPU verifier checks the result.
+/// The public explicit-proof path remains capped at 16 variables; a V2 storage
+/// capability at 17 through 31 variables cannot be proved through this entry
+/// point.
 #[cfg(feature = "gpu-proof-prover")]
 pub fn prove_explicit_whir_openings_with_prover_oracle_v2(
     transcript_binding: &[u8],
@@ -1833,6 +1838,9 @@ pub fn prove_explicit_whir_openings_with_prover_oracle_v2(
 /// WHIR prover artifacts in one caller-selected scratch directory.
 ///
 /// Storage failures abort the attempt without retrying through a dense path.
+/// The public explicit-proof path remains capped at 16 variables; a V2 storage
+/// capability at 17 through 31 variables cannot be proved through this entry
+/// point.
 #[cfg(feature = "gpu-proof-prover")]
 pub fn prove_explicit_whir_openings_with_prover_oracle_v2_in_spill_dir(
     transcript_binding: &[u8],
@@ -2621,6 +2629,30 @@ fn structured_aliases(
     table_variables: &[usize],
 ) -> Result<Vec<[u8; 32]>, ExplicitWhirError> {
     validate_stacked_shape(table_variables)?;
+    Ok(structured_aliases_for_validated_layout(
+        root,
+        table_variables,
+    ))
+}
+
+/// Derive the existing independent one-table alias at initial-oracle storage
+/// geometry without widening any explicit-proof or stacked-proof limit.
+#[cfg(feature = "gpu-proof-prover")]
+pub(crate) fn structured_whir_single_table_alias(
+    root: [u8; 32],
+    num_variables: usize,
+) -> Result<[u8; 32], ExplicitWhirError> {
+    if !(EXPLICIT_WHIR_MIN_VARIABLES..=WHIR_INITIAL_ARTIFACT_MAX_VARIABLES).contains(&num_variables)
+    {
+        return Err(ExplicitWhirError::InvalidVariableCount);
+    }
+    Ok(structured_aliases_for_validated_layout(root, &[num_variables])[0])
+}
+
+fn structured_aliases_for_validated_layout(
+    root: [u8; 32],
+    table_variables: &[usize],
+) -> Vec<[u8; 32]> {
     let mut layout_hasher = Blake3Hasher::new_derive_key(STRUCTURED_WHIR_ALIAS_DOMAIN);
     layout_hasher.update(STRUCTURED_WHIR_ALIAS_LAYOUT_LABEL);
     layout_hasher.update(&root);
@@ -2629,7 +2661,7 @@ fn structured_aliases(
         layout_hasher.update(&(variables as u32).to_le_bytes());
     }
     let layout_digest = *layout_hasher.finalize().as_bytes();
-    Ok(table_variables
+    table_variables
         .iter()
         .enumerate()
         .map(|(index, variables)| {
@@ -2641,7 +2673,7 @@ fn structured_aliases(
             hasher.update(&(*variables as u32).to_le_bytes());
             *hasher.finalize().as_bytes()
         })
-        .collect())
+        .collect()
 }
 
 fn validate_num_variables(num_variables: usize) -> Result<(), ExplicitWhirError> {
@@ -4060,6 +4092,34 @@ mod tests {
         assert_eq!(disk, dense);
         assert_eq!(disk.2.encode(), Err(ExplicitWhirError::ProofTooLarge));
         verify_explicit_whir_openings(binding, disk.0, &disk.1, &disk.2).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn initial_storage_alias_range_does_not_raise_proof_caps_or_change_alias_bytes() {
+        let root = [0x5c; 32];
+        for variables in EXPLICIT_WHIR_MIN_VARIABLES..=MAX_EXPLICIT_WHIR_VARIABLES {
+            assert_eq!(
+                structured_whir_single_table_alias(root, variables).unwrap(),
+                structured_aliases(root, &[variables]).unwrap()[0]
+            );
+        }
+        assert!(
+            structured_whir_single_table_alias(root, WHIR_INITIAL_ARTIFACT_MAX_VARIABLES).is_ok()
+        );
+        assert_eq!(
+            structured_whir_single_table_alias(root, 1),
+            Err(ExplicitWhirError::InvalidVariableCount)
+        );
+        assert_eq!(
+            structured_whir_single_table_alias(root, WHIR_INITIAL_ARTIFACT_MAX_VARIABLES + 1),
+            Err(ExplicitWhirError::InvalidVariableCount)
+        );
+        assert!(validate_num_variables(MAX_EXPLICIT_WHIR_VARIABLES).is_ok());
+        assert_eq!(
+            validate_num_variables(MAX_EXPLICIT_WHIR_VARIABLES + 1),
+            Err(ExplicitWhirError::InvalidVariableCount)
+        );
     }
 
     #[test]

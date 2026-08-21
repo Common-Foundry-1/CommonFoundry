@@ -7,6 +7,8 @@
 //! profile.
 
 #[cfg(feature = "gpu-proof-prover")]
+use std::path::Path;
+#[cfg(feature = "gpu-proof-prover")]
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,7 +60,10 @@ use disk_mmcs::{DiskWhirMmcs, DiskWhirOpeningPanic};
 #[cfg(feature = "gpu-proof-prover")]
 mod disk_sumcheck;
 #[cfg(feature = "gpu-proof-prover")]
-use disk_sumcheck::{evaluate_claims, prepare_sumcheck};
+use disk_sumcheck::{
+    ResidualArtifactConfig, evaluate_claims, prepare_sumcheck,
+    prepare_sumcheck_with_residual_artifact,
+};
 
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredPcsOpeningClaim, StructuredPcsOpeningSet,
@@ -88,6 +93,8 @@ const STRUCTURED_WHIR_ALIAS_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-ORACLE/V1";
 const STRUCTURED_WHIR_SUITE_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SUITE/V1";
 const STRUCTURED_WHIR_SPLIT_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SPLIT/V2";
 const EXPLICIT_WHIR_TRANSCRIPT_DOMAIN: &[u8] = b"CMFD/FORGEMATRIX/EXPLICIT-WHIR/V1";
+#[cfg(feature = "gpu-proof-prover")]
+const EXPLICIT_WHIR_RESIDUAL_INVOCATION_DOMAIN: &str = "Common Foundry WHIR residual invocation v1";
 const STRUCTURED_WHIR_ALIAS_LAYOUT_LABEL: &[u8] = b"layout";
 const STRUCTURED_WHIR_ALIAS_ORACLE_LABEL: &[u8] = b"oracle";
 const STRUCTURED_WHIR_SPLIT_COMMON_LABEL: &[u8] = b"common";
@@ -1368,6 +1375,40 @@ pub fn prove_explicit_whir_openings_with_initial_source(
     ),
     ExplicitWhirError,
 > {
+    prove_explicit_whir_openings_with_initial_source_inner(
+        transcript_binding,
+        points,
+        expected_oracle_identity,
+        source,
+        oracle,
+        None,
+    )
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+#[derive(Clone, Copy)]
+struct ResidualArtifactInvocation<'a> {
+    scratch_directory: &'a Path,
+    exact_source_binding: [u8; 32],
+    invocation_digest: [u8; 32],
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn prove_explicit_whir_openings_with_initial_source_inner(
+    transcript_binding: &[u8],
+    points: &[Vec<ExtensionElement>],
+    expected_oracle_identity: &InitialWhirOracleIdentity,
+    source: &dyn AuthenticatedWhirInitialSource,
+    oracle: InitialWhirOracle,
+    residual_artifact: Option<ResidualArtifactInvocation<'_>>,
+) -> Result<
+    (
+        ExplicitWhirCommitment,
+        Vec<ExplicitWhirOpening>,
+        ExplicitWhirProof,
+    ),
+    ExplicitWhirError,
+> {
     if oracle.identity() != expected_oracle_identity {
         return Err(ExplicitWhirError::ProverStorage);
     }
@@ -1432,15 +1473,28 @@ pub fn prove_explicit_whir_openings_with_initial_source(
         streamed_claims.push(claim);
     }
 
-    let prepared = catch_unwind(AssertUnwindSafe(|| {
-        prepare_sumcheck(
+    let prepared = catch_unwind(AssertUnwindSafe(|| match residual_artifact {
+        Some(invocation) => prepare_sumcheck_with_residual_artifact(
             expected_source,
             source,
             streamed_claims,
             &mut native_proof.initial_sumcheck,
             pcs.starting_folding_pow_bits,
             &mut challenger,
-        )
+            ResidualArtifactConfig {
+                exact_source_binding: invocation.exact_source_binding,
+                invocation_digest: invocation.invocation_digest,
+                scratch_directory: invocation.scratch_directory,
+            },
+        ),
+        None => prepare_sumcheck(
+            expected_source,
+            source,
+            streamed_claims,
+            &mut native_proof.initial_sumcheck,
+            pcs.starting_folding_pow_bits,
+            &mut challenger,
+        ),
     }))
     .map_err(|_| ExplicitWhirError::BackendPanic)??;
 
@@ -1515,6 +1569,75 @@ pub fn prove_explicit_whir_openings_with_prover_oracle(
         &source,
         oracle,
     )
+}
+
+/// Prove through a caller-selected residual scratch directory.
+///
+/// This exercises the authenticated bounded-memory residual-generation seam,
+/// then rematerializes the residual for the still-dense research WHIR backend.
+/// It therefore preserves exact proof bytes but does not yet remove the
+/// downstream in-memory sumcheck, extension commitment, or FFT allocations.
+/// The directory is a local, access-controlled scratch namespace: other code
+/// must not rename or replace generated `cmfd-whir-residual-*` entries while
+/// this call is active.
+#[cfg(feature = "gpu-proof-prover")]
+pub fn prove_explicit_whir_openings_with_prover_oracle_in_spill_dir(
+    transcript_binding: &[u8],
+    points: &[Vec<ExtensionElement>],
+    expected_prover_identity: &InitialWhirProverIdentity,
+    prover_oracle: InitialWhirProverOracle,
+    scratch_directory: impl AsRef<Path>,
+) -> Result<
+    (
+        ExplicitWhirCommitment,
+        Vec<ExplicitWhirOpening>,
+        ExplicitWhirProof,
+    ),
+    ExplicitWhirError,
+> {
+    if transcript_binding.len() > MAX_EXPLICIT_WHIR_BINDING_BYTES {
+        return Err(ExplicitWhirError::BindingTooLarge);
+    }
+    if prover_oracle.identity() != expected_prover_identity {
+        return Err(ExplicitWhirError::ProverStorage);
+    }
+    let scratch_directory = scratch_directory.as_ref();
+    if !scratch_directory.is_absolute() {
+        return Err(ExplicitWhirError::Configuration(
+            "WHIR residual scratch directory must be absolute".to_owned(),
+        ));
+    }
+    if !scratch_directory.is_dir() {
+        return Err(ExplicitWhirError::Configuration(
+            "WHIR residual scratch directory must already exist".to_owned(),
+        ));
+    }
+
+    let expected_oracle_identity = expected_prover_identity.oracle_identity();
+    let invocation = ResidualArtifactInvocation {
+        scratch_directory,
+        exact_source_binding: expected_prover_identity.binding_digest(),
+        invocation_digest: explicit_whir_residual_invocation_digest(transcript_binding),
+    };
+    let (source, oracle) = prover_oracle.into_parts();
+    prove_explicit_whir_openings_with_initial_source_inner(
+        transcript_binding,
+        points,
+        &expected_oracle_identity,
+        &source,
+        oracle,
+        Some(invocation),
+    )
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn explicit_whir_residual_invocation_digest(transcript_binding: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake3Hasher::new_derive_key(EXPLICIT_WHIR_RESIDUAL_INVOCATION_DOMAIN);
+    hasher.update(&EXPLICIT_WHIR_VERSION.to_le_bytes());
+    hasher.update(&structured_whir_suite_parameter_digest());
+    hasher.update(&(transcript_binding.len() as u64).to_le_bytes());
+    hasher.update(transcript_binding);
+    *hasher.finalize().as_bytes()
 }
 
 pub fn verify_explicit_whir_openings(
@@ -2644,6 +2767,58 @@ mod tests {
     }
 
     #[cfg(feature = "gpu-proof-prover")]
+    struct FailingAfterTableSource {
+        identity: WhirInitialSourceIdentity,
+        values: Vec<u64>,
+        fail_on_read: usize,
+        reads: AtomicUsize,
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    impl FailingAfterTableSource {
+        fn new(values: Vec<u64>, fail_on_read: usize) -> Self {
+            let exact = ExactTableSource::new(values);
+            Self {
+                identity: exact.identity,
+                values: exact.values,
+                fail_on_read,
+                reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    impl AuthenticatedWhirInitialSource for FailingAfterTableSource {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            &self.identity
+        }
+
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn read_elements(
+            &self,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            let read = self.reads.fetch_add(1, Ordering::Relaxed);
+            if read == self.fail_on_read {
+                return Err(WhirInitialSourceError::new(
+                    "injected delayed source failure",
+                ));
+            }
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| WhirInitialSourceError::new("table range overflow"))?;
+            self.values
+                .get(start..end)
+                .map(<[u64]>::to_vec)
+                .ok_or_else(|| WhirInitialSourceError::new("table range is out of bounds"))
+        }
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
     fn whir_initial_test_path() -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3270,6 +3445,46 @@ mod tests {
 
     #[test]
     #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_residual_artifact_preserves_complete_proof_bytes() {
+        for variables in [2_usize, 9] {
+            let binding = format!("forge-matrix-residual-artifact-{variables}");
+            let values = (0..1_usize << variables)
+                .map(|index| (index * index + 13 * index + 41) as u64)
+                .collect::<Vec<_>>();
+            let points = (0..2)
+                .map(|point_index| {
+                    (0..variables)
+                        .map(|index| ExtensionElement {
+                            limbs: [
+                                (index * 5 + point_index + 2) as u64,
+                                (index * 7 + point_index + 3) as u64,
+                                (index * 11 + point_index + 5) as u64,
+                            ],
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let dense = prove_explicit_whir_openings(binding.as_bytes(), &values, &points).unwrap();
+            let built = test_prover_oracle(&values, [variables as u8 + 0x60; 32]);
+            let scratch = whir_initial_test_path().with_extension("residual-spill");
+            std::fs::create_dir(&scratch).unwrap();
+            let spilled = prove_explicit_whir_openings_with_prover_oracle_in_spill_dir(
+                binding.as_bytes(),
+                &points,
+                &built.identity,
+                built.prover,
+                &scratch,
+            )
+            .unwrap();
+
+            assert_eq!(spilled, dense);
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            std::fs::remove_dir(scratch).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
     fn concrete_source_bundle_matches_dense_proof_bytes_across_round_shapes() {
         for variables in [2_usize, 8, 9] {
             let binding = format!("forge-matrix-concrete-source-{variables}");
@@ -3345,7 +3560,7 @@ mod tests {
     #[test]
     #[cfg(feature = "gpu-proof-prover")]
     fn authenticated_source_initial_sumcheck_matches_dense_above_parallel_threshold() {
-        let variables = 15;
+        let variables = 17;
         let values = (0..1_usize << variables)
             .map(|index| (index * index + 7 * index + 37) as u64)
             .collect::<Vec<_>>();
@@ -3369,6 +3584,8 @@ mod tests {
             build_pcs(variables, b"streamed-initial-threshold").unwrap();
         let (_, mut streamed_challenger) =
             build_pcs(variables, b"streamed-initial-threshold").unwrap();
+        let (_, mut artifact_challenger) =
+            build_pcs(variables, b"streamed-initial-threshold").unwrap();
         let mut layout = ExplicitPointLayout::from_poly_and_shapes(
             poly.clone(),
             EXPLICIT_WHIR_FOLDING,
@@ -3382,6 +3599,8 @@ mod tests {
         for (point, claim) in points.iter().zip(&streamed_claims) {
             streamed_challenger.observe_algebra_slice(point.as_slice());
             streamed_challenger.observe_algebra_element(claim.evaluation());
+            artifact_challenger.observe_algebra_slice(point.as_slice());
+            artifact_challenger.observe_algebra_element(claim.evaluation());
         }
 
         let mut dense_data = SumcheckData::default();
@@ -3394,10 +3613,27 @@ mod tests {
         let streamed = prepare_sumcheck(
             source.identity(),
             &source,
-            streamed_claims,
+            streamed_claims.clone(),
             &mut streamed_data,
             pcs.starting_folding_pow_bits,
             &mut streamed_challenger,
+        )
+        .unwrap();
+        let scratch = whir_initial_test_path().with_extension("sumcheck-residual");
+        std::fs::create_dir(&scratch).unwrap();
+        let mut artifact_data = SumcheckData::default();
+        let artifact = prepare_sumcheck_with_residual_artifact(
+            source.identity(),
+            &source,
+            streamed_claims,
+            &mut artifact_data,
+            pcs.starting_folding_pow_bits,
+            &mut artifact_challenger,
+            ResidualArtifactConfig {
+                exact_source_binding: [0x91; 32],
+                invocation_digest: [0xa2; 32],
+                scratch_directory: &scratch,
+            },
         )
         .unwrap();
 
@@ -3405,14 +3641,27 @@ mod tests {
             streamed_data.polynomial_evaluations,
             dense_data.polynomial_evaluations
         );
+        assert_eq!(
+            artifact_data.polynomial_evaluations,
+            dense_data.polynomial_evaluations
+        );
         assert_eq!(streamed_data.pow_witnesses, dense_data.pow_witnesses);
+        assert_eq!(artifact_data.pow_witnesses, dense_data.pow_witnesses);
         assert_eq!(streamed.randomness, dense_randomness);
+        assert_eq!(artifact.randomness, dense_randomness);
         assert_eq!(streamed.prover.claimed_sum(), dense_prover.claimed_sum());
+        assert_eq!(artifact.prover.claimed_sum(), dense_prover.claimed_sum());
         assert_eq!(streamed.prover.evals(), dense_prover.evals());
+        assert_eq!(artifact.prover.evals(), dense_prover.evals());
         assert_eq!(streamed.prover.weights(), dense_prover.weights());
+        assert_eq!(artifact.prover.weights(), dense_prover.weights());
         let dense_next: EF = dense_challenger.sample_algebra_element();
         let streamed_next: EF = streamed_challenger.sample_algebra_element();
+        let artifact_next: EF = artifact_challenger.sample_algebra_element();
         assert_eq!(streamed_next, dense_next);
+        assert_eq!(artifact_next, dense_next);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
     }
 
     #[test]
@@ -3475,6 +3724,45 @@ mod tests {
             ),
             Err(ExplicitWhirError::ProverStorage)
         );
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn residual_source_failure_removes_partial_artifact_without_fallback() {
+        let variables = 4;
+        let values = (0..1_usize << variables)
+            .map(|index| (index * index + 7) as u64)
+            .collect::<Vec<_>>();
+        let source = FailingAfterTableSource::new(values, 1);
+        let point = Point::new(
+            (0..variables)
+                .map(|index| EF::new([F::new(index as u64 + 2), F::ONE, F::ZERO]))
+                .collect(),
+        );
+        let claims = evaluate_claims(source.identity(), &source, &[point]).unwrap();
+        let (pcs, mut challenger) = build_pcs(variables, b"residual-source-failure").unwrap();
+        let scratch = whir_initial_test_path().with_extension("residual-failure");
+        std::fs::create_dir(&scratch).unwrap();
+        let mut sumcheck_data = SumcheckData::default();
+
+        let result = prepare_sumcheck_with_residual_artifact(
+            source.identity(),
+            &source,
+            claims,
+            &mut sumcheck_data,
+            pcs.starting_folding_pow_bits,
+            &mut challenger,
+            ResidualArtifactConfig {
+                exact_source_binding: [0xb3; 32],
+                invocation_digest: [0xc4; 32],
+                scratch_directory: &scratch,
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), ExplicitWhirError::ProverStorage);
+        assert_eq!(source.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
     }
 
     #[test]

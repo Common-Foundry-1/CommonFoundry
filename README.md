@@ -129,6 +129,18 @@ Merkle construction, and opening generation are not yet fully out of core. See
 [the custom proof specification](docs/consensus/forgematrix-custom-proof.md)
 for the measured scope and remaining activation gates.
 
+The WHIR path also has an authenticated ephemeral residual-product artifact.
+It writes six canonical Goldilocks limbs per row with bounded I/O. Normal
+consumption verifies the open file identity before removal; failure and unwind
+paths make a best-effort cleanup attempt, so an operating runbook must reap
+authenticated stale attempts. The caller must reserve the generated artifact
+names as a private local scratch namespace while proving because portable
+identity-check-and-unlink is not atomic. The production `2^29`-row residual geometry is 24 GiB plus
+about 2 MiB of authentication metadata. Current
+Plonky3 code rereads that artifact into dense vectors, then would allocate an
+approximately 48 GiB extension commitment and large FFT twiddle tables, so the
+16-variable proof cap remains unchanged.
+
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`
 launchers. Its live console reports per-GPU and rig hashrate, power, hashes per

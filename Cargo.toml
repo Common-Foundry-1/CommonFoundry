@@ -32,6 +32,7 @@ hex = "0.4"
 k256 = { version = "0.13", features = ["schnorr"] }
 libloading = "0.8.9"
 primitive-types = "0.13"
+same-file = "1.0.6"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "0.10"

@@ -5,11 +5,18 @@
 //! opening claim, and materialises the ordinary extension-field product
 //! polynomial only after both initial challenges have been sampled.
 
+use std::path::Path;
+
+use blake3::Hasher;
 use cmfd_proof_accel::whir_initial::{
     AuthenticatedWhirInitialSource, WHIR_INITIAL_MAX_SOURCE_READ_LIMBS, WhirInitialSourceIdentity,
 };
+use cmfd_proof_accel::whir_residual::{
+    WHIR_RESIDUAL_LIMBS_PER_ROW, WHIR_RESIDUAL_MAX_IO_ROWS, WhirResidualArtifactSpec,
+    WhirResidualArtifactWriter,
+};
 use p3_challenger::{FieldChallenger, GrindingChallenger};
-use p3_field::PrimeCharacteristicRing;
+use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField64};
 use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
 use p3_sumcheck::SumcheckData;
@@ -22,6 +29,7 @@ use crate::GOLDILOCKS_MODULUS;
 
 const INITIAL_FOLDING: usize = 2;
 const SUFFIX_WIDTH: usize = 1 << INITIAL_FOLDING;
+const RESIDUAL_CONTEXT_DOMAIN: &str = "Common Foundry WHIR initial residual context v1";
 
 #[derive(Clone, Debug)]
 pub(super) struct StreamedInitialClaim {
@@ -103,6 +111,76 @@ pub(super) fn prepare_sumcheck<Ch>(
 where
     Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
 {
+    prepare_sumcheck_inner(
+        expected_source,
+        source,
+        claims,
+        sumcheck_data,
+        pow_bits,
+        challenger,
+        None,
+    )
+}
+
+/// Prepare through an authenticated ephemeral residual artifact, then
+/// materialize the bounded research shape for the unchanged WHIR backend.
+///
+/// Artifact metadata is never observed by the challenger. Any storage failure
+/// aborts this locally owned proof attempt without a dense fallback.
+pub(super) fn prepare_sumcheck_with_residual_artifact<Ch>(
+    expected_source: &WhirInitialSourceIdentity,
+    source: &dyn AuthenticatedWhirInitialSource,
+    claims: Vec<StreamedInitialClaim>,
+    sumcheck_data: &mut SumcheckData<F, EF>,
+    pow_bits: usize,
+    challenger: &mut Ch,
+    artifact: ResidualArtifactConfig<'_>,
+) -> Result<StreamedInitialSumcheck, ExplicitWhirError>
+where
+    Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    prepare_sumcheck_inner(
+        expected_source,
+        source,
+        claims,
+        sumcheck_data,
+        pow_bits,
+        challenger,
+        Some(ResidualArtifactRequest {
+            exact_source_binding: artifact.exact_source_binding,
+            invocation_digest: artifact.invocation_digest,
+            scratch_directory: artifact.scratch_directory,
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ResidualArtifactConfig<'a> {
+    pub(super) exact_source_binding: [u8; 32],
+    pub(super) invocation_digest: [u8; 32],
+    pub(super) scratch_directory: &'a Path,
+}
+
+#[derive(Clone, Copy)]
+struct ResidualArtifactRequest<'a> {
+    exact_source_binding: [u8; 32],
+    invocation_digest: [u8; 32],
+    scratch_directory: &'a Path,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_sumcheck_inner<Ch>(
+    expected_source: &WhirInitialSourceIdentity,
+    source: &dyn AuthenticatedWhirInitialSource,
+    claims: Vec<StreamedInitialClaim>,
+    sumcheck_data: &mut SumcheckData<F, EF>,
+    pow_bits: usize,
+    challenger: &mut Ch,
+    residual_artifact: Option<ResidualArtifactRequest<'_>>,
+) -> Result<StreamedInitialSumcheck, ExplicitWhirError>
+where
+    Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
     if claims.is_empty() {
         return Err(ExplicitWhirError::InvalidOpeningCount);
     }
@@ -165,8 +243,53 @@ where
         .collect::<Vec<_>>();
     let prefix_variables = num_variables - INITIAL_FOLDING;
     let residual_len = source_len / SUFFIX_WIDTH;
-    let mut residual_evals = Vec::with_capacity(residual_len);
-    let mut residual_weights = Vec::with_capacity(residual_len);
+    let artifact_spec = if let Some(request) = residual_artifact {
+        Some(WhirResidualArtifactSpec {
+            source_digest: request.exact_source_binding,
+            context_digest: residual_context_digest(ResidualContext {
+                expected_source,
+                invocation_digest: request.invocation_digest,
+                residual_len,
+                claims: &claims,
+                alpha,
+                sumcheck_data,
+                pow_bits,
+                r0,
+                r1,
+                claimed_sum,
+            }),
+            num_variables: u32::try_from(prefix_variables)
+                .map_err(|_| ExplicitWhirError::ProverStorage)?,
+            generation: 0,
+        })
+    } else {
+        None
+    };
+    let mut residual_writer = match (residual_artifact, artifact_spec) {
+        (Some(request), Some(spec)) => Some(
+            WhirResidualArtifactWriter::create(request.scratch_directory, spec)
+                .map_err(|_| ExplicitWhirError::ProverStorage)?,
+        ),
+        (None, None) => None,
+        _ => return Err(ExplicitWhirError::ProverStorage),
+    };
+    let mut residual_evals = Vec::new();
+    let mut residual_weights = Vec::new();
+    if residual_writer.is_none() {
+        residual_evals
+            .try_reserve_exact(residual_len)
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+        residual_weights
+            .try_reserve_exact(residual_len)
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    }
+    let residual_chunk_capacity = residual_len.min(WHIR_RESIDUAL_MAX_IO_ROWS);
+    let mut residual_rows = Vec::new();
+    if residual_writer.is_some() {
+        residual_rows
+            .try_reserve_exact(residual_chunk_capacity)
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    }
     scan_source(expected_source, source, source_len, |start, values| {
         for (local_group, group) in values.chunks_exact(SUFFIX_WIDTH).enumerate() {
             let prefix_index = (start / SUFFIX_WIDTH) + local_group;
@@ -176,17 +299,60 @@ where
                 EF::from(F::new(group[2])),
                 EF::from(F::new(group[3])),
             ];
-            residual_evals.push(fold_suffix_pair(fold_suffix_quad(evals, r0), r1));
+            let residual_eval = fold_suffix_pair(fold_suffix_quad(evals, r0), r1);
 
             let mut weight = EF::ZERO;
             for (claim, &suffix_scale) in claims.iter().zip(&suffix_scales) {
                 weight += suffix_scale
                     * eq_at_index(&claim.point.as_slice()[..prefix_variables], prefix_index);
             }
-            residual_weights.push(weight);
+            if residual_writer.is_some() {
+                residual_rows.push(encode_residual_row(residual_eval, weight));
+            } else {
+                residual_evals.push(residual_eval);
+                residual_weights.push(weight);
+            }
+        }
+        if let Some(writer) = residual_writer.as_mut()
+            && !residual_rows.is_empty()
+        {
+            writer
+                .write_rows(writer.rows_written(), &residual_rows)
+                .map_err(|_| ExplicitWhirError::ProverStorage)?;
+            residual_rows.clear();
         }
         Ok(())
     })?;
+    if let Some(writer) = residual_writer {
+        let artifact = writer
+            .finish()
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+        residual_evals
+            .try_reserve_exact(residual_len)
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+        residual_weights
+            .try_reserve_exact(residual_len)
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+        let mut start = 0_u64;
+        while start < artifact.geometry().row_count {
+            let count = usize::try_from(
+                (artifact.geometry().row_count - start).min(WHIR_RESIDUAL_MAX_IO_ROWS as u64),
+            )
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+            let rows = artifact
+                .read_rows(start, count)
+                .map_err(|_| ExplicitWhirError::ProverStorage)?;
+            for row in rows {
+                let (eval, weight) = decode_residual_row(row);
+                residual_evals.push(eval);
+                residual_weights.push(weight);
+            }
+            start += count as u64;
+        }
+        artifact
+            .remove()
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    }
     if residual_evals.len() != residual_len || residual_weights.len() != residual_len {
         return Err(ExplicitWhirError::ProverStorage);
     }
@@ -200,6 +366,82 @@ where
         prover: SumcheckProver::new(product, claimed_sum),
         randomness: Point::new(vec![r0, r1]),
     })
+}
+
+struct ResidualContext<'a> {
+    expected_source: &'a WhirInitialSourceIdentity,
+    invocation_digest: [u8; 32],
+    residual_len: usize,
+    claims: &'a [StreamedInitialClaim],
+    alpha: EF,
+    sumcheck_data: &'a SumcheckData<F, EF>,
+    pow_bits: usize,
+    r0: EF,
+    r1: EF,
+    claimed_sum: EF,
+}
+
+fn residual_context_digest(context: ResidualContext<'_>) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(RESIDUAL_CONTEXT_DOMAIN);
+    hasher.update(&context.invocation_digest);
+    hasher.update(&context.expected_source.source_id);
+    hasher.update(&context.expected_source.num_variables.to_le_bytes());
+    hasher.update(&(INITIAL_FOLDING as u32).to_le_bytes());
+    hasher.update(&[1]); // Natural suffix-variable order.
+    hasher.update(&(context.residual_len as u64).to_le_bytes());
+    hasher.update(&(context.claims.len() as u64).to_le_bytes());
+    hash_extension(&mut hasher, context.alpha);
+    for claim in context.claims {
+        hasher.update(&(claim.point.num_variables() as u32).to_le_bytes());
+        for &coordinate in claim.point.as_slice() {
+            hash_extension(&mut hasher, coordinate);
+        }
+        hash_extension(&mut hasher, claim.evaluation);
+        for &partial in &claim.suffix_partials {
+            hash_extension(&mut hasher, partial);
+        }
+    }
+    hasher.update(&(context.sumcheck_data.polynomial_evaluations.len() as u32).to_le_bytes());
+    for coefficients in &context.sumcheck_data.polynomial_evaluations {
+        hash_extension(&mut hasher, coefficients[0]);
+        hash_extension(&mut hasher, coefficients[1]);
+    }
+    hasher.update(&(context.pow_bits as u32).to_le_bytes());
+    hasher.update(&(context.sumcheck_data.pow_witnesses.len() as u32).to_le_bytes());
+    for &witness in &context.sumcheck_data.pow_witnesses {
+        hasher.update(&witness.as_canonical_u64().to_le_bytes());
+    }
+    hash_extension(&mut hasher, context.r0);
+    hash_extension(&mut hasher, context.r1);
+    hash_extension(&mut hasher, context.claimed_sum);
+    *hasher.finalize().as_bytes()
+}
+
+fn encode_residual_row(eval: EF, weight: EF) -> [u64; WHIR_RESIDUAL_LIMBS_PER_ROW] {
+    let eval: &[F] = eval.as_basis_coefficients_slice();
+    let weight: &[F] = weight.as_basis_coefficients_slice();
+    [
+        eval[0].as_canonical_u64(),
+        eval[1].as_canonical_u64(),
+        eval[2].as_canonical_u64(),
+        weight[0].as_canonical_u64(),
+        weight[1].as_canonical_u64(),
+        weight[2].as_canonical_u64(),
+    ]
+}
+
+fn decode_residual_row(row: [u64; WHIR_RESIDUAL_LIMBS_PER_ROW]) -> (EF, EF) {
+    (
+        EF::new([F::new(row[0]), F::new(row[1]), F::new(row[2])]),
+        EF::new([F::new(row[3]), F::new(row[4]), F::new(row[5])]),
+    )
+}
+
+fn hash_extension(hasher: &mut Hasher, value: EF) {
+    let limbs: &[F] = value.as_basis_coefficients_slice();
+    for limb in limbs {
+        hasher.update(&limb.as_canonical_u64().to_le_bytes());
+    }
 }
 
 fn validate_source(

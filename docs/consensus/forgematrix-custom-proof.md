@@ -491,15 +491,49 @@ but a complete build still performs about 48 GiB of verification reads per
 handle across same-inode hard links remains a ceremony-throughput optimization.
 
 The initial fold-two sumcheck also streams that source in chunks of at most
-8,192 canonical `u64` values. It keeps four suffix partials per claim and
-materializes only the residual `N/4` evaluation and weight vectors before
-continuing through the ordinary WHIR prover. Exact tests match the dense
-commitment, openings, transcript, and serialized proof bytes at 2, 8, and 9
-variables and match the initial sumcheck state above the parallel threshold at
-15 variables. Completed proofs still pass the unchanged CPU verifier. Later
-WHIR folding rounds remain in memory, the explicit adapter remains capped at
-16 variables, and the production `2^30 x 4` weight-bank codeword remains
-unsupported.
+8,192 canonical `u64` values. It keeps four suffix partials per claim. An
+explicit scratch-directory path now writes the resulting `N/4` evaluation and
+weight pairs to a dedicated ephemeral artifact in natural suffix order. Every
+row contains six canonical little-endian Goldilocks limbs: three for the cubic
+extension-field evaluation and three for its weight. A caller-retained source
+capability digest and a separate digest of the suite invocation, ordered
+claims, alpha, both sumcheck messages, optional grinding witnesses, challenges,
+and post-fold claim bind the artifact locally. Neither digest, the file path,
+nor any storage metadata enters Fiat-Shamir.
+
+The writer uses bounded chunks, checked 64-bit geometry, free-space preflight,
+no-overwrite same-directory publication, complete BLAKE3 authentication, and
+per-chunk reauthentication on later reads. Normal successful consumption
+checks that the current path still names the owned open file before removal.
+Failure and unwind cleanup is best effort, so killed attempts or deletion
+failures can strand a large scratch file and production operation needs
+ownership-aware stale-attempt recovery. The generated filenames must remain an
+exclusive, access-controlled local scratch namespace while proving: the
+portable identity check and pathname unlink are not a single atomic filesystem
+operation. At the production
+31-variable source shape, the fixed two-variable fold gives `2^29` residual
+rows. The paired artifact is exactly 24 GiB of field data plus 2 MiB of chunk
+digests and a 160-byte header; this geometry is tested without allocating the
+rows.
+
+Exact tests match the dense commitment, openings, transcript, and serialized
+proof bytes at 2, 8, and 9 variables. A 17-variable initial-sumcheck test has a
+`2^15`-row residual, crosses Plonky3's parallel coefficient threshold, and
+matches every message, challenge, evaluation, weight, claimed sum, and next
+transcript sample. Completed proofs still pass the unchanged CPU verifier, and
+an injected source failure after artifact creation leaves no partial file or
+dense fallback.
+
+This checkpoint establishes authenticated residual storage, not an out-of-core
+WHIR prover. The current adapter rereads the artifact into the same two dense
+vectors because upstream `SumcheckProver` requires them. The next WHIR step
+immediately constructs an extension commitment with `2^31` cubic-field values
+at production geometry, about 48 GiB, and the selected small-batch DFT can retain
+roughly 16 GiB of forward and inverse twiddles. Those allocations, disk-backed
+folding and constraint incorporation, later MMCS commits, and authenticated
+openings must all be replaced before any size cap can move. The explicit
+adapter remains capped at 16 variables, the codeword/oracle path at 19, and the
+production `2^30 x 4` weight-bank codeword remains unsupported.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
@@ -508,8 +542,9 @@ commitment selection and bank-order substitution in the research boundary; it
 does not make the commitment/proof adapter production-capable. The production
 base table has 19 variables and each weight bank has 31. Source staging admits
 both, but the explicit proof adapter admits at most 16 variables per table and
-the codeword/oracle path admits at most 19. It still has no streaming
-31-variable commitment, residual sumcheck, or later-folding path. The upstream
+the codeword/oracle path admits at most 19. It now has bounded, authenticated
+residual generation but no streaming 31-variable commitment or
+artifact-consuming later-folding path. The upstream
 backend is an unaudited academic prototype. Review, benchmarks, fuzzing, a
 complete soundness report, and independent audits remain mandatory before any
 production selection.

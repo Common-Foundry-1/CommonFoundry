@@ -945,6 +945,7 @@ name = "cmfd-proof-accel"
 version = "0.1.0-devnet.11"
 dependencies = [
  "blake3",
+ "fs2",
  "libloading 0.8.9",
  "p3-blake3",
  "p3-commit",
@@ -955,6 +956,7 @@ dependencies = [
  "p3-maybe-rayon",
  "p3-merkle-tree",
  "p3-symmetric",
+ "same-file",
  "thiserror 2.0.20",
 ]
 

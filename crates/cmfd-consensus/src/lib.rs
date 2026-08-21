@@ -160,6 +160,7 @@ pub use whir_proof::{
     prove_explicit_whir_openings_with_initial_oracle,
     prove_explicit_whir_openings_with_initial_source,
     prove_explicit_whir_openings_with_prover_oracle,
+    prove_explicit_whir_openings_with_prover_oracle_in_spill_dir,
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,

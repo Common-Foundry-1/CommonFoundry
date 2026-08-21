@@ -2777,6 +2777,10 @@ impl<E: Clone + PrimeCharacteristicRing> ExtExpr<E> {
 }
 
 #[cfg(test)]
+#[path = "structured_blake3_narrow_xor_lookup.rs"]
+mod xor_lookup_migration;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::structured_blake3_identity::{

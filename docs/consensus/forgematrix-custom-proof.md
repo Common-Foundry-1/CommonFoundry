@@ -317,12 +317,41 @@ CUDA result feeds the ordinary Merkle tree; parent compression,
 shorter-matrix injection, openings, transcript operations, and verification
 remain on the CPU.
 
-ABI v1 is deliberately test-profile-only and caps a call at `2^24` rows and
-`2^31` field limbs. Production uses `2^27` LDE rows. At that height, widths 291
-and 87 imply 291 GiB and 87 GiB input matrices respectively, and the first
-digest layer alone is 4 GiB. The current monolithic ABI cannot represent the
-production proof path economically; streaming/out-of-core LDE and Merkle
-construction remain required.
+The monolithic Poseidon2 ABI v1 remains test-profile-only. The separate
+`proof_stream` ABI v1 copies up to 64 ordered, equal-height canonical
+physical-bit-reversed coefficient matrices to the selected device once, with a
+maximum `2^20` source height, seven added bits, `2^27` output rows, 4,096 total
+columns, and `2^31` input limbs. `next` accepts a monotonic global physical-row
+cursor and a power-of-two request no larger than `2^16` rows that may not cross
+a source-height coset block. It returns an optional interleaved physical LDE
+chunk and the required four-limb, unpadded Poseidon2 digest for each row. CPU and
+GPU differentials cover distinct per-matrix shifts, insertion order, chunk
+partitions, and the exact Plonky3 commitment input.
+
+For the `32,768 x 291`, `+7` case, the digest-only stream phase processed all
+4,194,304 rows in 308.345 ms, or 13.60 million rows/s, on an RTX 5090 while
+avoiding a 9.094 GiB host LDE. This is a bounded CUDA canary measurement, not a
+complete proof benchmark.
+
+The worker-side LDE artifact writer accepts canonical chunks only at the exact
+next global physical row. Its versioned header binds the job identifier, every
+ordered source-matrix width and coset shift, source and expanded heights,
+aggregate width, added bits, physical layout, and byte length; BLAKE3 covers
+that metadata and every canonical little-endian field limb. Normal error and
+drop paths remove an incomplete `.partial` file, while abrupt process
+termination can leave an unpublished partial for operator cleanup. Only a
+complete, synchronized, validated artifact is published without overwrite.
+A reader validates the header, exact file length, and full checksum when
+opening it, then reauthenticates every fixed-size chunk used by random row
+access. These digests protect spill storage integrity;
+consensus validity still comes from the unchanged proof verifier.
+
+The stream and sealed artifact do not yet make Plonky3 consume disk-backed
+matrices. Full out-of-core PCS and FRI processing, Merkle-level construction
+and storage, and query opening generation remain incomplete. Production uses
+`2^27` LDE rows; widths 291 and 87 still imply 291 GiB and 87 GiB logical LDE
+matrices, and the first digest layer alone is 4 GiB. This milestone is not a
+production-ready prover.
 
 The CUDA library is native code and is never trusted for validity. The direct
 accelerated entry point loads it in-process, is restricted to trusted

@@ -958,6 +958,7 @@ version = "0.1.0-devnet.11"
 dependencies = [
  "blake3",
  "cmfd-consensus",
+ "cmfd-proof-accel",
  "hex",
  "libc",
  "sha2",

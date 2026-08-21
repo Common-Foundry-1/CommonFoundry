@@ -35,8 +35,32 @@ against a same-user attacker replacing the worker, CUDA DLL, or a transitive
 dependency between hashing and execution/loading. Production operators need an
 OS-enforced sandbox and file/ACL isolation if that attacker is in scope.
 
-CUDA ABI v1 is test-profile-only and caps each call at `2^24` rows and `2^31`
-field limbs. Production uses `2^27` LDE rows; widths 291 and 87 would require
-291 GiB and 87 GiB input matrices respectively, plus a 4 GiB digest layer.
-Production therefore still requires streaming/out-of-core PCS, FRI, and Merkle
-construction rather than this monolithic ABI.
+The independent `proof_stream` ABI v1 copies ordered canonical
+physical-bit-reversed source coefficients to the GPU once and then advances a
+strict global physical-row cursor. It supports 1-64 equal-height matrices, a
+source height through `2^20`, zero to seven added bits, at most `2^27` expanded
+rows, 4,096 total columns, and `2^31` input limbs. Each call requests a
+power-of-two chunk no larger than `2^16` rows and cannot cross a source-height
+coset block. It returns optional interleaved physical LDE rows and always
+returns the matching unpadded four-limb Poseidon2 digests. At `32,768 x 291`,
+`+7`, the digest-only stream phase measured 308.345 ms and 13.60 million rows/s
+on an RTX 5090 while avoiding a 9.094 GiB host LDE.
+
+`LdeArtifactWriter` drains a fresh stream sequentially into a unique
+`.partial` file. It rejects skipped, repeated, incomplete, noncanonical, or
+geometry-mismatched rows. The sealed v1 artifact binds the job identifier,
+every ordered source-matrix width and coset shift, all aggregate LDE geometry,
+physical-bit-reversed layout, declared byte length, and canonical little-endian
+limbs with BLAKE3. Sealing requires every row, writes the authentication table
+and checksum, synchronizes and validates the file, and then publishes without
+overwrite. Normal failure or drop removes the partial artifact; abrupt process
+termination can leave an unpublished `.partial` file for operator cleanup.
+Opening a sealed artifact authenticates its header, exact length, and full
+checksum. Every later random row read reauthenticates the fixed-size chunks it
+uses and rejects noncanonical limbs.
+
+The artifact checksum is storage-integrity metadata, not a consensus
+commitment, and the CPU verifier remains authoritative. The current Plonky3 PCS
+does not yet consume these sealed matrices: full out-of-core PCS/FRI processing,
+Merkle construction and level storage, and opening generation remain
+incomplete. This milestone is not production-ready.

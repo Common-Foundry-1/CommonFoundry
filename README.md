@@ -105,11 +105,27 @@ operating-system sandbox.
 At the 32,768-row checkpoint on an RTX 5090, an unoptimized Cargo test-profile
 CPU run took 348.28 seconds (64.503 setup, 283.416 prove; 238,698-byte canonical
 zlib payload). CUDA DFT plus Poseidon2 took 76.71 seconds (7.700 setup, 68.551
-prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. CUDA ABI v1 is
-test-profile-only: it caps a call at `2^24` rows and `2^31` field limbs. The
-production `2^27`-row LDE would require 291 GiB and 87 GiB inputs for widths 291
-and 87, plus a 4 GiB digest layer, so a streaming/out-of-core prover remains
-required. See
+prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. The monolithic
+Poseidon2 CUDA ABI v1 is test-profile-only: it caps a call at `2^24` rows and
+`2^31` field limbs. The production `2^27`-row LDE would require 291 GiB and
+87 GiB inputs for widths 291 and 87, plus a 4 GiB digest layer, so a
+streaming/out-of-core prover remains required.
+
+The independent `proof_stream` ABI v1 now accepts up to 64 ordered, equal-height
+physical-bit-reversed coefficient matrices, a `2^20` source height, seven added
+bits, `2^27` output rows, 4,096 total columns, and `2^31` input limbs. It emits
+monotonic power-of-two row chunks of at most `2^16` rows, without crossing a
+source-height coset block, together with exact unpadded Poseidon2 leaf digests.
+At `32,768 x 291`, `+7`, its digest-only stream phase measured 308.345 ms and
+13.60 million rows/s on an RTX 5090 while avoiding a 9.094 GiB host LDE.
+
+The worker can drain those rows into a no-overwrite sealed spill artifact whose
+ordered matrix widths and shifts, geometry, physical layout, and canonical
+little-endian limbs are BLAKE3-bound. Partial or failed artifacts are not
+published; a reader authenticates the complete file when opening it and the
+fixed-size chunks used by every later row read. This is a storage-integrity seam, not a
+consensus proof or a production prover. Plonky3 PCS consumption, FRI folding,
+Merkle construction, and opening generation are not yet fully out of core. See
 [the custom proof specification](docs/consensus/forgematrix-custom-proof.md)
 for the measured scope and remaining activation gates.
 

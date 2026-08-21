@@ -109,11 +109,26 @@ seconds on CPU (64.503 setup, 283.416 prove; 238,698-byte canonical zlib
 payload) and 76.71 seconds with CUDA DFT plus Poseidon2 (7.700 setup, 68.551
 prove; 237,292 bytes): 4.54x faster and 78% less wall time.
 
-CUDA ABI v1 remains test-profile-only. Each call is capped at `2^24` rows and
-`2^31` field limbs. A production `2^27`-row LDE at widths 291 and 87 implies
-291 GiB and 87 GiB inputs respectively, plus a 4 GiB first-digest layer. Those
-objects cannot use the current monolithic ABI; streaming/out-of-core PCS and
-Merkle construction remain required.
+The monolithic Poseidon2 CUDA ABI v1 remains test-profile-only. The independent
+`proof_stream` ABI v1 instead holds ordered source coefficients on the selected
+device and emits exact physical-bit-reversed LDE rows plus unpadded Poseidon2
+digests through a monotonic bounded cursor. Its limits are 64 equal-height
+matrices, source height `2^20`, seven added bits, `2^27` output rows, 4,096 total
+columns, `2^31` input limbs, and power-of-two chunks no larger than `2^16` rows
+that cannot cross a source-height coset block. At `32,768 x 291`, `+7`, the
+digest-only stream phase measured 308.345 ms and 13.60 million rows/s on an RTX
+5090 while avoiding a 9.094 GiB host LDE.
+
+The worker spill writer accepts each global physical row exactly once, binds
+the job plus every ordered matrix width and coset shift, aggregate geometry,
+physical layout, and canonical little-endian limbs into BLAKE3, synchronizes
+and validates the complete file, and publishes without overwrite only after
+sealing. Normal error and drop paths remove the partial artifact; abrupt process
+termination may leave an unpublished `.partial` file for operator cleanup.
+Readers authenticate the header, exact length, full checksum, and every
+fixed-size chunk used by a later row read. This protects worker storage
+integrity only. It neither
+replaces the unchanged CPU proof verifier nor makes accelerator output trusted.
 
 This is still not a production succinct solution. The full production AIR has
 1,048,576 rows and has not yet been proved end to end; its final proof size,
@@ -122,13 +137,13 @@ derives the production-shape AIR constraint count and degree over a cubic
 Goldilocks challenge field and requires at least 128 proven bits under
 Plonky3's component-security model, but this is not the missing aggregate
 union-bound report. The legacy one-block backend and the
-new custom tree AIR both require independent algebraic review. There is now a
-bounded row-at-a-time main-trace generation seam, including early sink
-failure propagation, but the current Plonky3 PCS immediately collects those
-rows and materializes the full LDE in memory. There is still no production
-out-of-core PCS/FRI prover, raw-model-byte link, consensus tag, complete
-soundness report, or audit. The aggregate remains feature-gated research
-scaffolding with no consensus or wire tag. See
+new custom tree AIR both require independent algebraic review. Bounded trace
+generation, the CUDA row stream, and sealed spill storage now exist, but the
+current Plonky3 PCS does not consume those artifacts. Full out-of-core PCS,
+FRI, Merkle-level storage/construction, and opening generation are still not
+complete. There is also no production raw-model-byte link, consensus tag,
+complete soundness report, or audit. The aggregate remains feature-gated
+research scaffolding with no consensus or wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
 
 Mainnet remains disabled until all of the following are complete:

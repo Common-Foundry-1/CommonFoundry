@@ -7,6 +7,8 @@
 //! an operating-system sandbox and does not protect against a same-user attacker
 //! replacing the executable, DLL, or their dependencies during a check/load race.
 
+pub mod spill;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};

@@ -86,13 +86,15 @@ const ACTIVATION_HIGH_WEIGHT_WIDTH: usize = 3;
 const WORD_BITS: usize = 32;
 const MESSAGE_WORDS: usize = 16;
 const CV_WORDS: usize = 8;
-const FRI_LOG_BLOWUP: usize = 7;
+pub(crate) const FRI_LOG_BLOWUP: usize = 7;
 // The smallest supported narrow trace has 2^8 rows. FRI requires the final
 // polynomial degree to remain strictly below the trace degree, so seven is the
 // largest single consensus value that is valid for every supported shape.
-const FRI_LOG_FINAL_POLY_LEN: usize = 7;
-const FRI_QUERIES: usize = 33;
-const FRI_QUERY_POW_BITS: usize = 18;
+pub(crate) const FRI_LOG_FINAL_POLY_LEN: usize = 7;
+pub(crate) const FRI_MAX_LOG_ARITY: usize = 4;
+pub(crate) const FRI_QUERIES: usize = 33;
+pub(crate) const FRI_COMMIT_POW_BITS: usize = 0;
+pub(crate) const FRI_QUERY_POW_BITS: usize = 18;
 #[cfg(feature = "gpu-proof-prover")]
 const STREAM_CHUNK_ROWS: usize = 1 << 16;
 #[cfg(feature = "gpu-proof-prover")]
@@ -2662,9 +2664,9 @@ fn fri_parameters_with(
     FriParameters {
         log_blowup,
         log_final_poly_len: FRI_LOG_FINAL_POLY_LEN,
-        max_log_arity: 4,
+        max_log_arity: FRI_MAX_LOG_ARITY,
         num_queries,
-        commit_proof_of_work_bits: 0,
+        commit_proof_of_work_bits: FRI_COMMIT_POW_BITS,
         query_proof_of_work_bits: FRI_QUERY_POW_BITS,
         mmcs,
     }

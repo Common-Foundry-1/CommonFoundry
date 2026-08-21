@@ -23,12 +23,14 @@ primitive-types.workspace = true
 p3-blake3 = { version = "=0.6.3", optional = true }
 p3-blake3-air = { version = "=0.6.3", optional = true }
 p3-air = { version = "=0.6.3", optional = true }
+p3-batch-stark = { version = "=0.6.3", optional = true }
 p3-challenger = { version = "=0.6.3", optional = true }
 p3-commit = { version = "=0.6.3", optional = true }
 p3-dft = { version = "=0.6.3", optional = true }
 p3-field = { version = "=0.6.3", optional = true }
 p3-fri = { version = "=0.6.3", optional = true }
 p3-goldilocks = { version = "=0.6.3", optional = true }
+p3-lookup = { version = "=0.6.3", optional = true }
 p3-matrix = { version = "=0.6.3", optional = true }
 p3-merkle-tree = { version = "=0.6.3", optional = true }
 p3-multilinear-util = { version = "=0.6.3", optional = true }
@@ -55,6 +57,8 @@ remainder-prototype = [
 whir-prototype = [
     "dep:bincode",
     "dep:p3-air",
+    "dep:p3-batch-stark",
+    "p3-batch-stark/parallel",
     "dep:flate2",
     "dep:p3-blake3",
     "p3-blake3/parallel",
@@ -67,6 +71,8 @@ whir-prototype = [
     "dep:p3-field",
     "dep:p3-fri",
     "dep:p3-goldilocks",
+    "dep:p3-lookup",
+    "p3-lookup/parallel",
     "dep:p3-matrix",
     "dep:p3-merkle-tree",
     "dep:p3-multilinear-util",

@@ -863,6 +863,7 @@ dependencies = [
  "hex",
  "k256",
  "p3-air",
+ "p3-batch-stark",
  "p3-blake3",
  "p3-blake3-air",
  "p3-challenger",
@@ -871,6 +872,7 @@ dependencies = [
  "p3-field",
  "p3-fri",
  "p3-goldilocks",
+ "p3-lookup",
  "p3-matrix",
  "p3-merkle-tree",
  "p3-multilinear-util",
@@ -3763,6 +3765,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "p3-batch-stark"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e73d5df7d223fa94532e1a99e6033c8fd1dc999557cdd3bd3d83afda3de1cb5"
+dependencies = [
+ "hashbrown 0.17.1",
+ "p3-air",
+ "p3-challenger",
+ "p3-commit",
+ "p3-field",
+ "p3-lookup",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-uni-stark",
+ "p3-util",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "p3-blake3"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3887,6 +3910,24 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "spin 0.12.3",
+]
+
+[[package]]
+name = "p3-lookup"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9717c274152eb8e96fee81f654aefa398710b7c52373116fb24029417130de34"
+dependencies = [
+ "hashbrown 0.17.1",
+ "num-bigint 0.5.1",
+ "p3-air",
+ "p3-field",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-uni-stark",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

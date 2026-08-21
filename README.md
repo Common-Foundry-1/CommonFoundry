@@ -181,6 +181,31 @@ CPU-verified WHIR proof while rejecting substitution, reordering, omission,
 and transcript replay. The algebraic row fold is therefore fixed; a succinct
 authenticated opening for it remains the production proof-size gate.
 
+The trace-specific parameter boundary is now executable rather than inferred.
+Goldilocks two-adicity limits the selector-first starting inverse rate to
+`2^-6`. At the required 128-bit non-conjectural unique-decoding setting, zero
+grinding needs 131 initial queries (536,576 value bytes), and even a practical
+16-bit grinding ceiling needs 115 (471,040 bytes). An otherwise empty proof can
+fit at most 63 such queries, which would require at least 67 bits of grinding.
+A CapacityBound comparison fits conservatively in 193,444 bytes with no
+grinding but relies on the pinned library's Reed-Solomon capacity/correlated-
+agreement conjecture; a JohnsonBound comparison fits in 239,616 bytes only
+with 48-bit grinding. Neither is an activation candidate. Production therefore
+still requires a non-conjectural succinct commitment rather than a parameter
+change disguised as completion.
+
+The next non-conjectural layout is now fixed in code. It keeps only the 12
+algebraic transition values in each core table (11 for initialization because
+its input is fixed), giving 47 semantic columns and 64 padded slots across all
+components. The 98 nibble witnesses per cell move into 49 active rows of a
+64-row auxiliary block with four witness columns: digit, slack digit, and two
+running accumulators. Initialization and bank auxiliary tables have exactly 25
+and 32 variables, so the largest remains within Goldilocks two-adicity. The
+canonical row generator, padding, lookup IDs, source bounds, accumulators,
+ordered core mapping, and layout digest are tested. A batch-STARK/LogUp proof
+that authenticates these rows is still required before this layout can mint a
+verified production trace.
+
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the
 network limit. Geometry-derived maxima are 154,252 bytes for WHIR and 87,556

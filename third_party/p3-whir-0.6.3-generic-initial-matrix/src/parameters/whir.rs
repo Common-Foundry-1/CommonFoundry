@@ -19,12 +19,13 @@ pub enum WhirConfigError {
     #[error(transparent)]
     FoldingFactor(#[from] FoldingFactorError),
 
-    /// The domain after the first fold exceeds the base field two-adicity.
+    /// A domain after one of the configured folds exceeds the base field
+    /// two-adicity.
     ///
     /// - Twiddles and query equality polynomials must stay in the base field.
-    /// - A larger first-round folding factor shrinks this domain.
+    /// - A larger folding factor or a lower next-round code rate shrinks it.
     #[error(
-        "folded domain 2^{log_folded_domain_size} exceeds base-field two-adicity 2^{two_adicity}; increase the first-round folding factor"
+        "folded domain 2^{log_folded_domain_size} exceeds base-field two-adicity 2^{two_adicity}; increase the folding factor or lower the next-round code rate"
     )]
     FoldedDomainExceedsTwoAdicity {
         log_folded_domain_size: usize,
@@ -379,9 +380,17 @@ where
 
             let next_folding_factor = folding_schedule[round + 1];
 
-            // Generator of the two-adic subgroup for the folded domain.
-            let folded_domain_gen =
-                F::two_adic_generator(domain_size.ilog2() as usize - folding_factor);
+            // Generator of the two-adic subgroup for the folded domain. The
+            // first-fold guard above is insufficient when an explicit or
+            // derived next-round rate keeps a later codeword larger.
+            let log_folded_domain_size = domain_size.ilog2() as usize - folding_factor;
+            if log_folded_domain_size > F::TWO_ADICITY {
+                return Err(WhirConfigError::FoldedDomainExceedsTwoAdicity {
+                    log_folded_domain_size,
+                    two_adicity: F::TWO_ADICITY,
+                });
+            }
+            let folded_domain_gen = F::two_adic_generator(log_folded_domain_size);
 
             round_parameters.push(RoundConfig {
                 pow_bits: ceil_pow_bits(pow_bits),
@@ -399,6 +408,18 @@ where
             num_variables -= next_folding_factor;
             log_inv_rate = next_rate;
             domain_size >>= rs_reduction_factor;
+        }
+
+        // `final_round_config` is infallible and derives this generator again,
+        // so reject an oversized final folded domain before constructing a
+        // configuration that would later panic.
+        let final_log_folded_domain_size =
+            domain_size.ilog2() as usize - folding_schedule[num_rounds];
+        if final_log_folded_domain_size > F::TWO_ADICITY {
+            return Err(WhirConfigError::FoldedDomainExceedsTwoAdicity {
+                log_folded_domain_size: final_log_folded_domain_size,
+                two_adicity: F::TWO_ADICITY,
+            });
         }
 
         // ---------------------------------------------------------------
@@ -641,6 +662,28 @@ mod tests {
         assert_eq!(config.security_level, 100);
         assert_eq!(config.params.pow_bits, 20);
         assert_eq!(config.soundness_type, SecurityAssumption::CapacityBound);
+    }
+
+    #[test]
+    fn later_folded_domain_exceeding_two_adicity_returns_error() {
+        let params = ProtocolParameters {
+            security_level: 100,
+            pow_bits: 20,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::ConstantFromSecondRound(4, 2),
+            soundness_type: SecurityAssumption::UniqueDecoding,
+            starting_log_inv_rate: 1,
+        };
+
+        let error = WhirConfig::<F, F, MyChallenger>::new(30, params)
+            .expect_err("a later 2^28 folded domain must not reach BabyBear's generator");
+        assert!(matches!(
+            error,
+            WhirConfigError::FoldedDomainExceedsTwoAdicity {
+                log_folded_domain_size: 28,
+                two_adicity: 27,
+            }
+        ));
     }
 
     #[test]

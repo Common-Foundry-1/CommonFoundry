@@ -25,6 +25,21 @@ pub const STRUCTURED_TRANSITION_ORACLES: usize = 110;
 pub const STRUCTURED_TRANSITION_INPUT_ORACLE: usize = 0;
 pub const STRUCTURED_TRANSITION_ACTIVATION_ORACLE: usize = 10;
 pub const STRUCTURED_TRANSITION_MAX_DEGREE: usize = 17;
+pub const STRUCTURED_TRANSITION_REGULAR_ORACLES: usize = 12;
+pub const STRUCTURED_TRANSITION_RANGE_SPEC_COUNT: usize = 8;
+pub const STRUCTURED_TRANSITION_RANGE_DIGITS_PER_CELL: usize = 49;
+pub const STRUCTURED_TRANSITION_RANGE_ORACLES: [usize; STRUCTURED_TRANSITION_RANGE_SPEC_COUNT] = [
+    ENCODED,
+    SQUARE_QUOTIENT,
+    SQUARE_REMAINDER,
+    CUBE_QUOTIENT,
+    CUBE_REMAINDER,
+    OUTPUT_QUOTIENT,
+    OUTPUT_REMAINDER,
+    SHIFTED_ACCUMULATOR,
+];
+pub const STRUCTURED_TRANSITION_RANGE_DIGITS: [usize; STRUCTURED_TRANSITION_RANGE_SPEC_COUNT] =
+    [7, 7, 7, 7, 7, 5, 2, 7];
 pub const MAX_STRUCTURED_TRANSITION_ELEMENTS: usize = 1 << 20;
 pub const MAX_STRUCTURED_TRANSITION_PROOF_BYTES: usize = 256 * 1024;
 
@@ -38,7 +53,6 @@ const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/STRUCTURED-TRANSITION/V1";
 const OUTPUT_MODULUS: u64 = 251;
 const MAX_OUTPUT_QUOTIENT: u64 = 534_731;
 const OUTPUT_CENTER: i64 = 125;
-const REGULAR_ORACLES: usize = 12;
 const MAX_SUMCHECK_ROUNDS: usize = 64;
 
 const ACCUMULATOR: usize = STRUCTURED_TRANSITION_INPUT_ORACLE;
@@ -705,56 +719,41 @@ pub fn verify_structured_transition_sumcheck(
     })
 }
 
-#[derive(Clone, Copy)]
-struct RangeSpec {
-    oracle: usize,
-    maximum: u64,
-    digits: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredTransitionRangeSpec {
+    pub oracle: usize,
+    pub maximum: u64,
+    pub digits: usize,
 }
 
-fn range_specs(statement: StructuredTransitionStatement) -> [RangeSpec; 8] {
-    [
-        RangeSpec {
-            oracle: ENCODED,
-            maximum: V2_TRANSITION_MODULUS as u64 - 1,
-            digits: 7,
-        },
-        RangeSpec {
-            oracle: SQUARE_QUOTIENT,
-            maximum: V2_TRANSITION_MODULUS as u64 - 1,
-            digits: 7,
-        },
-        RangeSpec {
-            oracle: SQUARE_REMAINDER,
-            maximum: V2_TRANSITION_MODULUS as u64 - 1,
-            digits: 7,
-        },
-        RangeSpec {
-            oracle: CUBE_QUOTIENT,
-            maximum: V2_TRANSITION_MODULUS as u64 - 1,
-            digits: 7,
-        },
-        RangeSpec {
-            oracle: CUBE_REMAINDER,
-            maximum: V2_TRANSITION_MODULUS as u64 - 1,
-            digits: 7,
-        },
-        RangeSpec {
-            oracle: OUTPUT_QUOTIENT,
-            maximum: MAX_OUTPUT_QUOTIENT,
-            digits: 5,
-        },
-        RangeSpec {
-            oracle: OUTPUT_REMAINDER,
-            maximum: 250,
-            digits: 2,
-        },
-        RangeSpec {
-            oracle: SHIFTED_ACCUMULATOR,
-            maximum: statement.max_abs_accumulator * 2,
-            digits: 7,
-        },
-    ]
+pub fn structured_transition_range_specs(
+    statement: StructuredTransitionStatement,
+) -> Result<
+    [StructuredTransitionRangeSpec; STRUCTURED_TRANSITION_RANGE_SPEC_COUNT],
+    StructuredTransitionError,
+> {
+    statement.validate_verifier_shape()?;
+    Ok(range_specs(statement))
+}
+
+fn range_specs(
+    statement: StructuredTransitionStatement,
+) -> [StructuredTransitionRangeSpec; STRUCTURED_TRANSITION_RANGE_SPEC_COUNT] {
+    let maxima = [
+        V2_TRANSITION_MODULUS as u64 - 1,
+        V2_TRANSITION_MODULUS as u64 - 1,
+        V2_TRANSITION_MODULUS as u64 - 1,
+        V2_TRANSITION_MODULUS as u64 - 1,
+        V2_TRANSITION_MODULUS as u64 - 1,
+        MAX_OUTPUT_QUOTIENT,
+        250,
+        statement.max_abs_accumulator * 2,
+    ];
+    std::array::from_fn(|index| StructuredTransitionRangeSpec {
+        oracle: STRUCTURED_TRANSITION_RANGE_ORACLES[index],
+        maximum: maxima[index],
+        digits: STRUCTURED_TRANSITION_RANGE_DIGITS[index],
+    })
 }
 
 fn build_oracles(
@@ -977,7 +976,7 @@ fn mixed_constraint(
             .sub(ExtensionField::from_u64(statement.max_abs_accumulator)),
     );
 
-    let mut digit_cursor = REGULAR_ORACLES;
+    let mut digit_cursor = STRUCTURED_TRANSITION_REGULAR_ORACLES;
     for spec in range_specs(statement) {
         let mut reconstructed = ExtensionField::ZERO;
         let mut reconstructed_slack = ExtensionField::ZERO;
@@ -995,7 +994,7 @@ fn mixed_constraint(
                 .sub(ExtensionField::from_u64(spec.maximum)),
         );
     }
-    for digit in &values[REGULAR_ORACLES..] {
+    for digit in &values[STRUCTURED_TRANSITION_REGULAR_ORACLES..] {
         let membership = (0..16).fold(ExtensionField::ONE, |product, allowed| {
             product.mul(digit.sub(ExtensionField::from_u64(allowed)))
         });
@@ -1552,6 +1551,20 @@ mod tests {
         let (statement, mask, witness) = fixture();
         let oracles = build_oracles(statement, &witness).unwrap();
         assert_eq!(oracles.len(), STRUCTURED_TRANSITION_ORACLES);
+        assert_eq!(STRUCTURED_TRANSITION_REGULAR_ORACLES, 12);
+        assert_eq!(STRUCTURED_TRANSITION_RANGE_SPEC_COUNT, 8);
+        assert_eq!(STRUCTURED_TRANSITION_RANGE_DIGITS_PER_CELL, 49);
+        assert_eq!(
+            STRUCTURED_TRANSITION_RANGE_ORACLES,
+            [2, 3, 4, 5, 6, 7, 8, 11]
+        );
+        assert_eq!(STRUCTURED_TRANSITION_RANGE_DIGITS, [7, 7, 7, 7, 7, 5, 2, 7]);
+        assert_eq!(
+            structured_transition_range_specs(statement)
+                .unwrap()
+                .map(|spec| spec.digits),
+            STRUCTURED_TRANSITION_RANGE_DIGITS
+        );
         assert_eq!(STRUCTURED_TRANSITION_CONSTRAINTS, 121);
         assert_eq!(statement.sumcheck_error_numerator().unwrap(), 85);
         for (index, expected) in witness.masks.iter().copied().enumerate() {

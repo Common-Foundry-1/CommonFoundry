@@ -9,7 +9,8 @@
 //! therefore fails closed before activation.
 
 use blake3::Hasher as Blake3Hasher;
-use p3_field::PrimeCharacteristicRing;
+use p3_field::{PrimeCharacteristicRing, TwoAdicField};
+use p3_whir::parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig};
 use thiserror::Error;
 
 use super::{
@@ -50,6 +51,27 @@ pub const PRODUCTION_TRACE_BATCH_PADDED_COLUMNS: usize =
     1 << PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES;
 pub const PRODUCTION_TRACE_BATCH_PADDING_COLUMNS: usize =
     PRODUCTION_TRACE_BATCH_PADDED_COLUMNS - PRODUCTION_TRACE_SEMANTIC_COLUMNS;
+pub const PRODUCTION_TRACE_COMPACT_LAYOUT_VERSION: u32 = 1;
+pub const PRODUCTION_TRACE_CORE_INITIALIZATION_COLUMNS: usize =
+    crate::STRUCTURED_TRANSITION_REGULAR_ORACLES - 1;
+pub const PRODUCTION_TRACE_CORE_BANK_COLUMNS: usize = crate::STRUCTURED_TRANSITION_REGULAR_ORACLES;
+pub const PRODUCTION_TRACE_CORE_SEMANTIC_COLUMNS: usize =
+    PRODUCTION_TRACE_CORE_INITIALIZATION_COLUMNS
+        + PRODUCTION_V2_BANKS as usize * PRODUCTION_TRACE_CORE_BANK_COLUMNS;
+pub const PRODUCTION_TRACE_CORE_SELECTOR_VARIABLES: usize = 6;
+pub const PRODUCTION_TRACE_CORE_PADDED_COLUMNS: usize =
+    1 << PRODUCTION_TRACE_CORE_SELECTOR_VARIABLES;
+pub const PRODUCTION_TRACE_RANGE_ACTIVE_ROWS_PER_CELL: usize =
+    crate::STRUCTURED_TRANSITION_RANGE_DIGITS_PER_CELL;
+pub const PRODUCTION_TRACE_RANGE_ROWS_PER_CELL: usize = 64;
+pub const PRODUCTION_TRACE_RANGE_ROW_VARIABLES: usize = 6;
+pub const PRODUCTION_TRACE_RANGE_AUXILIARY_COLUMNS: usize = 4;
+pub const PRODUCTION_TRACE_INITIALIZATION_RANGE_VARIABLES: usize =
+    PRODUCTION_TRACE_INITIALIZATION_VARIABLES + PRODUCTION_TRACE_RANGE_ROW_VARIABLES;
+pub const PRODUCTION_TRACE_BANK_RANGE_VARIABLES: usize =
+    PRODUCTION_TRACE_BANK_VARIABLES + PRODUCTION_TRACE_RANGE_ROW_VARIABLES;
+pub const PRODUCTION_TRACE_PRACTICAL_MAX_GRINDING_BITS: usize = 16;
+pub const PRODUCTION_TRACE_JOHNSON_REFERENCE_GRINDING_BITS: usize = 48;
 pub const PRODUCTION_TRACE_TERMINAL_SECTION: usize =
     1 + (PRODUCTION_V2_BANKS as usize - 1) * PRODUCTION_TRACE_SECTIONS_PER_BANK;
 pub const PRODUCTION_TRACE_TERMINAL_COLUMN: usize = crate::STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
@@ -74,6 +96,7 @@ const PROOF_BINDING_SUITE_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-PROOF-SUIT
 const BATCHED_MODEL_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-BATCHED-MODEL/V1";
 const PROOF_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-PROOF-COMMITMENT/V1";
 const TRACE_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-LAYOUT/V1";
+const TRACE_COMPACT_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-COMPACT-LAYOUT/V1";
 const TRACE_PADDING_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-PADDING/V1";
 const TRACE_COLUMN_ALIAS_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-COLUMN/V1";
 const TRACE_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-ROOT/V1";
@@ -189,6 +212,76 @@ pub struct ProductionTraceBatchWireBudgetV1 {
     pub available_native_bytes: usize,
 }
 
+/// Exact comparison between non-conjectural and assumption-dependent WHIR
+/// schedules for the unified 35-variable production trace.
+///
+/// This is a sizing gate, not an activation configuration. Production keeps
+/// the non-conjectural unique-decoding policy. The CapacityBound comparison is
+/// retained only to show that the remaining obstacle is soundness rather than
+/// serialization; that mode assumes Reed-Solomon capacity decoding and mutual
+/// correlated agreement. The JohnsonBound comparison fits only by charging an
+/// operationally prohibitive transcript-grinding budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionTraceWhirAssumptionBudgetV1 {
+    pub maximum_starting_log_inv_rate: usize,
+    pub maximum_initial_queries_if_proof_were_otherwise_empty: usize,
+    pub unique_decoding_zero_grinding_queries: usize,
+    pub unique_decoding_zero_grinding_initial_value_bytes: usize,
+    pub unique_decoding_practical_grinding_bits: usize,
+    pub unique_decoding_practical_queries: usize,
+    pub unique_decoding_practical_initial_value_bytes: usize,
+    pub minimum_unique_decoding_grinding_bits_for_initial_values: usize,
+    pub capacity_bound_zero_grinding_conservative_bytes: usize,
+    pub capacity_bound_zero_grinding_derived_grinding_bits: usize,
+    pub johnson_bound_configured_grinding_bits: usize,
+    pub johnson_bound_derived_grinding_bits: usize,
+    pub johnson_bound_conservative_bytes: usize,
+    pub available_native_bytes: usize,
+}
+
+/// Exact row-transposed range layout for the production transition argument.
+///
+/// The original trace stores 98 range digits beside 12 algebraic values. The
+/// compact layout keeps only those 12 values in the core trace and moves each
+/// value/slack digit pair into one of 64 deterministic auxiliary rows. Four
+/// auxiliary witness columns are sufficient for the two digits and their two
+/// running accumulators; selectors, radix, source oracle, and lookup ID are
+/// verifier-fixed preprocessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTraceCompactLayoutV1 {
+    pub version: u32,
+    pub core_initialization_columns: usize,
+    pub core_bank_columns: usize,
+    pub core_semantic_columns: usize,
+    pub core_padded_columns: usize,
+    pub core_selector_variables: usize,
+    pub range_spec_count: usize,
+    pub range_active_rows_per_cell: usize,
+    pub range_rows_per_cell: usize,
+    pub range_row_variables: usize,
+    pub range_auxiliary_columns: usize,
+    pub initialization_range_variables: usize,
+    pub bank_range_variables: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTraceRangeRowV1 {
+    pub active: bool,
+    pub cell_index: u64,
+    pub lookup_id: u64,
+    pub spec_index: u8,
+    pub digit_index: u8,
+    pub source_oracle: u16,
+    pub source_maximum: u64,
+    pub radix: u64,
+    pub first_digit: bool,
+    pub last_digit: bool,
+    pub digit: u8,
+    pub slack_digit: u8,
+    pub value_accumulator: u64,
+    pub slack_accumulator: u64,
+}
+
 impl ProductionTraceBatchWireBudgetV1 {
     /// A direct wide-row opening fails even if canonical padding is omitted
     /// and all Merkle paths, roots, headers, and sumcheck messages are free.
@@ -201,6 +294,212 @@ impl ProductionTraceBatchWireBudgetV1 {
     pub const fn independent_sections_cannot_fit(&self) -> bool {
         self.independent_section_floor_bytes > self.available_native_bytes
     }
+}
+
+impl ProductionTraceWhirAssumptionBudgetV1 {
+    pub const fn unique_decoding_zero_grinding_cannot_fit(&self) -> bool {
+        self.unique_decoding_zero_grinding_initial_value_bytes > self.available_native_bytes
+    }
+
+    pub const fn unique_decoding_practical_cannot_fit(&self) -> bool {
+        self.unique_decoding_practical_initial_value_bytes > self.available_native_bytes
+    }
+
+    /// This fit is not an activation option because CapacityBound is
+    /// conjectural in the pinned WHIR soundness model.
+    pub const fn capacity_bound_reference_fits(&self) -> bool {
+        self.capacity_bound_zero_grinding_conservative_bytes <= self.available_native_bytes
+    }
+
+    /// This fit is not operationally viable because its grinding requirement
+    /// is exponential in the derived bit count.
+    pub const fn johnson_bound_reference_fits(&self) -> bool {
+        self.johnson_bound_conservative_bytes <= self.available_native_bytes
+    }
+}
+
+impl ProductionTraceCompactLayoutV1 {
+    pub const fn fits_goldilocks_two_adicity(&self) -> bool {
+        self.bank_range_variables <= 32
+    }
+}
+
+pub const fn production_trace_compact_layout_v1() -> ProductionTraceCompactLayoutV1 {
+    ProductionTraceCompactLayoutV1 {
+        version: PRODUCTION_TRACE_COMPACT_LAYOUT_VERSION,
+        core_initialization_columns: PRODUCTION_TRACE_CORE_INITIALIZATION_COLUMNS,
+        core_bank_columns: PRODUCTION_TRACE_CORE_BANK_COLUMNS,
+        core_semantic_columns: PRODUCTION_TRACE_CORE_SEMANTIC_COLUMNS,
+        core_padded_columns: PRODUCTION_TRACE_CORE_PADDED_COLUMNS,
+        core_selector_variables: PRODUCTION_TRACE_CORE_SELECTOR_VARIABLES,
+        range_spec_count: crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT,
+        range_active_rows_per_cell: PRODUCTION_TRACE_RANGE_ACTIVE_ROWS_PER_CELL,
+        range_rows_per_cell: PRODUCTION_TRACE_RANGE_ROWS_PER_CELL,
+        range_row_variables: PRODUCTION_TRACE_RANGE_ROW_VARIABLES,
+        range_auxiliary_columns: PRODUCTION_TRACE_RANGE_AUXILIARY_COLUMNS,
+        initialization_range_variables: PRODUCTION_TRACE_INITIALIZATION_RANGE_VARIABLES,
+        bank_range_variables: PRODUCTION_TRACE_BANK_RANGE_VARIABLES,
+    }
+}
+
+/// Ordered subset retained in the compact core trace.
+///
+/// Initialization still omits its fixed input oracle. Range-digit columns are
+/// omitted from every component because the auxiliary lookup table reconstructs
+/// and range-checks the same eight source values and their slacks.
+pub fn production_trace_core_columns_v1()
+-> Result<Vec<ProductionTraceColumnV1>, ProductionWhirCandidateError> {
+    let mut columns = Vec::with_capacity(PRODUCTION_TRACE_CORE_SEMANTIC_COLUMNS);
+    for oracle in 1..crate::STRUCTURED_TRANSITION_REGULAR_ORACLES {
+        columns.push(production_trace_initialization_column_v1(oracle)?);
+    }
+    for bank in 0..PRODUCTION_V2_BANKS as usize {
+        for oracle in 0..crate::STRUCTURED_TRANSITION_REGULAR_ORACLES {
+            columns.push(production_trace_bank_column_v1(bank, oracle)?);
+        }
+    }
+    debug_assert_eq!(columns.len(), PRODUCTION_TRACE_CORE_SEMANTIC_COLUMNS);
+    Ok(columns)
+}
+
+pub fn production_trace_compact_layout_digest_v1() -> Result<[u8; 32], ProductionWhirCandidateError>
+{
+    let layout = production_trace_compact_layout_v1();
+    let mut hasher = Blake3Hasher::new_derive_key(TRACE_COMPACT_LAYOUT_DOMAIN);
+    hasher.update(&layout.version.to_le_bytes());
+    hasher.update(&production_trace_layout_digest_v1());
+    for value in [
+        layout.core_initialization_columns,
+        layout.core_bank_columns,
+        layout.core_semantic_columns,
+        layout.core_padded_columns,
+        layout.core_selector_variables,
+        layout.range_spec_count,
+        layout.range_active_rows_per_cell,
+        layout.range_rows_per_cell,
+        layout.range_row_variables,
+        layout.range_auxiliary_columns,
+        layout.initialization_range_variables,
+        layout.bank_range_variables,
+    ] {
+        hasher.update(&(value as u64).to_le_bytes());
+    }
+    hasher.update(b"digit,slack-digit,value-accumulator,slack-accumulator");
+    let core_columns = production_trace_core_columns_v1()?;
+    hasher.update(&(core_columns.len() as u32).to_le_bytes());
+    for column in core_columns {
+        hasher.update(&column.semantic_column.to_le_bytes());
+        hasher.update(&column.section_index.to_le_bytes());
+        hasher.update(&column.section_column.to_le_bytes());
+        hasher.update(&column.column_variables.to_le_bytes());
+    }
+    for (oracle, digits) in crate::STRUCTURED_TRANSITION_RANGE_ORACLES
+        .into_iter()
+        .zip(crate::STRUCTURED_TRANSITION_RANGE_DIGITS)
+    {
+        hasher.update(&(oracle as u32).to_le_bytes());
+        hasher.update(&(digits as u32).to_le_bytes());
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Materialize one deterministic range-auxiliary witness row.
+///
+/// Each transition cell owns 64 consecutive rows. The first 49 rows enumerate
+/// the exact range specifications and base-16 digits in canonical order; the
+/// remaining 15 rows are canonical zero padding. A future batch-STARK uses the
+/// returned accumulators for local recurrence constraints and a LogUp
+/// interaction keyed by `lookup_id` to bind the final row back to its core
+/// source value.
+pub fn production_trace_range_row_v1(
+    statement: crate::StructuredTransitionStatement,
+    regular_values: &[u64],
+    auxiliary_row: u64,
+) -> Result<ProductionTraceRangeRowV1, ProductionWhirCandidateError> {
+    if regular_values.len() != crate::STRUCTURED_TRANSITION_REGULAR_ORACLES {
+        return Err(ProductionWhirCandidateError::InvalidRangeWitness);
+    }
+    let specs = crate::structured_transition_range_specs(statement)
+        .map_err(|_| ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let cells = statement
+        .layers
+        .checked_mul(statement.rows)
+        .and_then(|value| value.checked_mul(statement.cols))
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let rows_per_cell = PRODUCTION_TRACE_RANGE_ROWS_PER_CELL as u64;
+    let total_rows = cells
+        .checked_mul(rows_per_cell)
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    if auxiliary_row >= total_rows {
+        return Err(ProductionWhirCandidateError::InvalidRangeWitness);
+    }
+    let cell_index = auxiliary_row / rows_per_cell;
+    let mut slot = (auxiliary_row % rows_per_cell) as usize;
+    if slot >= PRODUCTION_TRACE_RANGE_ACTIVE_ROWS_PER_CELL {
+        return Ok(ProductionTraceRangeRowV1 {
+            active: false,
+            cell_index,
+            lookup_id: 0,
+            spec_index: 0,
+            digit_index: 0,
+            source_oracle: 0,
+            source_maximum: 0,
+            radix: 0,
+            first_digit: false,
+            last_digit: false,
+            digit: 0,
+            slack_digit: 0,
+            value_accumulator: 0,
+            slack_accumulator: 0,
+        });
+    }
+
+    let mut selected = None;
+    for (spec_index, spec) in specs.into_iter().enumerate() {
+        if slot < spec.digits {
+            selected = Some((spec_index, slot, spec));
+            break;
+        }
+        slot -= spec.digits;
+    }
+    let (spec_index, digit_index, spec) =
+        selected.ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let value = *regular_values
+        .get(spec.oracle)
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let slack = spec
+        .maximum
+        .checked_sub(value)
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let digit_shift = u32::try_from(digit_index * 4)
+        .map_err(|_| ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let prefix_bits = digit_shift + 4;
+    let prefix_mask = 1_u64
+        .checked_shl(prefix_bits)
+        .and_then(|bound| bound.checked_sub(1))
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+    let lookup_id = cell_index
+        .checked_mul(crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT as u64)
+        .and_then(|value| value.checked_add(spec_index as u64 + 1))
+        .ok_or(ProductionWhirCandidateError::InvalidRangeWitness)?;
+
+    Ok(ProductionTraceRangeRowV1 {
+        active: true,
+        cell_index,
+        lookup_id,
+        spec_index: spec_index as u8,
+        digit_index: digit_index as u8,
+        source_oracle: spec.oracle as u16,
+        source_maximum: spec.maximum,
+        radix: 1_u64 << digit_shift,
+        first_digit: digit_index == 0,
+        last_digit: digit_index + 1 == spec.digits,
+        digit: ((value >> digit_shift) & 0xf) as u8,
+        slack_digit: ((slack >> digit_shift) & 0xf) as u8,
+        value_accumulator: value & prefix_mask,
+        slack_accumulator: slack & prefix_mask,
+    })
 }
 
 /// Trusted identity for one batched commitment to the ordered base-input and
@@ -362,6 +661,164 @@ pub fn production_trace_batch_wire_budget_v1()
         local_first_semantic_value_bytes,
         local_first_padded_value_bytes,
         independent_section_floor_bytes,
+        available_native_bytes: PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES,
+    })
+}
+
+fn production_trace_reference_whir_config_v1(
+    soundness_type: SecurityAssumption,
+    pow_bits: usize,
+    later_folding: usize,
+    rate_cap: usize,
+) -> Result<WhirConfig<EF, F, Challenger>, ProductionWhirCandidateError> {
+    let total_variables = PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES
+        .checked_add(PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let maximum_starting_log_inv_rate = F::TWO_ADICITY
+        .checked_sub(PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let folding_factor = FoldingFactor::ConstantFromSecondRound(
+        PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES,
+        later_folding,
+    );
+    let schedule = folding_factor
+        .compute_folding_schedule(total_variables)
+        .map_err(|_| ProductionWhirCandidateError::Configuration)?;
+    let mut folded_variables = 0_usize;
+    let round_log_inv_rates = schedule
+        .iter()
+        .take(schedule.len() - 1)
+        .map(|folding| {
+            folded_variables += folding;
+            let remaining_variables = total_variables - folded_variables;
+            F::TWO_ADICITY
+                .checked_sub(remaining_variables)
+                .map(|maximum_rate| rate_cap.min(maximum_rate))
+                .ok_or(ProductionWhirCandidateError::Configuration)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let parameters = ProtocolParameters {
+        starting_log_inv_rate: maximum_starting_log_inv_rate,
+        round_log_inv_rates,
+        folding_factor,
+        soundness_type,
+        security_level: EXPLICIT_WHIR_SECURITY_BITS,
+        pow_bits,
+    };
+    let config = WhirConfig::<EF, F, Challenger>::new(total_variables, parameters)
+        .map_err(|_| ProductionWhirCandidateError::Configuration)?;
+    if !config.check_pow_bits() {
+        return Err(ProductionWhirCandidateError::Configuration);
+    }
+    Ok(config)
+}
+
+fn maximum_derived_whir_grinding_bits(config: &WhirConfig<EF, F, Challenger>) -> usize {
+    config
+        .round_parameters
+        .iter()
+        .flat_map(|round| [round.pow_bits, round.folding_pow_bits])
+        .chain([
+            config.starting_folding_pow_bits,
+            config.final_pow_bits,
+            config.final_folding_pow_bits,
+        ])
+        .max()
+        .unwrap_or(0)
+}
+
+/// Derive the exact 128-bit sizing boundary for selector-first trace WHIR.
+///
+/// The unique-decoding lower bound counts only the 512 base-field values in
+/// each initial opening. Roots, paths, sumchecks, and framing are deliberately
+/// free, so exceeding the payload here proves that the complete proof cannot
+/// fit. CapacityBound and JohnsonBound are comparison schedules only and must
+/// not be promoted to consensus by callers.
+pub fn production_trace_whir_assumption_budget_v1()
+-> Result<ProductionTraceWhirAssumptionBudgetV1, ProductionWhirCandidateError> {
+    let maximum_starting_log_inv_rate = F::TWO_ADICITY
+        .checked_sub(PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let initial_query_bytes = PRODUCTION_TRACE_BATCH_PADDED_COLUMNS
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let maximum_initial_queries_if_proof_were_otherwise_empty =
+        PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES / initial_query_bytes;
+
+    let unique_zero =
+        production_trace_reference_whir_config_v1(SecurityAssumption::UniqueDecoding, 0, 4, 5)?;
+    let unique_practical = production_trace_reference_whir_config_v1(
+        SecurityAssumption::UniqueDecoding,
+        PRODUCTION_TRACE_PRACTICAL_MAX_GRINDING_BITS,
+        4,
+        5,
+    )?;
+    let first_queries = |config: &WhirConfig<EF, F, Challenger>| {
+        config
+            .round_parameters
+            .first()
+            .map_or(config.final_queries, |round| round.num_queries)
+    };
+    let unique_decoding_zero_grinding_queries = first_queries(&unique_zero);
+    let unique_decoding_practical_queries = first_queries(&unique_practical);
+    let unique_decoding_zero_grinding_initial_value_bytes = unique_decoding_zero_grinding_queries
+        .checked_mul(initial_query_bytes)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let unique_decoding_practical_initial_value_bytes = unique_decoding_practical_queries
+        .checked_mul(initial_query_bytes)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let minimum_unique_decoding_grinding_bits_for_initial_values = (0
+        ..=EXPLICIT_WHIR_SECURITY_BITS)
+        .find(|pow_bits| {
+            production_trace_reference_whir_config_v1(
+                SecurityAssumption::UniqueDecoding,
+                *pow_bits,
+                4,
+                5,
+            )
+            .is_ok_and(|config| {
+                first_queries(&config) <= maximum_initial_queries_if_proof_were_otherwise_empty
+            })
+        })
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+
+    let capacity =
+        production_trace_reference_whir_config_v1(SecurityAssumption::CapacityBound, 0, 4, 13)?;
+    let capacity_geometry = native_codec::proof_geometry_with_profile(
+        &capacity,
+        NativeProofCodecProfile::new(b"CMFDTSB1", 1, 1, 35, usize::MAX),
+    )
+    .map_err(|_| ProductionWhirCandidateError::Configuration)?;
+
+    let johnson = production_trace_reference_whir_config_v1(
+        SecurityAssumption::JohnsonBound,
+        PRODUCTION_TRACE_JOHNSON_REFERENCE_GRINDING_BITS,
+        4,
+        21,
+    )?;
+    let johnson_geometry = native_codec::proof_geometry_with_profile(
+        &johnson,
+        NativeProofCodecProfile::new(b"CMFDTSB1", 1, 1, 35, usize::MAX),
+    )
+    .map_err(|_| ProductionWhirCandidateError::Configuration)?;
+
+    Ok(ProductionTraceWhirAssumptionBudgetV1 {
+        maximum_starting_log_inv_rate,
+        maximum_initial_queries_if_proof_were_otherwise_empty,
+        unique_decoding_zero_grinding_queries,
+        unique_decoding_zero_grinding_initial_value_bytes,
+        unique_decoding_practical_grinding_bits: PRODUCTION_TRACE_PRACTICAL_MAX_GRINDING_BITS,
+        unique_decoding_practical_queries,
+        unique_decoding_practical_initial_value_bytes,
+        minimum_unique_decoding_grinding_bits_for_initial_values,
+        capacity_bound_zero_grinding_conservative_bytes: capacity_geometry
+            .conservative_upper_bound_bytes,
+        capacity_bound_zero_grinding_derived_grinding_bits: maximum_derived_whir_grinding_bits(
+            &capacity,
+        ),
+        johnson_bound_configured_grinding_bits: PRODUCTION_TRACE_JOHNSON_REFERENCE_GRINDING_BITS,
+        johnson_bound_derived_grinding_bits: maximum_derived_whir_grinding_bits(&johnson),
+        johnson_bound_conservative_bytes: johnson_geometry.conservative_upper_bound_bytes,
         available_native_bytes: PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES,
     })
 }
@@ -877,6 +1334,8 @@ pub enum ProductionWhirCandidateError {
     InvalidTraceColumn,
     #[error("production trace row or its canonical zero padding is invalid")]
     InvalidTraceRow,
+    #[error("production range-auxiliary row or source value is invalid")]
+    InvalidRangeWitness,
     #[error("production component commitments do not match the canonical trace section aliases")]
     TraceCommitmentMismatch,
     #[error("verified production trace belongs to a different model or block challenge")]
@@ -2193,6 +2652,111 @@ mod tests {
     }
 
     #[test]
+    fn compact_trace_transposes_range_digits_into_canonical_rows() {
+        let layout = production_trace_compact_layout_v1();
+        assert_eq!(layout.version, 1);
+        assert_eq!(layout.core_initialization_columns, 11);
+        assert_eq!(layout.core_bank_columns, 12);
+        assert_eq!(layout.core_semantic_columns, 47);
+        assert_eq!(layout.core_padded_columns, 64);
+        assert_eq!(layout.core_selector_variables, 6);
+        assert_eq!(layout.range_spec_count, 8);
+        assert_eq!(layout.range_active_rows_per_cell, 49);
+        assert_eq!(layout.range_rows_per_cell, 64);
+        assert_eq!(layout.range_row_variables, 6);
+        assert_eq!(layout.range_auxiliary_columns, 4);
+        assert_eq!(layout.initialization_range_variables, 25);
+        assert_eq!(layout.bank_range_variables, 32);
+        assert!(layout.fits_goldilocks_two_adicity());
+        assert_eq!(
+            hex::encode(production_trace_compact_layout_digest_v1().unwrap()),
+            "6c7ccc9e63cae28907ae173372ddf33a3526f2ea2cc46b514510e4b330082769"
+        );
+
+        let columns = production_trace_core_columns_v1().unwrap();
+        assert_eq!(columns.len(), 47);
+        assert_eq!(
+            columns[0],
+            production_trace_initialization_column_v1(1).unwrap()
+        );
+        assert_eq!(
+            columns[10],
+            production_trace_initialization_column_v1(11).unwrap()
+        );
+        assert_eq!(columns[11], production_trace_bank_column_v1(0, 0).unwrap());
+        assert_eq!(columns[46], production_trace_bank_column_v1(2, 11).unwrap());
+        assert_eq!(columns[45], production_trace_terminal_column_v1());
+
+        let statement = crate::StructuredTransitionStatement {
+            layers: 1,
+            rows: 2,
+            cols: 4,
+            max_abs_accumulator: 1_000,
+            max_mask: 100,
+        };
+        let specs = crate::structured_transition_range_specs(statement).unwrap();
+        assert_eq!(specs.map(|spec| spec.digits), [7, 7, 7, 7, 7, 5, 2, 7]);
+        let mut values = [0_u64; crate::STRUCTURED_TRANSITION_REGULAR_ORACLES];
+        for (index, spec) in specs.into_iter().enumerate() {
+            values[spec.oracle] = (0x12_345 + index as u64 * 0x111).min(spec.maximum);
+        }
+
+        let first = production_trace_range_row_v1(statement, &values, 0).unwrap();
+        assert!(first.active);
+        assert_eq!(first.cell_index, 0);
+        assert_eq!(first.lookup_id, 1);
+        assert_eq!(first.spec_index, 0);
+        assert_eq!(first.digit_index, 0);
+        assert!(first.first_digit);
+        assert!(!first.last_digit);
+        assert_eq!(first.radix, 1);
+        assert_eq!(
+            u64::from(first.digit),
+            values[first.source_oracle as usize] & 0xf
+        );
+
+        let first_spec_end = production_trace_range_row_v1(statement, &values, 6).unwrap();
+        assert!(first_spec_end.last_digit);
+        assert_eq!(
+            first_spec_end.value_accumulator,
+            values[first_spec_end.source_oracle as usize]
+        );
+        assert_eq!(
+            first_spec_end.slack_accumulator,
+            first_spec_end.source_maximum - values[first_spec_end.source_oracle as usize]
+        );
+
+        let final_active = production_trace_range_row_v1(statement, &values, 48).unwrap();
+        assert!(final_active.active);
+        assert_eq!(final_active.spec_index, 7);
+        assert_eq!(final_active.digit_index, 6);
+        assert!(final_active.last_digit);
+        let padding = production_trace_range_row_v1(statement, &values, 49).unwrap();
+        assert!(!padding.active);
+        assert_eq!(padding.cell_index, 0);
+        assert_eq!(padding.lookup_id, 0);
+        assert_eq!(padding.value_accumulator, 0);
+        let next_cell = production_trace_range_row_v1(statement, &values, 64).unwrap();
+        assert_eq!(next_cell.cell_index, 1);
+        assert_eq!(next_cell.lookup_id, 9);
+
+        assert_eq!(
+            production_trace_range_row_v1(statement, &values[..11], 0),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+        assert_eq!(
+            production_trace_range_row_v1(statement, &values, 8 * 64),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+        let mut oversized = values;
+        oversized[specs[0].oracle] = specs[0].maximum + 1;
+        assert_eq!(
+            production_trace_range_row_v1(statement, &oversized, 0),
+            Err(ProductionWhirCandidateError::InvalidRangeWitness)
+        );
+    }
+
+    #[test]
     fn production_trace_batch_budget_rejects_both_direct_layouts() {
         let budget = production_trace_batch_wire_budget_v1().unwrap();
         assert_eq!(budget.selector_variables, 9);
@@ -2215,6 +2779,68 @@ mod tests {
         assert_eq!(budget.available_native_bytes, 262_128);
         assert!(budget.direct_wide_row_cannot_fit());
         assert!(budget.independent_sections_cannot_fit());
+    }
+
+    #[test]
+    fn production_trace_whir_budget_rejects_conjectures_and_impractical_grinding() {
+        let budget = production_trace_whir_assumption_budget_v1().unwrap();
+        assert_eq!(budget.maximum_starting_log_inv_rate, 6);
+        assert_eq!(
+            budget.maximum_initial_queries_if_proof_were_otherwise_empty,
+            63
+        );
+        assert_eq!(budget.unique_decoding_zero_grinding_queries, 131);
+        assert_eq!(
+            budget.unique_decoding_zero_grinding_initial_value_bytes,
+            536_576
+        );
+        assert_eq!(budget.unique_decoding_practical_grinding_bits, 16);
+        assert_eq!(budget.unique_decoding_practical_queries, 115);
+        assert_eq!(
+            budget.unique_decoding_practical_initial_value_bytes,
+            471_040
+        );
+        assert_eq!(
+            budget.minimum_unique_decoding_grinding_bits_for_initial_values,
+            67
+        );
+        assert_eq!(
+            budget.capacity_bound_zero_grinding_conservative_bytes,
+            193_444
+        );
+        assert_eq!(budget.capacity_bound_zero_grinding_derived_grinding_bits, 0);
+        assert_eq!(budget.johnson_bound_configured_grinding_bits, 48);
+        assert_eq!(budget.johnson_bound_derived_grinding_bits, 48);
+        assert_eq!(budget.johnson_bound_conservative_bytes, 239_616);
+        assert_eq!(budget.available_native_bytes, 262_128);
+        assert!(budget.unique_decoding_zero_grinding_cannot_fit());
+        assert!(budget.unique_decoding_practical_cannot_fit());
+        assert!(budget.capacity_bound_reference_fits());
+        assert!(budget.johnson_bound_reference_fits());
+    }
+
+    #[test]
+    fn oversized_later_whir_domain_fails_closed_without_panicking() {
+        let parameters = ProtocolParameters {
+            starting_log_inv_rate: 1,
+            round_log_inv_rates: Vec::new(),
+            folding_factor: FoldingFactor::ConstantFromSecondRound(9, 2),
+            soundness_type: SecurityAssumption::UniqueDecoding,
+            security_level: 128,
+            pow_bits: 0,
+        };
+        let result =
+            std::panic::catch_unwind(|| WhirConfig::<EF, F, Challenger>::new(35, parameters));
+        let error = result
+            .expect("invalid WHIR rates must return an error rather than panic")
+            .expect_err("the later folded domain is larger than Goldilocks two-adicity");
+        assert!(matches!(
+            error,
+            p3_whir::parameters::WhirConfigError::FoldedDomainExceedsTwoAdicity {
+                log_folded_domain_size: 33,
+                two_adicity: 32,
+            }
+        ));
     }
 
     #[test]

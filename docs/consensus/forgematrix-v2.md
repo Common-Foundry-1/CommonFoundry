@@ -476,6 +476,25 @@ The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;
 an independent challenge-to-coefficient implementation and a broader vector
 corpus remain required.
 
+The unified 439-column trace cannot be made production-sized by silently
+changing WHIR parameters. With nine selector variables folded first,
+Goldilocks two-adicity caps the starting log-inverse rate at six. The
+non-conjectural 128-bit unique-decoding schedule needs 536,576 initial-value
+bytes with no grinding and 471,040 with the practical 16-bit ceiling, already
+above the complete 262,128-byte payload before paths or sumchecks. Reducing the
+opening enough would require at least 67 grinding bits. CapacityBound can fit
+only by accepting an explicit Reed-Solomon capacity/correlated-agreement
+conjecture, while the fitting JohnsonBound comparison requires 48-bit
+grinding. Both remain rejected activation paths.
+
+The current replacement layout removes the principal width source without
+weakening that policy. It retains 47 ordered core columns padded to 64 and
+transposes the 98 nibble witnesses into four-column auxiliary tables with 49
+active plus 15 zero rows per transition cell. The largest auxiliary bank is
+`n=32`, within Goldilocks two-adicity. Canonical row generation and layout
+binding are implemented; the cross-table LogUp interactions and batch-STARK
+payload still have to be proved and measured before activation.
+
 Implementing any subset of those components must not make the v2 profile
 activatable. Activation is a separate consensus change after every gate above
 is satisfied.

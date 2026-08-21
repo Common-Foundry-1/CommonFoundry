@@ -684,6 +684,48 @@ replay are rejected. The production row-fold primitive separately enforces all
 establishes the algebraic handoff, not the missing succinct vector-commitment
 opening needed to fit the complete production proof below 256 KiB.
 
+An exhaustive trace-specific schedule checkpoint now separates wire geometry
+from soundness assumptions. Folding all nine selector variables first leaves
+26 local variables, so Goldilocks' 32-bit two-adicity caps the starting
+log-inverse rate at six. The 262,128-byte native payload could contain at most
+63 initial 512-value openings even if every other proof byte were free. At the
+requested 128-bit unique-decoding setting, the pinned WHIR derivation needs 131
+queries with no grinding, or 115 under the practical 16-bit grinding ceiling:
+536,576 and 471,040 base-field value bytes respectively. Reaching 63 queries
+requires at least 67 configured grinding bits, which is not an operational
+prover.
+
+Two smaller comparison schedules are deliberately not promoted. CapacityBound
+has a 193,444-byte conservative maximum with zero derived grinding, but that
+mode explicitly conjectures Reed-Solomon decoding and mutual correlated
+agreement up to capacity. JohnsonBound has a 239,616-byte conservative maximum
+only with 48 configured and derived grinding bits. The production policy
+therefore remains non-conjectural unique decoding and fails closed. The
+vendored WHIR constructor also now rejects a later folded domain above the
+base field's two-adicity instead of reaching an asserting field-generator call;
+the same guard covers the final fold.
+
+The implemented successor layout attacks width rather than soundness. Of the
+110 transition oracles, 12 carry the actual algebraic values and 98 are paired
+base-16 digits for eight value/slack range checks. Initialization retains 11
+core columns because its input is fixed; the three banks retain 12 each. The
+ordered production core is therefore 47 semantic columns padded to 64 slots.
+Range witnesses are transposed row-wise: each original cell owns 64 auxiliary
+rows, the first 49 enumerate digit counts `[7,7,7,7,7,5,2,7]`, and the final 15
+are canonical zero padding. Each active row carries only digit, slack digit,
+value accumulator, and slack accumulator. Its lookup ID, source oracle, bound,
+radix, and first/last selectors are verifier-fixed. The final accumulator row
+can consequently be linked to the corresponding core source through LogUp,
+while both digits query a fixed 16-value table.
+
+This makes the initialization auxiliary table `n=25` and each bank auxiliary
+table `n=32`, exactly at rather than above Goldilocks two-adicity. The code now
+generates every canonical row, rejects out-of-range sources and rows, pins the
+47-column order, and commits the complete structural plan under digest
+`6c7ccc9e63cae28907ae173372ddf33a3526f2ea2cc46b514510e4b330082769`.
+It is a layout and witness checkpoint, not yet a batch-STARK/LogUp verifier or
+evidence that the complete aggregate fits the network frame.
+
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
 proof is bounded at 87,556 bytes, and the remaining aggregate components are

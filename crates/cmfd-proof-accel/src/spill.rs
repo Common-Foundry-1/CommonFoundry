@@ -7,15 +7,23 @@
 //! access. These digests protect worker storage integrity; consensus acceptance
 //! still comes from the parent process's independent CPU proof verification.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use blake3::Hasher;
-use cmfd_consensus::GOLDILOCKS_MODULUS;
-use cmfd_proof_accel::{CudaProofStream, CudaProofStreamCanonicalRows, ProofAccelError};
+use p3_field::PrimeField64;
+use p3_goldilocks::Goldilocks;
+use p3_matrix::Matrix;
 use thiserror::Error;
+
+use crate::{CudaProofStream, CudaProofStreamCanonicalRows, ProofAccelError};
+
+const GOLDILOCKS_MODULUS: u64 = Goldilocks::ORDER_U64;
 
 const MAGIC: &[u8; 8] = b"CMFDLDE1";
 const VERSION: u32 = 1;
@@ -25,6 +33,7 @@ const DIGEST_BYTES: usize = 32;
 const HEADER_BYTES: usize = HEADER_PREFIX_BYTES + DIGEST_BYTES;
 const ENCODE_VALUES: usize = 4096;
 const AUTH_CHUNK_ROWS: u64 = 256;
+const AUTH_CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const STREAM_MANIFEST_DOMAIN: &[u8] = b"CMFD-PROOF-STREAM-MANIFEST-V1";
 const AUTH_CHUNK_DOMAIN: &[u8] = b"CMFD-LDE-AUTH-CHUNK-V1";
 
@@ -419,19 +428,124 @@ impl Drop for LdeArtifactWriter {
     }
 }
 
+struct AuthenticatedChunkCache {
+    chunks: HashMap<u64, Arc<[u64]>>,
+    insertion_order: VecDeque<u64>,
+    cached_bytes: usize,
+    max_bytes: usize,
+}
+
+impl AuthenticatedChunkCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            chunks: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            cached_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&self, chunk_index: u64) -> Option<Arc<[u64]>> {
+        self.chunks.get(&chunk_index).cloned()
+    }
+
+    fn insert(&mut self, chunk_index: u64, chunk: Arc<[u64]>) -> Result<Arc<[u64]>, SpillError> {
+        if let Some(existing) = self.get(chunk_index) {
+            return Ok(existing);
+        }
+        let chunk_bytes = chunk
+            .len()
+            .checked_mul(size_of::<u64>())
+            .ok_or(SpillError::Corrupt(
+                "authenticated chunk cache size overflow",
+            ))?;
+        if chunk_bytes > self.max_bytes {
+            return Ok(chunk);
+        }
+        while self
+            .cached_bytes
+            .checked_add(chunk_bytes)
+            .ok_or(SpillError::Corrupt(
+                "authenticated chunk cache size overflow",
+            ))?
+            > self.max_bytes
+        {
+            let oldest = self.insertion_order.pop_front().ok_or(SpillError::Corrupt(
+                "authenticated chunk cache eviction order is inconsistent",
+            ))?;
+            let evicted = self.chunks.remove(&oldest).ok_or(SpillError::Corrupt(
+                "authenticated chunk cache entry is missing",
+            ))?;
+            let evicted_bytes =
+                evicted
+                    .len()
+                    .checked_mul(size_of::<u64>())
+                    .ok_or(SpillError::Corrupt(
+                        "authenticated chunk cache size overflow",
+                    ))?;
+            self.cached_bytes =
+                self.cached_bytes
+                    .checked_sub(evicted_bytes)
+                    .ok_or(SpillError::Corrupt(
+                        "authenticated chunk cache accounting underflow",
+                    ))?;
+        }
+        self.cached_bytes =
+            self.cached_bytes
+                .checked_add(chunk_bytes)
+                .ok_or(SpillError::Corrupt(
+                    "authenticated chunk cache size overflow",
+                ))?;
+        self.insertion_order.push_back(chunk_index);
+        if self
+            .chunks
+            .insert(chunk_index, Arc::clone(&chunk))
+            .is_some()
+        {
+            return Err(SpillError::Corrupt(
+                "authenticated chunk cache entry was replaced",
+            ));
+        }
+        Ok(chunk)
+    }
+}
+
 /// Fully validated sealed LDE artifact with bounded random row access.
+///
+/// Authenticated chunks are decoded once into immutable snapshots and retained
+/// in a per-artifact FIFO cache capped at 64 MiB of canonical field payload.
+/// A chunk larger than that limit is authenticated for each read but not cached.
 pub struct SealedLdeArtifact {
     file: Mutex<File>,
+    chunk_cache: Mutex<AuthenticatedChunkCache>,
     path: PathBuf,
     spec: LdeArtifactSpec,
     digest: [u8; DIGEST_BYTES],
     header_prefix: [u8; HEADER_PREFIX_BYTES],
     auth_chunk_digests: Vec<[u8; DIGEST_BYTES]>,
+    #[cfg(test)]
+    authenticated_chunk_reads: AtomicU64,
+    cleanup: Option<ArtifactCleanup>,
+}
+
+struct ArtifactCleanup(PathBuf);
+
+impl Drop for ArtifactCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 impl SealedLdeArtifact {
     /// Open and fully authenticate a sealed artifact before exposing any rows.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SpillError> {
+        Self::open_with_cache_bytes(path, AUTH_CHUNK_CACHE_BYTES)
+    }
+
+    fn open_with_cache_bytes(
+        path: impl AsRef<Path>,
+        cache_bytes: usize,
+    ) -> Result<Self, SpillError> {
         let path = path.as_ref().to_path_buf();
         let mut file = File::open(&path).map_err(|source| io_error("opening", &path, source))?;
         let mut header = [0_u8; HEADER_BYTES];
@@ -486,6 +600,7 @@ impl SealedLdeArtifact {
 
         Ok(Self {
             file: Mutex::new(file),
+            chunk_cache: Mutex::new(AuthenticatedChunkCache::new(cache_bytes)),
             path,
             spec,
             digest,
@@ -493,6 +608,9 @@ impl SealedLdeArtifact {
                 .try_into()
                 .expect("header prefix slice is exact"),
             auth_chunk_digests,
+            #[cfg(test)]
+            authenticated_chunk_reads: AtomicU64::new(0),
+            cleanup: None,
         })
     }
 
@@ -508,6 +626,15 @@ impl SealedLdeArtifact {
         &self.path
     }
 
+    /// Remove the published artifact after its final in-process owner drops.
+    ///
+    /// The validated file handle is declared before the cleanup guard and is
+    /// therefore closed first. Cloned matrix views keep this owner alive.
+    pub fn remove_on_drop(mut self) -> Self {
+        self.cleanup = Some(ArtifactCleanup(self.path.clone()));
+        self
+    }
+
     /// Read complete rows by global physical index.
     pub fn read_rows(&self, row_start: u64, row_count: u64) -> Result<Vec<u64>, SpillError> {
         if row_count == 0 {
@@ -521,10 +648,6 @@ impl SealedLdeArtifact {
                 "requested rows exceed the declared matrix height",
             ));
         }
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| SpillError::Corrupt("artifact file lock is poisoned"))?;
         let mut values = Vec::new();
         let value_count_u64 = row_count
             .checked_mul(u64::from(self.spec.width))
@@ -537,43 +660,15 @@ impl SealedLdeArtifact {
         let first_chunk = row_start / AUTH_CHUNK_ROWS;
         let last_chunk = (row_end - 1) / AUTH_CHUNK_ROWS;
         for chunk_index in first_chunk..=last_chunk {
-            let chunk_row_start = chunk_index * AUTH_CHUNK_ROWS;
-            let chunk_row_end = self.spec.height.min(chunk_row_start + AUTH_CHUNK_ROWS);
-            let chunk_rows = chunk_row_end - chunk_row_start;
-            let chunk_bytes_u64 = chunk_rows
-                .checked_mul(u64::from(self.spec.width))
-                .and_then(|limbs| limbs.checked_mul(size_of::<u64>() as u64))
-                .ok_or(SpillError::Corrupt("authentication chunk length overflow"))?;
-            let chunk_bytes = usize::try_from(chunk_bytes_u64)
-                .map_err(|_| SpillError::Corrupt("authentication chunk does not fit memory"))?;
-            let data_offset = chunk_row_start
-                .checked_mul(u64::from(self.spec.width))
-                .and_then(|limbs| limbs.checked_mul(size_of::<u64>() as u64))
-                .and_then(|bytes| bytes.checked_add(HEADER_BYTES as u64))
-                .ok_or(SpillError::Corrupt("authentication chunk offset overflow"))?;
-            file.seek(SeekFrom::Start(data_offset))
-                .map_err(|source| io_error("seeking in", &self.path, source))?;
-            let mut encoded = Vec::new();
-            encoded
-                .try_reserve_exact(chunk_bytes)
-                .map_err(|_| SpillError::Corrupt("authentication chunk allocation failed"))?;
-            encoded.resize(chunk_bytes, 0);
-            file.read_exact(&mut encoded)
-                .map_err(|source| io_error("reading rows from", &self.path, source))?;
-            let expected_digest = self
-                .auth_chunk_digests
-                .get(usize::try_from(chunk_index).map_err(|_| {
-                    SpillError::Corrupt("authentication chunk index does not fit memory")
-                })?)
-                .ok_or(SpillError::Corrupt(
-                    "authentication chunk digest is missing",
-                ))?;
-            let mut hasher = auth_chunk_hasher(&self.header_prefix, chunk_index);
-            hasher.update(&encoded);
-            if hasher.finalize().as_bytes() != expected_digest {
-                return Err(SpillError::ChecksumMismatch);
-            }
-
+            let chunk = self.authenticated_chunk(chunk_index)?;
+            let chunk_row_start = chunk_index
+                .checked_mul(AUTH_CHUNK_ROWS)
+                .ok_or(SpillError::Corrupt("authentication chunk row overflow"))?;
+            let chunk_row_end = self.spec.height.min(
+                chunk_row_start
+                    .checked_add(AUTH_CHUNK_ROWS)
+                    .ok_or(SpillError::Corrupt("authentication chunk row overflow"))?,
+            );
             let wanted_start = row_start.max(chunk_row_start);
             let wanted_end = row_end.min(chunk_row_end);
             let first_value = usize::try_from(wanted_start - chunk_row_start)
@@ -584,27 +679,315 @@ impl SealedLdeArtifact {
                 .ok()
                 .and_then(|rows| rows.checked_mul(self.spec.width as usize))
                 .ok_or(SpillError::InvalidChunk("requested value count overflow"))?;
-            let first_byte = first_value
-                .checked_mul(size_of::<u64>())
-                .ok_or(SpillError::InvalidChunk("requested byte offset overflow"))?;
-            let wanted_bytes = wanted_values
-                .checked_mul(size_of::<u64>())
-                .ok_or(SpillError::InvalidChunk("requested byte count overflow"))?;
-            let last_byte = first_byte
-                .checked_add(wanted_bytes)
-                .ok_or(SpillError::InvalidChunk("requested byte range overflow"))?;
-            for bytes in encoded[first_byte..last_byte].chunks_exact(size_of::<u64>()) {
-                let value = u64::from_le_bytes(bytes.try_into().expect("u64 chunk is exact"));
-                if value >= GOLDILOCKS_MODULUS {
-                    return Err(SpillError::Corrupt(
-                        "artifact row contains a noncanonical Goldilocks element",
-                    ));
-                }
-                values.push(value);
-            }
+            let last_value = first_value
+                .checked_add(wanted_values)
+                .ok_or(SpillError::InvalidChunk("requested value range overflow"))?;
+            values.extend_from_slice(chunk.get(first_value..last_value).ok_or(
+                SpillError::Corrupt("authenticated chunk geometry is inconsistent"),
+            )?);
         }
         debug_assert_eq!(values.len(), value_count);
         Ok(values)
+    }
+
+    fn cached_chunk(&self, chunk_index: u64) -> Result<Option<Arc<[u64]>>, SpillError> {
+        let cache = self
+            .chunk_cache
+            .lock()
+            .map_err(|_| SpillError::Corrupt("authenticated chunk cache lock is poisoned"))?;
+        Ok(cache.get(chunk_index))
+    }
+
+    fn authenticated_chunk(&self, chunk_index: u64) -> Result<Arc<[u64]>, SpillError> {
+        if let Some(chunk) = self.cached_chunk(chunk_index)? {
+            return Ok(chunk);
+        }
+
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| SpillError::Corrupt("artifact file lock is poisoned"))?;
+        // Another reader may have populated the shared cache while this read
+        // waited for the serialized file cursor.
+        if let Some(chunk) = self.cached_chunk(chunk_index)? {
+            return Ok(chunk);
+        }
+
+        let chunk_row_start = chunk_index
+            .checked_mul(AUTH_CHUNK_ROWS)
+            .ok_or(SpillError::Corrupt("authentication chunk row overflow"))?;
+        if chunk_row_start >= self.spec.height {
+            return Err(SpillError::Corrupt(
+                "authentication chunk index exceeds the matrix",
+            ));
+        }
+        let chunk_row_end = self.spec.height.min(
+            chunk_row_start
+                .checked_add(AUTH_CHUNK_ROWS)
+                .ok_or(SpillError::Corrupt("authentication chunk row overflow"))?,
+        );
+        let chunk_rows = chunk_row_end - chunk_row_start;
+        let chunk_values_u64 = chunk_rows
+            .checked_mul(u64::from(self.spec.width))
+            .ok_or(SpillError::Corrupt("authentication chunk length overflow"))?;
+        let chunk_values = usize::try_from(chunk_values_u64)
+            .map_err(|_| SpillError::Corrupt("authentication chunk does not fit memory"))?;
+        let chunk_bytes = chunk_values
+            .checked_mul(size_of::<u64>())
+            .ok_or(SpillError::Corrupt("authentication chunk length overflow"))?;
+        let data_offset = chunk_row_start
+            .checked_mul(u64::from(self.spec.width))
+            .and_then(|limbs| limbs.checked_mul(size_of::<u64>() as u64))
+            .and_then(|bytes| bytes.checked_add(HEADER_BYTES as u64))
+            .ok_or(SpillError::Corrupt("authentication chunk offset overflow"))?;
+        file.seek(SeekFrom::Start(data_offset))
+            .map_err(|source| io_error("seeking in", &self.path, source))?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(chunk_bytes)
+            .map_err(|_| SpillError::Corrupt("authentication chunk allocation failed"))?;
+        encoded.resize(chunk_bytes, 0);
+        file.read_exact(&mut encoded)
+            .map_err(|source| io_error("reading rows from", &self.path, source))?;
+        #[cfg(test)]
+        self.authenticated_chunk_reads
+            .fetch_add(1, Ordering::Relaxed);
+
+        let expected_digest = self
+            .auth_chunk_digests
+            .get(usize::try_from(chunk_index).map_err(|_| {
+                SpillError::Corrupt("authentication chunk index does not fit memory")
+            })?)
+            .ok_or(SpillError::Corrupt(
+                "authentication chunk digest is missing",
+            ))?;
+        let mut hasher = auth_chunk_hasher(&self.header_prefix, chunk_index);
+        hasher.update(&encoded);
+        if hasher.finalize().as_bytes() != expected_digest {
+            return Err(SpillError::ChecksumMismatch);
+        }
+
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(chunk_values)
+            .map_err(|_| SpillError::Corrupt("authentication chunk allocation failed"))?;
+        for bytes in encoded.chunks_exact(size_of::<u64>()) {
+            let value = u64::from_le_bytes(bytes.try_into().expect("u64 chunk is exact"));
+            if value >= GOLDILOCKS_MODULUS {
+                return Err(SpillError::Corrupt(
+                    "artifact chunk contains a noncanonical Goldilocks element",
+                ));
+            }
+            decoded.push(value);
+        }
+        debug_assert_eq!(decoded.len(), chunk_values);
+        let chunk = Arc::<[u64]>::from(decoded);
+        let mut cache = self
+            .chunk_cache
+            .lock()
+            .map_err(|_| SpillError::Corrupt("authenticated chunk cache lock is poisoned"))?;
+        cache.insert(chunk_index, chunk)
+    }
+}
+
+/// Authenticated physical-bit-reversed rows exposed through Plonky3's matrix API.
+///
+/// Clones retain the same validated file handle and authenticated-chunk cache.
+/// The first access authenticates a complete storage chunk; later accesses use
+/// its immutable decoded snapshot while it remains in the bounded cache.
+#[derive(Clone)]
+pub struct AuthenticatedLdeMatrix {
+    artifact: Arc<SealedLdeArtifact>,
+    column_start: usize,
+    width: usize,
+    height: usize,
+}
+
+impl std::fmt::Debug for AuthenticatedLdeMatrix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedLdeMatrix")
+            .field("path", &self.artifact.path())
+            .field("digest", &self.artifact.digest())
+            .field("column_start", &self.column_start)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
+impl AuthenticatedLdeMatrix {
+    /// Expose the complete concatenated LDE stored in `artifact`.
+    pub fn new(artifact: Arc<SealedLdeArtifact>) -> Result<Self, SpillError> {
+        let width = artifact.spec().width as usize;
+        Self::column_view(artifact, 0, width)
+    }
+
+    /// Expose one contiguous column range without reopening the artifact path.
+    pub fn column_view(
+        artifact: Arc<SealedLdeArtifact>,
+        column_start: usize,
+        width: usize,
+    ) -> Result<Self, SpillError> {
+        if width == 0 {
+            return Err(SpillError::InvalidSpec(
+                "matrix column view width must be nonzero",
+            ));
+        }
+        let column_end = column_start
+            .checked_add(width)
+            .ok_or(SpillError::InvalidSpec("matrix column view overflow"))?;
+        if column_end > artifact.spec().width as usize {
+            return Err(SpillError::InvalidSpec(
+                "matrix column view exceeds the sealed artifact width",
+            ));
+        }
+        let height = usize::try_from(artifact.spec().height)
+            .map_err(|_| SpillError::InvalidSpec("matrix height does not fit usize"))?;
+        Ok(Self {
+            artifact,
+            column_start,
+            width,
+            height,
+        })
+    }
+
+    /// Split the concatenated stream into its original ordered components.
+    ///
+    /// The component manifest and total width must exactly match the sealed
+    /// artifact. This prevents a caller from relabeling or reordering columns
+    /// after the stream has been authenticated.
+    pub fn from_stream_components(
+        artifact: Arc<SealedLdeArtifact>,
+        components: &[crate::CudaProofStreamComponent],
+    ) -> Result<Vec<Self>, SpillError> {
+        if components.is_empty() {
+            return Err(SpillError::InvalidSpec(
+                "matrix component list must be nonempty",
+            ));
+        }
+        for (expected_ordinal, component) in components.iter().enumerate() {
+            if component.ordinal() != expected_ordinal {
+                return Err(SpillError::InvalidSpec(
+                    "matrix component ordinals must be contiguous and ordered",
+                ));
+            }
+            if component.width() == 0 || component.coset_shift() >= GOLDILOCKS_MODULUS {
+                return Err(SpillError::InvalidSpec(
+                    "matrix component metadata is invalid",
+                ));
+            }
+        }
+        let manifest = stream_manifest(
+            artifact.spec().source_height,
+            usize::from(artifact.spec().added_bits),
+            components.iter().map(|component| {
+                (
+                    component.ordinal(),
+                    component.width(),
+                    component.coset_shift(),
+                )
+            }),
+        );
+        if manifest != artifact.spec().stream_manifest {
+            return Err(SpillError::InvalidSpec(
+                "matrix components do not match the sealed stream manifest",
+            ));
+        }
+
+        let mut column_start = 0_usize;
+        let mut matrices = Vec::new();
+        matrices
+            .try_reserve_exact(components.len())
+            .map_err(|_| SpillError::InvalidSpec("matrix component allocation failed"))?;
+        for component in components {
+            matrices.push(Self::column_view(
+                Arc::clone(&artifact),
+                column_start,
+                component.width(),
+            )?);
+            column_start = column_start
+                .checked_add(component.width())
+                .ok_or(SpillError::InvalidSpec("matrix component width overflow"))?;
+        }
+        if column_start != artifact.spec().width as usize {
+            return Err(SpillError::InvalidSpec(
+                "matrix component widths do not fill the sealed artifact",
+            ));
+        }
+        Ok(matrices)
+    }
+
+    pub fn artifact(&self) -> &Arc<SealedLdeArtifact> {
+        &self.artifact
+    }
+
+    pub const fn column_start(&self) -> usize {
+        self.column_start
+    }
+
+    /// Read and authenticate several complete rows from this column view.
+    ///
+    /// The backing artifact authenticates each overlapping storage chunk on its
+    /// first cache miss, allowing sequential Merkle construction and cloned
+    /// column views to reuse the same immutable decoded snapshot.
+    pub fn read_canonical_rows(
+        &self,
+        row_start: usize,
+        row_count: usize,
+    ) -> Result<Vec<u64>, SpillError> {
+        let stored = self.artifact.read_rows(
+            u64::try_from(row_start)
+                .map_err(|_| SpillError::InvalidChunk("row start does not fit u64"))?,
+            u64::try_from(row_count)
+                .map_err(|_| SpillError::InvalidChunk("row count does not fit u64"))?,
+        )?;
+        let stored_width = self.artifact.spec().width as usize;
+        if self.column_start == 0 && self.width == stored_width {
+            return Ok(stored);
+        }
+        let output_len = row_count
+            .checked_mul(self.width)
+            .ok_or(SpillError::InvalidChunk("column-view row count overflow"))?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_len)
+            .map_err(|_| SpillError::InvalidChunk("column-view row allocation failed"))?;
+        for row in stored.chunks_exact(stored_width) {
+            output.extend_from_slice(&row[self.column_start..self.column_start + self.width]);
+        }
+        debug_assert_eq!(output.len(), output_len);
+        Ok(output)
+    }
+}
+
+impl Matrix<Goldilocks> for AuthenticatedLdeMatrix {
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    unsafe fn row_subseq_unchecked(
+        &self,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = Goldilocks, IntoIter = impl Iterator<Item = Goldilocks> + Send + Sync>
+    {
+        debug_assert!(row < self.height);
+        debug_assert!(start <= end && end <= self.width);
+        let stored = self
+            .read_canonical_rows(row, 1)
+            .unwrap_or_else(|error| panic!("authenticated LDE matrix read failed: {error}"));
+        stored[start..end]
+            .iter()
+            .copied()
+            .map(Goldilocks::new)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
@@ -791,7 +1174,10 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> SpillErr
 mod tests {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use super::*;
 
@@ -820,6 +1206,29 @@ mod tests {
 
     fn values() -> Vec<u64> {
         (0..24).map(|value| value + 1).collect()
+    }
+
+    fn two_chunk_artifact(path: &Path) -> (SealedLdeArtifact, Vec<u64>) {
+        let spec = LdeArtifactSpec {
+            job_id: [0x3c; 32],
+            source_height: 128,
+            height: 512,
+            width: 2,
+            added_bits: 2,
+            stream_manifest: stream_manifest(128, 2, [(0, 2, 7)]),
+        };
+        let expected = (0..1024).map(|value| value + 1).collect::<Vec<_>>();
+        let mut writer = LdeArtifactWriter::create(path, spec).unwrap();
+        writer.write_rows(0, &expected).unwrap();
+        (writer.seal().unwrap(), expected)
+    }
+
+    fn overwrite_artifact_value(path: &Path, row: u64, column: u64, value: u64) {
+        let offset = HEADER_BYTES as u64 + (row * 2 + column) * size_of::<u64>() as u64;
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&value.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
     }
 
     struct FakeProofRowStream {
@@ -915,6 +1324,135 @@ mod tests {
             drop(artifact);
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn authenticated_matrix_exposes_exact_rows_and_ordered_component_views() {
+        let dir = test_dir("matrix-view");
+        let path = dir.join("matrix.lde");
+        let matrix_spec = LdeArtifactSpec {
+            stream_manifest: stream_manifest(2, 2, [(0, 1, 7), (1, 2, 9)]),
+            ..spec()
+        };
+        let mut writer = LdeArtifactWriter::create(&path, matrix_spec).unwrap();
+        writer.write_rows(0, &values()).unwrap();
+        let artifact = Arc::new(writer.seal().unwrap());
+        let complete = AuthenticatedLdeMatrix::new(Arc::clone(&artifact)).unwrap();
+        assert_eq!(complete.width(), 3);
+        assert_eq!(complete.height(), 8);
+        assert_eq!(
+            complete.row(2).unwrap().into_iter().collect::<Vec<_>>(),
+            values()[6..9]
+                .iter()
+                .copied()
+                .map(Goldilocks::new)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            unsafe {
+                complete
+                    .row_subseq_unchecked(4, 1, 3)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            },
+            values()[13..15]
+                .iter()
+                .copied()
+                .map(Goldilocks::new)
+                .collect::<Vec<_>>()
+        );
+
+        let components = [
+            crate::CudaProofStreamComponent {
+                ordinal: 0,
+                width: 1,
+                coset_shift: 7,
+            },
+            crate::CudaProofStreamComponent {
+                ordinal: 1,
+                width: 2,
+                coset_shift: 9,
+            },
+        ];
+        let matrices =
+            AuthenticatedLdeMatrix::from_stream_components(Arc::clone(&artifact), &components)
+                .unwrap();
+        assert_eq!(matrices.len(), 2);
+        assert_eq!(matrices[0].column_start(), 0);
+        assert_eq!(matrices[1].column_start(), 1);
+        assert_eq!(
+            matrices[0].row(3).unwrap().into_iter().collect::<Vec<_>>(),
+            vec![Goldilocks::new(10)]
+        );
+        assert_eq!(
+            matrices[1].row(3).unwrap().into_iter().collect::<Vec<_>>(),
+            vec![Goldilocks::new(11), Goldilocks::new(12)]
+        );
+
+        let wrong_shift = [
+            components[0],
+            crate::CudaProofStreamComponent {
+                coset_shift: 10,
+                ..components[1]
+            },
+        ];
+        assert!(
+            AuthenticatedLdeMatrix::from_stream_components(Arc::clone(&artifact), &wrong_shift)
+                .is_err()
+        );
+        let wrong_order = [components[1], components[0]];
+        assert!(AuthenticatedLdeMatrix::from_stream_components(artifact, &wrong_order).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authenticated_matrix_panics_instead_of_exposing_mutated_rows() {
+        let dir = test_dir("matrix-view-mutation");
+        let path = dir.join("matrix.lde");
+        let mut writer = LdeArtifactWriter::create(&path, spec()).unwrap();
+        writer.write_rows(0, &values()).unwrap();
+        let matrix = AuthenticatedLdeMatrix::new(Arc::new(writer.seal().unwrap())).unwrap();
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(HEADER_BYTES as u64 + 8)).unwrap();
+        file.write_all(&99_u64.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert!(std::panic::catch_unwind(|| matrix.row(0)).is_err());
+        drop(matrix);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authenticated_matrix_rejects_invalid_column_views() {
+        let dir = test_dir("matrix-view-bounds");
+        let path = dir.join("matrix.lde");
+        let mut writer = LdeArtifactWriter::create(&path, spec()).unwrap();
+        writer.write_rows(0, &values()).unwrap();
+        let artifact = Arc::new(writer.seal().unwrap());
+        assert!(AuthenticatedLdeMatrix::column_view(Arc::clone(&artifact), 0, 0).is_err());
+        assert!(AuthenticatedLdeMatrix::column_view(Arc::clone(&artifact), 2, 2).is_err());
+        assert!(AuthenticatedLdeMatrix::column_view(artifact, usize::MAX, 1).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ephemeral_artifact_survives_matrix_clones_then_removes_its_file() {
+        let dir = test_dir("matrix-view-cleanup");
+        let path = dir.join("matrix.lde");
+        let mut writer = LdeArtifactWriter::create(&path, spec()).unwrap();
+        writer.write_rows(0, &values()).unwrap();
+        let artifact = Arc::new(writer.seal().unwrap().remove_on_drop());
+        let matrix = AuthenticatedLdeMatrix::new(Arc::clone(&artifact)).unwrap();
+        let clone = matrix.clone();
+        drop(artifact);
+        drop(matrix);
+        assert!(path.exists());
+        assert_eq!(clone.row(0).unwrap().into_iter().count(), 3);
+        drop(clone);
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1028,42 +1566,132 @@ mod tests {
             artifact.read_rows(0, 1),
             Err(SpillError::ChecksumMismatch)
         ));
+        assert!(
+            artifact.chunk_cache.lock().unwrap().chunks.is_empty(),
+            "a failed authentication must not populate the cache"
+        );
         drop(artifact);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn row_reads_authenticate_each_overlapping_fixed_chunk() {
-        let dir = test_dir("auth-chunks");
+    fn authenticated_cache_is_shared_by_column_views_and_keeps_its_snapshot() {
+        let dir = test_dir("shared-auth-cache");
         let path = dir.join("matrix.lde");
-        let large_spec = LdeArtifactSpec {
-            job_id: [0x3c; 32],
-            source_height: 128,
-            height: 512,
-            width: 2,
-            added_bits: 2,
-            stream_manifest: stream_manifest(128, 2, [(0, 2, 7)]),
-        };
-        let expected = (0..1024).map(|value| value + 1).collect::<Vec<_>>();
-        let mut writer = LdeArtifactWriter::create(&path, large_spec).unwrap();
-        writer.write_rows(0, &expected[..600]).unwrap();
-        writer.write_rows(300, &expected[600..]).unwrap();
-        let artifact = writer.seal().unwrap();
-        assert_eq!(artifact.read_rows(250, 20).unwrap(), expected[500..540]);
+        let (artifact, expected) = two_chunk_artifact(&path);
+        let artifact = Arc::new(artifact);
+        let first_column =
+            AuthenticatedLdeMatrix::column_view(Arc::clone(&artifact), 0, 1).unwrap();
+        let second_column =
+            AuthenticatedLdeMatrix::column_view(Arc::clone(&artifact), 1, 1).unwrap();
 
-        let mutated_row = 300_u64;
-        let offset = HEADER_BYTES as u64 + mutated_row * 2 * size_of::<u64>() as u64;
-        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&42_u64.to_le_bytes()).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
+        assert_eq!(first_column.read_canonical_rows(10, 1).unwrap(), [21]);
+        assert_eq!(
+            artifact.authenticated_chunk_reads.load(Ordering::Relaxed),
+            1
+        );
+        overwrite_artifact_value(&path, 10, 0, 42);
+        overwrite_artifact_value(&path, 10, 1, 43);
+
+        assert_eq!(second_column.read_canonical_rows(10, 1).unwrap(), [22]);
+        assert_eq!(first_column.read_canonical_rows(10, 1).unwrap(), [21]);
+        assert_eq!(
+            artifact.authenticated_chunk_reads.load(Ordering::Relaxed),
+            1,
+            "both column views must reuse the same immutable cached chunk"
+        );
+        let cache = artifact.chunk_cache.lock().unwrap();
+        assert_eq!(cache.max_bytes, AUTH_CHUNK_CACHE_BYTES);
+        assert_eq!(cache.chunks.len(), 1);
+        assert_eq!(cache.cached_bytes, 256 * 2 * size_of::<u64>());
+        drop(cache);
+
+        assert_eq!(expected[20..22], [21, 22]);
+        drop(first_column);
+        drop(second_column);
+        drop(artifact);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bounded_cache_evicts_fifo_and_reauthenticates_evicted_chunks() {
+        let dir = test_dir("bounded-auth-cache");
+        let path = dir.join("matrix.lde");
+        let (sealed, expected) = two_chunk_artifact(&path);
+        drop(sealed);
+        let one_chunk_bytes = 256 * 2 * size_of::<u64>();
+        let artifact = SealedLdeArtifact::open_with_cache_bytes(&path, one_chunk_bytes).unwrap();
 
         assert_eq!(artifact.read_rows(0, 1).unwrap(), expected[..2]);
+        assert_eq!(artifact.read_rows(300, 1).unwrap(), expected[600..602]);
+        {
+            let cache = artifact.chunk_cache.lock().unwrap();
+            assert_eq!(cache.cached_bytes, one_chunk_bytes);
+            assert!(cache.cached_bytes <= cache.max_bytes);
+            assert_eq!(cache.chunks.len(), 1);
+            assert!(!cache.chunks.contains_key(&0));
+            assert!(cache.chunks.contains_key(&1));
+        }
+
+        overwrite_artifact_value(&path, 0, 0, 42);
         assert!(matches!(
-            artifact.read_rows(mutated_row, 1),
+            artifact.read_rows(0, 1),
             Err(SpillError::ChecksumMismatch)
         ));
+        let cache = artifact.chunk_cache.lock().unwrap();
+        assert_eq!(cache.cached_bytes, one_chunk_bytes);
+        assert_eq!(cache.chunks.len(), 1);
+        assert!(cache.chunks.contains_key(&1));
+        drop(cache);
+        drop(artifact);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_chunks_remain_uncached_without_evicting_residents() {
+        let mut cache = AuthenticatedChunkCache::new(2 * size_of::<u64>());
+        let resident = Arc::<[u64]>::from(vec![1_u64]);
+        cache.insert(0, Arc::clone(&resident)).unwrap();
+        let oversized = Arc::<[u64]>::from(vec![2_u64, 3, 4]);
+        let returned = cache.insert(1, Arc::clone(&oversized)).unwrap();
+
+        assert!(Arc::ptr_eq(&returned, &oversized));
+        assert_eq!(cache.cached_bytes, size_of::<u64>());
+        assert_eq!(cache.chunks.len(), 1);
+        assert!(cache.chunks.contains_key(&0));
+        assert!(!cache.chunks.contains_key(&1));
+    }
+
+    #[test]
+    fn concurrent_same_chunk_misses_perform_one_authenticated_file_read() {
+        let dir = test_dir("concurrent-auth-cache");
+        let path = dir.join("matrix.lde");
+        let (artifact, expected) = two_chunk_artifact(&path);
+        let artifact = Arc::new(artifact);
+        let barrier = Arc::new(Barrier::new(9));
+        let threads = (0..8)
+            .map(|row| {
+                let artifact = Arc::clone(&artifact);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    artifact.read_rows(row, 1).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for (row, thread) in threads.into_iter().enumerate() {
+            assert_eq!(thread.join().unwrap(), expected[row * 2..row * 2 + 2]);
+        }
+        assert_eq!(
+            artifact.authenticated_chunk_reads.load(Ordering::Relaxed),
+            1,
+            "the post-file-lock cache recheck must prevent duplicate I/O"
+        );
+        let cache = artifact.chunk_cache.lock().unwrap();
+        assert_eq!(cache.chunks.len(), 1);
+        assert!(cache.cached_bytes <= AUTH_CHUNK_CACHE_BYTES);
+        drop(cache);
         drop(artifact);
         fs::remove_dir_all(dir).unwrap();
     }

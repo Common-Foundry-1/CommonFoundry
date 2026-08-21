@@ -7,7 +7,9 @@
 //! an operating-system sandbox and does not protect against a same-user attacker
 //! replacing the executable, DLL, or their dependencies during a check/load race.
 
-pub mod spill;
+pub mod spill {
+    pub use cmfd_proof_accel::spill::*;
+}
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -21,7 +23,8 @@ use std::time::{Duration, Instant};
 use cmfd_consensus::{
     ExtensionElement, GOLDILOCKS_MODULUS, MAX_STRUCTURED_BLAKE3_PROOF_BYTES,
     MAX_STRUCTURED_FINAL_ACTIVATION_BYTES, MAX_STRUCTURED_OPENING_VARIABLES,
-    StructuredBlake3Statement, prove_structured_blake3_with_cuda, verify_structured_blake3,
+    StructuredBlake3Statement, prove_structured_blake3_with_cuda_in_spill_dir,
+    verify_structured_blake3,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -34,6 +37,11 @@ const REQUEST_FIXED_BYTES: usize = 8 + 4 + 32 + 4 + 32 + 4 + EXTENSION_ELEMENT_B
 const SUCCESS_RESPONSE_FIXED_BYTES: usize = 8 + 4 + 1 + 4;
 const ERROR_RESPONSE_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
 const MAX_WORKER_ERROR_BYTES: usize = 1024;
+const DEFAULT_SPILL_ROOT_NAME: &str = "commonfoundry-proof-worker";
+const SPILL_DIRECTORY_ATTEMPTS: usize = 1_024;
+const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const SPILL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+static NEXT_SPILL_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Maximum canonical request size accepted by either process.
 pub const MAX_REQUEST_BYTES: usize = REQUEST_FIXED_BYTES
@@ -79,6 +87,28 @@ pub enum ProofWorkerError {
     HashMismatch { component: &'static str },
     #[error("could not launch proof worker: {0}")]
     Spawn(#[source] io::Error),
+    #[error("proof-worker spill directory I/O failed while {operation} {path}: {source}")]
+    SpillDirectory {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not clean proof-worker spill directory {path}: {source}")]
+    SpillCleanup {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "proof worker failed ({worker}); its spill directory {path} also could not be cleaned: {source}"
+    )]
+    SpillCleanupAfterFailure {
+        path: PathBuf,
+        worker: Box<ProofWorkerError>,
+        #[source]
+        source: io::Error,
+    },
     #[error(
         "could not establish proof-worker process-tree containment while {operation}: {source}"
     )]
@@ -142,6 +172,26 @@ pub fn prove_structured_blake3_out_of_process(
     statement: &StructuredBlake3Statement,
     final_activation: &[u8],
 ) -> Result<Vec<u8>, ProofWorkerError> {
+    let spill_root = std::env::temp_dir().join(DEFAULT_SPILL_ROOT_NAME);
+    prove_structured_blake3_out_of_process_with_spill_root(
+        config,
+        statement,
+        final_activation,
+        spill_root,
+    )
+}
+
+/// Prove in a pinned child process while placing all request artifacts under
+/// one unique leaf of the caller-selected spill root.
+///
+/// The root must be absolute. It is created when absent and is never removed;
+/// only the exact no-overwrite request leaf created by this call is cleaned.
+pub fn prove_structured_blake3_out_of_process_with_spill_root(
+    config: &ProofWorkerConfig,
+    statement: &StructuredBlake3Statement,
+    final_activation: &[u8],
+    spill_root: impl AsRef<Path>,
+) -> Result<Vec<u8>, ProofWorkerError> {
     validate_config(config)?;
     let request = encode_request(statement, final_activation)?;
     verify_file_hash(
@@ -155,27 +205,156 @@ pub fn prove_structured_blake3_out_of_process(
         config.cuda_library_sha256,
     )?;
 
-    let mut command = Command::new(&config.worker_executable);
-    command
-        .arg("--cuda-library")
-        .arg(&config.cuda_library)
-        .arg("--cuda-sha256")
-        .arg(hex::encode(config.cuda_library_sha256))
-        .arg("--device")
-        .arg(config.device_index.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    with_worker_spill_directory(spill_root.as_ref(), |spill_dir| {
+        let mut command = Command::new(&config.worker_executable);
+        command
+            .arg("--cuda-library")
+            .arg(&config.cuda_library)
+            .arg("--cuda-sha256")
+            .arg(hex::encode(config.cuda_library_sha256))
+            .arg("--device")
+            .arg(config.device_index.to_string())
+            .arg("--spill-dir")
+            .arg(spill_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-    let child = spawn_contained(&mut command)?;
-    let response = exchange_with_child(child, request, config.timeout)?;
-    let proof = match decode_response(&response)? {
-        WorkerResponse::Success(proof) => proof,
-        WorkerResponse::Failure { code, message } => {
-            return Err(ProofWorkerError::WorkerReported { code, message });
+        let child = spawn_contained(&mut command)?;
+        let response = exchange_with_child(child, request, config.timeout)?;
+        let proof = match decode_response(&response)? {
+            WorkerResponse::Success(proof) => proof,
+            WorkerResponse::Failure { code, message } => {
+                return Err(ProofWorkerError::WorkerReported { code, message });
+            }
+        };
+        require_cpu_verified(statement, proof)
+    })
+}
+
+struct WorkerSpillDirectory {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl WorkerSpillDirectory {
+    fn create(root: &Path) -> Result<Self, ProofWorkerError> {
+        if !root.is_absolute() {
+            return Err(ProofWorkerError::InvalidConfig(
+                "proof-worker spill root must be absolute",
+            ));
         }
-    };
-    require_cpu_verified(statement, proof)
+        std::fs::create_dir_all(root).map_err(|source| ProofWorkerError::SpillDirectory {
+            operation: "creating spill root",
+            path: root.to_path_buf(),
+            source,
+        })?;
+
+        for _ in 0..SPILL_DIRECTORY_ATTEMPTS {
+            let sequence = NEXT_SPILL_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = root.join(format!("request-{}-{sequence:016x}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path, armed: true }),
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(ProofWorkerError::SpillDirectory {
+                        operation: "creating unique request directory",
+                        path,
+                        source,
+                    });
+                }
+            }
+        }
+
+        Err(ProofWorkerError::SpillDirectory {
+            operation: "creating unique request directory",
+            path: root.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "unique spill-directory attempts exhausted",
+            ),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn close(mut self) -> io::Result<()> {
+        self.armed = false;
+        remove_worker_spill_directory(&self.path)
+    }
+}
+
+impl Drop for WorkerSpillDirectory {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_worker_spill_directory(&self.path);
+        }
+    }
+}
+
+fn with_worker_spill_directory<T>(
+    root: &Path,
+    operation: impl FnOnce(&Path) -> Result<T, ProofWorkerError>,
+) -> Result<T, ProofWorkerError> {
+    let spill = WorkerSpillDirectory::create(root)?;
+    let path = spill.path().to_path_buf();
+    let worker_result = operation(&path);
+    match spill.close() {
+        Ok(()) => worker_result,
+        Err(source) => match worker_result {
+            Ok(_) => Err(ProofWorkerError::SpillCleanup { path, source }),
+            Err(worker) => Err(ProofWorkerError::SpillCleanupAfterFailure {
+                path,
+                worker: Box::new(worker),
+                source,
+            }),
+        },
+    }
+}
+
+fn remove_worker_spill_directory(path: &Path) -> io::Result<()> {
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(5);
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(source) if spill_directory_is_absent(&source) => return Ok(()),
+            Err(source)
+                if retryable_spill_cleanup_error(&source)
+                    && started.elapsed() < SPILL_CLEANUP_TIMEOUT =>
+            {
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+            Err(source) => return Err(source),
+        }
+    }
+}
+
+fn spill_directory_is_absent(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(windows)]
+    return matches!(error.raw_os_error(), Some(2 | 3));
+    #[cfg(not(windows))]
+    false
+}
+
+fn retryable_spill_cleanup_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(5 | 32 | 33 | 145 | 303))
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::DirectoryNotEmpty
+        )
+    }
 }
 
 fn validate_config(config: &ProofWorkerConfig) -> Result<(), ProofWorkerError> {
@@ -265,17 +444,43 @@ impl ContainedChild {
             libc::kill(-self.process_group, libc::SIGKILL);
         }
         #[cfg(windows)]
-        self.job.terminate();
+        let _ = self.job.terminate();
 
         // Retain a direct-child fallback for setup/platform edge cases. The
         // process-group/job operation above is what contains descendants.
         let _ = self.child.kill();
     }
+
+    fn terminate_and_reap(&mut self) {
+        self.terminate_tree();
+        let started = Instant::now();
+        let mut direct_child_reaped = false;
+        loop {
+            if !direct_child_reaped {
+                match self.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => direct_child_reaped = true,
+                    Ok(None) => {}
+                }
+            }
+            #[cfg(windows)]
+            let process_tree_reaped = self.job.active_processes().is_ok_and(|active| active == 0);
+            #[cfg(not(windows))]
+            let process_tree_reaped = direct_child_reaped;
+
+            if direct_child_reaped && process_tree_reaped {
+                return;
+            }
+            if started.elapsed() >= PROCESS_REAP_TIMEOUT {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 impl Drop for ContainedChild {
     fn drop(&mut self) {
-        self.terminate_tree();
+        self.terminate_and_reap();
     }
 }
 
@@ -332,13 +537,41 @@ impl WindowsJob {
         Ok(())
     }
 
-    fn terminate(&self) {
+    fn terminate(&self) -> io::Result<()> {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
         // SAFETY: the job handle remains owned and live. Closing the handle
         // also has KILL_ON_JOB_CLOSE as a second termination path.
-        unsafe {
-            TerminateJobObject(self.handle, 1);
+        let terminated = unsafe { TerminateJobObject(self.handle, 1) };
+        if terminated == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn active_processes(&self) -> io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: `accounting` has the requested Win32 layout and remains live
+        // for the duration of the query. The return-length pointer is optional.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut accounting).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses)
         }
     }
 }
@@ -425,6 +658,50 @@ enum IoEvent {
     Stderr(io::Result<Capture>),
 }
 
+struct PipeThreadGuard {
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl PipeThreadGuard {
+    fn new(threads: impl IntoIterator<Item = thread::JoinHandle<()>>) -> Self {
+        Self {
+            threads: threads.into_iter().collect(),
+        }
+    }
+}
+
+impl Drop for PipeThreadGuard {
+    fn drop(&mut self) {
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct ExchangeResources {
+    child: Option<ContainedChild>,
+    _pipe_threads: PipeThreadGuard,
+}
+
+impl ExchangeResources {
+    fn child_mut(&mut self) -> &mut ContainedChild {
+        self.child
+            .as_mut()
+            .expect("exchange resources always own the worker child")
+    }
+}
+
+impl Drop for ExchangeResources {
+    fn drop(&mut self) {
+        // This order is lifecycle-critical: closing the Windows Job Object is
+        // the final KILL_ON_JOB_CLOSE fallback. It must happen before joining
+        // pipe readers, because a surviving descendant may inherit those pipe
+        // handles and otherwise turn a bounded worker timeout into a hang.
+        drop(self.child.take());
+        // `pipe_threads` is dropped and joined after this method returns.
+    }
+}
+
 fn exchange_with_child(
     mut child: ContainedChild,
     request: Vec<u8>,
@@ -462,7 +739,10 @@ fn exchange_with_child(
     let stderr_thread = thread::spawn(move || {
         let _ = event_tx.send(IoEvent::Stderr(capture_bounded(stderr, MAX_STDERR_BYTES)));
     });
-    let _threads = (input_thread, stdout_thread, stderr_thread);
+    let mut resources = ExchangeResources {
+        child: Some(child),
+        _pipe_threads: PipeThreadGuard::new([input_thread, stdout_thread, stderr_thread]),
+    };
 
     let started = Instant::now();
     let mut exit_status = None;
@@ -471,11 +751,11 @@ fn exchange_with_child(
     let mut stderr_capture = None;
     loop {
         if exit_status.is_none() {
-            match child.child.try_wait() {
+            match resources.child_mut().child.try_wait() {
                 Ok(Some(status)) => exit_status = Some(status),
                 Ok(None) => {}
                 Err(source) => {
-                    terminate_child_bounded(&mut child);
+                    terminate_child_bounded(resources.child_mut());
                     return Err(ProofWorkerError::Pipe {
                         operation: "waiting for worker",
                         source,
@@ -491,7 +771,7 @@ fn exchange_with_child(
             break;
         }
         if started.elapsed() >= timeout {
-            terminate_child_bounded(&mut child);
+            terminate_child_bounded(resources.child_mut());
             return Err(ProofWorkerError::Timeout {
                 milliseconds: timeout.as_millis(),
             });
@@ -501,31 +781,31 @@ fn exchange_with_child(
         match event_rx.recv_timeout(remaining.min(Duration::from_millis(5))) {
             Ok(IoEvent::Input(Ok(()))) => input_complete = true,
             Ok(IoEvent::Input(Err(source))) => {
-                terminate_child_bounded(&mut child);
+                terminate_child_bounded(resources.child_mut());
                 return Err(ProofWorkerError::Pipe {
                     operation: "writing stdin",
                     source,
                 });
             }
             Ok(IoEvent::Stdout(Ok(capture))) if capture.exceeded => {
-                terminate_child_bounded(&mut child);
+                terminate_child_bounded(resources.child_mut());
                 return Err(ProofWorkerError::StdoutTooLarge);
             }
             Ok(IoEvent::Stdout(Ok(capture))) => stdout_capture = Some(capture),
             Ok(IoEvent::Stdout(Err(source))) => {
-                terminate_child_bounded(&mut child);
+                terminate_child_bounded(resources.child_mut());
                 return Err(ProofWorkerError::Pipe {
                     operation: "reading stdout",
                     source,
                 });
             }
             Ok(IoEvent::Stderr(Ok(capture))) if capture.exceeded => {
-                terminate_child_bounded(&mut child);
+                terminate_child_bounded(resources.child_mut());
                 return Err(ProofWorkerError::StderrTooLarge);
             }
             Ok(IoEvent::Stderr(Ok(capture))) => stderr_capture = Some(capture),
             Ok(IoEvent::Stderr(Err(source))) => {
-                terminate_child_bounded(&mut child);
+                terminate_child_bounded(resources.child_mut());
                 return Err(ProofWorkerError::Pipe {
                     operation: "reading stderr",
                     source,
@@ -534,7 +814,7 @@ fn exchange_with_child(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if !io_collection_complete(input_complete, &stdout_capture, &stderr_capture) {
-                    terminate_child_bounded(&mut child);
+                    terminate_child_bounded(resources.child_mut());
                     return Err(ProofWorkerError::PipeThread("collecting worker pipes"));
                 }
             }
@@ -559,15 +839,7 @@ fn io_collection_complete(
 }
 
 fn terminate_child_bounded(child: &mut ContainedChild) {
-    child.terminate_tree();
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(100) {
-        match child.child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => {}
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
+    child.terminate_and_reap();
 }
 
 fn worker_exit_error(status: ExitStatus, stderr: &[u8]) -> ProofWorkerError {
@@ -833,24 +1105,25 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+#[derive(Debug)]
 struct WorkerArguments {
     cuda_library: PathBuf,
     cuda_sha256: [u8; 32],
     device_index: i32,
+    spill_dir: PathBuf,
 }
 
 fn parse_worker_arguments(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<WorkerArguments, String> {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
-    if arguments.len() != 6
+    if arguments.len() != 8
         || arguments[0].as_os_str() != OsStr::new("--cuda-library")
         || arguments[2].as_os_str() != OsStr::new("--cuda-sha256")
         || arguments[4].as_os_str() != OsStr::new("--device")
+        || arguments[6].as_os_str() != OsStr::new("--spill-dir")
     {
-        return Err(
-            "expected --cuda-library ABSOLUTE_PATH --cuda-sha256 HEX --device INDEX".to_owned(),
-        );
+        return Err("expected --cuda-library ABSOLUTE_PATH --cuda-sha256 HEX --device INDEX --spill-dir ABSOLUTE_PATH".to_owned());
     }
     let cuda_library = PathBuf::from(arguments[1].as_os_str());
     if !cuda_library.is_absolute() {
@@ -873,10 +1146,18 @@ fn parse_worker_arguments(
     if device_index < 0 {
         return Err("CUDA device index must be a nonnegative decimal i32".to_owned());
     }
+    let spill_dir = PathBuf::from(arguments[7].as_os_str());
+    if !spill_dir.is_absolute() {
+        return Err("proof spill directory path must be absolute".to_owned());
+    }
+    if !spill_dir.is_dir() {
+        return Err("proof spill directory must already exist".to_owned());
+    }
     Ok(WorkerArguments {
         cuda_library,
         cuda_sha256,
         device_index,
+        spill_dir,
     })
 }
 
@@ -901,11 +1182,12 @@ fn run_worker() -> Result<Vec<u8>, (u16, String)> {
         arguments.cuda_sha256,
     )
     .map_err(|error| (WORKER_ERROR_DLL_HASH, error.to_string()))?;
-    prove_structured_blake3_with_cuda(
+    prove_structured_blake3_with_cuda_in_spill_dir(
         &request.statement,
         &request.final_activation,
         &arguments.cuda_library,
         arguments.device_index,
+        &arguments.spill_dir,
     )
     .map_err(|error| (WORKER_ERROR_PROVER, error.to_string()))
 }
@@ -935,6 +1217,7 @@ mod tests {
     use super::*;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    const TEST_SPILL_DIRECTORY_ENV: &str = "CMFD_PROOF_WORKER_TEST_SPILL_DIRECTORY";
 
     fn statement() -> StructuredBlake3Statement {
         StructuredBlake3Statement {
@@ -961,6 +1244,16 @@ mod tests {
         let path = temporary_path("tmp");
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    fn hold_test_spill_file() -> Option<File> {
+        let directory = std::env::var_os(TEST_SPILL_DIRECTORY_ENV).map(PathBuf::from)?;
+        fs::write(directory.join("worker.merkle"), b"merkle").unwrap();
+        fs::write(directory.join("worker.merkle.partial"), b"partial").unwrap();
+        let mut held = File::create(directory.join("worker.lde")).unwrap();
+        held.write_all(b"held by worker").unwrap();
+        held.flush().unwrap();
+        Some(held)
     }
 
     fn real_one_block_fixture() -> (StructuredBlake3Statement, [u8; 8]) {
@@ -1096,6 +1389,118 @@ mod tests {
     }
 
     #[test]
+    fn worker_arguments_require_an_existing_absolute_spill_directory() {
+        let cuda = temporary_file(b"CUDA library");
+        let spill_dir = temporary_path("parser-spill");
+        fs::create_dir(&spill_dir).unwrap();
+        let arguments = vec![
+            OsString::from("--cuda-library"),
+            cuda.clone().into_os_string(),
+            OsString::from("--cuda-sha256"),
+            OsString::from("00".repeat(32)),
+            OsString::from("--device"),
+            OsString::from("0"),
+            OsString::from("--spill-dir"),
+            spill_dir.clone().into_os_string(),
+        ];
+
+        let parsed = parse_worker_arguments(arguments.clone()).unwrap();
+        assert_eq!(parsed.spill_dir, spill_dir);
+
+        let missing_argument = parse_worker_arguments(arguments[..6].iter().cloned());
+        assert!(missing_argument.is_err());
+
+        let mut relative = arguments.clone();
+        relative[7] = OsString::from("relative-spill-directory");
+        assert_eq!(
+            parse_worker_arguments(relative).unwrap_err(),
+            "proof spill directory path must be absolute"
+        );
+
+        fs::remove_dir(&spill_dir).unwrap();
+        assert_eq!(
+            parse_worker_arguments(arguments).unwrap_err(),
+            "proof spill directory must already exist"
+        );
+        fs::remove_file(cuda).unwrap();
+    }
+
+    #[test]
+    fn worker_spill_leaf_is_removed_after_success_and_error() {
+        let root = temporary_path("spill-root");
+        let mut success_leaf = None;
+        let value = with_worker_spill_directory(&root, |leaf| {
+            success_leaf = Some(leaf.to_path_buf());
+            fs::write(leaf.join("success.lde"), b"success").unwrap();
+            Ok(7_u8)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert!(!success_leaf.unwrap().exists());
+
+        let mut error_leaf = None;
+        let error = with_worker_spill_directory(&root, |leaf| {
+            error_leaf = Some(leaf.to_path_buf());
+            fs::write(leaf.join("error.partial"), b"error").unwrap();
+            Err::<(), _>(ProofWorkerError::InvalidConfig("injected worker failure"))
+        })
+        .unwrap_err();
+        assert!(matches!(error, ProofWorkerError::InvalidConfig(_)));
+        assert!(!error_leaf.unwrap().exists());
+        assert!(root.is_dir(), "operator-selected spill root was removed");
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn worker_spill_leaves_are_isolated_and_never_remove_the_root() {
+        let root = temporary_path("spill-isolation-root");
+        fs::create_dir(&root).unwrap();
+        let sentinel = root.join("operator-owned-sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        let first = WorkerSpillDirectory::create(&root).unwrap();
+        let second = WorkerSpillDirectory::create(&root).unwrap();
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        assert_ne!(first_path, second_path);
+        fs::write(first_path.join("first.lde"), b"first").unwrap();
+        fs::write(second_path.join("second.lde"), b"second").unwrap();
+
+        first.close().unwrap();
+        assert!(!first_path.exists());
+        assert!(second_path.is_dir());
+        assert!(sentinel.is_file());
+        second.close().unwrap();
+        assert!(!second_path.exists());
+        assert!(root.is_dir());
+        assert!(sentinel.is_file());
+
+        fs::remove_file(sentinel).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn spill_cleanup_failure_is_surfaced_and_preserves_the_worker_error() {
+        let root = temporary_path("spill-cleanup-error-root");
+        let mut leaf_path = None;
+        let error = with_worker_spill_directory(&root, |leaf| {
+            leaf_path = Some(leaf.to_path_buf());
+            fs::remove_dir(leaf).unwrap();
+            fs::write(leaf, b"replace the owned directory with a file").unwrap();
+            Err::<(), _>(ProofWorkerError::InvalidConfig("injected worker failure"))
+        })
+        .unwrap_err();
+        match error {
+            ProofWorkerError::SpillCleanupAfterFailure { worker, .. } => {
+                assert!(matches!(*worker, ProofWorkerError::InvalidConfig(_)));
+            }
+            other => panic!("unexpected cleanup error: {other}"),
+        }
+
+        fs::remove_file(leaf_path.unwrap()).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn caller_supplied_hash_mismatches_fail_before_spawn() {
         let worker = temporary_file(b"pinned executable bytes");
         let cuda = temporary_file(b"pinned CUDA bytes");
@@ -1156,6 +1561,7 @@ mod tests {
     #[test]
     fn child_timeout_helper() {
         if std::env::var_os("CMFD_PROOF_WORKER_TIMEOUT_HELPER").is_some() {
+            let _held_spill_file = hold_test_spill_file();
             thread::sleep(Duration::from_secs(5));
         }
     }
@@ -1166,22 +1572,27 @@ mod tests {
     #[test]
     fn child_oversize_stdout_helper() {
         if std::env::var_os("CMFD_PROOF_WORKER_STDOUT_HELPER").is_some() {
+            let _held_spill_file = hold_test_spill_file();
             let output = vec![b'x'; MAX_RESPONSE_BYTES + 1];
             let _ = io::stdout().write_all(&output);
+            thread::sleep(Duration::from_secs(5));
         }
     }
 
     #[test]
     fn child_oversize_stderr_helper() {
         if std::env::var_os("CMFD_PROOF_WORKER_STDERR_HELPER").is_some() {
+            let _held_spill_file = hold_test_spill_file();
             let output = vec![b'x'; MAX_STDERR_BYTES + 1];
             let _ = io::stderr().write_all(&output);
+            thread::sleep(Duration::from_secs(5));
         }
     }
 
     #[test]
     fn child_descendant_holds_pipes_helper() {
         if std::env::var_os("CMFD_PROOF_WORKER_PIPE_DESCENDANT").is_some() {
+            let _held_spill_file = hold_test_spill_file();
             let started = std::env::var_os("CMFD_PROOF_WORKER_DESCENDANT_STARTED")
                 .expect("descendant start-sentinel path must be provided");
             fs::write(PathBuf::from(started), b"descendant started").unwrap();
@@ -1209,20 +1620,30 @@ mod tests {
 
     #[test]
     fn parent_kills_worker_on_timeout() {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--exact")
-            .arg("tests::child_timeout_helper")
-            .arg("--nocapture")
-            .env("CMFD_PROOF_WORKER_TIMEOUT_HELPER", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = spawn_contained(&mut command).unwrap();
+        let root = temporary_path("timeout-spill-root");
+        let mut leaf = None;
         let started = Instant::now();
-        let error = exchange_with_child(child, Vec::new(), Duration::from_millis(50)).unwrap_err();
+        let error = with_worker_spill_directory(&root, |spill_dir| {
+            leaf = Some(spill_dir.to_path_buf());
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("tests::child_timeout_helper")
+                .arg("--nocapture")
+                .env("CMFD_PROOF_WORKER_TIMEOUT_HELPER", "1")
+                .env(TEST_SPILL_DIRECTORY_ENV, spill_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = spawn_contained(&mut command)?;
+            exchange_with_child(child, Vec::new(), Duration::from_millis(50))
+        })
+        .unwrap_err();
         assert!(matches!(error, ProofWorkerError::Timeout { .. }));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!leaf.unwrap().exists());
+        assert!(root.is_dir());
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -1242,56 +1663,85 @@ mod tests {
 
     #[test]
     fn parent_kills_worker_on_oversize_stdout_without_masking_error() {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--exact")
-            .arg("tests::child_oversize_stdout_helper")
-            .arg("--nocapture")
-            .env("CMFD_PROOF_WORKER_STDOUT_HELPER", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = spawn_contained(&mut command).unwrap();
-        let error = exchange_with_child(child, Vec::new(), Duration::from_secs(2)).unwrap_err();
+        let root = temporary_path("stdout-spill-root");
+        let mut leaf = None;
+        let error = with_worker_spill_directory(&root, |spill_dir| {
+            leaf = Some(spill_dir.to_path_buf());
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("tests::child_oversize_stdout_helper")
+                .arg("--nocapture")
+                .env("CMFD_PROOF_WORKER_STDOUT_HELPER", "1")
+                .env(TEST_SPILL_DIRECTORY_ENV, spill_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = spawn_contained(&mut command)?;
+            exchange_with_child(child, Vec::new(), Duration::from_secs(2))
+        })
+        .unwrap_err();
         assert!(matches!(error, ProofWorkerError::StdoutTooLarge));
+        assert!(!leaf.unwrap().exists());
+        assert!(root.is_dir());
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
     fn parent_kills_worker_on_oversize_stderr_without_masking_error() {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--exact")
-            .arg("tests::child_oversize_stderr_helper")
-            .arg("--nocapture")
-            .env("CMFD_PROOF_WORKER_STDERR_HELPER", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = spawn_contained(&mut command).unwrap();
-        let error = exchange_with_child(child, Vec::new(), Duration::from_secs(2)).unwrap_err();
+        let root = temporary_path("stderr-spill-root");
+        let mut leaf = None;
+        let error = with_worker_spill_directory(&root, |spill_dir| {
+            leaf = Some(spill_dir.to_path_buf());
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("tests::child_oversize_stderr_helper")
+                .arg("--nocapture")
+                .env("CMFD_PROOF_WORKER_STDERR_HELPER", "1")
+                .env(TEST_SPILL_DIRECTORY_ENV, spill_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = spawn_contained(&mut command)?;
+            exchange_with_child(child, Vec::new(), Duration::from_secs(2))
+        })
+        .unwrap_err();
         assert!(matches!(error, ProofWorkerError::StderrTooLarge));
+        assert!(!leaf.unwrap().exists());
+        assert!(root.is_dir());
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
     fn timeout_kills_descendants_and_their_inherited_pipes() {
         let started_sentinel = temporary_path("descendant-started");
         let survived_sentinel = temporary_path("descendant-survived");
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--exact")
-            .arg("tests::child_descendant_holds_pipes_helper")
-            .arg("--nocapture")
-            .env("CMFD_PROOF_WORKER_PIPE_SPAWNER", "1")
-            .env("CMFD_PROOF_WORKER_DESCENDANT_STARTED", &started_sentinel)
-            .env("CMFD_PROOF_WORKER_DESCENDANT_SURVIVED", &survived_sentinel)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = spawn_contained(&mut command).unwrap();
+        let root = temporary_path("descendant-spill-root");
+        let mut leaf = None;
         let started = Instant::now();
-        let error = exchange_with_child(child, Vec::new(), Duration::from_millis(500)).unwrap_err();
+        let error = with_worker_spill_directory(&root, |spill_dir| {
+            leaf = Some(spill_dir.to_path_buf());
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("tests::child_descendant_holds_pipes_helper")
+                .arg("--nocapture")
+                .env("CMFD_PROOF_WORKER_PIPE_SPAWNER", "1")
+                .env("CMFD_PROOF_WORKER_DESCENDANT_STARTED", &started_sentinel)
+                .env("CMFD_PROOF_WORKER_DESCENDANT_SURVIVED", &survived_sentinel)
+                .env(TEST_SPILL_DIRECTORY_ENV, spill_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = spawn_contained(&mut command)?;
+            exchange_with_child(child, Vec::new(), Duration::from_millis(500))
+        })
+        .unwrap_err();
         assert!(matches!(error, ProofWorkerError::Timeout { .. }));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!leaf.unwrap().exists());
+        assert!(root.is_dir());
         assert!(
             started_sentinel.exists(),
             "descendant was not observed before timeout"
@@ -1304,6 +1754,7 @@ mod tests {
             fs::remove_file(&survived_sentinel).unwrap();
         }
         assert!(!descendant_survived, "worker descendant survived timeout");
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -1323,9 +1774,13 @@ mod tests {
             cmfd_consensus::prove_structured_blake3(&statement, &final_activation).unwrap();
         verify_structured_blake3(&statement, &cpu_proof).unwrap();
 
-        let proof =
-            prove_structured_blake3_with_cuda(&statement, &final_activation, cuda, device_index)
-                .unwrap();
+        let proof = cmfd_consensus::prove_structured_blake3_with_cuda(
+            &statement,
+            &final_activation,
+            cuda,
+            device_index,
+        )
+        .unwrap();
         verify_structured_blake3(&statement, &proof).unwrap();
     }
 
@@ -1355,9 +1810,17 @@ mod tests {
             timeout: Duration::from_secs(15 * 60),
         };
 
-        let proof =
-            prove_structured_blake3_out_of_process(&config, &statement, &final_activation).unwrap();
+        let spill_root = temporary_path("real-cuda-spill-root");
+        let proof = prove_structured_blake3_out_of_process_with_spill_root(
+            &config,
+            &statement,
+            &final_activation,
+            &spill_root,
+        )
+        .unwrap();
         verify_structured_blake3(&statement, &proof).unwrap();
+        assert_eq!(fs::read_dir(&spill_root).unwrap().count(), 0);
+        fs::remove_dir(&spill_root).unwrap();
 
         let mut corrupted = proof;
         corrupted[0] ^= 0x80;

@@ -10,6 +10,7 @@ members = [
     "crates/cmfd-proof-worker",
 ]
 exclude = [
+    "third_party/p3-fri-0.6.3-out-of-core",
     "third_party/p3-merkle-tree-0.6.3-gpu-first-layer",
     "third_party/p3-util-0.6.3-msrv",
 ]
@@ -46,3 +47,7 @@ p3-util = { path = "third_party/p3-util-0.6.3-msrv" }
 # source copy adds only a checked prover-side hook while preserving the
 # standard Merkle tree, openings, and verifier.
 p3-merkle-tree = { path = "third_party/p3-merkle-tree-0.6.3-gpu-first-layer" }
+# Plonky3 0.6.3 fixes its prover-side input LDEs to in-memory row-major
+# matrices. This exact source copy generalizes only that prover-data matrix
+# type; commitments, openings, proof encoding, and verification are unchanged.
+p3-fri = { path = "third_party/p3-fri-0.6.3-out-of-core" }

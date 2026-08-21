@@ -944,12 +944,14 @@ dependencies = [
 name = "cmfd-proof-accel"
 version = "0.1.0-devnet.11"
 dependencies = [
+ "blake3",
  "libloading 0.8.9",
  "p3-dft",
  "p3-field",
  "p3-goldilocks",
  "p3-matrix",
  "p3-symmetric",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3843,8 +3845,6 @@ dependencies = [
 [[package]]
 name = "p3-fri"
 version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6207d9c658afdad926ebc6a5a344c98cfea59baa2eaaf7cd4a528ba02304bae9"
 dependencies = [
  "itertools 0.15.0",
  "p3-challenger",

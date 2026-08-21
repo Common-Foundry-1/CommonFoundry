@@ -10,18 +10,24 @@
 //! edge without a prover-known permutation challenge. A running sum binds the
 //! message bytes to the final-table multilinear opening.
 
+#[cfg(feature = "gpu-proof-prover")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     array,
     borrow::{Borrow, BorrowMut},
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
 };
 
 use bincode::Options;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::DuplexChallenger;
+#[cfg(feature = "gpu-proof-prover")]
+use p3_commit::{BatchOpening, BatchOpeningRef};
 use p3_commit::{
-    BuildPeriodicLdeTableFast, ExtensionMmcs, Mmcs, OpenedValues, Pcs as PcsTrait, PeriodicLdeTable,
+    BuildPeriodicLdeTableFast, ExtensionMmcs, Mmcs, OpenedValues, Pcs as PcsTrait,
+    PeriodicLdeTable, PolynomialSpace,
 };
 #[cfg(any(test, not(feature = "gpu-proof-prover")))]
 use p3_dft::Radix2DitParallel;
@@ -30,14 +36,20 @@ use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::extension::CubicTrinomialExtensionField;
 use p3_field::integers::QuotientMap;
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+#[cfg(feature = "gpu-proof-prover")]
+use p3_fri::FriLdeMatrix;
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks, default_goldilocks_poseidon2_8};
+#[cfg(feature = "gpu-proof-prover")]
+use p3_matrix::bitrev::BitReversalPerm;
 use p3_matrix::{
     Matrix,
     bitrev::{BitReversedMatrixView, BitReversibleMatrix},
     dense::{RowMajorMatrix, RowMajorMatrixViewMut},
 };
 use p3_merkle_tree::MerkleTreeMmcs;
+#[cfg(feature = "gpu-proof-prover")]
+use p3_symmetric::{CryptographicHasher, MerkleCap, PseudoCompressionFunction};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_uni_stark::{
     Proof, StarkConfig, prove_with_preprocessed, setup_preprocessed, verify_with_preprocessed,
@@ -46,7 +58,9 @@ use thiserror::Error;
 
 use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement,
-    structured_blake3_tree::{Blake3TreeError, CompressionKind, CompressionOp, build_tree_witness},
+    structured_blake3_tree::{
+        Blake3TreeError, Blake3TreeWitness, CompressionKind, CompressionOp, build_tree_witness,
+    },
 };
 
 #[cfg(feature = "gpu-proof-prover")]
@@ -63,6 +77,7 @@ const FINALIZATION_ROWS: usize = 8;
 const ROWS_PER_COMPRESSION: usize = G_STEPS_PER_COMPRESSION + FINALIZATION_ROWS;
 const BYTES_PER_EVAL_ROW: usize = 8;
 const LOW_EVALUATION_VARIABLES: usize = 3;
+const ACTIVATION_HIGH_WEIGHT_WIDTH: usize = 3;
 const WORD_BITS: usize = 32;
 const MESSAGE_WORDS: usize = 16;
 const CV_WORDS: usize = 8;
@@ -72,6 +87,12 @@ const NARROW_PROOF_VERSION: u32 = 2;
 const FRI_LOG_BLOWUP: usize = 7;
 const FRI_QUERIES: usize = 33;
 const FRI_QUERY_POW_BITS: usize = 18;
+#[cfg(feature = "gpu-proof-prover")]
+const STREAM_CHUNK_ROWS: usize = 1 << 16;
+#[cfg(feature = "gpu-proof-prover")]
+static NEXT_STREAM_ARTIFACT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-proof-prover")]
+static NEXT_MERKLE_ARTIFACT: AtomicU64 = AtomicU64::new(0);
 
 const IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
@@ -87,15 +108,467 @@ type ValMmcs =
     MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, FieldHash, Compress, 2, 4>;
 type ChallengeMmcs = ExtensionMmcs<F, EF, ValMmcs>;
 type Challenger = DuplexChallenger<F, Perm, 8, 4>;
-type InnerPcs = TwoAdicFriPcs<F, NarrowDft, ValMmcs, ChallengeMmcs>;
+#[cfg(not(feature = "gpu-proof-prover"))]
+type InputMmcs = ValMmcs;
+#[cfg(feature = "gpu-proof-prover")]
+type InputMmcs = NarrowInputMmcs;
+#[cfg(not(feature = "gpu-proof-prover"))]
+type StoredLde = RowMajorMatrix<F>;
+#[cfg(feature = "gpu-proof-prover")]
+type StoredLde = NarrowStoredLde;
+type InnerPcs = TwoAdicFriPcs<F, NarrowDft, InputMmcs, ChallengeMmcs, StoredLde>;
 type Pcs = NarrowPcs;
 pub(crate) type Config = StarkConfig<Pcs, EF, Challenger>;
 pub(crate) type NativeProof = Proof<Config>;
+
+#[cfg(feature = "gpu-proof-prover")]
+#[derive(Clone, Debug)]
+pub(crate) enum NarrowStoredLde {
+    Memory(RowMajorMatrix<F>),
+    Authenticated(cmfd_proof_accel::spill::AuthenticatedLdeMatrix),
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl NarrowStoredLde {
+    fn as_memory(&self) -> Option<&RowMajorMatrix<F>> {
+        match self {
+            Self::Memory(matrix) => Some(matrix),
+            Self::Authenticated(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl Matrix<F> for NarrowStoredLde {
+    fn width(&self) -> usize {
+        match self {
+            Self::Memory(matrix) => matrix.width(),
+            Self::Authenticated(matrix) => matrix.width(),
+        }
+    }
+
+    fn height(&self) -> usize {
+        match self {
+            Self::Memory(matrix) => matrix.height(),
+            Self::Authenticated(matrix) => matrix.height(),
+        }
+    }
+
+    unsafe fn row_subseq_unchecked(
+        &self,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = F, IntoIter = impl Iterator<Item = F> + Send + Sync> {
+        match self {
+            Self::Memory(matrix) => unsafe {
+                matrix
+                    .row_subseq_unchecked(row, start, end)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            },
+            Self::Authenticated(matrix) => unsafe {
+                matrix
+                    .row_subseq_unchecked(row, start, end)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            },
+        }
+        .into_iter()
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+pub(crate) struct NarrowStoredLdePrefix<'a> {
+    matrix: &'a NarrowStoredLde,
+    height: usize,
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl Matrix<F> for NarrowStoredLdePrefix<'_> {
+    fn width(&self) -> usize {
+        self.matrix.width()
+    }
+
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    unsafe fn row_subseq_unchecked(
+        &self,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = F, IntoIter = impl Iterator<Item = F> + Send + Sync> {
+        unsafe {
+            self.matrix
+                .row_subseq_unchecked(row, start, end)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+pub(crate) enum NarrowStoredEvaluations<'a> {
+    Borrowed(BitReversedMatrixView<NarrowStoredLdePrefix<'a>>),
+    Owned(BitReversedMatrixView<RowMajorMatrix<F>>),
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl Matrix<F> for NarrowStoredEvaluations<'_> {
+    fn width(&self) -> usize {
+        match self {
+            Self::Borrowed(matrix) => matrix.width(),
+            Self::Owned(matrix) => matrix.width(),
+        }
+    }
+
+    fn height(&self) -> usize {
+        match self {
+            Self::Borrowed(matrix) => matrix.height(),
+            Self::Owned(matrix) => matrix.height(),
+        }
+    }
+
+    unsafe fn row_subseq_unchecked(
+        &self,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = F, IntoIter = impl Iterator<Item = F> + Send + Sync> {
+        match self {
+            Self::Borrowed(matrix) => unsafe {
+                matrix
+                    .row_subseq_unchecked(row, start, end)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            },
+            Self::Owned(matrix) => unsafe {
+                matrix
+                    .row_subseq_unchecked(row, start, end)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            },
+        }
+        .into_iter()
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl FriLdeMatrix<F> for NarrowStoredLde {
+    type EvaluationsOnDomain<'a> = NarrowStoredEvaluations<'a>;
+
+    fn from_bit_reversed_row_major(lde: RowMajorMatrix<F>) -> Self {
+        Self::Memory(lde)
+    }
+
+    fn evaluations_from_prefix(&self, height: usize) -> Self::EvaluationsOnDomain<'_> {
+        assert!(height <= self.height());
+        NarrowStoredEvaluations::Borrowed(BitReversalPerm::new_view(NarrowStoredLdePrefix {
+            matrix: self,
+            height,
+        }))
+    }
+
+    fn evaluations_from_owned<'a>(evaluations: RowMajorMatrix<F>) -> Self::EvaluationsOnDomain<'a> {
+        NarrowStoredEvaluations::Owned(evaluations.bit_reverse_rows())
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl cmfd_proof_accel::merkle_store::MerkleRowSource for NarrowStoredLde {
+    fn height(&self) -> usize {
+        Matrix::height(self)
+    }
+
+    fn width(&self) -> usize {
+        Matrix::width(self)
+    }
+
+    fn read_row(
+        &self,
+        row: usize,
+    ) -> Result<Vec<u64>, cmfd_proof_accel::merkle_store::MerkleStoreError> {
+        self.read_rows(row, 1)
+    }
+
+    fn read_rows(
+        &self,
+        row_start: usize,
+        row_count: usize,
+    ) -> Result<Vec<u64>, cmfd_proof_accel::merkle_store::MerkleStoreError> {
+        match self {
+            Self::Memory(matrix) => {
+                let row_end = row_start.checked_add(row_count).ok_or(
+                    cmfd_proof_accel::merkle_store::MerkleStoreError::Invalid(
+                        "matrix row range overflow",
+                    ),
+                )?;
+                if row_count == 0 || row_end > matrix.height() {
+                    return Err(cmfd_proof_accel::merkle_store::MerkleStoreError::Invalid(
+                        "matrix row range is out of bounds",
+                    ));
+                }
+                Ok((row_start..row_end)
+                    .flat_map(|row| unsafe { matrix.row_unchecked(row) })
+                    .map(|value| value.as_canonical_u64())
+                    .collect())
+            }
+            Self::Authenticated(matrix) => matrix
+                .read_canonical_rows(row_start, row_count)
+                .map_err(|error| {
+                    cmfd_proof_accel::merkle_store::MerkleStoreError::Source(error.to_string())
+                }),
+        }
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+#[derive(Clone)]
+pub(crate) struct NarrowInputMmcs {
+    cpu: ValMmcs,
+    use_disk: bool,
+    disk_hash: NarrowBinaryMerkleHash,
+    spill_dir: Option<Arc<std::path::PathBuf>>,
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl NarrowInputMmcs {
+    #[cfg(test)]
+    fn new(cpu: ValMmcs, use_disk: bool) -> Self {
+        Self::new_with_spill_dir(cpu, use_disk, None)
+    }
+
+    fn new_with_spill_dir(
+        cpu: ValMmcs,
+        use_disk: bool,
+        spill_dir: Option<Arc<std::path::PathBuf>>,
+    ) -> Self {
+        Self {
+            cpu,
+            use_disk,
+            disk_hash: NarrowBinaryMerkleHash::new(),
+            spill_dir,
+        }
+    }
+
+    fn commit_stored_with_first_digest_layer(
+        &self,
+        matrices: Vec<NarrowStoredLde>,
+        first_digests: Option<&dyn cmfd_proof_accel::merkle_store::MerkleRowSource>,
+    ) -> (
+        <Self as Mmcs<F>>::Commitment,
+        <Self as Mmcs<F>>::ProverData<NarrowStoredLde>,
+    ) {
+        if !self.use_disk {
+            assert!(
+                first_digests.is_none(),
+                "prehashed Merkle leaves require authenticated disk prover data"
+            );
+            let (commitment, data) = self.cpu.commit(matrices);
+            return (commitment, NarrowMmcsProverData::Memory(data));
+        }
+        let sequence = NEXT_MERKLE_ARTIFACT.fetch_add(1, Ordering::Relaxed);
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"CMFD-NARROW-MERKLE-STORE-V1");
+        identity.update(&sequence.to_le_bytes());
+        identity.update(&(matrices.len() as u64).to_le_bytes());
+        for matrix in &matrices {
+            identity.update(&(matrix.height() as u64).to_le_bytes());
+            identity.update(&(matrix.width() as u64).to_le_bytes());
+            if let NarrowStoredLde::Authenticated(matrix) = matrix {
+                identity.update(&matrix.artifact().digest());
+                identity.update(&(matrix.column_start() as u64).to_le_bytes());
+            }
+        }
+        if let Some(first_digests) = first_digests {
+            identity.update(b"PREHASHED-FIRST-LAYER");
+            identity.update(&(first_digests.height() as u64).to_le_bytes());
+            identity.update(&(first_digests.width() as u64).to_le_bytes());
+        }
+        let store_id = *identity.finalize().as_bytes();
+        let artifact_dir =
+            proof_artifact_dir(self.spill_dir.as_deref().map(std::path::PathBuf::as_path));
+        let store_path = artifact_dir.join(format!(
+            "{}-{sequence}-{}.merkle",
+            std::process::id(),
+            hex::encode(store_id)
+        ));
+        let sources = matrices
+            .iter()
+            .map(|matrix| matrix as &dyn cmfd_proof_accel::merkle_store::MerkleRowSource)
+            .collect::<Vec<_>>();
+        let store = match first_digests {
+            Some(first_digests) => {
+                cmfd_proof_accel::merkle_store::build_authenticated_merkle_store_with_first_digest_layer(
+                    &store_path,
+                    store_id,
+                    &sources,
+                    first_digests,
+                    0,
+                    &self.disk_hash,
+                )
+            }
+            None => cmfd_proof_accel::merkle_store::build_authenticated_merkle_store(
+                &store_path,
+                store_id,
+                &sources,
+                0,
+                &self.disk_hash,
+            ),
+        }
+        .unwrap_or_else(|error| panic!("building authenticated Merkle store failed: {error}"))
+        .remove_on_drop();
+        let commitment = MerkleCap::new(
+            store
+                .cap()
+                .unwrap_or_else(|error| panic!("reading authenticated Merkle cap failed: {error}"))
+                .into_iter()
+                .map(digest_from_canonical_words)
+                .collect(),
+        );
+        (
+            commitment,
+            NarrowMmcsProverData::Disk {
+                matrices,
+                store: Box::new(store),
+            },
+        )
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+pub(crate) enum NarrowMmcsProverData<M> {
+    Memory(<ValMmcs as Mmcs<F>>::ProverData<M>),
+    Disk {
+        matrices: Vec<M>,
+        store: Box<cmfd_proof_accel::merkle_store::AuthenticatedMerkleStore>,
+    },
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl Mmcs<F> for NarrowInputMmcs {
+    type ProverData<M> = NarrowMmcsProverData<M>;
+    type Commitment = <ValMmcs as Mmcs<F>>::Commitment;
+    type Proof = <ValMmcs as Mmcs<F>>::Proof;
+    type Error = <ValMmcs as Mmcs<F>>::Error;
+
+    fn commit<M: Matrix<F>>(&self, inputs: Vec<M>) -> (Self::Commitment, Self::ProverData<M>) {
+        let (commitment, data) = self.cpu.commit(inputs);
+        (commitment, NarrowMmcsProverData::Memory(data))
+    }
+
+    fn open_batch<M: Matrix<F>>(
+        &self,
+        index: usize,
+        prover_data: &Self::ProverData<M>,
+    ) -> BatchOpening<F, Self> {
+        match prover_data {
+            NarrowMmcsProverData::Memory(data) => {
+                let (opened_values, opening_proof) = self.cpu.open_batch(index, data).unpack();
+                BatchOpening::new(opened_values, opening_proof)
+            }
+            NarrowMmcsProverData::Disk { matrices, store } => {
+                let row_indices = store.matrix_row_indices(index).unwrap_or_else(|error| {
+                    panic!("reading authenticated Merkle row indices failed: {error}")
+                });
+                let opened_values = matrices
+                    .iter()
+                    .zip(row_indices)
+                    .map(|(matrix, row)| {
+                        matrix
+                            .row(row)
+                            .expect("authenticated Merkle row index is in bounds")
+                            .into_iter()
+                            .collect()
+                    })
+                    .collect();
+                let opening_proof = store
+                    .opening_path(index)
+                    .unwrap_or_else(|error| {
+                        panic!("reading authenticated Merkle opening failed: {error}")
+                    })
+                    .into_iter()
+                    .map(digest_from_canonical_words)
+                    .collect();
+                BatchOpening::new(opened_values, opening_proof)
+            }
+        }
+    }
+
+    fn get_matrices<'a, M: Matrix<F>>(&self, prover_data: &'a Self::ProverData<M>) -> Vec<&'a M> {
+        match prover_data {
+            NarrowMmcsProverData::Memory(data) => self.cpu.get_matrices(data),
+            NarrowMmcsProverData::Disk { matrices, .. } => matrices.iter().collect(),
+        }
+    }
+
+    fn verify_batch(
+        &self,
+        commitment: &Self::Commitment,
+        dimensions: &[p3_matrix::Dimensions],
+        index: usize,
+        opening: BatchOpeningRef<'_, F, Self>,
+    ) -> Result<(), Self::Error> {
+        self.cpu.verify_batch(
+            commitment,
+            dimensions,
+            index,
+            BatchOpeningRef::new(opening.opened_values, opening.opening_proof),
+        )
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+#[derive(Clone)]
+struct NarrowBinaryMerkleHash {
+    hash: FieldHash,
+    compress: Compress,
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl NarrowBinaryMerkleHash {
+    fn new() -> Self {
+        let permutation = default_poseidon2();
+        Self {
+            hash: FieldHash::new(permutation.clone()),
+            compress: Compress::new(permutation),
+        }
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+impl cmfd_proof_accel::merkle_store::BinaryMerkleHash for NarrowBinaryMerkleHash {
+    fn hash_row(&self, values: &[u64]) -> [u64; 4] {
+        digest_to_canonical_words(self.hash.hash_iter(values.iter().copied().map(F::new)))
+    }
+
+    fn compress(&self, children: [[u64; 4]; 2]) -> [u64; 4] {
+        digest_to_canonical_words(
+            self.compress
+                .compress(children.map(digest_from_canonical_words)),
+        )
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn digest_to_canonical_words(digest: [F; 4]) -> [u64; 4] {
+    digest.map(|word| word.as_canonical_u64())
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn digest_from_canonical_words(digest: [u64; 4]) -> [F; 4] {
+    digest.map(F::new)
+}
 
 #[derive(Clone, Default)]
 struct NarrowCommitBackend {
     #[cfg(feature = "gpu-proof-prover")]
     poseidon2: Option<cmfd_proof_accel::CudaProofPoseidon2>,
+    #[cfg(feature = "gpu-proof-prover")]
+    spill_dir: Option<Arc<std::path::PathBuf>>,
 }
 
 impl NarrowCommitBackend {
@@ -107,16 +580,62 @@ impl NarrowCommitBackend {
         cmfd_proof_accel::CudaProofPoseidon2::load(library_path, device_index)
             .map(|poseidon2| Self {
                 poseidon2: Some(poseidon2),
+                spill_dir: None,
             })
             .map_err(|error| NarrowBlake3Error::Accelerator(error.to_string()))
     }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    fn load_cuda_in_spill_dir(
+        library_path: impl AsRef<std::path::Path>,
+        device_index: i32,
+        spill_dir: impl AsRef<std::path::Path>,
+    ) -> Result<Self, NarrowBlake3Error> {
+        let spill_dir = spill_dir.as_ref();
+        if !spill_dir.is_absolute() {
+            return Err(NarrowBlake3Error::Accelerator(
+                "proof spill directory must be absolute".to_owned(),
+            ));
+        }
+        if !spill_dir.is_dir() {
+            return Err(NarrowBlake3Error::Accelerator(
+                "proof spill directory must already exist".to_owned(),
+            ));
+        }
+        cmfd_proof_accel::CudaProofPoseidon2::load(library_path, device_index)
+            .map(|poseidon2| Self {
+                poseidon2: Some(poseidon2),
+                spill_dir: Some(Arc::new(spill_dir.to_path_buf())),
+            })
+            .map_err(|error| NarrowBlake3Error::Accelerator(error.to_string()))
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn proof_artifact_dir(explicit: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(explicit) = explicit {
+        assert!(
+            explicit.is_absolute(),
+            "proof spill directory must be absolute"
+        );
+        assert!(
+            explicit.is_dir(),
+            "proof spill directory must already exist"
+        );
+        return explicit.to_path_buf();
+    }
+
+    let artifact_dir = std::env::temp_dir().join("commonfoundry-proof-spill");
+    std::fs::create_dir_all(&artifact_dir)
+        .unwrap_or_else(|error| panic!("creating proof spill directory failed: {error}"));
+    artifact_dir
 }
 
 #[derive(Clone)]
 pub(crate) struct NarrowPcs {
     inner: InnerPcs,
     dft: NarrowDft,
-    input_mmcs: ValMmcs,
+    input_mmcs: InputMmcs,
     log_blowup: usize,
     #[cfg(feature = "gpu-proof-prover")]
     commit_backend: NarrowCommitBackend,
@@ -185,8 +704,14 @@ impl NarrowPcs {
     ) -> Self {
         #[cfg(not(feature = "gpu-proof-prover"))]
         let _ = commit_backend;
+        #[cfg(feature = "gpu-proof-prover")]
+        let input_mmcs = NarrowInputMmcs::new_with_spill_dir(
+            input_mmcs,
+            commit_backend.poseidon2.is_some(),
+            commit_backend.spill_dir.clone(),
+        );
         Self {
-            inner: InnerPcs::new(dft.clone(), input_mmcs.clone(), fri),
+            inner: InnerPcs::new_with_lde(dft.clone(), input_mmcs.clone(), fri),
             dft,
             input_mmcs,
             log_blowup: FRI_LOG_BLOWUP,
@@ -200,9 +725,23 @@ impl NarrowPcs {
         self
     }
 
-    fn commit_bit_reversed_ldes(
+    fn commit_stored_ldes(
         &self,
-        ldes: Vec<RowMajorMatrix<F>>,
+        ldes: Vec<StoredLde>,
+    ) -> (
+        <Self as PcsTrait<EF, Challenger>>::Commitment,
+        <Self as PcsTrait<EF, Challenger>>::ProverData,
+    ) {
+        #[cfg(feature = "gpu-proof-prover")]
+        return self.commit_stored_ldes_with_first_digest_layer(ldes, None);
+        #[cfg(not(feature = "gpu-proof-prover"))]
+        self.commit_stored_ldes_inner(ldes)
+    }
+
+    #[cfg(not(feature = "gpu-proof-prover"))]
+    fn commit_stored_ldes_inner(
+        &self,
+        ldes: Vec<StoredLde>,
     ) -> (
         <Self as PcsTrait<EF, Challenger>>::Commitment,
         <Self as PcsTrait<EF, Challenger>>::ProverData,
@@ -216,34 +755,227 @@ impl NarrowPcs {
             );
         }
 
-        #[cfg(feature = "gpu-proof-prover")]
-        if let Some(poseidon2) = &self.commit_backend.poseidon2 {
-            let max_height = ldes
-                .iter()
-                .map(Matrix::height)
-                .max()
-                .expect("all matrices have height 0");
-            let tallest = ldes
-                .iter()
-                .filter(|matrix| matrix.height() == max_height)
-                .collect::<Vec<_>>();
-            let digest_matrix = poseidon2
-                .try_first_digest_layer_refs(&tallest)
-                .unwrap_or_else(|error| panic!("explicit proof Poseidon2 backend failed: {error}"));
-            debug_assert_eq!(digest_matrix.height(), max_height);
-            debug_assert_eq!(digest_matrix.width, 4);
-            let first_digests = digest_matrix
-                .values
-                .chunks_exact(4)
-                .map(|digest| [digest[0], digest[1], digest[2], digest[3]])
-                .collect();
-            return self
-                .input_mmcs
-                .commit_with_first_digest_layer(ldes, first_digests);
-        }
-
         self.input_mmcs.commit(ldes)
     }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    fn commit_stored_ldes_with_first_digest_layer(
+        &self,
+        ldes: Vec<StoredLde>,
+        first_digests: Option<&dyn cmfd_proof_accel::merkle_store::MerkleRowSource>,
+    ) -> (
+        <Self as PcsTrait<EF, Challenger>>::Commitment,
+        <Self as PcsTrait<EF, Challenger>>::ProverData,
+    ) {
+        let min_height = 1 << self.log_blowup;
+        for lde in &ldes {
+            assert!(
+                lde.height() >= min_height,
+                "committed LDE height {} is smaller than the blowup factor {min_height}",
+                lde.height()
+            );
+        }
+
+        if first_digests.is_none()
+            && let Some(poseidon2) = &self.commit_backend.poseidon2
+        {
+            let memory_ldes = ldes
+                .iter()
+                .map(NarrowStoredLde::as_memory)
+                .collect::<Option<Vec<_>>>();
+            if let Some(memory_ldes) = memory_ldes {
+                let max_height = ldes
+                    .iter()
+                    .map(Matrix::height)
+                    .max()
+                    .expect("all matrices have height 0");
+                let tallest = memory_ldes
+                    .iter()
+                    .copied()
+                    .filter(|matrix| matrix.height() == max_height)
+                    .collect::<Vec<_>>();
+                let digest_matrix = poseidon2
+                    .try_first_digest_layer_refs(&tallest)
+                    .unwrap_or_else(|error| {
+                        panic!("explicit proof Poseidon2 backend failed: {error}")
+                    });
+                debug_assert_eq!(digest_matrix.height(), max_height);
+                debug_assert_eq!(digest_matrix.width, 4);
+                let first_digests = digest_matrix
+                    .values
+                    .chunks_exact(4)
+                    .map(|digest| [digest[0], digest[1], digest[2], digest[3]])
+                    .collect();
+                let (commitment, data) = self
+                    .input_mmcs
+                    .cpu
+                    .commit_with_first_digest_layer(ldes, first_digests);
+                return (commitment, NarrowMmcsProverData::Memory(data));
+            }
+        }
+
+        self.input_mmcs
+            .commit_stored_with_first_digest_layer(ldes, first_digests)
+    }
+
+    fn commit_bit_reversed_ldes(
+        &self,
+        ldes: Vec<RowMajorMatrix<F>>,
+    ) -> (
+        <Self as PcsTrait<EF, Challenger>>::Commitment,
+        <Self as PcsTrait<EF, Challenger>>::ProverData,
+    ) {
+        #[cfg(feature = "gpu-proof-prover")]
+        let ldes = ldes.into_iter().map(NarrowStoredLde::Memory).collect();
+        self.commit_stored_ldes(ldes)
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    fn commit_streamed_evaluations(
+        &self,
+        evaluations: impl IntoIterator<Item = (TwoAdicMultiplicativeCoset<F>, RowMajorMatrix<F>)>,
+    ) -> (
+        <Self as PcsTrait<EF, Challenger>>::Commitment,
+        <Self as PcsTrait<EF, Challenger>>::ProverData,
+    ) {
+        let backend = self
+            .commit_backend
+            .poseidon2
+            .as_ref()
+            .expect("streamed commitments require the explicit CUDA backend");
+        let coefficients = evaluations
+            .into_iter()
+            .map(|(domain, evaluations)| {
+                assert_eq!(domain.size(), evaluations.height());
+                let shift = F::GENERATOR / domain.shift();
+                let coefficients = self
+                    .dft
+                    .idft_batch(evaluations)
+                    .bit_reverse_rows()
+                    .to_row_major_matrix();
+                (coefficients, shift)
+            })
+            .collect::<Vec<_>>();
+        assert!(!coefficients.is_empty(), "No matrices given?");
+        let descriptors = coefficients
+            .iter()
+            .map(|(matrix, shift)| cmfd_proof_accel::CudaProofStreamMatrix::new(matrix, *shift))
+            .collect::<Vec<_>>();
+        let mut stream = cmfd_proof_accel::CudaProofStream::load(
+            backend.library_path(),
+            backend.device_index(),
+            &descriptors,
+            self.log_blowup,
+        )
+        .unwrap_or_else(|error| panic!("explicit proof stream backend failed: {error}"));
+        let components = stream.components().to_vec();
+        let job_id = streamed_lde_job_id(&coefficients, self.log_blowup);
+        let digest_job_id = streamed_digest_job_id(job_id);
+        let source_height = stream.source_height();
+        let expanded_rows = stream.expanded_rows();
+        let added_bits =
+            u8::try_from(stream.added_bits()).expect("validated proof stream blowup fits u8");
+        let stream_manifest = cmfd_proof_accel::spill::cuda_proof_stream_manifest(&stream);
+        let artifact_dir = proof_artifact_dir(
+            self.commit_backend
+                .spill_dir
+                .as_deref()
+                .map(std::path::PathBuf::as_path),
+        );
+        let sequence = NEXT_STREAM_ARTIFACT.fetch_add(1, Ordering::Relaxed);
+        let artifact_path = artifact_dir.join(format!(
+            "{}-{sequence}-{}.lde",
+            std::process::id(),
+            hex::encode(job_id)
+        ));
+        let digest_artifact_path = artifact_dir.join(format!(
+            "{}-{sequence}-{}.first-digests",
+            std::process::id(),
+            hex::encode(digest_job_id)
+        ));
+        let writer = cmfd_proof_accel::spill::LdeArtifactWriter::create(
+            &artifact_path,
+            cmfd_proof_accel::spill::LdeArtifactSpec {
+                job_id,
+                source_height,
+                height: expanded_rows,
+                width: u32::try_from(stream.total_width())
+                    .expect("validated proof stream width fits u32"),
+                added_bits,
+                stream_manifest,
+            },
+        )
+        .unwrap_or_else(|error| panic!("creating authenticated proof spill failed: {error}"));
+        let mut digest_writer = cmfd_proof_accel::spill::LdeArtifactWriter::create(
+            &digest_artifact_path,
+            cmfd_proof_accel::spill::LdeArtifactSpec {
+                job_id: digest_job_id,
+                source_height,
+                height: expanded_rows,
+                width: 4,
+                added_bits,
+                stream_manifest,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("creating authenticated first-digest spill failed: {error}")
+        });
+        let source_height = usize::try_from(source_height)
+            .expect("validated proof stream source height fits usize");
+        let artifact = cmfd_proof_accel::spill::drain_cuda_proof_stream(
+            &mut stream,
+            writer,
+            source_height.min(STREAM_CHUNK_ROWS),
+            |row_start, _row_count, digests| digest_writer.write_rows(row_start, digests),
+        )
+        .unwrap_or_else(|error| panic!("streaming authenticated proof LDE failed: {error}"))
+        .remove_on_drop();
+        let digest_artifact = digest_writer
+            .seal()
+            .unwrap_or_else(|error| {
+                panic!("sealing authenticated first-digest spill failed: {error}")
+            })
+            .remove_on_drop();
+        let first_digests =
+            cmfd_proof_accel::spill::AuthenticatedLdeMatrix::new(Arc::new(digest_artifact))
+                .unwrap_or_else(|error| {
+                    panic!("opening authenticated first-digest spill failed: {error}")
+                });
+        let matrices = cmfd_proof_accel::spill::AuthenticatedLdeMatrix::from_stream_components(
+            Arc::new(artifact),
+            &components,
+        )
+        .unwrap_or_else(|error| panic!("opening authenticated proof LDE failed: {error}"))
+        .into_iter()
+        .map(NarrowStoredLde::Authenticated)
+        .collect();
+        self.commit_stored_ldes_with_first_digest_layer(matrices, Some(&first_digests))
+    }
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn streamed_lde_job_id(coefficients: &[(RowMajorMatrix<F>, F)], added_bits: usize) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"CMFD-NARROW-STREAMED-LDE-JOB-V1");
+    hasher.update(&(added_bits as u64).to_le_bytes());
+    hasher.update(&(coefficients.len() as u64).to_le_bytes());
+    for (matrix, shift) in coefficients {
+        hasher.update(&(matrix.height() as u64).to_le_bytes());
+        hasher.update(&(matrix.width as u64).to_le_bytes());
+        hasher.update(&shift.as_canonical_u64().to_le_bytes());
+        for value in &matrix.values {
+            hasher.update(&value.as_canonical_u64().to_le_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn streamed_digest_job_id(lde_job_id: [u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"CMFD-NARROW-STREAMED-FIRST-DIGESTS-V1");
+    hasher.update(&lde_job_id);
+    *hasher.finalize().as_bytes()
 }
 
 impl BuildPeriodicLdeTableFast for NarrowPcs {
@@ -284,6 +1016,10 @@ impl PcsTrait<EF, Challenger> for NarrowPcs {
         &self,
         evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<F>)>,
     ) -> (Self::Commitment, Self::ProverData) {
+        #[cfg(feature = "gpu-proof-prover")]
+        if self.commit_backend.poseidon2.is_some() {
+            return self.commit_streamed_evaluations(evaluations);
+        }
         let ldes = evaluations
             .into_iter()
             .map(|(domain, evaluations)| {
@@ -296,6 +1032,32 @@ impl PcsTrait<EF, Challenger> for NarrowPcs {
             })
             .collect();
         self.commit_bit_reversed_ldes(ldes)
+    }
+
+    fn commit_quotient(
+        &self,
+        quotient_domain: Self::Domain,
+        quotient_evaluations: RowMajorMatrix<F>,
+        num_chunks: usize,
+    ) -> (Self::Commitment, Self::ProverData) {
+        let quotient_sub_evaluations =
+            quotient_domain.split_evals(num_chunks, quotient_evaluations);
+        let quotient_sub_domains = quotient_domain.split_domains(num_chunks);
+        #[cfg(feature = "gpu-proof-prover")]
+        if self.commit_backend.poseidon2.is_some() {
+            return self.commit_streamed_evaluations(
+                quotient_sub_domains
+                    .into_iter()
+                    .zip(quotient_sub_evaluations),
+            );
+        }
+        let ldes = self.get_quotient_ldes(
+            quotient_sub_domains
+                .into_iter()
+                .zip(quotient_sub_evaluations),
+            num_chunks,
+        );
+        self.commit_ldes(ldes)
     }
 
     fn get_quotient_ldes(
@@ -414,7 +1176,6 @@ struct PrepCols<T> {
     is_last_finalization: T,
     byte_group: [T; BYTES_PER_EVAL_ROW],
     activation_active: T,
-    activation_high_weight: [T; 3],
     padding_active: [T; BYTES_PER_EVAL_ROW],
     is_active_operation: T,
     is_root: T,
@@ -467,6 +1228,7 @@ pub(crate) struct NarrowBlake3Air {
     point_variables: usize,
     point: Vec<crate::structured_sumcheck::ExtensionField>,
     trace_rows: usize,
+    schedule: Arc<Blake3TreeWitness>,
 }
 
 impl NarrowBlake3Air {
@@ -487,7 +1249,10 @@ impl NarrowBlake3Air {
             return Err(NarrowBlake3Error::UnsupportedShape);
         }
         validate_field_elements(statement)?;
+        let dummy = vec![0_u8; statement.final_activation_len];
+        let schedule = build_tree_witness(OUTPUT_CONTEXT, [0; 32], &dummy)?;
         let operation_count = operation_count(statement.final_activation_len)?;
+        debug_assert_eq!(schedule.operations.len(), operation_count);
         let active_rows = operation_count
             .checked_mul(ROWS_PER_COMPRESSION)
             .ok_or(NarrowBlake3Error::UnsupportedShape)?;
@@ -509,7 +1274,23 @@ impl NarrowBlake3Air {
                 .map(|value| value.to_field().expect("validated point"))
                 .collect(),
             trace_rows,
+            schedule: Arc::new(schedule),
         })
+    }
+
+    fn activation_high_weight_at_row(
+        &self,
+        row_index: usize,
+    ) -> crate::structured_sumcheck::ExtensionField {
+        let operation_index = row_index / ROWS_PER_COMPRESSION;
+        let step = row_index % ROWS_PER_COMPRESSION;
+        let message_offset = self
+            .schedule
+            .operations
+            .get(operation_index)
+            .and_then(|operation| operation.message_offset);
+        activation_high_weight(self.activation_len, &self.point, message_offset, step)
+            .unwrap_or(crate::structured_sumcheck::ExtensionField::ZERO)
     }
 }
 
@@ -522,12 +1303,49 @@ impl BaseAir<F> for NarrowBlake3Air {
         Some(generate_preprocessed(
             self.activation_len,
             self.trace_rows,
-            &self.point,
+            &self.schedule,
         ))
     }
 
     fn preprocessed_width(&self) -> usize {
         PREP_WIDTH
+    }
+
+    fn num_periodic_columns(&self) -> usize {
+        ACTIVATION_HIGH_WEIGHT_WIDTH
+    }
+
+    fn periodic_columns(&self) -> Vec<Vec<F>> {
+        let mut columns: [Vec<F>; ACTIVATION_HIGH_WEIGHT_WIDTH] =
+            array::from_fn(|_| F::zero_vec(self.trace_rows));
+        for (operation_index, operation) in self.schedule.operations.iter().enumerate() {
+            for step in 0..BYTES_PER_EVAL_ROW {
+                let row_index = operation_index * ROWS_PER_COMPRESSION + step;
+                if row_index >= self.trace_rows {
+                    break;
+                }
+                let Some(weight) = activation_high_weight(
+                    self.activation_len,
+                    &self.point,
+                    operation.message_offset,
+                    step,
+                ) else {
+                    continue;
+                };
+                let mut limbs = [F::ZERO; ACTIVATION_HIGH_WEIGHT_WIDTH];
+                set_ext(&mut limbs, weight);
+                for limb in 0..ACTIVATION_HIGH_WEIGHT_WIDTH {
+                    columns[limb][row_index] = limbs[limb];
+                }
+            }
+        }
+        columns.into_iter().collect()
+    }
+
+    fn periodic_values(&self, row_index: usize) -> Vec<F> {
+        let mut limbs = [F::ZERO; ACTIVATION_HIGH_WEIGHT_WIDTH];
+        set_ext(&mut limbs, self.activation_high_weight_at_row(row_index));
+        limbs.into()
     }
 
     fn num_public_values(&self) -> usize {
@@ -553,7 +1371,7 @@ impl<AB: AirBuilder<F = F>> Air<AB> for NarrowBlake3Air {
         constrain_initial_state(builder, &local, &prep);
         constrain_message(builder, &local, &next, &prep);
         constrain_digest(builder, &local, &prep, self.point_variables);
-        constrain_evaluation(builder, &local, &next, &prep, self.point_variables);
+        constrain_evaluation(builder, &local, &next, self.point_variables);
         constrain_links(builder, &local, &next, &prep);
     }
 }
@@ -583,6 +1401,20 @@ pub(crate) fn prove_narrow_blake3_with_cuda(
     device_index: i32,
 ) -> Result<Vec<u8>, NarrowBlake3Error> {
     let commit_backend = NarrowCommitBackend::load_cuda(library_path, device_index)?;
+    prove_narrow_blake3_with_backends(statement, activation, dft, commit_backend)
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+pub(crate) fn prove_narrow_blake3_with_cuda_in_spill_dir(
+    statement: &StructuredBlake3Statement,
+    activation: &[u8],
+    dft: NarrowDft,
+    library_path: impl AsRef<std::path::Path>,
+    device_index: i32,
+    spill_dir: impl AsRef<std::path::Path>,
+) -> Result<Vec<u8>, NarrowBlake3Error> {
+    let commit_backend =
+        NarrowCommitBackend::load_cuda_in_spill_dir(library_path, device_index, spill_dir)?;
     prove_narrow_blake3_with_backends(statement, activation, dft, commit_backend)
 }
 
@@ -990,11 +1822,12 @@ fn constrain_evaluation<AB: AirBuilder>(
     builder: &mut AB,
     local: &MainCols<AB::Var>,
     next: &MainCols<AB::Var>,
-    prep: &PrepCols<AB::Var>,
     point_variables: usize,
 ) {
     let public = builder.public_values().to_vec();
-    let high_weight = ExtExpr(prep.activation_high_weight.map(Into::into));
+    let periodic = builder.periodic_values().to_vec();
+    debug_assert_eq!(periodic.len(), ACTIVATION_HIGH_WEIGHT_WIDTH);
+    let high_weight = ExtExpr(array::from_fn(|limb| periodic[limb].into()));
     let mut contribution = ExtExpr::zero();
     for byte in 0..8 {
         let mut low_weight = ExtExpr::one();
@@ -1079,14 +1912,41 @@ fn constrain_links<AB: AirBuilder>(
     }
 }
 
+fn activation_high_weight(
+    activation_len: usize,
+    point: &[crate::structured_sumcheck::ExtensionField],
+    message_offset: Option<usize>,
+    step: usize,
+) -> Option<crate::structured_sumcheck::ExtensionField> {
+    if step >= BYTES_PER_EVAL_ROW {
+        return None;
+    }
+    let activation_start = 40_usize;
+    let activation_end = activation_start.checked_add(activation_len)?;
+    let evaluation_offset = message_offset?.checked_add(step.checked_mul(BYTES_PER_EVAL_ROW)?)?;
+    let evaluation_end = evaluation_offset.checked_add(BYTES_PER_EVAL_ROW)?;
+    if evaluation_offset < activation_start || evaluation_end > activation_end {
+        return None;
+    }
+
+    let activation_index = evaluation_offset - activation_start;
+    let mut weight = crate::structured_sumcheck::ExtensionField::ONE;
+    for (variable, coordinate) in point.iter().enumerate().skip(LOW_EVALUATION_VARIABLES) {
+        let factor = if (activation_index >> variable) & 1 == 1 {
+            *coordinate
+        } else {
+            crate::structured_sumcheck::ExtensionField::ONE.sub(*coordinate)
+        };
+        weight = weight.mul(factor);
+    }
+    Some(weight)
+}
+
 fn generate_preprocessed(
     activation_len: usize,
     rows: usize,
-    point: &[crate::structured_sumcheck::ExtensionField],
+    witness: &Blake3TreeWitness,
 ) -> RowMajorMatrix<F> {
-    let dummy = vec![0_u8; activation_len];
-    let witness =
-        build_tree_witness(OUTPUT_CONTEXT, [0; 32], &dummy).expect("valid deterministic schedule");
     let mut values = F::zero_vec(rows * PREP_WIDTH);
     for row_index in 0..rows {
         let prep: &mut PrepCols<F> =
@@ -1164,17 +2024,7 @@ fn generate_preprocessed(
             {
                 let activation_index = message_offset - 40;
                 prep.activation_active = F::ONE;
-                let mut weight = crate::structured_sumcheck::ExtensionField::ONE;
-                for (variable, coordinate) in
-                    point.iter().enumerate().skip(LOW_EVALUATION_VARIABLES)
-                {
-                    weight = weight.mul(if (activation_index >> variable) & 1 == 1 {
-                        *coordinate
-                    } else {
-                        crate::structured_sumcheck::ExtensionField::ONE.sub(*coordinate)
-                    });
-                }
-                set_ext(&mut prep.activation_high_weight, weight);
+                debug_assert_eq!(activation_index % BYTES_PER_EVAL_ROW, 0);
             }
             if prep.is_last_message_block == F::ONE {
                 for byte in 0..8 {
@@ -1249,31 +2099,9 @@ pub(crate) fn for_each_main_trace_row<E>(
                 [F::from_u8(value & 0xf), F::from_u8(value >> 4)]
             });
             row.chaining_value = operation.chaining_value.map(F::from_u32);
-            let message_offset = operation
-                .message_offset
-                .unwrap_or(usize::MAX)
-                .saturating_add(step * 8);
-            let active = operation.kind == CompressionKind::Chunk
-                && step < BYTES_PER_EVAL_ROW
-                && (40..40 + air.activation_len).contains(&message_offset)
-                && message_offset + 8 <= 40 + air.activation_len;
-            let mut high_weight =
-                crate::structured_sumcheck::ExtensionField::from_u64(u64::from(active));
-            if active {
-                let base_index = message_offset - 40;
-                for (variable, coordinate) in point
-                    .iter()
-                    .enumerate()
-                    .take(air.point_variables)
-                    .skip(LOW_EVALUATION_VARIABLES)
-                {
-                    let factor = if (base_index >> variable) & 1 == 1 {
-                        *coordinate
-                    } else {
-                        crate::structured_sumcheck::ExtensionField::ONE.sub(*coordinate)
-                    };
-                    high_weight = high_weight.mul(factor);
-                }
+            if let Some(high_weight) =
+                activation_high_weight(air.activation_len, &point, operation.message_offset, step)
+            {
                 for byte in 0..8 {
                     let mut low_weight = crate::structured_sumcheck::ExtensionField::ONE;
                     for (variable, coordinate) in
@@ -1878,8 +2706,27 @@ impl<E: Clone + PrimeCharacteristicRing> ExtExpr<E> {
 mod tests {
     use super::*;
     use p3_air::AirLayout;
+    use p3_commit::PeriodicEvaluator;
     use p3_matrix::Matrix;
     use p3_uni_stark::{ProvenSecurity, StarkSecurityParams};
+
+    const PINNED_PREP_ACTIVATION_LENGTHS: [usize; 15] = [
+        1 << 5,
+        1 << 6,
+        1 << 7,
+        1 << 8,
+        1 << 9,
+        1 << 10,
+        1 << 11,
+        1 << 12,
+        1 << 13,
+        1 << 14,
+        1 << 15,
+        1 << 16,
+        1 << 17,
+        1 << 18,
+        1 << 19,
+    ];
 
     fn statement(activation: &[u8]) -> StructuredBlake3Statement {
         let challenge = [0x42; 32];
@@ -1912,6 +2759,271 @@ mod tests {
             final_activation_evaluation: crate::ExtensionElement::from_field(
                 crate::structured_sumcheck::evaluate_mle(&table, &native_point),
             ),
+        }
+    }
+
+    fn preprocessed_air(activation_len: usize) -> NarrowBlake3Air {
+        assert!(PINNED_PREP_ACTIVATION_LENGTHS.contains(&activation_len));
+        let challenge_digest = [0x42; 32];
+        let activation = vec![125; activation_len];
+        let statement = StructuredBlake3Statement {
+            challenge_digest,
+            final_activation_len: activation_len,
+            final_activation_digest: crate::forgematrix_v2::output_digest(
+                challenge_digest,
+                &activation,
+            ),
+            final_activation_point: vec![
+                crate::ExtensionElement { limbs: [0; 3] };
+                activation_len.ilog2() as usize
+            ],
+            final_activation_evaluation: crate::ExtensionElement { limbs: [0; 3] },
+        };
+        NarrowBlake3Air::new(&statement).unwrap()
+    }
+
+    fn preprocessed_root_and_drop(config: &Config, air: &NarrowBlake3Air) -> [u64; 4] {
+        let degree_bits = air.trace_rows.ilog2() as usize;
+        let (prover_key, verifier_key) = setup_preprocessed(config, air, degree_bits)
+            .expect("narrow BLAKE3 AIR has preprocessed columns");
+
+        assert_eq!(PREP_WIDTH, 84);
+        assert_eq!(prover_key.width, PREP_WIDTH);
+        assert_eq!(verifier_key.width, PREP_WIDTH);
+        assert_eq!(prover_key.degree_bits, degree_bits);
+        assert_eq!(verifier_key.degree_bits, degree_bits);
+        assert_eq!(prover_key.commitment, verifier_key.commitment);
+        assert_eq!(verifier_key.commitment.num_roots(), 1);
+        let root = verifier_key.commitment.roots()[0].map(|word| word.as_canonical_u64());
+
+        // GPU setup owns authenticated LDE and Merkle artifacts through this
+        // value. Release them before the generator advances to the next shape.
+        drop(prover_key);
+        root
+    }
+
+    fn legacy_activation_high_weight(
+        activation_len: usize,
+        point: &[crate::structured_sumcheck::ExtensionField],
+        operation: Option<&CompressionOp>,
+        step: usize,
+    ) -> crate::structured_sumcheck::ExtensionField {
+        let Some(operation) = operation else {
+            return crate::structured_sumcheck::ExtensionField::ZERO;
+        };
+        if operation.kind != CompressionKind::Chunk || step >= BYTES_PER_EVAL_ROW {
+            return crate::structured_sumcheck::ExtensionField::ZERO;
+        }
+        let message_offset = operation.message_offset.unwrap_or(usize::MAX) + step * 8;
+        if !(40..40 + activation_len).contains(&message_offset)
+            || message_offset + 8 > 40 + activation_len
+        {
+            return crate::structured_sumcheck::ExtensionField::ZERO;
+        }
+
+        let activation_index = message_offset - 40;
+        point
+            .iter()
+            .enumerate()
+            .skip(LOW_EVALUATION_VARIABLES)
+            .fold(
+                crate::structured_sumcheck::ExtensionField::ONE,
+                |weight, (variable, coordinate)| {
+                    weight.mul(if (activation_index >> variable) & 1 == 1 {
+                        *coordinate
+                    } else {
+                        crate::structured_sumcheck::ExtensionField::ONE.sub(*coordinate)
+                    })
+                },
+            )
+    }
+
+    fn deterministic_extension_point(
+        variables: usize,
+    ) -> Vec<crate::structured_sumcheck::ExtensionField> {
+        (0..variables)
+            .map(|index| {
+                let index = index as u64 + 1;
+                crate::structured_sumcheck::ExtensionField::from_canonical_limbs([
+                    0x1020_3040_5060_7080_u64.wrapping_mul(index) % GOLDILOCKS_MODULUS,
+                    0x8877_6655_4433_2211_u64.wrapping_mul(index) % GOLDILOCKS_MODULUS,
+                    0x0f1e_2d3c_4b5a_6978_u64.wrapping_mul(index) % GOLDILOCKS_MODULUS,
+                ])
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn periodic_activation_weights_match_legacy_rows_for_zero_one_and_random_points() {
+        assert_eq!(PREP_WIDTH, 84);
+        for activation_len in [32, 64, 2_048] {
+            let activation = vec![0_u8; activation_len];
+            let base_statement = statement(&activation);
+            let variables = activation_len.ilog2() as usize;
+            let point_cases = [
+                vec![crate::structured_sumcheck::ExtensionField::ZERO; variables],
+                vec![crate::structured_sumcheck::ExtensionField::ONE; variables],
+                deterministic_extension_point(variables),
+            ];
+
+            for point in point_cases {
+                let mut air = NarrowBlake3Air::new(&base_statement).unwrap();
+                air.point = point.clone();
+                let columns = air.periodic_columns();
+                assert_eq!(air.num_periodic_columns(), ACTIVATION_HIGH_WEIGHT_WIDTH);
+                assert_eq!(columns.len(), ACTIVATION_HIGH_WEIGHT_WIDTH);
+                assert!(columns.iter().all(|column| column.len() == air.trace_rows));
+
+                for (row_index, ((limb_0, limb_1), limb_2)) in columns[0]
+                    .iter()
+                    .zip(&columns[1])
+                    .zip(&columns[2])
+                    .enumerate()
+                {
+                    let operation = air
+                        .schedule
+                        .operations
+                        .get(row_index / ROWS_PER_COMPRESSION);
+                    let expected = legacy_activation_high_weight(
+                        activation_len,
+                        &point,
+                        operation,
+                        row_index % ROWS_PER_COMPRESSION,
+                    );
+                    let mut expected_limbs = [F::ZERO; ACTIVATION_HIGH_WEIGHT_WIDTH];
+                    set_ext(&mut expected_limbs, expected);
+                    let actual_limbs = [*limb_0, *limb_1, *limb_2];
+                    assert_eq!(
+                        actual_limbs, expected_limbs,
+                        "activation_len={activation_len}, row={row_index}"
+                    );
+                    assert_eq!(air.periodic_values(row_index), actual_limbs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn periodic_activation_polynomials_equal_rows_on_the_trace_domain() {
+        type Evaluator = p3_fri::TwoAdicPeriodicEvaluator<Radix2DitParallel<F>>;
+
+        let activation = vec![0_u8; 64];
+        let base_statement = statement(&activation);
+        let mut air = NarrowBlake3Air::new(&base_statement).unwrap();
+        air.point = deterministic_extension_point(activation.len().ilog2() as usize);
+        let columns = air.periodic_columns();
+        let mut domain = TwoAdicMultiplicativeCoset::new(F::ONE, air.trace_rows.ilog2() as usize)
+            .expect("supported trace domain");
+
+        for row_index in [0, 1, 4, 5, 8, 119, 120, 127, air.trace_rows - 1] {
+            let point = domain.element(row_index);
+            let evaluated = <Evaluator as PeriodicEvaluator<F, _>>::eval_at_point::<F>(
+                &columns, &domain, point,
+            );
+            assert_eq!(evaluated, air.periodic_values(row_index));
+        }
+    }
+
+    #[test]
+    fn preprocessed_schedule_is_point_independent_after_weight_extraction() {
+        let activation = vec![0_u8; 64];
+        let base_statement = statement(&activation);
+        let mut air = NarrowBlake3Air::new(&base_statement).unwrap();
+        air.point = vec![
+            crate::structured_sumcheck::ExtensionField::ZERO;
+            activation.len().ilog2() as usize
+        ];
+        let zero_point_preprocessed = air.preprocessed_trace().unwrap();
+        let zero_point_periodic = air.periodic_columns();
+
+        air.point = deterministic_extension_point(activation.len().ilog2() as usize);
+        let random_point_preprocessed = air.preprocessed_trace().unwrap();
+        let random_point_periodic = air.periodic_columns();
+
+        assert_eq!(zero_point_preprocessed, random_point_preprocessed);
+        assert_ne!(zero_point_periodic, random_point_periodic);
+    }
+
+    #[test]
+    fn small_preprocessed_keys_have_the_production_shape_and_distinct_roots() {
+        let config = build_config();
+        let roots = [32, 64].map(|activation_len| {
+            let air = preprocessed_air(activation_len);
+            preprocessed_root_and_drop(&config, &air)
+        });
+
+        assert_ne!(roots[0], roots[1]);
+        assert!(
+            roots
+                .into_iter()
+                .flatten()
+                .all(|word| word < GOLDILOCKS_MODULUS)
+        );
+    }
+
+    #[test]
+    fn preprocessed_key_is_point_independent() {
+        let config = build_config();
+        let mut air = preprocessed_air(64);
+        let zero_point_root = preprocessed_root_and_drop(&config, &air);
+
+        air.point = deterministic_extension_point(air.point_variables);
+        let nonzero_point_root = preprocessed_root_and_drop(&config, &air);
+
+        assert_eq!(zero_point_root, nonzero_point_root);
+        assert_ne!(air.periodic_columns()[0], vec![F::ZERO; air.trace_rows]);
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    #[ignore = "generates production preprocessed roots with an explicitly selected CUDA library and device"]
+    fn generate_cuda_pinned_preprocessed_roots() {
+        let library_path = std::path::PathBuf::from(
+            std::env::var_os("CMFD_TEST_PROOF_CUDA_LIBRARY")
+                .expect("set CMFD_TEST_PROOF_CUDA_LIBRARY to the exact CUDA proof-library path"),
+        );
+        assert!(
+            library_path.is_absolute() && library_path.is_file(),
+            "CMFD_TEST_PROOF_CUDA_LIBRARY must name an existing absolute file"
+        );
+        let device_index = std::env::var("CMFD_TEST_PROOF_CUDA_DEVICE")
+            .expect("set CMFD_TEST_PROOF_CUDA_DEVICE to the exact CUDA device index")
+            .parse::<i32>()
+            .expect("CMFD_TEST_PROOF_CUDA_DEVICE must be an i32");
+        assert!(
+            device_index >= 0,
+            "CMFD_TEST_PROOF_CUDA_DEVICE must be nonnegative"
+        );
+
+        let activation_lengths = match std::env::var("CMFD_PINNED_PREP_ACTIVATION_LEN") {
+            Ok(value) => {
+                let activation_len = value
+                    .parse::<usize>()
+                    .expect("CMFD_PINNED_PREP_ACTIVATION_LEN must be a decimal usize");
+                assert!(
+                    PINNED_PREP_ACTIVATION_LENGTHS.contains(&activation_len),
+                    "CMFD_PINNED_PREP_ACTIVATION_LEN must be one of {PINNED_PREP_ACTIVATION_LENGTHS:?}"
+                );
+                vec![activation_len]
+            }
+            Err(std::env::VarError::NotPresent) => PINNED_PREP_ACTIVATION_LENGTHS.to_vec(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("CMFD_PINNED_PREP_ACTIVATION_LEN must be valid Unicode")
+            }
+        };
+
+        let dft = NarrowDft::load_cuda(&library_path, device_index).unwrap();
+        let commit_backend = NarrowCommitBackend::load_cuda(&library_path, device_index).unwrap();
+        let config = build_config_with_backends(dft, commit_backend);
+
+        for activation_len in activation_lengths {
+            let air = preprocessed_air(activation_len);
+            let degree_bits = air.trace_rows.ilog2() as usize;
+            let root = preprocessed_root_and_drop(&config, &air);
+            println!(
+                "activation_len={activation_len} degree_bits={degree_bits} prep_width={PREP_WIDTH} preprocessed_root_u64={root:?}"
+            );
         }
     }
 
@@ -2047,6 +3159,42 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    fn authenticated_disk_mmcs_matches_cpu_commitment_and_every_opening() {
+        let permutation = default_poseidon2();
+        let cpu = ValMmcs::new(
+            FieldHash::new(permutation.clone()),
+            Compress::new(permutation),
+            0,
+        );
+        let matrices = vec![
+            dft_fixture(7, 1, 0x411),
+            dft_fixture(4, 3, 0x422),
+            dft_fixture(7, 2, 0x433),
+        ];
+        let (cpu_commitment, cpu_data) = cpu.commit(matrices.clone());
+        let disk = NarrowInputMmcs::new(cpu.clone(), true);
+        let (disk_commitment, disk_data) = disk.commit_stored_with_first_digest_layer(
+            matrices.into_iter().map(NarrowStoredLde::Memory).collect(),
+            None,
+        );
+        assert_eq!(disk_commitment, cpu_commitment);
+        let store_path = match &disk_data {
+            NarrowMmcsProverData::Disk { store, .. } => store.path().to_path_buf(),
+            NarrowMmcsProverData::Memory(_) => panic!("disk MMCS returned memory prover data"),
+        };
+        assert!(store_path.exists());
+        for index in 0..7 {
+            let cpu_opening = cpu.open_batch(index, &cpu_data);
+            let disk_opening = disk.open_batch(index, &disk_data);
+            assert_eq!(disk_opening.opened_values, cpu_opening.opened_values);
+            assert_eq!(disk_opening.opening_proof, cpu_opening.opening_proof);
+        }
+        drop(disk_data);
+        assert!(!store_path.exists());
+    }
+
     #[test]
     fn narrow_tree_trace_satisfies_every_air_constraint() {
         let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
@@ -2096,6 +3244,10 @@ mod tests {
         let mut wrong_digest = statement.clone();
         wrong_digest.final_activation_digest[0] ^= 1;
         assert!(verify_narrow_blake3(&wrong_digest, &proof).is_err());
+
+        let mut wrong_point = statement.clone();
+        wrong_point.final_activation_point[3].limbs[0] += 1;
+        assert!(verify_narrow_blake3(&wrong_point, &proof).is_err());
 
         for index in [0, 8, 12, 16, proof.len() / 2, proof.len() - 1] {
             let mut mutated = proof.clone();
@@ -2207,7 +3359,7 @@ mod tests {
 
     #[cfg(feature = "gpu-proof-prover")]
     #[test]
-    #[ignore = "requires CMFD_TEST_PROOF_CUDA_LIBRARY, a CUDA device, and about 14 GiB host RAM"]
+    #[ignore = "requires CMFD_TEST_PROOF_CUDA_LIBRARY, a CUDA device, and about 14 GiB temporary disk"]
     fn gpu_proof_size_at_32768_rows() {
         let library_path = std::env::var_os("CMFD_TEST_PROOF_CUDA_LIBRARY")
             .expect("set CMFD_TEST_PROOF_CUDA_LIBRARY to the exact CUDA proof-library path");

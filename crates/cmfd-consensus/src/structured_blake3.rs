@@ -38,6 +38,8 @@ use thiserror::Error;
 
 #[cfg(feature = "gpu-proof-prover")]
 use crate::structured_blake3_narrow::prove_narrow_blake3_with_cuda as prove_narrow_blake3_with_cuda_backends;
+#[cfg(feature = "gpu-proof-prover")]
+use crate::structured_blake3_narrow::prove_narrow_blake3_with_cuda_in_spill_dir as prove_narrow_blake3_with_cuda_in_spill_dir_backends;
 use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement, StructuredBlake3Verifier,
     forgematrix_v2::output_digest,
@@ -343,17 +345,77 @@ pub fn prove_structured_blake3_with_cuda(
     library_path: impl AsRef<std::path::Path>,
     device_index: i32,
 ) -> Result<Vec<u8>, StructuredBlake3Error> {
-    let library_path = library_path.as_ref();
+    prove_structured_blake3_with_cuda_inner(
+        statement,
+        final_activation,
+        library_path.as_ref(),
+        device_index,
+        None,
+    )
+}
+
+/// Explicit spill-directory entry point for the crash-isolated proof worker.
+///
+/// The caller must own this existing absolute directory for the duration of
+/// the call and remove it after the worker process exits.
+#[cfg(feature = "gpu-proof-prover")]
+#[doc(hidden)]
+pub fn prove_structured_blake3_with_cuda_in_spill_dir(
+    statement: &StructuredBlake3Statement,
+    final_activation: &[u8],
+    library_path: impl AsRef<std::path::Path>,
+    device_index: i32,
+    spill_dir: impl AsRef<std::path::Path>,
+) -> Result<Vec<u8>, StructuredBlake3Error> {
+    let spill_dir = spill_dir.as_ref();
+    if !spill_dir.is_absolute() {
+        return Err(StructuredBlake3Error::Accelerator(
+            "proof spill directory must be absolute".to_owned(),
+        ));
+    }
+    if !spill_dir.is_dir() {
+        return Err(StructuredBlake3Error::Accelerator(
+            "proof spill directory must already exist".to_owned(),
+        ));
+    }
+    prove_structured_blake3_with_cuda_inner(
+        statement,
+        final_activation,
+        library_path.as_ref(),
+        device_index,
+        Some(spill_dir),
+    )
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn prove_structured_blake3_with_cuda_inner(
+    statement: &StructuredBlake3Statement,
+    final_activation: &[u8],
+    library_path: &std::path::Path,
+    device_index: i32,
+    spill_dir: Option<&std::path::Path>,
+) -> Result<Vec<u8>, StructuredBlake3Error> {
     let dft = NarrowDft::load_cuda(library_path, device_index)?;
     let proof = if statement.final_activation_len > MAX_ONE_BLOCK_ACTIVATION_BYTES {
         let backend = BACKEND_TREE;
-        let payload = prove_narrow_blake3_with_cuda_backends(
-            statement,
-            final_activation,
-            dft,
-            library_path,
-            device_index,
-        )?;
+        let payload = if let Some(spill_dir) = spill_dir {
+            prove_narrow_blake3_with_cuda_in_spill_dir_backends(
+                statement,
+                final_activation,
+                dft,
+                library_path,
+                device_index,
+                spill_dir,
+            )?
+        } else {
+            prove_narrow_blake3_with_cuda_backends(
+                statement,
+                final_activation,
+                dft,
+                library_path,
+                device_index,
+            )?
+        };
         let compressed = compress_tree_proof(&payload)?;
         if 17 + compressed.len() > MAX_COMPRESSED_TREE_PROOF_BYTES {
             return Err(StructuredBlake3Error::ProofTooLarge);
@@ -1001,6 +1063,53 @@ mod tests {
         let error = prove_structured_blake3_with_cuda(&statement, &activation, missing, 0)
             .expect_err("an explicitly missing CUDA library must fail closed");
         assert!(matches!(error, StructuredBlake3Error::Accelerator(_)));
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    fn cuda_worker_spill_directory_must_be_absolute_and_existing() {
+        let activation = [1, 2, 3, 4, 5, 6, 7, 8];
+        let statement = statement(&activation);
+        let missing_library = std::env::temp_dir().join(format!(
+            "cmfd-proof-cuda-missing-{}-{}",
+            std::process::id(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        let relative = prove_structured_blake3_with_cuda_in_spill_dir(
+            &statement,
+            &activation,
+            &missing_library,
+            0,
+            std::path::Path::new("relative-spill-directory"),
+        );
+        assert_eq!(
+            relative,
+            Err(StructuredBlake3Error::Accelerator(
+                "proof spill directory must be absolute".to_owned()
+            ))
+        );
+
+        let missing_spill = std::env::temp_dir().join(format!(
+            "cmfd-proof-missing-spill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let absent = prove_structured_blake3_with_cuda_in_spill_dir(
+            &statement,
+            &activation,
+            missing_library,
+            0,
+            missing_spill,
+        );
+        assert_eq!(
+            absent,
+            Err(StructuredBlake3Error::Accelerator(
+                "proof spill directory must already exist".to_owned()
+            ))
+        );
     }
 
     #[cfg(feature = "gpu-proof-prover")]

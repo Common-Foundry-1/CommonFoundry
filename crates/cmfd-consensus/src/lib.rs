@@ -1,5 +1,7 @@
 pub mod chain;
 pub mod difficulty;
+#[cfg(feature = "dory-opening-prototype")]
+pub mod dory_opening_prototype;
 pub mod economics;
 pub mod forgematrix;
 pub mod forgematrix_v2;
@@ -8,7 +10,7 @@ pub mod model_bank;
 pub mod model_whir_sources;
 pub mod network;
 pub mod pow;
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(all(test, feature = "production-whir-candidate"))]
 mod production_range_lookup_prototype;
 #[cfg(feature = "remainder-prototype")]
 pub mod remainder_proof;

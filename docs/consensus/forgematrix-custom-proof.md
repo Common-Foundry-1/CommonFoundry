@@ -776,6 +776,30 @@ Fiat-Shamir grinding condition. The compact arithmetic and range reduction is
 therefore retained, but a different succinct commitment or aggregation layer
 is a production requirement.
 
+The next transport checkpoint is an off-by-default Dory aggregation prototype.
+It uses a degree-two multilinear sumcheck to reduce ordered openings at distinct
+points to one random point, then combines the polynomials, tier-one rows, and
+tier-two commitments with the final equality-polynomial weights and produces a
+single homomorphic Dory opening. The wrapper transcript binds the setup identity,
+block statement, exact matrix shape, every ordered commitment, every point, and
+every evaluation before sampling batching challenges. It also binds the combined
+opening because the upstream API does not absorb that public statement.
+
+The prototype wire parser is fixed-shape: before Dory deserialization it checks
+the total length, round count, transparent final-message flag, and `nu`/`sigma`,
+then validates group encodings, reserializes canonically, and rejects trailing
+bytes. An n=8 three-claim fixture is exactly 12,063 bytes. Using compressed
+BLS12-381 element sizes, the same n=31 grammar projects to 66,559 bytes for this
+sumcheck and opening aggregate. This is not a complete production proof-size
+claim. The implemented backend is BN254 with random setup vectors and the module's
+production gate always returns an error. Dory also works over the pairing scalar
+field, while the packed AIR uses the cubic Goldilocks extension; replacement
+therefore requires either an arithmetization migration or a proved conversion
+bridge. A 128-bit BLS12-381 backend,
+domain-separated deterministic hash-to-curve generators, streaming n=31 proving,
+complete soundness accounting, full aggregate measurement, and independent audit
+remain mandatory activation gates.
+
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
 proof is bounded at 87,556 bytes, and the remaining aggregate components are

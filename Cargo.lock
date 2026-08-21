@@ -508,6 +508,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "blake2b_simd"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -851,11 +860,13 @@ name = "cmfd-consensus"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ark-serialize",
  "bincode",
  "blake3",
  "clap",
  "cmfd-marketplace",
  "cmfd-proof-accel",
+ "dory-pcs",
  "enum-ordinalize",
  "flate2",
  "frontend",
@@ -1516,6 +1527,38 @@ dependencies = [
  "precomputed-hash",
  "selectors",
  "tendril",
+]
+
+[[package]]
+name = "dory-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc9c63de9e3d87d5be179ce2ddde4f31d95c12c1f20ccdbc3a70b004813959ca"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "dory-pcs"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "065945e9fff3c7dac5d6f72f8260eac82ad577e7c7009b6290847d1252d14d78"
+dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+ "bincode",
+ "blake2",
+ "digest 0.10.7",
+ "dory-derive",
+ "rand_core 0.6.4",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

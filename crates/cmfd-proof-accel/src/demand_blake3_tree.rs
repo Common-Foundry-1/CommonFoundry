@@ -1,17 +1,20 @@
 //! Demand-authenticated, production-geometry BLAKE3 paths for WHIR.
 //!
-//! Format v2 stores Plonky3's exact layer-major binary BLAKE3 tree without a
-//! proportional in-memory authentication table. Reopening performs two fixed
-//! `Read` calls totaling 288 bytes (plus seeks and two file-metadata queries)
-//! against a caller-retained identity. A proof-facing path is returned only
-//! together with an authenticated canonical extension-codeword row and only
-//! after that row and the on-disk siblings reconstruct the pinned root.
+//! The extension-v2 and initial-v1 suites store Plonky3's exact layer-major
+//! binary BLAKE3 tree without a proportional in-memory authentication table.
+//! They have independent magic, version, width, height cap, and header-digest
+//! domain. Reopening performs two fixed `Read` calls totaling 288 bytes (plus
+//! seeks and two file-metadata queries) against a caller-retained identity. A
+//! proof-facing extension path is returned only together with an authenticated
+//! canonical extension-codeword row and only after that row and the on-disk
+//! siblings reconstruct the pinned root.
 //!
-//! This is a correctness/reference primitive. Building the production
-//! `2^29`-row tree still writes about 32 GiB and has not yet been matched by the
-//! production GPU construction path. The feature-gated artifact WHIR prover
-//! adopts this store, but that integration does not raise any proof-activation
-//! cap.
+//! This is a correctness/reference primitive. Building the extension `2^29`
+//! tree writes about 32 GiB; the initial `2^30` tree writes about 64 GiB.
+//! Neither has yet been matched by the production GPU construction path. The
+//! feature-gated artifact WHIR prover adopts the extension store, but this
+//! initial suite is not yet integrated into that prover and raises no proof-
+//! activation cap.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -29,22 +32,89 @@ use crate::whir_extension::{
     AuthenticatedWhirExtensionCodeword, WHIR_EXTENSION_LIMBS_PER_ROW,
     WhirExtensionCodewordIdentity, WhirExtensionEncodingError,
 };
+use crate::whir_initial::{
+    AuthenticatedWhirInitialCodeword, WHIR_INITIAL_MIN_VARIABLES, WHIR_INITIAL_WIDTH,
+    WhirInitialEncodingError,
+};
 
-const MAGIC: &[u8; 8] = b"CMFDB3P2";
-const VERSION: u32 = 2;
+const EXTENSION_V2_MAGIC: &[u8; 8] = b"CMFDB3P2";
+const EXTENSION_V2_VERSION: u32 = 2;
+const INITIAL_V1_MAGIC: &[u8; 8] = b"CMFDB3I1";
+const INITIAL_V1_VERSION: u32 = 1;
 const HEADER_BYTES: usize = 256;
 const DIGEST_BYTES: usize = 32;
 const MATRIX_COUNT: u32 = 1;
-const WIDTH: u32 = WHIR_EXTENSION_LIMBS_PER_ROW as u32;
+const EXTENSION_V2_WIDTH: u32 = WHIR_EXTENSION_LIMBS_PER_ROW as u32;
+const INITIAL_V1_WIDTH: u32 = WHIR_INITIAL_WIDTH as u32;
 const CAP_HEIGHT: u32 = 0;
 const HEADER_DIGEST_START: usize = 160;
 const HEADER_DIGEST_END: usize = HEADER_DIGEST_START + DIGEST_BYTES;
-const HEADER_DOMAIN: &str = "Common Foundry demand BLAKE3 path-store header v2";
-const MAX_HEIGHT: u64 = 1 << 29;
+const EXTENSION_V2_HEADER_DOMAIN: &str = "Common Foundry demand BLAKE3 path-store header v2";
+const INITIAL_V1_HEADER_DOMAIN: &str =
+    "Common Foundry initial WHIR demand BLAKE3 path-store header v1";
+const EXTENSION_V2_MAX_HEIGHT: u64 = 1 << 29;
+const INITIAL_V1_MAX_HEIGHT: u64 = 1 << 30;
+const INITIAL_V1_MAX_VARIABLES: u32 = 31;
 const PARENT_BATCH: usize = 8 * 1024;
 const CREATE_ATTEMPTS: usize = 256;
 
 static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// Independently versioned demand-tree format and canonical WHIR shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DemandBlake3TreeSuite {
+    /// Existing extension-codeword suite. Its format-v2 bytes remain frozen.
+    WhirExtensionV2,
+    /// Initial-codeword suite for one canonical width-four matrix.
+    WhirInitialV1,
+}
+
+#[derive(Clone, Copy)]
+struct DemandBlake3TreeSuiteSpec {
+    magic: &'static [u8; 8],
+    version: u32,
+    width: u32,
+    minimum_height: u64,
+    maximum_height: u64,
+    maximum_height_error: &'static str,
+    header_domain: &'static str,
+    requires_nonzero_binding: bool,
+}
+
+impl DemandBlake3TreeSuite {
+    const fn spec(self) -> DemandBlake3TreeSuiteSpec {
+        match self {
+            Self::WhirExtensionV2 => DemandBlake3TreeSuiteSpec {
+                magic: EXTENSION_V2_MAGIC,
+                version: EXTENSION_V2_VERSION,
+                width: EXTENSION_V2_WIDTH,
+                minimum_height: 1,
+                maximum_height: EXTENSION_V2_MAX_HEIGHT,
+                maximum_height_error: "height exceeds 2^29",
+                header_domain: EXTENSION_V2_HEADER_DOMAIN,
+                requires_nonzero_binding: false,
+            },
+            Self::WhirInitialV1 => DemandBlake3TreeSuiteSpec {
+                magic: INITIAL_V1_MAGIC,
+                version: INITIAL_V1_VERSION,
+                width: INITIAL_V1_WIDTH,
+                minimum_height: 2,
+                maximum_height: INITIAL_V1_MAX_HEIGHT,
+                maximum_height_error: "initial WHIR height exceeds 2^30",
+                header_domain: INITIAL_V1_HEADER_DOMAIN,
+                requires_nonzero_binding: true,
+            },
+        }
+    }
+
+    pub const fn width(self) -> u32 {
+        self.spec().width
+    }
+
+    pub const fn maximum_height(self) -> u64 {
+        self.spec().maximum_height
+    }
+}
 
 /// Checked fixed-format geometry. Construction allocates only bounded batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +126,7 @@ pub struct DemandBlake3TreeGeometry {
     pub artifact_bytes: u64,
 }
 
-/// Exact caller-retained identity required to adopt or reopen one path store.
+/// Exact caller-retained identity for the frozen extension-v2 path store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DemandBlake3TreeIdentity {
     pub store_id: [u8; 32],
@@ -65,6 +135,50 @@ pub struct DemandBlake3TreeIdentity {
     pub width: u32,
     pub tree_root: Blake3MerkleDigest,
     pub artifact_bytes: u64,
+}
+
+/// Exact caller-retained identity for one initial-WHIR demand tree.
+///
+/// The suite and width are represented by this type rather than by a mutable
+/// discriminator. `codeword_binding` is derived from the complete authenticated
+/// initial-codeword identity by the only public builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialDemandBlake3TreeIdentity {
+    pub store_id: [u8; 32],
+    pub codeword_binding: [u8; 32],
+    pub height: u64,
+    pub tree_root: Blake3MerkleDigest,
+    pub artifact_bytes: u64,
+}
+
+impl InitialDemandBlake3TreeIdentity {
+    pub const fn width(&self) -> u32 {
+        INITIAL_V1_WIDTH
+    }
+
+    fn as_untyped(self) -> DemandBlake3TreeIdentity {
+        DemandBlake3TreeIdentity {
+            store_id: self.store_id,
+            source_binding: self.codeword_binding,
+            height: self.height,
+            width: INITIAL_V1_WIDTH,
+            tree_root: self.tree_root,
+            artifact_bytes: self.artifact_bytes,
+        }
+    }
+
+    fn from_untyped(identity: DemandBlake3TreeIdentity) -> Result<Self, DemandBlake3TreeError> {
+        if identity.width != INITIAL_V1_WIDTH || identity.source_binding == [0; 32] {
+            return Err(DemandBlake3TreeError::IdentityMismatch);
+        }
+        Ok(Self {
+            store_id: identity.store_id,
+            codeword_binding: identity.source_binding,
+            height: identity.height,
+            tree_root: identity.tree_root,
+            artifact_bytes: identity.artifact_bytes,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -112,10 +226,22 @@ pub enum DemandBlake3TreeError {
     LockPoisoned,
     #[error("WHIR extension codeword failed: {0}")]
     Extension(#[from] WhirExtensionEncodingError),
+    #[error("WHIR initial codeword failed: {0}")]
+    Initial(#[from] WhirInitialEncodingError),
 }
 
-/// Validate v2 geometry without allocating proportional to its height.
+/// Validate existing extension-v2 geometry without allocating proportional to
+/// its height. This legacy entry point remains pinned to width 12 and `2^29`.
 pub fn demand_blake3_tree_geometry(
+    height: u64,
+) -> Result<DemandBlake3TreeGeometry, DemandBlake3TreeError> {
+    demand_blake3_tree_geometry_for_suite(DemandBlake3TreeSuite::WhirExtensionV2, height)
+}
+
+/// Validate one suite's exact tree geometry without allocating proportional to
+/// its height.
+pub fn demand_blake3_tree_geometry_for_suite(
+    suite: DemandBlake3TreeSuite,
     height: u64,
 ) -> Result<DemandBlake3TreeGeometry, DemandBlake3TreeError> {
     if height == 0 || !height.is_power_of_two() {
@@ -123,8 +249,14 @@ pub fn demand_blake3_tree_geometry(
             "height must be a nonzero power of two",
         ));
     }
-    if height > MAX_HEIGHT {
-        return Err(DemandBlake3TreeError::Invalid("height exceeds 2^29"));
+    let spec = suite.spec();
+    if height < spec.minimum_height {
+        return Err(DemandBlake3TreeError::Invalid(
+            "height is smaller than the suite minimum",
+        ));
+    }
+    if height > spec.maximum_height {
+        return Err(DemandBlake3TreeError::Invalid(spec.maximum_height_error));
     }
     let layer_count = height
         .ilog2()
@@ -154,10 +286,36 @@ pub fn demand_blake3_tree_geometry(
     })
 }
 
-/// Immutable v2 path-store capability authenticated against external identity.
+/// Preflight the canonical initial-WHIR tree for `n` variables. Folding two
+/// packs `2^n` field elements into `2^(n - 1)` width-four rows. In particular,
+/// `n = 31` validates the complete `2^30`-row geometry without allocating it.
+pub fn initial_whir_demand_blake3_tree_geometry(
+    num_variables: u32,
+) -> Result<DemandBlake3TreeGeometry, DemandBlake3TreeError> {
+    if num_variables < WHIR_INITIAL_MIN_VARIABLES as u32 {
+        return Err(DemandBlake3TreeError::Invalid(
+            "initial WHIR variable count is smaller than folding",
+        ));
+    }
+    if num_variables > INITIAL_V1_MAX_VARIABLES {
+        return Err(DemandBlake3TreeError::Invalid(
+            "initial WHIR variable count exceeds 31",
+        ));
+    }
+    let height = 1_u64
+        .checked_shl(num_variables - 1)
+        .ok_or(DemandBlake3TreeError::Invalid(
+            "initial WHIR height overflow",
+        ))?;
+    demand_blake3_tree_geometry_for_suite(DemandBlake3TreeSuite::WhirInitialV1, height)
+}
+
+/// Immutable extension-v2 path-store capability authenticated against its
+/// caller-retained identity.
 pub struct AuthenticatedDemandBlake3Tree {
     file: Option<Mutex<File>>,
     path: PathBuf,
+    suite: DemandBlake3TreeSuite,
     identity: DemandBlake3TreeIdentity,
     geometry: DemandBlake3TreeGeometry,
     header: [u8; HEADER_BYTES],
@@ -182,13 +340,32 @@ impl AuthenticatedDemandBlake3Tree {
         path: impl AsRef<Path>,
         expected: &DemandBlake3TreeIdentity,
     ) -> Result<Self, DemandBlake3TreeError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_for_suite(
+            path.as_ref(),
+            DemandBlake3TreeSuite::WhirExtensionV2,
+            expected,
+        )
+    }
+
+    fn open_for_suite(
+        path: &Path,
+        suite: DemandBlake3TreeSuite,
+        expected: &DemandBlake3TreeIdentity,
+    ) -> Result<Self, DemandBlake3TreeError> {
+        let spec = suite.spec();
+        if expected.width != spec.width
+            || (spec.requires_nonzero_binding && expected.source_binding == [0; 32])
+        {
+            return Err(DemandBlake3TreeError::IdentityMismatch);
+        }
+        let path = path.to_path_buf();
         let mut file = File::open(&path).map_err(|source| io_error("opening", &path, source))?;
         let file_len = file
             .metadata()
             .map_err(|source| io_error("reading metadata for", &path, source))?
             .len();
-        let (header, geometry) = read_and_verify_envelope(&mut file, file_len, expected)?;
+        let (header, geometry) =
+            read_and_verify_envelope_for_suite(&mut file, file_len, suite, expected)?;
         let file_len_after = file
             .metadata()
             .map_err(|source| io_error("rechecking metadata for", &path, source))?
@@ -201,6 +378,7 @@ impl AuthenticatedDemandBlake3Tree {
         Ok(Self {
             file: Some(Mutex::new(file)),
             path,
+            suite,
             identity: *expected,
             geometry,
             header,
@@ -305,7 +483,8 @@ impl AuthenticatedDemandBlake3Tree {
             .metadata()
             .map_err(|source| io_error("reauthenticating metadata for", &self.path, source))?
             .len();
-        let (header, geometry) = read_and_verify_envelope(file, file_len, &self.identity)?;
+        let (header, geometry) =
+            read_and_verify_envelope_for_suite(file, file_len, self.suite, &self.identity)?;
         if header != self.header || geometry != self.geometry {
             return Err(DemandBlake3TreeError::IdentityMismatch);
         }
@@ -322,6 +501,78 @@ impl Drop for AuthenticatedDemandBlake3Tree {
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = remove_owned_file(&path, &file);
+    }
+}
+
+/// Authenticated initial-WHIR demand-tree capability with a typed identity.
+pub struct AuthenticatedInitialDemandBlake3Tree {
+    tree: AuthenticatedDemandBlake3Tree,
+    identity: InitialDemandBlake3TreeIdentity,
+}
+
+impl std::fmt::Debug for AuthenticatedInitialDemandBlake3Tree {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedInitialDemandBlake3Tree")
+            .field("path", &self.tree.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedInitialDemandBlake3Tree {
+    /// Reopen only the independently versioned initial-v1 suite.
+    pub fn open(
+        path: impl AsRef<Path>,
+        expected: &InitialDemandBlake3TreeIdentity,
+    ) -> Result<Self, DemandBlake3TreeError> {
+        let tree = AuthenticatedDemandBlake3Tree::open_for_suite(
+            path.as_ref(),
+            DemandBlake3TreeSuite::WhirInitialV1,
+            &expected.as_untyped(),
+        )?;
+        Self::from_tree(tree)
+    }
+
+    fn from_tree(tree: AuthenticatedDemandBlake3Tree) -> Result<Self, DemandBlake3TreeError> {
+        if tree.suite != DemandBlake3TreeSuite::WhirInitialV1 {
+            return Err(DemandBlake3TreeError::IdentityMismatch);
+        }
+        let identity = InitialDemandBlake3TreeIdentity::from_untyped(tree.identity)?;
+        Ok(Self { tree, identity })
+    }
+
+    pub const fn identity(&self) -> &InitialDemandBlake3TreeIdentity {
+        &self.identity
+    }
+
+    pub const fn geometry(&self) -> DemandBlake3TreeGeometry {
+        self.tree.geometry
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.tree.path
+    }
+
+    pub fn remove_on_drop(mut self) -> Self {
+        self.tree.cleanup_path = Some(self.tree.path.clone());
+        self
+    }
+
+    pub fn remove(self) -> Result<(), DemandBlake3TreeError> {
+        self.tree.remove()
+    }
+
+    /// Authenticate one caller-supplied canonical leaf. This remains
+    /// crate-private until an initial-WHIR proof oracle also authenticates the
+    /// corresponding codeword row before returning any opening.
+    #[allow(dead_code)]
+    pub(crate) fn authenticate_leaf(
+        &self,
+        index: usize,
+        leaf: Blake3MerkleDigest,
+    ) -> Result<Vec<Blake3MerkleDigest>, DemandBlake3TreeError> {
+        self.tree.authenticate_leaf(index, leaf)
     }
 }
 
@@ -369,7 +620,8 @@ impl WhirExtensionOracle {
         let source_binding = codeword.identity().binding_digest()?;
         if tree.identity.source_binding != source_binding
             || tree.identity.height != codeword.geometry().height
-            || tree.identity.width != WIDTH
+            || tree.suite != DemandBlake3TreeSuite::WhirExtensionV2
+            || tree.identity.width != EXTENSION_V2_WIDTH
         {
             return Err(DemandBlake3TreeError::IdentityMismatch);
         }
@@ -458,7 +710,52 @@ pub fn build_demand_blake3_tree(
     )
 }
 
+/// Build the independently versioned initial-WHIR width-four demand tree from
+/// one exact authenticated initial codeword.
+///
+/// The codeword binding is derived internally from every identity, geometry,
+/// and artifact-protocol field. No public initial-suite builder accepts an
+/// arbitrary digest source or caller-selected context. This bounded seam does
+/// not yet replace [`crate::initial_whir_oracle::InitialWhirOracle`].
+pub fn build_whir_initial_demand_blake3_tree(
+    final_path: impl AsRef<Path>,
+    store_id: [u8; 32],
+    codeword: &AuthenticatedWhirInitialCodeword,
+) -> Result<AuthenticatedInitialDemandBlake3Tree, DemandBlake3TreeError> {
+    let codeword_binding = codeword.identity().binding_digest()?;
+    let tree = build_demand_blake3_tree_for_suite_with_sync(
+        DemandBlake3TreeSuite::WhirInitialV1,
+        final_path.as_ref(),
+        store_id,
+        codeword_binding,
+        codeword,
+        sync_parent_directory,
+    )?;
+    AuthenticatedInitialDemandBlake3Tree::from_tree(tree)
+}
+
 fn build_demand_blake3_tree_with_sync<SyncParent>(
+    final_path: &Path,
+    store_id: [u8; 32],
+    source_binding: [u8; 32],
+    source: &dyn Blake3DigestSource,
+    sync_parent: SyncParent,
+) -> Result<AuthenticatedDemandBlake3Tree, DemandBlake3TreeError>
+where
+    SyncParent: FnMut(&Path) -> Result<(), DemandBlake3TreeError>,
+{
+    build_demand_blake3_tree_for_suite_with_sync(
+        DemandBlake3TreeSuite::WhirExtensionV2,
+        final_path,
+        store_id,
+        source_binding,
+        source,
+        sync_parent,
+    )
+}
+
+fn build_demand_blake3_tree_for_suite_with_sync<SyncParent>(
+    suite: DemandBlake3TreeSuite,
     final_path: &Path,
     store_id: [u8; 32],
     source_binding: [u8; 32],
@@ -473,9 +770,14 @@ where
             "store identity must be nonzero",
         ));
     }
+    if suite.spec().requires_nonzero_binding && source_binding == [0; 32] {
+        return Err(DemandBlake3TreeError::Invalid(
+            "initial WHIR codeword binding must be nonzero",
+        ));
+    }
     let height = u64::try_from(source.height())
         .map_err(|_| DemandBlake3TreeError::Invalid("source height does not fit u64"))?;
-    let geometry = demand_blake3_tree_geometry(height)?;
+    let geometry = demand_blake3_tree_geometry_for_suite(suite, height)?;
     let final_path = final_path.to_path_buf();
     let parent = artifact_parent(&final_path)?;
     if final_path
@@ -558,11 +860,11 @@ where
         store_id,
         source_binding,
         height,
-        width: WIDTH,
+        width: suite.width(),
         tree_root: root,
         artifact_bytes: geometry.artifact_bytes,
     };
-    let header = encode_header(&identity, geometry);
+    let header = encode_header_for_suite(suite, &identity, geometry);
     staging
         .file_mut()
         .seek(SeekFrom::Start(0))
@@ -581,11 +883,11 @@ where
         ));
     }
 
-    let staged = AuthenticatedDemandBlake3Tree::open(&partial_path, &identity)?;
+    let staged = AuthenticatedDemandBlake3Tree::open_for_suite(&partial_path, suite, &identity)?;
     ensure_path_names_file(&partial_path, staging.file_ref())?;
     let mut published =
         publish_verified_no_overwrite(&partial_path, &final_path, staging.file_ref())?;
-    let tree = AuthenticatedDemandBlake3Tree::open(&final_path, &identity)?;
+    let tree = AuthenticatedDemandBlake3Tree::open_for_suite(&final_path, suite, &identity)?;
     sync_parent(&parent)?;
     remove_owned_file(&partial_path, staging.file_ref())?;
     sync_parent(&parent)?;
@@ -608,6 +910,10 @@ fn validate_source_height(
 }
 
 fn hash_canonical_row(row: &[u64; WHIR_EXTENSION_LIMBS_PER_ROW]) -> Blake3MerkleDigest {
+    hash_canonical_words(row)
+}
+
+fn hash_canonical_words(row: &[u64]) -> Blake3MerkleDigest {
     let mut hasher = Hasher::new();
     for value in row {
         hasher.update(&value.to_le_bytes());
@@ -622,13 +928,24 @@ fn compress(children: [Blake3MerkleDigest; 2]) -> Blake3MerkleDigest {
     *hasher.finalize().as_bytes()
 }
 
+#[cfg(test)]
 fn encode_header(
     identity: &DemandBlake3TreeIdentity,
     geometry: DemandBlake3TreeGeometry,
 ) -> [u8; HEADER_BYTES] {
+    encode_header_for_suite(DemandBlake3TreeSuite::WhirExtensionV2, identity, geometry)
+}
+
+fn encode_header_for_suite(
+    suite: DemandBlake3TreeSuite,
+    identity: &DemandBlake3TreeIdentity,
+    geometry: DemandBlake3TreeGeometry,
+) -> [u8; HEADER_BYTES] {
+    let spec = suite.spec();
+    debug_assert_eq!(identity.width, spec.width);
     let mut header = [0_u8; HEADER_BYTES];
-    header[0..8].copy_from_slice(MAGIC);
-    header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    header[0..8].copy_from_slice(spec.magic);
+    header[8..12].copy_from_slice(&spec.version.to_le_bytes());
     header[12..16].copy_from_slice(&(HEADER_BYTES as u32).to_le_bytes());
     header[16..48].copy_from_slice(&identity.store_id);
     header[48..80].copy_from_slice(&identity.source_binding);
@@ -641,27 +958,44 @@ fn encode_header(
     header[120..124].copy_from_slice(&identity.width.to_le_bytes());
     header[124..128].copy_from_slice(&CAP_HEIGHT.to_le_bytes());
     header[128..160].copy_from_slice(&identity.tree_root);
-    let digest = header_digest(&header);
+    let digest = header_digest_for_suite(suite, &header);
     header[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
     header
 }
 
+#[cfg(test)]
 fn header_digest(header: &[u8; HEADER_BYTES]) -> [u8; DIGEST_BYTES] {
+    header_digest_for_suite(DemandBlake3TreeSuite::WhirExtensionV2, header)
+}
+
+fn header_digest_for_suite(
+    suite: DemandBlake3TreeSuite,
+    header: &[u8; HEADER_BYTES],
+) -> [u8; DIGEST_BYTES] {
     let mut canonical = *header;
     canonical[HEADER_DIGEST_START..HEADER_DIGEST_END].fill(0);
-    let mut hasher = Hasher::new_derive_key(HEADER_DOMAIN);
+    let mut hasher = Hasher::new_derive_key(suite.spec().header_domain);
     hasher.update(&canonical);
     *hasher.finalize().as_bytes()
 }
 
+#[cfg(test)]
 fn decode_header(
     header: &[u8; HEADER_BYTES],
 ) -> Result<(DemandBlake3TreeIdentity, DemandBlake3TreeGeometry), DemandBlake3TreeError> {
-    if &header[0..8] != MAGIC
-        || read_u32(header, 8) != VERSION
+    decode_header_for_suite(DemandBlake3TreeSuite::WhirExtensionV2, header)
+}
+
+fn decode_header_for_suite(
+    suite: DemandBlake3TreeSuite,
+    header: &[u8; HEADER_BYTES],
+) -> Result<(DemandBlake3TreeIdentity, DemandBlake3TreeGeometry), DemandBlake3TreeError> {
+    let spec = suite.spec();
+    if &header[0..8] != spec.magic
+        || read_u32(header, 8) != spec.version
         || read_u32(header, 12) != HEADER_BYTES as u32
         || read_u32(header, 88) != MATRIX_COUNT
-        || read_u32(header, 120) != WIDTH
+        || read_u32(header, 120) != spec.width
         || read_u32(header, 124) != CAP_HEIGHT
         || header[192..].iter().any(|byte| *byte != 0)
     {
@@ -672,7 +1006,7 @@ fn decode_header(
     let stored_header_digest: [u8; 32] = header[HEADER_DIGEST_START..HEADER_DIGEST_END]
         .try_into()
         .expect("fixed header digest slice");
-    if stored_header_digest != header_digest(header) {
+    if stored_header_digest != header_digest_for_suite(suite, header) {
         return Err(DemandBlake3TreeError::HeaderDigestMismatch);
     }
     let store_id: [u8; 32] = header[16..48].try_into().expect("fixed store-ID slice");
@@ -681,8 +1015,16 @@ fn decode_header(
             "store identity must be nonzero",
         ));
     }
+    let source_binding: [u8; 32] = header[48..80]
+        .try_into()
+        .expect("fixed source-binding slice");
+    if spec.requires_nonzero_binding && source_binding == [0; 32] {
+        return Err(DemandBlake3TreeError::Invalid(
+            "initial WHIR codeword binding must be nonzero",
+        ));
+    }
     let height = read_u64(header, 80);
-    let geometry = demand_blake3_tree_geometry(height)?;
+    let geometry = demand_blake3_tree_geometry_for_suite(suite, height)?;
     if read_u32(header, 92) != geometry.layer_count
         || read_u64(header, 96) != geometry.total_digests
         || read_u64(header, 104) != geometry.tree_bytes
@@ -694,28 +1036,47 @@ fn decode_header(
     }
     let identity = DemandBlake3TreeIdentity {
         store_id,
-        source_binding: header[48..80]
-            .try_into()
-            .expect("fixed source-binding slice"),
+        source_binding,
         height,
-        width: WIDTH,
+        width: spec.width,
         tree_root: header[128..160].try_into().expect("fixed root slice"),
         artifact_bytes: geometry.artifact_bytes,
     };
     Ok((identity, geometry))
 }
 
+#[cfg(test)]
 fn read_and_verify_envelope<R: Read + Seek>(
     reader: &mut R,
     file_len: u64,
     expected: &DemandBlake3TreeIdentity,
 ) -> Result<([u8; HEADER_BYTES], DemandBlake3TreeGeometry), DemandBlake3TreeError> {
+    read_and_verify_envelope_for_suite(
+        reader,
+        file_len,
+        DemandBlake3TreeSuite::WhirExtensionV2,
+        expected,
+    )
+}
+
+fn read_and_verify_envelope_for_suite<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    suite: DemandBlake3TreeSuite,
+    expected: &DemandBlake3TreeIdentity,
+) -> Result<([u8; HEADER_BYTES], DemandBlake3TreeGeometry), DemandBlake3TreeError> {
+    let spec = suite.spec();
+    if expected.width != spec.width
+        || (spec.requires_nonzero_binding && expected.source_binding == [0; 32])
+    {
+        return Err(DemandBlake3TreeError::IdentityMismatch);
+    }
     let mut header = [0_u8; HEADER_BYTES];
     reader
         .seek(SeekFrom::Start(0))
         .and_then(|_| reader.read_exact(&mut header))
         .map_err(|_| DemandBlake3TreeError::Invalid("could not read fixed header"))?;
-    let (actual, geometry) = decode_header(&header)?;
+    let (actual, geometry) = decode_header_for_suite(suite, &header)?;
     if &actual != expected {
         return Err(DemandBlake3TreeError::IdentityMismatch);
     }
@@ -1053,6 +1414,10 @@ mod tests {
     use super::*;
     use crate::blake3_merkle_store::Blake3MerkleStoreError;
     use crate::whir_extension::encode_whir_extension_codeword;
+    use crate::whir_initial::{
+        AuthenticatedWhirInitialSource, WhirInitialSourceError, WhirInitialSourceIdentity,
+        encode_whir_initial_suffix,
+    };
     use crate::whir_residual::{
         WHIR_RESIDUAL_LIMBS_PER_ROW, WhirResidualArtifactSpec, WhirResidualArtifactWriter,
     };
@@ -1115,6 +1480,56 @@ mod tests {
         }
     }
 
+    struct InitialSource {
+        identity: WhirInitialSourceIdentity,
+        values: Vec<u64>,
+    }
+
+    impl InitialSource {
+        fn new(num_variables: u32, source_id: u8) -> Self {
+            let len = 1_usize << num_variables;
+            Self {
+                identity: WhirInitialSourceIdentity {
+                    source_id: [source_id; 32],
+                    num_variables,
+                },
+                values: (0..len)
+                    .map(|index| {
+                        ((index as u64 + 7)
+                            .wrapping_mul(0x517c_c1b7)
+                            .wrapping_add(source_id as u64 * 0x1_0000_01b3)
+                            .wrapping_add(43))
+                            % GOLDILOCKS_MODULUS
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl AuthenticatedWhirInitialSource for InitialSource {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            &self.identity
+        }
+
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn read_elements(
+            &self,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| WhirInitialSourceError::new("test source range overflow"))?;
+            self.values
+                .get(start..end)
+                .map(<[u64]>::to_vec)
+                .ok_or_else(|| WhirInitialSourceError::new("test source range"))
+        }
+    }
+
     struct CountingSource {
         height: usize,
         reads: AtomicUsize,
@@ -1154,12 +1569,53 @@ mod tests {
             .collect()
     }
 
+    fn initial_values(codeword: &AuthenticatedWhirInitialCodeword) -> Vec<Goldilocks> {
+        let height = usize::try_from(codeword.identity().height).unwrap();
+        let mut values = Vec::with_capacity(height * WHIR_INITIAL_WIDTH);
+        for start in (0..height).step_by(256) {
+            let rows = (height - start).min(256);
+            values.extend(
+                codeword
+                    .read_canonical_rows(start, rows)
+                    .unwrap()
+                    .into_iter()
+                    .map(Goldilocks::new),
+            );
+        }
+        values
+    }
+
     fn build_dense(
         directory: &Path,
         label: &str,
         source: &DenseRows,
     ) -> AuthenticatedDemandBlake3Tree {
         build_demand_blake3_tree(directory.join(label), [0x31; 32], [0x72; 32], source).unwrap()
+    }
+
+    fn build_initial_codeword(
+        directory: &Path,
+        label: &str,
+        num_variables: u32,
+        identity_byte: u8,
+    ) -> AuthenticatedWhirInitialCodeword {
+        let source = InitialSource::new(num_variables, identity_byte);
+        encode_whir_initial_suffix(
+            directory.join(label),
+            [identity_byte.wrapping_add(1); 32],
+            source.identity(),
+            &source,
+        )
+        .unwrap()
+        .remove_on_drop()
+    }
+
+    fn build_initial_tree(
+        directory: &Path,
+        label: &str,
+        codeword: &AuthenticatedWhirInitialCodeword,
+    ) -> AuthenticatedInitialDemandBlake3Tree {
+        build_whir_initial_demand_blake3_tree(directory.join(label), [0x41; 32], codeword).unwrap()
     }
 
     fn mutate_byte(path: &Path, offset: u64) {
@@ -1196,6 +1652,50 @@ mod tests {
             demand_blake3_tree_geometry((1 << 29) + 1),
             Err(DemandBlake3TreeError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn initial_n31_geometry_is_exact_and_nonallocating() {
+        let geometry = initial_whir_demand_blake3_tree_geometry(31).unwrap();
+        assert_eq!(DemandBlake3TreeSuite::WhirInitialV1.width(), 4);
+        assert_eq!(
+            DemandBlake3TreeSuite::WhirInitialV1.maximum_height(),
+            1 << 30
+        );
+        assert_eq!(geometry.height, 1 << 30);
+        assert_eq!(geometry.layer_count, 31);
+        assert_eq!(geometry.total_digests, 2_147_483_647);
+        assert_eq!(geometry.tree_bytes, 68_719_476_704);
+        assert_eq!(geometry.artifact_bytes, 68_719_476_960);
+        assert_eq!(
+            demand_blake3_tree_geometry_for_suite(DemandBlake3TreeSuite::WhirInitialV1, 1 << 30,)
+                .unwrap(),
+            geometry
+        );
+        assert!(matches!(
+            initial_whir_demand_blake3_tree_geometry(1),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+        assert!(matches!(
+            initial_whir_demand_blake3_tree_geometry(32),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+        assert!(matches!(
+            demand_blake3_tree_geometry_for_suite(DemandBlake3TreeSuite::WhirInitialV1, 1 << 31,),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+        assert!(matches!(
+            demand_blake3_tree_geometry_for_suite(DemandBlake3TreeSuite::WhirInitialV1, 3),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+        assert!(matches!(
+            demand_blake3_tree_geometry_for_suite(DemandBlake3TreeSuite::WhirInitialV1, 1),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+        assert!(
+            demand_blake3_tree_geometry_for_suite(DemandBlake3TreeSuite::WhirExtensionV2, 1,)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1308,6 +1808,71 @@ mod tests {
     }
 
     #[test]
+    fn initial_header_has_an_independent_suite_version_and_domain() {
+        let suite = DemandBlake3TreeSuite::WhirInitialV1;
+        let geometry = demand_blake3_tree_geometry_for_suite(suite, 8).unwrap();
+        let identity = InitialDemandBlake3TreeIdentity {
+            store_id: [0x51; 32],
+            codeword_binding: [0x62; 32],
+            height: 8,
+            tree_root: [0x73; 32],
+            artifact_bytes: geometry.artifact_bytes,
+        };
+        let untyped = identity.as_untyped();
+        let header = encode_header_for_suite(suite, &untyped, geometry);
+        assert_eq!(&header[0..8], b"CMFDB3I1");
+        assert_eq!(read_u32(&header, 8), 1);
+        assert_eq!(read_u32(&header, 120), 4);
+        assert_eq!(
+            header[HEADER_DIGEST_START..HEADER_DIGEST_END],
+            header_digest_for_suite(suite, &header)
+        );
+        assert_eq!(
+            &header[HEADER_DIGEST_START..HEADER_DIGEST_END],
+            &[
+                0xea, 0xe0, 0x6c, 0x99, 0x91, 0x4e, 0x1b, 0x5f, 0xb0, 0xa7, 0x2b, 0xde, 0xe3, 0x86,
+                0x84, 0xe3, 0x39, 0xd4, 0x9c, 0xf8, 0xe6, 0x71, 0x7c, 0xca, 0x42, 0xd0, 0x00, 0x94,
+                0x8f, 0x49, 0xcd, 0xbe,
+            ]
+        );
+        assert_ne!(
+            header_digest_for_suite(suite, &header),
+            header_digest(&header)
+        );
+        assert_eq!(
+            decode_header_for_suite(suite, &header).unwrap(),
+            (untyped, geometry)
+        );
+        assert!(decode_header(&header).is_err());
+
+        let mut wrong_version = header;
+        wrong_version[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        let digest = header_digest_for_suite(suite, &wrong_version);
+        wrong_version[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
+        assert!(matches!(
+            decode_header_for_suite(suite, &wrong_version),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+
+        let mut wrong_domain = header;
+        let digest = header_digest(&wrong_domain);
+        wrong_domain[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
+        assert!(matches!(
+            decode_header_for_suite(suite, &wrong_domain),
+            Err(DemandBlake3TreeError::HeaderDigestMismatch)
+        ));
+
+        let mut wrong_width = header;
+        wrong_width[120..124].copy_from_slice(&12_u32.to_le_bytes());
+        let digest = header_digest_for_suite(suite, &wrong_width);
+        wrong_width[HEADER_DIGEST_START..HEADER_DIGEST_END].copy_from_slice(&digest);
+        assert!(matches!(
+            decode_header_for_suite(suite, &wrong_width),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn all_small_roots_and_paths_match_extension_mmcs() {
         for height in [1, 2, 4, 8, 16, 32, 64] {
             let directory = test_directory("p3-parity");
@@ -1326,6 +1891,44 @@ mod tests {
                 assert_eq!(opening, expected.opening_proof);
             }
             drop(tree);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+            fs::remove_dir(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn all_small_initial_roots_and_paths_match_canonical_blake3_mmcs() {
+        for num_variables in 2..=7 {
+            let directory = test_directory("initial-p3-parity");
+            let codeword = build_initial_codeword(
+                &directory,
+                "codeword",
+                num_variables,
+                0x80 + num_variables as u8,
+            );
+            let height = usize::try_from(codeword.identity().height).unwrap();
+            let canonical_values = initial_values(&codeword);
+            let tree = build_initial_tree(&directory, "tree", &codeword).remove_on_drop();
+            assert_eq!(tree.identity().width(), WHIR_INITIAL_WIDTH as u32);
+            assert_eq!(
+                tree.identity().codeword_binding,
+                codeword.identity().binding_digest().unwrap()
+            );
+            let mmcs = WhirMmcs::new(FieldHash::new(Blake3), Compress::new(Blake3), 0);
+            let (commitment, prover_data) = mmcs.commit(vec![RowMajorMatrix::new(
+                canonical_values.clone(),
+                WHIR_INITIAL_WIDTH,
+            )]);
+            assert_eq!(tree.identity().tree_root, commitment.roots()[0]);
+            for index in 0..height {
+                let row = codeword.read_canonical_rows(index, 1).unwrap();
+                let leaf = hash_canonical_words(&row);
+                let opening = tree.authenticate_leaf(index, leaf).unwrap();
+                let expected = mmcs.open_batch(index, &prover_data);
+                assert_eq!(opening, expected.opening_proof);
+            }
+            drop(tree);
+            drop(codeword);
             assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
             fs::remove_dir(directory).unwrap();
         }
@@ -1390,6 +1993,40 @@ mod tests {
         };
         let (actual_header, actual_geometry) =
             read_and_verify_envelope(&mut sparse, geometry.artifact_bytes, &identity).unwrap();
+        assert_eq!(actual_header, header);
+        assert_eq!(actual_geometry, geometry);
+        assert_eq!(sparse.reads, 2);
+        assert_eq!(sparse.bytes, HEADER_BYTES + DIGEST_BYTES);
+    }
+
+    #[test]
+    fn initial_n31_envelope_preflight_reads_only_header_and_root() {
+        let suite = DemandBlake3TreeSuite::WhirInitialV1;
+        let geometry = initial_whir_demand_blake3_tree_geometry(31).unwrap();
+        let identity = InitialDemandBlake3TreeIdentity {
+            store_id: [0x84; 32],
+            codeword_binding: [0x95; 32],
+            height: 1 << 30,
+            tree_root: [0xa6; 32],
+            artifact_bytes: geometry.artifact_bytes,
+        };
+        let untyped = identity.as_untyped();
+        let header = encode_header_for_suite(suite, &untyped, geometry);
+        let mut sparse = SparseEnvelope {
+            header,
+            root: identity.tree_root,
+            root_offset: geometry.artifact_bytes - 32,
+            position: 0,
+            reads: 0,
+            bytes: 0,
+        };
+        let (actual_header, actual_geometry) = read_and_verify_envelope_for_suite(
+            &mut sparse,
+            geometry.artifact_bytes,
+            suite,
+            &untyped,
+        )
+        .unwrap();
         assert_eq!(actual_header, header);
         assert_eq!(actual_geometry, geometry);
         assert_eq!(sparse.reads, 2);
@@ -1468,6 +2105,76 @@ mod tests {
             ));
             fs::remove_file(path).unwrap();
         }
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn initial_suite_identity_leaf_and_corruption_fail_closed() {
+        let directory = test_directory("initial-failures");
+        let codeword = build_initial_codeword(&directory, "codeword", 4, 0x8a);
+        let tree = build_initial_tree(&directory, "tree", &codeword);
+        let identity = *tree.identity();
+        let path = tree.path().to_path_buf();
+        assert_eq!(
+            identity.codeword_binding,
+            codeword.identity().binding_digest().unwrap()
+        );
+        drop(tree);
+
+        let wrong_suite = DemandBlake3TreeIdentity {
+            store_id: identity.store_id,
+            source_binding: identity.codeword_binding,
+            height: identity.height,
+            width: EXTENSION_V2_WIDTH,
+            tree_root: identity.tree_root,
+            artifact_bytes: identity.artifact_bytes,
+        };
+        assert!(matches!(
+            AuthenticatedDemandBlake3Tree::open(&path, &wrong_suite),
+            Err(DemandBlake3TreeError::Invalid(_))
+        ));
+
+        let mut unsupported_width = wrong_suite;
+        unsupported_width.width = 5;
+        assert!(matches!(
+            AuthenticatedDemandBlake3Tree::open(&path, &unsupported_width),
+            Err(DemandBlake3TreeError::IdentityMismatch)
+        ));
+
+        let mut wrong_height = identity;
+        wrong_height.height /= 2;
+        assert!(matches!(
+            AuthenticatedInitialDemandBlake3Tree::open(&path, &wrong_height),
+            Err(DemandBlake3TreeError::IdentityMismatch)
+        ));
+
+        let mut wrong_binding = identity;
+        wrong_binding.codeword_binding[0] ^= 1;
+        assert!(matches!(
+            AuthenticatedInitialDemandBlake3Tree::open(&path, &wrong_binding),
+            Err(DemandBlake3TreeError::IdentityMismatch)
+        ));
+
+        let tree = AuthenticatedInitialDemandBlake3Tree::open(&path, &identity)
+            .unwrap()
+            .remove_on_drop();
+        let correct_row = codeword.read_canonical_rows(3, 1).unwrap();
+        let mut wrong_row = correct_row.clone();
+        wrong_row[0] ^= 1;
+        assert!(matches!(
+            tree.authenticate_leaf(3, hash_canonical_words(&wrong_row)),
+            Err(DemandBlake3TreeError::OpeningMismatch)
+        ));
+
+        let sibling_offset = HEADER_BYTES as u64 + ((3 ^ 1) * DIGEST_BYTES) as u64;
+        mutate_byte(&path, sibling_offset);
+        assert!(matches!(
+            tree.authenticate_leaf(3, hash_canonical_words(&correct_row)),
+            Err(DemandBlake3TreeError::OpeningMismatch)
+        ));
+        drop(tree);
+        drop(codeword);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
         fs::remove_dir(directory).unwrap();
     }
 

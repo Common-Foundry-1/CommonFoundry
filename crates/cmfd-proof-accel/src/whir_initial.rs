@@ -17,13 +17,20 @@ use p3_goldilocks::Goldilocks;
 use p3_matrix::Matrix;
 use thiserror::Error;
 
+use crate::blake3_merkle_store::{
+    BLAKE3_LEAF_BATCH_ROWS, Blake3DigestSource, Blake3MerkleDigest, Blake3MerkleStoreError,
+};
 use crate::external_radix2::{ExternalRadix2Error, dft_goldilocks_rows_in_place};
 use crate::merkle_store::{GOLDILOCKS_MODULUS, MerkleRowSource, MerkleStoreError};
 
 /// Smallest table supported by folding two.
 pub const WHIR_INITIAL_MIN_VARIABLES: usize = 2;
-/// Bounded checkpoint cap. Production weight banks (`n = 31`) remain rejected.
+/// Legacy maximum used by the version-one initial WHIR oracle identity.
 pub const WHIR_INITIAL_MAX_VARIABLES: usize = 19;
+/// Largest table geometry admitted by the version-one artifact format.
+pub const WHIR_INITIAL_ARTIFACT_MAX_VARIABLES: usize = 31;
+/// Largest table the bounded reference encoder will execute.
+pub const WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES: usize = WHIR_INITIAL_MAX_VARIABLES;
 /// Fixed row width selected by folding two.
 pub const WHIR_INITIAL_WIDTH: usize = 4;
 /// Maximum canonical source values requested in one call.
@@ -38,11 +45,13 @@ const VERSION: u32 = 1;
 const FOLDING: u8 = 2;
 const STARTING_LOG_INV_RATE: u8 = 1;
 const NATURAL_ROW_LAYOUT: u8 = 1;
+const CANONICAL_U64_LE_ENCODING: u8 = 1;
 const PREFIX_BYTES: usize = 128;
 const DIGEST_BYTES: usize = 32;
 const HEADER_BYTES: usize = PREFIX_BYTES + DIGEST_BYTES;
 const AUTH_CHUNK_ROWS: usize = 256;
 const AUTH_DOMAIN: &[u8] = b"CMFD-WHIR-INITIAL-AUTH-V1";
+const IDENTITY_BINDING_DOMAIN: &str = "Common Foundry WHIR initial codeword identity binding v1";
 
 /// Exact external identity of the authenticated table being encoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +102,42 @@ pub struct WhirInitialCodewordIdentity {
     pub height: u64,
     pub width: u32,
     pub artifact_digest: [u8; 32],
+}
+
+impl WhirInitialCodewordIdentity {
+    /// Bind every caller-trusted identity field, derived geometry field, and
+    /// fixed artifact-protocol field into one domain-separated digest.
+    ///
+    /// This identifies the exact authenticated initial codeword consumed by a
+    /// demand tree. It is prover-local metadata and is not transcript input.
+    pub fn binding_digest(&self) -> Result<[u8; 32], WhirInitialEncodingError> {
+        let geometry = validate_geometry(self.artifact_id, &self.source)?;
+        if self.height != geometry.height as u64 || self.width != WHIR_INITIAL_WIDTH as u32 {
+            return Err(WhirInitialEncodingError::IdentityMismatch);
+        }
+
+        let mut hasher = Hasher::new_derive_key(IDENTITY_BINDING_DOMAIN);
+        hasher.update(MAGIC);
+        hasher.update(&VERSION.to_le_bytes());
+        hasher.update(&(PREFIX_BYTES as u32).to_le_bytes());
+        hasher.update(&(HEADER_BYTES as u32).to_le_bytes());
+        hasher.update(&self.artifact_id);
+        hasher.update(&self.source.source_id);
+        hasher.update(&self.source.num_variables.to_le_bytes());
+        hasher.update(&[FOLDING, STARTING_LOG_INV_RATE, NATURAL_ROW_LAYOUT]);
+        hasher.update(&[CANONICAL_U64_LE_ENCODING]);
+        hasher.update(&self.height.to_le_bytes());
+        hasher.update(&self.width.to_le_bytes());
+        hasher.update(&self.artifact_digest);
+        hasher.update(&(geometry.source_elements as u64).to_le_bytes());
+        hasher.update(&(geometry.height as u64).to_le_bytes());
+        hasher.update(&geometry.data_bytes.to_le_bytes());
+        hasher.update(&geometry.auth_count.to_le_bytes());
+        hasher.update(&(AUTH_CHUNK_ROWS as u64).to_le_bytes());
+        hasher.update(&(DIGEST_BYTES as u32).to_le_bytes());
+        hasher.update(AUTH_DOMAIN);
+        Ok(*hasher.finalize().as_bytes())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -365,6 +410,62 @@ impl MerkleRowSource for AuthenticatedWhirInitialCodeword {
     }
 }
 
+impl Blake3DigestSource for AuthenticatedWhirInitialCodeword {
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    fn read_digests(
+        &self,
+        row_start: usize,
+        row_count: usize,
+    ) -> Result<Vec<Blake3MerkleDigest>, Blake3MerkleStoreError> {
+        if row_count == 0 || row_count > BLAKE3_LEAF_BATCH_ROWS {
+            return Err(Blake3MerkleStoreError::Invalid(
+                "initial leaf digest read is empty or exceeds the batch limit",
+            ));
+        }
+        let row_end = row_start
+            .checked_add(row_count)
+            .ok_or(Blake3MerkleStoreError::Invalid(
+                "initial leaf digest range overflow",
+            ))?;
+        if row_end > self.height {
+            return Err(Blake3MerkleStoreError::Invalid(
+                "initial leaf digest range is outside the codeword",
+            ));
+        }
+
+        let mut digests = Vec::new();
+        digests
+            .try_reserve_exact(row_count)
+            .map_err(|_| Blake3MerkleStoreError::ResearchLimit("initial leaf digest allocation"))?;
+        let mut next_row = row_start;
+        while next_row < row_end {
+            let rows_until_auth_boundary =
+                WHIR_INITIAL_MAX_READ_ROWS - next_row % WHIR_INITIAL_MAX_READ_ROWS;
+            let authenticated_rows = (row_end - next_row).min(rows_until_auth_boundary);
+            let values = self
+                .read_canonical_rows(next_row, authenticated_rows)
+                .map_err(|error| Blake3MerkleStoreError::Source(error.to_string()))?;
+            if values.len() != authenticated_rows * WHIR_INITIAL_WIDTH {
+                return Err(Blake3MerkleStoreError::Source(
+                    "authenticated initial row count changed".to_owned(),
+                ));
+            }
+            for row in values.chunks_exact(WHIR_INITIAL_WIDTH) {
+                let mut hasher = Hasher::new();
+                for value in row {
+                    hasher.update(&value.to_le_bytes());
+                }
+                digests.push(*hasher.finalize().as_bytes());
+            }
+            next_row += authenticated_rows;
+        }
+        Ok(digests)
+    }
+}
+
 /// Encode and atomically publish one exact initial WHIR Suffix codeword.
 ///
 /// Over-cap or malformed geometry is rejected before any source range is read
@@ -394,6 +495,14 @@ fn encode_with_limits(
     source_read_limbs: usize,
     dft_buffer_limbs: usize,
 ) -> Result<AuthenticatedWhirInitialCodeword, WhirInitialEncodingError> {
+    if expected_source.num_variables
+        > u32::try_from(WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES)
+            .expect("reference encoder cap fits u32")
+    {
+        return Err(WhirInitialEncodingError::ResearchLimit(
+            "reference encoder num_variables exceeds 19",
+        ));
+    }
     let geometry = validate_geometry(artifact_id, expected_source)?;
     if source_read_limbs == 0
         || source_read_limbs > WHIR_INITIAL_MAX_SOURCE_READ_LIMBS
@@ -504,9 +613,9 @@ fn validate_geometry(
             "num_variables is smaller than folding",
         ));
     }
-    if variables > WHIR_INITIAL_MAX_VARIABLES {
+    if variables > WHIR_INITIAL_ARTIFACT_MAX_VARIABLES {
         return Err(WhirInitialEncodingError::ResearchLimit(
-            "num_variables exceeds 19",
+            "num_variables exceeds 31",
         ));
     }
     let source_elements = 1_usize.checked_shl(source.num_variables).ok_or(
@@ -515,10 +624,10 @@ fn validate_geometry(
     let height = 1_usize
         .checked_shl(source.num_variables - 1)
         .ok_or(WhirInitialEncodingError::ResearchLimit("codeword height"))?;
-    let data_bytes = height
-        .checked_mul(WHIR_INITIAL_WIDTH)
+    let data_bytes = u64::try_from(height)
+        .ok()
+        .and_then(|rows| rows.checked_mul(WHIR_INITIAL_WIDTH as u64))
         .and_then(|values| values.checked_mul(8))
-        .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(WhirInitialEncodingError::ResearchLimit(
             "artifact byte length",
         ))?;
@@ -684,9 +793,10 @@ fn read_encoded_rows(
 }
 
 fn data_offset(row: usize) -> Result<u64, WhirInitialEncodingError> {
-    row.checked_mul(WHIR_INITIAL_WIDTH * 8)
-        .and_then(|offset| offset.checked_add(HEADER_BYTES))
-        .and_then(|offset| u64::try_from(offset).ok())
+    u64::try_from(row)
+        .ok()
+        .and_then(|row| row.checked_mul((WHIR_INITIAL_WIDTH * 8) as u64))
+        .and_then(|offset| offset.checked_add(HEADER_BYTES as u64))
         .ok_or(WhirInitialEncodingError::Invalid("row offset overflow"))
 }
 
@@ -912,6 +1022,26 @@ mod tests {
         }
     }
 
+    struct ForbiddenSourceAccess;
+
+    impl AuthenticatedWhirInitialSource for ForbiddenSourceAccess {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            panic!("over-cap reference encoding touched the source identity")
+        }
+
+        fn len(&self) -> usize {
+            panic!("over-cap reference encoding touched the source length")
+        }
+
+        fn read_elements(
+            &self,
+            _start: usize,
+            _count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            panic!("over-cap reference encoding read the source")
+        }
+    }
+
     fn test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cmfd-whir-initial-{label}-{}-{}",
@@ -946,6 +1076,20 @@ mod tests {
             .values
             .into_iter()
             .map(|value| value.as_canonical_u64())
+            .collect()
+    }
+
+    fn expected_leaf_digests(values: &[u64]) -> Vec<Blake3MerkleDigest> {
+        assert!(values.len().is_multiple_of(WHIR_INITIAL_WIDTH));
+        values
+            .chunks_exact(WHIR_INITIAL_WIDTH)
+            .map(|row| {
+                let mut hasher = Hasher::new();
+                for value in row {
+                    hasher.update(&value.to_le_bytes());
+                }
+                *hasher.finalize().as_bytes()
+            })
             .collect()
     }
 
@@ -1001,6 +1145,55 @@ mod tests {
     }
 
     #[test]
+    fn codeword_binding_changes_or_rejects_every_identity_dimension() {
+        let identity = WhirInitialCodewordIdentity {
+            artifact_id: [0x12; 32],
+            source: WhirInitialSourceIdentity {
+                source_id: [0x23; 32],
+                num_variables: 6,
+            },
+            height: 1 << 5,
+            width: WHIR_INITIAL_WIDTH as u32,
+            artifact_digest: [0x34; 32],
+        };
+        let binding = identity.binding_digest().unwrap();
+        assert_eq!(
+            binding,
+            [
+                0xc1, 0xa5, 0xad, 0xe5, 0xc3, 0xc0, 0x20, 0xbc, 0x77, 0x54, 0x0c, 0x42, 0x82, 0x17,
+                0xf4, 0x36, 0x8a, 0x5f, 0x25, 0x0f, 0xcf, 0x87, 0x80, 0x37, 0xfe, 0xc0, 0x0b, 0x61,
+                0x01, 0x7b, 0x60, 0x9a,
+            ]
+        );
+
+        for mutate in [
+            |value: &mut WhirInitialCodewordIdentity| value.artifact_id[0] ^= 1,
+            |value: &mut WhirInitialCodewordIdentity| value.source.source_id[0] ^= 1,
+            |value: &mut WhirInitialCodewordIdentity| value.artifact_digest[0] ^= 1,
+        ] {
+            let mut changed = identity.clone();
+            mutate(&mut changed);
+            assert_ne!(changed.binding_digest().unwrap(), binding);
+        }
+
+        let mut changed_geometry = identity.clone();
+        changed_geometry.source.num_variables += 1;
+        changed_geometry.height *= 2;
+        assert_ne!(changed_geometry.binding_digest().unwrap(), binding);
+
+        for invalidate in [
+            |value: &mut WhirInitialCodewordIdentity| value.height += 1,
+            |value: &mut WhirInitialCodewordIdentity| value.width += 1,
+            |value: &mut WhirInitialCodewordIdentity| value.artifact_id = [0; 32],
+            |value: &mut WhirInitialCodewordIdentity| value.source.source_id = [0; 32],
+        ] {
+            let mut changed = identity.clone();
+            invalidate(&mut changed);
+            assert!(changed.binding_digest().is_err());
+        }
+    }
+
+    #[test]
     fn n16_boundary_is_natural_order_and_bounded() {
         let variables = 16;
         let values = table(variables);
@@ -1027,8 +1220,108 @@ mod tests {
     }
 
     #[test]
-    fn n19_research_cap_matches_small_batch() {
-        let variables = WHIR_INITIAL_MAX_VARIABLES;
+    fn n31_artifact_geometry_is_exact_without_allocation() {
+        const SOURCE_ELEMENTS: u64 = 2_147_483_648;
+        const HEIGHT: u64 = 1_073_741_824;
+        const DATA_BYTES: u64 = 34_359_738_368;
+        const AUTH_DIGESTS: u64 = 4_194_304;
+        const AUTH_BYTES: u64 = 134_217_728;
+        const TOTAL_ARTIFACT_BYTES: u64 = 34_493_956_256;
+
+        assert_eq!(WHIR_INITIAL_MAX_VARIABLES, 19);
+        assert_eq!(WHIR_INITIAL_ARTIFACT_MAX_VARIABLES, 31);
+        assert_eq!(WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES, 19);
+        let artifact_id = [0x53; 32];
+        let source = identity(WHIR_INITIAL_ARTIFACT_MAX_VARIABLES);
+        let geometry = validate_geometry(artifact_id, &source).unwrap();
+        assert_eq!(geometry.source_elements as u64, SOURCE_ELEMENTS);
+        assert_eq!(geometry.height as u64, HEIGHT);
+        assert_eq!(geometry.data_bytes, DATA_BYTES);
+        assert_eq!(geometry.auth_count, AUTH_DIGESTS);
+        let auth_bytes = geometry.auth_count * DIGEST_BYTES as u64;
+        assert_eq!(auth_bytes, AUTH_BYTES);
+        assert_eq!(
+            HEADER_BYTES as u64 + geometry.data_bytes + auth_bytes,
+            TOTAL_ARTIFACT_BYTES
+        );
+
+        let prefix = encode_prefix(artifact_id, &source, &geometry);
+        let decoded = decode_prefix(&prefix).unwrap();
+        assert_eq!(decoded.artifact_id, artifact_id);
+        assert_eq!(decoded.source_id, source.source_id);
+        assert_eq!(decoded.num_variables, 31);
+        assert_eq!(decoded.height as u64, HEIGHT);
+        assert_eq!(decoded.data_bytes, DATA_BYTES);
+        assert_eq!(decoded.auth_count, AUTH_DIGESTS);
+
+        assert!(matches!(
+            validate_geometry([0x54; 32], &identity(32)),
+            Err(WhirInitialEncodingError::ResearchLimit(_))
+        ));
+    }
+
+    #[test]
+    fn digest_source_matches_unpadded_rows_across_chunks_and_at_max_batch() {
+        let variables = 15;
+        let values = table(variables);
+        let expected = expected_codeword(&values, variables);
+        let source = DenseSource::new(values);
+        let path = test_path("leaf-digests");
+        let artifact = encode_whir_initial_suffix(&path, [0x55; 32], &identity(variables), &source)
+            .unwrap()
+            .remove_on_drop();
+        assert_eq!(Blake3DigestSource::height(&artifact), 1 << 14);
+
+        for (row_start, row_count) in [(250, 20), (4_096, BLAKE3_LEAF_BATCH_ROWS)] {
+            let actual = artifact.read_digests(row_start, row_count).unwrap();
+            let word_start = row_start * WHIR_INITIAL_WIDTH;
+            let word_end = (row_start + row_count) * WHIR_INITIAL_WIDTH;
+            assert_eq!(
+                actual,
+                expected_leaf_digests(&expected[word_start..word_end])
+            );
+        }
+    }
+
+    #[test]
+    fn digest_source_rejects_invalid_ranges_and_corruption() {
+        let variables = 10;
+        let source = DenseSource::new(table(variables));
+        let path = test_path("leaf-digest-failures");
+        let artifact = encode_whir_initial_suffix(&path, [0x56; 32], &identity(variables), &source)
+            .unwrap()
+            .remove_on_drop();
+        let height = Blake3DigestSource::height(&artifact);
+        for (row_start, row_count) in [
+            (0, 0),
+            (0, BLAKE3_LEAF_BATCH_ROWS + 1),
+            (height, 1),
+            (height - 1, 2),
+            (usize::MAX, 2),
+        ] {
+            assert!(matches!(
+                artifact.read_digests(row_start, row_count),
+                Err(Blake3MerkleStoreError::Invalid(_))
+            ));
+        }
+
+        let original = artifact.read_canonical_rows(256, 1).unwrap()[0];
+        let replacement = u64::from(original == 0);
+        let mut writer = OpenOptions::new().write(true).open(&path).unwrap();
+        writer
+            .seek(SeekFrom::Start(data_offset(256).unwrap()))
+            .unwrap();
+        writer.write_all(&replacement.to_le_bytes()).unwrap();
+        writer.sync_all().unwrap();
+        assert!(matches!(
+            artifact.read_digests(250, 20),
+            Err(Blake3MerkleStoreError::Source(_))
+        ));
+    }
+
+    #[test]
+    fn n19_reference_encoder_cap_matches_small_batch() {
+        let variables = WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES;
         let values = table(variables);
         let expected = expected_codeword(&values, variables);
         let source = DenseSource::new(values);
@@ -1071,21 +1364,45 @@ mod tests {
     }
 
     #[test]
-    fn over_cap_and_bad_geometry_fail_before_read_or_file_creation() {
+    fn reference_cap_and_bad_geometry_fail_before_source_or_file_access() {
+        let over_cap = identity(WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES + 1);
+        let path = test_path("reference-cap-public");
+        let partial_path = partial_path_for(&path).unwrap();
+        fs::write(&path, b"existing target").unwrap();
+        fs::write(&partial_path, b"existing partial").unwrap();
+        assert!(matches!(
+            encode_whir_initial_suffix(&path, [0x61; 32], &over_cap, &ForbiddenSourceAccess),
+            Err(WhirInitialEncodingError::ResearchLimit(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"existing target");
+        assert_eq!(fs::read(&partial_path).unwrap(), b"existing partial");
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&partial_path).unwrap();
+
+        let path = test_path("reference-cap-internal");
+        assert!(matches!(
+            encode_with_limits(
+                &path,
+                [0x61; 32],
+                &over_cap,
+                &ForbiddenSourceAccess,
+                WHIR_INITIAL_WIDTH,
+                WHIR_INITIAL_WIDTH,
+            ),
+            Err(WhirInitialEncodingError::ResearchLimit(_))
+        ));
+        assert!(!path.exists());
+        assert!(!partial_path_for(&path).unwrap().exists());
+
         let source = DenseSource::new(vec![0; 4]);
-        for (variables, expected_limit) in [(20, true), (1, false)] {
-            let path = test_path("preflight");
-            let result =
-                encode_whir_initial_suffix(&path, [0x61; 32], &identity(variables), &source);
-            assert!(if expected_limit {
-                matches!(result, Err(WhirInitialEncodingError::ResearchLimit(_)))
-            } else {
-                matches!(result, Err(WhirInitialEncodingError::Invalid(_)))
-            });
-            assert_eq!(source.reads.load(Ordering::SeqCst), 0);
-            assert!(!path.exists());
-            assert!(!partial_path_for(&path).unwrap().exists());
-        }
+        let path = test_path("bad-geometry-preflight");
+        assert!(matches!(
+            encode_whir_initial_suffix(&path, [0x61; 32], &identity(1), &source),
+            Err(WhirInitialEncodingError::Invalid(_))
+        ));
+        assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+        assert!(!path.exists());
+        assert!(!partial_path_for(&path).unwrap().exists());
 
         let path = test_path("wrong-source-identity");
         let expected = identity(4);

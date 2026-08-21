@@ -19,6 +19,10 @@ use crate::whir_initial::{
     AuthenticatedWhirInitialSource, WHIR_INITIAL_MAX_SOURCE_READ_LIMBS, WHIR_INITIAL_MIN_VARIABLES,
     WhirInitialSourceError, WhirInitialSourceIdentity,
 };
+#[cfg(test)]
+use crate::whir_initial::{
+    WHIR_INITIAL_ARTIFACT_MAX_VARIABLES, WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES,
+};
 
 const MAGIC: &[u8; 8] = b"CMFDWIS1";
 const VERSION: u32 = 1;
@@ -33,9 +37,11 @@ const AUTH_DOMAIN: &str = "Common Foundry WHIR initial source chunk v1";
 
 /// Byte offset of the first canonical source limb.
 pub const WHIR_INITIAL_SOURCE_HEADER_BYTES: usize = HEADER_BYTES;
-/// Largest original table that may be staged before a production codeword
-/// implementation exists. The current codeword/oracle path remains capped at
-/// [`crate::whir_initial::WHIR_INITIAL_MAX_VARIABLES`] (`n = 19`).
+/// Largest original table that may be staged and described by the codeword
+/// artifact format. The version-one oracle and bounded reference encoder remain
+/// capped at
+/// [`crate::whir_initial::WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES`]
+/// (`n = 19`).
 pub const WHIR_INITIAL_SOURCE_MAX_VARIABLES: usize = 31;
 
 /// Externally retained provenance for one exact original source artifact.
@@ -1217,11 +1223,14 @@ mod tests {
     }
 
     #[test]
-    fn production_weight_source_geometry_is_admitted_without_lowering_codeword_caps() {
+    fn production_weight_source_geometry_exceeds_the_reference_encoder_cap() {
         let geometry = validate_source_identity(&source_identity(31, 0x56)).unwrap();
         assert_eq!(geometry.element_count, 1_usize << 31);
         assert_eq!(geometry.data_bytes, 1_u64 << 34);
         assert_eq!(geometry.auth_count, 1_u64 << 18);
-        assert_eq!(crate::whir_initial::WHIR_INITIAL_MAX_VARIABLES, 19);
+        assert_eq!(WHIR_INITIAL_SOURCE_MAX_VARIABLES, 31);
+        assert_eq!(WHIR_INITIAL_ARTIFACT_MAX_VARIABLES, 31);
+        assert_eq!(WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES, 19);
+        assert!(geometry.element_count > 1_usize << WHIR_INITIAL_REFERENCE_ENCODER_MAX_VARIABLES);
     }
 }

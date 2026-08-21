@@ -12,9 +12,10 @@
 //! This is a correctness/reference primitive. Building the extension `2^29`
 //! tree writes about 32 GiB; the initial `2^30` tree writes about 64 GiB.
 //! Neither has yet been matched by the production GPU construction path. The
-//! feature-gated artifact WHIR prover adopts the extension store, but this
-//! initial suite is not yet integrated into that prover and raises no proof-
-//! activation cap.
+//! feature-gated artifact WHIR prover can adopt both typed stores without
+//! adding artifact metadata to its transcript. The initial-v1 store remains
+//! subject to the existing explicit-WHIR variable cap and does not activate a
+//! production proof profile.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};

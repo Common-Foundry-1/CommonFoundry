@@ -19,6 +19,9 @@ use cmfd_proof_accel::demand_blake3_tree::{
 use cmfd_proof_accel::initial_whir_oracle::{
     INITIAL_WHIR_TREE_PARTITION, InitialWhirOracle, InitialWhirOracleError,
 };
+use cmfd_proof_accel::initial_whir_oracle_v2::{
+    InitialWhirOracleIdentityV2, InitialWhirOracleV2, InitialWhirOracleV2Error,
+};
 #[cfg(test)]
 use cmfd_proof_accel::merkle_store::MerkleRowSource;
 #[cfg(test)]
@@ -64,6 +67,42 @@ impl Matrix<F> for InitialWhirMatrix {
             .oracle
             .opening(row)
             .map_err(DiskWhirStorageError::Initial)
+            .unwrap_or_else(|error| panic_storage(error));
+        opening.row()[start..end]
+            .iter()
+            .copied()
+            .map(F::new)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+/// Matrix view tied to the independently versioned initial demand-tree oracle.
+pub(super) struct InitialWhirMatrixV2 {
+    oracle: Arc<InitialWhirOracleV2>,
+}
+
+impl Matrix<F> for InitialWhirMatrixV2 {
+    fn width(&self) -> usize {
+        INITIAL_WHIR_TREE_PARTITION[0]
+    }
+
+    fn height(&self) -> usize {
+        self.oracle.height()
+    }
+
+    unsafe fn row_subseq_unchecked(
+        &self,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = F, IntoIter = impl Iterator<Item = F> + Send + Sync> {
+        debug_assert!(row < self.height());
+        debug_assert!(start <= end && end <= self.width());
+        let opening = self
+            .oracle
+            .opening(row)
+            .map_err(DiskWhirStorageError::InitialV2)
             .unwrap_or_else(|error| panic_storage(error));
         opening.row()[start..end]
             .iter()
@@ -179,6 +218,11 @@ pub(super) enum DiskWhirProverData<M> {
         matrix: M,
         oracle: Arc<InitialWhirOracle>,
     },
+    InitialV2 {
+        matrix: M,
+        oracle: Arc<InitialWhirOracleV2>,
+        oracle_identity: Box<InitialWhirOracleIdentityV2>,
+    },
     #[cfg(test)]
     Extension {
         matrix: M,
@@ -207,6 +251,11 @@ type AdoptedInitial = (
     <DiskWhirMmcs as Mmcs<F>>::ProverData<InitialWhirMatrix>,
 );
 
+pub(super) type AdoptedInitialV2 = (
+    <DiskWhirMmcs as Mmcs<F>>::Commitment,
+    <DiskWhirMmcs as Mmcs<F>>::ProverData<InitialWhirMatrixV2>,
+);
+
 #[cfg(test)]
 type AdoptedExtension = (
     <DiskWhirMmcs as Mmcs<F>>::Commitment,
@@ -223,6 +272,8 @@ type AdoptedDemandExtension = (
 pub(super) enum DiskWhirStorageError {
     #[error("initial WHIR storage failed: {0}")]
     Initial(#[from] InitialWhirOracleError),
+    #[error("initial WHIR v2 storage failed: {0}")]
+    InitialV2(#[from] InitialWhirOracleV2Error),
     #[cfg(test)]
     #[error("extension WHIR storage failed: {0}")]
     Extension(#[from] WhirExtensionEncodingError),
@@ -276,6 +327,37 @@ impl DiskWhirMmcs {
             oracle: Arc::clone(&oracle),
         };
         Ok((commitment, DiskWhirProverData::Initial { matrix, oracle }))
+    }
+
+    /// Adopt one exact initial-v2 codeword/demand-tree capability.
+    ///
+    /// The externally retained identity is checked before and during every
+    /// opening. One live row/path is authenticated before the ordinary Merkle
+    /// commitment is exposed; there is deliberately no dense fallback.
+    pub(super) fn adopt_initial_v2(
+        &self,
+        expected_num_variables: usize,
+        expected_identity: &InitialWhirOracleIdentityV2,
+        oracle: Arc<InitialWhirOracleV2>,
+    ) -> Result<AdoptedInitialV2, DiskWhirStorageError> {
+        validate_initial_v2_capability(expected_num_variables, expected_identity, &oracle)?;
+
+        // Prove that the live codeword and tree still produce one authenticated
+        // row/path before exposing their root as a commitment capability.
+        oracle.opening(0)?;
+
+        let commitment = MerkleCap::<F, [u8; 32]>::new(vec![expected_identity.pinned_root()]);
+        let matrix = InitialWhirMatrixV2 {
+            oracle: Arc::clone(&oracle),
+        };
+        Ok((
+            commitment,
+            DiskWhirProverData::InitialV2 {
+                matrix,
+                oracle,
+                oracle_identity: Box::new(*expected_identity),
+            },
+        ))
     }
 
     /// Adopt one exact authenticated extension codeword/tree pair.
@@ -390,6 +472,28 @@ impl DiskWhirMmcs {
                     opening.authentication_path().to_vec(),
                 ))
             }
+            DiskWhirProverData::InitialV2 {
+                matrix,
+                oracle,
+                oracle_identity,
+            } => {
+                validate_initial_v2_capability(
+                    usize::try_from(oracle_identity.codeword_identity().source.num_variables)
+                        .expect("bounded WHIR variable count fits usize"),
+                    oracle_identity,
+                    oracle,
+                )?;
+                if index >= matrix.height() {
+                    return Err(DiskWhirStorageError::Invalid(
+                        "initial WHIR v2 opening index is out of bounds",
+                    ));
+                }
+                let opening = oracle.opening(index)?;
+                Ok(BatchOpening::new(
+                    vec![opening.row().iter().copied().map(F::new).collect()],
+                    opening.authentication_path().to_vec(),
+                ))
+            }
             #[cfg(test)]
             DiskWhirProverData::Extension {
                 matrix,
@@ -477,6 +581,7 @@ impl Mmcs<F> for DiskWhirMmcs {
         match prover_data {
             DiskWhirProverData::Dense(data) => self.inner.get_matrices(data),
             DiskWhirProverData::Initial { matrix, .. } => vec![matrix],
+            DiskWhirProverData::InitialV2 { matrix, .. } => vec![matrix],
             #[cfg(test)]
             DiskWhirProverData::Extension { matrix, .. } => vec![matrix],
             DiskWhirProverData::DemandExtension { matrix, .. } => vec![matrix],
@@ -497,6 +602,41 @@ impl Mmcs<F> for DiskWhirMmcs {
             BatchOpeningRef::<F, WhirMmcs>::new(opening.opened_values, opening.opening_proof),
         )
     }
+}
+
+fn validate_initial_v2_capability(
+    expected_num_variables: usize,
+    expected_identity: &InitialWhirOracleIdentityV2,
+    oracle: &InitialWhirOracleV2,
+) -> Result<(), DiskWhirStorageError> {
+    if oracle.identity() != expected_identity {
+        return Err(DiskWhirStorageError::Invalid(
+            "initial WHIR v2 oracle identity does not match the retained identity",
+        ));
+    }
+    let codeword_identity = expected_identity.codeword_identity();
+    let actual_num_variables = usize::try_from(codeword_identity.source.num_variables)
+        .expect("bounded WHIR variable count fits usize");
+    if actual_num_variables != expected_num_variables {
+        return Err(DiskWhirStorageError::Invalid(
+            "initial WHIR v2 variable count does not match the prover state",
+        ));
+    }
+    let tree_identity = expected_identity.tree_identity();
+    if tree_identity.height != codeword_identity.height
+        || tree_identity.codeword_binding
+            != codeword_identity.binding_digest().map_err(|_| {
+                DiskWhirStorageError::Invalid("initial WHIR v2 codeword identity is invalid")
+            })?
+        || oracle.height()
+            != usize::try_from(tree_identity.height)
+                .expect("bounded initial WHIR v2 height fits usize")
+    {
+        return Err(DiskWhirStorageError::Invalid(
+            "initial WHIR v2 tree is not bound to the exact codeword geometry",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_demand_extension_capability(
@@ -596,8 +736,16 @@ mod tests {
     use cmfd_proof_accel::blake3_merkle_store::build_authenticated_blake3_merkle_store;
     use cmfd_proof_accel::demand_blake3_tree::{
         WhirExtensionOracle, build_whir_extension_demand_blake3_tree,
+        build_whir_initial_demand_blake3_tree,
+    };
+    use cmfd_proof_accel::initial_whir_oracle_v2::{
+        InitialWhirOracleIdentityV2, InitialWhirOracleV2,
     };
     use cmfd_proof_accel::whir_extension::encode_whir_extension_codeword;
+    use cmfd_proof_accel::whir_initial::{
+        AuthenticatedWhirInitialSource, WhirInitialSourceError, WhirInitialSourceIdentity,
+        encode_whir_initial_suffix,
+    };
     use cmfd_proof_accel::whir_residual::{
         AuthenticatedWhirResidualArtifact, WHIR_RESIDUAL_LIMBS_PER_ROW, WhirResidualArtifactSpec,
         WhirResidualArtifactWriter,
@@ -633,6 +781,42 @@ mod tests {
         codeword_identity: WhirExtensionCodewordIdentity,
         tree_identity: DemandBlake3TreeIdentity,
         values: Vec<EF>,
+    }
+
+    struct InitialSource {
+        identity: WhirInitialSourceIdentity,
+        values: Vec<u64>,
+    }
+
+    impl AuthenticatedWhirInitialSource for InitialSource {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            &self.identity
+        }
+
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn read_elements(
+            &self,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| WhirInitialSourceError::new("test source range overflow"))?;
+            self.values
+                .get(start..end)
+                .map(<[u64]>::to_vec)
+                .ok_or_else(|| WhirInitialSourceError::new("test source range"))
+        }
+    }
+
+    struct InitialV2Fixture {
+        directory: PathBuf,
+        oracle: Arc<InitialWhirOracleV2>,
+        identity: InitialWhirOracleIdentityV2,
+        values: Vec<F>,
     }
 
     fn test_directory(label: &str) -> PathBuf {
@@ -775,6 +959,139 @@ mod tests {
         Arc::try_unwrap(oracle).unwrap().remove().unwrap();
         drop(residual);
         fs::remove_dir(directory).unwrap();
+    }
+
+    fn build_initial_v2_fixture(label: &str, identity_byte: u8) -> InitialV2Fixture {
+        let directory = test_directory(label);
+        let source = InitialSource {
+            identity: WhirInitialSourceIdentity {
+                source_id: [identity_byte; 32],
+                num_variables: 4,
+            },
+            values: (0..16)
+                .map(|index| {
+                    ((index as u64 + 3) * 0x1_0000_01b3 + identity_byte as u64)
+                        % super::super::GOLDILOCKS_MODULUS
+                })
+                .collect(),
+        };
+        let codeword = encode_whir_initial_suffix(
+            directory.join("initial-codeword"),
+            [identity_byte.wrapping_add(1); 32],
+            source.identity(),
+            &source,
+        )
+        .unwrap()
+        .remove_on_drop();
+        let height = usize::try_from(codeword.identity().height).unwrap();
+        let values = codeword
+            .read_canonical_rows(0, height)
+            .unwrap()
+            .into_iter()
+            .map(F::new)
+            .collect();
+        let tree = build_whir_initial_demand_blake3_tree(
+            directory.join("initial-demand-tree"),
+            [identity_byte.wrapping_add(2); 32],
+            &codeword,
+        )
+        .unwrap()
+        .remove_on_drop();
+        let context = [identity_byte.wrapping_add(3); 32];
+        let identity =
+            InitialWhirOracleIdentityV2::bind(context, codeword.identity(), tree.identity())
+                .unwrap();
+        let oracle =
+            Arc::new(InitialWhirOracleV2::adopt(context, &identity, codeword, tree).unwrap());
+        InitialV2Fixture {
+            directory,
+            oracle,
+            identity,
+            values,
+        }
+    }
+
+    fn remove_initial_v2_fixture(fixture: InitialV2Fixture) {
+        let InitialV2Fixture {
+            directory, oracle, ..
+        } = fixture;
+        let (codeword, tree) = Arc::try_unwrap(oracle).unwrap().into_parts();
+        drop(tree);
+        drop(codeword);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn adopted_initial_v2_matches_ordinary_mmcs_commitment_and_openings() {
+        let fixture = build_initial_v2_fixture("initial-v2-parity", 0x31);
+        let disk = DiskWhirMmcs::new(ordinary_mmcs());
+        let (commitment, prover_data) = disk
+            .adopt_initial_v2(4, &fixture.identity, Arc::clone(&fixture.oracle))
+            .unwrap();
+        match &prover_data {
+            DiskWhirProverData::InitialV2 {
+                oracle_identity, ..
+            } => assert_eq!(oracle_identity.as_ref(), &fixture.identity),
+            _ => panic!("adopted initial v2 must retain its exact identity"),
+        }
+
+        let height = fixture.values.len() / INITIAL_WHIR_TREE_PARTITION[0];
+        let ordinary = ordinary_mmcs();
+        let (ordinary_commitment, ordinary_data) = ordinary.commit(vec![RowMajorMatrix::new(
+            fixture.values.clone(),
+            INITIAL_WHIR_TREE_PARTITION[0],
+        )]);
+        assert_eq!(commitment, ordinary_commitment);
+        let dimensions = [Dimensions {
+            width: INITIAL_WHIR_TREE_PARTITION[0],
+            height,
+        }];
+        for index in 0..height {
+            let opening = disk.try_open_batch(index, &prover_data).unwrap();
+            let ordinary_opening = ordinary.open_batch(index, &ordinary_data);
+            assert_eq!(opening.opened_values, ordinary_opening.opened_values);
+            assert_eq!(opening.opening_proof, ordinary_opening.opening_proof);
+            disk.verify_batch(&commitment, &dimensions, index, (&opening).into())
+                .unwrap();
+            let matrix_row = disk.get_matrices(&prover_data)[0]
+                .row(index)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(matrix_row, opening.opened_values[0]);
+        }
+        assert!(matches!(
+            disk.try_open_batch(height, &prover_data),
+            Err(DiskWhirStorageError::Invalid(
+                "initial WHIR v2 opening index is out of bounds"
+            ))
+        ));
+
+        drop(prover_data);
+        remove_initial_v2_fixture(fixture);
+    }
+
+    #[test]
+    fn initial_v2_adoption_rejects_variable_and_identity_substitution() {
+        let fixture = build_initial_v2_fixture("initial-v2-identity", 0x42);
+        let substitute = build_initial_v2_fixture("initial-v2-substitute", 0x53);
+        let disk = DiskWhirMmcs::new(ordinary_mmcs());
+
+        assert!(matches!(
+            disk.adopt_initial_v2(5, &fixture.identity, Arc::clone(&fixture.oracle)),
+            Err(DiskWhirStorageError::Invalid(
+                "initial WHIR v2 variable count does not match the prover state"
+            ))
+        ));
+        assert!(matches!(
+            disk.adopt_initial_v2(4, &fixture.identity, Arc::clone(&substitute.oracle)),
+            Err(DiskWhirStorageError::Invalid(
+                "initial WHIR v2 oracle identity does not match the retained identity"
+            ))
+        ));
+
+        remove_initial_v2_fixture(substitute);
+        remove_initial_v2_fixture(fixture);
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod blake3_merkle_store;
 pub mod demand_blake3_tree;
 mod external_radix2;
 pub mod initial_whir_oracle;
+pub mod initial_whir_oracle_v2;
 pub mod merkle_store;
 mod poseidon2;
 pub mod spill;

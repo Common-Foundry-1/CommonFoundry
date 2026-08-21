@@ -147,7 +147,10 @@ still capped at `2^20` rows. Its current file-backed DFT would move about
 31-variable initial weight-bank commitment still stand between this checkpoint
 and a cap increase. The native v2 proof codec is now fixed-width and
 configuration-derived, with a canonical first-reference Merkle dictionary and
-no general-purpose compression. Ten real 13-variable explicit envelopes
+no general-purpose compression. Its decoder enforces a tree-level,
+configuration-derived maximum on distinct authentication nodes; the inner
+codec is hard-versioned so the stricter accepted grammar is part of the WHIR
+suite identity. Ten real 13-variable explicit envelopes
 measured 188,104 through 190,024 bytes and passed the unchanged verifier, but
 the Merkle-tree geometry also gives a transcript-independent maximum of
 203,576 bytes including the outer wire header. This is one WHIR proof rather
@@ -155,6 +158,14 @@ than the complete production aggregate. The public 16-variable and 1 MiB
 research limits therefore remain unchanged; 15- and 16-variable standalone
 envelopes are deliberately rejected because they cannot fit the network proof
 budget.
+
+The complete tiny structured fixture now combines its arithmetic arguments, a
+split WHIR opening proof, and the exact one-block BLAKE3 argument below the
+network limit. Geometry-derived maxima are 154,252 bytes for WHIR and 87,556
+bytes for BLAKE3; with 16,804 fixed aggregate bytes, the aggregate is bounded at
+258,612 bytes. Retaining the current 193-byte V2 frame and a four-byte aggregate
+length gives a 258,809-byte full-wire ceiling, 3,335 bytes below 256 KiB. This is
+a deterministic tiny-profile bound, not a production-profile measurement.
 
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`

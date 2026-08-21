@@ -689,7 +689,7 @@ pub fn structured_whir_suite_parameter_digest() -> [u8; 32] {
     update_suite_descriptor(
         &mut hasher,
         b"native-proof-codec",
-        b"fixed-width-le-config-derived-shape-first-reference-merkle-dictionary-v1",
+        b"fixed-width-le-config-derived-shape-first-reference-merkle-dictionary-tree-level-bound-v2",
     );
     update_suite_descriptor(
         &mut hasher,
@@ -949,6 +949,44 @@ impl StructuredWhirSplitProof {
         }
         Ok(Self { fixed_model, trace })
     }
+}
+
+#[cfg(test)]
+pub(crate) fn structured_whir_encoded_proof_upper_bound(
+    encoded: &[u8],
+) -> Result<usize, ExplicitWhirError> {
+    let split = StructuredWhirSplitProof::decode(encoded)?;
+    let mut bound = 16usize;
+    for section in split
+        .fixed_model
+        .iter()
+        .chain(std::iter::once(&split.trace))
+    {
+        let table_variables = section
+            .table_variables
+            .iter()
+            .map(|variables| *variables as usize)
+            .collect::<Vec<_>>();
+        let stacked_variables = validate_stacked_shape(&table_variables)?;
+        let config = build_whir_config(stacked_variables)?;
+        let native_bound = native_codec::encoded_proof_upper_bound(&config)
+            .map_err(|_| ExplicitWhirError::Configuration("native proof bound".to_owned()))?;
+        let section_bound = 52usize
+            .checked_add(
+                section
+                    .table_variables
+                    .len()
+                    .checked_mul(4)
+                    .ok_or(ExplicitWhirError::AggregateProofTooLarge)?,
+            )
+            .and_then(|value| value.checked_add(native_bound))
+            .ok_or(ExplicitWhirError::AggregateProofTooLarge)?;
+        bound = bound
+            .checked_add(4)
+            .and_then(|value| value.checked_add(section_bound))
+            .ok_or(ExplicitWhirError::AggregateProofTooLarge)?;
+    }
+    Ok(bound)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2995,8 +3033,9 @@ mod tests {
             "434d4644424e4b3202000000b800000001000000020000000200000006000000",
             "040000000000000004000000000000001c00000000000000921f746e64fb0502",
             "2fe53c5ddcf048c74d79604680d5716a7299929750744c539a37a20d1bc3e472",
-            "41e63ac491185f80f717049e4982c922715b96f44943690e2bfd9ce2207d0ffd",
-            "a6d87033b34170bf1de73e6eb849e7d7c1c28faff4fc4939993745b234219cb7",
+            "41e63ac491185f80f717049e4982c922715b96f44943690e",
+            "243418c613738065dffcc5e1e9aaf725a7516e8f8834d53ea309bc25d1b9d0a4",
+            "993745b234219cb7",
             "bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff007dfa0102030405",
             "060708090a0b0c0d0e0f10111213141516171819"
         ))
@@ -3016,7 +3055,7 @@ mod tests {
                 "9a37a20d1bc3e47241e63ac491185f80f717049e4982c922715b96f44943690e",
             ),
             pcs_parameter_digest: decode_hex_32(
-                "2bfd9ce2207d0ffda6d87033b34170bf1de73e6eb849e7d7c1c28faff4fc4939",
+                "243418c613738065dffcc5e1e9aaf725a7516e8f8834d53ea309bc25d1b9d0a4",
             ),
             pcs_commitment_root: decode_hex_32(
                 "993745b234219cb7bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff",
@@ -3117,7 +3156,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(fixture.identity.digest().unwrap()),
-            "4b6674abacdd3a6ffcdb713e1fcab5101945e90f16e2d485b43e9e9899086a86"
+            "485fcbd31f2f20f477947d32f2c910c5e67005910e2ccfe94101996f0445c7de"
         );
         let derived = StructuredWhirModelCommitmentSet::from_verified_model_bank(
             Cursor::new(&fixture.bytes),
@@ -3493,7 +3532,7 @@ mod tests {
             if seed == 0 {
                 assert_eq!(
                     blake3::hash(&proof.proof_bytes).to_hex().as_str(),
-                    "1e4eed0b8faa47868b7ae2dc54df8fc63c85e0907ee659a9cfdbd44314a6b4d2"
+                    "b2a4ae88c9fbf7d1fe9056abf546429d1a88162b30b257c7968f7ea8777c852c"
                 );
             }
             assert!(
@@ -4423,7 +4462,7 @@ mod tests {
     fn structured_model_and_trace_openings_are_separate_and_bound() {
         assert_eq!(
             hex::encode(structured_whir_suite_parameter_digest()),
-            "2bfd9ce2207d0ffda6d87033b34170bf1de73e6eb849e7d7c1c28faff4fc4939"
+            "243418c613738065dffcc5e1e9aaf725a7516e8f8834d53ea309bc25d1b9d0a4"
         );
         let base = vec![3, 5, 7, 11];
         let weight_0 = vec![13, 17, 19, 23, 29, 31, 37, 41];

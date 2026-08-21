@@ -2,10 +2,10 @@ use blake3::Hasher;
 
 const PINNED_PREPROCESSED_REGISTRY_DOMAIN: &str = "CMFD/FORGEMATRIX/BLAKE3-PREPROCESSED-KEYS/V1";
 
-pub const STRUCTURED_BLAKE3_VERSION: u32 = 3;
-pub(crate) const STRUCTURED_BLAKE3_PROOF_MAGIC: &[u8; 8] = b"CMFDB3S3";
-pub(crate) const NARROW_BLAKE3_PROOF_VERSION: u32 = 3;
-pub(crate) const NARROW_BLAKE3_PROOF_MAGIC: &[u8; 8] = b"CMFDB3N3";
+pub const STRUCTURED_BLAKE3_VERSION: u32 = 4;
+pub(crate) const STRUCTURED_BLAKE3_PROOF_MAGIC: &[u8; 8] = b"CMFDB3S4";
+pub(crate) const NARROW_BLAKE3_PROOF_VERSION: u32 = 4;
+pub(crate) const NARROW_BLAKE3_PROOF_MAGIC: &[u8; 8] = b"CMFDB3N4";
 pub(crate) const PINNED_PREPROCESSED_REGISTRY_VERSION: u32 = 1;
 pub(crate) const PINNED_PREPROCESSED_WIDTH: usize = 84;
 pub(crate) const PINNED_PREPROCESSED_LOG_BLOWUP: usize = 7;
@@ -250,9 +250,9 @@ mod tests {
         assert_eq!(
             baseline,
             [
-                0x05, 0x7d, 0x66, 0x37, 0x25, 0x7c, 0x26, 0xe9, 0xb5, 0x0e, 0x2e, 0x42, 0x57, 0xa6,
-                0xea, 0x50, 0xe8, 0x54, 0xa2, 0xa8, 0x87, 0xc5, 0xbc, 0xb6, 0xd4, 0xa0, 0x4d, 0x56,
-                0xcf, 0xa0, 0xb7, 0x57,
+                0x2a, 0x80, 0x3a, 0x1b, 0xf8, 0x98, 0xcc, 0xdb, 0xc7, 0xb2, 0x48, 0x0d, 0x93, 0x4e,
+                0x95, 0x9f, 0xfd, 0x10, 0xa2, 0x49, 0x2d, 0xb8, 0x77, 0x50, 0xa0, 0x43, 0x92, 0x8f,
+                0x76, 0xbf, 0x49, 0x93,
             ]
         );
         assert_eq!(baseline, pinned_preprocessed_registry_digest());

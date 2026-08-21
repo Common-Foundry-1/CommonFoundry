@@ -25,8 +25,8 @@ use super::{
 };
 use crate::GOLDILOCKS_MODULUS;
 
-pub(super) const NATIVE_PROOF_CODEC_MAGIC: &[u8; 8] = b"CMFDWHB1";
-pub(super) const NATIVE_PROOF_CODEC_VERSION: u32 = 1;
+pub(super) const NATIVE_PROOF_CODEC_MAGIC: &[u8; 8] = b"CMFDWHB2";
+pub(super) const NATIVE_PROOF_CODEC_VERSION: u32 = 2;
 pub(super) const NATIVE_PROOF_CODEC_HEADER_BYTES: usize = 40;
 
 pub(super) const NATIVE_PROOF_CODEC_FLAGS: u32 = 0;
@@ -226,6 +226,53 @@ impl ProofShape {
         }
         Ok(references)
     }
+
+    fn maximum_dictionary_nodes(&self) -> Result<usize, NativeProofCodecError> {
+        let maximum = self
+            .rounds
+            .iter()
+            .map(|round| round.queries)
+            .chain(std::iter::once(self.final_queries))
+            .try_fold(0usize, |total, query| {
+                let mut nodes_at_level = checked_pow2(query.path_len)?;
+                let mut phase_nodes = 0usize;
+                for _ in 0..query.path_len {
+                    phase_nodes = phase_nodes
+                        .checked_add(query.count.min(nodes_at_level))
+                        .ok_or(NativeProofCodecError::Configuration)?;
+                    nodes_at_level /= 2;
+                }
+                total
+                    .checked_add(phase_nodes)
+                    .ok_or(NativeProofCodecError::Configuration)
+            })?;
+        Ok(maximum.min(MAX_DICTIONARY_NODES))
+    }
+
+    #[cfg(test)]
+    fn encoded_bytes_upper_bound(&self) -> Result<usize, NativeProofCodecError> {
+        let dictionary_bytes = self
+            .maximum_dictionary_nodes()?
+            .checked_mul(DIGEST_BYTES)
+            .ok_or(NativeProofCodecError::Configuration)?;
+        let reference_bytes = self
+            .reference_count
+            .checked_mul(REFERENCE_BYTES)
+            .ok_or(NativeProofCodecError::Configuration)?;
+        NATIVE_PROOF_CODEC_HEADER_BYTES
+            .checked_add(self.body_len)
+            .and_then(|value| value.checked_add(dictionary_bytes))
+            .and_then(|value| value.checked_add(reference_bytes))
+            .map(|value| value.min(MAX_EXPLICIT_WHIR_PROOF_BYTES))
+            .ok_or(NativeProofCodecError::Configuration)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn encoded_proof_upper_bound(
+    config: &WhirConfig<EF, F, Challenger>,
+) -> Result<usize, NativeProofCodecError> {
+    ProofShape::derive(config)?.encoded_bytes_upper_bound()
 }
 
 fn derive_query_shape(
@@ -311,7 +358,7 @@ where
     let mut body = Vec::new();
     body.try_reserve_exact(shape.body_len)
         .map_err(|_| NativeProofCodecError::TooLarge)?;
-    let mut paths = PathEncoder::new(shape.reference_count)?;
+    let mut paths = PathEncoder::new(shape.reference_count, shape.maximum_dictionary_nodes()?)?;
 
     write_extensions(&mut body, &proof.initial_ood_answers);
     write_sumcheck(&mut body, &proof.initial_sumcheck, shape.initial_sumcheck);
@@ -384,7 +431,7 @@ pub(super) fn decode_native_proof(
         || reference_count != shape.reference_count
         || flags != NATIVE_PROOF_CODEC_FLAGS
         || dictionary_count > reference_count
-        || dictionary_count > MAX_DICTIONARY_NODES
+        || dictionary_count > shape.maximum_dictionary_nodes()?
     {
         return Err(NativeProofCodecError::InvalidEncoding);
     }
@@ -630,10 +677,14 @@ struct PathEncoder {
     indices: BTreeMap<[u8; DIGEST_BYTES], u16>,
     dictionary: Vec<[u8; DIGEST_BYTES]>,
     references: Vec<u16>,
+    maximum_dictionary_nodes: usize,
 }
 
 impl PathEncoder {
-    fn new(reference_count: usize) -> Result<Self, NativeProofCodecError> {
+    fn new(
+        reference_count: usize,
+        maximum_dictionary_nodes: usize,
+    ) -> Result<Self, NativeProofCodecError> {
         let mut references = Vec::new();
         references
             .try_reserve_exact(reference_count)
@@ -642,6 +693,7 @@ impl PathEncoder {
             indices: BTreeMap::new(),
             dictionary: Vec::new(),
             references,
+            maximum_dictionary_nodes,
         })
     }
 
@@ -650,7 +702,7 @@ impl PathEncoder {
             let index = if let Some(&index) = self.indices.get(&node) {
                 index
             } else {
-                if self.dictionary.len() >= MAX_DICTIONARY_NODES {
+                if self.dictionary.len() >= self.maximum_dictionary_nodes {
                     return Err(NativeProofCodecError::TooLarge);
                 }
                 let index = u16::try_from(self.dictionary.len())
@@ -1049,20 +1101,6 @@ mod tests {
         )
     }
 
-    fn valid_path_dictionary_upper_bound(shape: &ProofShape) -> usize {
-        shape
-            .rounds
-            .iter()
-            .map(|round| round.queries)
-            .chain(std::iter::once(shape.final_queries))
-            .map(|query| {
-                (0..query.path_len)
-                    .map(|level| query.count.min(1_usize << (query.path_len - level)))
-                    .sum::<usize>()
-            })
-            .sum()
-    }
-
     #[test]
     fn production_candidate_shapes_are_exact() {
         for (variables, phases, body_len, references, final_poly_len, final_sumcheck_rounds) in [
@@ -1136,7 +1174,7 @@ mod tests {
         let shape = ProofShape::derive(&config(13)).unwrap();
         // At every tree level, verifier-valid paths can contain no more unique
         // siblings than either the query count or the number of nodes there.
-        let maximum_dictionary_nodes = valid_path_dictionary_upper_bound(&shape);
+        let maximum_dictionary_nodes = shape.maximum_dictionary_nodes().unwrap();
         assert_eq!(maximum_dictionary_nodes, 4_011);
         let maximum_native_bytes = NATIVE_PROOF_CODEC_HEADER_BYTES
             + shape.body_len
@@ -1155,6 +1193,67 @@ mod tests {
                 + maximum_native_bytes
                 <= crate::wire::MAX_PROOF_BYTES
         );
+    }
+
+    #[test]
+    fn tiny_split_shapes_have_exact_enforced_dictionary_and_byte_bounds() {
+        for (variables, phases, body_len, references, dictionary_nodes, encoded_bytes) in [
+            (3, vec![(4, 2)], 320, 8, 6, 568),
+            (6, vec![(32, 5)], 1_696, 160, 62, 4_040),
+            (
+                12,
+                vec![(309, 11), (189, 10), (155, 9)],
+                45_088,
+                6_684,
+                2_822,
+                148_800,
+            ),
+        ] {
+            let config = config(variables);
+            let shape = ProofShape::derive(&config).unwrap();
+            let actual_phases = shape
+                .rounds
+                .iter()
+                .map(|round| round.queries)
+                .chain(std::iter::once(shape.final_queries))
+                .map(|query| (query.count, query.path_len))
+                .collect::<Vec<_>>();
+            assert_eq!(actual_phases, phases);
+            assert_eq!(shape.body_len, body_len);
+            assert_eq!(shape.reference_count, references);
+            assert_eq!(shape.maximum_dictionary_nodes().unwrap(), dictionary_nodes);
+            assert_eq!(shape.encoded_bytes_upper_bound().unwrap(), encoded_bytes);
+            assert_eq!(encoded_proof_upper_bound(&config).unwrap(), encoded_bytes);
+        }
+    }
+
+    #[test]
+    fn dictionary_above_the_shape_bound_is_rejected_before_path_decoding() {
+        let config = config(3);
+        let proof = sample_proof(&config);
+        let encoded = encode_native_proof(&proof, &config).unwrap();
+        let (dictionary_start, references_start, dictionary_count, _) = header_layout(&encoded);
+        assert_eq!(dictionary_count, 6);
+        assert_eq!(
+            dictionary_count,
+            ProofShape::derive(&config)
+                .unwrap()
+                .maximum_dictionary_nodes()
+                .unwrap()
+        );
+
+        let mut malformed = encoded[..references_start].to_vec();
+        malformed.extend_from_slice(&[0xa7; DIGEST_BYTES]);
+        malformed.extend_from_slice(&encoded[references_start..]);
+        malformed[28..32].copy_from_slice(&7_u32.to_le_bytes());
+        assert_eq!(
+            dictionary_start + dictionary_count * DIGEST_BYTES,
+            references_start
+        );
+        assert!(matches!(
+            decode_native_proof(&malformed, &config),
+            Err(NativeProofCodecError::InvalidEncoding)
+        ));
     }
 
     #[test]
@@ -1213,6 +1312,18 @@ mod tests {
         assert!(matches!(
             decode_native_proof(&bad_magic, &config),
             Err(NativeProofCodecError::InvalidEncoding)
+        ));
+        let mut legacy_magic = encoded.clone();
+        legacy_magic[..8].copy_from_slice(b"CMFDWHB1");
+        assert!(matches!(
+            decode_native_proof(&legacy_magic, &config),
+            Err(NativeProofCodecError::InvalidEncoding)
+        ));
+        let mut legacy_version = encoded.clone();
+        legacy_version[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            decode_native_proof(&legacy_version, &config),
+            Err(NativeProofCodecError::UnsupportedVersion)
         ));
         assert!(decode_native_proof(&encoded[..encoded.len() - 1], &config).is_err());
         let mut trailing = encoded.clone();

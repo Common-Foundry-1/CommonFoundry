@@ -1614,19 +1614,19 @@ mod tests {
             - component_envelope_floor;
         assert_eq!(blake3_and_pcs_budget, 188_673);
 
-        const CURRENT_32768_ROW_BLAKE3_ZLIB_BYTES: usize = 232_050;
+        const CURRENT_32768_ROW_BLAKE3_ZLIB_BYTES: usize = 209_693;
         const STRUCTURED_BLAKE3_ENVELOPE_BYTES: usize = 8 + 4 + 1 + 4;
         let current_blake3_checkpoint_bytes =
             CURRENT_32768_ROW_BLAKE3_ZLIB_BYTES + STRUCTURED_BLAKE3_ENVELOPE_BYTES;
-        assert_eq!(current_blake3_checkpoint_bytes, 232_067);
+        assert_eq!(current_blake3_checkpoint_bytes, 209_710);
         assert!(current_blake3_checkpoint_bytes > blake3_and_pcs_budget);
         let total_before_pcs_payload = current_v2_frame.len()
             + aggregate_length_prefix
             + component_envelope_floor
             + current_blake3_checkpoint_bytes;
-        assert_eq!(total_before_pcs_payload, 305_538);
+        assert_eq!(total_before_pcs_payload, 283_181);
         let minimum_encodable_total = total_before_pcs_payload + 1;
-        assert_eq!(minimum_encodable_total, 305_539);
+        assert_eq!(minimum_encodable_total, 283_182);
         assert!(minimum_encodable_total > crate::wire::MAX_PROOF_BYTES);
     }
 
@@ -2094,7 +2094,38 @@ mod tests {
     fn aggregate_whir_openings_round_trip_and_fail_closed() {
         let (identity, statement, proof) = whir_fixture();
         let encoded = proof.encode().unwrap();
-        assert_eq!(encoded.len(), 3_384_054);
+        let fixed_aggregate_bytes =
+            encoded.len() - proof.blake3_proof.len() - proof.pcs_proof.len();
+        assert_eq!(fixed_aggregate_bytes, 16_804);
+        let blake3_statement = structured_blake3_statement(&statement, &proof, &identity).unwrap();
+        let blake3_upper_bound = crate::structured_blake3::one_block_encoded_proof_bound(
+            blake3_statement.final_activation_len,
+        )
+        .unwrap();
+        assert_eq!(blake3_upper_bound, 87_556);
+        assert!(proof.blake3_proof.len() <= blake3_upper_bound);
+        let pcs_upper_bound =
+            crate::whir_proof::structured_whir_encoded_proof_upper_bound(&proof.pcs_proof).unwrap();
+        assert_eq!(pcs_upper_bound, 154_252);
+        let aggregate_upper_bound = fixed_aggregate_bytes
+            .checked_add(blake3_upper_bound)
+            .and_then(|value| value.checked_add(pcs_upper_bound))
+            .unwrap();
+        assert_eq!(aggregate_upper_bound, 258_612);
+
+        // A production V2 frame retains its current 193-byte wire encoding and
+        // appends one u32-sized aggregate payload.
+        let structured_wrapper_bytes = 193 + std::mem::size_of::<u32>();
+        let wire_complete_upper_bound = structured_wrapper_bytes + aggregate_upper_bound;
+        assert_eq!(wire_complete_upper_bound, 258_809);
+        assert_eq!(
+            crate::wire::MAX_PROOF_BYTES - wire_complete_upper_bound,
+            3_335
+        );
+        assert!(proof.pcs_proof.len() <= pcs_upper_bound);
+        assert!(encoded.len() <= aggregate_upper_bound);
+        assert!(structured_wrapper_bytes + encoded.len() <= crate::wire::MAX_PROOF_BYTES);
+        assert!(wire_complete_upper_bound <= crate::wire::MAX_PROOF_BYTES);
         assert!(proof.blake3_proof.len() < MAX_STRUCTURED_BLAKE3_PROOF_BYTES);
         let decoded = StructuredForgeMatrixProof::decode(&encoded).unwrap();
         let openings =

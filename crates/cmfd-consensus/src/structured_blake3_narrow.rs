@@ -87,6 +87,10 @@ const WORD_BITS: usize = 32;
 const MESSAGE_WORDS: usize = 16;
 const CV_WORDS: usize = 8;
 const FRI_LOG_BLOWUP: usize = 7;
+// The smallest supported narrow trace has 2^8 rows. FRI requires the final
+// polynomial degree to remain strictly below the trace degree, so seven is the
+// largest single consensus value that is valid for every supported shape.
+const FRI_LOG_FINAL_POLY_LEN: usize = 7;
 const FRI_QUERIES: usize = 33;
 const FRI_QUERY_POW_BITS: usize = 18;
 #[cfg(feature = "gpu-proof-prover")]
@@ -2650,10 +2654,6 @@ fn build_config_with_backends_and_fri(
 fn default_poseidon2() -> Perm {
     default_goldilocks_poseidon2_8()
 }
-#[cfg(test)]
-fn fri_parameters(mmcs: ChallengeMmcs) -> FriParameters<ChallengeMmcs> {
-    fri_parameters_with(FRI_LOG_BLOWUP, FRI_QUERIES, mmcs)
-}
 fn fri_parameters_with(
     log_blowup: usize,
     num_queries: usize,
@@ -2661,7 +2661,7 @@ fn fri_parameters_with(
 ) -> FriParameters<ChallengeMmcs> {
     FriParameters {
         log_blowup,
-        log_final_poly_len: 0,
+        log_final_poly_len: FRI_LOG_FINAL_POLY_LEN,
         max_log_arity: 4,
         num_queries,
         commit_proof_of_work_bits: 0,
@@ -3023,11 +3023,12 @@ mod tests {
 
     #[test]
     fn pinned_preprocessed_registry_matches_every_supported_air_shape() {
-        assert_eq!(NARROW_BLAKE3_PROOF_VERSION, 3);
-        assert_eq!(NARROW_BLAKE3_PROOF_MAGIC, b"CMFDB3N3");
+        assert_eq!(NARROW_BLAKE3_PROOF_VERSION, 4);
+        assert_eq!(NARROW_BLAKE3_PROOF_MAGIC, b"CMFDB3N4");
         assert_eq!(PINNED_PREPROCESSED_REGISTRY_VERSION, 1);
         assert_eq!(PINNED_PREPROCESSED_WIDTH, PREP_WIDTH);
         assert_eq!(PINNED_PREPROCESSED_LOG_BLOWUP, FRI_LOG_BLOWUP);
+        assert_eq!(FRI_LOG_FINAL_POLY_LEN, 7);
         assert_eq!(PINNED_PREPROCESSED_KEYS.len(), 15);
 
         let mut roots = std::collections::BTreeSet::new();
@@ -3392,11 +3393,11 @@ mod tests {
         with_preprocessed_trace_forbidden(|| verify_narrow_blake3(&statement, &proof)).unwrap();
         assert!(proof.len() <= crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES);
 
-        let mut legacy_v2 = proof.clone();
-        legacy_v2[..8].copy_from_slice(b"CMFDB3N2");
-        legacy_v2[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        let mut legacy_v3 = proof.clone();
+        legacy_v3[..8].copy_from_slice(b"CMFDB3N3");
+        legacy_v3[8..12].copy_from_slice(&3_u32.to_le_bytes());
         assert_eq!(
-            decode_native_proof(&legacy_v2).err(),
+            decode_native_proof(&legacy_v3).err(),
             Some(NarrowBlake3Error::Encoding)
         );
 
@@ -3492,18 +3493,29 @@ mod tests {
         let statement = statement(&activation);
         let air = NarrowBlake3Air::new(&statement).unwrap();
         assert_eq!(air.trace_rows, 1 << 20);
-        let perm = default_poseidon2();
-        let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm), 0);
-        let params = StarkSecurityParams::from_air::<F, EF, _, _>(
-            &fri_parameters(ChallengeMmcs::new(val)),
-            &air,
-            AirLayout::from_air::<F>(&air),
-            192,
-            128,
-            1,
-        );
-        let security = ProvenSecurity::compute(&params, air.trace_rows);
+        let security_at = |num_queries| {
+            let perm = default_poseidon2();
+            let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm), 0);
+            let params = StarkSecurityParams::from_air::<F, EF, _, _>(
+                &fri_parameters_with(FRI_LOG_BLOWUP, num_queries, ChallengeMmcs::new(val)),
+                &air,
+                AirLayout::from_air::<F>(&air),
+                192,
+                128,
+                2,
+            );
+            ProvenSecurity::compute(&params, air.trace_rows)
+        };
+        let security = security_at(FRI_QUERIES);
         assert!(security.security_bits() >= 128, "{security:?}");
+        let minimum_queries = (1..=FRI_QUERIES)
+            .find(|queries| security_at(*queries).security_bits() >= 128)
+            .expect("configured query count must reach 128 proven bits");
+        assert_eq!(
+            FRI_QUERIES,
+            minimum_queries + 1,
+            "the production configuration must retain one full query above the calculated minimum"
+        );
     }
 
     #[test]

@@ -293,9 +293,11 @@ repeated Merkle authentication nodes before canonical zlib compression. The
 complete tree-component envelope is capped at 256 KiB and rejects malformed or
 noncanonical archives and compression streams. Deterministic release-mode
 vectors measure 165,039 bytes for a 64-byte activation and 222,555 bytes for a
-2,048-byte multi-chunk activation. A 32,768-row resource checkpoint measured a
-233,382-byte compressed payload (233,399 bytes with its outer envelope), about
-12.22 GiB peak memory, and 266.25 seconds proving time.
+2,048-byte multi-chunk activation. With a log-size-seven final polynomial, an
+isolated 32,768-row checkpoint measured a 209,693-byte compressed payload
+(209,710 bytes with its outer envelope). That configuration has not yet been
+timed; the earlier final-polynomial-zero run used about 12.22 GiB peak memory
+and took 266.25 seconds.
 
 At that 32,768-row shape on an RTX 5090, a separate unoptimized Cargo
 test-profile comparison measured 348.28 seconds for CPU (64.503 setup, 283.416

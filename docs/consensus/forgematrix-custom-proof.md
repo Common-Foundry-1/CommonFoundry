@@ -268,9 +268,11 @@ through the production 524,288-byte output shape. Its native transport removes
 repeated Merkle paths into a canonical first-reference dictionary and then
 uses canonical zlib compression under a 256 KiB component-envelope cap.
 Release-mode vectors measure 165,039 bytes for a 64-byte activation and 222,555
-bytes for a 2,048-byte multi-chunk activation. A 32,768-row checkpoint measured
-233,382 compressed bytes (233,399 bytes with the outer envelope), about 12.22
-GiB peak memory, and 266.25 seconds proving time.
+bytes for a 2,048-byte multi-chunk activation. With a log-size-seven final
+polynomial, an isolated 32,768-row checkpoint measured 209,693 compressed bytes
+(209,710 bytes with the outer envelope). That configuration has not yet been
+timed; the earlier final-polynomial-zero run used about 12.22 GiB peak memory
+and took 266.25 seconds.
 
 The full production AIR has 1,048,576 rows and has not yet been proved end to
 end. Its final size and resource use therefore remain activation gates. The
@@ -595,7 +597,10 @@ round, option, and PoW field is derived from the trusted `WhirConfig`. The
 decoder rejects duplicate or reordered dictionary entries, forward or unused
 references, noncanonical limbs, ignored nonzero PoW fields, wrong query
 variants, truncation, and trailing bytes before calling the unchanged verifier.
-It uses no general-purpose compression.
+It also rejects a dictionary larger than the exact per-tree-level maximum
+derived from the trusted query and path geometry. This stricter grammar is an
+inner-codec v2 hard cutover and changes the committed WHIR suite identity. It
+uses no general-purpose compression.
 
 Across ten deterministic 13-variable transcripts, native bytes measured
 188,084 through 190,004 and the standalone explicit envelope measured 188,104
@@ -603,7 +608,7 @@ through 190,024 bytes (about 183.7 through 185.6 KiB). The worst vector
 retains 72,104 bytes below the 256 KiB wire cap after including the 16-byte
 outer wire header. All ten native lengths are pinned by tests. The first native
 vector is 188,148 bytes with BLAKE3 digest
-`1e4eed0b8faa47868b7ae2dc54df8fc63c85e0907ee659a9cfdbd44314a6b4d2`.
+`b2a4ae88c9fbf7d1fe9056abf546429d1a88162b30b257c7968f7ea8777c852c`.
 Independently of those samples, the binary-tree geometry limits verifier-valid
 13-variable authentication paths to 4,011 distinct dictionary nodes. That
 gives a conservative maximum of 203,540 native bytes, or 203,576 bytes with
@@ -621,6 +626,15 @@ transform and the 31-variable initial weight-bank commitment remain required.
 The explicit adapter stays capped at 16 variables, the initial codeword/oracle
 path at 19, and the production `2^30 x 4` weight-bank codeword remains
 unsupported.
+
+For the complete tiny structured fixture, the same geometry gives a 154,252-byte
+maximum for the split WHIR proof. The canonical one-block BLAKE3 proof is bounded
+at 87,556 bytes, and the remaining aggregate components are exactly 16,804
+bytes. The aggregate maximum is therefore 258,612 bytes. Retaining the current
+193-byte V2 proof frame and adding a four-byte aggregate length gives a
+258,809-byte full-wire maximum, leaving 3,335 bytes below the 256 KiB cap. This
+bound does not use the smaller path dictionaries observed in individual prover
+runs and applies only to the tiny research fixture, not the production shape.
 
 Native proof v2, aggregate v2, split v3, and the revised suite identity are a
 hard cutover for research artifacts. Older explicit proofs, structured proofs,

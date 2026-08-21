@@ -738,6 +738,46 @@ pub fn collect_structured_forgematrix_openings(
     canonical_opening_set(fixed_model, trace)
 }
 
+/// Returns the exact production trace commitment order after every component
+/// transcript, shape, wiring edge, and algebraic opening claim has passed.
+///
+/// The PCS verifier must still authenticate these aliases before using them to
+/// mint a production trace capability. Initialization oracle zero is the fixed
+/// base-input role and is intentionally excluded. No sorting or deduplication
+/// is permitted because equal-valued semantic columns remain distinct roles.
+#[cfg(feature = "production-whir-candidate")]
+#[allow(dead_code)]
+pub(crate) fn collect_production_trace_commitments_v1(
+    statement: &StructuredForgeMatrixStatement,
+    proof: &StructuredForgeMatrixProof,
+    trusted_model: &ModelPcsIdentity,
+) -> Result<Vec<[u8; 32]>, StructuredProofError> {
+    if trusted_model.model_version != 2
+        || trusted_model.batch != crate::PRODUCTION_V2_BATCH
+        || trusted_model.dimension != crate::PRODUCTION_V2_DIMENSION
+        || trusted_model.layers_per_bank != crate::PRODUCTION_V2_LAYERS_PER_BANK
+        || trusted_model.weight_bank_commitments.len() != crate::PRODUCTION_V2_BANKS as usize
+    {
+        return Err(StructuredProofError::InvalidModelPcsIdentity);
+    }
+    collect_structured_forgematrix_openings(statement, proof, trusted_model)?;
+    let mut commitments = Vec::with_capacity(crate::PRODUCTION_TRACE_SEMANTIC_COLUMNS);
+    commitments.extend_from_slice(
+        proof
+            .initialization_proof
+            .oracle_commitments
+            .get(1..)
+            .ok_or(StructuredProofError::ComponentCount)?,
+    );
+    for transition in &proof.transition_proofs {
+        commitments.extend_from_slice(&transition.oracle_commitments);
+    }
+    if commitments.len() != crate::PRODUCTION_TRACE_SEMANTIC_COLUMNS {
+        return Err(StructuredProofError::ComponentCount);
+    }
+    Ok(commitments)
+}
+
 fn validate_model_pcs_identity(
     statement: &StructuredForgeMatrixStatement,
     trusted_model: &ModelPcsIdentity,

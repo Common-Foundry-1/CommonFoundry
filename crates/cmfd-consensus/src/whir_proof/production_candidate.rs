@@ -32,6 +32,19 @@ pub const PRODUCTION_BATCHED_MODEL_SLOT_VARIABLES: usize = PRODUCTION_WHIR_WEIGH
 pub const PRODUCTION_BATCHED_MODEL_SLOTS: usize = 1 + PRODUCTION_V2_BANKS as usize;
 pub const PRODUCTION_FINAL_ACTIVATION_ELEMENTS: usize =
     PRODUCTION_V2_BATCH as usize * PRODUCTION_V2_DIMENSION as usize;
+pub const PRODUCTION_TRACE_INITIALIZATION_VARIABLES: usize = 19;
+pub const PRODUCTION_TRACE_BANK_VARIABLES: usize = 26;
+pub const PRODUCTION_TRACE_INITIALIZATION_COLUMNS: usize = crate::STRUCTURED_TRANSITION_ORACLES - 1;
+pub const PRODUCTION_TRACE_BANK_COLUMNS: usize = crate::STRUCTURED_TRANSITION_ORACLES;
+pub const PRODUCTION_TRACE_BANK_SECTION_COLUMNS: usize = 32;
+pub const PRODUCTION_TRACE_SECTIONS_PER_BANK: usize = 4;
+pub const PRODUCTION_TRACE_SECTION_COUNT: usize =
+    1 + PRODUCTION_V2_BANKS as usize * PRODUCTION_TRACE_SECTIONS_PER_BANK;
+pub const PRODUCTION_TRACE_SEMANTIC_COLUMNS: usize = PRODUCTION_TRACE_INITIALIZATION_COLUMNS
+    + PRODUCTION_V2_BANKS as usize * PRODUCTION_TRACE_BANK_COLUMNS;
+pub const PRODUCTION_TRACE_TERMINAL_SECTION: usize =
+    1 + (PRODUCTION_V2_BANKS as usize - 1) * PRODUCTION_TRACE_SECTIONS_PER_BANK;
+pub const PRODUCTION_TRACE_TERMINAL_COLUMN: usize = crate::STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
 pub const PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES: usize =
     match crate::wire::MAX_PROOF_BYTES.checked_sub(crate::wire::WIRE_HEADER_BYTES) {
         Some(bytes) => bytes,
@@ -52,6 +65,10 @@ const CANDIDATE_SUITE_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-PRODUCTION-CANDIDATE
 const PROOF_BINDING_SUITE_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-PROOF-SUITE/V1";
 const BATCHED_MODEL_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-BATCHED-MODEL/V1";
 const PROOF_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-PROOF-COMMITMENT/V1";
+const TRACE_LAYOUT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-LAYOUT/V1";
+const TRACE_PADDING_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-PADDING/V1";
+const TRACE_COLUMN_ALIAS_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-COLUMN/V1";
+const TRACE_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-TRACE-ROOT/V1";
 const COMMITMENT_WORK_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-COMMITMENT-WORK/V1";
 const COMMITMENT_PUBLIC_BINDING_DOMAIN: &str = "CMFD/FORGEMATRIX/PRODUCTION-COMMITMENT-PUBLIC/V1";
 const NATIVE_CODEC_DESCRIPTION: &[u8] =
@@ -153,6 +170,214 @@ pub struct ProductionBatchedModelIdentityV1 {
     proof_suite_digest: [u8; 32],
 }
 
+/// One exact physical PCS section in the production trace layout.
+///
+/// Columns remain semantically ordered even when two columns contain equal
+/// values. Each section is independently padded with Goldilocks zeroes to the
+/// stated stacked arity; data-dependent sorting or deduplication is forbidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTraceSectionV1 {
+    pub section_index: u32,
+    pub semantic_column_start: u32,
+    pub column_count: u32,
+    pub column_variables: u32,
+    pub stacked_variables: u32,
+}
+
+/// Canonical address of one semantic transition oracle in the physical trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionTraceColumnV1 {
+    pub semantic_column: u32,
+    pub section_index: u32,
+    pub section_column: u32,
+    pub column_variables: u32,
+}
+
+const fn production_trace_section_v1(index: usize) -> ProductionTraceSectionV1 {
+    if index == 0 {
+        return ProductionTraceSectionV1 {
+            section_index: 0,
+            semantic_column_start: 0,
+            column_count: PRODUCTION_TRACE_INITIALIZATION_COLUMNS as u32,
+            column_variables: PRODUCTION_TRACE_INITIALIZATION_VARIABLES as u32,
+            stacked_variables: 26,
+        };
+    }
+    let bank_section = index - 1;
+    let bank = bank_section / PRODUCTION_TRACE_SECTIONS_PER_BANK;
+    let chunk = bank_section % PRODUCTION_TRACE_SECTIONS_PER_BANK;
+    let bank_column_start = chunk * PRODUCTION_TRACE_BANK_SECTION_COLUMNS;
+    let remaining = PRODUCTION_TRACE_BANK_COLUMNS - bank_column_start;
+    let column_count = if remaining < PRODUCTION_TRACE_BANK_SECTION_COLUMNS {
+        remaining
+    } else {
+        PRODUCTION_TRACE_BANK_SECTION_COLUMNS
+    };
+    ProductionTraceSectionV1 {
+        section_index: index as u32,
+        semantic_column_start: (PRODUCTION_TRACE_INITIALIZATION_COLUMNS
+            + bank * PRODUCTION_TRACE_BANK_COLUMNS
+            + bank_column_start) as u32,
+        column_count: column_count as u32,
+        column_variables: PRODUCTION_TRACE_BANK_VARIABLES as u32,
+        stacked_variables: if column_count == PRODUCTION_TRACE_BANK_SECTION_COLUMNS {
+            31
+        } else {
+            30
+        },
+    }
+}
+
+pub const fn production_trace_sections_v1()
+-> [ProductionTraceSectionV1; PRODUCTION_TRACE_SECTION_COUNT] {
+    let mut sections = [production_trace_section_v1(0); PRODUCTION_TRACE_SECTION_COUNT];
+    let mut index = 1;
+    while index < PRODUCTION_TRACE_SECTION_COUNT {
+        sections[index] = production_trace_section_v1(index);
+        index += 1;
+    }
+    sections
+}
+
+pub fn production_trace_initialization_column_v1(
+    oracle: usize,
+) -> Result<ProductionTraceColumnV1, ProductionWhirCandidateError> {
+    if oracle == crate::STRUCTURED_TRANSITION_INPUT_ORACLE
+        || oracle >= crate::STRUCTURED_TRANSITION_ORACLES
+    {
+        return Err(ProductionWhirCandidateError::InvalidTraceColumn);
+    }
+    Ok(ProductionTraceColumnV1 {
+        semantic_column: (oracle - 1) as u32,
+        section_index: 0,
+        section_column: (oracle - 1) as u32,
+        column_variables: PRODUCTION_TRACE_INITIALIZATION_VARIABLES as u32,
+    })
+}
+
+pub fn production_trace_bank_column_v1(
+    bank: usize,
+    oracle: usize,
+) -> Result<ProductionTraceColumnV1, ProductionWhirCandidateError> {
+    if bank >= PRODUCTION_V2_BANKS as usize || oracle >= PRODUCTION_TRACE_BANK_COLUMNS {
+        return Err(ProductionWhirCandidateError::InvalidTraceColumn);
+    }
+    let chunk = oracle / PRODUCTION_TRACE_BANK_SECTION_COLUMNS;
+    let section_index = 1 + bank * PRODUCTION_TRACE_SECTIONS_PER_BANK + chunk;
+    Ok(ProductionTraceColumnV1 {
+        semantic_column: (PRODUCTION_TRACE_INITIALIZATION_COLUMNS
+            + bank * PRODUCTION_TRACE_BANK_COLUMNS
+            + oracle) as u32,
+        section_index: section_index as u32,
+        section_column: (oracle % PRODUCTION_TRACE_BANK_SECTION_COLUMNS) as u32,
+        column_variables: PRODUCTION_TRACE_BANK_VARIABLES as u32,
+    })
+}
+
+pub fn production_trace_terminal_column_v1() -> ProductionTraceColumnV1 {
+    production_trace_bank_column_v1(
+        PRODUCTION_V2_BANKS as usize - 1,
+        crate::STRUCTURED_TRANSITION_ACTIVATION_ORACLE,
+    )
+    .expect("the pinned production terminal oracle is in range")
+}
+
+pub fn production_trace_layout_digest_v1() -> [u8; 32] {
+    let mut hasher = Blake3Hasher::new_derive_key(TRACE_LAYOUT_DOMAIN);
+    hasher.update(&PRODUCTION_PROOF_BINDING_VERSION.to_le_bytes());
+    hasher.update(&(PRODUCTION_TRACE_SEMANTIC_COLUMNS as u32).to_le_bytes());
+    hasher.update(&(PRODUCTION_TRACE_SECTION_COUNT as u32).to_le_bytes());
+    hasher.update(&(crate::STRUCTURED_TRANSITION_ORACLES as u32).to_le_bytes());
+    hasher.update(&(crate::STRUCTURED_TRANSITION_INPUT_ORACLE as u32).to_le_bytes());
+    hasher.update(&(crate::STRUCTURED_TRANSITION_ACTIVATION_ORACLE as u32).to_le_bytes());
+    for section in production_trace_sections_v1() {
+        hasher.update(&section.section_index.to_le_bytes());
+        hasher.update(&section.semantic_column_start.to_le_bytes());
+        hasher.update(&section.column_count.to_le_bytes());
+        hasher.update(&section.column_variables.to_le_bytes());
+        hasher.update(&section.stacked_variables.to_le_bytes());
+    }
+    let terminal = production_trace_terminal_column_v1();
+    hasher.update(&terminal.semantic_column.to_le_bytes());
+    hasher.update(&terminal.section_index.to_le_bytes());
+    hasher.update(&terminal.section_column.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+pub fn production_trace_padding_digest_v1() -> [u8; 32] {
+    let mut hasher = Blake3Hasher::new_derive_key(TRACE_PADDING_DOMAIN);
+    hasher.update(&PRODUCTION_PROOF_BINDING_VERSION.to_le_bytes());
+    hasher.update(&production_trace_layout_digest_v1());
+    for section in production_trace_sections_v1() {
+        let column_elements = 1_u64 << section.column_variables;
+        let populated = u64::from(section.column_count) * column_elements;
+        let committed = 1_u64 << section.stacked_variables;
+        hasher.update(&section.section_index.to_le_bytes());
+        hasher.update(&populated.to_le_bytes());
+        hasher.update(&committed.to_le_bytes());
+        hasher.update(&(committed - populated).to_le_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+pub fn production_trace_column_alias_v1(
+    section_root: [u8; 32],
+    column: ProductionTraceColumnV1,
+) -> [u8; 32] {
+    let mut hasher = Blake3Hasher::new_derive_key(TRACE_COLUMN_ALIAS_DOMAIN);
+    hasher.update(&PRODUCTION_PROOF_BINDING_VERSION.to_le_bytes());
+    hasher.update(&production_trace_layout_digest_v1());
+    hasher.update(&section_root);
+    hasher.update(&column.semantic_column.to_le_bytes());
+    hasher.update(&column.section_index.to_le_bytes());
+    hasher.update(&column.section_column.to_le_bytes());
+    hasher.update(&column.column_variables.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+pub fn production_trace_commitment_root_v1(
+    section_roots: &[[u8; 32]; PRODUCTION_TRACE_SECTION_COUNT],
+) -> Result<[u8; 32], ProductionWhirCandidateError> {
+    if section_roots.contains(&[0; 32]) {
+        return Err(ProductionWhirCandidateError::UncommittedTrace);
+    }
+    let mut hasher = Blake3Hasher::new_derive_key(TRACE_COMMITMENT_ROOT_DOMAIN);
+    hasher.update(&PRODUCTION_PROOF_BINDING_VERSION.to_le_bytes());
+    hasher.update(&production_trace_layout_digest_v1());
+    hasher.update(&production_trace_padding_digest_v1());
+    hasher.update(&(PRODUCTION_TRACE_SECTION_COUNT as u32).to_le_bytes());
+    for (index, root) in section_roots.iter().enumerate() {
+        hasher.update(&(index as u32).to_le_bytes());
+        hasher.update(root);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+pub fn production_trace_column_commitments_v1(
+    section_roots: &[[u8; 32]; PRODUCTION_TRACE_SECTION_COUNT],
+) -> Result<Vec<[u8; 32]>, ProductionWhirCandidateError> {
+    production_trace_commitment_root_v1(section_roots)?;
+    let mut commitments = Vec::with_capacity(PRODUCTION_TRACE_SEMANTIC_COLUMNS);
+    for oracle in 1..crate::STRUCTURED_TRANSITION_ORACLES {
+        let column = production_trace_initialization_column_v1(oracle)?;
+        commitments.push(production_trace_column_alias_v1(
+            section_roots[column.section_index as usize],
+            column,
+        ));
+    }
+    for bank in 0..PRODUCTION_V2_BANKS as usize {
+        for oracle in 0..crate::STRUCTURED_TRANSITION_ORACLES {
+            let column = production_trace_bank_column_v1(bank, oracle)?;
+            commitments.push(production_trace_column_alias_v1(
+                section_roots[column.section_index as usize],
+                column,
+            ));
+        }
+    }
+    debug_assert_eq!(commitments.len(), PRODUCTION_TRACE_SEMANTIC_COLUMNS);
+    Ok(commitments)
+}
+
 impl ProductionBatchedModelIdentityV1 {
     /// Research-only constructor. Activation must replace this with a verified
     /// model-ceremony receipt that proves the joint source layout.
@@ -215,47 +440,40 @@ pub(crate) struct VerifiedProductionTraceV1 {
     trace_commitment_root: [u8; 32],
     trace_layout_digest: [u8; 32],
     canonical_padding_digest: [u8; 32],
-    trace_table_count: u32,
-    terminal_table_index: u32,
+    trace_section_count: u32,
+    terminal_section_index: u32,
+    terminal_column_index: u32,
     final_output_commitment: [u8; 32],
 }
 
 impl VerifiedProductionTraceV1 {
     #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    fn from_verified_parts(
+    pub(super) fn from_verified_sections(
         trusted_model_digest: [u8; 32],
         challenge_digest: [u8; 32],
-        trace_commitment_root: [u8; 32],
-        trace_layout_digest: [u8; 32],
-        canonical_padding_digest: [u8; 32],
-        trace_table_count: u32,
-        terminal_table_index: u32,
-        final_output_commitment: [u8; 32],
+        section_roots: [[u8; 32]; PRODUCTION_TRACE_SECTION_COUNT],
+        semantic_commitments: &[[u8; 32]],
     ) -> Result<Self, ProductionWhirCandidateError> {
-        if trace_commitment_root == [0; 32] {
-            return Err(ProductionWhirCandidateError::UncommittedTrace);
+        let trace_commitment_root = production_trace_commitment_root_v1(&section_roots)?;
+        if production_trace_column_commitments_v1(&section_roots)? != semantic_commitments {
+            return Err(ProductionWhirCandidateError::TraceCommitmentMismatch);
         }
-        if final_output_commitment == [0; 32] {
-            return Err(ProductionWhirCandidateError::UncommittedFinalOutput);
-        }
-        if trace_layout_digest == [0; 32]
-            || canonical_padding_digest == [0; 32]
-            || trace_table_count == 0
-            || trace_table_count as usize
-                > crate::structured_proof::STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES
-            || terminal_table_index >= trace_table_count
-        {
-            return Err(ProductionWhirCandidateError::InvalidTraceIdentity);
-        }
+        let trace_layout_digest = production_trace_layout_digest_v1();
+        let canonical_padding_digest = production_trace_padding_digest_v1();
+        let terminal = production_trace_terminal_column_v1();
+        let final_output_commitment = production_trace_column_alias_v1(
+            section_roots[terminal.section_index as usize],
+            terminal,
+        );
         Ok(Self {
             trusted_model_digest,
             challenge_digest,
             trace_commitment_root,
             trace_layout_digest,
             canonical_padding_digest,
-            trace_table_count,
-            terminal_table_index,
+            trace_section_count: PRODUCTION_TRACE_SECTION_COUNT as u32,
+            terminal_section_index: terminal.section_index,
+            terminal_column_index: terminal.section_column,
             final_output_commitment,
         })
     }
@@ -281,8 +499,9 @@ impl ProductionProofCommitmentRootV1 {
         hasher.update(&trusted_model.digest());
         hasher.update(&verified_trace.challenge_digest);
         hasher.update(&verified_trace.trace_layout_digest);
-        hasher.update(&verified_trace.trace_table_count.to_le_bytes());
-        hasher.update(&verified_trace.terminal_table_index.to_le_bytes());
+        hasher.update(&verified_trace.trace_section_count.to_le_bytes());
+        hasher.update(&verified_trace.terminal_section_index.to_le_bytes());
+        hasher.update(&verified_trace.terminal_column_index.to_le_bytes());
         hasher.update(&verified_trace.canonical_padding_digest);
         hasher.update(&verified_trace.trace_commitment_root);
         hasher.update(&verified_trace.final_output_commitment);
@@ -476,10 +695,10 @@ pub enum ProductionWhirCandidateError {
     UncommittedBatchedModel,
     #[error("production proof has no authenticated trace commitment")]
     UncommittedTrace,
-    #[error("production proof has no authenticated final-output commitment")]
-    UncommittedFinalOutput,
-    #[error("production trace layout, padding, or terminal alias is not verifier-authenticated")]
-    InvalidTraceIdentity,
+    #[error("production trace bank, oracle, section, or column is outside the canonical layout")]
+    InvalidTraceColumn,
+    #[error("production component commitments do not match the canonical trace section aliases")]
+    TraceCommitmentMismatch,
     #[error("verified production trace belongs to a different model or block challenge")]
     VerifiedTraceContextMismatch,
     #[error("production proof commitment root mismatch")]
@@ -868,27 +1087,47 @@ pub fn production_proof_binding_suite_digest_v1() -> [u8; 32] {
     update_descriptor(
         &mut hasher,
         b"trace-layout",
-        b"activation-gated-exact-semantic-layout-digest-and-table-count",
+        b"ordered-init-oracles-1-through-109-then-bank-major-oracles-0-through-109-no-sort-no-dedup",
     );
     update_u64(
         &mut hasher,
-        b"maximum-trace-tables",
-        crate::structured_proof::STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES as u64,
+        b"trace-semantic-columns",
+        PRODUCTION_TRACE_SEMANTIC_COLUMNS as u64,
+    );
+    update_u64(
+        &mut hasher,
+        b"trace-section-count",
+        PRODUCTION_TRACE_SECTION_COUNT as u64,
     );
     update_descriptor(
         &mut hasher,
-        b"trace-table-count-encoding",
-        b"u32-little-endian-nonzero-at-most-maximum-trace-tables",
+        b"trace-physical-sections",
+        b"init:109xn19-to-n26;each-bank:32,32,32,14-columns-of-n26-to-n31,n31,n31,n30;zero-tail-padding",
     );
     update_descriptor(
         &mut hasher,
-        b"terminal-table-index-encoding",
-        b"u32-little-endian-strictly-less-than-trace-table-count",
+        b"trace-section-field-limit",
+        b"goldilocks-two-adicity-32-with-rate-one-no-committed-section-exceeds-n31",
+    );
+    update_descriptor(
+        &mut hasher,
+        b"terminal-column",
+        b"bank-2-transition-activation-oracle-10-at-section-9-column-10",
+    );
+    update_descriptor(
+        &mut hasher,
+        b"trace-root",
+        b"blake3(layout-digest,padding-digest,ordered-thirteen-section-roots)",
+    );
+    update_descriptor(
+        &mut hasher,
+        b"trace-column-alias",
+        b"blake3(layout-digest,section-root,semantic-column,section-index,section-column,column-variables)",
     );
     update_descriptor(
         &mut hasher,
         b"verified-trace-capability",
-        b"sealed-after-algebraic-pcs-layout-padding-and-terminal-alias-checks;binds-trusted-model-digest-and-block-challenge-digest",
+        b"sealed-after-all-thirteen-ordered-section-openings-layout-padding-and-terminal-column-alias-checks;binds-trusted-model-digest-and-block-challenge-digest",
     );
     update_descriptor(
         &mut hasher,
@@ -1322,21 +1561,32 @@ mod tests {
         }
     }
 
+    fn trace_section_roots(
+        trace_seed: [u8; 32],
+        terminal_seed: [u8; 32],
+    ) -> [[u8; 32]; PRODUCTION_TRACE_SECTION_COUNT] {
+        let mut section_roots = std::array::from_fn(|index| {
+            let mut root = trace_seed;
+            root[31] ^= index as u8;
+            root
+        });
+        section_roots[PRODUCTION_TRACE_TERMINAL_SECTION] = terminal_seed;
+        section_roots
+    }
+
     fn verified_trace(
         trusted_model: &ProductionBatchedModelIdentityV1,
         challenge: ProductionCommitmentChallengeV1,
-        trace_commitment_root: [u8; 32],
-        final_output_commitment: [u8; 32],
+        trace_seed: [u8; 32],
+        terminal_seed: [u8; 32],
     ) -> VerifiedProductionTraceV1 {
-        VerifiedProductionTraceV1::from_verified_parts(
+        let section_roots = trace_section_roots(trace_seed, terminal_seed);
+        let commitments = production_trace_column_commitments_v1(&section_roots).unwrap();
+        VerifiedProductionTraceV1::from_verified_sections(
             trusted_model.digest(),
             challenge.challenge_digest(),
-            trace_commitment_root,
-            [0x63; 32],
-            [0x64; 32],
-            2,
-            1,
-            final_output_commitment,
+            section_roots,
+            &commitments,
         )
         .unwrap()
     }
@@ -1633,6 +1883,126 @@ mod tests {
     }
 
     #[test]
+    fn production_trace_layout_is_exact_ordered_and_within_field_two_adicity() {
+        assert_eq!(PRODUCTION_TRACE_INITIALIZATION_COLUMNS, 109);
+        assert_eq!(PRODUCTION_TRACE_BANK_COLUMNS, 110);
+        assert_eq!(PRODUCTION_TRACE_BANK_SECTION_COLUMNS, 32);
+        assert_eq!(PRODUCTION_TRACE_SEMANTIC_COLUMNS, 439);
+        assert_eq!(PRODUCTION_TRACE_SECTION_COUNT, 13);
+
+        let sections = production_trace_sections_v1();
+        assert_eq!(
+            sections.map(|section| section.semantic_column_start),
+            [
+                0, 109, 141, 173, 205, 219, 251, 283, 315, 329, 361, 393, 425
+            ]
+        );
+        assert_eq!(
+            sections.map(|section| section.column_count),
+            [109, 32, 32, 32, 14, 32, 32, 32, 14, 32, 32, 32, 14]
+        );
+        assert_eq!(
+            sections.map(|section| section.stacked_variables),
+            [26, 31, 31, 31, 30, 31, 31, 31, 30, 31, 31, 31, 30]
+        );
+        for (index, section) in sections.into_iter().enumerate() {
+            assert_eq!(section.section_index, index as u32);
+            assert_eq!(section.column_variables, if index == 0 { 19 } else { 26 });
+            let populated = u64::from(section.column_count) << section.column_variables;
+            assert!(populated <= 1_u64 << section.stacked_variables);
+            assert!(section.stacked_variables <= 31);
+        }
+
+        assert_eq!(
+            production_trace_initialization_column_v1(0),
+            Err(ProductionWhirCandidateError::InvalidTraceColumn)
+        );
+        assert_eq!(
+            production_trace_initialization_column_v1(110),
+            Err(ProductionWhirCandidateError::InvalidTraceColumn)
+        );
+        assert_eq!(
+            production_trace_initialization_column_v1(1).unwrap(),
+            ProductionTraceColumnV1 {
+                semantic_column: 0,
+                section_index: 0,
+                section_column: 0,
+                column_variables: 19,
+            }
+        );
+        assert_eq!(
+            production_trace_initialization_column_v1(109).unwrap(),
+            ProductionTraceColumnV1 {
+                semantic_column: 108,
+                section_index: 0,
+                section_column: 108,
+                column_variables: 19,
+            }
+        );
+        assert_eq!(
+            production_trace_bank_column_v1(0, 31).unwrap(),
+            ProductionTraceColumnV1 {
+                semantic_column: 140,
+                section_index: 1,
+                section_column: 31,
+                column_variables: 26,
+            }
+        );
+        assert_eq!(
+            production_trace_bank_column_v1(0, 32).unwrap(),
+            ProductionTraceColumnV1 {
+                semantic_column: 141,
+                section_index: 2,
+                section_column: 0,
+                column_variables: 26,
+            }
+        );
+        assert_eq!(
+            production_trace_bank_column_v1(3, 0),
+            Err(ProductionWhirCandidateError::InvalidTraceColumn)
+        );
+        assert_eq!(
+            production_trace_bank_column_v1(0, 110),
+            Err(ProductionWhirCandidateError::InvalidTraceColumn)
+        );
+        assert_eq!(
+            production_trace_terminal_column_v1(),
+            ProductionTraceColumnV1 {
+                semantic_column: 339,
+                section_index: 9,
+                section_column: 10,
+                column_variables: 26,
+            }
+        );
+        assert_ne!(production_trace_layout_digest_v1(), [0; 32]);
+        assert_ne!(production_trace_padding_digest_v1(), [0; 32]);
+        assert_ne!(
+            production_trace_layout_digest_v1(),
+            production_trace_padding_digest_v1()
+        );
+
+        let section_roots = std::array::from_fn(|index| [index as u8 + 1; 32]);
+        let trace_root = production_trace_commitment_root_v1(&section_roots).unwrap();
+        let mut reordered = section_roots;
+        reordered.swap(1, 2);
+        assert_ne!(
+            trace_root,
+            production_trace_commitment_root_v1(&reordered).unwrap()
+        );
+        let terminal = production_trace_terminal_column_v1();
+        assert_ne!(
+            production_trace_column_alias_v1(
+                section_roots[terminal.section_index as usize],
+                terminal,
+            ),
+            production_trace_column_alias_v1(
+                section_roots[terminal.section_index as usize],
+                production_trace_bank_column_v1(2, 11).unwrap(),
+            )
+        );
+    }
+
+    #[test]
     fn commitment_derived_work_binding_binds_the_sealed_candidate_identity() {
         let model = production_model();
         assert_eq!(
@@ -1648,59 +2018,83 @@ mod tests {
         );
         let challenge = ProductionCommitmentChallengeV1::from_test_parts([0x11; 32], [0x7f; 32]);
         assert_eq!(
-            VerifiedProductionTraceV1::from_verified_parts(
+            VerifiedProductionTraceV1::from_verified_sections(
                 trusted.digest(),
                 challenge.challenge_digest(),
-                [0; 32],
-                [0x63; 32],
-                [0x64; 32],
-                2,
-                1,
-                [0x71; 32],
+                [[0; 32]; PRODUCTION_TRACE_SECTION_COUNT],
+                &[],
             ),
             Err(ProductionWhirCandidateError::UncommittedTrace)
         );
+        let mut incomplete_sections = [[0x62; 32]; PRODUCTION_TRACE_SECTION_COUNT];
+        incomplete_sections[3] = [0; 32];
         assert_eq!(
-            VerifiedProductionTraceV1::from_verified_parts(
+            VerifiedProductionTraceV1::from_verified_sections(
                 trusted.digest(),
                 challenge.challenge_digest(),
-                [0x62; 32],
-                [0x63; 32],
-                [0x64; 32],
-                2,
-                1,
-                [0; 32],
+                incomplete_sections,
+                &[],
             ),
-            Err(ProductionWhirCandidateError::UncommittedFinalOutput)
+            Err(ProductionWhirCandidateError::UncommittedTrace)
+        );
+
+        let exact_sections = trace_section_roots([0x62; 32], [0x71; 32]);
+        let exact_commitments = production_trace_column_commitments_v1(&exact_sections).unwrap();
+        assert_eq!(exact_commitments.len(), PRODUCTION_TRACE_SEMANTIC_COLUMNS);
+        let mut reordered_commitments = exact_commitments.clone();
+        reordered_commitments.swap(0, 1);
+        assert_eq!(
+            VerifiedProductionTraceV1::from_verified_sections(
+                trusted.digest(),
+                challenge.challenge_digest(),
+                exact_sections,
+                &reordered_commitments,
+            ),
+            Err(ProductionWhirCandidateError::TraceCommitmentMismatch)
+        );
+        let mut substituted_terminal = exact_commitments.clone();
+        substituted_terminal[production_trace_terminal_column_v1().semantic_column as usize][0] ^=
+            1;
+        assert_eq!(
+            VerifiedProductionTraceV1::from_verified_sections(
+                trusted.digest(),
+                challenge.challenge_digest(),
+                exact_sections,
+                &substituted_terminal,
+            ),
+            Err(ProductionWhirCandidateError::TraceCommitmentMismatch)
         );
         assert_eq!(
-            VerifiedProductionTraceV1::from_verified_parts(
+            VerifiedProductionTraceV1::from_verified_sections(
                 trusted.digest(),
                 challenge.challenge_digest(),
-                [0x62; 32],
-                [0; 32],
-                [0x64; 32],
-                2,
-                1,
-                [0x71; 32],
+                exact_sections,
+                &exact_commitments[..exact_commitments.len() - 1],
             ),
-            Err(ProductionWhirCandidateError::InvalidTraceIdentity)
-        );
-        assert_eq!(
-            VerifiedProductionTraceV1::from_verified_parts(
-                trusted.digest(),
-                challenge.challenge_digest(),
-                [0x62; 32],
-                [0x63; 32],
-                [0x64; 32],
-                2,
-                2,
-                [0x71; 32],
-            ),
-            Err(ProductionWhirCandidateError::InvalidTraceIdentity)
+            Err(ProductionWhirCandidateError::TraceCommitmentMismatch)
         );
 
         let trace = verified_trace(&trusted, challenge, [0x62; 32], [0x71; 32]);
+        assert_eq!(
+            trace.trace_layout_digest,
+            production_trace_layout_digest_v1()
+        );
+        assert_eq!(
+            trace.canonical_padding_digest,
+            production_trace_padding_digest_v1()
+        );
+        assert_eq!(
+            trace.trace_section_count,
+            PRODUCTION_TRACE_SECTION_COUNT as u32
+        );
+        assert_eq!(
+            trace.terminal_section_index,
+            PRODUCTION_TRACE_TERMINAL_SECTION as u32
+        );
+        assert_eq!(
+            trace.terminal_column_index,
+            PRODUCTION_TRACE_TERMINAL_COLUMN as u32
+        );
         let binding =
             ProductionCommitmentWorkBindingV1::derive(challenge, &trusted, &trace).unwrap();
         let different_challenge =
@@ -1748,51 +2142,19 @@ mod tests {
         );
         assert_ne!(binding.work_digest, different_trace.work_digest);
 
+        let mut wrong_layout = trace;
+        wrong_layout.trace_layout_digest[0] ^= 1;
+        let mut wrong_padding = trace;
+        wrong_padding.canonical_padding_digest[0] ^= 1;
+        let mut wrong_section_count = trace;
+        wrong_section_count.trace_section_count += 1;
+        let mut wrong_terminal = trace;
+        wrong_terminal.terminal_column_index += 1;
         for different_identity in [
-            VerifiedProductionTraceV1::from_verified_parts(
-                trusted.digest(),
-                challenge.challenge_digest(),
-                [0x62; 32],
-                [0x66; 32],
-                [0x64; 32],
-                2,
-                1,
-                [0x71; 32],
-            )
-            .unwrap(),
-            VerifiedProductionTraceV1::from_verified_parts(
-                trusted.digest(),
-                challenge.challenge_digest(),
-                [0x62; 32],
-                [0x63; 32],
-                [0x66; 32],
-                2,
-                1,
-                [0x71; 32],
-            )
-            .unwrap(),
-            VerifiedProductionTraceV1::from_verified_parts(
-                trusted.digest(),
-                challenge.challenge_digest(),
-                [0x62; 32],
-                [0x63; 32],
-                [0x64; 32],
-                3,
-                1,
-                [0x71; 32],
-            )
-            .unwrap(),
-            VerifiedProductionTraceV1::from_verified_parts(
-                trusted.digest(),
-                challenge.challenge_digest(),
-                [0x62; 32],
-                [0x63; 32],
-                [0x64; 32],
-                2,
-                0,
-                [0x71; 32],
-            )
-            .unwrap(),
+            wrong_layout,
+            wrong_padding,
+            wrong_section_count,
+            wrong_terminal,
         ] {
             let different =
                 ProductionCommitmentWorkBindingV1::derive(challenge, &trusted, &different_identity)
@@ -1839,23 +2201,23 @@ mod tests {
 
         assert_eq!(
             hex::encode(production_proof_binding_suite_digest_v1()),
-            "c02aa7c5e803dfd877d1fd894bef02c818535b96136074fdfb11f1b7f7dfb7d1"
+            "3901c9569e563768fe3246126aff67ab67aeeab7f45f265677bb534b05c91141"
         );
         assert_eq!(
             hex::encode(trusted.digest()),
-            "f73a6a68edda1ced67150695910ffdb09f2c8a5ad5fbf0c88ad6584c16f7b3bb"
+            "b75271070a010414ba70d5935e883dd29be3ccbb506a9d4a4a848535f2d20d9f"
         );
         assert_eq!(
             hex::encode(binding.proof_commitment_root.as_bytes()),
-            "21056541061756523da50c1b2b36613f16743063c499f84baff63fc6e014992d"
+            "27af7650a99357aeea43b2169d33606caf1735ce9faf2d5ca4389c5e954ca0b7"
         );
         assert_eq!(
             hex::encode(binding.work_digest),
-            "48afbf18486659848824e8128080f0cb31177687f13445700abe2e6fa0d9073e"
+            "96bcd8b3c377b4e8ca1d9f163eaa2de59d53c47e1850a86161395e41c31c88cf"
         );
         assert_eq!(
             hex::encode(binding.public_binding),
-            "c042a3cdd58a8fe8fc10cb47c77792f16179d51becd02ca124d9d92ef8aa5780"
+            "97c84266d09f14583c9d84f274033be8b03fd978c97e97773943d95704fa6e69"
         );
     }
 

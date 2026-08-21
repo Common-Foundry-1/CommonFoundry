@@ -75,15 +75,24 @@ pub use production_candidate::{
     PRODUCTION_BATCHED_MODEL_SLOT_VARIABLES, PRODUCTION_BATCHED_MODEL_SLOTS,
     PRODUCTION_BATCHED_MODEL_VARIABLES, PRODUCTION_BATCHED_WHIR_MODEL_BYTES,
     PRODUCTION_FINAL_ACTIVATION_ELEMENTS, PRODUCTION_PROOF_BINDING_VERSION,
+    PRODUCTION_TRACE_BANK_COLUMNS, PRODUCTION_TRACE_BANK_SECTION_COLUMNS,
+    PRODUCTION_TRACE_BANK_VARIABLES, PRODUCTION_TRACE_INITIALIZATION_COLUMNS,
+    PRODUCTION_TRACE_INITIALIZATION_VARIABLES, PRODUCTION_TRACE_SECTION_COUNT,
+    PRODUCTION_TRACE_SECTIONS_PER_BANK, PRODUCTION_TRACE_SEMANTIC_COLUMNS,
+    PRODUCTION_TRACE_TERMINAL_COLUMN, PRODUCTION_TRACE_TERMINAL_SECTION,
     PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES, PRODUCTION_WHIR_BASE_VARIABLES,
     PRODUCTION_WHIR_CANDIDATE_VERSION, PRODUCTION_WHIR_WEIGHT_VARIABLES,
     ProductionBatchedModelIdentityV1, ProductionBatchedModelWhirConfigV1,
     ProductionCommitmentChallengeV1, ProductionCommitmentClaimsV1,
-    ProductionCommitmentWorkBindingV1, ProductionProofCommitmentRootV1,
-    ProductionWhirCandidateError, ProductionWhirConfigV1, ProductionWhirRoleV1,
-    ProductionWhirWireShapeV1, production_batched_model_lift_point_v1,
+    ProductionCommitmentWorkBindingV1, ProductionProofCommitmentRootV1, ProductionTraceColumnV1,
+    ProductionTraceSectionV1, ProductionWhirCandidateError, ProductionWhirConfigV1,
+    ProductionWhirRoleV1, ProductionWhirWireShapeV1, production_batched_model_lift_point_v1,
     production_batched_model_source_index_v1, production_proof_binding_suite_digest_v1,
-    production_whir_suite_parameter_digest_v1,
+    production_trace_bank_column_v1, production_trace_column_alias_v1,
+    production_trace_column_commitments_v1, production_trace_commitment_root_v1,
+    production_trace_initialization_column_v1, production_trace_layout_digest_v1,
+    production_trace_padding_digest_v1, production_trace_sections_v1,
+    production_trace_terminal_column_v1, production_whir_suite_parameter_digest_v1,
 };
 #[cfg(feature = "gpu-proof-prover")]
 mod artifact_state;
@@ -1086,24 +1095,38 @@ struct ExplicitPointLayout {
     folding: usize,
     statement: EqStatement<EF>,
     table_variables: Vec<usize>,
-    selectors: Vec<Point<F>>,
+    table_widths: Vec<usize>,
+    selectors: Vec<Vec<Point<F>>>,
 }
 
 impl ExplicitPointLayout {
-    fn from_poly_and_shapes(poly: Poly<F>, folding: usize, table_variables: Vec<usize>) -> Self {
+    fn from_poly_and_shapes(
+        poly: Poly<F>,
+        folding: usize,
+        table_shapes: Vec<(usize, usize)>,
+    ) -> Self {
         let num_variables = poly.num_variables();
-        let selectors = plan_selectors(&table_variables, num_variables);
+        let table_variables = table_shapes
+            .iter()
+            .map(|(variables, _)| *variables)
+            .collect::<Vec<_>>();
+        let table_widths = table_shapes
+            .iter()
+            .map(|(_, width)| *width)
+            .collect::<Vec<_>>();
+        let selectors = plan_column_selectors(&table_variables, &table_widths, num_variables);
         Self {
             poly,
             folding,
             statement: EqStatement::initialize(num_variables),
             table_variables,
+            table_widths,
             selectors,
         }
     }
 
-    fn lift_point(&self, table_index: usize, point: &Point<EF>) -> Point<EF> {
-        let mut lifted = self.selectors[table_index]
+    fn lift_point(&self, table_index: usize, column_index: usize, point: &Point<EF>) -> Point<EF> {
+        let mut lifted = self.selectors[table_index][column_index]
             .as_slice()
             .iter()
             .copied()
@@ -1116,6 +1139,7 @@ impl ExplicitPointLayout {
     fn record_explicit_claim<Ch>(
         &mut self,
         table_index: usize,
+        column_index: usize,
         point: Point<EF>,
         evaluation: EF,
         challenger: &mut Ch,
@@ -1123,27 +1147,30 @@ impl ExplicitPointLayout {
         Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
         assert_eq!(point.num_variables(), self.table_variables[table_index]);
-        let point = self.lift_point(table_index, &point);
+        assert!(column_index < self.table_widths[table_index]);
+        let point = self.lift_point(table_index, column_index, &point);
         challenger.observe_algebra_slice(point.as_slice());
         challenger.observe_algebra_element(evaluation);
         self.statement.add_evaluated_constraint(point, evaluation);
     }
 
-    fn eval_table(&self, table_index: usize, point: &Point<EF>) -> EF {
+    fn eval_table(&self, table_index: usize, column_index: usize, point: &Point<EF>) -> EF {
         assert_eq!(point.num_variables(), self.table_variables[table_index]);
-        self.poly.eval_base(&self.lift_point(table_index, point))
+        assert!(column_index < self.table_widths[table_index]);
+        self.poly
+            .eval_base(&self.lift_point(table_index, column_index, point))
     }
 }
 
 impl Layout<F, EF> for ExplicitPointLayout {
     fn from_witness(witness: Witness<F>) -> Self {
         let poly = witness.poly().clone();
-        let table_variables = witness
+        let table_shapes = witness
             .table_shapes()
             .into_iter()
-            .map(|shape| shape.num_variables())
+            .map(|shape| (shape.num_variables(), shape.width()))
             .collect();
-        Self::from_poly_and_shapes(poly, 0, table_variables)
+        Self::from_poly_and_shapes(poly, 0, table_shapes)
     }
 
     fn new_witness(tables: Vec<Table<F>>, folding: usize) -> Witness<F> {
@@ -1164,10 +1191,10 @@ impl Layout<F, EF> for ExplicitPointLayout {
         Ch: CanObserve<MT::Commitment>,
     {
         let poly = witness.poly().clone();
-        let table_variables = witness
+        let table_shapes = witness
             .table_shapes()
             .into_iter()
-            .map(|shape| shape.num_variables())
+            .map(|shape| (shape.num_variables(), shape.width()))
             .collect();
         let (commitment, prover_data) = p3_sumcheck::commit::commit_base(
             VariableOrder::Suffix,
@@ -1179,7 +1206,7 @@ impl Layout<F, EF> for ExplicitPointLayout {
             starting_log_inv_rate,
         );
         (
-            Self::from_poly_and_shapes(poly, folding, table_variables),
+            Self::from_poly_and_shapes(poly, folding, table_shapes),
             commitment,
             prover_data,
         )
@@ -1209,16 +1236,21 @@ impl Layout<F, EF> for ExplicitPointLayout {
     where
         Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
-        assert_eq!(polys, [0]);
         let point: Point<EF> = Point::expand_from_univariate(
             challenger.sample_algebra_element(),
             self.table_variables[table_idx],
         );
-        let lifted = self.lift_point(table_idx, &point);
-        let evaluation = self.poly.eval_base(&lifted);
-        challenger.observe_algebra_element(evaluation);
-        self.statement.add_evaluated_constraint(lifted, evaluation);
-        vec![evaluation]
+        polys
+            .iter()
+            .map(|&column_idx| {
+                assert!(column_idx < self.table_widths[table_idx]);
+                let lifted = self.lift_point(table_idx, column_idx, &point);
+                let evaluation = self.poly.eval_base(&lifted);
+                challenger.observe_algebra_element(evaluation);
+                self.statement.add_evaluated_constraint(lifted, evaluation);
+                evaluation
+            })
+            .collect()
     }
 
     fn add_virtual_eval<Ch>(&mut self, challenger: &mut Ch) -> EF
@@ -1249,6 +1281,7 @@ impl Layout<F, EF> for ExplicitPointLayout {
             folding,
             statement,
             table_variables: _,
+            table_widths: _,
             selectors: _,
         } = self;
         assert!(!statement.is_empty());
@@ -1310,7 +1343,7 @@ pub fn prove_explicit_whir_openings(
         .map(|_| layout.add_virtual_eval(&mut challenger))
         .collect();
     for (point, &evaluation) in native_points.into_iter().zip(&evaluations) {
-        layout.record_explicit_claim(0, point, evaluation, &mut challenger);
+        layout.record_explicit_claim(0, 0, point, evaluation, &mut challenger);
     }
     pcs.prove(&mut native_proof, &mut challenger, layout, prover_data);
 
@@ -1408,13 +1441,14 @@ pub fn prove_explicit_whir_openings_with_initial_oracle(
     // This is the one normal initial-commitment observation. All fallible
     // artifact and context checks above are transcript-silent.
     challenger.observe(commitment.clone());
-    let mut layout = ExplicitPointLayout::from_poly_and_shapes(poly, folding, vec![num_variables]);
+    let mut layout =
+        ExplicitPointLayout::from_poly_and_shapes(poly, folding, vec![(num_variables, 1)]);
     let mut native_proof = empty_disk_proof(&pcs.config);
     native_proof.initial_ood_answers = (0..pcs.commitment_ood_samples)
         .map(|_| layout.add_virtual_eval(&mut challenger))
         .collect();
     for (point, &evaluation) in native_points.iter().zip(&evaluations) {
-        layout.record_explicit_claim(0, point.clone(), evaluation, &mut challenger);
+        layout.record_explicit_claim(0, 0, point.clone(), evaluation, &mut challenger);
     }
 
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
@@ -2087,10 +2121,10 @@ fn prove_structured_whir_section(
         }
         let point = convert_structured_point(&claim.point)?;
         let evaluation = convert_extension(claim.evaluation)?;
-        if layout.eval_table(table_index, &point) != evaluation {
+        if layout.eval_table(table_index, 0, &point) != evaluation {
             return Err(ExplicitWhirError::ClaimMismatch);
         }
-        layout.record_explicit_claim(table_index, point, evaluation, &mut challenger);
+        layout.record_explicit_claim(table_index, 0, point, evaluation, &mut challenger);
     }
     if used_tables.iter().any(|used| !used) {
         return Err(ExplicitWhirError::CommitmentMismatch);
@@ -2366,8 +2400,39 @@ fn verify_native_multi(
     evaluations: &[EF],
     proof: &NativeProof,
 ) -> Result<(), ExplicitWhirError> {
-    let stacked_variables = validate_stacked_shape(table_variables)?;
-    let selectors = plan_selectors(table_variables, stacked_variables);
+    verify_native_multi_columns(
+        transcript_binding,
+        commitment,
+        table_variables,
+        &vec![1; table_variables.len()],
+        table_indices,
+        &vec![0; table_indices.len()],
+        points,
+        evaluations,
+        proof,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_native_multi_columns(
+    transcript_binding: &[u8],
+    commitment: [u8; 32],
+    table_variables: &[usize],
+    table_widths: &[usize],
+    table_indices: &[usize],
+    column_indices: &[usize],
+    points: &[Point<EF>],
+    evaluations: &[EF],
+    proof: &NativeProof,
+) -> Result<(), ExplicitWhirError> {
+    if table_indices.len() != column_indices.len()
+        || table_indices.len() != points.len()
+        || table_indices.len() != evaluations.len()
+    {
+        return Err(ExplicitWhirError::InvalidOpeningCount);
+    }
+    let stacked_variables = validate_stacked_shape_with_widths(table_variables, table_widths)?;
+    let selectors = plan_column_selectors(table_variables, table_widths, stacked_variables);
     let (pcs, mut challenger) = build_pcs(stacked_variables, transcript_binding)?;
     let commitment = MerkleCap::<F, [u8; 32]>::new(vec![commitment]);
     challenger.observe(commitment.clone());
@@ -2381,8 +2446,17 @@ fn verify_native_multi(
         challenger.observe_algebra_element(evaluation);
         statement.add_evaluated_constraint(point, evaluation);
     }
-    for ((&table_index, point), &evaluation) in table_indices.iter().zip(points).zip(evaluations) {
-        let mut lifted = selectors[table_index]
+    for (((&table_index, &column_index), point), &evaluation) in table_indices
+        .iter()
+        .zip(column_indices)
+        .zip(points)
+        .zip(evaluations)
+    {
+        let selector = selectors
+            .get(table_index)
+            .and_then(|columns| columns.get(column_index))
+            .ok_or(ExplicitWhirError::InvalidOpeningCount)?;
+        let mut lifted = selector
             .as_slice()
             .iter()
             .copied()
@@ -2611,16 +2685,31 @@ fn validate_table(table: &[u64]) -> Result<usize, ExplicitWhirError> {
 }
 
 fn validate_stacked_shape(table_variables: &[usize]) -> Result<usize, ExplicitWhirError> {
+    validate_stacked_shape_with_widths(table_variables, &vec![1; table_variables.len()])
+}
+
+fn validate_stacked_shape_with_widths(
+    table_variables: &[usize],
+    table_widths: &[usize],
+) -> Result<usize, ExplicitWhirError> {
     if table_variables.is_empty() || table_variables.len() > MAX_STRUCTURED_WHIR_TABLES {
         return Err(ExplicitWhirError::InvalidTableCount);
     }
+    if table_variables.len() != table_widths.len()
+        || table_widths
+            .iter()
+            .any(|width| *width == 0 || *width > MAX_STRUCTURED_WHIR_TABLES)
+    {
+        return Err(ExplicitWhirError::InvalidTableCount);
+    }
     let mut elements = 0usize;
-    for &variables in table_variables {
+    for (&variables, &width) in table_variables.iter().zip(table_widths) {
         validate_num_variables(variables)?;
         elements = elements
             .checked_add(
                 1usize
                     .checked_shl(variables as u32)
+                    .and_then(|elements| elements.checked_mul(width))
                     .ok_or(ExplicitWhirError::AggregateTableSize)?,
             )
             .ok_or(ExplicitWhirError::AggregateTableSize)?;
@@ -2638,16 +2727,27 @@ fn validate_stacked_shape(table_variables: &[usize]) -> Result<usize, ExplicitWh
     Ok(variables)
 }
 
-fn plan_selectors(table_variables: &[usize], stacked_variables: usize) -> Vec<Point<F>> {
+fn plan_column_selectors(
+    table_variables: &[usize],
+    table_widths: &[usize],
+    stacked_variables: usize,
+) -> Vec<Vec<Point<F>>> {
+    assert_eq!(table_variables.len(), table_widths.len());
+    assert!(table_widths.iter().all(|width| *width > 0));
     let mut order = (0..table_variables.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| table_variables[index]);
     let mut offset = 0usize;
-    let mut selectors = vec![Point::new(Vec::new()); table_variables.len()];
+    let mut selectors = vec![Vec::new(); table_variables.len()];
     for table_index in order.into_iter().rev() {
         let variables = table_variables[table_index];
         let selector_variables = stacked_variables - variables;
-        selectors[table_index] = Point::hypercube(offset >> variables, selector_variables);
-        offset += 1usize << variables;
+        selectors[table_index] = (0..table_widths[table_index])
+            .map(|_| {
+                let selector = Point::hypercube(offset >> variables, selector_variables);
+                offset += 1usize << variables;
+                selector
+            })
+            .collect();
     }
     selectors
 }
@@ -3835,6 +3935,84 @@ mod tests {
     }
 
     #[test]
+    fn explicit_layout_authenticates_ordered_columns_without_deduplication() {
+        let binding = b"ordered-two-column-layout";
+        let columns = [
+            Poly::<F>::new(
+                [1, 2, 3, 4]
+                    .into_iter()
+                    .map(|value| canonical_base(value).unwrap())
+                    .collect(),
+            ),
+            Poly::<F>::new(
+                [9, 8, 7, 6]
+                    .into_iter()
+                    .map(|value| canonical_base(value).unwrap())
+                    .collect(),
+            ),
+        ];
+        let point = Point::new(vec![EF::from(F::TWO), EF::from(F::NEG_ONE)]);
+        let evaluations = columns
+            .iter()
+            .map(|column| column.eval_base(&point))
+            .collect::<Vec<_>>();
+        let table_variables = [2_usize];
+        let table_widths = [2_usize];
+        let stacked_variables =
+            validate_stacked_shape_with_widths(&table_variables, &table_widths).unwrap();
+        assert_eq!(stacked_variables, 3);
+        let (pcs, mut challenger) = build_pcs(stacked_variables, binding).unwrap();
+        let witness = ExplicitPointLayout::new_witness(
+            vec![Table::new(columns.to_vec())],
+            pcs.round_folding_factor(0),
+        );
+        let (mut layout, commitment, prover_data) = ExplicitPointLayout::commit(
+            &pcs.dft,
+            &pcs.mmcs,
+            &mut challenger,
+            witness,
+            pcs.round_folding_factor(0),
+            pcs.starting_log_inv_rate,
+        );
+        let mut proof = empty_proof(&pcs.config);
+        proof.initial_ood_answers = (0..pcs.commitment_ood_samples)
+            .map(|_| layout.add_virtual_eval(&mut challenger))
+            .collect();
+        for (column, &evaluation) in evaluations.iter().enumerate() {
+            assert_eq!(layout.eval_table(0, column, &point), evaluation);
+            layout.record_explicit_claim(0, column, point.clone(), evaluation, &mut challenger);
+        }
+        pcs.prove(&mut proof, &mut challenger, layout, prover_data);
+        let root = commitment.roots()[0];
+        verify_native_multi_columns(
+            binding,
+            root,
+            &table_variables,
+            &table_widths,
+            &[0, 0],
+            &[0, 1],
+            &[point.clone(), point.clone()],
+            &evaluations,
+            &proof,
+        )
+        .unwrap();
+        assert!(
+            verify_native_multi_columns(
+                binding,
+                root,
+                &table_variables,
+                &table_widths,
+                &[0, 0],
+                &[1, 0],
+                &[point.clone(), point],
+                &evaluations,
+                &proof,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn canonical_binary_n13_fits_wire_cap_across_transcripts() {
         const VARIABLES: usize = 13;
         const EXPECTED_NATIVE_BYTES: [usize; 10] = [
@@ -4394,11 +4572,11 @@ mod tests {
         let mut layout = ExplicitPointLayout::from_poly_and_shapes(
             poly.clone(),
             EXPLICIT_WHIR_FOLDING,
-            vec![variables],
+            vec![(variables, 1)],
         );
         for point in &points {
             let evaluation = poly.eval_base(point);
-            layout.record_explicit_claim(0, point.clone(), evaluation, &mut dense_challenger);
+            layout.record_explicit_claim(0, 0, point.clone(), evaluation, &mut dense_challenger);
         }
         let streamed_claims = evaluate_claims(source.identity(), &source, &points).unwrap();
         for (point, claim) in points.iter().zip(&streamed_claims) {

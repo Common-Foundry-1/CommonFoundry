@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use blake3::Hasher;
-use p3_field::{PrimeCharacteristicRing, PrimeField64, TwoAdicField};
 use p3_goldilocks::Goldilocks;
 use p3_matrix::Matrix;
 use thiserror::Error;
 
+use crate::external_radix2::{ExternalRadix2Error, dft_goldilocks_rows_in_place};
 use crate::merkle_store::{GOLDILOCKS_MODULUS, MerkleRowSource, MerkleStoreError};
 
 /// Smallest table supported by folding two.
@@ -118,6 +118,24 @@ pub enum WhirInitialEncodingError {
     IdentityMismatch,
     #[error("WHIR initial artifact file lock is poisoned")]
     LockPoisoned,
+}
+
+impl From<ExternalRadix2Error> for WhirInitialEncodingError {
+    fn from(error: ExternalRadix2Error) -> Self {
+        match error {
+            ExternalRadix2Error::Invalid(message) => Self::Invalid(message),
+            ExternalRadix2Error::BufferAllocation => Self::ResearchLimit("DFT buffer"),
+            ExternalRadix2Error::Io {
+                operation,
+                path,
+                source,
+            } => Self::Io {
+                operation,
+                path,
+                source,
+            },
+        }
+    }
 }
 
 /// Fully authenticated natural-row initial WHIR codeword.
@@ -428,11 +446,13 @@ fn encode_with_limits(
         &geometry,
         source_read_limbs,
     )?;
-    dft_in_place(
+    dft_goldilocks_rows_in_place(
         &mut file,
         &partial_path,
+        HEADER_BYTES as u64,
         geometry.height,
-        dft_buffer_limbs / WHIR_INITIAL_WIDTH,
+        WHIR_INITIAL_WIDTH,
+        dft_buffer_limbs,
     )?;
     let (auth_digests, artifact_digest) =
         seal_data(&mut file, &partial_path, &prefix, geometry.height)?;
@@ -553,55 +573,6 @@ fn scatter_bit_reversed_source(
     Ok(())
 }
 
-fn dft_in_place(
-    file: &mut File,
-    path: &Path,
-    height: usize,
-    buffer_rows: usize,
-) -> Result<(), WhirInitialEncodingError> {
-    let max_values =
-        buffer_rows
-            .checked_mul(WHIR_INITIAL_WIDTH)
-            .ok_or(WhirInitialEncodingError::Invalid(
-                "DFT buffer size overflow",
-            ))?;
-    let mut left = vec![0_u64; max_values];
-    let mut right = vec![0_u64; max_values];
-    let mut len = 2_usize;
-    loop {
-        let half = len / 2;
-        let root = Goldilocks::two_adic_generator(len.ilog2() as usize);
-        for block in (0..height).step_by(len) {
-            let mut offset = 0_usize;
-            while offset < half {
-                let rows = (half - offset).min(buffer_rows);
-                let values = rows * WHIR_INITIAL_WIDTH;
-                read_values(file, path, block + offset, &mut left[..values])?;
-                read_values(file, path, block + half + offset, &mut right[..values])?;
-                let mut twiddle = root.exp_u64(offset as u64);
-                for row in 0..rows {
-                    for column in 0..WHIR_INITIAL_WIDTH {
-                        let index = row * WHIR_INITIAL_WIDTH + column;
-                        let a = Goldilocks::new(left[index]);
-                        let b = Goldilocks::new(right[index]) * twiddle;
-                        left[index] = (a + b).as_canonical_u64();
-                        right[index] = (a - b).as_canonical_u64();
-                    }
-                    twiddle *= root;
-                }
-                write_values(file, path, block + offset, &left[..values])?;
-                write_values(file, path, block + half + offset, &right[..values])?;
-                offset += rows;
-            }
-        }
-        if len == height {
-            break;
-        }
-        len *= 2;
-    }
-    Ok(())
-}
-
 fn seal_data(
     file: &mut File,
     path: &Path,
@@ -678,46 +649,6 @@ fn auth_digest(prefix: &[u8; PREFIX_BYTES], chunk_index: usize, bytes: &[u8]) ->
     hasher.update(&(chunk_index as u64).to_le_bytes());
     hasher.update(bytes);
     *hasher.finalize().as_bytes()
-}
-
-fn read_values(
-    file: &mut File,
-    path: &Path,
-    row_start: usize,
-    output: &mut [u64],
-) -> Result<(), WhirInitialEncodingError> {
-    let offset = data_offset(row_start)?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|source| io_error("seeking in", path, source))?;
-    let mut encoded = vec![0_u8; output.len() * 8];
-    file.read_exact(&mut encoded)
-        .map_err(|source| io_error("reading staged rows from", path, source))?;
-    for (value, bytes) in output.iter_mut().zip(encoded.chunks_exact(8)) {
-        *value = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
-        if *value >= GOLDILOCKS_MODULUS {
-            return Err(WhirInitialEncodingError::Invalid(
-                "staged DFT row contains a noncanonical Goldilocks value",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn write_values(
-    file: &mut File,
-    path: &Path,
-    row_start: usize,
-    values: &[u64],
-) -> Result<(), WhirInitialEncodingError> {
-    let offset = data_offset(row_start)?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|source| io_error("seeking in", path, source))?;
-    let mut encoded = vec![0_u8; values.len() * 8];
-    for (value, bytes) in values.iter().zip(encoded.chunks_exact_mut(8)) {
-        bytes.copy_from_slice(&value.to_le_bytes());
-    }
-    file.write_all(&encoded)
-        .map_err(|source| io_error("writing staged rows to", path, source))
 }
 
 fn write_encoded_row(
@@ -904,6 +835,7 @@ mod tests {
     use p3_blake3::Blake3;
     use p3_commit::Mmcs;
     use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
+    use p3_field::PrimeField64;
     use p3_matrix::dense::RowMajorMatrix;
     use p3_merkle_tree::MerkleTreeMmcs;
     use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
@@ -1048,6 +980,24 @@ mod tests {
                 assert!(source.max_read.load(Ordering::SeqCst) <= source_chunk);
             }
         }
+    }
+
+    #[test]
+    fn artifact_digest_is_stable_across_external_dft_refactors() {
+        let variables = 6;
+        let source = DenseSource::new(table(variables));
+        let path = test_path("artifact-digest-regression");
+        let artifact = encode_with_limits(&path, [0x42; 32], &identity(variables), &source, 16, 32)
+            .unwrap()
+            .remove_on_drop();
+        assert_eq!(
+            artifact.identity().artifact_digest,
+            [
+                0x44, 0x68, 0x01, 0x3f, 0xbc, 0xf6, 0x59, 0x19, 0x20, 0x64, 0x0c, 0xae, 0x8d, 0xad,
+                0x9e, 0x4b, 0xca, 0x01, 0x9e, 0x96, 0xc6, 0x44, 0x44, 0x29, 0x1e, 0xbf, 0xd6, 0xbb,
+                0xe2, 0x79, 0xcd, 0xd3,
+            ]
+        );
     }
 
     #[test]
@@ -1198,14 +1148,20 @@ mod tests {
             .create_new(true)
             .open(&path)
             .unwrap();
-        file.set_len((HEADER_BYTES + WHIR_INITIAL_WIDTH * 8) as u64)
+        file.set_len((HEADER_BYTES + 2 * WHIR_INITIAL_WIDTH * 8) as u64)
             .unwrap();
         file.seek(SeekFrom::Start(data_offset(0).unwrap())).unwrap();
         file.write_all(&GOLDILOCKS_MODULUS.to_le_bytes()).unwrap();
-        let mut values = [0_u64; WHIR_INITIAL_WIDTH];
         assert!(matches!(
-            read_values(&mut file, &path, 0, &mut values),
-            Err(WhirInitialEncodingError::Invalid(_))
+            dft_goldilocks_rows_in_place(
+                &mut file,
+                &path,
+                HEADER_BYTES as u64,
+                2,
+                WHIR_INITIAL_WIDTH,
+                WHIR_INITIAL_WIDTH,
+            ),
+            Err(ExternalRadix2Error::Invalid(_))
         ));
         drop(file);
         fs::remove_file(path).unwrap();

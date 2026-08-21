@@ -58,11 +58,14 @@ mod disk_mmcs;
 #[cfg(feature = "gpu-proof-prover")]
 use disk_mmcs::{DiskWhirMmcs, DiskWhirOpeningPanic};
 #[cfg(feature = "gpu-proof-prover")]
+mod artifact_state;
+#[cfg(feature = "gpu-proof-prover")]
+use artifact_state::ArtifactWhirProverState;
+#[cfg(feature = "gpu-proof-prover")]
 mod disk_sumcheck;
 #[cfg(feature = "gpu-proof-prover")]
 use disk_sumcheck::{
-    ResidualArtifactConfig, evaluate_claims, prepare_sumcheck,
-    prepare_sumcheck_with_residual_artifact,
+    ResidualArtifactConfig, evaluate_claims, prepare_artifact_sumcheck, prepare_sumcheck,
 };
 
 use crate::{
@@ -1473,45 +1476,69 @@ fn prove_explicit_whir_openings_with_initial_source_inner(
         streamed_claims.push(claim);
     }
 
-    let prepared = catch_unwind(AssertUnwindSafe(|| match residual_artifact {
-        Some(invocation) => prepare_sumcheck_with_residual_artifact(
-            expected_source,
-            source,
-            streamed_claims,
-            &mut native_proof.initial_sumcheck,
-            pcs.starting_folding_pow_bits,
-            &mut challenger,
-            ResidualArtifactConfig {
-                exact_source_binding: invocation.exact_source_binding,
-                invocation_digest: invocation.invocation_digest,
-                scratch_directory: invocation.scratch_directory,
-            },
-        ),
-        None => prepare_sumcheck(
-            expected_source,
-            source,
-            streamed_claims,
-            &mut native_proof.initial_sumcheck,
-            pcs.starting_folding_pow_bits,
-            &mut challenger,
-        ),
-    }))
-    .map_err(|_| ExplicitWhirError::BackendPanic)??;
-
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
-        pcs.prove_from_sumcheck(
-            &mut native_proof,
-            &mut challenger,
-            prepared.prover,
-            prepared.randomness,
-            prover_data,
-        );
-    })) {
-        if let Some(storage) = payload.downcast_ref::<DiskWhirOpeningPanic>() {
-            let _ = storage.message();
-            return Err(ExplicitWhirError::ProverStorage);
+    match residual_artifact {
+        Some(invocation) => {
+            let prepared = catch_unwind(AssertUnwindSafe(|| {
+                prepare_artifact_sumcheck(
+                    expected_source,
+                    source,
+                    streamed_claims,
+                    &mut native_proof.initial_sumcheck,
+                    pcs.starting_folding_pow_bits,
+                    &mut challenger,
+                    ResidualArtifactConfig {
+                        exact_source_binding: invocation.exact_source_binding,
+                        invocation_digest: invocation.invocation_digest,
+                        scratch_directory: invocation.scratch_directory,
+                    },
+                )
+            }))
+            .map_err(|_| ExplicitWhirError::BackendPanic)??;
+            let randomness = prepared.randomness.clone();
+            let state = ArtifactWhirProverState::new(
+                invocation.scratch_directory,
+                invocation.invocation_digest,
+                pcs.mmcs.clone(),
+                prepared,
+            )
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+            pcs.try_prove_from_state(
+                &mut native_proof,
+                &mut challenger,
+                state,
+                randomness,
+                prover_data,
+            )
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
         }
-        return Err(ExplicitWhirError::BackendPanic);
+        None => {
+            let prepared = catch_unwind(AssertUnwindSafe(|| {
+                prepare_sumcheck(
+                    expected_source,
+                    source,
+                    streamed_claims,
+                    &mut native_proof.initial_sumcheck,
+                    pcs.starting_folding_pow_bits,
+                    &mut challenger,
+                )
+            }))
+            .map_err(|_| ExplicitWhirError::BackendPanic)??;
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                pcs.prove_from_sumcheck(
+                    &mut native_proof,
+                    &mut challenger,
+                    prepared.prover,
+                    prepared.randomness,
+                    prover_data,
+                );
+            })) {
+                if let Some(storage) = payload.downcast_ref::<DiskWhirOpeningPanic>() {
+                    let _ = storage.message();
+                    return Err(ExplicitWhirError::ProverStorage);
+                }
+                return Err(ExplicitWhirError::BackendPanic);
+            }
+        }
     }
 
     let proof_bytes =
@@ -1573,10 +1600,10 @@ pub fn prove_explicit_whir_openings_with_prover_oracle(
 
 /// Prove through a caller-selected residual scratch directory.
 ///
-/// This exercises the authenticated bounded-memory residual-generation seam,
-/// then rematerializes the residual for the still-dense research WHIR backend.
-/// It therefore preserves exact proof bytes but does not yet remove the
-/// downstream in-memory sumcheck, extension commitment, or FFT allocations.
+/// This keeps the authenticated residual, downstream sumcheck folds, extension
+/// codewords, and Merkle trees artifact-backed while preserving exact proof
+/// bytes for the unchanged verifier. A storage failure aborts the attempt;
+/// this path never retries through the dense prover state.
 /// The directory is a local, access-controlled scratch namespace: other code
 /// must not rename or replace generated `cmfd-whir-residual-*` entries while
 /// this call is active.
@@ -3622,7 +3649,7 @@ mod tests {
         let scratch = whir_initial_test_path().with_extension("sumcheck-residual");
         std::fs::create_dir(&scratch).unwrap();
         let mut artifact_data = SumcheckData::default();
-        let artifact = prepare_sumcheck_with_residual_artifact(
+        let artifact = prepare_artifact_sumcheck(
             source.identity(),
             &source,
             streamed_claims,
@@ -3650,16 +3677,32 @@ mod tests {
         assert_eq!(streamed.randomness, dense_randomness);
         assert_eq!(artifact.randomness, dense_randomness);
         assert_eq!(streamed.prover.claimed_sum(), dense_prover.claimed_sum());
-        assert_eq!(artifact.prover.claimed_sum(), dense_prover.claimed_sum());
+        assert_eq!(artifact.claimed_sum, dense_prover.claimed_sum());
         assert_eq!(streamed.prover.evals(), dense_prover.evals());
-        assert_eq!(artifact.prover.evals(), dense_prover.evals());
         assert_eq!(streamed.prover.weights(), dense_prover.weights());
-        assert_eq!(artifact.prover.weights(), dense_prover.weights());
+        let mut artifact_evals = Vec::new();
+        let mut artifact_weights = Vec::new();
+        let mut row_start = 0_u64;
+        while row_start < artifact.artifact.geometry().row_count {
+            let count = usize::try_from(
+                (artifact.artifact.geometry().row_count - row_start)
+                    .min(cmfd_proof_accel::whir_residual::WHIR_RESIDUAL_MAX_IO_ROWS as u64),
+            )
+            .unwrap();
+            for row in artifact.artifact.read_rows(row_start, count).unwrap() {
+                artifact_evals.push(EF::new([F::new(row[0]), F::new(row[1]), F::new(row[2])]));
+                artifact_weights.push(EF::new([F::new(row[3]), F::new(row[4]), F::new(row[5])]));
+            }
+            row_start += count as u64;
+        }
+        assert_eq!(Poly::new(artifact_evals), dense_prover.evals());
+        assert_eq!(Poly::new(artifact_weights), dense_prover.weights());
         let dense_next: EF = dense_challenger.sample_algebra_element();
         let streamed_next: EF = streamed_challenger.sample_algebra_element();
         let artifact_next: EF = artifact_challenger.sample_algebra_element();
         assert_eq!(streamed_next, dense_next);
         assert_eq!(artifact_next, dense_next);
+        artifact.artifact.remove().unwrap();
         assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
         std::fs::remove_dir(scratch).unwrap();
     }
@@ -3745,7 +3788,7 @@ mod tests {
         std::fs::create_dir(&scratch).unwrap();
         let mut sumcheck_data = SumcheckData::default();
 
-        let result = prepare_sumcheck_with_residual_artifact(
+        let result = prepare_artifact_sumcheck(
             source.identity(),
             &source,
             claims,

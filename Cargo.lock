@@ -859,6 +859,7 @@ dependencies = [
  "enum-ordinalize",
  "flate2",
  "frontend",
+ "fs2",
  "hex",
  "k256",
  "p3-air",

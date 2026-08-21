@@ -12,8 +12,8 @@ use cmfd_proof_accel::whir_initial::{
     AuthenticatedWhirInitialSource, WHIR_INITIAL_MAX_SOURCE_READ_LIMBS, WhirInitialSourceIdentity,
 };
 use cmfd_proof_accel::whir_residual::{
-    WHIR_RESIDUAL_LIMBS_PER_ROW, WHIR_RESIDUAL_MAX_IO_ROWS, WhirResidualArtifactSpec,
-    WhirResidualArtifactWriter,
+    AuthenticatedWhirResidualArtifact, WHIR_RESIDUAL_LIMBS_PER_ROW, WHIR_RESIDUAL_MAX_IO_ROWS,
+    WhirResidualArtifactSpec, WhirResidualArtifactWriter,
 };
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField64};
@@ -47,6 +47,13 @@ impl StreamedInitialClaim {
 #[derive(Debug)]
 pub(super) struct StreamedInitialSumcheck {
     pub(super) prover: SumcheckProver<F, EF>,
+    pub(super) randomness: Point<EF>,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedArtifactSumcheck {
+    pub(super) artifact: AuthenticatedWhirResidualArtifact,
+    pub(super) claimed_sum: EF,
     pub(super) randomness: Point<EF>,
 }
 
@@ -111,23 +118,24 @@ pub(super) fn prepare_sumcheck<Ch>(
 where
     Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
 {
-    prepare_sumcheck_inner(
+    let prepared = prepare_sumcheck_prefix(
         expected_source,
         source,
         claims,
         sumcheck_data,
         pow_bits,
         challenger,
-        None,
-    )
+    )?;
+    materialize_dense_sumcheck(expected_source, source, &prepared)
 }
 
-/// Prepare through an authenticated ephemeral residual artifact, then
-/// materialize the bounded research shape for the unchanged WHIR backend.
+/// Prepare and retain an authenticated residual artifact for a fallible WHIR
+/// prover state. The artifact is not read back into dense vectors and remains
+/// owned by the returned capability.
 ///
 /// Artifact metadata is never observed by the challenger. Any storage failure
 /// aborts this locally owned proof attempt without a dense fallback.
-pub(super) fn prepare_sumcheck_with_residual_artifact<Ch>(
+pub(super) fn prepare_artifact_sumcheck<Ch>(
     expected_source: &WhirInitialSourceIdentity,
     source: &dyn AuthenticatedWhirInitialSource,
     claims: Vec<StreamedInitialClaim>,
@@ -135,23 +143,66 @@ pub(super) fn prepare_sumcheck_with_residual_artifact<Ch>(
     pow_bits: usize,
     challenger: &mut Ch,
     artifact: ResidualArtifactConfig<'_>,
-) -> Result<StreamedInitialSumcheck, ExplicitWhirError>
+) -> Result<PreparedArtifactSumcheck, ExplicitWhirError>
 where
     Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
 {
-    prepare_sumcheck_inner(
+    let prepared = prepare_sumcheck_prefix(
         expected_source,
         source,
         claims,
         sumcheck_data,
         pow_bits,
         challenger,
-        Some(ResidualArtifactRequest {
-            exact_source_binding: artifact.exact_source_binding,
+    )?;
+    let spec = WhirResidualArtifactSpec {
+        source_digest: artifact.exact_source_binding,
+        context_digest: residual_context_digest(ResidualContext {
+            expected_source,
             invocation_digest: artifact.invocation_digest,
-            scratch_directory: artifact.scratch_directory,
+            residual_len: prepared.residual_len,
+            claims: &prepared.claims,
+            alpha: prepared.alpha,
+            sumcheck_data,
+            pow_bits,
+            r0: prepared.r0,
+            r1: prepared.r1,
+            claimed_sum: prepared.claimed_sum,
         }),
-    )
+        num_variables: u32::try_from(prepared.prefix_variables)
+            .map_err(|_| ExplicitWhirError::ProverStorage)?,
+        generation: 0,
+    };
+    let mut writer = WhirResidualArtifactWriter::create(artifact.scratch_directory, spec)
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    let chunk_capacity = prepared.residual_len.min(WHIR_RESIDUAL_MAX_IO_ROWS);
+    let mut residual_rows = Vec::new();
+    residual_rows
+        .try_reserve_exact(chunk_capacity)
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    emit_residual_product(expected_source, source, &prepared, |eval, weight| {
+        residual_rows.push(encode_residual_row(eval, weight));
+        if residual_rows.len() == chunk_capacity {
+            writer
+                .write_rows(writer.rows_written(), &residual_rows)
+                .map_err(|_| ExplicitWhirError::ProverStorage)?;
+            residual_rows.clear();
+        }
+        Ok(())
+    })?;
+    if !residual_rows.is_empty() {
+        writer
+            .write_rows(writer.rows_written(), &residual_rows)
+            .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    }
+    let artifact = writer
+        .finish()
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    Ok(PreparedArtifactSumcheck {
+        artifact,
+        claimed_sum: prepared.claimed_sum,
+        randomness: Point::new(vec![prepared.r0, prepared.r1]),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -161,23 +212,27 @@ pub(super) struct ResidualArtifactConfig<'a> {
     pub(super) scratch_directory: &'a Path,
 }
 
-#[derive(Clone, Copy)]
-struct ResidualArtifactRequest<'a> {
-    exact_source_binding: [u8; 32],
-    invocation_digest: [u8; 32],
-    scratch_directory: &'a Path,
+struct PreparedInitialFold {
+    source_len: usize,
+    prefix_variables: usize,
+    residual_len: usize,
+    claims: Vec<StreamedInitialClaim>,
+    suffix_scales: Vec<EF>,
+    alpha: EF,
+    r0: EF,
+    r1: EF,
+    claimed_sum: EF,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_sumcheck_inner<Ch>(
+fn prepare_sumcheck_prefix<Ch>(
     expected_source: &WhirInitialSourceIdentity,
     source: &dyn AuthenticatedWhirInitialSource,
     claims: Vec<StreamedInitialClaim>,
     sumcheck_data: &mut SumcheckData<F, EF>,
     pow_bits: usize,
     challenger: &mut Ch,
-    residual_artifact: Option<ResidualArtifactRequest<'_>>,
-) -> Result<StreamedInitialSumcheck, ExplicitWhirError>
+) -> Result<PreparedInitialFold, ExplicitWhirError>
 where
     Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
 {
@@ -243,117 +298,40 @@ where
         .collect::<Vec<_>>();
     let prefix_variables = num_variables - INITIAL_FOLDING;
     let residual_len = source_len / SUFFIX_WIDTH;
-    let artifact_spec = if let Some(request) = residual_artifact {
-        Some(WhirResidualArtifactSpec {
-            source_digest: request.exact_source_binding,
-            context_digest: residual_context_digest(ResidualContext {
-                expected_source,
-                invocation_digest: request.invocation_digest,
-                residual_len,
-                claims: &claims,
-                alpha,
-                sumcheck_data,
-                pow_bits,
-                r0,
-                r1,
-                claimed_sum,
-            }),
-            num_variables: u32::try_from(prefix_variables)
-                .map_err(|_| ExplicitWhirError::ProverStorage)?,
-            generation: 0,
-        })
-    } else {
-        None
-    };
-    let mut residual_writer = match (residual_artifact, artifact_spec) {
-        (Some(request), Some(spec)) => Some(
-            WhirResidualArtifactWriter::create(request.scratch_directory, spec)
-                .map_err(|_| ExplicitWhirError::ProverStorage)?,
-        ),
-        (None, None) => None,
-        _ => return Err(ExplicitWhirError::ProverStorage),
-    };
+    Ok(PreparedInitialFold {
+        source_len,
+        prefix_variables,
+        residual_len,
+        claims,
+        suffix_scales,
+        alpha,
+        r0,
+        r1,
+        claimed_sum,
+    })
+}
+
+fn materialize_dense_sumcheck(
+    expected_source: &WhirInitialSourceIdentity,
+    source: &dyn AuthenticatedWhirInitialSource,
+    prepared: &PreparedInitialFold,
+) -> Result<StreamedInitialSumcheck, ExplicitWhirError> {
     let mut residual_evals = Vec::new();
     let mut residual_weights = Vec::new();
-    if residual_writer.is_none() {
-        residual_evals
-            .try_reserve_exact(residual_len)
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-        residual_weights
-            .try_reserve_exact(residual_len)
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-    }
-    let residual_chunk_capacity = residual_len.min(WHIR_RESIDUAL_MAX_IO_ROWS);
-    let mut residual_rows = Vec::new();
-    if residual_writer.is_some() {
-        residual_rows
-            .try_reserve_exact(residual_chunk_capacity)
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-    }
-    scan_source(expected_source, source, source_len, |start, values| {
-        for (local_group, group) in values.chunks_exact(SUFFIX_WIDTH).enumerate() {
-            let prefix_index = (start / SUFFIX_WIDTH) + local_group;
-            let evals = [
-                EF::from(F::new(group[0])),
-                EF::from(F::new(group[1])),
-                EF::from(F::new(group[2])),
-                EF::from(F::new(group[3])),
-            ];
-            let residual_eval = fold_suffix_pair(fold_suffix_quad(evals, r0), r1);
-
-            let mut weight = EF::ZERO;
-            for (claim, &suffix_scale) in claims.iter().zip(&suffix_scales) {
-                weight += suffix_scale
-                    * eq_at_index(&claim.point.as_slice()[..prefix_variables], prefix_index);
-            }
-            if residual_writer.is_some() {
-                residual_rows.push(encode_residual_row(residual_eval, weight));
-            } else {
-                residual_evals.push(residual_eval);
-                residual_weights.push(weight);
-            }
-        }
-        if let Some(writer) = residual_writer.as_mut()
-            && !residual_rows.is_empty()
-        {
-            writer
-                .write_rows(writer.rows_written(), &residual_rows)
-                .map_err(|_| ExplicitWhirError::ProverStorage)?;
-            residual_rows.clear();
-        }
+    residual_evals
+        .try_reserve_exact(prepared.residual_len)
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    residual_weights
+        .try_reserve_exact(prepared.residual_len)
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    emit_residual_product(expected_source, source, prepared, |eval, weight| {
+        residual_evals.push(eval);
+        residual_weights.push(weight);
         Ok(())
     })?;
-    if let Some(writer) = residual_writer {
-        let artifact = writer
-            .finish()
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-        residual_evals
-            .try_reserve_exact(residual_len)
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-        residual_weights
-            .try_reserve_exact(residual_len)
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-        let mut start = 0_u64;
-        while start < artifact.geometry().row_count {
-            let count = usize::try_from(
-                (artifact.geometry().row_count - start).min(WHIR_RESIDUAL_MAX_IO_ROWS as u64),
-            )
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-            let rows = artifact
-                .read_rows(start, count)
-                .map_err(|_| ExplicitWhirError::ProverStorage)?;
-            for row in rows {
-                let (eval, weight) = decode_residual_row(row);
-                residual_evals.push(eval);
-                residual_weights.push(weight);
-            }
-            start += count as u64;
-        }
-        artifact
-            .remove()
-            .map_err(|_| ExplicitWhirError::ProverStorage)?;
-    }
-    if residual_evals.len() != residual_len || residual_weights.len() != residual_len {
+    if residual_evals.len() != prepared.residual_len
+        || residual_weights.len() != prepared.residual_len
+    {
         return Err(ExplicitWhirError::ProverStorage);
     }
 
@@ -363,9 +341,58 @@ where
         Poly::new(residual_weights),
     );
     Ok(StreamedInitialSumcheck {
-        prover: SumcheckProver::new(product, claimed_sum),
-        randomness: Point::new(vec![r0, r1]),
+        prover: SumcheckProver::new(product, prepared.claimed_sum),
+        randomness: Point::new(vec![prepared.r0, prepared.r1]),
     })
+}
+
+fn emit_residual_product(
+    expected_source: &WhirInitialSourceIdentity,
+    source: &dyn AuthenticatedWhirInitialSource,
+    prepared: &PreparedInitialFold,
+    mut emit: impl FnMut(EF, EF) -> Result<(), ExplicitWhirError>,
+) -> Result<(), ExplicitWhirError> {
+    let mut actual_sum = EF::ZERO;
+    let mut emitted = 0_usize;
+    scan_source(
+        expected_source,
+        source,
+        prepared.source_len,
+        |start, values| {
+            for (local_group, group) in values.chunks_exact(SUFFIX_WIDTH).enumerate() {
+                let prefix_index = (start / SUFFIX_WIDTH) + local_group;
+                let evals = [
+                    EF::from(F::new(group[0])),
+                    EF::from(F::new(group[1])),
+                    EF::from(F::new(group[2])),
+                    EF::from(F::new(group[3])),
+                ];
+                let residual_eval =
+                    fold_suffix_pair(fold_suffix_quad(evals, prepared.r0), prepared.r1);
+
+                let mut weight = EF::ZERO;
+                for (claim, &suffix_scale) in prepared.claims.iter().zip(&prepared.suffix_scales) {
+                    weight += suffix_scale
+                        * eq_at_index(
+                            &claim.point.as_slice()[..prepared.prefix_variables],
+                            prefix_index,
+                        );
+                }
+                actual_sum += residual_eval * weight;
+                emitted = emitted
+                    .checked_add(1)
+                    .ok_or(ExplicitWhirError::ProverStorage)?;
+                emit(residual_eval, weight)?;
+            }
+            Ok(())
+        },
+    )?;
+    // This equality is a prover-integrity boundary: never publish or return a
+    // residual whose encoded product disagrees with the live transcript claim.
+    if emitted != prepared.residual_len || actual_sum != prepared.claimed_sum {
+        return Err(ExplicitWhirError::ProverStorage);
+    }
+    Ok(())
 }
 
 struct ResidualContext<'a> {
@@ -430,6 +457,7 @@ fn encode_residual_row(eval: EF, weight: EF) -> [u64; WHIR_RESIDUAL_LIMBS_PER_RO
     ]
 }
 
+#[cfg(test)]
 fn decode_residual_row(row: [u64; WHIR_RESIDUAL_LIMBS_PER_ROW]) -> (EF, EF) {
     (
         EF::new([F::new(row[0]), F::new(row[1]), F::new(row[2])]),
@@ -530,7 +558,85 @@ fn fold_suffix_pair(values: [EF; 2], challenge: EF) -> EF {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use cmfd_proof_accel::whir_initial::WhirInitialSourceError;
+
     use super::*;
+
+    static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone)]
+    struct TestSource {
+        identity: WhirInitialSourceIdentity,
+        values: Vec<u64>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl TestSource {
+        fn new(identity: WhirInitialSourceIdentity, values: Vec<u64>) -> Self {
+            Self {
+                identity,
+                values,
+                reads: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AuthenticatedWhirInitialSource for TestSource {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            &self.identity
+        }
+
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn read_elements(
+            &self,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| WhirInitialSourceError::new("test source range overflow"))?;
+            self.values
+                .get(start..end)
+                .map(<[u64]>::to_vec)
+                .ok_or_else(|| WhirInitialSourceError::new("test source range is out of bounds"))
+        }
+    }
+
+    fn test_scratch(label: &str) -> PathBuf {
+        let sequence = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cmfd-disk-sumcheck-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn test_points(num_variables: usize) -> Vec<Point<EF>> {
+        (0..2)
+            .map(|point_index| {
+                Point::new(
+                    (0..num_variables)
+                        .map(|index| {
+                            EF::new([
+                                F::new((index * 3 + point_index + 2) as u64),
+                                F::new((index * 5 + point_index + 3) as u64),
+                                F::new((index * 7 + point_index + 5) as u64),
+                            ])
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn index_weights_match_point_equality_polynomial() {
@@ -543,5 +649,153 @@ mod tests {
         for (index, &expected) in expected.as_slice().iter().enumerate() {
             assert_eq!(eq_at_index(point.as_slice(), index), expected);
         }
+    }
+
+    #[test]
+    fn live_artifact_matches_dense_sumcheck_and_cleans_on_drop() {
+        let num_variables = 5;
+        let identity = WhirInitialSourceIdentity {
+            source_id: [0x51; 32],
+            num_variables: num_variables as u32,
+        };
+        let source = TestSource::new(
+            identity,
+            (0..1_usize << num_variables)
+                .map(|index| (index * index + 7 * index + 19) as u64)
+                .collect(),
+        );
+        let points = test_points(num_variables);
+        let claims = evaluate_claims(source.identity(), &source, &points).unwrap();
+        let (pcs, mut dense_challenger) =
+            super::super::build_pcs(num_variables, b"live-residual-parity").unwrap();
+        let (_, mut artifact_challenger) =
+            super::super::build_pcs(num_variables, b"live-residual-parity").unwrap();
+        for (point, claim) in points.iter().zip(&claims) {
+            dense_challenger.observe_algebra_slice(point.as_slice());
+            dense_challenger.observe_algebra_element(claim.evaluation());
+            artifact_challenger.observe_algebra_slice(point.as_slice());
+            artifact_challenger.observe_algebra_element(claim.evaluation());
+        }
+
+        let mut dense_data = SumcheckData::default();
+        let dense = prepare_sumcheck(
+            source.identity(),
+            &source,
+            claims.clone(),
+            &mut dense_data,
+            pcs.starting_folding_pow_bits,
+            &mut dense_challenger,
+        )
+        .unwrap();
+        let reads_before_artifact = source.reads.load(Ordering::Relaxed);
+        let scratch = test_scratch("live-parity");
+        let mut artifact_data = SumcheckData::default();
+        let artifact = prepare_artifact_sumcheck(
+            source.identity(),
+            &source,
+            claims,
+            &mut artifact_data,
+            pcs.starting_folding_pow_bits,
+            &mut artifact_challenger,
+            ResidualArtifactConfig {
+                exact_source_binding: [0x62; 32],
+                invocation_digest: [0x73; 32],
+                scratch_directory: &scratch,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            reads_before_artifact + 1,
+            "artifact preparation must scan the source exactly once"
+        );
+        assert_eq!(
+            artifact_data.polynomial_evaluations,
+            dense_data.polynomial_evaluations
+        );
+        assert_eq!(artifact_data.pow_witnesses, dense_data.pow_witnesses);
+        assert_eq!(artifact.randomness, dense.randomness);
+        assert_eq!(artifact.claimed_sum, dense.prover.claimed_sum());
+        assert_eq!(artifact.artifact.identity().spec.source_digest, [0x62; 32]);
+        assert_eq!(
+            artifact.artifact.identity().spec.num_variables,
+            (num_variables - INITIAL_FOLDING) as u32
+        );
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 1);
+
+        let rows = artifact
+            .artifact
+            .read_rows(
+                0,
+                usize::try_from(artifact.artifact.geometry().row_count).unwrap(),
+            )
+            .unwrap();
+        let (evals, weights): (Vec<_>, Vec<_>) = rows.into_iter().map(decode_residual_row).unzip();
+        assert_eq!(evals.as_slice(), dense.prover.evals().as_slice());
+        assert_eq!(weights.as_slice(), dense.prover.weights().as_slice());
+        assert_eq!(
+            evals
+                .iter()
+                .zip(&weights)
+                .fold(EF::ZERO, |sum, (&eval, &weight)| sum + eval * weight),
+            artifact.claimed_sum
+        );
+        let dense_next: EF = dense_challenger.sample_algebra_element();
+        let artifact_next: EF = artifact_challenger.sample_algebra_element();
+        assert_eq!(artifact_next, dense_next);
+
+        drop(artifact);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[test]
+    fn residual_sum_mismatch_aborts_before_publication_and_cleans_partial() {
+        let num_variables = 4;
+        let identity = WhirInitialSourceIdentity {
+            source_id: [0x84; 32],
+            num_variables: num_variables as u32,
+        };
+        let claimed_source = TestSource::new(
+            identity.clone(),
+            (0..1_usize << num_variables)
+                .map(|index| (index * index + 11) as u64)
+                .collect(),
+        );
+        let changed_source = TestSource::new(
+            identity,
+            (0..1_usize << num_variables)
+                .map(|index| (index * index + 3 * index + 101) as u64)
+                .collect(),
+        );
+        let points = test_points(num_variables);
+        let claims = evaluate_claims(claimed_source.identity(), &claimed_source, &points).unwrap();
+        let (pcs, mut challenger) =
+            super::super::build_pcs(num_variables, b"residual-sum-mismatch").unwrap();
+        for (point, claim) in points.iter().zip(&claims) {
+            challenger.observe_algebra_slice(point.as_slice());
+            challenger.observe_algebra_element(claim.evaluation());
+        }
+        let scratch = test_scratch("sum-mismatch");
+        let mut sumcheck_data = SumcheckData::default();
+
+        let result = prepare_artifact_sumcheck(
+            changed_source.identity(),
+            &changed_source,
+            claims,
+            &mut sumcheck_data,
+            pcs.starting_folding_pow_bits,
+            &mut challenger,
+            ResidualArtifactConfig {
+                exact_source_binding: [0x95; 32],
+                invocation_digest: [0xa6; 32],
+                scratch_directory: &scratch,
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), ExplicitWhirError::ProverStorage);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
     }
 }

@@ -124,22 +124,27 @@ ordered matrix widths and shifts, geometry, physical layout, and canonical
 little-endian limbs are BLAKE3-bound. Partial or failed artifacts are not
 published; a reader authenticates the complete file when opening it and the
 fixed-size chunks used by every later row read. This is a storage-integrity seam, not a
-consensus proof or a production prover. Plonky3 PCS consumption, FRI folding,
-Merkle construction, and opening generation are not yet fully out of core. See
+consensus proof or a production prover. Production-scale Plonky3 PCS
+consumption is not yet fully out of core. See
 [the custom proof specification](docs/consensus/forgematrix-custom-proof.md)
 for the measured scope and remaining activation gates.
 
-The WHIR path also has an authenticated ephemeral residual-product artifact.
-It writes six canonical Goldilocks limbs per row with bounded I/O. Normal
-consumption verifies the open file identity before removal; failure and unwind
-paths make a best-effort cleanup attempt, so an operating runbook must reap
-authenticated stale attempts. The caller must reserve the generated artifact
-names as a private local scratch namespace while proving because portable
-identity-check-and-unlink is not atomic. The production `2^29`-row residual geometry is 24 GiB plus
-about 2 MiB of authentication metadata. Current
-Plonky3 code rereads that artifact into dense vectors, then would allocate an
-approximately 48 GiB extension commitment and large FFT twiddle tables, so the
-16-variable proof cap remains unchanged.
+The WHIR path also has authenticated ephemeral residual and extension-codeword
+artifacts. The production residual geometry is 24 GiB plus about 2 MiB of
+authentication metadata; the next `2^29`-row cubic extension codeword is
+exactly 48 GiB plus about 2 MiB. A fallible artifact-backed WHIR state now
+consumes those residuals, adopts disk-backed extension commitments and
+authenticated BLAKE3 openings, and streams later folding and constraint rounds
+with bounded buffers. Tested commitments, openings, transcript challenges, and
+complete proof bytes match the dense prover; storage failure poisons the
+attempt without a dense retry. The proof-facing format-v1 BLAKE3 store remains
+capped at `2^18` rows and the exact reference extension encoder at `2^20` rows.
+A separate demand-authenticated format-v2 tree supports the production
+`2^29`-row geometry, but it is not yet wired into the prover state. The current
+file-backed DFT would also move about 1.97 TiB at that geometry, so a blocked or
+GPU transform, format-v2 integration, and production proof encoding still
+stand between this checkpoint and a cap increase. The public 16-variable and
+1 MiB proof limits therefore remain unchanged.
 
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`

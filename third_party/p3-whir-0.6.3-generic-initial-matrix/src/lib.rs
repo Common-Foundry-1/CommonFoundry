@@ -15,7 +15,7 @@ pub use parameters::{
 };
 pub use pcs::WhirProverData;
 pub use pcs::proof::{PcsProof, QueryOpening, WhirProof, WhirRoundProof};
-pub use pcs::prover::WhirProver;
+pub use pcs::prover::{FallibleWhirProverState, WhirProver};
 pub use pcs::verifier::WhirVerifier;
 pub use pcs::verifier::errors::VerifierError;
 pub use pcs::zk::{

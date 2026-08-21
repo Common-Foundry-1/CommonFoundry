@@ -16,14 +16,30 @@ inside `WhirProver::prove` and its private round state. It also exposes
 `WhirProver::prove_from_sumcheck`, a checked continuation seam for an initial
 sumcheck prepared from authenticated external storage. The ordinary `prove`
 entry point delegates to that seam after running the unchanged layout code.
-Later folded-round matrices remain the upstream dense extension-field type.
-The existing `MultilinearPcs` adapter and its `WhirProverData` remain
-explicitly `DenseMatrix<F>`, so current callers retain the same commit/open
-behavior.
+Later folded-round matrices remain the upstream dense extension-field type on
+the ordinary path. The existing `MultilinearPcs` adapter and its
+`WhirProverData` remain explicitly `DenseMatrix<F>`, so current callers retain
+the same commit/open behavior.
+
+The patch also exposes `FallibleWhirProverState` and
+`WhirProver::try_prove_from_state`. The trait is the smallest state surface
+used after the initial sumcheck: variable count, extension commitment,
+multilinear evaluation, base and extension MMCS openings, sumcheck folding,
+and final-polynomial materialization. Each fallible operation returns the
+state backend's own error. The fallible round and final-round paths return
+immediately on error; they neither retry nor switch to a dense fallback after
+the challenger has advanced. An error can leave a partial proof and transcript
+prefix, so callers must discard both values for that attempt. `SumcheckProver`
+implements the trait with `Infallible` and the ordinary `prove` and
+`prove_from_sumcheck` APIs continue to use that dense adapter.
 
 Commitments, verifier types, proof structs, transcript order, and serialized
-proof bytes are unchanged. A focused dense-adapter test exercises both prefix
-and suffix layouts through commit, open, and verify.
+proof bytes are unchanged. Focused tests compare the complete commitment,
+proof bytes, and next challenger sample between the ordinary and fallible
+dense paths for both prefix and suffix layouts. Injected failures at extension
+commitment, OOD evaluation, base opening, final-round extension opening,
+intermediate sumcheck, and final-polynomial materialization verify exact error
+propagation without retry.
 
 The normalized published `Cargo.toml` adds the upstream test-only field and
 hash crates imported by the source's unit tests. This lets the vendored unit

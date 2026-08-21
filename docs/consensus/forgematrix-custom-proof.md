@@ -524,16 +524,59 @@ transcript sample. Completed proofs still pass the unchanged CPU verifier, and
 an injected source failure after artifact creation leaves no partial file or
 dense fallback.
 
-This checkpoint establishes authenticated residual storage, not an out-of-core
-WHIR prover. The current adapter rereads the artifact into the same two dense
-vectors because upstream `SumcheckProver` requires them. The next WHIR step
-immediately constructs an extension commitment with `2^31` cubic-field values
-at production geometry, about 48 GiB, and the selected small-batch DFT can retain
-roughly 16 GiB of forward and inverse twiddles. Those allocations, disk-backed
-folding and constraint incorporation, later MMCS commits, and authenticated
-openings must all be replaced before any size cap can move. The explicit
-adapter remains capped at 16 variables, the codeword/oracle path at 19, and the
-production `2^30 x 4` weight-bank codeword remains unsupported.
+The vendored WHIR prover now exposes a fallible state boundary after the
+initial sumcheck. Its dense adapter preserves complete prefix- and
+suffix-layout proof bytes and the next transcript challenge. Injected failures
+at extension commitment, OOD evaluation, Merkle opening, sumcheck, and final
+polynomial materialization return without a retry or dense fallback; the
+caller must discard the partially advanced proof and challenger. The Common
+Foundry spill entry point now implements that boundary with an artifact-backed
+state. It scans the residual in chunks of at most 8,192 rows, adopts exact
+disk-backed extension commitment identities, authenticates requested Merkle
+paths, and writes each folded child residual incrementally. Only the final tail
+of at most six variables is materialized densely. Constraint equality and
+selector weights are generated per chunk, and every post-fold dot-product and
+row-count invariant is checked before the parent artifact is replaced. Any
+state or storage error poisons the attempt and cannot fall back to the dense
+state.
+
+An exact authenticated reference encoder now covers the next extension
+codeword. It groups four residual evaluations into four cubic-extension
+elements, stores their twelve canonical Goldilocks limbs per row, and matches
+Plonky3's suffix-order extension DFT and BLAKE3 MMCS leaves. At the production
+`2^29`-row, log-rate-two geometry the codeword is exactly 48 GiB plus 2 MiB of
+chunk digests and a 288-byte header. The identity binds the complete residual
+identity, folding and rate parameters, geometry, caller context, and final
+artifact digest. Reopen, random reads, publication, and cleanup fail closed on
+identity substitution, corruption, truncation, append, or path replacement.
+
+That encoder deliberately refuses execution above `2^20` rows before reading
+the source or creating a file. Its bounded fused radix-2 engine removes the
+large retained twiddle tables and matches exact bytes, but the modeled `2^29`
+run with the current 512-row buffer would still make 21 complete read/write
+passes: about 1.97 TiB of traffic and 44 million read/write calls. The current
+proof-facing format-v1 BLAKE3 store authenticates the complete artifact when it
+is opened and is capped at `2^18` rows.
+
+A separate format-v2 demand-authenticated tree stores only the exact Plonky3
+layer-major digests. At `2^29` rows it is 34,359,738,592 bytes. Reopening checks
+the fixed identity envelope without a proportional scan, and each opening
+reads one sibling per layer and reconstructs the independently pinned root
+against the separately authenticated 96-byte extension row. Publication is
+no-overwrite and directory-synchronized on supported Windows and Unix
+filesystems. This format reaches production geometry as a storage component,
+but the artifact-backed WHIR state does not yet adopt it.
+
+The artifact state has exact commitment, opening, and next-challenge parity at
+9, 13, and 16 variables, multi-chunk constrained-fold parity at 16 variables,
+and complete proof-byte parity at the bounded end-to-end fixtures. The
+unchanged verifier accepts those proofs. A public 13-variable serialized proof
+already exceeds the unchanged 1 MiB research cap, so merely raising the table
+geometry would not produce the intended succinct wire format. A blocked or GPU
+production transform, format-v2 state integration, production proof encoding,
+and the 31-variable initial weight-bank commitment remain required. The
+explicit adapter stays capped at 16 variables, the initial codeword/oracle path
+at 19, and the production `2^30 x 4` weight-bank codeword remains unsupported.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
@@ -543,8 +586,9 @@ does not make the commitment/proof adapter production-capable. The production
 base table has 19 variables and each weight bank has 31. Source staging admits
 both, but the explicit proof adapter admits at most 16 variables per table and
 the codeword/oracle path admits at most 19. It now has bounded, authenticated
-residual generation but no streaming 31-variable commitment or
-artifact-consuming later-folding path. The upstream
+residual generation and artifact-consuming later folds, but no streaming
+31-variable initial commitment or production-geometry extension transform and
+tree path. The upstream
 backend is an unaudited academic prototype. Review, benchmarks, fuzzing, a
 complete soundness report, and independent audits remain mandatory before any
 production selection.

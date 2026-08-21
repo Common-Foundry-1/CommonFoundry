@@ -779,6 +779,402 @@ mod error_variant_tests {
     }
 }
 
+mod fallible_state_tests {
+    use alloc::rc::Rc;
+    use alloc::vec;
+    use core::cell::Cell;
+
+    use p3_challenger::FieldChallenger;
+    use p3_commit::{BatchOpening, ExtensionMmcs, Mmcs, MultilinearPcs};
+    use p3_matrix::dense::DenseMatrix;
+    use p3_matrix::extension::FlatMatrixView;
+    use p3_multilinear_util::point::Point;
+    use p3_multilinear_util::poly::Poly;
+    use p3_sumcheck::constraints::Constraint;
+    use p3_sumcheck::layout::{Layout, PrefixProver, SuffixProver};
+    use p3_sumcheck::strategy::{SumcheckProver, VariableOrder};
+    use p3_sumcheck::{OpeningProtocol, TableShape, TableSpec};
+    use rand::SeedableRng;
+
+    use super::{
+        EF, F, MyChallenger, MyDft, MyMmcs, TestWhirPcs, challenger, default_round_log_inv_rates,
+        table_specs_to_tables,
+    };
+    use crate::fiat_shamir::domain_separator::DomainSeparator;
+    use crate::parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig};
+    use crate::pcs::WhirProverData;
+    use crate::pcs::proof::{PcsProof, SumcheckData, WhirProof};
+    use crate::pcs::prover::FallibleWhirProverState;
+
+    type InitialCommitment = <MyMmcs as Mmcs<F>>::Commitment;
+
+    struct Prepared<L>
+    where
+        L: Layout<F, EF>,
+    {
+        pcs: TestWhirPcs<L>,
+        commitment: InitialCommitment,
+        prover_data: WhirProverData<F, EF, MyMmcs, L>,
+        protocol: OpeningProtocol,
+        challenger: MyChallenger,
+    }
+
+    fn prepare<L>() -> Prepared<L>
+    where
+        L: Layout<F, EF>,
+    {
+        let folding_factor = FoldingFactor::Constant(2);
+        let specs = vec![TableSpec::new(
+            TableShape::new(12, 2),
+            vec![vec![0, 1], vec![1]],
+        )];
+        let witness = L::new_witness(table_specs_to_tables(&specs), 2);
+        let protocol = OpeningProtocol::new(specs).pad_to_min_num_variables(2);
+        assert_eq!(witness.table_shapes(), protocol.table_shapes());
+
+        let num_variables = witness.num_variables();
+        let params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            round_log_inv_rates: default_round_log_inv_rates(num_variables, &folding_factor),
+            folding_factor,
+            soundness_type: SecurityAssumption::CapacityBound,
+            starting_log_inv_rate: 1,
+        };
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(1);
+        let perm = super::Perm::new_from_rng_128(&mut rng);
+        let mmcs = MyMmcs::new(
+            super::MyHash::new(perm.clone()),
+            super::MyCompress::new(perm),
+            0,
+        );
+        let pcs = TestWhirPcs::<L>::new(
+            WhirConfig::new(num_variables, params).expect("valid WHIR test config"),
+            MyDft::default(),
+            mmcs,
+        );
+
+        let mut challenger = challenger();
+        let mut domain_separator = DomainSeparator::new(vec![]);
+        pcs.add_domain_separator::<8>(&mut domain_separator);
+        domain_separator.observe_domain_separator(&mut challenger);
+        let (commitment, prover_data) =
+            <TestWhirPcs<L> as MultilinearPcs<EF, MyChallenger>>::commit(
+                &pcs,
+                witness,
+                &mut challenger,
+            );
+
+        Prepared {
+            pcs,
+            commitment,
+            prover_data,
+            protocol,
+            challenger,
+        }
+    }
+
+    fn open_from_fallible_dense<L>() -> (
+        TestWhirPcs<L>,
+        InitialCommitment,
+        PcsProof<F, EF, MyMmcs>,
+        OpeningProtocol,
+        EF,
+    )
+    where
+        L: Layout<F, EF>,
+    {
+        let Prepared {
+            pcs,
+            commitment,
+            mut prover_data,
+            protocol,
+            mut challenger,
+        } = prepare::<L>();
+        let mut whir_proof = pcs.config.empty_proof();
+        whir_proof.initial_ood_answers = (0..pcs.commitment_ood_samples)
+            .map(|_| prover_data.layout.add_virtual_eval(&mut challenger))
+            .collect();
+        let evals = protocol
+            .iter_openings()
+            .map(|(table_idx, polys)| prover_data.layout.eval(table_idx, polys, &mut challenger))
+            .collect();
+        let (state, folding_randomness) = prover_data.layout.into_sumcheck(
+            &mut whir_proof.initial_sumcheck,
+            pcs.starting_folding_pow_bits,
+            &mut challenger,
+        );
+        pcs.try_prove_from_state(
+            &mut whir_proof,
+            &mut challenger,
+            state,
+            folding_randomness,
+            prover_data.merkle_data,
+        )
+        .expect("the dense adapter is infallible");
+        let next_challenge = challenger.sample_algebra_element();
+
+        (
+            pcs,
+            commitment,
+            PcsProof {
+                whir: whir_proof,
+                evals,
+            },
+            protocol,
+            next_challenge,
+        )
+    }
+
+    fn assert_dense_parity<L>()
+    where
+        L: Layout<F, EF>,
+    {
+        let Prepared {
+            pcs: legacy_pcs,
+            commitment: legacy_commitment,
+            prover_data: legacy_data,
+            protocol: legacy_protocol,
+            challenger: mut legacy_challenger,
+        } = prepare::<L>();
+        let legacy_proof = <TestWhirPcs<L> as MultilinearPcs<EF, MyChallenger>>::open(
+            &legacy_pcs,
+            legacy_data,
+            legacy_protocol,
+            &mut legacy_challenger,
+        );
+        let legacy_next: EF = legacy_challenger.sample_algebra_element();
+
+        let (fallible_pcs, fallible_commitment, fallible_proof, protocol, fallible_next) =
+            open_from_fallible_dense::<L>();
+
+        assert_eq!(
+            postcard::to_allocvec(&legacy_commitment).expect("serialize legacy commitment"),
+            postcard::to_allocvec(&fallible_commitment).expect("serialize fallible commitment")
+        );
+        assert_eq!(
+            postcard::to_allocvec(&legacy_proof).expect("serialize legacy proof"),
+            postcard::to_allocvec(&fallible_proof).expect("serialize fallible proof")
+        );
+        assert_eq!(legacy_next, fallible_next);
+
+        let mut verifier_challenger = challenger();
+        let mut domain_separator = DomainSeparator::new(vec![]);
+        fallible_pcs.add_domain_separator::<8>(&mut domain_separator);
+        domain_separator.observe_domain_separator(&mut verifier_challenger);
+        <TestWhirPcs<L> as MultilinearPcs<EF, MyChallenger>>::verify(
+            &fallible_pcs,
+            &fallible_commitment,
+            &fallible_proof,
+            &mut verifier_challenger,
+            protocol,
+        )
+        .expect("fallible dense proof verifies");
+    }
+
+    #[test]
+    fn fallible_dense_state_preserves_complete_proof_and_transcript() {
+        assert_dense_parity::<PrefixProver<F, EF>>();
+        assert_dense_parity::<SuffixProver<F, EF>>();
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FailurePoint {
+        Commit,
+        Eval,
+        BaseOpen,
+        ExtensionOpen,
+        Sumcheck,
+        FinalPoly,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct InjectedError(FailurePoint);
+
+    struct FailingDenseState {
+        inner: SumcheckProver<F, EF>,
+        failure: FailurePoint,
+        failure_hits: Rc<Cell<usize>>,
+        extension_open_calls: Cell<usize>,
+        extension_open_fail_at: usize,
+    }
+
+    impl FailingDenseState {
+        fn fail_if_requested(&self, point: FailurePoint) -> Result<(), InjectedError> {
+            if self.failure == point {
+                self.failure_hits.set(self.failure_hits.get() + 1);
+                Err(InjectedError(point))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl FallibleWhirProverState<EF, F, MyDft, MyMmcs, MyChallenger> for FailingDenseState {
+        type Error = InjectedError;
+        type ExtensionMatrix = DenseMatrix<EF>;
+
+        fn num_variables(&self) -> usize {
+            self.inner.num_variables()
+        }
+
+        fn try_commit_extension(
+            &self,
+            order: VariableOrder,
+            dft: &MyDft,
+            extension_mmcs: &ExtensionMmcs<F, EF, MyMmcs>,
+            folding: usize,
+            inv_rate: usize,
+        ) -> Result<
+            (
+                InitialCommitment,
+                <MyMmcs as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
+            ),
+            Self::Error,
+        > {
+            self.fail_if_requested(FailurePoint::Commit)?;
+            Ok(crate::pcs::committer::writer::commit_extension(
+                order,
+                dft,
+                extension_mmcs,
+                self.inner.evals_view(),
+                folding,
+                inv_rate,
+            ))
+        }
+
+        fn try_eval(&self, point: &Point<EF>) -> Result<EF, Self::Error> {
+            self.fail_if_requested(FailurePoint::Eval)?;
+            Ok(self.inner.eval(point))
+        }
+
+        fn try_open_base<M: p3_matrix::Matrix<F>>(
+            &self,
+            index: usize,
+            mmcs: &MyMmcs,
+            prover_data: &<MyMmcs as Mmcs<F>>::ProverData<M>,
+        ) -> Result<BatchOpening<F, MyMmcs>, Self::Error> {
+            self.fail_if_requested(FailurePoint::BaseOpen)?;
+            Ok(mmcs.open_batch(index, prover_data))
+        }
+
+        fn try_open_extension(
+            &self,
+            index: usize,
+            extension_mmcs: &ExtensionMmcs<F, EF, MyMmcs>,
+            prover_data: &<MyMmcs as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
+        ) -> Result<BatchOpening<EF, ExtensionMmcs<F, EF, MyMmcs>>, Self::Error> {
+            let call = self.extension_open_calls.get();
+            self.extension_open_calls.set(call + 1);
+            if self.failure == FailurePoint::ExtensionOpen && call == self.extension_open_fail_at {
+                self.failure_hits.set(self.failure_hits.get() + 1);
+                return Err(InjectedError(FailurePoint::ExtensionOpen));
+            }
+            Ok(extension_mmcs.open_batch(index, prover_data))
+        }
+
+        fn try_compute_sumcheck_polynomials(
+            &mut self,
+            sumcheck_data: &mut SumcheckData<F, EF>,
+            challenger: &mut MyChallenger,
+            folding_factor: usize,
+            pow_bits: usize,
+            constraint: Option<Constraint<F, EF>>,
+        ) -> Result<Point<EF>, Self::Error> {
+            self.fail_if_requested(FailurePoint::Sumcheck)?;
+            Ok(self.inner.compute_sumcheck_polynomials(
+                sumcheck_data,
+                challenger,
+                folding_factor,
+                pow_bits,
+                constraint,
+            ))
+        }
+
+        fn try_final_poly(&self) -> Result<Poly<EF>, Self::Error> {
+            self.fail_if_requested(FailurePoint::FinalPoly)?;
+            Ok(self.inner.evals())
+        }
+    }
+
+    fn run_injected_failure(failure: FailurePoint) {
+        type L = SuffixProver<F, EF>;
+
+        let Prepared {
+            pcs,
+            commitment: _,
+            mut prover_data,
+            protocol,
+            mut challenger,
+        } = prepare::<L>();
+        let mut proof: WhirProof<F, EF, MyMmcs> = pcs.config.empty_proof();
+        proof.initial_ood_answers = (0..pcs.commitment_ood_samples)
+            .map(|_| prover_data.layout.add_virtual_eval(&mut challenger))
+            .collect();
+        for (table_idx, polys) in protocol.iter_openings() {
+            let _ = prover_data.layout.eval(table_idx, polys, &mut challenger);
+        }
+        let (inner, folding_randomness) = prover_data.layout.into_sumcheck(
+            &mut proof.initial_sumcheck,
+            pcs.starting_folding_pow_bits,
+            &mut challenger,
+        );
+        let failure_hits = Rc::new(Cell::new(0));
+        let extension_open_fail_at = (1..pcs.n_rounds())
+            .map(|round_index| {
+                let round = &pcs.round_parameters[round_index];
+                round
+                    .num_queries
+                    .min(round.domain_size >> pcs.round_folding_factor(round_index))
+            })
+            .sum();
+        if failure == FailurePoint::ExtensionOpen {
+            assert!(pcs.n_rounds() > 0, "fixture must reach an extension round");
+            let final_round = pcs.final_round_config();
+            assert!(
+                pcs.final_queries
+                    .min(final_round.domain_size >> pcs.round_folding_factor(pcs.n_rounds()))
+                    > 0,
+                "fixture must perform a final extension opening"
+            );
+        }
+        let state = FailingDenseState {
+            inner,
+            failure,
+            failure_hits: Rc::clone(&failure_hits),
+            extension_open_calls: Cell::new(0),
+            extension_open_fail_at,
+        };
+
+        let result = pcs.try_prove_from_state(
+            &mut proof,
+            &mut challenger,
+            state,
+            folding_randomness,
+            prover_data.merkle_data,
+        );
+        assert_eq!(result, Err(InjectedError(failure)));
+        assert_eq!(failure_hits.get(), 1, "failure must not trigger a retry");
+        if failure == FailurePoint::ExtensionOpen {
+            assert!(
+                proof.final_poly.is_some(),
+                "extension opening failure should be injected in the final round"
+            );
+        }
+    }
+
+    #[test]
+    fn fallible_state_errors_propagate_without_retry() {
+        run_injected_failure(FailurePoint::Commit);
+        run_injected_failure(FailurePoint::Eval);
+        run_injected_failure(FailurePoint::BaseOpen);
+        run_injected_failure(FailurePoint::ExtensionOpen);
+        run_injected_failure(FailurePoint::Sumcheck);
+        run_injected_failure(FailurePoint::FinalPoly);
+    }
+}
+
 mod keccak_tests {
     //! Same lifecycle test using Keccak-based Merkle trees over a different field.
 

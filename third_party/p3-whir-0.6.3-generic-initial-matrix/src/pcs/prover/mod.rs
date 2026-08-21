@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
+use core::convert::Infallible;
 use core::marker::PhantomData;
 use core::ops::Deref;
 
 use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
-use p3_commit::{ExtensionMmcs, Mmcs};
+use p3_commit::{BatchOpening, ExtensionMmcs, Mmcs};
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, Field, TwoAdicField};
 use p3_matrix::Matrix;
@@ -23,20 +24,165 @@ use crate::pcs::committer::writer::commit_extension;
 use crate::pcs::proof::{QueryOpening, SumcheckData, WhirProof};
 use crate::pcs::utils::get_challenge_stir_queries;
 
-/// Per-round prover state with the Merkle authentication shapes
-/// baked in for the WHIR commitment scheme.
+/// Fallible state required by WHIR after the layout-specific initial sumcheck.
 ///
-/// - The first round commits to evaluations laid out as a base-field
-///   row-major matrix.
-/// - Subsequent rounds commit to folded extension-field evaluations,
-///   reinterpreted as wider base-field rows so a single Merkle backend
-///   handles both shapes.
-type WhirRoundState<EF, F, MT, M> = RoundState<
-    EF,
-    F,
-    <MT as Mmcs<F>>::ProverData<M>,
-    <MT as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
->;
+/// Implementations may keep the residual product polynomial in external
+/// storage. Storage identities and errors are prover-local: this interface
+/// does not add anything to the Fiat-Shamir transcript or the public proof.
+/// An error may occur after the proof and challenger have been partially
+/// advanced; callers must discard both values for that proving attempt.
+/// The ordinary dense [`SumcheckProver`] implements this trait with
+/// [`Infallible`] as its error type.
+pub trait FallibleWhirProverState<EF, F, Dft, MT, Challenger>
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F> + TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+    MT: Mmcs<F>,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    /// Backend error surfaced without advancing through a fallback path.
+    type Error;
+    /// Extension-field matrix retained by the MMCS after a round commitment.
+    type ExtensionMatrix: Matrix<EF>;
+
+    /// Number of variables not yet folded from the residual polynomial.
+    fn num_variables(&self) -> usize;
+
+    /// Encode and commit the current evaluation polynomial.
+    #[allow(clippy::type_complexity)]
+    fn try_commit_extension(
+        &self,
+        order: VariableOrder,
+        dft: &Dft,
+        extension_mmcs: &ExtensionMmcs<F, EF, MT>,
+        folding: usize,
+        inv_rate: usize,
+    ) -> Result<
+        (
+            MT::Commitment,
+            MT::ProverData<FlatMatrixView<F, EF, Self::ExtensionMatrix>>,
+        ),
+        Self::Error,
+    >;
+
+    /// Evaluate the current multilinear polynomial at `point`.
+    fn try_eval(&self, point: &Point<EF>) -> Result<EF, Self::Error>;
+
+    /// Open an initial base-field commitment at `index`.
+    fn try_open_base<M: Matrix<F>>(
+        &self,
+        index: usize,
+        mmcs: &MT,
+        prover_data: &MT::ProverData<M>,
+    ) -> Result<BatchOpening<F, MT>, Self::Error>;
+
+    /// Open a folded extension-field commitment at `index`.
+    #[allow(clippy::type_complexity)]
+    fn try_open_extension(
+        &self,
+        index: usize,
+        extension_mmcs: &ExtensionMmcs<F, EF, MT>,
+        prover_data: &MT::ProverData<FlatMatrixView<F, EF, Self::ExtensionMatrix>>,
+    ) -> Result<BatchOpening<EF, ExtensionMmcs<F, EF, MT>>, Self::Error>;
+
+    /// Apply an optional constraint and execute the requested sumcheck folds.
+    fn try_compute_sumcheck_polynomials(
+        &mut self,
+        sumcheck_data: &mut SumcheckData<F, EF>,
+        challenger: &mut Challenger,
+        folding_factor: usize,
+        pow_bits: usize,
+        constraint: Option<Constraint<F, EF>>,
+    ) -> Result<Point<EF>, Self::Error>;
+
+    /// Materialize the final polynomial sent in the clear.
+    fn try_final_poly(&self) -> Result<Poly<EF>, Self::Error>;
+}
+
+impl<EF, F, Dft, MT, Challenger> FallibleWhirProverState<EF, F, Dft, MT, Challenger>
+    for SumcheckProver<F, EF>
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F> + TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+    MT: Mmcs<F>,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    type Error = Infallible;
+    type ExtensionMatrix = DenseMatrix<EF>;
+
+    fn num_variables(&self) -> usize {
+        self.num_variables()
+    }
+
+    fn try_commit_extension(
+        &self,
+        order: VariableOrder,
+        dft: &Dft,
+        extension_mmcs: &ExtensionMmcs<F, EF, MT>,
+        folding: usize,
+        inv_rate: usize,
+    ) -> Result<
+        (
+            MT::Commitment,
+            MT::ProverData<FlatMatrixView<F, EF, Self::ExtensionMatrix>>,
+        ),
+        Self::Error,
+    > {
+        Ok(commit_extension(
+            order,
+            dft,
+            extension_mmcs,
+            self.evals_view(),
+            folding,
+            inv_rate,
+        ))
+    }
+
+    fn try_eval(&self, point: &Point<EF>) -> Result<EF, Self::Error> {
+        Ok(self.eval(point))
+    }
+
+    fn try_open_base<M: Matrix<F>>(
+        &self,
+        index: usize,
+        mmcs: &MT,
+        prover_data: &MT::ProverData<M>,
+    ) -> Result<BatchOpening<F, MT>, Self::Error> {
+        Ok(mmcs.open_batch(index, prover_data))
+    }
+
+    fn try_open_extension(
+        &self,
+        index: usize,
+        extension_mmcs: &ExtensionMmcs<F, EF, MT>,
+        prover_data: &MT::ProverData<FlatMatrixView<F, EF, Self::ExtensionMatrix>>,
+    ) -> Result<BatchOpening<EF, ExtensionMmcs<F, EF, MT>>, Self::Error> {
+        Ok(extension_mmcs.open_batch(index, prover_data))
+    }
+
+    fn try_compute_sumcheck_polynomials(
+        &mut self,
+        sumcheck_data: &mut SumcheckData<F, EF>,
+        challenger: &mut Challenger,
+        folding_factor: usize,
+        pow_bits: usize,
+        constraint: Option<Constraint<F, EF>>,
+    ) -> Result<Point<EF>, Self::Error> {
+        Ok(self.compute_sumcheck_polynomials(
+            sumcheck_data,
+            challenger,
+            folding_factor,
+            pow_bits,
+            constraint,
+        ))
+    }
+
+    fn try_final_poly(&self) -> Result<Poly<EF>, Self::Error> {
+        Ok(self.evals())
+    }
+}
 
 /// Active Merkle prover data for the polynomial currently being queried.
 #[derive(Debug)]
@@ -52,18 +198,22 @@ enum RoundData<BaseData, ExtData> {
 /// Tracks the sumcheck prover, folding randomness, and Merkle
 /// commitments across base and extension field rounds.
 #[derive(Debug)]
-struct RoundState<EF, F, BaseData, ExtData>
-where
-    F: TwoAdicField,
-    EF: ExtensionField<F> + TwoAdicField,
-{
-    /// Sumcheck prover managing constraint batching and polynomial folding.
-    sumcheck_prover: SumcheckProver<F, EF>,
+struct RoundState<State, EF, BaseData, ExtData> {
+    /// Backend managing constraint batching and polynomial folding.
+    prover_state: State,
     /// Folding challenges (alpha_1, ..., alpha_k) for the current round.
     folding_randomness: Point<EF>,
     /// Active Merkle prover data for the polynomial currently being queried.
     round_data: RoundData<BaseData, ExtData>,
 }
+
+/// Per-round prover state with the base and extension MMCS shapes fixed.
+type WhirRoundState<State, EF, F, MT, M, ExtensionMatrix> = RoundState<
+    State,
+    EF,
+    <MT as Mmcs<F>>::ProverData<M>,
+    <MT as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, ExtensionMatrix>>,
+>;
 
 /// WHIR prover bundling the protocol config with its FFT and commitment backends.
 #[derive(Debug)]
@@ -187,45 +337,84 @@ where
         Dft: TwoAdicSubgroupDft<F>,
         Challenger: CanObserve<MT::Commitment>,
     {
+        match self.try_prove_from_state(
+            proof,
+            challenger,
+            sumcheck_prover,
+            folding_randomness,
+            prover_data,
+        ) {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    /// Continue proving from a caller-provided fallible residual state.
+    ///
+    /// This is the prover-only external-storage seam. It produces the same
+    /// proof and observes the same transcript elements as
+    /// [`Self::prove_from_sumcheck`]. Backend metadata is never observed by
+    /// the challenger. If a state operation fails, the error is returned
+    /// immediately and this method does not retry with another backend.
+    /// The proof and challenger may contain a valid transcript prefix on
+    /// error; callers must discard both and start a new proving attempt.
+    pub fn try_prove_from_state<M, State>(
+        &self,
+        proof: &mut WhirProof<F, EF, MT>,
+        challenger: &mut Challenger,
+        prover_state: State,
+        folding_randomness: Point<EF>,
+        prover_data: MT::ProverData<M>,
+    ) -> Result<(), State::Error>
+    where
+        M: Matrix<F>,
+        State: FallibleWhirProverState<EF, F, Dft, MT, Challenger>,
+        Challenger: CanObserve<MT::Commitment>,
+    {
         let initial_folding = self.round_folding_factor(0);
         assert_eq!(proof.initial_sumcheck.num_rounds(), initial_folding);
         assert_eq!(folding_randomness.num_variables(), initial_folding);
         assert_eq!(
-            sumcheck_prover.num_variables(),
+            prover_state.num_variables(),
             self.num_variables - initial_folding
         );
         let variable_order = L::variable_order();
 
         let mut round_state = RoundState {
-            sumcheck_prover,
+            prover_state,
             folding_randomness,
             round_data: RoundData::Base(prover_data),
         };
 
         // Run each WHIR folding round.
         for round in 0..=self.n_rounds() {
-            self.round(round, proof, challenger, &mut round_state, variable_order);
+            self.try_round(round, proof, challenger, &mut round_state, variable_order)?;
         }
+
+        Ok(())
     }
 
     #[instrument(skip_all, fields(round_number = round_index, log_size = self.num_variables - self.total_folded_through(round_index)))]
     #[allow(clippy::too_many_lines)]
-    fn round<M: Matrix<F>>(
+    fn try_round<M, State>(
         &self,
         round_index: usize,
         proof: &mut WhirProof<F, EF, MT>,
         challenger: &mut Challenger,
-        round_state: &mut WhirRoundState<EF, F, MT, M>,
+        round_state: &mut WhirRoundState<State, EF, F, MT, M, State::ExtensionMatrix>,
         variable_order: VariableOrder,
-    ) where
+    ) -> Result<(), State::Error>
+    where
+        M: Matrix<F>,
+        State: FallibleWhirProverState<EF, F, Dft, MT, Challenger>,
         Challenger: CanObserve<MT::Commitment>,
     {
         let num_variables = self.num_variables - self.total_folded_through(round_index);
-        assert_eq!(num_variables, round_state.sumcheck_prover.num_variables());
+        assert_eq!(num_variables, round_state.prover_state.num_variables());
 
         // Final round: send polynomial in the clear.
         if round_index == self.n_rounds() {
-            return self.final_round(round_index, proof, challenger, round_state);
+            return self.try_final_round(round_index, proof, challenger, round_state);
         }
 
         let round_params = &self.round_parameters[round_index];
@@ -233,14 +422,13 @@ where
         let inv_rate = self.inv_rate(round_index);
 
         // Commit straight from the live sumcheck buffer; no scalar copy is materialized.
-        let (root, prover_data) = commit_extension(
+        let (root, prover_data) = round_state.prover_state.try_commit_extension(
             variable_order,
             &self.dft,
             &self.extension_mmcs,
-            round_state.sumcheck_prover.evals_view(),
             folding_factor_next,
             inv_rate,
-        );
+        )?;
 
         // Observe the round commitment.
         challenger.observe(root.clone());
@@ -249,15 +437,15 @@ where
         // OOD sampling.
         let mut ood_statement = EqStatement::initialize(num_variables);
         let mut ood_answers = Vec::with_capacity(round_params.ood_samples);
-        (0..round_params.ood_samples).for_each(|_| {
+        for _ in 0..round_params.ood_samples {
             let point =
                 Point::expand_from_univariate(challenger.sample_algebra_element(), num_variables);
-            let eval = round_state.sumcheck_prover.eval(&point);
+            let eval = round_state.prover_state.try_eval(&point)?;
             challenger.observe_algebra_element(eval);
 
             ood_answers.push(eval);
             ood_statement.add_evaluated_constraint(point, eval);
-        });
+        }
         proof.rounds[round_index].ood_answers = ood_answers;
 
         // PoW grinding: prevents query manipulation by forcing work after committing.
@@ -286,7 +474,9 @@ where
         match &round_state.round_data {
             RoundData::Base(data) => {
                 for &challenge in &stir_challenges_indexes {
-                    let opening = self.mmcs.open_batch(challenge, data);
+                    let opening = round_state
+                        .prover_state
+                        .try_open_base(challenge, &self.mmcs, data)?;
                     // WHIR commits a single matrix per round, so take its one opened row.
                     let answer = opening
                         .opened_values
@@ -309,7 +499,11 @@ where
             }
             RoundData::Ext(data) => {
                 for &challenge in &stir_challenges_indexes {
-                    let opening = self.extension_mmcs.open_batch(challenge, data);
+                    let opening = round_state.prover_state.try_open_extension(
+                        challenge,
+                        &self.extension_mmcs,
+                        data,
+                    )?;
                     // WHIR commits a single matrix per round, so take its one opened row.
                     let answer = opening
                         .opened_values
@@ -342,31 +536,37 @@ where
 
         // Run sumcheck and fold the polynomial.
         let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
-        let folding_randomness = round_state.sumcheck_prover.compute_sumcheck_polynomials(
+        let folding_randomness = round_state.prover_state.try_compute_sumcheck_polynomials(
             &mut sumcheck_data,
             challenger,
             folding_factor_next,
             round_params.folding_pow_bits,
             Some(constraint),
-        );
+        )?;
         proof.set_sumcheck_data_at(sumcheck_data, round_index);
 
         // Update round state for next iteration.
         round_state.folding_randomness = folding_randomness;
         round_state.round_data = RoundData::Ext(prover_data);
+
+        Ok(())
     }
 
     #[instrument(skip_all)]
-    fn final_round<M: Matrix<F>>(
+    fn try_final_round<M, State>(
         &self,
         round_index: usize,
         proof: &mut WhirProof<F, EF, MT>,
         challenger: &mut Challenger,
-        round_state: &mut WhirRoundState<EF, F, MT, M>,
-    ) {
+        round_state: &mut WhirRoundState<State, EF, F, MT, M, State::ExtensionMatrix>,
+    ) -> Result<(), State::Error>
+    where
+        M: Matrix<F>,
+        State: FallibleWhirProverState<EF, F, Dft, MT, Challenger>,
+    {
         // Send final polynomial coefficients in the clear.
         // Unpack once; the transcript and the proof share the same copy.
-        let final_poly = round_state.sumcheck_prover.evals();
+        let final_poly = round_state.prover_state.try_final_poly()?;
         challenger.observe_algebra_slice(final_poly.as_slice());
         proof.final_poly = Some(final_poly);
 
@@ -387,7 +587,9 @@ where
         match &round_state.round_data {
             RoundData::Base(data) => {
                 for challenge in final_challenge_indexes {
-                    let commitment = self.mmcs.open_batch(challenge, data);
+                    let commitment = round_state
+                        .prover_state
+                        .try_open_base(challenge, &self.mmcs, data)?;
 
                     proof.final_queries.push(QueryOpening::Base {
                         values: commitment.opened_values[0].clone(),
@@ -398,7 +600,11 @@ where
 
             RoundData::Ext(data) => {
                 for challenge in final_challenge_indexes {
-                    let commitment = self.extension_mmcs.open_batch(challenge, data);
+                    let commitment = round_state.prover_state.try_open_extension(
+                        challenge,
+                        &self.extension_mmcs,
+                        data,
+                    )?;
                     proof.final_queries.push(QueryOpening::Extension {
                         values: commitment.opened_values[0].clone(),
                         proof: commitment.opening_proof,
@@ -410,14 +616,16 @@ where
         // Optional final sumcheck.
         if self.final_sumcheck_rounds > 0 {
             let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
-            round_state.sumcheck_prover.compute_sumcheck_polynomials(
+            round_state.prover_state.try_compute_sumcheck_polynomials(
                 &mut sumcheck_data,
                 challenger,
                 self.final_sumcheck_rounds,
                 self.final_folding_pow_bits,
                 None,
-            );
+            )?;
             proof.set_final_sumcheck_data(sumcheck_data);
         }
+
+        Ok(())
     }
 }

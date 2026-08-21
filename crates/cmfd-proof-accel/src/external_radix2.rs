@@ -189,6 +189,58 @@ pub(crate) fn dft_goldilocks_rows_in_place(
     Ok(())
 }
 
+/// Transform one natural-order, row-major Goldilocks matrix in place.
+///
+/// The complete rows are first permuted into bit-reversed order, then the same
+/// radix-2 butterfly core used by the file-backed transform produces natural
+/// row-order evaluations. Validation completes before any input value changes.
+pub(crate) fn dft_goldilocks_natural_rows_in_place(
+    values: &mut [u64],
+    height: usize,
+    width: usize,
+) -> Result<(), ExternalRadix2Error> {
+    if width == 0 {
+        return Err(ExternalRadix2Error::Invalid(
+            "DFT row width must be nonzero",
+        ));
+    }
+    if height < 2 || !height.is_power_of_two() {
+        return Err(ExternalRadix2Error::Invalid(
+            "DFT height must be a power of two of at least two",
+        ));
+    }
+    if height.ilog2() as usize > Goldilocks::TWO_ADICITY {
+        return Err(ExternalRadix2Error::Invalid(
+            "DFT height exceeds Goldilocks two-adicity",
+        ));
+    }
+    let expected_values = height
+        .checked_mul(width)
+        .ok_or(ExternalRadix2Error::Invalid("DFT matrix size overflow"))?;
+    if values.len() != expected_values {
+        return Err(ExternalRadix2Error::Invalid(
+            "DFT input length does not match height and width",
+        ));
+    }
+    if values.iter().any(|value| *value >= GOLDILOCKS_MODULUS) {
+        return Err(ExternalRadix2Error::Invalid(
+            "DFT input contains a noncanonical Goldilocks value",
+        ));
+    }
+
+    let bits = height.ilog2();
+    for natural_row in 0..height {
+        let reversed_row = natural_row.reverse_bits() >> (usize::BITS - bits);
+        if natural_row < reversed_row {
+            for column in 0..width {
+                values.swap(natural_row * width + column, reversed_row * width + column);
+            }
+        }
+    }
+    dft_local_block_in_place(values, height, width);
+    Ok(())
+}
+
 fn fused_block_rows(height: usize, buffer_rows: usize) -> usize {
     let available_rows = height.min(buffer_rows);
     1_usize << available_rows.ilog2()
@@ -454,6 +506,52 @@ mod tests {
                 drop(file);
                 std::fs::remove_file(path).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn natural_rows_match_small_batch_across_heights_and_widths() {
+        for (height, width) in [(2, 1), (4, 4), (8, 3), (16, 12), (64, 5), (128, 4)] {
+            let mut actual = input(height, width);
+            let expected = Radix2DFTSmallBatch::new(height)
+                .dft_batch(RowMajorMatrix::new(
+                    actual.iter().copied().map(Goldilocks::new).collect(),
+                    width,
+                ))
+                .values
+                .into_iter()
+                .map(|value| value.as_canonical_u64())
+                .collect::<Vec<_>>();
+
+            dft_goldilocks_natural_rows_in_place(&mut actual, height, width).unwrap();
+            assert_eq!(actual, expected, "height={height}, width={width}");
+        }
+    }
+
+    #[test]
+    fn natural_rows_reject_invalid_inputs_without_mutation() {
+        fn assert_rejected(mut values: Vec<u64>, height: usize, width: usize) {
+            let original = values.clone();
+            assert!(matches!(
+                dft_goldilocks_natural_rows_in_place(&mut values, height, width),
+                Err(ExternalRadix2Error::Invalid(_))
+            ));
+            assert_eq!(values, original);
+        }
+
+        assert_rejected(vec![1, 2], 2, 0);
+        assert_rejected(vec![], 0, 1);
+        assert_rejected(vec![1], 1, 1);
+        assert_rejected(vec![1, 2, 3], 3, 1);
+        assert_rejected(vec![1; 7], 4, 2);
+        assert_rejected(vec![1; 9], 4, 2);
+        assert_rejected(vec![1, GOLDILOCKS_MODULUS], 2, 1);
+        assert_rejected(vec![1, 2], 2, usize::MAX);
+
+        if let Some(over_two_adic_height) =
+            1_usize.checked_shl((Goldilocks::TWO_ADICITY + 1) as u32)
+        {
+            assert_rejected(vec![], over_two_adic_height, 1);
         }
     }
 

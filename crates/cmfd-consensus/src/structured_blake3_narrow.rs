@@ -2784,7 +2784,19 @@ mod tests {
         PINNED_PREPROCESSED_REGISTRY_VERSION,
     };
     use p3_air::AirLayout;
+    use p3_batch_stark::{
+        BatchProof, CommonData, ProverData, StarkInstance,
+        common::{GlobalPreprocessed, PreprocessedInstanceMeta},
+        prove_batch,
+        symbolic::{
+            get_constraint_layout as get_batch_constraint_layout,
+            get_log_num_quotient_chunks as get_batch_log_num_quotient_chunks,
+            get_max_constraint_degree as get_batch_max_constraint_degree,
+        },
+        verify_batch,
+    };
     use p3_commit::PeriodicEvaluator;
+    use p3_lookup::{LogUpGadget, Lookups};
     use p3_matrix::Matrix;
     use p3_uni_stark::{ProvenSecurity, StarkSecurityParams};
 
@@ -2878,6 +2890,127 @@ mod tests {
         PREPROCESSED_TRACE_FORBIDDEN.with(|forbidden| assert!(!forbidden.replace(true)));
         let _guard = PreprocessedTraceForbidGuard;
         operation()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BatchPrototypeError {
+        DegreeBits,
+        PinnedKey,
+        UnexpectedLookups,
+        Statement,
+        Verification,
+        BackendPanic,
+    }
+
+    fn pinned_batch_common_data(
+        air: &NarrowBlake3Air,
+        degree_bits: &[usize],
+    ) -> Result<CommonData<Config>, BatchPrototypeError> {
+        let expected_degree_bits = air.trace_rows.ilog2() as usize;
+        if degree_bits != [expected_degree_bits] {
+            return Err(BatchPrototypeError::DegreeBits);
+        }
+
+        let pinned =
+            pinned_preprocessed_verifier_key(air).map_err(|_| BatchPrototypeError::PinnedKey)?;
+        if pinned.width != air.preprocessed_width()
+            || pinned.degree_bits != expected_degree_bits
+            || pinned.width != PINNED_PREPROCESSED_WIDTH
+        {
+            return Err(BatchPrototypeError::PinnedKey);
+        }
+
+        // Derive the lookup metadata from the trusted AIR so a future lookup
+        // addition cannot silently be verified with an empty reduction. This
+        // is symbolic evaluation only and never materializes the fixed trace.
+        let lookups = Lookups::<F>::from_air::<EF, _>(air);
+        if !lookups.is_empty() {
+            return Err(BatchPrototypeError::UnexpectedLookups);
+        }
+
+        Ok(CommonData::new(
+            Some(GlobalPreprocessed {
+                commitment: pinned.commitment,
+                instances: vec![Some(PreprocessedInstanceMeta {
+                    matrix_index: 0,
+                    width: pinned.width,
+                    degree_bits: pinned.degree_bits,
+                })],
+                matrix_to_instance: vec![0],
+            }),
+            vec![lookups],
+        ))
+    }
+
+    fn narrow_batch_inputs(
+        statement: &StructuredBlake3Statement,
+        activation: &[u8],
+    ) -> (NarrowBlake3Air, RowMajorMatrix<F>, Vec<F>) {
+        let air = NarrowBlake3Air::new(statement).unwrap();
+        validate_opening(statement, activation).unwrap();
+        let witness =
+            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, activation).unwrap();
+        assert_eq!(witness.digest, statement.final_activation_digest);
+        let trace = generate_main_trace(&air, statement, &witness);
+        let public = public_values(statement).unwrap();
+        (air, trace, public)
+    }
+
+    fn prove_narrow_blake3_batch_in_memory(
+        statement: &StructuredBlake3Statement,
+        activation: &[u8],
+    ) -> BatchProof<Config> {
+        let (air, trace, public) = narrow_batch_inputs(statement, activation);
+        let config = build_config();
+        let instances = [StarkInstance {
+            air: &air,
+            trace: &trace,
+            public_values: public,
+        }];
+        let prover_data = ProverData::from_instances(&config, &instances);
+
+        let generated = prover_data
+            .common
+            .preprocessed
+            .as_ref()
+            .expect("real narrow AIR has a preprocessed commitment");
+        let generated_meta = generated.instances[0]
+            .as_ref()
+            .expect("real narrow AIR has preprocessed metadata");
+        let pinned = pinned_preprocessed_verifier_key(&air).unwrap();
+        assert_eq!(generated.commitment, pinned.commitment);
+        assert_eq!(generated.instances.len(), 1);
+        assert_eq!(generated.matrix_to_instance, vec![0]);
+        assert_eq!(generated_meta.matrix_index, 0);
+        assert_eq!(generated_meta.width, pinned.width);
+        assert_eq!(generated_meta.degree_bits, pinned.degree_bits);
+        assert!(prover_data.prover_only.preprocessed_prover_data.is_some());
+        assert!(prover_data.common.lookups[0].is_empty());
+
+        prove_batch(&config, &instances, &prover_data)
+    }
+
+    fn verify_narrow_blake3_batch_in_memory(
+        statement: &StructuredBlake3Statement,
+        proof: &BatchProof<Config>,
+    ) -> Result<(), BatchPrototypeError> {
+        let air = NarrowBlake3Air::new(statement).map_err(|_| BatchPrototypeError::Statement)?;
+        let public = public_values(statement).map_err(|_| BatchPrototypeError::Statement)?;
+
+        with_preprocessed_trace_forbidden(|| {
+            let common = pinned_batch_common_data(&air, &proof.degree_bits)?;
+            catch_unwind(AssertUnwindSafe(|| {
+                verify_batch(
+                    &build_config(),
+                    std::slice::from_ref(&air),
+                    proof,
+                    &[public],
+                    &common,
+                )
+            }))
+            .map_err(|_| BatchPrototypeError::BackendPanic)?
+            .map_err(|_| BatchPrototypeError::Verification)
+        })
     }
 
     fn legacy_activation_high_weight(
@@ -3378,6 +3511,260 @@ mod tests {
         assert_eq!(stopped, Err("stop"));
         assert_eq!(emitted, 17);
         assert!(air.trace_rows > emitted);
+    }
+
+    #[test]
+    fn real_narrow_air_round_trips_through_the_pinned_batch_envelope() {
+        let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let mut proof = prove_narrow_blake3_batch_in_memory(&statement, &activation);
+
+        assert_eq!(MAIN_WIDTH, 291);
+        assert_eq!(PREP_WIDTH, 84);
+        assert_eq!(ACTIVATION_HIGH_WEIGHT_WIDTH, 3);
+        assert_eq!(proof.degree_bits, vec![8]);
+        assert_eq!(proof.opened_values.instances.len(), 1);
+        assert_eq!(proof.lookup_terminals.len(), 1);
+        assert!(proof.lookup_terminals[0].is_none());
+        assert!(proof.commitments.permutation.is_none());
+        assert!(proof.commitments.random.is_none());
+
+        let opened = &proof.opened_values.instances[0];
+        assert!(opened.permutation_local.is_empty());
+        assert!(opened.permutation_next.is_empty());
+        assert_eq!(opened.base_opened_values.trace_local.len(), MAIN_WIDTH);
+        assert_eq!(
+            opened.base_opened_values.trace_next.as_ref().map(Vec::len),
+            Some(MAIN_WIDTH)
+        );
+        assert_eq!(
+            opened
+                .base_opened_values
+                .preprocessed_local
+                .as_ref()
+                .map(Vec::len),
+            Some(PREP_WIDTH)
+        );
+        assert!(opened.base_opened_values.preprocessed_next.is_none());
+        assert!(opened.base_opened_values.random.is_none());
+        assert_eq!(opened.base_opened_values.quotient_chunks.len(), 16);
+        assert!(
+            opened
+                .base_opened_values
+                .quotient_chunks
+                .iter()
+                .all(|chunk| chunk.len() == 3)
+        );
+
+        verify_narrow_blake3_batch_in_memory(&statement, &proof).unwrap();
+
+        let mut wrong_digest = statement.clone();
+        wrong_digest.final_activation_digest[0] ^= 1;
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&wrong_digest, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+
+        let mut wrong_challenge = statement.clone();
+        wrong_challenge.challenge_digest[0] ^= 1;
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&wrong_challenge, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+
+        let mut wrong_point = statement.clone();
+        wrong_point.final_activation_point[0].limbs[0] += 1;
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&wrong_point, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+
+        let mut wrong_evaluation = statement.clone();
+        wrong_evaluation.final_activation_evaluation.limbs[0] += 1;
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&wrong_evaluation, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+
+        // Thirty-two and sixty-four activation bytes both use a 256-row trace,
+        // so degree checks alone cannot prevent cross-shape replay. The trusted
+        // registry selects different preprocessed commitments for the two AIRs.
+        let smaller_activation = (0..32).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let smaller_statement = self::statement(&smaller_activation);
+        let original_air = NarrowBlake3Air::new(&statement).unwrap();
+        let smaller_air = NarrowBlake3Air::new(&smaller_statement).unwrap();
+        assert_eq!(original_air.trace_rows, smaller_air.trace_rows);
+        assert_ne!(
+            pinned_preprocessed_verifier_key(&original_air)
+                .unwrap()
+                .commitment,
+            pinned_preprocessed_verifier_key(&smaller_air)
+                .unwrap()
+                .commitment
+        );
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&smaller_statement, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+
+        let missing_instance = proof.opened_values.instances.pop().unwrap();
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+        proof.opened_values.instances.push(missing_instance);
+
+        let missing_terminal = proof.lookup_terminals.pop().unwrap();
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+        proof.lookup_terminals.push(missing_terminal);
+
+        let missing_preprocessed_value = proof.opened_values.instances[0]
+            .base_opened_values
+            .preprocessed_local
+            .as_mut()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+        proof.opened_values.instances[0]
+            .base_opened_values
+            .preprocessed_local
+            .as_mut()
+            .unwrap()
+            .push(missing_preprocessed_value);
+
+        let missing_trace_value = proof.opened_values.instances[0]
+            .base_opened_values
+            .trace_local
+            .pop()
+            .unwrap();
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+        proof.opened_values.instances[0]
+            .base_opened_values
+            .trace_local
+            .push(missing_trace_value);
+
+        let missing_quotient_chunk = proof.opened_values.instances[0]
+            .base_opened_values
+            .quotient_chunks
+            .pop()
+            .unwrap();
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+        proof.opened_values.instances[0]
+            .base_opened_values
+            .quotient_chunks
+            .push(missing_quotient_chunk);
+
+        proof.commitments.permutation = Some(proof.commitments.main.clone());
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::Verification)
+        );
+        proof.commitments.permutation = None;
+
+        proof.degree_bits[0] = usize::BITS as usize;
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::DegreeBits)
+        );
+        proof.degree_bits = vec![8, 8];
+        assert_eq!(
+            verify_narrow_blake3_batch_in_memory(&statement, &proof),
+            Err(BatchPrototypeError::DegreeBits)
+        );
+    }
+
+    #[test]
+    fn real_narrow_batch_layout_is_pinned() {
+        let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let air = NarrowBlake3Air::new(&statement).unwrap();
+        let lookups = Lookups::<F>::from_air::<EF, _>(&air);
+        let gadget = LogUpGadget::new();
+        let layout = AirLayout::from_air::<F>(&air);
+        let constraints =
+            get_batch_constraint_layout::<F, EF, _, _>(&air, layout, &lookups, &gadget);
+        let max_degree =
+            get_batch_max_constraint_degree::<F, EF, _, _>(&air, layout, &lookups, &gadget);
+        let log_quotient_chunks =
+            get_batch_log_num_quotient_chunks::<F, EF, _, _>(&air, layout, &lookups, 0, &gadget);
+
+        assert_eq!(air.trace_rows, 256);
+        assert_eq!(air.width(), 291);
+        assert_eq!(air.preprocessed_width(), 84);
+        assert_eq!(air.num_periodic_columns(), 3);
+        assert_eq!(air.num_public_values(), 93);
+        assert!(lookups.is_empty());
+        assert_eq!(constraints.base_indices.len(), 1_305);
+        assert!(constraints.ext_indices.is_empty());
+        assert_eq!(constraints.total_constraints(), 1_305);
+        assert_eq!(max_degree, 16);
+        assert_eq!(log_quotient_chunks, 4);
+        assert_eq!(1 << log_quotient_chunks, 16);
+
+        let perm = default_poseidon2();
+        let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm), 0);
+        let fri = fri_parameters_with(FRI_LOG_BLOWUP, FRI_QUERIES, ChallengeMmcs::new(val));
+        let security_params = StarkSecurityParams::new(
+            &fri,
+            192,
+            128,
+            constraints.total_constraints(),
+            max_degree,
+            2,
+        );
+        let security = ProvenSecurity::compute(&security_params, air.trace_rows);
+        assert!(security.security_bits() >= 128, "{security:?}");
+        let minimum_queries = (1..=FRI_QUERIES)
+            .find(|queries| {
+                let mut candidate = security_params.clone();
+                candidate.fri_num_queries = *queries;
+                ProvenSecurity::compute(&candidate, air.trace_rows).security_bits() >= 128
+            })
+            .expect("real batch envelope must reach 128 proven bits");
+        assert_eq!(FRI_QUERIES, minimum_queries + 1);
+    }
+
+    #[test]
+    fn batch_common_data_accepts_every_pinned_preprocessed_shape_without_materializing() {
+        for key in PINNED_PREPROCESSED_KEYS {
+            let air = preprocessed_air(key.activation_len);
+            let degree_bits = air.trace_rows.ilog2() as usize;
+            assert_eq!(air.trace_rows, key.trace_rows);
+
+            let common = with_preprocessed_trace_forbidden(|| {
+                pinned_batch_common_data(&air, &[degree_bits])
+            })
+            .unwrap();
+            let global = common.preprocessed.unwrap();
+            let meta = global.instances[0].as_ref().unwrap();
+            let pinned = pinned_preprocessed_verifier_key(&air).unwrap();
+            assert_eq!(global.commitment, pinned.commitment);
+            assert_eq!(global.instances.len(), 1);
+            assert_eq!(global.matrix_to_instance, vec![0]);
+            assert_eq!(meta.matrix_index, 0);
+            assert_eq!(meta.width, PINNED_PREPROCESSED_WIDTH);
+            assert_eq!(meta.degree_bits, degree_bits);
+            assert_eq!(common.lookups.len(), 1);
+            assert!(common.lookups[0].is_empty());
+
+            assert!(matches!(
+                pinned_batch_common_data(&air, &[degree_bits + 1]),
+                Err(BatchPrototypeError::DegreeBits)
+            ));
+        }
     }
 
     #[test]

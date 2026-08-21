@@ -666,6 +666,24 @@ allocation. The reference extension-codeword encoder also remains capped at
 aggregation/compression design, a byte-identical blocked or GPU extension
 transform, and complete production execution and benchmarks.
 
+The ordered execution trace now has an exact 439-column batching model: 109
+initialization transition columns and three banks of 110 transition columns.
+Padding those columns to 512 slots adds nine selector variables over a shared
+26-variable local domain. Executable geometry rejects both direct transports.
+Thirteen independent section proofs have a 3,365,110-byte dictionary-free
+floor. Even selector-first folding would spend 1,085,208 bytes on first-round
+semantic field values alone (1,265,664 bytes with canonical slot padding),
+before roots, authentication paths, headers, or sumcheck messages. Keeping the
+ordinary two-variable local fold raises those figures to 4,340,832 and
+5,062,656 bytes. A bounded
+four-column reference test commits the stacked polynomial, folds its selector
+variables, continues the residual into one WHIR proof, and verifies it on the
+CPU; substituted evaluations, reordered or missing columns, and transcript
+replay are rejected. The production row-fold primitive separately enforces all
+439 semantic slots, 73 zero slots, and the smaller initialization domain. This
+establishes the algebraic handoff, not the missing succinct vector-commitment
+opening needed to fit the complete production proof below 256 KiB.
+
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
 proof is bounded at 87,556 bytes, and the remaining aggregate components are

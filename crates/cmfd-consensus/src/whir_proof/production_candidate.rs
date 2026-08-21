@@ -9,11 +9,13 @@
 //! therefore fails closed before activation.
 
 use blake3::Hasher as Blake3Hasher;
+use p3_field::PrimeCharacteristicRing;
 use thiserror::Error;
 
 use super::{
     Challenger, EF, EXPLICIT_WHIR_FOLDING, EXPLICIT_WHIR_POW_BITS, EXPLICIT_WHIR_SECURITY_BITS,
-    EXPLICIT_WHIR_STARTING_LOG_INV_RATE, F, build_whir_config_bounded,
+    EXPLICIT_WHIR_STARTING_LOG_INV_RATE, F, build_whir_config_bounded, convert_extension,
+    external_extension,
     native_codec::{self, NativeProofCodecError, NativeProofCodecProfile, NativeProofGeometry},
     structured_whir_suite_parameter_digest,
 };
@@ -42,6 +44,12 @@ pub const PRODUCTION_TRACE_SECTION_COUNT: usize =
     1 + PRODUCTION_V2_BANKS as usize * PRODUCTION_TRACE_SECTIONS_PER_BANK;
 pub const PRODUCTION_TRACE_SEMANTIC_COLUMNS: usize = PRODUCTION_TRACE_INITIALIZATION_COLUMNS
     + PRODUCTION_V2_BANKS as usize * PRODUCTION_TRACE_BANK_COLUMNS;
+pub const PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES: usize = PRODUCTION_TRACE_BANK_VARIABLES;
+pub const PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES: usize = 9;
+pub const PRODUCTION_TRACE_BATCH_PADDED_COLUMNS: usize =
+    1 << PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES;
+pub const PRODUCTION_TRACE_BATCH_PADDING_COLUMNS: usize =
+    PRODUCTION_TRACE_BATCH_PADDED_COLUMNS - PRODUCTION_TRACE_SEMANTIC_COLUMNS;
 pub const PRODUCTION_TRACE_TERMINAL_SECTION: usize =
     1 + (PRODUCTION_V2_BANKS as usize - 1) * PRODUCTION_TRACE_SECTIONS_PER_BANK;
 pub const PRODUCTION_TRACE_TERMINAL_COLUMN: usize = crate::STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
@@ -152,6 +160,49 @@ pub struct ProductionWhirWireShapeV1 {
     pub conservative_payload_fit: bool,
 }
 
+/// Exact byte floors for the two straightforward production-trace PCS layouts.
+///
+/// Neither layout is an activation candidate. Independent section proofs pay
+/// thirteen complete WHIR transports. A single 512-slot selector polynomial
+/// stays algebraically sound, but selector-first opening exposes every slot;
+/// the ordinary local-first schedule exposes four values per slot. This budget
+/// pins both failures before a prover allocates production-sized buffers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionTraceBatchWireBudgetV1 {
+    pub selector_variables: usize,
+    pub semantic_columns: usize,
+    pub padded_columns: usize,
+    pub canonical_zero_columns: usize,
+    pub local_variables: usize,
+    pub stacked_variables: usize,
+    pub first_round_queries: usize,
+    pub local_fold_width: usize,
+    pub selector_first_semantic_values_per_query: usize,
+    pub selector_first_padded_values_per_query: usize,
+    pub selector_first_semantic_value_bytes: usize,
+    pub selector_first_padded_value_bytes: usize,
+    pub local_first_semantic_values_per_query: usize,
+    pub local_first_padded_values_per_query: usize,
+    pub local_first_semantic_value_bytes: usize,
+    pub local_first_padded_value_bytes: usize,
+    pub independent_section_floor_bytes: usize,
+    pub available_native_bytes: usize,
+}
+
+impl ProductionTraceBatchWireBudgetV1 {
+    /// A direct wide-row opening fails even if canonical padding is omitted
+    /// and all Merkle paths, roots, headers, and sumcheck messages are free.
+    pub const fn direct_wide_row_cannot_fit(&self) -> bool {
+        self.selector_first_semantic_value_bytes > self.available_native_bytes
+    }
+
+    /// Thirteen ordinary child proofs fail before their Merkle dictionaries
+    /// or aggregate framing are added.
+    pub const fn independent_sections_cannot_fit(&self) -> bool {
+        self.independent_section_floor_bytes > self.available_native_bytes
+    }
+}
+
 /// Trusted identity for one batched commitment to the ordered base-input and
 /// three weight-bank polynomials.
 ///
@@ -237,6 +288,133 @@ pub const fn production_trace_sections_v1()
         index += 1;
     }
     sections
+}
+
+pub fn production_trace_batch_wire_budget_v1()
+-> Result<ProductionTraceBatchWireBudgetV1, ProductionWhirCandidateError> {
+    let mut independent_section_floor_bytes = 0_usize;
+    for section in production_trace_sections_v1() {
+        let variables = section.stacked_variables as usize;
+        let config = build_whir_config_bounded(variables, PRODUCTION_WHIR_WEIGHT_VARIABLES)
+            .map_err(|_| ProductionWhirCandidateError::Configuration)?;
+        let geometry =
+            native_codec::proof_geometry_with_profile(&config, candidate_codec_profile(usize::MAX))
+                .map_err(|_| ProductionWhirCandidateError::Configuration)?;
+        independent_section_floor_bytes = independent_section_floor_bytes
+            .checked_add(geometry.structural_floor_bytes)
+            .ok_or(ProductionWhirCandidateError::Configuration)?;
+    }
+
+    let local_config = build_whir_config_bounded(
+        PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES,
+        PRODUCTION_WHIR_WEIGHT_VARIABLES,
+    )
+    .map_err(|_| ProductionWhirCandidateError::Configuration)?;
+    let first_round_queries = local_config
+        .round_parameters
+        .first()
+        .ok_or(ProductionWhirCandidateError::Configuration)?
+        .num_queries;
+    let local_fold_width = 1_usize
+        .checked_shl(EXPLICIT_WHIR_FOLDING as u32)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let selector_first_semantic_values_per_query = PRODUCTION_TRACE_SEMANTIC_COLUMNS;
+    let selector_first_padded_values_per_query = PRODUCTION_TRACE_BATCH_PADDED_COLUMNS;
+    let selector_first_semantic_value_bytes = selector_first_semantic_values_per_query
+        .checked_mul(first_round_queries)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let selector_first_padded_value_bytes = selector_first_padded_values_per_query
+        .checked_mul(first_round_queries)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let local_first_semantic_values_per_query = PRODUCTION_TRACE_SEMANTIC_COLUMNS
+        .checked_mul(local_fold_width)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let local_first_padded_values_per_query = PRODUCTION_TRACE_BATCH_PADDED_COLUMNS
+        .checked_mul(local_fold_width)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let local_first_semantic_value_bytes = local_first_semantic_values_per_query
+        .checked_mul(first_round_queries)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let local_first_padded_value_bytes = local_first_padded_values_per_query
+        .checked_mul(first_round_queries)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+
+    Ok(ProductionTraceBatchWireBudgetV1 {
+        selector_variables: PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES,
+        semantic_columns: PRODUCTION_TRACE_SEMANTIC_COLUMNS,
+        padded_columns: PRODUCTION_TRACE_BATCH_PADDED_COLUMNS,
+        canonical_zero_columns: PRODUCTION_TRACE_BATCH_PADDING_COLUMNS,
+        local_variables: PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES,
+        stacked_variables: PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES
+            + PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES,
+        first_round_queries,
+        local_fold_width,
+        selector_first_semantic_values_per_query,
+        selector_first_padded_values_per_query,
+        selector_first_semantic_value_bytes,
+        selector_first_padded_value_bytes,
+        local_first_semantic_values_per_query,
+        local_first_padded_values_per_query,
+        local_first_semantic_value_bytes,
+        local_first_padded_value_bytes,
+        independent_section_floor_bytes,
+        available_native_bytes: PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES,
+    })
+}
+
+/// Fold one unified production-trace row at a selector point.
+///
+/// Semantic columns occupy slots `0..439`; slots `439..512` are canonical
+/// zeroes. Initialization columns are also zero above their `2^19` local
+/// domain. The prefix-order fold is the exact multilinear evaluation of that
+/// 512-slot row and is shared by the future prover and verifier bridge.
+pub fn production_trace_fold_row_v1(
+    local_row: u64,
+    semantic_values: &[crate::ExtensionElement],
+    selector_point: &[crate::ExtensionElement],
+) -> Result<crate::ExtensionElement, ProductionWhirCandidateError> {
+    if local_row >= (1_u64 << PRODUCTION_TRACE_BATCH_LOCAL_VARIABLES)
+        || semantic_values.len() != PRODUCTION_TRACE_SEMANTIC_COLUMNS
+    {
+        return Err(ProductionWhirCandidateError::InvalidTraceRow);
+    }
+    if selector_point.len() != PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES {
+        return Err(ProductionWhirCandidateError::InvalidOpeningPoint);
+    }
+    if local_row >= (1_u64 << PRODUCTION_TRACE_INITIALIZATION_VARIABLES)
+        && semantic_values[..PRODUCTION_TRACE_INITIALIZATION_COLUMNS]
+            .iter()
+            .any(|value| value.limbs != [0; 3])
+    {
+        return Err(ProductionWhirCandidateError::InvalidTraceRow);
+    }
+
+    let mut active = semantic_values
+        .iter()
+        .copied()
+        .map(|value| {
+            convert_extension(value).map_err(|_| ProductionWhirCandidateError::InvalidEncoding)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    active.resize(PRODUCTION_TRACE_BATCH_PADDED_COLUMNS, EF::ZERO);
+    for challenge in selector_point.iter().copied() {
+        let challenge = convert_extension(challenge)
+            .map_err(|_| ProductionWhirCandidateError::InvalidEncoding)?;
+        let half = active.len() / 2;
+        {
+            let (zero, one) = active.split_at_mut(half);
+            for (zero, &one) in zero.iter_mut().zip(one.iter()) {
+                *zero += (one - *zero) * challenge;
+            }
+        }
+        active.truncate(half);
+    }
+    debug_assert_eq!(active.len(), 1);
+    Ok(external_extension(active[0]))
 }
 
 pub fn production_trace_initialization_column_v1(
@@ -697,6 +875,8 @@ pub enum ProductionWhirCandidateError {
     UncommittedTrace,
     #[error("production trace bank, oracle, section, or column is outside the canonical layout")]
     InvalidTraceColumn,
+    #[error("production trace row or its canonical zero padding is invalid")]
+    InvalidTraceRow,
     #[error("production component commitments do not match the canonical trace section aliases")]
     TraceCommitmentMismatch,
     #[error("verified production trace belongs to a different model or block challenge")]
@@ -1519,8 +1699,18 @@ fn validate_prepared_production_whir_binding_v1(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Dft, WhirMmcs, build_pcs, empty_proof_for};
     use super::*;
     use crate::ExtensionElement;
+    use p3_challenger::{CanObserve, FieldChallenger};
+    use p3_multilinear_util::{point::Point, poly::Poly};
+    use p3_sumcheck::commit::commit_base;
+    use p3_sumcheck::constraints::{Constraint, statement::EqStatement};
+    use p3_sumcheck::layout::PrefixProver;
+    use p3_sumcheck::product_polynomial::ProductPolynomial;
+    use p3_sumcheck::strategy::{SumcheckProver, VariableOrder};
+    use p3_whir::pcs::prover::WhirProver;
+    use p3_whir::pcs::verifier::WhirVerifier;
 
     fn production_model() -> ModelPcsIdentity {
         ModelPcsIdentity {
@@ -2000,6 +2190,254 @@ mod tests {
                 production_trace_bank_column_v1(2, 11).unwrap(),
             )
         );
+    }
+
+    #[test]
+    fn production_trace_batch_budget_rejects_both_direct_layouts() {
+        let budget = production_trace_batch_wire_budget_v1().unwrap();
+        assert_eq!(budget.selector_variables, 9);
+        assert_eq!(budget.semantic_columns, 439);
+        assert_eq!(budget.padded_columns, 512);
+        assert_eq!(budget.canonical_zero_columns, 73);
+        assert_eq!(budget.local_variables, 26);
+        assert_eq!(budget.stacked_variables, 35);
+        assert_eq!(budget.first_round_queries, 309);
+        assert_eq!(budget.local_fold_width, 4);
+        assert_eq!(budget.selector_first_semantic_values_per_query, 439);
+        assert_eq!(budget.selector_first_padded_values_per_query, 512);
+        assert_eq!(budget.selector_first_semantic_value_bytes, 1_085_208);
+        assert_eq!(budget.selector_first_padded_value_bytes, 1_265_664);
+        assert_eq!(budget.local_first_semantic_values_per_query, 1_756);
+        assert_eq!(budget.local_first_padded_values_per_query, 2_048);
+        assert_eq!(budget.local_first_semantic_value_bytes, 4_340_832);
+        assert_eq!(budget.local_first_padded_value_bytes, 5_062_656);
+        assert_eq!(budget.independent_section_floor_bytes, 3_365_110);
+        assert_eq!(budget.available_native_bytes, 262_128);
+        assert!(budget.direct_wide_row_cannot_fit());
+        assert!(budget.independent_sections_cannot_fit());
+    }
+
+    #[test]
+    fn production_trace_selector_fold_matches_multilinear_evaluation() {
+        let selector_point = (0..PRODUCTION_TRACE_BATCH_SELECTOR_VARIABLES)
+            .map(|index| ExtensionElement {
+                limbs: [
+                    (index + 2) as u64,
+                    (2 * index + 3) as u64,
+                    (3 * index + 5) as u64,
+                ],
+            })
+            .collect::<Vec<_>>();
+        let semantic_values = (0..PRODUCTION_TRACE_SEMANTIC_COLUMNS)
+            .map(|index| ExtensionElement {
+                limbs: [
+                    (index + 11) as u64,
+                    (2 * index + 13) as u64,
+                    (3 * index + 17) as u64,
+                ],
+            })
+            .collect::<Vec<_>>();
+        let folded = production_trace_fold_row_v1(17, &semantic_values, &selector_point).unwrap();
+
+        let mut padded = semantic_values
+            .iter()
+            .copied()
+            .map(convert_extension)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        padded.resize(PRODUCTION_TRACE_BATCH_PADDED_COLUMNS, EF::ZERO);
+        let point = Point::new(
+            selector_point
+                .iter()
+                .copied()
+                .map(convert_extension)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        let expected = Poly::<EF>::new(padded).eval_ext::<F>(&point);
+        assert_eq!(convert_extension(folded).unwrap(), expected);
+
+        let mut noncanonical = semantic_values.clone();
+        noncanonical[0].limbs[0] = crate::GOLDILOCKS_MODULUS;
+        assert_eq!(
+            production_trace_fold_row_v1(17, &noncanonical, &selector_point),
+            Err(ProductionWhirCandidateError::InvalidEncoding)
+        );
+        assert_eq!(
+            production_trace_fold_row_v1(17, &semantic_values[..438], &selector_point),
+            Err(ProductionWhirCandidateError::InvalidTraceRow)
+        );
+        assert_eq!(
+            production_trace_fold_row_v1(17, &semantic_values, &selector_point[..8]),
+            Err(ProductionWhirCandidateError::InvalidOpeningPoint)
+        );
+
+        let high_row = 1_u64 << PRODUCTION_TRACE_INITIALIZATION_VARIABLES;
+        assert_eq!(
+            production_trace_fold_row_v1(high_row, &semantic_values, &selector_point),
+            Err(ProductionWhirCandidateError::InvalidTraceRow)
+        );
+        let mut padded_initialization = semantic_values;
+        padded_initialization[..PRODUCTION_TRACE_INITIALIZATION_COLUMNS]
+            .fill(ExtensionElement { limbs: [0; 3] });
+        assert!(
+            production_trace_fold_row_v1(high_row, &padded_initialization, &selector_point).is_ok()
+        );
+    }
+
+    #[test]
+    fn selector_sumcheck_continues_into_one_verified_whir_proof() {
+        const LOCAL_VARIABLES: usize = 3;
+        const SELECTOR_VARIABLES: usize = 2;
+        const STACKED_VARIABLES: usize = LOCAL_VARIABLES + SELECTOR_VARIABLES;
+        const COLUMNS: usize = 1 << SELECTOR_VARIABLES;
+        const BINDING: &[u8] = b"production-selector-batch-reference-v1";
+
+        type SelectorPcs = WhirProver<EF, F, Dft, WhirMmcs, Challenger, PrefixProver<F, EF>>;
+
+        let columns = (0..COLUMNS)
+            .map(|column| {
+                Poly::<F>::new(
+                    (0..1_usize << LOCAL_VARIABLES)
+                        .map(|row| F::from_u64((column * 101 + row * row + 7 * row + 19) as u64))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stacked = Poly::<F>::new(
+            columns
+                .iter()
+                .flat_map(|column| column.as_slice().iter().copied())
+                .collect(),
+        );
+
+        let (ordinary, mut prover_challenger) = build_pcs(STACKED_VARIABLES, BINDING).unwrap();
+        assert_eq!(ordinary.round_folding_factor(0), SELECTOR_VARIABLES);
+        let pcs = SelectorPcs::new(ordinary.config, ordinary.dft, ordinary.mmcs);
+        let (commitment, prover_data) = commit_base(
+            VariableOrder::Prefix,
+            &pcs.dft,
+            &pcs.mmcs,
+            &mut prover_challenger,
+            &stacked,
+            SELECTOR_VARIABLES,
+            pcs.starting_log_inv_rate,
+        );
+
+        let mut statement = EqStatement::initialize(STACKED_VARIABLES);
+        let mut evaluations = Vec::with_capacity(COLUMNS);
+        for (column, poly) in columns.iter().enumerate() {
+            let local_point = Point::expand_from_univariate(
+                prover_challenger.sample_algebra_element(),
+                LOCAL_VARIABLES,
+            );
+            let evaluation = poly.eval_base(&local_point);
+            let mut lifted = Point::<F>::hypercube(column, SELECTOR_VARIABLES)
+                .as_slice()
+                .iter()
+                .copied()
+                .map(EF::from)
+                .collect::<Vec<_>>();
+            lifted.extend_from_slice(local_point.as_slice());
+            let lifted = Point::new(lifted);
+            prover_challenger.observe_algebra_slice(lifted.as_slice());
+            prover_challenger.observe_algebra_element(evaluation);
+            statement.add_evaluated_constraint(lifted, evaluation);
+            evaluations.push(evaluation);
+        }
+
+        let alpha = prover_challenger.sample_algebra_element();
+        let mut weights = Poly::<EF>::zero(STACKED_VARIABLES);
+        let mut claimed_sum = EF::ZERO;
+        statement.combine_hypercube::<F, false>(&mut weights, &mut claimed_sum, alpha);
+        let extension_stacked = Poly::<EF>::new(stacked.iter().copied().map(EF::from).collect());
+        let product =
+            ProductPolynomial::new_unpacked(VariableOrder::Prefix, extension_stacked, weights);
+        let mut sumcheck_prover = SumcheckProver::new(product, claimed_sum);
+        let mut proof = empty_proof_for(&pcs.config);
+        let selector_randomness = sumcheck_prover.compute_sumcheck_polynomials(
+            &mut proof.initial_sumcheck,
+            &mut prover_challenger,
+            SELECTOR_VARIABLES,
+            pcs.starting_folding_pow_bits,
+            None,
+        );
+        assert_eq!(sumcheck_prover.num_variables(), LOCAL_VARIABLES);
+
+        let expected_residual = (0..1_usize << LOCAL_VARIABLES)
+            .map(|row| {
+                Poly::<F>::new(
+                    columns
+                        .iter()
+                        .map(|column| column.as_slice()[row])
+                        .collect(),
+                )
+                .eval_base(&selector_randomness)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sumcheck_prover.evals().as_slice(), expected_residual);
+
+        pcs.prove_from_sumcheck(
+            &mut proof,
+            &mut prover_challenger,
+            sumcheck_prover,
+            selector_randomness,
+            prover_data,
+        );
+
+        let verify = |binding: &[u8], columns: &[usize], evaluations: &[EF]| {
+            let (verifier_pcs, mut challenger) = build_pcs(STACKED_VARIABLES, binding).unwrap();
+            challenger.observe(commitment.clone());
+            let mut statement = EqStatement::initialize(STACKED_VARIABLES);
+            for (&column, &evaluation) in columns.iter().zip(evaluations) {
+                let local_point = Point::expand_from_univariate(
+                    challenger.sample_algebra_element(),
+                    LOCAL_VARIABLES,
+                );
+                let mut lifted = Point::<F>::hypercube(column, SELECTOR_VARIABLES)
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .map(EF::from)
+                    .collect::<Vec<_>>();
+                lifted.extend_from_slice(local_point.as_slice());
+                let lifted = Point::new(lifted);
+                challenger.observe_algebra_slice(lifted.as_slice());
+                challenger.observe_algebra_element(evaluation);
+                statement.add_evaluated_constraint(lifted, evaluation);
+            }
+            let alpha = challenger.sample_algebra_element();
+            let constraint = Constraint::new_eq_only(alpha, statement);
+            let mut claimed_sum = EF::ZERO;
+            constraint.combine_evals(&mut claimed_sum);
+            WhirVerifier::new(
+                &verifier_pcs.config,
+                &verifier_pcs.mmcs,
+                VariableOrder::Prefix,
+            )
+            .verify(
+                &proof,
+                &mut challenger,
+                &commitment,
+                constraint,
+                claimed_sum,
+            )
+            .is_ok()
+        };
+
+        let canonical_columns = [0, 1, 2, 3];
+        assert!(verify(BINDING, &canonical_columns, &evaluations));
+
+        let mut substituted = evaluations.clone();
+        substituted[2] += EF::ONE;
+        assert!(!verify(BINDING, &canonical_columns, &substituted));
+        assert!(!verify(BINDING, &[1, 0, 2, 3], &evaluations));
+        assert!(!verify(BINDING, &canonical_columns[..3], &evaluations[..3]));
+        assert!(!verify(
+            b"production-selector-batch-reference-replay",
+            &canonical_columns,
+            &evaluations,
+        ));
     }
 
     #[test]

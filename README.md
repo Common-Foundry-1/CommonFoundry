@@ -170,6 +170,17 @@ Production therefore needs a smaller proof geometry or a different
 aggregation/compression design; increasing the wire cap is not treated as
 completion.
 
+The execution-trace candidate now pins 439 ordered semantic columns in a
+512-slot, nine-selector layout over a 26-variable local domain. Executable
+budget checks show that thirteen independent proofs have a 3,365,110-byte
+dictionary-free floor and that even selector-first opening needs 1,085,208
+bytes of first-round semantic values before Merkle paths or other messages
+(4,340,832 bytes with the ordinary local fold). A bounded
+reference commits four columns, folds the selector variables, and completes one
+CPU-verified WHIR proof while rejecting substitution, reordering, omission,
+and transcript replay. The algebraic row fold is therefore fixed; a succinct
+authenticated opening for it remains the production proof-size gate.
+
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the
 network limit. Geometry-derived maxima are 154,252 bytes for WHIR and 87,556

@@ -1,13 +1,14 @@
 //! Research-only WHIR polynomial-opening prototype.
 //!
 //! This module is deliberately feature-gated and bounded. It authenticates
-//! evaluations at caller-supplied multilinear points and can batch every
-//! structured ForgeMatrix oracle under one Merkle root. It is not wired into
-//! block validation and does not activate the production ForgeMatrix profile.
+//! evaluations at caller-supplied multilinear points under independent fixed
+//! model-role commitments and a separate execution-trace commitment. It is not
+//! wired into block validation and does not activate the production ForgeMatrix
+//! profile.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -44,7 +45,10 @@ use thiserror::Error;
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredPcsOpeningClaim, StructuredPcsOpeningSet,
     StructuredPcsVerifier,
-    model_bank::{MAX_MODEL_PCS_WEIGHT_BANKS, ModelPcsIdentity},
+    model_bank::{
+        MAX_MODEL_PCS_WEIGHT_BANKS, MAX_SMALL_FIXTURE_PAYLOAD_BYTES, MODEL_BANK_HEADER_BYTES,
+        ModelBankError, ModelBankManifest, ModelPcsIdentity, verify_model_bank,
+    },
 };
 
 pub const EXPLICIT_WHIR_VERSION: u32 = 1;
@@ -126,13 +130,29 @@ pub struct StructuredWhirModelMetadata {
     pub model_byte_root: [u8; 32],
 }
 
-/// Four independently committed model roles: base input followed by ordered
-/// weight banks. Unlike the execution trace commitment, these sets are stable
-/// across blocks and are intended to be pinned at model activation.
+/// Independently committed model roles: one base input followed by one to
+/// three ordered weight banks. Unlike the execution trace commitment, these
+/// sets are stable across blocks and are intended to be pinned at activation.
 #[derive(Debug, Clone)]
 pub struct StructuredWhirModelCommitmentSet {
     sections: Vec<StructuredWhirCommitmentSet>,
     identity: ModelPcsIdentity,
+}
+
+/// Failure while deriving bounded research WHIR commitments from one verified
+/// canonical model bank.
+#[derive(Debug, Error)]
+pub enum VerifiedModelBankWhirError {
+    #[error("model-bank verification failed: {0}")]
+    ModelBank(#[from] ModelBankError),
+    #[error("structured WHIR commitment derivation failed: {0}")]
+    Whir(#[from] ExplicitWhirError),
+    #[error("model bank exceeds the bounded research WHIR limits")]
+    ResearchLimit,
+    #[error("trusted model identity selects a different WHIR suite")]
+    SuiteMismatch,
+    #[error("byte-derived model PCS identity does not match the trusted identity")]
+    IdentityMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +358,133 @@ impl StructuredWhirModelCommitmentSet {
 
     pub const fn identity(&self) -> &ModelPcsIdentity {
         &self.identity
+    }
+
+    /// Verifies one bounded canonical model bank and derives every fixed-model
+    /// commitment from the exact verified bytes. This remains research-only
+    /// and cannot admit production-sized ForgeMatrix tables.
+    pub fn from_verified_model_bank<R: Read>(
+        reader: R,
+        trusted_manifest: &ModelBankManifest,
+        trusted_identity: &ModelPcsIdentity,
+    ) -> Result<Self, VerifiedModelBankWhirError> {
+        trusted_identity.validate()?;
+        if trusted_identity.pcs_suite_parameter_digest != structured_whir_suite_parameter_digest() {
+            return Err(VerifiedModelBankWhirError::SuiteMismatch);
+        }
+        trusted_manifest.verify_pcs_identity(trusted_identity)?;
+
+        if trusted_manifest.payload_bytes > MAX_SMALL_FIXTURE_PAYLOAD_BYTES {
+            return Err(VerifiedModelBankWhirError::ResearchLimit);
+        }
+        let dimension = u64::from(trusted_manifest.dimension);
+        let base_elements = u64::from(trusted_manifest.batch)
+            .checked_mul(dimension)
+            .ok_or(VerifiedModelBankWhirError::ResearchLimit)?;
+        let bank_elements = u64::from(trusted_identity.layers_per_bank)
+            .checked_mul(dimension)
+            .and_then(|elements| elements.checked_mul(dimension))
+            .ok_or(VerifiedModelBankWhirError::ResearchLimit)?;
+        let base_len = bounded_model_table_len(base_elements)?;
+        let bank_len = bounded_model_table_len(bank_elements)?;
+        let bank_count = trusted_identity.weight_bank_commitments.len();
+        let payload_len = base_len
+            .checked_add(
+                bank_len
+                    .checked_mul(bank_count)
+                    .ok_or(VerifiedModelBankWhirError::ResearchLimit)?,
+            )
+            .ok_or(VerifiedModelBankWhirError::ResearchLimit)?;
+        if u64::try_from(payload_len).ok() != Some(trusted_manifest.payload_bytes) {
+            return Err(VerifiedModelBankWhirError::IdentityMismatch);
+        }
+        let exact_len = MODEL_BANK_HEADER_BYTES
+            .checked_add(payload_len)
+            .ok_or(VerifiedModelBankWhirError::ResearchLimit)?;
+        let read_limit = exact_len
+            .checked_add(1)
+            .ok_or(VerifiedModelBankWhirError::ResearchLimit)?;
+
+        let mut encoded = Vec::with_capacity(read_limit);
+        reader
+            .take(read_limit as u64)
+            .read_to_end(&mut encoded)
+            .map_err(ModelBankError::Io)?;
+        verify_model_bank(Cursor::new(encoded.as_slice()), trusted_manifest)?;
+
+        let payload = encoded
+            .get(MODEL_BANK_HEADER_BYTES..)
+            .ok_or(VerifiedModelBankWhirError::IdentityMismatch)?;
+        if payload.len() != payload_len {
+            return Err(VerifiedModelBankWhirError::IdentityMismatch);
+        }
+        let base_input = payload
+            .get(..base_len)
+            .ok_or(VerifiedModelBankWhirError::IdentityMismatch)?
+            .iter()
+            .copied()
+            .map(centered_model_byte)
+            .collect();
+        let mut weight_banks = Vec::with_capacity(bank_count);
+        for bank_index in 0..bank_count {
+            let start = base_len
+                .checked_add(
+                    bank_index
+                        .checked_mul(bank_len)
+                        .ok_or(VerifiedModelBankWhirError::ResearchLimit)?,
+                )
+                .ok_or(VerifiedModelBankWhirError::ResearchLimit)?;
+            let end = start
+                .checked_add(bank_len)
+                .ok_or(VerifiedModelBankWhirError::ResearchLimit)?;
+            weight_banks.push(
+                payload
+                    .get(start..end)
+                    .ok_or(VerifiedModelBankWhirError::IdentityMismatch)?
+                    .iter()
+                    .copied()
+                    .map(centered_model_byte)
+                    .collect(),
+            );
+        }
+
+        let derived = Self::new(
+            StructuredWhirModelMetadata {
+                model_version: trusted_manifest.model_version,
+                batch: trusted_manifest.batch,
+                dimension: trusted_manifest.dimension,
+                layers_per_bank: trusted_identity.layers_per_bank,
+                model_byte_root: trusted_manifest.raw_blake3_root,
+            },
+            base_input,
+            weight_banks,
+        )?;
+        if derived.identity() != trusted_identity {
+            return Err(VerifiedModelBankWhirError::IdentityMismatch);
+        }
+        Ok(derived)
+    }
+}
+
+fn bounded_model_table_len(elements: u64) -> Result<usize, VerifiedModelBankWhirError> {
+    let elements =
+        usize::try_from(elements).map_err(|_| VerifiedModelBankWhirError::ResearchLimit)?;
+    if !elements.is_power_of_two() {
+        return Err(VerifiedModelBankWhirError::ResearchLimit);
+    }
+    let variables = elements.ilog2() as usize;
+    if !(EXPLICIT_WHIR_MIN_VARIABLES..=MAX_EXPLICIT_WHIR_VARIABLES).contains(&variables) {
+        return Err(VerifiedModelBankWhirError::ResearchLimit);
+    }
+    Ok(elements)
+}
+
+fn centered_model_byte(value: u8) -> u64 {
+    debug_assert!(value <= crate::model_bank::MAX_MODEL_BYTE);
+    if value >= 125 {
+        u64::from(value - 125)
+    } else {
+        GOLDILOCKS_MODULUS - u64::from(125 - value)
     }
 }
 
@@ -1884,6 +2031,89 @@ fn take_split_blob<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_bank::{BuiltModelBankFixture, SmallModelBankFixture, build_small_model_bank};
+
+    const VERIFIED_BASE_BYTES: [u8; 4] = [0, 125, 250, 1];
+    const VERIFIED_LAYER_BYTES: [[u8; 4]; 6] = [
+        [2, 3, 4, 5],
+        [6, 7, 8, 9],
+        [10, 11, 12, 13],
+        [14, 15, 16, 17],
+        [18, 19, 20, 21],
+        [22, 23, 24, 25],
+    ];
+
+    struct VerifiedBankFixture {
+        bytes: Vec<u8>,
+        manifest: ModelBankManifest,
+        identity: ModelPcsIdentity,
+        base_table: Vec<u64>,
+        weight_banks: Vec<Vec<u64>>,
+    }
+
+    fn manual_centered_table(bytes: impl IntoIterator<Item = u8>) -> Vec<u64> {
+        bytes.into_iter().map(centered_model_byte).collect()
+    }
+
+    fn decode_hex_32(value: &str) -> [u8; 32] {
+        hex::decode(value).unwrap().try_into().unwrap()
+    }
+
+    fn manual_weight_banks(layers: &[[u8; 4]], layers_per_bank: usize) -> Vec<Vec<u64>> {
+        layers
+            .chunks_exact(layers_per_bank)
+            .map(|bank| manual_centered_table(bank.iter().flatten().copied()))
+            .collect()
+    }
+
+    fn build_bank_with_root(
+        layers: &[[u8; 4]],
+        pcs_commitment_root: [u8; 32],
+    ) -> BuiltModelBankFixture {
+        let layer_slices = layers
+            .iter()
+            .map(|layer| layer.as_slice())
+            .collect::<Vec<_>>();
+        build_small_model_bank(SmallModelBankFixture {
+            model_version: 1,
+            dimension: 2,
+            batch: 2,
+            base_input: &VERIFIED_BASE_BYTES,
+            layers: &layer_slices,
+            pcs_parameter_digest: structured_whir_suite_parameter_digest(),
+            pcs_commitment_root,
+        })
+        .unwrap()
+    }
+
+    fn verified_bank_fixture() -> VerifiedBankFixture {
+        let base_table = manual_centered_table(VERIFIED_BASE_BYTES);
+        let weight_banks = manual_weight_banks(&VERIFIED_LAYER_BYTES, 2);
+        let provisional = StructuredWhirModelCommitmentSet::new(
+            StructuredWhirModelMetadata {
+                model_version: 1,
+                batch: 2,
+                dimension: 2,
+                layers_per_bank: 2,
+                model_byte_root: [0x51; 32],
+            },
+            base_table.clone(),
+            weight_banks.clone(),
+        )
+        .unwrap();
+        let commitment_root = provisional.identity().commitment_root().unwrap();
+        let built = build_bank_with_root(&VERIFIED_LAYER_BYTES, commitment_root);
+        let mut identity = provisional.identity().clone();
+        identity.model_byte_root = built.manifest.raw_blake3_root;
+        built.manifest.verify_pcs_identity(&identity).unwrap();
+        VerifiedBankFixture {
+            bytes: built.bytes,
+            manifest: built.manifest,
+            identity,
+            base_table,
+            weight_banks,
+        }
+    }
 
     fn split_fixture(
         weight_banks: Vec<Vec<u64>>,
@@ -1973,6 +2203,463 @@ mod tests {
         let (commitment, openings, proof) =
             prove_explicit_whir_openings(&binding, &table(), &points()).unwrap();
         (binding, commitment, openings, proof)
+    }
+
+    #[test]
+    fn literal_model_bank_vector_derives_the_canonical_tables_and_identity() {
+        let artifact = hex::decode(concat!(
+            "434d4644424e4b3202000000b800000001000000020000000200000006000000",
+            "040000000000000004000000000000001c00000000000000921f746e64fb0502",
+            "2fe53c5ddcf048c74d79604680d5716a7299929750744c539a37a20d1bc3e472",
+            "41e63ac491185f80f717049e4982c922715b96f44943690ec4d6d139c79d8cd3",
+            "27e0b9001c9952dc786ff4a12277067c715fdb1895d2abf5993745b234219cb7",
+            "bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff007dfa0102030405",
+            "060708090a0b0c0d0e0f10111213141516171819"
+        ))
+        .unwrap();
+        let manifest = ModelBankManifest {
+            model_version: 1,
+            dimension: 2,
+            batch: 2,
+            layers: 6,
+            base_input_bytes: 4,
+            bytes_per_layer: 4,
+            payload_bytes: 28,
+            raw_blake3_root: decode_hex_32(
+                "921f746e64fb05022fe53c5ddcf048c74d79604680d5716a7299929750744c53",
+            ),
+            layer_roots_aggregate: decode_hex_32(
+                "9a37a20d1bc3e47241e63ac491185f80f717049e4982c922715b96f44943690e",
+            ),
+            pcs_parameter_digest: decode_hex_32(
+                "c4d6d139c79d8cd327e0b9001c9952dc786ff4a12277067c715fdb1895d2abf5",
+            ),
+            pcs_commitment_root: decode_hex_32(
+                "993745b234219cb7bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff",
+            ),
+        };
+        let identity = ModelPcsIdentity {
+            model_version: 1,
+            batch: 2,
+            dimension: 2,
+            layers_per_bank: 2,
+            model_byte_root: manifest.raw_blake3_root,
+            pcs_suite_parameter_digest: manifest.pcs_parameter_digest,
+            base_input_commitment: decode_hex_32(
+                "0625c5c07d31a47a86c1c3f0c98d4f9ea0b3ce02f5240912bc360b44356834ac",
+            ),
+            weight_bank_commitments: vec![
+                decode_hex_32("3640739c43b725b1a772d0dfd35917fcdee4a8355ba5e7f207c801488120a935"),
+                decode_hex_32("d3153726aefb3019c12d663e9aefa0acee76858b1ae286a36dbacbb3a523043b"),
+                decode_hex_32("96f2d3afdcd1e81dd8d7baebce4f8d4f5ecd3930eb71e03e27f42d2056768e1a"),
+            ],
+        };
+        let derived = StructuredWhirModelCommitmentSet::from_verified_model_bank(
+            Cursor::new(artifact),
+            &manifest,
+            &identity,
+        )
+        .unwrap();
+
+        assert_eq!(derived.identity(), &identity);
+        assert_eq!(
+            derived.sections[0].tables[0],
+            vec![GOLDILOCKS_MODULUS - 125, 0, 125, GOLDILOCKS_MODULUS - 124]
+        );
+        let expected_weight_banks = [
+            vec![
+                GOLDILOCKS_MODULUS - 123,
+                GOLDILOCKS_MODULUS - 122,
+                GOLDILOCKS_MODULUS - 121,
+                GOLDILOCKS_MODULUS - 120,
+                GOLDILOCKS_MODULUS - 119,
+                GOLDILOCKS_MODULUS - 118,
+                GOLDILOCKS_MODULUS - 117,
+                GOLDILOCKS_MODULUS - 116,
+            ],
+            vec![
+                GOLDILOCKS_MODULUS - 115,
+                GOLDILOCKS_MODULUS - 114,
+                GOLDILOCKS_MODULUS - 113,
+                GOLDILOCKS_MODULUS - 112,
+                GOLDILOCKS_MODULUS - 111,
+                GOLDILOCKS_MODULUS - 110,
+                GOLDILOCKS_MODULUS - 109,
+                GOLDILOCKS_MODULUS - 108,
+            ],
+            vec![
+                GOLDILOCKS_MODULUS - 107,
+                GOLDILOCKS_MODULUS - 106,
+                GOLDILOCKS_MODULUS - 105,
+                GOLDILOCKS_MODULUS - 104,
+                GOLDILOCKS_MODULUS - 103,
+                GOLDILOCKS_MODULUS - 102,
+                GOLDILOCKS_MODULUS - 101,
+                GOLDILOCKS_MODULUS - 100,
+            ],
+        ];
+        for (section, expected) in derived.sections[1..].iter().zip(expected_weight_banks) {
+            assert_eq!(section.tables[0], expected);
+        }
+    }
+
+    #[test]
+    fn verified_model_bank_exact_three_bank_derivation_is_deterministic() {
+        let fixture = verified_bank_fixture();
+        assert_eq!(
+            hex::encode(fixture.manifest.raw_blake3_root),
+            "921f746e64fb05022fe53c5ddcf048c74d79604680d5716a7299929750744c53"
+        );
+        assert_eq!(
+            hex::encode(fixture.identity.base_input_commitment),
+            "0625c5c07d31a47a86c1c3f0c98d4f9ea0b3ce02f5240912bc360b44356834ac"
+        );
+        assert_eq!(
+            fixture
+                .identity
+                .weight_bank_commitments
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>(),
+            [
+                "3640739c43b725b1a772d0dfd35917fcdee4a8355ba5e7f207c801488120a935",
+                "d3153726aefb3019c12d663e9aefa0acee76858b1ae286a36dbacbb3a523043b",
+                "96f2d3afdcd1e81dd8d7baebce4f8d4f5ecd3930eb71e03e27f42d2056768e1a",
+            ]
+        );
+        assert_eq!(
+            hex::encode(fixture.identity.commitment_root().unwrap()),
+            "993745b234219cb7bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff"
+        );
+        assert_eq!(
+            hex::encode(fixture.identity.digest().unwrap()),
+            "4704cca7add661c12051a445126c9b90bcbeb3ef7069f1d0fb283e3d1f46e12c"
+        );
+        let derived = StructuredWhirModelCommitmentSet::from_verified_model_bank(
+            Cursor::new(&fixture.bytes),
+            &fixture.manifest,
+            &fixture.identity,
+        )
+        .unwrap();
+        let repeated = StructuredWhirModelCommitmentSet::from_verified_model_bank(
+            Cursor::new(&fixture.bytes),
+            &fixture.manifest,
+            &fixture.identity,
+        )
+        .unwrap();
+
+        assert_eq!(derived.identity(), &fixture.identity);
+        assert_eq!(repeated.identity(), derived.identity());
+        assert_eq!(derived.sections.len(), 1 + MAX_MODEL_PCS_WEIGHT_BANKS);
+        assert_eq!(derived.sections[0].tables[0], fixture.base_table);
+        for (section, expected) in derived.sections[1..].iter().zip(&fixture.weight_banks) {
+            assert_eq!(&section.tables[0], expected);
+        }
+    }
+
+    #[test]
+    fn verified_model_bank_centered_byte_boundaries_are_canonical() {
+        assert_eq!(centered_model_byte(0), GOLDILOCKS_MODULUS - 125);
+        assert_eq!(centered_model_byte(124), GOLDILOCKS_MODULUS - 1);
+        assert_eq!(centered_model_byte(125), 0);
+        assert_eq!(centered_model_byte(126), 1);
+        assert_eq!(centered_model_byte(250), 125);
+    }
+
+    #[test]
+    fn verified_model_bank_rejects_payload_mutations_and_wrong_lengths() {
+        let fixture = verified_bank_fixture();
+
+        let mut mutated = fixture.bytes.clone();
+        mutated[MODEL_BANK_HEADER_BYTES] ^= 1;
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(mutated),
+                &fixture.manifest,
+                &fixture.identity,
+            ),
+            Err(VerifiedModelBankWhirError::ModelBank(
+                ModelBankError::RawRootMismatch
+            ))
+        ));
+
+        let mut forbidden = fixture.bytes.clone();
+        forbidden[MODEL_BANK_HEADER_BYTES] = 251;
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(forbidden),
+                &fixture.manifest,
+                &fixture.identity,
+            ),
+            Err(VerifiedModelBankWhirError::ModelBank(
+                ModelBankError::OutOfRange {
+                    offset: 0,
+                    value: 251
+                }
+            ))
+        ));
+
+        let mut truncated = fixture.bytes.clone();
+        truncated.pop();
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(truncated),
+                &fixture.manifest,
+                &fixture.identity,
+            ),
+            Err(VerifiedModelBankWhirError::ModelBank(
+                ModelBankError::Truncated
+            ))
+        ));
+
+        let mut trailing = fixture.bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(trailing),
+                &fixture.manifest,
+                &fixture.identity,
+            ),
+            Err(VerifiedModelBankWhirError::ModelBank(
+                ModelBankError::TrailingBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn verified_model_bank_rejects_wrong_suite_and_commitment_identity() {
+        let fixture = verified_bank_fixture();
+        let mut wrong_suite = fixture.identity.clone();
+        wrong_suite.pcs_suite_parameter_digest[0] ^= 1;
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(&fixture.bytes),
+                &fixture.manifest,
+                &wrong_suite,
+            ),
+            Err(VerifiedModelBankWhirError::SuiteMismatch)
+        ));
+
+        let mut wrong_commitment = fixture.identity.clone();
+        wrong_commitment.weight_bank_commitments[0][0] ^= 1;
+        let wrong_root = wrong_commitment.commitment_root().unwrap();
+        let rebuilt = build_bank_with_root(&VERIFIED_LAYER_BYTES, wrong_root);
+        wrong_commitment.model_byte_root = rebuilt.manifest.raw_blake3_root;
+        rebuilt
+            .manifest
+            .verify_pcs_identity(&wrong_commitment)
+            .unwrap();
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(rebuilt.bytes),
+                &rebuilt.manifest,
+                &wrong_commitment,
+            ),
+            Err(VerifiedModelBankWhirError::IdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn verified_model_bank_rejects_partition_and_order_replay() {
+        let fixture = verified_bank_fixture();
+        let reordered_layers = [
+            VERIFIED_LAYER_BYTES[2],
+            VERIFIED_LAYER_BYTES[3],
+            VERIFIED_LAYER_BYTES[0],
+            VERIFIED_LAYER_BYTES[1],
+            VERIFIED_LAYER_BYTES[4],
+            VERIFIED_LAYER_BYTES[5],
+        ];
+        let original_root = fixture.identity.commitment_root().unwrap();
+        let reordered = build_bank_with_root(&reordered_layers, original_root);
+        let mut reordered_identity = fixture.identity.clone();
+        reordered_identity.model_byte_root = reordered.manifest.raw_blake3_root;
+        reordered
+            .manifest
+            .verify_pcs_identity(&reordered_identity)
+            .unwrap();
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(reordered.bytes),
+                &reordered.manifest,
+                &reordered_identity,
+            ),
+            Err(VerifiedModelBankWhirError::IdentityMismatch)
+        ));
+
+        let partition_layers = [
+            [31, 32, 33, 34],
+            [35, 36, 37, 38],
+            [39, 40, 41, 42],
+            [43, 44, 45, 46],
+            [47, 48, 49, 50],
+            [51, 52, 53, 54],
+            [55, 56, 57, 58],
+            [59, 60, 61, 62],
+        ];
+        let base_table = manual_centered_table(VERIFIED_BASE_BYTES);
+        let first_partition =
+            manual_centered_table(partition_layers[..4].iter().flatten().copied());
+        let partial = StructuredWhirModelCommitmentSet::new(
+            StructuredWhirModelMetadata {
+                model_version: 1,
+                batch: 2,
+                dimension: 2,
+                layers_per_bank: 4,
+                model_byte_root: [0x61; 32],
+            },
+            base_table,
+            vec![first_partition],
+        )
+        .unwrap();
+        let mut partition_identity = ModelPcsIdentity {
+            model_version: 1,
+            batch: 2,
+            dimension: 2,
+            layers_per_bank: 8,
+            model_byte_root: [0x61; 32],
+            pcs_suite_parameter_digest: structured_whir_suite_parameter_digest(),
+            base_input_commitment: partial.identity().base_input_commitment,
+            weight_bank_commitments: partial.identity().weight_bank_commitments.clone(),
+        };
+        let partition_root = partition_identity.commitment_root().unwrap();
+        let partitioned = build_bank_with_root(&partition_layers, partition_root);
+        partition_identity.model_byte_root = partitioned.manifest.raw_blake3_root;
+        partitioned
+            .manifest
+            .verify_pcs_identity(&partition_identity)
+            .unwrap();
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                Cursor::new(partitioned.bytes),
+                &partitioned.manifest,
+                &partition_identity,
+            ),
+            Err(VerifiedModelBankWhirError::IdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn verified_model_bank_rejects_production_shape_without_reading() {
+        struct PanicReader;
+
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("bounded preflight must reject before touching the reader")
+            }
+        }
+
+        let identity = ModelPcsIdentity {
+            model_version: 1,
+            batch: 128,
+            dimension: 4_096,
+            layers_per_bank: 128,
+            model_byte_root: [0x71; 32],
+            pcs_suite_parameter_digest: structured_whir_suite_parameter_digest(),
+            base_input_commitment: [0x72; 32],
+            weight_bank_commitments: vec![[0x73; 32], [0x74; 32], [0x75; 32]],
+        };
+        let dimension = u64::from(identity.dimension);
+        let base_input_bytes = u64::from(identity.batch) * dimension;
+        let bytes_per_layer = dimension * dimension;
+        let layers = identity.layers_per_bank * 3;
+        let payload_bytes = base_input_bytes + u64::from(layers) * bytes_per_layer;
+        let manifest = ModelBankManifest {
+            model_version: identity.model_version,
+            dimension: identity.dimension,
+            batch: identity.batch,
+            layers,
+            base_input_bytes,
+            bytes_per_layer,
+            payload_bytes,
+            raw_blake3_root: identity.model_byte_root,
+            layer_roots_aggregate: [0x76; 32],
+            pcs_parameter_digest: identity.pcs_suite_parameter_digest,
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        };
+        manifest.verify_pcs_identity(&identity).unwrap();
+
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                PanicReader,
+                &manifest,
+                &identity,
+            ),
+            Err(VerifiedModelBankWhirError::ResearchLimit)
+        ));
+    }
+
+    #[test]
+    fn verified_model_bank_variable_caps_reject_without_reading() {
+        struct PanicReader;
+
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("variable-cap preflight must reject before touching the reader")
+            }
+        }
+
+        fn manifest_for(identity: &ModelPcsIdentity) -> ModelBankManifest {
+            let dimension = u64::from(identity.dimension);
+            let base_input_bytes = u64::from(identity.batch) * dimension;
+            let bytes_per_layer = dimension * dimension;
+            let layers = identity.layers_per_bank
+                * u32::try_from(identity.weight_bank_commitments.len()).unwrap();
+            ModelBankManifest {
+                model_version: identity.model_version,
+                dimension: identity.dimension,
+                batch: identity.batch,
+                layers,
+                base_input_bytes,
+                bytes_per_layer,
+                payload_bytes: base_input_bytes + u64::from(layers) * bytes_per_layer,
+                raw_blake3_root: identity.model_byte_root,
+                layer_roots_aggregate: [0x86; 32],
+                pcs_parameter_digest: identity.pcs_suite_parameter_digest,
+                pcs_commitment_root: identity.commitment_root().unwrap(),
+            }
+        }
+
+        let oversized_bank = ModelPcsIdentity {
+            model_version: 1,
+            batch: 1,
+            dimension: 256,
+            layers_per_bank: 2,
+            model_byte_root: [0x81; 32],
+            pcs_suite_parameter_digest: structured_whir_suite_parameter_digest(),
+            base_input_commitment: [0x82; 32],
+            weight_bank_commitments: vec![[0x83; 32]],
+        };
+        let oversized_bank_manifest = manifest_for(&oversized_bank);
+        assert!(oversized_bank_manifest.payload_bytes < MAX_SMALL_FIXTURE_PAYLOAD_BYTES);
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                PanicReader,
+                &oversized_bank_manifest,
+                &oversized_bank,
+            ),
+            Err(VerifiedModelBankWhirError::ResearchLimit)
+        ));
+
+        let undersized_base = ModelPcsIdentity {
+            model_version: 1,
+            batch: 1,
+            dimension: 2,
+            layers_per_bank: 1,
+            model_byte_root: [0x91; 32],
+            pcs_suite_parameter_digest: structured_whir_suite_parameter_digest(),
+            base_input_commitment: [0x92; 32],
+            weight_bank_commitments: vec![[0x93; 32]],
+        };
+        let undersized_base_manifest = manifest_for(&undersized_base);
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::from_verified_model_bank(
+                PanicReader,
+                &undersized_base_manifest,
+                &undersized_base,
+            ),
+            Err(VerifiedModelBankWhirError::ResearchLimit)
+        ));
     }
 
     #[test]

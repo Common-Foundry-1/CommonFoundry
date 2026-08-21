@@ -416,15 +416,29 @@ the structured split aggregate has a 512 KiB PCS-proof cap. A 4 KiB
 public-binding cap, canonical field checks, canonical JSON re-encoding, exact
 envelope exhaustion, and panic containment bound the current parser surface.
 
+For bounded research artifacts, `from_verified_model_bank` now closes the
+previously separate byte-root and PCS-table inputs. It accepts an externally
+trusted manifest and full model identity, rejects unsupported table dimensions
+before reading, buffers no more than the trusted fixture length plus one byte,
+and runs the canonical model-bank verifier over that immutable buffer. Only
+after the header, byte range, raw root, indexed layer roots, exact length, and
+EOF checks pass does it map each byte through the pinned `x - 125` Goldilocks
+encoding, preserve base/layer/bank order, derive the base role and every ordered
+weight-bank role, and require byte-for-byte equality with the trusted PCS
+identity. Callers cannot supply parallel field tables or a replacement byte
+root through this path.
+
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
 `StructuredWhirPcsVerifier` authenticates both scoped claim sets. This closes
 commitment selection and bank-order substitution in the research boundary; it
-does not prove that the BLAKE3-addressed model bytes encode those polynomials.
-The adapter still retains whole bounded tables in memory and has no production
-model-byte link or streaming 6 GiB prover. The upstream backend is an unaudited
-academic prototype. Review, benchmarks, fuzzing, a complete soundness report,
-and independent audits remain mandatory before any production selection.
+does not make the bounded byte linker production-capable. The production base
+table has 19 variables and each weight bank has 31, while this adapter admits at
+most 16 variables per table. It still retains whole bounded tables in memory
+and has no streaming 6 GiB commitment path. The upstream backend is an
+unaudited academic prototype. Review, benchmarks, fuzzing, a complete soundness
+report, and independent audits remain mandatory before any production
+selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded
@@ -470,7 +484,8 @@ Before a production proof tag can exist:
 
 1. harden and independently review the aggregate transparent PCS backend,
    canonical parameters, parser, and explicit-point transcript;
-2. link the raw model bytes to the pinned PCS commitment;
+2. reproduce the pinned PCS identity from the complete production model bytes
+   with an audited streaming/out-of-core commitment path;
 3. run the exact BLAKE3 tree argument at the complete production shape and
    demonstrate that the full aggregate, not only the hash component, remains
    below its total payload cap;

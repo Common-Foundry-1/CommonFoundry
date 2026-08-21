@@ -140,9 +140,9 @@ pub use whir_proof::{
     MAX_EXPLICIT_WHIR_OPENINGS, MAX_EXPLICIT_WHIR_PROOF_BYTES, MAX_EXPLICIT_WHIR_VARIABLES,
     MAX_STRUCTURED_WHIR_ELEMENTS, MAX_STRUCTURED_WHIR_TABLES, STRUCTURED_WHIR_SPLIT_VERSION,
     StructuredWhirCommitmentSet, StructuredWhirModelCommitmentSet, StructuredWhirModelMetadata,
-    StructuredWhirPcsVerifier, prove_explicit_whir_openings, prove_structured_whir_openings,
-    structured_whir_suite_parameter_digest, verify_explicit_whir_openings,
-    verify_structured_whir_openings,
+    StructuredWhirPcsVerifier, VerifiedModelBankWhirError, prove_explicit_whir_openings,
+    prove_structured_whir_openings, structured_whir_suite_parameter_digest,
+    verify_explicit_whir_openings, verify_structured_whir_openings,
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,

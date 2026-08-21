@@ -441,13 +441,21 @@ aggregate, exact payload length, and EOF all match. Reader and sink failures
 abort before that publication barrier. This establishes the byte/order/field
 interface; it does not yet implement a production WHIR commitment sink.
 
-The proof-acceleration crate now has a bounded authenticated BLAKE3 Merkle-store
-checkpoint whose root and opening paths match the unchanged WHIR MMCS through
-the current maximum `2^15 x 4` encoded matrix. Reopening requires an exact
-identity retained outside the store, binding the store ID, geometry, tree root,
-and artifact digest; checksums inside the same file are not treated as
-provenance. This checkpoint does not provide an out-of-core DFT, `Poly` or
-sumcheck storage, or support for the production `2^30 x 4` weight-bank matrix.
+The proof-acceleration crate now has a bounded external-memory encoder for the
+initial suffix-order WHIR codeword. It consumes an already authenticated,
+externally identified canonical Goldilocks source, scatters the source into the
+exact bit-reversed coefficient positions, runs the radix-2 butterflies with
+fixed bounded buffers, and publishes only a fully authenticated natural-row
+artifact. The current checkpoint admits at most 19 table variables: this
+covers the proposed production `2^18 x 4` base-input codeword, while rejecting
+a production weight bank before reading its source or creating a file.
+
+That codeword feeds a bounded authenticated BLAKE3 Merkle store whose root and
+opening paths match the unchanged WHIR MMCS. Reopening either artifact requires
+an exact identity retained outside the file; checksums embedded in the same
+file are integrity checks, not provenance. The checkpoint does not yet replace
+WHIR's in-memory `Poly`, extension-polynomial, or sumcheck state and does not
+support the production `2^30 x 4` weight-bank codeword.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and

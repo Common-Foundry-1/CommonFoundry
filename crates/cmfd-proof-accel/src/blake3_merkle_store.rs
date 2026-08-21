@@ -21,7 +21,8 @@ use crate::merkle_store::{GOLDILOCKS_MODULUS, MerkleRowSource};
 pub type Blake3MerkleDigest = [u8; 32];
 
 /// Maximum matrix height admitted by this bounded research checkpoint.
-pub const MAX_BLAKE3_MERKLE_ROWS: usize = 1 << 16;
+/// This covers the proposed `n = 19` base-input codeword, not an `n = 31` weight bank.
+pub const MAX_BLAKE3_MERKLE_ROWS: usize = 1 << 18;
 
 /// Maximum concatenated leaf-row width admitted by this checkpoint.
 pub const MAX_BLAKE3_MERKLE_ROW_WORDS: usize = 1 << 14;
@@ -515,9 +516,18 @@ fn build_store(
     drop(reader);
     drop(file);
 
-    let mut store = AuthenticatedBlake3MerkleStore::open_integrity_only(&partial_path)?;
+    let staged_store = AuthenticatedBlake3MerkleStore::open_integrity_only(&partial_path)?;
+    let expected_identity = staged_store.identity()?;
     fs::hard_link(&partial_path, &final_path)
         .map_err(|source| io_error("publishing", &final_path, source))?;
+    let store = match AuthenticatedBlake3MerkleStore::open(&final_path, &expected_identity) {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = fs::remove_file(&final_path);
+            return Err(error);
+        }
+    };
+    drop(staged_store);
     if let Err(source) = fs::remove_file(&partial_path) {
         let _ = fs::remove_file(&final_path);
         return Err(io_error(
@@ -527,7 +537,6 @@ fn build_store(
         ));
     }
     partial_cleanup.0 = PathBuf::new();
-    store.path = final_path;
     Ok(store)
 }
 
@@ -1248,9 +1257,9 @@ mod tests {
     }
 
     #[test]
-    fn current_max_whir_geometry_matches_cpu_root_and_selected_paths() {
+    fn n16_whir_geometry_matches_cpu_root_and_selected_paths() {
         // n=16, starting_log_inv_rate=1, folding=2 gives 2^(16+1-2)
-        // physical rows of width 2^2 in p3_sumcheck::commit::commit_base.
+        // natural rows of width 2^2 in p3_sumcheck::commit::commit_base.
         let rows = DenseRows::fixture(1 << 15, 4, 0x2f15);
         let matrix = rows.matrix();
         let cpu = mmcs();

@@ -71,6 +71,8 @@ pub use remainder_proof::{
     REMAINDER_PROTOTYPE_VERSION, RemainderPrototypeError, prove_remainder_prototype,
     verify_remainder_prototype,
 };
+#[cfg(feature = "gpu-proof-prover")]
+pub use structured_blake3::prove_structured_blake3_with_cuda;
 #[cfg(feature = "whir-prototype")]
 pub use structured_blake3::{
     STRUCTURED_BLAKE3_VERSION, StructuredBlake3Error, StructuredBlake3StarkVerifier,

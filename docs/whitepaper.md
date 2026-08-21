@@ -609,6 +609,8 @@ A proof of matrix and transition relations is incomplete if the final BLAKE3 dig
 
 Small inputs retain the original one-block research AIR. Power-of-two tables from 32 through 524,288 bytes use a narrow tree AIR that authenticates every chunk compression, deterministic parent merge, root compression, counter, flag, chaining-value stack edge, and final-table opening. The schedule is checked against upstream derive-key BLAKE3. A canonical transport deduplicates repeated Merkle authentication nodes and then applies canonical zlib compression, with strict parsing and a 256 KiB component-envelope cap. Release-mode vectors measure 165,039 bytes for 64 activation bytes and 222,555 bytes for a 2,048-byte multi-chunk input. A 32,768-row checkpoint measured a 233,382-byte compressed payload, or 233,399 bytes with the outer envelope, at about 12.22 GiB peak memory and 266.25 seconds proving time.
 
+An optional prover-only CUDA path now implements the exact Goldilocks DFT and coset-LDE semantics used by this STARK. It is selected only through an explicit library path and device, and every resulting encoded proof must pass the unchanged CPU verifier. The direct API loads native code in-process. Callers may instead use a hash-pinned, bounded child process whose whole process tree is terminated on timeout or overflow. This is crash containment, not an operating-system sandbox or a change to consensus. A separate exact Poseidon2 first-digest-layer ABI has matching CUDA/CPU canary vectors but is not yet connected to the proof configuration.
+
 This checkpoint still does not solve the production case. The complete production AIR has 1,048,576 rows and has not yet been proved end to end, so its final size, memory, proving latency, and verification latency remain unmeasured. Main-trace construction now has a bounded row-at-a-time sink that can stop on an early consumer failure, but the current Plonky3 PCS still collects the trace and materializes the full LDE in memory; an out-of-core PCS/FRI stage remains necessary. The production-shape component uses a cubic Goldilocks challenge field and its security test requires at least 128 proven bits, but the aggregate union-bound report, independent algebraic review, consensus integration, and audits remain production blockers. Passing the hash component's 256 KiB cap also does not prove that the complete aggregate fits its total payload cap.
 
 ## 9. GPU memory and hardware economics
@@ -900,16 +902,16 @@ It does not assume miners follow a reference kernel. Any implementation computin
 | Regenerate from a short seed | Seedless activated bytes | V2 format implemented; production ceremony absent |
 | Compress the bank | Structural review and competing implementations | Cannot be prohibited by consensus |
 | Retain only low accumulator bits | Exact signed interval plus canonical prime residue | Tiny reference and optional proof enforce exact ranges; production range proof absent |
-| Substitute final output | Prove final digest or publish bytes | Unresolved production blocker |
+| Substitute final output | Prove final digest or publish bytes | Feature-gated BLAKE3 STARK binds private bytes to the final WHIR opening; full production aggregation and audit remain absent |
 | Reuse proof on another block | Challenge binds network, model, parent, root, height, time, target, nonce | Implemented in reference path |
 | Claim an easier target | Chain independently derives target before proof verification | Implemented |
 | Substitute a pool share target for chain work | Targetless relation replay, separate comparisons, immutable challenge target | Implemented for Devnet pool |
 | Claim an uncomputed pool share | Submit nonce only; server independently recomputes proof and digest | Implemented at tiny Devnet scale |
 | Treat pool counters as owned funds | Explicit volatile/nonwithdrawable semantics and operator-directed miner output | No production payout ledger or user custody |
 | Cross-network replay | Full network ID in objects and fingerprint handshake | Implemented |
-| Forge polynomial openings | Transparent PCS with canonical openings | Not implemented |
+| Forge polynomial openings | Transparent PCS with canonical openings | Feature-gated WHIR research adapter authenticates canonical openings; production selection, soundness review, and audit remain absent |
 | Fake raw-to-PCS equivalence | Verifiable link certificate | Not implemented |
-| Transcript grinding | Canonical transcript, post-commit challenges, large extension field | Tiny Remainder experiment is pinned and canonicalized externally but is not production-sound or deployable |
+| Transcript grinding | Canonical transcript, post-commit challenges, large extension field | Feature-gated custom and WHIR transcripts bind post-commitment points; complete aggregate soundness and production review remain absent |
 | Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; production proof parser absent |
 | False remote height or work | Treat advertisement as hint and recompute locally | Implemented |
 | Peer spoofing, eclipse, MITM | Authenticated encrypted peer layer, discovery, reputation | Not implemented; private static peers only |
@@ -941,7 +943,7 @@ an SBOM, signed provenance, or an attestation.
 | Model bank | Seedless format, lengths, roots, byte checks | Published 6 GiB artifact, ceremony, PCS, byte-to-PCS link |
 | Matrix sumcheck | Standalone small educational skeleton | Batched GKR, openings, ranges, 128-bit aggregate soundness |
 | Final digest | Feature-gated exact BLAKE3 chunk/parent/root tree STARK bound to the final WHIR opening; canonical compressed component vectors below 256 KiB; row-at-a-time trace-generation seam | Out-of-core PCS/FRI, full 1,048,576-row benchmark, aggregate payload fit, soundness report, consensus integration, and audits |
-| CUDA | Tiny arithmetic differential smoke fixture | Independent optimized miner/prover and hardware matrix |
+| CUDA | Tiny mining-arithmetic fixture; exact prover DFT/LDE backend with mandatory CPU verification; Poseidon2 first-digest canary | Complete accelerated prover integration, OS sandboxing, independent implementation, and hardware matrix |
 | P2P | Bounded static private pull plus thin-miner template/submission messages | Authenticated public discovery/gossip and DoS defenses |
 | Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |
 | Mempool | Deterministic capped confirmed-input pool | Fee-burn inclusion/eviction economics and package policy |
@@ -951,7 +953,7 @@ an SBOM, signed provenance, or an attestation.
 | Governance | Fixed visible steward/community destinations | Secure multisig, beneficial-owner disclosure, reporting, change process |
 | Audits | Internal tests and review only | Two independent external audits |
 
-The CUDA fixture checks arithmetic only. It consumes CPU-generated mask coefficients rather than independently deriving them from the BLAKE3 challenge, so end-to-end CPU/GPU parity remains an activation requirement.
+The tiny mining-arithmetic CUDA fixture consumes CPU-generated mask coefficients rather than independently deriving them from the BLAKE3 challenge, so end-to-end mining CPU/GPU parity remains an activation requirement. This limitation is separate from the prover-only DFT/LDE backend described above.
 
 ## 14. Activation roadmap
 
@@ -1033,9 +1035,12 @@ marketplace transport, governance disclosure, and external audits.
 
 The complete tiny Remainder experiment usefully falsified one shortcut: a
 generic GKR/Ligero frontend yielded a roughly 302.7 MB proof with two-minute
-verification, so it cannot be relabeled as the production proof. The next proof
-milestone is the specialized batched matrix/transition sumcheck and transparent
-PCS prototype, measured against the activation gates from its first revision.
+verification, so it cannot be relabeled as the production proof. The
+specialized matrix, transition, wiring, WHIR, and final-digest research
+components now exist behind feature gates. The next proof milestone is to link
+the production model bytes, run the complete production-shape aggregate with
+an out-of-core PCS/FRI prover, publish the aggregate soundness accounting, and
+subject the result to independent cryptographic review.
 
 That honesty is part of the design. Common Foundry should become valuable only after its central claims are independently demonstrated, not because a white paper treats proposals as facts.
 
@@ -1178,7 +1183,7 @@ For avoidance of doubt, this paper does not claim that:
 - the current compact Devnet proof is succinct;
 - the current toy sumcheck is production-sound;
 - the manifest's PCS fields are a working deployed polynomial commitment;
-- the CUDA fixture is an optimized miner or prover, or independently rederives the BLAKE3 challenge-to-mask coefficients;
+- the tiny mining-arithmetic CUDA fixture is an optimized miner or prover, or independently rederives the BLAKE3 challenge-to-mask coefficients;
 - the 6 GiB model is mathematically incompressible;
 - inference receipts prove model correctness;
 - Devnet pool credits are spendable rewards, a debt, or an on-chain balance;

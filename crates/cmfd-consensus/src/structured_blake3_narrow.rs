@@ -21,13 +21,18 @@ use bincode::Options;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::DuplexChallenger;
 use p3_commit::ExtensionMmcs;
+#[cfg(any(test, not(feature = "gpu-proof-prover")))]
 use p3_dft::Radix2DitParallel;
+use p3_dft::{Layout, TwoAdicSubgroupDft};
 use p3_field::extension::CubicTrinomialExtensionField;
 use p3_field::integers::QuotientMap;
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks, default_goldilocks_poseidon2_8};
-use p3_matrix::dense::RowMajorMatrix;
+use p3_matrix::{
+    bitrev::BitReversedMatrixView,
+    dense::{RowMajorMatrix, RowMajorMatrixViewMut},
+};
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use p3_uni_stark::{
@@ -39,6 +44,11 @@ use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement,
     structured_blake3_tree::{Blake3TreeError, CompressionKind, CompressionOp, build_tree_witness},
 };
+
+#[cfg(feature = "gpu-proof-prover")]
+type NarrowDftBackend = cmfd_proof_accel::ProofDft;
+#[cfg(not(feature = "gpu-proof-prover"))]
+type NarrowDftBackend = Radix2DitParallel<F>;
 
 const OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
 const MAX_POINT_VARIABLES: usize = 19;
@@ -73,9 +83,63 @@ type ValMmcs =
     MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, FieldHash, Compress, 2, 4>;
 type ChallengeMmcs = ExtensionMmcs<F, EF, ValMmcs>;
 type Challenger = DuplexChallenger<F, Perm, 8, 4>;
-type Pcs = TwoAdicFriPcs<F, Radix2DitParallel<F>, ValMmcs, ChallengeMmcs>;
+type Pcs = TwoAdicFriPcs<F, NarrowDft, ValMmcs, ChallengeMmcs>;
 pub(crate) type Config = StarkConfig<Pcs, EF, Challenger>;
 pub(crate) type NativeProof = Proof<Config>;
+
+/// Exact proof DFT seam. Its default is always the CPU reference; CUDA is
+/// available only through the explicit accelerated-prover entry point.
+#[derive(Clone, Default)]
+pub(crate) struct NarrowDft {
+    backend: NarrowDftBackend,
+}
+
+impl NarrowDft {
+    #[cfg(feature = "gpu-proof-prover")]
+    pub(crate) fn load_cuda(
+        library_path: impl AsRef<std::path::Path>,
+        device_index: i32,
+    ) -> Result<Self, NarrowBlake3Error> {
+        cmfd_proof_accel::ProofDft::load_cuda(library_path, device_index)
+            .map(|backend| Self { backend })
+            .map_err(|error| NarrowBlake3Error::Accelerator(error.to_string()))
+    }
+
+    #[cfg(all(test, feature = "gpu-proof-prover"))]
+    fn is_cuda(&self) -> bool {
+        self.backend.is_cuda()
+    }
+}
+
+impl TwoAdicSubgroupDft<F> for NarrowDft {
+    type Evaluations = BitReversedMatrixView<RowMajorMatrix<F>>;
+
+    fn dft_batch(&self, mat: RowMajorMatrix<F>) -> Self::Evaluations {
+        self.backend.dft_batch(mat)
+    }
+
+    fn coset_dft_batch(&self, mat: RowMajorMatrix<F>, shift: F) -> Self::Evaluations {
+        self.backend.coset_dft_batch(mat, shift)
+    }
+
+    fn coset_idft_batch(&self, mat: RowMajorMatrix<F>, shift: F) -> RowMajorMatrix<F> {
+        self.backend.coset_idft_batch(mat, shift)
+    }
+
+    fn coset_lde_batch_with_transform<T>(
+        &self,
+        mat: RowMajorMatrix<F>,
+        added_bits: usize,
+        shift: F,
+        transform: T,
+    ) -> Self::Evaluations
+    where
+        T: FnOnce(&mut RowMajorMatrixViewMut<'_, F>, Layout),
+    {
+        self.backend
+            .coset_lde_batch_with_transform(mat, added_bits, shift, transform)
+    }
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MerklePathArchive {
@@ -98,6 +162,9 @@ pub(crate) enum NarrowBlake3Error {
     Encoding,
     #[error("narrow BLAKE3 tree verifier rejected the proof")]
     Verification,
+    #[cfg(feature = "gpu-proof-prover")]
+    #[error("narrow BLAKE3 tree accelerator setup failed: {0}")]
+    Accelerator(String),
     #[error("narrow BLAKE3 tree backend panicked")]
     BackendPanic,
 }
@@ -281,9 +348,18 @@ impl<AB: AirBuilder<F = F>> Air<AB> for NarrowBlake3Air {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prove_narrow_blake3(
     statement: &StructuredBlake3Statement,
     activation: &[u8],
+) -> Result<Vec<u8>, NarrowBlake3Error> {
+    prove_narrow_blake3_with_dft(statement, activation, NarrowDft::default())
+}
+
+pub(crate) fn prove_narrow_blake3_with_dft(
+    statement: &StructuredBlake3Statement,
+    activation: &[u8],
+    dft: NarrowDft,
 ) -> Result<Vec<u8>, NarrowBlake3Error> {
     let air = NarrowBlake3Air::new(statement)?;
     if activation.len() != statement.final_activation_len || activation.iter().any(|v| *v > 250) {
@@ -296,11 +372,11 @@ pub(crate) fn prove_narrow_blake3(
     }
     let trace = generate_main_trace(&air, statement, &witness);
     let public = public_values(statement)?;
-    let config = build_config();
+    let config = build_config_with_dft(dft);
     let log_rows = air.trace_rows.ilog2() as usize;
-    let (prep, _) = setup_preprocessed(&config, &air, log_rows)
-        .expect("narrow BLAKE3 AIR has preprocessed columns");
     let proof = catch_unwind(AssertUnwindSafe(|| {
+        let (prep, _) = setup_preprocessed(&config, &air, log_rows)
+            .expect("narrow BLAKE3 AIR has preprocessed columns");
         prove_with_preprocessed(&config, &air, trace, &public, Some(&prep))
     }))
     .map_err(|_| NarrowBlake3Error::BackendPanic)?;
@@ -315,10 +391,10 @@ pub(crate) fn verify_narrow_blake3(
     let proof = decode_native_proof(bytes)?;
     let config = build_config();
     let log_rows = air.trace_rows.ilog2() as usize;
-    let (_, verifier_key) = setup_preprocessed(&config, &air, log_rows)
-        .expect("narrow BLAKE3 AIR has preprocessed columns");
     let public = public_values(statement)?;
     catch_unwind(AssertUnwindSafe(|| {
+        let (_, verifier_key) = setup_preprocessed(&config, &air, log_rows)
+            .expect("narrow BLAKE3 AIR has preprocessed columns");
         verify_with_preprocessed(&config, &air, &proof, &public, Some(&verifier_key))
     }))
     .map_err(|_| NarrowBlake3Error::BackendPanic)?
@@ -1408,11 +1484,19 @@ pub(crate) fn build_config() -> Config {
 }
 
 pub(crate) fn build_config_with_fri(log_blowup: usize, num_queries: usize) -> Config {
+    build_config_with_dft_and_fri(NarrowDft::default(), log_blowup, num_queries)
+}
+
+fn build_config_with_dft(dft: NarrowDft) -> Config {
+    build_config_with_dft_and_fri(dft, FRI_LOG_BLOWUP, FRI_QUERIES)
+}
+
+fn build_config_with_dft_and_fri(dft: NarrowDft, log_blowup: usize, num_queries: usize) -> Config {
     let perm = default_poseidon2();
     let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm.clone()), 0);
     let challenge = ChallengeMmcs::new(val.clone());
     let pcs = Pcs::new(
-        Radix2DitParallel::default(),
+        dft,
         val,
         fri_parameters_with(log_blowup, num_queries, challenge),
     );
@@ -1550,6 +1634,7 @@ impl<E: Clone + PrimeCharacteristicRing> ExtExpr<E> {
 mod tests {
     use super::*;
     use p3_air::AirLayout;
+    use p3_matrix::Matrix;
     use p3_uni_stark::{ProvenSecurity, StarkSecurityParams};
 
     fn statement(activation: &[u8]) -> StructuredBlake3Statement {
@@ -1584,6 +1669,104 @@ mod tests {
                 crate::structured_sumcheck::evaluate_mle(&table, &native_point),
             ),
         }
+    }
+
+    fn dft_fixture(height: usize, width: usize, salt: u64) -> RowMajorMatrix<F> {
+        let boundaries = [0, 1, 2, GOLDILOCKS_MODULUS - 2, GOLDILOCKS_MODULUS - 1];
+        let values = (0..height * width)
+            .map(|index| {
+                let value = boundaries.get(index).copied().unwrap_or_else(|| {
+                    ((index as u128 * 0x9e37_79b9_7f4a_7c15_u128 + u128::from(salt))
+                        % u128::from(GOLDILOCKS_MODULUS)) as u64
+                });
+                F::from_u64(value)
+            })
+            .collect();
+        RowMajorMatrix::new(values, width)
+    }
+
+    fn assert_bit_reversed_outputs_equal(
+        label: &str,
+        reference: BitReversedMatrixView<RowMajorMatrix<F>>,
+        adapted: BitReversedMatrixView<RowMajorMatrix<F>>,
+    ) {
+        assert_eq!(
+            reference.inner, adapted.inner,
+            "{label} physical bit-reversed ordering differs"
+        );
+        assert_eq!(
+            reference.to_row_major_matrix(),
+            adapted.to_row_major_matrix(),
+            "{label} logical ordering differs"
+        );
+    }
+
+    fn transform_coefficients(matrix: &mut RowMajorMatrixViewMut<'_, F>, layout: Layout) {
+        assert_eq!(layout, Layout::BitReversed);
+        for (index, value) in matrix.values.iter_mut().enumerate() {
+            *value += F::from_u64((index as u64 % 251) + 1);
+        }
+    }
+
+    #[test]
+    fn narrow_dft_matches_reference_for_every_delegated_operation() {
+        let reference = Radix2DitParallel::<F>::default();
+        let adapted = NarrowDft::default();
+        let shifts = [F::ONE, F::from_u64(7), F::from_u64(0x1234_5678_9abc_def0)];
+
+        for log_height in 1..=6 {
+            let height = 1 << log_height;
+            for width in [1, 2, 3, 7] {
+                let input = dft_fixture(height, width, (height * width) as u64);
+                assert_bit_reversed_outputs_equal(
+                    "dft_batch",
+                    reference.dft_batch(input.clone()),
+                    adapted.dft_batch(input.clone()),
+                );
+
+                for shift in shifts {
+                    assert_bit_reversed_outputs_equal(
+                        "coset_dft_batch",
+                        reference.coset_dft_batch(input.clone(), shift),
+                        adapted.coset_dft_batch(input.clone(), shift),
+                    );
+                    assert_eq!(
+                        reference.coset_idft_batch(input.clone(), shift),
+                        adapted.coset_idft_batch(input.clone(), shift),
+                        "coset_idft_batch differs for height={height}, width={width}"
+                    );
+
+                    for added_bits in 0..=3 {
+                        assert_bit_reversed_outputs_equal(
+                            "coset_lde_batch",
+                            reference.coset_lde_batch(input.clone(), added_bits, shift),
+                            adapted.coset_lde_batch(input.clone(), added_bits, shift),
+                        );
+                        assert_bit_reversed_outputs_equal(
+                            "coset_lde_batch_with_transform",
+                            reference.coset_lde_batch_with_transform(
+                                input.clone(),
+                                added_bits,
+                                shift,
+                                transform_coefficients,
+                            ),
+                            adapted.coset_lde_batch_with_transform(
+                                input.clone(),
+                                added_bits,
+                                shift,
+                                transform_coefficients,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    fn narrow_dft_default_remains_cpu() {
+        assert!(!NarrowDft::default().is_cuda());
     }
 
     #[test]
@@ -1737,23 +1920,55 @@ mod tests {
     #[test]
     #[ignore = "resource-sizing benchmark"]
     fn proof_size_at_32768_rows() {
+        proof_size_at_32768_rows_with_dft("cpu", NarrowDft::default());
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    #[ignore = "requires CMFD_TEST_PROOF_CUDA_LIBRARY, a CUDA device, and about 14 GiB host RAM"]
+    fn gpu_proof_size_at_32768_rows() {
+        let library_path = std::env::var_os("CMFD_TEST_PROOF_CUDA_LIBRARY")
+            .expect("set CMFD_TEST_PROOF_CUDA_LIBRARY to the exact CUDA proof-library path");
+        let dft = NarrowDft::load_cuda(std::path::PathBuf::from(library_path), 0).unwrap();
+        proof_size_at_32768_rows_with_dft("cuda", dft);
+    }
+
+    fn proof_size_at_32768_rows_with_dft(label: &str, dft: NarrowDft) {
         use std::io::Write;
+        use std::time::Instant;
 
         let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         let statement = statement(&activation);
         let air = NarrowBlake3Air::new_with_min_rows(&statement, 32_768).unwrap();
+        let witness_started = Instant::now();
         let witness =
             build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+        let witness_elapsed = witness_started.elapsed();
+        let trace_started = Instant::now();
         let trace = generate_main_trace(&air, &statement, &witness);
+        let trace_elapsed = trace_started.elapsed();
         let public = public_values(&statement).unwrap();
-        let config = build_config();
+        let config = build_config_with_dft(dft);
+        let setup_started = Instant::now();
         let (prep, _) = setup_preprocessed(&config, &air, 15).unwrap();
+        let setup_elapsed = setup_started.elapsed();
+        let prove_started = Instant::now();
         let proof = prove_with_preprocessed(&config, &air, trace, &public, Some(&prep));
+        let prove_elapsed = prove_started.elapsed();
+        let encode_started = Instant::now();
         let native = encode_native_proof(proof).unwrap();
+        let encode_elapsed = encode_started.elapsed();
+        let compress_started = Instant::now();
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&native).unwrap();
         let compressed = encoder.finish().unwrap();
-        eprintln!("native={} zlib={}", native.len(), compressed.len());
+        let compress_elapsed = compress_started.elapsed();
+        eprintln!(
+            "backend={label} rows={} native={} zlib={} witness={witness_elapsed:?} trace={trace_elapsed:?} setup={setup_elapsed:?} prove={prove_elapsed:?} encode={encode_elapsed:?} compress={compress_elapsed:?}",
+            air.trace_rows,
+            native.len(),
+            compressed.len()
+        );
         assert!(17 + compressed.len() <= 256 * 1024);
     }
 }

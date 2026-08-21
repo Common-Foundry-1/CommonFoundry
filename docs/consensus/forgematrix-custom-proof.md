@@ -285,6 +285,46 @@ a disk-backed consumer, but the pinned Plonky3 PCS API still requires an owned
 `RowMajorMatrix` and materializes its LDE in memory. Replacing that PCS/FRI
 stage, not merely streaming witness construction, is the remaining memory task.
 
+### 5.1 Optional GPU prover work
+
+The feature-gated prover can explicitly replace Plonky3's CPU
+`TwoAdicSubgroupDft` with a CUDA implementation of the same Goldilocks DFT and
+coset-LDE semantics. Natural and physical bit-reversed row layouts, inverse
+transforms, transformed coefficient callbacks, canonical field
+representatives, and dimension caps are checked at the Rust/C ABI boundary.
+The production-shaped `32,768 x 291`, `+7` coefficient LDE produces a
+`4,194,304 x 291` output without constructing the expanded matrix on the host.
+On an RTX 5090 it measured 371.748 ms of device work and 482.986 ms for device
+allocation, input upload, and GPU completion. That canary deliberately left
+the 9.094 GiB result device-resident, so the latter number excludes output
+allocation and device-to-host transfer. These are kernel-path measurements,
+not a complete production proof benchmark.
+
+In an unoptimized Cargo test-profile comparison at the same 32,768-row shape,
+the accelerated run completed with 65.667 seconds of preprocessed setup and
+266.382 seconds in the prover, compared with 66.948 and 287.924 seconds for the
+corresponding CPU run. The compressed payload remained below 256 KiB. These
+numbers are not directly comparable to the release-mode checkpoint above.
+They show that DFT/LDE acceleration works and preserves CPU verification, but
+that it is no longer the dominant proving cost.
+
+The next measured seam is the prover-side Poseidon2 first digest layer used by
+the value MMCS. A standalone exact CUDA ABI matches the pinned Plonky3
+`PaddingFreeSponge` for concatenated rows from one or more matrices. At
+4,194,304 rows on the same RTX 5090, width 291 measured 202.013 ms of kernel
+time; host-to-device transfer of the 9.094 GiB input measured 732.967 ms. This
+is a validated canary, not yet an active proof backend. Parent Merkle
+compression, openings, transcript operations, and all verification remain on
+the CPU.
+
+The CUDA library is native code and is never trusted for validity. The direct
+accelerated entry point loads it in-process, then verifies the complete encoded
+proof with the unchanged CPU verifier. A caller can instead use the separate
+short-lived worker, which adds bounded canonical IPC, SHA-256 pins, deadlines,
+output limits, and process-tree termination. That boundary contains ordinary
+crashes but is not a same-user security sandbox; production deployment still
+needs OS-enforced isolation and artifact custody.
+
 ## 6. Transparent PCS boundary
 
 The PCS must support batched multilinear openings over the cubic Goldilocks

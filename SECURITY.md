@@ -76,6 +76,34 @@ multi-chunk activation. A 32,768-row resource checkpoint measured a 233,382-byte
 compressed payload (233,399 bytes with the outer envelope), about 12.22 GiB
 peak memory, and 266.25 seconds proving time.
 
+The optional `gpu-proof-prover` experiment accelerates only the prover's exact
+Goldilocks DFT/LDE operations. It does not change the Goldilocks modulus,
+transform or coset semantics, transcript, CPU verifier, or consensus rules.
+CUDA selection requires an explicit library path and device; there is no
+environment search or fallback after GPU selection. Every fully encoded
+accelerated proof is verified by the unchanged CPU verifier before it can be
+returned. CPU/GPU tests compare logical and physical bit-reversed layouts,
+transformed coset LDEs, commitments, openings, and final polynomials. Complete
+proof bytes are not required to match because the parallel FRI grinding search
+may select different valid nonces.
+
+The direct accelerated API loads the explicitly named native library in the
+calling process. CPU proof verification detects wrong arithmetic but cannot
+contain memory corruption, hangs, or process compromise. A caller can instead
+use the short-lived `cmfd-proof-worker`, which adds bounded canonical IPC,
+caller-pinned SHA-256 hashes, a deadline, output limits, and whole-process-tree
+termination through a Windows Job Object or Unix process group. The parent
+independently verifies the returned bytes. This contains ordinary crashes and
+descendants, but it is not an OS sandbox: same-user file replacement between
+hashing and loading, transitive native dependencies, and host-wide resource
+exhaustion remain outside this boundary. No wallet or node path enables either
+experimental path by default.
+
+An exact Poseidon2 first-digest-layer CUDA ABI and canary now match the pinned
+Plonky3 row hasher for single and multiple matrices. It remains disconnected
+from the proof configuration; Merkle parent compression, openings, transcript,
+and verification are still CPU work.
+
 This is still not a production succinct solution. The full production AIR has
 1,048,576 rows and has not yet been proved end to end; its final proof size,
 peak memory, proving time, and verification time remain unmeasured. A test
@@ -83,8 +111,8 @@ derives the production-shape AIR constraint count and degree over a cubic
 Goldilocks challenge field and requires at least 128 proven bits under
 Plonky3's component-security model, but this is not the missing aggregate
 union-bound report. The legacy one-block backend and the
-new custom tree AIR both require independent algebraic review. There is still
-now a bounded row-at-a-time main-trace generation seam, including early sink
+new custom tree AIR both require independent algebraic review. There is now a
+bounded row-at-a-time main-trace generation seam, including early sink
 failure propagation, but the current Plonky3 PCS immediately collects those
 rows and materializes the full LDE in memory. There is still no production
 out-of-core PCS/FRI prover, raw-model-byte link, consensus tag, complete

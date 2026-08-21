@@ -90,6 +90,20 @@ See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
 boundary, supported architectures, wallet packaging, and tester procedure, and
 [ForgeMatrix v2 OpenCL miner](docs/opencl-miner.md) for the Intel Arc backend,
 its backend-selection variables, and its known limits.
+
+The feature-gated succinct-proof research has a separate optional CUDA
+backend for exact Goldilocks DFT/LDE work. CPU proving remains the default, and
+the accelerated entry point accepts only an explicit CUDA library path and
+device. It loads native code in-process, but accepts a returned proof only
+after running the unchanged CPU verifier. Callers that need crash containment
+can instead use the separate proof worker, which pins the worker executable and
+CUDA library by SHA-256 and adds bounded binary IPC and process-tree
+termination. That worker is not an operating-system sandbox. An exact
+Poseidon2 first-digest-layer CUDA canary is also present; it is not yet wired
+into proof generation. See
+[the custom proof specification](docs/consensus/forgematrix-custom-proof.md)
+for the measured scope and remaining activation gates.
+
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`
 launchers. Its live console reports per-GPU and rig hashrate, power, hashes per

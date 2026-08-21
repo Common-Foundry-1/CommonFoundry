@@ -855,6 +855,7 @@ dependencies = [
  "blake3",
  "clap",
  "cmfd-marketplace",
+ "cmfd-proof-accel",
  "enum-ordinalize",
  "flate2",
  "frontend",
@@ -937,6 +938,31 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cmfd-proof-accel"
+version = "0.1.0-devnet.11"
+dependencies = [
+ "libloading 0.8.9",
+ "p3-dft",
+ "p3-field",
+ "p3-goldilocks",
+ "p3-matrix",
+ "p3-symmetric",
+]
+
+[[package]]
+name = "cmfd-proof-worker"
+version = "0.1.0-devnet.11"
+dependencies = [
+ "blake3",
+ "cmfd-consensus",
+ "hex",
+ "libc",
+ "sha2",
+ "thiserror 2.0.20",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

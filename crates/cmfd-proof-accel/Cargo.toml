@@ -1,0 +1,20 @@
+[package]
+name = "cmfd-proof-accel"
+version = "0.1.0-devnet.11"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libloading.workspace = true
+p3-dft = { version = "=0.6.3", features = ["parallel"] }
+p3-field = "=0.6.3"
+p3-goldilocks = "=0.6.3"
+p3-matrix = "=0.6.3"
+
+[dev-dependencies]
+p3-symmetric = "=0.6.3"
+
+[lib]
+name = "cmfd_proof_accel"
+path = "src/lib.rs"

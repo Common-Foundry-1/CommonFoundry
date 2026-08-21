@@ -25,7 +25,6 @@ use p3_blake3::Blake3;
 use p3_blake3_air::{Blake3Air, Blake3Cols, Blake3State, FullRound, NUM_BLAKE3_COLS};
 use p3_challenger::{HashChallenger, SerializingChallenger64};
 use p3_commit::ExtensionMmcs;
-use p3_dft::Radix2DitParallel;
 use p3_field::extension::CubicTrinomialExtensionField;
 use p3_field::integers::QuotientMap;
 use p3_field::{Field, PrimeCharacteristicRing};
@@ -40,7 +39,9 @@ use thiserror::Error;
 use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement, StructuredBlake3Verifier,
     forgematrix_v2::output_digest,
-    structured_blake3_narrow::{NarrowBlake3Error, prove_narrow_blake3, verify_narrow_blake3},
+    structured_blake3_narrow::{
+        NarrowBlake3Error, NarrowDft, prove_narrow_blake3_with_dft, verify_narrow_blake3,
+    },
 };
 
 pub const STRUCTURED_BLAKE3_VERSION: u32 = 2;
@@ -80,7 +81,7 @@ type Compress = CompressionFunctionFromHasher<Blake3, 2, 32>;
 type ValMmcs = MerkleTreeMmcs<<F as Field>::Packing, u8, FieldHash, Compress, 2, 32>;
 type ChallengeMmcs = ExtensionMmcs<F, EF, ValMmcs>;
 type Challenger = SerializingChallenger64<F, HashChallenger<u8, Blake3, 32>>;
-type Dft = Radix2DitParallel<F>;
+type Dft = NarrowDft;
 type Pcs = TwoAdicFriPcs<F, Dft, ValMmcs, ChallengeMmcs>;
 type Config = StarkConfig<Pcs, EF, Challenger>;
 type NativeProof = Proof<Config>;
@@ -114,6 +115,8 @@ pub enum StructuredBlake3Error {
     InvalidEncoding,
     #[error("BLAKE3 STARK verifier rejected the proof")]
     Verification,
+    #[error("BLAKE3 STARK accelerator setup failed: {0}")]
+    Accelerator(String),
     #[error("BLAKE3 STARK backend panicked while handling proof data")]
     BackendPanic,
 }
@@ -127,6 +130,8 @@ impl From<NarrowBlake3Error> for StructuredBlake3Error {
             NarrowBlake3Error::Opening => Self::ActivationOpening,
             NarrowBlake3Error::Encoding => Self::InvalidEncoding,
             NarrowBlake3Error::Verification => Self::Verification,
+            #[cfg(feature = "gpu-proof-prover")]
+            NarrowBlake3Error::Accelerator(message) => Self::Accelerator(message),
             NarrowBlake3Error::BackendPanic => Self::BackendPanic,
         }
     }
@@ -321,9 +326,43 @@ pub fn prove_structured_blake3(
     statement: &StructuredBlake3Statement,
     final_activation: &[u8],
 ) -> Result<Vec<u8>, StructuredBlake3Error> {
+    prove_structured_blake3_with_dft(statement, final_activation, NarrowDft::default())
+}
+
+/// Generate a BLAKE3 argument with the exact caller-supplied CUDA proof
+/// library and device. This never searches for a library, reads an accelerator
+/// setting from the environment, or falls back to CPU after selection. The
+/// fully encoded result must pass the unchanged CPU verifier before it is
+/// returned to the caller.
+#[cfg(feature = "gpu-proof-prover")]
+pub fn prove_structured_blake3_with_cuda(
+    statement: &StructuredBlake3Statement,
+    final_activation: &[u8],
+    library_path: impl AsRef<std::path::Path>,
+    device_index: i32,
+) -> Result<Vec<u8>, StructuredBlake3Error> {
+    let dft = NarrowDft::load_cuda(library_path, device_index)?;
+    let proof = prove_structured_blake3_with_dft(statement, final_activation, dft)?;
+    require_cpu_verified_proof(statement, proof)
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn require_cpu_verified_proof(
+    statement: &StructuredBlake3Statement,
+    proof: Vec<u8>,
+) -> Result<Vec<u8>, StructuredBlake3Error> {
+    verify_structured_blake3(statement, &proof)?;
+    Ok(proof)
+}
+
+fn prove_structured_blake3_with_dft(
+    statement: &StructuredBlake3Statement,
+    final_activation: &[u8],
+    dft: NarrowDft,
+) -> Result<Vec<u8>, StructuredBlake3Error> {
     if statement.final_activation_len > MAX_ONE_BLOCK_ACTIVATION_BYTES {
         let backend = BACKEND_TREE;
-        let payload = prove_narrow_blake3(statement, final_activation)?;
+        let payload = prove_narrow_blake3_with_dft(statement, final_activation, dft)?;
         let compressed = compress_tree_proof(&payload)?;
         if 17 + compressed.len() > MAX_COMPRESSED_TREE_PROOF_BYTES {
             return Err(StructuredBlake3Error::ProofTooLarge);
@@ -341,7 +380,7 @@ pub fn prove_structured_blake3(
 
     let trace = generate_trace(statement.challenge_digest, final_activation);
     let public_values = public_values(statement)?;
-    let config = build_config();
+    let config = build_config_with_dft(dft);
     let proof = catch_unwind(AssertUnwindSafe(|| {
         prove(&config, &air, trace, &public_values)
     }))
@@ -487,13 +526,17 @@ fn canonical_field(value: u64) -> Result<F, StructuredBlake3Error> {
 }
 
 fn build_config() -> Config {
+    build_config_with_dft(Dft::default())
+}
+
+fn build_config_with_dft(dft: Dft) -> Config {
     let byte_hash = Blake3 {};
     let field_hash = FieldHash::new(byte_hash);
     let compress = Compress::new(byte_hash);
     let val_mmcs = ValMmcs::new(field_hash, compress, 0);
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let fri_params = fri_parameters(challenge_mmcs);
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params);
+    let pcs = Pcs::new(dft, val_mmcs, fri_params);
     let challenger = Challenger::new(HashChallenger::new(Vec::new(), byte_hash));
     Config::new(pcs, challenger)
 }
@@ -924,6 +967,99 @@ mod tests {
             verify_structured_blake3(&production, &[0; 16]),
             Err(StructuredBlake3Error::ProofTooLarge)
         );
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    fn cuda_prover_requires_the_explicit_library_to_load() {
+        let activation = [1, 2, 3, 4, 5, 6, 7, 8];
+        let statement = statement(&activation);
+        let missing = std::env::temp_dir().join(format!(
+            "cmfd-proof-cuda-missing-{}-{}",
+            std::process::id(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        let error = prove_structured_blake3_with_cuda(&statement, &activation, missing, 0)
+            .expect_err("an explicitly missing CUDA library must fail closed");
+        assert!(matches!(error, StructuredBlake3Error::Accelerator(_)));
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    fn cuda_return_gate_rejects_a_corrupt_backend_proof() {
+        let activation = [1, 2, 3, 4, 5, 6, 7, 8];
+        let statement = statement(&activation);
+        assert_eq!(
+            require_cpu_verified_proof(&statement, vec![0; 17]),
+            Err(StructuredBlake3Error::InvalidEncoding)
+        );
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    #[ignore = "requires CMFD_TEST_PROOF_CUDA_LIBRARY and a CUDA device"]
+    fn cuda_tree_proof_is_accepted_by_the_unchanged_cpu_verifier() {
+        let library_path = std::env::var_os("CMFD_TEST_PROOF_CUDA_LIBRARY")
+            .expect("set CMFD_TEST_PROOF_CUDA_LIBRARY to the exact CUDA proof-library path");
+        let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let proof = prove_structured_blake3_with_cuda(
+            &statement,
+            &activation,
+            std::path::PathBuf::from(library_path),
+            0,
+        )
+        .unwrap();
+        let cpu_proof = prove_structured_blake3(&statement, &activation).unwrap();
+        // Plonky3's parallel FRI proof-of-work search may find a different
+        // valid nonce on each run. That changes query positions and Merkle
+        // paths, so complete proof bytes are not deterministic. Compare the
+        // algebraic commitments and transcript values fixed before that nonce.
+        let (_, gpu_compressed) = decode_proof(&proof).unwrap();
+        let gpu_native = crate::structured_blake3_narrow::decode_native_proof(
+            &decompress_tree_proof(gpu_compressed).unwrap(),
+        )
+        .unwrap();
+        let (_, cpu_compressed) = decode_proof(&cpu_proof).unwrap();
+        let cpu_native = crate::structured_blake3_narrow::decode_native_proof(
+            &decompress_tree_proof(cpu_compressed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gpu_native.degree_bits, cpu_native.degree_bits);
+        assert_eq!(
+            bincode_options()
+                .serialize(&gpu_native.commitments)
+                .unwrap(),
+            bincode_options()
+                .serialize(&cpu_native.commitments)
+                .unwrap()
+        );
+        assert_eq!(
+            bincode_options()
+                .serialize(&gpu_native.opened_values)
+                .unwrap(),
+            bincode_options()
+                .serialize(&cpu_native.opened_values)
+                .unwrap()
+        );
+        assert_eq!(
+            bincode_options()
+                .serialize(&gpu_native.opening_proof.commit_phase_commits)
+                .unwrap(),
+            bincode_options()
+                .serialize(&cpu_native.opening_proof.commit_phase_commits)
+                .unwrap()
+        );
+        assert_eq!(
+            bincode_options()
+                .serialize(&gpu_native.opening_proof.final_poly)
+                .unwrap(),
+            bincode_options()
+                .serialize(&cpu_native.opening_proof.final_poly)
+                .unwrap()
+        );
+        verify_structured_blake3(&statement, &proof).unwrap();
+        verify_structured_blake3(&statement, &cpu_proof).unwrap();
     }
 
     #[test]

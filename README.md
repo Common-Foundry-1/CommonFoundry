@@ -91,16 +91,25 @@ boundary, supported architectures, wallet packaging, and tester procedure, and
 [ForgeMatrix v2 OpenCL miner](docs/opencl-miner.md) for the Intel Arc backend,
 its backend-selection variables, and its known limits.
 
-The feature-gated succinct-proof research has a separate optional CUDA
-backend for exact Goldilocks DFT/LDE work. CPU proving remains the default, and
-the accelerated entry point accepts only an explicit CUDA library path and
-device. It loads native code in-process, but accepts a returned proof only
-after running the unchanged CPU verifier. Callers that need crash containment
-can instead use the separate proof worker, which pins the worker executable and
-CUDA library by SHA-256 and adds bounded binary IPC and process-tree
-termination. That worker is not an operating-system sandbox. An exact
-Poseidon2 first-digest-layer CUDA canary is also present; it is not yet wired
-into proof generation. See
+The feature-gated succinct-proof research has a separate optional CUDA backend
+for exact Goldilocks DFT/LDE work and the value-MMCS Poseidon2 first digest
+layer. CPU proving remains the default, and the accelerated entry point accepts
+only an explicit CUDA library path and device. The direct API loads native code
+in-process and is for trusted development only; every returned proof must pass
+the unchanged CPU verifier. Callers that need crash containment can instead use
+the separate proof worker, which pins the worker executable and CUDA library by
+SHA-256 and adds bounded binary IPC and process-tree termination. That path has
+been tested end to end with a 64-byte tree proof, but it is not an
+operating-system sandbox.
+
+At the 32,768-row checkpoint on an RTX 5090, an unoptimized Cargo test-profile
+CPU run took 348.28 seconds (64.503 setup, 283.416 prove; 238,698-byte canonical
+zlib payload). CUDA DFT plus Poseidon2 took 76.71 seconds (7.700 setup, 68.551
+prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. CUDA ABI v1 is
+test-profile-only: it caps a call at `2^24` rows and `2^31` field limbs. The
+production `2^27`-row LDE would require 291 GiB and 87 GiB inputs for widths 291
+and 87, plus a 4 GiB digest layer, so a streaming/out-of-core prover remains
+required. See
 [the custom proof specification](docs/consensus/forgematrix-custom-proof.md)
 for the measured scope and remaining activation gates.
 

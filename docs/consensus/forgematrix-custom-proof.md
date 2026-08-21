@@ -294,36 +294,45 @@ transforms, transformed coefficient callbacks, canonical field
 representatives, and dimension caps are checked at the Rust/C ABI boundary.
 The production-shaped `32,768 x 291`, `+7` coefficient LDE produces a
 `4,194,304 x 291` output without constructing the expanded matrix on the host.
-On an RTX 5090 it measured 371.748 ms of device work and 482.986 ms for device
-allocation, input upload, and GPU completion. That canary deliberately left
-the 9.094 GiB result device-resident, so the latter number excludes output
-allocation and device-to-host transfer. These are kernel-path measurements,
-not a complete production proof benchmark.
+On an RTX 5090 it measured 371.748 ms of device work and 482.986 ms end to end
+to a device-resident result, excluding device-to-host transfer. That canary
+deliberately left the 9.094 GiB result on the device. These are kernel-path
+measurements, not a complete production proof benchmark.
 
 In an unoptimized Cargo test-profile comparison at the same 32,768-row shape,
-the accelerated run completed with 65.667 seconds of preprocessed setup and
-266.382 seconds in the prover, compared with 66.948 and 287.924 seconds for the
-corresponding CPU run. The compressed payload remained below 256 KiB. These
-numbers are not directly comparable to the release-mode checkpoint above.
-They show that DFT/LDE acceleration works and preserves CPU verification, but
-that it is no longer the dominant proving cost.
+the CPU path took 348.28 seconds of wall time: 64.503 seconds of preprocessed
+setup, 283.416 seconds in the prover, and a 238,698-byte canonical zlib payload.
+The wired CUDA DFT plus Poseidon2 path took 76.71 seconds: 7.700 seconds of
+setup, 68.551 seconds in the prover, and a 237,292-byte payload. This is a 4.54x
+speedup and 78% less wall time on the RTX 5090. These test-profile numbers are
+not directly comparable to the release-mode checkpoint above. The unchanged
+CPU verifier accepted the accelerated proof.
 
-The next measured seam is the prover-side Poseidon2 first digest layer used by
-the value MMCS. A standalone exact CUDA ABI matches the pinned Plonky3
+The prover-side Poseidon2 first digest layer used by the value MMCS is now wired
+into proof generation. Its exact CUDA ABI matches the pinned Plonky3
 `PaddingFreeSponge` for concatenated rows from one or more matrices. At
 4,194,304 rows on the same RTX 5090, width 291 measured 202.013 ms of kernel
-time; host-to-device transfer of the 9.094 GiB input measured 732.967 ms. This
-is a validated canary, not yet an active proof backend. Parent Merkle
-compression, openings, transcript operations, and all verification remain on
-the CPU.
+time; host-to-device transfer of the 9.094 GiB input measured 732.967 ms. The
+CUDA result feeds the ordinary Merkle tree; parent compression,
+shorter-matrix injection, openings, transcript operations, and verification
+remain on the CPU.
+
+ABI v1 is deliberately test-profile-only and caps a call at `2^24` rows and
+`2^31` field limbs. Production uses `2^27` LDE rows. At that height, widths 291
+and 87 imply 291 GiB and 87 GiB input matrices respectively, and the first
+digest layer alone is 4 GiB. The current monolithic ABI cannot represent the
+production proof path economically; streaming/out-of-core LDE and Merkle
+construction remain required.
 
 The CUDA library is native code and is never trusted for validity. The direct
-accelerated entry point loads it in-process, then verifies the complete encoded
-proof with the unchanged CPU verifier. A caller can instead use the separate
-short-lived worker, which adds bounded canonical IPC, SHA-256 pins, deadlines,
-output limits, and process-tree termination. That boundary contains ordinary
-crashes but is not a same-user security sandbox; production deployment still
-needs OS-enforced isolation and artifact custody.
+accelerated entry point loads it in-process, is restricted to trusted
+development, and verifies the complete encoded proof with the unchanged CPU
+verifier. A caller can instead use the separate short-lived worker, which adds
+bounded canonical IPC, SHA-256 pins for both artifacts, deadlines, output
+limits, and process-tree termination. That worker path has been tested with a
+64-byte tree proof. It contains ordinary crashes but is not a same-user
+security sandbox; production deployment still needs OS-enforced isolation and
+artifact custody.
 
 ## 6. Transparent PCS boundary
 

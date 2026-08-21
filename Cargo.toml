@@ -9,7 +9,10 @@ members = [
     "crates/cmfd-proof-accel",
     "crates/cmfd-proof-worker",
 ]
-exclude = ["third_party/p3-util-0.6.3-msrv"]
+exclude = [
+    "third_party/p3-merkle-tree-0.6.3-gpu-first-layer",
+    "third_party/p3-util-0.6.3-msrv",
+]
 resolver = "2"
 
 [workspace.package]
@@ -39,3 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Plonky3 0.6.3 uses slice::assume_init_ref, which stabilized after our Rust 1.88 MSRV.
 # This is the exact 0.6.3 source with only its former equivalent conversion restored.
 p3-util = { path = "third_party/p3-util-0.6.3-msrv" }
+# Plonky3 0.6.3 has no bulk first-digest-layer injection seam. This exact
+# source copy adds only a checked prover-side hook while preserving the
+# standard Merkle tree, openings, and verifier.
+p3-merkle-tree = { path = "third_party/p3-merkle-tree-0.6.3-gpu-first-layer" }

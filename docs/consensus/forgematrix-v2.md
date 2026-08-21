@@ -297,6 +297,20 @@ vectors measure 165,039 bytes for a 64-byte activation and 222,555 bytes for a
 233,382-byte compressed payload (233,399 bytes with its outer envelope), about
 12.22 GiB peak memory, and 266.25 seconds proving time.
 
+At that 32,768-row shape on an RTX 5090, a separate unoptimized Cargo
+test-profile comparison measured 348.28 seconds for CPU (64.503 setup, 283.416
+prove; 238,698-byte canonical zlib payload) and 76.71 seconds with the now-wired
+CUDA DFT plus Poseidon2 first-digest layer (7.700 setup, 68.551 prove; 237,292
+bytes). That is 4.54x faster and 78% less wall time. The accelerated proof still
+uses the unchanged CPU verifier. The hash-pinned proof-worker path has also been
+tested with a 64-byte tree proof; the direct in-process API remains for trusted
+development only.
+
+CUDA ABI v1 is test-profile-only, with caps of `2^24` rows and `2^31` field
+limbs. Production requires `2^27` LDE rows: widths 291 and 87 imply 291 GiB and
+87 GiB inputs respectively, plus a 4 GiB first-digest layer. Streaming and an
+out-of-core PCS/FRI and Merkle path therefore remain production requirements.
+
 This does not establish production readiness. The production shape is
 1,048,576 trace rows, and its complete proof size, peak memory, proving latency,
 and verification latency have not yet been measured. The configured
@@ -448,8 +462,10 @@ compressed component transport are implemented, but only smaller and
 intermediate shapes have been proved below 256 KiB; the 1,048,576-row
 production shape remains an activation measurement. The aggregate proof has
 no consensus wire tag and the WHIR and BLAKE3 backends remain unaudited
-research code. The CUDA fixture is a differential harness, not a tensor-core
-succinct prover, low-VRAM proof benchmark, or evidence of residency.
+research code. The mining CUDA fixture remains a differential harness, not a
+tensor-core succinct prover or evidence of residency. The proof CUDA path
+accelerates DFT, LDE, and the first Poseidon2 digest layer, but its monolithic
+ABI is not a production low-VRAM or out-of-core prover.
 The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;
 an independent challenge-to-coefficient implementation and a broader vector
 corpus remain required.

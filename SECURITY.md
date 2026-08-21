@@ -76,33 +76,44 @@ multi-chunk activation. A 32,768-row resource checkpoint measured a 233,382-byte
 compressed payload (233,399 bytes with the outer envelope), about 12.22 GiB
 peak memory, and 266.25 seconds proving time.
 
-The optional `gpu-proof-prover` experiment accelerates only the prover's exact
-Goldilocks DFT/LDE operations. It does not change the Goldilocks modulus,
-transform or coset semantics, transcript, CPU verifier, or consensus rules.
-CUDA selection requires an explicit library path and device; there is no
-environment search or fallback after GPU selection. Every fully encoded
-accelerated proof is verified by the unchanged CPU verifier before it can be
-returned. CPU/GPU tests compare logical and physical bit-reversed layouts,
-transformed coset LDEs, commitments, openings, and final polynomials. Complete
-proof bytes are not required to match because the parallel FRI grinding search
-may select different valid nonces.
+The optional `gpu-proof-prover` experiment accelerates the prover's exact
+Goldilocks DFT/LDE operations and the value-MMCS Poseidon2 first digest layer.
+It does not change the Goldilocks modulus, transform or coset semantics,
+transcript, CPU verifier, or consensus rules. CUDA selection requires an
+explicit library path and device; there is no environment search or fallback
+after GPU selection. Every fully encoded accelerated proof is verified by the
+unchanged CPU verifier before it can be returned. CPU/GPU tests compare logical
+and physical bit-reversed layouts, transformed coset LDEs, commitments,
+openings, and final polynomials. Complete proof bytes are not required to match
+because the parallel FRI grinding search may select different valid nonces.
 
 The direct accelerated API loads the explicitly named native library in the
-calling process. CPU proof verification detects wrong arithmetic but cannot
-contain memory corruption, hangs, or process compromise. A caller can instead
-use the short-lived `cmfd-proof-worker`, which adds bounded canonical IPC,
-caller-pinned SHA-256 hashes, a deadline, output limits, and whole-process-tree
-termination through a Windows Job Object or Unix process group. The parent
-independently verifies the returned bytes. This contains ordinary crashes and
-descendants, but it is not an OS sandbox: same-user file replacement between
-hashing and loading, transitive native dependencies, and host-wide resource
-exhaustion remain outside this boundary. No wallet or node path enables either
-experimental path by default.
+calling process and is a trusted-development interface only. CPU proof
+verification detects wrong arithmetic but cannot contain memory corruption,
+hangs, or process compromise. A caller can instead use the short-lived
+`cmfd-proof-worker`, which adds bounded canonical IPC, caller-pinned SHA-256
+hashes, a deadline, output limits, and whole-process-tree termination through a
+Windows Job Object or Unix process group. The hash-pinned worker path has been
+tested with a 64-byte tree proof, and the parent independently verifies the
+returned bytes. This contains ordinary crashes and descendants, but it is not
+an OS sandbox: same-user file replacement between hashing and loading,
+transitive native dependencies, and host-wide resource exhaustion remain
+outside this boundary. No wallet or node path enables either experimental path
+by default.
 
-An exact Poseidon2 first-digest-layer CUDA ABI and canary now match the pinned
-Plonky3 row hasher for single and multiple matrices. It remains disconnected
-from the proof configuration; Merkle parent compression, openings, transcript,
-and verification are still CPU work.
+The exact Poseidon2 CUDA first-digest layer is now used by proof generation for
+the value MMCS. Merkle parent compression, shorter-matrix injection, openings,
+transcript operations, and all verification remain CPU work. At the 32,768-row
+checkpoint on an RTX 5090, the same unoptimized Cargo test profile took 348.28
+seconds on CPU (64.503 setup, 283.416 prove; 238,698-byte canonical zlib
+payload) and 76.71 seconds with CUDA DFT plus Poseidon2 (7.700 setup, 68.551
+prove; 237,292 bytes): 4.54x faster and 78% less wall time.
+
+CUDA ABI v1 remains test-profile-only. Each call is capped at `2^24` rows and
+`2^31` field limbs. A production `2^27`-row LDE at widths 291 and 87 implies
+291 GiB and 87 GiB inputs respectively, plus a 4 GiB first-digest layer. Those
+objects cannot use the current monolithic ABI; streaming/out-of-core PCS and
+Merkle construction remain required.
 
 This is still not a production succinct solution. The full production AIR has
 1,048,576 rows and has not yet been proved end to end; its final proof size,

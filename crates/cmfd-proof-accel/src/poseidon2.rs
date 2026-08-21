@@ -200,26 +200,27 @@ impl CudaProofPoseidon2 {
         &self,
         matrices: &[RowMajorMatrix<Goldilocks>],
     ) -> Result<RowMajorMatrix<Goldilocks>, ProofAccelError> {
-        let shape = validate_poseidon2_matrices(matrices)?;
+        let matrices = matrices.iter().collect::<Vec<_>>();
+        self.try_first_digest_layer_refs(&matrices)
+    }
+
+    /// Hash borrowed row-major matrices without cloning their value buffers.
+    ///
+    /// Matrix order is significant: each physical output row hashes the
+    /// ordered concatenation of the corresponding rows from `matrices`.
+    /// Canonical Goldilocks buffers cross the C boundary by reference;
+    /// noncanonical buffers still receive the required canonical copy.
+    pub fn try_first_digest_layer_refs(
+        &self,
+        matrices: &[&RowMajorMatrix<Goldilocks>],
+    ) -> Result<RowMajorMatrix<Goldilocks>, ProofAccelError> {
+        let shape = validate_poseidon2_matrix_refs(matrices)?;
         let encoded = matrices
             .iter()
             .enumerate()
             .map(|(index, matrix)| canonical_limb_storage(&matrix.values, index))
             .collect::<Result<Vec<_>, _>>()?;
-        let views = encoded
-            .iter()
-            .zip(matrices)
-            .map(|(storage, matrix)| {
-                let values = storage.as_slice();
-                RawPoseidon2MatrixViewV1 {
-                    values: values.as_ptr(),
-                    values_len: values.len(),
-                    rows: shape.rows,
-                    columns: u32::try_from(matrix.width)
-                        .expect("validated Poseidon2 width always fits u32"),
-                }
-            })
-            .collect::<Vec<_>>();
+        let views = poseidon2_raw_views(&encoded, matrices, shape.rows);
         let mut output = try_zeroed_output(shape.output_limbs, "Poseidon2 digest output")?;
         let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
         let handle = self
@@ -255,8 +256,8 @@ struct Poseidon2Shape {
     output_limbs: usize,
 }
 
-fn validate_poseidon2_matrices(
-    matrices: &[RowMajorMatrix<Goldilocks>],
+fn validate_poseidon2_matrix_refs(
+    matrices: &[&RowMajorMatrix<Goldilocks>],
 ) -> Result<Poseidon2Shape, ProofAccelError> {
     validate_poseidon2_matrix_count(matrices.len())?;
     let dimensions = matrices
@@ -264,6 +265,27 @@ fn validate_poseidon2_matrices(
         .map(|matrix| (matrix.values.len(), matrix.width))
         .collect::<Vec<_>>();
     validate_poseidon2_dimensions(&dimensions)
+}
+
+fn poseidon2_raw_views(
+    encoded: &[CanonicalLimbStorage<'_>],
+    matrices: &[&RowMajorMatrix<Goldilocks>],
+    rows: u32,
+) -> Vec<RawPoseidon2MatrixViewV1> {
+    encoded
+        .iter()
+        .zip(matrices)
+        .map(|(storage, matrix)| {
+            let values = storage.as_slice();
+            RawPoseidon2MatrixViewV1 {
+                values: values.as_ptr(),
+                values_len: values.len(),
+                rows,
+                columns: u32::try_from(matrix.width)
+                    .expect("validated Poseidon2 width always fits u32"),
+            }
+        })
+        .collect()
 }
 
 fn validate_poseidon2_matrix_count(count: usize) -> Result<(), ProofAccelError> {
@@ -416,7 +438,14 @@ mod tests {
     fn cpu_first_digest_layer(
         matrices: &[RowMajorMatrix<Goldilocks>],
     ) -> RowMajorMatrix<Goldilocks> {
-        let shape = validate_poseidon2_matrices(matrices).unwrap();
+        let matrices = matrices.iter().collect::<Vec<_>>();
+        cpu_first_digest_layer_refs(&matrices)
+    }
+
+    fn cpu_first_digest_layer_refs(
+        matrices: &[&RowMajorMatrix<Goldilocks>],
+    ) -> RowMajorMatrix<Goldilocks> {
+        let shape = validate_poseidon2_matrix_refs(matrices).unwrap();
         let hasher = Poseidon2Hasher::new(default_goldilocks_poseidon2_8());
         let mut output = Vec::with_capacity(shape.output_limbs);
         for row in 0..shape.rows as usize {
@@ -554,6 +583,40 @@ mod tests {
     }
 
     #[test]
+    fn poseidon2_reference_views_preserve_pointers_and_matrix_order() {
+        let first = matrix(4, 3, 0x101);
+        let second = matrix(4, 5, 0x202);
+        let matrices = [&second, &first];
+        let shape = validate_poseidon2_matrix_refs(&matrices).unwrap();
+        let encoded = matrices
+            .iter()
+            .enumerate()
+            .map(|(index, matrix)| canonical_limb_storage(&matrix.values, index))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            encoded
+                .iter()
+                .all(|storage| matches!(storage, CanonicalLimbStorage::Borrowed(_)))
+        );
+
+        let views = poseidon2_raw_views(&encoded, &matrices, shape.rows);
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].values, second.values.as_ptr().cast::<u64>());
+        assert_eq!(views[0].values_len, second.values.len());
+        assert_eq!(views[0].columns, 5);
+        assert_eq!(views[1].values, first.values.as_ptr().cast::<u64>());
+        assert_eq!(views[1].values_len, first.values.len());
+        assert_eq!(views[1].columns, 3);
+        assert!(views.iter().all(|view| view.rows == 4));
+
+        assert_ne!(
+            cpu_first_digest_layer_refs(&matrices),
+            cpu_first_digest_layer_refs(&[&first, &second])
+        );
+    }
+
+    #[test]
     fn noncanonical_poseidon2_input_gets_an_owned_canonical_copy() {
         let values = [
             Goldilocks::new(Goldilocks::ORDER_U64),
@@ -603,9 +666,14 @@ mod tests {
             .enumerate()
             .map(|(index, width)| matrix(16, width, 0x2000 + index as u64))
             .collect::<Vec<_>>();
+        let references = matrices.iter().rev().collect::<Vec<_>>();
         assert_eq!(
             cuda.try_first_digest_layer(&matrices).unwrap(),
             cpu_first_digest_layer(&matrices)
+        );
+        assert_eq!(
+            cuda.try_first_digest_layer_refs(&references).unwrap(),
+            cpu_first_digest_layer_refs(&references)
         );
     }
 }

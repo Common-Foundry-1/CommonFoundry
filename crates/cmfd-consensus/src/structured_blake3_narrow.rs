@@ -20,17 +20,21 @@ use std::{
 use bincode::Options;
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_challenger::DuplexChallenger;
-use p3_commit::ExtensionMmcs;
+use p3_commit::{
+    BuildPeriodicLdeTableFast, ExtensionMmcs, Mmcs, OpenedValues, Pcs as PcsTrait, PeriodicLdeTable,
+};
 #[cfg(any(test, not(feature = "gpu-proof-prover")))]
 use p3_dft::Radix2DitParallel;
 use p3_dft::{Layout, TwoAdicSubgroupDft};
+use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::extension::CubicTrinomialExtensionField;
 use p3_field::integers::QuotientMap;
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks, default_goldilocks_poseidon2_8};
 use p3_matrix::{
-    bitrev::BitReversedMatrixView,
+    Matrix,
+    bitrev::{BitReversedMatrixView, BitReversibleMatrix},
     dense::{RowMajorMatrix, RowMajorMatrixViewMut},
 };
 use p3_merkle_tree::MerkleTreeMmcs;
@@ -83,9 +87,40 @@ type ValMmcs =
     MerkleTreeMmcs<<F as Field>::Packing, <F as Field>::Packing, FieldHash, Compress, 2, 4>;
 type ChallengeMmcs = ExtensionMmcs<F, EF, ValMmcs>;
 type Challenger = DuplexChallenger<F, Perm, 8, 4>;
-type Pcs = TwoAdicFriPcs<F, NarrowDft, ValMmcs, ChallengeMmcs>;
+type InnerPcs = TwoAdicFriPcs<F, NarrowDft, ValMmcs, ChallengeMmcs>;
+type Pcs = NarrowPcs;
 pub(crate) type Config = StarkConfig<Pcs, EF, Challenger>;
 pub(crate) type NativeProof = Proof<Config>;
+
+#[derive(Clone, Default)]
+struct NarrowCommitBackend {
+    #[cfg(feature = "gpu-proof-prover")]
+    poseidon2: Option<cmfd_proof_accel::CudaProofPoseidon2>,
+}
+
+impl NarrowCommitBackend {
+    #[cfg(feature = "gpu-proof-prover")]
+    fn load_cuda(
+        library_path: impl AsRef<std::path::Path>,
+        device_index: i32,
+    ) -> Result<Self, NarrowBlake3Error> {
+        cmfd_proof_accel::CudaProofPoseidon2::load(library_path, device_index)
+            .map(|poseidon2| Self {
+                poseidon2: Some(poseidon2),
+            })
+            .map_err(|error| NarrowBlake3Error::Accelerator(error.to_string()))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct NarrowPcs {
+    inner: InnerPcs,
+    dft: NarrowDft,
+    input_mmcs: ValMmcs,
+    log_blowup: usize,
+    #[cfg(feature = "gpu-proof-prover")]
+    commit_backend: NarrowCommitBackend,
+}
 
 /// Exact proof DFT seam. Its default is always the CPU reference; CUDA is
 /// available only through the explicit accelerated-prover entry point.
@@ -138,6 +173,181 @@ impl TwoAdicSubgroupDft<F> for NarrowDft {
     {
         self.backend
             .coset_lde_batch_with_transform(mat, added_bits, shift, transform)
+    }
+}
+
+impl NarrowPcs {
+    fn new(
+        dft: NarrowDft,
+        input_mmcs: ValMmcs,
+        fri: FriParameters<ChallengeMmcs>,
+        commit_backend: NarrowCommitBackend,
+    ) -> Self {
+        #[cfg(not(feature = "gpu-proof-prover"))]
+        let _ = commit_backend;
+        Self {
+            inner: InnerPcs::new(dft.clone(), input_mmcs.clone(), fri),
+            dft,
+            input_mmcs,
+            log_blowup: FRI_LOG_BLOWUP,
+            #[cfg(feature = "gpu-proof-prover")]
+            commit_backend,
+        }
+    }
+
+    fn with_log_blowup(mut self, log_blowup: usize) -> Self {
+        self.log_blowup = log_blowup;
+        self
+    }
+
+    fn commit_bit_reversed_ldes(
+        &self,
+        ldes: Vec<RowMajorMatrix<F>>,
+    ) -> (
+        <Self as PcsTrait<EF, Challenger>>::Commitment,
+        <Self as PcsTrait<EF, Challenger>>::ProverData,
+    ) {
+        let min_height = 1 << self.log_blowup;
+        for lde in &ldes {
+            assert!(
+                lde.height() >= min_height,
+                "committed LDE height {} is smaller than the blowup factor {min_height}",
+                lde.height()
+            );
+        }
+
+        #[cfg(feature = "gpu-proof-prover")]
+        if let Some(poseidon2) = &self.commit_backend.poseidon2 {
+            let max_height = ldes
+                .iter()
+                .map(Matrix::height)
+                .max()
+                .expect("all matrices have height 0");
+            let tallest = ldes
+                .iter()
+                .filter(|matrix| matrix.height() == max_height)
+                .collect::<Vec<_>>();
+            let digest_matrix = poseidon2
+                .try_first_digest_layer_refs(&tallest)
+                .unwrap_or_else(|error| panic!("explicit proof Poseidon2 backend failed: {error}"));
+            debug_assert_eq!(digest_matrix.height(), max_height);
+            debug_assert_eq!(digest_matrix.width, 4);
+            let first_digests = digest_matrix
+                .values
+                .chunks_exact(4)
+                .map(|digest| [digest[0], digest[1], digest[2], digest[3]])
+                .collect();
+            return self
+                .input_mmcs
+                .commit_with_first_digest_layer(ldes, first_digests);
+        }
+
+        self.input_mmcs.commit(ldes)
+    }
+}
+
+impl BuildPeriodicLdeTableFast for NarrowPcs {
+    type PeriodicDomain = TwoAdicMultiplicativeCoset<F>;
+
+    fn maybe_build_periodic_lde_table_fast(
+        &self,
+        periodic_cols: &[Vec<F>],
+        trace_domain: Self::PeriodicDomain,
+        quotient_domain: Self::PeriodicDomain,
+    ) -> Option<PeriodicLdeTable<F>>
+    where
+        F: Clone,
+    {
+        self.inner
+            .maybe_build_periodic_lde_table_fast(periodic_cols, trace_domain, quotient_domain)
+    }
+}
+
+impl PcsTrait<EF, Challenger> for NarrowPcs {
+    type Domain = TwoAdicMultiplicativeCoset<F>;
+    type Commitment = <InnerPcs as PcsTrait<EF, Challenger>>::Commitment;
+    type ProverData = <InnerPcs as PcsTrait<EF, Challenger>>::ProverData;
+    type EvaluationsOnDomain<'a> = <InnerPcs as PcsTrait<EF, Challenger>>::EvaluationsOnDomain<'a>;
+    type Proof = <InnerPcs as PcsTrait<EF, Challenger>>::Proof;
+    type Error = <InnerPcs as PcsTrait<EF, Challenger>>::Error;
+    const ZK: bool = <InnerPcs as PcsTrait<EF, Challenger>>::ZK;
+
+    fn natural_domain_for_degree(&self, degree: usize) -> Self::Domain {
+        <InnerPcs as PcsTrait<EF, Challenger>>::natural_domain_for_degree(&self.inner, degree)
+    }
+
+    fn log_max_lde_height(&self) -> usize {
+        <InnerPcs as PcsTrait<EF, Challenger>>::log_max_lde_height(&self.inner)
+    }
+
+    fn commit(
+        &self,
+        evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<F>)>,
+    ) -> (Self::Commitment, Self::ProverData) {
+        let ldes = evaluations
+            .into_iter()
+            .map(|(domain, evaluations)| {
+                assert_eq!(domain.size(), evaluations.height());
+                let shift = F::GENERATOR / domain.shift();
+                self.dft
+                    .coset_lde_batch(evaluations, self.log_blowup, shift)
+                    .bit_reverse_rows()
+                    .to_row_major_matrix()
+            })
+            .collect();
+        self.commit_bit_reversed_ldes(ldes)
+    }
+
+    fn get_quotient_ldes(
+        &self,
+        evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<F>)>,
+        num_chunks: usize,
+    ) -> Vec<RowMajorMatrix<F>> {
+        <InnerPcs as PcsTrait<EF, Challenger>>::get_quotient_ldes(
+            &self.inner,
+            evaluations,
+            num_chunks,
+        )
+    }
+
+    fn commit_ldes(&self, ldes: Vec<RowMajorMatrix<F>>) -> (Self::Commitment, Self::ProverData) {
+        self.commit_bit_reversed_ldes(ldes)
+    }
+
+    fn get_evaluations_on_domain<'a>(
+        &self,
+        prover_data: &'a Self::ProverData,
+        index: usize,
+        domain: Self::Domain,
+    ) -> Self::EvaluationsOnDomain<'a> {
+        <InnerPcs as PcsTrait<EF, Challenger>>::get_evaluations_on_domain(
+            &self.inner,
+            prover_data,
+            index,
+            domain,
+        )
+    }
+
+    fn open(
+        &self,
+        commitment_data_with_opening_points: Vec<(&Self::ProverData, Vec<Vec<EF>>)>,
+        challenger: &mut Challenger,
+    ) -> (OpenedValues<EF>, Self::Proof) {
+        self.inner
+            .open(commitment_data_with_opening_points, challenger)
+    }
+
+    fn verify(
+        &self,
+        commitments_with_opening_points: Vec<(
+            Self::Commitment,
+            Vec<(Self::Domain, Vec<(EF, Vec<EF>)>)>,
+        )>,
+        proof: &Self::Proof,
+        challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .verify(commitments_with_opening_points, proof, challenger)
     }
 }
 
@@ -361,6 +571,27 @@ pub(crate) fn prove_narrow_blake3_with_dft(
     activation: &[u8],
     dft: NarrowDft,
 ) -> Result<Vec<u8>, NarrowBlake3Error> {
+    prove_narrow_blake3_with_backends(statement, activation, dft, NarrowCommitBackend::default())
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+pub(crate) fn prove_narrow_blake3_with_cuda(
+    statement: &StructuredBlake3Statement,
+    activation: &[u8],
+    dft: NarrowDft,
+    library_path: impl AsRef<std::path::Path>,
+    device_index: i32,
+) -> Result<Vec<u8>, NarrowBlake3Error> {
+    let commit_backend = NarrowCommitBackend::load_cuda(library_path, device_index)?;
+    prove_narrow_blake3_with_backends(statement, activation, dft, commit_backend)
+}
+
+fn prove_narrow_blake3_with_backends(
+    statement: &StructuredBlake3Statement,
+    activation: &[u8],
+    dft: NarrowDft,
+    commit_backend: NarrowCommitBackend,
+) -> Result<Vec<u8>, NarrowBlake3Error> {
     let air = NarrowBlake3Air::new(statement)?;
     if activation.len() != statement.final_activation_len || activation.iter().any(|v| *v > 250) {
         return Err(NarrowBlake3Error::UnsupportedShape);
@@ -372,7 +603,7 @@ pub(crate) fn prove_narrow_blake3_with_dft(
     }
     let trace = generate_main_trace(&air, statement, &witness);
     let public = public_values(statement)?;
-    let config = build_config_with_dft(dft);
+    let config = build_config_with_backends(dft, commit_backend);
     let log_rows = air.trace_rows.ilog2() as usize;
     let proof = catch_unwind(AssertUnwindSafe(|| {
         let (prep, _) = setup_preprocessed(&config, &air, log_rows)
@@ -1487,19 +1718,32 @@ pub(crate) fn build_config_with_fri(log_blowup: usize, num_queries: usize) -> Co
     build_config_with_dft_and_fri(NarrowDft::default(), log_blowup, num_queries)
 }
 
-fn build_config_with_dft(dft: NarrowDft) -> Config {
-    build_config_with_dft_and_fri(dft, FRI_LOG_BLOWUP, FRI_QUERIES)
+fn build_config_with_backends(dft: NarrowDft, commit_backend: NarrowCommitBackend) -> Config {
+    build_config_with_backends_and_fri(dft, commit_backend, FRI_LOG_BLOWUP, FRI_QUERIES)
 }
 
 fn build_config_with_dft_and_fri(dft: NarrowDft, log_blowup: usize, num_queries: usize) -> Config {
+    build_config_with_backends_and_fri(dft, NarrowCommitBackend::default(), log_blowup, num_queries)
+}
+
+fn build_config_with_backends_and_fri(
+    dft: NarrowDft,
+    commit_backend: NarrowCommitBackend,
+    log_blowup: usize,
+    num_queries: usize,
+) -> Config {
     let perm = default_poseidon2();
     let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm.clone()), 0);
+    // The accelerator is held by `NarrowPcs`, not by `ValMmcs`, so the FRI
+    // challenge MMCS remains the same plain CPU clone used by the verifier.
     let challenge = ChallengeMmcs::new(val.clone());
-    let pcs = Pcs::new(
+    let pcs = NarrowPcs::new(
         dft,
         val,
         fri_parameters_with(log_blowup, num_queries, challenge),
-    );
+        commit_backend,
+    )
+    .with_log_blowup(log_blowup);
     Config::new(pcs, Challenger::new(perm))
 }
 
@@ -1769,6 +2013,40 @@ mod tests {
         assert!(!NarrowDft::default().is_cuda());
     }
 
+    #[cfg(feature = "gpu-proof-prover")]
+    #[test]
+    #[ignore = "requires CMFD_TEST_PROOF_CUDA_LIBRARY and a CUDA device"]
+    fn cuda_first_digest_layer_matches_cpu_merkle_commit_and_openings() {
+        let library_path = std::env::var_os("CMFD_TEST_PROOF_CUDA_LIBRARY")
+            .expect("set CMFD_TEST_PROOF_CUDA_LIBRARY to the exact CUDA proof-library path");
+        let poseidon2 = cmfd_proof_accel::CudaProofPoseidon2::load(library_path, 0).unwrap();
+        let perm = default_poseidon2();
+        let mmcs = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm), 0);
+        let matrices = vec![
+            dft_fixture(7, 1, 0x101),
+            dft_fixture(4, 8, 0x202),
+            dft_fixture(7, 291, 0x303),
+        ];
+        let (cpu_commitment, cpu_data) = mmcs.commit(matrices.clone());
+        let tallest = [&matrices[0], &matrices[2]];
+        let digest_matrix = poseidon2.try_first_digest_layer_refs(&tallest).unwrap();
+        let first_digests = digest_matrix
+            .values
+            .chunks_exact(4)
+            .map(|digest| [digest[0], digest[1], digest[2], digest[3]])
+            .collect();
+        let (cuda_commitment, cuda_data) =
+            mmcs.commit_with_first_digest_layer(matrices, first_digests);
+
+        assert_eq!(cuda_commitment, cpu_commitment);
+        for index in 0..7 {
+            let cpu_opening = mmcs.open_batch(index, &cpu_data);
+            let cuda_opening = mmcs.open_batch(index, &cuda_data);
+            assert_eq!(cuda_opening.opened_values, cpu_opening.opened_values);
+            assert_eq!(cuda_opening.opening_proof, cpu_opening.opening_proof);
+        }
+    }
+
     #[test]
     fn narrow_tree_trace_satisfies_every_air_constraint() {
         let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
@@ -1920,7 +2198,11 @@ mod tests {
     #[test]
     #[ignore = "resource-sizing benchmark"]
     fn proof_size_at_32768_rows() {
-        proof_size_at_32768_rows_with_dft("cpu", NarrowDft::default());
+        proof_size_at_32768_rows_with_backends(
+            "cpu",
+            NarrowDft::default(),
+            NarrowCommitBackend::default(),
+        );
     }
 
     #[cfg(feature = "gpu-proof-prover")]
@@ -1929,11 +2211,17 @@ mod tests {
     fn gpu_proof_size_at_32768_rows() {
         let library_path = std::env::var_os("CMFD_TEST_PROOF_CUDA_LIBRARY")
             .expect("set CMFD_TEST_PROOF_CUDA_LIBRARY to the exact CUDA proof-library path");
-        let dft = NarrowDft::load_cuda(std::path::PathBuf::from(library_path), 0).unwrap();
-        proof_size_at_32768_rows_with_dft("cuda", dft);
+        let library_path = std::path::PathBuf::from(library_path);
+        let dft = NarrowDft::load_cuda(&library_path, 0).unwrap();
+        let commit_backend = NarrowCommitBackend::load_cuda(&library_path, 0).unwrap();
+        proof_size_at_32768_rows_with_backends("cuda", dft, commit_backend);
     }
 
-    fn proof_size_at_32768_rows_with_dft(label: &str, dft: NarrowDft) {
+    fn proof_size_at_32768_rows_with_backends(
+        label: &str,
+        dft: NarrowDft,
+        commit_backend: NarrowCommitBackend,
+    ) {
         use std::io::Write;
         use std::time::Instant;
 
@@ -1948,7 +2236,7 @@ mod tests {
         let trace = generate_main_trace(&air, &statement, &witness);
         let trace_elapsed = trace_started.elapsed();
         let public = public_values(&statement).unwrap();
-        let config = build_config_with_dft(dft);
+        let config = build_config_with_backends(dft, commit_backend);
         let setup_started = Instant::now();
         let (prep, _) = setup_preprocessed(&config, &air, 15).unwrap();
         let setup_elapsed = setup_started.elapsed();

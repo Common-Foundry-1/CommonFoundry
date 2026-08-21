@@ -981,6 +981,25 @@ mod tests {
         (statement, final_activation)
     }
 
+    fn real_tree_fixture() -> (StructuredBlake3Statement, [u8; 64]) {
+        // Sixty-four activation bytes select the narrow tree backend. The
+        // all-zero MLE point selects the leading centered value, which is zero.
+        let final_activation = std::array::from_fn(|index| 125 + index as u8);
+        let challenge_digest = [0x43; 32];
+        let mut output_hasher = blake3::Hasher::new_derive_key("CMFD/FORGEMATRIX/OUTPUT/V2");
+        output_hasher.update(&challenge_digest);
+        output_hasher.update(&(final_activation.len() as u64).to_le_bytes());
+        output_hasher.update(&final_activation);
+        let statement = StructuredBlake3Statement {
+            challenge_digest,
+            final_activation_len: final_activation.len(),
+            final_activation_digest: *output_hasher.finalize().as_bytes(),
+            final_activation_point: vec![ExtensionElement { limbs: [0; 3] }; 6],
+            final_activation_evaluation: ExtensionElement { limbs: [0; 3] },
+        };
+        (statement, final_activation)
+    }
+
     #[test]
     fn request_protocol_round_trips_and_rejects_noncanonical_streams() {
         let statement = statement();
@@ -1309,8 +1328,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicit paths to the built worker and a real CUDA proof ABI v2 library"]
-    fn real_cuda_worker_round_trip_is_parent_cpu_verified() {
+    #[ignore = "requires explicit paths to the built worker and a real CUDA proof library with DFT v2 and Poseidon2 v1"]
+    fn real_cuda_tree_worker_round_trip_is_parent_cpu_verified() {
         let worker = PathBuf::from(
             std::env::var_os("CMFD_TEST_PROOF_WORKER")
                 .expect("set CMFD_TEST_PROOF_WORKER to the built cmfd-proof-worker executable"),
@@ -1324,7 +1343,7 @@ mod tests {
             .map(|value| value.parse::<i32>().expect("CUDA device must be an i32"))
             .unwrap_or(0);
 
-        let (statement, final_activation) = real_one_block_fixture();
+        let (statement, final_activation) = real_tree_fixture();
         let config = ProofWorkerConfig {
             worker_sha256: hash_file(&worker).unwrap(),
             cuda_library_sha256: hash_file(&cuda).unwrap(),
@@ -1337,5 +1356,12 @@ mod tests {
         let proof =
             prove_structured_blake3_out_of_process(&config, &statement, &final_activation).unwrap();
         verify_structured_blake3(&statement, &proof).unwrap();
+
+        let mut corrupted = proof;
+        corrupted[0] ^= 0x80;
+        assert!(matches!(
+            require_cpu_verified(&statement, corrupted),
+            Err(ProofWorkerError::CpuRejected(_))
+        ));
     }
 }

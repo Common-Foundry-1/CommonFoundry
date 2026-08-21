@@ -36,6 +36,8 @@ use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
 use p3_uni_stark::{Proof, StarkConfig, prove, verify};
 use thiserror::Error;
 
+#[cfg(feature = "gpu-proof-prover")]
+use crate::structured_blake3_narrow::prove_narrow_blake3_with_cuda as prove_narrow_blake3_with_cuda_backends;
 use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement, StructuredBlake3Verifier,
     forgematrix_v2::output_digest,
@@ -341,8 +343,25 @@ pub fn prove_structured_blake3_with_cuda(
     library_path: impl AsRef<std::path::Path>,
     device_index: i32,
 ) -> Result<Vec<u8>, StructuredBlake3Error> {
+    let library_path = library_path.as_ref();
     let dft = NarrowDft::load_cuda(library_path, device_index)?;
-    let proof = prove_structured_blake3_with_dft(statement, final_activation, dft)?;
+    let proof = if statement.final_activation_len > MAX_ONE_BLOCK_ACTIVATION_BYTES {
+        let backend = BACKEND_TREE;
+        let payload = prove_narrow_blake3_with_cuda_backends(
+            statement,
+            final_activation,
+            dft,
+            library_path,
+            device_index,
+        )?;
+        let compressed = compress_tree_proof(&payload)?;
+        if 17 + compressed.len() > MAX_COMPRESSED_TREE_PROOF_BYTES {
+            return Err(StructuredBlake3Error::ProofTooLarge);
+        }
+        encode_proof(backend, &compressed)
+    } else {
+        prove_structured_blake3_with_dft(statement, final_activation, dft)
+    }?;
     require_cpu_verified_proof(statement, proof)
 }
 

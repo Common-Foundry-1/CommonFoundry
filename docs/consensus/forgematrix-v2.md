@@ -409,7 +409,11 @@ comparison. The v2 research code now implements:
   stacks bounded Goldilocks tables under one transparent commitment, supplies
   per-table commitment aliases to every component before transcript sampling,
   and verifies the complete canonical opening set under a requested 128-bit
-  unique-decoding WHIR configuration;
+  unique-decoding WHIR configuration. Its version-2 fixed-width native codec
+  derives all shapes from the trusted configuration and deduplicates Merkle
+  nodes in canonical first-reference order. Ten 13-variable explicit
+  envelopes measured 188,104 through 190,024 bytes and passed the unchanged
+  verifier;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

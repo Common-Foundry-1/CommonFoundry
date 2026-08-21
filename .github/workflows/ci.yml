@@ -59,6 +59,22 @@ jobs:
       - run: cargo test -p cmfd-consensus --all-targets --features whir-prototype --locked
       - run: cargo test -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
 
+  proof-codec:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: Verify canonical WHIR proof bytes
+        run: cargo test --locked -p cmfd-consensus --lib --features whir-prototype canonical_binary
+      - name: Reject malformed WHIR proof bytes
+        run: cargo test --locked -p cmfd-consensus --lib --features whir-prototype native_codec
+
   wallet:
     runs-on: ubuntu-latest
     defaults:

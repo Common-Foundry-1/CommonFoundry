@@ -143,9 +143,18 @@ demand-authenticated format-v2 tree, whose exact `2^29`-row artifact is
 against separately authenticated codeword rows. The legacy format-v1 store
 remains capped at `2^18` rows, while the exact reference extension encoder is
 still capped at `2^20` rows. Its current file-backed DFT would move about
-1.97 TiB at production geometry, so a blocked or GPU transform and production
-proof encoding still stand between this checkpoint and a cap increase. The
-public 16-variable and 1 MiB proof limits therefore remain unchanged.
+1.97 TiB at production geometry, so a blocked or GPU transform and the
+31-variable initial weight-bank commitment still stand between this checkpoint
+and a cap increase. The native v2 proof codec is now fixed-width and
+configuration-derived, with a canonical first-reference Merkle dictionary and
+no general-purpose compression. Ten real 13-variable explicit envelopes
+measured 188,104 through 190,024 bytes and passed the unchanged verifier, but
+the Merkle-tree geometry also gives a transcript-independent maximum of
+203,576 bytes including the outer wire header. This is one WHIR proof rather
+than the complete production aggregate. The public 16-variable and 1 MiB
+research limits therefore remain unchanged; 15- and 16-variable standalone
+envelopes are deliberately rejected because they cannot fit the network proof
+budget.
 
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Cursor, Read, Write},
+    io::{Cursor, Read},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -24,7 +24,6 @@ use cmfd_proof_accel::initial_whir_oracle::{
 };
 #[cfg(feature = "gpu-proof-prover")]
 use cmfd_proof_accel::whir_initial::AuthenticatedWhirInitialSource;
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use p3_blake3::Blake3;
 use p3_challenger::{
     CanObserve, FieldChallenger, GrindingChallenger, HashChallenger, SerializingChallenger64,
@@ -55,6 +54,7 @@ use thiserror::Error;
 
 #[cfg(feature = "gpu-proof-prover")]
 mod disk_mmcs;
+mod native_codec;
 #[cfg(feature = "gpu-proof-prover")]
 use disk_mmcs::{DiskWhirMmcs, DiskWhirOpeningPanic};
 #[cfg(feature = "gpu-proof-prover")]
@@ -78,8 +78,8 @@ use crate::{
     },
 };
 
-pub const EXPLICIT_WHIR_VERSION: u32 = 1;
-pub const STRUCTURED_WHIR_SPLIT_VERSION: u32 = 2;
+pub const EXPLICIT_WHIR_VERSION: u32 = 2;
+pub const STRUCTURED_WHIR_SPLIT_VERSION: u32 = 3;
 pub const EXPLICIT_WHIR_SECURITY_BITS: usize = 128;
 pub const MAX_EXPLICIT_WHIR_VARIABLES: usize = 16;
 pub const MAX_EXPLICIT_WHIR_OPENINGS: usize = 64;
@@ -89,12 +89,12 @@ pub const MAX_STRUCTURED_WHIR_TABLES: usize = 256;
 pub const MAX_STRUCTURED_WHIR_ELEMENTS: usize = 1 << 20;
 const MAX_STRUCTURED_WHIR_STACKED_VARIABLES: usize = 20;
 
-const EXPLICIT_WHIR_MAGIC: &[u8; 8] = b"CMFDWHR1";
-const STRUCTURED_WHIR_MAGIC: &[u8; 8] = b"CMFDWAG1";
-const STRUCTURED_WHIR_SPLIT_MAGIC: &[u8; 8] = b"CMFDWSP2";
+const EXPLICIT_WHIR_MAGIC: &[u8; 8] = b"CMFDWHR2";
+const STRUCTURED_WHIR_MAGIC: &[u8; 8] = b"CMFDWAG2";
+const STRUCTURED_WHIR_SPLIT_MAGIC: &[u8; 8] = b"CMFDWSP3";
 const STRUCTURED_WHIR_ALIAS_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-ORACLE/V1";
-const STRUCTURED_WHIR_SUITE_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SUITE/V1";
-const STRUCTURED_WHIR_SPLIT_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SPLIT/V2";
+const STRUCTURED_WHIR_SUITE_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SUITE/V2";
+const STRUCTURED_WHIR_SPLIT_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SPLIT/V3";
 const EXPLICIT_WHIR_TRANSCRIPT_DOMAIN: &[u8] = b"CMFD/FORGEMATRIX/EXPLICIT-WHIR/V1";
 #[cfg(feature = "gpu-proof-prover")]
 const EXPLICIT_WHIR_RESIDUAL_INVOCATION_DOMAIN: &str = "Common Foundry WHIR residual invocation v1";
@@ -104,12 +104,13 @@ const STRUCTURED_WHIR_SPLIT_COMMON_LABEL: &[u8] = b"common";
 const STRUCTURED_WHIR_SPLIT_CHILD_LABEL: &[u8] = b"child";
 const STRUCTURED_WHIR_FIXED_MODEL_SCOPE: &[u8] = b"fixed-model";
 const STRUCTURED_WHIR_EXECUTION_TRACE_SCOPE: &[u8] = b"execution-trace";
-const MAX_STRUCTURED_WHIR_NATIVE_JSON_BYTES: usize = 4 * 1024 * 1024;
 const EXPLICIT_WHIR_MIN_VARIABLES: usize = 2;
 const EXPLICIT_WHIR_FOLDING: usize = 2;
 const EXPLICIT_WHIR_STARTING_LOG_INV_RATE: usize = 1;
 const EXPLICIT_WHIR_POW_BITS: usize = 0;
 const EXPLICIT_WHIR_HEADER_BYTES: usize = 20;
+const MAX_EXPLICIT_WHIR_ENCODED_BYTES: usize =
+    crate::wire::MAX_PROOF_BYTES - crate::wire::WIRE_HEADER_BYTES;
 
 type F = Goldilocks;
 type EF = CubicTrinomialExtensionField<F>;
@@ -207,12 +208,17 @@ impl ExplicitWhirProof {
         if self.protocol_version != EXPLICIT_WHIR_VERSION {
             return Err(ExplicitWhirError::UnsupportedVersion);
         }
-        if self.proof_bytes.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES {
+        let encoded_len = EXPLICIT_WHIR_HEADER_BYTES
+            .checked_add(self.proof_bytes.len())
+            .ok_or(ExplicitWhirError::ProofTooLarge)?;
+        if self.proof_bytes.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES
+            || encoded_len > MAX_EXPLICIT_WHIR_ENCODED_BYTES
+        {
             return Err(ExplicitWhirError::ProofTooLarge);
         }
         let proof_len =
             u32::try_from(self.proof_bytes.len()).map_err(|_| ExplicitWhirError::ProofTooLarge)?;
-        let mut encoded = Vec::with_capacity(EXPLICIT_WHIR_HEADER_BYTES + self.proof_bytes.len());
+        let mut encoded = Vec::with_capacity(encoded_len);
         encoded.extend_from_slice(EXPLICIT_WHIR_MAGIC);
         encoded.extend_from_slice(&self.protocol_version.to_le_bytes());
         encoded.extend_from_slice(&self.num_variables.to_le_bytes());
@@ -223,7 +229,7 @@ impl ExplicitWhirProof {
 
     pub fn decode(encoded: &[u8]) -> Result<Self, ExplicitWhirError> {
         if encoded.len() < EXPLICIT_WHIR_HEADER_BYTES
-            || encoded.len() > EXPLICIT_WHIR_HEADER_BYTES + MAX_EXPLICIT_WHIR_PROOF_BYTES
+            || encoded.len() > MAX_EXPLICIT_WHIR_ENCODED_BYTES
         {
             return Err(ExplicitWhirError::InvalidEncoding);
         }
@@ -607,14 +613,6 @@ pub fn structured_whir_suite_parameter_digest() -> [u8; 32] {
         b"0.6.3+cmfd-generic-initial-matrix-preprocessed-sumcheck-v2",
     );
     update_suite_descriptor(&mut hasher, b"blake3-crate", b"1.8.6");
-    update_suite_descriptor(&mut hasher, b"flate2-crate", b"1.1.9");
-    update_suite_descriptor(&mut hasher, b"crc32fast-crate", b"1.5.0");
-    update_suite_descriptor(&mut hasher, b"cfg-if-crate", b"1.0.4");
-    update_suite_descriptor(&mut hasher, b"miniz-oxide-crate", b"0.8.9");
-    update_suite_descriptor(&mut hasher, b"adler2-crate", b"2.0.1");
-    update_suite_descriptor(&mut hasher, b"simd-adler32-crate", b"0.3.10");
-    update_suite_descriptor(&mut hasher, b"serde-crate", b"1.0.229");
-    update_suite_descriptor(&mut hasher, b"serde-json-crate", b"1.0.151");
     update_suite_descriptor(&mut hasher, b"base-field", b"goldilocks");
     update_suite_u64(&mut hasher, b"base-field-modulus", GOLDILOCKS_MODULUS);
     update_suite_descriptor(&mut hasher, b"extension-field", b"cubic:u^3=u+1");
@@ -691,7 +689,42 @@ pub fn structured_whir_suite_parameter_digest() -> [u8; 32] {
     update_suite_descriptor(
         &mut hasher,
         b"native-proof-codec",
-        b"serde-json-exact-reencode-zlib-rfc1950-best-level9-exact-stream-exhaustion",
+        b"fixed-width-le-config-derived-shape-first-reference-merkle-dictionary-v1",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"native-proof-codec-magic",
+        native_codec::NATIVE_PROOF_CODEC_MAGIC,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"native-proof-codec-version",
+        native_codec::NATIVE_PROOF_CODEC_VERSION as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"native-proof-codec-header-bytes",
+        native_codec::NATIVE_PROOF_CODEC_HEADER_BYTES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"native-proof-codec-flags",
+        native_codec::NATIVE_PROOF_CODEC_FLAGS as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"native-proof-dictionary-reference-bytes",
+        native_codec::NATIVE_PROOF_CODEC_REFERENCE_BYTES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"native-proof-maximum-dictionary-nodes",
+        native_codec::NATIVE_PROOF_CODEC_MAX_DICTIONARY_NODES as u64,
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"native-proof-dictionary-traversal",
+        b"intermediate-rounds-query-order-path-leaf-to-root-then-final-queries",
     );
     update_suite_descriptor(
         &mut hasher,
@@ -740,13 +773,13 @@ pub fn structured_whir_suite_parameter_digest() -> [u8; 32] {
     );
     update_suite_u64(
         &mut hasher,
-        b"maximum-native-json-bytes",
-        MAX_STRUCTURED_WHIR_NATIVE_JSON_BYTES as u64,
+        b"maximum-explicit-proof-bytes",
+        MAX_EXPLICIT_WHIR_PROOF_BYTES as u64,
     );
     update_suite_u64(
         &mut hasher,
-        b"maximum-explicit-proof-bytes",
-        MAX_EXPLICIT_WHIR_PROOF_BYTES as u64,
+        b"maximum-explicit-encoded-bytes",
+        MAX_EXPLICIT_WHIR_ENCODED_BYTES as u64,
     );
     update_suite_u64(
         &mut hasher,
@@ -1215,11 +1248,7 @@ pub fn prove_explicit_whir_openings(
     }
     pcs.prove(&mut native_proof, &mut challenger, layout, prover_data);
 
-    let proof_bytes =
-        serde_json::to_vec(&native_proof).map_err(|_| ExplicitWhirError::Serialization)?;
-    if proof_bytes.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES {
-        return Err(ExplicitWhirError::ProofTooLarge);
-    }
+    let proof_bytes = encode_explicit_native_proof(&native_proof, &pcs.config)?;
     let openings = points
         .iter()
         .cloned()
@@ -1332,11 +1361,7 @@ pub fn prove_explicit_whir_openings_with_initial_oracle(
         return Err(ExplicitWhirError::BackendPanic);
     }
 
-    let proof_bytes =
-        serde_json::to_vec(&native_proof).map_err(|_| ExplicitWhirError::Serialization)?;
-    if proof_bytes.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES {
-        return Err(ExplicitWhirError::ProofTooLarge);
-    }
+    let proof_bytes = encode_explicit_native_proof(&native_proof, &pcs.config)?;
     let openings = points
         .iter()
         .cloned()
@@ -1541,11 +1566,7 @@ fn prove_explicit_whir_openings_with_initial_source_inner(
         }
     }
 
-    let proof_bytes =
-        serde_json::to_vec(&native_proof).map_err(|_| ExplicitWhirError::Serialization)?;
-    if proof_bytes.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES {
-        return Err(ExplicitWhirError::ProofTooLarge);
-    }
+    let proof_bytes = encode_explicit_native_proof(&native_proof, &pcs.config)?;
     let openings = points
         .iter()
         .cloned()
@@ -1701,13 +1722,8 @@ pub fn verify_explicit_whir_openings(
         .map(|opening| convert_extension(opening.evaluation))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let native_proof: NativeProof = serde_json::from_slice(&proof.proof_bytes)
-        .map_err(|_| ExplicitWhirError::InvalidEncoding)?;
-    let canonical_proof_bytes =
-        serde_json::to_vec(&native_proof).map_err(|_| ExplicitWhirError::InvalidEncoding)?;
-    if canonical_proof_bytes != proof.proof_bytes {
-        return Err(ExplicitWhirError::InvalidEncoding);
-    }
+    let config = build_whir_config(num_variables)?;
+    let native_proof = decode_explicit_native_proof(&proof.proof_bytes, &config)?;
     catch_unwind(AssertUnwindSafe(|| {
         verify_native(
             transcript_binding,
@@ -1846,7 +1862,7 @@ fn prove_structured_whir_section(
         return Err(ExplicitWhirError::CommitmentMismatch);
     }
     pcs.prove(&mut native_proof, &mut challenger, layout, prover_data);
-    let proof_bytes = encode_aggregate_native_proof(&native_proof)?;
+    let proof_bytes = encode_aggregate_native_proof(&native_proof, &pcs.config)?;
     Ok(StructuredWhirAggregateProof {
         root: commitment_set.root,
         table_variables: commitment_set
@@ -1931,6 +1947,7 @@ fn verify_structured_whir_section(
         .iter()
         .map(|variables| *variables as usize)
         .collect::<Vec<_>>();
+    let stacked_variables = validate_stacked_shape(&table_variables)?;
     let aliases = structured_aliases(aggregate.root, &table_variables)?;
     let alias_map = aliases
         .into_iter()
@@ -1964,8 +1981,9 @@ fn verify_structured_whir_section(
     if used_tables.iter().any(|used| !used) {
         return Err(ExplicitWhirError::CommitmentMismatch);
     }
-    let native_proof = decode_aggregate_native_proof(&aggregate.proof_bytes)?;
-    let canonical = encode_aggregate_native_proof(&native_proof)
+    let config = build_whir_config(stacked_variables)?;
+    let native_proof = decode_aggregate_native_proof(&aggregate.proof_bytes, &config)?;
+    let canonical = encode_aggregate_native_proof(&native_proof, &config)
         .map_err(|_| ExplicitWhirError::InvalidEncoding)?;
     if canonical != aggregate.proof_bytes {
         return Err(ExplicitWhirError::InvalidEncoding);
@@ -2204,13 +2222,32 @@ fn build_pcs(
     num_variables: usize,
     transcript_binding: &[u8],
 ) -> Result<(Pcs, Challenger), ExplicitWhirError> {
+    if transcript_binding.len() > MAX_EXPLICIT_WHIR_BINDING_BYTES {
+        return Err(ExplicitWhirError::BindingTooLarge);
+    }
+    let config = build_whir_config(num_variables)?;
+    let field_hash = FieldHash::new(Blake3 {});
+    let compress = Compress::new(Blake3 {});
+    let mmcs = WhirMmcs::new(field_hash, compress, 0);
+    let dft = Dft::new(1 << config.max_fft_size());
+    let pcs = Pcs::new(config, dft, mmcs);
+    let mut initial_state = EXPLICIT_WHIR_TRANSCRIPT_DOMAIN.to_vec();
+    initial_state.extend_from_slice(&(transcript_binding.len() as u64).to_le_bytes());
+    initial_state.extend_from_slice(transcript_binding);
+    let mut challenger = Challenger::new(HashChallenger::new(initial_state, Blake3 {}));
+    let mut domain_separator = DomainSeparator::new(vec![]);
+    pcs.add_domain_separator::<32>(&mut domain_separator);
+    domain_separator.observe_domain_separator(&mut challenger);
+    Ok((pcs, challenger))
+}
+
+fn build_whir_config(
+    num_variables: usize,
+) -> Result<WhirConfig<EF, F, Challenger>, ExplicitWhirError> {
     if !(EXPLICIT_WHIR_MIN_VARIABLES..=MAX_STRUCTURED_WHIR_STACKED_VARIABLES)
         .contains(&num_variables)
     {
         return Err(ExplicitWhirError::InvalidVariableCount);
-    }
-    if transcript_binding.len() > MAX_EXPLICIT_WHIR_BINDING_BYTES {
-        return Err(ExplicitWhirError::BindingTooLarge);
     }
     let folding_factor = FoldingFactor::Constant(EXPLICIT_WHIR_FOLDING);
     let (num_rounds, _) = folding_factor
@@ -2237,19 +2274,7 @@ fn build_pcs(
             "derived WHIR grinding exceeds the configured maximum".to_owned(),
         ));
     }
-    let field_hash = FieldHash::new(Blake3 {});
-    let compress = Compress::new(Blake3 {});
-    let mmcs = WhirMmcs::new(field_hash, compress, 0);
-    let dft = Dft::new(1 << config.max_fft_size());
-    let pcs = Pcs::new(config, dft, mmcs);
-    let mut initial_state = EXPLICIT_WHIR_TRANSCRIPT_DOMAIN.to_vec();
-    initial_state.extend_from_slice(&(transcript_binding.len() as u64).to_le_bytes());
-    initial_state.extend_from_slice(transcript_binding);
-    let mut challenger = Challenger::new(HashChallenger::new(initial_state, Blake3 {}));
-    let mut domain_separator = DomainSeparator::new(vec![]);
-    pcs.add_domain_separator::<32>(&mut domain_separator);
-    domain_separator.observe_domain_separator(&mut challenger);
-    Ok((pcs, challenger))
+    Ok(config)
 }
 
 fn empty_proof(config: &WhirConfig<EF, F, Challenger>) -> NativeProof {
@@ -2275,40 +2300,64 @@ fn empty_proof_for<MT: Mmcs<F>>(config: &WhirConfig<EF, F, Challenger>) -> WhirP
     }
 }
 
-fn encode_aggregate_native_proof(proof: &NativeProof) -> Result<Vec<u8>, ExplicitWhirError> {
-    let canonical_json = serde_json::to_vec(proof).map_err(|_| ExplicitWhirError::Serialization)?;
-    if canonical_json.len() > MAX_STRUCTURED_WHIR_NATIVE_JSON_BYTES {
-        return Err(ExplicitWhirError::AggregateProofTooLarge);
-    }
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-    encoder
-        .write_all(&canonical_json)
-        .map_err(|_| ExplicitWhirError::Serialization)?;
-    encoder
-        .finish()
-        .map_err(|_| ExplicitWhirError::Serialization)
+fn encode_explicit_native_proof<MT>(
+    proof: &WhirProof<F, EF, MT>,
+    config: &WhirConfig<EF, F, Challenger>,
+) -> Result<Vec<u8>, ExplicitWhirError>
+where
+    MT: Mmcs<F, Commitment = MerkleCap<F, [u8; 32]>, Proof = Vec<[u8; 32]>>,
+{
+    native_codec::encode_native_proof(proof, config).map_err(|error| match error {
+        native_codec::NativeProofCodecError::TooLarge => ExplicitWhirError::ProofTooLarge,
+        _ => ExplicitWhirError::Serialization,
+    })
 }
 
-fn decode_aggregate_native_proof(encoded: &[u8]) -> Result<NativeProof, ExplicitWhirError> {
-    let decoder = ZlibDecoder::new(encoded);
-    let mut limited = decoder.take((MAX_STRUCTURED_WHIR_NATIVE_JSON_BYTES + 1) as u64);
-    let mut canonical_json = Vec::new();
-    limited
-        .read_to_end(&mut canonical_json)
-        .map_err(|_| ExplicitWhirError::InvalidEncoding)?;
-    let decoder = limited.into_inner();
-    if canonical_json.len() > MAX_STRUCTURED_WHIR_NATIVE_JSON_BYTES
-        || decoder.total_in() != encoded.len() as u64
-    {
-        return Err(ExplicitWhirError::InvalidEncoding);
+fn decode_explicit_native_proof(
+    encoded: &[u8],
+    config: &WhirConfig<EF, F, Challenger>,
+) -> Result<NativeProof, ExplicitWhirError> {
+    native_codec::decode_native_proof(encoded, config).map_err(map_native_codec_decode_error)
+}
+
+fn encode_aggregate_native_proof(
+    proof: &NativeProof,
+    config: &WhirConfig<EF, F, Challenger>,
+) -> Result<Vec<u8>, ExplicitWhirError> {
+    let encoded =
+        native_codec::encode_native_proof(proof, config).map_err(|error| match error {
+            native_codec::NativeProofCodecError::TooLarge => {
+                ExplicitWhirError::AggregateProofTooLarge
+            }
+            _ => ExplicitWhirError::Serialization,
+        })?;
+    if encoded.len() > crate::MAX_STRUCTURED_PCS_PROOF_BYTES {
+        return Err(ExplicitWhirError::AggregateProofTooLarge);
     }
-    let proof =
-        serde_json::from_slice(&canonical_json).map_err(|_| ExplicitWhirError::InvalidEncoding)?;
-    let reencoded = serde_json::to_vec(&proof).map_err(|_| ExplicitWhirError::InvalidEncoding)?;
-    if reencoded != canonical_json {
-        return Err(ExplicitWhirError::InvalidEncoding);
+    Ok(encoded)
+}
+
+fn decode_aggregate_native_proof(
+    encoded: &[u8],
+    config: &WhirConfig<EF, F, Challenger>,
+) -> Result<NativeProof, ExplicitWhirError> {
+    if encoded.is_empty() || encoded.len() > crate::MAX_STRUCTURED_PCS_PROOF_BYTES {
+        return Err(ExplicitWhirError::AggregateProofTooLarge);
     }
-    Ok(proof)
+    native_codec::decode_native_proof(encoded, config).map_err(map_native_codec_decode_error)
+}
+
+fn map_native_codec_decode_error(error: native_codec::NativeProofCodecError) -> ExplicitWhirError {
+    match error {
+        native_codec::NativeProofCodecError::TooLarge => ExplicitWhirError::ProofTooLarge,
+        native_codec::NativeProofCodecError::UnsupportedVersion => {
+            ExplicitWhirError::UnsupportedVersion
+        }
+        native_codec::NativeProofCodecError::NonCanonicalField => {
+            ExplicitWhirError::NonCanonicalFieldElement
+        }
+        _ => ExplicitWhirError::InvalidEncoding,
+    }
 }
 
 fn validate_table(table: &[u64]) -> Result<usize, ExplicitWhirError> {
@@ -2520,7 +2569,7 @@ mod tests {
     #[cfg(feature = "gpu-proof-prover")]
     use std::fs::OpenOptions;
     #[cfg(feature = "gpu-proof-prover")]
-    use std::io::{Seek as _, SeekFrom};
+    use std::io::{Seek as _, SeekFrom, Write as _};
     #[cfg(feature = "gpu-proof-prover")]
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "gpu-proof-prover")]
@@ -2946,8 +2995,8 @@ mod tests {
             "434d4644424e4b3202000000b800000001000000020000000200000006000000",
             "040000000000000004000000000000001c00000000000000921f746e64fb0502",
             "2fe53c5ddcf048c74d79604680d5716a7299929750744c539a37a20d1bc3e472",
-            "41e63ac491185f80f717049e4982c922715b96f44943690e8509efcbad60e644",
-            "69c5a0208b59e517d4a0a968becd879acfedd35bb965398b993745b234219cb7",
+            "41e63ac491185f80f717049e4982c922715b96f44943690e2bfd9ce2207d0ffd",
+            "a6d87033b34170bf1de73e6eb849e7d7c1c28faff4fc4939993745b234219cb7",
             "bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff007dfa0102030405",
             "060708090a0b0c0d0e0f10111213141516171819"
         ))
@@ -2967,7 +3016,7 @@ mod tests {
                 "9a37a20d1bc3e47241e63ac491185f80f717049e4982c922715b96f44943690e",
             ),
             pcs_parameter_digest: decode_hex_32(
-                "8509efcbad60e64469c5a0208b59e517d4a0a968becd879acfedd35bb965398b",
+                "2bfd9ce2207d0ffda6d87033b34170bf1de73e6eb849e7d7c1c28faff4fc4939",
             ),
             pcs_commitment_root: decode_hex_32(
                 "993745b234219cb7bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff",
@@ -3068,7 +3117,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(fixture.identity.digest().unwrap()),
-            "7668cf0552d25b3b00924cfeb8d9ba03540b6788f57e1797a259cf5e04ad7324"
+            "4b6674abacdd3a6ffcdb713e1fcab5101945e90f16e2d485b43e9e9899086a86"
         );
         let derived = StructuredWhirModelCommitmentSet::from_verified_model_bank(
             Cursor::new(&fixture.bytes),
@@ -3403,6 +3452,95 @@ mod tests {
         verify_explicit_whir_openings(&binding, commitment, &openings, &proof).unwrap();
         assert_eq!(proof.num_variables, 8);
         assert!(proof.proof_bytes.len() <= MAX_EXPLICIT_WHIR_PROOF_BYTES);
+    }
+
+    #[test]
+    fn canonical_binary_n13_fits_wire_cap_across_transcripts() {
+        const VARIABLES: usize = 13;
+        const EXPECTED_NATIVE_BYTES: [usize; 10] = [
+            188_148, 189_044, 189_748, 189_460, 188_724, 190_004, 189_556, 188_660, 188_084,
+            189_492,
+        ];
+        let table = (0..1_usize << VARIABLES)
+            .map(|index| (index * index + 17 * index + 29) as u64)
+            .collect::<Vec<_>>();
+
+        for (seed, expected_native_bytes) in EXPECTED_NATIVE_BYTES.into_iter().enumerate() {
+            let binding = format!("canonical-binary-n13-seed-{seed}");
+            let points = (0..2_usize)
+                .map(|point_index| {
+                    (0..VARIABLES)
+                        .map(|index| ExtensionElement {
+                            limbs: [
+                                (index * 5 + point_index + seed + 2) as u64,
+                                (index * 7 + point_index + 2 * seed + 3) as u64,
+                                (index * 11 + point_index + 3 * seed + 5) as u64,
+                            ],
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let (commitment, openings, proof) =
+                prove_explicit_whir_openings(binding.as_bytes(), &table, &points).unwrap();
+            verify_explicit_whir_openings(binding.as_bytes(), commitment, &openings, &proof)
+                .unwrap();
+            assert_eq!(
+                proof.proof_bytes.len(),
+                expected_native_bytes,
+                "seed {seed}"
+            );
+            let framed = proof.encode().unwrap();
+            if seed == 0 {
+                assert_eq!(
+                    blake3::hash(&proof.proof_bytes).to_hex().as_str(),
+                    "1e4eed0b8faa47868b7ae2dc54df8fc63c85e0907ee659a9cfdbd44314a6b4d2"
+                );
+            }
+            assert!(
+                crate::wire::WIRE_HEADER_BYTES + framed.len() <= crate::wire::MAX_PROOF_BYTES,
+                "seed {seed} needs {} bytes with the outer wire header",
+                crate::wire::WIRE_HEADER_BYTES + framed.len()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_binary_verifies_every_supported_round_topology() {
+        for variables in [2_usize, 8, 9, 13, 14, 15, 16] {
+            let binding = format!("canonical-binary-topology-{variables}");
+            let table = (0..1_usize << variables)
+                .map(|index| (index * index + 23 * index + variables) as u64)
+                .collect::<Vec<_>>();
+            let points = vec![
+                (0..variables)
+                    .map(|index| ExtensionElement {
+                        limbs: [
+                            (index * 3 + 2) as u64,
+                            (index * 5 + 3) as u64,
+                            (index * 7 + 5) as u64,
+                        ],
+                    })
+                    .collect::<Vec<_>>(),
+            ];
+            let (commitment, openings, proof) =
+                prove_explicit_whir_openings(binding.as_bytes(), &table, &points).unwrap();
+            assert_eq!(proof.protocol_version, EXPLICIT_WHIR_VERSION);
+            assert_eq!(proof.num_variables, variables as u32);
+            assert_eq!(
+                &proof.proof_bytes[..native_codec::NATIVE_PROOF_CODEC_MAGIC.len()],
+                native_codec::NATIVE_PROOF_CODEC_MAGIC
+            );
+            if variables <= 14 {
+                let encoded = proof.encode().unwrap();
+                assert!(
+                    crate::wire::WIRE_HEADER_BYTES + encoded.len() <= crate::wire::MAX_PROOF_BYTES
+                );
+            } else {
+                assert_eq!(proof.encode(), Err(ExplicitWhirError::ProofTooLarge));
+            }
+            verify_explicit_whir_openings(binding.as_bytes(), commitment, &openings, &proof)
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3964,6 +4102,14 @@ mod tests {
             Err(ExplicitWhirError::UnsupportedVersion)
         );
 
+        let mut legacy_v1 = encoded.clone();
+        legacy_v1[..8].copy_from_slice(b"CMFDWHR1");
+        legacy_v1[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            ExplicitWhirProof::decode(&legacy_v1),
+            Err(ExplicitWhirError::InvalidEncoding)
+        );
+
         let mut wrong_length = encoded.clone();
         let claimed_length = u32::from_le_bytes(wrong_length[16..20].try_into().unwrap());
         wrong_length[16..20].copy_from_slice(&(claimed_length + 1).to_le_bytes());
@@ -3980,9 +4126,47 @@ mod tests {
         );
 
         let mut noncanonical_payload = proof.clone();
-        noncanonical_payload.proof_bytes.push(b' ');
+        noncanonical_payload.proof_bytes.push(0);
         assert_eq!(
             verify_explicit_whir_openings(&binding, commitment, &openings, &noncanonical_payload,),
+            Err(ExplicitWhirError::InvalidEncoding)
+        );
+
+        for legacy_payload in [b"{}".to_vec(), vec![0x78, 0xda, 0xab, 0xae, 0x05, 0x00]] {
+            let mut legacy = proof.clone();
+            legacy.proof_bytes = legacy_payload;
+            assert_eq!(
+                verify_explicit_whir_openings(&binding, commitment, &openings, &legacy),
+                Err(ExplicitWhirError::InvalidEncoding)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_envelope_matches_the_network_byte_budget() {
+        let maximum_native_bytes = MAX_EXPLICIT_WHIR_ENCODED_BYTES - EXPLICIT_WHIR_HEADER_BYTES;
+        let proof = ExplicitWhirProof {
+            protocol_version: EXPLICIT_WHIR_VERSION,
+            num_variables: EXPLICIT_WHIR_MIN_VARIABLES as u32,
+            proof_bytes: vec![0; maximum_native_bytes],
+        };
+        let encoded = proof.encode().unwrap();
+        assert_eq!(
+            crate::wire::WIRE_HEADER_BYTES + encoded.len(),
+            crate::wire::MAX_PROOF_BYTES
+        );
+        assert_eq!(ExplicitWhirProof::decode(&encoded).unwrap(), proof);
+
+        let mut oversized_proof = proof;
+        oversized_proof.proof_bytes.push(0);
+        assert_eq!(
+            oversized_proof.encode(),
+            Err(ExplicitWhirError::ProofTooLarge)
+        );
+        let mut oversized_encoding = encoded;
+        oversized_encoding.push(0);
+        assert_eq!(
+            ExplicitWhirProof::decode(&oversized_encoding),
             Err(ExplicitWhirError::InvalidEncoding)
         );
     }
@@ -4119,6 +4303,23 @@ mod tests {
             Err(ExplicitWhirError::InvalidEncoding)
         );
 
+        let mut legacy_split = proof.clone();
+        legacy_split[..8].copy_from_slice(b"CMFDWSP2");
+        legacy_split[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &legacy_split,),
+            Err(ExplicitWhirError::InvalidEncoding)
+        );
+
+        let current_split = StructuredWhirSplitProof::decode(&proof).unwrap();
+        let mut legacy_aggregate = current_split.fixed_model[0].encode().unwrap();
+        legacy_aggregate[..8].copy_from_slice(b"CMFDWAG1");
+        legacy_aggregate[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            StructuredWhirAggregateProof::decode(&legacy_aggregate),
+            Err(ExplicitWhirError::InvalidEncoding)
+        );
+
         let mut zero_sections = proof.clone();
         zero_sections[12..16].copy_from_slice(&0_u32.to_le_bytes());
         assert_eq!(
@@ -4222,7 +4423,7 @@ mod tests {
     fn structured_model_and_trace_openings_are_separate_and_bound() {
         assert_eq!(
             hex::encode(structured_whir_suite_parameter_digest()),
-            "8509efcbad60e64469c5a0208b59e517d4a0a968becd879acfedd35bb965398b"
+            "2bfd9ce2207d0ffda6d87033b34170bf1de73e6eb849e7d7c1c28faff4fc4939"
         );
         let base = vec![3, 5, 7, 11];
         let weight_0 = vec![13, 17, 19, 23, 29, 31, 37, 41];

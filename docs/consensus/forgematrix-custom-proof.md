@@ -410,11 +410,18 @@ extension, builds their equality constraints directly, and verifies those exact
 points through the lower-level WHIR verifier. It does not replace the
 independent coordinates with the high-level layout's structured
 univariate-power points.
+
 The prototype uses WHIR's non-conjectural unique-decoding parameter mode at a
-requested 128-bit level. The standalone explicit proof format has a 1 MiB cap;
-the structured split aggregate has a 512 KiB PCS-proof cap. A 4 KiB
-public-binding cap, canonical field checks, canonical JSON re-encoding, exact
+requested 128-bit level. The native research payload has a 1 MiB parser cap;
+its 20-byte standalone envelope also refuses any encoding that would exceed
+the 256 KiB network proof budget after the 16-byte outer wire header. The
+structured split aggregate has a 512 KiB PCS-proof cap. A 4 KiB public-binding
+cap, canonical field checks, configuration-derived vector shapes, exact
 envelope exhaustion, and panic containment bound the current parser surface.
+Native proof v2 uses a manual fixed-width little-endian codec; it does not
+accept legacy JSON, zlib, bincode, varints, trailing bytes, or
+attacker-selected semantic vector lengths. Its untrusted dictionary count is
+strictly bounded by both the exact input length and the fixed proof cap.
 
 For bounded research artifacts, `from_verified_model_bank` now closes the
 previously separate byte-root and PCS-table inputs. It accepts an externally
@@ -577,18 +584,50 @@ and that preflight allocates no row-proportional memory.
 The artifact state has exact commitment, opening, and next-challenge parity at
 9, 13, and 16 variables, multi-chunk constrained-fold parity at 16 variables,
 and complete proof-byte parity at the bounded end-to-end fixtures. The
-unchanged verifier accepts those proofs. A public 13-variable serialized proof
-is 1,236,482 bytes in the current canonical JSON: 99.5 percent is the 794 query
-openings, including 8,606 path nodes rendered as decimal byte arrays. Even a
-flat fixed-width encoding of every repeated node would exceed 256 KiB. A
-canonical first-reference node dictionary would reduce the measured dominant
-fields to about 187 KiB before framing and the small non-query fields, but that
-versioned binary format is not implemented yet. Merely raising the table
-geometry would therefore not produce the intended succinct wire format. A
-blocked or GPU production transform, production proof encoding, and the
-31-variable initial weight-bank commitment remain required. The
-explicit adapter stays capped at 16 variables, the initial codeword/oracle path
-at 19, and the production `2^30 x 4` weight-bank codeword remains unsupported.
+unchanged verifier accepts those proofs. The former public 13-variable JSON
+encoding was 1,236,482 bytes, of which 99.5 percent was the 794 query openings
+and their 8,606 authentication nodes.
+
+Native proof v2 replaces that transport with a 40-byte versioned header,
+fixed-width canonical Goldilocks limbs, and a `u16` dictionary ordered by each
+Merkle node's first use. Every query count, value width, path depth, sumcheck
+round, option, and PoW field is derived from the trusted `WhirConfig`. The
+decoder rejects duplicate or reordered dictionary entries, forward or unused
+references, noncanonical limbs, ignored nonzero PoW fields, wrong query
+variants, truncation, and trailing bytes before calling the unchanged verifier.
+It uses no general-purpose compression.
+
+Across ten deterministic 13-variable transcripts, native bytes measured
+188,084 through 190,004 and the standalone explicit envelope measured 188,104
+through 190,024 bytes (about 183.7 through 185.6 KiB). The worst vector
+retains 72,104 bytes below the 256 KiB wire cap after including the 16-byte
+outer wire header. All ten native lengths are pinned by tests. The first native
+vector is 188,148 bytes with BLAKE3 digest
+`1e4eed0b8faa47868b7ae2dc54df8fc63c85e0907ee659a9cfdbd44314a6b4d2`.
+Independently of those samples, the binary-tree geometry limits verifier-valid
+13-variable authentication paths to 4,011 distinct dictionary nodes. That
+gives a conservative maximum of 203,540 native bytes, or 203,576 bytes with
+both envelopes, leaving 58,568 bytes of transcript-independent headroom.
+Real prover/decoder/verifier round trips cover 2, 8, 9, and 13 through 16
+variables; configuration-derived synthetic codec round trips extend through
+the structured adapter's 20-variable limit. The research prover and verifier
+continue to exercise 15- and 16-variable proofs, but their standalone encoder
+returns `ProofTooLarge`; those shapes are not represented as wire-ready.
+
+This result is one direct WHIR proof, not the complete production block proof;
+the split PCS envelope contains multiple child proofs and the aggregate also
+contains the arithmetic and BLAKE3 arguments. A blocked or GPU production
+transform and the 31-variable initial weight-bank commitment remain required.
+The explicit adapter stays capped at 16 variables, the initial codeword/oracle
+path at 19, and the production `2^30 x 4` weight-bank codeword remains
+unsupported.
+
+Native proof v2, aggregate v2, split v3, and the revised suite identity are a
+hard cutover for research artifacts. Older explicit proofs, structured proofs,
+model bundles, and source pointers must be regenerated. This does not fork the
+current Devnet block format because succinct WHIR is not yet a block-proof
+variant; activation requires a new proof tag rather than reusing the compact
+reference tag.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
@@ -599,11 +638,10 @@ base table has 19 variables and each weight bank has 31. Source staging admits
 both, but the explicit proof adapter admits at most 16 variables per table and
 the codeword/oracle path admits at most 19. It now has bounded, authenticated
 residual generation and artifact-consuming later folds, but no streaming
-31-variable initial commitment, production-geometry extension transform, or
-production binary proof encoding. The upstream
-backend is an unaudited academic prototype. Review, benchmarks, fuzzing, a
-complete soundness report, and independent audits remain mandatory before any
-production selection.
+31-variable initial commitment or production-geometry extension transform. The
+upstream backend is an unaudited academic prototype. Review, benchmarks,
+fuzzing, a complete soundness report, and independent audits remain mandatory
+before any production selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded

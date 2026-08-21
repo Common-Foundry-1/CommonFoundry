@@ -1420,11 +1420,11 @@ mod tests {
         assert_eq!(bytes.len(), BUNDLE_HEADER_BYTES + 3 * BUNDLE_ROLE_BYTES);
         assert_eq!(
             hex::encode(bundle.bundle_digest()),
-            "6a30bd0e0569c40837bcf7d236f18ffddada787f37738210b107bc82a662779b"
+            "101da7aaad576db4bcadf336ae508d64b5afae8e4c6ee9f488f1bb60360dfac7"
         );
         assert_eq!(
             hex::encode(blake3::hash(&bytes).as_bytes()),
-            "7c88421cec8006df1ba6adf73a9d705b211e05de0d37a2675f9edb7a43cc40e0"
+            "d5a8a1e33a0a7c5684b4b83798bd0dd4199715226fa941a20a7405716cad5d7a"
         );
         drop(bundle);
         fs::remove_dir_all(root).unwrap();

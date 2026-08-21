@@ -202,31 +202,40 @@ its input is fixed), giving 47 semantic columns. An earlier four-column,
 The replacement packs two range specifications into each of four rows per
 cell, using 28 digit columns and seven table-multiplicity columns. Main widths
 are 46 for initialization and 47 for a bank. Its bank trace is `n=28`; the FRI
-LDE is exactly `n=32`, within Goldilocks two-adicity. The reusable 40-column
-preprocessing plan contains only selectors, lookup IDs, and the fixed nibble
-table; it explicitly excludes the per-block mask. The canonical row generator,
-padding, lookup topology, source bounds, ordered core mapping, and V2 layout
-digest are tested. Actual production PCS roots, a mask-polynomial opening
-bridge, and aggregate payload measurement are still required before this
-layout can mint a verified production trace.
+LDE is exactly `n=32`, within Goldilocks two-adicity. The reusable 66-column
+preprocessing plan contains selectors, lookup IDs, the fixed nibble table, and
+the exact 7 layer, 7 row, and 12 column bits; it contains no per-block mask.
+The AIR selects the challenge-derived affine coefficients from those bits and
+enforces the mask directly. Canonical rows, padding, lookup topology, source
+bounds, ordered core mapping, and V2 layout digest are tested. Actual
+production PCS roots and aggregate payload measurement are still required
+before this layout can mint a verified production trace.
 
 A test-only 128-cell batch-STARK proves that packed range handoff and the
 transition arithmetic end to end. The core mask is rederived from the
 challenge polynomial, all seven ForgeMatrix transition equations are enforced,
 eight independent LogUp buses bind each core source/slack pair, and seven
 nibble buses range-check four packed digit columns apiece against the fixed
-`0..15` table. The pinned prototype has maximum degree six, 119 constraints,
+`0..15` table. The pinned prototype has maximum degree nine, 145 constraints,
 three quotient splits, 48 base-field lookup auxiliary openings at each local
-and next evaluation, and 128-bit computed list-decoding security with one FRI
-query above the measured minimum. Its shared-pair LogUp challenge error is
-bounded below `2^-163`. The 512-row proof has a 141,528-byte fixed-width
-bincode baseline; two best-zlib runs measured 111,818 and 112,603 bytes, and a
-115,000-byte regression ceiling is tested. This is not the production native
-codec or a production-shape size result. Every core column, active digit, padding,
-multiplicity, preprocessing, and degree-shape mutation is rejected.
-Production-sized component construction, fixed initialization-input and cross-
-component wiring, native encoding, and aggregate payload measurement remain
-required; the fixture proves the reduction, not activation readiness.
+and next evaluation, and 128-bit computed list-decoding security at FRI log
+blowup four with 57 queries, one above the measured minimum. Its shared-pair
+LogUp challenge error is bounded below `2^-163`. The 512-row proof has a
+222,960-byte fixed-width bincode baseline; repeated best-zlib runs measured
+160,461 to 160,667 bytes, and a 165,000-byte regression ceiling is tested.
+This is not the production native codec or a production-shape size result.
+Every core column, active digit, padding, multiplicity, preprocessing, and
+degree-shape mutation is rejected.
+
+Exact production geometry also rules out ordinary batch-STARK FRI as the
+activation transport for this reduction. A valid 57-query transcript whose
+queries occupy distinct six-bit prefix buckets has a 333,792-byte lower bound
+even with globally deduplicated Merkle paths. That is already 71,664 bytes over
+the 262,128-byte native proof budget before roots, proof-of-work witnesses,
+lookup terminals, input commitment paths, or headers. The compact arithmetic
+and range reduction remains useful, but production needs a different succinct
+commitment or aggregation layer; the current FRI path cannot guarantee the
+wire cap.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

@@ -88,13 +88,25 @@ pub const PRODUCTION_TRACE_PACKED_BANK_MAIN_COLUMNS: usize = PRODUCTION_TRACE_CO
     + PRODUCTION_TRACE_PACKED_TABLE_MULTIPLICITY_COLUMNS;
 pub const PRODUCTION_TRACE_PACKED_MAIN_COLUMNS: usize = PRODUCTION_TRACE_PACKED_BANK_MAIN_COLUMNS;
 pub const PRODUCTION_TRACE_PACKED_PREPROCESSED_VERSION: u32 = 1;
-pub const PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH: usize =
-    4 + crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
+pub const PRODUCTION_TRACE_PACKED_LAYER_BITS: usize =
+    PRODUCTION_V2_LAYERS_PER_BANK.ilog2() as usize;
+pub const PRODUCTION_TRACE_PACKED_ROW_BITS: usize = PRODUCTION_V2_BATCH.ilog2() as usize;
+pub const PRODUCTION_TRACE_PACKED_COLUMN_BITS: usize = PRODUCTION_V2_DIMENSION.ilog2() as usize;
+pub const PRODUCTION_TRACE_PACKED_COORDINATE_COLUMNS: usize = PRODUCTION_TRACE_PACKED_LAYER_BITS
+    + PRODUCTION_TRACE_PACKED_ROW_BITS
+    + PRODUCTION_TRACE_PACKED_COLUMN_BITS;
+pub const PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH: usize = 4
+    + crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT
+    + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS
+    + PRODUCTION_TRACE_PACKED_COORDINATE_COLUMNS;
 pub const PRODUCTION_TRACE_PACKED_INITIALIZATION_VARIABLES: usize =
     PRODUCTION_TRACE_INITIALIZATION_VARIABLES + PRODUCTION_TRACE_PACKED_ROW_VARIABLES;
 pub const PRODUCTION_TRACE_PACKED_BANK_VARIABLES: usize =
     PRODUCTION_TRACE_BANK_VARIABLES + PRODUCTION_TRACE_PACKED_ROW_VARIABLES;
 pub const PRODUCTION_TRACE_PACKED_FRI_LOG_BLOWUP: usize = 4;
+pub const PRODUCTION_TRACE_PACKED_FRI_LOG_FINAL_POLY_LEN: usize = 7;
+pub const PRODUCTION_TRACE_PACKED_FRI_MAX_LOG_ARITY: usize = 4;
+pub const PRODUCTION_TRACE_PACKED_FRI_QUERIES: usize = 57;
 pub const PRODUCTION_TRACE_PACKED_BANK_LDE_VARIABLES: usize =
     PRODUCTION_TRACE_PACKED_BANK_VARIABLES + PRODUCTION_TRACE_PACKED_FRI_LOG_BLOWUP;
 pub const PRODUCTION_TRACE_PACKED_SPEC_ROWS: [usize;
@@ -363,9 +375,9 @@ pub enum ProductionTracePackedComponentV2 {
 
 /// Challenge-independent topology committed by a reusable preprocessing key.
 ///
-/// The challenge-derived mask is intentionally absent. It remains a main-trace
-/// column and must be authenticated against `StructuredMaskPolynomial` by the
-/// cross-component opening argument.
+/// The challenge-derived mask is intentionally absent. The coordinate bits
+/// let the AIR select the block-derived affine coefficients and constrain the
+/// main-trace mask without rebuilding this preprocessing key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProductionTracePackedPreprocessedPlanV2 {
     pub version: u32,
@@ -385,6 +397,46 @@ pub struct ProductionTracePackedPreprocessedRowV2 {
     pub table_value: u8,
     pub source_active: [bool; crate::STRUCTURED_TRANSITION_RANGE_SPEC_COUNT],
     pub digit_active: [bool; PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS],
+    pub layer_bits: [bool; PRODUCTION_TRACE_PACKED_LAYER_BITS],
+    pub row_bits: [bool; PRODUCTION_TRACE_PACKED_ROW_BITS],
+    pub column_bits: [bool; PRODUCTION_TRACE_PACKED_COLUMN_BITS],
+}
+
+/// Wire lower bound for a valid transcript whose 57 FRI queries occupy
+/// distinct six-bit prefix buckets at every committed fold.
+///
+/// This is deliberately stronger than measuring one favorable proof. Even a
+/// globally deduplicated Merkle dictionary must carry the collision-free path
+/// nodes below those distinct prefixes. A production protocol cannot silently
+/// reject this transcript shape without turning proof size into another
+/// Fiat-Shamir grinding condition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionTracePackedFriWireBudgetV2 {
+    pub trace_variables: usize,
+    pub lde_variables: usize,
+    pub final_codeword_variables: usize,
+    pub queries: usize,
+    pub distinct_prefix_bits: usize,
+    pub round_log_arities: Vec<usize>,
+    pub round_tree_variables: Vec<usize>,
+    pub input_base_values_per_query: usize,
+    pub sibling_extension_values_per_query: usize,
+    pub out_of_domain_extension_values: usize,
+    pub final_polynomial_extension_values: usize,
+    pub query_input_bytes: usize,
+    pub sibling_value_bytes: usize,
+    pub out_of_domain_bytes: usize,
+    pub final_polynomial_bytes: usize,
+    pub distinct_path_nodes: usize,
+    pub distinct_path_bytes: usize,
+    pub spread_transcript_lower_bound_bytes: usize,
+    pub available_native_bytes: usize,
+}
+
+impl ProductionTracePackedFriWireBudgetV2 {
+    pub const fn cannot_guarantee_wire_fit(&self) -> bool {
+        self.spread_transcript_lower_bound_bytes > self.available_native_bytes
+    }
 }
 
 impl ProductionTraceBatchWireBudgetV1 {
@@ -525,6 +577,20 @@ pub fn production_trace_packed_preprocessed_row_v2(
     for (column, active) in digit_active.iter_mut().enumerate() {
         *active = production_trace_packed_digit_slot_v2(row_in_cell, column)?.active;
     }
+    let cells_per_layer = u64::from(PRODUCTION_V2_BATCH)
+        .checked_mul(u64::from(PRODUCTION_V2_DIMENSION))
+        .ok_or(ProductionWhirCandidateError::InvalidTraceRow)?;
+    let layer = cell_index / cells_per_layer;
+    let within_layer = cell_index % cells_per_layer;
+    let row = within_layer / u64::from(PRODUCTION_V2_DIMENSION);
+    let column = within_layer % u64::from(PRODUCTION_V2_DIMENSION);
+    let expected_layers = match plan.component {
+        ProductionTracePackedComponentV2::Initialization => 1,
+        ProductionTracePackedComponentV2::Bank => u64::from(PRODUCTION_V2_LAYERS_PER_BANK),
+    };
+    if layer >= expected_layers {
+        return Err(ProductionWhirCandidateError::InvalidTraceRow);
+    }
     let table_active = packed_row < 16;
     Ok(ProductionTracePackedPreprocessedRowV2 {
         core_active: row_in_cell == 0,
@@ -533,6 +599,9 @@ pub fn production_trace_packed_preprocessed_row_v2(
         table_value: if table_active { packed_row as u8 } else { 0 },
         source_active,
         digit_active,
+        layer_bits: std::array::from_fn(|bit| (layer >> bit) & 1 == 1),
+        row_bits: std::array::from_fn(|bit| (row >> bit) & 1 == 1),
+        column_bits: std::array::from_fn(|bit| (column >> bit) & 1 == 1),
     })
 }
 
@@ -553,6 +622,7 @@ pub fn production_trace_packed_preprocessed_plan_digest_v2(
     hasher.update(&plan.layout_digest);
     hasher.update(b"core-active;cell-lookup-id-start;table-active;table-value");
     hasher.update(b"source-active[8];digit-active[28];no-mask-column");
+    hasher.update(b"layer-bits[7];row-bits[7];column-bits[12]");
     for row_in_cell in 0..PRODUCTION_TRACE_PACKED_ROWS_PER_CELL {
         hasher.update(&(row_in_cell as u32).to_le_bytes());
         for spec_row in PRODUCTION_TRACE_PACKED_SPEC_ROWS {
@@ -565,6 +635,108 @@ pub fn production_trace_packed_preprocessed_plan_digest_v2(
         }
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+pub fn production_trace_packed_fri_wire_budget_v2()
+-> Result<ProductionTracePackedFriWireBudgetV2, ProductionWhirCandidateError> {
+    const BASE_FIELD_BYTES: usize = 8;
+    const EXTENSION_DEGREE: usize = 3;
+    const DIGEST_BYTES: usize = 32;
+    const QUOTIENT_CHUNKS: usize = 8;
+    const QUOTIENT_CHUNK_WIDTH: usize = 3;
+
+    let trace_variables = PRODUCTION_TRACE_PACKED_BANK_VARIABLES;
+    let lde_variables = PRODUCTION_TRACE_PACKED_BANK_LDE_VARIABLES;
+    let final_codeword_variables = PRODUCTION_TRACE_PACKED_FRI_LOG_FINAL_POLY_LEN
+        .checked_add(PRODUCTION_TRACE_PACKED_FRI_LOG_BLOWUP)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let mut current = lde_variables;
+    let mut round_log_arities = Vec::new();
+    let mut round_tree_variables = Vec::new();
+    while current > final_codeword_variables {
+        let log_arity =
+            PRODUCTION_TRACE_PACKED_FRI_MAX_LOG_ARITY.min(current - final_codeword_variables);
+        current -= log_arity;
+        round_log_arities.push(log_arity);
+        round_tree_variables.push(current);
+    }
+    let queries = PRODUCTION_TRACE_PACKED_FRI_QUERIES;
+    let distinct_prefix_bits = queries.next_power_of_two().ilog2() as usize;
+    let sibling_extension_values_per_query = round_log_arities
+        .iter()
+        .try_fold(0_usize, |sum, log_arity| {
+            (1_usize << log_arity)
+                .checked_sub(1)
+                .and_then(|siblings| sum.checked_add(siblings))
+        })
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let input_base_values_per_query = PRODUCTION_TRACE_PACKED_BANK_MAIN_COLUMNS
+        + QUOTIENT_CHUNKS * QUOTIENT_CHUNK_WIDTH
+        + PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH
+        + 48;
+    let out_of_domain_extension_values = PRODUCTION_TRACE_PACKED_BANK_MAIN_COLUMNS
+        + QUOTIENT_CHUNKS * QUOTIENT_CHUNK_WIDTH
+        + PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH
+        + 2 * 48;
+    let final_polynomial_extension_values = 1_usize
+        .checked_shl(PRODUCTION_TRACE_PACKED_FRI_LOG_FINAL_POLY_LEN as u32)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let distinct_path_nodes_per_query = round_tree_variables
+        .iter()
+        .try_fold(0_usize, |sum, height| {
+            height
+                .checked_sub(distinct_prefix_bits)
+                .and_then(|nodes| sum.checked_add(nodes))
+        })
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let distinct_path_nodes = distinct_path_nodes_per_query
+        .checked_mul(queries)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let query_input_bytes = input_base_values_per_query
+        .checked_mul(queries)
+        .and_then(|values| values.checked_mul(BASE_FIELD_BYTES))
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let sibling_value_bytes = sibling_extension_values_per_query
+        .checked_mul(queries)
+        .and_then(|values| values.checked_mul(EXTENSION_DEGREE * BASE_FIELD_BYTES))
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let out_of_domain_bytes = out_of_domain_extension_values
+        .checked_mul(EXTENSION_DEGREE * BASE_FIELD_BYTES)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let final_polynomial_bytes = final_polynomial_extension_values
+        .checked_mul(EXTENSION_DEGREE * BASE_FIELD_BYTES)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let distinct_path_bytes = distinct_path_nodes
+        .checked_mul(DIGEST_BYTES)
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+    let spread_transcript_lower_bound_bytes = query_input_bytes
+        .checked_add(sibling_value_bytes)
+        .and_then(|bytes| bytes.checked_add(out_of_domain_bytes))
+        .and_then(|bytes| bytes.checked_add(final_polynomial_bytes))
+        .and_then(|bytes| bytes.checked_add(distinct_path_bytes))
+        .ok_or(ProductionWhirCandidateError::Configuration)?;
+
+    Ok(ProductionTracePackedFriWireBudgetV2 {
+        trace_variables,
+        lde_variables,
+        final_codeword_variables,
+        queries,
+        distinct_prefix_bits,
+        round_log_arities,
+        round_tree_variables,
+        input_base_values_per_query,
+        sibling_extension_values_per_query,
+        out_of_domain_extension_values,
+        final_polynomial_extension_values,
+        query_input_bytes,
+        sibling_value_bytes,
+        out_of_domain_bytes,
+        final_polynomial_bytes,
+        distinct_path_nodes,
+        distinct_path_bytes,
+        spread_transcript_lower_bound_bytes,
+        available_native_bytes: PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES,
+    })
 }
 
 pub fn production_trace_packed_digit_slot_v2(
@@ -3229,7 +3401,7 @@ mod tests {
         assert_eq!(bank.trace_variables, 28);
         assert_eq!(bank.trace_rows, 1 << 28);
         for plan in [initialization, bank] {
-            assert_eq!(plan.width, 40);
+            assert_eq!(plan.width, 66);
             assert_eq!(plan.challenge_dependent_columns, 0);
             assert_eq!(
                 plan.layout_digest,
@@ -3249,6 +3421,9 @@ mod tests {
                 first.digit_active.iter().filter(|active| **active).count(),
                 28
             );
+            assert_eq!(first.layer_bits, [false; 7]);
+            assert_eq!(first.row_bits, [false; 7]);
+            assert_eq!(first.column_bits, [false; 12]);
 
             let fourth = production_trace_packed_preprocessed_row_v2(plan, 3).unwrap();
             assert!(!fourth.core_active);
@@ -3265,6 +3440,8 @@ mod tests {
             let second_cell = production_trace_packed_preprocessed_row_v2(plan, 4).unwrap();
             assert!(second_cell.core_active);
             assert_eq!(second_cell.cell_lookup_id_start, 9);
+            assert!(second_cell.column_bits[0]);
+            assert_eq!(second_cell.row_bits, [false; 7]);
             let table_end = production_trace_packed_preprocessed_row_v2(plan, 15).unwrap();
             assert!(table_end.table_active);
             assert_eq!(table_end.table_value, 15);
@@ -3276,7 +3453,23 @@ mod tests {
                 production_trace_packed_preprocessed_row_v2(plan, plan.trace_rows),
                 Err(ProductionWhirCandidateError::InvalidTraceRow)
             );
+            let first_cell_of_row_one = production_trace_packed_preprocessed_row_v2(
+                plan,
+                u64::from(PRODUCTION_V2_DIMENSION) * 4,
+            )
+            .unwrap();
+            assert!(first_cell_of_row_one.row_bits[0]);
+            assert_eq!(first_cell_of_row_one.column_bits, [false; 12]);
         }
+
+        let first_cell_of_layer_one = production_trace_packed_preprocessed_row_v2(
+            bank,
+            u64::from(PRODUCTION_V2_BATCH) * u64::from(PRODUCTION_V2_DIMENSION) * 4,
+        )
+        .unwrap();
+        assert!(first_cell_of_layer_one.layer_bits[0]);
+        assert_eq!(first_cell_of_layer_one.row_bits, [false; 7]);
+        assert_eq!(first_cell_of_layer_one.column_bits, [false; 12]);
 
         let mut malformed = bank;
         malformed.challenge_dependent_columns = 1;
@@ -3294,13 +3487,42 @@ mod tests {
         .unwrap();
         assert_eq!(
             hex::encode(initialization_digest),
-            "8fbef0d70eb794140226b98c61dfe22b9a17c81f86ca2989f27ce248118b9467"
+            "5b2b1251538d96ebc8eb5a9f3a6ecdb314a3de73d15b3ef60643db84af84811e"
         );
         assert_eq!(
             hex::encode(bank_digest),
-            "3ddd191feaafac0b09ff2d982cc2b0fa0253dad7d1607e56b0ade964437cde30"
+            "c5c2d698f1cbdf016d5272ec4c574314fef63653ebeb62e460bb45b11640fa75"
         );
         assert_ne!(initialization_digest, bank_digest);
+    }
+
+    #[test]
+    fn packed_fri_cannot_guarantee_the_network_wire_cap() {
+        let budget = production_trace_packed_fri_wire_budget_v2().unwrap();
+        assert_eq!(budget.trace_variables, 28);
+        assert_eq!(budget.lde_variables, 32);
+        assert_eq!(budget.final_codeword_variables, 11);
+        assert_eq!(budget.queries, 57);
+        assert_eq!(budget.distinct_prefix_bits, 6);
+        assert_eq!(budget.round_log_arities, [4, 4, 4, 4, 4, 1]);
+        assert_eq!(budget.round_tree_variables, [28, 24, 20, 16, 12, 11]);
+        assert_eq!(budget.input_base_values_per_query, 185);
+        assert_eq!(budget.sibling_extension_values_per_query, 76);
+        assert_eq!(budget.out_of_domain_extension_values, 233);
+        assert_eq!(budget.final_polynomial_extension_values, 128);
+        assert_eq!(budget.query_input_bytes, 84_360);
+        assert_eq!(budget.sibling_value_bytes, 103_968);
+        assert_eq!(budget.out_of_domain_bytes, 5_592);
+        assert_eq!(budget.final_polynomial_bytes, 3_072);
+        assert_eq!(budget.distinct_path_nodes, 4_275);
+        assert_eq!(budget.distinct_path_bytes, 136_800);
+        assert_eq!(budget.spread_transcript_lower_bound_bytes, 333_792);
+        assert_eq!(budget.available_native_bytes, 262_128);
+        assert_eq!(
+            budget.spread_transcript_lower_bound_bytes - budget.available_native_bytes,
+            71_664
+        );
+        assert!(budget.cannot_guarantee_wire_fit());
     }
 
     #[test]

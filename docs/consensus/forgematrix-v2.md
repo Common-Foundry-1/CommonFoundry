@@ -497,29 +497,40 @@ buses, with seven table-multiplicity columns. Main widths are 46 for
 initialization and 47 for each bank. The bank trace is `n=28` and its FRI LDE
 is exactly `n=32`. Canonical row generation and layout binding under digest
 `88f2f31f6f9d4aca4a69bc2ac6dfd88bcf670c3ed803e0fb24a241f791372cb3`
-are implemented. The reusable preprocessing topology has width 40 and zero
-challenge-dependent columns; its initialization and bank plan digests are
-`8fbef0d70eb794140226b98c61dfe22b9a17c81f86ca2989f27ce248118b9467`
-and `3ddd191feaafac0b09ff2d982cc2b0fa0253dad7d1607e56b0ade964437cde30`.
-Those are structural identities, not PCS roots. The mask remains a main-trace
-column requiring a separate opening bridge to the challenge polynomial, and
-the production-sized payload still has to be proved and measured.
+are implemented. The reusable preprocessing topology has width 66 and zero
+challenge-dependent columns: the previous 40 columns plus 7 layer, 7 row, and
+12 column bits. Its initialization and bank plan digests are
+`5b2b1251538d96ebc8eb5a9f3a6ecdb314a3de73d15b3ef60643db84af84811e`
+and `c5c2d698f1cbdf016d5272ec4c574314fef63653ebeb62e460bb45b11640fa75`.
+Those are structural identities, not PCS roots. The AIR uses the authenticated
+coordinate bits to select the challenge-derived affine mask coefficients, so
+no per-block mask table or separate mask opening is needed. The production-
+sized payload still has to be proved and measured.
 
 The transition and range reduction now has a bounded test-only proof. On 128
 cells, the AIR binds the challenge-derived mask and enforces all seven
 transition equations. Eight source buses bind every core source/slack pair,
 and seven nibble buses range-check four packed digit columns apiece against the
-fixed table. The pinned proof has maximum degree six, 119 constraints, three
+fixed table. The pinned proof has maximum degree nine, 145 constraints, three
 quotient splits, and 48 base-field lookup auxiliary openings at each local and
-next evaluation. It reaches the configured 128-bit list-decoding target with
-33 FRI queries, one above the measured minimum, and bounds the shared-pair
-lookup-challenge error below `2^-163` from 288,388,719 counted bad roots. Every
-core column plus adversarial packed-witness, topology, table, and degree
-mutation fails. Its 512-row bincode baseline is 141,528 bytes; observed
-best-zlib encodings are 111,818 and 112,603 bytes under a tested 115,000-byte
-ceiling. That diagnostic is neither a production codec nor a production-shape
-bound. Production component wiring, full geometry, canonical codec, payload
-measurement, and aggregate verification remain gates.
+next evaluation. At FRI log blowup four it reaches the configured 128-bit
+list-decoding target with 57 queries, one above the measured minimum, and
+bounds the shared-pair lookup-challenge error below `2^-163` from 288,388,719
+counted bad roots. Every core column plus adversarial packed-witness, topology,
+table, and degree mutation fails. Its 512-row bincode baseline is 222,960
+bytes; repeated best-zlib encodings measured 160,461 to 160,667 bytes under a
+tested 165,000-byte ceiling. That diagnostic is neither a production codec nor
+a production-shape bound.
+
+More importantly, the production `n=28` geometry cannot guarantee the
+262,128-byte native proof cap with ordinary batch-STARK FRI. A valid 57-query
+transcript spread across distinct six-bit prefix buckets has a 333,792-byte
+lower bound even with globally deduplicated Merkle paths, exceeding the cap by
+71,664 bytes before roots, proof-of-work witnesses, lookup terminals, input
+commitment paths, or headers. The compact reduction remains valid, but its
+production transport requires a different succinct commitment or aggregation
+layer. Production component wiring, canonical encoding, aggregate measurement,
+and verification remain gates.
 
 Implementing any subset of those components must not make the v2 profile
 activatable. Activation is a separate consensus change after every gate above

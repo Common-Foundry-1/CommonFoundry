@@ -194,6 +194,15 @@ impl StructuredMaskPolynomial {
         *hasher.finalize().as_bytes()
     }
 
+    #[cfg(test)]
+    pub(crate) fn affine_coefficients(
+        &self,
+        statement: StructuredTransitionStatement,
+    ) -> Result<&[u8], StructuredTransitionError> {
+        self.validate(statement)?;
+        Ok(&self.coefficients)
+    }
+
     fn evaluate(&self, point: &[ExtensionField]) -> ExtensionField {
         let col_end = self.col_bits as usize;
         let row_end = col_end + self.row_bits as usize;

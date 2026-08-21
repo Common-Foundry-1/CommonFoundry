@@ -11,9 +11,9 @@
 //!
 //! The prototype uses 128 transition cells so the pinned FRI configuration has
 //! a valid minimum domain while adversarial tests remain bounded.
-//! Its extra fixed-mask column is fixture-only. The production preprocessing
-//! plan excludes challenge-dependent columns and requires a separate
-//! mask-polynomial opening bridge.
+//! Its 26 fixed coordinate-bit columns match the production preprocessing
+//! plan. The AIR selects the challenge-derived affine coefficients itself, so
+//! preprocessing remains reusable across blocks and contains no mask table.
 //! It is not a production proof type and does not activate the compact layout.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -36,16 +36,17 @@ use p3_uni_stark::{ProvenSecurity, StarkSecurityParams};
 use primitive_types::U256;
 
 use crate::structured_blake3_narrow::{
-    Config, EF, F, FRI_COMMIT_POW_BITS, FRI_LOG_BLOWUP, FRI_LOG_FINAL_POLY_LEN, FRI_MAX_LOG_ARITY,
-    FRI_QUERIES, FRI_QUERY_POW_BITS, build_config,
+    Config, EF, F, FRI_COMMIT_POW_BITS, FRI_LOG_FINAL_POLY_LEN, FRI_MAX_LOG_ARITY,
+    FRI_QUERY_POW_BITS, build_config_with_fri,
 };
 use crate::{
-    PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS, PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS,
-    PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP, PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH,
-    PRODUCTION_TRACE_PACKED_ROWS_PER_CELL, PRODUCTION_TRACE_PACKED_SPEC_ROWS,
-    STRUCTURED_TRANSITION_RANGE_SPEC_COUNT, STRUCTURED_TRANSITION_REGULAR_ORACLES,
-    StructuredMaskPolynomial, StructuredTransitionStatement, V2_TRANSITION_MODULUS,
-    production_trace_packed_digit_slot_v2, production_trace_packed_row_v2,
+    PRODUCTION_TRACE_PACKED_COLUMN_BITS, PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS,
+    PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS, PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP,
+    PRODUCTION_TRACE_PACKED_LAYER_BITS, PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH,
+    PRODUCTION_TRACE_PACKED_ROW_BITS, PRODUCTION_TRACE_PACKED_ROWS_PER_CELL,
+    PRODUCTION_TRACE_PACKED_SPEC_ROWS, STRUCTURED_TRANSITION_RANGE_SPEC_COUNT,
+    STRUCTURED_TRANSITION_REGULAR_ORACLES, StructuredMaskPolynomial, StructuredTransitionStatement,
+    V2_TRANSITION_MODULUS, production_trace_packed_digit_slot_v2, production_trace_packed_row_v2,
     structured_transition_range_specs,
 };
 
@@ -75,14 +76,22 @@ const TABLE_ACTIVE: usize = 2;
 const TABLE_VALUE: usize = 3;
 const SOURCE_ACTIVE_START: usize = 4;
 const DIGIT_ACTIVE_START: usize = SOURCE_ACTIVE_START + STRUCTURED_TRANSITION_RANGE_SPEC_COUNT;
-const FIXED_CORE_MASK: usize = DIGIT_ACTIVE_START + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
-const PREPROCESSED_WIDTH: usize = FIXED_CORE_MASK + 1;
+const LAYER_BITS_START: usize = DIGIT_ACTIVE_START + PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS;
+const ROW_BITS_START: usize = LAYER_BITS_START + PRODUCTION_TRACE_PACKED_LAYER_BITS;
+const COLUMN_BITS_START: usize = ROW_BITS_START + PRODUCTION_TRACE_PACKED_ROW_BITS;
+const PREPROCESSED_WIDTH: usize = COLUMN_BITS_START + PRODUCTION_TRACE_PACKED_COLUMN_BITS;
 
 const LOOKUP_COUNT: usize =
     STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + PRODUCTION_TRACE_PACKED_DIGIT_LOOKUPS;
 const LOOKUP_MAX_COMBO: usize = PRODUCTION_TRACE_PACKED_DIGITS_PER_LOOKUP + 1;
 const LOOKUP_AUX_EXTENSION_WIDTH: usize = LOOKUP_COUNT + 1;
 const LOOKUP_AUX_BASE_WIDTH: usize = LOOKUP_AUX_EXTENSION_WIDTH * 3;
+const PACKED_FRI_LOG_BLOWUP: usize = 4;
+const PACKED_FRI_QUERIES: usize = 57;
+
+fn build_packed_config() -> Config {
+    build_config_with_fri(PACKED_FRI_LOG_BLOWUP, PACKED_FRI_QUERIES)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VerificationShapeError {
@@ -191,11 +200,20 @@ impl ProductionRangeLookupAir {
                 F::from_u64((cell * STRUCTURED_TRANSITION_RANGE_SPEC_COUNT + 1) as u64);
             if row_in_cell == 0 {
                 local[CORE_ACTIVE] = F::ONE;
-                local[FIXED_CORE_MASK] = F::from_u64(
-                    self.mask
-                        .value_at_boolean_index(self.statement, cell)
-                        .unwrap(),
-                );
+            }
+            let cells_per_layer = self.statement.rows * self.statement.cols;
+            let layer = cell / cells_per_layer;
+            let within_layer = cell % cells_per_layer;
+            let matrix_row = within_layer / self.statement.cols;
+            let column = within_layer % self.statement.cols;
+            for bit in 0..PRODUCTION_TRACE_PACKED_LAYER_BITS {
+                local[LAYER_BITS_START + bit] = F::from_bool((layer >> bit) & 1 == 1);
+            }
+            for bit in 0..PRODUCTION_TRACE_PACKED_ROW_BITS {
+                local[ROW_BITS_START + bit] = F::from_bool((matrix_row >> bit) & 1 == 1);
+            }
+            for bit in 0..PRODUCTION_TRACE_PACKED_COLUMN_BITS {
+                local[COLUMN_BITS_START + bit] = F::from_bool((column >> bit) & 1 == 1);
             }
             if row < 16 {
                 local[TABLE_ACTIVE] = F::ONE;
@@ -246,8 +264,49 @@ impl BaseAir<F> for ProductionRangeLookupAir {
     }
 
     fn max_constraint_degree(&self) -> Option<usize> {
-        Some(6)
+        Some(9)
     }
+}
+
+fn select_mask_coefficient<AB: AirBuilder<F = F>>(
+    coefficients: &[u8],
+    statement: StructuredTransitionStatement,
+    padded_coefficient: usize,
+    layer_bits: &[AB::Var],
+) -> AB::Expr {
+    let actual_row_bits = statement.rows.ilog2() as usize;
+    let actual_column_bits = statement.cols.ilog2() as usize;
+    let actual_coefficient_count = 1 + actual_row_bits + actual_column_bits;
+    let actual_coefficient = if padded_coefficient == 0 {
+        Some(0)
+    } else if padded_coefficient <= PRODUCTION_TRACE_PACKED_ROW_BITS {
+        let bit = padded_coefficient - 1;
+        (bit < actual_row_bits).then_some(1 + bit)
+    } else {
+        let bit = padded_coefficient - 1 - PRODUCTION_TRACE_PACKED_ROW_BITS;
+        (bit < actual_column_bits).then_some(1 + actual_row_bits + bit)
+    };
+    let mut values = (0..(1 << PRODUCTION_TRACE_PACKED_LAYER_BITS))
+        .map(|layer| {
+            let value = if layer < statement.layers {
+                actual_coefficient
+                    .map(|index| coefficients[layer * actual_coefficient_count + index])
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            AB::Expr::from_u8(value)
+        })
+        .collect::<Vec<_>>();
+    for bit in layer_bits {
+        values = values
+            .chunks_exact(2)
+            .map(|pair| {
+                pair[0].clone() + AB::Expr::from(*bit) * (pair[1].clone() - pair[0].clone())
+            })
+            .collect();
+    }
+    values.pop().expect("seven layer folds leave one value")
 }
 
 impl<AB> Air<AB> for ProductionRangeLookupAir
@@ -273,6 +332,9 @@ where
         {
             builder.assert_bool(*selector);
         }
+        for bit in &prep[LAYER_BITS_START..PREPROCESSED_WIDTH] {
+            builder.assert_bool(*bit);
+        }
         for column in 0..PRODUCTION_TRACE_PACKED_DIGIT_COLUMNS {
             let active: AB::Expr = prep[DIGIT_ACTIVE_START + column].into();
             builder.assert_bool(prep[DIGIT_ACTIVE_START + column]);
@@ -288,9 +350,26 @@ where
         let encoded: AB::Expr = local[CORE_ENCODED].into();
         let square_remainder: AB::Expr = local[CORE_SQUARE_REMAINDER].into();
         let cube_remainder: AB::Expr = local[CORE_CUBE_REMAINDER].into();
+        let coefficients = self.mask.affine_coefficients(self.statement).unwrap();
+        let layer_bits = &prep[LAYER_BITS_START..ROW_BITS_START];
+        let mut expected_mask =
+            select_mask_coefficient::<AB>(coefficients, self.statement, 0, layer_bits);
+        for bit in 0..PRODUCTION_TRACE_PACKED_ROW_BITS {
+            expected_mask += AB::Expr::from(prep[ROW_BITS_START + bit])
+                * select_mask_coefficient::<AB>(coefficients, self.statement, 1 + bit, layer_bits);
+        }
+        for bit in 0..PRODUCTION_TRACE_PACKED_COLUMN_BITS {
+            expected_mask += AB::Expr::from(prep[COLUMN_BITS_START + bit])
+                * select_mask_coefficient::<AB>(
+                    coefficients,
+                    self.statement,
+                    1 + PRODUCTION_TRACE_PACKED_ROW_BITS + bit,
+                    layer_bits,
+                );
+        }
         builder
             .when(core_active.clone())
-            .assert_eq(local[CORE_MASK], prep[FIXED_CORE_MASK]);
+            .assert_eq(local[CORE_MASK], expected_mask);
         builder.when(core_active.clone()).assert_eq(
             local[CORE_ENCODED],
             AB::Expr::from(local[CORE_ACCUMULATOR])
@@ -476,7 +555,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 fn invalid_trace_is_rejected(air: ProductionRangeLookupAir, trace: RowMajorMatrix<F>) -> bool {
     match catch_unwind(AssertUnwindSafe(|| {
-        let config = build_config();
+        let config = build_packed_config();
         let instances = [StarkInstance {
             air: &air,
             trace: &trace,
@@ -509,7 +588,7 @@ fn invalid_trace_is_rejected(air: ProductionRangeLookupAir, trace: RowMajorMatri
 fn compact_transition_batch_logup_proves_arithmetic_core_and_range_bindings() {
     let air = ProductionRangeLookupAir::canonical();
     let trace = air.valid_trace();
-    let config = build_config();
+    let config = build_packed_config();
     let instances = [StarkInstance {
         air: &air,
         trace: &trace,
@@ -530,7 +609,20 @@ fn compact_transition_batch_logup_proves_arithmetic_core_and_range_bindings() {
         proof.opened_values.instances[0].permutation_next.len(),
         LOOKUP_AUX_BASE_WIDTH
     );
-
+    let opened = &proof.opened_values.instances[0].base_opened_values;
+    assert_eq!(opened.trace_local.len(), MAIN_WIDTH);
+    assert_eq!(
+        opened.preprocessed_local.as_ref().map(Vec::len),
+        Some(PREPROCESSED_WIDTH)
+    );
+    assert_eq!(
+        opened
+            .quotient_chunks
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        vec![3; 8]
+    );
     let verifier_data = trusted_verifier_data(&config, &air, &proof.degree_bits).unwrap();
     verify_batch(
         &config,
@@ -550,9 +642,9 @@ fn compact_transition_batch_logup_proves_arithmetic_core_and_range_bindings() {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
     std::io::Write::write_all(&mut encoder, &native).unwrap();
     let compressed = encoder.finish().unwrap();
-    assert_eq!(native.len(), 141_528);
+    assert_eq!(native.len(), 222_960);
     assert!(compressed.len() < native.len());
-    assert!(compressed.len() <= 115_000);
+    assert!(compressed.len() <= 165_000);
 
     let decoded: p3_batch_stark::BatchProof<Config> = bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -597,7 +689,7 @@ fn compact_range_witness_mutations_are_rejected() {
 fn verifier_rederives_compact_range_topology() {
     let air = ProductionRangeLookupAir::canonical();
     let trace = air.valid_trace();
-    let config = build_config();
+    let config = build_packed_config();
     let instances = [StarkInstance {
         air: &air,
         trace: &trace,
@@ -611,7 +703,9 @@ fn verifier_rederives_compact_range_topology() {
         air.with_preprocessed_delta(1, SOURCE_ACTIVE_START, 1),
         air.with_preprocessed_delta(2, DIGIT_ACTIVE_START + 24, 1),
         air.with_preprocessed_delta(3, TABLE_VALUE, 1),
-        air.with_preprocessed_delta(0, FIXED_CORE_MASK, 1),
+        air.with_preprocessed_delta(0, LAYER_BITS_START, 1),
+        air.with_preprocessed_delta(0, ROW_BITS_START, 1),
+        air.with_preprocessed_delta(0, COLUMN_BITS_START, 1),
     ] {
         let verifier_data = trusted_verifier_data(&config, &changed, &proof.degree_bits).unwrap();
         assert!(
@@ -625,11 +719,39 @@ fn verifier_rederives_compact_range_topology() {
             .is_err()
         );
     }
+
+    let different_mask = ProductionRangeLookupAir {
+        statement: air.statement,
+        mask: StructuredMaskPolynomial::from_challenge(
+            &[0x43; 32],
+            air.statement.layers,
+            air.statement.rows,
+            air.statement.cols,
+        )
+        .unwrap(),
+        preprocessed_deltas: Vec::new(),
+    };
+    assert_eq!(
+        air.canonical_preprocessed().values,
+        different_mask.canonical_preprocessed().values
+    );
+    let verifier_data =
+        trusted_verifier_data(&config, &different_mask, &proof.degree_bits).unwrap();
+    assert!(
+        verify_batch(
+            &config,
+            &[different_mask],
+            &proof,
+            &[Vec::new()],
+            &verifier_data.common,
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn compact_range_verifier_rejects_untrusted_degree_bits() {
-    let config = build_config();
+    let config = build_packed_config();
     let air = ProductionRangeLookupAir::canonical();
     assert!(matches!(
         trusted_verifier_data(&config, &air, &[]),
@@ -649,7 +771,7 @@ fn compact_range_verifier_rejects_untrusted_degree_bits() {
 fn compact_range_constraint_layout_is_pinned() {
     let air = ProductionRangeLookupAir::canonical();
     let trace = air.valid_trace();
-    let config = build_config();
+    let config = build_packed_config();
     let instances = [StarkInstance {
         air: &air,
         trace: &trace,
@@ -667,23 +789,23 @@ fn compact_range_constraint_layout_is_pinned() {
 
     assert_eq!(lookups.len(), LOOKUP_COUNT);
     assert_eq!(lookups.total_count_weight(), 36);
-    assert_eq!(constraint_layout.base_indices.len(), 101);
+    assert_eq!(constraint_layout.base_indices.len(), 127);
     assert_eq!(constraint_layout.ext_indices.len(), 18);
-    assert_eq!(constraint_layout.total_constraints(), 119);
+    assert_eq!(constraint_layout.total_constraints(), 145);
     assert_eq!(LOOKUP_AUX_EXTENSION_WIDTH, 16);
     assert_eq!(LOOKUP_AUX_BASE_WIDTH, 48);
     assert_eq!(
         PREPROCESSED_WIDTH,
-        PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH + 1
+        PRODUCTION_TRACE_PACKED_PREPROCESSED_WIDTH
     );
-    assert_eq!(max_degree, 6);
+    assert_eq!(max_degree, 9);
     assert_eq!(log_chunks, 3);
 
     let fri = FriParameters {
-        log_blowup: FRI_LOG_BLOWUP,
+        log_blowup: PACKED_FRI_LOG_BLOWUP,
         log_final_poly_len: FRI_LOG_FINAL_POLY_LEN,
         max_log_arity: FRI_MAX_LOG_ARITY,
-        num_queries: FRI_QUERIES,
+        num_queries: PACKED_FRI_QUERIES,
         commit_proof_of_work_bits: FRI_COMMIT_POW_BITS,
         query_proof_of_work_bits: FRI_QUERY_POW_BITS,
         mmcs: (),
@@ -697,19 +819,32 @@ fn compact_range_constraint_layout_is_pinned() {
         LOOKUP_MAX_COMBO,
     );
     let security = ProvenSecurity::compute(&params, TRACE_ROWS);
-    assert_eq!(security.unique_decoding_bits, 50);
+    assert_eq!(security.unique_decoding_bits, 69);
     assert_eq!(security.list_decoding_bits, 128);
     assert_eq!(security.security_bits(), 128);
 
-    let minimum_queries = (1..=FRI_QUERIES)
+    let minimum_queries = (1..=256)
         .find(|queries| {
             let mut candidate = params.clone();
             candidate.fri_num_queries = *queries;
             ProvenSecurity::compute(&candidate, TRACE_ROWS).security_bits() >= 128
         })
         .expect("configured compact range proof must reach 128 proven bits");
-    assert_eq!(minimum_queries, 32);
-    assert_eq!(FRI_QUERIES, minimum_queries + 1);
+    assert_eq!(minimum_queries, 56);
+    assert_eq!(PACKED_FRI_QUERIES, minimum_queries + 1);
+
+    let production_security = ProvenSecurity::compute(&params, 1 << 28);
+    let production_minimum_queries = (1..=256)
+        .find(|queries| {
+            let mut candidate = params.clone();
+            candidate.fri_num_queries = *queries;
+            ProvenSecurity::compute(&candidate, 1 << 28).security_bits() >= 128
+        })
+        .unwrap();
+    assert_eq!(production_security.unique_decoding_bits, 70);
+    assert_eq!(production_security.list_decoding_bits, 128);
+    assert_eq!(production_security.security_bits(), 128);
+    assert_eq!(production_minimum_queries, 56);
 }
 
 #[test]

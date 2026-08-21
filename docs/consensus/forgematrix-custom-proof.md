@@ -725,38 +725,56 @@ for a bank. Initialization is `n=21`, each bank is `n=28`, and the log-four LDE
 is exactly `n=32`. Canonical generation, reconstruction, padding, and column
 order are committed under digest
 `88f2f31f6f9d4aca4a69bc2ac6dfd88bcf670c3ed803e0fb24a241f791372cb3`.
-The reusable preprocessing plan has width 40 and explicitly contains no
-challenge-dependent mask column. Its initialization and bank structural
+The reusable preprocessing plan has width 66 and explicitly contains no
+challenge-dependent mask column. Its selector/table prefix is followed by 7
+layer, 7 row, and 12 column bits. Its initialization and bank structural
 digests are
-`8fbef0d70eb794140226b98c61dfe22b9a17c81f86ca2989f27ce248118b9467`
-and `3ddd191feaafac0b09ff2d982cc2b0fa0253dad7d1607e56b0ade964437cde30`;
+`5b2b1251538d96ebc8eb5a9f3a6ecdb314a3de73d15b3ef60643db84af84811e`
+and `c5c2d698f1cbdf016d5272ec4c574314fef63653ebeb62e460bb45b11640fa75`;
 actual pinned PCS roots remain to be generated.
 
 The first batch-STARK reduction for V2 is executable on a 128-cell, 512-row
-fixture. Its extra fixed-mask column is generated from the challenge-derived
-mask polynomial solely for this bounded test, and the AIR enforces the encoded input,
+fixture. The AIR folds a 128-layer padded coefficient table with the seven
+authenticated layer bits, combines the selected affine coefficients with the
+row and column bits, and enforces the resulting challenge-derived mask. It also
+enforces the encoded input,
 square reduction, cube reduction, output reduction, centered activation,
 negative-bit, and shifted-accumulator equations. Eight source buses bind every
 `(lookup ID, source, maximum - source)` tuple. Seven nibble buses each bind four
 packed digit columns to the verifier-fixed `0..15` table. The pinned AIR has
-maximum degree six, 119 constraints, three quotient splits, and 48 base-field
+maximum degree nine, 145 constraints, three quotient splits, and 48 base-field
 lookup auxiliary openings at each local and next evaluation.
 
-With the configured 33 FRI queries, the library's executable estimator reports
-128 list-decoding bits; 32 is the first query count reaching that target. A
+With log blowup four and 57 configured FRI queries, the library's executable
+estimator reports 128 list-decoding bits; 56 is the first query count reaching
+that target for both the fixture and production trace size. A
 separate root count covers same-bus and cross-bus beta collisions, false
 rational sums, and all denominators under the single shared `(alpha, beta)`
 pair. Its 288,388,719 roots over the cubic Goldilocks extension give an error
-below `2^-163`. The 512-row fixture serializes to a 141,528-byte fixed-width
-bincode baseline. Two best-zlib runs measured 111,818 and 112,603 bytes; tests
-enforce a 115,000-byte ceiling. These are diagnostic fixture sizes, not the
+below `2^-163`. The 512-row fixture serializes to a 222,960-byte fixed-width
+bincode baseline. Repeated best-zlib runs measured 160,461 to 160,667 bytes;
+tests enforce a 165,000-byte ceiling. These are diagnostic fixture sizes, not the
 production native codec or production-shape bound. Tests mutate every core column and reject changed arithmetic,
 mask, active digits, padding, table multiplicities, lookup topology, table
 values, and untrusted degree vectors. This remains test-only: the production
-argument still needs a mask-polynomial opening bridge, exact initialization
-input and cross-component wiring, actual pinned preprocessing roots, native
-canonical encoding, aggregate size and latency measurements, and verifier
-integration.
+argument still needs exact initialization input and cross-component wiring,
+actual pinned preprocessing roots, native canonical encoding, aggregate size
+and latency measurements, and verifier integration.
+
+The executable wire budget also rejects ordinary batch-STARK FRI as the
+production transport for this reduction. At the production bank geometry the
+trace has 28 variables, the log-four LDE has 32, and the six folding rounds
+have log arities `[4, 4, 4, 4, 4, 1]`. A valid 57-query transcript whose queries
+occupy distinct six-bit prefix buckets at every committed fold forces 4,275
+distinct authentication nodes below those prefixes. Even with one globally
+deduplicated Merkle dictionary, query inputs, FRI siblings, out-of-domain
+values, the final polynomial, and those nodes total at least 333,792 bytes.
+That exceeds the 262,128-byte native budget by 71,664 bytes before commitment
+roots, proof-of-work witnesses, lookup terminals, input commitment paths, or
+headers. Rejecting that transcript shape would turn proof size into another
+Fiat-Shamir grinding condition. The compact arithmetic and range reduction is
+therefore retained, but a different succinct commitment or aggregation layer
+is a production requirement.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

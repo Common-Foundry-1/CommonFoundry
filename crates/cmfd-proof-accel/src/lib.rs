@@ -4,6 +4,7 @@
 //! select [`CudaProofDft`] with a caller-supplied library path and device, but
 //! proof verification must remain independent of this crate and its backend.
 
+pub mod blake3_merkle_store;
 pub mod merkle_store;
 mod poseidon2;
 pub mod spill;

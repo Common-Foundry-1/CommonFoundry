@@ -428,6 +428,27 @@ weight-bank role, and require byte-for-byte equality with the trusted PCS
 identity. Callers cannot supply parallel field tables or a replacement byte
 root through this path.
 
+The model-bank layer also exposes a one-pass staged field stream for the next
+out-of-core checkpoint. It accepts the full externally trusted PCS identity,
+derives the bank partition from that identity, reads one already-open source
+without seeking or reopening it, and feeds base input followed by ordered
+weight banks as canonical centered Goldilocks `u64` chunks. One fixed 64 KiB
+byte buffer and one fixed 64 KiB field buffer bound its working memory. The
+current 184-byte format authenticates the complete payload rather than each
+prefix, so sink writes remain provisional: the sink receives an unforgeable
+completion receipt and may publish only after the raw root, indexed layer-root
+aggregate, exact payload length, and EOF all match. Reader and sink failures
+abort before that publication barrier. This establishes the byte/order/field
+interface; it does not yet implement a production WHIR commitment sink.
+
+The proof-acceleration crate now has a bounded authenticated BLAKE3 Merkle-store
+checkpoint whose root and opening paths match the unchanged WHIR MMCS through
+the current maximum `2^15 x 4` encoded matrix. Reopening requires an exact
+identity retained outside the store, binding the store ID, geometry, tree root,
+and artifact digest; checksums inside the same file are not treated as
+provenance. This checkpoint does not provide an out-of-core DFT, `Poly` or
+sumcheck storage, or support for the production `2^30 x 4` weight-bank matrix.
+
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
 `StructuredWhirPcsVerifier` authenticates both scoped claim sets. This closes

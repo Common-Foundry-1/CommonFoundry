@@ -492,8 +492,17 @@ weakening that policy. It retains 47 ordered core columns padded to 64 and
 transposes the 98 nibble witnesses into four-column auxiliary tables with 49
 active plus 15 zero rows per transition cell. The largest auxiliary bank is
 `n=32`, within Goldilocks two-adicity. Canonical row generation and layout
-binding are implemented; the cross-table LogUp interactions and batch-STARK
-payload still have to be proved and measured before activation.
+binding are implemented; the production-sized cross-table LogUp interactions
+and batch-STARK payload still have to be proved and measured before activation.
+
+The cross-table range reduction now has a bounded test-only proof. On eight
+cells, ten narrow LogUp buses bind all eight core source/slack pairs to their
+final row accumulators and both digit columns to the fixed nibble table. The
+AIR stays at degree three with 52 constraints, reaches the configured 128-bit
+list-decoding target, and bounds lookup-challenge error below `2^-172`.
+Adversarial witness, topology, table, and degree mutations fail. This validates
+the range-check reduction only; the production arithmetic AIR, full geometry,
+canonical codec, payload measurement, and aggregate verifier remain gates.
 
 Implementing any subset of those components must not make the v2 profile
 activatable. Activation is a separate consensus change after every gate above

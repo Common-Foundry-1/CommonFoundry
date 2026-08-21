@@ -202,9 +202,22 @@ components. The 98 nibble witnesses per cell move into 49 active rows of a
 running accumulators. Initialization and bank auxiliary tables have exactly 25
 and 32 variables, so the largest remains within Goldilocks two-adicity. The
 canonical row generator, padding, lookup IDs, source bounds, accumulators,
-ordered core mapping, and layout digest are tested. A batch-STARK/LogUp proof
-that authenticates these rows is still required before this layout can mint a
-verified production trace.
+ordered core mapping, and layout digest are tested. A production-sized batch-
+STARK/LogUp proof that authenticates these rows is still required before this
+layout can mint a verified production trace.
+
+A test-only eight-cell batch-STARK now proves that missing range handoff end to
+end. Eight independent LogUp buses bind each core source/slack pair to its final
+auxiliary accumulators, and two more bind the value and slack digits to a fixed
+`0..15` table. Splitting the relations keeps the maximum constraint degree at
+three: the pinned prototype has 52 constraints, one quotient split, 33 base-
+field lookup auxiliary openings at each evaluation row, and 128-bit computed
+list-decoding security with one FRI query above the measured minimum. Its
+single-pair LogUp challenge error is bounded below `2^-172`. Digit, slack,
+accumulator, core-source, padding, multiplicity, preprocessing, and degree-shape
+mutations are rejected. Production-sized table construction, the arithmetic
+core AIR, native encoding and aggregate payload measurement remain required;
+the fixture is evidence for the reduction, not an activation proof.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

@@ -8,6 +8,8 @@ pub mod model_bank;
 pub mod model_whir_sources;
 pub mod network;
 pub mod pow;
+#[cfg(all(test, feature = "whir-prototype"))]
+mod production_range_lookup_prototype;
 #[cfg(feature = "remainder-prototype")]
 pub mod remainder_proof;
 #[cfg(feature = "whir-prototype")]

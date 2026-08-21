@@ -723,8 +723,31 @@ table `n=32`, exactly at rather than above Goldilocks two-adicity. The code now
 generates every canonical row, rejects out-of-range sources and rows, pins the
 47-column order, and commits the complete structural plan under digest
 `6c7ccc9e63cae28907ae173372ddf33a3526f2ea2cc46b514510e4b330082769`.
-It is a layout and witness checkpoint, not yet a batch-STARK/LogUp verifier or
-evidence that the complete aggregate fits the network frame.
+It is a layout and witness checkpoint, not yet a production-sized batch-
+STARK/LogUp verifier or evidence that the complete aggregate fits the network
+frame.
+
+The first batch-STARK reduction for this layout is now executable on an
+eight-cell, 512-row fixture. Each of the eight range specifications gets a
+separate local LogUp bus binding `(lookup ID, source, maximum - source)` from
+the core row to `(lookup ID, value accumulator, slack accumulator)` on the
+final digit row. Two additional buses bind value and slack digits separately
+to the verifier-fixed `0..15` table. Separate buses avoid the degree-ten
+quotient caused by multiplying nine denominators on one bus: the pinned AIR
+has maximum degree three, 52 total constraints, one quotient split, and 33
+base-field lookup auxiliary openings at each local and next evaluation.
+
+With the configured 33 FRI queries, the library's executable estimator reports
+128 list-decoding bits; 32 is the first query count reaching that target. A
+separate root count covers same-bus and cross-bus beta collisions, false
+rational sums, and all denominators under the single shared `(alpha, beta)`
+pair. Its 847,343 roots over the cubic Goldilocks extension give an error below
+`2^-172`. Tests reject changed value/slack digits, accumulators, core sources,
+padding, table multiplicities, lookup IDs, bounds, radices, active rows, table
+values, and untrusted degree vectors. This remains test-only: the production
+argument still needs the transition arithmetic AIR, production-sized
+preprocessed-key construction, native canonical encoding, aggregate size and
+latency measurements, and verifier integration.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

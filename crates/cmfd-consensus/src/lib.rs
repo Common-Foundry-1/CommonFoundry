@@ -136,6 +136,8 @@ pub use sumcheck::{
     TOY_SUMCHECK_RAW_CHALLENGE_BITS, prove_toy_matrix_product, reference_matrix_product,
     verify_toy_matrix_product,
 };
+#[cfg(feature = "gpu-proof-prover")]
+pub use whir_proof::prove_explicit_whir_openings_with_initial_oracle;
 #[cfg(feature = "whir-prototype")]
 pub use whir_proof::{
     EXPLICIT_WHIR_SECURITY_BITS, EXPLICIT_WHIR_VERSION, ExplicitWhirCommitment, ExplicitWhirError,

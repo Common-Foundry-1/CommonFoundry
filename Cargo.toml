@@ -12,6 +12,7 @@ members = [
 exclude = [
     "third_party/p3-fri-0.6.3-out-of-core",
     "third_party/p3-merkle-tree-0.6.3-gpu-first-layer",
+    "third_party/p3-whir-0.6.3-generic-initial-matrix",
     "third_party/p3-util-0.6.3-msrv",
 ]
 resolver = "2"
@@ -51,3 +52,7 @@ p3-merkle-tree = { path = "third_party/p3-merkle-tree-0.6.3-gpu-first-layer" }
 # matrices. This exact source copy generalizes only that prover-data matrix
 # type; commitments, openings, proof encoding, and verification are unchanged.
 p3-fri = { path = "third_party/p3-fri-0.6.3-out-of-core" }
+# Plonky3 0.6.3 fixes the initial WHIR prover-data matrix to DenseMatrix.
+# This exact source copy generalizes only that internal initial matrix type;
+# the existing adapter, proof, transcript, and verifier remain unchanged.
+p3-whir = { path = "third_party/p3-whir-0.6.3-generic-initial-matrix" }

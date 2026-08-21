@@ -6,6 +6,8 @@
 //! wired into block validation and does not activate the production ForgeMatrix
 //! profile.
 
+#[cfg(feature = "gpu-proof-prover")]
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Cursor, Read, Write},
@@ -13,6 +15,8 @@ use std::{
 };
 
 use blake3::Hasher as Blake3Hasher;
+#[cfg(feature = "gpu-proof-prover")]
+use cmfd_proof_accel::initial_whir_oracle::{InitialWhirOracle, InitialWhirOracleIdentity};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use p3_blake3::Blake3;
 use p3_challenger::{
@@ -41,6 +45,11 @@ use p3_whir::pcs::proof::{WhirProof, WhirRoundProof};
 use p3_whir::pcs::prover::WhirProver;
 use p3_whir::pcs::verifier::WhirVerifier;
 use thiserror::Error;
+
+#[cfg(feature = "gpu-proof-prover")]
+mod disk_mmcs;
+#[cfg(feature = "gpu-proof-prover")]
+use disk_mmcs::{DiskWhirMmcs, DiskWhirOpeningPanic};
 
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredPcsOpeningClaim, StructuredPcsOpeningSet,
@@ -92,6 +101,10 @@ type Challenger = SerializingChallenger64<F, HashChallenger<u8, Blake3, 32>>;
 type Dft = Radix2DFTSmallBatch<F>;
 type Pcs = WhirProver<EF, F, Dft, WhirMmcs, Challenger, ExplicitPointLayout>;
 type NativeProof = WhirProof<F, EF, WhirMmcs>;
+#[cfg(feature = "gpu-proof-prover")]
+type DiskPcs = WhirProver<EF, F, Dft, DiskWhirMmcs, Challenger, ExplicitPointLayout>;
+#[cfg(feature = "gpu-proof-prover")]
+type DiskNativeProof = WhirProof<F, EF, DiskWhirMmcs>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExplicitWhirCommitment(pub [u8; 32]);
@@ -569,6 +582,11 @@ pub fn structured_whir_suite_parameter_digest() -> [u8; 32] {
         b"p3-fri-source",
         b"0.6.3+cmfd-generic-prover-data-matrix-v1",
     );
+    update_suite_descriptor(
+        &mut hasher,
+        b"p3-whir-source",
+        b"0.6.3+cmfd-generic-initial-matrix-v1",
+    );
     update_suite_descriptor(&mut hasher, b"blake3-crate", b"1.8.6");
     update_suite_descriptor(&mut hasher, b"flate2-crate", b"1.1.9");
     update_suite_descriptor(&mut hasher, b"crc32fast-crate", b"1.5.0");
@@ -924,6 +942,8 @@ pub enum ExplicitWhirError {
     Verification,
     #[error("WHIR backend panicked while handling untrusted proof data")]
     BackendPanic,
+    #[error("authenticated WHIR prover storage failed")]
+    ProverStorage,
     #[error("structured WHIR requires 1..={MAX_STRUCTURED_WHIR_TABLES} unique tables")]
     InvalidTableCount,
     #[error("structured WHIR tables exceed the aggregate research element cap")]
@@ -1196,6 +1216,119 @@ pub fn prove_explicit_whir_openings(
             proof_bytes,
         },
     ))
+}
+
+/// Prove the same bounded explicit WHIR statement while adopting an already
+/// authenticated disk-backed initial codeword and Merkle tree.
+///
+/// The caller must retain `expected_oracle_identity`, whose context binds the
+/// proof suite, table role, and fixed model identity, before constructing or
+/// reopening the oracle. Artifact metadata is never observed by the
+/// transcript: after every fallible exact-identity check succeeds, only the
+/// ordinary Merkle commitment is observed at the ordinary protocol position.
+/// Later WHIR rounds remain on the standard in-memory MMCS, and the completed
+/// proof must pass the unchanged CPU verifier before it is returned. This
+/// checkpoint does not yet move the layout polynomial, extension polynomial,
+/// or sumcheck buffers out of memory.
+#[cfg(feature = "gpu-proof-prover")]
+pub fn prove_explicit_whir_openings_with_initial_oracle(
+    transcript_binding: &[u8],
+    table: &[u64],
+    points: &[Vec<ExtensionElement>],
+    expected_oracle_identity: &InitialWhirOracleIdentity,
+    oracle: InitialWhirOracle,
+) -> Result<
+    (
+        ExplicitWhirCommitment,
+        Vec<ExplicitWhirOpening>,
+        ExplicitWhirProof,
+    ),
+    ExplicitWhirError,
+> {
+    let num_variables = validate_table(table)?;
+    validate_points(points, num_variables)?;
+    if oracle.identity() != expected_oracle_identity {
+        return Err(ExplicitWhirError::ProverStorage);
+    }
+    let oracle_variables = usize::try_from(
+        expected_oracle_identity
+            .codeword_identity()
+            .source
+            .num_variables,
+    )
+    .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    if oracle_variables != num_variables {
+        return Err(ExplicitWhirError::ProverStorage);
+    }
+    let native_table = table
+        .iter()
+        .copied()
+        .map(canonical_base)
+        .collect::<Result<Vec<_>, _>>()?;
+    let native_points = convert_points(points)?;
+    let poly = Poly::<F>::new(native_table);
+    let extension_poly = extend_poly(&poly);
+    let evaluations = native_points
+        .iter()
+        .map(|point| extension_poly.eval_ext::<F>(point))
+        .collect::<Vec<_>>();
+
+    let (ordinary_pcs, mut challenger) = build_pcs(num_variables, transcript_binding)?;
+    let folding = ordinary_pcs.round_folding_factor(0);
+    let disk_mmcs = DiskWhirMmcs::new(ordinary_pcs.mmcs);
+    let pcs = DiskPcs::new(ordinary_pcs.config, ordinary_pcs.dft, disk_mmcs);
+    let (commitment, prover_data) = pcs
+        .mmcs
+        .adopt_initial(num_variables, Arc::new(oracle))
+        .map_err(|_| ExplicitWhirError::ProverStorage)?;
+    if commitment.num_roots() != 1 {
+        return Err(ExplicitWhirError::Configuration(
+            "WHIR commitment cap must contain exactly one root".to_owned(),
+        ));
+    }
+
+    // This is the one normal initial-commitment observation. All fallible
+    // artifact and context checks above are transcript-silent.
+    challenger.observe(commitment.clone());
+    let mut layout = ExplicitPointLayout::from_poly_and_shapes(poly, folding, vec![num_variables]);
+    let mut native_proof = empty_disk_proof(&pcs.config);
+    native_proof.initial_ood_answers = (0..pcs.commitment_ood_samples)
+        .map(|_| layout.add_virtual_eval(&mut challenger))
+        .collect();
+    for (point, &evaluation) in native_points.iter().zip(&evaluations) {
+        layout.record_explicit_claim(0, point.clone(), evaluation, &mut challenger);
+    }
+
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+        pcs.prove(&mut native_proof, &mut challenger, layout, prover_data);
+    })) {
+        if let Some(storage) = payload.downcast_ref::<DiskWhirOpeningPanic>() {
+            let _ = storage.message();
+            return Err(ExplicitWhirError::ProverStorage);
+        }
+        return Err(ExplicitWhirError::BackendPanic);
+    }
+
+    let proof_bytes =
+        serde_json::to_vec(&native_proof).map_err(|_| ExplicitWhirError::Serialization)?;
+    if proof_bytes.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES {
+        return Err(ExplicitWhirError::ProofTooLarge);
+    }
+    let openings = points
+        .iter()
+        .cloned()
+        .zip(evaluations.into_iter().map(external_extension))
+        .map(|(point, evaluation)| ExplicitWhirOpening { point, evaluation })
+        .collect::<Vec<_>>();
+    let commitment = ExplicitWhirCommitment(commitment.roots()[0]);
+    let proof = ExplicitWhirProof {
+        protocol_version: EXPLICIT_WHIR_VERSION,
+        num_variables: num_variables as u32,
+        proof_bytes,
+    };
+
+    verify_explicit_whir_openings(transcript_binding, commitment, &openings, &proof)?;
+    Ok((commitment, openings, proof))
 }
 
 pub fn verify_explicit_whir_openings(
@@ -1785,7 +1918,16 @@ fn build_pcs(
 }
 
 fn empty_proof(config: &WhirConfig<EF, F, Challenger>) -> NativeProof {
-    NativeProof {
+    empty_proof_for(config)
+}
+
+#[cfg(feature = "gpu-proof-prover")]
+fn empty_disk_proof(config: &WhirConfig<EF, F, Challenger>) -> DiskNativeProof {
+    empty_proof_for(config)
+}
+
+fn empty_proof_for<MT: Mmcs<F>>(config: &WhirConfig<EF, F, Challenger>) -> WhirProof<F, EF, MT> {
+    WhirProof {
         initial_ood_answers: Vec::new(),
         initial_sumcheck: SumcheckData::default(),
         rounds: (0..config.n_rounds())
@@ -2024,6 +2166,26 @@ fn take_split_blob<'a>(
 mod tests {
     use super::*;
     use crate::model_bank::{BuiltModelBankFixture, SmallModelBankFixture, build_small_model_bank};
+    #[cfg(feature = "gpu-proof-prover")]
+    use cmfd_proof_accel::blake3_merkle_store::build_authenticated_blake3_merkle_store;
+    #[cfg(feature = "gpu-proof-prover")]
+    use cmfd_proof_accel::initial_whir_oracle::{InitialWhirOracle, InitialWhirOracleIdentity};
+    #[cfg(feature = "gpu-proof-prover")]
+    use cmfd_proof_accel::whir_initial::{
+        AuthenticatedWhirInitialSource, WhirInitialSourceError, WhirInitialSourceIdentity,
+        encode_whir_initial_suffix,
+    };
+    #[cfg(feature = "gpu-proof-prover")]
+    use std::fs::OpenOptions;
+    #[cfg(feature = "gpu-proof-prover")]
+    use std::io::{Seek as _, SeekFrom};
+    #[cfg(feature = "gpu-proof-prover")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "gpu-proof-prover")]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(feature = "gpu-proof-prover")]
+    static NEXT_WHIR_INITIAL_PATH: AtomicUsize = AtomicUsize::new(0);
 
     const VERIFIED_BASE_BYTES: [u8; 4] = [0, 125, 250, 1];
     const VERIFIED_LAYER_BYTES: [[u8; 4]; 6] = [
@@ -2200,14 +2362,110 @@ mod tests {
         (binding, commitment, openings, proof)
     }
 
+    #[cfg(feature = "gpu-proof-prover")]
+    struct ExactTableSource {
+        identity: WhirInitialSourceIdentity,
+        values: Vec<u64>,
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    impl ExactTableSource {
+        fn new(values: Vec<u64>) -> Self {
+            let mut hasher = Blake3Hasher::new_derive_key("CMFD/TEST/WHIR-INITIAL-SOURCE/V1");
+            for value in &values {
+                hasher.update(&value.to_le_bytes());
+            }
+            Self {
+                identity: WhirInitialSourceIdentity {
+                    source_id: *hasher.finalize().as_bytes(),
+                    num_variables: values.len().ilog2(),
+                },
+                values,
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    impl AuthenticatedWhirInitialSource for ExactTableSource {
+        fn identity(&self) -> &WhirInitialSourceIdentity {
+            &self.identity
+        }
+
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn read_elements(
+            &self,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<u64>, WhirInitialSourceError> {
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| WhirInitialSourceError::new("table range overflow"))?;
+            self.values
+                .get(start..end)
+                .map(<[u64]>::to_vec)
+                .ok_or_else(|| WhirInitialSourceError::new("table range is out of bounds"))
+        }
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    fn whir_initial_test_path() -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cmfd-whir-initial-proof-{}-{unique}-{}",
+            std::process::id(),
+            NEXT_WHIR_INITIAL_PATH.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    struct TestInitialOracle {
+        oracle: InitialWhirOracle,
+        identity: InitialWhirOracleIdentity,
+        codeword_path: std::path::PathBuf,
+    }
+
+    #[cfg(feature = "gpu-proof-prover")]
+    fn test_initial_oracle(values: &[u64], context: [u8; 32]) -> TestInitialOracle {
+        let source = ExactTableSource::new(values.to_vec());
+        let base = whir_initial_test_path();
+        let codeword_path = base.with_extension("codeword");
+        let tree_path = base.with_extension("tree");
+        let codeword =
+            encode_whir_initial_suffix(&codeword_path, [0xa6; 32], source.identity(), &source)
+                .unwrap()
+                .remove_on_drop();
+        let tree = build_authenticated_blake3_merkle_store(&tree_path, [0xb7; 32], &[&codeword])
+            .unwrap()
+            .remove_on_drop();
+        let tree_identity = tree.identity().unwrap();
+        let identity = InitialWhirOracleIdentity::bind(
+            context,
+            codeword.identity(),
+            &tree_identity,
+            tree_identity.tree_root,
+        )
+        .unwrap();
+        TestInitialOracle {
+            oracle: InitialWhirOracle::adopt(context, &identity, codeword, tree).unwrap(),
+            identity,
+            codeword_path,
+        }
+    }
+
     #[test]
     fn literal_model_bank_vector_derives_the_canonical_tables_and_identity() {
         let artifact = hex::decode(concat!(
             "434d4644424e4b3202000000b800000001000000020000000200000006000000",
             "040000000000000004000000000000001c00000000000000921f746e64fb0502",
             "2fe53c5ddcf048c74d79604680d5716a7299929750744c539a37a20d1bc3e472",
-            "41e63ac491185f80f717049e4982c922715b96f44943690ec4d6d139c79d8cd3",
-            "27e0b9001c9952dc786ff4a12277067c715fdb1895d2abf5993745b234219cb7",
+            "41e63ac491185f80f717049e4982c922715b96f44943690e0292317d478a8808",
+            "b00f2dd6124a33486c3391b38c42e73e2a93574e475a9f6b993745b234219cb7",
             "bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff007dfa0102030405",
             "060708090a0b0c0d0e0f10111213141516171819"
         ))
@@ -2227,7 +2485,7 @@ mod tests {
                 "9a37a20d1bc3e47241e63ac491185f80f717049e4982c922715b96f44943690e",
             ),
             pcs_parameter_digest: decode_hex_32(
-                "c4d6d139c79d8cd327e0b9001c9952dc786ff4a12277067c715fdb1895d2abf5",
+                "0292317d478a8808b00f2dd6124a33486c3391b38c42e73e2a93574e475a9f6b",
             ),
             pcs_commitment_root: decode_hex_32(
                 "993745b234219cb7bd26be1e800e1cf8c12a0dcb47677ef001da4d8168a4f8ff",
@@ -2328,7 +2586,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(fixture.identity.digest().unwrap()),
-            "4704cca7add661c12051a445126c9b90bcbeb3ef7069f1d0fb283e3d1f46e12c"
+            "b91513ea22742cfdbdc64260055b0efb4dd1c4282ed160fdbbb0bdd69fb1ab44"
         );
         let derived = StructuredWhirModelCommitmentSet::from_verified_model_bank(
             Cursor::new(&fixture.bytes),
@@ -2666,6 +2924,164 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_initial_oracle_matches_dense_commitment_and_proof_bytes() {
+        let (binding, dense_commitment, openings, dense_proof) = fixture();
+        let values = table();
+        let context = [0xc8; 32];
+        let built = test_initial_oracle(&values, context);
+        let (commitment, disk_openings, disk_proof) =
+            prove_explicit_whir_openings_with_initial_oracle(
+                &binding,
+                &values,
+                &points(),
+                &built.identity,
+                built.oracle,
+            )
+            .unwrap();
+
+        assert_eq!(commitment, dense_commitment);
+        assert_eq!(disk_openings, openings);
+        assert_eq!(disk_proof, dense_proof);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_initial_oracle_matches_dense_extension_rounds() {
+        let binding = b"forge-matrix-dense-extension-round";
+        let values = (0..512)
+            .map(|index| (index * index + 3 * index + 29) as u64)
+            .collect::<Vec<_>>();
+        let points = vec![
+            (0..9)
+                .map(|index| ExtensionElement {
+                    limbs: [
+                        (index * 5 + 2) as u64,
+                        (index * 7 + 3) as u64,
+                        (index * 11 + 5) as u64,
+                    ],
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let (pcs, _) = build_pcs(9, binding).unwrap();
+        assert!(pcs.config.n_rounds() > 0);
+
+        let dense = prove_explicit_whir_openings(binding, &values, &points).unwrap();
+        let built = test_initial_oracle(&values, [0xcf; 32]);
+        let disk = prove_explicit_whir_openings_with_initial_oracle(
+            binding,
+            &values,
+            &points,
+            &built.identity,
+            built.oracle,
+        )
+        .unwrap();
+
+        assert_eq!(disk, dense);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_initial_oracle_matches_dense_base_final_round() {
+        let binding = b"forge-matrix-base-final";
+        let values = vec![3, 5, 7, 11];
+        let points = vec![vec![
+            ExtensionElement { limbs: [2, 3, 5] },
+            ExtensionElement { limbs: [7, 11, 13] },
+        ]];
+        let dense = prove_explicit_whir_openings(binding, &values, &points).unwrap();
+        let context = [0xd9; 32];
+        let built = test_initial_oracle(&values, context);
+        let disk = prove_explicit_whir_openings_with_initial_oracle(
+            binding,
+            &values,
+            &points,
+            &built.identity,
+            built.oracle,
+        )
+        .unwrap();
+
+        assert_eq!(disk, dense);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_initial_oracle_fails_closed_without_dense_fallback() {
+        let binding = b"forge-matrix-storage-failure";
+        let values = table();
+        let points = points();
+        let context = [0xea; 32];
+        let built = test_initial_oracle(&values, context);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&built.codeword_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(160)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(160)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+
+        assert_eq!(
+            prove_explicit_whir_openings_with_initial_oracle(
+                binding,
+                &values,
+                &points,
+                &built.identity,
+                built.oracle,
+            ),
+            Err(ExplicitWhirError::ProverStorage)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-proof-prover")]
+    fn authenticated_initial_oracle_rejects_identity_and_variable_mismatch() {
+        let values = vec![3, 5, 7, 11];
+        let points = vec![vec![
+            ExtensionElement { limbs: [2, 3, 5] },
+            ExtensionElement { limbs: [7, 11, 13] },
+        ]];
+        let context = [0xfb; 32];
+        let built = test_initial_oracle(&values, context);
+        let other = test_initial_oracle(&values, [0xfc; 32]);
+        assert_eq!(
+            prove_explicit_whir_openings_with_initial_oracle(
+                b"context-mismatch",
+                &values,
+                &points,
+                &other.identity,
+                built.oracle,
+            ),
+            Err(ExplicitWhirError::ProverStorage)
+        );
+
+        let wrong_shape = test_initial_oracle(&values, context);
+        let larger_values = vec![3, 5, 7, 11, 13, 17, 19, 23];
+        let larger_points = vec![vec![
+            ExtensionElement { limbs: [2, 3, 5] },
+            ExtensionElement { limbs: [7, 11, 13] },
+            ExtensionElement {
+                limbs: [17, 19, 23],
+            },
+        ]];
+        assert_eq!(
+            prove_explicit_whir_openings_with_initial_oracle(
+                b"variable-mismatch",
+                &larger_values,
+                &larger_points,
+                &wrong_shape.identity,
+                wrong_shape.oracle,
+            ),
+            Err(ExplicitWhirError::ProverStorage)
+        );
+    }
+
+    #[test]
     fn envelope_round_trip_and_rejects_trailing_bytes() {
         let (binding, commitment, openings, proof) = fixture();
         let encoded = proof.encode().unwrap();
@@ -2943,7 +3359,7 @@ mod tests {
     fn structured_model_and_trace_openings_are_separate_and_bound() {
         assert_eq!(
             hex::encode(structured_whir_suite_parameter_digest()),
-            "c4d6d139c79d8cd327e0b9001c9952dc786ff4a12277067c715fdb1895d2abf5"
+            "0292317d478a8808b00f2dd6124a33486c3391b38c42e73e2a93574e475a9f6b"
         );
         let base = vec![3, 5, 7, 11];
         let weight_0 = vec![13, 17, 19, 23, 29, 31, 37, 41];

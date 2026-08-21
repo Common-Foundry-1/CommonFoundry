@@ -4071,8 +4071,6 @@ dependencies = [
 [[package]]
 name = "p3-whir"
 version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52f9f312d6df9c7467791a720a6cba2506373e9e130f2882c05ed329d256293"
 dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.15.0",

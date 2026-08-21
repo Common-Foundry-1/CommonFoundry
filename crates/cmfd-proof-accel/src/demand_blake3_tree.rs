@@ -9,8 +9,9 @@
 //!
 //! This is a correctness/reference primitive. Building the production
 //! `2^29`-row tree still writes about 32 GiB and has not yet been matched by the
-//! production GPU construction path. This module is not wired into consensus
-//! and does not raise any proof-activation cap.
+//! production GPU construction path. The feature-gated artifact WHIR prover
+//! adopts this store, but that integration does not raise any proof-activation
+//! cap.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};

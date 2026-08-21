@@ -137,14 +137,15 @@ consumes those residuals, adopts disk-backed extension commitments and
 authenticated BLAKE3 openings, and streams later folding and constraint rounds
 with bounded buffers. Tested commitments, openings, transcript challenges, and
 complete proof bytes match the dense prover; storage failure poisons the
-attempt without a dense retry. The proof-facing format-v1 BLAKE3 store remains
-capped at `2^18` rows and the exact reference extension encoder at `2^20` rows.
-A separate demand-authenticated format-v2 tree supports the production
-`2^29`-row geometry, but it is not yet wired into the prover state. The current
-file-backed DFT would also move about 1.97 TiB at that geometry, so a blocked or
-GPU transform, format-v2 integration, and production proof encoding still
-stand between this checkpoint and a cap increase. The public 16-variable and
-1 MiB proof limits therefore remain unchanged.
+attempt without a dense retry. The prover state now uses the
+demand-authenticated format-v2 tree, whose exact `2^29`-row artifact is
+34,359,738,592 bytes and whose openings authenticate only the requested paths
+against separately authenticated codeword rows. The legacy format-v1 store
+remains capped at `2^18` rows, while the exact reference extension encoder is
+still capped at `2^20` rows. Its current file-backed DFT would move about
+1.97 TiB at production geometry, so a blocked or GPU transform and production
+proof encoding still stand between this checkpoint and a cap increase. The
+public 16-variable and 1 MiB proof limits therefore remain unchanged.
 
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`

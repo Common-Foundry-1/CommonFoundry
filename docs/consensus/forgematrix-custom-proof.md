@@ -554,9 +554,10 @@ That encoder deliberately refuses execution above `2^20` rows before reading
 the source or creating a file. Its bounded fused radix-2 engine removes the
 large retained twiddle tables and matches exact bytes, but the modeled `2^29`
 run with the current 512-row buffer would still make 21 complete read/write
-passes: about 1.97 TiB of traffic and 44 million read/write calls. The current
-proof-facing format-v1 BLAKE3 store authenticates the complete artifact when it
-is opened and is capped at `2^18` rows.
+passes: about 1.97 TiB of traffic and 44 million read/write calls. The legacy
+format-v1 BLAKE3 store authenticates the complete artifact when it is opened
+and remains capped at `2^18` rows; the spill prover no longer selects it for
+extension commitments.
 
 A separate format-v2 demand-authenticated tree stores only the exact Plonky3
 layer-major digests. At `2^29` rows it is 34,359,738,592 bytes. Reopening checks
@@ -565,16 +566,27 @@ reads one sibling per layer and reconstructs the independently pinned root
 against the separately authenticated 96-byte extension row. Publication is
 no-overwrite and directory-synchronized on supported Windows and Unix
 filesystems. This format reaches production geometry as a storage component,
-but the artifact-backed WHIR state does not yet adopt it.
+and the artifact-backed WHIR state now adopts it through the joined extension
+oracle. Retained codeword and tree identities are rechecked on adoption and
+every opening; each child residual binds every field of both identities in its
+local lineage. Combined extension-and-tree space is checked before either
+artifact is created. The worst checked geometry is 51,541,704,992 bytes for the
+extension plus 34,359,738,592 bytes for the tree, or 85,901,443,584 bytes total,
+and that preflight allocates no row-proportional memory.
 
 The artifact state has exact commitment, opening, and next-challenge parity at
 9, 13, and 16 variables, multi-chunk constrained-fold parity at 16 variables,
 and complete proof-byte parity at the bounded end-to-end fixtures. The
 unchanged verifier accepts those proofs. A public 13-variable serialized proof
-already exceeds the unchanged 1 MiB research cap, so merely raising the table
-geometry would not produce the intended succinct wire format. A blocked or GPU
-production transform, format-v2 state integration, production proof encoding,
-and the 31-variable initial weight-bank commitment remain required. The
+is 1,236,482 bytes in the current canonical JSON: 99.5 percent is the 794 query
+openings, including 8,606 path nodes rendered as decimal byte arrays. Even a
+flat fixed-width encoding of every repeated node would exceed 256 KiB. A
+canonical first-reference node dictionary would reduce the measured dominant
+fields to about 187 KiB before framing and the small non-query fields, but that
+versioned binary format is not implemented yet. Merely raising the table
+geometry would therefore not produce the intended succinct wire format. A
+blocked or GPU production transform, production proof encoding, and the
+31-variable initial weight-bank commitment remain required. The
 explicit adapter stays capped at 16 variables, the initial codeword/oracle path
 at 19, and the production `2^30 x 4` weight-bank codeword remains unsupported.
 
@@ -587,8 +599,8 @@ base table has 19 variables and each weight bank has 31. Source staging admits
 both, but the explicit proof adapter admits at most 16 variables per table and
 the codeword/oracle path admits at most 19. It now has bounded, authenticated
 residual generation and artifact-consuming later folds, but no streaming
-31-variable initial commitment or production-geometry extension transform and
-tree path. The upstream
+31-variable initial commitment, production-geometry extension transform, or
+production binary proof encoding. The upstream
 backend is an unaudited academic prototype. Review, benchmarks, fuzzing, a
 complete soundness report, and independent audits remain mandatory before any
 production selection.

@@ -8,17 +8,26 @@
 use std::panic::panic_any;
 use std::sync::Arc;
 
+#[cfg(test)]
 use cmfd_proof_accel::blake3_merkle_store::{
     AuthenticatedBlake3MerkleStore, Blake3MerkleStoreError, Blake3MerkleStoreIdentity,
+};
+use cmfd_proof_accel::demand_blake3_tree::{
+    DemandBlake3TreeError, DemandBlake3TreeIdentity, WhirExtensionOracle,
+    demand_blake3_tree_geometry,
 };
 use cmfd_proof_accel::initial_whir_oracle::{
     INITIAL_WHIR_TREE_PARTITION, InitialWhirOracle, InitialWhirOracleError,
 };
+#[cfg(test)]
 use cmfd_proof_accel::merkle_store::MerkleRowSource;
+#[cfg(test)]
 use cmfd_proof_accel::whir_extension::{
-    AuthenticatedWhirExtensionCodeword, WHIR_EXTENSION_FOLDING, WHIR_EXTENSION_LIMBS_PER_ELEMENT,
-    WHIR_EXTENSION_LIMBS_PER_ROW, WHIR_EXTENSION_WIDTH, WhirExtensionCodewordIdentity,
-    WhirExtensionEncodingError,
+    AuthenticatedWhirExtensionCodeword, WhirExtensionEncodingError,
+};
+use cmfd_proof_accel::whir_extension::{
+    WHIR_EXTENSION_FOLDING, WHIR_EXTENSION_LIMBS_PER_ELEMENT, WHIR_EXTENSION_LIMBS_PER_ROW,
+    WHIR_EXTENSION_WIDTH, WhirExtensionCodewordIdentity,
 };
 use p3_commit::{BatchOpening, BatchOpeningRef, Mmcs};
 use p3_field::BasedVectorSpace;
@@ -70,10 +79,12 @@ impl Matrix<F> for InitialWhirMatrix {
 /// Each on-disk row contains twelve canonical Goldilocks limbs. The view
 /// groups them, in order, into four cubic extension-field elements so
 /// [`FlatMatrixView`] recovers the exact original twelve-limb row.
+#[cfg(test)]
 pub(super) struct WhirExtensionMatrix {
     codeword: Arc<AuthenticatedWhirExtensionCodeword>,
 }
 
+#[cfg(test)]
 impl WhirExtensionMatrix {
     fn try_row(&self, row: usize) -> Result<[EF; WHIR_EXTENSION_WIDTH], DiskWhirStorageError> {
         let limbs = self.codeword.read_canonical_rows(row, 1)?;
@@ -88,6 +99,7 @@ impl WhirExtensionMatrix {
     }
 }
 
+#[cfg(test)]
 impl Matrix<EF> for WhirExtensionMatrix {
     fn width(&self) -> usize {
         WHIR_EXTENSION_WIDTH
@@ -96,6 +108,51 @@ impl Matrix<EF> for WhirExtensionMatrix {
     fn height(&self) -> usize {
         usize::try_from(self.codeword.geometry().height)
             .expect("bounded extension height fits usize")
+    }
+
+    unsafe fn row_subseq_unchecked(
+        &self,
+        row: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = EF, IntoIter = impl Iterator<Item = EF> + Send + Sync> {
+        debug_assert!(row < self.height());
+        debug_assert!(start <= end && end <= self.width());
+        let values = self
+            .try_row(row)
+            .unwrap_or_else(|error| panic_storage(error));
+        values.into_iter().skip(start).take(end - start)
+    }
+}
+
+/// Extension-field view tied to one demand-authenticated v2 oracle.
+///
+/// Unlike the v1 matrix view, every row access crosses the proof-facing
+/// oracle boundary and therefore returns no value unless the codeword row and
+/// its exact BLAKE3 path reconstruct the retained root.
+pub(super) struct DemandWhirExtensionMatrix {
+    oracle: Arc<WhirExtensionOracle>,
+}
+
+impl DemandWhirExtensionMatrix {
+    fn try_row(&self, row: usize) -> Result<[EF; WHIR_EXTENSION_WIDTH], DiskWhirStorageError> {
+        let opening = self.oracle.authenticated_opening(row)?;
+        Ok(core::array::from_fn(|element| {
+            EF::from_basis_coefficients_fn(|limb| {
+                F::new(opening.row()[element * WHIR_EXTENSION_LIMBS_PER_ELEMENT + limb])
+            })
+        }))
+    }
+}
+
+impl Matrix<EF> for DemandWhirExtensionMatrix {
+    fn width(&self) -> usize {
+        WHIR_EXTENSION_WIDTH
+    }
+
+    fn height(&self) -> usize {
+        usize::try_from(self.oracle.tree_identity().height)
+            .expect("bounded demand-authenticated extension height fits usize")
     }
 
     unsafe fn row_subseq_unchecked(
@@ -122,12 +179,19 @@ pub(super) enum DiskWhirProverData<M> {
         matrix: M,
         oracle: Arc<InitialWhirOracle>,
     },
+    #[cfg(test)]
     Extension {
         matrix: M,
         codeword: Arc<AuthenticatedWhirExtensionCodeword>,
         tree: Arc<AuthenticatedBlake3MerkleStore>,
         codeword_identity: Box<WhirExtensionCodewordIdentity>,
         tree_identity: Box<Blake3MerkleStoreIdentity>,
+    },
+    DemandExtension {
+        matrix: M,
+        oracle: Arc<WhirExtensionOracle>,
+        codeword_identity: Box<WhirExtensionCodewordIdentity>,
+        tree_identity: Box<DemandBlake3TreeIdentity>,
     },
 }
 
@@ -143,9 +207,15 @@ type AdoptedInitial = (
     <DiskWhirMmcs as Mmcs<F>>::ProverData<InitialWhirMatrix>,
 );
 
+#[cfg(test)]
 type AdoptedExtension = (
     <DiskWhirMmcs as Mmcs<F>>::Commitment,
     <DiskWhirMmcs as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, WhirExtensionMatrix>>,
+);
+
+type AdoptedDemandExtension = (
+    <DiskWhirMmcs as Mmcs<F>>::Commitment,
+    <DiskWhirMmcs as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DemandWhirExtensionMatrix>>,
 );
 
 /// Fallible authenticated-storage boundary used by an external WHIR state.
@@ -153,10 +223,14 @@ type AdoptedExtension = (
 pub(super) enum DiskWhirStorageError {
     #[error("initial WHIR storage failed: {0}")]
     Initial(#[from] InitialWhirOracleError),
+    #[cfg(test)]
     #[error("extension WHIR storage failed: {0}")]
     Extension(#[from] WhirExtensionEncodingError),
+    #[cfg(test)]
     #[error("WHIR Merkle storage failed: {0}")]
     Merkle(#[from] Blake3MerkleStoreError),
+    #[error("demand-authenticated WHIR storage failed: {0}")]
+    Demand(#[from] DemandBlake3TreeError),
     #[error("invalid disk-backed WHIR storage: {0}")]
     Invalid(&'static str),
 }
@@ -209,6 +283,7 @@ impl DiskWhirMmcs {
     /// The caller must retain both identities outside the scratch artifacts.
     /// All checks happen before a commitment or prover-data capability is
     /// returned, so an intact self-consistent substitute is not accepted.
+    #[cfg(test)]
     pub(super) fn adopt_extension(
         &self,
         expected_codeword: &WhirExtensionCodewordIdentity,
@@ -236,6 +311,39 @@ impl DiskWhirMmcs {
                 tree,
                 codeword_identity: Box::new(expected_codeword.clone()),
                 tree_identity: Box::new(expected_tree.clone()),
+            },
+        ))
+    }
+
+    /// Adopt one exact v2 demand-authenticated extension oracle.
+    ///
+    /// The oracle remains the sole proof-facing source of rows and paths. The
+    /// retained external identities prevent substitution with another intact,
+    /// self-consistent codeword/tree pair.
+    pub(super) fn adopt_demand_extension(
+        &self,
+        expected_codeword: &WhirExtensionCodewordIdentity,
+        expected_tree: &DemandBlake3TreeIdentity,
+        oracle: Arc<WhirExtensionOracle>,
+    ) -> Result<AdoptedDemandExtension, DiskWhirStorageError> {
+        validate_demand_extension_capability(expected_codeword, expected_tree, &oracle)?;
+
+        // Reauthenticate one complete row/path against the live artifacts
+        // before exposing a commitment capability. Later openings repeat the
+        // same fail-closed envelope and path checks for their selected row.
+        oracle.authenticated_opening(0)?;
+
+        let commitment = MerkleCap::<F, [u8; 32]>::new(vec![expected_tree.tree_root]);
+        let matrix = FlatMatrixView::new(DemandWhirExtensionMatrix {
+            oracle: Arc::clone(&oracle),
+        });
+        Ok((
+            commitment,
+            DiskWhirProverData::DemandExtension {
+                matrix,
+                oracle,
+                codeword_identity: Box::new(expected_codeword.clone()),
+                tree_identity: Box::new(*expected_tree),
             },
         ))
     }
@@ -282,6 +390,7 @@ impl DiskWhirMmcs {
                     opening.authentication_path().to_vec(),
                 ))
             }
+            #[cfg(test)]
             DiskWhirProverData::Extension {
                 matrix,
                 codeword,
@@ -318,6 +427,28 @@ impl DiskWhirMmcs {
                     opening.opening_path,
                 ))
             }
+            DiskWhirProverData::DemandExtension {
+                matrix,
+                oracle,
+                codeword_identity,
+                tree_identity,
+            } => {
+                validate_demand_extension_capability(
+                    codeword_identity.as_ref(),
+                    tree_identity.as_ref(),
+                    oracle,
+                )?;
+                if index >= matrix.height() {
+                    return Err(DiskWhirStorageError::Invalid(
+                        "demand-authenticated extension opening index is out of bounds",
+                    ));
+                }
+                let opening = oracle.authenticated_opening(index)?;
+                Ok(BatchOpening::new(
+                    vec![opening.row().iter().copied().map(F::new).collect()],
+                    opening.authentication_path().to_vec(),
+                ))
+            }
         }
     }
 }
@@ -346,7 +477,9 @@ impl Mmcs<F> for DiskWhirMmcs {
         match prover_data {
             DiskWhirProverData::Dense(data) => self.inner.get_matrices(data),
             DiskWhirProverData::Initial { matrix, .. } => vec![matrix],
+            #[cfg(test)]
             DiskWhirProverData::Extension { matrix, .. } => vec![matrix],
+            DiskWhirProverData::DemandExtension { matrix, .. } => vec![matrix],
         }
     }
 
@@ -366,6 +499,45 @@ impl Mmcs<F> for DiskWhirMmcs {
     }
 }
 
+fn validate_demand_extension_capability(
+    expected_codeword: &WhirExtensionCodewordIdentity,
+    expected_tree: &DemandBlake3TreeIdentity,
+    oracle: &WhirExtensionOracle,
+) -> Result<(), DiskWhirStorageError> {
+    if oracle.codeword_identity() != expected_codeword {
+        return Err(DiskWhirStorageError::Invalid(
+            "demand-authenticated codeword identity does not match the retained identity",
+        ));
+    }
+    if oracle.tree_identity() != expected_tree {
+        return Err(DiskWhirStorageError::Invalid(
+            "demand-authenticated tree identity does not match the retained identity",
+        ));
+    }
+    if expected_codeword.folding != WHIR_EXTENSION_FOLDING as u8
+        || expected_codeword.width != WHIR_EXTENSION_WIDTH as u32
+    {
+        return Err(DiskWhirStorageError::Invalid(
+            "demand-authenticated codeword has the wrong protocol shape",
+        ));
+    }
+    let source_binding = expected_codeword
+        .binding_digest()
+        .map_err(DemandBlake3TreeError::from)?;
+    let geometry = demand_blake3_tree_geometry(expected_codeword.height)?;
+    if expected_tree.source_binding != source_binding
+        || expected_tree.height != expected_codeword.height
+        || expected_tree.width != WHIR_EXTENSION_LIMBS_PER_ROW as u32
+        || expected_tree.artifact_bytes != geometry.artifact_bytes
+    {
+        return Err(DiskWhirStorageError::Invalid(
+            "demand-authenticated tree is not bound to the exact extension codeword geometry",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn validate_extension_capabilities(
     expected_codeword: &WhirExtensionCodewordIdentity,
     expected_tree: &Blake3MerkleStoreIdentity,
@@ -422,6 +594,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cmfd_proof_accel::blake3_merkle_store::build_authenticated_blake3_merkle_store;
+    use cmfd_proof_accel::demand_blake3_tree::{
+        WhirExtensionOracle, build_whir_extension_demand_blake3_tree,
+    };
     use cmfd_proof_accel::whir_extension::encode_whir_extension_codeword;
     use cmfd_proof_accel::whir_residual::{
         AuthenticatedWhirResidualArtifact, WHIR_RESIDUAL_LIMBS_PER_ROW, WhirResidualArtifactSpec,
@@ -437,6 +612,7 @@ mod tests {
     use super::*;
 
     const TREE_HEADER_BYTES: u64 = 128 + 8;
+    const DEMAND_TREE_HEADER_BYTES: u64 = 256;
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
     struct ExtensionFixture {
@@ -446,6 +622,16 @@ mod tests {
         tree: Arc<AuthenticatedBlake3MerkleStore>,
         codeword_identity: WhirExtensionCodewordIdentity,
         tree_identity: Blake3MerkleStoreIdentity,
+        values: Vec<EF>,
+    }
+
+    struct DemandExtensionFixture {
+        directory: PathBuf,
+        residual: AuthenticatedWhirResidualArtifact,
+        oracle: Arc<WhirExtensionOracle>,
+        tree_path: PathBuf,
+        codeword_identity: WhirExtensionCodewordIdentity,
+        tree_identity: DemandBlake3TreeIdentity,
         values: Vec<EF>,
     }
 
@@ -537,6 +723,56 @@ mod tests {
         } = fixture;
         drop(tree);
         drop(codeword);
+        drop(residual);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    fn build_demand_fixture(label: &str, identity_byte: u8) -> DemandExtensionFixture {
+        let directory = test_directory(label);
+        let residual = build_residual(&directory);
+        let codeword = encode_whir_extension_codeword(
+            &directory,
+            [identity_byte; 32],
+            residual.identity(),
+            &residual,
+            1,
+        )
+        .unwrap();
+        let height = usize::try_from(codeword.geometry().height).unwrap();
+        let canonical = codeword.read_canonical_rows(0, height).unwrap();
+        let values = canonical
+            .chunks_exact(WHIR_EXTENSION_LIMBS_PER_ELEMENT)
+            .map(|limbs| EF::from_basis_coefficients_fn(|index| F::new(limbs[index])))
+            .collect::<Vec<_>>();
+        let codeword_identity = codeword.identity().clone();
+        let tree_path = directory.join("demand-extension-tree");
+        let tree = build_whir_extension_demand_blake3_tree(
+            &tree_path,
+            [identity_byte.wrapping_add(1); 32],
+            &codeword,
+        )
+        .unwrap();
+        let tree_identity = *tree.identity();
+        let oracle = Arc::new(WhirExtensionOracle::new(codeword, tree).unwrap());
+        DemandExtensionFixture {
+            directory,
+            residual,
+            oracle,
+            tree_path,
+            codeword_identity,
+            tree_identity,
+            values,
+        }
+    }
+
+    fn remove_demand_fixture(fixture: DemandExtensionFixture) {
+        let DemandExtensionFixture {
+            directory,
+            residual,
+            oracle,
+            ..
+        } = fixture;
+        Arc::try_unwrap(oracle).unwrap().remove().unwrap();
         drop(residual);
         fs::remove_dir(directory).unwrap();
     }
@@ -728,6 +964,178 @@ mod tests {
         drop(prover_data);
         drop(file);
         remove_fixture(fixture);
+    }
+
+    #[test]
+    fn adopted_demand_extension_matches_ordinary_extension_mmcs_exactly() {
+        let fixture = build_demand_fixture("demand-parity", 0x51);
+        let disk = DiskWhirMmcs::new(ordinary_mmcs());
+        let (commitment, prover_data) = disk
+            .adopt_demand_extension(
+                &fixture.codeword_identity,
+                &fixture.tree_identity,
+                Arc::clone(&fixture.oracle),
+            )
+            .unwrap();
+        match &prover_data {
+            DiskWhirProverData::DemandExtension {
+                codeword_identity,
+                tree_identity,
+                ..
+            } => {
+                assert_eq!(codeword_identity.as_ref(), &fixture.codeword_identity);
+                assert_eq!(tree_identity.as_ref(), &fixture.tree_identity);
+            }
+            _ => panic!("adopted v2 extension must retain demand prover data"),
+        }
+
+        let ordinary_extension = ExtensionMmcs::<F, EF, _>::new(ordinary_mmcs());
+        let (ordinary_commitment, ordinary_data) =
+            ordinary_extension.commit(vec![RowMajorMatrix::new(
+                fixture.values.clone(),
+                WHIR_EXTENSION_WIDTH,
+            )]);
+        assert_eq!(commitment, ordinary_commitment);
+
+        let disk_extension = ExtensionMmcs::<F, EF, _>::new(disk.clone());
+        let dimensions = [Dimensions {
+            width: WHIR_EXTENSION_LIMBS_PER_ROW,
+            height: fixture.tree_identity.height as usize,
+        }];
+        for index in 0..fixture.tree_identity.height as usize {
+            let base_opening = disk.try_open_batch(index, &prover_data).unwrap();
+            disk.verify_batch(&commitment, &dimensions, index, (&base_opening).into())
+                .unwrap();
+
+            let disk_opening = disk_extension.open_batch(index, &prover_data);
+            let ordinary_opening = ordinary_extension.open_batch(index, &ordinary_data);
+            assert_eq!(disk_opening.opened_values, ordinary_opening.opened_values);
+            assert_eq!(disk_opening.opening_proof, ordinary_opening.opening_proof);
+            assert_eq!(base_opening.opening_proof, ordinary_opening.opening_proof);
+            let ordinary_base = ordinary_opening.opened_values[0]
+                .iter()
+                .flat_map(|value| value.as_basis_coefficients_slice().iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(base_opening.opened_values, vec![ordinary_base]);
+            let matrix_row = disk.get_matrices(&prover_data)[0]
+                .row(index)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(matrix_row, base_opening.opened_values[0]);
+        }
+
+        drop(prover_data);
+        remove_demand_fixture(fixture);
+    }
+
+    #[test]
+    fn demand_extension_adoption_rejects_identity_substitution() {
+        let fixture = build_demand_fixture("demand-identity", 0x62);
+        let substitute = build_demand_fixture("demand-substitute", 0x73);
+        let disk = DiskWhirMmcs::new(ordinary_mmcs());
+
+        assert!(matches!(
+            disk.adopt_demand_extension(
+                &fixture.codeword_identity,
+                &fixture.tree_identity,
+                Arc::clone(&substitute.oracle),
+            ),
+            Err(DiskWhirStorageError::Invalid(
+                "demand-authenticated codeword identity does not match the retained identity"
+            ))
+        ));
+
+        let mut wrong_codeword = fixture.codeword_identity.clone();
+        wrong_codeword.codeword_id[0] ^= 1;
+        assert!(matches!(
+            disk.adopt_demand_extension(
+                &wrong_codeword,
+                &fixture.tree_identity,
+                Arc::clone(&fixture.oracle),
+            ),
+            Err(DiskWhirStorageError::Invalid(
+                "demand-authenticated codeword identity does not match the retained identity"
+            ))
+        ));
+
+        let mut wrong_tree = fixture.tree_identity;
+        wrong_tree.store_id[0] ^= 1;
+        assert!(matches!(
+            disk.adopt_demand_extension(
+                &fixture.codeword_identity,
+                &wrong_tree,
+                Arc::clone(&fixture.oracle),
+            ),
+            Err(DiskWhirStorageError::Invalid(
+                "demand-authenticated tree identity does not match the retained identity"
+            ))
+        ));
+
+        remove_demand_fixture(substitute);
+        remove_demand_fixture(fixture);
+    }
+
+    #[test]
+    fn demand_extension_tree_corruption_fails_closed_without_fallback() {
+        let fixture = build_demand_fixture("demand-corruption", 0x84);
+        let disk = DiskWhirMmcs::new(ordinary_mmcs());
+        let (_, prover_data) = disk
+            .adopt_demand_extension(
+                &fixture.codeword_identity,
+                &fixture.tree_identity,
+                Arc::clone(&fixture.oracle),
+            )
+            .unwrap();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture.tree_path)
+            .unwrap();
+        let sibling_offset = DEMAND_TREE_HEADER_BYTES + 32;
+        file.seek(SeekFrom::Start(sibling_offset)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(sibling_offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                disk.try_open_batch(0, &prover_data),
+                Err(DiskWhirStorageError::Demand(
+                    DemandBlake3TreeError::OpeningMismatch
+                ))
+            ));
+        }
+
+        drop(prover_data);
+        drop(file);
+        remove_demand_fixture(fixture);
+    }
+
+    #[test]
+    fn demand_extension_out_of_bounds_opening_is_fallible() {
+        let fixture = build_demand_fixture("demand-oob", 0x95);
+        let disk = DiskWhirMmcs::new(ordinary_mmcs());
+        let (_, prover_data) = disk
+            .adopt_demand_extension(
+                &fixture.codeword_identity,
+                &fixture.tree_identity,
+                Arc::clone(&fixture.oracle),
+            )
+            .unwrap();
+        assert!(matches!(
+            disk.try_open_batch(fixture.tree_identity.height as usize, &prover_data),
+            Err(DiskWhirStorageError::Invalid(
+                "demand-authenticated extension opening index is out of bounds"
+            ))
+        ));
+
+        drop(prover_data);
+        remove_demand_fixture(fixture);
     }
 
     #[test]

@@ -10,14 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use blake3::Hasher;
-use cmfd_proof_accel::blake3_merkle_store::{
-    Blake3MerkleStoreError, Blake3MerkleStoreIdentity, blake3_merkle_store_geometry,
-    build_authenticated_blake3_merkle_store_with_first_digest_layer,
+use cmfd_proof_accel::demand_blake3_tree::{
+    DemandBlake3TreeError, DemandBlake3TreeIdentity, WhirExtensionOracle,
+    build_whir_extension_demand_blake3_tree, demand_blake3_tree_geometry,
 };
-use cmfd_proof_accel::merkle_store::MerkleRowSource;
 use cmfd_proof_accel::whir_extension::{
-    WHIR_EXTENSION_FOLDING, WHIR_EXTENSION_LIMBS_PER_ROW, WhirExtensionCodewordIdentity,
-    WhirExtensionEncodingError, encode_whir_extension_codeword, whir_extension_geometry,
+    WHIR_EXTENSION_FOLDING, WhirExtensionCodewordIdentity, WhirExtensionEncodingError,
+    encode_whir_extension_codeword, whir_extension_geometry,
 };
 use cmfd_proof_accel::whir_residual::{
     AuthenticatedWhirResidualArtifact, WHIR_RESIDUAL_LIMBS_PER_ROW, WHIR_RESIDUAL_MAX_IO_ROWS,
@@ -38,7 +37,7 @@ use p3_sumcheck::strategy::{SumcheckProver, VariableOrder};
 use p3_whir::pcs::prover::FallibleWhirProverState;
 use thiserror::Error;
 
-use super::disk_mmcs::{DiskWhirMmcs, DiskWhirStorageError, WhirExtensionMatrix};
+use super::disk_mmcs::{DemandWhirExtensionMatrix, DiskWhirMmcs, DiskWhirStorageError};
 use super::disk_sumcheck::PreparedArtifactSumcheck;
 use super::{Challenger, Dft, EF, F};
 
@@ -46,8 +45,8 @@ const FINAL_TAIL_MAX_VARIABLES: usize = 6;
 const CHILD_CONTEXT_DOMAIN: &str = "Common Foundry WHIR residual child context v1";
 const CHILD_SOURCE_DOMAIN: &str = "Common Foundry WHIR residual child source v1";
 const CODEWORD_ID_DOMAIN: &str = "Common Foundry WHIR extension codeword ID v1";
-const TREE_ID_DOMAIN: &str = "Common Foundry WHIR extension Merkle store ID v1";
-const TREE_FILE_PREFIX: &str = "cmfd-whir-extension-tree";
+const TREE_ID_DOMAIN: &str = "Common Foundry WHIR demand Merkle store ID v2";
+const TREE_FILE_PREFIX: &str = "cmfd-whir-extension-demand-tree";
 
 #[derive(Debug, Error)]
 pub(super) enum ArtifactWhirStateError {
@@ -61,8 +60,8 @@ pub(super) enum ArtifactWhirStateError {
     Residual(#[from] WhirResidualArtifactError),
     #[error("WHIR extension storage failed: {0}")]
     Extension(#[from] WhirExtensionEncodingError),
-    #[error("WHIR Merkle storage failed: {0}")]
-    Merkle(#[from] Blake3MerkleStoreError),
+    #[error("demand-authenticated WHIR Merkle storage failed: {0}")]
+    Demand(#[from] DemandBlake3TreeError),
     #[error("WHIR MMCS storage failed: {0}")]
     Mmcs(#[from] DiskWhirStorageError),
     #[error("WHIR scratch free-space query failed: {0}")]
@@ -72,12 +71,12 @@ pub(super) enum ArtifactWhirStateError {
 #[derive(Clone, Debug)]
 struct PendingCommitment {
     codeword: WhirExtensionCodewordIdentity,
-    tree: Blake3MerkleStoreIdentity,
+    tree: DemandBlake3TreeIdentity,
 }
 
 type ArtifactExtensionCommitment = (
     <DiskWhirMmcs as Mmcs<F>>::Commitment,
-    <DiskWhirMmcs as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, WhirExtensionMatrix>>,
+    <DiskWhirMmcs as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DemandWhirExtensionMatrix>>,
 );
 
 /// The first real external-storage state consumed by WHIR after its initial
@@ -226,18 +225,15 @@ impl ArtifactWhirProverState {
             "{TREE_FILE_PREFIX}-{}.artifact",
             hex::encode(store_id)
         ));
-        let sources: [&dyn MerkleRowSource; 1] = [&codeword];
-        let tree = build_authenticated_blake3_merkle_store_with_first_digest_layer(
-            &tree_path, store_id, &sources, &codeword,
-        )?
-        .remove_on_drop();
-        let tree_identity = tree.identity()?;
+        let tree = build_whir_extension_demand_blake3_tree(&tree_path, store_id, &codeword)?
+            .remove_on_drop();
+        let tree_identity = *tree.identity();
+        let oracle = WhirExtensionOracle::new(codeword, tree)?;
 
-        let (commitment, prover_data) = self.mmcs.adopt_extension(
+        let (commitment, prover_data) = self.mmcs.adopt_demand_extension(
             &codeword_identity,
             &tree_identity,
-            Arc::new(codeword),
-            Arc::new(tree),
+            Arc::new(oracle),
         )?;
         *pending = Some(PendingCommitment {
             codeword: codeword_identity,
@@ -274,7 +270,7 @@ impl ArtifactWhirProverState {
         &self,
         index: usize,
         prover_data: &<DiskWhirMmcs as Mmcs<F>>::ProverData<
-            FlatMatrixView<F, EF, WhirExtensionMatrix>,
+            FlatMatrixView<F, EF, DemandWhirExtensionMatrix>,
         >,
     ) -> Result<BatchOpening<EF, ExtensionMmcs<F, EF, DiskWhirMmcs>>, ArtifactWhirStateError> {
         self.ensure_live()?;
@@ -604,7 +600,7 @@ impl ArtifactWhirProverState {
 
 impl FallibleWhirProverState<EF, F, Dft, DiskWhirMmcs, Challenger> for ArtifactWhirProverState {
     type Error = ArtifactWhirStateError;
-    type ExtensionMatrix = WhirExtensionMatrix;
+    type ExtensionMatrix = DemandWhirExtensionMatrix;
 
     fn num_variables(&self) -> usize {
         self.residual
@@ -720,9 +716,7 @@ fn preflight_extension_tree(
     available: u64,
 ) -> Result<u64, ArtifactWhirStateError> {
     let extension_geometry = whir_extension_geometry(residual, log_inv_rate)?;
-    let height = usize::try_from(extension_geometry.height)
-        .map_err(|_| ArtifactWhirStateError::Invalid("extension height does not fit usize"))?;
-    let tree_geometry = blake3_merkle_store_geometry(height, &[WHIR_EXTENSION_LIMBS_PER_ROW])?;
+    let tree_geometry = demand_blake3_tree_geometry(extension_geometry.height)?;
     let required = extension_geometry
         .artifact_bytes
         .checked_add(tree_geometry.artifact_bytes)
@@ -979,15 +973,13 @@ fn hash_codeword_identity(hasher: &mut Hasher, identity: &WhirExtensionCodewordI
     hasher.update(&identity.artifact_digest);
 }
 
-fn hash_tree_identity(hasher: &mut Hasher, identity: &Blake3MerkleStoreIdentity) {
+fn hash_tree_identity(hasher: &mut Hasher, identity: &DemandBlake3TreeIdentity) {
     hasher.update(&identity.store_id);
-    hasher.update(&(identity.height as u64).to_le_bytes());
-    hasher.update(&(identity.ordered_matrix_widths.len() as u32).to_le_bytes());
-    for &width in &identity.ordered_matrix_widths {
-        hasher.update(&(width as u64).to_le_bytes());
-    }
+    hasher.update(&identity.source_binding);
+    hasher.update(&identity.height.to_le_bytes());
+    hasher.update(&identity.width.to_le_bytes());
     hasher.update(&identity.tree_root);
-    hasher.update(&identity.artifact_global_digest);
+    hasher.update(&identity.artifact_bytes.to_le_bytes());
 }
 
 fn hash_extension(hasher: &mut Hasher, value: EF) {
@@ -1078,7 +1070,7 @@ fn hash_constraint(hasher: &mut Hasher, constraint: &Constraint<F, EF>) {
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1346,6 +1338,29 @@ mod tests {
     }
 
     #[test]
+    fn production_v2_peak_geometry_is_exact_and_nonallocating() {
+        let variables = 3;
+        let scratch = scratch_dir("production-v2-geometry");
+        let (evals, weights) = values(variables, 31);
+        let prepared = prepare(&scratch, variables, 0, &evals, &weights);
+        let mut production = prepared.artifact.identity().clone();
+        production.spec.num_variables = WHIR_RESIDUAL_MAX_VARIABLES as u32;
+        production.row_count = 1_u64 << WHIR_RESIDUAL_MAX_VARIABLES;
+
+        let required = preflight_extension_tree(&production, 2, u64::MAX).unwrap();
+        let extension = whir_extension_geometry(&production, 2).unwrap();
+        let tree = demand_blake3_tree_geometry(extension.height).unwrap();
+        assert_eq!(extension.height, 1_u64 << 29);
+        assert_eq!(extension.artifact_bytes, 51_541_704_992);
+        assert_eq!(tree.artifact_bytes, 34_359_738_592);
+        assert_eq!(required, 85_901_443_584);
+
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[test]
     fn constrained_fold_matches_dense_with_eq_and_selector() {
         let original_variables = 16;
         let variables = original_variables - 2;
@@ -1454,6 +1469,54 @@ mod tests {
         let prepared = prepare(&scratch, variables, 0, &evals, &weights);
         let (_, _, mmcs) = disk_pcs(variables + 2, b"artifact-state-identity");
         assert!(ArtifactWhirProverState::new(&scratch, [0; 32], mmcs, prepared).is_err());
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[test]
+    fn demand_tree_corruption_poisons_the_attempt_without_fallback() {
+        let variables = 5;
+        let scratch = scratch_dir("demand-tree-corruption");
+        let (evals, weights) = values(variables, 45);
+        let prepared = prepare(&scratch, variables, 0, &evals, &weights);
+        let (pcs, _, mmcs) = disk_pcs(variables + 2, b"artifact-state-demand-corruption");
+        let state = ArtifactWhirProverState::new(&scratch, [0x86; 32], mmcs, prepared).unwrap();
+        let (_, prover_data) = state
+            .try_commit_extension(VariableOrder::Suffix, &pcs.dft, &pcs.extension_mmcs, 2, 2)
+            .unwrap();
+        let tree_path = std::fs::read_dir(&scratch)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(TREE_FILE_PREFIX))
+            })
+            .unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tree_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(256 + 32)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Current(-1)).unwrap();
+        file.write_all(&[byte[0] ^ 1]).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(
+            state
+                .try_open_extension(0, &pcs.extension_mmcs, &prover_data)
+                .is_err()
+        );
+        assert!(
+            state
+                .try_eval(&Point::new(vec![EF::ONE; variables]))
+                .is_err()
+        );
+
+        drop(prover_data);
+        drop(state);
         assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
         std::fs::remove_dir(scratch).unwrap();
     }

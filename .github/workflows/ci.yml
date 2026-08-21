@@ -28,6 +28,7 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check -p cmfd-consensus --all-targets --features whir-prototype --locked
       - run: cargo check -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
+      - run: cargo check -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked
 
   rust:
     runs-on: ubuntu-22.04
@@ -55,9 +56,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features whir-prototype --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features gpu-proof-prover --locked -- -D warnings
+      - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate --locked -- -D warnings
+      - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked --no-deps -- -D warnings
       - run: cargo test --workspace --all-targets --locked
       - run: cargo test -p cmfd-consensus --all-targets --features whir-prototype --locked
       - run: cargo test -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
+      - run: cargo test -p cmfd-consensus --lib --features production-whir-candidate,gpu-proof-prover --locked production_candidate
 
   proof-codec:
     strategy:

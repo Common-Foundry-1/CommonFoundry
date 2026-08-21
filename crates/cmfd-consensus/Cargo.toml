@@ -47,6 +47,7 @@ thiserror.workspace = true
 [features]
 default = []
 gpu-proof-prover = ["whir-prototype", "dep:cmfd-proof-accel", "dep:fs2"]
+production-whir-candidate = ["whir-prototype"]
 remainder-prototype = [
     "dep:bincode",
     "dep:enum-ordinalize",

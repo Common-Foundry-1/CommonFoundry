@@ -144,10 +144,12 @@ codeword/tree commitment, and streamed fold-two initial sumcheck. Later folded
 rounds, FRI, and opening generation are not yet fully out of core. There is
 now a fail-closed raw-model-byte-to-authenticated-source bundle: one verified
 stream stages the production `n = 19` base role and `n = 31` weight roles and
-publishes a single manifest pointer only after every role seals. It does not
-yet derive the corresponding codeword/tree roots or prove that they equal the
-pinned PCS commitment aliases. There is therefore still no complete
-raw-model-byte-to-PCS link, consensus tag, complete soundness report, or audit.
+publishes a single manifest pointer only after every role seals. Exact initial
+codeword construction, typed demand trees, and the V2 role join now bind each
+prepared role to its pinned PCS commitment alias. A complete production-scale
+run through extension encoding, openings, and verification is still absent, so
+there is no activation certificate, consensus tag, complete soundness report,
+or audit.
 The publication pointer is untrusted storage: a separately retained canonical
 bundle identity pins the exact bundle and every source-artifact digest on each
 reopen, including after restart. A self-consistent pointer/object replacement
@@ -159,6 +161,10 @@ still production gates.
 The aggregate remains feature-gated research scaffolding with no consensus or
 wire tag. See
 [docs/consensus/forgematrix-custom-proof.md](docs/consensus/forgematrix-custom-proof.md).
+The separate `production-whir-candidate` parser profile admits exact n=19/n=31
+configuration geometry but intentionally rejects n=31 at the byte gate: its
+268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof
+payload before dictionary and aggregate bytes.
 
 Mainnet remains disabled until all of the following are complete:
 

@@ -411,7 +411,7 @@ Two commitments are required because they answer different questions:
 - The BLAKE3 root identifies the exact distributable byte artifact.
 - The polynomial commitment binds the multilinear polynomials opened by a succinct proof.
 
-Merely listing both digests in one manifest does not prove they encode the same data. Production therefore requires an independently verifiable byte-to-field link certificate, or a deterministic activation procedure in which every validator recomputes both commitments from the complete artifact. That link is not implemented.
+Merely listing both digests in one manifest does not prove they encode the same data. The current research path now streams authenticated model bytes into exact field sources, initial codewords, typed trees, and role joins that check the pinned PCS aliases. Production still requires an independently reproduced end-to-end activation certificate covering the complete artifact and proof path; the component-level link is implemented, but the production-scale certificate and audit are not.
 
 The intended polynomial ordering is explicit:
 
@@ -592,7 +592,9 @@ The current WHIR research path has moved the original table, initial codeword an
 
 The version-2 native WHIR transport is now a manual fixed-width little-endian codec. Its trusted configuration determines every semantic vector length, query variant, path depth, sumcheck round, option, and PoW field. Repeated authentication nodes are stored once in canonical first-reference order and addressed by `u16`; no general-purpose compression is accepted. The version-2 inner codec rejects a dictionary larger than the tree-level maximum derived from the trusted query count and path depths, and that stricter grammar is committed by the WHIR suite identity. Across ten deterministic 13-variable transcripts, the complete explicit envelope measured 188,104 through 190,024 bytes (about 183.7 through 185.6 KiB), leaving at least 72,104 bytes under the 256 KiB cap after the 16-byte outer wire header. All ten lengths are pinned in tests. Independently, binary-tree geometry caps verifier-valid paths at 4,011 dictionary nodes, for a transcript-independent maximum of 203,576 bytes including both envelopes and 58,568 bytes of guaranteed headroom. Real prover-to-decoder-to-verifier tests cover 2, 8, 9, and 13 through 16 variables, while configuration-derived codec tests extend through the structured adapter's 20-variable limit. The 15- and 16-variable research proofs are deliberately rejected by the standalone encoder because they exceed the network budget. This is a direct WHIR proof, not the complete block-proof aggregate.
 
-The exact reference extension encoder still refuses execution above `2^20` rows. Its current fused file-backed radix-2 transform would make 21 full read/write passes at production geometry, about 1.97 TiB of traffic and 44 million I/O calls. Production therefore still requires a blocked or GPU transform, a streaming 31-variable initial commitment, full aggregate size and latency measurements, and independent review before the research caps can be raised.
+The opt-in production candidate separately derives the exact n=19 base-input and n=31 weight-bank verifier/parser geometries without widening the version-2 research limits. Its canonical fixed-width grammar has dictionary-free floors of 133,298 bytes at n=19 and 268,640 bytes at n=31. The complete network proof payload is only 262,128 bytes after its outer header, so an n=31 child exceeds the entire budget by 6,512 bytes before its Merkle dictionary or any aggregate component. The candidate rejects that shape before proof decoding or proof-sized allocation. This checkpoint identifies proof geometry or aggregation/compression as the next gate; it is not a production proof, verifier, or consensus tag.
+
+The exact reference extension encoder still refuses execution above `2^20` rows. Its current fused file-backed radix-2 transform would make 21 full read/write passes at production geometry, about 1.97 TiB of traffic and 44 million I/O calls. Production therefore still requires a blocked or GPU transform for the `2^29`-row n=31 extension codeword, full aggregate size and latency measurements, and independent review before the research caps can be raised.
 
 ### 8.5 Winner-only proving
 
@@ -920,9 +922,9 @@ It does not assume miners follow a reference kernel. Any implementation computin
 | Treat pool counters as owned funds | Explicit volatile/nonwithdrawable semantics and operator-directed miner output | No production payout ledger or user custody |
 | Cross-network replay | Full network ID in objects and fingerprint handshake | Implemented |
 | Forge polynomial openings | Transparent PCS with canonical openings | Feature-gated WHIR research adapter authenticates canonical openings; production selection, soundness review, and audit remain absent |
-| Fake raw-to-PCS equivalence | Verifiable link certificate | Not implemented |
+| Fake raw-to-PCS equivalence | Verifiable link certificate | Component-level authenticated source/codeword/tree/alias link implemented; production-scale activation certificate and audit absent |
 | Transcript grinding | Canonical transcript, post-commit challenges, large extension field | Feature-gated custom and WHIR transcripts bind post-commitment points; complete aggregate soundness and production review remain absent |
-| Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; production proof parser absent |
+| Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; candidate n19/n31 native grammar is bounded and n31 fails before proof decoding or proof-sized allocation, but the aggregate network proof parser is absent |
 | False remote height or work | Treat advertisement as hint and recompute locally | Implemented |
 | Peer spoofing, eclipse, MITM | Authenticated encrypted peer layer, discovery, reputation | Not implemented; private static peers only |
 | Local wallet compromise | Encrypted custody, backup/recovery, and process isolation | Distinct unencrypted Devnet keys only; production custody not implemented |

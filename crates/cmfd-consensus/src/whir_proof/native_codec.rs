@@ -39,6 +39,53 @@ pub(super) const NATIVE_PROOF_CODEC_MAX_DICTIONARY_NODES: usize = u16::MAX as us
 const REFERENCE_BYTES: usize = NATIVE_PROOF_CODEC_REFERENCE_BYTES;
 const MAX_DICTIONARY_NODES: usize = NATIVE_PROOF_CODEC_MAX_DICTIONARY_NODES;
 
+#[derive(Clone, Copy)]
+pub(super) struct NativeProofCodecProfile {
+    magic: &'static [u8; 8],
+    codec_version: u32,
+    protocol_version: u32,
+    max_variables: usize,
+    max_encoded_bytes: usize,
+}
+
+impl NativeProofCodecProfile {
+    pub(super) const fn new(
+        magic: &'static [u8; 8],
+        codec_version: u32,
+        protocol_version: u32,
+        max_variables: usize,
+        max_encoded_bytes: usize,
+    ) -> Self {
+        Self {
+            magic,
+            codec_version,
+            protocol_version,
+            max_variables,
+            max_encoded_bytes,
+        }
+    }
+}
+
+#[cfg(feature = "production-whir-candidate")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct NativeProofGeometry {
+    pub intermediate_rounds: usize,
+    pub path_depths: Vec<usize>,
+    pub body_bytes: usize,
+    pub reference_count: usize,
+    pub maximum_dictionary_nodes: usize,
+    pub structural_floor_bytes: usize,
+    pub conservative_upper_bound_bytes: usize,
+}
+
+const LEGACY_CODEC_PROFILE: NativeProofCodecProfile = NativeProofCodecProfile::new(
+    NATIVE_PROOF_CODEC_MAGIC,
+    NATIVE_PROOF_CODEC_VERSION,
+    EXPLICIT_WHIR_VERSION,
+    MAX_STRUCTURED_WHIR_STACKED_VARIABLES,
+    MAX_EXPLICIT_WHIR_PROOF_BYTES,
+);
+
 type NativeQuery = QueryOpening<F, EF, Vec<[u8; DIGEST_BYTES]>>;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +150,17 @@ struct ProofShape {
 }
 
 impl ProofShape {
+    #[cfg(test)]
     fn derive(config: &WhirConfig<EF, F, Challenger>) -> Result<Self, NativeProofCodecError> {
+        Self::derive_with_profile(config, LEGACY_CODEC_PROFILE)
+    }
+
+    fn derive_with_profile(
+        config: &WhirConfig<EF, F, Challenger>,
+        profile: NativeProofCodecProfile,
+    ) -> Result<Self, NativeProofCodecError> {
         if config.num_variables == 0
-            || config.num_variables > MAX_STRUCTURED_WHIR_STACKED_VARIABLES
+            || config.num_variables > profile.max_variables
             || config.n_rounds() > config.num_variables
         {
             return Err(NativeProofCodecError::Configuration);
@@ -179,9 +234,9 @@ impl ProofShape {
                     .and_then(|references| value.checked_add(references))
             })
             .ok_or(NativeProofCodecError::Configuration)?;
-        if shape.body_len > MAX_EXPLICIT_WHIR_PROOF_BYTES
+        if shape.body_len > profile.max_encoded_bytes
             || shape.reference_count > u32::MAX as usize
-            || minimum_encoded_len > MAX_EXPLICIT_WHIR_PROOF_BYTES
+            || minimum_encoded_len > profile.max_encoded_bytes
         {
             return Err(NativeProofCodecError::Configuration);
         }
@@ -251,6 +306,13 @@ impl ProofShape {
 
     #[cfg(test)]
     fn encoded_bytes_upper_bound(&self) -> Result<usize, NativeProofCodecError> {
+        Ok(self
+            .conservative_encoded_bytes_upper_bound()?
+            .min(MAX_EXPLICIT_WHIR_PROOF_BYTES))
+    }
+
+    #[cfg(any(test, feature = "production-whir-candidate"))]
+    fn conservative_encoded_bytes_upper_bound(&self) -> Result<usize, NativeProofCodecError> {
         let dictionary_bytes = self
             .maximum_dictionary_nodes()?
             .checked_mul(DIGEST_BYTES)
@@ -263,7 +325,18 @@ impl ProofShape {
             .checked_add(self.body_len)
             .and_then(|value| value.checked_add(dictionary_bytes))
             .and_then(|value| value.checked_add(reference_bytes))
-            .map(|value| value.min(MAX_EXPLICIT_WHIR_PROOF_BYTES))
+            .ok_or(NativeProofCodecError::Configuration)
+    }
+
+    #[cfg(feature = "production-whir-candidate")]
+    fn structural_floor_bytes(&self) -> Result<usize, NativeProofCodecError> {
+        let reference_bytes = self
+            .reference_count
+            .checked_mul(REFERENCE_BYTES)
+            .ok_or(NativeProofCodecError::Configuration)?;
+        NATIVE_PROOF_CODEC_HEADER_BYTES
+            .checked_add(self.body_len)
+            .and_then(|value| value.checked_add(reference_bytes))
             .ok_or(NativeProofCodecError::Configuration)
     }
 }
@@ -273,6 +346,29 @@ pub(super) fn encoded_proof_upper_bound(
     config: &WhirConfig<EF, F, Challenger>,
 ) -> Result<usize, NativeProofCodecError> {
     ProofShape::derive(config)?.encoded_bytes_upper_bound()
+}
+
+#[cfg(feature = "production-whir-candidate")]
+pub(super) fn proof_geometry_with_profile(
+    config: &WhirConfig<EF, F, Challenger>,
+    profile: NativeProofCodecProfile,
+) -> Result<NativeProofGeometry, NativeProofCodecError> {
+    let shape = ProofShape::derive_with_profile(config, profile)?;
+    let mut path_depths = shape
+        .rounds
+        .iter()
+        .map(|round| round.queries.path_len)
+        .collect::<Vec<_>>();
+    path_depths.push(shape.final_queries.path_len);
+    Ok(NativeProofGeometry {
+        intermediate_rounds: shape.rounds.len(),
+        path_depths,
+        body_bytes: shape.body_len,
+        reference_count: shape.reference_count,
+        maximum_dictionary_nodes: shape.maximum_dictionary_nodes()?,
+        structural_floor_bytes: shape.structural_floor_bytes()?,
+        conservative_upper_bound_bytes: shape.conservative_encoded_bytes_upper_bound()?,
+    })
 }
 
 fn derive_query_shape(
@@ -352,7 +448,18 @@ pub(super) fn encode_native_proof<MT>(
 where
     MT: Mmcs<F, Commitment = MerkleCap<F, [u8; DIGEST_BYTES]>, Proof = Vec<[u8; DIGEST_BYTES]>>,
 {
-    let shape = ProofShape::derive(config)?;
+    encode_native_proof_with_profile(proof, config, LEGACY_CODEC_PROFILE)
+}
+
+pub(super) fn encode_native_proof_with_profile<MT>(
+    proof: &WhirProof<F, EF, MT>,
+    config: &WhirConfig<EF, F, Challenger>,
+    profile: NativeProofCodecProfile,
+) -> Result<Vec<u8>, NativeProofCodecError>
+where
+    MT: Mmcs<F, Commitment = MerkleCap<F, [u8; DIGEST_BYTES]>, Proof = Vec<[u8; DIGEST_BYTES]>>,
+{
+    let shape = ProofShape::derive_with_profile(config, profile)?;
     validate_proof_shape(proof, &shape)?;
 
     let mut body = Vec::new();
@@ -397,7 +504,7 @@ where
     if body.len() != shape.body_len || paths.references.len() != shape.reference_count {
         return Err(NativeProofCodecError::Shape);
     }
-    paths.finish(&body, config.num_variables)
+    paths.finish(&body, config.num_variables, profile)
 }
 
 /// Decode one native proof without trusting any encoded vector length.
@@ -405,13 +512,20 @@ pub(super) fn decode_native_proof(
     encoded: &[u8],
     config: &WhirConfig<EF, F, Challenger>,
 ) -> Result<NativeProof, NativeProofCodecError> {
-    let shape = ProofShape::derive(config)?;
-    if encoded.len() < NATIVE_PROOF_CODEC_HEADER_BYTES
-        || encoded.len() > MAX_EXPLICIT_WHIR_PROOF_BYTES
+    decode_native_proof_with_profile(encoded, config, LEGACY_CODEC_PROFILE)
+}
+
+pub(super) fn decode_native_proof_with_profile(
+    encoded: &[u8],
+    config: &WhirConfig<EF, F, Challenger>,
+    profile: NativeProofCodecProfile,
+) -> Result<NativeProof, NativeProofCodecError> {
+    let shape = ProofShape::derive_with_profile(config, profile)?;
+    if encoded.len() < NATIVE_PROOF_CODEC_HEADER_BYTES || encoded.len() > profile.max_encoded_bytes
     {
         return Err(NativeProofCodecError::InvalidEncoding);
     }
-    if &encoded[..8] != NATIVE_PROOF_CODEC_MAGIC {
+    if &encoded[..8] != profile.magic {
         return Err(NativeProofCodecError::InvalidEncoding);
     }
     let codec_version = header_u32(encoded, 8)?;
@@ -422,7 +536,7 @@ pub(super) fn decode_native_proof(
     let dictionary_count = header_u32(encoded, 28)? as usize;
     let reference_count = header_u32(encoded, 32)? as usize;
     let flags = header_u32(encoded, 36)?;
-    if codec_version != NATIVE_PROOF_CODEC_VERSION || protocol_version != EXPLICIT_WHIR_VERSION {
+    if codec_version != profile.codec_version || protocol_version != profile.protocol_version {
         return Err(NativeProofCodecError::UnsupportedVersion);
     }
     if header_bytes as usize != NATIVE_PROOF_CODEC_HEADER_BYTES
@@ -447,7 +561,7 @@ pub(super) fn decode_native_proof(
         .and_then(|value| value.checked_add(dictionary_bytes))
         .and_then(|value| value.checked_add(reference_bytes))
         .ok_or(NativeProofCodecError::InvalidEncoding)?;
-    if expected_len != encoded.len() || expected_len > MAX_EXPLICIT_WHIR_PROOF_BYTES {
+    if expected_len != encoded.len() || expected_len > profile.max_encoded_bytes {
         return Err(NativeProofCodecError::InvalidEncoding);
     }
 
@@ -716,7 +830,12 @@ impl PathEncoder {
         Ok(())
     }
 
-    fn finish(self, body: &[u8], num_variables: usize) -> Result<Vec<u8>, NativeProofCodecError> {
+    fn finish(
+        self,
+        body: &[u8],
+        num_variables: usize,
+        profile: NativeProofCodecProfile,
+    ) -> Result<Vec<u8>, NativeProofCodecError> {
         let dictionary_bytes = self
             .dictionary
             .len()
@@ -732,7 +851,7 @@ impl PathEncoder {
             .and_then(|value| value.checked_add(dictionary_bytes))
             .and_then(|value| value.checked_add(reference_bytes))
             .ok_or(NativeProofCodecError::TooLarge)?;
-        if encoded_len > MAX_EXPLICIT_WHIR_PROOF_BYTES {
+        if encoded_len > profile.max_encoded_bytes {
             return Err(NativeProofCodecError::TooLarge);
         }
 
@@ -747,10 +866,10 @@ impl PathEncoder {
         encoded
             .try_reserve_exact(encoded_len)
             .map_err(|_| NativeProofCodecError::TooLarge)?;
-        encoded.extend_from_slice(NATIVE_PROOF_CODEC_MAGIC);
-        encoded.extend_from_slice(&NATIVE_PROOF_CODEC_VERSION.to_le_bytes());
+        encoded.extend_from_slice(profile.magic);
+        encoded.extend_from_slice(&profile.codec_version.to_le_bytes());
         encoded.extend_from_slice(&(NATIVE_PROOF_CODEC_HEADER_BYTES as u32).to_le_bytes());
-        encoded.extend_from_slice(&EXPLICIT_WHIR_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&profile.protocol_version.to_le_bytes());
         encoded.extend_from_slice(&num_variables.to_le_bytes());
         encoded.extend_from_slice(&body_len.to_le_bytes());
         encoded.extend_from_slice(&dictionary_count.to_le_bytes());
@@ -1034,7 +1153,14 @@ mod tests {
     }
 
     fn sample_proof(config: &WhirConfig<EF, F, Challenger>) -> NativeProof {
-        let shape = ProofShape::derive(config).expect("test proof shape");
+        sample_proof_with_profile(config, LEGACY_CODEC_PROFILE)
+    }
+
+    fn sample_proof_with_profile(
+        config: &WhirConfig<EF, F, Challenger>,
+        profile: NativeProofCodecProfile,
+    ) -> NativeProof {
+        let shape = ProofShape::derive_with_profile(config, profile).expect("test proof shape");
         let mut counter = 0u64;
         let initial_ood_answers = (0..shape.initial_ood_answers)
             .map(|_| next_extension(&mut counter))
@@ -1284,6 +1410,100 @@ mod tests {
             let decoded = decode_native_proof(&encoded, &config).unwrap();
             assert_eq!(encode_native_proof(&decoded, &config).unwrap(), encoded);
         }
+    }
+
+    #[cfg(feature = "production-whir-candidate")]
+    #[test]
+    fn production_candidate_codec_reaches_n31_without_widening_legacy_v2() {
+        use crate::whir_proof::production_candidate::{
+            PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES, ProductionWhirConfigV1, candidate_codec_profile,
+        };
+
+        fn collapse_paths(proof: &mut NativeProof) {
+            let shared = [0x5a; DIGEST_BYTES];
+            for query in proof
+                .rounds
+                .iter_mut()
+                .flat_map(|round| round.queries.iter_mut())
+                .chain(proof.final_queries.iter_mut())
+            {
+                let path = match query {
+                    QueryOpening::Base { proof, .. } | QueryOpening::Extension { proof, .. } => {
+                        proof
+                    }
+                };
+                path.fill(shared);
+            }
+        }
+
+        let strict = candidate_codec_profile(PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES);
+        let unbounded = candidate_codec_profile(usize::MAX);
+        for variables in [19, 31] {
+            let config = crate::whir_proof::build_whir_config_bounded(variables, 31).unwrap();
+            let mut proof = sample_proof_with_profile(&config, unbounded);
+            collapse_paths(&mut proof);
+            let encoded = encode_native_proof_with_profile(&proof, &config, unbounded).unwrap();
+            let decoded = decode_native_proof_with_profile(&encoded, &config, unbounded).unwrap();
+            assert_eq!(
+                encode_native_proof_with_profile(&decoded, &config, unbounded).unwrap(),
+                encoded
+            );
+
+            if variables == 19 {
+                assert!(encoded.len() <= PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES);
+                let strict_decoded =
+                    decode_native_proof_with_profile(&encoded, &config, strict).unwrap();
+                assert_eq!(
+                    encode_native_proof_with_profile(&strict_decoded, &config, strict).unwrap(),
+                    encoded
+                );
+
+                let legacy = encode_native_proof(&proof, &config).unwrap();
+                assert_eq!(
+                    decode_native_proof_with_profile(&legacy, &config, strict).err(),
+                    Some(NativeProofCodecError::InvalidEncoding)
+                );
+                assert_eq!(
+                    decode_native_proof(&encoded, &config).err(),
+                    Some(NativeProofCodecError::InvalidEncoding)
+                );
+
+                let model = crate::ModelPcsIdentity {
+                    model_version: 2,
+                    batch: crate::PRODUCTION_V2_BATCH,
+                    dimension: crate::PRODUCTION_V2_DIMENSION,
+                    layers_per_bank: crate::PRODUCTION_V2_LAYERS_PER_BANK,
+                    model_byte_root: [0x31; 32],
+                    pcs_suite_parameter_digest:
+                        crate::whir_proof::structured_whir_suite_parameter_digest(),
+                    base_input_commitment: [0x41; 32],
+                    weight_bank_commitments: vec![[0x51; 32], [0x52; 32], [0x53; 32]],
+                };
+                let public_config =
+                    ProductionWhirConfigV1::for_model_role(&model, crate::ModelPcsRole::BaseInput)
+                        .unwrap();
+                public_config
+                    .validate_native_proof_encoding(&encoded)
+                    .unwrap();
+
+                let mut unsupported_version = encoded.clone();
+                unsupported_version[8..12]
+                    .copy_from_slice(&(strict.codec_version.checked_add(1).unwrap()).to_le_bytes());
+                assert_eq!(
+                    decode_native_proof_with_profile(&unsupported_version, &config, strict).err(),
+                    Some(NativeProofCodecError::UnsupportedVersion)
+                );
+            } else {
+                assert!(encoded.len() > PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES);
+                assert!(matches!(
+                    decode_native_proof_with_profile(&encoded, &config, strict),
+                    Err(NativeProofCodecError::Configuration)
+                ));
+            }
+        }
+
+        assert!(crate::whir_proof::validate_num_variables(16).is_ok());
+        assert!(crate::whir_proof::validate_num_variables(17).is_err());
     }
 
     #[test]

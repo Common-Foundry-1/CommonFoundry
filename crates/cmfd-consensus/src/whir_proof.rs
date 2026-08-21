@@ -62,8 +62,21 @@ use thiserror::Error;
 #[cfg(feature = "gpu-proof-prover")]
 mod disk_mmcs;
 mod native_codec;
+#[cfg(feature = "production-whir-candidate")]
+mod production_candidate;
 #[cfg(feature = "gpu-proof-prover")]
 use disk_mmcs::{DiskWhirMmcs, DiskWhirOpeningPanic, DiskWhirStorageError};
+#[cfg(all(feature = "production-whir-candidate", feature = "gpu-proof-prover"))]
+pub use production_candidate::{
+    BoundProductionWhirRoleV1, ProductionWhirBindFailure, bind_prepared_production_whir_role_v1,
+};
+#[cfg(feature = "production-whir-candidate")]
+pub use production_candidate::{
+    PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES, PRODUCTION_WHIR_BASE_VARIABLES,
+    PRODUCTION_WHIR_CANDIDATE_VERSION, PRODUCTION_WHIR_WEIGHT_VARIABLES,
+    ProductionWhirCandidateError, ProductionWhirConfigV1, ProductionWhirRoleV1,
+    ProductionWhirWireShapeV1, production_whir_suite_parameter_digest_v1,
+};
 #[cfg(feature = "gpu-proof-prover")]
 mod artifact_state;
 #[cfg(feature = "gpu-proof-prover")]
@@ -2457,8 +2470,15 @@ fn build_pcs(
 fn build_whir_config(
     num_variables: usize,
 ) -> Result<WhirConfig<EF, F, Challenger>, ExplicitWhirError> {
-    if !(EXPLICIT_WHIR_MIN_VARIABLES..=MAX_STRUCTURED_WHIR_STACKED_VARIABLES)
-        .contains(&num_variables)
+    build_whir_config_bounded(num_variables, MAX_STRUCTURED_WHIR_STACKED_VARIABLES)
+}
+
+fn build_whir_config_bounded(
+    num_variables: usize,
+    max_variables: usize,
+) -> Result<WhirConfig<EF, F, Challenger>, ExplicitWhirError> {
+    if max_variables < EXPLICIT_WHIR_MIN_VARIABLES
+        || !(EXPLICIT_WHIR_MIN_VARIABLES..=max_variables).contains(&num_variables)
     {
         return Err(ExplicitWhirError::InvalidVariableCount);
     }

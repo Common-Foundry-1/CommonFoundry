@@ -655,12 +655,16 @@ contains the arithmetic and BLAKE3 arguments. Exact 31-variable codeword
 construction, the typed initial demand tree, V2 oracle identities, and the
 typed role join now cover initial artifact preparation, but they do not make a
 31-variable proof executable. The public explicit prover/verifier remains
-capped at 16 variables. Configuration-derived synthetic codec tests reach a
-20-variable stacked geometry, but that is not a public n=20 proof path. The
-reference extension-codeword encoder remains capped at `2^20` rows. Production
-still requires a separately versioned 31-variable proof configuration and
-verifier path, a byte-identical blocked or GPU extension transform, and
-complete production execution and benchmarks.
+capped at 16 variables. The opt-in `production-whir-candidate` profile now
+derives a separate suite and canonical parser geometry for the exact n=19 base
+and n=31 weight roles while leaving V2 unchanged. The measured n=19 native
+dictionary-free floor is 133,298 bytes; n=31 is 268,640 bytes before any Merkle
+dictionary, exceeding the complete 262,128-byte proof payload by 6,512 bytes.
+The candidate therefore rejects n=31 before proof decoding or proof-sized
+allocation. The reference extension-codeword encoder also remains capped at
+`2^20` rows. Production now requires a smaller proof geometry or
+aggregation/compression design, a byte-identical blocked or GPU extension
+transform, and complete production execution and benchmarks.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
@@ -688,12 +692,14 @@ base table has 19 variables and each weight bank has 31. Source staging, exact
 initial-codeword construction, typed initial trees, and V2 oracle preparation
 now admit both geometries; the typed role join binds each prepared artifact set
 to the corresponding structured alias, model identity, and role. The explicit
-proof adapter still admits at most 16 variables per table, and the
-production-geometry extension transform is not executable through the current
-`2^20`-row reference encoder. No complete 31-variable preparation or proof run
-has been benchmarked. The upstream backend is an unaudited academic prototype.
-Review, benchmarks, fuzzing, a complete soundness report, and independent audits
-remain mandatory before any production selection.
+proof adapter still admits at most 16 variables per table. The separate
+production candidate defines the n=31 configuration and parser grammar but
+fails its unchanged network byte gate, and the production-geometry extension
+transform is not executable through the current `2^20`-row reference encoder.
+No complete 31-variable preparation or proof run has been benchmarked. The
+upstream backend is an unaudited academic prototype. Proof-size redesign,
+review, benchmarks, fuzzing, a complete soundness report, and independent
+audits remain mandatory before any production selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded

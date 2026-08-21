@@ -147,6 +147,10 @@ pub use sumcheck::{
     TOY_SUMCHECK_RAW_CHALLENGE_BITS, prove_toy_matrix_product, reference_matrix_product,
     verify_toy_matrix_product,
 };
+#[cfg(all(feature = "production-whir-candidate", feature = "gpu-proof-prover"))]
+pub use whir_proof::{
+    BoundProductionWhirRoleV1, ProductionWhirBindFailure, bind_prepared_production_whir_role_v1,
+};
 #[cfg(feature = "whir-prototype")]
 pub use whir_proof::{
     EXPLICIT_WHIR_SECURITY_BITS, EXPLICIT_WHIR_VERSION, ExplicitWhirCommitment, ExplicitWhirError,
@@ -157,6 +161,13 @@ pub use whir_proof::{
     StructuredWhirPcsVerifier, VerifiedModelBankWhirError, prove_explicit_whir_openings,
     prove_structured_whir_openings, structured_whir_suite_parameter_digest,
     verify_explicit_whir_openings, verify_structured_whir_openings,
+};
+#[cfg(feature = "production-whir-candidate")]
+pub use whir_proof::{
+    PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES, PRODUCTION_WHIR_BASE_VARIABLES,
+    PRODUCTION_WHIR_CANDIDATE_VERSION, PRODUCTION_WHIR_WEIGHT_VARIABLES,
+    ProductionWhirCandidateError, ProductionWhirConfigV1, ProductionWhirRoleV1,
+    ProductionWhirWireShapeV1, production_whir_suite_parameter_digest_v1,
 };
 #[cfg(feature = "gpu-proof-prover")]
 pub use whir_proof::{

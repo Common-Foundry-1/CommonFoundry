@@ -143,9 +143,9 @@ demand-authenticated format-v2 tree, whose exact `2^29`-row artifact is
 against separately authenticated codeword rows. The legacy format-v1 store
 remains capped at `2^18` rows, while the exact reference extension encoder is
 still capped at `2^20` rows. Its current file-backed DFT would move about
-1.97 TiB at production geometry, so a blocked or GPU transform and the
-31-variable initial weight-bank commitment still stand between this checkpoint
-and a cap increase. The native v2 proof codec is now fixed-width and
+1.97 TiB at production geometry, so a blocked or GPU transform for the
+`2^29`-row extension codeword of an n=31 role still stands between this
+checkpoint and a complete proof run. The native v2 proof codec is now fixed-width and
 configuration-derived, with a canonical first-reference Merkle dictionary and
 no general-purpose compression. Its decoder enforces a tree-level,
 configuration-derived maximum on distinct authentication nodes; the inner
@@ -158,6 +158,17 @@ than the complete production aggregate. The public 16-variable and 1 MiB
 research limits therefore remain unchanged; 15- and 16-variable standalone
 envelopes are deliberately rejected because they cannot fit the network proof
 budget.
+
+The opt-in `production-whir-candidate` feature now derives a separately
+versioned verifier/parser geometry for the exact n=19 base and n=31 weight
+roles without raising those legacy limits. It pins the n=19 native
+dictionary-free floor at 133,298 bytes and the n=31 floor at 268,640 bytes.
+Because the latter already exceeds the complete 262,128-byte proof payload by
+6,512 bytes before any Merkle dictionary or outer aggregate component, n=31
+parsing fails closed before proof decoding or proof-sized allocation.
+Production therefore needs a smaller proof geometry or a different
+aggregation/compression design; increasing the wire cap is not treated as
+completion.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

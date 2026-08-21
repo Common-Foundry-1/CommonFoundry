@@ -10,7 +10,7 @@
 //! [`StructuredPcsVerifier`] or [`StructuredBlake3Verifier`] with a test stub
 //! does not make this a consensus-ready succinct proof.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,13 +20,15 @@ use crate::{
         PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
         PRODUCTION_V2_LAYERS_PER_BANK, work_digest_from_roots,
     },
+    model_bank::ModelPcsIdentity,
     structured_sumcheck::{
         ExtensionElement, ExtensionField, StructuredMatrixProof, StructuredMatrixStatement,
         StructuredSumcheckError, verify_structured_matrix_sumcheck,
     },
     structured_transition::{
-        StructuredMaskPolynomial, StructuredTransitionError, StructuredTransitionProof,
-        StructuredTransitionStatement, verify_structured_transition_sumcheck,
+        STRUCTURED_TRANSITION_INPUT_ORACLE, StructuredMaskPolynomial, StructuredTransitionError,
+        StructuredTransitionProof, StructuredTransitionStatement,
+        verify_structured_transition_sumcheck,
     },
     structured_wiring::{
         MAX_STRUCTURED_WIRING_BANKS, StructuredWiringError, StructuredWiringProof,
@@ -190,17 +192,29 @@ pub struct StructuredPcsOpeningClaim {
     pub evaluation: ExtensionElement,
 }
 
+/// Semantically separated PCS openings for the immutable model and the
+/// challenge-specific execution trace.
+///
+/// Keeping these scopes distinct prevents a trace proof from silently
+/// substituting commitments for the model identity pinned by consensus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredPcsOpeningSet {
+    pub fixed_model: Vec<StructuredPcsOpeningClaim>,
+    pub trace: Vec<StructuredPcsOpeningClaim>,
+}
+
 /// Consensus-owned PCS verifier boundary.
 ///
-/// Implementations must bind `public_binding`, every claim, and `proof` in one
-/// pinned transcript. They must be deterministic, panic-free for untrusted
-/// bytes, and reject noncanonical encodings before this interface is eligible
-/// for consensus use.
+/// Implementations must bind `public_binding`, the trusted model identity,
+/// both opening scopes, and `proof` in one pinned transcript. They must be
+/// deterministic, panic-free for untrusted bytes, and reject noncanonical
+/// encodings before this interface is eligible for consensus use.
 pub trait StructuredPcsVerifier: Send + Sync {
     fn verify_openings(
         &self,
         public_binding: &[u8; 32],
-        claims: &[StructuredPcsOpeningClaim],
+        trusted_model: &ModelPcsIdentity,
+        openings: &StructuredPcsOpeningSet,
         proof: &[u8],
     ) -> bool;
 }
@@ -217,7 +231,7 @@ pub trait StructuredBlake3Verifier: Send + Sync {
 pub fn structured_forgematrix_public_binding(
     challenge_digest: [u8; 32],
     model_byte_root: [u8; 32],
-    model_pcs_root: [u8; 32],
+    model_pcs_identity: &ModelPcsIdentity,
     final_activation_digest: [u8; 32],
     work_digest: [u8; 32],
     work_target: [u8; 32],
@@ -225,11 +239,14 @@ pub fn structured_forgematrix_public_binding(
 ) -> Result<[u8; 32], StructuredProofError> {
     let final_activation_len = u64::try_from(final_activation_len)
         .map_err(|_| StructuredProofError::FinalActivationShape)?;
+    let model_pcs_identity_digest = model_pcs_identity
+        .digest()
+        .map_err(|_| StructuredProofError::InvalidModelPcsIdentity)?;
     let mut hasher = blake3::Hasher::new_derive_key(PUBLIC_BINDING_DOMAIN);
     hasher.update(&STRUCTURED_AGGREGATE_VERSION.to_le_bytes());
     hasher.update(&challenge_digest);
     hasher.update(&model_byte_root);
-    hasher.update(&model_pcs_root);
+    hasher.update(&model_pcs_identity_digest);
     hasher.update(&final_activation_digest);
     hasher.update(&work_digest);
     hasher.update(&work_target);
@@ -265,6 +282,10 @@ pub enum StructuredProofError {
     HighHash,
     #[error("model digest roots are not committed")]
     ModelBinding,
+    #[error("trusted model PCS identity is malformed")]
+    InvalidModelPcsIdentity,
+    #[error("aggregate statement does not exactly match the trusted model PCS identity")]
+    ModelPcsIdentityMismatch,
     #[error("aggregate proof is missing its authenticated PCS opening proof")]
     MissingPcsProof,
     #[error("aggregate proof contains too many PCS opening claims")]
@@ -273,6 +294,8 @@ pub enum StructuredProofError {
     OpeningVariables,
     #[error("the same PCS commitment and point claim conflicting evaluations")]
     ConflictingOpening,
+    #[error("the same PCS commitment appears in fixed-model and trace opening scopes")]
+    OpeningScopeConflict,
     #[error("the selected PCS rejected one or more aggregate opening claims")]
     PcsRejected,
     #[error("aggregate proof exceeds its research byte cap")]
@@ -391,21 +414,28 @@ impl StructuredForgeMatrixProof {
 pub fn verify_structured_forgematrix_proof(
     statement: &StructuredForgeMatrixStatement,
     proof: &StructuredForgeMatrixProof,
+    trusted_model: &ModelPcsIdentity,
     pcs: &dyn StructuredPcsVerifier,
     blake3: &dyn StructuredBlake3Verifier,
 ) -> Result<(), StructuredProofError> {
+    validate_model_pcs_identity(statement, trusted_model)?;
     if proof.pcs_proof.is_empty() {
         return Err(StructuredProofError::MissingPcsProof);
     }
     // Enforce all in-memory resource and canonical-field checks as well as the
     // byte parser does for an untrusted wire proof.
     proof.encode()?;
-    let openings = collect_structured_forgematrix_openings(statement, proof)?;
-    let hash_statement = structured_blake3_statement(statement, proof)?;
+    let openings = collect_structured_forgematrix_openings(statement, proof, trusted_model)?;
+    let hash_statement = structured_blake3_statement(statement, proof, trusted_model)?;
     if !blake3.verify_argument(&hash_statement, &proof.blake3_proof) {
         return Err(StructuredProofError::Blake3Rejected);
     }
-    if !pcs.verify_openings(&statement.public_binding, &openings, &proof.pcs_proof) {
+    if !pcs.verify_openings(
+        &statement.public_binding,
+        trusted_model,
+        &openings,
+        &proof.pcs_proof,
+    ) {
         return Err(StructuredProofError::PcsRejected);
     }
     Ok(())
@@ -419,12 +449,14 @@ pub fn verify_structured_forgematrix_proof(
 pub fn collect_structured_forgematrix_openings(
     statement: &StructuredForgeMatrixStatement,
     proof: &StructuredForgeMatrixProof,
-) -> Result<Vec<StructuredPcsOpeningClaim>, StructuredProofError> {
+    trusted_model: &ModelPcsIdentity,
+) -> Result<StructuredPcsOpeningSet, StructuredProofError> {
+    validate_model_pcs_identity(statement, trusted_model)?;
     validate_component_shapes(statement, proof)?;
     if proof.protocol_version != STRUCTURED_AGGREGATE_VERSION {
         return Err(StructuredProofError::ProtocolVersion);
     }
-    validate_final_output_metadata(statement, proof)?;
+    validate_final_output_metadata(statement, proof, trusted_model)?;
 
     verify_structured_wiring_component_commitments(
         statement.wiring_statement,
@@ -455,8 +487,12 @@ pub fn collect_structured_forgematrix_openings(
         &statement.initialization_mask,
         &proof.initialization_proof,
     )?;
-    let mut openings = Vec::new();
-    append_transition_openings(&mut openings, initialization)?;
+    let mut initialization_openings = transition_openings(initialization)?;
+    if initialization_openings.is_empty() {
+        return Err(StructuredProofError::ComponentCount);
+    }
+    let mut fixed_model = vec![initialization_openings.remove(STRUCTURED_TRANSITION_INPUT_ORACLE)];
+    let mut trace = initialization_openings;
     for ((matrix_statement, transition_statement), (transition_mask, (matrix, transition))) in
         statement
             .matrix_statements
@@ -470,17 +506,17 @@ pub fn collect_structured_forgematrix_openings(
             )
     {
         let matrix_claims = verify_structured_matrix_sumcheck(binding, *matrix_statement, matrix)?;
-        openings.push(StructuredPcsOpeningClaim {
+        trace.push(StructuredPcsOpeningClaim {
             commitment: matrix_claims.activation_commitment,
             point: matrix_claims.activation_point,
             evaluation: matrix_claims.activation_evaluation,
         });
-        openings.push(StructuredPcsOpeningClaim {
+        fixed_model.push(StructuredPcsOpeningClaim {
             commitment: matrix_claims.weight_commitment,
             point: matrix_claims.weight_point,
             evaluation: matrix_claims.weight_evaluation,
         });
-        openings.push(StructuredPcsOpeningClaim {
+        trace.push(StructuredPcsOpeningClaim {
             commitment: matrix_claims.accumulator_commitment,
             point: matrix_claims.accumulator_point,
             evaluation: matrix_claims.accumulator_evaluation,
@@ -491,7 +527,7 @@ pub fn collect_structured_forgematrix_openings(
             transition_mask,
             transition,
         )?;
-        append_transition_openings(&mut openings, transition_claims)?;
+        trace.extend(transition_openings(transition_claims)?);
     }
     let wiring = verify_structured_wiring_openings(
         binding,
@@ -499,7 +535,7 @@ pub fn collect_structured_forgematrix_openings(
         &proof.wiring_proof,
     )?;
     validate_final_output_opening(statement, &wiring.final_output)?;
-    openings.extend(
+    trace.extend(
         wiring
             .openings
             .into_iter()
@@ -510,12 +546,38 @@ pub fn collect_structured_forgematrix_openings(
             }),
     );
 
-    canonical_openings(openings)
+    canonical_opening_set(fixed_model, trace)
+}
+
+fn validate_model_pcs_identity(
+    statement: &StructuredForgeMatrixStatement,
+    trusted_model: &ModelPcsIdentity,
+) -> Result<(), StructuredProofError> {
+    trusted_model
+        .validate()
+        .map_err(|_| StructuredProofError::InvalidModelPcsIdentity)?;
+    let commitment_root = trusted_model
+        .commitment_root()
+        .map_err(|_| StructuredProofError::InvalidModelPcsIdentity)?;
+    let wiring = statement.wiring_statement;
+    if statement.model_byte_root != trusted_model.model_byte_root
+        || statement.model_pcs_root != commitment_root
+        || statement.base_input_commitment != trusted_model.base_input_commitment
+        || statement.weight_commitments != trusted_model.weight_bank_commitments
+        || wiring.banks != trusted_model.weight_bank_commitments.len()
+        || u32::try_from(wiring.rows).ok() != Some(trusted_model.batch)
+        || u32::try_from(wiring.cols).ok() != Some(trusted_model.dimension)
+        || u32::try_from(wiring.layers_per_bank).ok() != Some(trusted_model.layers_per_bank)
+    {
+        return Err(StructuredProofError::ModelPcsIdentityMismatch);
+    }
+    Ok(())
 }
 
 fn validate_final_output_metadata(
     statement: &StructuredForgeMatrixStatement,
     proof: &StructuredForgeMatrixProof,
+    trusted_model: &ModelPcsIdentity,
 ) -> Result<(), StructuredProofError> {
     if proof.blake3_proof.is_empty() {
         return Err(StructuredProofError::MissingBlake3Proof);
@@ -546,7 +608,7 @@ fn validate_final_output_metadata(
     let expected_binding = structured_forgematrix_public_binding(
         statement.challenge_digest,
         statement.model_byte_root,
-        statement.model_pcs_root,
+        trusted_model,
         statement.final_activation_digest,
         statement.work_digest,
         statement.work_target,
@@ -579,8 +641,9 @@ fn validate_final_output_opening(
 fn structured_blake3_statement(
     statement: &StructuredForgeMatrixStatement,
     proof: &StructuredForgeMatrixProof,
+    trusted_model: &ModelPcsIdentity,
 ) -> Result<StructuredBlake3Statement, StructuredProofError> {
-    validate_final_output_metadata(statement, proof)?;
+    validate_final_output_metadata(statement, proof, trusted_model)?;
     let wiring = verify_structured_wiring_openings(
         &statement.public_binding,
         statement.wiring_statement,
@@ -644,25 +707,50 @@ fn validate_component_shapes(
     Ok(())
 }
 
-fn append_transition_openings(
-    output: &mut Vec<StructuredPcsOpeningClaim>,
+fn transition_openings(
     claims: crate::StructuredTransitionOpeningClaims,
-) -> Result<(), StructuredProofError> {
-    if claims.oracle_commitments.len() != claims.evaluations.len() {
+) -> Result<Vec<StructuredPcsOpeningClaim>, StructuredProofError> {
+    if claims.oracle_commitments.is_empty()
+        || claims.oracle_commitments.len() != claims.evaluations.len()
+    {
         return Err(StructuredProofError::ComponentCount);
     }
-    output.extend(
-        claims
-            .oracle_commitments
-            .into_iter()
-            .zip(claims.evaluations)
-            .map(|(commitment, evaluation)| StructuredPcsOpeningClaim {
-                commitment,
-                point: claims.point.clone(),
-                evaluation,
-            }),
-    );
-    Ok(())
+    Ok(claims
+        .oracle_commitments
+        .into_iter()
+        .zip(claims.evaluations)
+        .map(|(commitment, evaluation)| StructuredPcsOpeningClaim {
+            commitment,
+            point: claims.point.clone(),
+            evaluation,
+        })
+        .collect())
+}
+
+fn canonical_opening_set(
+    fixed_model: Vec<StructuredPcsOpeningClaim>,
+    trace: Vec<StructuredPcsOpeningClaim>,
+) -> Result<StructuredPcsOpeningSet, StructuredProofError> {
+    if fixed_model
+        .len()
+        .checked_add(trace.len())
+        .is_none_or(|count| count > MAX_STRUCTURED_OPENING_CLAIMS)
+    {
+        return Err(StructuredProofError::OpeningCount);
+    }
+    let fixed_model = canonical_openings(fixed_model)?;
+    let trace = canonical_openings(trace)?;
+    let fixed_commitments = fixed_model
+        .iter()
+        .map(|claim| claim.commitment)
+        .collect::<BTreeSet<_>>();
+    if trace
+        .iter()
+        .any(|claim| fixed_commitments.contains(&claim.commitment))
+    {
+        return Err(StructuredProofError::OpeningScopeConflict);
+    }
+    Ok(StructuredPcsOpeningSet { fixed_model, trace })
 }
 
 pub(crate) fn canonical_openings(
@@ -671,8 +759,7 @@ pub(crate) fn canonical_openings(
     if openings.len() > MAX_STRUCTURED_OPENING_CLAIMS {
         return Err(StructuredProofError::OpeningCount);
     }
-    let mut seen = BTreeMap::<Vec<u8>, ExtensionElement>::new();
-    let mut unique = Vec::with_capacity(openings.len());
+    let mut unique = BTreeMap::<Vec<u8>, StructuredPcsOpeningClaim>::new();
     for opening in openings {
         if opening.point.len() > MAX_STRUCTURED_OPENING_VARIABLES {
             return Err(StructuredProofError::OpeningVariables);
@@ -685,18 +772,17 @@ pub(crate) fn canonical_openings(
             coordinate.to_field()?;
             coordinate.encode(&mut key);
         }
-        match seen.get(&key) {
-            Some(evaluation) if *evaluation != opening.evaluation => {
+        match unique.get(&key) {
+            Some(existing) if existing.evaluation != opening.evaluation => {
                 return Err(StructuredProofError::ConflictingOpening);
             }
             Some(_) => {}
             None => {
-                seen.insert(key, opening.evaluation);
-                unique.push(opening);
+                unique.insert(key, opening);
             }
         }
     }
-    Ok(unique)
+    Ok(unique.into_values().collect())
 }
 
 fn encode_blobs(output: &mut Vec<u8>, values: &[Vec<u8>]) -> Result<(), StructuredProofError> {
@@ -763,7 +849,11 @@ impl<'a> ProofReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    #[cfg(feature = "whir-prototype")]
+    use crate::whir_proof::{StructuredWhirModelCommitmentSet, StructuredWhirModelMetadata};
     use crate::{
         BlockChallenge, ReductionWitness, StructuredTransitionWitness,
         prove_structured_matrix_product, prove_structured_transition, prove_structured_wiring,
@@ -788,14 +878,62 @@ mod tests {
         accept: bool,
     }
 
+    struct ForwardingPcs {
+        expected_identity: ModelPcsIdentity,
+        called: AtomicBool,
+    }
+
+    struct NeverPcs;
+
     impl StructuredPcsVerifier for TestPcs {
         fn verify_openings(
             &self,
             _public_binding: &[u8; 32],
-            claims: &[StructuredPcsOpeningClaim],
+            trusted_model: &ModelPcsIdentity,
+            openings: &StructuredPcsOpeningSet,
             proof: &[u8],
         ) -> bool {
-            self.accept && !claims.is_empty() && proof == b"authenticated-openings"
+            self.accept
+                && trusted_model.validate().is_ok()
+                && !openings.fixed_model.is_empty()
+                && !openings.trace.is_empty()
+                && proof == b"authenticated-openings"
+        }
+    }
+
+    impl StructuredPcsVerifier for ForwardingPcs {
+        fn verify_openings(
+            &self,
+            _public_binding: &[u8; 32],
+            trusted_model: &ModelPcsIdentity,
+            openings: &StructuredPcsOpeningSet,
+            proof: &[u8],
+        ) -> bool {
+            self.called.store(true, Ordering::SeqCst);
+            let fixed_commitments = openings
+                .fixed_model
+                .iter()
+                .map(|claim| claim.commitment)
+                .collect::<BTreeSet<_>>();
+            let expected_commitments = std::iter::once(trusted_model.base_input_commitment)
+                .chain(trusted_model.weight_bank_commitments.iter().copied())
+                .collect::<BTreeSet<_>>();
+            trusted_model == &self.expected_identity
+                && fixed_commitments == expected_commitments
+                && !openings.trace.is_empty()
+                && proof == b"authenticated-openings"
+        }
+    }
+
+    impl StructuredPcsVerifier for NeverPcs {
+        fn verify_openings(
+            &self,
+            _public_binding: &[u8; 32],
+            _trusted_model: &ModelPcsIdentity,
+            _openings: &StructuredPcsOpeningSet,
+            _proof: &[u8],
+        ) -> bool {
+            panic!("PCS verifier must not run before trusted model validation")
         }
     }
 
@@ -860,8 +998,7 @@ mod tests {
     struct FixtureData {
         challenge_digest: [u8; 32],
         binding: [u8; 32],
-        model_byte_root: [u8; 32],
-        model_pcs_root: [u8; 32],
+        identity: ModelPcsIdentity,
         #[cfg(feature = "whir-prototype")]
         final_activation: Vec<u8>,
         final_activation_digest: [u8; 32],
@@ -872,7 +1009,6 @@ mod tests {
         outputs: Vec<i64>,
         weights: Vec<i64>,
         accumulators: Vec<i64>,
-        base_input: Vec<i64>,
         initialization_witness: StructuredTransitionWitness,
         transition_witness: StructuredTransitionWitness,
         initialization_statement: StructuredTransitionStatement,
@@ -907,17 +1043,6 @@ mod tests {
             .iter()
             .map(|value| u8::try_from(*value + 125).unwrap())
             .collect::<Vec<_>>();
-        let binding = structured_forgematrix_public_binding(
-            trace.challenge_digest,
-            descriptor.model.raw_blake3_root,
-            descriptor.model.pcs_commitment_root,
-            trace.final_activation_digest,
-            trace.work_digest,
-            block.target,
-            final_activation.len(),
-        )
-        .unwrap();
-
         let initial = trace
             .initial_activation
             .iter()
@@ -957,6 +1082,48 @@ mod tests {
             .iter()
             .map(|value| i64::from(*value) - 125)
             .collect::<Vec<_>>();
+        let base_input_commitment = table_commitment(
+            &base_input
+                .iter()
+                .copied()
+                .map(ExtensionField::from_signed)
+                .collect::<Vec<_>>(),
+        );
+        let weight_commitment = table_commitment(
+            &weights
+                .iter()
+                .copied()
+                .map(ExtensionField::from_signed)
+                .collect::<Vec<_>>(),
+        );
+        let identity = ModelPcsIdentity {
+            model_version: descriptor.model.model_version,
+            batch: u32::try_from(rows).unwrap(),
+            dimension: u32::try_from(cols).unwrap(),
+            layers_per_bank: u32::try_from(layers).unwrap(),
+            model_byte_root: descriptor.model.raw_blake3_root,
+            pcs_suite_parameter_digest: descriptor.model.pcs_parameter_digest,
+            base_input_commitment,
+            weight_bank_commitments: vec![weight_commitment],
+        };
+        identity.validate().unwrap();
+        let model_pcs_root = identity.commitment_root().unwrap();
+        let work_digest = work_digest_from_roots(
+            trace.challenge_digest,
+            identity.model_byte_root,
+            model_pcs_root,
+            trace.final_activation_digest,
+        );
+        let binding = structured_forgematrix_public_binding(
+            trace.challenge_digest,
+            identity.model_byte_root,
+            &identity,
+            trace.final_activation_digest,
+            work_digest,
+            block.target,
+            final_activation.len(),
+        )
+        .unwrap();
         let mut initialization_witness = empty_witness();
         for ((base, reduction), activation) in base_input
             .iter()
@@ -1011,19 +1178,17 @@ mod tests {
         FixtureData {
             challenge_digest: trace.challenge_digest,
             binding,
-            model_byte_root: descriptor.model.raw_blake3_root,
-            model_pcs_root: descriptor.model.pcs_commitment_root,
+            identity,
             #[cfg(feature = "whir-prototype")]
             final_activation,
             final_activation_digest: trace.final_activation_digest,
-            work_digest: trace.work_digest,
+            work_digest,
             work_target: block.target,
             initial,
             inputs,
             outputs,
             weights,
             accumulators,
-            base_input,
             initialization_witness,
             transition_witness,
             initialization_statement,
@@ -1035,7 +1200,11 @@ mod tests {
         }
     }
 
-    fn fixture() -> (StructuredForgeMatrixStatement, StructuredForgeMatrixProof) {
+    fn fixture() -> (
+        ModelPcsIdentity,
+        StructuredForgeMatrixStatement,
+        StructuredForgeMatrixProof,
+    ) {
         let data = fixture_data();
         let matrix_proof = prove_structured_matrix_product(
             &data.binding,
@@ -1067,24 +1236,20 @@ mod tests {
             &data.outputs,
         )
         .unwrap();
-        let base_input_commitment = table_commitment(
-            &data
-                .base_input
-                .iter()
-                .copied()
-                .map(ExtensionField::from_signed)
-                .collect::<Vec<_>>(),
+        assert_eq!(
+            matrix_proof.weight_commitment,
+            data.identity.weight_bank_commitments[0]
         );
         let statement = StructuredForgeMatrixStatement {
             challenge_digest: data.challenge_digest,
             public_binding: data.binding,
-            model_byte_root: data.model_byte_root,
-            model_pcs_root: data.model_pcs_root,
+            model_byte_root: data.identity.model_byte_root,
+            model_pcs_root: data.identity.commitment_root().unwrap(),
             final_activation_digest: data.final_activation_digest,
             work_digest: data.work_digest,
             work_target: data.work_target,
-            base_input_commitment,
-            weight_commitments: vec![matrix_proof.weight_commitment],
+            base_input_commitment: data.identity.base_input_commitment,
+            weight_commitments: data.identity.weight_bank_commitments.clone(),
             final_bank_output_commitment: *wiring_proof.output_commitments.last().unwrap(),
             initialization_statement: data.initialization_statement,
             initialization_mask: data.initialization_mask,
@@ -1102,11 +1267,15 @@ mod tests {
             blake3_proof: b"authenticated-blake3".to_vec(),
             pcs_proof: b"authenticated-openings".to_vec(),
         };
-        (statement, proof)
+        (data.identity, statement, proof)
     }
 
     #[cfg(feature = "whir-prototype")]
-    fn whir_fixture() -> (StructuredForgeMatrixStatement, StructuredForgeMatrixProof) {
+    fn whir_fixture() -> (
+        ModelPcsIdentity,
+        StructuredForgeMatrixStatement,
+        StructuredForgeMatrixProof,
+    ) {
         let data = fixture_data();
         let matrix_tables = structured_matrix_whir_tables(
             data.matrix_statement,
@@ -1130,29 +1299,65 @@ mod tests {
             &data.outputs,
         )
         .unwrap();
-        let commitment_set = StructuredWhirCommitmentSet::new(
+        let model_commitments = StructuredWhirModelCommitmentSet::new(
+            StructuredWhirModelMetadata {
+                model_version: data.identity.model_version,
+                batch: data.identity.batch,
+                dimension: data.identity.dimension,
+                layers_per_bank: data.identity.layers_per_bank,
+                model_byte_root: data.identity.model_byte_root,
+            },
+            initialization_tables[0].clone(),
+            vec![matrix_tables[1].clone()],
+        )
+        .unwrap();
+        let identity = model_commitments.identity().clone();
+        let trace_commitments = StructuredWhirCommitmentSet::new(
             matrix_tables
                 .iter()
-                .chain(&initialization_tables)
-                .chain(&transition_tables)
-                .chain(&wiring_tables)
-                .cloned()
+                .enumerate()
+                .filter(|(index, _)| *index != 1)
+                .map(|(_, table)| table.clone())
+                .chain(initialization_tables.iter().skip(1).cloned())
+                .chain(transition_tables.iter().cloned())
+                .chain(wiring_tables.iter().cloned())
                 .collect(),
         )
         .unwrap();
-        let aliases = |tables: &[Vec<u64>]| {
+        let trace_aliases = |tables: &[Vec<u64>]| {
             tables
                 .iter()
-                .map(|table| commitment_set.commitment_for(table).unwrap())
+                .map(|table| trace_commitments.commitment_for(table).unwrap())
                 .collect::<Vec<_>>()
         };
-        let matrix_aliases: [[u8; 32]; 3] = aliases(&matrix_tables).try_into().unwrap();
-        let initialization_aliases = aliases(&initialization_tables);
-        let transition_aliases = aliases(&transition_tables);
-        let wiring_aliases = aliases(&wiring_tables);
+        let matrix_aliases = [
+            trace_commitments.commitment_for(&matrix_tables[0]).unwrap(),
+            identity.weight_bank_commitments[0],
+            trace_commitments.commitment_for(&matrix_tables[2]).unwrap(),
+        ];
+        let mut initialization_aliases = vec![identity.base_input_commitment];
+        initialization_aliases.extend(trace_aliases(&initialization_tables[1..]));
+        let transition_aliases = trace_aliases(&transition_tables);
+        let wiring_aliases = trace_aliases(&wiring_tables);
+        let work_digest = work_digest_from_roots(
+            data.challenge_digest,
+            identity.model_byte_root,
+            identity.commitment_root().unwrap(),
+            data.final_activation_digest,
+        );
+        let binding = structured_forgematrix_public_binding(
+            data.challenge_digest,
+            identity.model_byte_root,
+            &identity,
+            data.final_activation_digest,
+            work_digest,
+            data.work_target,
+            data.final_activation.len(),
+        )
+        .unwrap();
 
         let matrix_proof = prove_structured_matrix_product_with_commitments(
-            &data.binding,
+            &binding,
             data.matrix_statement,
             &data.inputs,
             &data.weights,
@@ -1161,7 +1366,7 @@ mod tests {
         )
         .unwrap();
         let initialization_proof = prove_structured_transition_with_commitments(
-            &data.binding,
+            &binding,
             data.initialization_statement,
             &data.initialization_mask,
             &data.initialization_witness,
@@ -1169,7 +1374,7 @@ mod tests {
         )
         .unwrap();
         let transition_proof = prove_structured_transition_with_commitments(
-            &data.binding,
+            &binding,
             data.transition_statement,
             &data.transition_mask,
             &data.transition_witness,
@@ -1177,7 +1382,7 @@ mod tests {
         )
         .unwrap();
         let wiring_proof = prove_structured_wiring_with_commitments(
-            &data.binding,
+            &binding,
             data.wiring_statement,
             &data.initial,
             &data.inputs,
@@ -1189,14 +1394,14 @@ mod tests {
         .unwrap();
         let statement = StructuredForgeMatrixStatement {
             challenge_digest: data.challenge_digest,
-            public_binding: data.binding,
-            model_byte_root: data.model_byte_root,
-            model_pcs_root: data.model_pcs_root,
+            public_binding: binding,
+            model_byte_root: identity.model_byte_root,
+            model_pcs_root: identity.commitment_root().unwrap(),
             final_activation_digest: data.final_activation_digest,
-            work_digest: data.work_digest,
+            work_digest,
             work_target: data.work_target,
-            base_input_commitment: initialization_aliases[0],
-            weight_commitments: vec![matrix_aliases[1]],
+            base_input_commitment: identity.base_input_commitment,
+            weight_commitments: identity.weight_bank_commitments.clone(),
             final_bank_output_commitment: wiring_aliases[2],
             initialization_statement: data.initialization_statement,
             initialization_mask: data.initialization_mask,
@@ -1214,13 +1419,20 @@ mod tests {
             blake3_proof: b"provisional".to_vec(),
             pcs_proof: Vec::new(),
         };
-        let openings = collect_structured_forgematrix_openings(&statement, &proof).unwrap();
-        proof.pcs_proof =
-            prove_structured_whir_openings(&data.binding, &commitment_set, &openings).unwrap();
-        let hash_statement = structured_blake3_statement(&statement, &proof).unwrap();
+        let openings =
+            collect_structured_forgematrix_openings(&statement, &proof, &identity).unwrap();
+        proof.pcs_proof = prove_structured_whir_openings(
+            &binding,
+            &identity,
+            &model_commitments,
+            &trace_commitments,
+            &openings,
+        )
+        .unwrap();
+        let hash_statement = structured_blake3_statement(&statement, &proof, &identity).unwrap();
         proof.blake3_proof =
             crate::prove_structured_blake3(&hash_statement, &data.final_activation).unwrap();
-        (statement, proof)
+        (identity, statement, proof)
     }
 
     fn canonical_matrix_envelope(statement: StructuredMatrixStatement) -> StructuredMatrixProof {
@@ -1420,13 +1632,14 @@ mod tests {
 
     #[test]
     fn aggregate_requires_every_component_and_authenticated_openings() {
-        let (statement, proof) = fixture();
+        let (identity, statement, proof) = fixture();
         let encoded = proof.encode().unwrap();
         let decoded = StructuredForgeMatrixProof::decode(&encoded).unwrap();
         assert_eq!(decoded, proof);
         verify_structured_forgematrix_proof(
             &statement,
             &decoded,
+            &identity,
             &TestPcs { accept: true },
             &TestBlake3 { accept: true },
         )
@@ -1435,6 +1648,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &statement,
                 &proof,
+                &identity,
                 &TestPcs { accept: false },
                 &TestBlake3 { accept: true },
             ),
@@ -1447,6 +1661,20 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &wrong_weight,
                 &proof,
+                &identity,
+                &TestPcs { accept: true },
+                &TestBlake3 { accept: true },
+            ),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+
+        let mut wrong_weight_proof = proof.clone();
+        wrong_weight_proof.matrix_proofs[0].weight_commitment[0] ^= 1;
+        assert_eq!(
+            verify_structured_forgematrix_proof(
+                &statement,
+                &wrong_weight_proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
@@ -1459,6 +1687,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &statement,
                 &wrong_accumulator,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
@@ -1473,6 +1702,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &wrong_final_output,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
@@ -1485,6 +1715,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &wrong_binding,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             )
@@ -1493,8 +1724,169 @@ mod tests {
     }
 
     #[test]
+    fn trusted_model_identity_is_checked_and_forwarded_before_algebra() {
+        let (identity, statement, proof) = fixture();
+        let forwarding = ForwardingPcs {
+            expected_identity: identity.clone(),
+            called: AtomicBool::new(false),
+        };
+        verify_structured_forgematrix_proof(
+            &statement,
+            &proof,
+            &identity,
+            &forwarding,
+            &TestBlake3 { accept: true },
+        )
+        .unwrap();
+        assert!(forwarding.called.load(Ordering::SeqCst));
+
+        let mut malformed = identity.clone();
+        malformed.pcs_suite_parameter_digest = [0; 32];
+        assert_eq!(
+            verify_structured_forgematrix_proof(
+                &statement,
+                &proof,
+                &malformed,
+                &NeverPcs,
+                &TestBlake3 { accept: true },
+            ),
+            Err(StructuredProofError::InvalidModelPcsIdentity)
+        );
+
+        let mut wrong_model_root = identity.clone();
+        wrong_model_root.model_byte_root[0] ^= 1;
+        assert_eq!(
+            validate_model_pcs_identity(&statement, &wrong_model_root),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+        let mut wrong_base = identity.clone();
+        wrong_base.base_input_commitment[0] ^= 1;
+        assert_eq!(
+            validate_model_pcs_identity(&statement, &wrong_base),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+        let mut wrong_weight = identity.clone();
+        wrong_weight.weight_bank_commitments[0][0] ^= 1;
+        assert_eq!(
+            validate_model_pcs_identity(&statement, &wrong_weight),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+
+        let mut wrong_batch = identity.clone();
+        wrong_batch.batch *= 2;
+        assert_eq!(
+            validate_model_pcs_identity(&statement, &wrong_batch),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+        let mut wrong_dimension = identity.clone();
+        wrong_dimension.dimension *= 2;
+        assert_eq!(
+            validate_model_pcs_identity(&statement, &wrong_dimension),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+        let mut wrong_layers = identity.clone();
+        wrong_layers.layers_per_bank *= 2;
+        assert_eq!(
+            validate_model_pcs_identity(&statement, &wrong_layers),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+        let mut wrong_bank_count = identity.clone();
+        wrong_bank_count.weight_bank_commitments.push([0x5a; 32]);
+        assert_eq!(
+            validate_model_pcs_identity(&statement, &wrong_bank_count),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+
+        let mut two_bank_identity = identity.clone();
+        two_bank_identity.weight_bank_commitments.push([0x5a; 32]);
+        let mut two_bank_statement = statement.clone();
+        two_bank_statement.wiring_statement.banks = 2;
+        two_bank_statement.weight_commitments = two_bank_identity.weight_bank_commitments.clone();
+        two_bank_statement.model_pcs_root = two_bank_identity.commitment_root().unwrap();
+        validate_model_pcs_identity(&two_bank_statement, &two_bank_identity).unwrap();
+        two_bank_identity.weight_bank_commitments.swap(0, 1);
+        assert_eq!(
+            validate_model_pcs_identity(&two_bank_statement, &two_bank_identity),
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
+        );
+
+        // The commitment root intentionally covers only ordered PCS
+        // commitments. Suite and shape are instead frozen by the full identity
+        // digest in the public transcript binding.
+        let mut wrong_suite = identity.clone();
+        wrong_suite.pcs_suite_parameter_digest[0] ^= 1;
+        assert_eq!(
+            wrong_suite.commitment_root().unwrap(),
+            identity.commitment_root().unwrap()
+        );
+        assert_eq!(
+            verify_structured_forgematrix_proof(
+                &statement,
+                &proof,
+                &wrong_suite,
+                &NeverPcs,
+                &TestBlake3 { accept: true },
+            ),
+            Err(StructuredProofError::PublicBinding)
+        );
+    }
+
+    #[test]
+    fn opening_scopes_are_semantic_disjoint_and_share_one_cap() {
+        let (identity, statement, proof) = fixture();
+        let openings =
+            collect_structured_forgematrix_openings(&statement, &proof, &identity).unwrap();
+        let mut expected_fixed_commitments = std::iter::once(identity.base_input_commitment)
+            .chain(identity.weight_bank_commitments.iter().copied())
+            .collect::<Vec<_>>();
+        expected_fixed_commitments.sort();
+        assert_eq!(
+            openings
+                .fixed_model
+                .iter()
+                .map(|claim| claim.commitment)
+                .collect::<Vec<_>>(),
+            expected_fixed_commitments
+        );
+        let fixed_commitments = openings
+            .fixed_model
+            .iter()
+            .map(|claim| claim.commitment)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            openings
+                .trace
+                .iter()
+                .all(|claim| !fixed_commitments.contains(&claim.commitment))
+        );
+
+        let fixed = StructuredPcsOpeningClaim {
+            commitment: [7; 32],
+            point: vec![ExtensionElement { limbs: [1, 0, 0] }],
+            evaluation: ExtensionElement { limbs: [2, 0, 0] },
+        };
+        let mut trace = fixed.clone();
+        trace.point[0].limbs[0] = 3;
+        assert_eq!(
+            canonical_opening_set(vec![fixed.clone()], vec![trace]),
+            Err(StructuredProofError::OpeningScopeConflict)
+        );
+        assert_eq!(
+            canonical_opening_set(
+                vec![fixed; MAX_STRUCTURED_OPENING_CLAIMS],
+                vec![StructuredPcsOpeningClaim {
+                    commitment: [8; 32],
+                    point: vec![],
+                    evaluation: ExtensionElement { limbs: [0; 3] },
+                }],
+            ),
+            Err(StructuredProofError::OpeningCount)
+        );
+    }
+
+    #[test]
     fn blake3_argument_and_work_digest_are_bound_fail_closed() {
-        let (statement, proof) = fixture();
+        let (identity, statement, proof) = fixture();
 
         let mut missing_argument = proof.clone();
         missing_argument.blake3_proof.clear();
@@ -1502,6 +1894,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &statement,
                 &missing_argument,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
@@ -1512,6 +1905,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &statement,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: false },
             ),
@@ -1524,6 +1918,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &wrong_digest,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
@@ -1536,6 +1931,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &wrong_work,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
@@ -1548,6 +1944,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &impossible_target,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
@@ -1560,10 +1957,11 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &missing_model,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             ),
-            Err(StructuredProofError::ModelBinding)
+            Err(StructuredProofError::ModelPcsIdentityMismatch)
         );
 
         let mut different_challenge = statement.clone();
@@ -1577,7 +1975,7 @@ mod tests {
         different_challenge.public_binding = structured_forgematrix_public_binding(
             different_challenge.challenge_digest,
             different_challenge.model_byte_root,
-            different_challenge.model_pcs_root,
+            &identity,
             different_challenge.final_activation_digest,
             different_challenge.work_digest,
             different_challenge.work_target,
@@ -1588,6 +1986,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &different_challenge,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             )
@@ -1601,7 +2000,7 @@ mod tests {
         different_valid_target.public_binding = structured_forgematrix_public_binding(
             different_valid_target.challenge_digest,
             different_valid_target.model_byte_root,
-            different_valid_target.model_pcs_root,
+            &identity,
             different_valid_target.final_activation_digest,
             different_valid_target.work_digest,
             different_valid_target.work_target,
@@ -1613,6 +2012,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &different_valid_target,
                 &proof,
+                &identity,
                 &TestPcs { accept: true },
                 &TestBlake3 { accept: true },
             )
@@ -1623,14 +2023,14 @@ mod tests {
 
     #[test]
     fn blake3_statement_uses_the_committed_last_layer_opening() {
-        let (statement, proof) = fixture();
+        let (identity, statement, proof) = fixture();
         let wiring = verify_structured_wiring_openings(
             &statement.public_binding,
             statement.wiring_statement,
             &proof.wiring_proof,
         )
         .unwrap();
-        let hash_statement = structured_blake3_statement(&statement, &proof).unwrap();
+        let hash_statement = structured_blake3_statement(&statement, &proof, &identity).unwrap();
         let cell_variables = statement.wiring_statement.cols.ilog2() as usize
             + statement.wiring_statement.rows.ilog2() as usize;
         assert_eq!(
@@ -1649,7 +2049,7 @@ mod tests {
 
     #[test]
     fn aggregate_parser_is_bounded_and_exact() {
-        let (_, proof) = fixture();
+        let (_, _, proof) = fixture();
         let canonical = proof.encode().unwrap();
         for length in [0, 1, 8, 12, canonical.len() - 1] {
             assert!(StructuredForgeMatrixProof::decode(&canonical[..length]).is_err());
@@ -1692,29 +2092,37 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     #[test]
     fn aggregate_whir_openings_round_trip_and_fail_closed() {
-        let (statement, proof) = whir_fixture();
+        let (identity, statement, proof) = whir_fixture();
         let encoded = proof.encode().unwrap();
-        assert_eq!(encoded.len(), 3_435_855);
+        assert_eq!(encoded.len(), 3_443_549);
         assert!(proof.blake3_proof.len() < MAX_STRUCTURED_BLAKE3_PROOF_BYTES);
         let decoded = StructuredForgeMatrixProof::decode(&encoded).unwrap();
-        let openings = collect_structured_forgematrix_openings(&statement, &decoded).unwrap();
-        verify_structured_whir_openings(&statement.public_binding, &openings, &decoded.pcs_proof)
-            .unwrap();
+        let openings =
+            collect_structured_forgematrix_openings(&statement, &decoded, &identity).unwrap();
+        verify_structured_whir_openings(
+            &statement.public_binding,
+            &identity,
+            &openings,
+            &decoded.pcs_proof,
+        )
+        .unwrap();
         let blake3 = crate::StructuredBlake3StarkVerifier;
         verify_structured_forgematrix_proof(
             &statement,
             &decoded,
+            &identity,
             &StructuredWhirPcsVerifier,
             &blake3,
         )
         .unwrap();
 
-        let mut wrong_root = proof.clone();
-        wrong_root.pcs_proof[12] ^= 1;
+        let mut wrong_fixed_count = proof.clone();
+        wrong_fixed_count.pcs_proof[12] ^= 1;
         assert_eq!(
             verify_structured_forgematrix_proof(
                 &statement,
-                &wrong_root,
+                &wrong_fixed_count,
+                &identity,
                 &StructuredWhirPcsVerifier,
                 &blake3,
             ),
@@ -1727,6 +2135,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &statement,
                 &wrong_opening,
+                &identity,
                 &StructuredWhirPcsVerifier,
                 &blake3,
             )
@@ -1739,6 +2148,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &statement,
                 &truncated,
+                &identity,
                 &StructuredWhirPcsVerifier,
                 &blake3,
             ),
@@ -1751,6 +2161,7 @@ mod tests {
             verify_structured_forgematrix_proof(
                 &statement,
                 &corrupted_hash,
+                &identity,
                 &StructuredWhirPcsVerifier,
                 &blake3,
             ),
@@ -1765,6 +2176,15 @@ mod tests {
             point: vec![ExtensionElement { limbs: [1, 0, 0] }],
             evaluation: ExtensionElement { limbs: [2, 0, 0] },
         };
+        let second = StructuredPcsOpeningClaim {
+            commitment: [6; 32],
+            point: vec![ExtensionElement { limbs: [3, 0, 0] }],
+            evaluation: ExtensionElement { limbs: [4, 0, 0] },
+        };
+        assert_eq!(
+            canonical_openings(vec![first.clone(), second.clone()]).unwrap(),
+            canonical_openings(vec![second, first.clone()]).unwrap()
+        );
         assert_eq!(
             canonical_openings(vec![first.clone(), first.clone()])
                 .unwrap()

@@ -6,7 +6,7 @@
 //! block validation and does not activate the production ForgeMatrix profile.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
     panic::{AssertUnwindSafe, catch_unwind},
 };
@@ -42,10 +42,13 @@ use p3_whir::pcs::verifier::WhirVerifier;
 use thiserror::Error;
 
 use crate::{
-    ExtensionElement, GOLDILOCKS_MODULUS, StructuredPcsOpeningClaim, StructuredPcsVerifier,
+    ExtensionElement, GOLDILOCKS_MODULUS, StructuredPcsOpeningClaim, StructuredPcsOpeningSet,
+    StructuredPcsVerifier,
+    model_bank::{MAX_MODEL_PCS_WEIGHT_BANKS, ModelPcsIdentity},
 };
 
 pub const EXPLICIT_WHIR_VERSION: u32 = 1;
+pub const STRUCTURED_WHIR_SPLIT_VERSION: u32 = 2;
 pub const EXPLICIT_WHIR_SECURITY_BITS: usize = 128;
 pub const MAX_EXPLICIT_WHIR_VARIABLES: usize = 16;
 pub const MAX_EXPLICIT_WHIR_OPENINGS: usize = 64;
@@ -57,7 +60,17 @@ const MAX_STRUCTURED_WHIR_STACKED_VARIABLES: usize = 20;
 
 const EXPLICIT_WHIR_MAGIC: &[u8; 8] = b"CMFDWHR1";
 const STRUCTURED_WHIR_MAGIC: &[u8; 8] = b"CMFDWAG1";
+const STRUCTURED_WHIR_SPLIT_MAGIC: &[u8; 8] = b"CMFDWSP2";
 const STRUCTURED_WHIR_ALIAS_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-ORACLE/V1";
+const STRUCTURED_WHIR_SUITE_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SUITE/V1";
+const STRUCTURED_WHIR_SPLIT_DOMAIN: &str = "CMFD/FORGEMATRIX/WHIR-SPLIT/V2";
+const EXPLICIT_WHIR_TRANSCRIPT_DOMAIN: &[u8] = b"CMFD/FORGEMATRIX/EXPLICIT-WHIR/V1";
+const STRUCTURED_WHIR_ALIAS_LAYOUT_LABEL: &[u8] = b"layout";
+const STRUCTURED_WHIR_ALIAS_ORACLE_LABEL: &[u8] = b"oracle";
+const STRUCTURED_WHIR_SPLIT_COMMON_LABEL: &[u8] = b"common";
+const STRUCTURED_WHIR_SPLIT_CHILD_LABEL: &[u8] = b"child";
+const STRUCTURED_WHIR_FIXED_MODEL_SCOPE: &[u8] = b"fixed-model";
+const STRUCTURED_WHIR_EXECUTION_TRACE_SCOPE: &[u8] = b"execution-trace";
 const MAX_STRUCTURED_WHIR_NATIVE_JSON_BYTES: usize = 4 * 1024 * 1024;
 const EXPLICIT_WHIR_MIN_VARIABLES: usize = 2;
 const EXPLICIT_WHIR_FOLDING: usize = 2;
@@ -103,11 +116,36 @@ pub struct StructuredWhirCommitmentSet {
     aliases: Vec<[u8; 32]>,
 }
 
+/// Model metadata needed to derive the stable PCS identity for one artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredWhirModelMetadata {
+    pub model_version: u32,
+    pub batch: u32,
+    pub dimension: u32,
+    pub layers_per_bank: u32,
+    pub model_byte_root: [u8; 32],
+}
+
+/// Four independently committed model roles: base input followed by ordered
+/// weight banks. Unlike the execution trace commitment, these sets are stable
+/// across blocks and are intended to be pinned at model activation.
+#[derive(Debug, Clone)]
+pub struct StructuredWhirModelCommitmentSet {
+    sections: Vec<StructuredWhirCommitmentSet>,
+    identity: ModelPcsIdentity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StructuredWhirAggregateProof {
     root: [u8; 32],
     table_variables: Vec<u32>,
     proof_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuredWhirSplitProof {
+    fixed_model: Vec<StructuredWhirAggregateProof>,
+    trace: StructuredWhirAggregateProof,
 }
 
 impl ExplicitWhirProof {
@@ -238,6 +276,336 @@ impl StructuredWhirCommitmentSet {
     }
 }
 
+impl StructuredWhirModelCommitmentSet {
+    pub fn new(
+        metadata: StructuredWhirModelMetadata,
+        base_input: Vec<u64>,
+        weight_banks: Vec<Vec<u64>>,
+    ) -> Result<Self, ExplicitWhirError> {
+        if weight_banks.is_empty() || weight_banks.len() > MAX_MODEL_PCS_WEIGHT_BANKS {
+            return Err(ExplicitWhirError::ModelIdentity);
+        }
+        let expected_base = usize::try_from(metadata.batch)
+            .ok()
+            .and_then(|batch| {
+                usize::try_from(metadata.dimension)
+                    .ok()
+                    .and_then(|dimension| batch.checked_mul(dimension))
+            })
+            .ok_or(ExplicitWhirError::ModelIdentity)?;
+        let expected_weight = usize::try_from(metadata.layers_per_bank)
+            .ok()
+            .and_then(|layers| {
+                usize::try_from(metadata.dimension)
+                    .ok()
+                    .and_then(|dimension| {
+                        layers
+                            .checked_mul(dimension)
+                            .and_then(|elements| elements.checked_mul(dimension))
+                    })
+            })
+            .ok_or(ExplicitWhirError::ModelIdentity)?;
+        if base_input.len() != expected_base
+            || weight_banks
+                .iter()
+                .any(|bank| bank.len() != expected_weight)
+        {
+            return Err(ExplicitWhirError::ModelIdentity);
+        }
+        let mut sections = Vec::with_capacity(1 + weight_banks.len());
+        sections.push(StructuredWhirCommitmentSet::new(vec![base_input])?);
+        for bank in weight_banks {
+            sections.push(StructuredWhirCommitmentSet::new(vec![bank])?);
+        }
+        let identity = ModelPcsIdentity {
+            model_version: metadata.model_version,
+            batch: metadata.batch,
+            dimension: metadata.dimension,
+            layers_per_bank: metadata.layers_per_bank,
+            model_byte_root: metadata.model_byte_root,
+            pcs_suite_parameter_digest: structured_whir_suite_parameter_digest(),
+            base_input_commitment: sections[0].aliases[0],
+            weight_bank_commitments: sections[1..]
+                .iter()
+                .map(|section| section.aliases[0])
+                .collect(),
+        };
+        identity
+            .validate()
+            .map_err(|_| ExplicitWhirError::ModelIdentity)?;
+        Ok(Self { sections, identity })
+    }
+
+    pub const fn identity(&self) -> &ModelPcsIdentity {
+        &self.identity
+    }
+}
+
+/// Digest of every cryptographic and canonical-encoding choice made by the
+/// current research WHIR adapter. A production suite must replace this
+/// prototype identifier only through an explicit protocol version change.
+pub fn structured_whir_suite_parameter_digest() -> [u8; 32] {
+    let mut hasher = Blake3Hasher::new_derive_key(STRUCTURED_WHIR_SUITE_DOMAIN);
+    update_suite_descriptor(
+        &mut hasher,
+        b"descriptor-format",
+        b"ordered-label-u64le-length-value-u64le-length-v1",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"suite-domain",
+        STRUCTURED_WHIR_SUITE_DOMAIN.as_bytes(),
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"alias-domain",
+        STRUCTURED_WHIR_ALIAS_DOMAIN.as_bytes(),
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"split-domain",
+        STRUCTURED_WHIR_SPLIT_DOMAIN.as_bytes(),
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"explicit-transcript-domain",
+        EXPLICIT_WHIR_TRANSCRIPT_DOMAIN,
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"alias-layout-label",
+        STRUCTURED_WHIR_ALIAS_LAYOUT_LABEL,
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"alias-oracle-label",
+        STRUCTURED_WHIR_ALIAS_ORACLE_LABEL,
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"split-common-label",
+        STRUCTURED_WHIR_SPLIT_COMMON_LABEL,
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"split-child-label",
+        STRUCTURED_WHIR_SPLIT_CHILD_LABEL,
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"fixed-model-scope",
+        STRUCTURED_WHIR_FIXED_MODEL_SCOPE,
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"execution-trace-scope",
+        STRUCTURED_WHIR_EXECUTION_TRACE_SCOPE,
+    );
+    update_suite_descriptor(&mut hasher, b"explicit-magic", EXPLICIT_WHIR_MAGIC);
+    update_suite_descriptor(&mut hasher, b"aggregate-magic", STRUCTURED_WHIR_MAGIC);
+    update_suite_descriptor(&mut hasher, b"split-magic", STRUCTURED_WHIR_SPLIT_MAGIC);
+    update_suite_u64(
+        &mut hasher,
+        b"explicit-version",
+        EXPLICIT_WHIR_VERSION as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"split-version",
+        STRUCTURED_WHIR_SPLIT_VERSION as u64,
+    );
+    update_suite_descriptor(&mut hasher, b"p3-suite", b"0.6.3");
+    update_suite_descriptor(
+        &mut hasher,
+        b"p3-util-source",
+        b"0.6.3+cmfd-rust-1.88-assume-init-ref-backport-v1",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"p3-merkle-tree-source",
+        b"0.6.3+cmfd-checked-prover-first-digest-layer-hook-v1",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"p3-fri-source",
+        b"0.6.3+cmfd-generic-prover-data-matrix-v1",
+    );
+    update_suite_descriptor(&mut hasher, b"blake3-crate", b"1.8.6");
+    update_suite_descriptor(&mut hasher, b"flate2-crate", b"1.1.9");
+    update_suite_descriptor(&mut hasher, b"crc32fast-crate", b"1.5.0");
+    update_suite_descriptor(&mut hasher, b"cfg-if-crate", b"1.0.4");
+    update_suite_descriptor(&mut hasher, b"miniz-oxide-crate", b"0.8.9");
+    update_suite_descriptor(&mut hasher, b"adler2-crate", b"2.0.1");
+    update_suite_descriptor(&mut hasher, b"simd-adler32-crate", b"0.3.10");
+    update_suite_descriptor(&mut hasher, b"serde-crate", b"1.0.229");
+    update_suite_descriptor(&mut hasher, b"serde-json-crate", b"1.0.151");
+    update_suite_descriptor(&mut hasher, b"base-field", b"goldilocks");
+    update_suite_u64(&mut hasher, b"base-field-modulus", GOLDILOCKS_MODULUS);
+    update_suite_descriptor(&mut hasher, b"extension-field", b"cubic:u^3=u+1");
+    update_suite_descriptor(&mut hasher, b"variable-order", b"suffix");
+    update_suite_descriptor(
+        &mut hasher,
+        b"structured-point-order",
+        b"reverse-fastest-first",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"field-element-encoding",
+        b"canonical-u64-coefficients-extension-basis-1-u-u2",
+    );
+    update_suite_descriptor(&mut hasher, b"dft", b"radix2-small-batch");
+    update_suite_descriptor(
+        &mut hasher,
+        b"challenger",
+        b"serializing64-hash-challenger-blake3-32",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"mmcs",
+        b"merkle-tree-field-u8-serializing-blake3-binary-digest32-min-height0-cap1",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"table-canonicalization",
+        b"lexicographic-u64-sort-dedup",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"stack-layout",
+        b"descending-variable-count-reverse-stable-index-ties-zero-pad-power-of-two",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"alias-encoding",
+        b"root32-layout-count-u32le-vars-u32le-oracle-index-u32le",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"fixed-role-layout",
+        b"base-input-then-ordered-weight-banks-one-table-per-role",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"split-common-transcript",
+        b"label-version-u32le-public32-identity32-fixed-count-u32le-indexed-roots-trace-root",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"split-child-transcript",
+        b"label-common32-scope-length-u32le-scope-index-u32le",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"pcs-transcript-initial-state",
+        b"domain-binding-length-u64le-binding-pcs-domain-separator32",
+    );
+    update_suite_descriptor(&mut hasher, b"security-assumption", b"unique-decoding");
+    update_suite_u64(
+        &mut hasher,
+        b"security-bits",
+        EXPLICIT_WHIR_SECURITY_BITS as u64,
+    );
+    update_suite_u64(&mut hasher, b"folding-factor", EXPLICIT_WHIR_FOLDING as u64);
+    update_suite_u64(
+        &mut hasher,
+        b"starting-log-inverse-rate",
+        EXPLICIT_WHIR_STARTING_LOG_INV_RATE as u64,
+    );
+    update_suite_u64(&mut hasher, b"pow-bits", EXPLICIT_WHIR_POW_BITS as u64);
+    update_suite_descriptor(
+        &mut hasher,
+        b"native-proof-codec",
+        b"serde-json-exact-reencode-zlib-rfc1950-best-level9-exact-stream-exhaustion",
+    );
+    update_suite_descriptor(
+        &mut hasher,
+        b"split-envelope-codec",
+        b"little-endian-u32-count-and-length-exact-exhaustion",
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"minimum-variables",
+        EXPLICIT_WHIR_MIN_VARIABLES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-explicit-variables",
+        MAX_EXPLICIT_WHIR_VARIABLES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-stacked-variables",
+        MAX_STRUCTURED_WHIR_STACKED_VARIABLES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-explicit-openings",
+        MAX_EXPLICIT_WHIR_OPENINGS as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-structured-openings",
+        crate::MAX_STRUCTURED_OPENING_CLAIMS as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-opening-variables",
+        crate::MAX_STRUCTURED_OPENING_VARIABLES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-structured-tables",
+        MAX_STRUCTURED_WHIR_TABLES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-structured-elements",
+        MAX_STRUCTURED_WHIR_ELEMENTS as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-native-json-bytes",
+        MAX_STRUCTURED_WHIR_NATIVE_JSON_BYTES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-explicit-proof-bytes",
+        MAX_EXPLICIT_WHIR_PROOF_BYTES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-pcs-proof-bytes",
+        crate::MAX_STRUCTURED_PCS_PROOF_BYTES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-binding-bytes",
+        MAX_EXPLICIT_WHIR_BINDING_BYTES as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"maximum-fixed-weight-banks",
+        MAX_MODEL_PCS_WEIGHT_BANKS as u64,
+    );
+    update_suite_u64(
+        &mut hasher,
+        b"explicit-header-bytes",
+        EXPLICIT_WHIR_HEADER_BYTES as u64,
+    );
+    *hasher.finalize().as_bytes()
+}
+
+fn update_suite_descriptor(hasher: &mut Blake3Hasher, label: &[u8], value: &[u8]) {
+    hasher.update(&(label.len() as u64).to_le_bytes());
+    hasher.update(label);
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn update_suite_u64(hasher: &mut Blake3Hasher, label: &[u8], value: u64) {
+    update_suite_descriptor(hasher, label, &value.to_le_bytes());
+}
+
 impl StructuredWhirAggregateProof {
     fn encode(&self) -> Result<Vec<u8>, ExplicitWhirError> {
         if self.table_variables.is_empty()
@@ -322,6 +690,58 @@ impl StructuredWhirAggregateProof {
     }
 }
 
+impl StructuredWhirSplitProof {
+    fn encode(&self) -> Result<Vec<u8>, ExplicitWhirError> {
+        if self.fixed_model.is_empty() || self.fixed_model.len() > 1 + MAX_MODEL_PCS_WEIGHT_BANKS {
+            return Err(ExplicitWhirError::ModelIdentity);
+        }
+        let fixed = self
+            .fixed_model
+            .iter()
+            .map(StructuredWhirAggregateProof::encode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let trace = self.trace.encode()?;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(STRUCTURED_WHIR_SPLIT_MAGIC);
+        encoded.extend_from_slice(&STRUCTURED_WHIR_SPLIT_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&(fixed.len() as u32).to_le_bytes());
+        for section in fixed {
+            encode_split_blob(&mut encoded, &section)?;
+        }
+        encode_split_blob(&mut encoded, &trace)?;
+        if encoded.len() > crate::MAX_STRUCTURED_PCS_PROOF_BYTES {
+            return Err(ExplicitWhirError::AggregateProofTooLarge);
+        }
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, ExplicitWhirError> {
+        if encoded.len() > crate::MAX_STRUCTURED_PCS_PROOF_BYTES
+            || encoded.get(..8) != Some(STRUCTURED_WHIR_SPLIT_MAGIC.as_slice())
+            || read_u32(encoded, 8)? != STRUCTURED_WHIR_SPLIT_VERSION
+        {
+            return Err(ExplicitWhirError::InvalidEncoding);
+        }
+        let count = read_u32(encoded, 12)? as usize;
+        if count == 0 || count > 1 + MAX_MODEL_PCS_WEIGHT_BANKS {
+            return Err(ExplicitWhirError::ModelIdentity);
+        }
+        let mut offset = 16;
+        let mut fixed_model = Vec::with_capacity(count);
+        for _ in 0..count {
+            fixed_model.push(StructuredWhirAggregateProof::decode(take_split_blob(
+                encoded,
+                &mut offset,
+            )?)?);
+        }
+        let trace = StructuredWhirAggregateProof::decode(take_split_blob(encoded, &mut offset)?)?;
+        if offset != encoded.len() {
+            return Err(ExplicitWhirError::InvalidEncoding);
+        }
+        Ok(Self { fixed_model, trace })
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StructuredWhirPcsVerifier;
 
@@ -329,10 +749,11 @@ impl StructuredPcsVerifier for StructuredWhirPcsVerifier {
     fn verify_openings(
         &self,
         public_binding: &[u8; 32],
-        claims: &[StructuredPcsOpeningClaim],
+        expected_model: &ModelPcsIdentity,
+        openings: &StructuredPcsOpeningSet,
         proof: &[u8],
     ) -> bool {
-        verify_structured_whir_openings(public_binding, claims, proof).is_ok()
+        verify_structured_whir_openings(public_binding, expected_model, openings, proof).is_ok()
     }
 }
 
@@ -376,6 +797,10 @@ pub enum ExplicitWhirError {
     ClaimMismatch,
     #[error("structured WHIR proof exceeds the aggregate PCS byte cap")]
     AggregateProofTooLarge,
+    #[error("structured WHIR fixed-model PCS identity is invalid or mismatched")]
+    ModelIdentity,
+    #[error("structured WHIR opening claims cross the fixed-model and trace scopes")]
+    OpeningScope,
 }
 
 #[derive(Debug, Clone)]
@@ -690,9 +1115,57 @@ pub fn verify_explicit_whir_openings(
 
 pub fn prove_structured_whir_openings(
     public_binding: &[u8; 32],
+    expected_model: &ModelPcsIdentity,
+    model_commitments: &StructuredWhirModelCommitmentSet,
+    trace_commitments: &StructuredWhirCommitmentSet,
+    openings: &StructuredPcsOpeningSet,
+) -> Result<Vec<u8>, ExplicitWhirError> {
+    validate_model_identity(expected_model)?;
+    if model_commitments.identity() != expected_model {
+        return Err(ExplicitWhirError::ModelIdentity);
+    }
+    let (fixed_claims, trace_claims) = partition_openings(expected_model, openings)?;
+    let fixed_roots = model_commitments
+        .sections
+        .iter()
+        .map(StructuredWhirCommitmentSet::root)
+        .collect::<Vec<_>>();
+    let common_binding = split_binding(
+        public_binding,
+        expected_model,
+        &fixed_roots,
+        trace_commitments.root(),
+    )?;
+    let fixed_model = model_commitments
+        .sections
+        .iter()
+        .zip(fixed_claims)
+        .enumerate()
+        .map(|(index, (commitments, claims))| {
+            prove_structured_whir_section(
+                &child_binding(
+                    common_binding,
+                    STRUCTURED_WHIR_FIXED_MODEL_SCOPE,
+                    index as u32,
+                ),
+                commitments,
+                &claims,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let trace = prove_structured_whir_section(
+        &child_binding(common_binding, STRUCTURED_WHIR_EXECUTION_TRACE_SCOPE, 0),
+        trace_commitments,
+        &trace_claims,
+    )?;
+    StructuredWhirSplitProof { fixed_model, trace }.encode()
+}
+
+fn prove_structured_whir_section(
+    transcript_binding: &[u8; 32],
     commitment_set: &StructuredWhirCommitmentSet,
     claims: &[StructuredPcsOpeningClaim],
-) -> Result<Vec<u8>, ExplicitWhirError> {
+) -> Result<StructuredWhirAggregateProof, ExplicitWhirError> {
     let claims = crate::structured_proof::canonical_openings(claims.to_vec())
         .map_err(|_| ExplicitWhirError::ClaimMismatch)?;
     if claims.is_empty() || claims.len() > crate::MAX_STRUCTURED_OPENING_CLAIMS {
@@ -723,7 +1196,7 @@ pub fn prove_structured_whir_openings(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let extension_tables = native_tables.iter().map(extend_poly).collect::<Vec<_>>();
-    let (pcs, mut challenger) = build_pcs(stacked_variables, public_binding)?;
+    let (pcs, mut challenger) = build_pcs(stacked_variables, transcript_binding)?;
     let witness = ExplicitPointLayout::new_witness(
         native_tables
             .into_iter()
@@ -767,7 +1240,7 @@ pub fn prove_structured_whir_openings(
     }
     pcs.prove(&mut native_proof, &mut challenger, layout, prover_data);
     let proof_bytes = encode_aggregate_native_proof(&native_proof)?;
-    StructuredWhirAggregateProof {
+    Ok(StructuredWhirAggregateProof {
         root: commitment_set.root,
         table_variables: commitment_set
             .table_variables
@@ -775,16 +1248,77 @@ pub fn prove_structured_whir_openings(
             .map(|variables| *variables as u32)
             .collect(),
         proof_bytes,
-    }
-    .encode()
+    })
 }
 
 pub fn verify_structured_whir_openings(
     public_binding: &[u8; 32],
-    claims: &[StructuredPcsOpeningClaim],
+    expected_model: &ModelPcsIdentity,
+    openings: &StructuredPcsOpeningSet,
     encoded_proof: &[u8],
 ) -> Result<(), ExplicitWhirError> {
-    let aggregate = StructuredWhirAggregateProof::decode(encoded_proof)?;
+    validate_model_identity(expected_model)?;
+    let expected_table_variables = model_table_variables(expected_model)?;
+    let aggregate = StructuredWhirSplitProof::decode(encoded_proof)?;
+    let expected_commitments = model_commitment_encodings(expected_model);
+    if aggregate.fixed_model.len() != expected_commitments.len()
+        || expected_table_variables.len() != expected_commitments.len()
+    {
+        return Err(ExplicitWhirError::ModelIdentity);
+    }
+    for ((section, expected), expected_variables) in aggregate
+        .fixed_model
+        .iter()
+        .zip(&expected_commitments)
+        .zip(expected_table_variables)
+    {
+        let table_variables = section
+            .table_variables
+            .iter()
+            .map(|variables| *variables as usize)
+            .collect::<Vec<_>>();
+        if section.table_variables.len() != 1
+            || section.table_variables[0] != expected_variables
+            || structured_aliases(section.root, &table_variables)? != [*expected]
+        {
+            return Err(ExplicitWhirError::ModelIdentity);
+        }
+    }
+    let (fixed_claims, trace_claims) = partition_openings(expected_model, openings)?;
+    let fixed_roots = aggregate
+        .fixed_model
+        .iter()
+        .map(|section| section.root)
+        .collect::<Vec<_>>();
+    let common_binding = split_binding(
+        public_binding,
+        expected_model,
+        &fixed_roots,
+        aggregate.trace.root,
+    )?;
+    for (index, (section, claims)) in aggregate.fixed_model.iter().zip(fixed_claims).enumerate() {
+        verify_structured_whir_section(
+            &child_binding(
+                common_binding,
+                STRUCTURED_WHIR_FIXED_MODEL_SCOPE,
+                index as u32,
+            ),
+            &claims,
+            section,
+        )?;
+    }
+    verify_structured_whir_section(
+        &child_binding(common_binding, STRUCTURED_WHIR_EXECUTION_TRACE_SCOPE, 0),
+        &trace_claims,
+        &aggregate.trace,
+    )
+}
+
+fn verify_structured_whir_section(
+    transcript_binding: &[u8; 32],
+    claims: &[StructuredPcsOpeningClaim],
+    aggregate: &StructuredWhirAggregateProof,
+) -> Result<(), ExplicitWhirError> {
     let table_variables = aggregate
         .table_variables
         .iter()
@@ -831,7 +1365,7 @@ pub fn verify_structured_whir_openings(
     }
     catch_unwind(AssertUnwindSafe(|| {
         verify_native_multi(
-            public_binding,
+            transcript_binding,
             aggregate.root,
             &table_variables,
             &table_indices,
@@ -841,6 +1375,127 @@ pub fn verify_structured_whir_openings(
         )
     }))
     .map_err(|_| ExplicitWhirError::BackendPanic)?
+}
+
+fn validate_model_identity(identity: &ModelPcsIdentity) -> Result<(), ExplicitWhirError> {
+    identity
+        .validate()
+        .map_err(|_| ExplicitWhirError::ModelIdentity)?;
+    if identity.pcs_suite_parameter_digest != structured_whir_suite_parameter_digest() {
+        return Err(ExplicitWhirError::ModelIdentity);
+    }
+    Ok(())
+}
+
+fn model_commitment_encodings(identity: &ModelPcsIdentity) -> Vec<[u8; 32]> {
+    std::iter::once(identity.base_input_commitment)
+        .chain(identity.weight_bank_commitments.iter().copied())
+        .collect()
+}
+
+fn model_table_variables(identity: &ModelPcsIdentity) -> Result<Vec<u32>, ExplicitWhirError> {
+    let batch = u128::from(identity.batch);
+    let dimension = u128::from(identity.dimension);
+    let layers = u128::from(identity.layers_per_bank);
+    let base_elements = batch
+        .checked_mul(dimension)
+        .ok_or(ExplicitWhirError::ModelIdentity)?;
+    let weight_elements = layers
+        .checked_mul(dimension)
+        .and_then(|elements| elements.checked_mul(dimension))
+        .ok_or(ExplicitWhirError::ModelIdentity)?;
+    if !base_elements.is_power_of_two() || !weight_elements.is_power_of_two() {
+        return Err(ExplicitWhirError::ModelIdentity);
+    }
+    Ok(std::iter::once(base_elements.ilog2())
+        .chain(std::iter::repeat_n(
+            weight_elements.ilog2(),
+            identity.weight_bank_commitments.len(),
+        ))
+        .collect())
+}
+
+fn partition_openings(
+    identity: &ModelPcsIdentity,
+    openings: &StructuredPcsOpeningSet,
+) -> Result<
+    (
+        Vec<Vec<StructuredPcsOpeningClaim>>,
+        Vec<StructuredPcsOpeningClaim>,
+    ),
+    ExplicitWhirError,
+> {
+    let fixed = crate::structured_proof::canonical_openings(openings.fixed_model.clone())
+        .map_err(|_| ExplicitWhirError::ClaimMismatch)?;
+    let trace = crate::structured_proof::canonical_openings(openings.trace.clone())
+        .map_err(|_| ExplicitWhirError::ClaimMismatch)?;
+    if fixed
+        .len()
+        .checked_add(trace.len())
+        .is_none_or(|count| count == 0 || count > crate::MAX_STRUCTURED_OPENING_CLAIMS)
+    {
+        return Err(ExplicitWhirError::InvalidOpeningCount);
+    }
+    let fixed_commitments = fixed
+        .iter()
+        .map(|claim| claim.commitment)
+        .collect::<BTreeSet<_>>();
+    if trace
+        .iter()
+        .any(|claim| fixed_commitments.contains(&claim.commitment))
+    {
+        return Err(ExplicitWhirError::OpeningScope);
+    }
+    let expected = model_commitment_encodings(identity);
+    let mut grouped = vec![Vec::new(); expected.len()];
+    for claim in fixed {
+        let index = expected
+            .iter()
+            .position(|commitment| *commitment == claim.commitment)
+            .ok_or(ExplicitWhirError::OpeningScope)?;
+        grouped[index].push(claim);
+    }
+    if grouped.iter().any(Vec::is_empty) {
+        return Err(ExplicitWhirError::CommitmentMismatch);
+    }
+    Ok((grouped, trace))
+}
+
+fn split_binding(
+    public_binding: &[u8; 32],
+    identity: &ModelPcsIdentity,
+    fixed_roots: &[[u8; 32]],
+    trace_root: [u8; 32],
+) -> Result<[u8; 32], ExplicitWhirError> {
+    if fixed_roots.len() != 1 + identity.weight_bank_commitments.len() {
+        return Err(ExplicitWhirError::ModelIdentity);
+    }
+    let mut hasher = Blake3Hasher::new_derive_key(STRUCTURED_WHIR_SPLIT_DOMAIN);
+    hasher.update(STRUCTURED_WHIR_SPLIT_COMMON_LABEL);
+    hasher.update(&STRUCTURED_WHIR_SPLIT_VERSION.to_le_bytes());
+    hasher.update(public_binding);
+    hasher.update(
+        &identity
+            .digest()
+            .map_err(|_| ExplicitWhirError::ModelIdentity)?,
+    );
+    hasher.update(&(fixed_roots.len() as u32).to_le_bytes());
+    for (index, root) in fixed_roots.iter().enumerate() {
+        hasher.update(&(index as u32).to_le_bytes());
+        hasher.update(root);
+    }
+    hasher.update(&trace_root);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn child_binding(common: [u8; 32], scope: &[u8], index: u32) -> [u8; 32] {
+    let mut hasher = Blake3Hasher::new_derive_key(STRUCTURED_WHIR_SPLIT_DOMAIN);
+    hasher.update(STRUCTURED_WHIR_SPLIT_CHILD_LABEL);
+    hasher.update(&common);
+    hasher.update(&(scope.len() as u32).to_le_bytes());
+    hasher.update(scope);
+    hasher.update(&index.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 fn verify_native_multi(
@@ -980,7 +1635,7 @@ fn build_pcs(
     let mmcs = WhirMmcs::new(field_hash, compress, 0);
     let dft = Dft::new(1 << config.max_fft_size());
     let pcs = Pcs::new(config, dft, mmcs);
-    let mut initial_state = b"CMFD/FORGEMATRIX/EXPLICIT-WHIR/V1".to_vec();
+    let mut initial_state = EXPLICIT_WHIR_TRANSCRIPT_DOMAIN.to_vec();
     initial_state.extend_from_slice(&(transcript_binding.len() as u64).to_le_bytes());
     initial_state.extend_from_slice(transcript_binding);
     let mut challenger = Challenger::new(HashChallenger::new(initial_state, Blake3 {}));
@@ -1097,7 +1752,7 @@ fn structured_aliases(
 ) -> Result<Vec<[u8; 32]>, ExplicitWhirError> {
     validate_stacked_shape(table_variables)?;
     let mut layout_hasher = Blake3Hasher::new_derive_key(STRUCTURED_WHIR_ALIAS_DOMAIN);
-    layout_hasher.update(b"layout");
+    layout_hasher.update(STRUCTURED_WHIR_ALIAS_LAYOUT_LABEL);
     layout_hasher.update(&root);
     layout_hasher.update(&(table_variables.len() as u32).to_le_bytes());
     for &variables in table_variables {
@@ -1109,7 +1764,7 @@ fn structured_aliases(
         .enumerate()
         .map(|(index, variables)| {
             let mut hasher = Blake3Hasher::new_derive_key(STRUCTURED_WHIR_ALIAS_DOMAIN);
-            hasher.update(b"oracle");
+            hasher.update(STRUCTURED_WHIR_ALIAS_ORACLE_LABEL);
             hasher.update(&root);
             hasher.update(&layout_digest);
             hasher.update(&(index as u32).to_le_bytes());
@@ -1200,9 +1855,86 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ExplicitWhirError> {
     ))
 }
 
+fn encode_split_blob(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ExplicitWhirError> {
+    let length =
+        u32::try_from(bytes.len()).map_err(|_| ExplicitWhirError::AggregateProofTooLarge)?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn take_split_blob<'a>(
+    encoded: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], ExplicitWhirError> {
+    let length = read_u32(encoded, *offset)? as usize;
+    *offset = offset
+        .checked_add(4)
+        .ok_or(ExplicitWhirError::InvalidEncoding)?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(ExplicitWhirError::InvalidEncoding)?;
+    let bytes = encoded
+        .get(*offset..end)
+        .ok_or(ExplicitWhirError::InvalidEncoding)?;
+    *offset = end;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split_fixture(
+        weight_banks: Vec<Vec<u64>>,
+    ) -> (ModelPcsIdentity, StructuredPcsOpeningSet, Vec<u8>) {
+        let base = vec![3, 5, 7, 11];
+        let trace = vec![79, 83, 89, 97];
+        let model = StructuredWhirModelCommitmentSet::new(
+            StructuredWhirModelMetadata {
+                model_version: 1,
+                batch: 2,
+                dimension: 2,
+                layers_per_bank: 2,
+                model_byte_root: [0x51; 32],
+            },
+            base.clone(),
+            weight_banks.clone(),
+        )
+        .unwrap();
+        let identity = model.identity().clone();
+        let trace_set = StructuredWhirCommitmentSet::new(vec![trace.clone()]).unwrap();
+        let mut fixed_model = vec![StructuredPcsOpeningClaim {
+            commitment: identity.base_input_commitment,
+            point: vec![ExtensionElement { limbs: [0; 3] }; 2],
+            evaluation: ExtensionElement {
+                limbs: [base[0], 0, 0],
+            },
+        }];
+        fixed_model.extend(weight_banks.iter().enumerate().map(|(index, weights)| {
+            StructuredPcsOpeningClaim {
+                commitment: identity.weight_bank_commitments[index],
+                point: vec![ExtensionElement { limbs: [0; 3] }; 3],
+                evaluation: ExtensionElement {
+                    limbs: [weights[0], 0, 0],
+                },
+            }
+        }));
+        let openings = StructuredPcsOpeningSet {
+            fixed_model,
+            trace: vec![StructuredPcsOpeningClaim {
+                commitment: trace_set.commitment_for(&trace).unwrap(),
+                point: vec![ExtensionElement { limbs: [0; 3] }; 2],
+                evaluation: ExtensionElement {
+                    limbs: [trace[0], 0, 0],
+                },
+            }],
+        };
+        let proof =
+            prove_structured_whir_openings(&[0x42; 32], &identity, &model, &trace_set, &openings)
+                .unwrap();
+        (identity, openings, proof)
+    }
 
     fn table() -> Vec<u64> {
         (0..256).map(|index| (index * index + 17) as u64).collect()
@@ -1407,62 +2139,307 @@ mod tests {
     }
 
     #[test]
-    fn structured_multi_table_opening_is_batched_and_every_table_is_required() {
-        let first = vec![3, 5, 7, 11];
-        let second = vec![13, 17, 19, 23, 29, 31, 37, 41];
-        let set =
-            StructuredWhirCommitmentSet::new(vec![second.clone(), first.clone(), first.clone()])
-                .unwrap();
-        assert_eq!(set.len(), 2);
-        let claims = vec![
-            StructuredPcsOpeningClaim {
-                commitment: set.commitment_for(&first).unwrap(),
-                point: vec![ExtensionElement { limbs: [0; 3] }; 2],
-                evaluation: ExtensionElement {
-                    limbs: [first[0], 0, 0],
-                },
-            },
-            StructuredPcsOpeningClaim {
-                commitment: set.commitment_for(&second).unwrap(),
-                point: vec![ExtensionElement { limbs: [0; 3] }; 3],
-                evaluation: ExtensionElement {
-                    limbs: [second[0], 0, 0],
-                },
-            },
-        ];
-        let binding = [0x42; 32];
-        let proof = prove_structured_whir_openings(&binding, &set, &claims).unwrap();
-        verify_structured_whir_openings(&binding, &claims, &proof).unwrap();
+    fn structured_split_envelope_and_fixed_layout_fail_closed() {
+        let weight = vec![13, 17, 19, 23, 29, 31, 37, 41];
+        let (identity, openings, proof) = split_fixture(vec![weight]);
+        verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &proof).unwrap();
 
-        let mut wrong_binding = binding;
-        wrong_binding[0] ^= 1;
-        assert!(verify_structured_whir_openings(&wrong_binding, &claims, &proof).is_err());
-
-        let mut wrong_root = proof.clone();
-        wrong_root[12] ^= 1;
+        let mut trailing = proof.clone();
+        trailing.push(0);
         assert_eq!(
-            verify_structured_whir_openings(&binding, &claims, &wrong_root),
-            Err(ExplicitWhirError::UnknownCommitment)
-        );
-
-        let mut trailing_stream = StructuredWhirAggregateProof::decode(&proof).unwrap();
-        trailing_stream.proof_bytes.push(0);
-        let trailing_stream = trailing_stream.encode().unwrap();
-        assert_eq!(
-            verify_structured_whir_openings(&binding, &claims, &trailing_stream),
+            verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &trailing),
             Err(ExplicitWhirError::InvalidEncoding)
         );
 
-        let unused =
-            StructuredWhirCommitmentSet::new(vec![first, second, vec![43, 47, 53, 59]]).unwrap();
-        let partial_claims = vec![StructuredPcsOpeningClaim {
-            commitment: unused.commitment_for(&[3, 5, 7, 11]).unwrap(),
-            point: vec![ExtensionElement { limbs: [0; 3] }; 2],
-            evaluation: ExtensionElement { limbs: [3, 0, 0] },
-        }];
+        let mut truncated = proof.clone();
+        truncated.pop();
         assert_eq!(
-            prove_structured_whir_openings(&binding, &unused, &partial_claims),
-            Err(ExplicitWhirError::CommitmentMismatch)
+            verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &truncated),
+            Err(ExplicitWhirError::InvalidEncoding)
         );
+
+        let mut zero_sections = proof.clone();
+        zero_sections[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &zero_sections,),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+
+        let mut excess_sections = proof.clone();
+        excess_sections[12..16]
+            .copy_from_slice(&((2 + MAX_MODEL_PCS_WEIGHT_BANKS) as u32).to_le_bytes());
+        assert_eq!(
+            verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &excess_sections,),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+
+        let mut oversized_section = proof.clone();
+        oversized_section[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &oversized_section,),
+            Err(ExplicitWhirError::InvalidEncoding)
+        );
+
+        assert_eq!(
+            verify_structured_whir_openings(
+                &[0x42; 32],
+                &identity,
+                &openings,
+                &vec![0; crate::MAX_STRUCTURED_PCS_PROOF_BYTES + 1],
+            ),
+            Err(ExplicitWhirError::InvalidEncoding)
+        );
+
+        let mut wrong_layout = StructuredWhirSplitProof::decode(&proof).unwrap();
+        let root = wrong_layout.fixed_model[0].root;
+        wrong_layout.fixed_model[0].table_variables[0] = 3;
+        let mut wrong_identity = identity.clone();
+        wrong_identity.base_input_commitment = structured_aliases(root, &[3]).unwrap()[0];
+        assert_eq!(
+            verify_structured_whir_openings(
+                &[0x42; 32],
+                &wrong_identity,
+                &openings,
+                &wrong_layout.encode().unwrap(),
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+    }
+
+    #[test]
+    fn exact_three_bank_split_round_trip_and_order_replay_fails() {
+        let weight_0 = vec![13, 17, 19, 23, 29, 31, 37, 41];
+        let weight_1 = vec![43, 47, 53, 59, 61, 67, 71, 73];
+        let weight_2 = vec![83, 89, 97, 101, 103, 107, 109, 113];
+        let (identity, openings, proof) = split_fixture(vec![weight_0, weight_1, weight_2]);
+        assert_eq!(
+            identity.weight_bank_commitments.len(),
+            MAX_MODEL_PCS_WEIGHT_BANKS
+        );
+        verify_structured_whir_openings(&[0x42; 32], &identity, &openings, &proof).unwrap();
+
+        let mut reordered_identity = identity.clone();
+        reordered_identity.weight_bank_commitments.swap(0, 1);
+        assert_eq!(
+            verify_structured_whir_openings(&[0x42; 32], &reordered_identity, &openings, &proof,),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+
+        let mut reordered_proof = StructuredWhirSplitProof::decode(&proof).unwrap();
+        reordered_proof.fixed_model.swap(1, 2);
+        assert_eq!(
+            verify_structured_whir_openings(
+                &[0x42; 32],
+                &identity,
+                &openings,
+                &reordered_proof.encode().unwrap(),
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+    }
+
+    #[test]
+    fn equal_fixed_polynomials_are_rejected_as_ambiguous_roles() {
+        let weight = vec![13, 17, 19, 23, 29, 31, 37, 41];
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::new(
+                StructuredWhirModelMetadata {
+                    model_version: 1,
+                    batch: 2,
+                    dimension: 2,
+                    layers_per_bank: 2,
+                    model_byte_root: [0x51; 32],
+                },
+                vec![3, 5, 7, 11],
+                vec![weight.clone(), weight],
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        ));
+    }
+
+    #[test]
+    fn structured_model_and_trace_openings_are_separate_and_bound() {
+        assert_eq!(
+            hex::encode(structured_whir_suite_parameter_digest()),
+            "c4d6d139c79d8cd327e0b9001c9952dc786ff4a12277067c715fdb1895d2abf5"
+        );
+        let base = vec![3, 5, 7, 11];
+        let weight_0 = vec![13, 17, 19, 23, 29, 31, 37, 41];
+        let weight_1 = vec![43, 47, 53, 59, 61, 67, 71, 73];
+        let trace = vec![79, 83, 89, 97];
+        let metadata = StructuredWhirModelMetadata {
+            model_version: 1,
+            batch: 2,
+            dimension: 2,
+            layers_per_bank: 2,
+            model_byte_root: [0x21; 32],
+        };
+        let model = StructuredWhirModelCommitmentSet::new(
+            metadata,
+            base.clone(),
+            vec![weight_0.clone(), weight_1.clone()],
+        )
+        .unwrap();
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::new(
+                metadata,
+                base[..2].to_vec(),
+                vec![weight_0.clone(), weight_1.clone()],
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        ));
+        assert!(matches!(
+            StructuredWhirModelCommitmentSet::new(
+                metadata,
+                base.clone(),
+                vec![weight_0[..4].to_vec(), weight_1.clone()],
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        ));
+        let trace_set = StructuredWhirCommitmentSet::new(vec![trace.clone()]).unwrap();
+        let identity = model.identity().clone();
+        let openings = StructuredPcsOpeningSet {
+            fixed_model: vec![
+                StructuredPcsOpeningClaim {
+                    commitment: identity.base_input_commitment,
+                    point: vec![ExtensionElement { limbs: [0; 3] }; 2],
+                    evaluation: ExtensionElement {
+                        limbs: [base[0], 0, 0],
+                    },
+                },
+                StructuredPcsOpeningClaim {
+                    commitment: identity.weight_bank_commitments[0],
+                    point: vec![ExtensionElement { limbs: [0; 3] }; 3],
+                    evaluation: ExtensionElement {
+                        limbs: [weight_0[0], 0, 0],
+                    },
+                },
+                StructuredPcsOpeningClaim {
+                    commitment: identity.weight_bank_commitments[1],
+                    point: vec![ExtensionElement { limbs: [0; 3] }; 3],
+                    evaluation: ExtensionElement {
+                        limbs: [weight_1[0], 0, 0],
+                    },
+                },
+            ],
+            trace: vec![StructuredPcsOpeningClaim {
+                commitment: trace_set.commitment_for(&trace).unwrap(),
+                point: vec![ExtensionElement { limbs: [0; 3] }; 2],
+                evaluation: ExtensionElement {
+                    limbs: [trace[0], 0, 0],
+                },
+            }],
+        };
+        let binding = [0x42; 32];
+        let proof =
+            prove_structured_whir_openings(&binding, &identity, &model, &trace_set, &openings)
+                .unwrap();
+        verify_structured_whir_openings(&binding, &identity, &openings, &proof).unwrap();
+
+        let mut wrong_binding = binding;
+        wrong_binding[0] ^= 1;
+        assert!(
+            verify_structured_whir_openings(&wrong_binding, &identity, &openings, &proof).is_err()
+        );
+
+        let mut wrong_suite = identity.clone();
+        wrong_suite.pcs_suite_parameter_digest[0] ^= 1;
+        assert_eq!(
+            verify_structured_whir_openings(&binding, &wrong_suite, &openings, &proof),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+
+        let mut swapped = StructuredWhirSplitProof::decode(&proof).unwrap();
+        swapped.fixed_model.swap(0, 1);
+        assert_eq!(
+            verify_structured_whir_openings(
+                &binding,
+                &identity,
+                &openings,
+                &swapped.encode().unwrap(),
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+
+        let mut wrong_root = StructuredWhirSplitProof::decode(&proof).unwrap();
+        wrong_root.fixed_model[0].root[0] ^= 1;
+        assert_eq!(
+            verify_structured_whir_openings(
+                &binding,
+                &identity,
+                &openings,
+                &wrong_root.encode().unwrap(),
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+
+        let mut wrong_trace_root = StructuredWhirSplitProof::decode(&proof).unwrap();
+        wrong_trace_root.trace.root[0] ^= 1;
+        assert!(
+            verify_structured_whir_openings(
+                &binding,
+                &identity,
+                &openings,
+                &wrong_trace_root.encode().unwrap(),
+            )
+            .is_err()
+        );
+
+        let mut missing_model = StructuredWhirSplitProof::decode(&proof).unwrap();
+        missing_model.fixed_model.pop();
+        assert_eq!(
+            verify_structured_whir_openings(
+                &binding,
+                &identity,
+                &openings,
+                &missing_model.encode().unwrap(),
+            ),
+            Err(ExplicitWhirError::ModelIdentity)
+        );
+
+        let mut trailing_stream = StructuredWhirSplitProof::decode(&proof).unwrap();
+        trailing_stream.trace.proof_bytes.push(0);
+        assert_eq!(
+            verify_structured_whir_openings(
+                &binding,
+                &identity,
+                &openings,
+                &trailing_stream.encode().unwrap(),
+            ),
+            Err(ExplicitWhirError::InvalidEncoding)
+        );
+
+        let mut crossed_scope = openings.clone();
+        crossed_scope
+            .fixed_model
+            .push(crossed_scope.trace[0].clone());
+        assert_eq!(
+            verify_structured_whir_openings(&binding, &identity, &crossed_scope, &proof),
+            Err(ExplicitWhirError::OpeningScope)
+        );
+
+        let other_trace = vec![101, 103, 107, 109];
+        let other_trace_set = StructuredWhirCommitmentSet::new(vec![other_trace.clone()]).unwrap();
+        assert_eq!(model.identity(), &identity);
+        assert_ne!(trace_set.root(), other_trace_set.root());
+        let mut other_openings = openings.clone();
+        other_openings.trace[0] = StructuredPcsOpeningClaim {
+            commitment: other_trace_set.commitment_for(&other_trace).unwrap(),
+            point: vec![ExtensionElement { limbs: [0; 3] }; 2],
+            evaluation: ExtensionElement {
+                limbs: [other_trace[0], 0, 0],
+            },
+        };
+        let other_proof = prove_structured_whir_openings(
+            &binding,
+            &identity,
+            &model,
+            &other_trace_set,
+            &other_openings,
+        )
+        .unwrap();
+        verify_structured_whir_openings(&binding, &identity, &other_openings, &other_proof)
+            .unwrap();
+        assert_ne!(proof, other_proof);
     }
 }

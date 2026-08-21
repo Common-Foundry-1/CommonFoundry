@@ -51,9 +51,11 @@ pub use forgematrix_v2::{
     V2_TEST_DIMENSION, V2_TEST_LAYERS, V2_TRANSITION_MODULUS, v2_test_reference,
 };
 pub use model_bank::{
-    BuiltModelBankFixture, MAX_MODEL_BYTE, MAX_SMALL_FIXTURE_PAYLOAD_BYTES,
-    MODEL_BANK_FORMAT_VERSION, MODEL_BANK_HEADER_BYTES, MODEL_BANK_MAGIC, ModelBankError,
-    ModelBankManifest, SmallModelBankFixture, build_small_model_bank, verify_model_bank,
+    BuiltModelBankFixture, MAX_MODEL_BYTE, MAX_MODEL_PCS_WEIGHT_BANKS,
+    MAX_SMALL_FIXTURE_PAYLOAD_BYTES, MODEL_BANK_FORMAT_VERSION, MODEL_BANK_HEADER_BYTES,
+    MODEL_BANK_MAGIC, MODEL_PCS_BASE_INPUT_AXIS_ORDER, MODEL_PCS_IDENTITY_VERSION,
+    MODEL_PCS_VALUE_ENCODING, MODEL_PCS_WEIGHT_BANK_AXIS_ORDER, ModelBankError, ModelBankManifest,
+    ModelPcsIdentity, SmallModelBankFixture, build_small_model_bank, verify_model_bank,
 };
 pub use network::{
     BlockValidationContext, CONSENSUS_SIGNATURE_BYTES, FixedRewardDestinations,
@@ -86,8 +88,8 @@ pub use structured_proof::{
     MAX_STRUCTURED_FINAL_ACTIVATION_BYTES, MAX_STRUCTURED_OPENING_CLAIMS,
     MAX_STRUCTURED_OPENING_VARIABLES, MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION,
     StructuredBlake3Statement, StructuredBlake3Verifier, StructuredForgeMatrixProof,
-    StructuredForgeMatrixStatement, StructuredPcsOpeningClaim, StructuredPcsVerifier,
-    StructuredProofError, collect_structured_forgematrix_openings,
+    StructuredForgeMatrixStatement, StructuredPcsOpeningClaim, StructuredPcsOpeningSet,
+    StructuredPcsVerifier, StructuredProofError, collect_structured_forgematrix_openings,
     structured_forgematrix_public_binding, verify_structured_forgematrix_proof,
 };
 pub use structured_sumcheck::{
@@ -136,9 +138,11 @@ pub use whir_proof::{
     EXPLICIT_WHIR_SECURITY_BITS, EXPLICIT_WHIR_VERSION, ExplicitWhirCommitment, ExplicitWhirError,
     ExplicitWhirOpening, ExplicitWhirProof, MAX_EXPLICIT_WHIR_BINDING_BYTES,
     MAX_EXPLICIT_WHIR_OPENINGS, MAX_EXPLICIT_WHIR_PROOF_BYTES, MAX_EXPLICIT_WHIR_VARIABLES,
-    MAX_STRUCTURED_WHIR_ELEMENTS, MAX_STRUCTURED_WHIR_TABLES, StructuredWhirCommitmentSet,
+    MAX_STRUCTURED_WHIR_ELEMENTS, MAX_STRUCTURED_WHIR_TABLES, STRUCTURED_WHIR_SPLIT_VERSION,
+    StructuredWhirCommitmentSet, StructuredWhirModelCommitmentSet, StructuredWhirModelMetadata,
     StructuredWhirPcsVerifier, prove_explicit_whir_openings, prove_structured_whir_openings,
-    verify_explicit_whir_openings, verify_structured_whir_openings,
+    structured_whir_suite_parameter_digest, verify_explicit_whir_openings,
+    verify_structured_whir_openings,
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,

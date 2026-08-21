@@ -386,27 +386,45 @@ opening claims, and then requires both `StructuredPcsVerifier` and
 digest. A missing, empty, malformed, oversized, conflicting, or rejected proof
 is a hard error. There is no accept-without-verification path.
 
-The optional `whir-prototype` feature now implements an accepting aggregate
-research adapter beneath that boundary. It stacks bounded base-field tables
-under one Plonky3 WHIR 0.6.3 commitment, exposes deterministic per-table
-aliases, records caller-supplied points in the cubic Goldilocks extension,
-builds their equality constraints directly, and verifies those exact points
-through the lower-level WHIR verifier. It does not replace the independent
-coordinates with the high-level layout's structured univariate-power points.
-Its BLAKE3 transcript binds the public statement, all points and evaluations,
-and the aggregate commitment before batching.
-The prototype uses WHIR's non-conjectural unique-decoding parameter mode at a
-requested 128-bit level. A 1 MiB proof cap, a 4 KiB public-binding cap,
-canonical field checks, canonical JSON re-encoding, exact envelope exhaustion,
-and panic containment bound its current parser surface.
+The optional `whir-prototype` feature now implements an accepting split
+research adapter beneath that boundary. `ModelPcsIdentity` freezes the model
+version and shape, model byte root, centered-byte field encoding, MLE axis
+order, exact WHIR suite/parameter digest, base-input commitment, and ordered
+weight-bank commitments. The model-bank manifest retains its 184-byte format:
+its existing PCS parameter digest and commitment root must match this separately
+supplied identity. The aggregate verifier receives that identity from its
+trusted caller and rejects statement-level root, base commitment, weight-bank,
+bank-order, and model-shape substitutions before component algebra. The scoped
+PCS verifier separately rejects a substituted split-envelope root or table
+layout when it authenticates the collected openings.
 
-The component proof constructors can now receive the WHIR aliases before any
-component transcript samples challenges, and `StructuredWhirPcsVerifier`
-authenticates the resulting aggregate claim set. The adapter still retains
-whole bounded tables in memory and has no production model-byte link or
-streaming 6 GiB prover. The upstream backend is an unaudited academic
-prototype. Review, benchmarks, fuzzing, a complete soundness report, and
-independent audits remain mandatory before any production selection.
+The WHIR adapter commits each fixed model role independently and places all
+challenge-specific trace tables under a separate commitment. A new versioned
+split envelope carries one opening proof for the base table, one for each
+ordered weight bank, and one for the execution trace. A common BLAKE3 transcript
+binds the public statement, complete model identity, every fixed root, and the
+trace root before scope-specific child transcripts are derived. Fixed-model and
+trace opening claims are canonicalized separately and cannot share commitment
+identifiers. The adapter records caller-supplied points in the cubic Goldilocks
+extension, builds their equality constraints directly, and verifies those exact
+points through the lower-level WHIR verifier. It does not replace the
+independent coordinates with the high-level layout's structured
+univariate-power points.
+The prototype uses WHIR's non-conjectural unique-decoding parameter mode at a
+requested 128-bit level. The standalone explicit proof format has a 1 MiB cap;
+the structured split aggregate has a 512 KiB PCS-proof cap. A 4 KiB
+public-binding cap, canonical field checks, canonical JSON re-encoding, exact
+envelope exhaustion, and panic containment bound the current parser surface.
+
+The component proof constructors receive the fixed or trace commitment aliases
+before any component transcript samples challenges, and
+`StructuredWhirPcsVerifier` authenticates both scoped claim sets. This closes
+commitment selection and bank-order substitution in the research boundary; it
+does not prove that the BLAKE3-addressed model bytes encode those polynomials.
+The adapter still retains whole bounded tables in memory and has no production
+model-byte link or streaming 6 GiB prover. The upstream backend is an unaudited
+academic prototype. Review, benchmarks, fuzzing, a complete soundness report,
+and independent audits remain mandatory before any production selection.
 
 The PCS adapter must stream production model and trace data. Expanding every
 model byte into an in-memory 32-byte field object, retaining duplicate encoded

@@ -55,6 +55,195 @@ const _: () =
     assert!(PRODUCTION_V2_LAYERS as usize == PRODUCTION_BANKS * PRODUCTION_LAYERS_PER_BANK);
 const _: () = assert!(MAX_STRUCTURED_WIRING_BANKS == PRODUCTION_BANKS);
 
+/// Complete consensus frame limit that a production ForgeMatrix proof must fit.
+pub const STRUCTURED_PRODUCTION_FRAME_BYTES: usize = crate::wire::MAX_PROOF_BYTES;
+/// Current V2 frame bytes retained by the proposed production wrapper.
+pub const STRUCTURED_PRODUCTION_V2_WRAPPER_BYTES: usize = 193;
+/// Length prefix for the structured aggregate appended to that wrapper.
+pub const STRUCTURED_PRODUCTION_AGGREGATE_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+/// Canonical V3 aggregate envelope excluding its BLAKE3 and PCS payload bytes.
+pub const STRUCTURED_PRODUCTION_COMPONENT_FLOOR_BYTES: usize = 73_274;
+/// Fixed split-PCS metadata for one base, three weight, and one trace section.
+pub const STRUCTURED_PRODUCTION_SPLIT_PCS_FIXED_BYTES: usize = 312;
+/// Split-PCS metadata added for every trace table.
+pub const STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES: usize = std::mem::size_of::<u32>();
+/// Current V3 maximum number of tables in one aggregate section.
+pub const STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES: usize = 256;
+/// Bytes shared by the BLAKE3 argument and the complete split PCS payload.
+pub const STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES: usize = STRUCTURED_PRODUCTION_FRAME_BYTES
+    - STRUCTURED_PRODUCTION_V2_WRAPPER_BYTES
+    - STRUCTURED_PRODUCTION_AGGREGATE_LENGTH_BYTES
+    - STRUCTURED_PRODUCTION_COMPONENT_FLOOR_BYTES;
+
+/// Candidate aggregate floor after removing the BLAKE3 proof length field.
+pub const STRUCTURED_BATCHED_PRODUCTION_COMPONENT_FLOOR_BYTES: usize =
+    STRUCTURED_PRODUCTION_COMPONENT_FLOOR_BYTES - std::mem::size_of::<u32>();
+/// Split-PCS metadata for one fixed-model section and one trace section.
+pub const STRUCTURED_BATCHED_PRODUCTION_SPLIT_PCS_FIXED_BYTES: usize = 132;
+/// PCS bytes available to the one-fixed/one-trace commitment-derived proposal.
+pub const STRUCTURED_BATCHED_PRODUCTION_PCS_BYTES: usize = STRUCTURED_PRODUCTION_FRAME_BYTES
+    - STRUCTURED_PRODUCTION_V2_WRAPPER_BYTES
+    - STRUCTURED_PRODUCTION_AGGREGATE_LENGTH_BYTES
+    - STRUCTURED_BATCHED_PRODUCTION_COMPONENT_FLOOR_BYTES;
+/// Optimistic largest joint-model native payload with one trace table and a
+/// nonempty trace payload. Additional trace tables consume four bytes each.
+pub const STRUCTURED_BATCHED_PRODUCTION_MODEL_NATIVE_BYTES: usize =
+    STRUCTURED_BATCHED_PRODUCTION_PCS_BYTES
+        - STRUCTURED_BATCHED_PRODUCTION_SPLIT_PCS_FIXED_BYTES
+        - STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES
+        - 1;
+
+/// Exact whole-frame accounting for the current V3 four-fixed-child proposal.
+///
+/// Native WHIR payloads are not independently entitled to the wire proof cap:
+/// all four fixed-model sections, the trace section, split metadata, and the
+/// BLAKE3 argument share [`STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredSplitV3ProductionBudget {
+    pub blake3_argument_bytes: usize,
+    pub base_model_native_bytes: usize,
+    pub weight_model_native_bytes: [usize; PRODUCTION_BANKS],
+    pub trace_native_bytes: usize,
+    pub trace_table_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredProductionProofUsage {
+    pub pcs_payload_bytes: usize,
+    pub shared_argument_bytes: usize,
+    pub complete_frame_bytes: usize,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredProductionBudgetError {
+    #[error("production proof payloads must be nonempty")]
+    EmptyPayload,
+    #[error("production trace table count is not canonically encodable")]
+    InvalidTraceTableCount,
+    #[error("production proof byte accounting overflowed")]
+    ArithmeticOverflow,
+    #[error("production proof requires {actual} bytes, exceeding the {maximum}-byte frame")]
+    ProofTooLarge { actual: usize, maximum: usize },
+}
+
+impl StructuredSplitV3ProductionBudget {
+    pub fn usage(self) -> Result<StructuredProductionProofUsage, StructuredProductionBudgetError> {
+        if self.blake3_argument_bytes == 0
+            || self.base_model_native_bytes == 0
+            || self.weight_model_native_bytes.contains(&0)
+            || self.trace_native_bytes == 0
+        {
+            return Err(StructuredProductionBudgetError::EmptyPayload);
+        }
+        if self.trace_table_count == 0
+            || self.trace_table_count > STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES
+        {
+            return Err(StructuredProductionBudgetError::InvalidTraceTableCount);
+        }
+        let trace_metadata = self
+            .trace_table_count
+            .checked_mul(STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES)
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        let weight_bytes = self
+            .weight_model_native_bytes
+            .into_iter()
+            .try_fold(0_usize, |total, bytes| total.checked_add(bytes))
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        let pcs_payload_bytes = STRUCTURED_PRODUCTION_SPLIT_PCS_FIXED_BYTES
+            .checked_add(trace_metadata)
+            .and_then(|total| total.checked_add(self.base_model_native_bytes))
+            .and_then(|total| total.checked_add(weight_bytes))
+            .and_then(|total| total.checked_add(self.trace_native_bytes))
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        let shared_argument_bytes = self
+            .blake3_argument_bytes
+            .checked_add(pcs_payload_bytes)
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        let complete_frame_bytes = STRUCTURED_PRODUCTION_V2_WRAPPER_BYTES
+            .checked_add(STRUCTURED_PRODUCTION_AGGREGATE_LENGTH_BYTES)
+            .and_then(|total| total.checked_add(STRUCTURED_PRODUCTION_COMPONENT_FLOOR_BYTES))
+            .and_then(|total| total.checked_add(shared_argument_bytes))
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        Ok(StructuredProductionProofUsage {
+            pcs_payload_bytes,
+            shared_argument_bytes,
+            complete_frame_bytes,
+        })
+    }
+
+    pub fn ensure_fits(
+        self,
+    ) -> Result<StructuredProductionProofUsage, StructuredProductionBudgetError> {
+        let usage = self.usage()?;
+        if usage.complete_frame_bytes > STRUCTURED_PRODUCTION_FRAME_BYTES {
+            return Err(StructuredProductionBudgetError::ProofTooLarge {
+                actual: usage.complete_frame_bytes,
+                maximum: STRUCTURED_PRODUCTION_FRAME_BYTES,
+            });
+        }
+        Ok(usage)
+    }
+}
+
+/// Exact whole-frame estimator for the commitment-derived proposal with one
+/// n33 fixed-model child and one joint trace child.
+///
+/// This describes a candidate format, not a deployed wire tag. It removes the
+/// obsolete BLAKE3 proof blob and retains a same-size V2-derived outer wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredBatchedProductionBudget {
+    pub fixed_model_native_bytes: usize,
+    pub trace_native_bytes: usize,
+    pub trace_table_count: usize,
+}
+
+impl StructuredBatchedProductionBudget {
+    pub fn usage(self) -> Result<StructuredProductionProofUsage, StructuredProductionBudgetError> {
+        if self.fixed_model_native_bytes == 0 || self.trace_native_bytes == 0 {
+            return Err(StructuredProductionBudgetError::EmptyPayload);
+        }
+        if self.trace_table_count == 0
+            || self.trace_table_count > STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES
+        {
+            return Err(StructuredProductionBudgetError::InvalidTraceTableCount);
+        }
+        let trace_metadata = self
+            .trace_table_count
+            .checked_mul(STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES)
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        let pcs_payload_bytes = STRUCTURED_BATCHED_PRODUCTION_SPLIT_PCS_FIXED_BYTES
+            .checked_add(trace_metadata)
+            .and_then(|total| total.checked_add(self.fixed_model_native_bytes))
+            .and_then(|total| total.checked_add(self.trace_native_bytes))
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        let complete_frame_bytes = STRUCTURED_PRODUCTION_V2_WRAPPER_BYTES
+            .checked_add(STRUCTURED_PRODUCTION_AGGREGATE_LENGTH_BYTES)
+            .and_then(|total| {
+                total.checked_add(STRUCTURED_BATCHED_PRODUCTION_COMPONENT_FLOOR_BYTES)
+            })
+            .and_then(|total| total.checked_add(pcs_payload_bytes))
+            .ok_or(StructuredProductionBudgetError::ArithmeticOverflow)?;
+        Ok(StructuredProductionProofUsage {
+            pcs_payload_bytes,
+            shared_argument_bytes: pcs_payload_bytes,
+            complete_frame_bytes,
+        })
+    }
+
+    pub fn ensure_fits(
+        self,
+    ) -> Result<StructuredProductionProofUsage, StructuredProductionBudgetError> {
+        let usage = self.usage()?;
+        if usage.complete_frame_bytes > STRUCTURED_PRODUCTION_FRAME_BYTES {
+            return Err(StructuredProductionBudgetError::ProofTooLarge {
+                actual: usage.complete_frame_bytes,
+                maximum: STRUCTURED_PRODUCTION_FRAME_BYTES,
+            });
+        }
+        Ok(usage)
+    }
+}
+
 /// Public data that fixes every component interpretation and fixed model
 /// commitment in one ForgeMatrix execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1556,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn production_component_floor_leaves_too_little_for_blake3() {
+    fn production_whole_frame_budget_rejects_individually_sized_children() {
         let shape = StructuredForgeMatrixResearchShape::production_candidate();
         shape.validate_verifier_shape().unwrap();
 
@@ -1585,7 +1774,10 @@ mod tests {
         // The two one-byte payloads make the envelope encodable; subtracting
         // them retains their canonical u32 length prefixes in the floor.
         let component_envelope_floor = aggregate.encode().unwrap().len() - 2;
-        assert_eq!(component_envelope_floor, 73_274);
+        assert_eq!(
+            component_envelope_floor,
+            STRUCTURED_PRODUCTION_COMPONENT_FLOOR_BYTES
+        );
 
         let current_v2_frame = crate::encode_forgematrix_proof(
             &crate::BlockProof::V2Reference(crate::ForgeMatrixV2CompactProof {
@@ -1600,19 +1792,72 @@ mod tests {
             [0; 32],
         )
         .unwrap();
-        assert_eq!(current_v2_frame.len(), 193);
+        assert_eq!(
+            current_v2_frame.len(),
+            STRUCTURED_PRODUCTION_V2_WRAPPER_BYTES
+        );
         assert_eq!(current_v2_frame.len() - crate::wire::WIRE_HEADER_BYTES, 177);
 
         // A future payload that preserves the current V2 identity fields and
         // appends one canonical sized aggregate needs this u32 length prefix.
         // MAX_PROOF_BYTES caps the complete frame, so the 16-byte wire header
         // and the 177 existing payload bytes must both remain in the budget.
-        let aggregate_length_prefix = std::mem::size_of::<u32>();
+        let aggregate_length_prefix = STRUCTURED_PRODUCTION_AGGREGATE_LENGTH_BYTES;
         let blake3_and_pcs_budget = crate::wire::MAX_PROOF_BYTES
             - current_v2_frame.len()
             - aggregate_length_prefix
             - component_envelope_floor;
-        assert_eq!(blake3_and_pcs_budget, 188_673);
+        assert_eq!(
+            blake3_and_pcs_budget,
+            STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES
+        );
+        assert_eq!(STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES, 188_673);
+
+        // These are the exact dictionary-free floors of the pinned n19 base
+        // and three n31 weight candidates. One byte each is still required for
+        // the hash and trace native payloads, so this is deliberately the most
+        // optimistic representation of the current five-section split proof.
+        let current_whir_floors = StructuredSplitV3ProductionBudget {
+            blake3_argument_bytes: 1,
+            base_model_native_bytes: 133_298,
+            weight_model_native_bytes: [268_640; PRODUCTION_BANKS],
+            trace_native_bytes: 1,
+            trace_table_count: 1,
+        };
+        let usage = current_whir_floors.usage().unwrap();
+        assert_eq!(usage.pcs_payload_bytes, 939_535);
+        assert_eq!(usage.shared_argument_bytes, 939_536);
+        assert_eq!(usage.complete_frame_bytes, 1_013_007);
+        assert_eq!(
+            current_whir_floors.ensure_fits(),
+            Err(StructuredProductionBudgetError::ProofTooLarge {
+                actual: 1_013_007,
+                maximum: STRUCTURED_PRODUCTION_FRAME_BYTES,
+            })
+        );
+        assert_eq!(
+            usage.complete_frame_bytes - STRUCTURED_PRODUCTION_FRAME_BYTES,
+            750_863
+        );
+
+        // Even if the hash, base, trace, and trace-table payloads were each
+        // only one byte, equal n31 children could use at most 62,784 bytes.
+        let non_weight_bytes = 1
+            + STRUCTURED_PRODUCTION_SPLIT_PCS_FIXED_BYTES
+            + STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES
+            + 1
+            + 1;
+        let optimistic_equal_weight_bytes =
+            (STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES - non_weight_bytes) / PRODUCTION_BANKS;
+        assert_eq!(optimistic_equal_weight_bytes, 62_784);
+
+        // Retaining the exact n19 base floor leaves only 18,352 bytes for each
+        // n31 child, before any native authentication dictionary is included.
+        let non_weight_bytes_with_base = non_weight_bytes - 1 + 133_298;
+        let equal_weight_bytes_with_base = (STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES
+            - non_weight_bytes_with_base)
+            / PRODUCTION_BANKS;
+        assert_eq!(equal_weight_bytes_with_base, 18_352);
 
         const CURRENT_32768_ROW_BLAKE3_ZLIB_BYTES: usize = 209_693;
         const STRUCTURED_BLAKE3_ENVELOPE_BYTES: usize = 8 + 4 + 1 + 4;
@@ -1628,6 +1873,190 @@ mod tests {
         let minimum_encodable_total = total_before_pcs_payload + 1;
         assert_eq!(minimum_encodable_total, 283_182);
         assert!(minimum_encodable_total > crate::wire::MAX_PROOF_BYTES);
+    }
+
+    #[test]
+    fn production_whole_frame_budget_is_exact_and_overflow_safe() {
+        let exact_trace_bytes = STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES
+            - STRUCTURED_PRODUCTION_SPLIT_PCS_FIXED_BYTES
+            - STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES
+            - 1
+            - 1
+            - PRODUCTION_BANKS;
+        let exact = StructuredSplitV3ProductionBudget {
+            blake3_argument_bytes: 1,
+            base_model_native_bytes: 1,
+            weight_model_native_bytes: [1; PRODUCTION_BANKS],
+            trace_native_bytes: exact_trace_bytes,
+            trace_table_count: 1,
+        };
+        let exact_usage = exact.ensure_fits().unwrap();
+        assert_eq!(
+            exact_usage.shared_argument_bytes,
+            STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES
+        );
+        assert_eq!(
+            exact_usage.complete_frame_bytes,
+            STRUCTURED_PRODUCTION_FRAME_BYTES
+        );
+
+        let one_byte_over = StructuredSplitV3ProductionBudget {
+            trace_native_bytes: exact_trace_bytes + 1,
+            ..exact
+        };
+        assert_eq!(
+            one_byte_over.ensure_fits(),
+            Err(StructuredProductionBudgetError::ProofTooLarge {
+                actual: STRUCTURED_PRODUCTION_FRAME_BYTES + 1,
+                maximum: STRUCTURED_PRODUCTION_FRAME_BYTES,
+            })
+        );
+        assert_eq!(
+            StructuredSplitV3ProductionBudget {
+                trace_table_count: 0,
+                ..exact
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::InvalidTraceTableCount)
+        );
+        assert_eq!(
+            StructuredSplitV3ProductionBudget {
+                trace_table_count: STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES + 1,
+                ..exact
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::InvalidTraceTableCount)
+        );
+        assert_eq!(
+            StructuredSplitV3ProductionBudget {
+                blake3_argument_bytes: 0,
+                ..exact
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::EmptyPayload)
+        );
+        if let Some(unencodable_count) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(
+                StructuredSplitV3ProductionBudget {
+                    trace_table_count: unencodable_count,
+                    ..exact
+                }
+                .usage(),
+                Err(StructuredProductionBudgetError::InvalidTraceTableCount)
+            );
+        }
+        assert_eq!(
+            StructuredSplitV3ProductionBudget {
+                blake3_argument_bytes: usize::MAX,
+                ..exact
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn batched_commitment_budget_pins_the_n33_deficit() {
+        assert_eq!(STRUCTURED_BATCHED_PRODUCTION_COMPONENT_FLOOR_BYTES, 73_270);
+        assert_eq!(STRUCTURED_BATCHED_PRODUCTION_SPLIT_PCS_FIXED_BYTES, 132);
+        assert_eq!(STRUCTURED_BATCHED_PRODUCTION_PCS_BYTES, 188_677);
+        assert_eq!(STRUCTURED_BATCHED_PRODUCTION_MODEL_NATIVE_BYTES, 188_540);
+
+        let exact = StructuredBatchedProductionBudget {
+            fixed_model_native_bytes: STRUCTURED_BATCHED_PRODUCTION_MODEL_NATIVE_BYTES,
+            trace_native_bytes: 1,
+            trace_table_count: 1,
+        };
+        assert_eq!(
+            exact.ensure_fits().unwrap().complete_frame_bytes,
+            STRUCTURED_PRODUCTION_FRAME_BYTES
+        );
+        assert_eq!(
+            StructuredBatchedProductionBudget {
+                fixed_model_native_bytes: STRUCTURED_BATCHED_PRODUCTION_MODEL_NATIVE_BYTES + 1,
+                ..exact
+            }
+            .ensure_fits(),
+            Err(StructuredProductionBudgetError::ProofTooLarge {
+                actual: STRUCTURED_PRODUCTION_FRAME_BYTES + 1,
+                maximum: STRUCTURED_PRODUCTION_FRAME_BYTES,
+            })
+        );
+
+        const N33_DICTIONARY_FREE_FLOOR: usize = 293_906;
+        let n33 = StructuredBatchedProductionBudget {
+            fixed_model_native_bytes: N33_DICTIONARY_FREE_FLOOR,
+            trace_native_bytes: 1,
+            trace_table_count: 1,
+        };
+        let usage = n33.usage().unwrap();
+        assert_eq!(usage.pcs_payload_bytes, 294_043);
+        assert_eq!(usage.complete_frame_bytes, 367_510);
+        assert_eq!(
+            usage.complete_frame_bytes - STRUCTURED_PRODUCTION_FRAME_BYTES,
+            105_366
+        );
+        assert_eq!(
+            n33.ensure_fits(),
+            Err(StructuredProductionBudgetError::ProofTooLarge {
+                actual: 367_510,
+                maximum: STRUCTURED_PRODUCTION_FRAME_BYTES,
+            })
+        );
+        assert_eq!(
+            StructuredBatchedProductionBudget {
+                fixed_model_native_bytes: 0,
+                trace_native_bytes: 1,
+                trace_table_count: 1,
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::EmptyPayload)
+        );
+        assert_eq!(
+            StructuredBatchedProductionBudget {
+                fixed_model_native_bytes: 1,
+                trace_native_bytes: 0,
+                trace_table_count: 1,
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::EmptyPayload)
+        );
+        assert_eq!(
+            StructuredBatchedProductionBudget {
+                fixed_model_native_bytes: usize::MAX,
+                trace_native_bytes: 1,
+                trace_table_count: 1,
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            StructuredBatchedProductionBudget {
+                fixed_model_native_bytes: 1,
+                trace_native_bytes: 1,
+                trace_table_count: 0,
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::InvalidTraceTableCount)
+        );
+        assert_eq!(
+            StructuredBatchedProductionBudget {
+                fixed_model_native_bytes: 1,
+                trace_native_bytes: 1,
+                trace_table_count: STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES + 1,
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::InvalidTraceTableCount)
+        );
+        assert_eq!(
+            StructuredBatchedProductionBudget {
+                fixed_model_native_bytes: 1,
+                trace_native_bytes: 1,
+                trace_table_count: 452,
+            }
+            .usage(),
+            Err(StructuredProductionBudgetError::InvalidTraceTableCount)
+        );
     }
 
     #[test]

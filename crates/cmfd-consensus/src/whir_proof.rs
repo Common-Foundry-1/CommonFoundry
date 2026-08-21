@@ -72,10 +72,18 @@ pub use production_candidate::{
 };
 #[cfg(feature = "production-whir-candidate")]
 pub use production_candidate::{
+    PRODUCTION_BATCHED_MODEL_SLOT_VARIABLES, PRODUCTION_BATCHED_MODEL_SLOTS,
+    PRODUCTION_BATCHED_MODEL_VARIABLES, PRODUCTION_BATCHED_WHIR_MODEL_BYTES,
+    PRODUCTION_FINAL_ACTIVATION_ELEMENTS, PRODUCTION_PROOF_BINDING_VERSION,
     PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES, PRODUCTION_WHIR_BASE_VARIABLES,
     PRODUCTION_WHIR_CANDIDATE_VERSION, PRODUCTION_WHIR_WEIGHT_VARIABLES,
+    ProductionBatchedModelIdentityV1, ProductionBatchedModelWhirConfigV1,
+    ProductionCommitmentChallengeV1, ProductionCommitmentClaimsV1,
+    ProductionCommitmentWorkBindingV1, ProductionProofCommitmentRootV1,
     ProductionWhirCandidateError, ProductionWhirConfigV1, ProductionWhirRoleV1,
-    ProductionWhirWireShapeV1, production_whir_suite_parameter_digest_v1,
+    ProductionWhirWireShapeV1, production_batched_model_lift_point_v1,
+    production_batched_model_source_index_v1, production_proof_binding_suite_digest_v1,
+    production_whir_suite_parameter_digest_v1,
 };
 #[cfg(feature = "gpu-proof-prover")]
 mod artifact_state;
@@ -2976,6 +2984,66 @@ mod tests {
             prove_structured_whir_openings(&[0x42; 32], &identity, &model, &trace_set, &openings)
                 .unwrap();
         (identity, openings, proof)
+    }
+
+    #[test]
+    fn split_v3_metadata_budget_is_exact_and_decodable() {
+        assert_eq!(
+            crate::structured_proof::STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES,
+            MAX_STRUCTURED_WHIR_TABLES
+        );
+        let child = |variables| StructuredWhirAggregateProof {
+            root: [0; 32],
+            table_variables: variables,
+            proof_bytes: vec![0],
+        };
+        let trace_table_count = 452;
+        let split = StructuredWhirSplitProof {
+            fixed_model: vec![
+                child(vec![2]),
+                child(vec![3]),
+                child(vec![3]),
+                child(vec![3]),
+            ],
+            trace: child(vec![2; trace_table_count]),
+        };
+        let encoded = split.encode().unwrap_err();
+        assert_eq!(encoded, ExplicitWhirError::AggregateProofTooLarge);
+
+        // The current V3 parser caps a section at 256 tables, so pin the wire
+        // formula independently at the largest encodable trace count. Four
+        // fixed-model native bytes plus one trace native byte are subtracted.
+        let trace_table_count = MAX_STRUCTURED_WHIR_TABLES;
+        let split = StructuredWhirSplitProof {
+            fixed_model: vec![
+                child(vec![2]),
+                child(vec![3]),
+                child(vec![3]),
+                child(vec![3]),
+            ],
+            trace: child(vec![2; trace_table_count]),
+        };
+        let encoded = split.encode().unwrap();
+        assert_eq!(StructuredWhirSplitProof::decode(&encoded).unwrap(), split);
+        let metadata_bytes = encoded.len() - 5;
+        assert_eq!(
+            metadata_bytes,
+            crate::structured_proof::STRUCTURED_PRODUCTION_SPLIT_PCS_FIXED_BYTES
+                + trace_table_count
+                    * crate::structured_proof::STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES
+        );
+
+        let batched = StructuredWhirSplitProof {
+            fixed_model: vec![child(vec![3])],
+            trace: child(vec![3, 3]),
+        };
+        let encoded = batched.encode().unwrap();
+        assert_eq!(StructuredWhirSplitProof::decode(&encoded).unwrap(), batched);
+        assert_eq!(
+            encoded.len() - 2,
+            crate::structured_proof::STRUCTURED_BATCHED_PRODUCTION_SPLIT_PCS_FIXED_BYTES
+                + 2 * crate::structured_proof::STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES
+        );
     }
 
     fn table() -> Vec<u64> {

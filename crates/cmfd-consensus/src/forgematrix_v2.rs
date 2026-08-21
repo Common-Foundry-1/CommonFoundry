@@ -817,7 +817,7 @@ pub fn v2_test_reference() -> Result<ForgeMatrixV2Reference, ForgeMatrixV2Error>
     ForgeMatrixV2Reference::from_explicit_model(descriptor, base, layers)
 }
 
-fn challenge_digest(
+pub(crate) fn challenge_digest(
     descriptor: &ForgeMatrixV2Descriptor,
     block: &BlockChallenge,
     nonce: u64,

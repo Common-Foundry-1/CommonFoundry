@@ -101,10 +101,19 @@ pub use structured_proof::{
     MAX_STRUCTURED_AGGREGATE_PROOF_BYTES, MAX_STRUCTURED_BLAKE3_PROOF_BYTES,
     MAX_STRUCTURED_FINAL_ACTIVATION_BYTES, MAX_STRUCTURED_OPENING_CLAIMS,
     MAX_STRUCTURED_OPENING_VARIABLES, MAX_STRUCTURED_PCS_PROOF_BYTES, STRUCTURED_AGGREGATE_VERSION,
-    StructuredBlake3Statement, StructuredBlake3Verifier, StructuredForgeMatrixProof,
-    StructuredForgeMatrixStatement, StructuredPcsOpeningClaim, StructuredPcsOpeningSet,
-    StructuredPcsVerifier, StructuredProofError, collect_structured_forgematrix_openings,
-    structured_forgematrix_public_binding, verify_structured_forgematrix_proof,
+    STRUCTURED_BATCHED_PRODUCTION_COMPONENT_FLOOR_BYTES,
+    STRUCTURED_BATCHED_PRODUCTION_MODEL_NATIVE_BYTES, STRUCTURED_BATCHED_PRODUCTION_PCS_BYTES,
+    STRUCTURED_BATCHED_PRODUCTION_SPLIT_PCS_FIXED_BYTES,
+    STRUCTURED_PRODUCTION_AGGREGATE_LENGTH_BYTES, STRUCTURED_PRODUCTION_COMPONENT_FLOOR_BYTES,
+    STRUCTURED_PRODUCTION_FRAME_BYTES, STRUCTURED_PRODUCTION_SHARED_ARGUMENT_BYTES,
+    STRUCTURED_PRODUCTION_SPLIT_PCS_FIXED_BYTES, STRUCTURED_PRODUCTION_SPLIT_PCS_TRACE_TABLE_BYTES,
+    STRUCTURED_PRODUCTION_SPLIT_V3_MAX_TRACE_TABLES, STRUCTURED_PRODUCTION_V2_WRAPPER_BYTES,
+    StructuredBatchedProductionBudget, StructuredBlake3Statement, StructuredBlake3Verifier,
+    StructuredForgeMatrixProof, StructuredForgeMatrixStatement, StructuredPcsOpeningClaim,
+    StructuredPcsOpeningSet, StructuredPcsVerifier, StructuredProductionBudgetError,
+    StructuredProductionProofUsage, StructuredProofError, StructuredSplitV3ProductionBudget,
+    collect_structured_forgematrix_openings, structured_forgematrix_public_binding,
+    verify_structured_forgematrix_proof,
 };
 pub use structured_sumcheck::{
     ExtensionElement, MAX_STRUCTURED_MATRIX_ELEMENTS, MAX_STRUCTURED_SUMCHECK_PROOF_BYTES,
@@ -164,10 +173,18 @@ pub use whir_proof::{
 };
 #[cfg(feature = "production-whir-candidate")]
 pub use whir_proof::{
+    PRODUCTION_BATCHED_MODEL_SLOT_VARIABLES, PRODUCTION_BATCHED_MODEL_SLOTS,
+    PRODUCTION_BATCHED_MODEL_VARIABLES, PRODUCTION_BATCHED_WHIR_MODEL_BYTES,
+    PRODUCTION_FINAL_ACTIVATION_ELEMENTS, PRODUCTION_PROOF_BINDING_VERSION,
     PRODUCTION_WHIR_ABSOLUTE_NATIVE_BYTES, PRODUCTION_WHIR_BASE_VARIABLES,
     PRODUCTION_WHIR_CANDIDATE_VERSION, PRODUCTION_WHIR_WEIGHT_VARIABLES,
+    ProductionBatchedModelIdentityV1, ProductionBatchedModelWhirConfigV1,
+    ProductionCommitmentChallengeV1, ProductionCommitmentClaimsV1,
+    ProductionCommitmentWorkBindingV1, ProductionProofCommitmentRootV1,
     ProductionWhirCandidateError, ProductionWhirConfigV1, ProductionWhirRoleV1,
-    ProductionWhirWireShapeV1, production_whir_suite_parameter_digest_v1,
+    ProductionWhirWireShapeV1, production_batched_model_lift_point_v1,
+    production_batched_model_source_index_v1, production_proof_binding_suite_digest_v1,
+    production_whir_suite_parameter_digest_v1,
 };
 #[cfg(feature = "gpu-proof-prover")]
 pub use whir_proof::{

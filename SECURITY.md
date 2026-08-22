@@ -164,9 +164,12 @@ wire tag. See
 The optional `dory-bls12-381-prototype` feature now exercises a real BLS12-381
 Dory opening with deterministic, role-separated hash-to-curve setup generators
 and a pinned setup identity. Its n=8 compressed opening payload is 16,909 bytes,
-and tests reject statement, setup, and proof mutations. It remains a sequential,
-unaudited backend checkpoint; it is not wired to the full aggregate or accepted
-by consensus.
+and its distinct-point aggregate produces a 17,695-byte proof for three n=8
+claims. The fixed parser preflights the full shape and tests reject statement,
+order, setup, sumcheck, and proof mutations. The n=31 grammar projects to 66,559
+bytes, but the executable prover is still capped at n=16. This remains a
+sequential, unaudited backend checkpoint; the complete AIR and LogUp relation
+are not ported and consensus does not accept it.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

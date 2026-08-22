@@ -791,16 +791,22 @@ then validates group encodings, reserializes canonically, and rejects trailing
 bytes. An n=8 three-claim fixture is exactly 12,063 bytes. Using compressed
 BLS12-381 element sizes, the same n=31 grammar projects to 66,559 bytes for this
 sumcheck and opening aggregate. This is not a complete production proof-size
-claim. The implemented backend is BN254 with random setup vectors and the module's
-production gate always returns an error. A separate
+claim. That original module remains a BN254 reference with random setup vectors,
+and its production gate always returns an error. A separate
 `dory-bls12-381-prototype` feature now implements the generic Dory field, group,
 pairing, polynomial, and transcript adapters on BLS12-381. It deterministically
 derives role-separated setup points with IETF hash-to-curve, binds the complete
 setup to a pinned BLAKE3 identity, and produces and verifies a real n=8 opening.
-Its canonical compressed Dory payload is 16,909 bytes. Statement, setup, and
-proof mutations are rejected. This executable checkpoint confirms the curve and
-setup route; it is still a sequential, unaudited reference and is not connected
-to the aggregation wrapper or consensus.
+Its canonical compressed Dory payload is 16,909 bytes. The BLS aggregate now
+executes the same distinct-point reduction for three n=8 claims and emits a
+17,695-byte canonical proof including the eight sumcheck rounds and fixed
+header. Its parser preflights the complete shape before group decoding and
+rejects malformed lengths, trailing data, statement or claim reordering, mixed
+setup identities, and mutated sumcheck or Dory bytes. The implemented n=31 wire
+projection is 66,559 bytes, below the 262,128-byte payload cap, but the in-memory
+prover remains capped at n=16. This executable checkpoint confirms the curve,
+setup, aggregation, and codec route; it is still a sequential, unaudited
+reference and is not connected to consensus.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -808,8 +814,8 @@ characteristics differ. Cross-field tests do show that the canonical
 bounded-integer witness makes all 121 local transition constraints vanish in
 both fields across signed boundary cases, while altered reductions and digits
 fail in both. The selected route is therefore native scalar-field
-re-arithmetization; this checkpoint does not yet port the sumcheck transcript or
-LogUp. Integrating the BLS12-381 backend with that re-arithmetized aggregate,
+re-arithmetization. The distinct-point sumcheck transcript is now ported, but
+the complete AIR and LogUp relation are not. Connecting those relations,
 streaming n=31 proving, complete soundness accounting, full aggregate
 measurement, and independent audit remain mandatory activation gates.
 

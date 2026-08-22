@@ -612,10 +612,61 @@ fn absorb_bytes(hasher: &mut blake3::Hasher, label: &[u8], bytes: &[u8]) {
 /// Deterministically generated prover/verifier setup and its consensus-facing identity.
 #[derive(Clone)]
 pub struct DeterministicBlsDorySetup {
-    pub prover: ProverSetup<BlsDoryCurve>,
-    pub verifier: VerifierSetup<BlsDoryCurve>,
-    pub identity: [u8; 32],
-    pub max_log_n: usize,
+    prover: ProverSetup<BlsDoryCurve>,
+    verifier: VerifierSetup<BlsDoryCurve>,
+    identity: [u8; 32],
+    max_log_n: usize,
+}
+
+impl DeterministicBlsDorySetup {
+    /// Pinned identity of every generator and setup parameter.
+    #[must_use]
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    /// Largest multilinear table dimension admitted by this setup.
+    #[must_use]
+    pub fn max_log_n(&self) -> usize {
+        self.max_log_n
+    }
+
+    pub(crate) fn prover(&self) -> &ProverSetup<BlsDoryCurve> {
+        &self.prover
+    }
+
+    pub(crate) fn verifier(&self) -> &VerifierSetup<BlsDoryCurve> {
+        &self.verifier
+    }
+
+    /// Recompute every derived setup invariant before the setup is trusted.
+    pub fn validate(&self) -> Result<(), BlsDoryPrototypeError> {
+        if self.max_log_n == 0 || self.max_log_n > MAX_BLS_DORY_PROTOTYPE_VARIABLES {
+            return Err(BlsDoryPrototypeError::InvalidSetup);
+        }
+        let generator_count = 1usize << self.max_log_n.div_ceil(2);
+        if self.prover.g1_vec.len() != generator_count
+            || self.prover.g2_vec.len() != generator_count
+            || self.prover.ht != BlsDoryCurve::pair(&self.prover.h1, &self.prover.h2)
+            || setup_identity(&self.prover, self.max_log_n)? != self.identity
+        {
+            return Err(BlsDoryPrototypeError::InvalidSetup);
+        }
+
+        let expected_verifier = self.prover.to_verifier_setup();
+        let mut expected_bytes = Vec::new();
+        let mut actual_bytes = Vec::new();
+        expected_verifier
+            .serialize_compressed(&mut expected_bytes)
+            .map_err(|error| BlsDoryPrototypeError::Serialization(error.to_string()))?;
+        self.verifier
+            .serialize_compressed(&mut actual_bytes)
+            .map_err(|error| BlsDoryPrototypeError::Serialization(error.to_string()))?;
+        if expected_bytes != actual_bytes {
+            return Err(BlsDoryPrototypeError::InvalidSetup);
+        }
+        Ok(())
+    }
 }
 
 /// Errors from the BLS12-381 Dory backend checkpoint.
@@ -623,6 +674,8 @@ pub struct DeterministicBlsDorySetup {
 pub enum BlsDoryPrototypeError {
     #[error("BLS12-381 Dory prototype size is invalid")]
     InvalidSize,
+    #[error("deterministic BLS12-381 setup is internally inconsistent")]
+    InvalidSetup,
     #[error("hash-to-curve setup derivation failed: {0}")]
     HashToCurve(String),
     #[error("canonical serialization failed: {0}")]
@@ -865,6 +918,7 @@ mod tests {
     fn deterministic_setup_has_a_pinned_identity() {
         let first = deterministic_bls_dory_setup(8).unwrap();
         let second = deterministic_bls_dory_setup(8).unwrap();
+        first.validate().unwrap();
         assert_eq!(first.identity, second.identity);
         assert_eq!(first.prover.g1_vec, second.prover.g1_vec);
         assert_eq!(first.prover.g2_vec, second.prover.g2_vec);
@@ -879,6 +933,20 @@ mod tests {
                 50, 143, 95, 189, 101, 85, 38, 221, 219, 96, 221, 96, 123, 231,
             ]
         );
+
+        let mut stale_identity = first.clone();
+        stale_identity.identity[0] ^= 1;
+        assert!(matches!(
+            stale_identity.validate(),
+            Err(BlsDoryPrototypeError::InvalidSetup)
+        ));
+
+        let mut stale_verifier = first.clone();
+        stale_verifier.verifier.h1 = BlsDoryG1::identity();
+        assert!(matches!(
+            stale_verifier.validate(),
+            Err(BlsDoryPrototypeError::InvalidSetup)
+        ));
     }
 
     #[test]

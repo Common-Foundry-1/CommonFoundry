@@ -956,10 +956,11 @@ zeros; every later fold preserves that implicit tail instead of writing padded
 zeros. The scratch-enabled shared prover uses it for every matrix, fixed-base,
 transition, LogUp, and wiring commitment. Matrix terminal evaluation and wiring
 commitment/evaluations read signed witness slices directly with bounded working
-memory, while transition and LogUp avoid power-of-two-padded commitment copies.
-The standalone aggregate and complete shared-layout fixture produce exactly the
-same proof through that path. Transition and LogUp still materialize witness or
-sumcheck working tables, so this is not yet the complete n=33 out-of-core prover.
+memory; the transition commitment derives all 110 regular and radix-16 lanes
+directly from the witness. The standalone aggregate and complete shared-layout
+fixture produce exactly the same proof through that path. Transition and LogUp
+still materialize sumcheck working tables, so this is not yet the complete n=33
+out-of-core prover.
 Streaming those remaining working sets, executing the final model
 commitment ceremony, independent review of the transcript and soundness
 accounting, and external audit remain activation requirements.

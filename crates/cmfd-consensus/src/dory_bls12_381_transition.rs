@@ -26,12 +26,13 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
         MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_padded_prefix_with_optional_scratch,
-        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
-        verify_bls_dory_openings,
+        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
+    dory_bls12_381_streaming::BlsDoryRowSource,
     structured_transition::{structured_transition_range_specs, validate_witness},
 };
 
@@ -51,7 +52,7 @@ pub const PRODUCTION_BLS_DORY_TRANSITION_VARIABLES: usize = 33;
 pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
 /// Remaining gates on this transition path.
 pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the scratch commitment omits packed zero padding, but the n=33 transition prover still materializes and folds all source oracle tables",
+    "the scratch commitment derives all 110 lanes directly from the witness, but the n=33 transition sumcheck still materializes and folds its oracle tables",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar transition transcript and packed opening path have not received an external audit",
 ];
@@ -416,16 +417,33 @@ fn prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryTransitionError::InvalidDimensions);
     }
-    let packed_coefficients = pack_oracles(&oracles)?;
     let packed_nu = packed_variables / 2;
     let packed_sigma = packed_variables - packed_nu;
-    let committed = commit_bls_dory_padded_prefix_with_optional_scratch(
-        &packed_coefficients,
-        packed_nu,
-        packed_sigma,
-        setup,
-        scratch_directory,
-    )?;
+    let committed = if let Some(scratch_directory) = scratch_directory {
+        let rows = 1usize
+            .checked_shl(packed_nu as u32)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        let columns = 1usize
+            .checked_shl(packed_sigma as u32)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        let mut source = BlsDoryTransitionWitnessRowSource::new(statement, witness, rows, columns)?;
+        commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            packed_nu,
+            packed_sigma,
+            setup,
+            scratch_directory,
+        )?
+    } else {
+        let packed_coefficients = pack_oracles(&oracles)?;
+        commit_bls_dory_padded_prefix_with_optional_scratch(
+            &packed_coefficients,
+            packed_nu,
+            packed_sigma,
+            setup,
+            None,
+        )?
+    };
     let oracle_commitment = committed.commitment();
 
     let mut transcript = transition_transcript(
@@ -850,6 +868,212 @@ pub(crate) fn build_scalar_oracles(
     Ok(oracles)
 }
 
+#[derive(Clone, Copy)]
+struct RangeOracleDescriptor {
+    source_oracle: usize,
+    digit: usize,
+    maximum: u64,
+    slack: bool,
+}
+
+pub(crate) struct BlsDoryTransitionWitnessRowSource<'a> {
+    statement: StructuredTransitionStatement,
+    witness: &'a StructuredTransitionWitness,
+    range_oracles: Vec<RangeOracleDescriptor>,
+    elements: usize,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+}
+
+impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
+    pub(crate) fn new(
+        statement: StructuredTransitionStatement,
+        witness: &'a StructuredTransitionWitness,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryTransitionError> {
+        validate_witness(statement, witness)?;
+        let elements = statement.elements()?;
+        let mut range_oracles = Vec::with_capacity(
+            STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES,
+        );
+        for spec in structured_transition_range_specs(statement)? {
+            for digit in 0..spec.digits {
+                range_oracles.push(RangeOracleDescriptor {
+                    source_oracle: spec.oracle,
+                    digit,
+                    maximum: spec.maximum,
+                    slack: false,
+                });
+                range_oracles.push(RangeOracleDescriptor {
+                    source_oracle: spec.oracle,
+                    digit,
+                    maximum: spec.maximum,
+                    slack: true,
+                });
+            }
+        }
+        let explicit_scalars = elements
+            .checked_mul(STRUCTURED_TRANSITION_ORACLES)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        let logical_scalars = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if range_oracles.len()
+            != STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES
+            || explicit_scalars > logical_scalars
+        {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        Ok(Self {
+            statement,
+            witness,
+            range_oracles,
+            elements,
+            rows,
+            columns,
+            explicit_scalars,
+        })
+    }
+
+    fn regular_value(
+        &self,
+        oracle: usize,
+        index: usize,
+    ) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+        let unsigned = |values: &[u64]| {
+            values
+                .get(index)
+                .copied()
+                .map(BlsDoryFr::from_u64)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)
+        };
+        let signed = |values: &[i64]| {
+            values
+                .get(index)
+                .copied()
+                .map(BlsDoryFr::from_i64)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)
+        };
+        match oracle {
+            ACCUMULATOR => signed(&self.witness.accumulators),
+            MASK => unsigned(&self.witness.masks),
+            ENCODED => unsigned(&self.witness.encoded),
+            SQUARE_QUOTIENT => unsigned(&self.witness.square_quotients),
+            SQUARE_REMAINDER => unsigned(&self.witness.square_remainders),
+            CUBE_QUOTIENT => unsigned(&self.witness.cube_quotients),
+            CUBE_REMAINDER => unsigned(&self.witness.cube_remainders),
+            OUTPUT_QUOTIENT => unsigned(&self.witness.output_quotients),
+            OUTPUT_REMAINDER => unsigned(&self.witness.output_remainders),
+            NEGATIVE => unsigned(&self.witness.negative),
+            ACTIVATION => signed(&self.witness.activations),
+            SHIFTED_ACCUMULATOR => {
+                let accumulator = self
+                    .witness
+                    .accumulators
+                    .get(index)
+                    .copied()
+                    .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+                let shifted = u64::try_from(
+                    i128::from(accumulator) + i128::from(self.statement.max_abs_accumulator),
+                )
+                .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+                Ok(BlsDoryFr::from_u64(shifted))
+            }
+            _ => Err(BlsDoryTransitionError::InvalidProofShape),
+        }
+    }
+
+    fn range_value(
+        &self,
+        descriptor: RangeOracleDescriptor,
+        index: usize,
+    ) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+        let value = if descriptor.source_oracle == SHIFTED_ACCUMULATOR {
+            let accumulator = self
+                .witness
+                .accumulators
+                .get(index)
+                .copied()
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+            u64::try_from(i128::from(accumulator) + i128::from(self.statement.max_abs_accumulator))
+                .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?
+        } else {
+            *witness_unsigned_values(self.witness, descriptor.source_oracle)?
+                .get(index)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?
+        };
+        let bounded = if descriptor.slack {
+            descriptor
+                .maximum
+                .checked_sub(value)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?
+        } else {
+            value
+        };
+        Ok(BlsDoryFr::from_u64(
+            (bounded >> (descriptor.digit * 4)) & 0xf,
+        ))
+    }
+
+    pub(crate) fn scalar(
+        &self,
+        oracle: usize,
+        index: usize,
+    ) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+        if index >= self.elements {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        if oracle < STRUCTURED_TRANSITION_REGULAR_ORACLES {
+            return self.regular_value(oracle, index);
+        }
+        let descriptor = self
+            .range_oracles
+            .get(oracle - STRUCTURED_TRANSITION_REGULAR_ORACLES)
+            .copied()
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+        self.range_value(descriptor, index)
+    }
+}
+
+impl BlsDoryRowSource for BlsDoryTransitionWitnessRowSource<'_> {
+    type Error = BlsDoryTransitionError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            let packed_index = start + column;
+            let oracle = packed_index / self.elements;
+            let index = packed_index % self.elements;
+            *scalar = if oracle < STRUCTURED_TRANSITION_ORACLES {
+                self.scalar(oracle, index)?
+            } else {
+                BlsDoryFr::zero()
+            };
+        }
+        Ok(output.len())
+    }
+}
+
 fn witness_unsigned_values(
     witness: &StructuredTransitionWitness,
     oracle: usize,
@@ -1185,6 +1409,29 @@ mod tests {
             witness.activations.push(activation);
         }
         (statement, mask, witness)
+    }
+
+    #[test]
+    fn witness_row_source_matches_every_materialized_transition_oracle() {
+        let (statement, _, witness) = fixture();
+        let variables = minimum_packed_variables(statement).unwrap();
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let oracles = build_scalar_oracles(statement, &witness).unwrap();
+        let packed = pack_oracles(&oracles).unwrap();
+        let mut source =
+            BlsDoryTransitionWitnessRowSource::new(statement, &witness, rows, columns).unwrap();
+        let explicit = source.explicit_scalar_count();
+        let mut streamed = Vec::new();
+        let mut row = vec![BlsDoryFr::zero(); columns];
+        for row_index in 0..explicit.div_ceil(columns) {
+            source.read_row(row_index, &mut row).unwrap();
+            streamed.extend_from_slice(&row);
+        }
+        streamed.truncate(explicit);
+        assert_eq!(streamed, packed[..explicit]);
     }
 
     #[test]

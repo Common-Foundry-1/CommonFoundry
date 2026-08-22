@@ -458,10 +458,11 @@ comparison. The v2 research code now implements:
   instead of allocating or writing it. The scratch-enabled shared path uses it
   for every matrix, fixed-base, transition, LogUp, and wiring commitment,
   without power-of-two-padded coefficient copies. Wiring additionally reads its
-  signed tables directly for commitment and multilinear evaluation. Transition
-  and LogUp witness or sumcheck working tables remain materialized, so the final
-  production artifact still needs an n=33 commitment run and streaming for
-  those remaining working sets;
+  signed tables directly for commitment and multilinear evaluation, and the
+  transition commitment derives all 110 regular and radix-16 lanes directly
+  from its witness. Transition and LogUp sumcheck working tables remain
+  materialized, so the final production artifact still needs an n=33 commitment
+  run and streaming for those remaining working sets;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

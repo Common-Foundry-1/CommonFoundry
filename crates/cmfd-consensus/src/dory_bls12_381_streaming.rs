@@ -31,6 +31,12 @@ pub trait BlsDoryRowSource {
     fn rows(&self) -> usize;
     fn columns(&self) -> usize;
 
+    /// Number of row-major scalars that are explicit before a canonical zero
+    /// suffix. Dense sources use the full logical geometry.
+    fn explicit_scalar_count(&self) -> usize {
+        self.rows().saturating_mul(self.columns())
+    }
+
     /// Fill `output` with the exact canonical row and return the number written.
     fn read_row(
         &mut self,

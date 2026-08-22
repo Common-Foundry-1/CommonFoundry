@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
+    arithmetic::Field,
     serialization::{Compress, Validate},
 };
 use same_file::Handle;
@@ -18,12 +19,12 @@ use thiserror::Error;
 
 use crate::dory_bls12_381_prototype::BlsDoryFr;
 
-const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSF1";
-const ARTIFACT_VERSION: u16 = 1;
-const ARTIFACT_HEADER_BYTES: usize = 92;
+const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSF2";
+const ARTIFACT_VERSION: u16 = 2;
+const ARTIFACT_HEADER_BYTES: usize = 100;
 const ARTIFACT_DIGEST_BYTES: usize = 32;
 const ARTIFACT_SCALAR_BYTES: usize = 32;
-const ARTIFACT_HASH_DOMAIN: &str = "CommonFoundry/ForgeMatrix/BlsDoryFoldArtifact/v1";
+const ARTIFACT_HASH_DOMAIN: &str = "CommonFoundry/ForgeMatrix/BlsDoryFoldArtifact/v2";
 static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// A fold retains only the current decoded scalar pair plus one 32-byte buffer.
@@ -34,7 +35,10 @@ pub struct BlsDoryFoldArtifactSpec {
     pub context_digest: [u8; 32],
     pub table_index: u32,
     pub generation: u32,
+    /// Logical power-of-two table length, including the implicit zero tail.
     pub scalar_count: u64,
+    /// Canonically stored prefix length. Remaining logical scalars are zero.
+    pub explicit_scalar_count: u64,
     pub parent_digest: [u8; 32],
 }
 
@@ -45,6 +49,8 @@ impl BlsDoryFoldArtifactSpec {
             || self.generation == 0
             || self.scalar_count == 0
             || !self.scalar_count.is_power_of_two()
+            || self.explicit_scalar_count == 0
+            || self.explicit_scalar_count > self.scalar_count
         {
             return Err(BlsDoryFoldArtifactError::InvalidSpec);
         }
@@ -61,7 +67,8 @@ impl BlsDoryFoldArtifactSpec {
         header[44..48].copy_from_slice(&self.table_index.to_le_bytes());
         header[48..52].copy_from_slice(&self.generation.to_le_bytes());
         header[52..60].copy_from_slice(&self.scalar_count.to_le_bytes());
-        header[60..92].copy_from_slice(&self.parent_digest);
+        header[60..68].copy_from_slice(&self.explicit_scalar_count.to_le_bytes());
+        header[68..100].copy_from_slice(&self.parent_digest);
         Ok(header)
     }
 }
@@ -124,7 +131,7 @@ impl BlsDoryFoldArtifactWriter {
     }
 
     pub fn write_scalar(&mut self, scalar: &BlsDoryFr) -> Result<(), BlsDoryFoldArtifactError> {
-        if self.written >= self.spec.scalar_count {
+        if self.written >= self.spec.explicit_scalar_count {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
         let encoded = encode_scalar(scalar)?;
@@ -135,7 +142,7 @@ impl BlsDoryFoldArtifactWriter {
     }
 
     pub fn finish(mut self) -> Result<BlsDoryFoldArtifact, BlsDoryFoldArtifactError> {
-        if self.written != self.spec.scalar_count {
+        if self.written != self.spec.explicit_scalar_count {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
         let digest = *self.hasher.finalize().as_bytes();
@@ -143,7 +150,7 @@ impl BlsDoryFoldArtifactWriter {
         file.write_all(&digest)?;
         file.flush()?;
         file.sync_all()?;
-        if file.metadata()?.len() != artifact_file_bytes(self.spec.scalar_count)? {
+        if file.metadata()?.len() != artifact_file_bytes(self.spec.explicit_scalar_count)? {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
         let file = self
@@ -201,7 +208,7 @@ impl BlsDoryFoldArtifact {
     ) -> Result<(), BlsDoryFoldArtifactError> {
         self.validate_live_file(|reader, hasher| {
             let mut encoded = [0u8; ARTIFACT_SCALAR_BYTES];
-            for _ in 0..self.spec.scalar_count {
+            for _ in 0..self.spec.explicit_scalar_count {
                 reader.read_exact(&mut encoded)?;
                 hasher.update(&encoded);
                 visitor(decode_scalar(encoded)?)?;
@@ -226,8 +233,8 @@ impl BlsDoryFoldArtifact {
                 Ok(())
             }
         })?;
-        if pending.is_some() {
-            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        if let Some(lower) = pending {
+            visitor(lower, BlsDoryFr::zero())?;
         }
         Ok(())
     }
@@ -236,7 +243,7 @@ impl BlsDoryFoldArtifact {
         &self,
         consume: impl FnOnce(&mut File, &mut blake3::Hasher) -> Result<(), BlsDoryFoldArtifactError>,
     ) -> Result<(), BlsDoryFoldArtifactError> {
-        let expected_len = artifact_file_bytes(self.spec.scalar_count)?;
+        let expected_len = artifact_file_bytes(self.spec.explicit_scalar_count)?;
         if self.file.metadata()?.len() != expected_len {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
@@ -347,6 +354,7 @@ mod tests {
             table_index: 7,
             generation: 2,
             scalar_count: count,
+            explicit_scalar_count: count,
             parent_digest: [9; 32],
         }
     }
@@ -385,6 +393,40 @@ mod tests {
         assert_eq!(BLS_DORY_FOLD_ARTIFACT_MAX_WORKING_SCALARS, 2);
         drop(artifact);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn implicit_zero_suffix_is_not_stored_and_odd_prefix_pairs_with_zero() {
+        let directory = TestDirectory::create();
+        let mut sparse_spec = spec(8);
+        sparse_spec.explicit_scalar_count = 3;
+        let values = [
+            BlsDoryFr::from_u64(5),
+            BlsDoryFr::from_u64(7),
+            BlsDoryFr::from_u64(11),
+        ];
+        let mut writer = BlsDoryFoldArtifactWriter::create(&directory.0, sparse_spec).unwrap();
+        for value in &values {
+            writer.write_scalar(value).unwrap();
+        }
+        let artifact = writer.finish().unwrap();
+        assert_eq!(artifact.spec().scalar_count, 8);
+        assert_eq!(artifact.spec().explicit_scalar_count, 3);
+        assert_eq!(
+            std::fs::metadata(artifact.path()).unwrap().len(),
+            artifact_file_bytes(3).unwrap()
+        );
+        let mut pairs = Vec::new();
+        artifact
+            .for_each_pair(|lower, upper| {
+                pairs.push((lower, upper));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            pairs,
+            vec![(values[0], values[1]), (values[2], BlsDoryFr::zero())]
+        );
     }
 
     #[test]
@@ -444,6 +486,12 @@ mod tests {
         let directory = TestDirectory::create();
         assert!(matches!(
             BlsDoryFoldArtifactWriter::create(&directory.0, spec(3)),
+            Err(BlsDoryFoldArtifactError::InvalidSpec)
+        ));
+        let mut invalid_explicit = spec(4);
+        invalid_explicit.explicit_scalar_count = 5;
+        assert!(matches!(
+            BlsDoryFoldArtifactWriter::create(&directory.0, invalid_explicit),
             Err(BlsDoryFoldArtifactError::InvalidSpec)
         ));
         let mut writer = BlsDoryFoldArtifactWriter::create(&directory.0, spec(4)).unwrap();

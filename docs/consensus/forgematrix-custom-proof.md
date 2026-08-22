@@ -949,8 +949,11 @@ self-authenticating, lineage-bound artifact. It uses a two-scalar fold working s
 rejects corruption, truncation, non-canonical fields, and trailing bytes, removes
 partial or completed files only while it still owns them, and aborts without a
 dense fallback. A row-source constructor now computes ordinary row and tier-two
-commitments while writing the canonical coefficient stream to the same
-self-authenticating storage boundary. The scratch-enabled shared prover uses it
+commitments while writing the canonical explicit coefficient prefix to the same
+self-authenticating storage boundary. The artifact header binds both its logical
+power-of-two length and explicit length, making the omitted suffix canonical
+zeros; every later fold preserves that implicit tail instead of writing padded
+zeros. The scratch-enabled shared prover uses it
 for all matrix activation, weight, and accumulator tables and for the fixed base
 table; it evaluates the matrix terminal directly from signed witness slices and
 does not allocate padded scalar copies. The standalone aggregate and complete

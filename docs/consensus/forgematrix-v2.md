@@ -452,8 +452,10 @@ comparison. The v2 research code now implements:
   tables. An explicit scratch path keeps every post-challenge fold in a
   self-authenticating artifact, aborts on storage corruption without a dense
   fallback, and preserves complete shared-layout proof bytes. A row-source
-  constructor now writes canonical authenticated source artifacts while
-  computing the unchanged commitments. The scratch-enabled shared path uses it
+  constructor now writes canonical authenticated source prefixes while
+  computing the unchanged commitments. Each artifact authenticates its logical
+  and explicit lengths, and every fold keeps the remaining zero tail implicit
+  instead of allocating or writing it. The scratch-enabled shared path uses it
   for matrix activation, weight, and accumulator tables and the fixed base,
   without padded scalar copies. Transition, LogUp, and wiring tables remain
   materialized, so the final production artifact still needs an n=33 commitment

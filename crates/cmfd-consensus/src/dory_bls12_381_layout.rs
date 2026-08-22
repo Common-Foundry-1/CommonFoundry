@@ -556,6 +556,10 @@ impl BlsDoryRowSource for PaddedFixedRowSource<'_> {
         self.columns
     }
 
+    fn explicit_scalar_count(&self) -> usize {
+        self.values.len()
+    }
+
     fn read_row(
         &mut self,
         row_index: usize,

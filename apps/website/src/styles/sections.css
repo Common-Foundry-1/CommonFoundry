@@ -1,0 +1,1318 @@
+/* Hero */
+.hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(420px, 0.78fr) minmax(600px, 1.22fr);
+  height: calc(100svh - var(--header-height));
+  min-height: 760px;
+  padding-top: clamp(2rem, 4vh, 2.75rem);
+  overflow: hidden;
+}
+
+.hero::before,
+.thesis::before,
+.progress::before,
+.economics::before {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: radial-gradient(circle at 66% 40%, rgba(207, 76, 16, 0.08), transparent 32%);
+  content: "";
+  pointer-events: none;
+}
+
+.hero__copy {
+  position: relative;
+  z-index: 2;
+  align-self: start;
+  padding: 0 clamp(1rem, 2vw, 2.5rem) 8rem 0;
+}
+
+.hero h1 {
+  max-width: 660px;
+  margin-bottom: 1.45rem;
+  font-size: clamp(3.7rem, 4.25vw, 4.65rem);
+  line-height: 1.02;
+}
+
+.hero__copy > p {
+  max-width: 600px;
+  margin-bottom: 1.75rem;
+  color: var(--mineral-300);
+  font-size: clamp(1.05rem, 1.28vw, 1.35rem);
+  line-height: 1.65;
+}
+
+.hero__actions {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1.85rem;
+}
+
+.hero__actions .button-link {
+  min-width: 210px;
+}
+
+.hero__visual {
+  position: relative;
+  min-width: 0;
+  align-self: start;
+  padding-bottom: 7rem;
+}
+
+.hero__visual::before {
+  position: absolute;
+  inset: 4% -10% 15%;
+  z-index: -1;
+  background:
+    linear-gradient(rgba(236, 122, 48, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(236, 122, 48, 0.06) 1px, transparent 1px);
+  background-size: 42px 42px;
+  -webkit-mask-image: radial-gradient(ellipse, black 20%, transparent 72%);
+  mask-image: radial-gradient(ellipse, black 20%, transparent 72%);
+  content: "";
+}
+
+.hero__art-wrap {
+  width: 112%;
+  margin-left: -8%;
+  transform: translate3d(var(--hero-x, 0), var(--hero-y, 0), 0);
+  transition: transform 180ms ease-out;
+  will-change: transform;
+}
+
+.hero__art-wrap img {
+  width: 100%;
+  filter: drop-shadow(0 30px 45px rgba(0, 0, 0, 0.5));
+}
+
+.hero__legend {
+  position: absolute;
+  right: 2%;
+  bottom: 7.25rem;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  color: var(--copper-300);
+  font-family: var(--display);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+
+.hero__legend span {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  white-space: nowrap;
+}
+
+.hero__legend b {
+  width: clamp(18px, 2vw, 45px);
+  height: 1px;
+  background: var(--copper-400);
+}
+
+.hero__legend i {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--copper-400);
+}
+
+.hero__legend .legend-line {
+  width: 28px;
+  height: 1px;
+  border: 0;
+  background: var(--copper-400);
+}
+
+.hero__legend .legend-hex {
+  clip-path: polygon(50% 0, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%);
+}
+
+.section-preview {
+  position: absolute;
+  z-index: 3;
+  right: var(--page-gutter);
+  bottom: 0;
+  left: var(--page-gutter);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 116px;
+  padding: 0 2.25rem;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  clip-path: polygon(24px 0, calc(100% - 24px) 0, 100% 24px, 100% 100%, 0 100%, 0 24px);
+  background: rgba(15, 16, 16, 0.9);
+  font-family: var(--display);
+  font-size: clamp(2rem, 3vw, 3.5rem);
+}
+
+.section-preview i {
+  color: var(--copper-400);
+  font-style: normal;
+}
+
+/* Thesis */
+.thesis,
+.progress,
+.economics {
+  position: relative;
+  min-height: calc(100svh - var(--header-height));
+  padding-top: clamp(2rem, 4vh, 2.75rem);
+  padding-bottom: clamp(3.5rem, 6vh, 5rem);
+}
+
+.thesis__diagram {
+  display: grid;
+  grid-template-columns: minmax(270px, 1fr) minmax(300px, 0.68fr) minmax(270px, 1fr);
+  align-items: center;
+  min-height: 440px;
+  margin-top: clamp(1.5rem, 3vh, 2.5rem);
+}
+
+.thesis-path {
+  display: grid;
+  gap: 2rem;
+  min-height: 310px;
+  padding: 1.5rem;
+  color: var(--mineral-500);
+  text-align: left;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0.56;
+  transition: opacity 180ms ease, color 180ms ease;
+}
+
+.thesis-path[aria-pressed="true"],
+.thesis-path:hover,
+.thesis-path:focus-visible {
+  color: var(--mineral-100);
+  opacity: 1;
+}
+
+.thesis-path__signal {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 145px;
+}
+
+.thesis-path__signal::before {
+  position: absolute;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(236, 122, 48, 0.25), var(--copper-400));
+  content: "";
+}
+
+.thesis-path--inference .thesis-path__signal::before {
+  background: linear-gradient(90deg, var(--copper-400), rgba(236, 122, 48, 0.25));
+}
+
+.thesis-path__signal i {
+  position: relative;
+  z-index: 1;
+  width: clamp(34px, 3vw, 54px);
+  aspect-ratio: 1;
+  border: 1px solid var(--copper-400);
+  background:
+    linear-gradient(135deg, transparent 45%, rgba(236, 122, 48, 0.5) 46% 54%, transparent 55%),
+    var(--graphite-950);
+  transform: rotate(45deg);
+}
+
+.thesis-path__signal--stages i {
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+  transform: none;
+}
+
+.thesis-path__copy {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.thesis-path__copy strong {
+  color: var(--mineral-100);
+  font-family: var(--display);
+  font-size: clamp(1.6rem, 2vw, 2.1rem);
+  font-weight: 500;
+}
+
+.thesis-path__copy span {
+  max-width: 480px;
+  font-size: 1rem;
+  line-height: 1.65;
+}
+
+.operator {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+}
+
+.operator::before {
+  position: absolute;
+  width: 84%;
+  aspect-ratio: 1;
+  border: 1px solid var(--line-soft);
+  border-radius: 50%;
+  box-shadow: 0 0 75px rgba(221, 92, 28, 0.18);
+  content: "";
+}
+
+.operator img {
+  position: relative;
+  z-index: 1;
+  width: 145%;
+  max-width: none;
+}
+
+.operator span {
+  position: absolute;
+  z-index: 2;
+  bottom: 7%;
+  padding: 0.45rem 0.85rem;
+  color: var(--copper-300);
+  border: 1px solid var(--line-soft);
+  background: rgba(5, 6, 6, 0.82);
+  font-family: var(--display);
+  font-size: 0.84rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+
+.thesis__close,
+.progress__close {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1.75rem;
+  padding-top: 1.4rem;
+  border-top: 1px solid var(--white-line);
+}
+
+.thesis__close p,
+.progress__close p {
+  margin: 0;
+  color: var(--mineral-300);
+  font-family: var(--display);
+  font-size: clamp(1.35rem, 2vw, 2rem);
+}
+
+.thesis__close a,
+.progress__close a,
+.economics__disclosures a {
+  display: inline-flex;
+  align-items: center;
+  gap: 1rem;
+  color: var(--copper-300);
+  font-family: var(--display);
+  font-size: 1.2rem;
+}
+
+.thesis__close svg,
+.progress__close svg,
+.economics__disclosures a svg {
+  width: 1.4rem;
+}
+
+/* Progress */
+.progress {
+  border-top: 1px solid var(--white-line);
+  border-bottom: 1px solid var(--white-line);
+  background: rgba(14, 15, 15, 0.76);
+}
+
+.progress__heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 2rem;
+}
+
+.release-line {
+  flex: 0 0 auto;
+  margin: 0 0 0.35rem;
+  color: var(--mineral-500);
+  font-size: 0.92rem;
+}
+
+.release-line strong {
+  color: var(--mineral-300);
+  font-weight: 500;
+}
+
+.release-line span {
+  margin: 0 0.45rem;
+  color: var(--copper-400);
+}
+
+.release-line code {
+  color: var(--copper-300);
+}
+
+.progress__instrument {
+  display: grid;
+  grid-template-columns: 1fr 94px 1fr;
+  min-height: 430px;
+  margin-top: clamp(1.75rem, 3.5vh, 3rem);
+}
+
+.progress__group {
+  padding: clamp(1.5rem, 3vw, 3.5rem);
+  border: 1px solid var(--white-line);
+  background: rgba(5, 6, 6, 0.76);
+  transition: opacity 180ms ease;
+}
+
+.progress__group--implemented {
+  border-color: var(--line);
+  opacity: var(--implemented-opacity);
+}
+
+.progress__group--gated {
+  opacity: var(--gated-opacity);
+}
+
+.progress__group h3 {
+  margin-bottom: 1.6rem;
+  color: var(--copper-300);
+  font-size: clamp(1.45rem, 2vw, 2rem);
+  text-transform: uppercase;
+}
+
+.progress__group--gated h3 {
+  color: var(--mineral-500);
+}
+
+.progress-list {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.progress-list li {
+  display: grid;
+  grid-template-columns: 48px 1fr auto;
+  align-items: center;
+  gap: 1rem;
+  min-height: 61px;
+  border-bottom: 1px solid var(--white-line);
+}
+
+.progress-list__icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  color: var(--copper-300);
+  border: 1px solid var(--line-soft);
+}
+
+.progress-list__icon svg {
+  width: 21px;
+}
+
+.progress-list li > span:nth-child(2) {
+  font-size: 1rem;
+}
+
+.progress-list li > i {
+  width: 8px;
+  height: 8px;
+  background: var(--copper-400);
+  transform: rotate(45deg);
+}
+
+.progress-list--gated .progress-list__icon,
+.progress-list--gated li > i {
+  color: var(--mineral-500);
+  border-color: var(--white-line);
+}
+
+.progress-list--gated li > i {
+  background: var(--mineral-500);
+}
+
+.progress__divider {
+  position: relative;
+  display: grid;
+  place-items: center;
+  cursor: ew-resize;
+}
+
+.progress__divider::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--copper-400);
+  content: "";
+}
+
+.progress__divider input {
+  position: absolute;
+  width: 420px;
+  height: 94px;
+  opacity: 0;
+  cursor: ew-resize;
+  transform: rotate(-90deg);
+}
+
+.progress__divider i {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  width: 70px;
+  height: 70px;
+  color: var(--graphite-1000);
+  background: var(--copper-400);
+  clip-path: polygon(14px 0, 100% 0, 100% calc(100% - 14px), calc(100% - 14px) 100%, 0 100%, 0 14px);
+  font-size: 1.5rem;
+  font-style: normal;
+}
+
+/* Economics */
+.economics__instrument {
+  display: grid;
+  grid-template-columns: minmax(0, 2.1fr) minmax(330px, 0.9fr);
+  gap: 0;
+  margin-top: clamp(1.5rem, 3vh, 2.25rem);
+  padding: clamp(1rem, 1.3vw, 1.25rem);
+  border: 1px solid var(--line);
+  background: rgba(9, 10, 10, 0.76);
+  clip-path: polygon(14px 0, calc(100% - 14px) 0, 100% 14px, 100% calc(100% - 14px), calc(100% - 14px) 100%, 14px 100%, 0 calc(100% - 14px), 0 14px);
+}
+
+.emission-chart,
+.allocation,
+.economics__disclosures {
+  border: 0;
+  background: transparent;
+}
+
+.emission-chart {
+  grid-column: 1 / -1;
+  padding: 0 0 clamp(1rem, 2vh, 1.5rem);
+  border-bottom: 1px solid var(--white-line);
+}
+
+.emission-chart h3,
+.allocation h3 {
+  margin-bottom: 1.4rem;
+  color: var(--mineral-300);
+  font-size: 1.1rem;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.emission-chart svg {
+  width: 100%;
+  max-height: 220px;
+  overflow: visible;
+}
+
+.chart-grid path {
+  stroke: rgba(242, 240, 236, 0.1);
+  stroke-width: 1;
+}
+
+.chart-decline,
+.chart-tail {
+  fill: none;
+  stroke: var(--copper-400);
+  stroke-width: 3;
+}
+
+.chart-tail {
+  stroke-dasharray: 8 6;
+}
+
+.chart-axis-labels {
+  fill: var(--mineral-500);
+  font: 16px var(--body);
+}
+
+.chart-annotations {
+  fill: var(--copper-300);
+  font: 14px var(--display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.chart-marker {
+  fill: var(--mineral-50);
+  stroke: var(--copper-400);
+  stroke-width: 4;
+}
+
+.emission-control {
+  margin-top: 0.8rem;
+}
+
+.emission-control output {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.45rem;
+}
+
+.emission-control output strong {
+  color: var(--copper-300);
+  font-family: var(--display);
+  font-size: 1.45rem;
+}
+
+.emission-control output span {
+  color: var(--mineral-300);
+  font-variant-numeric: tabular-nums;
+}
+
+.emission-control input {
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  accent-color: var(--copper-400);
+  cursor: ew-resize;
+}
+
+.emission-control__labels {
+  display: flex;
+  justify-content: space-between;
+  color: var(--mineral-500);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.allocation {
+  padding: 1.1rem 1.2rem 0 0;
+}
+
+.allocation__bar {
+  display: flex;
+  width: 100%;
+  min-height: 88px;
+  overflow: hidden;
+}
+
+.allocation__bar button {
+  display: grid;
+  min-width: 0;
+  padding: 0.75rem;
+  place-content: center;
+  color: var(--mineral-300);
+  border: 1px solid rgba(5, 6, 6, 0.7);
+  background: var(--graphite-800);
+  cursor: pointer;
+  transition: filter 160ms ease;
+}
+
+.allocation__bar button:nth-child(1) {
+  flex-grow: 70;
+  color: var(--graphite-1000);
+  background: var(--copper-400);
+}
+
+.allocation__bar button:nth-child(2) {
+  flex-grow: 25;
+  background: #8c3b18;
+}
+
+.allocation__bar button:nth-child(3) {
+  flex-grow: 5;
+  min-width: 64px;
+  background: #422115;
+}
+
+.allocation__bar button.is-active {
+  box-shadow: inset 0 0 0 3px var(--mineral-100);
+  filter: brightness(1.15);
+}
+
+.allocation__bar strong,
+.allocation__bar span {
+  display: block;
+  white-space: nowrap;
+}
+
+.allocation__bar strong {
+  font-family: var(--display);
+  font-size: clamp(1.5rem, 2.4vw, 2.5rem);
+  font-weight: 500;
+}
+
+.allocation__bar span {
+  font-size: clamp(0.66rem, 0.8vw, 0.88rem);
+  text-transform: uppercase;
+}
+
+.allocation__bar button:nth-child(3) span {
+  display: none;
+}
+
+.allocation__detail {
+  min-height: 2rem;
+  margin: 0.75rem 0 0;
+  color: var(--mineral-500);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.economics__disclosures {
+  display: grid;
+  gap: 0.65rem;
+  padding: 1.1rem 0 0 1.2rem;
+  border-left: 1px solid var(--white-line);
+}
+
+.economics__disclosures p {
+  display: grid;
+  grid-template-columns: 32px 1fr;
+  gap: 0.8rem;
+  margin: 0;
+  color: var(--mineral-300);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.economics__disclosures p svg {
+  width: 25px;
+  color: var(--copper-400);
+}
+
+.economics__disclosures .economics__plain {
+  grid-template-columns: 1fr;
+  color: var(--copper-300);
+  font-weight: 600;
+}
+
+/* Roadmap and close */
+.roadmap {
+  position: relative;
+  min-height: calc(100svh - var(--header-height));
+  overflow: hidden;
+  background: var(--graphite-1000);
+}
+
+.roadmap__background {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: max(100%, 1500px);
+  height: min(1000px, 65%);
+  object-fit: cover;
+  opacity: 0.5;
+  transform: translateX(-50%);
+  -webkit-mask-image: linear-gradient(#000 40%, transparent 100%);
+  mask-image: linear-gradient(#000 40%, transparent 100%);
+}
+
+.roadmap__content {
+  position: relative;
+  z-index: 1;
+  padding-top: clamp(2rem, 4vh, 3rem);
+}
+
+.roadmap__rail {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0;
+  padding: 0;
+  margin: clamp(2rem, 4vh, 3rem) 0 clamp(2rem, 4vh, 3rem);
+  list-style: none;
+}
+
+.roadmap__rail::before {
+  position: absolute;
+  top: 70px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, var(--copper-300), var(--copper-400) 38%, var(--mineral-500) 38%, var(--mineral-500));
+  content: "";
+}
+
+.roadmap__rail li {
+  position: relative;
+  min-width: 0;
+}
+
+.roadmap__rail button {
+  display: grid;
+  width: 100%;
+  min-height: 195px;
+  padding: 0 1.1rem;
+  align-content: start;
+  justify-items: start;
+  color: var(--mineral-300);
+  text-align: left;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.roadmap__number {
+  color: var(--copper-300);
+  font-family: var(--display);
+  font-size: 1.05rem;
+  letter-spacing: 0.12em;
+}
+
+.roadmap__node {
+  position: relative;
+  z-index: 1;
+  width: 22px;
+  height: 22px;
+  margin: 27px 0 25px;
+  border: 2px solid var(--copper-400);
+  background: var(--graphite-1000);
+  transform: rotate(45deg);
+}
+
+.roadmap__rail li.is-active .roadmap__node,
+.roadmap__rail button[aria-expanded="true"] .roadmap__node {
+  background: var(--copper-400);
+  box-shadow: 0 0 24px rgba(236, 122, 48, 0.65);
+}
+
+.roadmap__rail li.is-future .roadmap__number,
+.roadmap__rail li.is-future .roadmap__node {
+  color: var(--mineral-500);
+  border-color: var(--mineral-500);
+}
+
+.roadmap__rail strong {
+  max-width: 240px;
+  font-family: var(--display);
+  font-size: clamp(1.12rem, 1.45vw, 1.45rem);
+  font-weight: 500;
+  line-height: 1.15;
+}
+
+.roadmap__rail li > p {
+  position: absolute;
+  z-index: 3;
+  top: 190px;
+  right: 1rem;
+  left: 1rem;
+  padding: 1rem;
+  color: var(--mineral-300);
+  border: 1px solid var(--line);
+  background: rgba(5, 6, 6, 0.96);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.conversion-band {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  padding: clamp(1.6rem, 3vw, 2.75rem);
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(110deg, rgba(221, 92, 28, 0.12), transparent 45%),
+    rgba(15, 16, 16, 0.9);
+  clip-path: polygon(24px 0, calc(100% - 24px) 0, 100% 24px, 100% calc(100% - 24px), calc(100% - 24px) 100%, 24px 100%, 0 calc(100% - 24px), 0 24px);
+}
+
+.conversion-band h3 {
+  margin-bottom: 0.8rem;
+  font-size: clamp(2.5rem, 3.35vw, 3.65rem);
+  line-height: 0.96;
+}
+
+.conversion-band > div > p {
+  max-width: 600px;
+  margin-bottom: 0;
+  color: var(--mineral-500);
+  line-height: 1.65;
+}
+
+.conversion-band__actions {
+  display: grid;
+  align-content: center;
+  gap: 1.4rem;
+}
+
+.conversion-band__actions > div {
+  display: flex;
+  gap: 1rem;
+}
+
+.conversion-band__actions .button-link {
+  flex: 1;
+}
+
+.site-footer {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 2rem;
+  min-height: 112px;
+  padding: 1.6rem 0;
+  border-top: 1px solid var(--white-line);
+}
+
+.site-footer nav {
+  display: flex;
+  justify-content: center;
+  gap: clamp(1rem, 2.5vw, 2.75rem);
+}
+
+.site-footer nav a {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--mineral-500);
+  font-size: 0.84rem;
+}
+
+.site-footer nav svg {
+  width: 1rem;
+  color: var(--copper-400);
+}
+
+.site-footer > p {
+  max-width: 220px;
+  margin: 0;
+  color: var(--mineral-500);
+  font-size: 0.78rem;
+  text-align: right;
+}
+
+@media (max-width: 1180px) {
+  .hero {
+    grid-template-columns: minmax(360px, 0.82fr) minmax(480px, 1.18fr);
+  }
+
+  .hero__legend {
+    font-size: 0.64rem;
+    letter-spacing: 0.14em;
+  }
+
+  .thesis__diagram {
+    grid-template-columns: 1fr 280px 1fr;
+  }
+
+  .progress__instrument {
+    grid-template-columns: 1fr 72px 1fr;
+  }
+
+  .economics__instrument {
+    grid-template-columns: minmax(0, 1.35fr) minmax(315px, 0.65fr);
+  }
+
+  .roadmap__rail button {
+    padding-right: 0.7rem;
+    padding-left: 0.7rem;
+  }
+}
+
+@media (max-width: 860px) {
+  .hero {
+    display: flex;
+    height: auto;
+    min-height: auto;
+    flex-direction: column;
+    padding-top: 3rem;
+  }
+
+  .hero__copy {
+    padding: 0;
+  }
+
+  .hero h1 {
+    max-width: 620px;
+    font-size: clamp(3.4rem, 12vw, 5.5rem);
+  }
+
+  .hero__copy > p {
+    max-width: 680px;
+  }
+
+  .hero__visual {
+    order: 2;
+    min-height: 410px;
+    padding: 1rem 0 6rem;
+  }
+
+  .hero__art-wrap {
+    width: 112%;
+    margin-left: -6%;
+  }
+
+  .hero__legend {
+    bottom: 3.5rem;
+  }
+
+  .section-preview {
+    position: relative;
+    right: auto;
+    bottom: auto;
+    left: auto;
+    order: 3;
+    min-height: 96px;
+    margin: 0;
+    padding: 0 1.5rem;
+  }
+
+  .thesis,
+  .progress,
+  .economics {
+    min-height: auto;
+    padding-top: 6rem;
+    padding-bottom: 6rem;
+  }
+
+  .thesis__diagram {
+    grid-template-columns: 1fr;
+    margin-top: 3rem;
+  }
+
+  .operator {
+    grid-row: 1;
+    width: min(76vw, 480px);
+    margin: 0 auto;
+  }
+
+  .thesis-path {
+    grid-template-columns: 0.92fr 1.08fr;
+    min-height: 220px;
+  }
+
+  .thesis-path__signal {
+    min-height: 120px;
+  }
+
+  .thesis__close,
+  .progress__close {
+    align-items: flex-start;
+    gap: 1.5rem;
+  }
+
+  .progress__heading {
+    display: block;
+  }
+
+  .release-line {
+    margin-top: 1.5rem;
+  }
+
+  .progress__instrument {
+    grid-template-columns: 1fr;
+  }
+
+  .progress__divider {
+    min-height: 74px;
+    cursor: ns-resize;
+  }
+
+  .progress__divider::before {
+    top: 50%;
+    right: 0;
+    bottom: auto;
+    left: 0;
+    width: auto;
+    height: 1px;
+  }
+
+  .progress__divider input {
+    width: 100%;
+    height: 74px;
+    transform: none;
+  }
+
+  .economics__instrument {
+    grid-template-columns: 1fr;
+    padding: 1rem;
+  }
+
+  .emission-chart {
+    grid-column: auto;
+  }
+
+  .allocation {
+    padding-right: 0;
+  }
+
+  .economics__disclosures {
+    padding-left: 0;
+    border-top: 1px solid var(--white-line);
+    border-left: 0;
+  }
+
+  .roadmap__rail {
+    grid-template-columns: 1fr;
+    margin-bottom: 5rem;
+  }
+
+  .roadmap__rail::before {
+    top: 0;
+    bottom: 0;
+    left: 23px;
+    width: 1px;
+    height: auto;
+    background: linear-gradient(var(--copper-400), var(--copper-400) 38%, var(--mineral-500) 38%, var(--mineral-500));
+  }
+
+  .roadmap__rail li {
+    min-height: 120px;
+  }
+
+  .roadmap__rail button {
+    grid-template-columns: 48px 1fr;
+    grid-template-rows: auto auto;
+    min-height: 110px;
+    padding: 0 0 1.5rem;
+  }
+
+  .roadmap__number {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .roadmap__node {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+    margin: 3px 0 0 12px;
+  }
+
+  .roadmap__rail strong {
+    grid-column: 2;
+    grid-row: 2;
+    max-width: 620px;
+    margin-top: 0.35rem;
+  }
+
+  .roadmap__rail li > p {
+    position: relative;
+    top: auto;
+    right: auto;
+    left: auto;
+    margin: -1rem 0 1.5rem 48px;
+  }
+
+  .conversion-band {
+    grid-template-columns: 1fr;
+  }
+
+  .site-footer {
+    grid-template-columns: 1fr;
+  }
+
+  .site-footer nav {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .site-footer > p {
+    max-width: none;
+    text-align: left;
+  }
+}
+
+@media (max-width: 520px) {
+  .hero {
+    padding-top: 2.2rem;
+  }
+
+  .hero h1 {
+    margin-bottom: 1.1rem;
+    font-size: clamp(3.2rem, 15vw, 4.2rem);
+    line-height: 0.98;
+  }
+
+  .hero__copy > p {
+    font-size: 1rem;
+    line-height: 1.55;
+  }
+
+  .hero__actions {
+    display: grid;
+  }
+
+  .hero__actions .button-link {
+    width: 100%;
+    min-height: 58px;
+  }
+
+  .hero .trust-note {
+    align-items: flex-start;
+    font-size: 0.78rem;
+  }
+
+  .hero__visual {
+    min-height: 300px;
+    padding-top: 1.5rem;
+  }
+
+  .hero__art-wrap {
+    width: 135%;
+    margin-left: -18%;
+  }
+
+  .hero__legend {
+    right: -0.5rem;
+    left: -0.5rem;
+    gap: 0.45rem;
+    font-size: 0.46rem;
+    letter-spacing: 0.07em;
+  }
+
+  .hero__legend b {
+    width: 10px;
+  }
+
+  .hero__legend i {
+    width: 10px;
+    height: 10px;
+  }
+
+  .hero__legend .legend-line {
+    width: 14px;
+  }
+
+  .section-preview {
+    min-height: 78px;
+    font-size: 1.45rem;
+  }
+
+  .thesis__diagram {
+    gap: 1rem;
+  }
+
+  .operator {
+    width: 100%;
+    overflow: hidden;
+  }
+
+  .operator img {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .hero__art-wrap {
+    width: 110%;
+    margin-left: -5%;
+  }
+
+  .thesis-path {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+    min-height: 0;
+    padding: 1rem 0;
+  }
+
+  .thesis-path__signal {
+    min-height: 90px;
+  }
+
+  .thesis-path__signal i {
+    width: 36px;
+  }
+
+  .thesis__close,
+  .progress__close {
+    display: grid;
+  }
+
+  .progress__group {
+    padding: 1.15rem;
+  }
+
+  .progress-list li {
+    grid-template-columns: 40px 1fr auto;
+    gap: 0.65rem;
+  }
+
+  .progress-list li > span:nth-child(2) {
+    font-size: 0.9rem;
+  }
+
+  .progress-list__icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .emission-chart,
+  .allocation,
+  .economics__disclosures {
+    padding: 1rem 0;
+  }
+
+  .emission-chart svg {
+    margin-left: -0.5rem;
+    max-width: calc(100% + 0.5rem);
+  }
+
+  .chart-axis-labels {
+    font-size: 12px;
+  }
+
+  .chart-annotations {
+    font-size: 11px;
+  }
+
+  .emission-control output {
+    display: grid;
+  }
+
+  .emission-control output span {
+    font-size: 0.78rem;
+  }
+
+  .allocation__bar {
+    min-height: 100px;
+  }
+
+  .allocation__bar button {
+    padding: 0.35rem;
+  }
+
+  .allocation__bar button:nth-child(3) {
+    min-width: 48px;
+  }
+
+  .conversion-band {
+    padding: 2rem 1.25rem;
+  }
+
+  .conversion-band h3 {
+    font-size: 2.7rem;
+  }
+
+  .conversion-band__actions > div {
+    display: grid;
+  }
+
+  .conversion-band__actions .button-link {
+    min-height: 58px;
+  }
+
+  .site-footer nav {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero__art-wrap {
+    transform: none !important;
+  }
+}

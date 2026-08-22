@@ -7,7 +7,7 @@ allocation is a failure; ordinary parser rejection is expected.
 ```text
 cargo +nightly fuzz run structured_aggregate_decode -- "-dict=fuzz/dictionaries/structured.dict" -max_len=262144 -timeout=10
 cargo +nightly fuzz run bls_shared_layout_decode -- "-dict=fuzz/dictionaries/bls-shared.dict" -max_len=262128 -timeout=10
-cargo +nightly fuzz run bls_v3_candidate_decode -- "-dict=fuzz/dictionaries/bls-v3-candidate.dict" -max_len=262128 -timeout=10
+cargo +nightly fuzz run bls_v3_candidate_decode -- "-dict=fuzz/dictionaries/bls-v3-candidate.dict" -max_len=261947 -timeout=10
 ```
 
 On Windows, use an MSVC nightly and put Visual Studio's directory containing

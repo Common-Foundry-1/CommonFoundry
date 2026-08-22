@@ -635,15 +635,15 @@ byte-identical recompression. The smallest 32-byte, 256-row checkpoint has
 main width 393; release runs measured 222,256 to 222,384 native bytes and
 156,500 to 156,650 wire bytes. With the current 133,409-byte production Dory
 projection and 18-byte candidate envelope, the compressed cross-shape
-projection is 289,927 to 290,077 bytes, still 27,799 to 27,949 bytes above the
-structured-proof allowance.
+projection is 289,927 to 290,077 bytes, still 27,980 to 28,130 bytes above the
+261,947-byte V3 structured-proof allowance.
 
 Query reduction cannot safely close that gap at the current rate. The
 production proven-security calculation needs 32 queries at log blowup 7 with
 18 grinding bits. Reducing the bridge to 27 or 24 queries would require 35 or
 45 grinding bits. Raising log blowup to 10 permits 24 queries with a one-query
 margin, but the resulting 129,722-byte compressed bridge still composes to
-263,149 bytes, 1,021 bytes over the cap, while the LDE is eight times larger
+263,149 bytes, 1,202 bytes over the cap, while the LDE is eight times larger
 and the tiny-fixture proving time rises from 394 to 2,538 milliseconds. At
 production shape its `2^30`-row LDE would contain 3,144 GiB of raw main values
 plus 672 GiB of raw preprocessing before Merkle data or scratch space, and no
@@ -657,8 +657,18 @@ seven and maximum fold arities one through seven while retaining the
 128-proven-bit query margin. The best verified tiny-fixture frame was 154,606
 bytes at terminal length six and maximum fold arity two. Together with the
 133,409-byte Dory projection and 18-byte envelope, it would total 288,033 bytes,
-still 25,905 bytes over the consensus cap. Ordinary FRI transport tuning is
+still 26,086 bytes over the consensus cap. Ordinary FRI transport tuning is
 therefore insufficient.
+
+The successor design removes the separate FRI transport. It represents the
+narrow BLAKE3 computation directly over the BLS12-381 scalar field and binds
+row adjacency with a row-indexed LogUp permutation. Conservative accounting
+adds 662 execution and 580 adjacency claims to the existing 128. The projected
+component frames are 33,332 and 21,748 bytes, producing a complete 188,497-byte
+V3 payload with 73,450 bytes of room under the exact 261,947-byte allowance.
+The current parser deliberately remains at 128 claims: this projection does not
+replace the missing scalar-field constraint implementation, adjacency
+soundness proof, complete n=33 run, independent review, or audit.
 
 The verified model-bank reader can now transactionally publish reusable BLS coefficient artifacts as well as the fixed identity. It builds the base input and every ordered weight bank while checking the canonical byte roots and EOF, returns nothing on failure, and cleans provisional files. Its writer reassembles arbitrary authenticated input chunks into canonical rows, commits complete rows in deterministic parallel batches behind a bounded 256 MiB window, and preserves canonical artifact and target-group accumulation order. Three n=19 release A/B repeats measured 814--826 ms for the former serial writer and 377--391 ms for the parallel writer; their 822 and 385 ms medians give a 53.2% reduction while producing the identical artifact digest, row commitments, tier-two commitment, opening claims, and proof bytes. Matrix proving consumes the authenticated weight artifact sequentially, reuses it in the shared aggregate opening, and rejects a commitment from the wrong pinned bank before proving. Bounded fixtures match materialized proof bytes exactly. This removes the roughly 16 GiB in-memory `i64` slice for an n=31 weight bank. It also replaces the former 32-byte-per-weight scalar artifact: the first Dory row is stored as canonical signed words and each remaining model weight in the consensus range `[-125, 125]` is one authenticated byte selecting the fixed dictionary `0, -1..-125, 1..125`. Every read reauthenticates the dictionary, codes, dimensions, source digest, and EOF before expansion.
 

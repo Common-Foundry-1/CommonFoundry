@@ -291,14 +291,15 @@ identity, and requires byte-identical recompression. Release runs measured
 156,500 to 156,650 wire bytes, with a 157,000-byte regression ceiling. Together
 with the current 133,409-byte production Dory projection and 18-byte candidate
 envelope, that cross-shape checkpoint projects to 289,927 through 290,077 bytes,
-27,799 through 27,949 bytes above the 262,128-byte structured-proof allowance.
+27,980 through 28,130 bytes above the 261,947-byte V3 structured-proof
+allowance.
 
 An executable parameter sweep also rejects FRI tuning as a disguised fix. At
 18 query-grinding bits, the production security calculation needs 32 queries
 at log blowup 7, 28 at log blowup 8, 25 at log blowup 9, and 23 at log blowup
 10. Retaining one query of margin gave compressed bridge frames of 156,650,
 145,632, 134,932, and 129,722 bytes respectively. Even the log-10 candidate
-would compose to 263,149 bytes, 1,021 bytes over the cap, while multiplying the
+would compose to 263,149 bytes, 1,202 bytes over the cap, while multiplying the
 LDE by eight and increasing the tiny-fixture proving time from 394 to 2,538 ms.
 At production shape that log-10 LDE has `2^30` rows: its 393 main columns contain
 3,375,844,294,656 raw bytes (3,144 GiB), and its 84 preprocessed columns contain
@@ -315,8 +316,21 @@ through seven and maximum fold arities one through seven. Every tiny-fixture
 proof verified under its exact configuration. The best canonical compressed
 bridge was 154,606 bytes at terminal length six and maximum fold arity two.
 Together with the 133,409-byte Dory projection and 18-byte candidate envelope,
-it totals 288,033 bytes, still 25,905 bytes over the structured-proof cap. FRI
+it totals 288,033 bytes, still 26,086 bytes over the structured-proof cap. FRI
 transport geometry therefore does not close the activation gap.
+
+The replacement direction is now bounded without widening any active parser.
+A BLS-native execution sumcheck would open 662 local/next/preprocessed claims;
+a separate row-indexed LogUp permutation would open 580 claims and is mandatory
+to prevent independently chosen next rows. Composed with the existing 128
+claims, the design requires a future bounded maximum of at least 1,370 claims.
+Its conservative component projections are 33,332 and 21,748 bytes, placing the
+complete V3 payload at 188,497 bytes with 73,450 bytes below the exact V3
+allowance of 261,947 bytes. The current aggregate limit remains 128. No
+claim-limit change
+or V3 activation is permitted until the 1,305 BLAKE3 constraints are translated
+and differentially tested over the BLS12-381 scalar field, the adjacency
+argument and union bound are reviewed, and a complete proof verifies.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

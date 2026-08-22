@@ -3,6 +3,8 @@ pub mod difficulty;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_aggregate;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_bls12_381_blake3;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_candidate;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_compact_artifact;

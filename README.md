@@ -256,15 +256,26 @@ cross-field AIR proves that the exact activation bytes hashed by BLAKE3 have the
 same multilinear evaluation opened by Dory. Its bounded canonical zlib codec
 measured 156,500 to 156,650 bytes on the 32-byte bridge fixture, down from
 222,256 to 222,384 native bytes. The resulting cross-shape composition remains
-27,799 to 27,949 bytes over the 262,128-byte payload cap. Query/grinding and
+27,980 to 28,130 bytes over the 261,947-byte V3 structured-proof cap.
+Query/grinding and
 higher-blowup sweeps do not close that gap at an operationally acceptable cost,
 and a 56-point sweep across FRI terminal lengths zero through seven and maximum
 fold arities one through seven found a best 154,606-byte bridge at terminal
 length six and maximum fold arity two. That still composes to 288,033 bytes,
-25,905 bytes over the cap. The V3 selector therefore remains absent and
+26,086 bytes over the cap. The V3 selector therefore remains absent and
 consensus fails closed. A narrower bridge
 or different sound aggregation layer, a complete n=33 run, independent review,
 and audits remain activation gates.
+
+The next fail-closed design removes the separate FRI bridge instead of tuning
+it. It projects the exact BLAKE3 execution as a BLS/Dory sumcheck plus a
+row-indexed LogUp adjacency argument, so prover-supplied local and next rows
+cannot be unrelated. Conservative accounting adds 662 execution claims and 580
+adjacency claims to the existing 128, projects 33,332- and 21,748-byte component
+frames, and places the complete V3 payload at 188,497 bytes with 73,450 bytes of
+headroom. This is a budget, not an implemented proof: the active parser remains
+capped at 128 claims until the BLS constraint translation, adjacency argument,
+soundness analysis, end-to-end verification, and audit are complete.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

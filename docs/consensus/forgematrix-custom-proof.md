@@ -993,14 +993,14 @@ retains the inner proof identity, rejects trailing data, and requires
 byte-identical recompression. The resulting wire frames measured 156,500 to
 156,650 bytes under a 157,000-byte regression ceiling. Combining those measured
 checkpoints with the current 133,409-byte production Dory projection and the
-18-byte two-proof envelope gives 289,927 to 290,077 bytes, which remains 27,799
-to 27,949 bytes above the 262,128-byte structured payload allowance.
+18-byte two-proof envelope gives 289,927 to 290,077 bytes, which remains 27,980
+to 28,130 bytes above the 261,947-byte V3 structured payload allowance.
 
 The parameter boundary is executable as well. With 18 query-grinding bits, the
 production bridge requires at least 32, 28, 25, and 23 queries at log blowups 7,
 8, 9, and 10. Keeping one query above each calculated minimum produces
 compressed frames of 156,650, 145,632, 134,932, and 129,722 bytes. The last is
-still 1,021 bytes over budget after composition, while its LDE is eight times
+still 1,202 bytes over budget after composition, while its LDE is eight times
 the configured size and the tiny-fixture prover slows from 394 to 2,538 ms.
 At production shape, that `2^30`-row LDE contains 3,375,844,294,656 raw main
 bytes (3,144 GiB) plus 721,554,505,728 raw preprocessed bytes (672 GiB) before
@@ -1018,8 +1018,21 @@ through seven and maximum fold arities one through seven. Every tiny-fixture
 proof verified under its exact configuration. The best canonical compressed
 bridge was 154,606 bytes at terminal length six and maximum fold arity two. It
 would produce a 288,033-byte candidate with the 133,409-byte Dory projection and
-18-byte envelope, still 25,905 bytes over the cap. FRI folding geometry is
+18-byte envelope, still 26,086 bytes over the cap. FRI folding geometry is
 therefore a measured rejection rather than the missing size optimization.
+
+The next bounded design eliminates that FRI frame. The narrow BLAKE3 execution
+becomes a BLS/Dory sumcheck with 289 BLS-native main columns, where the
+evaluation accumulator is one scalar rather than three Goldilocks limbs. It
+opens 662 local/next/preprocessed claims. A separate row-indexed LogUp
+permutation opens 580 more claims and binds every committed next row to the
+following local row; omitting that argument would let a prover choose unrelated
+rows. Together with the current 128 claims, the design requires 1,370 claims
+under a future bounded 2,048-claim parser. Conservative wire accounting gives
+33,332 bytes for execution and 21,748 bytes for adjacency, projecting the full
+V3 payload at 188,497 bytes with 73,450 bytes of headroom. The current parser
+remains capped at 128. These values are an executable layout projection, not a
+proof-size measurement or an activation result.
 
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate

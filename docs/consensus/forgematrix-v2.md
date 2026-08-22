@@ -457,8 +457,9 @@ comparison. The v2 research code now implements:
   and explicit lengths, and every fold keeps the remaining zero tail implicit
   instead of allocating or writing it. The scratch-enabled shared path uses it
   for every matrix, fixed-base, transition, LogUp, and wiring commitment,
-  without power-of-two-padded coefficient copies. Transition, LogUp, and wiring
-  witness or sumcheck working tables remain materialized, so the final
+  without power-of-two-padded coefficient copies. Wiring additionally reads its
+  signed tables directly for commitment and multilinear evaluation. Transition
+  and LogUp witness or sumcheck working tables remain materialized, so the final
   production artifact still needs an n=33 commitment run and streaming for
   those remaining working sets;
   independent soundness review and audit also remain activation gates. The

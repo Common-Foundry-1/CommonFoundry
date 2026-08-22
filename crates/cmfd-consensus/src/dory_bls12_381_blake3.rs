@@ -12,7 +12,7 @@
 //! one prover-supplied table would not prove that adjacent rows are related.
 
 #[cfg(all(test, feature = "whir-prototype"))]
-use dory_pcs::primitives::arithmetic::Field as DoryField;
+use dory_pcs::primitives::{arithmetic::Field as DoryField, transcript::Transcript};
 #[cfg(all(test, feature = "whir-prototype"))]
 use p3_air::symbolic::{
     AirLayout, BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression, get_symbolic_constraints,
@@ -21,7 +21,7 @@ use p3_air::symbolic::{
 use p3_field::PrimeField64;
 
 #[cfg(all(test, feature = "whir-prototype"))]
-use crate::dory_bls12_381_prototype::BlsDoryFr;
+use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryTranscript};
 #[cfg(all(test, feature = "whir-prototype"))]
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredBlake3Statement,
@@ -58,9 +58,11 @@ pub const BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE: usize =
     BLS_DORY_BLAKE3_EXECUTION_CONSTRAINT_DEGREE + 1;
 /// The row-indexed LogUp adjacency relation has degree at most three after equality weighting.
 pub const BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE: usize = 3;
-/// Execution opens every local/next main column and every fixed preprocessing column.
+/// Execution opens local and next evaluations for every main and fixed
+/// preprocessing column. A single preprocessing claim would leave its shifted
+/// next-row value unauthenticated.
 pub const BLS_DORY_BLAKE3_EXECUTION_CLAIMS: usize =
-    2 * BLS_DORY_BLAKE3_MAIN_WIDTH + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+    2 * (BLS_DORY_BLAKE3_MAIN_WIDTH + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
 /// Adjacency reopens local/next columns and the two LogUp inverse columns.
 pub const BLS_DORY_BLAKE3_ADJACENCY_CLAIMS: usize = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH + 2;
 /// Complete claim count after composing with the existing production shared proof.
@@ -112,7 +114,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the translated 1,305 narrow BLAKE3 constraints have not been wired into a Dory execution sumcheck",
+    "the bounded dense execution sumcheck verifies, but its 746 terminal evaluations are not yet authenticated by Dory openings",
     "the row-indexed LogUp adjacency argument and its complete Fiat-Shamir soundness bound have not been implemented or independently reviewed",
     "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -398,25 +400,43 @@ fn native_activation_contribution(
     activation_group: Option<usize>,
     point: &[BlsDoryFr],
 ) -> BlsDoryFr {
+    let coefficients = native_byte_coefficients(activation_group, point);
+    native_activation_contribution_from_coefficients(main_local, &coefficients)
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn native_byte_coefficients(
+    activation_group: Option<usize>,
+    point: &[BlsDoryFr],
+) -> [BlsDoryFr; 8] {
     let Some(group) = activation_group else {
-        return BlsDoryFr::zero();
+        return [BlsDoryFr::zero(); 8];
     };
-    (0..8).fold(BlsDoryFr::zero(), |sum, byte| {
-        let low = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte];
-        let high = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte + 1];
-        let value = low + BlsDoryFr::from_u64(16) * high;
+    std::array::from_fn(|byte| {
         let index = group + byte;
-        let weight = point.iter().enumerate().fold(
-            BlsDoryFr::from_u64(1),
-            |weight, (variable, coordinate)| {
+        point
+            .iter()
+            .enumerate()
+            .fold(BlsDoryFr::from_u64(1), |weight, (variable, coordinate)| {
                 if (index >> variable) & 1 == 1 {
                     weight * *coordinate
                 } else {
                     weight * (BlsDoryFr::from_u64(1) - *coordinate)
                 }
-            },
-        );
-        sum + value * weight
+            })
+    })
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn native_activation_contribution_from_coefficients(
+    main_local: &[BlsDoryFr],
+    coefficients: &[BlsDoryFr; 8],
+) -> BlsDoryFr {
+    (0..8).fold(BlsDoryFr::zero(), |sum, byte| {
+        let low = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte];
+        let high = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte + 1];
+        let value = low + BlsDoryFr::from_u64(16) * high;
+        sum + value * coefficients[byte]
     })
 }
 
@@ -436,9 +456,20 @@ fn native_evaluation_residuals(
     point: &[BlsDoryFr],
     raw_evaluation: BlsDoryFr,
 ) -> [BlsDoryFr; 3] {
+    let coefficients = native_byte_coefficients(activation_group, point);
+    native_evaluation_residuals_from_coefficients(row, &coefficients, raw_evaluation)
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn native_evaluation_residuals_from_coefficients(
+    row: &BlsDoryNativeEvaluationRow<'_>,
+    coefficients: &[BlsDoryFr; 8],
+    raw_evaluation: BlsDoryFr,
+) -> [BlsDoryFr; 3] {
     let current = row.main_local[TEST_EVALUATION_ACCUMULATOR_START];
     let next = row.main_next[TEST_EVALUATION_ACCUMULATOR_START];
-    let contribution = native_activation_contribution(row.main_local, activation_group, point);
+    let contribution =
+        native_activation_contribution_from_coefficients(row.main_local, coefficients);
     [
         row.first_row * current,
         row.transition * (next - current - contribution),
@@ -534,23 +565,456 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whir-prototype")]
+    const DENSE_EXECUTION_SUMCHECK_DEGREE: usize = BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE;
+
+    #[cfg(feature = "whir-prototype")]
+    #[derive(Clone)]
+    struct DenseExecutionSumcheckProof {
+        rounds: Vec<Vec<BlsDoryFr>>,
+        terminal_evaluations: Vec<BlsDoryFr>,
+        transcript_digest: [u8; 32],
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    struct DenseExecutionRelation<'a> {
+        public: &'a [BlsDoryFr],
+        constraints: &'a [BlsDoryBlake3ConstraintExpr],
+        mixing_powers: &'a [BlsDoryFr],
+        raw_evaluation: BlsDoryFr,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_execution_tables(
+        main_rows: &[Vec<BlsDoryFr>],
+        preprocessed_rows: &[Vec<BlsDoryFr>],
+    ) -> Vec<Vec<BlsDoryFr>> {
+        assert_eq!(main_rows.len(), preprocessed_rows.len());
+        assert!(main_rows.len().is_power_of_two());
+        assert!(
+            main_rows
+                .iter()
+                .all(|row| row.len() == BLS_DORY_BLAKE3_MAIN_WIDTH)
+        );
+        assert!(
+            preprocessed_rows
+                .iter()
+                .all(|row| row.len() == BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
+        );
+        let mut tables = Vec::with_capacity(BLS_DORY_BLAKE3_EXECUTION_CLAIMS);
+        for column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
+            tables.push(main_rows.iter().map(|row| row[column]).collect());
+        }
+        for column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
+            tables.push(
+                main_rows[1..]
+                    .iter()
+                    .chain(&main_rows[..1])
+                    .map(|row| row[column])
+                    .collect(),
+            );
+        }
+        for column in 0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+            tables.push(preprocessed_rows.iter().map(|row| row[column]).collect());
+        }
+        for column in 0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+            tables.push(
+                preprocessed_rows[1..]
+                    .iter()
+                    .chain(&preprocessed_rows[..1])
+                    .map(|row| row[column])
+                    .collect(),
+            );
+        }
+        assert_eq!(tables.len(), BLS_DORY_BLAKE3_EXECUTION_CLAIMS);
+        tables
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_relation_value(
+        terminal: &[BlsDoryFr],
+        selectors: [BlsDoryFr; 3],
+        coefficients: &[BlsDoryFr; 8],
+        relation: &DenseExecutionRelation<'_>,
+    ) -> BlsDoryFr {
+        let main_next_start = BLS_DORY_BLAKE3_MAIN_WIDTH;
+        let preprocessed_local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+        let preprocessed_next_start = preprocessed_local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+        let values = BlsDoryBlake3Evaluation {
+            main_local: &terminal[..main_next_start],
+            main_next: &terminal[main_next_start..preprocessed_local_start],
+            preprocessed_local: &terminal[preprocessed_local_start..preprocessed_next_start],
+            preprocessed_next: &terminal[preprocessed_next_start..],
+            public: relation.public,
+            periodic: &[],
+            first_row: selectors[0],
+            last_row: selectors[1],
+            transition: selectors[2],
+        };
+        let mut mixed = relation
+            .constraints
+            .iter()
+            .zip(relation.mixing_powers)
+            .fold(BlsDoryFr::zero(), |sum, (constraint, coefficient)| {
+                sum + constraint.evaluate(&values) * *coefficient
+            });
+        let native = native_evaluation_residuals_from_coefficients(
+            &BlsDoryNativeEvaluationRow {
+                main_local: values.main_local,
+                main_next: values.main_next,
+                first_row: values.first_row,
+                last_row: values.last_row,
+                transition: values.transition,
+            },
+            coefficients,
+            relation.raw_evaluation,
+        );
+        for (residual, coefficient) in native
+            .into_iter()
+            .zip(&relation.mixing_powers[relation.constraints.len()..])
+        {
+            mixed = mixed + residual * *coefficient;
+        }
+        mixed
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_execution_transcript(bridge: &BlsDoryOutputBridgeStatement) -> BlsDoryTranscript {
+        let mut transcript = BlsDoryTranscript::new(b"blake3-native-execution-sumcheck");
+        transcript.append_bytes(b"protocol-version", &1_u16.to_le_bytes());
+        transcript.append_bytes(b"challenge-digest", &bridge.challenge_digest());
+        transcript.append_bytes(
+            b"activation-length",
+            &(bridge.final_activation_len() as u64).to_le_bytes(),
+        );
+        transcript.append_bytes(b"activation-digest", &bridge.final_activation_digest());
+        transcript.append_bytes(b"dory-binding", &bridge.transcript_binding());
+        transcript.append_bytes(
+            b"point-count",
+            &(bridge.cell_point().len() as u64).to_le_bytes(),
+        );
+        for coordinate in bridge.cell_point() {
+            transcript.append_field(b"dory-point", coordinate);
+        }
+        transcript.append_field(b"raw-evaluation", &bridge.raw_byte_evaluation());
+        transcript
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_constraint_powers(transcript: &mut BlsDoryTranscript) -> Vec<BlsDoryFr> {
+        let mixing = transcript.challenge_scalar(b"constraint-mixing");
+        let mut powers = Vec::with_capacity(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS);
+        let mut power = BlsDoryFr::from_u64(1);
+        for _ in 0..BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS {
+            powers.push(power);
+            power = power * mixing;
+        }
+        powers
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_cell_point(transcript: &mut BlsDoryTranscript, variables: usize) -> Vec<BlsDoryFr> {
+        (0..variables)
+            .map(|index| {
+                transcript.append_bytes(b"cell-index", &(index as u64).to_le_bytes());
+                transcript.challenge_scalar(b"cell-point")
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_absorb_round(
+        transcript: &mut BlsDoryTranscript,
+        round_index: usize,
+        evaluations: &[BlsDoryFr],
+    ) {
+        transcript.append_bytes(b"round-index", &(round_index as u64).to_le_bytes());
+        transcript.append_bytes(b"round-count", &(evaluations.len() as u64).to_le_bytes());
+        for evaluation in evaluations {
+            transcript.append_field(b"round-evaluation", evaluation);
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_absorb_terminal(transcript: &mut BlsDoryTranscript, terminal: &[BlsDoryFr]) {
+        transcript.append_bytes(b"terminal-count", &(terminal.len() as u64).to_le_bytes());
+        for evaluation in terminal {
+            transcript.append_field(b"terminal-evaluation", evaluation);
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_interpolate(pair: &[BlsDoryFr], point: BlsDoryFr) -> BlsDoryFr {
+        pair[0] + point * (pair[1] - pair[0])
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_fold(table: &[BlsDoryFr], point: BlsDoryFr) -> Vec<BlsDoryFr> {
+        table
+            .chunks_exact(2)
+            .map(|pair| dense_interpolate(pair, point))
+            .collect()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_equality_table(point: &[BlsDoryFr]) -> Vec<BlsDoryFr> {
+        let mut table = vec![BlsDoryFr::from_u64(1); 1usize << point.len()];
+        let mut active = 1usize;
+        for coordinate in point {
+            for index in (0..active).rev() {
+                let value = table[index];
+                table[index] = value * (BlsDoryFr::from_u64(1) - *coordinate);
+                table[index + active] = value * *coordinate;
+            }
+            active *= 2;
+        }
+        table
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_equality_evaluation(left: &[BlsDoryFr], right: &[BlsDoryFr]) -> BlsDoryFr {
+        left.iter()
+            .zip(right)
+            .fold(BlsDoryFr::from_u64(1), |product, (left, right)| {
+                product
+                    * ((BlsDoryFr::from_u64(1) - *left) * (BlsDoryFr::from_u64(1) - *right)
+                        + *left * *right)
+            })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_evaluate_samples(values: &[BlsDoryFr], point: BlsDoryFr) -> BlsDoryFr {
+        assert_eq!(values.len(), DENSE_EXECUTION_SUMCHECK_DEGREE + 1);
+        values
+            .iter()
+            .copied()
+            .enumerate()
+            .fold(BlsDoryFr::zero(), |result, (index, value)| {
+                let mut numerator = BlsDoryFr::from_u64(1);
+                let mut denominator = BlsDoryFr::from_u64(1);
+                for other in 0..values.len() {
+                    if other != index {
+                        numerator = numerator * (point - BlsDoryFr::from_u64(other as u64));
+                        denominator =
+                            denominator * BlsDoryFr::from_i64(index as i64 - other as i64);
+                    }
+                }
+                result + value * numerator * denominator.inv().unwrap()
+            })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_boolean_equality(index: usize, point: &[BlsDoryFr]) -> BlsDoryFr {
+        point
+            .iter()
+            .enumerate()
+            .fold(BlsDoryFr::from_u64(1), |weight, (variable, coordinate)| {
+                if (index >> variable) & 1 == 1 {
+                    weight * *coordinate
+                } else {
+                    weight * (BlsDoryFr::from_u64(1) - *coordinate)
+                }
+            })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_coefficient_terminal(
+        air: &NarrowBlake3Air,
+        dory_point: &[BlsDoryFr],
+        sumcheck_point: &[BlsDoryFr],
+    ) -> [BlsDoryFr; 8] {
+        let mut terminal = [BlsDoryFr::zero(); 8];
+        for row in 0..air.trace_rows() {
+            let equality = dense_boolean_equality(row, sumcheck_point);
+            let coefficients =
+                native_byte_coefficients(air.activation_group_index_at_row(row), dory_point);
+            for byte in 0..8 {
+                terminal[byte] = terminal[byte] + equality * coefficients[byte];
+            }
+        }
+        terminal
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn prove_dense_execution_sumcheck(
+        mut tables: Vec<Vec<BlsDoryFr>>,
+        air: &NarrowBlake3Air,
+        public: &[BlsDoryFr],
+        constraints: &[BlsDoryBlake3ConstraintExpr],
+        bridge: &BlsDoryOutputBridgeStatement,
+    ) -> DenseExecutionSumcheckProof {
+        assert_eq!(tables.len(), BLS_DORY_BLAKE3_EXECUTION_CLAIMS);
+        let rows = tables[0].len();
+        assert!(rows.is_power_of_two());
+        assert!(tables.iter().all(|table| table.len() == rows));
+        assert_eq!(constraints.len() + 3, BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS);
+        let variables = rows.ilog2() as usize;
+        let mut transcript = dense_execution_transcript(bridge);
+        let mixing_powers = dense_constraint_powers(&mut transcript);
+        let cell_point = dense_cell_point(&mut transcript, variables);
+        let relation = DenseExecutionRelation {
+            public,
+            constraints,
+            mixing_powers: &mixing_powers,
+            raw_evaluation: bridge.raw_byte_evaluation(),
+        };
+        let mut equality = dense_equality_table(&cell_point);
+        let mut first = vec![BlsDoryFr::zero(); rows];
+        first[0] = BlsDoryFr::from_u64(1);
+        let mut last = vec![BlsDoryFr::zero(); rows];
+        last[rows - 1] = BlsDoryFr::from_u64(1);
+        let mut transition = vec![BlsDoryFr::from_u64(1); rows];
+        transition[rows - 1] = BlsDoryFr::zero();
+        let mut byte_coefficients: [Vec<BlsDoryFr>; 8] = std::array::from_fn(|byte| {
+            (0..rows)
+                .map(|row| {
+                    native_byte_coefficients(
+                        air.activation_group_index_at_row(row),
+                        bridge.cell_point(),
+                    )[byte]
+                })
+                .collect()
+        });
+        let mut claim = BlsDoryFr::zero();
+        let mut rounds = Vec::with_capacity(variables);
+        for round_index in 0..variables {
+            let pair_count = equality.len() / 2;
+            let evaluations = (0..=DENSE_EXECUTION_SUMCHECK_DEGREE)
+                .map(|sample| {
+                    let sample = BlsDoryFr::from_u64(sample as u64);
+                    (0..pair_count).fold(BlsDoryFr::zero(), |sum, pair| {
+                        let offset = 2 * pair;
+                        let terminal = tables
+                            .iter()
+                            .map(|table| dense_interpolate(&table[offset..offset + 2], sample))
+                            .collect::<Vec<_>>();
+                        let selectors = [
+                            dense_interpolate(&first[offset..offset + 2], sample),
+                            dense_interpolate(&last[offset..offset + 2], sample),
+                            dense_interpolate(&transition[offset..offset + 2], sample),
+                        ];
+                        let coefficients = std::array::from_fn(|byte| {
+                            dense_interpolate(&byte_coefficients[byte][offset..offset + 2], sample)
+                        });
+                        sum + dense_interpolate(&equality[offset..offset + 2], sample)
+                            * dense_relation_value(&terminal, selectors, &coefficients, &relation)
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(evaluations[0] + evaluations[1], claim);
+            dense_absorb_round(&mut transcript, round_index, &evaluations);
+            let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+            claim = dense_evaluate_samples(&evaluations, challenge);
+            for table in &mut tables {
+                *table = dense_fold(table, challenge);
+            }
+            equality = dense_fold(&equality, challenge);
+            first = dense_fold(&first, challenge);
+            last = dense_fold(&last, challenge);
+            transition = dense_fold(&transition, challenge);
+            for coefficients in &mut byte_coefficients {
+                *coefficients = dense_fold(coefficients, challenge);
+            }
+            rounds.push(evaluations);
+        }
+        let terminal_evaluations = tables.iter().map(|table| table[0]).collect::<Vec<_>>();
+        let selectors = [first[0], last[0], transition[0]];
+        let coefficients = std::array::from_fn(|byte| byte_coefficients[byte][0]);
+        assert_eq!(
+            claim,
+            equality[0]
+                * dense_relation_value(&terminal_evaluations, selectors, &coefficients, &relation,)
+        );
+        dense_absorb_terminal(&mut transcript, &terminal_evaluations);
+        DenseExecutionSumcheckProof {
+            rounds,
+            terminal_evaluations,
+            transcript_digest: transcript.digest(),
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn verify_dense_execution_sumcheck(
+        proof: &DenseExecutionSumcheckProof,
+        air: &NarrowBlake3Air,
+        public: &[BlsDoryFr],
+        constraints: &[BlsDoryBlake3ConstraintExpr],
+        bridge: &BlsDoryOutputBridgeStatement,
+    ) -> bool {
+        let variables = air.trace_rows().ilog2() as usize;
+        if proof.rounds.len() != variables
+            || proof.terminal_evaluations.len() != BLS_DORY_BLAKE3_EXECUTION_CLAIMS
+            || proof
+                .rounds
+                .iter()
+                .any(|round| round.len() != DENSE_EXECUTION_SUMCHECK_DEGREE + 1)
+        {
+            return false;
+        }
+        let mut transcript = dense_execution_transcript(bridge);
+        let mixing_powers = dense_constraint_powers(&mut transcript);
+        let cell_point = dense_cell_point(&mut transcript, variables);
+        let relation = DenseExecutionRelation {
+            public,
+            constraints,
+            mixing_powers: &mixing_powers,
+            raw_evaluation: bridge.raw_byte_evaluation(),
+        };
+        let mut claim = BlsDoryFr::zero();
+        let mut sumcheck_point = Vec::with_capacity(variables);
+        for (round_index, round) in proof.rounds.iter().enumerate() {
+            if round[0] + round[1] != claim {
+                return false;
+            }
+            dense_absorb_round(&mut transcript, round_index, round);
+            let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+            claim = dense_evaluate_samples(round, challenge);
+            sumcheck_point.push(challenge);
+        }
+        let first = sumcheck_point
+            .iter()
+            .fold(BlsDoryFr::from_u64(1), |value, coordinate| {
+                value * (BlsDoryFr::from_u64(1) - *coordinate)
+            });
+        let last = sumcheck_point
+            .iter()
+            .fold(BlsDoryFr::from_u64(1), |value, coordinate| {
+                value * *coordinate
+            });
+        let selectors = [first, last, BlsDoryFr::from_u64(1) - last];
+        let coefficients = dense_coefficient_terminal(air, bridge.cell_point(), &sumcheck_point);
+        if claim
+            != dense_equality_evaluation(&cell_point, &sumcheck_point)
+                * dense_relation_value(
+                    &proof.terminal_evaluations,
+                    selectors,
+                    &coefficients,
+                    &relation,
+                )
+        {
+            return false;
+        }
+        dense_absorb_terminal(&mut transcript, &proof.terminal_evaluations);
+        transcript.digest() == proof.transcript_digest
+    }
+
     #[test]
     fn native_blake3_projection_is_bounded_but_fail_closed() {
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES, 524_288);
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS, 1_048_576);
-        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CLAIMS, 662);
+        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CLAIMS, 746);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS, 1_299);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_CLAIMS, 580);
-        assert_eq!(BLS_DORY_BLAKE3_COMPOSED_CLAIMS, 1_370);
-        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES, 33_332);
+        assert_eq!(BLS_DORY_BLAKE3_COMPOSED_CLAIMS, 1_454);
+        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES, 36_020);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_PROOF_BYTES, 21_748);
         assert_eq!(
             crate::dory_bls12_381_layout::projected_shared_production_proof_bytes().unwrap(),
             133_409
         );
-        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES, 188_497);
+        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES, 191_185);
         assert_eq!(MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES, 261_947);
-        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 73_450);
+        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 70_762);
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS.len(), 4);
     }
@@ -894,5 +1358,50 @@ mod tests {
             ),
             [BlsDoryFr::zero(); 3]
         );
+
+        let preprocessed_rows = (0..air.trace_rows())
+            .map(|row| bls_values(unsafe { preprocessed.row_unchecked(row) }))
+            .collect::<Vec<_>>();
+        let tables = dense_execution_tables(&native_rows, &preprocessed_rows);
+        let proof = prove_dense_execution_sumcheck(tables, &air, &public, &constraints, &bridge);
+        assert_eq!(proof.rounds.len(), 8);
+        assert!(
+            proof
+                .rounds
+                .iter()
+                .all(|round| round.len() == DENSE_EXECUTION_SUMCHECK_DEGREE + 1)
+        );
+        assert_eq!(
+            proof.terminal_evaluations.len(),
+            BLS_DORY_BLAKE3_EXECUTION_CLAIMS
+        );
+        assert!(verify_dense_execution_sumcheck(
+            &proof,
+            &air,
+            &public,
+            &constraints,
+            &bridge,
+        ));
+
+        let mut changed_round = proof.clone();
+        changed_round.rounds[0][0] = changed_round.rounds[0][0] + BlsDoryFr::from_u64(1);
+        assert!(!verify_dense_execution_sumcheck(
+            &changed_round,
+            &air,
+            &public,
+            &constraints,
+            &bridge,
+        ));
+
+        let mut changed_terminal = proof.clone();
+        changed_terminal.terminal_evaluations[0] =
+            changed_terminal.terminal_evaluations[0] + BlsDoryFr::from_u64(1);
+        assert!(!verify_dense_execution_sumcheck(
+            &changed_terminal,
+            &air,
+            &public,
+            &constraints,
+            &bridge,
+        ));
     }
 }

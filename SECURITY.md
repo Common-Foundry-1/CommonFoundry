@@ -320,12 +320,14 @@ it totals 288,033 bytes, still 26,086 bytes over the structured-proof cap. FRI
 transport geometry therefore does not close the activation gap.
 
 The replacement direction is now bounded without widening any active parser.
-A BLS-native execution sumcheck would open 662 local/next/preprocessed claims;
-a separate row-indexed LogUp permutation would open 580 claims and is mandatory
+A BLS-native execution sumcheck would open 746 local/next main and preprocessing
+claims; both preprocessing evaluations are required to authenticate a shifted
+next row. A separate row-indexed LogUp permutation would open 580 claims and is
+mandatory
 to prevent independently chosen next rows. Composed with the existing 128
-claims, the design requires a future bounded maximum of at least 1,370 claims.
-Its conservative component projections are 33,332 and 21,748 bytes, placing the
-complete V3 payload at 188,497 bytes with 73,450 bytes below the exact V3
+claims, the design requires a future bounded maximum of at least 1,454 claims.
+Its conservative component projections are 36,020 and 21,748 bytes, placing the
+complete V3 payload at 191,185 bytes with 70,762 bytes below the exact V3
 allowance of 261,947 bytes. The current aggregate limit remains 128. No
 claim-limit change or V3 activation is permitted. A test-only canonical
 translation now evaluates all 1,305 existing BLAKE3 constraints over BLS12-381:
@@ -338,6 +340,12 @@ Its 289-column honest trace reaches the Dory-authenticated raw-byte evaluation,
 and accumulator, hashed-byte, point, and claimed-evaluation mutations fail. The
 Dory execution sumcheck, adjacency argument and union bound, complete proof,
 independent review, and audit remain required.
+
+The bounded dense execution sumcheck now mixes all 1,299 native constraints and
+verifies the 256-row fixture in eight degree-17 rounds, with 18 samples per
+round. It produces 746 terminal evaluations and rejects altered round messages
+and terminal values. The terminal evaluations are not yet authenticated by Dory
+openings; accepting this algebraic transcript as V3 would therefore be unsound.
 
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its

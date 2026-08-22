@@ -663,9 +663,12 @@ therefore insufficient.
 The successor design removes the separate FRI transport. It represents the
 narrow BLAKE3 computation directly over the BLS12-381 scalar field and binds
 row adjacency with a row-indexed LogUp permutation. Conservative accounting
-adds 662 execution and 580 adjacency claims to the existing 128. The projected
-component frames are 33,332 and 21,748 bytes, producing a complete 188,497-byte
-V3 payload with 73,450 bytes of room under the exact 261,947-byte allowance.
+adds 746 execution and 580 adjacency claims to the existing 128. The execution
+count includes both local and shifted-next evaluations of all 84 preprocessing
+columns; omitting the second opening would leave next-row preprocessing
+unauthenticated. The projected component frames are 36,020 and 21,748 bytes,
+producing a complete 191,185-byte V3 payload with 70,762 bytes of room under the
+exact 261,947-byte allowance.
 The current parser deliberately remains at 128 claims: this projection does not
 replace the missing scalar-field constraint implementation, adjacency
 soundness proof, complete n=33 run, independent review, or audit.
@@ -681,7 +684,14 @@ equations, retains 1,296 translated equations, and adds three one-scalar
 evaluation equations. The resulting 1,299-constraint trace has 289 main
 columns, reaches the Dory-authenticated raw-byte evaluation, and rejects
 accumulator, hashed-byte, Dory-point, and claimed-evaluation mutations. This
-does not yet produce a Dory sumcheck, bind row adjacency, or authorize V3.
+does not yet produce a Dory-authenticated sumcheck, bind row adjacency, or authorize V3.
+
+A bounded dense sumcheck now proves the zero sum of a Fiat-Shamir mixture of all
+1,299 native constraints on the 256-row fixture. It uses eight degree-17 rounds
+and 18 samples per round, yields the expected 746 terminal evaluations, and
+rejects modified round messages and terminal values. Those terminal values are
+not yet authenticated by Dory openings, so the result is an algebraic handoff,
+not a succinct or admissible proof.
 
 The verified model-bank reader can now transactionally publish reusable BLS coefficient artifacts as well as the fixed identity. It builds the base input and every ordered weight bank while checking the canonical byte roots and EOF, returns nothing on failure, and cleans provisional files. Its writer reassembles arbitrary authenticated input chunks into canonical rows, commits complete rows in deterministic parallel batches behind a bounded 256 MiB window, and preserves canonical artifact and target-group accumulation order. Three n=19 release A/B repeats measured 814--826 ms for the former serial writer and 377--391 ms for the parallel writer; their 822 and 385 ms medians give a 53.2% reduction while producing the identical artifact digest, row commitments, tier-two commitment, opening claims, and proof bytes. Matrix proving consumes the authenticated weight artifact sequentially, reuses it in the shared aggregate opening, and rejects a commitment from the wrong pinned bank before proving. Bounded fixtures match materialized proof bytes exactly. This removes the roughly 16 GiB in-memory `i64` slice for an n=31 weight bank. It also replaces the former 32-byte-per-weight scalar artifact: the first Dory row is stored as canonical signed words and each remaining model weight in the consensus range `[-125, 125]` is one authenticated byte selecting the fixed dictionary `0, -1..-125, 1..125`. Every read reauthenticates the dictionary, codes, dimensions, source digest, and EOF before expansion.
 

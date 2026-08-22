@@ -1024,13 +1024,15 @@ therefore a measured rejection rather than the missing size optimization.
 The next bounded design eliminates that FRI frame. The narrow BLAKE3 execution
 becomes a BLS/Dory sumcheck with 289 BLS-native main columns, where the
 evaluation accumulator is one scalar rather than three Goldilocks limbs. It
-opens 662 local/next/preprocessed claims. A separate row-indexed LogUp
+opens 746 local/next main and preprocessing claims; authenticating only one
+preprocessing evaluation would leave the shifted next row unbound. A separate
+row-indexed LogUp
 permutation opens 580 more claims and binds every committed next row to the
 following local row; omitting that argument would let a prover choose unrelated
-rows. Together with the current 128 claims, the design requires 1,370 claims
+rows. Together with the current 128 claims, the design requires 1,454 claims
 under a future bounded 2,048-claim parser. Conservative wire accounting gives
-33,332 bytes for execution and 21,748 bytes for adjacency, projecting the full
-V3 payload at 188,497 bytes with 73,450 bytes of headroom. The current parser
+36,020 bytes for execution and 21,748 bytes for adjacency, projecting the full
+V3 payload at 191,185 bytes with 70,762 bytes of headroom. The current parser
 remains capped at 128. These values are an executable layout projection, not a
 proof-size measurement or an activation result.
 
@@ -1044,8 +1046,15 @@ equations are removed, 1,296 translated equations remain, and three BLS-scalar
 accumulator equations produce a 1,299-constraint, 289-column trace. The honest
 trace reaches the Dory-authenticated raw-byte evaluation, while accumulator,
 hashed-byte, Dory-point, and final-evaluation mutations fail. It is not yet
-wired into the Dory execution sumcheck; adjacency soundness, a complete n=33
+wired into Dory opening proofs; adjacency soundness, a complete n=33
 run, independent review, and audit also remain.
+
+The first dense execution sumcheck now combines all 1,299 native constraints
+with a Fiat-Shamir challenge. The 256-row fixture verifies in eight degree-17
+rounds with 18 evaluations per round, exposes all 746 local/next terminal
+evaluations, and rejects round-message and terminal-value substitutions. The
+terminal evaluations still lack Dory opening proofs. This checkpoint establishes
+the algebraic reduction only and remains non-admissible.
 
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate

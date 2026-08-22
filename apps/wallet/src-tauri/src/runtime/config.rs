@@ -16,6 +16,7 @@ pub(crate) struct NodeRuntimeConfig {
     pub(super) p2p_bind: SocketAddr,
     pub(super) peers: Vec<SocketAddr>,
     pub(super) allow_public_peers: bool,
+    pub(super) peers_explicit: bool,
     /// `-v` count: 0 = silent, 1 = warn, 2 = info, 3 = debug, 4+ = trace on
     /// the console. The file log under the node's data directory is always
     /// debug level, regardless of this count.
@@ -53,6 +54,7 @@ impl NodeRuntimeConfig {
         let mut p2p_bind = None;
         let mut peers = Vec::new();
         let mut allow_public_peers = false;
+        let mut peers_explicit = false;
         let mut verbose: u8 = 0;
         let mut arguments = arguments.into_iter().map(Into::into);
 
@@ -83,6 +85,7 @@ impl NodeRuntimeConfig {
                 }
                 "--peer" => {
                     has_control_arg = true;
+                    peers_explicit = true;
                     let value = arguments
                         .next()
                         .ok_or(ConfigError::MissingValue("--peer"))?;
@@ -90,6 +93,7 @@ impl NodeRuntimeConfig {
                 }
                 "--allow-public-peers" => {
                     has_control_arg = true;
+                    peers_explicit = true;
                     if allow_public_peers {
                         return Err(ConfigError::DuplicateOption("--allow-public-peers"));
                     }
@@ -115,6 +119,7 @@ impl NodeRuntimeConfig {
                 }
                 _ if argument.starts_with("--peer=") => {
                     has_control_arg = true;
+                    peers_explicit = true;
                     let value = argument
                         .strip_prefix("--peer=")
                         .expect("prefix was checked");
@@ -147,6 +152,7 @@ impl NodeRuntimeConfig {
             p2p_bind: p2p_bind.unwrap_or(default_bind),
             peers,
             allow_public_peers,
+            peers_explicit,
             verbose,
         }
         .with_default_bootstrap();
@@ -277,6 +283,7 @@ mod tests {
         assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
         assert_eq!(config.peers, vec![DEFAULT_BOOTSTRAP_PEER]);
         assert!(config.allow_public_peers);
+        assert!(!config.peers_explicit);
         assert_eq!(config.verbose, 0);
     }
 
@@ -324,6 +331,7 @@ mod tests {
             ]
         );
         assert!(!config.allow_public_peers);
+        assert!(config.peers_explicit);
     }
 
     #[test]

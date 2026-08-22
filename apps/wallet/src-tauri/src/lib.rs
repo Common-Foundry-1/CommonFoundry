@@ -57,6 +57,8 @@ pub fn run() -> i32 {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_node_status,
+            commands::get_peer_settings,
+            commands::update_peer_settings,
             commands::get_wallet_snapshot,
             commands::get_mempool_snapshot,
             commands::send_wallet_transaction,

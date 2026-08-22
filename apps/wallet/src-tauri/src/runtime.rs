@@ -2,10 +2,7 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cmfd_node::p2p::{
-    InboundPeerHandle, StaticPeerPollHandle, spawn_inbound_listener_with_policy,
-    spawn_static_peer_polling,
-};
+use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
 use cmfd_node::peer::PeerLimits;
 use cmfd_node::{Node, NodeClientError};
 use tauri::{App, Manager, Runtime};
@@ -13,8 +10,10 @@ use tauri::{App, Manager, Runtime};
 use crate::mining::MiningManager;
 
 mod config;
+mod peers;
 
 pub(crate) use config::{ConfigError, NodeRuntimeConfig, ProcessCommand};
+pub(crate) use peers::{PeerManager, PeerSettings, UpdatePeerSettingsRequest};
 
 const STATIC_PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -25,13 +24,20 @@ enum NodeAvailability {
 }
 
 struct ServiceHandles {
-    static_peer_poller: Option<StaticPeerPollHandle>,
     inbound: InboundPeerHandle,
+}
+
+struct EmbeddedNode {
+    node: Arc<Mutex<Node>>,
+    peers: Arc<PeerManager>,
+    services: ServiceHandles,
+    log_guard: cmfd_node::logging::WorkerGuard,
 }
 
 pub struct RuntimeState {
     node: NodeAvailability,
     mining: Option<Arc<MiningManager>>,
+    peers: Option<Arc<PeerManager>>,
     services: Mutex<Option<ServiceHandles>>,
     // Held for the life of the process: dropping it stops the non-blocking
     // file writer from flushing buffered log lines.
@@ -47,15 +53,17 @@ impl RuntimeState {
             config.p2p_bind, peers
         );
         match start_embedded_node(app, config) {
-            Ok((node, services, log_guard)) => Self {
-                mining: Some(Arc::new(MiningManager::new(Arc::clone(&node)))),
-                node: NodeAvailability::Ready(node),
-                services: Mutex::new(Some(services)),
-                _log_guard: Some(log_guard),
+            Ok(started) => Self {
+                mining: Some(Arc::new(MiningManager::new(Arc::clone(&started.node)))),
+                node: NodeAvailability::Ready(started.node),
+                peers: Some(started.peers),
+                services: Mutex::new(Some(started.services)),
+                _log_guard: Some(started.log_guard),
             },
             Err(error) => Self {
                 node: NodeAvailability::Failed(error),
                 mining: None,
+                peers: None,
                 services: Mutex::new(None),
                 _log_guard: None,
             },
@@ -80,9 +88,23 @@ impl RuntimeState {
         })
     }
 
+    pub fn peers(&self) -> Result<Arc<PeerManager>, NodeClientError> {
+        self.peers.clone().ok_or_else(|| match &self.node {
+            NodeAvailability::Failed(error) => error.clone(),
+            NodeAvailability::Ready(_) => startup_error(
+                "peer_manager_unavailable",
+                "The desktop peer service is unavailable. Reopen the wallet.",
+                true,
+            ),
+        })
+    }
+
     pub fn stop_services(&self) {
         if let Some(mining) = &self.mining {
             mining.stop_for_shutdown();
+        }
+        if let Some(peers) = &self.peers {
+            peers.stop();
         }
         let services = self
             .services
@@ -90,14 +112,7 @@ impl RuntimeState {
             .ok()
             .and_then(|mut services| services.take());
         if let Some(services) = services {
-            let ServiceHandles {
-                static_peer_poller,
-                inbound,
-            } = services;
-            if let Some(poller) = static_peer_poller {
-                let _ = poller.stop();
-            }
-            let _ = inbound.stop();
+            let _ = services.inbound.stop();
         }
     }
 
@@ -106,6 +121,7 @@ impl RuntimeState {
         Self {
             node: NodeAvailability::Failed(error),
             mining: None,
+            peers: None,
             services: Mutex::new(None),
             _log_guard: None,
         }
@@ -115,14 +131,7 @@ impl RuntimeState {
 fn start_embedded_node<R: Runtime>(
     app: &App<R>,
     config: NodeRuntimeConfig,
-) -> Result<
-    (
-        Arc<Mutex<Node>>,
-        ServiceHandles,
-        cmfd_node::logging::WorkerGuard,
-    ),
-    NodeClientError,
-> {
+) -> Result<EmbeddedNode, NodeClientError> {
     let data_dir = app
         .path()
         .app_local_data_dir()
@@ -135,8 +144,7 @@ fn start_embedded_node<R: Runtime>(
         })?
         .join("devnet-0");
     let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
-    let mut node = Node::open(&data_dir).map_err(|error| error.client_error())?;
-    node.set_public_peer_mode(config.allow_public_peers);
+    let node = Node::open(&data_dir).map_err(|error| error.client_error())?;
     let shared = Arc::new(Mutex::new(node));
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
         startup_error(
@@ -169,35 +177,26 @@ fn start_embedded_node<R: Runtime>(
             true,
         )
     })?;
-    let static_peer_poller = if config.peers.is_empty() {
-        None
-    } else {
-        let mut static_peers = config.static_peers(limits);
-        static_peers.listen_address = p2p_address;
-        match spawn_static_peer_polling(
-            Arc::clone(&shared),
-            static_peers,
-            STATIC_PEER_POLL_INTERVAL,
-        ) {
-            Ok(poller) => Some(poller),
-            Err(_) => {
-                let _ = inbound.stop();
-                return Err(startup_error(
-                    "static_peer_poller_start_failed",
-                    "The embedded node could not start outbound Devnet peer polling. Check the peer configuration, then reopen the wallet.",
-                    true,
-                ));
-            }
+    let peers = match PeerManager::start(
+        Arc::clone(&shared),
+        &config,
+        &data_dir,
+        p2p_address,
+        limits,
+        STATIC_PEER_POLL_INTERVAL,
+    ) {
+        Ok(peers) => Arc::new(peers),
+        Err(error) => {
+            let _ = inbound.stop();
+            return Err(error);
         }
     };
-    Ok((
-        shared,
-        ServiceHandles {
-            static_peer_poller,
-            inbound,
-        },
+    Ok(EmbeddedNode {
+        node: shared,
+        peers,
+        services: ServiceHandles { inbound },
         log_guard,
-    ))
+    })
 }
 
 pub(crate) fn parse_command() -> Result<ProcessCommand, ConfigError> {

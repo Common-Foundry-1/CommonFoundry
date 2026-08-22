@@ -1,8 +1,8 @@
-import { ArrowDownToLine, ArrowUpFromLine, Blocks, Check, Clipboard, Hammer, RefreshCw, ServerCog, ShieldAlert } from "lucide-react";
-import { useState } from "react";
-import { mineDevnetBlock, usesEmbeddedNode } from "../api/nodeClient";
+import { ArrowDownToLine, ArrowUpFromLine, Blocks, Check, Clipboard, Hammer, Plus, RefreshCw, RotateCcw, ServerCog, ShieldAlert, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { getPeerSettings, mineDevnetBlock, updatePeerSettings, usesEmbeddedNode } from "../api/nodeClient";
 import { formatBytes, shortenHash } from "../lib/amount";
-import type { MempoolSnapshot, NodeStatus, WalletSnapshot } from "../types";
+import type { MempoolSnapshot, NodeStatus, PeerSettings, WalletSnapshot } from "../types";
 
 interface NetworkViewProps {
   status: NodeStatus | null;
@@ -17,7 +17,56 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
   const [mining, setMining] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [peerSettings, setPeerSettings] = useState<PeerSettings | null>(null);
+  const [peerInput, setPeerInput] = useState("");
+  const [peerSaving, setPeerSaving] = useState(false);
+  const [peerError, setPeerError] = useState<string | null>(null);
   const peers = status?.peers ?? [];
+
+  useEffect(() => {
+    if (!usesEmbeddedNode) return;
+    let active = true;
+    void getPeerSettings().then(
+      (settings) => {
+        if (active) setPeerSettings(settings);
+      },
+      (cause) => {
+        if (active) setPeerError(cause instanceof Error ? cause.message : "Peer settings could not be loaded");
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const savePeers = async (nextPeers: string[], notice: string) => {
+    setPeerSaving(true);
+    setPeerError(null);
+    try {
+      const saved = await updatePeerSettings(nextPeers);
+      setPeerSettings(saved);
+      onNotice(notice);
+      try {
+        await onRefresh();
+      } catch {
+        // Peer settings remain applied even if the best-effort status refresh fails.
+      }
+      return true;
+    } catch (cause) {
+      setPeerError(cause instanceof Error ? cause.message : "Peer settings could not be saved");
+      return false;
+    } finally {
+      setPeerSaving(false);
+    }
+  };
+
+  const addPeer = async () => {
+    if (!peerSettings || !peerInput.trim()) return;
+    const entered = peerInput.trim();
+    if (await savePeers([...peerSettings.peers, entered], `Peer ${entered} added. Connection attempts begin automatically.`)) {
+      setPeerInput("");
+    }
+  };
 
   const copyDiagnostics = async () => {
     if (!status) return;
@@ -100,6 +149,67 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
         </dl>
 
         <section className="peer-panel" aria-labelledby="recent-peers-heading">
+          {usesEmbeddedNode ? (
+            <div className="peer-settings" aria-labelledby="configured-peers-heading">
+              <div className="peer-panel-heading">
+                <div>
+                  <span>Connection settings</span>
+                  <h3 id="configured-peers-heading">Configured peers</h3>
+                </div>
+                <button
+                  className="button-quiet"
+                  type="button"
+                  disabled={!peerSettings || peerSaving || peerSettings.peers.length === 1 && peerSettings.peers[0] === peerSettings.bootstrap_peer}
+                  onClick={() => peerSettings && void savePeers([peerSettings.bootstrap_peer], "Community bootstrap peer restored.")}
+                >
+                  <RotateCcw aria-hidden="true" size={14} />
+                  Reset
+                </button>
+              </div>
+              <p className="peer-panel-help">
+                Add a numeric IP address. Port 18444 is used automatically when no port is entered.
+              </p>
+              <form className="peer-add-form" onSubmit={(event) => { event.preventDefault(); void addPeer(); }}>
+                <label className="sr-only" htmlFor="peer-address">Peer IP address</label>
+                <input
+                  id="peer-address"
+                  className="form-input form-input-mono"
+                  value={peerInput}
+                  onChange={(event) => setPeerInput(event.target.value)}
+                  placeholder="203.0.113.20 or 203.0.113.20:18444"
+                  autoComplete="off"
+                  spellCheck={false}
+                  disabled={!peerSettings || peerSaving}
+                />
+                <button className="button-secondary compact" type="submit" disabled={!peerSettings || !peerInput.trim() || peerSaving || peerSettings.peers.length >= peerSettings.max_peers}>
+                  {peerSaving ? <RefreshCw className="spin" aria-hidden="true" size={15} /> : <Plus aria-hidden="true" size={15} />}
+                  Add peer
+                </button>
+              </form>
+              {peerError ? <p className="form-error" role="alert">{peerError}</p> : null}
+              {peerSettings ? (
+                <ul className="configured-peer-list">
+                  {peerSettings.peers.map((peer) => (
+                    <li key={peer}>
+                      <code>{peer}</code>
+                      {peer === peerSettings.bootstrap_peer ? <span>Community bootstrap</span> : <span>Manual peer</span>}
+                      <button
+                        className="icon-button bordered"
+                        type="button"
+                        aria-label={`Remove peer ${peer}`}
+                        title={peerSettings.peers.length === 1 ? "Keep at least one peer configured" : "Remove peer"}
+                        disabled={peerSaving || peerSettings.peers.length === 1}
+                        onClick={() => void savePeers(peerSettings.peers.filter((candidate) => candidate !== peer), `Peer ${peer} removed.`)}
+                      >
+                        <Trash2 aria-hidden="true" size={14} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : peerError ? null : <p className="peer-settings-loading">Loading peer settings…</p>}
+            </div>
+          ) : null}
+
           <div className="peer-panel-heading">
             <div>
               <span>Peer activity</span>

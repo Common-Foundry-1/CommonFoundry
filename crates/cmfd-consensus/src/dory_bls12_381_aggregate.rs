@@ -423,8 +423,9 @@ impl BlsDoryCommittedPolynomial {
 }
 
 /// Transactional builder for one authenticated coefficient artifact and its
-/// matching Dory commitment. It accepts bounded scalar chunks so a verified
-/// model-bank stream never materializes the complete polynomial.
+/// matching Dory commitment. It accepts bounded scalar chunks, commits complete
+/// rows in deterministic parallel batches, and never materializes the complete
+/// polynomial.
 pub(crate) struct BlsDoryCommittedPolynomialWriter<'a> {
     writer: BlsDoryFoldArtifactWriter,
     setup: &'a DeterministicBlsDorySetup,
@@ -434,9 +435,9 @@ pub(crate) struct BlsDoryCommittedPolynomialWriter<'a> {
     columns: usize,
     explicit_count: usize,
     written: usize,
-    row_index: usize,
-    column_offset: usize,
-    current_row_commitment: BlsDoryG1,
+    committed_rows: usize,
+    pending_capacity: usize,
+    pending_scalars: Vec<BlsDoryFr>,
     row_commitments: Vec<BlsDoryG1>,
     commitment: BlsDoryGt,
 }
@@ -448,6 +449,24 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         nu: usize,
         sigma: usize,
         setup: &'a DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        Self::create_with_chunk_bytes(
+            scratch_directory,
+            explicit_count,
+            nu,
+            sigma,
+            setup,
+            ROW_COMMIT_CHUNK_BYTES,
+        )
+    }
+
+    fn create_with_chunk_bytes(
+        scratch_directory: &Path,
+        explicit_count: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &'a DeterministicBlsDorySetup,
+        chunk_bytes: usize,
     ) -> Result<Self, BlsDoryAggregateError> {
         setup
             .validate()
@@ -479,6 +498,15 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         )?;
         let writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
             .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        let row_bytes = columns
+            .checked_mul(std::mem::size_of::<BlsDoryFr>())
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let rows_per_chunk = (chunk_bytes / row_bytes.max(1)).max(1);
+        let explicit_rows = explicit_count.div_ceil(columns);
+        let pending_capacity = rows_per_chunk
+            .min(explicit_rows)
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
         Ok(Self {
             writer,
             setup,
@@ -488,9 +516,9 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
             columns,
             explicit_count,
             written: 0,
-            row_index: 0,
-            column_offset: 0,
-            current_row_commitment: BlsDoryG1::identity(),
+            committed_rows: 0,
+            pending_capacity,
+            pending_scalars: Vec::new(),
             row_commitments: vec![BlsDoryG1::identity(); rows],
             commitment: BlsDoryGt::identity(),
         })
@@ -509,27 +537,22 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
         while !scalars.is_empty() {
-            if self.row_index >= self.rows {
-                return Err(BlsDoryAggregateError::InvalidCoefficientCount);
-            }
-            let take = scalars.len().min(self.columns - self.column_offset);
+            let take = scalars
+                .len()
+                .min(self.pending_capacity - self.pending_scalars.len());
             let segment = &scalars[..take];
-            let partial = self
-                .setup
-                .commit_row_segment(self.column_offset, segment)
-                .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
-            self.current_row_commitment = self.current_row_commitment + partial;
-            for scalar in segment {
-                self.writer
-                    .write_scalar(scalar)
-                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-            }
-            self.column_offset += take;
+            self.writer
+                .write_scalars(segment)
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+            self.pending_scalars.extend_from_slice(segment);
             self.written += take;
             scalars = &scalars[take..];
-            if self.column_offset == self.columns {
-                self.finish_row()?;
+            if self.pending_scalars.len() == self.pending_capacity {
+                self.flush_pending_rows(false)?;
             }
+        }
+        if self.written == self.explicit_count && self.pending_scalars.is_empty() {
+            self.pending_scalars = Vec::new();
         }
         Ok(())
     }
@@ -538,10 +561,10 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         if self.written != self.explicit_count {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
-        if self.column_offset != 0 {
-            self.finish_row()?;
+        if !self.pending_scalars.is_empty() {
+            self.flush_pending_rows(true)?;
         }
-        if self.row_index != self.explicit_count.div_ceil(self.columns) {
+        if self.committed_rows != self.explicit_count.div_ceil(self.columns) {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
         let artifact = self
@@ -558,17 +581,46 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         })
     }
 
-    fn finish_row(&mut self) -> Result<(), BlsDoryAggregateError> {
-        let row_commitment = self.current_row_commitment;
-        self.commitment = self.commitment
-            + self
-                .setup
-                .pair_committed_row(self.row_index, &row_commitment)
-                .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
-        self.row_commitments[self.row_index] = row_commitment;
-        self.row_index += 1;
-        self.column_offset = 0;
-        self.current_row_commitment = BlsDoryG1::identity();
+    fn flush_pending_rows(&mut self, final_chunk: bool) -> Result<(), BlsDoryAggregateError> {
+        if self.pending_scalars.is_empty()
+            || (!final_chunk && !self.pending_scalars.len().is_multiple_of(self.columns))
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let chunk_rows = self.pending_scalars.len().div_ceil(self.columns);
+        if self
+            .committed_rows
+            .checked_add(chunk_rows)
+            .is_none_or(|end| end > self.rows)
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        self.pending_scalars
+            .resize(chunk_rows * self.columns, BlsDoryFr::zero());
+        let chunk_start = self.committed_rows;
+        let committed = self
+            .pending_scalars
+            .par_chunks_exact(self.columns)
+            .enumerate()
+            .map(|(local_row, row)| {
+                let row_index = chunk_start + local_row;
+                let row_commitment = self
+                    .setup
+                    .commit_row_segment(0, row)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                let paired = self
+                    .setup
+                    .pair_committed_row(row_index, &row_commitment)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                Ok((row_commitment, paired))
+            })
+            .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        for (local_row, (row_commitment, paired)) in committed.into_iter().enumerate() {
+            self.row_commitments[chunk_start + local_row] = row_commitment;
+            self.commitment = self.commitment + paired;
+        }
+        self.committed_rows += chunk_rows;
+        self.pending_scalars.clear();
         Ok(())
     }
 }
@@ -2191,6 +2243,73 @@ mod tests {
         }
     }
 
+    fn benchmark_model_scalar(index: usize) -> BlsDoryFr {
+        BlsDoryFr::from_u64(((index as u64 + 7) * 13 + 19) % 65_521)
+    }
+
+    fn serial_model_writer_reference(
+        scratch_directory: &Path,
+        explicit_count: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+    ) -> BlsDoryCommittedPolynomial {
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let spec =
+            source_artifact_spec(setup.identity(), nu, sigma, rows * columns, explicit_count)
+                .unwrap();
+        let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec).unwrap();
+        let mut row_index = 0usize;
+        let mut column_offset = 0usize;
+        let mut current_row_commitment = BlsDoryG1::identity();
+        let mut row_commitments = vec![BlsDoryG1::identity(); rows];
+        let mut commitment = BlsDoryGt::identity();
+        let scalar_chunk = 1usize << 16;
+        for start in (0..explicit_count).step_by(scalar_chunk) {
+            let end = start.saturating_add(scalar_chunk).min(explicit_count);
+            let scalars = (start..end).map(benchmark_model_scalar).collect::<Vec<_>>();
+            let mut remaining = scalars.as_slice();
+            while !remaining.is_empty() {
+                let take = remaining.len().min(columns - column_offset);
+                let segment = &remaining[..take];
+                current_row_commitment = current_row_commitment
+                    + setup.commit_row_segment(column_offset, segment).unwrap();
+                for scalar in segment {
+                    writer.write_scalar(scalar).unwrap();
+                }
+                column_offset += take;
+                remaining = &remaining[take..];
+                if column_offset == columns {
+                    commitment = commitment
+                        + setup
+                            .pair_committed_row(row_index, &current_row_commitment)
+                            .unwrap();
+                    row_commitments[row_index] = current_row_commitment;
+                    row_index += 1;
+                    column_offset = 0;
+                    current_row_commitment = BlsDoryG1::identity();
+                }
+            }
+        }
+        if column_offset != 0 {
+            commitment = commitment
+                + setup
+                    .pair_committed_row(row_index, &current_row_commitment)
+                    .unwrap();
+            row_commitments[row_index] = current_row_commitment;
+        }
+        let artifact = writer.finish().unwrap();
+        BlsDoryCommittedPolynomial {
+            coefficients: BlsDoryCoefficientStorage::AuthenticatedArtifact(Arc::new(artifact)),
+            commitment,
+            row_commitments,
+            setup_identity: setup.identity(),
+            nu,
+            sigma,
+        }
+    }
+
     struct Fixture {
         setup: DeterministicBlsDorySetup,
         polynomials: Vec<BlsDoryCommittedPolynomial>,
@@ -2491,6 +2610,152 @@ mod tests {
         drop(clone);
         assert!(!artifact_path.exists());
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn chunked_polynomial_writer_matches_row_source_and_exact_proof_bytes() {
+        let variables = 8;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let columns = 1usize << sigma;
+        let explicit = 1usize << (variables - 1);
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let coefficients = (0..(1usize << variables))
+            .map(|index| BlsDoryFr::from_u64((index as u64 + 5) * 17))
+            .collect::<Vec<_>>();
+        let first_scratch = ScratchDirectory::create();
+        let second_scratch = ScratchDirectory::create();
+        let chunk_bytes = 2 * columns * std::mem::size_of::<BlsDoryFr>();
+        let mut writer = BlsDoryCommittedPolynomialWriter::create_with_chunk_bytes(
+            &first_scratch.0,
+            explicit,
+            nu,
+            sigma,
+            &setup,
+            chunk_bytes,
+        )
+        .unwrap();
+        assert_eq!(writer.pending_capacity, 2 * columns);
+        let mut offset = 0usize;
+        for chunk_len in [3usize, 29, 1, 47, 11, 37] {
+            writer
+                .write_scalars(&coefficients[offset..offset + chunk_len])
+                .unwrap();
+            offset += chunk_len;
+            assert!(writer.pending_scalars.len() < writer.pending_capacity);
+        }
+        assert_eq!(offset, explicit);
+        assert_eq!(writer.pending_scalars.capacity(), 0);
+        let chunked = writer.finish().unwrap();
+
+        let mut source = fixture_row_source(variables);
+        source.coefficients = coefficients;
+        source.explicit_coefficients = explicit;
+        let streamed = commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            &setup,
+            &second_scratch.0,
+        )
+        .unwrap();
+        assert_eq!(chunked.commitment, streamed.commitment);
+        assert_eq!(chunked.row_commitments, streamed.row_commitments);
+        match (&chunked.coefficients, &streamed.coefficients) {
+            (
+                BlsDoryCoefficientStorage::AuthenticatedArtifact(left),
+                BlsDoryCoefficientStorage::AuthenticatedArtifact(right),
+            ) => {
+                assert_eq!(left.spec(), right.spec());
+                assert_eq!(left.digest(), right.digest());
+            }
+            _ => panic!("both commitment paths must retain authenticated artifacts"),
+        }
+
+        let points = vec![
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 2))
+                .collect::<Vec<_>>(),
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 19))
+                .collect::<Vec<_>>(),
+        ];
+        let chunked_refs = vec![&chunked, &chunked];
+        let streamed_refs = vec![&streamed, &streamed];
+        let chunked_proof = prove_bls_dory_opening_refs_with_scratch(
+            b"chunked-writer-equivalence",
+            &chunked_refs,
+            &points,
+            &setup,
+            None,
+        )
+        .unwrap();
+        let streamed_proof = prove_bls_dory_opening_refs_with_scratch(
+            b"chunked-writer-equivalence",
+            &streamed_refs,
+            &points,
+            &setup,
+            None,
+        )
+        .unwrap();
+        assert_eq!(chunked_proof, streamed_proof);
+    }
+
+    #[test]
+    #[ignore = "release-only scaling benchmark selected through CMFD_BLS_MODEL_WRITER_BENCH_VARIABLES"]
+    fn authenticated_model_writer_scaling_benchmark() {
+        let variables = std::env::var("CMFD_BLS_MODEL_WRITER_BENCH_VARIABLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(19);
+        assert!((8..=23).contains(&variables));
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let explicit = 1usize << variables;
+        let setup_start = std::time::Instant::now();
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let setup_millis = setup_start.elapsed().as_millis();
+        let serial_scratch = ScratchDirectory::create();
+        let serial_started = std::time::Instant::now();
+        let serial = serial_model_writer_reference(&serial_scratch.0, explicit, nu, sigma, &setup);
+        let serial_millis = serial_started.elapsed().as_millis();
+        let parallel_scratch = ScratchDirectory::create();
+        let mut writer = BlsDoryCommittedPolynomialWriter::create(
+            &parallel_scratch.0,
+            explicit,
+            nu,
+            sigma,
+            &setup,
+        )
+        .unwrap();
+        let window_bytes = writer.pending_capacity * std::mem::size_of::<BlsDoryFr>();
+        let started = std::time::Instant::now();
+        let scalar_chunk = 1usize << 16;
+        for start in (0..explicit).step_by(scalar_chunk) {
+            let end = start.saturating_add(scalar_chunk).min(explicit);
+            let scalars = (start..end).map(benchmark_model_scalar).collect::<Vec<_>>();
+            writer.write_scalars(&scalars).unwrap();
+        }
+        let parallel = writer.finish().unwrap();
+        let parallel_millis = started.elapsed().as_millis();
+        assert_eq!(parallel.commitment, serial.commitment);
+        assert_eq!(parallel.row_commitments, serial.row_commitments);
+        match (&parallel.coefficients, &serial.coefficients) {
+            (
+                BlsDoryCoefficientStorage::AuthenticatedArtifact(left),
+                BlsDoryCoefficientStorage::AuthenticatedArtifact(right),
+            ) => {
+                assert_eq!(left.spec(), right.spec());
+                assert_eq!(left.digest(), right.digest());
+            }
+            _ => panic!("both benchmark paths must retain authenticated artifacts"),
+        }
+        let artifact_bytes = std::fs::metadata(parallel.coefficient_artifact_path().unwrap())
+            .unwrap()
+            .len();
+        println!(
+            "CMFD_BLS_MODEL_WRITER_BENCHMARK {{\"variables\":{variables},\"coefficients\":{explicit},\"setup_millis\":{setup_millis},\"serial_millis\":{serial_millis},\"parallel_millis\":{parallel_millis},\"window_bytes\":{window_bytes},\"artifact_bytes\":{artifact_bytes}}}"
+        );
     }
 
     #[test]

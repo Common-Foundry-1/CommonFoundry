@@ -1005,6 +1005,13 @@ lineage-authenticated two-lane artifact implementation with bounded 1 MiB
 artifact reads and writes. Row commitments are computed in deterministic
 parallel batches behind a bounded 256 MiB coefficient window; source reads,
 artifact writes, and target-group accumulation remain in canonical row order.
+The verified model-bank writer now uses the same bounded row-batch boundary:
+arbitrary authenticated input chunks are reassembled into canonical rows,
+committed in parallel, and published only after the model receipt verifies.
+Three n=19 release A/B repeats measured 814--826 ms for the former serial
+writer and 377--391 ms for the parallel writer. Their 822 and 385 ms medians
+give a 53.2% reduction, with identical artifact digest, row commitments,
+tier-two commitment, opening claims, and proof bytes.
 Inverse source rows use exact Montgomery batch inversion and reject a zero
 denominator before publishing the commitment. The Dory G1/G2 MSM and
 elementwise vector routines also use ordered CPU-parallel maps and normalize to

@@ -120,7 +120,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; shared transition artifacts and reusable model artifacts remove duplicate sources, but linear LogUp scaling still projects CPU time and retained scratch beyond a practical complete production run",
+    "the final model bank lacks pinned n=33 BLS commitments; its authenticated writer now uses bounded parallel row batches and shared transition artifacts remove duplicate sources, but linear LogUp scaling still projects CPU time and retained scratch beyond a practical complete production run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 

@@ -478,6 +478,11 @@ comparison. The v2 research code now implements:
   scratch outputs match exactly. Commitment rows now execute in deterministic
   parallel batches behind a bounded 256 MiB coefficient window, while source
   reads, artifact writes, and target-group accumulation retain canonical order;
+  the authenticated model-bank writer now uses that same row-batch boundary
+  across arbitrary verified input chunks. Three n=19 release A/B repeats gave
+  serial and parallel medians of 822 and 385 ms, respectively, a 53.2%
+  reduction, with identical artifact digest, commitments, claims, and proof
+  bytes;
   inverse source rows use exact batch inversion. Dory MSM and elementwise vector
   routines are CPU-parallel and preserve the normalized group elements and
   proof bytes. At n=19 the resulting linear prover took 9.923 seconds versus

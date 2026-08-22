@@ -51,7 +51,7 @@ pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
 /// Remaining gates on this transition path.
 pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the n=33 packed transition polynomial is not streamed by the in-memory prover",
-    "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
+    "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar transition transcript and packed opening path have not received an external audit",
 ];
 

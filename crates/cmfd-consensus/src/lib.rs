@@ -11,6 +11,8 @@ pub mod dory_bls12_381_matrix;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_prototype;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_bls12_381_soundness;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_transition;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_wiring;

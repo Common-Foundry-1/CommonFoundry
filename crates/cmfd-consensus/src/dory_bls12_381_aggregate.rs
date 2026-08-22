@@ -28,6 +28,8 @@ use crate::dory_bls12_381_prototype::{
 
 /// Version of the bounded BLS12-381 aggregate wire grammar.
 pub const BLS_DORY_AGGREGATE_VERSION: u16 = 1;
+/// Degree of the distinct-point reduction sumcheck.
+pub const BLS_DORY_AGGREGATE_SUMCHECK_DEGREE: usize = 2;
 /// Maximum number of claims admitted by the research verifier.
 pub const MAX_BLS_DORY_AGGREGATE_CLAIMS: usize = 128;
 /// Same proof-payload ceiling enforced by the production candidate frame.
@@ -37,7 +39,7 @@ pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the production n=29/n=31/n=33 polynomials are not streamed by this in-memory implementation",
-    "the aggregate soundness bound has not been independently reviewed",
+    "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
 

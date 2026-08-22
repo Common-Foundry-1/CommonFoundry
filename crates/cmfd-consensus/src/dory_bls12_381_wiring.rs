@@ -41,7 +41,7 @@ pub const BLS_DORY_WIRING_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar wiring path.
 pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the n=29 packed wiring polynomial is not streamed by the in-memory prover",
-    "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
+    "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar wiring transcript and packed opening path have not received an external audit",
 ];
 

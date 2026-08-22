@@ -49,6 +49,12 @@ absorbs the protocol version, public statement binding, exact dimensions and
 integer bounds, commitments, claimed evaluations, every round index and
 message, and terminal evaluations before its final digest.
 
+The BLS12-381 backend uses transcript version 2. Its sampler accepts a 256-bit
+little-endian candidate only when it is the canonical encoding of a nonzero
+scalar, otherwise it derives another candidate with a counter. Accepted
+challenges are therefore exactly uniform over `Fr*`; algebraic error terms use
+the denominator `|Fr|-1` without modulo-reduction bias.
+
 The current research statement binding is an opaque byte string. The eventual
 block proof must replace it with the canonical encoding of all public inputs
 listed in section 1.
@@ -930,8 +936,9 @@ projects to 133,373 bytes. Tests reject changed model identities, fixed
 commitments, equality values, and substituted, reordered, or omitted components.
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. An n=33 streaming
-prover, execution of the final model commitment ceremony, complete transcript and
-soundness accounting, and independent audit remain activation requirements.
+prover, execution of the final model commitment ceremony, independent review of
+the transcript and soundness accounting, and external audit remain activation
+requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -946,9 +953,10 @@ The scalar LogUp membership and source/slack reconstruction identities and the
 seven-constraint arithmetic sumcheck are connected through the same packed
 transition commitment. The shared layout also authenticates the eleven
 fixed-model and cross-component equalities described above. The individual tables
-accept the common n=33 layout, but streaming that shared geometry, complete
-soundness accounting, production latency and peak-memory measurement, and
-independent audit remain mandatory activation gates.
+accept the common n=33 layout and the executable algebraic report covers this
+topology, but streaming that shared geometry, independent soundness review,
+production latency and peak-memory measurement, and external audit remain
+mandatory activation gates.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
@@ -992,30 +1000,50 @@ automatic rejection for the 16 GiB target.
 
 ## 7. Soundness accounting
 
-For one matrix bank, the raw sumcheck error is bounded by
+For one matrix bank in the original cubic-Goldilocks path, the sumcheck error
+is bounded by
 
 ```text
 (2*log2(D) + 3*log2(L)) / |Fp^3|.
 ```
 
-At `D=4096` and `L=128`, the numerator is 45. The final report must add all
-three matrix banks. The original direct transition baseline uses a degree-17
-sumcheck over 26 variables (`7 layer + 7 row + 12 column`), giving numerator
-442, while mixing 121 constraints contributes at most 120 more. The split BLS
-arithmetic checkpoint lowers its sumcheck contribution to `3 * 26 = 78` and
-mixes seven constraints, but that is not the complete transition bound. The
-degree-four LogUp rounds, the randomly combined degree-two selector sumcheck,
-lookup and reconstruction-mixing challenges, random cell/spec evaluation, slack
-mixing, PCS binding/list-decoding error,
-wiring sumchecks, hash collision assumptions, and proof-of-work grinding must
-all be union-bounded. A machine-generated report must show total error at most
-`2^-128`; quoting the scalar-field size or only the arithmetic contribution is
-insufficient.
+At `D=4096` and `L=128`, the numerator is 45. Native BLS re-arithmetization has
+the same degree numerator over `Fr*`. The BLS report also counts the
+26-variable random point that reduces the complete matrix relation. The
+original direct transition baseline uses a degree-17 sumcheck over 26 variables
+(`7 layer + 7 row + 12 column`), giving numerator 442, while mixing 121
+constraints contributes at most 120 more. The split BLS arithmetic checkpoint
+lowers its bank sumcheck contribution to `3 * 26 = 78` and mixes seven
+constraints. Degree-four LogUp rounds, the randomly combined degree-two
+selector sumcheck, lookup and reconstruction-mixing challenges, random
+cell/spec evaluation, slack mixing, wiring identities, equality links, and
+distinct-point aggregation are all included in the executable BLS algebraic
+report. Dory knowledge soundness, hash collision assumptions, the Fiat-Shamir
+reduction, and proof-attempt grinding remain separate computational and
+operational obligations.
 
 The successor argument contributes numerator 135 for the production shape:
 three 26-variable within-bank identities, two 19-variable bank-boundary
 identities, and one 19-variable initialization identity. This is accounted
 before PCS binding error and Fiat-Shamir grinding.
+
+For the exact production topology, the machine-derived conservative numerator
+is `19,781,388,244`. The dominant contribution is the LogUp lookup challenge:
+for each transition, the report grants a nonidentical rational multiset identity
+one root per active range value plus all sixteen table values. The initialization
+has `98 * 2^19` active values and each of three banks has `98 * 2^26`. All
+remaining matrix, transition, reconstruction, wiring, link, and aggregate terms
+sum to 1,940. BLS12-381 `Fr` has a 255-bit modulus, so `|Fr|-1 >= 2^254`; because
+the total numerator is below `2^35`, the algebraic false-accept probability is
+strictly below `2^-219`. This leaves 91 bits of simple proof-attempt union-bound
+grinding headroom before reaching the required 128-bit algebraic floor.
+
+That 219-bit figure is not a claim that the complete system has 219-bit security.
+The implementation targets 128-bit computational security and remains
+fail-closed because Dory knowledge soundness, the BLAKE3 Fiat-Shamir transform,
+and the codec/implementation have not been independently reviewed or externally
+audited. The report's readiness predicate stays false until those flags are
+explicitly changed after review.
 
 ## 8. Miner shortcut boundary
 

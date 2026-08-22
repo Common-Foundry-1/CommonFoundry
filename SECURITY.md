@@ -178,7 +178,8 @@ accumulator commitments, runs the exact degree-two common and degree-three layer
 sumcheck, and authenticates all three terminal evaluations with one aggregate.
 Its executable n=3 fixture is 11,539 bytes, including a 9,439-byte Dory proof.
 The production n=31 grammar projects to 70,483 bytes, including a 66,559-byte
-aggregate, and pins the raw matrix soundness numerator at 45. Unequal table
+aggregate, and pins the matrix sumcheck numerator at 45 plus a 26-variable
+random-point relation reduction. Unequal table
 geometries, every transcript role, and the canonical outer parser have mutation
 coverage. The shared layout now checks each weight commitment against a trusted
 BLS fixed-model identity bound to `ModelPcsIdentity`. The model-bank verifier now
@@ -198,8 +199,8 @@ transition table. A composed verifier requires this arithmetic proof and the
 range proof below to carry the exact same commitment. The verifier is
 witness-free, and tests reject statement, mask, round, terminal, commitment,
 opening, length, and trailing-byte mutations. This still does not provide a
-streamed n=33 prover, one shared opening aggregate, a complete soundness
-analysis, or an audit.
+streamed n=33 prover, independent review of the executable soundness analysis,
+or an audit.
 The scalar wiring checkpoint packs the initial activation plus three input/output
 bank pairs into eight selector slots under one Dory commitment. It authenticates
 all initialization, within-bank successor, and cross-bank boundary evaluations.
@@ -245,8 +246,20 @@ and range needs 16; adding nine matrix and 31 wiring claims gives a compressed
 subtotal of 104. The composed transition verifier requires arithmetic and range
 proofs to share one commitment. The shared layout adds 22 fixed-model and
 cross-component equality claims and authenticates all 126 claims with one opening
-proof. Final-model commitment publication, n=33 prover streaming, complete
-soundness accounting, and audit remain required.
+proof. Transcript v2 now rejection-samples exactly uniformly from nonzero
+BLS12-381 scalars. The executable production union-bound report includes every
+matrix relation and sumcheck, transition reduction, LogUp rational-identity and
+sumcheck term, reconstruction reduction, wiring identity, equality link, and
+distinct-point aggregation term. Its conservative algebraic numerator is
+19,781,388,244 over at least a 2^254 nonzero challenge space, establishing a
+219-bit algebraic floor and 91 bits of proof-attempt grinding headroom above the
+128-bit target. The dominant term conservatively grants each invalid LogUp
+multiset one root per active range value plus all sixteen table values. Dory
+knowledge soundness, the BLAKE3 Fiat-Shamir reduction, and the implementation
+have not been independently reviewed; those computational assumptions are not
+silently included in the algebraic number. Final-model commitment publication,
+n=33 prover streaming, production benchmarks, independent review, and external
+audit remain required.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

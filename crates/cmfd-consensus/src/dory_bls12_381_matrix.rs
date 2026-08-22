@@ -39,8 +39,8 @@ pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
 pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the n=31 activation, weight, and accumulator polynomials are not streamed by the in-memory prover",
-    "the model-weight commitment is not yet derived from the pinned production ModelPcsIdentity",
-    "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
+    "the final production artifact commitments have not been generated and pinned in network parameters",
+    "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
 ];
 

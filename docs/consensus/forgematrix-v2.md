@@ -447,8 +447,13 @@ comparison. The v2 research code now implements:
   incrementally and publishes them only after full bank verification; bounded
   fixtures match the in-memory commitment path and reject corrupt, trailing, or
   reordered input. The final production artifact still needs an n=33 commitment
-  run, and an n=33 streaming prover, soundness review, and audit remain activation
-  gates;
+  run, and an n=33 streaming prover, independent soundness review, and audit
+  remain activation gates. The executable BLS algebraic report uses exact
+  nonzero-scalar rejection sampling and bounds the production numerator at
+  19,781,388,244 over at least 2^254 challenges: a 219-bit algebraic floor with
+  91 bits of proof-attempt grinding headroom above the 128-bit requirement.
+  Dory knowledge soundness, Fiat-Shamir, and implementation review remain
+  fail-closed gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

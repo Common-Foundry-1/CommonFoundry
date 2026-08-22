@@ -38,6 +38,12 @@ use crate::{
 pub const BLS_DORY_RANGE_LOGUP_VERSION: u16 = 3;
 /// Seven bits select the 110 used transition roles inside 128 slots.
 pub const BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES: usize = 7;
+/// Degree of the packed LogUp relation after equality weighting.
+pub const BLS_DORY_RANGE_LOGUP_SUMCHECK_DEGREE: usize = 4;
+/// Degree of the selector reconstruction sumcheck.
+pub const BLS_DORY_RANGE_LOGUP_SELECTOR_SUMCHECK_DEGREE: usize = 2;
+/// Cardinality of the fixed radix-16 lookup table.
+pub const BLS_DORY_RANGE_LOGUP_TABLE_VALUES: usize = 16;
 /// Production transition cells have 26 variables and seven selector variables.
 pub const PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES: usize = 33;
 /// Membership opens transition, multiplicity, and inverse commitments.
@@ -52,7 +58,7 @@ pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the n=33 transition, multiplicity, and inverse polynomials are not streamed",
-    "the lookup soundness accounting, transcript, and implementation have not received independent audit",
+    "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
 
@@ -60,13 +66,13 @@ const PROOF_MAGIC: [u8; 8] = *b"CFBLSL01";
 const PROOF_HEADER_BYTES: usize = 18;
 const MAX_LOGUP_PROOF_BYTES: usize = 262_128;
 const MAX_LOGUP_BINDING_BYTES: usize = 4_096;
-const LOGUP_ROUND_DEGREE: usize = 4;
+const LOGUP_ROUND_DEGREE: usize = BLS_DORY_RANGE_LOGUP_SUMCHECK_DEGREE;
 const LOGUP_ROUND_VALUES: usize = LOGUP_ROUND_DEGREE + 1;
 const LOGUP_TERMINALS: usize = 3;
 const SELECTOR_ROUNDS: usize = BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
 const SELECTOR_ROUND_VALUES: usize = 3;
 const RECONSTRUCTION_WIRE_FIELDS: usize = 1 + SELECTOR_ROUNDS * SELECTOR_ROUND_VALUES + 1;
-const TABLE_VALUES: usize = 16;
+const TABLE_VALUES: usize = BLS_DORY_RANGE_LOGUP_TABLE_VALUES;
 const SELECTOR_SLOTS: usize = 1 << BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
 
 /// Witness-free scalar range-membership proof.

@@ -19,7 +19,9 @@ use ark_ec::{
     hashing::{HashToCurve, curve_maps::wb::WBMap, map_to_curve_hasher::MapToCurveBasedHasher},
     pairing::{Pairing, PairingOutput},
 };
-use ark_ff::{Field as ArkField, PrimeField, UniformRand, Zero, field_hashers::DefaultFieldHasher};
+use ark_ff::{
+    BigInteger, Field as ArkField, PrimeField, UniformRand, Zero, field_hashers::DefaultFieldHasher,
+};
 use ark_serialize::{
     CanonicalDeserialize, CanonicalSerialize, Compress as ArkCompress, Valid as ArkValid,
     Validate as ArkValidate,
@@ -42,6 +44,10 @@ use thiserror::Error;
 
 /// Version of the deterministic BLS12-381 setup derivation.
 pub const BLS_DORY_SETUP_VERSION: u16 = 1;
+/// Version of the BLS12-381 Fiat-Shamir transcript and challenge sampler.
+pub const BLS_DORY_TRANSCRIPT_VERSION: u16 = 2;
+/// Transcript v2 samples exactly uniformly from the nonzero scalar field.
+pub const BLS_DORY_EXACT_NONZERO_CHALLENGE_SAMPLING: bool = true;
 /// This backend is a research checkpoint and cannot activate consensus.
 pub const BLS_DORY_PROTOTYPE_PRODUCTION_READY: bool = false;
 /// Largest fully materialized polynomial accepted by the reference prover.
@@ -56,7 +62,7 @@ pub const MAX_BLS_DORY_SETUP_VARIABLES: usize = 33;
 const G1_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G1_XMD:SHA-256_SSWU_RO_V1";
 const G2_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G2_XMD:SHA-256_SSWU_RO_V1";
 const SETUP_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/DORY-BLS12-381-SETUP/V1";
-const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/DORY-BLS12-381-OPENING/V1";
+const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/DORY-BLS12-381-OPENING/V2";
 
 type G1Hasher =
     MapToCurveBasedHasher<G1Projective, DefaultFieldHasher<Sha256, 128>, WBMap<g1::Config>>;
@@ -559,6 +565,11 @@ pub struct BlsDoryTranscript {
 impl BlsDoryTranscript {
     pub fn new(domain: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new_derive_key(TRANSCRIPT_DOMAIN);
+        absorb_bytes(
+            &mut hasher,
+            b"transcript-version",
+            &BLS_DORY_TRANSCRIPT_VERSION.to_le_bytes(),
+        );
         absorb_bytes(&mut hasher, b"domain", domain);
         Self { hasher }
     }
@@ -598,11 +609,10 @@ impl Transcript for BlsDoryTranscript {
         for counter in 0u32.. {
             let mut challenge_hasher = self.hasher.clone();
             challenge_hasher.update(&counter.to_le_bytes());
-            let mut wide = [0u8; 64];
-            challenge_hasher.finalize_xof().fill(&mut wide);
-            let challenge = BlsDoryFr(Fr::from_le_bytes_mod_order(&wide));
-            if !challenge.is_zero() {
-                absorb_bytes(&mut self.hasher, b"challenge-output", &wide);
+            let mut candidate = [0u8; 32];
+            challenge_hasher.finalize_xof().fill(&mut candidate);
+            if let Some(challenge) = canonical_nonzero_scalar(candidate) {
+                absorb_bytes(&mut self.hasher, b"challenge-output", &candidate);
                 return challenge;
             }
         }
@@ -612,6 +622,16 @@ impl Transcript for BlsDoryTranscript {
     fn reset(&mut self, domain_label: &[u8]) {
         *self = Self::new(domain_label);
     }
+}
+
+fn canonical_nonzero_scalar(candidate: [u8; 32]) -> Option<BlsDoryFr> {
+    let scalar = Fr::from_le_bytes_mod_order(&candidate);
+    if scalar.is_zero() {
+        return None;
+    }
+    let mut canonical = scalar.into_bigint().to_bytes_le();
+    canonical.resize(candidate.len(), 0);
+    (canonical.as_slice() == candidate).then_some(BlsDoryFr(scalar))
 }
 
 fn absorb_bytes(hasher: &mut blake3::Hasher, label: &[u8], bytes: &[u8]) {
@@ -992,6 +1012,41 @@ mod tests {
             deterministic_bls_dory_setup(MAX_BLS_DORY_SETUP_VARIABLES + 1),
             Err(BlsDoryPrototypeError::InvalidSize)
         ));
+    }
+
+    #[test]
+    fn transcript_challenges_use_exact_nonzero_scalar_rejection_sampling() {
+        assert!(canonical_nonzero_scalar([0; 32]).is_none());
+
+        let mut modulus = Fr::MODULUS.to_bytes_le();
+        modulus.resize(32, 0);
+        let modulus: [u8; 32] = modulus.try_into().unwrap();
+        assert!(canonical_nonzero_scalar(modulus).is_none());
+
+        let mut maximum = modulus;
+        for byte in &mut maximum {
+            if *byte != 0 {
+                *byte -= 1;
+                break;
+            }
+            *byte = u8::MAX;
+        }
+        assert!(canonical_nonzero_scalar(maximum).is_some());
+        let mut one = [0_u8; 32];
+        one[0] = 1;
+        assert_eq!(canonical_nonzero_scalar(one), Some(BlsDoryFr::one()));
+
+        let mut first = BlsDoryTranscript::new(b"sampler-test");
+        first.append_bytes(b"statement", b"fixed");
+        let mut second = first.clone();
+        let first_challenge = first.challenge_scalar(b"challenge");
+        let second_challenge = second.challenge_scalar(b"challenge");
+        assert_eq!(first_challenge, second_challenge);
+        assert!(!first_challenge.is_zero());
+
+        let mut different = BlsDoryTranscript::new(b"sampler-test");
+        different.append_bytes(b"statement", b"changed");
+        assert_ne!(first_challenge, different.challenge_scalar(b"challenge"));
     }
 
     #[test]

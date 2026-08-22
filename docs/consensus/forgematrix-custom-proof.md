@@ -1277,6 +1277,15 @@ mathematically impossible."
 
 ## 9. Remaining activation work
 
+Two sanitizer-ready `cargo-fuzz` targets now exercise the outer structured
+aggregate decoder and the nested BLS shared-layout decoder. The latter uses a
+valid fixed topology and a format dictionary so mutations reach matrix,
+transition, LogUp, wiring, and field-element decoding instead of stopping at
+the outer header. Bounded Windows MSVC smoke campaigns completed one million
+executions per target without a crash, panic, timeout, or sanitizer finding.
+This is a reproducible starting dictionary and harness, not an exhaustive fuzzing
+claim or a substitute for sustained independent campaigns.
+
 Before a production proof tag can exist:
 
 1. harden and independently review the aggregate transparent PCS backend,
@@ -1290,8 +1299,9 @@ Before a production proof tag can exist:
 3. run the exact BLAKE3 tree argument at the complete production shape and
    demonstrate that the full aggregate, not only the hash component, remains
    below its total payload cap;
-4. fuzz the implemented bounded aggregate parser and add a bounded,
-   panic-contained network verifier queue;
+4. sustain sanitizer fuzzing of the bounded aggregate parsers, preserve every
+   finding as a deterministic regression, and add a bounded, panic-contained
+   network verifier queue when the production frame is integrated;
 5. demonstrate production-size streaming proving within the memory, proof-size,
    proving-time, and verification-time gates;
 6. publish independent prover/verifier implementations and canonical vectors;

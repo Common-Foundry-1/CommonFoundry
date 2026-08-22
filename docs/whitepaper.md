@@ -654,6 +654,15 @@ Small inputs retain the original one-block research AIR. Its canonical codec rem
 
 At the complete tiny-profile checkpoint, exact geometry bounds the split WHIR proof at 154,252 bytes and the one-block BLAKE3 proof at 87,556 bytes. Adding 16,804 fixed aggregate bytes gives a deterministic 258,612-byte aggregate. If a future V2 proof frame retains the current 193 bytes and adds a four-byte aggregate length, the complete wire encoding is bounded at 258,809 bytes, leaving 3,335 bytes below 256 KiB. Two repeated fixture runs produced smaller aggregates because their Merkle paths shared more nodes, but measured sharing is not used in the bound. This closes the payload-size gate only for the tiny fixture.
 
+The repository now includes sanitizer fuzz targets and format dictionaries for
+both the outer structured aggregate decoder and the nested BLS shared-layout
+decoder. Initial bounded Windows MSVC campaigns completed one million inputs per
+target without a crash, panic, timeout, or sanitizer report and reached nested
+matrix, transition, LogUp, wiring, and field-element parsing. These smoke runs
+establish a repeatable harness, not exhaustive assurance; sustained independent
+campaigns, regression preservation, and the production network verification
+queue remain activation work.
+
 An optional prover-only CUDA path now implements the exact Goldilocks DFT and coset-LDE semantics used by this STARK and supplies the value-MMCS Poseidon2 first digest layer to actual proof generation. Merkle parent compression, openings, transcript operations, and verification remain on the CPU, and every resulting encoded proof must pass the unchanged CPU verifier. At the 32,768-row checkpoint on an RTX 5090, the same unoptimized Cargo test profile took 348.28 seconds on CPU (64.503 setup, 283.416 prove; 238,698-byte canonical zlib payload) and 76.71 seconds with CUDA DFT plus Poseidon2 (7.700 setup, 68.551 prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. The direct API loads native code in-process and is for trusted development only. The hash-pinned, bounded worker path has been tested with a 64-byte tree proof and terminates its whole process tree on timeout or overflow; this is crash containment, not an operating-system sandbox or a change to consensus.
 
 CUDA ABI v1 is test-profile-only, capped at `2^24` rows and `2^31` field limbs. Production uses `2^27` LDE rows, where widths 291 and 87 imply 291 GiB and 87 GiB inputs respectively and the first-digest layer alone is 4 GiB. The current ABI therefore does not remove the need for streaming/out-of-core PCS, FRI, and Merkle construction.

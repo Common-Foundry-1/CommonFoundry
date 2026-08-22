@@ -1,0 +1,7 @@
+shared_header="CFBLSS01\x03\x00\x0a\x00\x01\x00\x02\x00"
+matrix_magic="CFBLSM01"
+transition_magic="CFBLST01"
+logup_magic="CFBLSL01"
+wiring_magic="CFBLSW01"
+aggregate_magic="CFDBLS01"
+zero_u32="\x00\x00\x00\x00"

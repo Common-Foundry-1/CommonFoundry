@@ -10,6 +10,7 @@ members = [
     "crates/cmfd-proof-worker",
 ]
 exclude = [
+    "fuzz",
     "third_party/p3-fri-0.6.3-out-of-core",
     "third_party/p3-merkle-tree-0.6.3-gpu-first-layer",
     "third_party/p3-whir-0.6.3-generic-initial-matrix",

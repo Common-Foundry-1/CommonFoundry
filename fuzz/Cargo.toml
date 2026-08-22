@@ -1,0 +1,27 @@
+[package]
+name = "common-foundry-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cmfd-consensus = { path = "../crates/cmfd-consensus", features = ["dory-bls12-381-prototype"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "structured_aggregate_decode"
+path = "fuzz_targets/structured_aggregate_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bls_shared_layout_decode"
+path = "fuzz_targets/bls_shared_layout_decode.rs"
+test = false
+doc = false
+bench = false

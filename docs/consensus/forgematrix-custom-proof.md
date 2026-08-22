@@ -864,14 +864,17 @@ geometry. That padding preserves the original multilinear coordinates. The
 canonical outer decoders require the same exact count and reject a different
 layout before invoking Dory verification. In the executable n=10 integration
 fixture, matrix, arithmetic transition, range, and wiring all prove and verify
-at that one geometry. The compressed fixture has 29 openings, although the four
-component constructors still emit separate 21,775-byte Dory payloads.
+at that one geometry. The compressed fixture has 29 openings, one 21,775-byte
+Dory payload, and a complete 31,135-byte canonical frame. The parser derives
+every component shape from trusted statements and rejects malformed lengths,
+trailing bytes, omitted components, and incompatible geometry.
 
 Production is pinned to the maximum component geometry, n=33. One Dory opening
 payload at n=33 projects to 70,639 bytes, but direct composition would expose 9
 matrix claims, 440 transition claims, and 31 wiring claims: 480 total, which
-exceeds the current 128-claim aggregate bound. This projection is not a complete
-proof-size or proving-time result.
+exceeds the current 128-claim aggregate bound. That direct composition cannot
+be aggregated within the bound and is why the range compression below is
+required.
 
 The scalar range bridge now proves digit membership and radix reconstruction
 against that same transition commitment. The prover commits the sixteen
@@ -900,10 +903,13 @@ Across the initialization transition and three banks, arithmetic needs 48
 openings and the range checkpoints need twenty. Adding nine matrix and 31 wiring
 openings gives the correct 108-claim compressed checkpoint, below the bounded
 128-claim aggregate. The composed transition verifier requires its arithmetic
-and range halves to use the same packed commitment. The constructors must still
-emit one shared aggregate, and equality openings must link matrix, transition,
-and wiring commitments. An n=33 streaming prover, complete transcript and
-soundness accounting, and independent audit remain activation requirements.
+and range halves to use the same packed commitment. The shared proof grammar
+accepts the exact production topology of three matrix proofs, four
+arithmetic/range transition pairs, and one wiring proof, and authenticates all
+ordered claims with one aggregate. Its complete n=33 frame projects to 135,833
+bytes. Equality openings must still link matrix, transition, and wiring
+commitments. An n=33 streaming prover, complete transcript and soundness
+accounting, and independent audit remain activation requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

@@ -35,8 +35,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 /// This aggregate remains unavailable to consensus activation.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
-pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 5] = [
-    "the 108 compressed matrix, arithmetic, range, and wiring claims are not yet emitted through one shared block aggregate",
+pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the scalar matrix and transition commitments are not yet linked to the packed wiring roles",
     "the production n=29/n=31/n=33 polynomials are not streamed by this in-memory implementation",
     "the aggregate soundness bound has not been independently reviewed",
@@ -65,6 +64,62 @@ pub struct BlsDoryCommittedPolynomial {
     setup_identity: [u8; 32],
     nu: usize,
     sigma: usize,
+}
+
+/// Prover-only opening witnesses retained until a shared aggregate is built.
+///
+/// The index vector permits several claims to open the same committed
+/// polynomial without cloning its coefficient table.
+#[derive(Clone, Debug)]
+pub(crate) struct BlsDoryDeferredOpeningSet {
+    polynomials: Vec<BlsDoryCommittedPolynomial>,
+    polynomial_indices: Vec<usize>,
+    points: Vec<Vec<BlsDoryFr>>,
+    claims: Vec<BlsDoryOpeningClaim>,
+}
+
+impl BlsDoryDeferredOpeningSet {
+    pub(crate) fn new(
+        polynomials: Vec<BlsDoryCommittedPolynomial>,
+        polynomial_indices: Vec<usize>,
+        points: Vec<Vec<BlsDoryFr>>,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        if polynomials.is_empty()
+            || polynomial_indices.is_empty()
+            || polynomial_indices.len() != points.len()
+            || polynomial_indices
+                .iter()
+                .any(|index| *index >= polynomials.len())
+        {
+            return Err(BlsDoryAggregateError::InvalidClaimCount);
+        }
+        let variables = polynomials[0].variables();
+        if points.iter().any(|point| point.len() != variables) {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        let claims = polynomial_indices
+            .iter()
+            .zip(&points)
+            .map(|(index, point)| {
+                let polynomial = &polynomials[*index];
+                BlsDoryOpeningClaim {
+                    commitment: polynomial.commitment,
+                    point: point.clone(),
+                    evaluation: polynomial.polynomial.evaluate(point),
+                }
+            })
+            .collect();
+        Ok(Self {
+            polynomials,
+            polynomial_indices,
+            points,
+            claims,
+        })
+    }
+
+    pub(crate) fn claims(&self) -> &[BlsDoryOpeningClaim] {
+        &self.claims
+    }
 }
 
 impl BlsDoryCommittedPolynomial {
@@ -282,6 +337,39 @@ pub(crate) fn prove_bls_dory_opening_refs(
         &dory_proof,
     )?;
     Ok((claims, encoded))
+}
+
+/// Prove several component opening sets with one aggregate transcript and one
+/// Dory payload.
+pub(crate) fn prove_bls_dory_deferred_opening_sets(
+    public_binding: &[u8],
+    sets: &[&BlsDoryDeferredOpeningSet],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    if sets.is_empty() {
+        return Err(BlsDoryAggregateError::InvalidClaimCount);
+    }
+    let claim_count = sets.iter().try_fold(0usize, |count, set| {
+        count
+            .checked_add(set.polynomial_indices.len())
+            .ok_or(BlsDoryAggregateError::InvalidClaimCount)
+    })?;
+    let mut polynomials = Vec::with_capacity(claim_count);
+    let mut points = Vec::with_capacity(claim_count);
+    let mut expected_claims = Vec::with_capacity(claim_count);
+    for set in sets {
+        for (index, point) in set.polynomial_indices.iter().zip(&set.points) {
+            polynomials.push(&set.polynomials[*index]);
+            points.push(point.clone());
+        }
+        expected_claims.extend_from_slice(&set.claims);
+    }
+    let (claims, proof) =
+        prove_bls_dory_opening_refs(public_binding, &polynomials, &points, setup)?;
+    if claims != expected_claims {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    Ok((claims, proof))
 }
 
 /// Verify the bounded aggregate after absorbing every public claim.
@@ -1077,7 +1165,7 @@ mod tests {
             require_bls_dory_aggregate_production_ready(),
             Err(BlsDoryAggregateError::NotProductionReady)
         );
-        assert_eq!(BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS.len(), 5);
+        assert_eq!(BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS.len(), 4);
         let projected = projected_bls_dory_aggregate_bytes(31).unwrap();
         assert_eq!(projected, 66_559);
         assert!(projected < MAX_BLS_DORY_AGGREGATE_BYTES);

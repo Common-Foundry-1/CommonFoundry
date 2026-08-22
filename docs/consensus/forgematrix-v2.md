@@ -433,7 +433,9 @@ comparison. The v2 research code now implements:
   bytes. Four arithmetic proofs need 48 claims and four range proofs need 20;
   matrix and wiring bring the correct compressed total to 108 claims. A
   composed verifier requires each arithmetic/range pair to share one packed
-  commitment. One shared aggregate, cross-component commitment links, an n=33
+  commitment. A canonical shared frame now authenticates the exact three-matrix,
+  four-transition, one-wiring production topology with one aggregate and
+  projects to 135,833 bytes at n=33. Cross-component commitment links, an n=33
   streaming prover, soundness review, and audit remain activation gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model

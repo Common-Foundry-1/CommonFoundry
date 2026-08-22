@@ -19,8 +19,9 @@ use thiserror::Error;
 use crate::{
     StructuredMatrixStatement, StructuredSumcheckError,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_polynomial, projected_bls_dory_aggregate_bytes, prove_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
         verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
@@ -67,13 +68,41 @@ pub struct BlsDoryMatrixProof {
     pub opening_proof: Vec<u8>,
 }
 
+pub(crate) struct PreparedBlsDoryMatrixProof {
+    pub(crate) proof: BlsDoryMatrixProof,
+    pub(crate) openings: BlsDoryDeferredOpeningSet,
+}
+
 impl BlsDoryMatrixProof {
     /// Encode the exact statement-derived proof shape canonically.
     pub fn encode(
         &self,
         statement: StructuredMatrixStatement,
     ) -> Result<Vec<u8>, BlsDoryMatrixError> {
-        validate_proof_shape(statement, self, usize::from(self.padded_variables))?;
+        self.encode_with_opening(statement, true)
+    }
+
+    pub(crate) fn encode_deferred(
+        &self,
+        statement: StructuredMatrixStatement,
+    ) -> Result<Vec<u8>, BlsDoryMatrixError> {
+        self.encode_with_opening(statement, false)
+    }
+
+    fn encode_with_opening(
+        &self,
+        statement: StructuredMatrixStatement,
+        require_opening: bool,
+    ) -> Result<Vec<u8>, BlsDoryMatrixError> {
+        validate_proof_shape_with_opening(
+            statement,
+            self,
+            usize::from(self.padded_variables),
+            require_opening,
+        )?;
+        if !require_opening && !self.opening_proof.is_empty() {
+            return Err(BlsDoryMatrixError::InvalidProofShape);
+        }
         let common_rounds = statement.inner.ilog2() as usize;
         let layer_rounds = statement.layers.ilog2() as usize;
         let opening_len = u32::try_from(self.opening_proof.len())
@@ -124,6 +153,23 @@ impl BlsDoryMatrixProof {
         statement: StructuredMatrixStatement,
         expected_variables: usize,
     ) -> Result<Self, BlsDoryMatrixError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, true)
+    }
+
+    pub(crate) fn decode_deferred_with_variables(
+        encoded: &[u8],
+        statement: StructuredMatrixStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryMatrixError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, false)
+    }
+
+    fn decode_with_variables_and_opening(
+        encoded: &[u8],
+        statement: StructuredMatrixStatement,
+        expected_variables: usize,
+        require_opening: bool,
+    ) -> Result<Self, BlsDoryMatrixError> {
         statement.validate_verifier_shape()?;
         validate_target_variables(matrix_variables(statement)?, expected_variables)?;
         if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_MATRIX_PROOF_BYTES {
@@ -143,7 +189,8 @@ impl BlsDoryMatrixProof {
             || usize::from(padded_variables) != expected_variables
             || common_rounds != expected_common
             || layer_rounds != expected_layer
-            || opening_len == 0
+            || (require_opening && opening_len == 0)
+            || (!require_opening && opening_len != 0)
             || opening_len > MAX_BLS_DORY_AGGREGATE_BYTES
             || encoded.len() != matrix_wire_bytes(common_rounds, layer_rounds, opening_len)?
         {
@@ -193,7 +240,7 @@ impl BlsDoryMatrixProof {
             transcript_digest,
             opening_proof,
         };
-        if proof.encode(statement)? != encoded {
+        if proof.encode_with_opening(statement, require_opening)? != encoded {
             return Err(BlsDoryMatrixError::InvalidEncoding);
         }
         Ok(proof)
@@ -283,6 +330,42 @@ pub fn prove_bls_dory_matrix_at_variables(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryMatrixProof, BlsDoryMatrixError> {
+    let mut prepared = prove_bls_dory_matrix_deferred_at_variables(
+        binding,
+        statement,
+        activations,
+        weights,
+        accumulators,
+        padded_variables,
+        setup,
+    )?;
+    let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
+    let (claims, opening_proof) =
+        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    if claims != prepared.openings.claims() {
+        return Err(BlsDoryMatrixError::Opening);
+    }
+    prepared.proof.opening_proof = opening_proof;
+    verify_bls_dory_matrix_at_variables(
+        binding,
+        statement,
+        &prepared.proof,
+        padded_variables,
+        setup,
+    )?;
+    Ok(prepared.proof)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_matrix_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
@@ -438,14 +521,11 @@ pub fn prove_bls_dory_matrix_at_variables(
         pad_point(&weight_point, padded_variables)?,
         pad_point(&accumulator_point, padded_variables)?,
     ];
-    let opening_binding = opening_binding(binding, &transcript_digest);
-    let polynomials = [
+    let polynomials = vec![
         activation_polynomial,
         weight_polynomial,
         accumulator_polynomial,
     ];
-    let (claims, opening_proof) =
-        prove_bls_dory_openings(&opening_binding, &polynomials, &opening_points, setup)?;
     let expected_claims = matrix_opening_claims(
         [
             activation_commitment,
@@ -459,7 +539,8 @@ pub fn prove_bls_dory_matrix_at_variables(
             accumulator_evaluation,
         ],
     );
-    if claims != expected_claims {
+    let openings = BlsDoryDeferredOpeningSet::new(polynomials, vec![0, 1, 2], opening_points)?;
+    if openings.claims() != expected_claims {
         return Err(BlsDoryMatrixError::Opening);
     }
 
@@ -475,10 +556,16 @@ pub fn prove_bls_dory_matrix_at_variables(
         activation_evaluation,
         weight_evaluation,
         transcript_digest,
-        opening_proof,
+        opening_proof: Vec::new(),
     };
-    verify_bls_dory_matrix_at_variables(binding, statement, &proof, padded_variables, setup)?;
-    Ok(proof)
+    verify_bls_dory_matrix_deferred_at_variables(
+        binding,
+        statement,
+        &proof,
+        padded_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryMatrixProof { proof, openings })
 }
 
 /// Verify the matrix sumcheck and all three Dory openings without table witnesses.
@@ -500,6 +587,25 @@ pub fn verify_bls_dory_matrix_at_variables(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryMatrixError> {
+    let claims = verify_bls_dory_matrix_deferred_at_variables(
+        binding,
+        statement,
+        proof,
+        padded_variables,
+        setup,
+    )?;
+    let binding = opening_binding(binding, &proof.transcript_digest);
+    verify_bls_dory_openings(&binding, &claims, &proof.opening_proof, setup)?;
+    Ok(())
+}
+
+pub(crate) fn verify_bls_dory_matrix_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    proof: &BlsDoryMatrixProof,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<Vec<BlsDoryOpeningClaim>, BlsDoryMatrixError> {
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
@@ -508,7 +614,7 @@ pub fn verify_bls_dory_matrix_at_variables(
     if padded_variables > setup.max_log_n() {
         return Err(BlsDoryMatrixError::InvalidDimensions);
     }
-    validate_proof_shape(statement, proof, padded_variables)?;
+    validate_deferred_proof_shape(statement, proof, padded_variables)?;
     let mut transcript = matrix_transcript(
         binding,
         statement,
@@ -597,9 +703,7 @@ pub fn verify_bls_dory_matrix_at_variables(
             proof.accumulator_evaluation,
         ],
     );
-    let binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&binding, &claims, &proof.opening_proof, setup)?;
-    Ok(())
+    Ok(claims)
 }
 
 fn production_matrix_statement() -> StructuredMatrixStatement {
@@ -614,10 +718,19 @@ fn production_matrix_statement() -> StructuredMatrixStatement {
     }
 }
 
-fn validate_proof_shape(
+fn validate_deferred_proof_shape(
     statement: StructuredMatrixStatement,
     proof: &BlsDoryMatrixProof,
     expected_variables: usize,
+) -> Result<(), BlsDoryMatrixError> {
+    validate_proof_shape_with_opening(statement, proof, expected_variables, false)
+}
+
+fn validate_proof_shape_with_opening(
+    statement: StructuredMatrixStatement,
+    proof: &BlsDoryMatrixProof,
+    expected_variables: usize,
+    require_opening: bool,
 ) -> Result<(), BlsDoryMatrixError> {
     statement.validate_verifier_shape()?;
     validate_target_variables(matrix_variables(statement)?, expected_variables)?;
@@ -636,7 +749,7 @@ fn validate_proof_shape(
             .iter()
             .skip(common_rounds)
             .any(|round| round.len() != LAYER_ROUND_DEGREE + 1)
-        || proof.opening_proof.is_empty()
+        || (require_opening && proof.opening_proof.is_empty())
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
         return Err(BlsDoryMatrixError::InvalidProofShape);

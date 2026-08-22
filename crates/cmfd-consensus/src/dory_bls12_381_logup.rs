@@ -22,9 +22,10 @@ use crate::{
     STRUCTURED_TRANSITION_ORACLES, STRUCTURED_TRANSITION_REGULAR_ORACLES,
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_polynomial, projected_bls_dory_aggregate_bytes,
-        prove_bls_dory_opening_refs, verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
+        verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
@@ -49,8 +50,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 /// This checkpoint is not accepted by consensus.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
-pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the five range openings are not yet folded into the block-wide shared Dory aggregate",
+pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the n=33 transition, multiplicity, and inverse polynomials are not streamed",
     "the lookup soundness accounting, transcript, and implementation have not received independent audit",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
@@ -89,13 +89,41 @@ pub struct BlsDoryRangeLogUpProof {
     pub opening_proof: Vec<u8>,
 }
 
+pub(crate) struct PreparedBlsDoryRangeLogUpProof {
+    pub(crate) proof: BlsDoryRangeLogUpProof,
+    pub(crate) openings: BlsDoryDeferredOpeningSet,
+}
+
 impl BlsDoryRangeLogUpProof {
     /// Encode the statement-derived proof shape canonically.
     pub fn encode(
         &self,
         statement: StructuredTransitionStatement,
     ) -> Result<Vec<u8>, BlsDoryRangeLogUpError> {
-        validate_proof_shape(statement, self, usize::from(self.packed_variables))?;
+        self.encode_with_opening(statement, true)
+    }
+
+    pub(crate) fn encode_deferred(
+        &self,
+        statement: StructuredTransitionStatement,
+    ) -> Result<Vec<u8>, BlsDoryRangeLogUpError> {
+        self.encode_with_opening(statement, false)
+    }
+
+    fn encode_with_opening(
+        &self,
+        statement: StructuredTransitionStatement,
+        require_opening: bool,
+    ) -> Result<Vec<u8>, BlsDoryRangeLogUpError> {
+        validate_proof_shape_with_opening(
+            statement,
+            self,
+            usize::from(self.packed_variables),
+            require_opening,
+        )?;
+        if !require_opening && !self.opening_proof.is_empty() {
+            return Err(BlsDoryRangeLogUpError::InvalidProofShape);
+        }
         let opening_len = u32::try_from(self.opening_proof.len())
             .map_err(|_| BlsDoryRangeLogUpError::ProofTooLarge)?;
         let expected = logup_wire_bytes(self.rounds.len(), self.opening_proof.len())?;
@@ -156,6 +184,23 @@ impl BlsDoryRangeLogUpProof {
         statement: StructuredTransitionStatement,
         expected_variables: usize,
     ) -> Result<Self, BlsDoryRangeLogUpError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, true)
+    }
+
+    pub(crate) fn decode_deferred_with_variables(
+        encoded: &[u8],
+        statement: StructuredTransitionStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryRangeLogUpError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, false)
+    }
+
+    fn decode_with_variables_and_opening(
+        encoded: &[u8],
+        statement: StructuredTransitionStatement,
+        expected_variables: usize,
+        require_opening: bool,
+    ) -> Result<Self, BlsDoryRangeLogUpError> {
         statement.validate_verifier_shape()?;
         validate_target_variables(minimum_packed_variables(statement)?, expected_variables)?;
         if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_LOGUP_PROOF_BYTES {
@@ -171,7 +216,8 @@ impl BlsDoryRangeLogUpProof {
         if protocol_version != BLS_DORY_RANGE_LOGUP_VERSION
             || usize::from(packed_variables) != expected_variables
             || round_count != expected_variables
-            || opening_len == 0
+            || (require_opening && opening_len == 0)
+            || (!require_opening && opening_len != 0)
             || opening_len > MAX_BLS_DORY_AGGREGATE_BYTES
             || encoded.len() != logup_wire_bytes(round_count, opening_len)?
         {
@@ -230,7 +276,7 @@ impl BlsDoryRangeLogUpProof {
             transcript_digest,
             opening_proof,
         };
-        if proof.encode(statement)? != encoded {
+        if proof.encode_with_opening(statement, require_opening)? != encoded {
             return Err(BlsDoryRangeLogUpError::InvalidEncoding);
         }
         Ok(proof)
@@ -309,6 +355,17 @@ pub fn prove_bls_dory_range_logup_at_variables(
     prove_from_oracles(binding, statement, &oracles, packed_variables, setup)
 }
 
+pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    witness: &StructuredTransitionWitness,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    let oracles = build_scalar_oracles(statement, witness)?;
+    prove_from_oracles_deferred(binding, statement, &oracles, packed_variables, setup)
+}
+
 fn prove_from_oracles(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -316,6 +373,33 @@ fn prove_from_oracles(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    let mut prepared =
+        prove_from_oracles_deferred(binding, statement, oracles, packed_variables, setup)?;
+    let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
+    let (claims, opening_proof) =
+        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    if claims != prepared.openings.claims() {
+        return Err(BlsDoryRangeLogUpError::Opening);
+    }
+    prepared.proof.opening_proof = opening_proof;
+    verify_bls_dory_range_logup_at_variables(
+        binding,
+        statement,
+        prepared.proof.transition_commitment,
+        &prepared.proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(prepared.proof)
+}
+
+fn prove_from_oracles_deferred(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    oracles: &[Vec<BlsDoryFr>],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
     if binding.len() > MAX_LOGUP_BINDING_BYTES {
         return Err(BlsDoryRangeLogUpError::PublicBindingTooLarge);
     }
@@ -467,7 +551,6 @@ fn prove_from_oracles(
     transcript.append_field(b"digit-evaluation", &digit.evaluation);
 
     let transcript_digest = transcript.digest();
-    let opening_binding = opening_binding(binding, &transcript_digest);
     let source_point = reconstruction_opening_point(&cell_point, &source.point, packed_variables)?;
     let digit_point = reconstruction_opening_point(&cell_point, &digit.point, packed_variables)?;
     let points = vec![
@@ -484,24 +567,19 @@ fn prove_from_oracles(
         transition.commitment(),
         transition.commitment(),
     ];
-    let (claims, opening_proof) = prove_bls_dory_opening_refs(
-        &opening_binding,
-        &[
-            &transition,
-            &multiplicity,
-            &inverse,
-            &transition,
-            &transition,
-        ],
-        &points,
-        setup,
+    let openings = BlsDoryDeferredOpeningSet::new(
+        vec![transition, multiplicity, inverse],
+        vec![0, 1, 2, 0, 0],
+        points,
     )?;
-    let commitments = claims
+    let commitments = openings
+        .claims()
         .iter()
         .map(|claim| claim.commitment)
         .collect::<Vec<_>>();
     if commitments.as_slice() != expected_commitments
-        || claims
+        || openings
+            .claims()
             .iter()
             .zip([
                 terminal_evaluations[0],
@@ -515,7 +593,7 @@ fn prove_from_oracles(
         return Err(BlsDoryRangeLogUpError::Opening);
     }
 
-    Ok(BlsDoryRangeLogUpProof {
+    let proof = BlsDoryRangeLogUpProof {
         protocol_version: BLS_DORY_RANGE_LOGUP_VERSION,
         packed_variables: u16::try_from(packed_variables)
             .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
@@ -530,8 +608,17 @@ fn prove_from_oracles(
         digit_rounds: digit.rounds,
         digit_evaluation: digit.evaluation,
         transcript_digest,
-        opening_proof,
-    })
+        opening_proof: Vec::new(),
+    };
+    verify_bls_dory_range_logup_deferred_at_variables(
+        binding,
+        statement,
+        proof.transition_commitment,
+        &proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryRangeLogUpProof { proof, openings })
 }
 
 pub fn verify_bls_dory_range_logup(
@@ -560,12 +647,33 @@ pub fn verify_bls_dory_range_logup_at_variables(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryRangeLogUpError> {
+    let claims = verify_bls_dory_range_logup_deferred_at_variables(
+        binding,
+        statement,
+        expected_transition_commitment,
+        proof,
+        packed_variables,
+        setup,
+    )?;
+    let opening_binding = opening_binding(binding, &proof.transcript_digest);
+    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
+    Ok(())
+}
+
+pub(crate) fn verify_bls_dory_range_logup_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    expected_transition_commitment: BlsDoryGt,
+    proof: &BlsDoryRangeLogUpProof,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<Vec<BlsDoryOpeningClaim>, BlsDoryRangeLogUpError> {
     if binding.len() > MAX_LOGUP_BINDING_BYTES {
         return Err(BlsDoryRangeLogUpError::PublicBindingTooLarge);
     }
     statement.validate_verifier_shape()?;
     validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
-    validate_proof_shape(statement, proof, packed_variables)?;
+    validate_deferred_proof_shape(statement, proof, packed_variables)?;
     if packed_variables > setup.max_log_n()
         || proof.transition_commitment != expected_transition_commitment
     {
@@ -663,7 +771,7 @@ pub fn verify_bls_dory_range_logup_at_variables(
     let source_opening =
         reconstruction_opening_point(&cell_point, &source_point, packed_variables)?;
     let digit_opening = reconstruction_opening_point(&cell_point, &digit_point, packed_variables)?;
-    let claims = [
+    let claims = vec![
         BlsDoryOpeningClaim {
             commitment: proof.transition_commitment,
             point: sumcheck_point.clone(),
@@ -690,15 +798,22 @@ pub fn verify_bls_dory_range_logup_at_variables(
             evaluation: proof.digit_evaluation,
         },
     ];
-    let opening_binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
-    Ok(())
+    Ok(claims)
 }
 
-fn validate_proof_shape(
+fn validate_deferred_proof_shape(
     statement: StructuredTransitionStatement,
     proof: &BlsDoryRangeLogUpProof,
     expected_variables: usize,
+) -> Result<(), BlsDoryRangeLogUpError> {
+    validate_proof_shape_with_opening(statement, proof, expected_variables, false)
+}
+
+fn validate_proof_shape_with_opening(
+    statement: StructuredTransitionStatement,
+    proof: &BlsDoryRangeLogUpProof,
+    expected_variables: usize,
+    require_opening: bool,
 ) -> Result<(), BlsDoryRangeLogUpError> {
     statement.validate_verifier_shape()?;
     validate_target_variables(minimum_packed_variables(statement)?, expected_variables)?;
@@ -707,7 +822,7 @@ fn validate_proof_shape(
         || proof.rounds.len() != expected_variables
         || proof.source_rounds.len() != SELECTOR_ROUNDS
         || proof.digit_rounds.len() != SELECTOR_ROUNDS
-        || proof.opening_proof.is_empty()
+        || (require_opening && proof.opening_proof.is_empty())
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
         return Err(BlsDoryRangeLogUpError::InvalidProofShape);
@@ -1715,7 +1830,7 @@ mod tests {
             projected_production_range_logup_proof_bytes().unwrap(),
             79_233
         );
-        assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 4);
+        assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(
             require_bls_dory_range_logup_production_ready(),
             Err(BlsDoryRangeLogUpError::NotProductionReady)

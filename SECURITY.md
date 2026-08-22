@@ -209,10 +209,14 @@ verifier-selected variable count. High-zero padding preserves each component's
 natural multilinear coordinates, while canonical decoders reject a proof made
 for any other geometry before opening verification. An executable n=10 fixture
 proves and verifies matrix, arithmetic transition, range, and wiring at one
-layout with 29 claims; each component still carries a separate 21,775-byte Dory
-payload. Production is pinned to n=33. A single Dory opening at that geometry
-projects to 70,639 bytes, but the uncompressed production terminal set has 480
-claims, exceeding the current 128-claim aggregate bound.
+layout with 29 claims and one 21,775-byte Dory payload. Its complete canonical
+frame is 31,135 bytes. The shared grammar admits the exact production topology
+of three matrix proofs, four arithmetic/range transition pairs, and one wiring
+proof, binds their transcript digests and ordered claims into one aggregate,
+and rejects omitted or reordered components. Production is pinned to n=33.
+Range compression reduces the former 480 direct claims to 108, below the
+128-claim bound; the complete production frame projects to 135,833 bytes,
+including one 70,639-byte shared Dory payload.
 The scalar range checkpoint now reuses the exact packed transition commitment,
 commits the sixteen table multiplicities before sampling `alpha`, and commits
 an inverse polynomial afterward. A degree-four sumcheck proves the inverse,
@@ -227,8 +231,8 @@ The complete n=33 range grammar projects to 79,233 bytes, including the shared
 70,639-byte opening payload. Across four transitions, arithmetic needs 48 claims
 and range needs 20; adding nine matrix and 31 wiring claims gives the correct
 compressed total of 108. The composed transition verifier requires arithmetic
-and range proofs to share one commitment, but those components still carry
-separate Dory proofs. One shared opening proof, cross-component equality
+and range proofs to share one commitment, and the shared layout authenticates
+all 108 production claims with one opening proof. Cross-component equality
 openings, n=33 streaming, complete soundness accounting, and audit remain
 required.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31

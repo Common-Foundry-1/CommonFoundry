@@ -3,27 +3,54 @@
 //! Matrix, transition, and wiring commitments must use one variable count before
 //! their openings can be reduced by a single Dory aggregate. This module pins
 //! the production n=33 geometry, composes transition arithmetic with the range
-//! checkpoint against one commitment, and keeps the remaining shared-aggregate
-//! deficit explicit.
+//! checkpoint against one commitment, and binds every component opening into a
+//! single aggregate.
 
 use thiserror::Error;
 
 use crate::{
-    STRUCTURED_TRANSITION_ORACLES, StructuredMaskPolynomial, StructuredTransitionStatement,
-    StructuredTransitionWitness,
-    dory_bls12_381_aggregate::{BlsDoryAggregateError, projected_bls_dory_aggregate_bytes},
+    STRUCTURED_TRANSITION_ORACLES, StructuredMaskPolynomial, StructuredMatrixStatement,
+    StructuredTransitionStatement, StructuredTransitionWitness, StructuredWiringStatement,
+    dory_bls12_381_aggregate::{
+        BlsDoryAggregateError, MAX_BLS_DORY_AGGREGATE_BYTES, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
+    },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof,
-        prove_bls_dory_range_logup, prove_bls_dory_range_logup_at_variables,
+        PreparedBlsDoryRangeLogUpProof, projected_production_range_logup_opening_bytes,
+        projected_production_range_logup_proof_bytes, prove_bls_dory_range_logup,
+        prove_bls_dory_range_logup_at_variables, prove_bls_dory_range_logup_deferred_at_variables,
         verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
+        verify_bls_dory_range_logup_deferred_at_variables,
+    },
+    dory_bls12_381_matrix::{
+        BlsDoryMatrixError, BlsDoryMatrixProof, PreparedBlsDoryMatrixProof,
+        projected_production_matrix_opening_bytes, projected_production_matrix_proof_bytes,
+        prove_bls_dory_matrix_deferred_at_variables, verify_bls_dory_matrix_deferred_at_variables,
     },
     dory_bls12_381_prototype::DeterministicBlsDorySetup,
     dory_bls12_381_transition::{
         BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryTransitionError, BlsDoryTransitionProof,
-        prove_bls_dory_transition, prove_bls_dory_transition_at_variables,
+        PreparedBlsDoryTransitionProof, projected_production_transition_opening_bytes,
+        projected_production_transition_proof_bytes, prove_bls_dory_transition,
+        prove_bls_dory_transition_at_variables, prove_bls_dory_transition_deferred_at_variables,
         verify_bls_dory_transition, verify_bls_dory_transition_at_variables,
+        verify_bls_dory_transition_deferred_at_variables,
+    },
+    dory_bls12_381_wiring::{
+        BlsDoryWiringError, BlsDoryWiringProof, PreparedBlsDoryWiringProof,
+        projected_production_wiring_opening_bytes, projected_production_wiring_proof_bytes,
+        prove_bls_dory_wiring_deferred_at_variables, verify_bls_dory_wiring_deferred_at_variables,
     },
 };
+
+pub const BLS_DORY_SHARED_LAYOUT_VERSION: u16 = 1;
+const MAX_SHARED_LAYOUT_BINDING_BYTES: usize = 4_096;
+const SHARED_PROOF_MAGIC: [u8; 8] = *b"CFBLSS01";
+const SHARED_PROOF_HEADER_BYTES: usize = 16;
+pub const MAX_BLS_DORY_SHARED_MATRIX_PROOFS: usize = 3;
+pub const MAX_BLS_DORY_SHARED_TRANSITION_PROOFS: usize = 4;
+pub const MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES: usize = 262_128;
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
 pub const BLS_DORY_SHARED_PRODUCTION_VARIABLES: usize = 33;
@@ -54,8 +81,7 @@ pub const BLS_DORY_SHARED_COMPRESSED_CHECKPOINT_CLAIMS: usize =
 /// Shared transport is not yet accepted by consensus.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
-pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the 108 matrix, arithmetic, range, and wiring claims still emit separate opening proofs instead of one shared Dory aggregate",
+pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 3] = [
     "matrix, transition, and wiring commitments are not yet linked by equality openings",
     "the common n=33 coefficient tables are not streamed by the in-memory prover",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
@@ -68,6 +94,165 @@ pub struct BlsDoryTransitionRangeProof {
     pub range: BlsDoryRangeLogUpProof,
 }
 
+/// One or more matrix and transition checkpoints plus wiring, authenticated by
+/// one shared Dory opening payload. The production shape uses three matrix
+/// proofs and four transition/range proofs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlsDorySharedLayoutProof {
+    pub protocol_version: u16,
+    pub padded_variables: u16,
+    pub matrices: Vec<BlsDoryMatrixProof>,
+    pub transitions: Vec<BlsDoryTransitionRangeProof>,
+    pub wiring: BlsDoryWiringProof,
+    pub opening_proof: Vec<u8>,
+}
+
+impl BlsDorySharedLayoutProof {
+    /// Encode the component algebraic messages and their single shared opening
+    /// payload with exact length-delimited canonical framing.
+    pub fn encode(
+        &self,
+        matrix_statements: &[StructuredMatrixStatement],
+        transition_statements: &[StructuredTransitionStatement],
+        wiring_statement: StructuredWiringStatement,
+    ) -> Result<Vec<u8>, BlsDorySharedLayoutError> {
+        validate_shared_component_shape(self, usize::from(self.padded_variables))?;
+        if self.matrices.len() != matrix_statements.len()
+            || self.transitions.len() != transition_statements.len()
+        {
+            return Err(BlsDorySharedLayoutError::InvalidProofShape);
+        }
+        let matrices = self
+            .matrices
+            .iter()
+            .zip(matrix_statements)
+            .map(|(proof, statement)| proof.encode_deferred(*statement))
+            .collect::<Result<Vec<_>, _>>()?;
+        let transitions = self
+            .transitions
+            .iter()
+            .zip(transition_statements)
+            .map(|(proof, statement)| {
+                Ok((
+                    proof.arithmetic.encode_deferred(*statement)?,
+                    proof.range.encode_deferred(*statement)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, BlsDorySharedLayoutError>>()?;
+        let wiring = self.wiring.encode_deferred(wiring_statement)?;
+        let mut total = SHARED_PROOF_HEADER_BYTES;
+        for matrix in &matrices {
+            total = framed_size(total, matrix.len())?;
+        }
+        for (arithmetic, range) in &transitions {
+            total = framed_size(total, arithmetic.len())?;
+            total = framed_size(total, range.len())?;
+        }
+        total = framed_size(total, wiring.len())?;
+        total = framed_size(total, self.opening_proof.len())?;
+        if total > MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES {
+            return Err(BlsDorySharedLayoutError::ProofTooLarge);
+        }
+        let mut encoded = Vec::with_capacity(total);
+        encoded.extend_from_slice(&SHARED_PROOF_MAGIC);
+        encoded.extend_from_slice(&self.protocol_version.to_le_bytes());
+        encoded.extend_from_slice(&self.padded_variables.to_le_bytes());
+        encoded.extend_from_slice(&(matrices.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&(transitions.len() as u16).to_le_bytes());
+        for matrix in &matrices {
+            append_framed(&mut encoded, matrix)?;
+        }
+        for (arithmetic, range) in &transitions {
+            append_framed(&mut encoded, arithmetic)?;
+            append_framed(&mut encoded, range)?;
+        }
+        append_framed(&mut encoded, &wiring)?;
+        append_framed(&mut encoded, &self.opening_proof)?;
+        if encoded.len() != total {
+            return Err(BlsDorySharedLayoutError::ProofTooLarge);
+        }
+        Ok(encoded)
+    }
+
+    /// Decode the exact component shapes implied by the trusted statements and
+    /// shared variable count.
+    pub fn decode_with_variables(
+        encoded: &[u8],
+        matrix_statements: &[StructuredMatrixStatement],
+        transition_statements: &[StructuredTransitionStatement],
+        wiring_statement: StructuredWiringStatement,
+        padded_variables: usize,
+    ) -> Result<Self, BlsDorySharedLayoutError> {
+        if encoded.len() < SHARED_PROOF_HEADER_BYTES
+            || encoded.len() > MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES
+            || encoded[..8] != SHARED_PROOF_MAGIC
+        {
+            return Err(BlsDorySharedLayoutError::InvalidEncoding);
+        }
+        let protocol_version = read_u16(encoded, 8)?;
+        let encoded_variables = read_u16(encoded, 10)?;
+        let matrix_count = read_u16(encoded, 12)? as usize;
+        let transition_count = read_u16(encoded, 14)? as usize;
+        if protocol_version != BLS_DORY_SHARED_LAYOUT_VERSION
+            || usize::from(encoded_variables) != padded_variables
+            || matrix_count != matrix_statements.len()
+            || transition_count != transition_statements.len()
+            || !(1..=MAX_BLS_DORY_SHARED_MATRIX_PROOFS).contains(&matrix_count)
+            || !(1..=MAX_BLS_DORY_SHARED_TRANSITION_PROOFS).contains(&transition_count)
+        {
+            return Err(BlsDorySharedLayoutError::InvalidProofShape);
+        }
+        let mut offset = SHARED_PROOF_HEADER_BYTES;
+        let mut matrices = Vec::with_capacity(matrix_count);
+        for statement in matrix_statements {
+            matrices.push(BlsDoryMatrixProof::decode_deferred_with_variables(
+                take_framed(encoded, &mut offset)?,
+                *statement,
+                padded_variables,
+            )?);
+        }
+        let mut transitions = Vec::with_capacity(transition_count);
+        for statement in transition_statements {
+            let arithmetic = BlsDoryTransitionProof::decode_deferred_with_variables(
+                take_framed(encoded, &mut offset)?,
+                *statement,
+                padded_variables,
+            )?;
+            let range = BlsDoryRangeLogUpProof::decode_deferred_with_variables(
+                take_framed(encoded, &mut offset)?,
+                *statement,
+                padded_variables,
+            )?;
+            transitions.push(BlsDoryTransitionRangeProof { arithmetic, range });
+        }
+        let wiring = BlsDoryWiringProof::decode_deferred_with_variables(
+            take_framed(encoded, &mut offset)?,
+            wiring_statement,
+            padded_variables,
+        )?;
+        let opening_proof = take_framed(encoded, &mut offset)?.to_vec();
+        if opening_proof.is_empty()
+            || opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
+            || offset != encoded.len()
+        {
+            return Err(BlsDorySharedLayoutError::InvalidProofShape);
+        }
+        let proof = Self {
+            protocol_version,
+            padded_variables: encoded_variables,
+            matrices,
+            transitions,
+            wiring,
+            opening_proof,
+        };
+        validate_shared_component_shape(&proof, padded_variables)?;
+        if proof.encode(matrix_statements, transition_statements, wiring_statement)? != encoded {
+            return Err(BlsDorySharedLayoutError::InvalidEncoding);
+        }
+        Ok(proof)
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BlsDorySharedLayoutError {
     #[error("shared Dory layout projection failed: {0}")]
@@ -76,10 +261,382 @@ pub enum BlsDorySharedLayoutError {
     Transition(#[from] BlsDoryTransitionError),
     #[error("transition range checkpoint failed: {0}")]
     Range(#[from] BlsDoryRangeLogUpError),
+    #[error("matrix checkpoint failed: {0}")]
+    Matrix(#[from] BlsDoryMatrixError),
+    #[error("wiring checkpoint failed: {0}")]
+    Wiring(#[from] BlsDoryWiringError),
     #[error("transition arithmetic and range proofs do not share one commitment")]
     TransitionRangeCommitment,
+    #[error("shared layout proof has the wrong fixed shape")]
+    InvalidProofShape,
+    #[error("shared layout proof is too large")]
+    ProofTooLarge,
+    #[error("shared layout proof encoding is non-canonical or malformed")]
+    InvalidEncoding,
+    #[error("shared aggregate claims do not match the component transcripts")]
+    OpeningClaims,
     #[error("the shared BLS12-381 layout is not production ready")]
     NotProductionReady,
+}
+
+pub struct BlsDoryMatrixProverInput<'a> {
+    pub statement: StructuredMatrixStatement,
+    pub activations: &'a [i64],
+    pub weights: &'a [i64],
+    pub accumulators: &'a [i64],
+}
+
+pub struct BlsDoryTransitionProverInput<'a> {
+    pub statement: StructuredTransitionStatement,
+    pub mask_polynomial: &'a StructuredMaskPolynomial,
+    pub witness: &'a StructuredTransitionWitness,
+}
+
+/// Prove all scalar checkpoints with a single opening aggregate. The bounded
+/// vectors cover both small fixtures and the exact three-matrix/four-transition
+/// production topology.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_bls_dory_shared_layout_at_variables(
+    binding: &[u8],
+    matrix_inputs: &[BlsDoryMatrixProverInput<'_>],
+    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
+    wiring_statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    if binding.len() > MAX_SHARED_LAYOUT_BINDING_BYTES
+        || !(1..=MAX_BLS_DORY_SHARED_MATRIX_PROOFS).contains(&matrix_inputs.len())
+        || !(1..=MAX_BLS_DORY_SHARED_TRANSITION_PROOFS).contains(&transition_inputs.len())
+    {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    let mut matrices = Vec::with_capacity(matrix_inputs.len());
+    for input in matrix_inputs {
+        matrices.push(prove_bls_dory_matrix_deferred_at_variables(
+            binding,
+            input.statement,
+            input.activations,
+            input.weights,
+            input.accumulators,
+            padded_variables,
+            setup,
+        )?);
+    }
+    let mut transitions = Vec::with_capacity(transition_inputs.len());
+    for input in transition_inputs {
+        let arithmetic = prove_bls_dory_transition_deferred_at_variables(
+            binding,
+            input.statement,
+            input.mask_polynomial,
+            input.witness,
+            padded_variables,
+            setup,
+        )?;
+        let range = prove_bls_dory_range_logup_deferred_at_variables(
+            binding,
+            input.statement,
+            input.witness,
+            padded_variables,
+            setup,
+        )?;
+        if arithmetic.proof.oracle_commitment != range.proof.transition_commitment {
+            return Err(BlsDorySharedLayoutError::TransitionRangeCommitment);
+        }
+        transitions.push((arithmetic, range));
+    }
+    let wiring = prove_bls_dory_wiring_deferred_at_variables(
+        binding,
+        wiring_statement,
+        initial,
+        inputs,
+        outputs,
+        padded_variables,
+        setup,
+    )?;
+    prove_prepared_shared_layout(
+        binding,
+        matrices,
+        transitions,
+        wiring,
+        padded_variables,
+        setup,
+    )
+}
+
+fn prove_prepared_shared_layout(
+    binding: &[u8],
+    matrices: Vec<PreparedBlsDoryMatrixProof>,
+    transitions: Vec<(
+        PreparedBlsDoryTransitionProof,
+        PreparedBlsDoryRangeLogUpProof,
+    )>,
+    wiring: PreparedBlsDoryWiringProof,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let matrix_proofs = matrices
+        .iter()
+        .map(|prepared| &prepared.proof)
+        .collect::<Vec<_>>();
+    let transition_proofs = transitions
+        .iter()
+        .map(|(arithmetic, range)| (&arithmetic.proof, &range.proof))
+        .collect::<Vec<_>>();
+    let opening_binding = shared_opening_binding(
+        binding,
+        padded_variables,
+        setup,
+        &matrix_proofs,
+        &transition_proofs,
+        &wiring.proof,
+    )?;
+    let mut opening_sets = Vec::new();
+    let mut expected_claims = Vec::new();
+    for matrix in &matrices {
+        opening_sets.push(&matrix.openings);
+        expected_claims.extend_from_slice(matrix.openings.claims());
+    }
+    for (arithmetic, range) in &transitions {
+        opening_sets.push(&arithmetic.openings);
+        expected_claims.extend_from_slice(arithmetic.openings.claims());
+        opening_sets.push(&range.openings);
+        expected_claims.extend_from_slice(range.openings.claims());
+    }
+    opening_sets.push(&wiring.openings);
+    expected_claims.extend_from_slice(wiring.openings.claims());
+    let (claims, opening_proof) =
+        prove_bls_dory_deferred_opening_sets(&opening_binding, &opening_sets, setup)?;
+    if claims != expected_claims {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    Ok(BlsDorySharedLayoutProof {
+        protocol_version: BLS_DORY_SHARED_LAYOUT_VERSION,
+        padded_variables: u16::try_from(padded_variables)
+            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
+        matrices: matrices
+            .into_iter()
+            .map(|prepared| prepared.proof)
+            .collect(),
+        transitions: transitions
+            .into_iter()
+            .map(|(arithmetic, range)| BlsDoryTransitionRangeProof {
+                arithmetic: arithmetic.proof,
+                range: range.proof,
+            })
+            .collect(),
+        wiring: wiring.proof,
+        opening_proof,
+    })
+}
+
+/// Verify every component transcript, then authenticate their ordered opening
+/// claims with exactly one Dory payload.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_bls_dory_shared_layout_at_variables(
+    binding: &[u8],
+    matrix_statements: &[StructuredMatrixStatement],
+    transition_statements: &[StructuredTransitionStatement],
+    mask_polynomials: &[&StructuredMaskPolynomial],
+    wiring_statement: StructuredWiringStatement,
+    proof: &BlsDorySharedLayoutProof,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDorySharedLayoutError> {
+    validate_shared_proof_shape(binding, proof, padded_variables)?;
+    if proof.matrices.len() != matrix_statements.len()
+        || proof.transitions.len() != transition_statements.len()
+        || proof.transitions.len() != mask_polynomials.len()
+    {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    let mut claims = Vec::new();
+    for (statement, matrix) in matrix_statements.iter().zip(&proof.matrices) {
+        claims.extend(verify_bls_dory_matrix_deferred_at_variables(
+            binding,
+            *statement,
+            matrix,
+            padded_variables,
+            setup,
+        )?);
+    }
+    for ((statement, mask), transition) in transition_statements
+        .iter()
+        .zip(mask_polynomials)
+        .zip(&proof.transitions)
+    {
+        if transition.arithmetic.oracle_commitment != transition.range.transition_commitment {
+            return Err(BlsDorySharedLayoutError::TransitionRangeCommitment);
+        }
+        claims.extend(verify_bls_dory_transition_deferred_at_variables(
+            binding,
+            *statement,
+            mask,
+            &transition.arithmetic,
+            padded_variables,
+            setup,
+        )?);
+        claims.extend(verify_bls_dory_range_logup_deferred_at_variables(
+            binding,
+            *statement,
+            transition.arithmetic.oracle_commitment,
+            &transition.range,
+            padded_variables,
+            setup,
+        )?);
+    }
+    claims.extend(verify_bls_dory_wiring_deferred_at_variables(
+        binding,
+        wiring_statement,
+        &proof.wiring,
+        padded_variables,
+        setup,
+    )?);
+    let matrix_proofs = proof.matrices.iter().collect::<Vec<_>>();
+    let transition_proofs = proof
+        .transitions
+        .iter()
+        .map(|proof| (&proof.arithmetic, &proof.range))
+        .collect::<Vec<_>>();
+    let opening_binding = shared_opening_binding(
+        binding,
+        padded_variables,
+        setup,
+        &matrix_proofs,
+        &transition_proofs,
+        &proof.wiring,
+    )?;
+    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
+    Ok(())
+}
+
+fn validate_shared_proof_shape(
+    binding: &[u8],
+    proof: &BlsDorySharedLayoutProof,
+    padded_variables: usize,
+) -> Result<(), BlsDorySharedLayoutError> {
+    if binding.len() > MAX_SHARED_LAYOUT_BINDING_BYTES {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    validate_shared_component_shape(proof, padded_variables)
+}
+
+fn validate_shared_component_shape(
+    proof: &BlsDorySharedLayoutProof,
+    padded_variables: usize,
+) -> Result<(), BlsDorySharedLayoutError> {
+    if proof.protocol_version != BLS_DORY_SHARED_LAYOUT_VERSION
+        || usize::from(proof.padded_variables) != padded_variables
+        || proof.opening_proof.is_empty()
+        || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
+        || !(1..=MAX_BLS_DORY_SHARED_MATRIX_PROOFS).contains(&proof.matrices.len())
+        || !(1..=MAX_BLS_DORY_SHARED_TRANSITION_PROOFS).contains(&proof.transitions.len())
+        || proof
+            .matrices
+            .iter()
+            .any(|matrix| !matrix.opening_proof.is_empty())
+        || proof.transitions.iter().any(|transition| {
+            !transition.arithmetic.opening_proof.is_empty()
+                || !transition.range.opening_proof.is_empty()
+        })
+        || !proof.wiring.opening_proof.is_empty()
+    {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+fn read_u16(encoded: &[u8], offset: usize) -> Result<u16, BlsDorySharedLayoutError> {
+    let bytes = encoded
+        .get(offset..offset + 2)
+        .ok_or(BlsDorySharedLayoutError::InvalidEncoding)?;
+    Ok(u16::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| BlsDorySharedLayoutError::InvalidEncoding)?,
+    ))
+}
+
+fn read_u32(encoded: &[u8], offset: usize) -> Result<u32, BlsDorySharedLayoutError> {
+    let bytes = encoded
+        .get(offset..offset + 4)
+        .ok_or(BlsDorySharedLayoutError::InvalidEncoding)?;
+    Ok(u32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| BlsDorySharedLayoutError::InvalidEncoding)?,
+    ))
+}
+
+fn framed_size(total: usize, payload: usize) -> Result<usize, BlsDorySharedLayoutError> {
+    total
+        .checked_add(4)
+        .and_then(|total| total.checked_add(payload))
+        .ok_or(BlsDorySharedLayoutError::ProofTooLarge)
+}
+
+fn append_framed(encoded: &mut Vec<u8>, payload: &[u8]) -> Result<(), BlsDorySharedLayoutError> {
+    let length =
+        u32::try_from(payload.len()).map_err(|_| BlsDorySharedLayoutError::ProofTooLarge)?;
+    encoded.extend_from_slice(&length.to_le_bytes());
+    encoded.extend_from_slice(payload);
+    Ok(())
+}
+
+fn take_framed<'a>(
+    encoded: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], BlsDorySharedLayoutError> {
+    let length = read_u32(encoded, *offset)? as usize;
+    if length == 0 {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    *offset = offset
+        .checked_add(4)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let payload = encoded
+        .get(*offset..end)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    *offset = end;
+    Ok(payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shared_opening_binding(
+    binding: &[u8],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    matrices: &[&BlsDoryMatrixProof],
+    transitions: &[(&BlsDoryTransitionProof, &BlsDoryRangeLogUpProof)],
+    wiring: &BlsDoryWiringProof,
+) -> Result<[u8; 32], BlsDorySharedLayoutError> {
+    let variables =
+        u16::try_from(padded_variables).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+    let binding_len =
+        u32::try_from(binding.len()).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"CommonFoundry/BlsDorySharedLayout/openings/v1");
+    hasher.update(&BLS_DORY_SHARED_LAYOUT_VERSION.to_le_bytes());
+    hasher.update(&variables.to_le_bytes());
+    hasher.update(&setup.identity());
+    hasher.update(&binding_len.to_le_bytes());
+    hasher.update(binding);
+    hasher.update(&(matrices.len() as u16).to_le_bytes());
+    for matrix in matrices {
+        hasher.update(&matrix.transcript_digest);
+    }
+    hasher.update(&(transitions.len() as u16).to_le_bytes());
+    for (arithmetic, range) in transitions {
+        hasher.update(&arithmetic.transcript_digest);
+        hasher.update(&range.transcript_digest);
+    }
+    hasher.update(&wiring.transcript_digest);
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// Prove transition arithmetic and range constraints against one commitment.
@@ -197,6 +754,37 @@ pub fn projected_shared_production_opening_bytes() -> Result<usize, BlsDoryShare
     Ok(projected_bls_dory_aggregate_bytes(
         BLS_DORY_SHARED_PRODUCTION_VARIABLES,
     )?)
+}
+
+/// Project the exact three-matrix/four-transition production frame after the
+/// component-specific opening payloads have been replaced by one shared payload.
+pub fn projected_shared_production_proof_bytes() -> Result<usize, BlsDorySharedLayoutError> {
+    let matrix = projected_production_matrix_proof_bytes()?
+        .checked_sub(projected_production_matrix_opening_bytes()?)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let arithmetic = projected_production_transition_proof_bytes()?
+        .checked_sub(projected_production_transition_opening_bytes()?)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let range = projected_production_range_logup_proof_bytes()?
+        .checked_sub(projected_production_range_logup_opening_bytes()?)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let wiring = projected_production_wiring_proof_bytes()?
+        .checked_sub(projected_production_wiring_opening_bytes()?)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let mut total = SHARED_PROOF_HEADER_BYTES;
+    for _ in 0..MAX_BLS_DORY_SHARED_MATRIX_PROOFS {
+        total = framed_size(total, matrix)?;
+    }
+    for _ in 0..MAX_BLS_DORY_SHARED_TRANSITION_PROOFS {
+        total = framed_size(total, arithmetic)?;
+        total = framed_size(total, range)?;
+    }
+    total = framed_size(total, wiring)?;
+    total = framed_size(total, projected_shared_production_opening_bytes()?)?;
+    if total > MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES {
+        return Err(BlsDorySharedLayoutError::ProofTooLarge);
+    }
+    Ok(total)
 }
 
 /// Fail closed until every shared-layout blocker is resolved.
@@ -438,6 +1026,198 @@ mod tests {
     }
 
     #[test]
+    fn scalar_components_share_one_opening_payload() {
+        let setup = deterministic_bls_dory_setup(FIXTURE_VARIABLES).unwrap();
+        let (matrix_statement, activations, weights, accumulators) = matrix_fixture();
+        let (transition_statement, mask, transition_witness) = transition_fixture();
+        let (wiring_statement, initial, inputs, outputs) = wiring_fixture();
+        let matrix_statements = [matrix_statement];
+        let transition_statements = [transition_statement];
+        let masks = [&mask];
+        let matrix_inputs = [BlsDoryMatrixProverInput {
+            statement: matrix_statement,
+            activations: &activations,
+            weights: &weights,
+            accumulators: &accumulators,
+        }];
+        let transition_inputs = [BlsDoryTransitionProverInput {
+            statement: transition_statement,
+            mask_polynomial: &mask,
+            witness: &transition_witness,
+        }];
+        let proof = prove_bls_dory_shared_layout_at_variables(
+            b"shared-opening",
+            &matrix_inputs,
+            &transition_inputs,
+            wiring_statement,
+            &initial,
+            &inputs,
+            &outputs,
+            FIXTURE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        verify_bls_dory_shared_layout_at_variables(
+            b"shared-opening",
+            &matrix_statements,
+            &transition_statements,
+            &masks,
+            wiring_statement,
+            &proof,
+            FIXTURE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+
+        let encoded = proof
+            .encode(&matrix_statements, &transition_statements, wiring_statement)
+            .unwrap();
+        assert_eq!(encoded.len(), 31_135);
+        let decoded = BlsDorySharedLayoutProof::decode_with_variables(
+            &encoded,
+            &matrix_statements,
+            &transition_statements,
+            wiring_statement,
+            FIXTURE_VARIABLES,
+        )
+        .unwrap();
+        assert_eq!(decoded, proof);
+        verify_bls_dory_shared_layout_at_variables(
+            b"shared-opening",
+            &matrix_statements,
+            &transition_statements,
+            &masks,
+            wiring_statement,
+            &decoded,
+            FIXTURE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+
+        assert!(proof.matrices[0].opening_proof.is_empty());
+        assert!(proof.transitions[0].arithmetic.opening_proof.is_empty());
+        assert!(proof.transitions[0].range.opening_proof.is_empty());
+        assert!(proof.wiring.opening_proof.is_empty());
+        assert_eq!(proof.opening_proof.len(), 21_775);
+
+        let mut malformed = encoded.clone();
+        malformed[0] ^= 1;
+        assert!(
+            BlsDorySharedLayoutProof::decode_with_variables(
+                &malformed,
+                &matrix_statements,
+                &transition_statements,
+                wiring_statement,
+                FIXTURE_VARIABLES,
+            )
+            .is_err()
+        );
+        let mut malformed = encoded.clone();
+        malformed[16..20].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(
+            BlsDorySharedLayoutProof::decode_with_variables(
+                &malformed,
+                &matrix_statements,
+                &transition_statements,
+                wiring_statement,
+                FIXTURE_VARIABLES,
+            )
+            .is_err()
+        );
+        let mut malformed = encoded.clone();
+        malformed.push(0);
+        assert!(
+            BlsDorySharedLayoutProof::decode_with_variables(
+                &malformed,
+                &matrix_statements,
+                &transition_statements,
+                wiring_statement,
+                FIXTURE_VARIABLES,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        let middle = changed.opening_proof.len() / 2;
+        changed.opening_proof[middle] ^= 1;
+        assert!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"shared-opening",
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                wiring_statement,
+                &changed,
+                FIXTURE_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.matrices[0].transcript_digest[0] ^= 1;
+        assert!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"shared-opening",
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                wiring_statement,
+                &changed,
+                FIXTURE_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.transitions[0].range.transition_commitment =
+            changed.transitions[0].range.multiplicity_commitment;
+        assert_eq!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"shared-opening",
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                wiring_statement,
+                &changed,
+                FIXTURE_VARIABLES,
+                &setup,
+            ),
+            Err(BlsDorySharedLayoutError::TransitionRangeCommitment)
+        );
+
+        let mut changed = proof.clone();
+        changed.wiring.opening_proof.push(0);
+        assert_eq!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"shared-opening",
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                wiring_statement,
+                &changed,
+                FIXTURE_VARIABLES,
+                &setup,
+            ),
+            Err(BlsDorySharedLayoutError::InvalidProofShape)
+        );
+        assert!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"other-binding",
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                wiring_statement,
+                &proof,
+                FIXTURE_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn transition_range_composition_requires_both_proofs_and_one_commitment() {
         let setup = deterministic_bls_dory_setup(FIXTURE_VARIABLES).unwrap();
         let (statement, mask, witness) = transition_fixture();
@@ -461,6 +1241,133 @@ mod tests {
                 statement,
                 &mask,
                 &missing_range,
+                &setup,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_component_counts_share_one_payload() {
+        let setup = deterministic_bls_dory_setup(FIXTURE_VARIABLES).unwrap();
+        let (matrix_statement, activations, weights, accumulators) = matrix_fixture();
+        let negated_activations = activations.iter().map(|value| -*value).collect::<Vec<_>>();
+        let negated_accumulators = accumulators.iter().map(|value| -*value).collect::<Vec<_>>();
+        let (transition_statement, mask, transition_witness) = transition_fixture();
+        let (wiring_statement, initial, inputs, outputs) = wiring_fixture();
+        let matrix_inputs = [
+            BlsDoryMatrixProverInput {
+                statement: matrix_statement,
+                activations: &negated_activations,
+                weights: &weights,
+                accumulators: &negated_accumulators,
+            },
+            BlsDoryMatrixProverInput {
+                statement: matrix_statement,
+                activations: &activations,
+                weights: &weights,
+                accumulators: &accumulators,
+            },
+            BlsDoryMatrixProverInput {
+                statement: matrix_statement,
+                activations: &activations,
+                weights: &weights,
+                accumulators: &accumulators,
+            },
+        ];
+        let transition_inputs = [
+            BlsDoryTransitionProverInput {
+                statement: transition_statement,
+                mask_polynomial: &mask,
+                witness: &transition_witness,
+            },
+            BlsDoryTransitionProverInput {
+                statement: transition_statement,
+                mask_polynomial: &mask,
+                witness: &transition_witness,
+            },
+            BlsDoryTransitionProverInput {
+                statement: transition_statement,
+                mask_polynomial: &mask,
+                witness: &transition_witness,
+            },
+            BlsDoryTransitionProverInput {
+                statement: transition_statement,
+                mask_polynomial: &mask,
+                witness: &transition_witness,
+            },
+        ];
+        let matrix_statements = [matrix_statement; 3];
+        let transition_statements = [transition_statement; 4];
+        let masks = [&mask; 4];
+        let proof = prove_bls_dory_shared_layout_at_variables(
+            b"production-topology",
+            &matrix_inputs,
+            &transition_inputs,
+            wiring_statement,
+            &initial,
+            &inputs,
+            &outputs,
+            FIXTURE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        verify_bls_dory_shared_layout_at_variables(
+            b"production-topology",
+            &matrix_statements,
+            &transition_statements,
+            &masks,
+            wiring_statement,
+            &proof,
+            FIXTURE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(proof.matrices.len(), 3);
+        assert_eq!(proof.transitions.len(), 4);
+        assert_eq!(proof.opening_proof.len(), 21_775);
+        assert_eq!(3 * 3 + 4 * (12 + 5) + 9, 86);
+
+        let encoded = proof
+            .encode(&matrix_statements, &transition_statements, wiring_statement)
+            .unwrap();
+        let decoded = BlsDorySharedLayoutProof::decode_with_variables(
+            &encoded,
+            &matrix_statements,
+            &transition_statements,
+            wiring_statement,
+            FIXTURE_VARIABLES,
+        )
+        .unwrap();
+        assert_eq!(decoded, proof);
+
+        let mut reordered = proof.clone();
+        reordered.matrices.swap(0, 1);
+        assert!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"production-topology",
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                wiring_statement,
+                &reordered,
+                FIXTURE_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut omitted = proof;
+        omitted.matrices.pop();
+        assert!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"production-topology",
+                &matrix_statements[..2],
+                &transition_statements,
+                &masks,
+                wiring_statement,
+                &omitted,
+                FIXTURE_VARIABLES,
                 &setup,
             )
             .is_err()
@@ -567,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn production_claim_deficit_and_opening_projection_are_explicit() {
+    fn production_claim_accounting_and_shared_projection_are_explicit() {
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);
@@ -576,7 +1483,12 @@ mod tests {
         assert_eq!(BLS_DORY_SHARED_COMPRESSED_CHECKPOINT_CLAIMS, 108);
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         assert_eq!(projected_shared_production_opening_bytes().unwrap(), 70_639);
-        assert_eq!(BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS.len(), 4);
+        assert_eq!(projected_shared_production_proof_bytes().unwrap(), 135_833);
+        assert!(
+            projected_shared_production_proof_bytes().unwrap()
+                < MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES
+        );
+        assert_eq!(BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(
             require_bls_dory_shared_layout_production_ready(),
             Err(BlsDorySharedLayoutError::NotProductionReady)

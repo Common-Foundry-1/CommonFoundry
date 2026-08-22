@@ -19,9 +19,10 @@ use thiserror::Error;
 use crate::{
     StructuredWiringError, StructuredWiringStatement,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_polynomial, projected_bls_dory_aggregate_bytes,
-        prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
+        verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
@@ -63,13 +64,41 @@ pub struct BlsDoryWiringProof {
     pub opening_proof: Vec<u8>,
 }
 
+pub(crate) struct PreparedBlsDoryWiringProof {
+    pub(crate) proof: BlsDoryWiringProof,
+    pub(crate) openings: BlsDoryDeferredOpeningSet,
+}
+
 impl BlsDoryWiringProof {
     /// Encode the exact statement-derived proof shape canonically.
     pub fn encode(
         &self,
         statement: StructuredWiringStatement,
     ) -> Result<Vec<u8>, BlsDoryWiringError> {
-        validate_proof_shape(statement, self, usize::from(self.packed_variables))?;
+        self.encode_with_opening(statement, true)
+    }
+
+    pub(crate) fn encode_deferred(
+        &self,
+        statement: StructuredWiringStatement,
+    ) -> Result<Vec<u8>, BlsDoryWiringError> {
+        self.encode_with_opening(statement, false)
+    }
+
+    fn encode_with_opening(
+        &self,
+        statement: StructuredWiringStatement,
+        require_opening: bool,
+    ) -> Result<Vec<u8>, BlsDoryWiringError> {
+        validate_proof_shape_with_opening(
+            statement,
+            self,
+            usize::from(self.packed_variables),
+            require_opening,
+        )?;
+        if !require_opening && !self.opening_proof.is_empty() {
+            return Err(BlsDoryWiringError::InvalidProofShape);
+        }
         let opening_len = u32::try_from(self.opening_proof.len())
             .map_err(|_| BlsDoryWiringError::ProofTooLarge)?;
         let expected = wiring_wire_bytes(self.evaluations.len(), self.opening_proof.len())?;
@@ -106,6 +135,23 @@ impl BlsDoryWiringProof {
         statement: StructuredWiringStatement,
         expected_variables: usize,
     ) -> Result<Self, BlsDoryWiringError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, true)
+    }
+
+    pub(crate) fn decode_deferred_with_variables(
+        encoded: &[u8],
+        statement: StructuredWiringStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryWiringError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, false)
+    }
+
+    fn decode_with_variables_and_opening(
+        encoded: &[u8],
+        statement: StructuredWiringStatement,
+        expected_variables: usize,
+        require_opening: bool,
+    ) -> Result<Self, BlsDoryWiringError> {
         statement.validate_verifier_shape()?;
         validate_target_variables(packed_wiring_variables(statement)?, expected_variables)?;
         if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_WIRING_PROOF_BYTES {
@@ -122,7 +168,8 @@ impl BlsDoryWiringProof {
         if protocol_version != BLS_DORY_WIRING_VERSION
             || usize::from(packed_variables) != expected_variables
             || evaluation_count != expected_evaluations
-            || opening_len == 0
+            || (require_opening && opening_len == 0)
+            || (!require_opening && opening_len != 0)
             || opening_len > MAX_BLS_DORY_AGGREGATE_BYTES
             || encoded.len() != wiring_wire_bytes(evaluation_count, opening_len)?
         {
@@ -159,7 +206,7 @@ impl BlsDoryWiringProof {
             transcript_digest,
             opening_proof,
         };
-        if proof.encode(statement)? != encoded {
+        if proof.encode_with_opening(statement, require_opening)? != encoded {
             return Err(BlsDoryWiringError::InvalidEncoding);
         }
         Ok(proof)
@@ -244,6 +291,42 @@ pub fn prove_bls_dory_wiring_at_variables(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryWiringProof, BlsDoryWiringError> {
+    let mut prepared = prove_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+    )?;
+    let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
+    let (claims, opening_proof) =
+        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    if claims != prepared.openings.claims() {
+        return Err(BlsDoryWiringError::Opening);
+    }
+    prepared.proof.opening_proof = opening_proof;
+    verify_bls_dory_wiring_at_variables(
+        binding,
+        statement,
+        &prepared.proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(prepared.proof)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_wiring_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
     if binding.len() > MAX_WIRING_BINDING_BYTES {
         return Err(BlsDoryWiringError::PublicBindingTooLarge);
     }
@@ -281,15 +364,13 @@ pub fn prove_bls_dory_wiring_at_variables(
     absorb_evaluations(&mut transcript, &flattened);
     let transcript_digest = transcript.digest();
     let opening_points = opening_points(statement, &points, packed_variables)?;
-    let opening_binding = opening_binding(binding, &transcript_digest);
-    let (claims, opening_proof) = prove_bls_dory_same_commitment_openings(
-        &opening_binding,
-        &committed,
-        &opening_points,
-        setup,
-    )?;
     let expected_claims = opening_claims(oracle_commitment, &opening_points, &flattened)?;
-    if claims != expected_claims {
+    let openings = BlsDoryDeferredOpeningSet::new(
+        vec![committed],
+        vec![0; opening_points.len()],
+        opening_points,
+    )?;
+    if openings.claims() != expected_claims {
         return Err(BlsDoryWiringError::Opening);
     }
 
@@ -300,10 +381,16 @@ pub fn prove_bls_dory_wiring_at_variables(
         oracle_commitment,
         evaluations: flattened,
         transcript_digest,
-        opening_proof,
+        opening_proof: Vec::new(),
     };
-    verify_bls_dory_wiring_at_variables(binding, statement, &proof, packed_variables, setup)?;
-    Ok(proof)
+    verify_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        &proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryWiringProof { proof, openings })
 }
 
 /// Verify wiring identities and their Dory-authenticated evaluations without a witness.
@@ -325,6 +412,25 @@ pub fn verify_bls_dory_wiring_at_variables(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryWiringError> {
+    let claims = verify_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        proof,
+        packed_variables,
+        setup,
+    )?;
+    let binding = opening_binding(binding, &proof.transcript_digest);
+    verify_bls_dory_openings(&binding, &claims, &proof.opening_proof, setup)?;
+    Ok(())
+}
+
+pub(crate) fn verify_bls_dory_wiring_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<Vec<BlsDoryOpeningClaim>, BlsDoryWiringError> {
     if binding.len() > MAX_WIRING_BINDING_BYTES {
         return Err(BlsDoryWiringError::PublicBindingTooLarge);
     }
@@ -333,7 +439,7 @@ pub fn verify_bls_dory_wiring_at_variables(
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryWiringError::InvalidDimensions);
     }
-    validate_proof_shape(statement, proof, packed_variables)?;
+    validate_deferred_proof_shape(statement, proof, packed_variables)?;
     let mut transcript = wiring_transcript(binding, statement, &proof.oracle_commitment);
     let points = WiringPoints::derive(statement, &mut transcript);
     let evaluations = WiringEvaluations::from_flat(statement, &proof.evaluations)?;
@@ -344,9 +450,7 @@ pub fn verify_bls_dory_wiring_at_variables(
     }
     let points = opening_points(statement, &points, packed_variables)?;
     let claims = opening_claims(proof.oracle_commitment, &points, &proof.evaluations)?;
-    let binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&binding, &claims, &proof.opening_proof, setup)?;
-    Ok(())
+    Ok(claims)
 }
 
 fn production_wiring_statement() -> StructuredWiringStatement {
@@ -359,17 +463,26 @@ fn production_wiring_statement() -> StructuredWiringStatement {
     }
 }
 
-fn validate_proof_shape(
+fn validate_deferred_proof_shape(
     statement: StructuredWiringStatement,
     proof: &BlsDoryWiringProof,
     expected_variables: usize,
+) -> Result<(), BlsDoryWiringError> {
+    validate_proof_shape_with_opening(statement, proof, expected_variables, false)
+}
+
+fn validate_proof_shape_with_opening(
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    expected_variables: usize,
+    require_opening: bool,
 ) -> Result<(), BlsDoryWiringError> {
     statement.validate_verifier_shape()?;
     validate_target_variables(packed_wiring_variables(statement)?, expected_variables)?;
     if proof.protocol_version != BLS_DORY_WIRING_VERSION
         || usize::from(proof.packed_variables) != expected_variables
         || proof.evaluations.len() != wiring_evaluation_count(statement)?
-        || proof.opening_proof.is_empty()
+        || (require_opening && proof.opening_proof.is_empty())
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
         return Err(BlsDoryWiringError::InvalidProofShape);

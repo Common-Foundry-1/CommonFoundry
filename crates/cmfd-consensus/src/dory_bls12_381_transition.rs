@@ -23,9 +23,10 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     V2_TRANSITION_MODULUS,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_polynomial, projected_bls_dory_aggregate_bytes,
-        prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
+        verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
@@ -48,9 +49,8 @@ pub const PRODUCTION_BLS_DORY_TRANSITION_VARIABLES: usize = 33;
 /// This checkpoint is not accepted by consensus.
 pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
 /// Remaining gates on this transition path.
-pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 4] = [
+pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the n=33 packed transition polynomial is not streamed by the in-memory prover",
-    "the arithmetic and range checkpoints still emit separate Dory proofs instead of one shared block aggregate",
     "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
     "the scalar transition transcript and packed opening path have not received an external audit",
 ];
@@ -87,13 +87,41 @@ pub struct BlsDoryTransitionProof {
     pub opening_proof: Vec<u8>,
 }
 
+pub(crate) struct PreparedBlsDoryTransitionProof {
+    pub(crate) proof: BlsDoryTransitionProof,
+    pub(crate) openings: BlsDoryDeferredOpeningSet,
+}
+
 impl BlsDoryTransitionProof {
     /// Encode the exact statement-bound proof shape canonically.
     pub fn encode(
         &self,
         statement: StructuredTransitionStatement,
     ) -> Result<Vec<u8>, BlsDoryTransitionError> {
-        validate_proof_shape(statement, self, usize::from(self.packed_variables))?;
+        self.encode_with_opening(statement, true)
+    }
+
+    pub(crate) fn encode_deferred(
+        &self,
+        statement: StructuredTransitionStatement,
+    ) -> Result<Vec<u8>, BlsDoryTransitionError> {
+        self.encode_with_opening(statement, false)
+    }
+
+    fn encode_with_opening(
+        &self,
+        statement: StructuredTransitionStatement,
+        require_opening: bool,
+    ) -> Result<Vec<u8>, BlsDoryTransitionError> {
+        validate_proof_shape_with_opening(
+            statement,
+            self,
+            usize::from(self.packed_variables),
+            require_opening,
+        )?;
+        if !require_opening && !self.opening_proof.is_empty() {
+            return Err(BlsDoryTransitionError::InvalidProofShape);
+        }
         let opening_len = u32::try_from(self.opening_proof.len())
             .map_err(|_| BlsDoryTransitionError::ProofTooLarge)?;
         let expected = transition_wire_bytes(self.rounds.len(), self.opening_proof.len())?;
@@ -136,6 +164,23 @@ impl BlsDoryTransitionProof {
         statement: StructuredTransitionStatement,
         expected_variables: usize,
     ) -> Result<Self, BlsDoryTransitionError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, true)
+    }
+
+    pub(crate) fn decode_deferred_with_variables(
+        encoded: &[u8],
+        statement: StructuredTransitionStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryTransitionError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, false)
+    }
+
+    fn decode_with_variables_and_opening(
+        encoded: &[u8],
+        statement: StructuredTransitionStatement,
+        expected_variables: usize,
+        require_opening: bool,
+    ) -> Result<Self, BlsDoryTransitionError> {
         statement.validate_verifier_shape()?;
         validate_target_variables(minimum_packed_variables(statement)?, expected_variables)?;
         if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_TRANSITION_PROOF_BYTES {
@@ -154,7 +199,8 @@ impl BlsDoryTransitionProof {
             || usize::from(packed_variables) != expected_variables
             || round_count != expected_rounds
             || terminal_count != BLS_DORY_TRANSITION_OPENING_CLAIMS
-            || opening_len == 0
+            || (require_opening && opening_len == 0)
+            || (!require_opening && opening_len != 0)
             || opening_len > MAX_BLS_DORY_AGGREGATE_BYTES
             || encoded.len() != transition_wire_bytes(round_count, opening_len)?
         {
@@ -200,7 +246,7 @@ impl BlsDoryTransitionProof {
             transcript_digest,
             opening_proof,
         };
-        if proof.encode(statement)? != encoded {
+        if proof.encode_with_opening(statement, require_opening)? != encoded {
             return Err(BlsDoryTransitionError::InvalidEncoding);
         }
         Ok(proof)
@@ -283,6 +329,40 @@ pub fn prove_bls_dory_transition_at_variables(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryTransitionProof, BlsDoryTransitionError> {
+    let mut prepared = prove_bls_dory_transition_deferred_at_variables(
+        binding,
+        statement,
+        mask_polynomial,
+        witness,
+        packed_variables,
+        setup,
+    )?;
+    let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
+    let (claims, opening_proof) =
+        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    if claims != prepared.openings.claims() {
+        return Err(BlsDoryTransitionError::Opening);
+    }
+    prepared.proof.opening_proof = opening_proof;
+    verify_bls_dory_transition_at_variables(
+        binding,
+        statement,
+        mask_polynomial,
+        &prepared.proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(prepared.proof)
+}
+
+pub(crate) fn prove_bls_dory_transition_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    witness: &StructuredTransitionWitness,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
     if binding.len() > MAX_TRANSITION_BINDING_BYTES {
         return Err(BlsDoryTransitionError::PublicBindingTooLarge);
     }
@@ -352,24 +432,22 @@ pub fn prove_bls_dory_transition_at_variables(
     let transcript_digest = transcript.digest();
 
     let opening_points = packed_opening_points(&sumcheck_point, packed_variables)?;
-    let opening_binding = opening_binding(binding, &transcript_digest);
-    let (claims, opening_proof) = prove_bls_dory_same_commitment_openings(
-        &opening_binding,
-        &committed,
-        &opening_points,
-        setup,
-    )?;
     let expected_claims = transition_opening_claims(
         oracle_commitment,
         &sumcheck_point,
         &terminal_evaluations,
         packed_variables,
     )?;
-    if claims != expected_claims {
+    let openings = BlsDoryDeferredOpeningSet::new(
+        vec![committed],
+        vec![0; opening_points.len()],
+        opening_points,
+    )?;
+    if openings.claims() != expected_claims {
         return Err(BlsDoryTransitionError::Opening);
     }
 
-    Ok(BlsDoryTransitionProof {
+    let proof = BlsDoryTransitionProof {
         protocol_version: BLS_DORY_TRANSITION_VERSION,
         packed_variables: u16::try_from(packed_variables)
             .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
@@ -377,8 +455,17 @@ pub fn prove_bls_dory_transition_at_variables(
         rounds,
         terminal_evaluations,
         transcript_digest,
-        opening_proof,
-    })
+        opening_proof: Vec::new(),
+    };
+    verify_bls_dory_transition_deferred_at_variables(
+        binding,
+        statement,
+        mask_polynomial,
+        &proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryTransitionProof { proof, openings })
 }
 
 /// Verify regular transition arithmetic and its packed Dory openings without the witness.
@@ -409,6 +496,27 @@ pub fn verify_bls_dory_transition_at_variables(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryTransitionError> {
+    let claims = verify_bls_dory_transition_deferred_at_variables(
+        binding,
+        statement,
+        mask_polynomial,
+        proof,
+        packed_variables,
+        setup,
+    )?;
+    let opening_binding = opening_binding(binding, &proof.transcript_digest);
+    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
+    Ok(())
+}
+
+pub(crate) fn verify_bls_dory_transition_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    proof: &BlsDoryTransitionProof,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<Vec<BlsDoryOpeningClaim>, BlsDoryTransitionError> {
     if binding.len() > MAX_TRANSITION_BINDING_BYTES {
         return Err(BlsDoryTransitionError::PublicBindingTooLarge);
     }
@@ -416,7 +524,7 @@ pub fn verify_bls_dory_transition_at_variables(
     mask_polynomial.validate(statement)?;
     let cell_variables = statement.elements()?.ilog2() as usize;
     validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
-    validate_proof_shape(statement, proof, packed_variables)?;
+    validate_deferred_proof_shape(statement, proof, packed_variables)?;
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryTransitionError::InvalidProofShape);
     }
@@ -467,15 +575,22 @@ pub fn verify_bls_dory_transition_at_variables(
         &proof.terminal_evaluations,
         packed_variables,
     )?;
-    let opening_binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
-    Ok(())
+    Ok(claims)
 }
 
-fn validate_proof_shape(
+fn validate_deferred_proof_shape(
     statement: StructuredTransitionStatement,
     proof: &BlsDoryTransitionProof,
     expected_variables: usize,
+) -> Result<(), BlsDoryTransitionError> {
+    validate_proof_shape_with_opening(statement, proof, expected_variables, false)
+}
+
+fn validate_proof_shape_with_opening(
+    statement: StructuredTransitionStatement,
+    proof: &BlsDoryTransitionProof,
+    expected_variables: usize,
+    require_opening: bool,
 ) -> Result<(), BlsDoryTransitionError> {
     statement.validate_verifier_shape()?;
     let cell_variables = statement.elements()?.ilog2() as usize;
@@ -488,7 +603,7 @@ fn validate_proof_shape(
             .iter()
             .any(|round| round.len() != BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1)
         || proof.terminal_evaluations.len() != BLS_DORY_TRANSITION_OPENING_CLAIMS
-        || proof.opening_proof.is_empty()
+        || (require_opening && proof.opening_proof.is_empty())
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
         return Err(BlsDoryTransitionError::InvalidProofShape);
@@ -1116,7 +1231,7 @@ mod tests {
             74_979
         );
         assert!(projected_production_transition_opening_bytes().unwrap() < 262_128);
-        assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 4);
+        assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(
             require_bls_dory_transition_production_ready(),
             Err(BlsDoryTransitionError::NotProductionReady)

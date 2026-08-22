@@ -469,19 +469,21 @@ comparison. The v2 research code now implements:
   weights implicit and folds 12 live lanes in authenticated 16-scalar scratch
   rows. The shared prover reuses that exact authenticated transition artifact
   in LogUp, and the aggregate folds and streams cloned handles only once. A
-  mismatched same-shape artifact is rejected. A canonical, self-authenticating
-  indexed formats support either a literal-scalar prefix or signed/unsigned
+  mismatched same-shape artifact is rejected. Canonical, self-authenticating
+  formats support either a literal-scalar prefix or signed/unsigned
   64-bit words followed by dictionary codes. The transition stores twelve
   unrestricted lanes as words and its 98
   radix-16 lanes as checked `0..15` bytes. LogUp's inverse coefficients are
-  restricted to zero plus sixteen `1 / (alpha - digit)` values and use one
-  checked byte each. Every read authenticates the complete header, dictionary,
+  restricted to zero plus sixteen `1 / (alpha - digit)` values. A
+  challenge-bound mapped view reuses the transition's authenticated digit
+  codes instead of writing a second coefficient file. Every read authenticates the complete header, dictionary,
   words or literal scalars, codes, digest, length, and EOF. Differential tests match the
   former 32-byte-scalar artifacts' commitments, claims, and exact proof bytes
   and reject corruption, truncation, non-canonical scalars, and forged codes.
   Exact production projections put the transition at 12.125 GiB plus framing
-  and its inverse at 6.875 GiB plus framing. One retained transition/range pair
-  is therefore about 19 GiB and all four are about 76 GiB instead of 1.76 TiB.
+  and the mapped inverse at zero additional coefficient-file bytes. One retained
+  transition/range pair is therefore about 12.125 GiB and all four are about
+  48.5 GiB instead of 1.76 TiB.
   LogUp streams its inverse commitment and folds cell-variable rounds in linear
   work. Its first authenticated lineage stores regular selectors as one scalar
   and range cells as one-byte codes for two original radix-16 digits; its second
@@ -497,22 +499,22 @@ comparison. The v2 research code now implements:
   across arbitrary verified input chunks. Three n=19 release A/B repeats gave
   serial and parallel medians of 822 and 385 ms, respectively, a 53.2%
   reduction, with identical artifact digest, commitments, claims, and proof
-  bytes. The indexed inverse computes the sixteen dictionary inverses once and
-  emits witness-derived radix-16 codes. Dory MSM and elementwise vector
+  bytes. The mapped inverse computes the sixteen dictionary inverses once and
+  reuses the transition's exact radix-16 codes. Dory MSM and elementwise vector
   routines are CPU-parallel and preserve the normalized group elements and
   proof bytes. A consuming aggregate boundary now derives the sumcheck,
   combined row commitments, and `L^T M`, then releases deferred coefficient
   artifacts before the final Dory reduction. Direct testing preserves exact
   proof bytes, and standalone n=15, n=17, and n=19 runs leave zero scratch after
-  completion. At n=19 the latest linear prover took 9.517 seconds versus
+  completion. At n=19 the latest linear prover took 9.479 seconds versus
   42.699 seconds for the buffered serial-row checkpoint and 53.948 seconds for
-  the rejected recomputation path. Aggregate opening took 7.036 seconds,
-  prepared scratch was 1,247,108 bytes, and the verified proof remained 47,729
+  the rejected recomputation path. Aggregate opening took 7.048 seconds,
+  prepared scratch was 795,900 bytes, and the verified proof remained 47,729
   bytes. Extrapolation to n=33 still gives roughly 1.80 CPU proving days and
   1.34 aggregate-opening days. Exact projection puts the first two compressed
   lineages at 15.06 and 9.06 GiB and their maximum overlap with the first scalar
   child at 64.06 GiB. With four retained source pairs, the projected scratch
-  peak is about 140.06 GiB instead of 478 GiB. This rejects the current
+  peak is about 112.56 GiB instead of 478 GiB. This rejects the current
   CPU/storage pipeline
   for production; GPU or distributed folds, aggregation or regeneration before
   all pair sources accumulate, and a complete measured n=33 run remain required;

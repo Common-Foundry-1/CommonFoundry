@@ -25,7 +25,7 @@ use crate::{
     V2_TRANSITION_MODULUS,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
-        BlsDoryIndexedRowSource, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
         commit_bls_dory_compact_row_source_with_scratch,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
@@ -1202,7 +1202,10 @@ impl BlsDoryRowSource for BlsDoryTransitionWitnessRowSource<'_> {
     }
 }
 
-impl BlsDoryIndexedRowSource for BlsDoryTransitionWitnessRowSource<'_> {
+#[cfg(test)]
+impl crate::dory_bls12_381_aggregate::BlsDoryIndexedRowSource
+    for BlsDoryTransitionWitnessRowSource<'_>
+{
     type Error = BlsDoryTransitionError;
 
     fn rows(&self) -> usize {

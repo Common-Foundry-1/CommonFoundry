@@ -2882,7 +2882,15 @@ mod tests {
             range.proof.transition_commitment
         );
         assert!(transition.shares_coefficient_source(range.openings.polynomial(0).unwrap()));
-        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 3);
+        assert_eq!(
+            transition.coefficient_artifact_path(),
+            range
+                .openings
+                .polynomial(2)
+                .unwrap()
+                .coefficient_artifact_path()
+        );
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 2);
 
         let wrong_coefficients =
             vec![BlsDoryFr::zero(); statement.elements().unwrap() * STRUCTURED_TRANSITION_ORACLES];
@@ -2904,10 +2912,12 @@ mod tests {
                 &setup,
                 &scratch.0,
             ),
-            Err(BlsDoryRangeLogUpError::Opening)
+            Err(BlsDoryRangeLogUpError::Aggregate(
+                BlsDoryAggregateError::CoefficientSource
+            ))
         ));
         drop(wrong_transition);
-        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 3);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 2);
         drop(range);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
         drop(arithmetic);

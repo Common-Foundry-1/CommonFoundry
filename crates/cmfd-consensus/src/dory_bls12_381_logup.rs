@@ -27,9 +27,8 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
-        BlsDoryIndexedRowSource, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_compact_row_source_with_scratch,
-        commit_bls_dory_indexed_row_source_with_scratch,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_mapped_compact_polynomial,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
@@ -37,7 +36,6 @@ use crate::{
         BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
         BlsDoryFoldArtifactWriter,
     },
-    dory_bls12_381_index_artifact::BlsDoryIndexArtifactSpec,
     dory_bls12_381_logup_artifact::{
         BlsDoryLogUpArtifact, BlsDoryLogUpArtifactError, BlsDoryLogUpArtifactSpec,
         BlsDoryLogUpArtifactValue, BlsDoryLogUpArtifactWriter,
@@ -54,7 +52,10 @@ use crate::{
 
 #[cfg(test)]
 use crate::{
-    dory_bls12_381_aggregate::commit_bls_dory_row_source_with_scratch,
+    dory_bls12_381_aggregate::{
+        BlsDoryIndexedRowSource, commit_bls_dory_indexed_row_source_with_scratch,
+        commit_bls_dory_row_source_with_scratch,
+    },
     dory_bls12_381_streaming::BlsDoryRowSource,
 };
 
@@ -81,7 +82,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, compact transition/inverse sources, challenge-bound compressed early LogUp lineages, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.517 seconds proving plus 7.036 seconds opening; CPU n=33 projects to roughly 1.80 plus 1.34 days and the fourth range pair still projects near 140.06 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
+    "bounded parallel work, compact transition sources, mapped inverse views, challenge-bound compressed early LogUp lineages, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.479 seconds proving plus 7.048 seconds opening; CPU n=33 projects to roughly 1.80 plus 1.34 days and the fourth range pair still projects near 112.56 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -351,34 +352,11 @@ pub fn projected_production_range_logup_proof_bytes() -> Result<usize, BlsDoryRa
     )
 }
 
-/// Exact retained coefficient bytes for the production LogUp inverse source.
+/// Extra retained coefficient-file bytes for the mapped production inverse.
+/// The inverse reuses the authenticated transition artifact and adds no file.
 pub fn projected_production_range_logup_inverse_artifact_bytes()
 -> Result<u64, BlsDoryRangeLogUpError> {
-    let cells = 1u64
-        .checked_shl(
-            u32::try_from(
-                PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES - BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES,
-            )
-            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
-        )
-        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    let scalar_count = 1u64
-        .checked_shl(
-            u32::try_from(PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES)
-                .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
-        )
-        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    let explicit_scalar_count = cells
-        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
-        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    BlsDoryIndexArtifactSpec {
-        context_digest: [1; 32],
-        scalar_count,
-        explicit_scalar_count,
-        literal_scalar_count: 0,
-    }
-    .encoded_bytes(TABLE_VALUES + 1)
-    .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)
+    Ok(0)
 }
 
 /// Exact retained transition plus inverse bytes for one production pair.
@@ -751,22 +729,22 @@ fn prove_from_source_deferred(
         } else {
             (None, None, None, None)
         };
-    let inverse = if let Some(scratch_directory) = scratch_directory {
-        let mut inverse_source = LogUpInverseCodeRowSource::new(
-            witness_source
-                .as_ref()
-                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
-            alpha,
-            elements,
-            rows,
-            columns,
-        )?;
-        commit_bls_dory_indexed_row_source_with_scratch(
-            &mut inverse_source,
-            nu,
-            sigma,
+    let inverse = if scratch_directory.is_some() {
+        let mapped_dictionary = (0..TABLE_VALUES)
+            .map(|digit| {
+                (alpha - BlsDoryFr::from_u64(digit as u64))
+                    .inv()
+                    .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let zero_prefix_count = elements
+            .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        commit_bls_dory_mapped_compact_polynomial(
+            &transition,
+            zero_prefix_count,
+            mapped_dictionary,
             setup,
-            scratch_directory,
         )?
     } else {
         let transition_explicit_len = elements
@@ -1239,6 +1217,7 @@ struct LogUpInverseRowSource<'a, 'w> {
     denominators: Vec<BlsDoryFr>,
 }
 
+#[cfg(test)]
 struct LogUpInverseCodeRowSource<'a, 'w> {
     transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
     elements: usize,
@@ -1248,6 +1227,7 @@ struct LogUpInverseCodeRowSource<'a, 'w> {
     dictionary: Vec<BlsDoryFr>,
 }
 
+#[cfg(test)]
 impl<'a, 'w> LogUpInverseCodeRowSource<'a, 'w> {
     fn new(
         transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
@@ -1286,6 +1266,7 @@ impl<'a, 'w> LogUpInverseCodeRowSource<'a, 'w> {
     }
 }
 
+#[cfg(test)]
 impl BlsDoryIndexedRowSource for LogUpInverseCodeRowSource<'_, '_> {
     type Error = BlsDoryRangeLogUpError;
 
@@ -3894,7 +3875,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_inverse_commitment_matches_scalar_and_reduces_storage() {
+    fn mapped_inverse_matches_scalar_without_a_second_coefficient_file() {
         let (statement, _, witness) = fixture();
         let variables = minimum_packed_variables(statement).unwrap();
         let (nu, sigma) = dory_layout(variables);
@@ -3907,6 +3888,7 @@ mod tests {
             BlsDoryTransitionWitnessRowSource::new(statement, &witness, rows, columns).unwrap();
         let scalar_scratch = ScratchDirectory::create();
         let indexed_scratch = ScratchDirectory::create();
+        let transition_scratch = ScratchDirectory::create();
 
         let mut scalar_source =
             LogUpInverseRowSource::new(&source, alpha, elements, rows, columns).unwrap();
@@ -3928,9 +3910,44 @@ mod tests {
             &indexed_scratch.0,
         )
         .unwrap();
+        let mut compact_source =
+            BlsDoryTransitionWitnessRowSource::new(statement, &witness, rows, columns).unwrap();
+        let transition = commit_bls_dory_compact_row_source_with_scratch(
+            &mut compact_source,
+            nu,
+            sigma,
+            &setup,
+            &transition_scratch.0,
+        )
+        .unwrap();
+        let mapped_dictionary = (0..TABLE_VALUES)
+            .map(|digit| (alpha - BlsDoryFr::from_u64(digit as u64)).inv().unwrap())
+            .collect::<Vec<_>>();
+        let mapped = commit_bls_dory_mapped_compact_polynomial(
+            &transition,
+            elements * STRUCTURED_TRANSITION_REGULAR_ORACLES,
+            mapped_dictionary,
+            &setup,
+        )
+        .unwrap();
 
         assert_eq!(indexed.commitment(), scalar.commitment());
         assert_eq!(indexed.row_commitments(), scalar.row_commitments());
+        assert_eq!(mapped.commitment(), scalar.commitment());
+        assert_eq!(mapped.row_commitments(), scalar.row_commitments());
+        let mut mapped_coefficients = Vec::new();
+        mapped
+            .for_each_explicit_coefficient(|_index, coefficient| {
+                mapped_coefficients.push(coefficient)
+            })
+            .unwrap();
+        let mut scalar_coefficients = Vec::new();
+        scalar
+            .for_each_explicit_coefficient(|_index, coefficient| {
+                scalar_coefficients.push(coefficient)
+            })
+            .unwrap();
+        assert_eq!(mapped_coefficients, scalar_coefficients);
         let scalar_bytes = std::fs::metadata(scalar.coefficient_artifact_path().unwrap())
             .unwrap()
             .len();
@@ -3940,11 +3957,25 @@ mod tests {
         let explicit = u64::try_from(elements * STRUCTURED_TRANSITION_ORACLES).unwrap();
         assert_eq!(indexed_bytes, explicit + 72 + 17 * 32 + 32);
         assert!(indexed_bytes * 10 < scalar_bytes);
+        let transition_path = transition
+            .coefficient_artifact_path()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(
+            mapped.coefficient_artifact_path(),
+            Some(transition_path.as_path())
+        );
+        assert_eq!(std::fs::read_dir(&transition_scratch.0).unwrap().count(), 1);
 
         drop(scalar);
         drop(indexed);
+        drop(transition);
+        assert!(transition_path.exists());
+        drop(mapped);
+        assert!(!transition_path.exists());
         assert_eq!(std::fs::read_dir(&scalar_scratch.0).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(&indexed_scratch.0).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&transition_scratch.0).unwrap().count(), 0);
     }
 
     #[test]
@@ -4576,11 +4607,11 @@ mod tests {
         );
         assert_eq!(
             projected_production_range_logup_inverse_artifact_bytes().unwrap(),
-            7_381_975_688
+            0
         );
         assert_eq!(
             projected_production_transition_range_source_bytes().unwrap(),
-            20_401_095_936
+            13_019_120_248
         );
         assert_eq!(
             projected_production_range_logup_compressed_lineage_bytes().unwrap(),
@@ -4592,7 +4623,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_range_logup_four_pair_peak_bytes().unwrap(),
-            150_390_969_648
+            120_863_066_896
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

@@ -42,14 +42,6 @@ pub struct BlsDoryIndexArtifactSpec {
 }
 
 impl BlsDoryIndexArtifactSpec {
-    pub(crate) fn encoded_bytes(
-        self,
-        dictionary_len: usize,
-    ) -> Result<u64, BlsDoryIndexArtifactError> {
-        self.validate(dictionary_len)?;
-        artifact_file_bytes(self, dictionary_len)
-    }
-
     fn validate(self, dictionary_len: usize) -> Result<(), BlsDoryIndexArtifactError> {
         if self.context_digest == [0; 32]
             || self.scalar_count == 0

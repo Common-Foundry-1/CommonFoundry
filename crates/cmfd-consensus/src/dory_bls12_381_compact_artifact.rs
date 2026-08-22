@@ -9,6 +9,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dory_pcs::primitives::{DorySerialize, arithmetic::Field};
@@ -25,7 +26,15 @@ const ARTIFACT_SCALAR_BYTES: usize = 32;
 const ARTIFACT_WORD_BYTES: usize = 8;
 const ARTIFACT_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const ARTIFACT_HASH_DOMAIN: &str = "CommonFoundry/ForgeMatrix/BlsDoryCompactArtifact/v1";
+const MAPPED_ARTIFACT_HASH_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/BlsDoryMappedCompactArtifact/v1";
 static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+enum CompactEncodedScalar {
+    Word { value: u64, signed: bool },
+    Code(u8),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlsDoryCompactArtifactSpec {
@@ -289,6 +298,16 @@ pub struct BlsDoryCompactArtifact {
     digest: [u8; 32],
 }
 
+/// An authenticated coefficient view derived from a compact source without a
+/// second coefficient file. A prefix maps to zero; each remaining canonical
+/// source digit selects the corresponding scalar in `mapped_dictionary`.
+pub struct BlsDoryMappedCompactArtifact {
+    source: Arc<BlsDoryCompactArtifact>,
+    zero_prefix_count: u64,
+    mapped_dictionary: Vec<BlsDoryFr>,
+    digest: [u8; 32],
+}
+
 impl BlsDoryCompactArtifact {
     #[must_use]
     pub const fn spec(&self) -> BlsDoryCompactArtifactSpec {
@@ -303,6 +322,29 @@ impl BlsDoryCompactArtifact {
     pub fn for_each_scalar(
         &self,
         mut visitor: impl FnMut(BlsDoryFr) -> Result<(), BlsDoryCompactArtifactError>,
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        self.for_each_encoded_scalar(|_index, encoded| {
+            let scalar = match encoded {
+                CompactEncodedScalar::Word { value, signed } => {
+                    if signed {
+                        BlsDoryFr::from_i64(i64::from_le_bytes(value.to_le_bytes()))
+                    } else {
+                        BlsDoryFr::from_u64(value)
+                    }
+                }
+                CompactEncodedScalar::Code(code) => self
+                    .dictionary
+                    .get(usize::from(code))
+                    .copied()
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?,
+            };
+            visitor(scalar)
+        })
+    }
+
+    fn for_each_encoded_scalar(
+        &self,
+        mut visitor: impl FnMut(u64, CompactEncodedScalar) -> Result<(), BlsDoryCompactArtifactError>,
     ) -> Result<(), BlsDoryCompactArtifactError> {
         self.validate_live_file(|reader, hasher| {
             let words_per_chunk = ARTIFACT_IO_BUFFER_BYTES / ARTIFACT_WORD_BYTES;
@@ -323,12 +365,13 @@ impl BlsDoryCompactArtifact {
                         .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
                     let selector = word_index / self.spec.word_group_len;
                     let signed = self.spec.signed_word_selectors & (1u64 << selector) != 0;
-                    let scalar = if signed {
-                        BlsDoryFr::from_i64(i64::from_le_bytes(bytes))
-                    } else {
-                        BlsDoryFr::from_u64(u64::from_le_bytes(bytes))
-                    };
-                    visitor(scalar)?;
+                    visitor(
+                        word_index,
+                        CompactEncodedScalar::Word {
+                            value: u64::from_le_bytes(bytes),
+                            signed,
+                        },
+                    )?;
                     word_index += 1;
                 }
                 remaining -= words as u64;
@@ -345,14 +388,14 @@ impl BlsDoryCompactArtifact {
                 reader.read_exact(&mut codes[..take])?;
                 hasher.update(&codes[..take]);
                 for code in &codes[..take] {
-                    visitor(
-                        self.dictionary
-                            .get(usize::from(*code))
-                            .copied()
-                            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?,
-                    )?;
+                    let index = self
+                        .spec
+                        .explicit_scalar_count
+                        .checked_sub(remaining)
+                        .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+                    visitor(index, CompactEncodedScalar::Code(*code))?;
+                    remaining -= 1;
                 }
-                remaining -= take as u64;
             }
             Ok(())
         })
@@ -425,6 +468,149 @@ impl BlsDoryCompactArtifact {
     #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl BlsDoryMappedCompactArtifact {
+    pub(crate) fn new(
+        source: Arc<BlsDoryCompactArtifact>,
+        zero_prefix_count: u64,
+        mapped_dictionary: Vec<BlsDoryFr>,
+    ) -> Result<Self, BlsDoryCompactArtifactError> {
+        if zero_prefix_count == 0
+            || zero_prefix_count > source.spec.word_scalar_count
+            || zero_prefix_count >= source.spec.explicit_scalar_count
+            || mapped_dictionary.len() != source.dictionary.len()
+            || source
+                .dictionary
+                .iter()
+                .enumerate()
+                .any(|(index, scalar)| *scalar != BlsDoryFr::from_u64(index as u64))
+            || mapped_dictionary
+                .iter()
+                .enumerate()
+                .any(|(index, scalar)| mapped_dictionary[..index].contains(scalar))
+        {
+            return Err(BlsDoryCompactArtifactError::InvalidSpec);
+        }
+        let mut hasher = blake3::Hasher::new_derive_key(MAPPED_ARTIFACT_HASH_DOMAIN);
+        hasher.update(&source.digest);
+        hasher.update(&zero_prefix_count.to_le_bytes());
+        hasher.update(&(mapped_dictionary.len() as u64).to_le_bytes());
+        for scalar in &mapped_dictionary {
+            hasher.update(&encode_scalar(scalar)?);
+        }
+        let digest = *hasher.finalize().as_bytes();
+        Ok(Self {
+            source,
+            zero_prefix_count,
+            mapped_dictionary,
+            digest,
+        })
+    }
+
+    #[must_use]
+    pub fn scalar_count(&self) -> u64 {
+        self.source.spec.scalar_count
+    }
+
+    #[must_use]
+    pub fn explicit_scalar_count(&self) -> u64 {
+        self.source.spec.explicit_scalar_count
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub fn for_each_scalar(
+        &self,
+        mut visitor: impl FnMut(BlsDoryFr) -> Result<(), BlsDoryCompactArtifactError>,
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        self.source
+            .for_each_encoded_scalar(|index, encoded| visitor(self.mapped_scalar(index, encoded)?))
+    }
+
+    pub fn for_each_chunk(
+        &self,
+        chunk_scalars: usize,
+        mut visitor: impl FnMut(&[BlsDoryFr]) -> Result<(), BlsDoryCompactArtifactError>,
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        if chunk_scalars == 0 {
+            return Err(BlsDoryCompactArtifactError::InvalidSpec);
+        }
+        let capacity = chunk_scalars.min(
+            usize::try_from(self.explicit_scalar_count())
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?,
+        );
+        let mut chunk = Vec::with_capacity(capacity);
+        self.source.for_each_encoded_scalar(|index, encoded| {
+            chunk.push(self.mapped_scalar(index, encoded)?);
+            if chunk.len() == chunk_scalars {
+                visitor(&chunk)?;
+                chunk.clear();
+            }
+            Ok(())
+        })?;
+        if !chunk.is_empty() {
+            visitor(&chunk)?;
+        }
+        Ok(())
+    }
+
+    pub fn for_each_pair(
+        &self,
+        mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr) -> Result<(), BlsDoryCompactArtifactError>,
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        if self.scalar_count() < 2 {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        let mut pending = None;
+        self.for_each_scalar(|scalar| {
+            if let Some(lower) = pending.take() {
+                visitor(lower, scalar)
+            } else {
+                pending = Some(scalar);
+                Ok(())
+            }
+        })?;
+        if let Some(lower) = pending {
+            visitor(lower, BlsDoryFr::zero())?;
+        }
+        Ok(())
+    }
+
+    fn mapped_scalar(
+        &self,
+        index: u64,
+        encoded: CompactEncodedScalar,
+    ) -> Result<BlsDoryFr, BlsDoryCompactArtifactError> {
+        if index < self.zero_prefix_count {
+            return Ok(BlsDoryFr::zero());
+        }
+        let digit = match encoded {
+            CompactEncodedScalar::Word {
+                value,
+                signed: false,
+            } => usize::try_from(value)
+                .ok()
+                .filter(|digit| *digit < self.mapped_dictionary.len())
+                .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?,
+            CompactEncodedScalar::Word { signed: true, .. } => {
+                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+            }
+            CompactEncodedScalar::Code(code) => usize::from(code),
+        };
+        self.mapped_dictionary
+            .get(digit)
+            .copied()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source.path
     }
 }
 
@@ -625,5 +811,66 @@ mod tests {
             drop(artifact);
             assert!(!path.exists());
         }
+    }
+
+    #[test]
+    fn mapped_view_reuses_authenticated_codes_binds_mapping_and_owns_lifetime() {
+        let directory = TestDirectory::create();
+        let words = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3];
+        let codes = [3, 2, 1, 0, 0, 1, 2, 3];
+        let dictionary = (0..4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+        let mut writer =
+            BlsDoryCompactArtifactWriter::create(&directory.0, spec(), dictionary).unwrap();
+        writer.write_words(&words).unwrap();
+        writer.write_codes(&codes).unwrap();
+        let source = Arc::new(writer.finish().unwrap());
+        let path = source.path().to_path_buf();
+        let mapped_dictionary = (100..104).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+        let mapped =
+            BlsDoryMappedCompactArtifact::new(Arc::clone(&source), 12, mapped_dictionary.clone())
+                .unwrap();
+        let other_mapping = BlsDoryMappedCompactArtifact::new(
+            Arc::clone(&source),
+            12,
+            (200..204).map(BlsDoryFr::from_u64).collect(),
+        )
+        .unwrap();
+        assert_ne!(mapped.digest(), other_mapping.digest());
+
+        let mut decoded = Vec::new();
+        mapped
+            .for_each_chunk(5, |chunk| {
+                decoded.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        let expected = std::iter::repeat_n(BlsDoryFr::zero(), 12)
+            .chain([0usize, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3].map(|digit| mapped_dictionary[digit]))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, expected);
+        assert!(
+            BlsDoryMappedCompactArtifact::new(Arc::clone(&source), 12, vec![BlsDoryFr::one(); 4],)
+                .is_err()
+        );
+        let signed_suffix =
+            BlsDoryMappedCompactArtifact::new(Arc::clone(&source), 8, mapped_dictionary).unwrap();
+        assert!(signed_suffix.for_each_scalar(|_| Ok(())).is_err());
+
+        let code_offset = ARTIFACT_HEADER_BYTES as u64
+            + 4 * ARTIFACT_SCALAR_BYTES as u64
+            + 16 * ARTIFACT_WORD_BYTES as u64;
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(code_offset)).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.flush().unwrap();
+        assert!(mapped.for_each_scalar(|_| Ok(())).is_err());
+
+        drop(file);
+        drop(mapped);
+        drop(other_mapping);
+        drop(signed_suffix);
+        assert!(path.exists());
+        drop(source);
+        assert!(!path.exists());
     }
 }

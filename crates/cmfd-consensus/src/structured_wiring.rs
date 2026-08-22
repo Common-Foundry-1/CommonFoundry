@@ -97,15 +97,15 @@ impl StructuredWiringStatement {
         Ok(())
     }
 
-    fn elements(&self) -> Result<usize, StructuredWiringError> {
+    pub(crate) fn elements(&self) -> Result<usize, StructuredWiringError> {
         checked_product(&[self.banks, self.layers_per_bank, self.rows, self.cols])
     }
 
-    fn bank_elements(&self) -> Result<usize, StructuredWiringError> {
+    pub(crate) fn bank_elements(&self) -> Result<usize, StructuredWiringError> {
         checked_product(&[self.layers_per_bank, self.rows, self.cols])
     }
 
-    fn cell_variables(&self) -> u32 {
+    pub(crate) fn cell_variables(&self) -> u32 {
         self.cols.ilog2() + self.rows.ilog2()
     }
 }
@@ -735,7 +735,7 @@ fn opening_claims(
     }
 }
 
-fn validate_tables(
+pub(crate) fn validate_tables(
     statement: StructuredWiringStatement,
     initial: &[i64],
     inputs: &[i64],
@@ -758,7 +758,7 @@ fn validate_tables(
     Ok(())
 }
 
-fn validate_successors(
+pub(crate) fn validate_successors(
     statement: StructuredWiringStatement,
     initial: &[i64],
     inputs: &[i64],

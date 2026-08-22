@@ -823,6 +823,22 @@ cell variables plus seven selector variables; the unchanged n=33 grammar
 projects to 89,763 bytes, of which 70,639 bytes are the opening aggregate. This
 is size accounting, not a production-scale proving result.
 
+The successor-wiring checkpoint uses the same scalar field and Dory backend. It
+packs the initial activation table and up to three input/output bank pairs into
+eight selector slots under one commitment. Challenges sampled after that
+commitment reduce every within-bank successor edge to the exact shift identity
+from Section 5, while fixed first/last-layer openings enforce initialization and
+both bank boundaries. A single distinct-point aggregate authenticates all of
+those evaluations. The executable two-bank, two-layer fixture packs to n=6 and
+is 14,529 bytes with nine openings, including a 13,615-byte Dory aggregate. The
+production table has 26 table variables plus three selector variables and needs
+31 openings; its n=29 grammar projects to 64,097 bytes, including 62,479 bytes
+for the aggregate. The verifier receives no activation tables. Its canonical
+parser preflights the statement-derived variables, evaluation count, opening
+length, and total length, and mutation tests cover every evaluation role.
+Production still needs equality links from the future scalar matrix commitments
+and existing packed transition commitments to these wiring roles.
+
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
 characteristics differ. Cross-field tests do show that the canonical
@@ -830,12 +846,12 @@ bounded-integer witness makes all 121 local transition constraints vanish in
 the cubic Goldilocks field, the BN254 reference scalar field, and the actual
 BLS12-381 scalar field across signed boundary cases, while altered reductions
 and digits fail with the same constraint pattern in all three. The selected
-route is therefore native scalar-field re-arithmetization. The distinct-point
-and full local-transition sumcheck transcripts are now ported. The matrix,
-successor-wiring, and production packed LogUp arguments are not yet connected.
-Streaming the n=33 transition and n=31 model polynomials, complete soundness
-accounting, full aggregate measurement, and independent audit remain mandatory
-activation gates.
+route is therefore native scalar-field re-arithmetization. The distinct-point,
+full local-transition, and successor-wiring transcripts are now ported. The
+matrix and production packed LogUp arguments, plus the cross-component scalar
+commitment links, are not yet connected. Streaming the n=29 wiring, n=33
+transition, and n=31 model polynomials, complete soundness accounting, full
+aggregate measurement, and independent audit remain mandatory activation gates.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

@@ -416,6 +416,14 @@ comparison. The v2 research code now implements:
   nodes in canonical first-reference order. Ten 13-variable explicit
   envelopes measured 188,104 through 190,024 bytes and passed the unchanged
   verifier;
+- an optional `dory-bls12-381-prototype` backend with deterministic,
+  identity-pinned BLS12-381 setup, canonical distinct-point aggregation, an
+  exact 121-constraint scalar transition sumcheck, and a packed successor-wiring
+  argument. Witness-free fixture proofs are 27,651 bytes for transition and
+  14,529 bytes for wiring; their n=33 and n=29 production grammars project to
+  89,763 and 64,097 bytes. The scalar matrix argument, packed LogUp path,
+  cross-component commitment links, streaming provers, soundness review, and
+  audit remain activation gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

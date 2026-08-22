@@ -35,9 +35,10 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 /// This aggregate remains unavailable to consensus activation.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
-pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the matrix, successor-wiring, and packed LogUp arguments are not yet connected over the pairing scalar field",
-    "the production n=31 polynomial is not streamed by this in-memory implementation",
+pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 5] = [
+    "the matrix identities and packed LogUp argument are not yet connected over the pairing scalar field",
+    "the scalar matrix and transition commitments are not yet linked to the packed wiring roles",
+    "the production n=29/n=31/n=33 polynomials are not streamed by this in-memory implementation",
     "the aggregate soundness bound has not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -1072,7 +1073,7 @@ mod tests {
             require_bls_dory_aggregate_production_ready(),
             Err(BlsDoryAggregateError::NotProductionReady)
         );
-        assert_eq!(BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS.len(), 4);
+        assert_eq!(BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS.len(), 5);
         let projected = projected_bls_dory_aggregate_bytes(31).unwrap();
         assert_eq!(projected, 66_559);
         assert!(projected < MAX_BLS_DORY_AGGREGATE_BYTES);

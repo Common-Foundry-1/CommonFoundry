@@ -180,8 +180,17 @@ bytes for an executable n=10 packed fixture. The same grammar projects to 89,763
 bytes for the production n=33 transition table. The verifier is witness-free and
 tests reject statement, mask, round, terminal, commitment, opening, length, and
 trailing-byte mutations. This still does not provide a streamed n=33 prover,
-the production packed LogUp path, the matrix/wiring scalar arguments, a complete
-soundness analysis, or an audit.
+the production packed LogUp path, a complete soundness analysis, or an audit.
+The scalar wiring checkpoint packs the initial activation plus three input/output
+bank pairs into eight selector slots under one Dory commitment. It authenticates
+all initialization, within-bank successor, and cross-bank boundary evaluations.
+Its executable two-bank n=6 fixture uses nine openings and is 14,529 bytes. The
+production n=29 grammar uses 31 openings and projects to 64,097 bytes, including
+a 62,479-byte Dory aggregate. The verifier is witness-free and mutation tests
+cover the binding, statement, commitment, every evaluation, transcript, opening,
+and outer parser. The scalar matrix argument and the cross-component links from
+matrix/transition commitments to these wiring roles are still missing; n=29
+streaming, soundness review, and audit also remain gates.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

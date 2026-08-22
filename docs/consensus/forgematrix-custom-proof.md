@@ -1039,9 +1039,13 @@ equations to centered integer expressions and evaluates them over BLS12-381.
 An honest nonconstant 32-byte trace at a nonzero point satisfies every equation
 on all 256 rows; a changed trace cell and a changed public point are both
 rejected. The largest centered constant is exactly `2^33`. The three-limb
-evaluation accumulator still must be replaced by one BLS scalar and wired into
-the Dory execution sumcheck; adjacency soundness, a complete n=33 run,
-independent review, and audit also remain.
+evaluation relation is now replaced in a test-only native layout: nine old
+equations are removed, 1,296 translated equations remain, and three BLS-scalar
+accumulator equations produce a 1,299-constraint, 289-column trace. The honest
+trace reaches the Dory-authenticated raw-byte evaluation, while accumulator,
+hashed-byte, Dory-point, and final-evaluation mutations fail. It is not yet
+wired into the Dory execution sumcheck; adjacency soundness, a complete n=33
+run, independent review, and audit also remain.
 
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate

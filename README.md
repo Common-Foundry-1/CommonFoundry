@@ -279,10 +279,13 @@ existing BLAKE3 AIR equations as centered integer expressions and evaluates
 them over BLS12-381. A nonconstant 32-byte activation at a nonzero point
 satisfies every translated equation across all 256 rows; changing either one
 trace cell or one public point value is rejected. The largest translated
-constant is exactly `2^33`. This differential checkpoint does not yet replace
-the three Goldilocks evaluation limbs with one BLS scalar or implement the Dory
-execution sumcheck, adjacency argument, soundness analysis, end-to-end
-verification, or audit.
+constant is exactly `2^33`. A second test-only relation removes exactly nine
+three-limb evaluation equations, retains 1,296 translated BLAKE3 equations, and
+adds three native accumulator equations. The resulting 1,299-constraint trace
+has the projected 289 main columns and reaches the Dory-authenticated raw-byte
+evaluation; accumulator, hashed-byte, Dory-point, and final-evaluation
+mutations are rejected. The Dory execution sumcheck, adjacency argument,
+soundness analysis, end-to-end verification, and audit remain incomplete.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

@@ -332,8 +332,12 @@ translation now evaluates all 1,305 existing BLAKE3 constraints over BLS12-381:
 a nonconstant 32-byte, 256-row trace at a nonzero point satisfies every equation,
 while trace-cell and public-point mutations fail. The exact largest centered
 constant is `2^33`. This closes the field-translation checkpoint only; the
-one-scalar accumulator, Dory execution sumcheck, adjacency argument and union
-bound, complete proof, independent review, and audit remain required.
+test-only native relation also replaces the nine three-limb evaluation
+equations with three BLS-scalar equations while retaining 1,296 other equations.
+Its 289-column honest trace reaches the Dory-authenticated raw-byte evaluation,
+and accumulator, hashed-byte, point, and claimed-evaluation mutations fail. The
+Dory execution sumcheck, adjacency argument and union bound, complete proof,
+independent review, and audit remain required.
 
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its

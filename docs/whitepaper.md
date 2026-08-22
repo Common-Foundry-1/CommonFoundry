@@ -676,8 +676,12 @@ nonconstant 32-byte activation and nonzero opening point, every translated
 equation evaluates to zero over BLS12-381 on all 256 rows; changing one trace
 cell or one public point value is rejected. The largest centered constant is
 exactly `2^33`. This validates the translation route on the bounded fixture; it
-does not yet replace the three Goldilocks evaluation limbs with one BLS scalar,
-produce a Dory sumcheck, bind row adjacency, or authorize V3.
+also supports a test-only native layout that removes nine three-limb evaluation
+equations, retains 1,296 translated equations, and adds three one-scalar
+evaluation equations. The resulting 1,299-constraint trace has 289 main
+columns, reaches the Dory-authenticated raw-byte evaluation, and rejects
+accumulator, hashed-byte, Dory-point, and claimed-evaluation mutations. This
+does not yet produce a Dory sumcheck, bind row adjacency, or authorize V3.
 
 The verified model-bank reader can now transactionally publish reusable BLS coefficient artifacts as well as the fixed identity. It builds the base input and every ordered weight bank while checking the canonical byte roots and EOF, returns nothing on failure, and cleans provisional files. Its writer reassembles arbitrary authenticated input chunks into canonical rows, commits complete rows in deterministic parallel batches behind a bounded 256 MiB window, and preserves canonical artifact and target-group accumulation order. Three n=19 release A/B repeats measured 814--826 ms for the former serial writer and 377--391 ms for the parallel writer; their 822 and 385 ms medians give a 53.2% reduction while producing the identical artifact digest, row commitments, tier-two commitment, opening claims, and proof bytes. Matrix proving consumes the authenticated weight artifact sequentially, reuses it in the shared aggregate opening, and rejects a commitment from the wrong pinned bank before proving. Bounded fixtures match materialized proof bytes exactly. This removes the roughly 16 GiB in-memory `i64` slice for an n=31 weight bank. It also replaces the former 32-byte-per-weight scalar artifact: the first Dory row is stored as canonical signed words and each remaining model weight in the consensus range `[-125, 125]` is one authenticated byte selecting the fixed dictionary `0, -1..-125, 1..125`. Every read reauthenticates the dictionary, codes, dimensions, source digest, and EOF before expansion.
 

@@ -25,7 +25,11 @@ use crate::dory_bls12_381_prototype::BlsDoryFr;
 #[cfg(all(test, feature = "whir-prototype"))]
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredBlake3Statement,
-    structured_blake3_narrow::{F as Goldilocks, NarrowBlake3Air, NarrowBlake3Error},
+    dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
+    structured_blake3_narrow::{
+        F as Goldilocks, NarrowBlake3Air, NarrowBlake3Error, TEST_EVALUATION_ACCUMULATOR_START,
+        TEST_MAIN_WIDTH, TEST_ORIGINAL_NIBBLES_START, TEST_STACK_START,
+    },
 };
 use crate::{
     dory_bls12_381_layout::BLS_DORY_SHARED_PRODUCTION_CLAIMS,
@@ -46,6 +50,9 @@ pub const BLS_DORY_BLAKE3_MAIN_WIDTH: usize = 289;
 pub const BLS_DORY_BLAKE3_PREPROCESSED_WIDTH: usize = 84;
 /// The translated execution constraints have degree at most sixteen.
 pub const BLS_DORY_BLAKE3_EXECUTION_CONSTRAINT_DEGREE: usize = 16;
+/// The native relation keeps 1,296 BLAKE3 constraints and replaces nine
+/// three-limb evaluation constraints with three scalar constraints.
+pub const BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS: usize = 1_299;
 /// Multiplying by the row-equality polynomial raises sumcheck degree by one.
 pub const BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE: usize =
     BLS_DORY_BLAKE3_EXECUTION_CONSTRAINT_DEGREE + 1;
@@ -271,6 +278,197 @@ fn centered_goldilocks(value: Goldilocks) -> i64 {
     }
 }
 
+#[cfg(all(test, feature = "whir-prototype"))]
+fn uses_old_evaluation_constraint(expression: &BlsDoryBlake3ConstraintExpr) -> bool {
+    match expression {
+        BlsDoryBlake3ConstraintExpr::Variable(BlsDoryBlake3Variable::Main { index, .. }) => {
+            (TEST_EVALUATION_ACCUMULATOR_START..TEST_STACK_START).contains(&usize::from(*index))
+        }
+        BlsDoryBlake3ConstraintExpr::Add(left, right)
+        | BlsDoryBlake3ConstraintExpr::Sub(left, right)
+        | BlsDoryBlake3ConstraintExpr::Mul(left, right) => {
+            uses_old_evaluation_constraint(left) || uses_old_evaluation_constraint(right)
+        }
+        BlsDoryBlake3ConstraintExpr::Neg(value) => uses_old_evaluation_constraint(value),
+        BlsDoryBlake3ConstraintExpr::Variable(_)
+        | BlsDoryBlake3ConstraintExpr::FirstRow
+        | BlsDoryBlake3ConstraintExpr::LastRow
+        | BlsDoryBlake3ConstraintExpr::Transition
+        | BlsDoryBlake3ConstraintExpr::Constant(_) => false,
+    }
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn remap_native_main_constraint(
+    expression: &BlsDoryBlake3ConstraintExpr,
+) -> Result<BlsDoryBlake3ConstraintExpr, NarrowBlake3Error> {
+    Ok(match expression {
+        BlsDoryBlake3ConstraintExpr::Variable(variable) => {
+            let variable = match *variable {
+                BlsDoryBlake3Variable::Main { offset, index } => {
+                    let index = usize::from(index);
+                    if (TEST_EVALUATION_ACCUMULATOR_START..TEST_STACK_START).contains(&index) {
+                        return Err(NarrowBlake3Error::Encoding);
+                    }
+                    let native_index = if index >= TEST_STACK_START {
+                        index - (TEST_STACK_START - TEST_EVALUATION_ACCUMULATOR_START - 1)
+                    } else {
+                        index
+                    };
+                    BlsDoryBlake3Variable::Main {
+                        offset,
+                        index: u16::try_from(native_index)
+                            .map_err(|_| NarrowBlake3Error::Encoding)?,
+                    }
+                }
+                other => other,
+            };
+            BlsDoryBlake3ConstraintExpr::Variable(variable)
+        }
+        BlsDoryBlake3ConstraintExpr::FirstRow => BlsDoryBlake3ConstraintExpr::FirstRow,
+        BlsDoryBlake3ConstraintExpr::LastRow => BlsDoryBlake3ConstraintExpr::LastRow,
+        BlsDoryBlake3ConstraintExpr::Transition => BlsDoryBlake3ConstraintExpr::Transition,
+        BlsDoryBlake3ConstraintExpr::Constant(value) => {
+            BlsDoryBlake3ConstraintExpr::Constant(*value)
+        }
+        BlsDoryBlake3ConstraintExpr::Add(left, right) => BlsDoryBlake3ConstraintExpr::Add(
+            Box::new(remap_native_main_constraint(left)?),
+            Box::new(remap_native_main_constraint(right)?),
+        ),
+        BlsDoryBlake3ConstraintExpr::Sub(left, right) => BlsDoryBlake3ConstraintExpr::Sub(
+            Box::new(remap_native_main_constraint(left)?),
+            Box::new(remap_native_main_constraint(right)?),
+        ),
+        BlsDoryBlake3ConstraintExpr::Neg(value) => {
+            BlsDoryBlake3ConstraintExpr::Neg(Box::new(remap_native_main_constraint(value)?))
+        }
+        BlsDoryBlake3ConstraintExpr::Mul(left, right) => BlsDoryBlake3ConstraintExpr::Mul(
+            Box::new(remap_native_main_constraint(left)?),
+            Box::new(remap_native_main_constraint(right)?),
+        ),
+    })
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn uses_removed_native_input(expression: &BlsDoryBlake3ConstraintExpr) -> bool {
+    match expression {
+        BlsDoryBlake3ConstraintExpr::Variable(BlsDoryBlake3Variable::Public { index }) => {
+            usize::from(*index) >= 72
+        }
+        BlsDoryBlake3ConstraintExpr::Variable(BlsDoryBlake3Variable::Periodic { .. }) => true,
+        BlsDoryBlake3ConstraintExpr::Add(left, right)
+        | BlsDoryBlake3ConstraintExpr::Sub(left, right)
+        | BlsDoryBlake3ConstraintExpr::Mul(left, right) => {
+            uses_removed_native_input(left) || uses_removed_native_input(right)
+        }
+        BlsDoryBlake3ConstraintExpr::Neg(value) => uses_removed_native_input(value),
+        BlsDoryBlake3ConstraintExpr::Variable(_)
+        | BlsDoryBlake3ConstraintExpr::FirstRow
+        | BlsDoryBlake3ConstraintExpr::LastRow
+        | BlsDoryBlake3ConstraintExpr::Transition
+        | BlsDoryBlake3ConstraintExpr::Constant(_) => false,
+    }
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn bls_dory_native_blake3_constraint_ir(
+    activation_len: usize,
+) -> Result<Vec<BlsDoryBlake3ConstraintExpr>, NarrowBlake3Error> {
+    bls_dory_blake3_constraint_ir(activation_len)?
+        .iter()
+        .filter(|constraint| !uses_old_evaluation_constraint(constraint))
+        .map(remap_native_main_constraint)
+        .collect()
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn native_main_row(old_row: &[BlsDoryFr], accumulator: BlsDoryFr) -> Vec<BlsDoryFr> {
+    assert_eq!(old_row.len(), TEST_MAIN_WIDTH);
+    let mut row = Vec::with_capacity(BLS_DORY_BLAKE3_MAIN_WIDTH);
+    row.extend_from_slice(&old_row[..TEST_EVALUATION_ACCUMULATOR_START]);
+    row.push(accumulator);
+    row.extend_from_slice(&old_row[TEST_STACK_START..]);
+    assert_eq!(row.len(), BLS_DORY_BLAKE3_MAIN_WIDTH);
+    row
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn native_activation_contribution(
+    main_local: &[BlsDoryFr],
+    activation_group: Option<usize>,
+    point: &[BlsDoryFr],
+) -> BlsDoryFr {
+    let Some(group) = activation_group else {
+        return BlsDoryFr::zero();
+    };
+    (0..8).fold(BlsDoryFr::zero(), |sum, byte| {
+        let low = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte];
+        let high = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte + 1];
+        let value = low + BlsDoryFr::from_u64(16) * high;
+        let index = group + byte;
+        let weight = point.iter().enumerate().fold(
+            BlsDoryFr::from_u64(1),
+            |weight, (variable, coordinate)| {
+                if (index >> variable) & 1 == 1 {
+                    weight * *coordinate
+                } else {
+                    weight * (BlsDoryFr::from_u64(1) - *coordinate)
+                }
+            },
+        );
+        sum + value * weight
+    })
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+struct BlsDoryNativeEvaluationRow<'a> {
+    main_local: &'a [BlsDoryFr],
+    main_next: &'a [BlsDoryFr],
+    first_row: BlsDoryFr,
+    last_row: BlsDoryFr,
+    transition: BlsDoryFr,
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn native_evaluation_residuals(
+    row: &BlsDoryNativeEvaluationRow<'_>,
+    activation_group: Option<usize>,
+    point: &[BlsDoryFr],
+    raw_evaluation: BlsDoryFr,
+) -> [BlsDoryFr; 3] {
+    let current = row.main_local[TEST_EVALUATION_ACCUMULATOR_START];
+    let next = row.main_next[TEST_EVALUATION_ACCUMULATOR_START];
+    let contribution = native_activation_contribution(row.main_local, activation_group, point);
+    [
+        row.first_row * current,
+        row.transition * (next - current - contribution),
+        row.last_row * (current - raw_evaluation),
+    ]
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+fn native_accumulator_trace(
+    air: &NarrowBlake3Air,
+    old_main_rows: &[Vec<BlsDoryFr>],
+    statement: &BlsDoryOutputBridgeStatement,
+) -> Vec<BlsDoryFr> {
+    let mut accumulator = BlsDoryFr::zero();
+    old_main_rows
+        .iter()
+        .enumerate()
+        .map(|(row, main_local)| {
+            let current = accumulator;
+            accumulator = accumulator
+                + native_activation_contribution(
+                    main_local,
+                    air.activation_group_index_at_row(row),
+                    statement.cell_point(),
+                );
+            current
+        })
+        .collect()
+}
+
 /// Exact projection values exposed to tests and activation tooling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlsDoryBlake3Projection {
@@ -341,6 +539,7 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES, 524_288);
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS, 1_048_576);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CLAIMS, 662);
+        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS, 1_299);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_CLAIMS, 580);
         assert_eq!(BLS_DORY_BLAKE3_COMPOSED_CLAIMS, 1_370);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES, 33_332);
@@ -364,6 +563,15 @@ mod tests {
         assert_eq!(constraints.len(), 1_305);
         let maximum = constraints.iter().map(maximum_abs_constant).max().unwrap();
         assert_eq!(maximum, 1_u64 << 33);
+        let native =
+            bls_dory_native_blake3_constraint_ir(BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES)
+                .unwrap();
+        assert_eq!(native.len() + 3, BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS);
+        assert!(
+            native
+                .iter()
+                .all(|constraint| !uses_removed_native_input(constraint))
+        );
     }
 
     #[test]
@@ -484,5 +692,207 @@ mod tests {
                 .any(|constraint| constraint.evaluate(&changed) != BlsDoryFr::zero())
         });
         assert!(point_mutation_rejected);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn native_bls_accumulator_replaces_three_goldilocks_limbs() {
+        let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
+        let challenge_digest = [0x42; 32];
+        let witness = build_tree_witness(OUTPUT_CONTEXT, challenge_digest, &activation).unwrap();
+        let goldilocks_point = (0..activation.len().ilog2())
+            .map(|index| ExtensionElement {
+                limbs: [
+                    u64::from(index) + 2,
+                    u64::from(index) + 3,
+                    u64::from(index) + 4,
+                ],
+            })
+            .collect::<Vec<_>>();
+        let native_point = goldilocks_point
+            .iter()
+            .copied()
+            .map(ExtensionElement::to_field)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let signed_activation = activation
+            .iter()
+            .map(|value| {
+                crate::structured_sumcheck::ExtensionField::from_signed(i64::from(*value) - 125)
+            })
+            .collect::<Vec<_>>();
+        let statement = StructuredBlake3Statement {
+            challenge_digest,
+            final_activation_len: activation.len(),
+            final_activation_digest: witness.digest,
+            final_activation_point: goldilocks_point,
+            final_activation_evaluation: ExtensionElement::from_field(
+                crate::structured_sumcheck::evaluate_mle(&signed_activation, &native_point),
+            ),
+        };
+        let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            challenge_digest,
+            witness.digest,
+            &activation,
+            [0x51; 32],
+            [2_u64, 3, 5, 7, 11]
+                .into_iter()
+                .map(BlsDoryFr::from_u64)
+                .collect(),
+        )
+        .unwrap();
+        bridge.validate_activation(&activation).unwrap();
+
+        let air = NarrowBlake3Air::new(&statement).unwrap();
+        let main = generate_main_trace(&air, &statement, &witness);
+        let preprocessed = air.preprocessed_trace().unwrap();
+        let public = bls_values(public_values(&statement).unwrap());
+        let old_main_rows = (0..air.trace_rows())
+            .map(|row| bls_values(unsafe { main.row_unchecked(row) }))
+            .collect::<Vec<_>>();
+        let accumulators = native_accumulator_trace(&air, &old_main_rows, &bridge);
+        assert_eq!(TEST_MAIN_WIDTH, 291);
+        assert_eq!(BLS_DORY_BLAKE3_MAIN_WIDTH, 289);
+        assert_eq!(accumulators.last(), Some(&bridge.raw_byte_evaluation()));
+
+        let original_constraints = bls_dory_blake3_constraint_ir(activation.len()).unwrap();
+        assert_eq!(
+            original_constraints
+                .iter()
+                .filter(|constraint| uses_old_evaluation_constraint(constraint))
+                .count(),
+            9
+        );
+        let constraints = bls_dory_native_blake3_constraint_ir(activation.len()).unwrap();
+        assert_eq!(constraints.len(), 1_296);
+        assert!(
+            constraints
+                .iter()
+                .all(|constraint| !uses_removed_native_input(constraint))
+        );
+
+        let native_rows = old_main_rows
+            .iter()
+            .zip(&accumulators)
+            .map(|(row, accumulator)| native_main_row(row, *accumulator))
+            .collect::<Vec<_>>();
+        for row in 0..air.trace_rows() {
+            let next_row = (row + 1) % air.trace_rows();
+            let preprocessed_local = bls_values(unsafe { preprocessed.row_unchecked(row) });
+            let preprocessed_next = bls_values(unsafe { preprocessed.row_unchecked(next_row) });
+            let first_row = BlsDoryFr::from_u64(u64::from(row == 0));
+            let last_row = BlsDoryFr::from_u64(u64::from(row + 1 == air.trace_rows()));
+            let transition = BlsDoryFr::from_u64(u64::from(row + 1 != air.trace_rows()));
+            let values = BlsDoryBlake3Evaluation {
+                main_local: &native_rows[row],
+                main_next: &native_rows[next_row],
+                preprocessed_local: &preprocessed_local,
+                preprocessed_next: &preprocessed_next,
+                public: &public,
+                periodic: &[],
+                first_row,
+                last_row,
+                transition,
+            };
+            for (constraint_index, constraint) in constraints.iter().enumerate() {
+                assert_eq!(
+                    constraint.evaluate(&values),
+                    BlsDoryFr::zero(),
+                    "native constraint {constraint_index} failed at row {row}"
+                );
+            }
+            assert_eq!(
+                native_evaluation_residuals(
+                    &BlsDoryNativeEvaluationRow {
+                        main_local: &native_rows[row],
+                        main_next: &native_rows[next_row],
+                        first_row,
+                        last_row,
+                        transition,
+                    },
+                    air.activation_group_index_at_row(row),
+                    bridge.cell_point(),
+                    bridge.raw_byte_evaluation(),
+                ),
+                [BlsDoryFr::zero(); 3],
+                "native evaluation relation failed at row {row}"
+            );
+        }
+
+        let mut changed_first = native_rows[0].clone();
+        changed_first[TEST_EVALUATION_ACCUMULATOR_START] = BlsDoryFr::from_u64(1);
+        assert_ne!(
+            native_evaluation_residuals(
+                &BlsDoryNativeEvaluationRow {
+                    main_local: &changed_first,
+                    main_next: &native_rows[1],
+                    first_row: BlsDoryFr::from_u64(1),
+                    last_row: BlsDoryFr::zero(),
+                    transition: BlsDoryFr::from_u64(1),
+                },
+                air.activation_group_index_at_row(0),
+                bridge.cell_point(),
+                bridge.raw_byte_evaluation(),
+            ),
+            [BlsDoryFr::zero(); 3]
+        );
+
+        let activation_row = (0..air.trace_rows())
+            .find(|row| air.activation_group_index_at_row(*row).is_some())
+            .unwrap();
+        let mut changed_byte = native_rows[activation_row].clone();
+        changed_byte[TEST_ORIGINAL_NIBBLES_START] =
+            changed_byte[TEST_ORIGINAL_NIBBLES_START] + BlsDoryFr::from_u64(1);
+        assert_ne!(
+            native_evaluation_residuals(
+                &BlsDoryNativeEvaluationRow {
+                    main_local: &changed_byte,
+                    main_next: &native_rows[activation_row + 1],
+                    first_row: BlsDoryFr::zero(),
+                    last_row: BlsDoryFr::zero(),
+                    transition: BlsDoryFr::from_u64(1),
+                },
+                air.activation_group_index_at_row(activation_row),
+                bridge.cell_point(),
+                bridge.raw_byte_evaluation(),
+            ),
+            [BlsDoryFr::zero(); 3]
+        );
+
+        let mut changed_point = bridge.cell_point().to_vec();
+        changed_point[0] = changed_point[0] + BlsDoryFr::from_u64(1);
+        let point_mutation_rejected = (0..air.trace_rows()).any(|row| {
+            let next_row = (row + 1) % air.trace_rows();
+            native_evaluation_residuals(
+                &BlsDoryNativeEvaluationRow {
+                    main_local: &native_rows[row],
+                    main_next: &native_rows[next_row],
+                    first_row: BlsDoryFr::from_u64(u64::from(row == 0)),
+                    last_row: BlsDoryFr::from_u64(u64::from(row + 1 == air.trace_rows())),
+                    transition: BlsDoryFr::from_u64(u64::from(row + 1 != air.trace_rows())),
+                },
+                air.activation_group_index_at_row(row),
+                &changed_point,
+                bridge.raw_byte_evaluation(),
+            ) != [BlsDoryFr::zero(); 3]
+        });
+        assert!(point_mutation_rejected);
+
+        let last_row = air.trace_rows() - 1;
+        assert_ne!(
+            native_evaluation_residuals(
+                &BlsDoryNativeEvaluationRow {
+                    main_local: &native_rows[last_row],
+                    main_next: &native_rows[0],
+                    first_row: BlsDoryFr::zero(),
+                    last_row: BlsDoryFr::from_u64(1),
+                    transition: BlsDoryFr::zero(),
+                },
+                air.activation_group_index_at_row(last_row),
+                bridge.cell_point(),
+                bridge.raw_byte_evaluation() + BlsDoryFr::from_u64(1),
+            ),
+            [BlsDoryFr::zero(); 3]
+        );
     }
 }

@@ -1184,6 +1184,16 @@ struct MainCols<T> {
 }
 
 const MAIN_WIDTH: usize = size_of::<MainCols<u8>>();
+#[cfg(test)]
+pub(crate) const TEST_MAIN_WIDTH: usize = MAIN_WIDTH;
+#[cfg(test)]
+pub(crate) const TEST_ORIGINAL_NIBBLES_START: usize =
+    std::mem::offset_of!(MainCols<u8>, original_nibbles);
+#[cfg(test)]
+pub(crate) const TEST_EVALUATION_ACCUMULATOR_START: usize =
+    std::mem::offset_of!(MainCols<u8>, evaluation_accumulator);
+#[cfg(test)]
+pub(crate) const TEST_STACK_START: usize = std::mem::offset_of!(MainCols<u8>, stack);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1303,6 +1313,18 @@ impl NarrowBlake3Air {
     #[cfg(test)]
     pub(crate) const fn trace_rows(&self) -> usize {
         self.trace_rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activation_group_index_at_row(&self, row_index: usize) -> Option<usize> {
+        let operation_index = row_index / ROWS_PER_COMPRESSION;
+        let step = row_index % ROWS_PER_COMPRESSION;
+        let message_offset = self
+            .schedule
+            .operations
+            .get(operation_index)
+            .and_then(|operation| operation.message_offset);
+        activation_group_index(self.activation_len, message_offset, step)
     }
 
     fn activation_high_weight_at_row(
@@ -2004,18 +2026,7 @@ fn activation_high_weight(
     message_offset: Option<usize>,
     step: usize,
 ) -> Option<crate::structured_sumcheck::ExtensionField> {
-    if step >= BYTES_PER_EVAL_ROW {
-        return None;
-    }
-    let activation_start = 40_usize;
-    let activation_end = activation_start.checked_add(activation_len)?;
-    let evaluation_offset = message_offset?.checked_add(step.checked_mul(BYTES_PER_EVAL_ROW)?)?;
-    let evaluation_end = evaluation_offset.checked_add(BYTES_PER_EVAL_ROW)?;
-    if evaluation_offset < activation_start || evaluation_end > activation_end {
-        return None;
-    }
-
-    let activation_index = evaluation_offset - activation_start;
+    let activation_index = activation_group_index(activation_len, message_offset, step)?;
     let mut weight = crate::structured_sumcheck::ExtensionField::ONE;
     for (variable, coordinate) in point.iter().enumerate().skip(LOW_EVALUATION_VARIABLES) {
         let factor = if (activation_index >> variable) & 1 == 1 {
@@ -2026,6 +2037,24 @@ fn activation_high_weight(
         weight = weight.mul(factor);
     }
     Some(weight)
+}
+
+fn activation_group_index(
+    activation_len: usize,
+    message_offset: Option<usize>,
+    step: usize,
+) -> Option<usize> {
+    if step >= BYTES_PER_EVAL_ROW {
+        return None;
+    }
+    let activation_start = 40_usize;
+    let activation_end = activation_start.checked_add(activation_len)?;
+    let evaluation_offset = message_offset?.checked_add(step.checked_mul(BYTES_PER_EVAL_ROW)?)?;
+    let evaluation_end = evaluation_offset.checked_add(BYTES_PER_EVAL_ROW)?;
+    if evaluation_offset < activation_start || evaluation_end > activation_end {
+        return None;
+    }
+    Some(evaluation_offset - activation_start)
 }
 
 fn generate_preprocessed(

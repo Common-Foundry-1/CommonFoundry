@@ -24,17 +24,17 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     V2_TRANSITION_MODULUS,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryIndexedRowSource,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_indexed_row_source_with_scratch,
+        BlsDoryAggregateError, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
+        BlsDoryIndexedRowSource, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_compact_row_source_with_scratch,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
+    dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
     dory_bls12_381_fold_artifact::{
         BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
         BlsDoryFoldArtifactWriter,
     },
-    dory_bls12_381_index_artifact::BlsDoryIndexArtifactSpec,
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
@@ -85,6 +85,7 @@ const NEGATIVE: usize = 9;
 const ACTIVATION: usize = STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
 const SHIFTED_ACCUMULATOR: usize = 11;
 const TRANSITION_FOLD_SLOTS: usize = 16;
+const TRANSITION_SIGNED_WORD_SELECTORS: u64 = (1u64 << ACCUMULATOR) | (1u64 << ACTIVATION);
 
 /// In-memory transition proof plus its canonical Dory opening payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,11 +336,13 @@ pub fn projected_production_transition_source_artifact_bytes() -> Result<u64, Bl
     let literal_scalar_count = cells
         .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES as u64)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-    BlsDoryIndexArtifactSpec {
+    BlsDoryCompactArtifactSpec {
         context_digest: [1; 32],
         scalar_count,
         explicit_scalar_count,
-        literal_scalar_count,
+        word_scalar_count: literal_scalar_count,
+        word_group_len: cells,
+        signed_word_selectors: TRANSITION_SIGNED_WORD_SELECTORS,
     }
     .encoded_bytes(16)
     .map_err(|_| BlsDoryTransitionError::InvalidDimensions)
@@ -482,7 +485,7 @@ fn prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
         None
     };
     let committed = if let Some(scratch_directory) = scratch_directory {
-        commit_bls_dory_indexed_row_source_with_scratch(
+        commit_bls_dory_compact_row_source_with_scratch(
             witness_source
                 .as_mut()
                 .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
@@ -1038,23 +1041,18 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
             .min(self.explicit_scalars)
     }
 
-    fn regular_value(
-        &self,
-        oracle: usize,
-        index: usize,
-    ) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+    fn regular_word(&self, oracle: usize, index: usize) -> Result<u64, BlsDoryTransitionError> {
         let unsigned = |values: &[u64]| {
             values
                 .get(index)
                 .copied()
-                .map(BlsDoryFr::from_u64)
                 .ok_or(BlsDoryTransitionError::InvalidDimensions)
         };
         let signed = |values: &[i64]| {
             values
                 .get(index)
                 .copied()
-                .map(BlsDoryFr::from_i64)
+                .map(|value| u64::from_le_bytes(value.to_le_bytes()))
                 .ok_or(BlsDoryTransitionError::InvalidDimensions)
         };
         match oracle {
@@ -1080,9 +1078,22 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
                     i128::from(accumulator) + i128::from(self.statement.max_abs_accumulator),
                 )
                 .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
-                Ok(BlsDoryFr::from_u64(shifted))
+                Ok(shifted)
             }
             _ => Err(BlsDoryTransitionError::InvalidProofShape),
+        }
+    }
+
+    fn regular_value(
+        &self,
+        oracle: usize,
+        index: usize,
+    ) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+        let word = self.regular_word(oracle, index)?;
+        if TRANSITION_SIGNED_WORD_SELECTORS & (1u64 << oracle) != 0 {
+            Ok(BlsDoryFr::from_i64(i64::from_le_bytes(word.to_le_bytes())))
+        } else {
+            Ok(BlsDoryFr::from_u64(word))
         }
     }
 
@@ -1233,6 +1244,85 @@ impl BlsDoryIndexedRowSource for BlsDoryTransitionWitnessRowSource<'_> {
             let oracle = packed_index / self.elements;
             let index = packed_index % self.elements;
             *scalar = self.scalar(oracle, index)?;
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if output.len() != self.columns || start < self.literal_scalar_count() {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        for (column, code) in output.iter_mut().enumerate() {
+            let packed_index = start + column;
+            if packed_index >= self.explicit_scalars {
+                *code = 0;
+                continue;
+            }
+            let oracle = packed_index / self.elements;
+            let index = packed_index % self.elements;
+            *code = self.range_digit(oracle, index)?;
+        }
+        Ok(output.len())
+    }
+}
+
+impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
+    type Error = BlsDoryTransitionError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalar_count()
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.literal_scalar_count()
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.elements
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        TRANSITION_SIGNED_WORD_SELECTORS
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.range_dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        let end = start
+            .checked_add(output.len())
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if output.len() != self.columns || end > self.literal_scalar_count() {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        for (column, word) in output.iter_mut().enumerate() {
+            let packed_index = start + column;
+            let oracle = packed_index / self.elements;
+            let index = packed_index % self.elements;
+            *word = if oracle < STRUCTURED_TRANSITION_REGULAR_ORACLES {
+                self.regular_word(oracle, index)?
+            } else {
+                u64::from(self.range_digit(oracle, index)?)
+            };
         }
         Ok(output.len())
     }
@@ -2108,20 +2198,26 @@ mod tests {
             scratch_polynomial.row_commitments(),
             ordinary_polynomial.row_commitments()
         );
+        let packed = pack_oracles(&build_scalar_oracles(statement, &witness).unwrap()).unwrap();
+        let mut decoded = Vec::new();
+        scratch_polynomial
+            .for_each_explicit_coefficient(|_index, coefficient| decoded.push(coefficient))
+            .unwrap();
+        assert_eq!(decoded, packed[..decoded.len()]);
         let artifact_bytes =
             std::fs::metadata(scratch_polynomial.coefficient_artifact_path().unwrap())
                 .unwrap()
                 .len();
         let elements = u64::try_from(statement.elements().unwrap()).unwrap();
-        let literal_scalars = elements * STRUCTURED_TRANSITION_REGULAR_ORACLES as u64;
-        let indexed_scalars = elements
+        let word_scalars = elements * STRUCTURED_TRANSITION_REGULAR_ORACLES as u64;
+        let code_scalars = elements
             * (STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES) as u64;
         assert_eq!(
             artifact_bytes,
-            72 + 16 * 32 + literal_scalars * 32 + indexed_scalars + 32
+            88 + 16 * 32 + word_scalars * 8 + code_scalars + 32
         );
         let former_scalar_bytes = 100 + elements * STRUCTURED_TRANSITION_ORACLES as u64 * 32 + 32;
-        assert!(artifact_bytes * 5 < former_scalar_bytes);
+        assert!(artifact_bytes * 10 < former_scalar_bytes);
         drop(scratch);
         assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
     }
@@ -2215,7 +2311,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_transition_source_artifact_bytes().unwrap(),
-            32_346_473_064
+            13_019_120_248
         );
         assert!(projected_production_transition_opening_bytes().unwrap() < 262_128);
         assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 3);

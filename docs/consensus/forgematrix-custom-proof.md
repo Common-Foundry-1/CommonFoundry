@@ -1016,20 +1016,21 @@ Three n=19 release A/B repeats measured 814--826 ms for the former serial
 writer and 377--391 ms for the parallel writer. Their 822 and 385 ms medians
 give a 53.2% reduction, with identical artifact digest, row commitments,
 tier-two commitment, opening claims, and proof bytes.
-The authenticated indexed source supports a literal-scalar prefix followed by
-dictionary codes. Transition artifacts store twelve unrestricted lanes
-literally and the remaining 98 radix-16 lanes as one-byte `0..15` codes. The
+The authenticated indexed formats support either a literal-scalar prefix or
+signed/unsigned 64-bit words followed by dictionary codes. Transition artifacts
+store twelve unrestricted lanes as words and the remaining 98 radix-16 lanes as
+one-byte `0..15` codes. The
 inverse source stores zero and the sixteen possible `1 / (alpha - digit)`
 values once, rejects a zero denominator before publishing the commitment, and
 stores one authenticated code per explicit coefficient. The Dory G1/G2 MSM and
 elementwise vector routines also use ordered CPU-parallel maps and normalize to
 the same group elements and proof bytes.
 
-| Cell variables | Cells | Packed variables | Recompute prover | Indexed prover | Prepared scratch | Aggregate opening | Verify | Proof | Scratch after proof |
+| Cell variables | Cells | Packed variables | Recompute prover | Compact prover | Prepared scratch | Aggregate opening | Verify | Proof | Scratch after proof |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 256 | 15 | 4.696 s | 1.930 s | 153,460 B | 1.799 s | 0.684 s | 38,929 B | 0 B |
-| 10 | 1,024 | 17 | 15.160 s | 4.190 s | 608,116 B | 3.551 s | 1.258 s | 43,329 B | 0 B |
-| 12 | 4,096 | 19 | 53.948 s | 9.484 s | 2,426,740 B | 7.066 s | 2.391 s | 47,729 B | 0 B |
+| 8 | 256 | 15 | 4.696 s | 1.920 s | 79,748 B | 1.805 s | 0.683 s | 38,929 B | 0 B |
+| 10 | 1,024 | 17 | 15.160 s | 4.096 s | 313,220 B | 3.531 s | 1.262 s | 43,329 B | 0 B |
+| 12 | 4,096 | 19 | 53.948 s | 9.517 s | 1,247,108 B | 7.036 s | 2.389 s | 47,729 B | 0 B |
 
 The current implementation derives every child file from the Fiat-Shamir
 challenge, authenticates its complete header and scalar payload, binds it to the
@@ -1039,10 +1040,10 @@ across the buffer boundary. Buffering alone reduced the prior direct-I/O n=19
 measurement from 48.385 to 42.699 seconds proving and from 19.315 to 10.618
 seconds opening. Bounded parallel row commitments reduced proving to 9.952
 seconds, and parallel Dory MSM/vector routines reduced opening from 10.504 to
-7.244 seconds. Hybrid source artifacts and compressed early lineages now measure
-9.484 seconds proving and 7.066 seconds opening; combined time is 69.0% below the
+7.244 seconds. Compact source artifacts and compressed early lineages now measure
+9.517 seconds proving and 7.036 seconds opening; combined time is 69.0% below the
 buffered checkpoint. Proof bytes are unchanged, while prepared n=19 scratch is
-83.7% below the inverse-only indexed checkpoint.
+48.6% below the preceding compressed-lineage checkpoint.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
 simultaneous LogUp lineage overlap at n=19 is now exactly 4,198,704 bytes.
@@ -1060,11 +1061,11 @@ production lineages are exactly 16,173,236,396 and 9,730,785,452 bytes. Their
 overlap is 24.125 GiB; the larger overlap with the generation-three scalar child
 is 68,786,585,904 bytes, or about 64.06 GiB, instead of the former 330 GiB.
 Exact production geometry stores the transition's 805,306,368
-regular scalars and 6,576,668,672 digit codes in 30.125 GiB plus framing. Its
+regular 64-bit words and 6,576,668,672 digit codes in 12.125 GiB plus framing. Its
 7,381,975,040 inverse codes occupy 6.875 GiB plus 648 framing bytes. One
-retained transition/inverse pair is about 37 GiB; four pairs project to about
-148 GiB, with the fourth-pair lineage overlap putting the earlier peak at
-227,700,380,912 bytes, or about 212.06 GiB. Executable projection functions pin
+retained transition/inverse pair is about 19 GiB; four pairs project to about
+76 GiB, with the fourth-pair lineage overlap putting the earlier peak at
+150,390,969,648 bytes, or about 140.06 GiB. Executable projection functions pin
 all source, lineage, and peak sizes. These extrapolations still reject the
 current CPU and storage pipeline for production; they are not n=33 measurements.
 The new consuming boundary removes those sources before the final Dory

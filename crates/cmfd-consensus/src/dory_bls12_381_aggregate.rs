@@ -23,6 +23,10 @@ use dory_pcs::{
 use rayon::prelude::*;
 use thiserror::Error;
 
+use crate::dory_bls12_381_compact_artifact::{
+    BlsDoryCompactArtifact, BlsDoryCompactArtifactError, BlsDoryCompactArtifactSpec,
+    BlsDoryCompactArtifactWriter,
+};
 use crate::dory_bls12_381_fold_artifact::{
     BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
     BlsDoryFoldArtifactWriter,
@@ -51,7 +55,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, compact transition/inverse sources, compressed early LogUp lineages, and consuming openings preserve exact proofs; n=19 still takes 9.484 seconds proving plus 7.066 seconds opening, projects to roughly 1.80 plus 1.34 CPU days at n=33, and the fourth range pair still projects near 212.06 GiB peak scratch",
+    "bounded parallel commitments, compact transition/inverse sources, compressed early LogUp lineages, and consuming openings preserve exact proofs; n=19 still takes 9.517 seconds proving plus 7.036 seconds opening, projects to roughly 1.80 plus 1.34 CPU days at n=33, and the fourth range pair still projects near 140.06 GiB peak scratch",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -85,6 +89,7 @@ enum BlsDoryCoefficientStorage {
     Materialized(BlsDoryPolynomial),
     AuthenticatedArtifact(Arc<BlsDoryFoldArtifact>),
     IndexedArtifact(Arc<BlsDoryIndexArtifact>),
+    CompactArtifact(Arc<BlsDoryCompactArtifact>),
 }
 
 impl fmt::Debug for BlsDoryCoefficientStorage {
@@ -101,6 +106,11 @@ impl fmt::Debug for BlsDoryCoefficientStorage {
                 .finish(),
             Self::IndexedArtifact(artifact) => formatter
                 .debug_struct("IndexedArtifact")
+                .field("coefficient_count", &artifact.spec().scalar_count)
+                .field("digest", &hex::encode(artifact.digest()))
+                .finish(),
+            Self::CompactArtifact(artifact) => formatter
+                .debug_struct("CompactArtifact")
                 .field("coefficient_count", &artifact.spec().scalar_count)
                 .field("digest", &hex::encode(artifact.digest()))
                 .finish(),
@@ -248,6 +258,9 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => {
                 artifact.spec().scalar_count as usize
             }
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
+                artifact.spec().scalar_count as usize
+            }
         }
     }
 
@@ -258,6 +271,9 @@ impl BlsDoryCommittedPolynomial {
                 artifact.spec().explicit_scalar_count as usize
             }
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => {
+                artifact.spec().explicit_scalar_count as usize
+            }
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
                 artifact.spec().explicit_scalar_count as usize
             }
         }
@@ -296,6 +312,16 @@ impl BlsDoryCommittedPolynomial {
                     && self.nu == other.nu
                     && self.sigma == other.sigma
             }
+            (
+                BlsDoryCoefficientStorage::CompactArtifact(left),
+                BlsDoryCoefficientStorage::CompactArtifact(right),
+            ) => {
+                Arc::ptr_eq(left, right)
+                    && self.commitment == other.commitment
+                    && self.setup_identity == other.setup_identity
+                    && self.nu == other.nu
+                    && self.sigma == other.sigma
+            }
             _ => false,
         }
     }
@@ -320,6 +346,13 @@ impl BlsDoryCommittedPolynomial {
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => artifact
+                .for_each_scalar(|coefficient| {
+                    visitor(visited, coefficient);
+                    visited += 1;
+                    Ok(())
+                })
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
                     visitor(visited, coefficient);
                     visited += 1;
@@ -377,6 +410,25 @@ impl BlsDoryCommittedPolynomial {
                 }
                 Ok(evaluation)
             }
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
+                let mut weights = EqualityWeightIterator::new(point);
+                let mut evaluation = BlsDoryFr::zero();
+                let mut visited = 0usize;
+                artifact
+                    .for_each_scalar(|coefficient| {
+                        let weight = weights
+                            .next()
+                            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+                        evaluation = evaluation + coefficient * weight;
+                        visited += 1;
+                        Ok(())
+                    })
+                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+                if visited != self.explicit_coefficient_count() {
+                    return Err(BlsDoryAggregateError::ProverStorage);
+                }
+                Ok(evaluation)
+            }
         }
     }
 
@@ -397,6 +449,12 @@ impl BlsDoryCommittedPolynomial {
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage),
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => artifact
+                .for_each_pair(|lower, upper| {
+                    visitor(lower, upper);
+                    Ok(())
+                })
+                .map_err(|_| BlsDoryAggregateError::ProverStorage),
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => artifact
                 .for_each_pair(|lower, upper| {
                     visitor(lower, upper);
                     Ok(())
@@ -457,6 +515,12 @@ impl BlsDoryCommittedPolynomial {
                     Ok(())
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => artifact
+                .for_each_scalar(|coefficient| {
+                    accumulate(coefficient);
+                    Ok(())
+                })
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
         }
         let explicit_count = self.explicit_coefficient_count();
         if visited != explicit_count
@@ -473,7 +537,8 @@ impl BlsDoryCommittedPolynomial {
         match &self.coefficients {
             BlsDoryCoefficientStorage::Materialized(polynomial) => Some(polynomial.coefficients()),
             BlsDoryCoefficientStorage::AuthenticatedArtifact(_)
-            | BlsDoryCoefficientStorage::IndexedArtifact(_) => None,
+            | BlsDoryCoefficientStorage::IndexedArtifact(_)
+            | BlsDoryCoefficientStorage::CompactArtifact(_) => None,
         }
     }
 
@@ -483,6 +548,7 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::Materialized(_) => None,
             BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => Some(artifact.path()),
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => Some(artifact.path()),
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => Some(artifact.path()),
         }
     }
 
@@ -1014,6 +1080,22 @@ pub(crate) trait BlsDoryIndexedRowSource {
     fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error>;
 }
 
+/// Canonical 64-bit prefix plus one-byte dictionary-code coefficient source.
+pub(crate) trait BlsDoryCompactRowSource {
+    type Error;
+
+    fn rows(&self) -> usize;
+    fn columns(&self) -> usize;
+    fn explicit_scalar_count(&self) -> usize;
+    fn word_scalar_count(&self) -> usize;
+    fn word_group_len(&self) -> usize;
+    fn signed_word_selectors(&self) -> u64;
+    fn dictionary(&self) -> &[BlsDoryFr];
+    fn read_word_row(&mut self, row_index: usize, output: &mut [u64])
+    -> Result<usize, Self::Error>;
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error>;
+}
+
 /// Commit a canonical indexed row source while retaining literal scalars only
 /// for the source-selected row prefix and one authenticated code byte for every
 /// remaining explicit coefficient. Expansion is bounded to a row chunk and
@@ -1189,6 +1271,223 @@ pub(crate) fn commit_bls_dory_indexed_row_source_with_scratch<S: BlsDoryIndexedR
         nu,
         sigma,
     })
+}
+
+/// Commit a mixed-width source while retaining regular coefficients as
+/// canonical signed/unsigned words and its remaining coefficients as codes.
+pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactRowSource>(
+    source: &mut S,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    setup
+        .validate()
+        .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+    validate_layout(nu, sigma)?;
+    let rows = 1usize
+        .checked_shl(u32::try_from(nu).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let columns = 1usize
+        .checked_shl(u32::try_from(sigma).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let coefficient_count = rows
+        .checked_mul(columns)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let explicit_coefficient_count = source.explicit_scalar_count();
+    let word_coefficient_count = source.word_scalar_count();
+    let word_group_len = source.word_group_len();
+    let signed_word_selectors = source.signed_word_selectors();
+    if source.rows() != rows
+        || source.columns() != columns
+        || explicit_coefficient_count == 0
+        || explicit_coefficient_count > coefficient_count
+        || word_coefficient_count == 0
+        || word_coefficient_count > explicit_coefficient_count
+        || !word_coefficient_count.is_multiple_of(columns)
+        || word_group_len == 0
+        || !word_group_len.is_power_of_two()
+        || !word_coefficient_count.is_multiple_of(word_group_len)
+        || word_coefficient_count / word_group_len > 64
+        || setup.max_log_n() < nu + sigma
+        || setup.prover().g1_vec.len() < columns
+        || setup.prover().g2_vec.len() < rows
+    {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+
+    let dictionary = source.dictionary().to_vec();
+    let fold_spec = source_artifact_spec(
+        setup.identity(),
+        nu,
+        sigma,
+        coefficient_count,
+        explicit_coefficient_count,
+    )?;
+    let compact_spec = BlsDoryCompactArtifactSpec {
+        context_digest: fold_spec.context_digest,
+        scalar_count: fold_spec.scalar_count,
+        explicit_scalar_count: fold_spec.explicit_scalar_count,
+        word_scalar_count: u64::try_from(word_coefficient_count)
+            .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+        word_group_len: u64::try_from(word_group_len)
+            .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+        signed_word_selectors,
+    };
+    let mut writer =
+        BlsDoryCompactArtifactWriter::create(scratch_directory, compact_spec, dictionary.clone())
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    let mut row_commitments = vec![BlsDoryG1::identity(); rows];
+    let mut commitment = BlsDoryGt::identity();
+    let explicit_rows = explicit_coefficient_count.div_ceil(columns);
+    let word_rows = word_coefficient_count / columns;
+    let expanded_row_bytes = columns
+        .checked_mul(std::mem::size_of::<BlsDoryFr>())
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let rows_per_chunk = (ROW_COMMIT_CHUNK_BYTES / expanded_row_bytes.max(1)).max(1);
+    for chunk_start in (0..word_rows).step_by(rows_per_chunk) {
+        let chunk_end = chunk_start.saturating_add(rows_per_chunk).min(word_rows);
+        let chunk_rows = chunk_end - chunk_start;
+        let chunk_words = chunk_rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let mut words = vec![0u64; chunk_words];
+        for (local_row, row) in words.chunks_exact_mut(columns).enumerate() {
+            let written = source
+                .read_word_row(chunk_start + local_row, row)
+                .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
+            if written != columns {
+                return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+            }
+        }
+        let committed_rows = words
+            .par_chunks_exact(columns)
+            .enumerate()
+            .map(|(local_row, row)| {
+                let row_index = chunk_start + local_row;
+                let packed_start = row_index
+                    .checked_mul(columns)
+                    .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+                let coefficients = row
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(column, word)| {
+                        compact_word_scalar(
+                            word,
+                            packed_start + column,
+                            word_group_len,
+                            signed_word_selectors,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let row_commitment = setup
+                    .commit_row_segment(0, &coefficients)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                let paired = setup
+                    .pair_committed_row(row_index, &row_commitment)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                Ok((row_commitment, paired))
+            })
+            .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        for (local_row, (row_commitment, paired)) in committed_rows.into_iter().enumerate() {
+            let row_index = chunk_start + local_row;
+            commitment = commitment + paired;
+            row_commitments[row_index] = row_commitment;
+            let row_start = local_row * columns;
+            writer
+                .write_words(&words[row_start..row_start + columns])
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        }
+    }
+    for chunk_start in (word_rows..explicit_rows).step_by(rows_per_chunk) {
+        let chunk_end = chunk_start
+            .saturating_add(rows_per_chunk)
+            .min(explicit_rows);
+        let chunk_rows = chunk_end - chunk_start;
+        let chunk_codes = chunk_rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let mut codes = vec![0u8; chunk_codes];
+        for (local_row, row) in codes.chunks_exact_mut(columns).enumerate() {
+            let row_index = chunk_start + local_row;
+            let written = source
+                .read_code_row(row_index, row)
+                .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
+            if written != columns {
+                return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+            }
+            let explicit_in_row = explicit_coefficient_count
+                .saturating_sub(row_index * columns)
+                .min(columns);
+            row[explicit_in_row..].fill(0);
+        }
+        if codes
+            .iter()
+            .any(|code| usize::from(*code) >= dictionary.len())
+        {
+            return Err(BlsDoryAggregateError::CoefficientSource);
+        }
+        let committed_rows = codes
+            .par_chunks_exact(columns)
+            .enumerate()
+            .map(|(local_row, row)| {
+                let row_index = chunk_start + local_row;
+                let coefficients = row
+                    .iter()
+                    .map(|code| dictionary[usize::from(*code)])
+                    .collect::<Vec<_>>();
+                let row_commitment = setup
+                    .commit_row_segment(0, &coefficients)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                let paired = setup
+                    .pair_committed_row(row_index, &row_commitment)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                Ok((row_commitment, paired))
+            })
+            .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        for (local_row, (row_commitment, paired)) in committed_rows.into_iter().enumerate() {
+            let row_index = chunk_start + local_row;
+            let explicit_in_row = explicit_coefficient_count
+                .saturating_sub(row_index * columns)
+                .min(columns);
+            commitment = commitment + paired;
+            row_commitments[row_index] = row_commitment;
+            let row_start = local_row * columns;
+            writer
+                .write_codes(&codes[row_start..row_start + explicit_in_row])
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        }
+    }
+    let artifact = writer
+        .finish()
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    Ok(BlsDoryCommittedPolynomial {
+        coefficients: BlsDoryCoefficientStorage::CompactArtifact(Arc::new(artifact)),
+        commitment,
+        row_commitments,
+        setup_identity: setup.identity(),
+        nu,
+        sigma,
+    })
+}
+
+fn compact_word_scalar(
+    word: u64,
+    packed_index: usize,
+    word_group_len: usize,
+    signed_word_selectors: u64,
+) -> Result<BlsDoryFr, BlsDoryAggregateError> {
+    let selector = packed_index
+        .checked_div(word_group_len)
+        .filter(|selector| *selector < 64)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    if signed_word_selectors & (1u64 << selector) != 0 {
+        Ok(BlsDoryFr::from_i64(i64::from_le_bytes(word.to_le_bytes())))
+    } else {
+        Ok(BlsDoryFr::from_u64(word))
+    }
 }
 
 fn source_artifact_spec(

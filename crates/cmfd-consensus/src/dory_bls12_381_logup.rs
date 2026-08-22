@@ -28,6 +28,7 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
         BlsDoryIndexedRowSource, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_compact_row_source_with_scratch,
         commit_bls_dory_indexed_row_source_with_scratch,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
@@ -80,7 +81,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, hybrid transition/inverse sources, challenge-bound compressed early LogUp lineages, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.484 seconds proving plus 7.066 seconds opening; CPU n=33 projects to roughly 1.80 plus 1.34 days and the fourth range pair still projects near 212.06 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
+    "bounded parallel work, compact transition/inverse sources, challenge-bound compressed early LogUp lineages, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.517 seconds proving plus 7.036 seconds opening; CPU n=33 projects to roughly 1.80 plus 1.34 days and the fourth range pair still projects near 140.06 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -651,7 +652,7 @@ fn prove_from_source_deferred(
         }
         transition.clone()
     } else if let Some(scratch_directory) = scratch_directory {
-        commit_bls_dory_indexed_row_source_with_scratch(
+        commit_bls_dory_compact_row_source_with_scratch(
             witness_source
                 .as_mut()
                 .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
@@ -4579,7 +4580,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_transition_range_source_bytes().unwrap(),
-            39_728_448_752
+            20_401_095_936
         );
         assert_eq!(
             projected_production_range_logup_compressed_lineage_bytes().unwrap(),
@@ -4591,7 +4592,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_range_logup_four_pair_peak_bytes().unwrap(),
-            227_700_380_912
+            150_390_969_648
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

@@ -943,10 +943,16 @@ also folds each repeated polynomial only once and generates equality weights
 without full equality tables. Its pre-change 17,695-byte fixture remains pinned
 at BLAKE3 digest
 `6aa99fd095e70180b6b2fdd94dc96fc420f99eb529ec03ad5dfa978731d9cfac`.
-Component construction and the first fold of each unique table are still
-materialized, so this is not the n=33 out-of-core prover. That prover, execution
-of the final model commitment ceremony, independent review of the transcript
-and soundness accounting, and external audit remain activation requirements.
+An explicit scratch API now writes every post-challenge unique-table fold to a
+self-authenticating, lineage-bound artifact. It uses a two-scalar fold working set,
+rejects corruption, truncation, non-canonical fields, and trailing bytes, removes
+partial or completed files only while it still owns them, and aborts without a
+dense fallback. The standalone aggregate and complete shared-layout fixture
+produce exactly the same proof through that path. Component construction still
+materializes every source table before the first fold, so this is not the n=33
+out-of-core prover. Streaming those sources, executing the final model
+commitment ceremony, independent review of the transcript and soundness
+accounting, and external audit remain activation requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

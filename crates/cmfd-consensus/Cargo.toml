@@ -45,6 +45,7 @@ p3-uni-stark = { version = "=0.6.3", optional = true }
 p3-whir = { version = "=0.6.3", optional = true }
 remainder = { git = "https://github.com/worldcoin/Remainder_CE", rev = "5687fe7f3a077c75c374422ef79f22e3860de9c1", optional = true }
 rand_core = { version = "=0.6.4", features = ["getrandom"], optional = true }
+same-file = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
@@ -59,6 +60,7 @@ dory-bls12-381-prototype = [
     "dep:ark-ec",
     "dep:ark-ff",
     "dep:rand_core",
+    "dep:same-file",
     "dep:sha2",
 ]
 dory-opening-prototype = ["dep:ark-serialize", "dep:dory-pcs"]

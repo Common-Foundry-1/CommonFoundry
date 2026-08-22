@@ -909,6 +909,7 @@ dependencies = [
  "primitive-types",
  "rand_core 0.6.4",
  "remainder",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

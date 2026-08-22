@@ -7,6 +7,7 @@
 //! single aggregate.
 
 use std::io::{Cursor, Read};
+use std::path::Path;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -26,7 +27,7 @@ use crate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
         BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
         projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
-        verify_bls_dory_openings,
+        prove_bls_dory_deferred_opening_sets_with_scratch, verify_bls_dory_openings,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof,
@@ -111,7 +112,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and component construction plus distinct-point folding still materialize the unique n=33 coefficient tables",
+    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and component construction still materializes the unique n=33 source tables before authenticated scratch folding",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -804,6 +805,70 @@ pub fn prove_bls_dory_shared_layout_at_variables(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
+        binding,
+        trusted_model,
+        fixed_model,
+        matrix_inputs,
+        transition_inputs,
+        wiring_statement,
+        initial,
+        inputs,
+        outputs,
+        padded_variables,
+        setup,
+        None,
+    )
+}
+
+/// Prove the shared scalar layout while keeping aggregate polynomial folds in
+/// authenticated scratch artifacts. Component construction remains in memory.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_bls_dory_shared_layout_at_variables_with_scratch(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_inputs: &[BlsDoryMatrixProverInput<'_>],
+    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
+    wiring_statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
+        binding,
+        trusted_model,
+        fixed_model,
+        matrix_inputs,
+        transition_inputs,
+        wiring_statement,
+        initial,
+        inputs,
+        outputs,
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_inputs: &[BlsDoryMatrixProverInput<'_>],
+    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
+    wiring_statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
     if binding.len() > MAX_SHARED_LAYOUT_BINDING_BYTES
         || !(1..=MAX_BLS_DORY_SHARED_MATRIX_PROOFS).contains(&matrix_inputs.len())
         || !(1..=MAX_BLS_DORY_SHARED_TRANSITION_PROOFS).contains(&transition_inputs.len())
@@ -899,6 +964,7 @@ pub fn prove_bls_dory_shared_layout_at_variables(
         wiring_statement,
         padded_variables,
         setup,
+        scratch_directory,
     )
 }
 
@@ -918,6 +984,7 @@ fn prove_prepared_shared_layout(
     wiring_statement: StructuredWiringStatement,
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
 ) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
     let matrix_proofs = matrices
         .iter()
@@ -967,8 +1034,16 @@ fn prove_prepared_shared_layout(
     expected_claims.extend_from_slice(wiring.openings.claims());
     opening_sets.push(&fixed_base);
     expected_claims.extend_from_slice(fixed_base.claims());
-    let (claims, opening_proof) =
-        prove_bls_dory_deferred_opening_sets(&opening_binding, &opening_sets, setup)?;
+    let (claims, opening_proof) = if let Some(scratch_directory) = scratch_directory {
+        prove_bls_dory_deferred_opening_sets_with_scratch(
+            &opening_binding,
+            &opening_sets,
+            setup,
+            scratch_directory,
+        )?
+    } else {
+        prove_bls_dory_deferred_opening_sets(&opening_binding, &opening_sets, setup)?
+    };
     if claims != expected_claims {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
     }
@@ -1875,6 +1950,8 @@ pub fn require_bls_dory_shared_layout_production_ready() -> Result<(), BlsDorySh
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::{
         BuiltModelBankFixture, SmallModelBankFixture, StructuredMaskPolynomial,
@@ -1896,6 +1973,27 @@ mod tests {
     const FIXTURE_VARIABLES: usize = 10;
     const OUTPUT_MODULUS: u64 = 251;
     const OUTPUT_CENTER: i64 = 125;
+    static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn create() -> Self {
+            let nonce = SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-dory-shared-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn authenticated_fixed_model_fixture() -> (
         BuiltModelBankFixture,
@@ -2542,6 +2640,24 @@ mod tests {
             &setup,
         )
         .unwrap();
+        let scratch = ScratchDirectory::create();
+        let scratch_proof = prove_bls_dory_shared_layout_at_variables_with_scratch(
+            b"shared-opening",
+            &model,
+            &fixed_model,
+            &matrix_inputs,
+            &transition_inputs,
+            fixture.wiring_statement,
+            &fixture.initial,
+            &fixture.inputs,
+            &fixture.outputs,
+            FIXTURE_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(scratch_proof, proof);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
         verify_bls_dory_shared_layout_at_variables(
             b"shared-opening",
             &model,

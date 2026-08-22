@@ -5,6 +5,7 @@
 //! deliberately feature-gated and fail-closed for production activation.
 
 use std::io::Cursor;
+use std::path::Path;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -19,6 +20,10 @@ use dory_pcs::{
 };
 use thiserror::Error;
 
+use crate::dory_bls12_381_fold_artifact::{
+    BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
+    BlsDoryFoldArtifactWriter,
+};
 use crate::dory_bls12_381_prototype::{
     BlsDoryCurve, BlsDoryFr, BlsDoryG1, BlsDoryG1Routines, BlsDoryG2, BlsDoryG2Routines, BlsDoryGt,
     BlsDoryPolynomial, BlsDoryTranscript, DeterministicBlsDorySetup,
@@ -41,7 +46,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "component construction and distinct-point folding still materialize the unique n=29/n=31/n=33 coefficient tables; only the final Dory row reduction is streamed",
+    "component polynomial construction still materializes the unique n=29/n=31/n=33 source tables; authenticated scratch folding does not yet remove those sources",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -206,6 +211,8 @@ pub enum BlsDoryAggregateError {
     InvalidEncoding,
     #[error("sumcheck relation failed")]
     SumcheckFailed,
+    #[error("authenticated prover scratch storage failed")]
+    ProverStorage,
     #[error("Dory operation failed: {0}")]
     Dory(String),
 }
@@ -280,7 +287,29 @@ pub fn prove_bls_dory_openings(
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     let polynomial_refs = polynomials.iter().collect::<Vec<_>>();
-    prove_bls_dory_opening_refs(public_binding, &polynomial_refs, points, setup)
+    prove_bls_dory_opening_refs_with_scratch(public_binding, &polynomial_refs, points, setup, None)
+}
+
+/// Prove the same aggregate while keeping every post-challenge polynomial fold
+/// in self-authenticating scratch files.
+///
+/// Storage metadata is prover-local and does not alter the proof transcript.
+/// Any scratch failure aborts without retrying through the in-memory path.
+pub fn prove_bls_dory_openings_with_scratch(
+    public_binding: &[u8],
+    polynomials: &[BlsDoryCommittedPolynomial],
+    points: &[Vec<BlsDoryFr>],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let polynomial_refs = polynomials.iter().collect::<Vec<_>>();
+    prove_bls_dory_opening_refs_with_scratch(
+        public_binding,
+        &polynomial_refs,
+        points,
+        setup,
+        Some(scratch_directory),
+    )
 }
 
 /// Prove many points of one commitment without cloning its coefficient table.
@@ -291,18 +320,15 @@ pub fn prove_bls_dory_same_commitment_openings(
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     let polynomial_refs = vec![polynomial; points.len()];
-    prove_bls_dory_opening_refs(public_binding, &polynomial_refs, points, setup)
+    prove_bls_dory_opening_refs_with_scratch(public_binding, &polynomial_refs, points, setup, None)
 }
 
-/// Prove an ordered selection that may repeat committed polynomials.
-///
-/// This avoids cloning coefficient tables when several protocol claims open
-/// the same commitment at different points.
-pub(crate) fn prove_bls_dory_opening_refs(
+fn prove_bls_dory_opening_refs_with_scratch(
     public_binding: &[u8],
     polynomials: &[&BlsDoryCommittedPolynomial],
     points: &[Vec<BlsDoryFr>],
     setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     setup
         .validate()
@@ -342,7 +368,16 @@ pub(crate) fn prove_bls_dory_opening_refs(
     let mut transcript =
         statement_transcript(public_binding, &setup.identity(), &claims, nu, sigma)?;
     let batching = batching_challenges(&mut transcript, claims.len());
-    let sumcheck = prove_distinct_point_sumcheck(polynomials, &claims, &batching, &mut transcript)?;
+    let scratch = scratch_directory
+        .map(|directory| FoldScratch::new(directory, transcript.digest()))
+        .transpose()?;
+    let sumcheck = prove_distinct_point_sumcheck(
+        polynomials,
+        &claims,
+        &batching,
+        &mut transcript,
+        scratch.as_ref(),
+    )?;
 
     let lambdas = batching
         .iter()
@@ -393,6 +428,29 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets(
     sets: &[&BlsDoryDeferredOpeningSet],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    prove_bls_dory_deferred_opening_sets_with_optional_scratch(public_binding, sets, setup, None)
+}
+
+pub(crate) fn prove_bls_dory_deferred_opening_sets_with_scratch(
+    public_binding: &[u8],
+    sets: &[&BlsDoryDeferredOpeningSet],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    prove_bls_dory_deferred_opening_sets_with_optional_scratch(
+        public_binding,
+        sets,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+fn prove_bls_dory_deferred_opening_sets_with_optional_scratch(
+    public_binding: &[u8],
+    sets: &[&BlsDoryDeferredOpeningSet],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     if sets.is_empty() {
         return Err(BlsDoryAggregateError::InvalidClaimCount);
     }
@@ -411,8 +469,13 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets(
         }
         expected_claims.extend_from_slice(&set.claims);
     }
-    let (claims, proof) =
-        prove_bls_dory_opening_refs(public_binding, &polynomials, &points, setup)?;
+    let (claims, proof) = prove_bls_dory_opening_refs_with_scratch(
+        public_binding,
+        &polynomials,
+        &points,
+        setup,
+        scratch_directory,
+    )?;
     if claims != expected_claims {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
@@ -577,22 +640,118 @@ struct SumcheckProverOutput {
     peak_additional_coefficients: usize,
 }
 
-enum FoldedPolynomialTable<'a> {
-    Borrowed(&'a [BlsDoryFr]),
-    Owned(Vec<BlsDoryFr>),
+struct FoldScratch<'a> {
+    directory: &'a Path,
+    context_digest: [u8; 32],
 }
 
-impl FoldedPolynomialTable<'_> {
-    fn as_slice(&self) -> &[BlsDoryFr] {
-        match self {
-            Self::Borrowed(values) => values,
-            Self::Owned(values) => values,
+impl<'a> FoldScratch<'a> {
+    fn new(directory: &'a Path, context_digest: [u8; 32]) -> Result<Self, BlsDoryAggregateError> {
+        if !directory.is_absolute() || !directory.is_dir() || context_digest == [0; 32] {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(Self {
+            directory,
+            context_digest,
+        })
+    }
+}
+
+enum FoldedPolynomialStorage<'a> {
+    Borrowed(&'a [BlsDoryFr]),
+    Owned(Vec<BlsDoryFr>),
+    Artifact(BlsDoryFoldArtifact),
+}
+
+struct FoldedPolynomialTable<'a> {
+    storage: FoldedPolynomialStorage<'a>,
+    table_index: u32,
+    lineage_digest: [u8; 32],
+}
+
+impl<'a> FoldedPolynomialTable<'a> {
+    fn borrowed(
+        polynomial: &'a BlsDoryCommittedPolynomial,
+        table_index: usize,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        Ok(Self {
+            storage: FoldedPolynomialStorage::Borrowed(polynomial.polynomial.coefficients()),
+            table_index: u32::try_from(table_index)
+                .map_err(|_| BlsDoryAggregateError::InvalidClaimCount)?,
+            lineage_digest: committed_polynomial_fold_parent(polynomial)?,
+        })
+    }
+
+    fn len(&self) -> usize {
+        match &self.storage {
+            FoldedPolynomialStorage::Borrowed(values) => values.len(),
+            FoldedPolynomialStorage::Owned(values) => values.len(),
+            FoldedPolynomialStorage::Artifact(artifact) => artifact.spec().scalar_count as usize,
         }
     }
 
-    fn fold(&mut self, challenge: BlsDoryFr) -> Result<(), BlsDoryAggregateError> {
-        match self {
-            Self::Borrowed(values) => {
+    fn for_each_pair(
+        &self,
+        mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        match &self.storage {
+            FoldedPolynomialStorage::Borrowed(values) => for_each_memory_pair(values, &mut visitor),
+            FoldedPolynomialStorage::Owned(values) => for_each_memory_pair(values, &mut visitor),
+            FoldedPolynomialStorage::Artifact(artifact) => artifact
+                .for_each_pair(|lower, upper| {
+                    visitor(lower, upper);
+                    Ok(())
+                })
+                .map_err(|_| BlsDoryAggregateError::ProverStorage),
+        }
+    }
+
+    fn fold(
+        &mut self,
+        challenge: BlsDoryFr,
+        generation: usize,
+        scratch: Option<&FoldScratch<'_>>,
+    ) -> Result<(), BlsDoryAggregateError> {
+        if let Some(scratch) = scratch {
+            let scalar_count = self
+                .len()
+                .checked_div(2)
+                .filter(|count| *count > 0)
+                .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+            let spec = BlsDoryFoldArtifactSpec {
+                context_digest: scratch.context_digest,
+                table_index: self.table_index,
+                generation: u32::try_from(generation)
+                    .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+                scalar_count: u64::try_from(scalar_count)
+                    .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+                parent_digest: self.lineage_digest,
+            };
+            let mut writer = BlsDoryFoldArtifactWriter::create(scratch.directory, spec)
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+            match &self.storage {
+                FoldedPolynomialStorage::Borrowed(values) => {
+                    write_memory_fold(values, challenge, &mut writer)?
+                }
+                FoldedPolynomialStorage::Owned(values) => {
+                    write_memory_fold(values, challenge, &mut writer)?
+                }
+                FoldedPolynomialStorage::Artifact(artifact) => artifact
+                    .for_each_pair(|lower, upper| {
+                        writer.write_scalar(&(lower + challenge * (upper - lower)))
+                    })
+                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            }
+            let artifact = writer
+                .finish()
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+            self.lineage_digest = artifact.digest();
+            self.storage = FoldedPolynomialStorage::Artifact(artifact);
+            return Ok(());
+        }
+
+        match &mut self.storage {
+            FoldedPolynomialStorage::Borrowed(values) => {
                 if values.len() < 2 || values.len() % 2 != 0 {
                     return Err(BlsDoryAggregateError::InvalidProofShape);
                 }
@@ -600,9 +759,9 @@ impl FoldedPolynomialTable<'_> {
                     .chunks_exact(2)
                     .map(|pair| pair[0] + challenge * (pair[1] - pair[0]))
                     .collect();
-                *self = Self::Owned(folded);
+                self.storage = FoldedPolynomialStorage::Owned(folded);
             }
-            Self::Owned(values) => {
+            FoldedPolynomialStorage::Owned(values) => {
                 if values.len() < 2 || values.len() % 2 != 0 {
                     return Err(BlsDoryAggregateError::InvalidProofShape);
                 }
@@ -614,9 +773,78 @@ impl FoldedPolynomialTable<'_> {
                 }
                 values.truncate(folded_len);
             }
+            FoldedPolynomialStorage::Artifact(_) => {
+                return Err(BlsDoryAggregateError::ProverStorage);
+            }
         }
         Ok(())
     }
+
+    fn single(&self) -> Result<BlsDoryFr, BlsDoryAggregateError> {
+        if self.len() != 1 {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        match &self.storage {
+            FoldedPolynomialStorage::Borrowed(values) => Ok(values[0]),
+            FoldedPolynomialStorage::Owned(values) => Ok(values[0]),
+            FoldedPolynomialStorage::Artifact(artifact) => {
+                let mut value = None;
+                artifact
+                    .for_each_scalar(|scalar| {
+                        value = Some(scalar);
+                        Ok::<(), BlsDoryFoldArtifactError>(())
+                    })
+                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+                value.ok_or(BlsDoryAggregateError::InvalidProofShape)
+            }
+        }
+    }
+}
+
+fn for_each_memory_pair(
+    values: &[BlsDoryFr],
+    visitor: &mut impl FnMut(BlsDoryFr, BlsDoryFr),
+) -> Result<(), BlsDoryAggregateError> {
+    if values.len() < 2 || !values.len().is_multiple_of(2) {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    for pair in values.chunks_exact(2) {
+        visitor(pair[0], pair[1]);
+    }
+    Ok(())
+}
+
+fn write_memory_fold(
+    values: &[BlsDoryFr],
+    challenge: BlsDoryFr,
+    writer: &mut BlsDoryFoldArtifactWriter,
+) -> Result<(), BlsDoryAggregateError> {
+    if values.len() < 2 || !values.len().is_multiple_of(2) {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    for pair in values.chunks_exact(2) {
+        writer
+            .write_scalar(&(pair[0] + challenge * (pair[1] - pair[0])))
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    }
+    Ok(())
+}
+
+fn committed_polynomial_fold_parent(
+    polynomial: &BlsDoryCommittedPolynomial,
+) -> Result<[u8; 32], BlsDoryAggregateError> {
+    let mut commitment = Vec::new();
+    polynomial
+        .commitment
+        .serialize_compressed(&mut commitment)
+        .map_err(|_| BlsDoryAggregateError::InvalidEncoding)?;
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryFoldParent/v1");
+    hasher.update(&polynomial.setup_identity);
+    hasher.update(&(polynomial.nu as u64).to_le_bytes());
+    hasher.update(&(polynomial.sigma as u64).to_le_bytes());
+    hasher.update(&commitment);
+    Ok(*hasher.finalize().as_bytes())
 }
 
 fn prove_distinct_point_sumcheck(
@@ -624,6 +852,7 @@ fn prove_distinct_point_sumcheck(
     claims: &[BlsDoryOpeningClaim],
     batching: &[BlsDoryFr],
     transcript: &mut BlsDoryTranscript,
+    scratch: Option<&FoldScratch<'_>>,
 ) -> Result<SumcheckProverOutput, BlsDoryAggregateError> {
     let variables = claims[0].point.len();
     let coefficient_count = 1usize
@@ -652,8 +881,9 @@ fn prove_distinct_point_sumcheck(
     }
     let mut polynomial_tables = unique_polynomials
         .iter()
-        .map(|polynomial| FoldedPolynomialTable::Borrowed(polynomial.polynomial.coefficients()))
-        .collect::<Vec<_>>();
+        .enumerate()
+        .map(|(table_index, polynomial)| FoldedPolynomialTable::borrowed(polynomial, table_index))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut equality_prefixes = vec![BlsDoryFr::one(); claims.len()];
     let mut current_claim = claims
         .iter()
@@ -673,7 +903,7 @@ fn prove_distinct_point_sumcheck(
             .zip(&equality_prefixes)
         {
             accumulate_distinct_point_round(
-                polynomial_tables[*table_index].as_slice(),
+                &polynomial_tables[*table_index],
                 claim,
                 *rho,
                 round_index,
@@ -689,7 +919,7 @@ fn prove_distinct_point_sumcheck(
         current_claim = interpolate_quadratic(message, challenge)?;
         random_point.push(challenge);
         for table in &mut polynomial_tables {
-            table.fold(challenge)?;
+            table.fold(challenge, round_index + 1, scratch)?;
         }
         for (prefix, claim) in equality_prefixes.iter_mut().zip(claims) {
             let coordinate = claim.point[round_index];
@@ -704,11 +934,7 @@ fn prove_distinct_point_sumcheck(
         .iter()
         .zip(equality_prefixes.iter().zip(batching))
         .try_fold(BlsDoryFr::zero(), |sum, (table_index, (equality, rho))| {
-            let table = polynomial_tables[*table_index].as_slice();
-            if table.len() != 1 {
-                return Err(BlsDoryAggregateError::InvalidProofShape);
-            }
-            Ok(sum + table[0] * equality * rho)
+            Ok(sum + polynomial_tables[*table_index].single()? * equality * rho)
         })?;
     if terminal != current_claim {
         return Err(BlsDoryAggregateError::SumcheckFailed);
@@ -723,12 +949,16 @@ fn prove_distinct_point_sumcheck(
         #[cfg(test)]
         unique_polynomial_tables: unique_polynomials.len(),
         #[cfg(test)]
-        peak_additional_coefficients: unique_polynomials.len() * (coefficient_count / 2),
+        peak_additional_coefficients: if scratch.is_some() {
+            0
+        } else {
+            unique_polynomials.len() * (coefficient_count / 2)
+        },
     })
 }
 
 fn accumulate_distinct_point_round(
-    polynomial: &[BlsDoryFr],
+    polynomial: &FoldedPolynomialTable<'_>,
     claim: &BlsDoryOpeningClaim,
     rho: BlsDoryFr,
     round_index: usize,
@@ -751,45 +981,59 @@ fn accumulate_distinct_point_round(
     }
 
     let coordinate = claim.point[round_index];
-    let mut pairs = polynomial.chunks_exact(2);
-    for_each_equality_weight(
-        &claim.point[round_index + 1..],
-        BlsDoryFr::one(),
-        &mut |suffix_weight| {
-            let values = pairs
-                .next()
-                .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let mut weights = EqualityWeightIterator::new(&claim.point[round_index + 1..]);
+    let mut visited = 0usize;
+    let mut extra_pair = false;
+    polynomial.for_each_pair(|lower, upper| {
+        if let Some(suffix_weight) = weights.next() {
             let equality_scale = equality_prefix * suffix_weight;
             let equality_zero = equality_scale * (BlsDoryFr::one() - coordinate);
             let equality_one = equality_scale * coordinate;
-            let value_two = values[1] + values[1] - values[0];
+            let value_two = upper + upper - lower;
             let equality_two = equality_one + equality_one - equality_zero;
-            message[0] = message[0] + rho * values[0] * equality_zero;
-            message[1] = message[1] + rho * values[1] * equality_one;
+            message[0] = message[0] + rho * lower * equality_zero;
+            message[1] = message[1] + rho * upper * equality_one;
             message[2] = message[2] + rho * value_two * equality_two;
-            Ok(())
-        },
-    )?;
-    if pairs.next().is_some() {
+            visited += 1;
+        } else {
+            extra_pair = true;
+        }
+    })?;
+    if extra_pair || weights.next().is_some() || visited != expected_len / 2 {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     Ok(())
 }
 
-fn for_each_equality_weight(
-    point: &[BlsDoryFr],
-    prefix: BlsDoryFr,
-    visitor: &mut impl FnMut(BlsDoryFr) -> Result<(), BlsDoryAggregateError>,
-) -> Result<(), BlsDoryAggregateError> {
-    let Some((coordinate, preceding)) = point.split_last() else {
-        return visitor(prefix);
-    };
-    for_each_equality_weight(
-        preceding,
-        prefix * (BlsDoryFr::one() - *coordinate),
-        visitor,
-    )?;
-    for_each_equality_weight(preceding, prefix * *coordinate, visitor)
+struct EqualityWeightIterator<'a> {
+    point: &'a [BlsDoryFr],
+    stack: Vec<(usize, BlsDoryFr)>,
+}
+
+impl<'a> EqualityWeightIterator<'a> {
+    fn new(point: &'a [BlsDoryFr]) -> Self {
+        Self {
+            point,
+            stack: vec![(point.len(), BlsDoryFr::one())],
+        }
+    }
+}
+
+impl Iterator for EqualityWeightIterator<'_> {
+    type Item = BlsDoryFr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((remaining, prefix)) = self.stack.pop() {
+            if remaining == 0 {
+                return Some(prefix);
+            }
+            let coordinate = self.point[remaining - 1];
+            self.stack.push((remaining - 1, prefix * coordinate));
+            self.stack
+                .push((remaining - 1, prefix * (BlsDoryFr::one() - coordinate)));
+        }
+        None
+    }
 }
 
 fn verify_distinct_point_sumcheck(
@@ -1249,8 +1493,32 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, BlsDoryAggregateError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::dory_bls12_381_prototype::deterministic_bls_dory_setup;
+
+    static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn create() -> Self {
+            let nonce = SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-dory-aggregate-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct Fixture {
         setup: DeterministicBlsDorySetup,
@@ -1329,16 +1597,66 @@ mod tests {
             statement_transcript(b"deduplicated-folds", &setup.identity(), &claims, 3, 3).unwrap();
         let batching = batching_challenges(&mut transcript, claims.len());
 
-        let sumcheck =
-            prove_distinct_point_sumcheck(&polynomial_refs, &claims, &batching, &mut transcript)
-                .unwrap();
+        let sumcheck = prove_distinct_point_sumcheck(
+            &polynomial_refs,
+            &claims,
+            &batching,
+            &mut transcript,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(sumcheck.unique_polynomial_tables, 1);
         assert_eq!(sumcheck.peak_additional_coefficients, 1 << 5);
-        let (public_claims, proof) =
-            prove_bls_dory_opening_refs(b"deduplicated-folds", &polynomial_refs, &points, &setup)
-                .unwrap();
+        let (public_claims, proof) = prove_bls_dory_opening_refs_with_scratch(
+            b"deduplicated-folds",
+            &polynomial_refs,
+            &points,
+            &setup,
+            None,
+        )
+        .unwrap();
         verify_bls_dory_openings(b"deduplicated-folds", &public_claims, &proof, &setup).unwrap();
+    }
+
+    #[test]
+    fn authenticated_scratch_preserves_exact_proof_bytes_and_cleans_artifacts() {
+        let Fixture {
+            setup,
+            polynomials,
+            points,
+        } = fixture(6, 3);
+        let scratch = ScratchDirectory::create();
+        let ordinary =
+            prove_bls_dory_openings(b"scratch-equivalence", &polynomials, &points, &setup).unwrap();
+        let artifact_backed = prove_bls_dory_openings_with_scratch(
+            b"scratch-equivalence",
+            &polynomials,
+            &points,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+
+        assert_eq!(artifact_backed, ordinary);
+        verify_bls_dory_openings(
+            b"scratch-equivalence",
+            &artifact_backed.0,
+            &artifact_backed.1,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        assert_eq!(
+            prove_bls_dory_openings_with_scratch(
+                b"scratch-equivalence",
+                &polynomials,
+                &points,
+                &setup,
+                Path::new("relative-scratch"),
+            ),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
     }
 
     #[test]

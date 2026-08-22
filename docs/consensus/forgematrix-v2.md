@@ -440,8 +440,8 @@ comparison. The v2 research code now implements:
   to their corresponding transition or wiring roles. The matrix weight
   commitments are checked directly against the trusted BLS fixed-model identity.
   A canonical shared frame authenticates the exact three-matrix,
-  four-transition, one-wiring production topology with one 126-claim aggregate
-  and projects to 133,373 bytes at n=33. Altered model commitments, equality
+  four-transition, one-wiring production topology with one 128-claim aggregate
+  and projects to 133,409 bytes at n=33. Altered model commitments, equality
   values, and substituted, reordered, or omitted components reject.
   The authenticated model-bank stream now derives the BLS commitments
   incrementally and publishes them only after full bank verification; bounded
@@ -564,7 +564,7 @@ comparison. The v2 research code now implements:
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at
-  19,781,388,244 over at least 2^254 challenges: a 219-bit algebraic floor with
+  19,781,388,263 over at least 2^254 challenges: a 219-bit algebraic floor with
   91 bits of proof-attempt grinding headroom above the 128-bit requirement.
   Dory knowledge soundness, Fiat-Shamir, and implementation review remain
   fail-closed gates;

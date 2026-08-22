@@ -68,6 +68,9 @@ use crate::{
     },
 };
 
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub(crate) mod bls_bridge;
+
 #[cfg(feature = "gpu-proof-prover")]
 type NarrowDftBackend = cmfd_proof_accel::ProofDft;
 #[cfg(not(feature = "gpu-proof-prover"))]
@@ -2419,7 +2422,19 @@ fn validate_opening(
     }
 }
 
-fn encode_native_proof(mut proof: NativeProof) -> Result<Vec<u8>, NarrowBlake3Error> {
+fn encode_native_proof(proof: NativeProof) -> Result<Vec<u8>, NarrowBlake3Error> {
+    encode_native_proof_with_identity(
+        proof,
+        NARROW_BLAKE3_PROOF_MAGIC,
+        NARROW_BLAKE3_PROOF_VERSION,
+    )
+}
+
+fn encode_native_proof_with_identity(
+    mut proof: NativeProof,
+    magic: &[u8; 8],
+    version: u32,
+) -> Result<Vec<u8>, NarrowBlake3Error> {
     let archive = extract_merkle_paths(&mut proof)?;
     let proof_bytes = bincode_options()
         .serialize(&proof)
@@ -2431,8 +2446,8 @@ fn encode_native_proof(mut proof: NativeProof) -> Result<Vec<u8>, NarrowBlake3Er
     let archive_len =
         u32::try_from(archive_bytes.len()).map_err(|_| NarrowBlake3Error::Encoding)?;
     let mut encoded = Vec::with_capacity(20 + proof_bytes.len() + archive_bytes.len());
-    encoded.extend_from_slice(NARROW_BLAKE3_PROOF_MAGIC);
-    encoded.extend_from_slice(&NARROW_BLAKE3_PROOF_VERSION.to_le_bytes());
+    encoded.extend_from_slice(magic);
+    encoded.extend_from_slice(&version.to_le_bytes());
     encoded.extend_from_slice(&proof_len.to_le_bytes());
     encoded.extend_from_slice(&archive_len.to_le_bytes());
     encoded.extend_from_slice(&proof_bytes);
@@ -2441,7 +2456,19 @@ fn encode_native_proof(mut proof: NativeProof) -> Result<Vec<u8>, NarrowBlake3Er
 }
 
 pub(crate) fn decode_native_proof(bytes: &[u8]) -> Result<NativeProof, NarrowBlake3Error> {
-    if bytes.len() < 20 || bytes.get(..8) != Some(NARROW_BLAKE3_PROOF_MAGIC.as_slice()) {
+    decode_native_proof_with_identity(
+        bytes,
+        NARROW_BLAKE3_PROOF_MAGIC,
+        NARROW_BLAKE3_PROOF_VERSION,
+    )
+}
+
+fn decode_native_proof_with_identity(
+    bytes: &[u8],
+    magic: &[u8; 8],
+    expected_version: u32,
+) -> Result<NativeProof, NarrowBlake3Error> {
+    if bytes.len() < 20 || bytes.get(..8) != Some(magic.as_slice()) {
         return Err(NarrowBlake3Error::Encoding);
     }
     let version = u32::from_le_bytes(
@@ -2465,7 +2492,7 @@ pub(crate) fn decode_native_proof(bytes: &[u8]) -> Result<NativeProof, NarrowBla
     let archive_end = proof_end
         .checked_add(archive_len)
         .ok_or(NarrowBlake3Error::Encoding)?;
-    if version != NARROW_BLAKE3_PROOF_VERSION || archive_end != bytes.len() {
+    if version != expected_version || archive_end != bytes.len() {
         return Err(NarrowBlake3Error::Encoding);
     }
     let proof_bytes = &bytes[20..proof_end];

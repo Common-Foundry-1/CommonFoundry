@@ -894,8 +894,8 @@ geometry. That padding preserves the original multilinear coordinates. The
 canonical outer decoders require the same exact count and reject a different
 layout before invoking Dory verification. In the executable n=10 integration
 fixture, matrix, arithmetic transition, range, and wiring all prove and verify
-at that one geometry. The linked fixture has 54 openings, one 21,775-byte Dory
-payload, and a complete 35,953-byte canonical frame. The parser derives
+at that one geometry. The linked fixture has 56 openings, one 21,775-byte Dory
+payload, and a complete 35,989-byte canonical frame. The parser derives
 every component shape from trusted statements and rejects malformed lengths,
 trailing bytes, omitted components, and incompatible geometry.
 
@@ -965,11 +965,36 @@ One equality links the fixed base input to the virtual transition input, another
 links that transition's activation to the wiring initial table, and three per
 bank link matrix activation to wiring input, matrix accumulator to transition
 input, and transition activation to wiring output. Opening both independently
-committed representations adds twenty-two claims, bringing the bounded aggregate
-to 126 under the unchanged cap of 128. One shared Dory payload
-authenticates every ordered base and equality claim. Its complete n=33 frame
-projects to 133,373 bytes. Tests reject changed model identities, fixed
+committed representations adds twenty-two claims. The final-output bridge opens
+the last transition activation and final wiring output at one fresh
+BLS12-381 point, adding two claims and bringing the bounded aggregate to the
+unchanged cap of 128. One shared Dory payload authenticates every ordered base,
+equality, and bridge claim. Its complete n=33 frame projects to 133,409 bytes.
+Tests reject changed model identities, fixed
 commitments, equality values, and substituted, reordered, or omitted components.
+
+The companion BLAKE3 bridge AIR now consumes the exact same eight byte columns
+used by each narrow-tree compression row and accumulates their multilinear basis
+weights at the Dory-derived point. It represents the BLS12-381 scalar with eight
+32-bit limbs. Eight-nibble range decompositions, a bounded 12-bit quotient, and
+bounded signed carry digits make each modular-reduction limb an exact integer
+identity whose absolute value remains below the Goldilocks modulus. The verifier
+therefore does not assume that Goldilocks and BLS12-381 evaluations can be
+compared directly. A real cross-proof fixture obtains the point and evaluation
+from the Dory verifier, proves the matching activation bytes and BLAKE3 digest,
+and rejects byte substitution, point, challenge, digest, transcript-binding,
+codec, and replay changes.
+
+This correctness checkpoint does not fit the block proof budget. At the smallest
+supported 32-byte activation, its 256-row trace has width 393 and produces a
+222,256-byte proof. Combining that measured checkpoint with the current
+133,409-byte production Dory projection and the 18-byte two-proof envelope would
+occupy 355,683 bytes, which is 93,555 bytes above the 262,128-byte structured
+payload allowance. This cross-shape calculation is not a production-size
+measurement, but it is an explicit no-go for direct composition in the current
+form. A sparse byte-link trace, narrower non-native range argument, or another
+sound aggregation/recursion strategy remains the next proof-size gate.
+
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate
 prover no longer retains a duplicate coefficient vector or builds a full
@@ -1290,12 +1315,13 @@ identities, and one 19-variable initialization identity. This is accounted
 before PCS binding error and Fiat-Shamir grinding.
 
 For the exact production topology, the machine-derived conservative numerator
-is `19,781,388,244`. The dominant contribution is the LogUp lookup challenge:
+is `19,781,388,263`. The dominant contribution is the LogUp lookup challenge:
 for each transition, the report grants a nonidentical rational multiset identity
 one root per active range value plus all sixteen table values. The initialization
 has `98 * 2^19` active values and each of three banks has `98 * 2^26`. All
-remaining matrix, transition, reconstruction, wiring, link, and aggregate terms
-sum to 1,940. BLS12-381 `Fr` has a 255-bit modulus, so `|Fr|-1 >= 2^254`; because
+remaining matrix, transition, reconstruction, wiring, link, final-output, and
+aggregate terms sum to 1,959. BLS12-381 `Fr` has a 255-bit modulus, so
+`|Fr|-1 >= 2^254`; because
 the total numerator is below `2^35`, the algebraic false-accept probability is
 strictly below `2^-219`. This leaves 91 bits of simple proof-attempt union-bound
 grinding headroom before reaching the required 128-bit algebraic floor.

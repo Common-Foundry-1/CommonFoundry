@@ -24,6 +24,7 @@ use crate::{
         BLS_DORY_RANGE_LOGUP_SELECTOR_SUMCHECK_DEGREE, BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES,
         BLS_DORY_RANGE_LOGUP_SUMCHECK_DEGREE, BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
     },
+    dory_bls12_381_output_bridge::BLS_DORY_OUTPUT_BRIDGE_PRODUCTION_VARIABLES,
     dory_bls12_381_prototype::{
         BLS_DORY_EXACT_NONZERO_CHALLENGE_SAMPLING, BLS_DORY_TRANSCRIPT_VERSION,
     },
@@ -268,6 +269,11 @@ pub fn production_bls_dory_soundness_report()
             bank_equality_links,
             bank_cell_variables,
         )?,
+        term(
+            "final-output BLAKE3/Dory equality point",
+            1,
+            u64::try_from(BLS_DORY_OUTPUT_BRIDGE_PRODUCTION_VARIABLES)?,
+        )?,
         term("distinct-point claim batching", 1, 1)?,
         term(
             "distinct-point aggregate sumcheck",
@@ -452,6 +458,7 @@ mod tests {
             ("fixed base-input equality link", 1, 19),
             ("initialization-output equality link", 1, 19),
             ("bank equality links", 9, 26),
+            ("final-output BLAKE3/Dory equality point", 1, 19),
             ("distinct-point claim batching", 1, 1),
             ("distinct-point aggregate sumcheck", 1, 66),
         ];
@@ -469,9 +476,9 @@ mod tests {
         assert_eq!(report.transcript_version, 2);
         assert_eq!(report.scalar_modulus_bits, 255);
         assert_eq!(report.nonzero_challenge_space_lower_bound_bits, 254);
-        assert_eq!(report.aggregate_claims, 126);
+        assert_eq!(report.aggregate_claims, 128);
         assert_eq!(report.maximum_aggregate_claims, 128);
-        assert_eq!(report.total_algebraic_numerator_upper_bound, 19_781_388_244);
+        assert_eq!(report.total_algebraic_numerator_upper_bound, 19_781_388_263);
         assert_eq!(ceil_log2(report.total_algebraic_numerator_upper_bound), 35);
         assert_eq!(report.algebraic_soundness_bits, 219);
         assert_eq!(report.required_algebraic_soundness_bits, 128);

@@ -229,8 +229,8 @@ verifier-selected variable count. High-zero padding preserves each component's
 natural multilinear coordinates, while canonical decoders reject a proof made
 for any other geometry before opening verification. An executable n=10 fixture
 proves and verifies matrix, arithmetic transition, range, and wiring at one
-layout with 54 claims and one 21,775-byte Dory payload. Its complete canonical
-frame is 35,953 bytes. The shared grammar admits the exact production topology
+layout with 56 claims and one 21,775-byte Dory payload. Its complete canonical
+frame is 35,989 bytes. The shared grammar admits the exact production topology
 of three matrix proofs, four arithmetic/range transition pairs, and one wiring
 proof. Eleven Fiat-Shamir equality points link the fixed base input to the
 virtual transition, the initialization output to wiring, and, for every bank,
@@ -238,11 +238,12 @@ link matrix activation to wiring input, matrix accumulator to transition input,
 and transition activation to wiring output. Each equality opens both
 independently committed representations. A random combination of the two range
 reconstruction identities reduces the former 480 direct claims to 104; the 22
-link claims bring the aggregate to 126, below the unchanged 128-claim cap. The
+link claims plus two final-output bridge openings bring the aggregate to the
+unchanged 128-claim cap. The
 grammar binds the trusted model identity, every transcript digest, ordered claim,
 and link evaluation, and rejects altered model commitments, links, and omitted or
 reordered components. Production is pinned to n=33. The complete production
-frame projects to 133,373 bytes, including one 70,639-byte shared Dory payload.
+frame projects to 133,409 bytes, including one 70,639-byte shared Dory payload.
 The scalar range checkpoint now reuses the exact packed transition commitment,
 commits the sixteen table multiplicities before sampling `alpha`, and commits
 an inverse polynomial afterward. A degree-four sumcheck proves the inverse,
@@ -258,13 +259,14 @@ The complete n=33 range grammar projects to 78,529 bytes, including the shared
 and range needs 16; adding nine matrix and 31 wiring claims gives a compressed
 subtotal of 104. The composed transition verifier requires arithmetic and range
 proofs to share one commitment. The shared layout adds 22 fixed-model and
-cross-component equality claims and authenticates all 126 claims with one opening
-proof. Transcript v2 now rejection-samples exactly uniformly from nonzero
+cross-component equality claims plus two final-output bridge claims and
+authenticates all 128 claims with one opening proof. Transcript v2 now
+rejection-samples exactly uniformly from nonzero
 BLS12-381 scalars. The executable production union-bound report includes every
 matrix relation and sumcheck, transition reduction, LogUp rational-identity and
 sumcheck term, reconstruction reduction, wiring identity, equality link, and
 distinct-point aggregation term. Its conservative algebraic numerator is
-19,781,388,244 over at least a 2^254 nonzero challenge space, establishing a
+19,781,388,263 over at least a 2^254 nonzero challenge space, establishing a
 219-bit algebraic floor and 91 bits of proof-attempt grinding headroom above the
 128-bit target. The dominant term conservatively grants each invalid LogUp
 multiset one root per active range value plus all sixteen table values. Dory
@@ -273,6 +275,21 @@ have not been independently reviewed; those computational assumptions are not
 silently included in the algebraic number. Final-model commitment publication,
 n=33 prover streaming, production benchmarks, independent review, and external
 audit remain required.
+The final-output bridge checkpoint now opens the last transition activation and
+the final wiring output at one fresh Dory-derived BLS12-381 point and proves
+that the exact bytes consumed by the narrow BLAKE3 trace have the corresponding
+raw-byte MLE value. The byte-side AIR uses eight range-constrained 32-bit limbs,
+bounded modular quotients, and signed carries, so every BLS12-381 reduction is
+an integer equality below the Goldilocks modulus rather than an assumed
+cross-field conversion. A real composed fixture rejects altered activation
+bytes, challenge, digest, transcript binding, point, proof framing, and replay.
+The 32-byte, 256-row checkpoint has main width 393 and a 222,256-byte proof.
+Together with the current 133,409-byte production Dory projection and 18-byte
+candidate envelope, that measured checkpoint would occupy 355,683 bytes,
+93,555 bytes above the 262,128-byte structured-proof allowance. This is a
+correctness checkpoint and an explicit transport no-go, not a production-size
+claim. Production therefore still needs a substantially narrower bridge or a
+different aggregation/recursion strategy before V3 can activate.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

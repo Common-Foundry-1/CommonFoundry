@@ -249,6 +249,19 @@ and range reduction remains useful, but production needs a different succinct
 commitment or aggregation layer; the current FRI path cannot guarantee the
 wire cap.
 
+The feature-gated BLS12-381 Dory replacement now aggregates the production
+matrix, transition, range, wiring, fixed-model, equality-link, and final-output
+claims into a canonical n=33 frame projected at 133,409 bytes. A companion
+cross-field AIR proves that the exact activation bytes hashed by BLAKE3 have the
+same multilinear evaluation opened by Dory. Its bounded canonical zlib codec
+measured 156,500 to 156,650 bytes on the 32-byte bridge fixture, down from
+222,256 to 222,384 native bytes. The resulting cross-shape composition remains
+27,799 to 27,949 bytes over the 262,128-byte payload cap. Query/grinding and
+higher-blowup sweeps do not close that gap at an operationally acceptable cost,
+so the V3 selector remains absent and consensus fails closed. A narrower bridge
+or different sound aggregation layer, a complete n=33 run, independent review,
+and audits remain activation gates.
+
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the
 network limit. Geometry-derived maxima are 154,252 bytes for WHIR and 87,556

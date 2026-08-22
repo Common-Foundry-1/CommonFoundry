@@ -985,15 +985,29 @@ from the Dory verifier, proves the matching activation bytes and BLAKE3 digest,
 and rejects byte substitution, point, challenge, digest, transcript-binding,
 codec, and replay changes.
 
-This correctness checkpoint does not fit the block proof budget. At the smallest
-supported 32-byte activation, its 256-row trace has width 393 and produces a
-222,256-byte proof. Combining that measured checkpoint with the current
-133,409-byte production Dory projection and the 18-byte two-proof envelope would
-occupy 355,683 bytes, which is 93,555 bytes above the 262,128-byte structured
-payload allowance. This cross-shape calculation is not a production-size
-measurement, but it is an explicit no-go for direct composition in the current
-form. A sparse byte-link trace, narrower non-native range argument, or another
-sound aggregation/recursion strategy remains the next proof-size gate.
+This correctness checkpoint does not yet fit the block proof budget. At the
+smallest supported 32-byte activation, its 256-row trace has width 393 and
+release runs produced 222,256- to 222,384-byte native frames. A canonical
+best-zlib outer frame now caps decompression, binds the declared native length,
+retains the inner proof identity, rejects trailing data, and requires
+byte-identical recompression. The resulting wire frames measured 156,500 to
+156,650 bytes under a 157,000-byte regression ceiling. Combining those measured
+checkpoints with the current 133,409-byte production Dory projection and the
+18-byte two-proof envelope gives 289,927 to 290,077 bytes, which remains 27,799
+to 27,949 bytes above the 262,128-byte structured payload allowance.
+
+The parameter boundary is executable as well. With 18 query-grinding bits, the
+production bridge requires at least 32, 28, 25, and 23 queries at log blowups 7,
+8, 9, and 10. Keeping one query above each calculated minimum produces
+compressed frames of 156,650, 145,632, 134,932, and 129,722 bytes. The last is
+still 1,021 bytes over budget after composition, while its LDE is eight times
+the configured size and the tiny-fixture prover slows from 394 to 2,538 ms.
+Keeping log blowup 7 but dropping to 27 or 24 queries would require 35 or 45
+grinding bits for 128 proven bits. This cross-shape calculation is not a
+production-size measurement, but it rules out both direct composition and
+operationally prohibitive grinding as completion. A narrower non-native range
+argument or another sound aggregation/recursion strategy remains the next
+proof-size gate.
 
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate

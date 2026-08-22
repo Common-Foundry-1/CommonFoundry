@@ -1,10 +1,10 @@
-//! Non-consensus verifier boundary for the production-shaped BLS/Dory algebraic proof.
+//! Non-consensus verifier boundary for the production-shaped BLS/Dory proof.
 //!
-//! This module intentionally cannot produce [`crate::PreverifiedBlockProof`].
-//! The shared Dory layout proves the ForgeMatrix arithmetic and wiring, but it
-//! does not yet prove that the final activation hashed by the BLAKE3 argument
-//! is the same table authenticated by Dory. Returning success here therefore
-//! means "algebraic candidate verified", not "block proof verified".
+//! The composed research path verifies both the shared ForgeMatrix arithmetic
+//! layout and the final-output BLAKE3 bridge. This module intentionally cannot
+//! produce [`crate::PreverifiedBlockProof`]: the production proof still exceeds
+//! its wire budget, has not completed an n=33 run, and has not passed the
+//! required independent review and audit gates.
 
 use std::sync::Arc;
 

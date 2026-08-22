@@ -623,19 +623,31 @@ A feature-gated algebraic preverification boundary now connects the reserved V3
 public fields to that real shared-layout decoder and verifier. It pins the
 authenticated model-commitment record, recomputes the block challenge, target,
 and work digest, and preserves global layer numbers when deriving the three
-bank masks. It deliberately returns a different, non-admissible result type:
+bank masks. It deliberately returns a different, non-admissible result type.
 The Dory verifier now returns an opaque authenticated final-output opening. A
 companion narrow BLAKE3 AIR uses range-constrained 32-bit limbs, bounded modular
 quotients, and signed carries to prove that the exact bytes hashed by BLAKE3
 evaluate to that same value over BLS12-381. A real composed fixture rejects
 activation, point, challenge, digest, transcript-binding, codec, and replay
-changes. Direct composition is still too large: the smallest 32-byte,
-256-row bridge checkpoint is 222,256 bytes at main width 393. With the current
-133,409-byte production Dory projection and 18-byte candidate envelope, it would
-occupy 355,683 bytes, 93,555 bytes above the structured-proof allowance. V3
-therefore remains unselectable until this correct bridge is made substantially
-narrower or replaced by another sound aggregation strategy, then measured and
-independently reviewed.
+changes. The bridge now uses a bounded canonical best-zlib outer codec whose
+decoder checks its declared expansion, exact inner proof identity, and
+byte-identical recompression. The smallest 32-byte, 256-row checkpoint has
+main width 393; release runs measured 222,256 to 222,384 native bytes and
+156,500 to 156,650 wire bytes. With the current 133,409-byte production Dory
+projection and 18-byte candidate envelope, the compressed cross-shape
+projection is 289,927 to 290,077 bytes, still 27,799 to 27,949 bytes above the
+structured-proof allowance.
+
+Query reduction cannot safely close that gap at the current rate. The
+production proven-security calculation needs 32 queries at log blowup 7 with
+18 grinding bits. Reducing the bridge to 27 or 24 queries would require 35 or
+45 grinding bits. Raising log blowup to 10 permits 24 queries with a one-query
+margin, but the resulting 129,722-byte compressed bridge still composes to
+263,149 bytes, 1,021 bytes over the cap, while the LDE is eight times larger
+and the tiny-fixture proving time rises from 394 to 2,538 milliseconds. V3
+therefore remains unselectable until the bridge is made substantially
+narrower or replaced by another sound aggregation strategy, then measured
+and independently reviewed.
 
 The verified model-bank reader can now transactionally publish reusable BLS coefficient artifacts as well as the fixed identity. It builds the base input and every ordered weight bank while checking the canonical byte roots and EOF, returns nothing on failure, and cleans provisional files. Its writer reassembles arbitrary authenticated input chunks into canonical rows, commits complete rows in deterministic parallel batches behind a bounded 256 MiB window, and preserves canonical artifact and target-group accumulation order. Three n=19 release A/B repeats measured 814--826 ms for the former serial writer and 377--391 ms for the parallel writer; their 822 and 385 ms medians give a 53.2% reduction while producing the identical artifact digest, row commitments, tier-two commitment, opening claims, and proof bytes. Matrix proving consumes the authenticated weight artifact sequentially, reuses it in the shared aggregate opening, and rejects a commitment from the wrong pinned bank before proving. Bounded fixtures match materialized proof bytes exactly. This removes the roughly 16 GiB in-memory `i64` slice for an n=31 weight bank. It also replaces the former 32-byte-per-weight scalar artifact: the first Dory row is stored as canonical signed words and each remaining model weight in the consensus range `[-125, 125]` is one authenticated byte selecting the fixed dictionary `0, -1..-125, 1..125`. Every read reauthenticates the dictionary, codes, dimensions, source digest, and EOF before expansion.
 

@@ -283,13 +283,28 @@ bounded modular quotients, and signed carries, so every BLS12-381 reduction is
 an integer equality below the Goldilocks modulus rather than an assumed
 cross-field conversion. A real composed fixture rejects altered activation
 bytes, challenge, digest, transcript binding, point, proof framing, and replay.
-The 32-byte, 256-row checkpoint has main width 393 and a 222,256-byte proof.
-Together with the current 133,409-byte production Dory projection and 18-byte
-candidate envelope, that measured checkpoint would occupy 355,683 bytes,
-93,555 bytes above the 262,128-byte structured-proof allowance. This is a
-correctness checkpoint and an explicit transport no-go, not a production-size
-claim. Production therefore still needs a substantially narrower bridge or a
-different aggregation/recursion strategy before V3 can activate.
+The 32-byte, 256-row checkpoint has main width 393. Parallel proof-of-work
+witness selection produced 222,256- to 222,384-byte native frames in release
+runs. The bridge now wraps that frame in a bounded canonical best-zlib codec:
+the decoder caps expansion, checks the declared native length and inner proof
+identity, and requires byte-identical recompression. Release runs measured
+156,500 to 156,650 wire bytes, with a 157,000-byte regression ceiling. Together
+with the current 133,409-byte production Dory projection and 18-byte candidate
+envelope, that cross-shape checkpoint projects to 289,927 through 290,077 bytes,
+27,799 through 27,949 bytes above the 262,128-byte structured-proof allowance.
+
+An executable parameter sweep also rejects FRI tuning as a disguised fix. At
+18 query-grinding bits, the production security calculation needs 32 queries
+at log blowup 7, 28 at log blowup 8, 25 at log blowup 9, and 23 at log blowup
+10. Retaining one query of margin gave compressed bridge frames of 156,650,
+145,632, 134,932, and 129,722 bytes respectively. Even the log-10 candidate
+would compose to 263,149 bytes, 1,021 bytes over the cap, while multiplying the
+LDE by eight and increasing the tiny-fixture proving time from 394 to 2,538 ms.
+At log blowup 7, the 27- and 24-query frames would require 35 and 45 grinding
+bits to retain 128 proven bits; those operationally prohibitive searches are not
+activation candidates. This remains a correctness checkpoint rather than a
+production-size claim. Production still needs a substantially narrower bridge
+or a different aggregation/recursion strategy before V3 can activate.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

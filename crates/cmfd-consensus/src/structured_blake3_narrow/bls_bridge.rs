@@ -7,9 +7,12 @@
 //! an integer equality below the Goldilocks modulus. No field homomorphism
 //! between Goldilocks and BLS12-381 is assumed.
 
+use std::io::{Read, Write};
+
 use ark_bls12_381::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use dory_pcs::primitives::arithmetic::Field as DoryField;
+use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use primitive_types::U512;
 
 use super::*;
@@ -23,6 +26,8 @@ use crate::{
 
 const BRIDGE_PROOF_MAGIC: &[u8; 8] = b"CMFDB3B1";
 const BRIDGE_PROOF_VERSION: u32 = 1;
+const BRIDGE_CODEC_MAGIC: &[u8; 8] = b"CMFDB3Z1";
+const BRIDGE_CODEC_HEADER_BYTES: usize = 12;
 const LIMBS: usize = BLS_DORY_OUTPUT_BRIDGE_SCALAR_LIMBS;
 const LIMB_NIBBLES: usize = 8;
 const QUOTIENT_NIBBLES: usize = 3;
@@ -167,6 +172,17 @@ pub(crate) fn prove_bls_dory_narrow_blake3(
     statement: &BlsDoryOutputBridgeStatement,
     activation: &[u8],
 ) -> Result<Vec<u8>, NarrowBlake3Error> {
+    let config = build_config_with_backends(NarrowDft::default(), NarrowCommitBackend::default());
+    let native = prove_bls_dory_narrow_blake3_with_config(statement, activation, &config, true)?;
+    compress_bridge_proof(&native)
+}
+
+fn prove_bls_dory_narrow_blake3_with_config(
+    statement: &BlsDoryOutputBridgeStatement,
+    activation: &[u8],
+    config: &Config,
+    require_pinned_key: bool,
+) -> Result<Vec<u8>, NarrowBlake3Error> {
     if activation.len() != statement.final_activation_len()
         || activation.iter().any(|value| *value > 250)
     {
@@ -183,15 +199,16 @@ pub(crate) fn prove_bls_dory_narrow_blake3(
     }
     let trace = generate_bridge_trace(&air, statement, &witness)?;
     let public = bridge_public_values(statement);
-    let config = build_config_with_backends(NarrowDft::default(), NarrowCommitBackend::default());
     let log_rows = air.base.trace_rows.ilog2() as usize;
     let proof = catch_unwind(AssertUnwindSafe(
         || -> Result<NativeProof, NarrowBlake3Error> {
-            let (prep, generated_key) = setup_preprocessed(&config, &air, log_rows)
+            let (prep, generated_key) = setup_preprocessed(config, &air, log_rows)
                 .expect("BLS bridge AIR has preprocessed columns");
-            require_matching_preprocessed_key(&generated_key, &pinned_key)?;
+            if require_pinned_key {
+                require_matching_preprocessed_key(&generated_key, &pinned_key)?;
+            }
             Ok(prove_with_preprocessed(
-                &config,
+                config,
                 &air,
                 trace,
                 &public,
@@ -208,7 +225,9 @@ pub(crate) fn verify_bls_dory_narrow_blake3(
     bytes: &[u8],
 ) -> Result<(), NarrowBlake3Error> {
     let air = BlsDoryNarrowBlake3Air::new(statement)?;
-    let proof = decode_native_proof_with_identity(bytes, BRIDGE_PROOF_MAGIC, BRIDGE_PROOF_VERSION)?;
+    let native = decompress_bridge_proof(bytes)?;
+    let proof =
+        decode_native_proof_with_identity(&native, BRIDGE_PROOF_MAGIC, BRIDGE_PROOF_VERSION)?;
     let config = build_config();
     let verifier_key = pinned_preprocessed_verifier_key(&air.base)?;
     let public = bridge_public_values(statement);
@@ -217,6 +236,53 @@ pub(crate) fn verify_bls_dory_narrow_blake3(
     }))
     .map_err(|_| NarrowBlake3Error::BackendPanic)?
     .map_err(|_| NarrowBlake3Error::Verification)
+}
+
+fn compress_bridge_proof(native: &[u8]) -> Result<Vec<u8>, NarrowBlake3Error> {
+    if native.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES {
+        return Err(NarrowBlake3Error::Encoding);
+    }
+    let native_len = u32::try_from(native.len()).map_err(|_| NarrowBlake3Error::Encoding)?;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(native)
+        .map_err(|_| NarrowBlake3Error::Encoding)?;
+    let compressed = encoder.finish().map_err(|_| NarrowBlake3Error::Encoding)?;
+    let mut encoded = Vec::with_capacity(BRIDGE_CODEC_HEADER_BYTES + compressed.len());
+    encoded.extend_from_slice(BRIDGE_CODEC_MAGIC);
+    encoded.extend_from_slice(&native_len.to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    if encoded.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES {
+        return Err(NarrowBlake3Error::Encoding);
+    }
+    Ok(encoded)
+}
+
+fn decompress_bridge_proof(encoded: &[u8]) -> Result<Vec<u8>, NarrowBlake3Error> {
+    if encoded.len() < BRIDGE_CODEC_HEADER_BYTES
+        || encoded.len() > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES
+        || encoded.get(..8) != Some(BRIDGE_CODEC_MAGIC.as_slice())
+    {
+        return Err(NarrowBlake3Error::Encoding);
+    }
+    let expected_len = u32::from_le_bytes(
+        encoded[8..12]
+            .try_into()
+            .map_err(|_| NarrowBlake3Error::Encoding)?,
+    ) as usize;
+    if expected_len > crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES {
+        return Err(NarrowBlake3Error::Encoding);
+    }
+    let decoder = ZlibDecoder::new(&encoded[BRIDGE_CODEC_HEADER_BYTES..]);
+    let mut bounded = decoder.take((crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES + 1) as u64);
+    let mut native = Vec::with_capacity(expected_len);
+    bounded
+        .read_to_end(&mut native)
+        .map_err(|_| NarrowBlake3Error::Encoding)?;
+    if native.len() != expected_len || compress_bridge_proof(&native)? != encoded {
+        return Err(NarrowBlake3Error::Encoding);
+    }
+    Ok(native)
 }
 
 fn constrain_bls_evaluation<AB: AirBuilder>(
@@ -519,6 +585,8 @@ fn nibbles_12(value: u16) -> [u8; 3] {
 mod tests {
     use super::*;
     use crate::forgematrix_v2::output_digest;
+    use p3_air::AirLayout;
+    use p3_uni_stark::{ProvenSecurity, StarkSecurityParams};
 
     fn statement(activation: &[u8], point: Vec<BlsDoryFr>) -> BlsDoryOutputBridgeStatement {
         let challenge = [0x39; 32];
@@ -580,7 +648,16 @@ mod tests {
             256
         );
         assert_eq!(BRIDGE_WIDTH, 393);
-        assert_eq!(proof.len(), 222_256);
+        assert!(
+            proof.len() <= 157_000,
+            "compressed bridge proof is {} bytes",
+            proof.len()
+        );
+        let native = decompress_bridge_proof(&proof).unwrap();
+        assert!(
+            native.len() <= 222_500,
+            "native bridge proof exceeded its measured regression ceiling"
+        );
         verify_bls_dory_narrow_blake3(&bridge_statement, &proof).unwrap();
 
         let changed_point = statement(&activation, point(5).into_iter().rev().collect());
@@ -600,9 +677,121 @@ mod tests {
         let mut wrong_magic = proof.clone();
         wrong_magic[0] ^= 1;
         assert!(verify_bls_dory_narrow_blake3(&bridge_statement, &wrong_magic).is_err());
+        let mut wrong_length = proof.clone();
+        wrong_length[8] ^= 1;
+        assert!(verify_bls_dory_narrow_blake3(&bridge_statement, &wrong_length).is_err());
+        let mut trailing = proof.clone();
+        trailing.push(0);
+        assert!(verify_bls_dory_narrow_blake3(&bridge_statement, &trailing).is_err());
+        let mut noncanonical_encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        noncanonical_encoder.write_all(&native).unwrap();
+        let mut noncanonical = Vec::new();
+        noncanonical.extend_from_slice(BRIDGE_CODEC_MAGIC);
+        noncanonical.extend_from_slice(&u32::try_from(native.len()).unwrap().to_le_bytes());
+        noncanonical.extend_from_slice(&noncanonical_encoder.finish().unwrap());
+        assert_ne!(noncanonical, proof);
+        assert!(verify_bls_dory_narrow_blake3(&bridge_statement, &noncanonical).is_err());
+
+        let mut bomb_encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        bomb_encoder
+            .write_all(&vec![0; crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES + 1])
+            .unwrap();
+        let mut expansion_bomb = Vec::new();
+        expansion_bomb.extend_from_slice(BRIDGE_CODEC_MAGIC);
+        expansion_bomb.extend_from_slice(
+            &u32::try_from(crate::MAX_STRUCTURED_BLAKE3_PROOF_BYTES)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        expansion_bomb.extend_from_slice(&bomb_encoder.finish().unwrap());
+        assert!(decompress_bridge_proof(&expansion_bomb).is_err());
 
         let mut changed_activation = activation;
         changed_activation[9] ^= 1;
         assert!(prove_bls_dory_narrow_blake3(&bridge_statement, &changed_activation).is_err());
+    }
+
+    #[test]
+    #[ignore = "proof-size and soundness parameter measurement"]
+    fn bridge_query_size_and_soundness_measurement() {
+        use std::{io::Write, time::Instant};
+
+        fn proven_security(
+            air: &BlsDoryNarrowBlake3Air,
+            log_blowup: usize,
+            queries: usize,
+            query_pow_bits: usize,
+        ) -> ProvenSecurity {
+            let perm = default_poseidon2();
+            let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm), 0);
+            let mut fri = fri_parameters_with(log_blowup, queries, ChallengeMmcs::new(val));
+            fri.query_proof_of_work_bits = query_pow_bits;
+            let params = StarkSecurityParams::from_air::<F, EF, _, _>(
+                &fri,
+                air,
+                AirLayout::from_air::<F>(air),
+                192,
+                128,
+                2,
+            );
+            ProvenSecurity::compute(&params, air.base.trace_rows)
+        }
+
+        let activation = (0..32).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let bridge_statement = statement(&activation, point(5));
+
+        let production_activation = vec![0_u8; 1 << 19];
+        let production_statement = statement(&production_activation, point(19));
+        let production_air = BlsDoryNarrowBlake3Air::new(&production_statement).unwrap();
+        assert_eq!(production_air.base.trace_rows, 1 << 20);
+
+        let mut margin_candidates = Vec::new();
+        for log_blowup in [7, 8, 9, 10] {
+            let minimum_queries = (1..=FRI_QUERIES)
+                .find(|queries| {
+                    proven_security(&production_air, log_blowup, *queries, FRI_QUERY_POW_BITS)
+                        .security_bits()
+                        >= 128
+                })
+                .unwrap();
+            eprintln!(
+                "kind=bls-bridge-security log_blowup={log_blowup} query_pow_bits={} minimum_queries={minimum_queries}",
+                FRI_QUERY_POW_BITS
+            );
+            margin_candidates.push((log_blowup, minimum_queries + 1));
+        }
+
+        for (log_blowup, queries) in margin_candidates {
+            let required_pow_bits = (0..=64)
+                .find(|query_pow_bits| {
+                    proven_security(&production_air, log_blowup, queries, *query_pow_bits)
+                        .security_bits()
+                        >= 128
+                })
+                .unwrap();
+            let security =
+                proven_security(&production_air, log_blowup, queries, FRI_QUERY_POW_BITS);
+            let config = build_config_with_dft_and_fri(NarrowDft::default(), log_blowup, queries);
+            let started = Instant::now();
+            let proof = prove_bls_dory_narrow_blake3_with_config(
+                &bridge_statement,
+                &activation,
+                &config,
+                false,
+            )
+            .unwrap();
+            let prove_ms = started.elapsed().as_millis();
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(&proof).unwrap();
+            let compressed = encoder.finish().unwrap();
+            eprintln!(
+                "kind=bls-bridge-query-size log_blowup={log_blowup} queries={queries} configured_query_pow_bits={} minimum_query_pow_bits={required_pow_bits} proven_bits={} native_bytes={} zlib_bytes={} prove_ms={prove_ms}",
+                FRI_QUERY_POW_BITS,
+                security.security_bits(),
+                proof.len(),
+                compressed.len(),
+            );
+        }
     }
 }

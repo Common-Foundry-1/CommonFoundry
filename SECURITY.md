@@ -300,6 +300,10 @@ at log blowup 7, 28 at log blowup 8, 25 at log blowup 9, and 23 at log blowup
 145,632, 134,932, and 129,722 bytes respectively. Even the log-10 candidate
 would compose to 263,149 bytes, 1,021 bytes over the cap, while multiplying the
 LDE by eight and increasing the tiny-fixture proving time from 394 to 2,538 ms.
+At production shape that log-10 LDE has `2^30` rows: its 393 main columns contain
+3,375,844,294,656 raw bytes (3,144 GiB), and its 84 preprocessed columns contain
+another 721,554,505,728 raw bytes (672 GiB), before Merkle data or scratch space.
+No log-10 production preprocessed key is pinned.
 At log blowup 7, the 27- and 24-query frames would require 35 and 45 grinding
 bits to retain 128 proven bits; those operationally prohibitive searches are not
 activation candidates. This remains a correctness checkpoint rather than a

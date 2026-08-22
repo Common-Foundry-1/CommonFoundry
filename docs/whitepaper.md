@@ -644,7 +644,10 @@ production proven-security calculation needs 32 queries at log blowup 7 with
 45 grinding bits. Raising log blowup to 10 permits 24 queries with a one-query
 margin, but the resulting 129,722-byte compressed bridge still composes to
 263,149 bytes, 1,021 bytes over the cap, while the LDE is eight times larger
-and the tiny-fixture proving time rises from 394 to 2,538 milliseconds. V3
+and the tiny-fixture proving time rises from 394 to 2,538 milliseconds. At
+production shape its `2^30`-row LDE would contain 3,144 GiB of raw main values
+plus 672 GiB of raw preprocessing before Merkle data or scratch space, and no
+matching production preprocessed key is pinned. V3
 therefore remains unselectable until the bridge is made substantially
 narrower or replaced by another sound aggregation strategy, then measured
 and independently reviewed.

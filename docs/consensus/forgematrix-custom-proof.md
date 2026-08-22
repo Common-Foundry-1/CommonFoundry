@@ -1002,6 +1002,9 @@ production bridge requires at least 32, 28, 25, and 23 queries at log blowups 7,
 compressed frames of 156,650, 145,632, 134,932, and 129,722 bytes. The last is
 still 1,021 bytes over budget after composition, while its LDE is eight times
 the configured size and the tiny-fixture prover slows from 394 to 2,538 ms.
+At production shape, that `2^30`-row LDE contains 3,375,844,294,656 raw main
+bytes (3,144 GiB) plus 721,554,505,728 raw preprocessed bytes (672 GiB) before
+Merkle data or scratch space, and it has no pinned production preprocessed key.
 Keeping log blowup 7 but dropping to 27 or 24 queries would require 35 or 45
 grinding bits for 128 proven bits. This cross-shape calculation is not a
 production-size measurement, but it rules out both direct composition and
@@ -1359,13 +1362,16 @@ mathematically impossible."
 
 ## 9. Remaining activation work
 
-Two sanitizer-ready `cargo-fuzz` targets now exercise the outer structured
-aggregate decoder and the nested BLS shared-layout decoder. The latter uses a
-valid fixed topology and a format dictionary so mutations reach matrix,
-transition, LogUp, wiring, and field-element decoding instead of stopping at
-the outer header. Bounded Windows MSVC smoke campaigns completed one million
-executions per target without a crash, panic, timeout, or sanitizer finding.
-This is a reproducible starting dictionary and harness, not an exhaustive fuzzing
+Three sanitizer-ready `cargo-fuzz` targets now exercise the outer structured
+aggregate decoder, the nested BLS shared-layout decoder, and the V3 candidate
+envelope. The shared-layout target uses a valid fixed topology and a format
+dictionary so mutations reach matrix, transition, LogUp, wiring, and
+field-element decoding instead of stopping at the outer header. Bounded Windows
+MSVC smoke campaigns completed one million executions for each of the first two
+targets without a crash, panic, timeout, or sanitizer finding. A Linux
+AddressSanitizer smoke campaign completed 10,000 executions of the V3 envelope
+target without a crash, panic, timeout, or sanitizer finding. These are
+reproducible starting dictionaries and harnesses, not an exhaustive fuzzing
 claim or a substitute for sustained independent campaigns.
 
 Before a production proof tag can exist:

@@ -25,3 +25,10 @@ path = "fuzz_targets/bls_shared_layout_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "bls_v3_candidate_decode"
+path = "fuzz_targets/bls_v3_candidate_decode.rs"
+test = false
+doc = false
+bench = false

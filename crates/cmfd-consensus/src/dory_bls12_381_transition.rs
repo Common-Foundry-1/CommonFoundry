@@ -24,15 +24,17 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     V2_TRANSITION_MODULUS,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_padded_prefix_with_optional_scratch,
-        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryIndexedRowSource,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_indexed_row_source_with_scratch,
+        commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
     dory_bls12_381_fold_artifact::{
         BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
         BlsDoryFoldArtifactWriter,
     },
+    dory_bls12_381_index_artifact::BlsDoryIndexArtifactSpec,
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
@@ -310,6 +312,39 @@ pub fn projected_production_transition_proof_bytes() -> Result<usize, BlsDoryTra
     transition_wire_bytes(26, opening)
 }
 
+/// Exact retained coefficient bytes for the production transition source.
+pub fn projected_production_transition_source_artifact_bytes() -> Result<u64, BlsDoryTransitionError>
+{
+    let cells = 1u64
+        .checked_shl(
+            u32::try_from(
+                PRODUCTION_BLS_DORY_TRANSITION_VARIABLES - BLS_DORY_TRANSITION_SELECTOR_VARIABLES,
+            )
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        )
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let scalar_count = 1u64
+        .checked_shl(
+            u32::try_from(PRODUCTION_BLS_DORY_TRANSITION_VARIABLES)
+                .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        )
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let explicit_scalar_count = cells
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let literal_scalar_count = cells
+        .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES as u64)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    BlsDoryIndexArtifactSpec {
+        context_digest: [1; 32],
+        scalar_count,
+        explicit_scalar_count,
+        literal_scalar_count,
+    }
+    .encoded_bytes(16)
+    .map_err(|_| BlsDoryTransitionError::InvalidDimensions)
+}
+
 /// Prove the seven regular transition constraints and authenticate twelve terminals.
 pub fn prove_bls_dory_transition(
     binding: &[u8],
@@ -447,7 +482,7 @@ fn prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
         None
     };
     let committed = if let Some(scratch_directory) = scratch_directory {
-        commit_bls_dory_row_source_with_scratch(
+        commit_bls_dory_indexed_row_source_with_scratch(
             witness_source
                 .as_mut()
                 .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
@@ -938,6 +973,7 @@ pub(crate) struct BlsDoryTransitionWitnessRowSource<'a> {
     rows: usize,
     columns: usize,
     explicit_scalars: usize,
+    range_dictionary: Vec<BlsDoryFr>,
 }
 
 impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
@@ -988,7 +1024,18 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
             rows,
             columns,
             explicit_scalars,
+            range_dictionary: (0..16).map(BlsDoryFr::from_u64).collect(),
         })
+    }
+
+    pub(crate) const fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn literal_scalar_count(&self) -> usize {
+        ((self.elements * STRUCTURED_TRANSITION_REGULAR_ORACLES).div_ceil(self.columns)
+            * self.columns)
+            .min(self.explicit_scalars)
     }
 
     fn regular_value(
@@ -1119,7 +1166,7 @@ impl BlsDoryRowSource for BlsDoryTransitionWitnessRowSource<'_> {
     }
 
     fn explicit_scalar_count(&self) -> usize {
-        self.explicit_scalars
+        self.explicit_scalar_count()
     }
 
     fn read_row(
@@ -1139,6 +1186,73 @@ impl BlsDoryRowSource for BlsDoryTransitionWitnessRowSource<'_> {
             } else {
                 BlsDoryFr::zero()
             };
+        }
+        Ok(output.len())
+    }
+}
+
+impl BlsDoryIndexedRowSource for BlsDoryTransitionWitnessRowSource<'_> {
+    type Error = BlsDoryTransitionError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalar_count()
+    }
+
+    fn literal_scalar_count(&self) -> usize {
+        self.literal_scalar_count()
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.range_dictionary
+    }
+
+    fn read_literal_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        let end = start
+            .checked_add(output.len())
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if output.len() != self.columns || end > self.literal_scalar_count() {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        for (column, scalar) in output.iter_mut().enumerate() {
+            let packed_index = start + column;
+            let oracle = packed_index / self.elements;
+            let index = packed_index % self.elements;
+            *scalar = self.scalar(oracle, index)?;
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if output.len() != self.columns || start < self.literal_scalar_count() {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        for (column, code) in output.iter_mut().enumerate() {
+            let packed_index = start + column;
+            if packed_index >= self.explicit_scalars {
+                *code = 0;
+                continue;
+            }
+            let oracle = packed_index / self.elements;
+            let index = packed_index % self.elements;
+            *code = self.range_digit(oracle, index)?;
         }
         Ok(output.len())
     }
@@ -1988,6 +2102,26 @@ mod tests {
         .unwrap();
         assert_eq!(scratch.proof, ordinary.proof);
         assert_eq!(scratch.openings.claims(), ordinary.openings.claims());
+        let ordinary_polynomial = ordinary.openings.polynomial(0).unwrap();
+        let scratch_polynomial = scratch.openings.polynomial(0).unwrap();
+        assert_eq!(
+            scratch_polynomial.row_commitments(),
+            ordinary_polynomial.row_commitments()
+        );
+        let artifact_bytes =
+            std::fs::metadata(scratch_polynomial.coefficient_artifact_path().unwrap())
+                .unwrap()
+                .len();
+        let elements = u64::try_from(statement.elements().unwrap()).unwrap();
+        let literal_scalars = elements * STRUCTURED_TRANSITION_REGULAR_ORACLES as u64;
+        let indexed_scalars = elements
+            * (STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES) as u64;
+        assert_eq!(
+            artifact_bytes,
+            72 + 16 * 32 + literal_scalars * 32 + indexed_scalars + 32
+        );
+        let former_scalar_bytes = 100 + elements * STRUCTURED_TRANSITION_ORACLES as u64 * 32 + 32;
+        assert!(artifact_bytes * 5 < former_scalar_bytes);
         drop(scratch);
         assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
     }
@@ -2078,6 +2212,10 @@ mod tests {
         assert_eq!(
             projected_production_transition_proof_bytes().unwrap(),
             74_979
+        );
+        assert_eq!(
+            projected_production_transition_source_artifact_bytes().unwrap(),
+            32_346_473_064
         );
         assert!(projected_production_transition_opening_bytes().unwrap() < 262_128);
         assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 3);

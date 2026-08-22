@@ -1,23 +1,28 @@
 //! Self-authenticating indexed scalar artifacts for BLS12-381 polynomials.
 //!
-//! A small canonical dictionary is stored once and each explicit coefficient
-//! is represented by one authenticated byte. These prover-local files never
-//! enter Fiat-Shamir; any framing, code, digest, or I/O failure aborts proving.
+//! A canonical literal-scalar prefix is followed by a small dictionary and one
+//! authenticated byte per remaining explicit coefficient. These prover-local
+//! files never enter Fiat-Shamir; any framing, scalar, code, digest, or I/O
+//! failure aborts proving.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dory_pcs::primitives::{DorySerialize, arithmetic::Field};
+use dory_pcs::primitives::{
+    DoryDeserialize, DorySerialize,
+    arithmetic::Field,
+    serialization::{Compress, Validate},
+};
 use same_file::Handle;
 use thiserror::Error;
 
 use crate::dory_bls12_381_prototype::BlsDoryFr;
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSI1";
-const ARTIFACT_VERSION: u16 = 1;
-const ARTIFACT_HEADER_BYTES: usize = 64;
+const ARTIFACT_VERSION: u16 = 2;
+const ARTIFACT_HEADER_BYTES: usize = 72;
 const ARTIFACT_DIGEST_BYTES: usize = 32;
 const ARTIFACT_SCALAR_BYTES: usize = 32;
 const ARTIFACT_IO_BUFFER_BYTES: usize = 1024 * 1024;
@@ -31,15 +36,27 @@ pub struct BlsDoryIndexArtifactSpec {
     pub scalar_count: u64,
     /// Canonically stored prefix length. Remaining logical scalars are zero.
     pub explicit_scalar_count: u64,
+    /// Initial explicit scalars stored canonically at 32 bytes each. The
+    /// remaining explicit coefficients are one-byte dictionary codes.
+    pub literal_scalar_count: u64,
 }
 
 impl BlsDoryIndexArtifactSpec {
+    pub(crate) fn encoded_bytes(
+        self,
+        dictionary_len: usize,
+    ) -> Result<u64, BlsDoryIndexArtifactError> {
+        self.validate(dictionary_len)?;
+        artifact_file_bytes(self, dictionary_len)
+    }
+
     fn validate(self, dictionary_len: usize) -> Result<(), BlsDoryIndexArtifactError> {
         if self.context_digest == [0; 32]
             || self.scalar_count == 0
             || !self.scalar_count.is_power_of_two()
             || self.explicit_scalar_count == 0
             || self.explicit_scalar_count > self.scalar_count
+            || self.literal_scalar_count > self.explicit_scalar_count
             || !(1..=256).contains(&dictionary_len)
         {
             return Err(BlsDoryIndexArtifactError::InvalidSpec);
@@ -61,7 +78,8 @@ impl BlsDoryIndexArtifactSpec {
         header[12..44].copy_from_slice(&self.context_digest);
         header[44..52].copy_from_slice(&self.scalar_count.to_le_bytes());
         header[52..60].copy_from_slice(&self.explicit_scalar_count.to_le_bytes());
-        header[60..62].copy_from_slice(&dictionary_len.to_le_bytes());
+        header[60..68].copy_from_slice(&self.literal_scalar_count.to_le_bytes());
+        header[68..70].copy_from_slice(&dictionary_len.to_le_bytes());
         Ok(header)
     }
 }
@@ -86,7 +104,8 @@ pub struct BlsDoryIndexArtifactWriter {
     spec: BlsDoryIndexArtifactSpec,
     dictionary: Vec<BlsDoryFr>,
     hasher: blake3::Hasher,
-    written: u64,
+    written_literals: u64,
+    written_codes: u64,
 }
 
 impl BlsDoryIndexArtifactWriter {
@@ -126,18 +145,52 @@ impl BlsDoryIndexArtifactWriter {
             spec,
             dictionary,
             hasher,
-            written: 0,
+            written_literals: 0,
+            written_codes: 0,
         })
     }
 
+    pub fn write_scalars(
+        &mut self,
+        scalars: &[BlsDoryFr],
+    ) -> Result<(), BlsDoryIndexArtifactError> {
+        if self.written_codes != 0 {
+            return Err(BlsDoryIndexArtifactError::InvalidArtifact);
+        }
+        let count =
+            u64::try_from(scalars.len()).map_err(|_| BlsDoryIndexArtifactError::InvalidArtifact)?;
+        let next_written = self
+            .written_literals
+            .checked_add(count)
+            .ok_or(BlsDoryIndexArtifactError::InvalidArtifact)?;
+        if next_written > self.spec.literal_scalar_count {
+            return Err(BlsDoryIndexArtifactError::InvalidArtifact);
+        }
+        for scalar in scalars {
+            let encoded = encode_scalar(scalar)?;
+            self.file_mut()?.write_all(&encoded)?;
+            self.hasher.update(&encoded);
+        }
+        self.written_literals = next_written;
+        Ok(())
+    }
+
     pub fn write_codes(&mut self, codes: &[u8]) -> Result<(), BlsDoryIndexArtifactError> {
+        if self.written_literals != self.spec.literal_scalar_count {
+            return Err(BlsDoryIndexArtifactError::InvalidArtifact);
+        }
         let count =
             u64::try_from(codes.len()).map_err(|_| BlsDoryIndexArtifactError::InvalidArtifact)?;
         let next_written = self
-            .written
+            .written_codes
             .checked_add(count)
             .ok_or(BlsDoryIndexArtifactError::InvalidArtifact)?;
-        if next_written > self.spec.explicit_scalar_count
+        let code_count = self
+            .spec
+            .explicit_scalar_count
+            .checked_sub(self.spec.literal_scalar_count)
+            .ok_or(BlsDoryIndexArtifactError::InvalidArtifact)?;
+        if next_written > code_count
             || codes
                 .iter()
                 .any(|code| usize::from(*code) >= self.dictionary.len())
@@ -146,12 +199,19 @@ impl BlsDoryIndexArtifactWriter {
         }
         self.file_mut()?.write_all(codes)?;
         self.hasher.update(codes);
-        self.written = next_written;
+        self.written_codes = next_written;
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<BlsDoryIndexArtifact, BlsDoryIndexArtifactError> {
-        if self.written != self.spec.explicit_scalar_count {
+        if self.written_literals != self.spec.literal_scalar_count
+            || self.written_codes
+                != self
+                    .spec
+                    .explicit_scalar_count
+                    .checked_sub(self.spec.literal_scalar_count)
+                    .ok_or(BlsDoryIndexArtifactError::InvalidArtifact)?
+        {
             return Err(BlsDoryIndexArtifactError::InvalidArtifact);
         }
         let digest = *self.hasher.finalize().as_bytes();
@@ -222,7 +282,17 @@ impl BlsDoryIndexArtifact {
         mut visitor: impl FnMut(BlsDoryFr) -> Result<(), BlsDoryIndexArtifactError>,
     ) -> Result<(), BlsDoryIndexArtifactError> {
         self.validate_live_file(|reader, hasher| {
-            let mut remaining = self.spec.explicit_scalar_count;
+            let mut encoded = [0u8; ARTIFACT_SCALAR_BYTES];
+            for _ in 0..self.spec.literal_scalar_count {
+                reader.read_exact(&mut encoded)?;
+                hasher.update(&encoded);
+                visitor(decode_scalar(encoded)?)?;
+            }
+            let mut remaining = self
+                .spec
+                .explicit_scalar_count
+                .checked_sub(self.spec.literal_scalar_count)
+                .ok_or(BlsDoryIndexArtifactError::InvalidArtifact)?;
             let mut codes = vec![0u8; ARTIFACT_IO_BUFFER_BYTES];
             while remaining > 0 {
                 let take = usize::try_from(remaining.min(codes.len() as u64))
@@ -342,9 +412,18 @@ fn artifact_file_bytes(
         .ok()
         .and_then(|count| count.checked_mul(ARTIFACT_SCALAR_BYTES as u64))
         .ok_or(BlsDoryIndexArtifactError::InvalidSpec)?;
+    let literal_bytes = spec
+        .literal_scalar_count
+        .checked_mul(ARTIFACT_SCALAR_BYTES as u64)
+        .ok_or(BlsDoryIndexArtifactError::InvalidSpec)?;
+    let code_bytes = spec
+        .explicit_scalar_count
+        .checked_sub(spec.literal_scalar_count)
+        .ok_or(BlsDoryIndexArtifactError::InvalidSpec)?;
     (ARTIFACT_HEADER_BYTES as u64)
         .checked_add(dictionary_bytes)
-        .and_then(|bytes| bytes.checked_add(spec.explicit_scalar_count))
+        .and_then(|bytes| bytes.checked_add(literal_bytes))
+        .and_then(|bytes| bytes.checked_add(code_bytes))
         .and_then(|bytes| bytes.checked_add(ARTIFACT_DIGEST_BYTES as u64))
         .ok_or(BlsDoryIndexArtifactError::InvalidSpec)
 }
@@ -357,6 +436,16 @@ fn encode_scalar(scalar: &BlsDoryFr) -> Result<[u8; 32], BlsDoryIndexArtifactErr
     encoded
         .try_into()
         .map_err(|_| BlsDoryIndexArtifactError::InvalidScalar)
+}
+
+fn decode_scalar(encoded: [u8; 32]) -> Result<BlsDoryFr, BlsDoryIndexArtifactError> {
+    let mut reader = Cursor::new(encoded.as_slice());
+    let scalar = BlsDoryFr::deserialize_with_mode(&mut reader, Compress::Yes, Validate::Yes)
+        .map_err(|_| BlsDoryIndexArtifactError::InvalidScalar)?;
+    if reader.position() != ARTIFACT_SCALAR_BYTES as u64 {
+        return Err(BlsDoryIndexArtifactError::InvalidScalar);
+    }
+    Ok(scalar)
 }
 
 fn remove_if_owned(path: &Path, file: &File) {
@@ -403,6 +492,7 @@ mod tests {
             context_digest: [7; 32],
             scalar_count: 16,
             explicit_scalar_count: explicit,
+            literal_scalar_count: 0,
         }
     }
 
@@ -451,6 +541,61 @@ mod tests {
             artifact.for_each_scalar(|_| Ok(())),
             Err(BlsDoryIndexArtifactError::Authentication)
         ));
+        drop(artifact);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn indexed_artifact_round_trips_a_canonical_literal_prefix() {
+        let directory = TestDirectory::create();
+        let dictionary = vec![
+            BlsDoryFr::zero(),
+            BlsDoryFr::from_u64(1),
+            BlsDoryFr::from_u64(2),
+        ];
+        let literals = [
+            BlsDoryFr::from_u64(101),
+            BlsDoryFr::from_u64(103),
+            BlsDoryFr::from_u64(107),
+        ];
+        let hybrid_spec = BlsDoryIndexArtifactSpec {
+            literal_scalar_count: literals.len() as u64,
+            ..spec(8)
+        };
+        let mut writer =
+            BlsDoryIndexArtifactWriter::create(&directory.0, hybrid_spec, dictionary.clone())
+                .unwrap();
+        assert!(matches!(
+            writer.write_codes(&[1]),
+            Err(BlsDoryIndexArtifactError::InvalidArtifact)
+        ));
+        writer.write_scalars(&literals[..2]).unwrap();
+        writer.write_scalars(&literals[2..]).unwrap();
+        writer.write_codes(&[0, 1, 2, 1, 0]).unwrap();
+        assert!(matches!(
+            writer.write_scalars(&[BlsDoryFr::one()]),
+            Err(BlsDoryIndexArtifactError::InvalidArtifact)
+        ));
+        let artifact = writer.finish().unwrap();
+        let path = artifact.path().to_path_buf();
+        let mut decoded = Vec::new();
+        artifact
+            .for_each_scalar(|scalar| {
+                decoded.push(scalar);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            decoded,
+            literals
+                .into_iter()
+                .chain([0usize, 1, 2, 1, 0].map(|code| dictionary[code]))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            artifact_file_bytes(hybrid_spec, dictionary.len()).unwrap()
+        );
         drop(artifact);
         assert!(!path.exists());
     }
@@ -517,6 +662,38 @@ mod tests {
         assert!(matches!(
             artifact.for_each_scalar(|_| Ok(())),
             Err(BlsDoryIndexArtifactError::InvalidArtifact)
+        ));
+        drop(artifact);
+        assert!(!path.exists());
+
+        let hybrid_spec = BlsDoryIndexArtifactSpec {
+            literal_scalar_count: 1,
+            ..spec(2)
+        };
+        let mut writer = BlsDoryIndexArtifactWriter::create(
+            &directory.0,
+            hybrid_spec,
+            vec![BlsDoryFr::zero(), BlsDoryFr::one()],
+        )
+        .unwrap();
+        writer.write_scalars(&[BlsDoryFr::one()]).unwrap();
+        writer.write_codes(&[0]).unwrap();
+        let artifact = writer.finish().unwrap();
+        let path = artifact.path().to_path_buf();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let literal_offset = ARTIFACT_HEADER_BYTES + 2 * ARTIFACT_SCALAR_BYTES;
+        bytes[literal_offset..literal_offset + ARTIFACT_SCALAR_BYTES].fill(0xff);
+        let digest_offset = bytes.len() - ARTIFACT_DIGEST_BYTES;
+        let mut hasher = blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN);
+        hasher.update(&bytes[..digest_offset]);
+        bytes[digest_offset..].copy_from_slice(hasher.finalize().as_bytes());
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        assert!(matches!(
+            artifact.for_each_scalar(|_| Ok(())),
+            Err(BlsDoryIndexArtifactError::InvalidScalar)
         ));
         drop(artifact);
         assert!(!path.exists());

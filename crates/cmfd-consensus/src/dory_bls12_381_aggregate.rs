@@ -51,7 +51,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, indexed inverse artifacts, and consuming openings preserve exact proofs; n=19 still takes 9.746 seconds proving plus 7.161 seconds opening, projects to roughly 1.85 plus 1.36 CPU days at n=33, and the fourth range pair still projects near 1.21 TiB peak scratch",
+    "bounded parallel commitments, hybrid transition/inverse artifacts, and consuming openings preserve exact proofs; n=19 still takes 9.714 seconds proving plus 7.072 seconds opening, projects to roughly 1.84 plus 1.34 CPU days at n=33, and the fourth range pair still projects near 478 GiB peak scratch",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -994,22 +994,30 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
     })
 }
 
-/// Canonical one-byte coefficient source backed by a fixed scalar dictionary.
-/// Dictionary entry zero must be the field zero; omitted trailing coefficients
-/// are therefore represented canonically without entering the artifact.
+/// Canonical literal-prefix and one-byte coefficient source backed by a fixed
+/// scalar dictionary. Dictionary entry zero must be the field zero; omitted
+/// trailing coefficients are represented canonically without entering the
+/// artifact.
 pub(crate) trait BlsDoryIndexedRowSource {
     type Error;
 
     fn rows(&self) -> usize;
     fn columns(&self) -> usize;
     fn explicit_scalar_count(&self) -> usize;
+    fn literal_scalar_count(&self) -> usize;
     fn dictionary(&self) -> &[BlsDoryFr];
+    fn read_literal_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error>;
     fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error>;
 }
 
-/// Commit a canonical indexed row source while retaining one authenticated
-/// code byte per explicit coefficient instead of one 32-byte field element.
-/// Expansion is bounded to a row chunk and does not change Dory commitments.
+/// Commit a canonical indexed row source while retaining literal scalars only
+/// for the source-selected row prefix and one authenticated code byte for every
+/// remaining explicit coefficient. Expansion is bounded to a row chunk and
+/// does not change Dory commitments.
 pub(crate) fn commit_bls_dory_indexed_row_source_with_scratch<S: BlsDoryIndexedRowSource>(
     source: &mut S,
     nu: usize,
@@ -1031,10 +1039,13 @@ pub(crate) fn commit_bls_dory_indexed_row_source_with_scratch<S: BlsDoryIndexedR
         .checked_mul(columns)
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
     let explicit_coefficient_count = source.explicit_scalar_count();
+    let literal_coefficient_count = source.literal_scalar_count();
     if source.rows() != rows
         || source.columns() != columns
         || explicit_coefficient_count == 0
         || explicit_coefficient_count > coefficient_count
+        || literal_coefficient_count > explicit_coefficient_count
+        || !literal_coefficient_count.is_multiple_of(columns)
         || setup.max_log_n() < nu + sigma
         || setup.prover().g1_vec.len() < columns
         || setup.prover().g2_vec.len() < rows
@@ -1054,6 +1065,8 @@ pub(crate) fn commit_bls_dory_indexed_row_source_with_scratch<S: BlsDoryIndexedR
         context_digest: fold_spec.context_digest,
         scalar_count: fold_spec.scalar_count,
         explicit_scalar_count: fold_spec.explicit_scalar_count,
+        literal_scalar_count: u64::try_from(literal_coefficient_count)
+            .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
     };
     let mut writer =
         BlsDoryIndexArtifactWriter::create(scratch_directory, index_spec, dictionary.clone())
@@ -1061,11 +1074,52 @@ pub(crate) fn commit_bls_dory_indexed_row_source_with_scratch<S: BlsDoryIndexedR
     let mut row_commitments = vec![BlsDoryG1::identity(); rows];
     let mut commitment = BlsDoryGt::identity();
     let explicit_rows = explicit_coefficient_count.div_ceil(columns);
+    let literal_rows = literal_coefficient_count / columns;
     let expanded_row_bytes = columns
         .checked_mul(std::mem::size_of::<BlsDoryFr>())
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
     let rows_per_chunk = (ROW_COMMIT_CHUNK_BYTES / expanded_row_bytes.max(1)).max(1);
-    for chunk_start in (0..explicit_rows).step_by(rows_per_chunk) {
+    for chunk_start in (0..literal_rows).step_by(rows_per_chunk) {
+        let chunk_end = chunk_start.saturating_add(rows_per_chunk).min(literal_rows);
+        let chunk_rows = chunk_end - chunk_start;
+        let chunk_scalars = chunk_rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let mut coefficients = vec![BlsDoryFr::zero(); chunk_scalars];
+        for (local_row, row) in coefficients.chunks_exact_mut(columns).enumerate() {
+            let row_index = chunk_start + local_row;
+            let written = source
+                .read_literal_row(row_index, row)
+                .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
+            if written != columns {
+                return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+            }
+        }
+        let committed_rows = coefficients
+            .par_chunks_exact(columns)
+            .enumerate()
+            .map(|(local_row, row)| {
+                let row_index = chunk_start + local_row;
+                let row_commitment = setup
+                    .commit_row_segment(0, row)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                let paired = setup
+                    .pair_committed_row(row_index, &row_commitment)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                Ok((row_commitment, paired))
+            })
+            .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        for (local_row, (row_commitment, paired)) in committed_rows.into_iter().enumerate() {
+            let row_index = chunk_start + local_row;
+            commitment = commitment + paired;
+            row_commitments[row_index] = row_commitment;
+            let row_start = local_row * columns;
+            writer
+                .write_scalars(&coefficients[row_start..row_start + columns])
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        }
+    }
+    for chunk_start in (literal_rows..explicit_rows).step_by(rows_per_chunk) {
         let chunk_end = chunk_start
             .saturating_add(rows_per_chunk)
             .min(explicit_rows);

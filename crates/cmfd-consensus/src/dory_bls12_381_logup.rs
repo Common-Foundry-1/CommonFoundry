@@ -29,26 +29,29 @@ use crate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
         BlsDoryIndexedRowSource, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
         commit_bls_dory_indexed_row_source_with_scratch,
-        commit_bls_dory_padded_prefix_with_optional_scratch,
-        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
     dory_bls12_381_fold_artifact::{
         BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
         BlsDoryFoldArtifactWriter,
     },
+    dory_bls12_381_index_artifact::BlsDoryIndexArtifactSpec,
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
     dory_bls12_381_transition::{
         BlsDoryTransitionError, BlsDoryTransitionWitnessRowSource, build_scalar_oracles,
-        pack_oracles,
+        pack_oracles, projected_production_transition_source_artifact_bytes,
     },
     structured_transition::structured_transition_range_specs,
 };
 
 #[cfg(test)]
-use crate::dory_bls12_381_streaming::BlsDoryRowSource;
+use crate::{
+    dory_bls12_381_aggregate::commit_bls_dory_row_source_with_scratch,
+    dory_bls12_381_streaming::BlsDoryRowSource,
+};
 
 /// Version of the scalar LogUp transcript and reconstruction wire grammar.
 pub const BLS_DORY_RANGE_LOGUP_VERSION: u16 = 3;
@@ -73,7 +76,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, indexed inverse artifacts, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.746 seconds proving plus 7.161 seconds opening; CPU n=33 projects to roughly 1.85 plus 1.36 days and the fourth range pair still projects near 1.21 TiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
+    "bounded parallel work, hybrid transition/inverse artifacts, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.714 seconds proving plus 7.072 seconds opening; CPU n=33 projects to roughly 1.84 plus 1.34 days and the fourth range pair still projects near 478 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -342,6 +345,43 @@ pub fn projected_production_range_logup_proof_bytes() -> Result<usize, BlsDoryRa
     )
 }
 
+/// Exact retained coefficient bytes for the production LogUp inverse source.
+pub fn projected_production_range_logup_inverse_artifact_bytes()
+-> Result<u64, BlsDoryRangeLogUpError> {
+    let cells = 1u64
+        .checked_shl(
+            u32::try_from(
+                PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES - BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES,
+            )
+            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        )
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let scalar_count = 1u64
+        .checked_shl(
+            u32::try_from(PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES)
+                .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        )
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let explicit_scalar_count = cells
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    BlsDoryIndexArtifactSpec {
+        context_digest: [1; 32],
+        scalar_count,
+        explicit_scalar_count,
+        literal_scalar_count: 0,
+    }
+    .encoded_bytes(TABLE_VALUES + 1)
+    .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
+/// Exact retained transition plus inverse bytes for one production pair.
+pub fn projected_production_transition_range_source_bytes() -> Result<u64, BlsDoryRangeLogUpError> {
+    projected_production_transition_source_artifact_bytes()?
+        .checked_add(projected_production_range_logup_inverse_artifact_bytes()?)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
 pub fn prove_bls_dory_range_logup(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -529,7 +569,7 @@ fn prove_from_source_deferred(
         }
         transition.clone()
     } else if let Some(scratch_directory) = scratch_directory {
-        commit_bls_dory_row_source_with_scratch(
+        commit_bls_dory_indexed_row_source_with_scratch(
             witness_source
                 .as_mut()
                 .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
@@ -1178,8 +1218,20 @@ impl BlsDoryIndexedRowSource for LogUpInverseCodeRowSource<'_, '_> {
         self.explicit_scalars
     }
 
+    fn literal_scalar_count(&self) -> usize {
+        0
+    }
+
     fn dictionary(&self) -> &[BlsDoryFr] {
         &self.dictionary
+    }
+
+    fn read_literal_row(
+        &mut self,
+        _row_index: usize,
+        _output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        Err(BlsDoryRangeLogUpError::InvalidDimensions)
     }
 
     fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
@@ -3447,7 +3499,7 @@ mod tests {
             .unwrap()
             .len();
         let explicit = u64::try_from(elements * STRUCTURED_TRANSITION_ORACLES).unwrap();
-        assert_eq!(indexed_bytes, explicit + 64 + 17 * 32 + 32);
+        assert_eq!(indexed_bytes, explicit + 72 + 17 * 32 + 32);
         assert!(indexed_bytes * 10 < scalar_bytes);
 
         drop(scalar);
@@ -3959,6 +4011,14 @@ mod tests {
         assert_eq!(
             projected_production_range_logup_proof_bytes().unwrap(),
             78_529
+        );
+        assert_eq!(
+            projected_production_range_logup_inverse_artifact_bytes().unwrap(),
+            7_381_975_688
+        );
+        assert_eq!(
+            projected_production_transition_range_source_bytes().unwrap(),
+            39_728_448_752
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

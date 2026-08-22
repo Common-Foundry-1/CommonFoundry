@@ -469,16 +469,18 @@ comparison. The v2 research code now implements:
   weights implicit and folds 12 live lanes in authenticated 16-scalar scratch
   rows. The shared prover reuses that exact authenticated transition artifact
   in LogUp, and the aggregate folds and streams cloned handles only once. A
-  mismatched same-shape artifact is rejected. LogUp's inverse coefficients are
-  restricted to zero plus sixteen `1 / (alpha - digit)` values. A canonical,
-  self-authenticating indexed artifact stores that 17-scalar dictionary once
-  and one checked byte per coefficient; every read authenticates the complete
-  header, dictionary, codes, digest, length, and EOF. Differential tests match
-  the former 32-byte-scalar artifact's commitments, claims, and exact proof
-  bytes and reject corruption, truncation, and forged out-of-range codes. This
-  reduces the production inverse source from about 220 GiB to 6.875 GiB plus
-  640 framing bytes. One retained transition/range source pair is therefore
-  about 226.875 GiB and all four are about 907.5 GiB instead of 1.76 TiB.
+  mismatched same-shape artifact is rejected. A canonical, self-authenticating
+  indexed artifact supports a literal-scalar prefix followed by dictionary
+  codes. The transition stores twelve unrestricted lanes literally and its 98
+  radix-16 lanes as checked `0..15` bytes. LogUp's inverse coefficients are
+  restricted to zero plus sixteen `1 / (alpha - digit)` values and use one
+  checked byte each. Every read authenticates the complete header, dictionary,
+  literal scalars, codes, digest, length, and EOF. Differential tests match the
+  former 32-byte-scalar artifacts' commitments, claims, and exact proof bytes
+  and reject corruption, truncation, non-canonical scalars, and forged codes.
+  Exact production projections put the transition at 30.125 GiB plus framing
+  and its inverse at 6.875 GiB plus framing. One retained transition/range pair
+  is therefore about 37 GiB and all four are about 148 GiB instead of 1.76 TiB.
   LogUp streams its inverse commitment, uses
   lineage-authenticated two-lane artifacts with bounded 1 MiB I/O to fold
   cell-variable rounds in linear work, retains only the 128 production
@@ -497,13 +499,13 @@ comparison. The v2 research code now implements:
   combined row commitments, and `L^T M`, then releases deferred coefficient
   artifacts before the final Dory reduction. Direct testing preserves exact
   proof bytes, and standalone n=15, n=17, and n=19 runs leave zero scratch after
-  completion. At n=19 the latest linear prover took 9.746 seconds versus
+  completion. At n=19 the latest linear prover took 9.714 seconds versus
   42.699 seconds for the buffered serial-row checkpoint and 53.948 seconds for
-  the rejected recomputation path. Aggregate opening took 7.161 seconds,
-  prepared scratch was 14,869,896 bytes, and the verified proof remained
-  47,729 bytes. Extrapolation to n=33 still gives roughly 1.85 CPU proving days
-  and 1.36 aggregate-opening days. The 330 GiB transient lineage overlap puts
-  the projected fourth-pair scratch peak near 1.21 TiB. This rejects the current
+  the rejected recomputation path. Aggregate opening took 7.072 seconds,
+  prepared scratch was 2,426,740 bytes, and the verified proof remained 47,729
+  bytes. Extrapolation to n=33 still gives roughly 1.84 CPU proving days and
+  1.34 aggregate-opening days. The 330 GiB transient lineage overlap puts the
+  projected fourth-pair scratch peak near 478 GiB. This rejects the current
   CPU/storage pipeline
   for production; GPU or distributed folds, aggregation or regeneration before
   all pair sources accumulate, and a complete measured n=33 run remain required;

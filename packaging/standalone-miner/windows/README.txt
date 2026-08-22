@@ -1,11 +1,12 @@
-COMMON FOUNDRY STANDALONE CUDA MINER
+COMMON FOUNDRY STANDALONE GPU MINER
 
-1. Double-click LIST-GPUS.bat and confirm every NVIDIA GPU appears.
-2. Open your wallet's Receive page and copy its 64-character address.
-3. Right-click START-MINER.bat, choose Edit, and paste that address into
+1. NVIDIA: leave GPU_BACKEND=auto. Intel Arc: set GPU_BACKEND=opencl.
+2. Double-click LIST-GPUS.bat and confirm every intended GPU appears.
+3. Open your wallet's Receive page and copy its 64-character address.
+4. Right-click START-MINER.bat, choose Edit, and paste that address into
    PAYOUT_ADDRESS near the top. The node addresses normally need no changes.
-4. Double-click START-MINER.bat.
-5. Leave the miner window open. Press Ctrl+C to stop cleanly.
+5. Double-click START-MINER.bat.
+6. Leave the miner window open. Press Ctrl+C to stop cleanly.
 
 The miner requests current work directly from the first reachable node. It does
 not download or maintain another copy of the blockchain. The connected wallet
@@ -21,6 +22,10 @@ Supported native CUDA targets:
   Ampere sm_86: RTX 30 series
   Ada sm_89: RTX 40 series
   Blackwell sm_120: RTX 50 series
+
+Intel Arc uses the included OpenCL backend and the Intel graphics driver's
+OpenCL runtime. One miner process uses one backend; run a second process only
+when intentionally mining on both NVIDIA and Intel devices in a mixed rig.
 
 The miner automatically divides host preparation workers across selected GPUs,
 up to 16 workers per GPU. Work ranges are separated so no worker in the rig

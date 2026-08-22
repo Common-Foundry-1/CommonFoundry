@@ -8,6 +8,8 @@ rem ================================================================
 rem These defaults work with a wallet on this PC or the community bootstrap.
 set "LOCAL_PEER=127.0.0.1:18444"
 set "BOOTSTRAP_PEER=107.214.187.2:18444"
+rem Use auto for NVIDIA, or opencl for Intel Arc.
+set "GPU_BACKEND=auto"
 set "GPU_INDEXES="
 rem PAYOUT_ADDRESS is your wallet's 64-character receive address.
 set "PAYOUT_ADDRESS="
@@ -17,7 +19,7 @@ set "WORKERS_PER_GPU=0"
 set "STATS_SECONDS=5"
 rem ================================================================
 rem GPU_INDEXES examples:
-rem   blank   = use every supported NVIDIA GPU
+rem   blank   = use every GPU exposed by the selected backend
 rem   0       = use GPU 0 only
 rem   0,1,2,3 = use GPUs 0 through 3
 rem Run LIST-GPUS.bat to see the indexes on this rig.
@@ -47,7 +49,10 @@ if defined GPU_INDEXES (
   for %%G in (!GPU_LIST!) do set "DEVICE_ARGS=!DEVICE_ARGS! --device %%G"
 )
 
+set "CMFD_GPU_BACKEND=%GPU_BACKEND%"
+
 echo Starting Common Foundry miner...
+echo GPU backend: %GPU_BACKEND%
 echo Local wallet peer: %LOCAL_PEER%
 echo Bootstrap fallback: %BOOTSTRAP_PEER%
 if defined GPU_INDEXES (

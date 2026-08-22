@@ -101,6 +101,19 @@ transitive native dependencies, and host-wide resource exhaustion remain
 outside this boundary. No wallet or node path enables either experimental path
 by default.
 
+The node has a separate operator-enabled verifier-worker mode for externally
+submitted blocks. It reuses the hash-pinned executable and process-tree
+containment, adds an explicit wall-time limit and a Windows Job Object memory
+limit or Unix address-space limit, and transports only canonical bounded block
+bytes plus identities for the exact verifier and statement. A successful
+response is accepted only when both identities match. The worker outcome is a
+local trust boundary: unlike proof generation, the parent cannot repeat the
+expensive verification without defeating isolation. Operators must therefore
+pin a trusted executable and protect its path and account. This mode is crash
+and resource containment, not a defense against same-user code replacement or
+a compromised host, and it currently supports only Devnet's V2 reference
+verifier. V3 remains fail-closed.
+
 The exact Poseidon2 CUDA first-digest layer is now used by proof generation for
 the value MMCS. Merkle parent compression, shorter-matrix injection, openings,
 transcript operations, and all verification remain CPU work. At the 32,768-row

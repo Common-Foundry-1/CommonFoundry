@@ -60,6 +60,28 @@ pub struct PreverifiedBlockProof {
     statement_identity: [u8; 32],
 }
 
+/// Exact verifier and statement identities transported across a trusted
+/// external-verifier boundary.
+///
+/// This is not proof of verification by itself. It exists so a process runner
+/// can bind a worker response to the exact consensus verifier, challenge, and
+/// proof bytes requested by the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalPreverificationBinding {
+    verifier_identity: [u8; 32],
+    statement_identity: [u8; 32],
+}
+
+impl ExternalPreverificationBinding {
+    pub fn verifier_identity(self) -> [u8; 32] {
+        self.verifier_identity
+    }
+
+    pub fn statement_identity(self) -> [u8; 32] {
+        self.statement_identity
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PowError {
     #[error("legacy ForgeMatrix v1 failed: {0}")]
@@ -228,6 +250,44 @@ impl ConsensusPowVerifier {
         Ok(PreverifiedBlockProof {
             verifier_identity: self.preverification_identity(block.network_id)?,
             statement_identity: preverified_statement_identity(block, proof),
+        })
+    }
+
+    /// Returns the exact identities an external verifier must echo after
+    /// validating this statement with this configured verifier.
+    pub fn external_preverification_binding(
+        &self,
+        block: &BlockChallenge,
+        proof: &BlockProof,
+    ) -> Result<ExternalPreverificationBinding, PowError> {
+        Ok(ExternalPreverificationBinding {
+            verifier_identity: self.preverification_identity(block.network_id)?,
+            statement_identity: preverified_statement_identity(block, proof),
+        })
+    }
+
+    /// Issues the process-local capability after a trusted external verifier
+    /// has accepted the exact bound statement.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have obtained `binding` from a fail-closed verifier
+    /// process whose executable identity, canonical request/response, exit
+    /// status, execution time, memory, and output were independently bounded.
+    /// Calling this based only on untrusted bytes bypasses proof verification.
+    pub unsafe fn issue_external_preverification(
+        &self,
+        block: &BlockChallenge,
+        proof: &BlockProof,
+        binding: ExternalPreverificationBinding,
+    ) -> Result<PreverifiedBlockProof, PowError> {
+        let expected = self.external_preverification_binding(block, proof)?;
+        if binding != expected {
+            return Err(PowError::PreverificationMismatch);
+        }
+        Ok(PreverifiedBlockProof {
+            verifier_identity: binding.verifier_identity,
+            statement_identity: binding.statement_identity,
         })
     }
 
@@ -443,6 +503,38 @@ mod tests {
         assert!(matches!(
             legacy.verify_preverified(&challenge, &changed_proof, &preverified),
             Err(PowError::PreverificationMismatch | PowError::WrongNetwork)
+        ));
+    }
+
+    #[test]
+    fn external_preverification_issuance_rechecks_the_exact_binding() {
+        let reference = v2_test_reference().unwrap();
+        let network_id = reference.descriptor().network_id;
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let challenge = block(network_id);
+        let proof = verifier.mine(&challenge, 7, 1).unwrap();
+        let binding = verifier
+            .external_preverification_binding(&challenge, &proof)
+            .unwrap();
+
+        // SAFETY: this unit test models a successful external verifier and
+        // immediately checks the resulting capability through consensus.
+        let preverified = unsafe {
+            verifier
+                .issue_external_preverification(&challenge, &proof, binding)
+                .unwrap()
+        };
+        verifier
+            .verify_preverified(&challenge, &proof, &preverified)
+            .unwrap();
+
+        let mut substituted = binding;
+        substituted.statement_identity[0] ^= 1;
+        // SAFETY: the deliberately substituted binding must be rejected before
+        // any capability is issued.
+        assert!(matches!(
+            unsafe { verifier.issue_external_preverification(&challenge, &proof, substituted) },
+            Err(PowError::PreverificationMismatch)
         ));
     }
 }

@@ -1211,12 +1211,19 @@ capability while rerunning every parent, height, target, timestamp,
 transaction, UTXO, coinbase, fork-choice, and persistence check. Admission is
 serialized to one active proof with at most eight waiting callers and a
 five-second queue timeout; saturation is retryable, verifier panics reject only
-the candidate, and active/queued counts are observable in node status. This is
-bounded in-process admission, not a production sandbox: an active verifier has
-no killable wall-time or memory boundary, and side-branch reconstruction still
-replays historical blocks synchronously. Production therefore still requires
-an OS-contained verifier worker, hard execution budgets, load tests, and the
-final V3 parser/verifier selection.
+the candidate, and active/queued counts are observable in node status. Devnet
+keeps bounded in-process admission as its default. Operators can now select a
+hash-pinned short-lived verifier process for external blocks. Its canonical
+request and response bind the exact verifier parameters, challenge, proof
+type, public fields, and proof bytes. Windows Job Objects and Unix process
+groups terminate the process tree on timeout, crash, malformed or oversized
+output, while an explicit Windows job-memory or Unix address-space limit bounds
+the worker. Hash mismatch and response substitution fail closed. This is crash
+and resource containment rather than an OS sandbox, supports only the active
+V2 reference verifier, and does not move side-branch replay out of process.
+Production therefore still requires final V3 parser/verifier integration,
+production-shape resource limits and load tests, protected executable
+deployment, and independent review.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and

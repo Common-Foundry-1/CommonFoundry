@@ -15,6 +15,7 @@ use cmfd_node::{
     DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, DEFAULT_P2P_ADDRESS, DEFAULT_RPC_ADDRESS, Node,
     parse_miner_destination, serve_rpc_shared, unix_time_seconds,
 };
+use cmfd_proof_worker::VerifierWorkerConfig;
 use serde_json::json;
 
 #[derive(Debug, Parser)]
@@ -31,6 +32,20 @@ struct Cli {
     /// `<data_dir>/logs` is always captured at debug level regardless.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Absolute path to the hash-pinned proof-verifier worker. When omitted,
+    /// Devnet retains bounded in-process verification.
+    #[arg(long, global = true, requires = "proof_verifier_worker_sha256")]
+    proof_verifier_worker: Option<PathBuf>,
+    /// Expected SHA-256 of --proof-verifier-worker as 64 hexadecimal
+    /// characters.
+    #[arg(long, global = true, requires = "proof_verifier_worker")]
+    proof_verifier_worker_sha256: Option<String>,
+    /// Kill the proof-verifier worker after this many milliseconds.
+    #[arg(long, global = true, default_value_t = 30_000)]
+    proof_verifier_timeout_ms: u64,
+    /// Hard worker address-space/job memory limit in bytes.
+    #[arg(long, global = true, default_value_t = 2_147_483_648)]
+    proof_verifier_memory_bytes: u64,
     #[command(subcommand)]
     command: Command,
 }
@@ -97,7 +112,11 @@ enum Command {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if cmfd_proof_worker::verifier_worker_mode_requested() {
+        std::process::exit(cmfd_proof_worker::worker_main());
+    }
     let cli = Cli::parse();
+    let verifier_worker = verifier_worker_config(&cli)?;
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::Run {
@@ -107,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_public_peers,
         } => {
             let address_policy = peer_address_policy(allow_public_peers);
-            let mut node = Node::open(&cli.data_dir)?;
+            let mut node = open_node(&cli.data_dir, verifier_worker.as_ref())?;
             node.set_public_peer_mode(allow_public_peers);
             let status = node.status()?;
             let shared = Arc::new(Mutex::new(node));
@@ -157,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::MineOnce { miner, attempts } => {
-            let mut node = Node::open(&cli.data_dir)?;
+            let mut node = open_node(&cli.data_dir, verifier_worker.as_ref())?;
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
                 None => node.wallet_destination(),
@@ -178,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::Status => {
-            let node = Node::open(&cli.data_dir)?;
+            let node = open_node(&cli.data_dir, verifier_worker.as_ref())?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
             Ok(())
         }
@@ -215,7 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             let address_policy = peer_address_policy(allow_public_peers);
-            let mut node_instance = Node::open(&cli.data_dir)?;
+            let mut node_instance = open_node(&cli.data_dir, verifier_worker.as_ref())?;
             node_instance.set_public_peer_mode(allow_public_peers);
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
@@ -277,6 +296,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+fn verifier_worker_config(
+    cli: &Cli,
+) -> Result<Option<VerifierWorkerConfig>, Box<dyn std::error::Error>> {
+    let Some(worker_executable) = cli.proof_verifier_worker.clone() else {
+        return Ok(None);
+    };
+    let hash = cli
+        .proof_verifier_worker_sha256
+        .as_deref()
+        .ok_or("--proof-verifier-worker-sha256 is required with --proof-verifier-worker")?;
+    if hash.len() != 64 {
+        return Err("proof-verifier worker SHA-256 must contain exactly 64 hex characters".into());
+    }
+    let mut worker_sha256 = [0_u8; 32];
+    hex::decode_to_slice(hash, &mut worker_sha256)
+        .map_err(|_| "proof-verifier worker SHA-256 must contain exactly 64 hex characters")?;
+    Ok(Some(VerifierWorkerConfig {
+        worker_executable,
+        worker_sha256,
+        timeout: Duration::from_millis(cli.proof_verifier_timeout_ms),
+        memory_limit_bytes: cli.proof_verifier_memory_bytes,
+    }))
+}
+
+fn open_node(
+    data_dir: &PathBuf,
+    verifier_worker: Option<&VerifierWorkerConfig>,
+) -> Result<Node, Box<dyn std::error::Error>> {
+    let mut node = Node::open(data_dir)?;
+    if let Some(config) = verifier_worker {
+        node.use_external_proof_verifier(config.clone())?;
+    }
+    Ok(node)
 }
 
 fn peer_address_policy(allow_public_peers: bool) -> PeerAddressPolicy {

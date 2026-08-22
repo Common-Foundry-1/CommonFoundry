@@ -21,6 +21,9 @@ use cmfd_consensus::{
     WireError, add_chain_work, chain_work_bytes, decode_block, decode_transaction, encode_block,
     encode_transaction, merkle_root, v2_test_reference, validate_block_resources,
 };
+use cmfd_proof_worker::{
+    ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
+};
 use fs2::FileExt;
 use k256::schnorr::{SigningKey, VerifyingKey};
 use primitive_types::U512;
@@ -167,6 +170,8 @@ pub enum NodeError {
     ProofVerificationQueuePoisoned,
     #[error("proof verifier panicked; the candidate was rejected")]
     ProofVerifierPanicked,
+    #[error("external proof verifier failed: {0}")]
+    ProofVerifierWorker(#[from] VerifierWorkerError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -231,6 +236,17 @@ impl NodeError {
             Self::ProofVerificationQueueTimeout => ("proof_queue_timeout", 503, true),
             Self::ProofVerificationQueuePoisoned => ("proof_queue_poisoned", 500, false),
             Self::ProofVerifierPanicked => ("proof_verifier_panicked", 500, false),
+            Self::ProofVerifierWorker(VerifierWorkerError::ProofRejected(_)) => {
+                ("proof_rejected", 422, false)
+            }
+            Self::ProofVerifierWorker(VerifierWorkerError::Process(
+                ProofWorkerError::Timeout { .. },
+            )) => ("proof_verifier_timeout", 503, true),
+            Self::ProofVerifierWorker(VerifierWorkerError::InvalidConfig(_))
+            | Self::ProofVerifierWorker(VerifierWorkerError::Process(
+                ProofWorkerError::HashMismatch { .. } | ProofWorkerError::FileRead { .. },
+            )) => ("proof_verifier_configuration", 500, false),
+            Self::ProofVerifierWorker(_) => ("proof_verifier_unavailable", 503, true),
             Self::Json(_) => ("invalid_json", 400, false),
             Self::Network(_) => ("network_parameters", 500, false),
             Self::Chain(_) => ("chain_rejected", 422, false),
@@ -246,6 +262,9 @@ impl NodeError {
             }
             Self::NonLoopbackRpc(_) => "RPC must remain bound to loopback".to_owned(),
             Self::RpcIo(_) => "node RPC I/O failed".to_owned(),
+            Self::ProofVerifierWorker(_) => {
+                "external proof verifier failed; inspect the node logs".to_owned()
+            }
             Self::Json(_) => "request JSON is invalid".to_owned(),
             _ => self.to_string(),
         };
@@ -343,6 +362,13 @@ impl Drop for ProofVerificationPermit<'_> {
 pub struct BlockPreverifier {
     verifier: ConsensusPowVerifier,
     queue: Arc<ProofVerificationQueue>,
+    backend: ProofVerificationBackend,
+}
+
+#[derive(Clone)]
+enum ProofVerificationBackend {
+    InProcess,
+    External(Arc<VerifierWorkerConfig>),
 }
 
 impl BlockPreverifier {
@@ -368,23 +394,53 @@ impl BlockPreverifier {
                 max_queued,
                 wait_timeout,
             )),
+            backend: ProofVerificationBackend::InProcess,
         }
+    }
+
+    fn use_external_worker(
+        &mut self,
+        config: VerifierWorkerConfig,
+    ) -> Result<(), VerifierWorkerError> {
+        config.validate_executable()?;
+        self.backend = ProofVerificationBackend::External(Arc::new(config));
+        Ok(())
     }
 
     pub fn preverify(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
         validate_block_resources(block)?;
         encode_block(block)?;
-        self.run_guarded(|| self.verifier.preverify(&block.challenge, &block.proof))
+        match &self.backend {
+            ProofVerificationBackend::InProcess => self.run_guarded(|| {
+                self.verifier
+                    .preverify(&block.challenge, &block.proof)
+                    .map_err(NodeError::from)
+            }),
+            ProofVerificationBackend::External(config) => self.run_guarded(|| {
+                verify_block_out_of_process(config, &self.verifier, block).map_err(NodeError::from)
+            }),
+        }
     }
 
     fn run_guarded<T>(
         &self,
-        operation: impl FnOnce() -> Result<T, PowError>,
+        operation: impl FnOnce() -> Result<T, NodeError>,
     ) -> Result<T, NodeError> {
         let _permit = self.queue.acquire()?;
         match catch_unwind(AssertUnwindSafe(operation)) {
-            Ok(result) => result.map_err(NodeError::from),
+            Ok(result) => result,
             Err(_) => Err(NodeError::ProofVerifierPanicked),
+        }
+    }
+
+    fn backend_status(&self) -> (&'static str, Option<u64>, Option<u64>) {
+        match &self.backend {
+            ProofVerificationBackend::InProcess => ("in_process", None, None),
+            ProofVerificationBackend::External(config) => (
+                "external_worker",
+                Some(config.timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+                Some(config.memory_limit_bytes),
+            ),
         }
     }
 }
@@ -407,6 +463,9 @@ pub struct NodeStatus {
     pub proof_verification_queued: usize,
     pub proof_verification_capacity: usize,
     pub proof_verification_queue_capacity: usize,
+    pub proof_verification_mode: &'static str,
+    pub proof_verification_timeout_ms: Option<u64>,
+    pub proof_verification_memory_limit_bytes: Option<u64>,
     pub storage_healthy: bool,
     pub public_peer_mode: bool,
     pub peers: Vec<PeerObservation>,
@@ -1301,6 +1360,18 @@ impl Node {
         self.block_preverifier.clone()
     }
 
+    /// Enables hash-pinned, killable proof verification for subsequently
+    /// admitted external blocks. Startup log replay remains authoritative and
+    /// in-process so a missing worker cannot make an existing database
+    /// unreadable.
+    pub fn use_external_proof_verifier(
+        &mut self,
+        config: VerifierWorkerConfig,
+    ) -> Result<(), NodeError> {
+        self.block_preverifier.use_external_worker(config)?;
+        Ok(())
+    }
+
     pub fn wallet_destination(&self) -> [u8; 32] {
         self.wallet_signing_key.verifying_key().to_bytes().into()
     }
@@ -1320,6 +1391,11 @@ impl Node {
     pub fn status(&self) -> Result<NodeStatus, NodeError> {
         let (proof_verification_active, proof_verification_queued) =
             self.block_preverifier.queue.counts()?;
+        let (
+            proof_verification_mode,
+            proof_verification_timeout_ms,
+            proof_verification_memory_limit_bytes,
+        ) = self.block_preverifier.backend_status();
         Ok(NodeStatus {
             network: "CommonFoundry Devnet-0",
             network_id: hex::encode(self.params.network_id),
@@ -1337,6 +1413,9 @@ impl Node {
             proof_verification_queued,
             proof_verification_capacity: self.block_preverifier.queue.max_active,
             proof_verification_queue_capacity: self.block_preverifier.queue.max_queued,
+            proof_verification_mode,
+            proof_verification_timeout_ms,
+            proof_verification_memory_limit_bytes,
             storage_healthy: !self.storage_faulted,
             public_peer_mode: self.public_peer_mode,
             peers: self.peer_observations(),
@@ -3719,7 +3798,7 @@ mod tests {
             Duration::from_secs(1),
         );
         assert!(matches!(
-            verifier.run_guarded(|| -> Result<(), PowError> { panic!("isolated verifier panic") }),
+            verifier.run_guarded(|| -> Result<(), NodeError> { panic!("isolated verifier panic") }),
             Err(NodeError::ProofVerifierPanicked)
         ));
         assert_eq!(verifier.queue.counts().unwrap(), (0, 0));

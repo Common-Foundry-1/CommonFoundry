@@ -10,6 +10,12 @@
 pub mod spill {
     pub use cmfd_proof_accel::spill::*;
 }
+mod verifier;
+
+pub use verifier::{
+    MAX_VERIFIER_REQUEST_BYTES, MAX_VERIFIER_RESPONSE_BYTES, VerifierProtocolError,
+    VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
+};
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -220,8 +226,8 @@ pub fn prove_structured_blake3_out_of_process_with_spill_root(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let child = spawn_contained(&mut command)?;
-        let response = exchange_with_child(child, request, config.timeout)?;
+        let child = spawn_contained(&mut command, None)?;
+        let response = exchange_with_child(child, request, config.timeout, MAX_RESPONSE_BYTES)?;
         let proof = match decode_response(&response)? {
             WorkerResponse::Success(proof) => proof,
             WorkerResponse::Failure { code, message } => {
@@ -491,11 +497,11 @@ struct WindowsJob {
 
 #[cfg(windows)]
 impl WindowsJob {
-    fn create() -> io::Result<Self> {
+    fn create(memory_limit_bytes: Option<u64>) -> io::Result<Self> {
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
 
         // SAFETY: null security/name pointers request an unnamed job with
@@ -507,6 +513,18 @@ impl WindowsJob {
         let job = Self { handle };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(memory_limit_bytes) = memory_limit_bytes {
+            let memory_limit = usize::try_from(memory_limit_bytes).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker memory limit does not fit this platform",
+                )
+            })?;
+            limits.BasicLimitInformation.LimitFlags |=
+                JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
+            limits.ProcessMemoryLimit = memory_limit;
+            limits.JobMemoryLimit = memory_limit;
+        }
         // SAFETY: `limits` has the exact Win32 layout and remains live for the
         // duration of this call.
         let configured = unsafe {
@@ -589,12 +607,36 @@ impl Drop for WindowsJob {
     }
 }
 
-fn spawn_contained(command: &mut Command) -> Result<ContainedChild, ProofWorkerError> {
+fn spawn_contained(
+    command: &mut Command,
+    memory_limit_bytes: Option<u64>,
+) -> Result<ContainedChild, ProofWorkerError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
 
         command.process_group(0);
+        if let Some(memory_limit_bytes) = memory_limit_bytes {
+            let memory_limit = libc::rlim_t::try_from(memory_limit_bytes).map_err(|_| {
+                ProofWorkerError::InvalidConfig(
+                    "worker memory limit does not fit the platform resource-limit type",
+                )
+            })?;
+            // SAFETY: this closure calls only the async-signal-safe setrlimit
+            // operation between fork and exec. The limit is copied by value.
+            unsafe {
+                command.pre_exec(move || {
+                    let limit = libc::rlimit {
+                        rlim_cur: memory_limit,
+                        rlim_max: memory_limit,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = command.spawn().map_err(ProofWorkerError::Spawn)?;
         let process_group = match libc::pid_t::try_from(child.id()) {
             Ok(process_group) => process_group,
@@ -614,9 +656,11 @@ fn spawn_contained(command: &mut Command) -> Result<ContainedChild, ProofWorkerE
 
     #[cfg(windows)]
     {
-        let job = WindowsJob::create().map_err(|source| ProofWorkerError::Containment {
-            operation: "creating a Windows Job Object",
-            source,
+        let job = WindowsJob::create(memory_limit_bytes).map_err(|source| {
+            ProofWorkerError::Containment {
+                operation: "creating a Windows Job Object",
+                source,
+            }
         })?;
         let mut child = command.spawn().map_err(ProofWorkerError::Spawn)?;
         if let Err(source) = job.assign(&child) {
@@ -706,6 +750,7 @@ fn exchange_with_child(
     mut child: ContainedChild,
     request: Vec<u8>,
     timeout: Duration,
+    stdout_limit: usize,
 ) -> Result<Vec<u8>, ProofWorkerError> {
     let Some(mut stdin) = child.child.stdin.take() else {
         terminate_child_bounded(&mut child);
@@ -734,7 +779,7 @@ fn exchange_with_child(
     });
     let stdout_tx = event_tx.clone();
     let stdout_thread = thread::spawn(move || {
-        let _ = stdout_tx.send(IoEvent::Stdout(capture_bounded(stdout, MAX_RESPONSE_BYTES)));
+        let _ = stdout_tx.send(IoEvent::Stdout(capture_bounded(stdout, stdout_limit)));
     });
     let stderr_thread = thread::spawn(move || {
         let _ = event_tx.send(IoEvent::Stderr(capture_bounded(stderr, MAX_STDERR_BYTES)));
@@ -1196,6 +1241,9 @@ fn run_worker() -> Result<Vec<u8>, (u16, String)> {
 /// share the audited protocol and hashing implementation with the library.
 #[doc(hidden)]
 pub fn worker_main() -> i32 {
+    if verifier::verifier_mode_requested() {
+        return verifier::verifier_worker_main();
+    }
     let response = match run_worker() {
         Ok(proof) => match encode_success_response(&proof) {
             Ok(response) => response,
@@ -1207,6 +1255,14 @@ pub fn worker_main() -> i32 {
         Ok(()) => 0,
         Err(_) => 1,
     }
+}
+
+/// Reports whether this process was invoked in the exact internal verifier
+/// mode. Node binaries use this to host the same audited worker protocol
+/// without requiring a second executable in the release package.
+#[doc(hidden)]
+pub fn verifier_worker_mode_requested() -> bool {
+    verifier::verifier_mode_requested()
 }
 
 #[cfg(test)]
@@ -1570,6 +1626,14 @@ mod tests {
     fn child_fast_exit_helper() {}
 
     #[test]
+    fn child_crash_helper() {
+        if std::env::var_os("CMFD_PROOF_WORKER_CRASH_HELPER").is_some() {
+            let _ = io::stderr().write_all(b"intentional worker crash");
+            std::process::exit(23);
+        }
+    }
+
+    #[test]
     fn child_oversize_stdout_helper() {
         if std::env::var_os("CMFD_PROOF_WORKER_STDOUT_HELPER").is_some() {
             let _held_spill_file = hold_test_spill_file();
@@ -1635,8 +1699,13 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let child = spawn_contained(&mut command)?;
-            exchange_with_child(child, Vec::new(), Duration::from_millis(50))
+            let child = spawn_contained(&mut command, None)?;
+            exchange_with_child(
+                child,
+                Vec::new(),
+                Duration::from_millis(50),
+                MAX_RESPONSE_BYTES,
+            )
         })
         .unwrap_err();
         assert!(matches!(error, ProofWorkerError::Timeout { .. }));
@@ -1656,9 +1725,66 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = spawn_contained(&mut command).unwrap();
-        let output = exchange_with_child(child, Vec::new(), Duration::from_secs(2)).unwrap();
+        let child = spawn_contained(&mut command, None).unwrap();
+        let output = exchange_with_child(
+            child,
+            Vec::new(),
+            Duration::from_secs(2),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn child_crash_is_reported_without_affecting_the_parent() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("tests::child_crash_helper")
+            .arg("--nocapture")
+            .env("CMFD_PROOF_WORKER_CRASH_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_contained(&mut command, None).unwrap();
+        let error = exchange_with_child(
+            child,
+            Vec::new(),
+            Duration::from_secs(2),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProofWorkerError::WorkerExited { code: Some(23), .. }
+        ));
+    }
+
+    #[test]
+    fn impossible_memory_limit_fails_closed() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("tests::child_timeout_helper")
+            .arg("--nocapture")
+            .env("CMFD_PROOF_WORKER_TIMEOUT_HELPER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result = match spawn_contained(&mut command, Some(1)) {
+            Ok(child) => exchange_with_child(
+                child,
+                Vec::new(),
+                Duration::from_secs(2),
+                MAX_RESPONSE_BYTES,
+            ),
+            Err(error) => Err(error),
+        };
+        assert!(
+            result.is_err(),
+            "one-byte worker memory limit must fail closed"
+        );
     }
 
     #[test]
@@ -1677,8 +1803,13 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let child = spawn_contained(&mut command)?;
-            exchange_with_child(child, Vec::new(), Duration::from_secs(2))
+            let child = spawn_contained(&mut command, None)?;
+            exchange_with_child(
+                child,
+                Vec::new(),
+                Duration::from_secs(2),
+                MAX_RESPONSE_BYTES,
+            )
         })
         .unwrap_err();
         assert!(matches!(error, ProofWorkerError::StdoutTooLarge));
@@ -1703,8 +1834,13 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let child = spawn_contained(&mut command)?;
-            exchange_with_child(child, Vec::new(), Duration::from_secs(2))
+            let child = spawn_contained(&mut command, None)?;
+            exchange_with_child(
+                child,
+                Vec::new(),
+                Duration::from_secs(2),
+                MAX_RESPONSE_BYTES,
+            )
         })
         .unwrap_err();
         assert!(matches!(error, ProofWorkerError::StderrTooLarge));
@@ -1734,8 +1870,13 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let child = spawn_contained(&mut command)?;
-            exchange_with_child(child, Vec::new(), Duration::from_millis(500))
+            let child = spawn_contained(&mut command, None)?;
+            exchange_with_child(
+                child,
+                Vec::new(),
+                Duration::from_millis(500),
+                MAX_RESPONSE_BYTES,
+            )
         })
         .unwrap_err();
         assert!(matches!(error, ProofWorkerError::Timeout { .. }));

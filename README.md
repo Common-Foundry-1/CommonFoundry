@@ -102,6 +102,18 @@ SHA-256 and adds bounded binary IPC and process-tree termination. That path has
 been tested end to end with a 64-byte tree proof, but it is not an
 operating-system sandbox.
 
+External block admission can also run the active V2 verifier in a short-lived
+child process. The operator supplies an absolute `cmfd-node` or
+`cmfd-proof-worker` path and its SHA-256 pin through
+`--proof-verifier-worker` and `--proof-verifier-worker-sha256`; wall-time and
+memory limits are explicit. The parent accepts a result only after a canonical
+response echoes identities bound to the exact verifier parameters, block
+challenge, proof type, and proof bytes. Timeout, crash, output overflow,
+malformed response, identity substitution, and hash mismatch all fail closed.
+This mode is optional on Devnet and supports only the active V2 verifier. It
+does not activate the reserved V3 proof or replace the required production
+parser, measurements, and audit.
+
 At the 32,768-row checkpoint on an RTX 5090, an unoptimized Cargo test-profile
 CPU run took 348.28 seconds (64.503 setup, 283.416 prove; 238,698-byte canonical
 zlib payload). CUDA DFT plus Poseidon2 took 76.71 seconds (7.700 setup, 68.551

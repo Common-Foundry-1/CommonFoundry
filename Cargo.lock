@@ -959,6 +959,7 @@ dependencies = [
  "blake3",
  "clap",
  "cmfd-consensus",
+ "cmfd-proof-worker",
  "fs2",
  "getrandom 0.3.4",
  "hex",

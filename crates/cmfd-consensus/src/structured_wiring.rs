@@ -742,6 +742,25 @@ pub(crate) fn validate_tables(
     outputs: &[i64],
 ) -> Result<(), StructuredWiringError> {
     statement.validate_materialized_shape()?;
+    validate_tables_after_shape(statement, initial, inputs, outputs)
+}
+
+pub(crate) fn validate_streaming_tables(
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+) -> Result<(), StructuredWiringError> {
+    statement.validate_verifier_shape()?;
+    validate_tables_after_shape(statement, initial, inputs, outputs)
+}
+
+fn validate_tables_after_shape(
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+) -> Result<(), StructuredWiringError> {
     let elements = statement.elements()?;
     let cells = checked_product(&[statement.rows, statement.cols])?;
     if initial.len() != cells || inputs.len() != elements || outputs.len() != elements {
@@ -1130,6 +1149,10 @@ mod tests {
         assert!(matches!(
             statement.validate_materialized_shape(),
             Err(StructuredWiringError::ResearchCap)
+        ));
+        assert!(matches!(
+            validate_streaming_tables(statement, &[], &[], &[]),
+            Err(StructuredWiringError::InvalidLength)
         ));
         assert!(matches!(
             prove_structured_wiring(b"binding", statement, &[], &[], &[]),

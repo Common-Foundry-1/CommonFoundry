@@ -680,6 +680,25 @@ pub(crate) fn validate_tables(
     accumulators: &[i64],
 ) -> Result<(), StructuredSumcheckError> {
     statement.validate_materialized_shape()?;
+    validate_tables_after_shape(statement, activations, weights, accumulators)
+}
+
+pub(crate) fn validate_streaming_tables(
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+) -> Result<(), StructuredSumcheckError> {
+    statement.validate_verifier_shape()?;
+    validate_tables_after_shape(statement, activations, weights, accumulators)
+}
+
+fn validate_tables_after_shape(
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+) -> Result<(), StructuredSumcheckError> {
     let [activation_len, weight_len, accumulator_len] = statement.table_lengths()?;
     if activations.len() != activation_len
         || weights.len() != weight_len
@@ -1268,6 +1287,10 @@ mod tests {
         assert!(matches!(
             statement.validate_materialized_shape(),
             Err(StructuredSumcheckError::ResearchCap)
+        ));
+        assert!(matches!(
+            validate_streaming_tables(statement, &[], &[], &[]),
+            Err(StructuredSumcheckError::InvalidLength)
         ));
         assert!(matches!(
             prove_structured_matrix_product(b"binding", statement, &[], &[], &[]),

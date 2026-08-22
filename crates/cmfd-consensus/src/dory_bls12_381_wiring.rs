@@ -29,7 +29,7 @@ use crate::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
     dory_bls12_381_streaming::BlsDoryRowSource,
-    structured_wiring::{validate_successors, validate_tables},
+    structured_wiring::{validate_streaming_tables, validate_successors, validate_tables},
 };
 
 /// Version of the scalar-field wiring transcript.
@@ -377,7 +377,11 @@ fn prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
     if binding.len() > MAX_WIRING_BINDING_BYTES {
         return Err(BlsDoryWiringError::PublicBindingTooLarge);
     }
-    validate_tables(statement, initial, inputs, outputs)?;
+    if scratch_directory.is_some() {
+        validate_streaming_tables(statement, initial, inputs, outputs)?;
+    } else {
+        validate_tables(statement, initial, inputs, outputs)?;
+    }
     validate_successors(statement, initial, inputs, outputs)?;
     validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
     if packed_variables > setup.max_log_n() {

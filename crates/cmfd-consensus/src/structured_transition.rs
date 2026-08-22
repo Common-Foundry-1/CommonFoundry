@@ -874,6 +874,21 @@ pub(crate) fn validate_witness(
     witness: &StructuredTransitionWitness,
 ) -> Result<(), StructuredTransitionError> {
     statement.validate_materialized_shape()?;
+    validate_witness_after_shape(statement, witness)
+}
+
+pub(crate) fn validate_streaming_witness(
+    statement: StructuredTransitionStatement,
+    witness: &StructuredTransitionWitness,
+) -> Result<(), StructuredTransitionError> {
+    statement.validate_verifier_shape()?;
+    validate_witness_after_shape(statement, witness)
+}
+
+fn validate_witness_after_shape(
+    statement: StructuredTransitionStatement,
+    witness: &StructuredTransitionWitness,
+) -> Result<(), StructuredTransitionError> {
     let elements = statement.elements()?;
     let lengths = [
         witness.accumulators.len(),
@@ -907,21 +922,18 @@ pub(crate) fn validate_witness(
     {
         return Err(StructuredTransitionError::ValueOutOfRange);
     }
-    let shifted_accumulators = witness
-        .accumulators
-        .iter()
-        .map(|value| {
-            u64::try_from(i128::from(*value) + i128::from(statement.max_abs_accumulator))
-                .expect("validated signed accumulator shift is nonnegative")
-        })
-        .collect::<Vec<_>>();
     for spec in range_specs(statement) {
-        let values = if spec.oracle == SHIFTED_ACCUMULATOR {
-            shifted_accumulators.as_slice()
+        let out_of_range = if spec.oracle == SHIFTED_ACCUMULATOR {
+            witness.accumulators.iter().any(|value| {
+                u64::try_from(i128::from(*value) + i128::from(statement.max_abs_accumulator))
+                    .map_or(true, |shifted| shifted > spec.maximum)
+            })
         } else {
             witness_values(witness, spec.oracle)
+                .iter()
+                .any(|value| *value > spec.maximum)
         };
-        if values.iter().any(|value| *value > spec.maximum) {
+        if out_of_range {
             return Err(StructuredTransitionError::ValueOutOfRange);
         }
     }
@@ -1403,6 +1415,10 @@ mod tests {
         assert!(matches!(
             statement.validate_materialized_shape(),
             Err(StructuredTransitionError::ResearchCap)
+        ));
+        assert!(matches!(
+            validate_streaming_witness(statement, &witness),
+            Err(StructuredTransitionError::InvalidLength)
         ));
         assert!(matches!(
             prove_structured_transition(b"binding", statement, &mask, &witness),

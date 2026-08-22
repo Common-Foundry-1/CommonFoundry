@@ -37,7 +37,9 @@ use crate::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
     dory_bls12_381_streaming::BlsDoryRowSource,
-    structured_transition::{structured_transition_range_specs, validate_witness},
+    structured_transition::{
+        structured_transition_range_specs, validate_streaming_witness, validate_witness,
+    },
 };
 
 /// Version of the arithmetic-only scalar-field transition transcript.
@@ -945,7 +947,7 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         rows: usize,
         columns: usize,
     ) -> Result<Self, BlsDoryTransitionError> {
-        validate_witness(statement, witness)?;
+        validate_streaming_witness(statement, witness)?;
         let elements = statement.elements()?;
         let mut range_oracles = Vec::with_capacity(
             STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES,

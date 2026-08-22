@@ -29,7 +29,7 @@ use crate::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
     dory_bls12_381_streaming::BlsDoryRowSource,
-    structured_sumcheck::validate_tables,
+    structured_sumcheck::{validate_streaming_tables, validate_tables},
 };
 
 /// Version of the scalar-field matrix transcript.
@@ -416,7 +416,11 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
-    validate_tables(statement, activations, weights, accumulators)?;
+    if scratch_directory.is_some() {
+        validate_streaming_tables(statement, activations, weights, accumulators)?;
+    } else {
+        validate_tables(statement, activations, weights, accumulators)?;
+    }
     validate_target_variables(matrix_variables(statement)?, padded_variables)?;
     if padded_variables > setup.max_log_n() {
         return Err(BlsDoryMatrixError::InvalidDimensions);

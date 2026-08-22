@@ -26,8 +26,9 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
         BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
-        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
-        prove_bls_dory_deferred_opening_sets_with_scratch, verify_bls_dory_openings,
+        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets, prove_bls_dory_deferred_opening_sets_with_scratch,
+        verify_bls_dory_openings,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof,
@@ -40,11 +41,14 @@ use crate::{
     dory_bls12_381_matrix::{
         BlsDoryMatrixError, BlsDoryMatrixProof, PreparedBlsDoryMatrixProof,
         projected_production_matrix_opening_bytes, projected_production_matrix_proof_bytes,
-        prove_bls_dory_matrix_deferred_at_variables, verify_bls_dory_matrix_deferred_at_variables,
+        prove_bls_dory_matrix_deferred_at_variables,
+        prove_bls_dory_matrix_deferred_at_variables_with_scratch,
+        verify_bls_dory_matrix_deferred_at_variables,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryG1, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
+    dory_bls12_381_streaming::BlsDoryRowSource,
     dory_bls12_381_transition::{
         BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryTransitionError, BlsDoryTransitionProof,
         PreparedBlsDoryTransitionProof, projected_production_transition_opening_bytes,
@@ -112,7 +116,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and component construction still materializes the unique n=33 source tables before authenticated scratch folding",
+    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and transition, LogUp, and wiring construction still materialize production source tables",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -532,11 +536,78 @@ fn commit_fixed_table(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDorySharedLayoutError> {
+    commit_fixed_table_with_optional_scratch(values, padded_variables, setup, None)
+}
+
+struct PaddedFixedRowSource<'a> {
+    values: &'a [i64],
+    rows: usize,
+    columns: usize,
+}
+
+impl BlsDoryRowSource for PaddedFixedRowSource<'_> {
+    type Error = std::convert::Infallible;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index * self.columns;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            *scalar = self
+                .values
+                .get(start + column)
+                .copied()
+                .map(BlsDoryFr::from_i64)
+                .unwrap_or_else(BlsDoryFr::zero);
+        }
+        Ok(output.len())
+    }
+}
+
+fn commit_fixed_table_with_optional_scratch(
+    values: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<BlsDoryCommittedPolynomial, BlsDorySharedLayoutError> {
     let padded_len = 1usize
         .checked_shl(padded_variables as u32)
         .ok_or(BlsDorySharedLayoutError::FixedModelIdentity)?;
     if values.is_empty() || values.len() > padded_len || !values.len().is_power_of_two() {
         return Err(BlsDorySharedLayoutError::FixedModelIdentity);
+    }
+    let nu = padded_variables / 2;
+    let sigma = padded_variables - nu;
+    if let Some(scratch_directory) = scratch_directory {
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDorySharedLayoutError::FixedModelIdentity)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDorySharedLayoutError::FixedModelIdentity)?;
+        let mut source = PaddedFixedRowSource {
+            values,
+            rows,
+            columns,
+        };
+        return commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )
+        .map_err(Into::into);
     }
     let mut coefficients = values
         .iter()
@@ -544,8 +615,7 @@ fn commit_fixed_table(
         .map(BlsDoryFr::from_i64)
         .collect::<Vec<_>>();
     coefficients.resize(padded_len, BlsDoryFr::zero());
-    let nu = padded_variables / 2;
-    commit_bls_dory_polynomial(coefficients, nu, padded_variables - nu, setup).map_err(Into::into)
+    commit_bls_dory_polynomial(coefficients, nu, sigma, setup).map_err(Into::into)
 }
 
 /// Arithmetic and range proofs that share the exact packed transition commitment.
@@ -821,8 +891,9 @@ pub fn prove_bls_dory_shared_layout_at_variables(
     )
 }
 
-/// Prove the shared scalar layout while keeping aggregate polynomial folds in
-/// authenticated scratch artifacts. Component construction remains in memory.
+/// Prove the shared scalar layout with authenticated source and fold artifacts.
+/// Matrix and fixed-base commitments stream directly from their signed witness
+/// slices; transition, LogUp, and wiring construction remain in memory.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_bls_dory_shared_layout_at_variables_with_scratch(
     binding: &[u8],
@@ -894,10 +965,11 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         setup,
     )?;
     let component_binding = fixed_model_binding(binding, trusted_model, fixed_model, setup)?;
-    let fixed_base = commit_fixed_table(
+    let fixed_base = commit_fixed_table_with_optional_scratch(
         &transition_inputs[0].witness.accumulators,
         padded_variables,
         setup,
+        scratch_directory,
     )?;
     if fixed_base.commitment() != fixed_model.base_input_commitment {
         return Err(BlsDorySharedLayoutError::FixedModelCommitment);
@@ -907,15 +979,28 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         .iter()
         .zip(&fixed_model.weight_bank_commitments)
     {
-        let matrix = prove_bls_dory_matrix_deferred_at_variables(
-            &component_binding,
-            input.statement,
-            input.activations,
-            input.weights,
-            input.accumulators,
-            padded_variables,
-            setup,
-        )?;
+        let matrix = if let Some(scratch_directory) = scratch_directory {
+            prove_bls_dory_matrix_deferred_at_variables_with_scratch(
+                &component_binding,
+                input.statement,
+                input.activations,
+                input.weights,
+                input.accumulators,
+                padded_variables,
+                setup,
+                scratch_directory,
+            )?
+        } else {
+            prove_bls_dory_matrix_deferred_at_variables(
+                &component_binding,
+                input.statement,
+                input.activations,
+                input.weights,
+                input.accumulators,
+                padded_variables,
+                setup,
+            )?
+        };
         if matrix.proof.weight_commitment != *expected_weight {
             return Err(BlsDorySharedLayoutError::FixedModelCommitment);
         }

@@ -451,9 +451,13 @@ comparison. The v2 research code now implements:
   repeated aggregate claims share polynomial folds and allocate no equality
   tables. An explicit scratch path keeps every post-challenge fold in a
   self-authenticating artifact, aborts on storage corruption without a dense
-  fallback, and preserves complete shared-layout proof bytes. Component
-  construction still materializes the source tables, so the final production
-  artifact needs an n=33 commitment run and a genuinely source-streamed prover;
+  fallback, and preserves complete shared-layout proof bytes. A row-source
+  constructor now writes canonical authenticated source artifacts while
+  computing the unchanged commitments. The scratch-enabled shared path uses it
+  for matrix activation, weight, and accumulator tables and the fixed base,
+  without padded scalar copies. Transition, LogUp, and wiring tables remain
+  materialized, so the final production artifact still needs an n=33 commitment
+  run and streaming for those remaining components;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

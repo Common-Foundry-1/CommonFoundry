@@ -7,6 +7,7 @@
 //! multilinear openings.
 
 use std::io::Cursor;
+use std::path::Path;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -19,14 +20,15 @@ use thiserror::Error;
 use crate::{
     StructuredMatrixStatement, StructuredSumcheckError,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
-        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
-        verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
+    dory_bls12_381_streaming::BlsDoryRowSource,
     structured_sumcheck::validate_tables,
 };
 
@@ -38,7 +40,7 @@ pub const PRODUCTION_BLS_DORY_MATRIX_VARIABLES: usize = 31;
 pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
 pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the n=31 activation, weight, and accumulator polynomials are not streamed by the in-memory prover",
+    "the scratch-backed n=31 matrix path has not completed the exact production topology with measured disk, peak-memory, and proving-time bounds",
     "the final production artifact commitments have not been generated and pinned in network parameters",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
@@ -365,6 +367,52 @@ pub(crate) fn prove_bls_dory_matrix_deferred_at_variables(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        activations,
+        weights,
+        accumulators,
+        padded_variables,
+        setup,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_matrix_deferred_at_variables_with_scratch(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        activations,
+        weights,
+        accumulators,
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
@@ -373,28 +421,31 @@ pub(crate) fn prove_bls_dory_matrix_deferred_at_variables(
     if padded_variables > setup.max_log_n() {
         return Err(BlsDoryMatrixError::InvalidDimensions);
     }
-    let activation_values = signed_values(activations);
-    let weight_values = signed_values(weights);
-    let accumulator_values = signed_values(accumulators);
     let nu = padded_variables / 2;
     let sigma = padded_variables - nu;
-    let activation_polynomial = commit_bls_dory_polynomial(
-        pad_coefficients(&activation_values, padded_variables)?,
+    let activation_polynomial = commit_signed_table(
+        activations,
+        padded_variables,
         nu,
         sigma,
         setup,
+        scratch_directory,
     )?;
-    let weight_polynomial = commit_bls_dory_polynomial(
-        pad_coefficients(&weight_values, padded_variables)?,
+    let weight_polynomial = commit_signed_table(
+        weights,
+        padded_variables,
         nu,
         sigma,
         setup,
+        scratch_directory,
     )?;
-    let accumulator_polynomial = commit_bls_dory_polynomial(
-        pad_coefficients(&accumulator_values, padded_variables)?,
+    let accumulator_polynomial = commit_signed_table(
+        accumulators,
+        padded_variables,
         nu,
         sigma,
         setup,
+        scratch_directory,
     )?;
     let activation_commitment = activation_polynomial.commitment();
     let weight_commitment = weight_polynomial.commitment();
@@ -423,12 +474,17 @@ pub(crate) fn prove_bls_dory_matrix_deferred_at_variables(
         statement.cols.ilog2() as usize,
     );
     let accumulator_point = accumulator_point(&col_point, &row_point, &layer_point);
-    let accumulator_evaluation = evaluate_mle(&accumulator_values, &accumulator_point)?;
-    transcript.append_field(b"accumulator-evaluation", &accumulator_evaluation);
-
     let layer_weights = equality_weights(&layer_point);
     let row_weights = equality_weights(&row_point);
     let col_weights = equality_weights(&col_point);
+    let accumulator_evaluation = evaluate_accumulators(
+        statement,
+        accumulators,
+        &layer_weights,
+        &row_weights,
+        &col_weights,
+    )?;
+    transcript.append_field(b"accumulator-evaluation", &accumulator_evaluation);
     let partial_len = statement
         .layers
         .checked_mul(statement.inner)
@@ -442,14 +498,14 @@ pub(crate) fn prove_bls_dory_matrix_deferred_at_variables(
             let mut activation = BlsDoryFr::zero();
             for (row, row_weight) in row_weights.iter().copied().enumerate() {
                 let index = (layer * statement.rows + row) * statement.inner + common;
-                activation = activation + activation_values[index] * row_weight;
+                activation = activation + BlsDoryFr::from_i64(activations[index]) * row_weight;
             }
             activation_partial.push(activation);
 
             let mut weight = BlsDoryFr::zero();
             for (col, col_weight) in col_weights.iter().copied().enumerate() {
                 let index = (layer * statement.inner + common) * statement.cols + col;
-                weight = weight + weight_values[index] * col_weight;
+                weight = weight + BlsDoryFr::from_i64(weights[index]) * col_weight;
             }
             weight_partial.push(weight);
         }
@@ -905,24 +961,84 @@ fn opening_binding(binding: &[u8], transcript_digest: &[u8; 32]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn signed_values(values: &[i64]) -> Vec<BlsDoryFr> {
-    values.iter().copied().map(BlsDoryFr::from_i64).collect()
+struct PaddedSignedRowSource<'a> {
+    values: &'a [i64],
+    rows: usize,
+    columns: usize,
 }
 
-fn pad_coefficients(
-    values: &[BlsDoryFr],
-    variables: usize,
-) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {
+impl BlsDoryRowSource for PaddedSignedRowSource<'_> {
+    type Error = std::convert::Infallible;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index * self.columns;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            *scalar = self
+                .values
+                .get(start + column)
+                .copied()
+                .map(BlsDoryFr::from_i64)
+                .unwrap_or_else(BlsDoryFr::zero);
+        }
+        Ok(output.len())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_signed_table(
+    values: &[i64],
+    padded_variables: usize,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
     let padded_len = 1usize
-        .checked_shl(variables as u32)
+        .checked_shl(padded_variables as u32)
         .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
     if values.is_empty() || !values.len().is_power_of_two() || values.len() > padded_len {
         return Err(BlsDoryMatrixError::InvalidDimensions);
     }
-    let mut padded = Vec::with_capacity(padded_len);
-    padded.extend_from_slice(values);
+    if let Some(scratch_directory) = scratch_directory {
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut source = PaddedSignedRowSource {
+            values,
+            rows,
+            columns,
+        };
+        return commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )
+        .map_err(Into::into);
+    }
+    let mut padded = values
+        .iter()
+        .copied()
+        .map(BlsDoryFr::from_i64)
+        .collect::<Vec<_>>();
     padded.resize(padded_len, BlsDoryFr::zero());
-    Ok(padded)
+    commit_bls_dory_polynomial(padded, nu, sigma, setup).map_err(Into::into)
 }
 
 fn pad_point(point: &[BlsDoryFr], variables: usize) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {
@@ -1060,24 +1176,39 @@ fn equality_evaluation(
         }))
 }
 
-fn evaluate_mle(
-    values: &[BlsDoryFr],
-    point: &[BlsDoryFr],
+fn evaluate_accumulators(
+    statement: StructuredMatrixStatement,
+    accumulators: &[i64],
+    layer_weights: &[BlsDoryFr],
+    row_weights: &[BlsDoryFr],
+    col_weights: &[BlsDoryFr],
 ) -> Result<BlsDoryFr, BlsDoryMatrixError> {
-    let expected = 1usize
-        .checked_shl(point.len() as u32)
+    let expected = statement
+        .layers
+        .checked_mul(statement.rows)
+        .and_then(|count| count.checked_mul(statement.cols))
         .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
-    if values.len() != expected {
+    if accumulators.len() != expected
+        || layer_weights.len() != statement.layers
+        || row_weights.len() != statement.rows
+        || col_weights.len() != statement.cols
+    {
         return Err(BlsDoryMatrixError::InvalidDimensions);
     }
-    let mut table = values.to_vec();
-    for challenge in point {
-        table = fold(&table, *challenge)?;
+    let mut evaluation = BlsDoryFr::zero();
+    for (layer, layer_weight) in layer_weights.iter().copied().enumerate() {
+        for (row, row_weight) in row_weights.iter().copied().enumerate() {
+            for (column, column_weight) in col_weights.iter().copied().enumerate() {
+                let index = (layer * statement.rows + row) * statement.cols + column;
+                evaluation = evaluation
+                    + BlsDoryFr::from_i64(accumulators[index])
+                        * column_weight
+                        * row_weight
+                        * layer_weight;
+            }
+        }
     }
-    table
-        .first()
-        .copied()
-        .ok_or(BlsDoryMatrixError::InvalidDimensions)
+    Ok(evaluation)
 }
 
 fn fold(table: &[BlsDoryFr], challenge: BlsDoryFr) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {

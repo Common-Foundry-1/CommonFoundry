@@ -937,8 +937,9 @@ commitments, equality values, and substituted, reordered, or omitted components.
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate
 prover no longer retains a duplicate coefficient vector or builds a full
-combined polynomial for the final Dory opening: it computes `L^T M` one row at
-a time and feeds the unchanged Dory state machine. The distinct-point sumcheck
+combined polynomial for the final Dory opening: it streams authenticated
+coefficients into `L^T M` and feeds the unchanged Dory state machine. The
+distinct-point sumcheck
 also folds each repeated polynomial only once and generates equality weights
 without full equality tables. Its pre-change 17,695-byte fixture remains pinned
 at BLAKE3 digest
@@ -947,10 +948,16 @@ An explicit scratch API now writes every post-challenge unique-table fold to a
 self-authenticating, lineage-bound artifact. It uses a two-scalar fold working set,
 rejects corruption, truncation, non-canonical fields, and trailing bytes, removes
 partial or completed files only while it still owns them, and aborts without a
-dense fallback. The standalone aggregate and complete shared-layout fixture
-produce exactly the same proof through that path. Component construction still
-materializes every source table before the first fold, so this is not the n=33
-out-of-core prover. Streaming those sources, executing the final model
+dense fallback. A row-source constructor now computes ordinary row and tier-two
+commitments while writing the canonical coefficient stream to the same
+self-authenticating storage boundary. The scratch-enabled shared prover uses it
+for all matrix activation, weight, and accumulator tables and for the fixed base
+table; it evaluates the matrix terminal directly from signed witness slices and
+does not allocate padded scalar copies. The standalone aggregate and complete
+shared-layout fixture produce exactly the same proof through that path.
+Transition, LogUp, and wiring constructors still materialize their source
+tables, so this is not yet the complete n=33 out-of-core prover. Streaming those
+remaining sources, executing the final model
 commitment ceremony, independent review of the transcript and soundness
 accounting, and external audit remain activation requirements.
 

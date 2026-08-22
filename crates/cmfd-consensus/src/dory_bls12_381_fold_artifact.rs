@@ -263,7 +263,7 @@ impl BlsDoryFoldArtifact {
     }
 
     #[cfg(test)]
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }

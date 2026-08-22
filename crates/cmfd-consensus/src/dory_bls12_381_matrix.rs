@@ -21,8 +21,9 @@ use thiserror::Error;
 use crate::{
     StructuredMatrixStatement, StructuredSumcheckError,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCompactRowSource,
+        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
@@ -33,6 +34,9 @@ use crate::{
     structured_sumcheck::{validate_streaming_tables, validate_tables},
 };
 
+#[cfg(test)]
+use crate::dory_bls12_381_aggregate::prove_bls_dory_deferred_opening_sets_with_scratch;
+
 /// Version of the scalar-field matrix transcript.
 pub const BLS_DORY_MATRIX_VERSION: u16 = 1;
 /// Production weights contain 128 * 4096 * 4096 = 2^31 elements.
@@ -41,7 +45,7 @@ pub const PRODUCTION_BLS_DORY_MATRIX_VARIABLES: usize = 31;
 pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
 pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank, but the exact n=31 path still lacks production disk, memory, and latency measurements",
+    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank; canonical signed-word sources preserve the exact commitments, claims, and proof bytes and project all three production matrix sources at 54,760,834,392 bytes (51 GiB) without first-four-generation fold files, but the exact n=31 path still lacks production disk, memory, and latency measurements",
     "the final production artifact commitments have not been generated and pinned in network parameters",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
@@ -1094,6 +1098,7 @@ struct PaddedSignedRowSource<'a> {
     values: &'a [i64],
     rows: usize,
     columns: usize,
+    dictionary: [BlsDoryFr; 1],
 }
 
 impl BlsDoryRowSource for PaddedSignedRowSource<'_> {
@@ -1129,6 +1134,64 @@ impl BlsDoryRowSource for PaddedSignedRowSource<'_> {
     }
 }
 
+impl BlsDoryCompactRowSource for PaddedSignedRowSource<'_> {
+    type Error = std::convert::Infallible;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.values.len()
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.values.len()
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        1
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index * self.columns;
+        for (column, word) in output.iter_mut().enumerate() {
+            *word = self
+                .values
+                .get(start + column)
+                .copied()
+                .map(|value| u64::from_le_bytes(value.to_le_bytes()))
+                .unwrap_or(0);
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(
+        &mut self,
+        _row_index: usize,
+        output: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        output.fill(0);
+        Ok(output.len())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn commit_signed_table(
     values: &[i64],
@@ -1155,7 +1218,18 @@ fn commit_signed_table(
             values,
             rows,
             columns,
+            dictionary: [BlsDoryFr::zero()],
         };
+        if values.len().is_multiple_of(columns) {
+            return commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )
+            .map_err(Into::into);
+        }
         return commit_bls_dory_row_source_with_scratch(
             &mut source,
             nu,
@@ -1461,6 +1535,16 @@ mod tests {
         let sigma = variables - nu;
         let setup = deterministic_bls_dory_setup(variables).unwrap();
         let scratch = ScratchDirectory::create();
+        let dense = prove_bls_dory_matrix_deferred_at_variables(
+            b"precommitted-weight",
+            statement,
+            &activations,
+            &weights,
+            &accumulators,
+            variables,
+            &setup,
+        )
+        .unwrap();
         let ordinary = prove_bls_dory_matrix_deferred_at_variables_with_scratch(
             b"precommitted-weight",
             statement,
@@ -1472,6 +1556,21 @@ mod tests {
             &scratch.0,
         )
         .unwrap();
+        assert_eq!(ordinary.proof, dense.proof);
+        assert_eq!(ordinary.openings.claims(), dense.openings.claims());
+        let aggregate_binding =
+            opening_binding(b"precommitted-weight", &ordinary.proof.transcript_digest);
+        let dense_opening =
+            prove_bls_dory_deferred_opening_sets(&aggregate_binding, &[&dense.openings], &setup)
+                .unwrap();
+        let compact_opening = prove_bls_dory_deferred_opening_sets_with_scratch(
+            &aggregate_binding,
+            &[&ordinary.openings],
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(compact_opening, dense_opening);
         let weight =
             commit_signed_table(&weights, variables, nu, sigma, &setup, Some(&scratch.0)).unwrap();
         let streamed = prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
@@ -1519,6 +1618,7 @@ mod tests {
             ))
         ));
         drop(out_of_range_weight);
+        drop(dense);
         drop(ordinary);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }

@@ -19,8 +19,10 @@ use thiserror::Error;
 
 use crate::{
     ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk, ModelPcsIdentity, ModelPcsRole,
-    STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_INPUT_ORACLE,
-    STRUCTURED_TRANSITION_ORACLES, StagedModelFieldSink, StructuredMaskPolynomial,
+    PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION,
+    PRODUCTION_V2_LAYERS_PER_BANK, STRUCTURED_TRANSITION_ACTIVATION_ORACLE,
+    STRUCTURED_TRANSITION_INPUT_ORACLE, STRUCTURED_TRANSITION_ORACLES,
+    STRUCTURED_TRANSITION_REGULAR_ORACLES, StagedModelFieldSink, StructuredMaskPolynomial,
     StructuredMatrixStatement, StructuredTransitionStatement, StructuredTransitionWitness,
     StructuredWiringStatement, VerifiedModelBankReceipt,
     dory_bls12_381_aggregate::{
@@ -31,15 +33,19 @@ use crate::{
         prove_bls_dory_deferred_opening_sets_consuming_with_scratch,
         regenerate_bls_dory_compact_row_source_with_scratch, verify_bls_dory_openings,
     },
+    dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
+    dory_bls12_381_fold_artifact::BlsDoryFoldArtifactSpec,
     dory_bls12_381_logup::{
-        BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof,
-        PreparedBlsDoryRangeLogUpProof, projected_production_range_logup_opening_bytes,
+        BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
+        BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof, PreparedBlsDoryRangeLogUpProof,
+        projected_production_range_logup_opening_bytes,
         projected_production_range_logup_proof_bytes, prove_bls_dory_range_logup,
         prove_bls_dory_range_logup_at_variables, prove_bls_dory_range_logup_deferred_at_variables,
         prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
         verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
         verify_bls_dory_range_logup_deferred_at_variables,
     },
+    dory_bls12_381_logup_artifact::BlsDoryLogUpArtifactSpec,
     dory_bls12_381_matrix::{
         BlsDoryMatrixError, BlsDoryMatrixProof, PreparedBlsDoryMatrixProof,
         projected_production_matrix_opening_bytes, projected_production_matrix_proof_bytes,
@@ -82,6 +88,7 @@ pub const MAX_BLS_DORY_SHARED_TRANSITION_PROOFS: usize = 4;
 pub const MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES: usize = 262_128;
 pub const BLS_DORY_SHARED_INITIALIZATION_LINKS: usize = 2;
 pub const BLS_DORY_SHARED_LINKS_PER_BANK: usize = 3;
+const BLS_DORY_SHARED_COMPRESSED_FOLD_GENERATIONS: u32 = 4;
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
 pub const BLS_DORY_SHARED_PRODUCTION_VARIABLES: usize = 33;
@@ -122,9 +129,35 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, authenticated release/regeneration, and four shared compressed aggregate-fold generations preserve exact proofs, but the exact four-pair retained-source and transition/mapped-fold lower bound remains 126,500,212,028 bytes (about 117.8 GiB) before multiplicity, matrix, and wiring folds, and the complete n=33 prover has not been run",
+    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, signed-word matrix and wiring sources, authenticated release/regeneration, and four challenge-bound aggregate-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 156,029,690,964 bytes (about 145.3 GiB) and the complete n=33 prover has not been run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
+
+/// Exact on-disk accounting for the current scratch-backed production topology.
+///
+/// The aggregate keeps every committed coefficient source live while it folds
+/// each unique polynomial. This projection follows every generation in table
+/// order and accounts for the child being fully written before its parent is
+/// deleted. Input model-bank bytes and in-memory Dory row commitments are not
+/// included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlsDorySharedProductionScratchProjection {
+    pub matrix_source_bytes: u64,
+    pub transition_source_bytes: u64,
+    pub multiplicity_source_bytes: u64,
+    pub wiring_source_bytes: u64,
+    pub fixed_base_source_bytes: u64,
+    pub retained_source_bytes: u64,
+    pub matrix_first_fold_bytes: u64,
+    pub transition_first_fold_bytes: u64,
+    pub multiplicity_first_fold_bytes: u64,
+    pub wiring_first_fold_bytes: u64,
+    pub fixed_base_first_fold_bytes: u64,
+    pub first_generation_fold_bytes: u64,
+    pub fifth_generation_fold_bytes: u64,
+    pub aggregate_fold_peak_bytes: u64,
+    pub aggregate_peak_bytes: u64,
+}
 
 /// Network-pinned BLS commitments for the authenticated fixed model.
 ///
@@ -2442,6 +2475,421 @@ pub fn verify_bls_dory_transition_range_at_variables(
     Ok(())
 }
 
+fn projected_shared_scalar_artifact_bytes(
+    logical_scalars: u64,
+    explicit_scalars: u64,
+    generation: u32,
+) -> Result<u64, BlsDorySharedLayoutError> {
+    BlsDoryFoldArtifactSpec {
+        context_digest: [1; 32],
+        table_index: 0,
+        generation,
+        scalar_count: logical_scalars,
+        explicit_scalar_count: explicit_scalars,
+        parent_digest: [2; 32],
+    }
+    .encoded_bytes()
+    .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
+}
+
+fn projected_shared_signed_word_source_bytes(
+    logical_scalars: u64,
+    explicit_scalars: u64,
+    word_group_len: u64,
+) -> Result<u64, BlsDorySharedLayoutError> {
+    BlsDoryCompactArtifactSpec {
+        context_digest: [1; 32],
+        scalar_count: logical_scalars,
+        explicit_scalar_count: explicit_scalars,
+        word_scalar_count: explicit_scalars,
+        word_group_len,
+        signed_word_selectors: 1,
+    }
+    .encoded_bytes(1)
+    .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
+}
+
+fn projected_shared_transition_source_bytes(
+    logical_scalars: u64,
+    cells: u64,
+) -> Result<u64, BlsDorySharedLayoutError> {
+    let explicit_scalars = cells
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let word_scalars = cells
+        .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES as u64)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    BlsDoryCompactArtifactSpec {
+        context_digest: [1; 32],
+        scalar_count: logical_scalars,
+        explicit_scalar_count: explicit_scalars,
+        word_scalar_count: word_scalars,
+        word_group_len: cells,
+        signed_word_selectors: 0,
+    }
+    .encoded_bytes(BLS_DORY_RANGE_LOGUP_TABLE_VALUES)
+    .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
+}
+
+fn projected_shared_transition_compressed_fold_bytes(
+    logical_scalars: u64,
+    cells: u64,
+    generation: u32,
+) -> Result<u64, BlsDorySharedLayoutError> {
+    let selector_rows = logical_scalars
+        .checked_div(cells)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    BlsDoryLogUpArtifactSpec {
+        context_digest: [1; 32],
+        parent_digest: [2; 32],
+        reconstruction_digest: [3; 32],
+        generation,
+        selector_rows,
+        current_cells: cells
+            .checked_shr(generation)
+            .filter(|value| *value > 0)
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?,
+        regular_selectors: STRUCTURED_TRANSITION_REGULAR_ORACLES as u32,
+        range_selectors: (STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES)
+            as u32,
+    }
+    .encoded_bytes()
+    .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
+}
+
+fn checked_projection_sum(values: &[u64]) -> Result<u64, BlsDorySharedLayoutError> {
+    values.iter().try_fold(0u64, |sum, value| {
+        sum.checked_add(*value)
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)
+    })
+}
+
+fn projected_shared_scalar_fold_bytes(
+    logical_scalars: u64,
+    explicit_scalars: u64,
+    generation: u32,
+) -> Result<u64, BlsDorySharedLayoutError> {
+    let divisor = 1u64
+        .checked_shl(generation)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    projected_shared_scalar_artifact_bytes(
+        logical_scalars
+            .checked_shr(generation)
+            .filter(|value| *value > 0)
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?,
+        explicit_scalars.div_ceil(divisor),
+        generation,
+    )
+}
+
+fn add_projected_fold(
+    current: &mut u64,
+    peak: &mut u64,
+    child: u64,
+) -> Result<(), BlsDorySharedLayoutError> {
+    let writing = current
+        .checked_add(child)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    *peak = (*peak).max(writing);
+    *current = writing;
+    Ok(())
+}
+
+fn replace_projected_fold(
+    current: &mut u64,
+    peak: &mut u64,
+    parent: u64,
+    child: u64,
+) -> Result<(), BlsDorySharedLayoutError> {
+    let writing = current
+        .checked_add(child)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    *peak = (*peak).max(writing);
+    *current = writing
+        .checked_sub(parent)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    Ok(())
+}
+
+fn projected_shared_scratch_bytes_for_shape(
+    padded_variables: usize,
+    banks: u64,
+    batch: u64,
+    dimension: u64,
+    layers_per_bank: u64,
+) -> Result<BlsDorySharedProductionScratchProjection, BlsDorySharedLayoutError> {
+    let logical_scalars = 1u64
+        .checked_shl(padded_variables as u32)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    if banks != MAX_BLS_DORY_SHARED_MATRIX_PROOFS as u64
+        || banks + 1 != MAX_BLS_DORY_SHARED_TRANSITION_PROOFS as u64
+    {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    let initialization_cells = batch
+        .checked_mul(dimension)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let bank_cells = layers_per_bank
+        .checked_mul(batch)
+        .and_then(|value| value.checked_mul(dimension))
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let weight_cells = layers_per_bank
+        .checked_mul(dimension)
+        .and_then(|value| value.checked_mul(dimension))
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let wiring_scalars = bank_cells
+        .checked_mul(
+            banks
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?,
+        )
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let transition_count = banks
+        .checked_add(1)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+
+    let matrix_source_per_bank = checked_projection_sum(&[
+        projected_shared_signed_word_source_bytes(logical_scalars, bank_cells, bank_cells)?,
+        projected_shared_signed_word_source_bytes(logical_scalars, weight_cells, weight_cells)?,
+        projected_shared_signed_word_source_bytes(logical_scalars, bank_cells, bank_cells)?,
+    ])?;
+    let matrix_source_bytes = matrix_source_per_bank
+        .checked_mul(banks)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let transition_source_bytes =
+        projected_shared_transition_source_bytes(logical_scalars, initialization_cells)?
+            .checked_add(
+                projected_shared_transition_source_bytes(logical_scalars, bank_cells)?
+                    .checked_mul(banks)
+                    .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?,
+            )
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let multiplicity_source_bytes = projected_shared_scalar_artifact_bytes(
+        logical_scalars,
+        BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+        1,
+    )?
+    .checked_mul(transition_count)
+    .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let wiring_source_bytes =
+        projected_shared_signed_word_source_bytes(logical_scalars, wiring_scalars, bank_cells)?;
+    let fixed_base_source_bytes =
+        projected_shared_scalar_artifact_bytes(logical_scalars, initialization_cells, 1)?;
+    let retained_source_bytes = checked_projection_sum(&[
+        matrix_source_bytes,
+        transition_source_bytes,
+        multiplicity_source_bytes,
+        wiring_source_bytes,
+        fixed_base_source_bytes,
+    ])?;
+
+    let mut transition_cells = Vec::with_capacity(transition_count as usize);
+    transition_cells.push(initialization_cells);
+    transition_cells.extend(std::iter::repeat_n(bank_cells, banks as usize));
+    let matrix_first_fold_bytes = 0;
+    let transition_first_fold_bytes = transition_cells.iter().try_fold(0u64, |sum, cells| {
+        sum.checked_add(projected_shared_transition_compressed_fold_bytes(
+            logical_scalars,
+            *cells,
+            1,
+        )?)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)
+    })?;
+    let multiplicity_first_fold_bytes = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+        1,
+    )?
+    .checked_mul(transition_count)
+    .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let wiring_first_fold_bytes = 0;
+    let fixed_base_first_fold_bytes =
+        projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, 1)?;
+    let first_generation_fold_bytes = checked_projection_sum(&[
+        matrix_first_fold_bytes,
+        transition_first_fold_bytes,
+        multiplicity_first_fold_bytes,
+        wiring_first_fold_bytes,
+        fixed_base_first_fold_bytes,
+    ])?;
+    let mut current_fold_bytes = first_generation_fold_bytes;
+    let mut aggregate_fold_peak_bytes = current_fold_bytes;
+
+    for generation in 2..=BLS_DORY_SHARED_COMPRESSED_FOLD_GENERATIONS {
+        for cells in &transition_cells {
+            replace_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                projected_shared_transition_compressed_fold_bytes(
+                    logical_scalars,
+                    *cells,
+                    generation - 1,
+                )?,
+                projected_shared_transition_compressed_fold_bytes(
+                    logical_scalars,
+                    *cells,
+                    generation,
+                )?,
+            )?;
+        }
+        for _ in 0..transition_count {
+            replace_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                projected_shared_scalar_fold_bytes(
+                    logical_scalars,
+                    BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+                    generation - 1,
+                )?,
+                projected_shared_scalar_fold_bytes(
+                    logical_scalars,
+                    BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+                    generation,
+                )?,
+            )?;
+        }
+        replace_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            projected_shared_scalar_fold_bytes(
+                logical_scalars,
+                initialization_cells,
+                generation - 1,
+            )?,
+            projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, generation)?,
+        )?;
+    }
+
+    let mut ordinary_folds = Vec::new();
+    for _ in 0..banks {
+        for explicit in [bank_cells, weight_cells, bank_cells] {
+            let child = projected_shared_scalar_fold_bytes(logical_scalars, explicit, 5)?;
+            add_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                child,
+            )?;
+            ordinary_folds.push((explicit, child));
+        }
+    }
+    for cells in &transition_cells {
+        let transition_explicit = cells
+            .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+        let compact_parent = projected_shared_transition_compressed_fold_bytes(
+            logical_scalars,
+            *cells,
+            BLS_DORY_SHARED_COMPRESSED_FOLD_GENERATIONS,
+        )?;
+        let transition_child =
+            projected_shared_scalar_fold_bytes(logical_scalars, transition_explicit, 5)?;
+        add_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            transition_child,
+        )?;
+        ordinary_folds.push((transition_explicit, transition_child));
+
+        let multiplicity_parent = projected_shared_scalar_fold_bytes(
+            logical_scalars,
+            BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+            4,
+        )?;
+        let multiplicity_child = projected_shared_scalar_fold_bytes(
+            logical_scalars,
+            BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+            5,
+        )?;
+        replace_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            multiplicity_parent,
+            multiplicity_child,
+        )?;
+        ordinary_folds.push((BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64, multiplicity_child));
+
+        let mapped_child = transition_child;
+        add_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            mapped_child,
+        )?;
+        current_fold_bytes = current_fold_bytes
+            .checked_sub(compact_parent)
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+        ordinary_folds.push((transition_explicit, mapped_child));
+    }
+    let wiring_child = projected_shared_scalar_fold_bytes(logical_scalars, wiring_scalars, 5)?;
+    add_projected_fold(
+        &mut current_fold_bytes,
+        &mut aggregate_fold_peak_bytes,
+        wiring_child,
+    )?;
+    ordinary_folds.push((wiring_scalars, wiring_child));
+    let fixed_parent =
+        projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, 4)?;
+    let fixed_child = projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, 5)?;
+    replace_projected_fold(
+        &mut current_fold_bytes,
+        &mut aggregate_fold_peak_bytes,
+        fixed_parent,
+        fixed_child,
+    )?;
+    ordinary_folds.push((initialization_cells, fixed_child));
+    let fifth_generation_fold_bytes = current_fold_bytes;
+
+    for generation in 6..=padded_variables as u32 {
+        for (explicit, parent) in &mut ordinary_folds {
+            let child = projected_shared_scalar_fold_bytes(logical_scalars, *explicit, generation)?;
+            replace_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                *parent,
+                child,
+            )?;
+            *parent = child;
+        }
+    }
+    let aggregate_peak_bytes = retained_source_bytes
+        .checked_add(aggregate_fold_peak_bytes)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+
+    Ok(BlsDorySharedProductionScratchProjection {
+        matrix_source_bytes,
+        transition_source_bytes,
+        multiplicity_source_bytes,
+        wiring_source_bytes,
+        fixed_base_source_bytes,
+        retained_source_bytes,
+        matrix_first_fold_bytes,
+        transition_first_fold_bytes,
+        multiplicity_first_fold_bytes,
+        wiring_first_fold_bytes,
+        fixed_base_first_fold_bytes,
+        first_generation_fold_bytes,
+        fifth_generation_fold_bytes,
+        aggregate_fold_peak_bytes,
+        aggregate_peak_bytes,
+    })
+}
+
+/// Project the exact current scratch peak for the three-bank production
+/// topology. Unlike the earlier four-full-transition lower bound, this uses
+/// one 2^19-cell initialization transition and three 2^26-cell bank
+/// transitions, and includes matrix, multiplicity, wiring, and fixed-base
+/// coefficient sources plus the complete aggregate-fold artifact lifecycle.
+pub fn projected_shared_production_scratch_bytes()
+-> Result<BlsDorySharedProductionScratchProjection, BlsDorySharedLayoutError> {
+    projected_shared_scratch_bytes_for_shape(
+        BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+        u64::from(PRODUCTION_V2_BANKS),
+        u64::from(PRODUCTION_V2_BATCH),
+        u64::from(PRODUCTION_V2_DIMENSION),
+        u64::from(PRODUCTION_V2_LAYERS_PER_BANK),
+    )
+}
+
 /// Project one Dory opening aggregate at the canonical production geometry.
 pub fn projected_shared_production_opening_bytes() -> Result<usize, BlsDorySharedLayoutError> {
     Ok(projected_bls_dory_aggregate_bytes(
@@ -2507,7 +2955,10 @@ mod tests {
             BlsDoryMatrixProof, prove_bls_dory_matrix_at_variables,
             verify_bls_dory_matrix_at_variables,
         },
-        dory_bls12_381_prototype::{MAX_BLS_DORY_SETUP_VARIABLES, deterministic_bls_dory_setup},
+        dory_bls12_381_prototype::{
+            MAX_BLS_DORY_PROTOTYPE_VARIABLES, MAX_BLS_DORY_SETUP_VARIABLES,
+            deterministic_bls_dory_setup,
+        },
         dory_bls12_381_wiring::{
             BlsDoryWiringProof, prove_bls_dory_wiring_at_variables,
             verify_bls_dory_wiring_at_variables,
@@ -2538,6 +2989,16 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn observed_directory_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum()
     }
 
     fn authenticated_fixed_model_fixture() -> (
@@ -3021,9 +3482,15 @@ mod tests {
     }
 
     fn linked_fixture(banks: usize) -> LinkedFixture {
-        let rows = 2;
-        let cols = 2;
-        let layers = 2;
+        linked_fixture_shape(banks, 2, 2, 2)
+    }
+
+    fn linked_fixture_shape(
+        banks: usize,
+        layers: usize,
+        rows: usize,
+        cols: usize,
+    ) -> LinkedFixture {
         let initialization_statement = StructuredTransitionStatement {
             layers: 1,
             rows,
@@ -3033,10 +3500,13 @@ mod tests {
         };
         let initialization_mask =
             StructuredMaskPolynomial::from_challenge(&[0x31; 32], 1, rows, cols).unwrap();
+        let initialization_accumulators = (0..rows * cols)
+            .map(|index| [-7, 11, 23, -19][index % 4])
+            .collect::<Vec<_>>();
         let initialization_witness = transition_witness_from_accumulators(
             initialization_statement,
             &initialization_mask,
-            &[-7, 11, 23, -19],
+            &initialization_accumulators,
         );
         let initial = initialization_witness.activations.clone();
         let mut transitions = vec![LinkedTransitionWitness {
@@ -3139,6 +3609,14 @@ mod tests {
         fixture: &LinkedFixture,
         setup: &DeterministicBlsDorySetup,
     ) -> (ModelPcsIdentity, BlsDoryFixedModelIdentity) {
+        fixed_model_fixture_at_variables(fixture, setup, FIXTURE_VARIABLES)
+    }
+
+    fn fixed_model_fixture_at_variables(
+        fixture: &LinkedFixture,
+        setup: &DeterministicBlsDorySetup,
+        padded_variables: usize,
+    ) -> (ModelPcsIdentity, BlsDoryFixedModelIdentity) {
         let model = ModelPcsIdentity {
             model_version: 1,
             batch: fixture.wiring_statement.rows as u32,
@@ -3156,14 +3634,54 @@ mod tests {
             .iter()
             .map(|matrix| matrix.weights.as_slice())
             .collect::<Vec<_>>();
-        let fixed = derive_bls_dory_fixed_model_identity(
-            &model,
-            &fixture.transitions[0].witness.accumulators,
-            &weights,
-            FIXTURE_VARIABLES,
-            setup,
-        )
-        .unwrap();
+        let fixed = if padded_variables <= MAX_BLS_DORY_PROTOTYPE_VARIABLES {
+            derive_bls_dory_fixed_model_identity(
+                &model,
+                &fixture.transitions[0].witness.accumulators,
+                &weights,
+                padded_variables,
+                setup,
+            )
+            .unwrap()
+        } else {
+            let scratch = ScratchDirectory::create();
+            let base = commit_fixed_table_with_optional_scratch(
+                &fixture.transitions[0].witness.accumulators,
+                padded_variables,
+                setup,
+                Some(&scratch.0),
+            )
+            .unwrap();
+            let committed_weights = weights
+                .iter()
+                .map(|weight| {
+                    commit_fixed_table_with_optional_scratch(
+                        weight,
+                        padded_variables,
+                        setup,
+                        Some(&scratch.0),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let identity = BlsDoryFixedModelIdentity {
+                protocol_version: BLS_DORY_FIXED_MODEL_IDENTITY_VERSION,
+                model_pcs_identity_digest: model.digest().unwrap(),
+                setup_identity: setup.identity(),
+                base_input_commitment: base.commitment(),
+                weight_bank_commitments: committed_weights
+                    .iter()
+                    .map(BlsDoryCommittedPolynomial::commitment)
+                    .collect(),
+            };
+            identity
+                .validate(&model, fixture.matrices.len(), setup)
+                .unwrap();
+            drop(committed_weights);
+            drop(base);
+            assert_eq!(observed_directory_bytes(&scratch.0), 0);
+            identity
+        };
         (model, fixed)
     }
 
@@ -3771,6 +4289,132 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-only complete shared-layout scratch and latency benchmark"]
+    fn shared_layout_release_scaling_benchmark() {
+        const PADDED_VARIABLES: usize = 19;
+        const BANKS: usize = 3;
+        const LAYERS: usize = 16;
+        const ROWS: usize = 8;
+        const COLUMNS: usize = 32;
+
+        let fixture_start = std::time::Instant::now();
+        let fixture = linked_fixture_shape(BANKS, LAYERS, ROWS, COLUMNS);
+        let fixture_millis = fixture_start.elapsed().as_millis();
+        let setup_start = std::time::Instant::now();
+        let setup = deterministic_bls_dory_setup(PADDED_VARIABLES).unwrap();
+        let (model, fixed_model) =
+            fixed_model_fixture_at_variables(&fixture, &setup, PADDED_VARIABLES);
+        let setup_millis = setup_start.elapsed().as_millis();
+        let matrix_statements = vec![fixture.matrix_statement; fixture.matrices.len()];
+        let transition_statements = fixture
+            .transitions
+            .iter()
+            .map(|transition| transition.statement)
+            .collect::<Vec<_>>();
+        let masks = fixture
+            .transitions
+            .iter()
+            .map(|transition| &transition.mask)
+            .collect::<Vec<_>>();
+        let matrix_inputs = fixture
+            .matrices
+            .iter()
+            .map(|matrix| BlsDoryMatrixProverInput {
+                statement: fixture.matrix_statement,
+                activations: &matrix.activations,
+                weights: &matrix.weights,
+                accumulators: &matrix.accumulators,
+            })
+            .collect::<Vec<_>>();
+        let transition_inputs = fixture
+            .transitions
+            .iter()
+            .map(|transition| BlsDoryTransitionProverInput {
+                statement: transition.statement,
+                mask_polynomial: &transition.mask,
+                witness: &transition.witness,
+            })
+            .collect::<Vec<_>>();
+        let scratch = ScratchDirectory::create();
+        let stop_observer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak_scratch_bytes = std::sync::Arc::new(AtomicU64::new(0));
+        let observer = {
+            let path = scratch.0.clone();
+            let stop = std::sync::Arc::clone(&stop_observer);
+            let peak = std::sync::Arc::clone(&peak_scratch_bytes);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    peak.fetch_max(observed_directory_bytes(&path), Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                peak.fetch_max(observed_directory_bytes(&path), Ordering::Relaxed);
+            })
+        };
+
+        let prover_start = std::time::Instant::now();
+        let proof = prove_bls_dory_shared_layout_at_variables_with_scratch(
+            b"shared-layout-scaling-benchmark",
+            &model,
+            &fixed_model,
+            &matrix_inputs,
+            &transition_inputs,
+            fixture.wiring_statement,
+            &fixture.initial,
+            &fixture.inputs,
+            &fixture.outputs,
+            PADDED_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let prover_millis = prover_start.elapsed().as_millis();
+        stop_observer.store(true, Ordering::Relaxed);
+        observer.join().unwrap();
+        let peak_scratch_bytes = peak_scratch_bytes.load(Ordering::Relaxed);
+        let projected_scratch = projected_shared_scratch_bytes_for_shape(
+            PADDED_VARIABLES,
+            BANKS as u64,
+            ROWS as u64,
+            COLUMNS as u64,
+            LAYERS as u64,
+        )
+        .unwrap();
+
+        let verification_start = std::time::Instant::now();
+        verify_bls_dory_shared_layout_at_variables(
+            b"shared-layout-scaling-benchmark",
+            &model,
+            &fixed_model,
+            &matrix_statements,
+            &transition_statements,
+            &masks,
+            fixture.wiring_statement,
+            &proof,
+            PADDED_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        let verification_millis = verification_start.elapsed().as_millis();
+        let proof_bytes = proof
+            .encode(
+                &matrix_statements,
+                &transition_statements,
+                fixture.wiring_statement,
+            )
+            .unwrap()
+            .len();
+        let retained_scratch_bytes = observed_directory_bytes(&scratch.0);
+        println!(
+            "CMFD_BLS_SHARED_BENCHMARK {{\"padded_variables\":{PADDED_VARIABLES},\"banks\":{BANKS},\"layers\":{LAYERS},\"rows\":{ROWS},\"columns\":{COLUMNS},\"fixture_millis\":{fixture_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"peak_scratch_bytes\":{peak_scratch_bytes},\"projected_aggregate_scratch_bytes\":{},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
+            projected_scratch.aggregate_peak_bytes
+        );
+        assert_eq!(proof.matrices.len(), BANKS);
+        assert_eq!(proof.transitions.len(), BANKS + 1);
+        assert!(peak_scratch_bytes >= projected_scratch.aggregate_peak_bytes);
+        assert_eq!(retained_scratch_bytes, 0);
+    }
+
+    #[test]
     fn transition_range_composition_requires_both_proofs_and_one_commitment() {
         let setup = deterministic_bls_dory_setup(FIXTURE_VARIABLES).unwrap();
         let (statement, mask, witness) = transition_fixture();
@@ -4023,6 +4667,22 @@ mod tests {
 
     #[test]
     fn production_claim_accounting_and_shared_projection_are_explicit() {
+        let scratch = projected_shared_production_scratch_bytes().unwrap();
+        assert_eq!(scratch.matrix_source_bytes, 54_760_834_392);
+        assert_eq!(scratch.transition_source_bytes, 39_159_073_248);
+        assert_eq!(scratch.multiplicity_source_bytes, 2_576);
+        assert_eq!(scratch.wiring_source_bytes, 3_758_096_536);
+        assert_eq!(scratch.fixed_base_source_bytes, 16_777_348);
+        assert_eq!(scratch.retained_source_bytes, 97_694_784_100);
+        assert_eq!(scratch.matrix_first_fold_bytes, 0);
+        assert_eq!(scratch.transition_first_fold_bytes, 48_646_062_768);
+        assert_eq!(scratch.multiplicity_first_fold_bytes, 1_552);
+        assert_eq!(scratch.wiring_first_fold_bytes, 0);
+        assert_eq!(scratch.fixed_base_first_fold_bytes, 8_388_740);
+        assert_eq!(scratch.first_generation_fold_bytes, 48_654_453_060);
+        assert_eq!(scratch.fifth_generation_fold_bytes, 51_722_587_228);
+        assert_eq!(scratch.aggregate_fold_peak_bytes, 58_334_906_864);
+        assert_eq!(scratch.aggregate_peak_bytes, 156_029_690_964);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);

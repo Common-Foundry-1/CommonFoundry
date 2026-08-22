@@ -60,7 +60,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, compact transition sources, mapped inverse views, authenticated release/regeneration, consuming openings, and four shared compressed aggregate-fold generations preserve exact proofs; two n=19 release runs retained the 47,729-byte proof, measured 7.220-7.282 seconds opening and 2.415-2.446 seconds verification, and reduced aggregate-opening scratch from 18,819,084 to 2,377,688 bytes; the exact n=33 retained-source and transition/mapped-fold lower bound is now 126,500,212,028 bytes (about 117.8 GiB) for four pairs, before multiplicity, matrix, and wiring folds, so a complete measured n=33 run remains required",
+    "bounded parallel commitments, compact transition/mapped sources, signed-word matrix and wiring sources, authenticated release/regeneration, consuming openings, and four challenge-bound aggregate-fold views preserve exact proofs; the complete n=19 shared-layout release run retained the 84,717-byte proof, measured 92.212 seconds proving and 7.045 seconds verification, matched its 6,866,772-byte aggregate scratch projection exactly, and left zero scratch; the exact complete n=33 aggregate-stage projection is now 156,029,690,964 bytes (about 145.3 GiB), down 2.81 times from 438,943,885,320 bytes (about 408.8 GiB), but a complete measured n=33 run remains required",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -2291,6 +2291,21 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets(
     prove_bls_dory_deferred_opening_sets_with_optional_scratch(public_binding, sets, setup, None)
 }
 
+#[cfg(test)]
+pub(crate) fn prove_bls_dory_deferred_opening_sets_with_scratch(
+    public_binding: &[u8],
+    sets: &[&BlsDoryDeferredOpeningSet],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    prove_bls_dory_deferred_opening_sets_with_optional_scratch(
+        public_binding,
+        sets,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
 pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming(
     public_binding: &[u8],
     sets: Vec<BlsDoryDeferredOpeningSet>,
@@ -2676,6 +2691,35 @@ fn aggregate_compact_role_digest(
     Ok(digest)
 }
 
+fn aggregate_word_fold_digest(
+    source_digest: [u8; 32],
+    initial_parent: [u8; 32],
+    challenges: &[BlsDoryFr],
+) -> Result<[u8; 32], BlsDoryAggregateError> {
+    if source_digest == [0; 32]
+        || initial_parent == [0; 32]
+        || challenges.is_empty()
+        || challenges.len() > AGGREGATE_COMPACT_FOLD_GENERATIONS
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryAggregateWordFold/v1");
+    hasher.update(&source_digest);
+    hasher.update(&initial_parent);
+    hasher.update(&(challenges.len() as u32).to_le_bytes());
+    let mut encoded = Vec::with_capacity(challenges.len().saturating_mul(32));
+    for challenge in challenges {
+        append_serialized(&mut encoded, challenge)?;
+    }
+    hasher.update(&encoded);
+    let digest = *hasher.finalize().as_bytes();
+    if digest == [0; 32] {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok(digest)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AggregateCompactFoldRole {
     Transition,
@@ -2843,6 +2887,143 @@ impl AggregateCompactFoldView {
     }
 }
 
+struct AggregateWordFoldView {
+    source: Arc<BlsDoryCompactArtifact>,
+    initial_parent: [u8; 32],
+    challenges: Vec<BlsDoryFr>,
+    explicit_len: usize,
+}
+
+impl AggregateWordFoldView {
+    fn validate_lineage(&self, expected: [u8; 32]) -> Result<(), BlsDoryAggregateError> {
+        if aggregate_word_fold_digest(self.source.digest(), self.initial_parent, &self.challenges)?
+            != expected
+        {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(())
+    }
+
+    fn for_each_scalar(
+        &self,
+        mut visitor: impl FnMut(BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        if self.challenges.is_empty() || self.challenges.len() > AGGREGATE_COMPACT_FOLD_GENERATIONS
+        {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let spec = self.source.spec();
+        if spec.word_scalar_count != spec.explicit_scalar_count
+            || self.source.dictionary() != [BlsDoryFr::zero()]
+        {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let word_group_len = usize::try_from(spec.word_group_len)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        let block_len = 1usize
+            .checked_shl(
+                u32::try_from(self.challenges.len())
+                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            )
+            .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        let expected = usize::try_from(spec.explicit_scalar_count)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?
+            .div_ceil(block_len);
+        if expected != self.explicit_len || block_len > 1 << AGGREGATE_COMPACT_FOLD_GENERATIONS {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let mut block = [BlsDoryFr::zero(); 1 << AGGREGATE_COMPACT_FOLD_GENERATIONS];
+        let mut block_used = 0usize;
+        let mut visited = 0usize;
+        let mut failed = false;
+        let read_result = self.source.for_each_encoded_scalar(|index, encoded| {
+            let CompactEncodedScalar::Word { value, signed } = encoded else {
+                failed = true;
+                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+            };
+            let selector = usize::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_div(word_group_len));
+            if selector.is_none_or(|selector| selector >= 64)
+                || signed
+                    != selector.is_some_and(|selector| {
+                        spec.signed_word_selectors & (1u64 << selector) != 0
+                    })
+            {
+                failed = true;
+                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+            }
+            block[block_used] = if signed {
+                BlsDoryFr::from_i64(i64::from_le_bytes(value.to_le_bytes()))
+            } else {
+                BlsDoryFr::from_u64(value)
+            };
+            block_used += 1;
+            if block_used == block_len {
+                visitor(fold_aggregate_word_block(
+                    &mut block,
+                    block_len,
+                    &self.challenges,
+                ));
+                visited += 1;
+                block.fill(BlsDoryFr::zero());
+                block_used = 0;
+            }
+            Ok(())
+        });
+        if failed || read_result.is_err() {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        if block_used != 0 {
+            visitor(fold_aggregate_word_block(
+                &mut block,
+                block_len,
+                &self.challenges,
+            ));
+            visited += 1;
+        }
+        if visited != expected {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(())
+    }
+
+    fn for_each_pair(
+        &self,
+        mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        let mut pending = None;
+        self.for_each_scalar(|scalar| {
+            if let Some(lower) = pending.take() {
+                visitor(lower, scalar);
+            } else {
+                pending = Some(scalar);
+            }
+        })?;
+        if let Some(lower) = pending {
+            visitor(lower, BlsDoryFr::zero());
+        }
+        Ok(())
+    }
+}
+
+fn fold_aggregate_word_block(
+    block: &mut [BlsDoryFr; 1 << AGGREGATE_COMPACT_FOLD_GENERATIONS],
+    block_len: usize,
+    challenges: &[BlsDoryFr],
+) -> BlsDoryFr {
+    let mut width = block_len;
+    for challenge in challenges {
+        for index in 0..width / 2 {
+            block[index] =
+                block[index * 2] + *challenge * (block[index * 2 + 1] - block[index * 2]);
+        }
+        width /= 2;
+    }
+    debug_assert_eq!(width, 1);
+    block[0]
+}
+
 struct AggregateCompactPair {
     transition_table: usize,
     mapped_table: usize,
@@ -2911,6 +3092,23 @@ fn find_aggregate_compact_pairs(
         });
     }
     pairs
+}
+
+fn find_aggregate_word_tables(polynomials: &[&BlsDoryCommittedPolynomial]) -> Vec<usize> {
+    polynomials
+        .iter()
+        .enumerate()
+        .filter_map(|(table_index, polynomial)| {
+            let BlsDoryCoefficientStorage::CompactArtifact(source) = &polynomial.coefficients
+            else {
+                return None;
+            };
+            let spec = source.spec();
+            (spec.word_scalar_count == spec.explicit_scalar_count
+                && source.dictionary() == [BlsDoryFr::zero()])
+            .then_some(table_index)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -3321,11 +3519,67 @@ fn fold_aggregate_compact_pair(
     install_aggregate_compact_pair(tables, pair, artifact, challenges)
 }
 
+fn fold_aggregate_word_table(
+    table: &mut FoldedPolynomialTable<'_>,
+    challenge: BlsDoryFr,
+    generation: usize,
+) -> Result<(), BlsDoryAggregateError> {
+    if generation == 0 || generation > AGGREGATE_COMPACT_FOLD_GENERATIONS {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let child_logical_len = table
+        .logical_len
+        .checked_div(2)
+        .filter(|len| *len > 0)
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let child_explicit_len = table.explicit_pair_count()?;
+    let (source, initial_parent, mut challenges) = if generation == 1 {
+        let FoldedPolynomialStorage::Source(polynomial) = &table.storage else {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        };
+        let BlsDoryCoefficientStorage::CompactArtifact(source) = &polynomial.coefficients else {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        };
+        let spec = source.spec();
+        if spec.word_scalar_count != spec.explicit_scalar_count
+            || source.dictionary() != [BlsDoryFr::zero()]
+        {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        (Arc::clone(source), table.lineage_digest, Vec::new())
+    } else {
+        let FoldedPolynomialStorage::WordCompact(view) = &table.storage else {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        };
+        view.validate_lineage(table.lineage_digest)?;
+        if view.challenges.len() != generation - 1 {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        (
+            Arc::clone(&view.source),
+            view.initial_parent,
+            view.challenges.clone(),
+        )
+    };
+    challenges.push(challenge);
+    table.lineage_digest =
+        aggregate_word_fold_digest(source.digest(), initial_parent, &challenges)?;
+    table.storage = FoldedPolynomialStorage::WordCompact(AggregateWordFoldView {
+        source,
+        initial_parent,
+        challenges,
+        explicit_len: child_explicit_len,
+    });
+    table.logical_len = child_logical_len;
+    Ok(())
+}
+
 enum FoldedPolynomialStorage<'a> {
     Source(&'a BlsDoryCommittedPolynomial),
     Owned(Vec<BlsDoryFr>),
     Artifact(BlsDoryFoldArtifact),
     Compact(AggregateCompactFoldView),
+    WordCompact(AggregateWordFoldView),
 }
 
 struct FoldedPolynomialTable<'a> {
@@ -3361,6 +3615,7 @@ impl<'a> FoldedPolynomialTable<'a> {
                 artifact.spec().explicit_scalar_count as usize
             }
             FoldedPolynomialStorage::Compact(view) => view.explicit_len,
+            FoldedPolynomialStorage::WordCompact(view) => view.explicit_len,
         }
     }
 
@@ -3392,6 +3647,10 @@ impl<'a> FoldedPolynomialTable<'a> {
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage),
             FoldedPolynomialStorage::Compact(view) => {
+                view.validate_lineage(self.lineage_digest)?;
+                view.for_each_pair(visitor)
+            }
+            FoldedPolynomialStorage::WordCompact(view) => {
                 view.validate_lineage(self.lineage_digest)?;
                 view.for_each_pair(visitor)
             }
@@ -3463,6 +3722,21 @@ impl<'a> FoldedPolynomialTable<'a> {
                         return Err(BlsDoryAggregateError::ProverStorage);
                     }
                 }
+                FoldedPolynomialStorage::WordCompact(view) => {
+                    view.validate_lineage(self.lineage_digest)?;
+                    let mut write_failed = false;
+                    view.for_each_pair(|lower, upper| {
+                        if writer
+                            .write_scalar(&(lower + challenge * (upper - lower)))
+                            .is_err()
+                        {
+                            write_failed = true;
+                        }
+                    })?;
+                    if write_failed {
+                        return Err(BlsDoryAggregateError::ProverStorage);
+                    }
+                }
             }
             let artifact = writer
                 .finish()
@@ -3494,6 +3768,9 @@ impl<'a> FoldedPolynomialTable<'a> {
             FoldedPolynomialStorage::Compact(_) => {
                 return Err(BlsDoryAggregateError::ProverStorage);
             }
+            FoldedPolynomialStorage::WordCompact(_) => {
+                return Err(BlsDoryAggregateError::ProverStorage);
+            }
         }
         self.logical_len = child_logical_len;
         Ok(())
@@ -3517,6 +3794,12 @@ impl<'a> FoldedPolynomialTable<'a> {
                 value.ok_or(BlsDoryAggregateError::InvalidProofShape)
             }
             FoldedPolynomialStorage::Compact(view) => {
+                view.validate_lineage(self.lineage_digest)?;
+                let mut value = None;
+                view.for_each_scalar(|scalar| value = Some(scalar))?;
+                value.ok_or(BlsDoryAggregateError::InvalidProofShape)
+            }
+            FoldedPolynomialStorage::WordCompact(view) => {
                 view.validate_lineage(self.lineage_digest)?;
                 let mut value = None;
                 view.for_each_scalar(|scalar| value = Some(scalar))?;
@@ -3628,6 +3911,11 @@ fn prove_distinct_point_sumcheck(
     } else {
         Vec::new()
     };
+    let word_tables = if scratch.is_some() {
+        find_aggregate_word_tables(&unique_polynomials)
+    } else {
+        Vec::new()
+    };
     let mut table_claim_indices = vec![Vec::new(); unique_polynomials.len()];
     for (claim_index, table_index) in claim_table_indices.iter().copied().enumerate() {
         table_claim_indices[table_index].push(claim_index);
@@ -3666,7 +3954,8 @@ fn prove_distinct_point_sumcheck(
         random_point.push(challenge);
         let generation = round_index + 1;
         if let Some(scratch) = scratch.filter(|_| {
-            generation <= AGGREGATE_COMPACT_FOLD_GENERATIONS && !compact_pairs.is_empty()
+            generation <= AGGREGATE_COMPACT_FOLD_GENERATIONS
+                && (!compact_pairs.is_empty() || !word_tables.is_empty())
         }) {
             let mut compressed_tables = vec![false; polynomial_tables.len()];
             for pair in &compact_pairs {
@@ -3695,6 +3984,13 @@ fn prove_distinct_point_sumcheck(
                     compressed_tables[pair.transition_table] = true;
                     compressed_tables[pair.mapped_table] = true;
                 }
+            }
+            for table_index in &word_tables {
+                let table = polynomial_tables
+                    .get_mut(*table_index)
+                    .ok_or(BlsDoryAggregateError::ProverStorage)?;
+                fold_aggregate_word_table(table, challenge, generation)?;
+                compressed_tables[*table_index] = true;
             }
             for (table_index, table) in polynomial_tables.iter_mut().enumerate() {
                 if !compressed_tables[table_index] {
@@ -4535,6 +4831,19 @@ mod tests {
         }
     }
 
+    fn fixture_word_row_source(variables: usize) -> FixtureCompactRowSource {
+        let rows = 1usize << (variables / 2);
+        let columns = 1usize << (variables - variables / 2);
+        FixtureCompactRowSource {
+            rows,
+            columns,
+            explicit_coefficients: rows * columns,
+            word_coefficients: rows * columns,
+            dictionary: vec![BlsDoryFr::zero()],
+            tamper_first_code: false,
+        }
+    }
+
     fn fixture(variables: usize, claims: usize) -> Fixture {
         let setup = deterministic_bls_dory_setup(variables).unwrap();
         let nu = variables / 2;
@@ -4934,6 +5243,60 @@ mod tests {
         )
         .unwrap();
         drop(mapped);
+        drop(compact);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn word_compact_aggregate_folds_preserve_proof_bytes_and_bind_lineage() {
+        let variables = 8;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let coefficients = (0..1usize << variables)
+            .map(|index| BlsDoryFr::from_u64(index as u64 + 17))
+            .collect::<Vec<_>>();
+        let dense = commit_bls_dory_polynomial(coefficients, nu, sigma, &setup).unwrap();
+        let mut source = fixture_word_row_source(variables);
+        let compact = commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(compact.commitment(), dense.commitment());
+        let point = (0..variables)
+            .map(|index| BlsDoryFr::from_u64(index as u64 + 29))
+            .collect::<Vec<_>>();
+        let dense_result = prove_bls_dory_opening_refs_with_scratch(
+            b"word-compact-folds",
+            &[&dense],
+            std::slice::from_ref(&point),
+            &setup,
+            None,
+        )
+        .unwrap();
+        let compact_result = prove_bls_dory_opening_refs_with_scratch(
+            b"word-compact-folds",
+            &[&compact],
+            &[point],
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        assert_eq!(compact_result, dense_result);
+
+        let mut table = FoldedPolynomialTable::source(&compact, 0).unwrap();
+        fold_aggregate_word_table(&mut table, BlsDoryFr::from_u64(31), 1).unwrap();
+        table.lineage_digest[0] ^= 1;
+        assert_eq!(
+            table.for_each_pair(|_, _| {}),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
+        drop(table);
         drop(compact);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }

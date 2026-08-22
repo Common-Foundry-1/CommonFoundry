@@ -534,12 +534,16 @@ comparison. The v2 research code now implements:
   ordinary scalar lineages. Dense, ordinary scratch, and compressed paths produce
   the same proof bytes; corruption aborts and cleans the shared artifact. Two n=19
   release runs retained the 47,729-byte proof and measured the same 2,377,688-byte
-  opening peak, down from 18,819,084 bytes by 7.91 times. The executable n=33
-  four-pair retained-source plus transition/mapped-fold lower bound falls from the
-  uncompressed 1,056,025,091,748 bytes to 126,500,212,028 bytes (about 117.8 GiB),
-  an 8.35-times reduction. Multiplicity, matrix, and wiring fold files remain
-  outside that bound, so remaining-lineage compression and a complete measured
-  n=33 run are still required;
+  opening peak, down from 18,819,084 bytes by 7.91 times. Matrix and wiring sources
+  now retain their canonical signed 64-bit words instead of expanded field scalars,
+  and challenge-bound logical views avoid writing their first four fold artifacts.
+  A complete three-bank n=19 shared-layout run preserved the 84,717-byte proof,
+  measured 92.212 seconds proving and 7.045 seconds verification, matched its
+  6,866,772-byte aggregate scratch projection exactly, and ended with zero scratch.
+  The complete n=33 aggregate-stage projection, including every source and ordered
+  fold overlap, is 156,029,690,964 bytes (about 145.3 GiB), down 2.81 times from
+  438,943,885,320 bytes (about 408.8 GiB). Further reduction or distribution and a
+  complete measured n=33 run are still required;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

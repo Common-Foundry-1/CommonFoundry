@@ -20,8 +20,9 @@ use thiserror::Error;
 use crate::{
     StructuredWiringError, StructuredWiringStatement,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        BlsDoryAggregateError, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
@@ -42,7 +43,7 @@ pub const PRODUCTION_BLS_DORY_WIRING_VARIABLES: usize = 29;
 pub const BLS_DORY_WIRING_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar wiring path.
 pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the scratch prover streams signed wiring tables with bounded evaluation memory, but n=29 latency and peak memory have not been measured",
+    "the scratch prover streams signed wiring tables with bounded evaluation memory; its canonical signed-word source preserves the exact commitment, claims, and opening proof and projects to 3,758,096,536 bytes (3.5 GiB) without first-four-generation fold files, but n=29 latency, peak disk, and peak memory have not been measured",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar wiring transcript and packed opening path have not received an external audit",
 ];
@@ -406,7 +407,23 @@ fn prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
             .ok_or(BlsDoryWiringError::InvalidDimensions)?;
         let mut source =
             WiringSignedRowSource::new(statement, initial, inputs, outputs, rows, columns)?;
-        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)?
+        if source.explicit_scalars.is_multiple_of(columns) {
+            commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )?
+        } else {
+            commit_bls_dory_row_source_with_scratch(
+                &mut source,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )?
+        }
     } else {
         let (initial_values, input_banks, output_banks) = materialized
             .as_ref()
@@ -714,6 +731,7 @@ struct WiringSignedRowSource<'a> {
     rows: usize,
     columns: usize,
     explicit_scalars: usize,
+    dictionary: [BlsDoryFr; 1],
 }
 
 impl<'a> WiringSignedRowSource<'a> {
@@ -754,10 +772,11 @@ impl<'a> WiringSignedRowSource<'a> {
             rows,
             columns,
             explicit_scalars,
+            dictionary: [BlsDoryFr::zero()],
         })
     }
 
-    fn scalar(&self, index: usize) -> BlsDoryFr {
+    fn value(&self, index: usize) -> i64 {
         let slot = index / self.bank_elements;
         let offset = index % self.bank_elements;
         let value = if slot == INITIAL_SLOT {
@@ -777,7 +796,64 @@ impl<'a> WiringSignedRowSource<'a> {
         } else {
             None
         };
-        value.map_or_else(BlsDoryFr::zero, BlsDoryFr::from_i64)
+        value.unwrap_or(0)
+    }
+
+    fn scalar(&self, index: usize) -> BlsDoryFr {
+        BlsDoryFr::from_i64(self.value(index))
+    }
+}
+
+impl BlsDoryCompactRowSource for WiringSignedRowSource<'_> {
+    type Error = std::convert::Infallible;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.bank_elements
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        (1u64 << (self.banks * 2 + 1)) - 1
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index * self.columns;
+        for (column, word) in output.iter_mut().enumerate() {
+            *word = u64::from_le_bytes(self.value(start + column).to_le_bytes());
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(
+        &mut self,
+        _row_index: usize,
+        output: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        output.fill(0);
+        Ok(output.len())
     }
 }
 
@@ -1244,8 +1320,37 @@ fn evaluate_mle(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
-    use crate::dory_bls12_381_prototype::deterministic_bls_dory_setup;
+    use crate::{
+        dory_bls12_381_aggregate::{
+            prove_bls_dory_deferred_opening_sets, prove_bls_dory_deferred_opening_sets_with_scratch,
+        },
+        dory_bls12_381_prototype::deterministic_bls_dory_setup,
+    };
+
+    static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn create() -> Self {
+            let nonce = SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-dory-wiring-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn fixture() -> (StructuredWiringStatement, Vec<i64>, Vec<i64>, Vec<i64>) {
         let statement = StructuredWiringStatement {
@@ -1277,7 +1382,7 @@ mod tests {
         let mut source =
             WiringSignedRowSource::new(statement, &initial, &inputs, &outputs, rows, columns)
                 .unwrap();
-        let explicit = source.explicit_scalar_count();
+        let explicit = source.explicit_scalars;
         let mut streamed = Vec::new();
         let mut row = vec![BlsDoryFr::zero(); columns];
         for row_index in 0..explicit.div_ceil(columns) {
@@ -1327,6 +1432,53 @@ mod tests {
         let decoded = BlsDoryWiringProof::decode(&encoded, statement).unwrap();
         assert_eq!(decoded, proof);
         verify_bls_dory_wiring(b"block-binding", statement, &decoded, &setup).unwrap();
+    }
+
+    #[test]
+    fn signed_word_scratch_source_preserves_exact_opening_proof() {
+        let (statement, initial, inputs, outputs) = fixture();
+        let variables = packed_wiring_variables(statement).unwrap();
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let dense = prove_bls_dory_wiring_deferred_at_variables(
+            b"signed-word-wiring",
+            statement,
+            &initial,
+            &inputs,
+            &outputs,
+            variables,
+            &setup,
+        )
+        .unwrap();
+        let scratch_directory = ScratchDirectory::create();
+        let scratch = prove_bls_dory_wiring_deferred_at_variables_with_scratch(
+            b"signed-word-wiring",
+            statement,
+            &initial,
+            &inputs,
+            &outputs,
+            variables,
+            &setup,
+            &scratch_directory.0,
+        )
+        .unwrap();
+        assert_eq!(scratch.proof, dense.proof);
+        assert_eq!(scratch.openings.claims(), dense.openings.claims());
+        let aggregate_binding =
+            opening_binding(b"signed-word-wiring", &scratch.proof.transcript_digest);
+        let dense_opening =
+            prove_bls_dory_deferred_opening_sets(&aggregate_binding, &[&dense.openings], &setup)
+                .unwrap();
+        let scratch_opening = prove_bls_dory_deferred_opening_sets_with_scratch(
+            &aggregate_binding,
+            &[&scratch.openings],
+            &setup,
+            &scratch_directory.0,
+        )
+        .unwrap();
+        assert_eq!(scratch_opening, dense_opening);
+        drop(scratch);
+        drop(dense);
+        assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
     }
 
     #[test]

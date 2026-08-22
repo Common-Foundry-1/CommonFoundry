@@ -83,7 +83,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, compact transition sources, mapped inverse views, authenticated release/regeneration, consuming openings, and four challenge-bound shared aggregate-fold generations preserve exact proofs and leave zero scratch after completion; two n=19 release runs retained the 47,729-byte proof and measured 2,377,688 peak opening scratch, down from 18,819,084 bytes, while the exact n=33 retained-source and transition/mapped-fold lower bound fell from 1,056,025,091,748 to 126,500,212,028 bytes (about 117.8 GiB) for four pairs; multiplicity, matrix, wiring, GPU/distributed proving, and a complete measured n=33 run remain required",
+    "bounded parallel work, compact transition sources, mapped inverse views, authenticated release/regeneration, consuming openings, and four challenge-bound shared aggregate-fold generations preserve exact proofs and leave zero scratch after completion; after signed-word matrix and wiring sources and word-backed aggregate-fold views, the complete n=19 shared-layout proof measured 6,866,772 peak scratch and the exact complete n=33 aggregate-stage projection is 156,029,690,964 bytes (about 145.3 GiB), down 2.81 times from 438,943,885,320 bytes (about 408.8 GiB); GPU or distributed proving and a complete measured n=33 run remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];

@@ -318,13 +318,19 @@ h3 {
   }
 
   .mobile-menu {
-    position: fixed;
+    position: absolute;
     z-index: -1;
-    inset: var(--header-height) 0 0;
+    top: 100%;
+    right: 0;
+    left: 0;
     display: flex;
+    height: calc(100vh - var(--header-height));
+    height: calc(100dvh - var(--header-height));
     flex-direction: column;
     justify-content: space-between;
     padding: 2rem var(--page-gutter) 2.5rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     background: var(--graphite-1000);
     opacity: 0;
     pointer-events: none;

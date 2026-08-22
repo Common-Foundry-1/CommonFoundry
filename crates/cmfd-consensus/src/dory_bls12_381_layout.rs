@@ -111,7 +111,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and the common n=33 coefficient tables are not streamed by the prover",
+    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and component construction plus distinct-point folding still materialize the unique n=33 coefficient tables",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 

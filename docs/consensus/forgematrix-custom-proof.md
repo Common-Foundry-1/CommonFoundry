@@ -935,10 +935,18 @@ authenticates every ordered base and equality claim. Its complete n=33 frame
 projects to 133,373 bytes. Tests reject changed model identities, fixed
 commitments, equality values, and substituted, reordered, or omitted components.
 The deterministic setup now admits the required n=33 square-root generator
-geometry separately from the n=16 materialized-polynomial cap. An n=33 streaming
-prover, execution of the final model commitment ceremony, independent review of
-the transcript and soundness accounting, and external audit remain activation
-requirements.
+geometry separately from the n=16 materialized-polynomial cap. The aggregate
+prover no longer retains a duplicate coefficient vector or builds a full
+combined polynomial for the final Dory opening: it computes `L^T M` one row at
+a time and feeds the unchanged Dory state machine. The distinct-point sumcheck
+also folds each repeated polynomial only once and generates equality weights
+without full equality tables. Its pre-change 17,695-byte fixture remains pinned
+at BLAKE3 digest
+`6aa99fd095e70180b6b2fdd94dc96fc420f99eb529ec03ad5dfa978731d9cfac`.
+Component construction and the first fold of each unique table are still
+materialized, so this is not the n=33 out-of-core prover. That prover, execution
+of the final model commitment ceremony, independent review of the transcript
+and soundness accounting, and external audit remain activation requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

@@ -41,7 +41,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the production n=29/n=31/n=33 polynomials are not streamed by this in-memory implementation",
+    "component construction and distinct-point folding still materialize the unique n=29/n=31/n=33 coefficient tables; only the final Dory row reduction is streamed",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -571,6 +571,52 @@ struct SumcheckTerminal {
 struct SumcheckProverOutput {
     rounds: Vec<[BlsDoryFr; 3]>,
     terminal: SumcheckTerminal,
+    #[cfg(test)]
+    unique_polynomial_tables: usize,
+    #[cfg(test)]
+    peak_additional_coefficients: usize,
+}
+
+enum FoldedPolynomialTable<'a> {
+    Borrowed(&'a [BlsDoryFr]),
+    Owned(Vec<BlsDoryFr>),
+}
+
+impl FoldedPolynomialTable<'_> {
+    fn as_slice(&self) -> &[BlsDoryFr] {
+        match self {
+            Self::Borrowed(values) => values,
+            Self::Owned(values) => values,
+        }
+    }
+
+    fn fold(&mut self, challenge: BlsDoryFr) -> Result<(), BlsDoryAggregateError> {
+        match self {
+            Self::Borrowed(values) => {
+                if values.len() < 2 || values.len() % 2 != 0 {
+                    return Err(BlsDoryAggregateError::InvalidProofShape);
+                }
+                let folded = values
+                    .chunks_exact(2)
+                    .map(|pair| pair[0] + challenge * (pair[1] - pair[0]))
+                    .collect();
+                *self = Self::Owned(folded);
+            }
+            Self::Owned(values) => {
+                if values.len() < 2 || values.len() % 2 != 0 {
+                    return Err(BlsDoryAggregateError::InvalidProofShape);
+                }
+                let folded_len = values.len() / 2;
+                for index in 0..folded_len {
+                    let lower = values[2 * index];
+                    let upper = values[2 * index + 1];
+                    values[index] = lower + challenge * (upper - lower);
+                }
+                values.truncate(folded_len);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn prove_distinct_point_sumcheck(
@@ -580,14 +626,35 @@ fn prove_distinct_point_sumcheck(
     transcript: &mut BlsDoryTranscript,
 ) -> Result<SumcheckProverOutput, BlsDoryAggregateError> {
     let variables = claims[0].point.len();
-    let mut polynomial_tables = polynomials
+    let coefficient_count = 1usize
+        .checked_shl(u32::try_from(variables).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    if polynomials.len() != claims.len()
+        || claims.len() != batching.len()
+        || polynomials
+            .iter()
+            .any(|polynomial| polynomial.polynomial.coefficients().len() != coefficient_count)
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+
+    let mut unique_polynomials = Vec::<&BlsDoryCommittedPolynomial>::new();
+    let mut claim_table_indices = Vec::with_capacity(polynomials.len());
+    for polynomial in polynomials {
+        let table_index = unique_polynomials
+            .iter()
+            .position(|existing| std::ptr::eq(*existing, *polynomial))
+            .unwrap_or_else(|| {
+                unique_polynomials.push(*polynomial);
+                unique_polynomials.len() - 1
+            });
+        claim_table_indices.push(table_index);
+    }
+    let mut polynomial_tables = unique_polynomials
         .iter()
-        .map(|polynomial| polynomial.polynomial.coefficients().to_vec())
+        .map(|polynomial| FoldedPolynomialTable::Borrowed(polynomial.polynomial.coefficients()))
         .collect::<Vec<_>>();
-    let mut equality_tables = claims
-        .iter()
-        .map(|claim| equality_table(&claim.point))
-        .collect::<Vec<_>>();
+    let mut equality_prefixes = vec![BlsDoryFr::one(); claims.len()];
     let mut current_claim = claims
         .iter()
         .zip(batching)
@@ -597,23 +664,22 @@ fn prove_distinct_point_sumcheck(
     let mut rounds = Vec::with_capacity(variables);
     let mut random_point = Vec::with_capacity(variables);
 
-    for _ in 0..variables {
+    for round_index in 0..variables {
         let mut message = [BlsDoryFr::zero(); 3];
-        for ((polynomial, equality), rho) in
-            polynomial_tables.iter().zip(&equality_tables).zip(batching)
+        for (((claim, rho), table_index), equality_prefix) in claims
+            .iter()
+            .zip(batching)
+            .zip(&claim_table_indices)
+            .zip(&equality_prefixes)
         {
-            if polynomial.len() != equality.len() || polynomial.len() % 2 != 0 {
-                return Err(BlsDoryAggregateError::InvalidProofShape);
-            }
-            for (values, equality_values) in
-                polynomial.chunks_exact(2).zip(equality.chunks_exact(2))
-            {
-                let value_two = values[1] + values[1] - values[0];
-                let equality_two = equality_values[1] + equality_values[1] - equality_values[0];
-                message[0] = message[0] + *rho * values[0] * equality_values[0];
-                message[1] = message[1] + *rho * values[1] * equality_values[1];
-                message[2] = message[2] + *rho * value_two * equality_two;
-            }
+            accumulate_distinct_point_round(
+                polynomial_tables[*table_index].as_slice(),
+                claim,
+                *rho,
+                round_index,
+                *equality_prefix,
+                &mut message,
+            )?;
         }
         if message[0] + message[1] != current_claim {
             return Err(BlsDoryAggregateError::SumcheckFailed);
@@ -623,24 +689,27 @@ fn prove_distinct_point_sumcheck(
         current_claim = interpolate_quadratic(message, challenge)?;
         random_point.push(challenge);
         for table in &mut polynomial_tables {
-            *table = fold_table(table, challenge);
+            table.fold(challenge)?;
         }
-        for table in &mut equality_tables {
-            *table = fold_table(table, challenge);
+        for (prefix, claim) in equality_prefixes.iter_mut().zip(claims) {
+            let coordinate = claim.point[round_index];
+            *prefix = *prefix
+                * ((BlsDoryFr::one() - coordinate) * (BlsDoryFr::one() - challenge)
+                    + coordinate * challenge);
         }
         rounds.push(message);
     }
 
-    let equality_values = equality_tables
+    let terminal = claim_table_indices
         .iter()
-        .map(|table| table[0])
-        .collect::<Vec<_>>();
-    let terminal = polynomial_tables
-        .iter()
-        .zip(equality_values.iter().zip(batching))
-        .fold(BlsDoryFr::zero(), |sum, (polynomial, (equality, rho))| {
-            sum + polynomial[0] * equality * rho
-        });
+        .zip(equality_prefixes.iter().zip(batching))
+        .try_fold(BlsDoryFr::zero(), |sum, (table_index, (equality, rho))| {
+            let table = polynomial_tables[*table_index].as_slice();
+            if table.len() != 1 {
+                return Err(BlsDoryAggregateError::InvalidProofShape);
+            }
+            Ok(sum + table[0] * equality * rho)
+        })?;
     if terminal != current_claim {
         return Err(BlsDoryAggregateError::SumcheckFailed);
     }
@@ -649,9 +718,78 @@ fn prove_distinct_point_sumcheck(
         terminal: SumcheckTerminal {
             random_point,
             final_claim: current_claim,
-            equality_values,
+            equality_values: equality_prefixes,
         },
+        #[cfg(test)]
+        unique_polynomial_tables: unique_polynomials.len(),
+        #[cfg(test)]
+        peak_additional_coefficients: unique_polynomials.len() * (coefficient_count / 2),
     })
+}
+
+fn accumulate_distinct_point_round(
+    polynomial: &[BlsDoryFr],
+    claim: &BlsDoryOpeningClaim,
+    rho: BlsDoryFr,
+    round_index: usize,
+    equality_prefix: BlsDoryFr,
+    message: &mut [BlsDoryFr; 3],
+) -> Result<(), BlsDoryAggregateError> {
+    let remaining_variables = claim
+        .point
+        .len()
+        .checked_sub(round_index)
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let expected_len = 1usize
+        .checked_shl(
+            u32::try_from(remaining_variables)
+                .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+        )
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    if polynomial.len() != expected_len || polynomial.len() < 2 {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+
+    let coordinate = claim.point[round_index];
+    let mut pairs = polynomial.chunks_exact(2);
+    for_each_equality_weight(
+        &claim.point[round_index + 1..],
+        BlsDoryFr::one(),
+        &mut |suffix_weight| {
+            let values = pairs
+                .next()
+                .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+            let equality_scale = equality_prefix * suffix_weight;
+            let equality_zero = equality_scale * (BlsDoryFr::one() - coordinate);
+            let equality_one = equality_scale * coordinate;
+            let value_two = values[1] + values[1] - values[0];
+            let equality_two = equality_one + equality_one - equality_zero;
+            message[0] = message[0] + rho * values[0] * equality_zero;
+            message[1] = message[1] + rho * values[1] * equality_one;
+            message[2] = message[2] + rho * value_two * equality_two;
+            Ok(())
+        },
+    )?;
+    if pairs.next().is_some() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+fn for_each_equality_weight(
+    point: &[BlsDoryFr],
+    prefix: BlsDoryFr,
+    visitor: &mut impl FnMut(BlsDoryFr) -> Result<(), BlsDoryAggregateError>,
+) -> Result<(), BlsDoryAggregateError> {
+    let Some((coordinate, preceding)) = point.split_last() else {
+        return visitor(prefix);
+    };
+    for_each_equality_weight(
+        preceding,
+        prefix * (BlsDoryFr::one() - *coordinate),
+        visitor,
+    )?;
+    for_each_equality_weight(preceding, prefix * *coordinate, visitor)
 }
 
 fn verify_distinct_point_sumcheck(
@@ -691,20 +829,6 @@ fn verify_distinct_point_sumcheck(
     })
 }
 
-fn equality_table(point: &[BlsDoryFr]) -> Vec<BlsDoryFr> {
-    let mut table = vec![BlsDoryFr::one(); 1usize << point.len()];
-    let mut active = 1usize;
-    for coordinate in point {
-        for index in (0..active).rev() {
-            let value = table[index];
-            table[index] = value * (BlsDoryFr::one() - *coordinate);
-            table[index + active] = value * coordinate;
-        }
-        active *= 2;
-    }
-    table
-}
-
 fn equality_evaluation(point: &[BlsDoryFr], evaluation_point: &[BlsDoryFr]) -> BlsDoryFr {
     point
         .iter()
@@ -712,13 +836,6 @@ fn equality_evaluation(point: &[BlsDoryFr], evaluation_point: &[BlsDoryFr]) -> B
         .fold(BlsDoryFr::one(), |product, (left, right)| {
             product * ((BlsDoryFr::one() - *left) * (BlsDoryFr::one() - *right) + *left * right)
         })
-}
-
-fn fold_table(table: &[BlsDoryFr], challenge: BlsDoryFr) -> Vec<BlsDoryFr> {
-    table
-        .chunks_exact(2)
-        .map(|pair| pair[0] + challenge * (pair[1] - pair[0]))
-        .collect()
 }
 
 fn interpolate_quadratic(
@@ -1182,9 +1299,46 @@ mod tests {
         let (claims, proof) =
             prove_bls_dory_openings(b"block-binding", &polynomials, &points, &setup).unwrap();
         verify_bls_dory_openings(b"block-binding", &claims, &proof, &setup).unwrap();
+        assert_eq!(
+            blake3::hash(&proof).to_hex().as_str(),
+            "6aa99fd095e70180b6b2fdd94dc96fc420f99eb529ec03ad5dfa978731d9cfac"
+        );
         assert_eq!(proof.len(), aggregate_wire_bytes(8, 4));
         assert_eq!(proof.len(), 17_695);
         assert!(proof.len() < MAX_BLS_DORY_AGGREGATE_BYTES);
+    }
+
+    #[test]
+    fn repeated_claims_share_one_folded_polynomial_table() {
+        let Fixture {
+            setup,
+            polynomials,
+            points,
+        } = fixture(6, 3);
+        let polynomial = &polynomials[0];
+        let polynomial_refs = vec![polynomial, polynomial, polynomial];
+        let claims = points
+            .iter()
+            .map(|point| BlsDoryOpeningClaim {
+                commitment: polynomial.commitment,
+                point: point.clone(),
+                evaluation: polynomial.polynomial.evaluate(point),
+            })
+            .collect::<Vec<_>>();
+        let mut transcript =
+            statement_transcript(b"deduplicated-folds", &setup.identity(), &claims, 3, 3).unwrap();
+        let batching = batching_challenges(&mut transcript, claims.len());
+
+        let sumcheck =
+            prove_distinct_point_sumcheck(&polynomial_refs, &claims, &batching, &mut transcript)
+                .unwrap();
+
+        assert_eq!(sumcheck.unique_polynomial_tables, 1);
+        assert_eq!(sumcheck.peak_additional_coefficients, 1 << 5);
+        let (public_claims, proof) =
+            prove_bls_dory_opening_refs(b"deduplicated-folds", &polynomial_refs, &points, &setup)
+                .unwrap();
+        verify_bls_dory_openings(b"deduplicated-folds", &public_claims, &proof, &setup).unwrap();
     }
 
     #[test]

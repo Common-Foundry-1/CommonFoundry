@@ -446,9 +446,13 @@ comparison. The v2 research code now implements:
   The authenticated model-bank stream now derives the BLS commitments
   incrementally and publishes them only after full bank verification; bounded
   fixtures match the in-memory commitment path and reject corrupt, trailing, or
-  reordered input. The final production artifact still needs an n=33 commitment
-  run, and an n=33 streaming prover, independent soundness review, and audit
-  remain activation gates. The executable BLS algebraic report uses exact
+  reordered input. The final Dory opening now combines committed rows through
+  a one-row buffer without materializing a combined coefficient table, while
+  repeated aggregate claims share polynomial folds and allocate no equality
+  tables. Component construction and unique-table folding remain materialized,
+  so the final production artifact still needs an n=33 commitment run and an
+  n=33 out-of-core prover; independent soundness review and audit also remain
+  activation gates. The executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at
   19,781,388,244 over at least 2^254 challenges: a 219-bit algebraic floor with
   91 bits of proof-attempt grinding headroom above the 128-bit requirement.

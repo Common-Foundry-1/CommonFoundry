@@ -954,10 +954,12 @@ The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate
 prover no longer retains a duplicate coefficient vector or builds a full
 combined polynomial for the final Dory opening: it streams authenticated
-coefficients into `L^T M` and feeds the unchanged Dory state machine. The
-distinct-point sumcheck
-also folds each repeated polynomial only once and generates equality weights
-without full equality tables. Its pre-change 17,695-byte fixture remains pinned
+coefficients into `L^T M` and feeds the unchanged Dory state machine. Repeated
+claims backed by one authenticated artifact combine their opening scales first,
+so that final vector-matrix product reads each physical source once. The
+distinct-point sumcheck recognizes cloned artifact handles as the same source,
+folds each repeated polynomial only once, and generates equality weights without
+full equality tables. Its pre-change 17,695-byte fixture remains pinned
 at BLAKE3 digest
 `6aa99fd095e70180b6b2fdd94dc96fc420f99eb529ec03ad5dfa978731d9cfac`.
 An explicit scratch API now writes every post-challenge unique-table fold to a
@@ -977,8 +979,12 @@ directly from the witness. Its arithmetic sumcheck reads raw rows for the first
 round, keeps equality-selector weights implicit, and authenticates later folds
 in scratch artifacts with 12 live lanes inside a 16-scalar row. The standalone
 aggregate and complete shared-layout fixture produce exactly the same proof
-through that path. The scratch LogUp prover streams the transition and inverse
-commitments, folds each cell-variable sumcheck round through authenticated
+through that path. The shared scratch path passes that authenticated transition
+source directly into LogUp instead of writing the same 110-lane table again.
+LogUp still checks its terminal and reconstruction evaluations against the
+shared commitment, and tests reject a same-shape artifact with different
+coefficients. It streams the inverse commitment and folds each cell-variable
+sumcheck round through authenticated
 two-lane artifacts with linear work, and retains only the 128 selector-boundary
 values at production geometry. Its reconstruction evaluations also stream from
 the witness. Dense and scratch fixtures match exactly at both the minimum layout
@@ -1015,12 +1021,13 @@ LogUp prover and 3.66 days for the aggregate opening. The first two production
 lineage generations project to 220 and 110 GiB, so their transient overlap is
 about 330 GiB. Retained opening sources project to about 440 GiB for one LogUp
 instance, putting its combined scratch near 770 GiB while folding. Four retained
-range instances alone project near 1.76 TiB before matrix, transition, wiring,
-or aggregate artifacts. These extrapolations reject the current CPU and storage
-pipeline for production; they are not n=33 measurements. The next implementation
-gate is GPU or distributed linear folding plus early aggregation/reclamation of
-opening sources, shared transition artifacts, reusable fixed-model prover
-artifacts, and then a complete measured production run.
+transition/range pairs now reuse the transition half of those sources and
+therefore project near 1.76 TiB total instead of adding another roughly 880 GiB
+of duplicate arithmetic-transition artifacts. These extrapolations reject the
+current CPU and storage pipeline for production; they are not n=33 measurements.
+The next implementation gate is GPU or distributed linear folding plus early
+aggregation/reclamation of the two remaining sources per pair, followed by a
+complete measured production run.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

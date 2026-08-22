@@ -23,8 +23,9 @@ use crate::{
     STRUCTURED_TRANSITION_ORACLES, STRUCTURED_TRANSITION_REGULAR_ORACLES,
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_padded_prefix_with_optional_scratch,
+        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_padded_prefix_with_optional_scratch,
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
@@ -370,9 +371,11 @@ pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables(
         packed_variables,
         setup,
         None,
+        None,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -388,6 +391,28 @@ pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
         packed_variables,
         setup,
         Some(scratch_directory),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    witness: &StructuredTransitionWitness,
+    transition: &BlsDoryCommittedPolynomial,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    prove_from_source_deferred(
+        binding,
+        statement,
+        LogUpProverSource::Witness(witness),
+        packed_variables,
+        setup,
+        Some(scratch_directory),
+        Some(transition),
     )
 }
 
@@ -432,6 +457,7 @@ fn prove_from_oracles_deferred(
         packed_variables,
         setup,
         None,
+        None,
     )
 }
 
@@ -448,6 +474,7 @@ fn prove_from_source_deferred(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
+    precommitted_transition: Option<&BlsDoryCommittedPolynomial>,
 ) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
     if binding.len() > MAX_LOGUP_BINDING_BYTES {
         return Err(BlsDoryRangeLogUpError::PublicBindingTooLarge);
@@ -458,7 +485,10 @@ fn prove_from_source_deferred(
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
-    if matches!(source, LogUpProverSource::Witness(_)) != scratch_directory.is_some() {
+    if matches!(source, LogUpProverSource::Witness(_)) != scratch_directory.is_some()
+        || (precommitted_transition.is_some()
+            && (!matches!(source, LogUpProverSource::Witness(_)) || scratch_directory.is_none()))
+    {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
     let padded_len = 1usize
@@ -481,7 +511,17 @@ fn prove_from_source_deferred(
         LogUpProverSource::Materialized(oracles) => Some(pack_oracles(oracles)?),
         LogUpProverSource::Witness(_) => None,
     };
-    let transition = if let Some(scratch_directory) = scratch_directory {
+    let transition = if let Some(transition) = precommitted_transition {
+        let explicit_scalars = elements
+            .checked_mul(STRUCTURED_TRANSITION_ORACLES)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        if !transition.matches_layout(packed_variables, setup)
+            || transition.explicit_coefficient_count() != explicit_scalars
+        {
+            return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+        }
+        transition.clone()
+    } else if let Some(scratch_directory) = scratch_directory {
         commit_bls_dory_row_source_with_scratch(
             witness_source
                 .as_mut()

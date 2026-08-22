@@ -467,7 +467,11 @@ comparison. The v2 research code now implements:
   transition commitment derives all 110 regular and radix-16 lanes directly
   from its witness. The transition arithmetic sumcheck also keeps selector
   weights implicit and folds 12 live lanes in authenticated 16-scalar scratch
-  rows. LogUp now streams its transition and inverse commitments, uses
+  rows. The shared prover reuses that exact authenticated transition artifact
+  in LogUp, and the aggregate folds and streams cloned handles only once. A
+  mismatched same-shape artifact is rejected. This removes one projected
+  220 GiB source per production transition/range pair, or roughly 880 GiB over
+  the four-pair layout. LogUp now streams its inverse commitment, uses
   lineage-authenticated two-lane artifacts to fold cell-variable rounds in
   linear work, retains only the 128 production selector-boundary values, and
   streams reconstruction evaluations. Dense and scratch outputs match exactly.
@@ -476,8 +480,8 @@ comparison. The v2 research code now implements:
   to n=33 still gives roughly 9.18 CPU proving days, 3.66 aggregate-opening days,
   440 GiB retained scratch, and 330 GiB transient lineage overlap for one range
   instance. This rejects the current CPU/storage pipeline for production; GPU
-  or distributed folds, early source reclamation, shared source artifacts, and
-  a complete measured n=33 run remain required;
+  or distributed folds, early reclamation of the remaining transition and
+  inverse sources, and a complete measured n=33 run remain required;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

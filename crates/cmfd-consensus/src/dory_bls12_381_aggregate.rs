@@ -187,6 +187,10 @@ impl BlsDoryDeferredOpeningSet {
         &self.claims
     }
 
+    pub(crate) fn polynomial(&self, index: usize) -> Option<&BlsDoryCommittedPolynomial> {
+        self.polynomials.get(index)
+    }
+
     pub(crate) fn push_opening(
         &mut self,
         polynomial_index: usize,
@@ -239,6 +243,33 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => {
                 artifact.spec().explicit_scalar_count as usize
             }
+        }
+    }
+
+    pub(crate) fn matches_layout(
+        &self,
+        variables: usize,
+        setup: &DeterministicBlsDorySetup,
+    ) -> bool {
+        self.variables() == variables && self.setup_identity == setup.identity()
+    }
+
+    pub(crate) fn shares_coefficient_source(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        match (&self.coefficients, &other.coefficients) {
+            (
+                BlsDoryCoefficientStorage::AuthenticatedArtifact(left),
+                BlsDoryCoefficientStorage::AuthenticatedArtifact(right),
+            ) => {
+                Arc::ptr_eq(left, right)
+                    && self.commitment == other.commitment
+                    && self.setup_identity == other.setup_identity
+                    && self.nu == other.nu
+                    && self.sigma == other.sigma
+            }
+            _ => false,
         }
     }
 
@@ -1493,7 +1524,7 @@ fn prove_distinct_point_sumcheck(
     for polynomial in polynomials {
         let table_index = unique_polynomials
             .iter()
-            .position(|existing| std::ptr::eq(*existing, *polynomial))
+            .position(|existing| existing.shares_coefficient_source(polynomial))
             .unwrap_or_else(|| {
                 unique_polynomials.push(*polynomial);
                 unique_polynomials.len() - 1
@@ -1505,6 +1536,10 @@ fn prove_distinct_point_sumcheck(
         .enumerate()
         .map(|(table_index, polynomial)| FoldedPolynomialTable::source(polynomial, table_index))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut table_claim_indices = vec![Vec::new(); unique_polynomials.len()];
+    for (claim_index, table_index) in claim_table_indices.iter().copied().enumerate() {
+        table_claim_indices[table_index].push(claim_index);
+    }
     let mut equality_prefixes = vec![BlsDoryFr::one(); claims.len()];
     let mut current_claim = claims
         .iter()
@@ -1517,18 +1552,14 @@ fn prove_distinct_point_sumcheck(
 
     for round_index in 0..variables {
         let mut message = [BlsDoryFr::zero(); 3];
-        for (((claim, rho), table_index), equality_prefix) in claims
-            .iter()
-            .zip(batching)
-            .zip(&claim_table_indices)
-            .zip(&equality_prefixes)
-        {
+        for (table, claim_indices) in polynomial_tables.iter().zip(&table_claim_indices) {
             accumulate_distinct_point_round(
-                &polynomial_tables[*table_index],
-                claim,
-                *rho,
+                table,
+                claim_indices,
+                claims,
+                batching,
                 round_index,
-                *equality_prefix,
+                &equality_prefixes,
                 &mut message,
             )?;
         }
@@ -1580,13 +1611,24 @@ fn prove_distinct_point_sumcheck(
 
 fn accumulate_distinct_point_round(
     polynomial: &FoldedPolynomialTable<'_>,
-    claim: &BlsDoryOpeningClaim,
-    rho: BlsDoryFr,
+    claim_indices: &[usize],
+    claims: &[BlsDoryOpeningClaim],
+    batching: &[BlsDoryFr],
     round_index: usize,
-    equality_prefix: BlsDoryFr,
+    equality_prefixes: &[BlsDoryFr],
     message: &mut [BlsDoryFr; 3],
 ) -> Result<(), BlsDoryAggregateError> {
-    let remaining_variables = claim
+    let first_claim = claim_indices
+        .first()
+        .and_then(|index| claims.get(*index))
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    if claims.len() != batching.len()
+        || claims.len() != equality_prefixes.len()
+        || claim_indices.iter().any(|index| *index >= claims.len())
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let remaining_variables = first_claim
         .point
         .len()
         .checked_sub(round_index)
@@ -1605,26 +1647,33 @@ fn accumulate_distinct_point_round(
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
 
-    let coordinate = claim.point[round_index];
-    let mut weights = EqualityWeightIterator::new(&claim.point[round_index + 1..]);
+    let mut weights = claim_indices
+        .iter()
+        .map(|index| EqualityWeightIterator::new(&claims[*index].point[round_index + 1..]))
+        .collect::<Vec<_>>();
     let mut visited = 0usize;
-    let mut extra_pair = false;
+    let mut missing_weight = false;
     polynomial.for_each_pair(|lower, upper| {
-        if let Some(suffix_weight) = weights.next() {
-            let equality_scale = equality_prefix * suffix_weight;
+        let value_two = upper + upper - lower;
+        for (claim_index, weights) in claim_indices.iter().zip(&mut weights) {
+            let claim = &claims[*claim_index];
+            let Some(suffix_weight) = weights.next() else {
+                missing_weight = true;
+                continue;
+            };
+            let coordinate = claim.point[round_index];
+            let equality_scale = equality_prefixes[*claim_index] * suffix_weight;
             let equality_zero = equality_scale * (BlsDoryFr::one() - coordinate);
             let equality_one = equality_scale * coordinate;
-            let value_two = upper + upper - lower;
             let equality_two = equality_one + equality_one - equality_zero;
+            let rho = batching[*claim_index];
             message[0] = message[0] + rho * lower * equality_zero;
             message[1] = message[1] + rho * upper * equality_one;
             message[2] = message[2] + rho * value_two * equality_two;
-            visited += 1;
-        } else {
-            extra_pair = true;
         }
+        visited += 1;
     })?;
-    if extra_pair || visited != explicit_pairs {
+    if missing_weight || visited != explicit_pairs {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     Ok(())
@@ -1748,9 +1797,21 @@ fn combine_polynomials_for_opening(
         return Err(BlsDoryAggregateError::MixedStatement);
     }
 
+    let mut grouped = Vec::<(&BlsDoryCommittedPolynomial, BlsDoryFr)>::new();
+    for (polynomial, lambda) in polynomials.iter().zip(lambdas) {
+        if let Some((_, scale)) = grouped
+            .iter_mut()
+            .find(|(existing, _)| existing.shares_coefficient_source(polynomial))
+        {
+            *scale = *scale + *lambda;
+        } else {
+            grouped.push((*polynomial, *lambda));
+        }
+    }
+
     let mut rows = vec![BlsDoryG1::identity(); row_count];
     let mut commitment = BlsDoryGt::identity();
-    for (polynomial, lambda) in polynomials.iter().zip(lambdas) {
+    for (polynomial, lambda) in &grouped {
         if polynomial.row_commitments.len() != rows.len() {
             return Err(BlsDoryAggregateError::MixedStatement);
         }
@@ -1762,8 +1823,8 @@ fn combine_polynomials_for_opening(
 
     let (left, _) = compute_left_right_vectors(point, nu as usize, sigma as usize);
     let mut product = vec![BlsDoryFr::zero(); column_count];
-    for (polynomial, lambda) in polynomials.iter().zip(lambdas) {
-        polynomial.accumulate_vector_matrix_product(&left, *lambda, &mut product)?;
+    for (polynomial, lambda) in grouped {
+        polynomial.accumulate_vector_matrix_product(&left, lambda, &mut product)?;
     }
     Ok((rows, commitment, product))
 }
@@ -2366,6 +2427,35 @@ mod tests {
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
 
         let clone = artifact_backed.clone();
+        assert!(artifact_backed.shares_coefficient_source(&clone));
+        let cloned_refs = vec![&artifact_backed, &clone];
+        let mut transcript = statement_transcript(
+            b"row-source-equivalence",
+            &setup.identity(),
+            &streamed.0,
+            nu,
+            sigma,
+        )
+        .unwrap();
+        let batching = batching_challenges(&mut transcript, streamed.0.len());
+        let sumcheck = prove_distinct_point_sumcheck(
+            &cloned_refs,
+            &streamed.0,
+            &batching,
+            &mut transcript,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sumcheck.unique_polynomial_tables, 1);
+        let cloned = prove_bls_dory_opening_refs_with_scratch(
+            b"row-source-equivalence",
+            &cloned_refs,
+            &points,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        assert_eq!(cloned, streamed);
         let artifact_path = artifact_backed
             .coefficient_artifact_path()
             .unwrap()

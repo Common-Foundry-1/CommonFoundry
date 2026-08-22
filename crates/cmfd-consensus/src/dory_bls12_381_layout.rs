@@ -35,8 +35,8 @@ use crate::{
         PreparedBlsDoryRangeLogUpProof, projected_production_range_logup_opening_bytes,
         projected_production_range_logup_proof_bytes, prove_bls_dory_range_logup,
         prove_bls_dory_range_logup_at_variables, prove_bls_dory_range_logup_deferred_at_variables,
-        prove_bls_dory_range_logup_deferred_at_variables_with_scratch, verify_bls_dory_range_logup,
-        verify_bls_dory_range_logup_at_variables,
+        prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
+        verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
         verify_bls_dory_range_logup_deferred_at_variables,
     },
     dory_bls12_381_matrix::{
@@ -120,7 +120,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments and reusable prover artifacts; linear LogUp scaling still projects CPU time and retained scratch beyond a practical complete production run",
+    "the final model bank lacks pinned n=33 BLS commitments; shared transition artifacts and reusable model artifacts remove duplicate sources, but linear LogUp scaling still projects CPU time and retained scratch beyond a practical complete production run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -1356,25 +1356,30 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
     let mut transitions = Vec::with_capacity(transition_inputs.len());
     for input in transition_inputs {
         let (arithmetic, range) = if let Some(scratch_directory) = scratch_directory {
-            (
-                prove_bls_dory_transition_deferred_at_variables_with_scratch(
+            let arithmetic = prove_bls_dory_transition_deferred_at_variables_with_scratch(
+                &component_binding,
+                input.statement,
+                input.mask_polynomial,
+                input.witness,
+                padded_variables,
+                setup,
+                scratch_directory,
+            )?;
+            let transition = arithmetic
+                .openings
+                .polynomial(0)
+                .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+            let range =
+                prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch(
                     &component_binding,
                     input.statement,
-                    input.mask_polynomial,
                     input.witness,
+                    transition,
                     padded_variables,
                     setup,
                     scratch_directory,
-                )?,
-                prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
-                    &component_binding,
-                    input.statement,
-                    input.witness,
-                    padded_variables,
-                    setup,
-                    scratch_directory,
-                )?,
-            )
+                )?;
+            (arithmetic, range)
         } else {
             (
                 prove_bls_dory_transition_deferred_at_variables(
@@ -2426,7 +2431,9 @@ mod tests {
         BuiltModelBankFixture, SmallModelBankFixture, StructuredMaskPolynomial,
         StructuredMatrixStatement, StructuredTransitionStatement, StructuredTransitionWitness,
         StructuredWiringStatement, V2_TRANSITION_MODULUS, build_small_model_bank,
-        dory_bls12_381_aggregate::MAX_BLS_DORY_AGGREGATE_CLAIMS,
+        dory_bls12_381_aggregate::{
+            MAX_BLS_DORY_AGGREGATE_CLAIMS, commit_bls_dory_padded_prefix_with_optional_scratch,
+        },
         dory_bls12_381_matrix::{
             BlsDoryMatrixProof, prove_bls_dory_matrix_at_variables,
             verify_bls_dory_matrix_at_variables,
@@ -2831,6 +2838,70 @@ mod tests {
                 .push(i64::try_from(output_remainder).unwrap() - OUTPUT_CENTER);
         }
         (statement, mask, witness)
+    }
+
+    #[test]
+    fn scratch_transition_and_logup_share_one_oracle_artifact() {
+        let setup = deterministic_bls_dory_setup(FIXTURE_VARIABLES).unwrap();
+        let (statement, mask, witness) = transition_fixture();
+        let scratch = ScratchDirectory::create();
+        let arithmetic = prove_bls_dory_transition_deferred_at_variables_with_scratch(
+            b"shared-transition-artifact",
+            statement,
+            &mask,
+            &witness,
+            FIXTURE_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+        let transition = arithmetic.openings.polynomial(0).unwrap();
+        let range = prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch(
+            b"shared-transition-artifact",
+            statement,
+            &witness,
+            transition,
+            FIXTURE_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(
+            arithmetic.proof.oracle_commitment,
+            range.proof.transition_commitment
+        );
+        assert!(transition.shares_coefficient_source(range.openings.polynomial(0).unwrap()));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 3);
+
+        let wrong_coefficients =
+            vec![BlsDoryFr::zero(); statement.elements().unwrap() * STRUCTURED_TRANSITION_ORACLES];
+        let wrong_transition = commit_bls_dory_padded_prefix_with_optional_scratch(
+            &wrong_coefficients,
+            FIXTURE_VARIABLES / 2,
+            FIXTURE_VARIABLES - FIXTURE_VARIABLES / 2,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        assert!(matches!(
+            prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch(
+                b"shared-transition-artifact",
+                statement,
+                &witness,
+                &wrong_transition,
+                FIXTURE_VARIABLES,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryRangeLogUpError::Opening)
+        ));
+        drop(wrong_transition);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 3);
+        drop(range);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+        drop(arithmetic);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     fn wiring_fixture() -> (StructuredWiringStatement, Vec<i64>, Vec<i64>, Vec<i64>) {

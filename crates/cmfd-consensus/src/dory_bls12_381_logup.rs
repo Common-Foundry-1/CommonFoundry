@@ -55,6 +55,7 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryIndexedRowSource, commit_bls_dory_indexed_row_source_with_scratch,
         commit_bls_dory_row_source_with_scratch,
+        regenerate_bls_dory_compact_row_source_with_scratch,
     },
     dory_bls12_381_streaming::BlsDoryRowSource,
 };
@@ -82,7 +83,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, compact transition sources, mapped inverse views, four challenge-bound compressed LogUp generations, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.431 seconds proving plus 7.064 seconds opening; CPU n=33 projects to roughly 1.79 plus 1.34 days and the fourth range pair still projects near 72.62 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
+    "bounded parallel work, compact transition sources, mapped inverse views, four challenge-bound compressed LogUp generations, authenticated release/regeneration between range pairs, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 takes 9.480 seconds proving, 2.267 seconds regenerating one source, and 7.043 seconds opening; CPU n=33 projects to roughly 1.80 days plus 10.32 hours per regenerated source plus 1.34 opening days, four regenerated sources still project near 48.5 GiB before aggregation, and aggregate-fold overlap is not yet measured, so GPU or distributed folds and a complete n=33 measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -437,15 +438,19 @@ pub fn projected_production_range_logup_early_lineage_peak_bytes()
     ))
 }
 
-/// Four retained transition/inverse pairs plus the fourth pair's lineage peak.
+/// Peak transition/range source storage with release-and-regeneration enabled.
+/// Component construction retains one source beside one LogUp lineage; the
+/// pre-aggregate boundary reconstructs all four sources without a lineage.
 pub fn projected_production_range_logup_four_pair_peak_bytes() -> Result<u64, BlsDoryRangeLogUpError>
 {
-    let sources = projected_production_transition_range_source_bytes()?
+    let source = projected_production_transition_range_source_bytes()?;
+    let component_peak = source
+        .checked_add(projected_production_range_logup_early_lineage_peak_bytes()?)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let regenerated_sources = source
         .checked_mul(4)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    sources
-        .checked_add(projected_production_range_logup_early_lineage_peak_bytes()?)
-        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
+    Ok(component_peak.max(regenerated_sources))
 }
 
 pub fn prove_bls_dory_range_logup(
@@ -4539,7 +4544,7 @@ mod tests {
         let setup_millis = setup_start.elapsed().as_millis();
 
         let prover_start = std::time::Instant::now();
-        let prepared = prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
+        let mut prepared = prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
             b"logup-scaling-benchmark",
             statement,
             &witness,
@@ -4550,6 +4555,32 @@ mod tests {
         .unwrap();
         let prover_millis = prover_start.elapsed().as_millis();
         let prepared_scratch_bytes = directory_bytes(&scratch_directory);
+
+        let released_identity = prepared.openings.release_compact_source().unwrap().unwrap();
+        let released_scratch_bytes = directory_bytes(&scratch_directory);
+        let regeneration_start = std::time::Instant::now();
+        let nu = packed_variables / 2;
+        let sigma = packed_variables - nu;
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let mut regeneration_source =
+            BlsDoryTransitionWitnessRowSource::new(statement, &witness, rows, columns).unwrap();
+        let regenerated = regenerate_bls_dory_compact_row_source_with_scratch(
+            &mut regeneration_source,
+            &released_identity,
+            nu,
+            sigma,
+            &setup,
+            &scratch_directory,
+        )
+        .unwrap();
+        prepared
+            .openings
+            .restore_compact_source(&regenerated)
+            .unwrap();
+        drop(regenerated);
+        let regeneration_millis = regeneration_start.elapsed().as_millis();
+        let regenerated_scratch_bytes = directory_bytes(&scratch_directory);
 
         let opening_start = std::time::Instant::now();
         let opening_binding = opening_binding(
@@ -4585,7 +4616,7 @@ mod tests {
         let retained_scratch_bytes = directory_bytes(&scratch_directory);
 
         println!(
-            "CMFD_BLS_LOGUP_BENCHMARK {{\"cell_variables\":{cell_variables},\"cells\":{},\"packed_variables\":{packed_variables},\"witness_millis\":{witness_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"prepared_scratch_bytes\":{prepared_scratch_bytes},\"opening_millis\":{opening_millis},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
+            "CMFD_BLS_LOGUP_BENCHMARK {{\"cell_variables\":{cell_variables},\"cells\":{},\"packed_variables\":{packed_variables},\"witness_millis\":{witness_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"prepared_scratch_bytes\":{prepared_scratch_bytes},\"released_scratch_bytes\":{released_scratch_bytes},\"regeneration_millis\":{regeneration_millis},\"regenerated_scratch_bytes\":{regenerated_scratch_bytes},\"opening_millis\":{opening_millis},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
             statement.elements().unwrap()
         );
 
@@ -4828,7 +4859,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_range_logup_four_pair_peak_bytes().unwrap(),
-            77_980_502_840
+            52_076_480_992
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

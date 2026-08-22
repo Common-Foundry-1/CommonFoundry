@@ -1042,9 +1042,11 @@ measurement from 48.385 to 42.699 seconds proving and from 19.315 to 10.618
 seconds opening. Bounded parallel row commitments reduced proving to 9.952
 seconds, and parallel Dory MSM/vector routines reduced opening from 10.504 to
 7.244 seconds. Compact transition artifacts, mapped inverse views, and four
-compressed lineage generations now measure 9.431 seconds proving and 7.064 seconds opening;
-combined time is 69.0% below the buffered checkpoint. Proof bytes are unchanged,
-while prepared n=19 scratch is 36.2% below the preceding compact-source checkpoint.
+compressed lineage generations measured 9.480 seconds proving in the
+release/regeneration run. Releasing the source reduced scratch from 795,900
+bytes to 644 bytes; exact regeneration took 2.267 seconds and restored 795,900
+bytes before the 7.043-second opening. Verification took 2.381 seconds, proof
+bytes remained 47,729, and final scratch was zero.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
 simultaneous LogUp lineage overlap at n=19 is now exactly 1,581,400 bytes.
@@ -1056,8 +1058,9 @@ sources. A direct test deletes the source at that boundary and obtains the same
 proof bytes; the three standalone benchmark runs leave zero scratch bytes after
 proof completion. These are component measurements, not production results.
 
-A linear extrapolation from n=19 to n=33 gives about 1.79 CPU days for the
-LogUp prover and 1.34 days for the aggregate opening. The four compressed
+A linear extrapolation from n=19 to n=33 gives about 1.80 CPU days for the
+LogUp prover, 10.32 hours for each regenerated source (1.72 days for four
+sequential sources), and 1.34 days for the aggregate opening. The four compressed
 production lineages are exactly 16,173,236,396, 9,730,785,452,
 6,509,559,980, and 4,898,947,244 bytes. Their maximum adjacent overlap remains
 the first two at 25,904,021,848 bytes, or about 24.125 GiB. Delaying the first
@@ -1066,16 +1069,22 @@ transition overlap.
 Exact production geometry stores the transition's 805,306,368
 regular 64-bit words and 6,576,668,672 digit codes in 12.125 GiB plus framing.
 The mapped inverse reuses those authenticated digits and adds no coefficient
-file. One retained transition/inverse pair is about 12.125 GiB; four pairs
-project to about 48.5 GiB, with the fourth-pair lineage overlap putting the
-earlier peak at 77,980,502,840 bytes, or about 72.62 GiB. Executable projection functions pin
-all source, lineage, and peak sizes. These extrapolations still reject the
-current CPU and storage pipeline for production; they are not n=33 measurements.
-The new consuming boundary removes those sources before the final Dory
-reduction and after proof completion, but it does not lower the earlier peak.
-The next implementation gate is GPU or distributed linear folding plus
-aggregation or regeneration that avoids retaining all pair sources before the
-first aggregate fold, followed by a complete measured production run.
+file. One retained transition/inverse pair is about 12.125 GiB and four pairs
+are about 48.5 GiB. The shared prover now retains each compact source's exact
+format, dictionary, and BLAKE3 digest, releases the completed source before the
+next pair builds its lineage, and regenerates all four immediately before shared
+openings. Regeneration writes only the canonical word/code artifact and reuses
+the original Dory commitment and row commitments; a changed witness or any
+identity mismatch aborts. The construction-phase source-plus-lineage peak is
+38,923,142,096 bytes, about 36.25 GiB. Reconstructing all four sources is the
+larger transition/range storage boundary at exactly 52,076,480,992 bytes, about
+48.5 GiB, down from 77,980,502,840 bytes or 72.62 GiB. Executable projection
+functions pin all source, lineage, and peak sizes. Exact fixtures preserve the
+complete proof bytes, reject a one-byte regenerated-source substitution, and
+leave zero scratch files. These extrapolations still reject the current CPU and
+storage pipeline for production; they are not n=33 measurements. The next
+implementation gate is GPU or distributed linear folding, measurement and
+reduction of aggregate-fold overlap, then a complete production run.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

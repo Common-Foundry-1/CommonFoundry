@@ -319,6 +319,10 @@ impl BlsDoryCompactArtifact {
         self.digest
     }
 
+    pub(crate) fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
     pub fn for_each_scalar(
         &self,
         mut visitor: impl FnMut(BlsDoryFr) -> Result<(), BlsDoryCompactArtifactError>,
@@ -522,6 +526,18 @@ impl BlsDoryMappedCompactArtifact {
     #[must_use]
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    pub(crate) fn source(&self) -> &Arc<BlsDoryCompactArtifact> {
+        &self.source
+    }
+
+    pub(crate) const fn zero_prefix_count(&self) -> u64 {
+        self.zero_prefix_count
+    }
+
+    pub(crate) fn mapped_dictionary(&self) -> &[BlsDoryFr] {
+        &self.mapped_dictionary
     }
 
     pub fn for_each_scalar(

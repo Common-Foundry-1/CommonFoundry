@@ -56,7 +56,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, compact transition sources, mapped inverse views, four compressed LogUp generations, and consuming openings preserve exact proofs; n=19 still takes 9.431 seconds proving plus 7.064 seconds opening, projects to roughly 1.79 plus 1.34 CPU days at n=33, and the fourth range pair still projects near 72.62 GiB peak scratch",
+    "bounded parallel commitments, compact transition sources, mapped inverse views, four compressed LogUp generations, authenticated release/regeneration between range pairs, and consuming openings preserve exact proofs; n=19 takes 9.480 seconds proving, 2.267 seconds regenerating one source, and 7.043 seconds opening, projecting to roughly 1.80 days plus 10.32 hours per regenerated source plus 1.34 opening days at n=33; four regenerated sources still project near 48.5 GiB before aggregation, and aggregate-fold overlap is not yet measured",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -85,6 +85,40 @@ pub struct BlsDoryCommittedPolynomial {
     sigma: usize,
 }
 
+/// Exact authenticated identity retained while a large compact coefficient
+/// source is absent from scratch storage. Regeneration must reproduce every
+/// field and the complete artifact digest before the source can be reopened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlsDoryReleasedCompactSource {
+    spec: BlsDoryCompactArtifactSpec,
+    dictionary: Vec<BlsDoryFr>,
+    digest: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct BlsDoryReleasedMappedCompactSource {
+    source: BlsDoryReleasedCompactSource,
+    zero_prefix_count: u64,
+    mapped_dictionary: Vec<BlsDoryFr>,
+    digest: [u8; 32],
+}
+
+impl BlsDoryReleasedCompactSource {
+    fn from_artifact(artifact: &BlsDoryCompactArtifact) -> Self {
+        Self {
+            spec: artifact.spec(),
+            dictionary: artifact.dictionary().to_vec(),
+            digest: artifact.digest(),
+        }
+    }
+
+    fn matches(&self, artifact: &BlsDoryCompactArtifact) -> bool {
+        self.spec == artifact.spec()
+            && self.dictionary == artifact.dictionary()
+            && self.digest == artifact.digest()
+    }
+}
+
 #[derive(Clone)]
 enum BlsDoryCoefficientStorage {
     Materialized(BlsDoryPolynomial),
@@ -93,6 +127,8 @@ enum BlsDoryCoefficientStorage {
     IndexedArtifact(Arc<BlsDoryIndexArtifact>),
     CompactArtifact(Arc<BlsDoryCompactArtifact>),
     MappedCompactArtifact(Arc<BlsDoryMappedCompactArtifact>),
+    ReleasedCompact(BlsDoryReleasedCompactSource),
+    ReleasedMappedCompact(BlsDoryReleasedMappedCompactSource),
 }
 
 impl fmt::Debug for BlsDoryCoefficientStorage {
@@ -122,6 +158,16 @@ impl fmt::Debug for BlsDoryCoefficientStorage {
                 .debug_struct("MappedCompactArtifact")
                 .field("coefficient_count", &artifact.scalar_count())
                 .field("digest", &hex::encode(artifact.digest()))
+                .finish(),
+            Self::ReleasedCompact(source) => formatter
+                .debug_struct("ReleasedCompact")
+                .field("coefficient_count", &source.spec.scalar_count)
+                .field("digest", &hex::encode(source.digest))
+                .finish(),
+            Self::ReleasedMappedCompact(source) => formatter
+                .debug_struct("ReleasedMappedCompact")
+                .field("coefficient_count", &source.source.spec.scalar_count)
+                .field("digest", &hex::encode(source.digest))
                 .finish(),
         }
     }
@@ -221,6 +267,56 @@ impl BlsDoryDeferredOpeningSet {
         self.polynomials.get(index)
     }
 
+    /// Drop every compact coefficient handle in this set while retaining an
+    /// exact authenticated identity. All compact and mapped polynomials in one
+    /// set must share the same physical source.
+    pub(crate) fn release_compact_source(
+        &mut self,
+    ) -> Result<Option<BlsDoryReleasedCompactSource>, BlsDoryAggregateError> {
+        let mut expected = None;
+        for polynomial in &self.polynomials {
+            let Some(source) = polynomial.compact_source_identity() else {
+                continue;
+            };
+            if expected
+                .as_ref()
+                .is_some_and(|expected| expected != &source)
+            {
+                return Err(BlsDoryAggregateError::ProverStorage);
+            }
+            expected = Some(source);
+        }
+        if expected.is_some() {
+            for polynomial in &mut self.polynomials {
+                polynomial.release_compact_source();
+            }
+        }
+        Ok(expected)
+    }
+
+    /// Reattach one regenerated compact source after validating every compact
+    /// and mapped identity. Replacement is transactional: no polynomial is
+    /// modified unless every reconstruction validates first.
+    pub(crate) fn restore_compact_source(
+        &mut self,
+        source: &Arc<BlsDoryCompactArtifact>,
+    ) -> Result<(), BlsDoryAggregateError> {
+        let replacements = self
+            .polynomials
+            .iter()
+            .map(|polynomial| polynomial.restored_compact_coefficients(source))
+            .collect::<Result<Vec<_>, _>>()?;
+        if replacements.iter().all(Option::is_none) {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        for (polynomial, replacement) in self.polynomials.iter_mut().zip(replacements) {
+            if let Some(replacement) = replacement {
+                polynomial.coefficients = replacement;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn push_opening(
         &mut self,
         polynomial_index: usize,
@@ -246,6 +342,91 @@ impl BlsDoryDeferredOpeningSet {
 }
 
 impl BlsDoryCommittedPolynomial {
+    fn compact_source_identity(&self) -> Option<BlsDoryReleasedCompactSource> {
+        match &self.coefficients {
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
+                Some(BlsDoryReleasedCompactSource::from_artifact(artifact))
+            }
+            BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => Some(
+                BlsDoryReleasedCompactSource::from_artifact(artifact.source()),
+            ),
+            BlsDoryCoefficientStorage::ReleasedCompact(source) => Some(source.clone()),
+            BlsDoryCoefficientStorage::ReleasedMappedCompact(source) => Some(source.source.clone()),
+            BlsDoryCoefficientStorage::Materialized(_)
+            | BlsDoryCoefficientStorage::AuthenticatedArtifact(_) => None,
+            #[cfg(test)]
+            BlsDoryCoefficientStorage::IndexedArtifact(_) => None,
+        }
+    }
+
+    fn release_compact_source(&mut self) {
+        let replacement = match &self.coefficients {
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
+                Some(BlsDoryCoefficientStorage::ReleasedCompact(
+                    BlsDoryReleasedCompactSource::from_artifact(artifact),
+                ))
+            }
+            BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => {
+                Some(BlsDoryCoefficientStorage::ReleasedMappedCompact(
+                    BlsDoryReleasedMappedCompactSource {
+                        source: BlsDoryReleasedCompactSource::from_artifact(artifact.source()),
+                        zero_prefix_count: artifact.zero_prefix_count(),
+                        mapped_dictionary: artifact.mapped_dictionary().to_vec(),
+                        digest: artifact.digest(),
+                    },
+                ))
+            }
+            BlsDoryCoefficientStorage::Materialized(_)
+            | BlsDoryCoefficientStorage::AuthenticatedArtifact(_)
+            | BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => None,
+            #[cfg(test)]
+            BlsDoryCoefficientStorage::IndexedArtifact(_) => None,
+        };
+        if let Some(replacement) = replacement {
+            self.coefficients = replacement;
+        }
+    }
+
+    fn restored_compact_coefficients(
+        &self,
+        source: &Arc<BlsDoryCompactArtifact>,
+    ) -> Result<Option<BlsDoryCoefficientStorage>, BlsDoryAggregateError> {
+        match &self.coefficients {
+            BlsDoryCoefficientStorage::ReleasedCompact(expected) => {
+                if !expected.matches(source) {
+                    return Err(BlsDoryAggregateError::ProverStorage);
+                }
+                Ok(Some(BlsDoryCoefficientStorage::CompactArtifact(
+                    Arc::clone(source),
+                )))
+            }
+            BlsDoryCoefficientStorage::ReleasedMappedCompact(expected) => {
+                if !expected.source.matches(source) {
+                    return Err(BlsDoryAggregateError::ProverStorage);
+                }
+                let mapped = BlsDoryMappedCompactArtifact::new(
+                    Arc::clone(source),
+                    expected.zero_prefix_count,
+                    expected.mapped_dictionary.clone(),
+                )
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+                if mapped.digest() != expected.digest {
+                    return Err(BlsDoryAggregateError::ProverStorage);
+                }
+                Ok(Some(BlsDoryCoefficientStorage::MappedCompactArtifact(
+                    Arc::new(mapped),
+                )))
+            }
+            BlsDoryCoefficientStorage::Materialized(_)
+            | BlsDoryCoefficientStorage::AuthenticatedArtifact(_)
+            | BlsDoryCoefficientStorage::CompactArtifact(_)
+            | BlsDoryCoefficientStorage::MappedCompactArtifact(_) => Ok(None),
+            #[cfg(test)]
+            BlsDoryCoefficientStorage::IndexedArtifact(_) => Ok(None),
+        }
+    }
+
     /// Public tier-two commitment used by the opening statement.
     #[must_use]
     pub fn commitment(&self) -> BlsDoryGt {
@@ -274,6 +455,10 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => {
                 artifact.scalar_count() as usize
             }
+            BlsDoryCoefficientStorage::ReleasedCompact(source)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(
+                BlsDoryReleasedMappedCompactSource { source, .. },
+            ) => source.spec.scalar_count as usize,
         }
     }
 
@@ -293,6 +478,10 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => {
                 artifact.explicit_scalar_count() as usize
             }
+            BlsDoryCoefficientStorage::ReleasedCompact(source)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(
+                BlsDoryReleasedMappedCompactSource { source, .. },
+            ) => source.spec.explicit_scalar_count as usize,
         }
     }
 
@@ -350,6 +539,29 @@ impl BlsDoryCommittedPolynomial {
                     && self.nu == other.nu
                     && self.sigma == other.sigma
             }
+            (
+                BlsDoryCoefficientStorage::ReleasedCompact(left),
+                BlsDoryCoefficientStorage::ReleasedCompact(right),
+            ) => {
+                left == right
+                    && self.commitment == other.commitment
+                    && self.setup_identity == other.setup_identity
+                    && self.nu == other.nu
+                    && self.sigma == other.sigma
+            }
+            (
+                BlsDoryCoefficientStorage::ReleasedMappedCompact(left),
+                BlsDoryCoefficientStorage::ReleasedMappedCompact(right),
+            ) => {
+                left.source == right.source
+                    && left.zero_prefix_count == right.zero_prefix_count
+                    && left.mapped_dictionary == right.mapped_dictionary
+                    && left.digest == right.digest
+                    && self.commitment == other.commitment
+                    && self.setup_identity == other.setup_identity
+                    && self.nu == other.nu
+                    && self.sigma == other.sigma
+            }
             _ => false,
         }
     }
@@ -395,6 +607,10 @@ impl BlsDoryCommittedPolynomial {
                     Ok(())
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
+                return Err(BlsDoryAggregateError::ProverStorage);
+            }
         }
         if visited != self.explicit_coefficient_count() {
             return Err(BlsDoryAggregateError::ProverStorage);
@@ -485,6 +701,10 @@ impl BlsDoryCommittedPolynomial {
                 }
                 Ok(evaluation)
             }
+            BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
+                Err(BlsDoryAggregateError::ProverStorage)
+            }
         }
     }
 
@@ -523,6 +743,10 @@ impl BlsDoryCommittedPolynomial {
                     Ok(())
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage),
+            BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
+                Err(BlsDoryAggregateError::ProverStorage)
+            }
         }
     }
 
@@ -591,6 +815,10 @@ impl BlsDoryCommittedPolynomial {
                     Ok(())
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
+                return Err(BlsDoryAggregateError::ProverStorage);
+            }
         }
         let explicit_count = self.explicit_coefficient_count();
         if visited != explicit_count
@@ -609,7 +837,9 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::AuthenticatedArtifact(_)
             | BlsDoryCoefficientStorage::IndexedArtifact(_)
             | BlsDoryCoefficientStorage::CompactArtifact(_)
-            | BlsDoryCoefficientStorage::MappedCompactArtifact(_) => None,
+            | BlsDoryCoefficientStorage::MappedCompactArtifact(_)
+            | BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => None,
         }
     }
 
@@ -623,6 +853,8 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => {
                 Some(artifact.source_path())
             }
+            BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => None,
         }
     }
 
@@ -1547,6 +1779,120 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
         nu,
         sigma,
     })
+}
+
+/// Regenerate only the authenticated compact coefficient file for a committed
+/// source that was deliberately released between component proving and shared
+/// aggregation. Existing Dory commitments are never recomputed or trusted
+/// against a new witness: the complete regenerated artifact must match the
+/// independently retained source identity byte-for-byte through its digest.
+pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactRowSource>(
+    source: &mut S,
+    expected: &BlsDoryReleasedCompactSource,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<Arc<BlsDoryCompactArtifact>, BlsDoryAggregateError> {
+    setup
+        .validate()
+        .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+    validate_layout(nu, sigma)?;
+    let rows = 1usize
+        .checked_shl(u32::try_from(nu).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let columns = 1usize
+        .checked_shl(u32::try_from(sigma).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let coefficient_count = rows
+        .checked_mul(columns)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let explicit_coefficient_count = source.explicit_scalar_count();
+    let word_coefficient_count = source.word_scalar_count();
+    let word_group_len = source.word_group_len();
+    let signed_word_selectors = source.signed_word_selectors();
+    if source.rows() != rows
+        || source.columns() != columns
+        || explicit_coefficient_count == 0
+        || explicit_coefficient_count > coefficient_count
+        || word_coefficient_count == 0
+        || word_coefficient_count > explicit_coefficient_count
+        || !word_coefficient_count.is_multiple_of(columns)
+        || word_group_len == 0
+        || !word_group_len.is_power_of_two()
+        || !word_coefficient_count.is_multiple_of(word_group_len)
+        || word_coefficient_count / word_group_len > 64
+        || setup.max_log_n() < nu + sigma
+    {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let dictionary = source.dictionary().to_vec();
+    let fold_spec = source_artifact_spec(
+        setup.identity(),
+        nu,
+        sigma,
+        coefficient_count,
+        explicit_coefficient_count,
+    )?;
+    let compact_spec = BlsDoryCompactArtifactSpec {
+        context_digest: fold_spec.context_digest,
+        scalar_count: fold_spec.scalar_count,
+        explicit_scalar_count: fold_spec.explicit_scalar_count,
+        word_scalar_count: u64::try_from(word_coefficient_count)
+            .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+        word_group_len: u64::try_from(word_group_len)
+            .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+        signed_word_selectors,
+    };
+    if compact_spec != expected.spec || dictionary != expected.dictionary {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let mut writer =
+        BlsDoryCompactArtifactWriter::create(scratch_directory, compact_spec, dictionary.clone())
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    let word_rows = word_coefficient_count / columns;
+    let explicit_rows = explicit_coefficient_count.div_ceil(columns);
+    let mut words = vec![0u64; columns];
+    for row_index in 0..word_rows {
+        let written = source
+            .read_word_row(row_index, &mut words)
+            .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
+        if written != columns {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        writer
+            .write_words(&words)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    }
+    let mut codes = vec![0u8; columns];
+    for row_index in word_rows..explicit_rows {
+        let written = source
+            .read_code_row(row_index, &mut codes)
+            .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
+        if written != columns {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let explicit_in_row = explicit_coefficient_count
+            .saturating_sub(row_index * columns)
+            .min(columns);
+        codes[explicit_in_row..].fill(0);
+        if codes[..explicit_in_row]
+            .iter()
+            .any(|code| usize::from(*code) >= dictionary.len())
+        {
+            return Err(BlsDoryAggregateError::CoefficientSource);
+        }
+        writer
+            .write_codes(&codes[..explicit_in_row])
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    }
+    let artifact = writer
+        .finish()
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    if !expected.matches(&artifact) {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok(Arc::new(artifact))
 }
 
 /// Commit a deterministic scalar mapping of an authenticated compact source
@@ -3290,6 +3636,100 @@ mod tests {
         }
     }
 
+    struct FixtureCompactRowSource {
+        rows: usize,
+        columns: usize,
+        explicit_coefficients: usize,
+        word_coefficients: usize,
+        dictionary: Vec<BlsDoryFr>,
+        tamper_first_code: bool,
+    }
+
+    impl BlsDoryCompactRowSource for FixtureCompactRowSource {
+        type Error = FixtureSourceError;
+
+        fn rows(&self) -> usize {
+            self.rows
+        }
+
+        fn columns(&self) -> usize {
+            self.columns
+        }
+
+        fn explicit_scalar_count(&self) -> usize {
+            self.explicit_coefficients
+        }
+
+        fn word_scalar_count(&self) -> usize {
+            self.word_coefficients
+        }
+
+        fn word_group_len(&self) -> usize {
+            self.columns
+        }
+
+        fn signed_word_selectors(&self) -> u64 {
+            0
+        }
+
+        fn dictionary(&self) -> &[BlsDoryFr] {
+            &self.dictionary
+        }
+
+        fn read_word_row(
+            &mut self,
+            row_index: usize,
+            output: &mut [u64],
+        ) -> Result<usize, Self::Error> {
+            if output.len() != self.columns || row_index >= self.word_coefficients / self.columns {
+                return Err(FixtureSourceError::Injected);
+            }
+            for (column, word) in output.iter_mut().enumerate() {
+                *word = (row_index * self.columns + column + 17) as u64;
+            }
+            Ok(output.len())
+        }
+
+        fn read_code_row(
+            &mut self,
+            row_index: usize,
+            output: &mut [u8],
+        ) -> Result<usize, Self::Error> {
+            let start = row_index * self.columns;
+            if output.len() != self.columns
+                || start < self.word_coefficients
+                || start >= self.explicit_coefficients
+            {
+                return Err(FixtureSourceError::Injected);
+            }
+            for (column, code) in output.iter_mut().enumerate() {
+                let index = start + column;
+                *code = if index < self.explicit_coefficients {
+                    (index % self.dictionary.len()) as u8
+                } else {
+                    0
+                };
+            }
+            if self.tamper_first_code && start == self.word_coefficients {
+                output[0] = (output[0] + 1) % self.dictionary.len() as u8;
+            }
+            Ok(output.len())
+        }
+    }
+
+    fn fixture_compact_row_source(variables: usize) -> FixtureCompactRowSource {
+        let rows = 1usize << (variables / 2);
+        let columns = 1usize << (variables - variables / 2);
+        FixtureCompactRowSource {
+            rows,
+            columns,
+            explicit_coefficients: 6 * columns,
+            word_coefficients: 2 * columns,
+            dictionary: (0..16).map(BlsDoryFr::from_u64).collect(),
+            tamper_first_code: false,
+        }
+    }
+
     fn fixture(variables: usize, claims: usize) -> Fixture {
         let setup = deterministic_bls_dory_setup(variables).unwrap();
         let nu = variables / 2;
@@ -3517,6 +3957,93 @@ mod tests {
         assert!(artifact_path.is_file());
         drop(clone);
         assert!(!artifact_path.exists());
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn compact_source_release_regenerates_exact_bytes_and_rejects_substitution() {
+        let variables = 6;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let mut source = fixture_compact_row_source(variables);
+        let compact = commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let mapped = commit_bls_dory_mapped_compact_polynomial(
+            &compact,
+            source.word_coefficients,
+            (0..16)
+                .map(|index| BlsDoryFr::from_u64(index + 101))
+                .collect(),
+            &setup,
+        )
+        .unwrap();
+        let points = vec![
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 3))
+                .collect::<Vec<_>>(),
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 29))
+                .collect::<Vec<_>>(),
+        ];
+        let mut openings =
+            BlsDoryDeferredOpeningSet::new(vec![compact, mapped], vec![0, 1], points).unwrap();
+        let original =
+            prove_bls_dory_deferred_opening_sets(b"compact-release", &[&openings], &setup).unwrap();
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+
+        let identity = openings.release_compact_source().unwrap().unwrap();
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        assert_eq!(
+            openings
+                .polynomial(0)
+                .unwrap()
+                .evaluate(&original.0[0].point),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
+
+        let mut substituted = fixture_compact_row_source(variables);
+        substituted.tamper_first_code = true;
+        assert!(matches!(
+            regenerate_bls_dory_compact_row_source_with_scratch(
+                &mut substituted,
+                &identity,
+                nu,
+                sigma,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryAggregateError::ProverStorage)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let mut regenerated_source = fixture_compact_row_source(variables);
+        let regenerated = regenerate_bls_dory_compact_row_source_with_scratch(
+            &mut regenerated_source,
+            &identity,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        openings.restore_compact_source(&regenerated).unwrap();
+        assert_eq!(
+            openings.restore_compact_source(&regenerated),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
+        let restored =
+            prove_bls_dory_deferred_opening_sets(b"compact-release", &[&openings], &setup).unwrap();
+        assert_eq!(restored, original);
+        drop(regenerated);
+        drop(openings);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

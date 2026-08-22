@@ -28,7 +28,8 @@ use crate::{
         BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
         commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
         projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets_consuming,
-        prove_bls_dory_deferred_opening_sets_consuming_with_scratch, verify_bls_dory_openings,
+        prove_bls_dory_deferred_opening_sets_consuming_with_scratch,
+        regenerate_bls_dory_compact_row_source_with_scratch, verify_bls_dory_openings,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof,
@@ -53,9 +54,10 @@ use crate::{
     dory_bls12_381_streaming::BlsDoryRowSource,
     dory_bls12_381_transition::{
         BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryTransitionError, BlsDoryTransitionProof,
-        PreparedBlsDoryTransitionProof, projected_production_transition_opening_bytes,
-        projected_production_transition_proof_bytes, prove_bls_dory_transition,
-        prove_bls_dory_transition_at_variables, prove_bls_dory_transition_deferred_at_variables,
+        BlsDoryTransitionWitnessRowSource, PreparedBlsDoryTransitionProof,
+        projected_production_transition_opening_bytes, projected_production_transition_proof_bytes,
+        prove_bls_dory_transition, prove_bls_dory_transition_at_variables,
+        prove_bls_dory_transition_deferred_at_variables,
         prove_bls_dory_transition_deferred_at_variables_with_scratch, verify_bls_dory_transition,
         verify_bls_dory_transition_at_variables, verify_bls_dory_transition_deferred_at_variables,
     },
@@ -120,7 +122,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; its authenticated writer now uses bounded parallel row batches and shared transition artifacts remove duplicate sources, but linear LogUp scaling still projects CPU time and retained scratch beyond a practical complete production run",
+    "the final model bank lacks pinned n=33 BLS commitments; its authenticated writer uses bounded parallel row batches, shared transition artifacts remove duplicate sources, and range pairs release then digest-authenticate regenerated sources, but linear LogUp scaling, four pre-aggregate sources, and unmeasured aggregate-fold overlap remain beyond a proven practical production run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -1354,8 +1356,9 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         matrices.push(matrix);
     }
     let mut transitions = Vec::with_capacity(transition_inputs.len());
+    let mut released_transition_sources = Vec::with_capacity(transition_inputs.len());
     for input in transition_inputs {
-        let (arithmetic, range) = if let Some(scratch_directory) = scratch_directory {
+        let (mut arithmetic, mut range) = if let Some(scratch_directory) = scratch_directory {
             let arithmetic = prove_bls_dory_transition_deferred_at_variables_with_scratch(
                 &component_binding,
                 input.statement,
@@ -1402,7 +1405,24 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         if arithmetic.proof.oracle_commitment != range.proof.transition_commitment {
             return Err(BlsDorySharedLayoutError::TransitionRangeCommitment);
         }
+        let released_source = if scratch_directory.is_some() {
+            let arithmetic_source = arithmetic
+                .openings
+                .release_compact_source()?
+                .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+            let range_source = range
+                .openings
+                .release_compact_source()?
+                .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+            if arithmetic_source != range_source {
+                return Err(BlsDorySharedLayoutError::OpeningClaims);
+            }
+            Some(arithmetic_source)
+        } else {
+            None
+        };
         transitions.push((arithmetic, range));
+        released_transition_sources.push(released_source);
     }
     let wiring = if let Some(scratch_directory) = scratch_directory {
         prove_bls_dory_wiring_deferred_at_variables_with_scratch(
@@ -1426,6 +1446,45 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
             setup,
         )?
     };
+    if let Some(scratch_directory) = scratch_directory {
+        let nu = padded_variables / 2;
+        let sigma = padded_variables - nu;
+        let rows = 1usize
+            .checked_shl(
+                u32::try_from(nu).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
+            )
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+        let columns = 1usize
+            .checked_shl(
+                u32::try_from(sigma).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
+            )
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+        for (((arithmetic, range), input), expected) in transitions
+            .iter_mut()
+            .zip(transition_inputs)
+            .zip(&released_transition_sources)
+        {
+            let expected = expected
+                .as_ref()
+                .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+            let mut source = BlsDoryTransitionWitnessRowSource::new(
+                input.statement,
+                input.witness,
+                rows,
+                columns,
+            )?;
+            let restored = regenerate_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                expected,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )?;
+            arithmetic.openings.restore_compact_source(&restored)?;
+            range.openings.restore_compact_source(&restored)?;
+        }
+    }
     prove_prepared_shared_layout(
         &component_binding,
         matrices,

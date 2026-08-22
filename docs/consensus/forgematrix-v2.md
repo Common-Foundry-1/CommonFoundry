@@ -508,19 +508,28 @@ comparison. The v2 research code now implements:
   combined row commitments, and `L^T M`, then releases deferred coefficient
   artifacts before the final Dory reduction. Direct testing preserves exact
   proof bytes, and standalone n=15, n=17, and n=19 runs leave zero scratch after
-  completion. At n=19 the latest linear prover took 9.431 seconds versus
+  completion. At n=19 the release/regeneration run took 9.480 seconds proving versus
   42.699 seconds for the buffered serial-row checkpoint and 53.948 seconds for
-  the rejected recomputation path. Aggregate opening took 7.064 seconds,
-  prepared scratch was 795,900 bytes, and the verified proof remained 47,729
-  bytes. Extrapolation to n=33 still gives roughly 1.79 CPU proving days and
-  1.34 aggregate-opening days. Exact projection puts the four compressed
+  the rejected recomputation path. Releasing the source reduced scratch from
+  795,900 bytes to 644 bytes; exact regeneration took 2.267 seconds and restored
+  795,900 bytes before the 7.043-second aggregate opening. Verification took
+  2.381 seconds, the proof remained 47,729 bytes, and final scratch was zero.
+  Linear n=33 extrapolation gives roughly 1.80 CPU proving days, 10.32 hours per
+  regenerated source (1.72 days for four sequential sources), and 1.34
+  aggregate-opening days. Exact projection puts the four compressed
   lineages at 15.06, 9.06, 6.06, and 4.56 GiB. Their maximum overlap is the
   first two at 24.125 GiB; the first ordinary scalar child is delayed until
-  generation five. With four retained source pairs, the projected scratch
-  peak is about 72.62 GiB instead of 478 GiB. This rejects the current
-  CPU/storage pipeline
-  for production; GPU or distributed folds, aggregation or regeneration before
-  all pair sources accumulate, and a complete measured n=33 run remain required;
+  generation five. The shared prover now retains the exact compact artifact
+  identity, releases each completed pair source before constructing the next
+  lineage, and regenerates all four sources before shared openings. Regeneration
+  writes only canonical words and codes, reuses the original Dory commitments,
+  and aborts unless the complete BLAKE3-authenticated artifact matches. A changed
+  witness is rejected. The projected transition/range storage peak is therefore
+  52,076,480,992 bytes, about 48.5 GiB, rather than 72.62 GiB: one source plus
+  the largest lineage overlap is about 36.25 GiB, while four regenerated sources
+  before aggregation are larger. This still rejects the current CPU/storage
+  pipeline for production; GPU or distributed folds, measured aggregate-fold
+  overlap, and a complete measured n=33 run remain required;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

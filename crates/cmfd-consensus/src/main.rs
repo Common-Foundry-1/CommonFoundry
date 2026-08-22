@@ -5,6 +5,12 @@ use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
     BlockChallenge, DEFAULT_MONETARY_POLICY, ForgeMatrixVerifier, TEST_PROFILE, v2_test_reference,
 };
+#[cfg(feature = "dory-bls12-381-prototype")]
+use cmfd_consensus::{
+    ModelBankManifest, ModelPcsIdentity,
+    dory_bls12_381_model_commitment::derive_bls_dory_model_commitment_record,
+    dory_bls12_381_prototype::deterministic_bls_dory_setup,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,6 +57,25 @@ enum Command {
     },
     /// Report exact memory and work for the unactivated 16 GB candidate.
     Profile16gb,
+    /// Authenticate a model bank and emit its reproducible fixed-model BLS commitment record.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    BlsModelCommitment {
+        /// Canonical binary model bank to authenticate.
+        #[arg(long)]
+        bank: std::path::PathBuf,
+        /// Separately trusted model-bank manifest JSON.
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        /// Separately trusted ModelPcsIdentity JSON.
+        #[arg(long)]
+        model_identity: std::path::PathBuf,
+        /// Fixed-table geometry and deterministic setup size.
+        #[arg(long, default_value_t = 33)]
+        padded_variables: usize,
+        /// New JSON record path; omit for stdout. Existing files are never overwritten.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 fn sample_block(network_id: [u8; 32], target: [u8; 32]) -> BlockChallenge {
@@ -111,6 +136,56 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&CANDIDATE_16GB_PROFILE.metrics())?
             );
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::BlsModelCommitment {
+            bank,
+            manifest,
+            model_identity,
+            padded_variables,
+            output,
+        } => {
+            let manifest_reader = std::fs::File::open(&manifest)
+                .with_context(|| format!("failed to open {}", manifest.display()))?;
+            let trusted_manifest: ModelBankManifest = serde_json::from_reader(manifest_reader)
+                .with_context(|| format!("failed to parse {}", manifest.display()))?;
+            let identity_reader = std::fs::File::open(&model_identity)
+                .with_context(|| format!("failed to open {}", model_identity.display()))?;
+            let trusted_identity: ModelPcsIdentity = serde_json::from_reader(identity_reader)
+                .with_context(|| format!("failed to parse {}", model_identity.display()))?;
+            let bank_reader = std::fs::File::open(&bank)
+                .with_context(|| format!("failed to open {}", bank.display()))?;
+            let setup = deterministic_bls_dory_setup(padded_variables)
+                .context("failed to derive deterministic BLS setup")?;
+            let record = derive_bls_dory_model_commitment_record(
+                bank_reader,
+                &trusted_manifest,
+                &trusted_identity,
+                padded_variables,
+                &setup,
+            )
+            .context("failed to derive authenticated fixed-model commitments")?;
+            let mut encoded = serde_json::to_vec_pretty(&record)?;
+            encoded.push(b'\n');
+            if let Some(output) = output {
+                use std::io::Write as _;
+
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&output)
+                    .with_context(|| {
+                        format!("failed to create new output file {}", output.display())
+                    })?;
+                file.write_all(&encoded)
+                    .with_context(|| format!("failed to write {}", output.display()))?;
+                file.sync_all()
+                    .with_context(|| format!("failed to sync {}", output.display()))?;
+                println!("wrote {}", output.display());
+                println!("record digest {}", record.record_digest);
+            } else {
+                print!("{}", String::from_utf8(encoded)?);
+            }
         }
     }
     Ok(())

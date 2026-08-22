@@ -941,6 +941,26 @@ BLS fixed-model identity binds the existing `ModelPcsIdentity`, setup identity,
 base-input commitment, and ordered weight-bank commitments. Each matrix weight
 commitment must match it exactly. The shared transcript derives eleven equality
 points after absorbing that identity and every component commitment and digest.
+
+The feature-gated `bls-model-commitment` command is the offline ceremony bridge
+for that identity. It takes the bank, a separately reviewed manifest, and a
+separately reviewed `ModelPcsIdentity`; streams and authenticates every model
+byte; derives the ordered BLS commitments; and emits a deterministic JSON record
+with the manifest, identities, canonical compressed commitments, and a
+domain-separated record digest. The deterministic setup's maximum variable
+count must equal the padded geometry, so the production record uses `33`. The
+command creates a requested output file only after authentication succeeds and
+will not overwrite an existing file:
+
+```text
+cargo run -p cmfd-consensus --features dory-bls12-381-prototype -- bls-model-commitment --bank MODEL.bank --manifest MANIFEST.json --model-identity MODEL-PCS-IDENTITY.json --padded-variables 33 --output BLS-MODEL-COMMITMENT.json
+```
+
+Independent operators must reproduce the same record digest from the same three
+inputs before it can be proposed for network pinning. Producing a matching
+record neither replaces external review of the prior `ModelPcsIdentity`
+ceremony nor activates production consensus.
+
 One equality links the fixed base input to the virtual transition input, another
 links that transition's activation to the wiring initial table, and three per
 bank link matrix activation to wiring input, matrix accumulator to transition
@@ -1264,8 +1284,9 @@ Before a production proof tag can exist:
 2. execute, independently reproduce, benchmark, and audit the complete
    production model path from the published source bundle through the exact
    initial codewords, typed demand trees, and typed role joins, retaining the
-   V2 identities and verifying every structured commitment alias against the
-   pinned `ModelPcsIdentity`;
+   V2 identities, reproducing the offline fixed-model commitment record, and
+   verifying every structured commitment alias against the pinned
+   `ModelPcsIdentity`;
 3. run the exact BLAKE3 tree argument at the complete production shape and
    demonstrate that the full aggregate, not only the hash component, remains
    below its total payload cap;

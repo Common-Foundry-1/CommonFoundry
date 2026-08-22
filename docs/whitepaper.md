@@ -413,6 +413,15 @@ Two commitments are required because they answer different questions:
 
 Merely listing both digests in one manifest does not prove they encode the same data. The current research path now streams authenticated model bytes into exact field sources, initial codewords, typed trees, and role joins that check the pinned PCS aliases. Production still requires an independently reproduced end-to-end activation certificate covering the complete artifact and proof path; the component-level link is implemented, but the production-scale certificate and audit are not.
 
+An offline, feature-gated commitment tool now covers the next ceremony boundary.
+Given the complete bank plus separately reviewed manifest and
+`ModelPcsIdentity`, it authenticates the stream and deterministically emits the
+ordered BLS fixed-table commitments, setup identity, source identities, and a
+domain-separated record digest. Independent operators must reproduce that
+digest before network pinning. This record does not manufacture trust in the
+input `ModelPcsIdentity`, substitute for the production-scale proof run, or
+enable production consensus.
+
 The intended polynomial ordering is explicit:
 
 - base table: `[column bits, row bits]`;

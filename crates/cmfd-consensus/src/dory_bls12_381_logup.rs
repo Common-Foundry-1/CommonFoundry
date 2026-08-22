@@ -69,7 +69,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel row commitments, artifact I/O, and lineage-authenticated folds preserve exact proofs and reduce n=19 proving to 9.952 seconds and opening to 10.504 seconds, but CPU n=33 still projects to roughly 1.89 proving days plus 1.99 opening days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
+    "bounded parallel row commitments, Dory arithmetic, artifact I/O, and lineage-authenticated folds preserve exact proofs and reduce n=19 proving to 9.923 seconds and opening to 7.244 seconds, but CPU n=33 still projects to roughly 1.88 proving days plus 1.37 opening days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];

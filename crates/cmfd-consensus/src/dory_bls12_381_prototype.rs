@@ -7,7 +7,7 @@
 //! than sampled from an operating-system RNG.
 //!
 //! This remains a non-consensus prototype: its arithmetic routines are simple
-//! sequential references, the complete ForgeMatrix AIR is not connected, and
+//! CPU-parallel references, the complete ForgeMatrix AIR is not connected, and
 //! its codec has not been externally audited.
 
 use std::io::{Read, Write};
@@ -39,6 +39,7 @@ use dory_pcs::proof::DoryProof;
 use dory_pcs::setup::{ProverSetup, VerifierSetup};
 #[cfg(test)]
 use dory_pcs::{Transparent, prove, verify};
+use rayon::prelude::*;
 use sha2::Sha256;
 use thiserror::Error;
 
@@ -399,9 +400,9 @@ impl PairingCurve for BlsDoryCurve {
     }
 }
 
-/// Sequential reference routines for BLS12-381 G1.
+/// Parallel reference routines for BLS12-381 G1.
 pub struct BlsDoryG1Routines;
-/// Sequential reference routines for BLS12-381 G2.
+/// Parallel reference routines for BLS12-381 G2.
 pub struct BlsDoryG2Routines;
 
 macro_rules! impl_reference_routines {
@@ -410,15 +411,17 @@ macro_rules! impl_reference_routines {
             fn msm(bases: &[$group], scalars: &[BlsDoryFr]) -> $group {
                 assert_eq!(bases.len(), scalars.len());
                 bases
-                    .iter()
-                    .zip(scalars)
-                    .fold(<$group>::identity(), |sum, (base, scalar)| {
-                        sum + base.scale(scalar)
-                    })
+                    .par_iter()
+                    .zip(scalars.par_iter())
+                    .map(|(base, scalar)| base.scale(scalar))
+                    .reduce(<$group>::identity, |sum, value| sum + value)
             }
 
             fn fixed_base_vector_scalar_mul(base: &$group, scalars: &[BlsDoryFr]) -> Vec<$group> {
-                scalars.iter().map(|scalar| base.scale(scalar)).collect()
+                scalars
+                    .par_iter()
+                    .map(|scalar| base.scale(scalar))
+                    .collect()
             }
 
             fn fixed_scalar_mul_bases_then_add(
@@ -427,9 +430,10 @@ macro_rules! impl_reference_routines {
                 scalar: &BlsDoryFr,
             ) {
                 assert_eq!(bases.len(), values.len());
-                for (value, base) in values.iter_mut().zip(bases) {
-                    *value = *value + base.scale(scalar);
-                }
+                values
+                    .par_iter_mut()
+                    .zip(bases.par_iter())
+                    .for_each(|(value, base)| *value = *value + base.scale(scalar));
             }
 
             fn fixed_scalar_mul_vs_then_add(
@@ -438,9 +442,10 @@ macro_rules! impl_reference_routines {
                 scalar: &BlsDoryFr,
             ) {
                 assert_eq!(values.len(), addends.len());
-                for (value, addend) in values.iter_mut().zip(addends) {
-                    *value = value.scale(scalar) + *addend;
-                }
+                values
+                    .par_iter_mut()
+                    .zip(addends.par_iter())
+                    .for_each(|(value, addend)| *value = value.scale(scalar) + *addend);
             }
         }
     };

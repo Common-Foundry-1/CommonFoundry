@@ -48,7 +48,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel row commitments preserve exact proofs and reduce n=19 LogUp proving to 9.952 seconds, but linear n=33 extrapolation still gives roughly 1.89 proving days plus 1.99 opening days and retained opening sources near 440 GiB per range instance",
+    "bounded parallel row commitments and Dory arithmetic preserve exact proofs and reduce n=19 LogUp proving to 9.923 seconds and opening to 7.244 seconds, but linear n=33 extrapolation still gives roughly 1.88 proving days plus 1.37 opening days and retained opening sources near 440 GiB per range instance",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];

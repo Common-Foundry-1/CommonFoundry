@@ -1006,13 +1006,15 @@ artifact reads and writes. Row commitments are computed in deterministic
 parallel batches behind a bounded 256 MiB coefficient window; source reads,
 artifact writes, and target-group accumulation remain in canonical row order.
 Inverse source rows use exact Montgomery batch inversion and reject a zero
-denominator before publishing the commitment.
+denominator before publishing the commitment. The Dory G1/G2 MSM and
+elementwise vector routines also use ordered CPU-parallel maps and normalize to
+the same group elements and proof bytes.
 
 | Cell variables | Cells | Packed variables | Recompute prover | Linear prover | Aggregate opening | Verify | Proof | Retained scratch |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 256 | 15 | 4.696 s | 1.954 s | 2.669 s | 0.682 s | 38,929 B | 1,803,148 B |
-| 10 | 1,024 | 17 | 15.160 s | 4.239 s | 5.274 s | 1.254 s | 43,329 B | 7,209,868 B |
-| 12 | 4,096 | 19 | 53.948 s | 9.952 s | 10.504 s | 2.402 s | 47,729 B | 28,836,748 B |
+| 8 | 256 | 15 | 4.696 s | 1.942 s | 1.863 s | 0.684 s | 38,929 B | 1,803,148 B |
+| 10 | 1,024 | 17 | 15.160 s | 4.212 s | 3.641 s | 1.251 s | 43,329 B | 7,209,868 B |
+| 12 | 4,096 | 19 | 53.948 s | 9.923 s | 7.244 s | 2.421 s | 47,729 B | 28,836,748 B |
 
 The current implementation derives every child file from the Fiat-Shamir
 challenge, authenticates its complete header and scalar payload, binds it to the
@@ -1022,17 +1024,18 @@ across the buffer boundary. Buffering alone reduced the prior direct-I/O n=19
 measurement from 48.385 to 42.699 seconds proving and from 19.315 to 10.618
 seconds opening. Bounded parallel row commitments then reduced proving to 9.952
 seconds, 76.7% below the buffered serial-row checkpoint and 81.6% below the
-rejected recomputation prover. Opening remains effectively unchanged at 10.504
-seconds; combined proving and opening time is 61.6% below the buffered
-checkpoint. Proof bytes and retained scratch are unchanged.
+rejected recomputation prover. Parallel Dory MSM/vector routines then reduce
+opening from 10.504 to 7.244 seconds, another 31.0%; combined proving and
+opening time is 67.8% below the buffered checkpoint. Proof bytes and retained
+scratch are unchanged.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
 simultaneous pair of LogUp lineage files at n=19 is exactly 21,627,144 bytes;
 retained opening sources are reported separately in the table. These are
 component measurements, not production results.
 
-A linear extrapolation from n=19 to n=33 gives about 1.89 CPU days for the
-LogUp prover and 1.99 days for the aggregate opening. The first two production
+A linear extrapolation from n=19 to n=33 gives about 1.88 CPU days for the
+LogUp prover and 1.37 days for the aggregate opening. The first two production
 lineage generations project to 220 and 110 GiB, so their transient overlap is
 about 330 GiB. Retained opening sources project to about 440 GiB for one LogUp
 instance, putting its combined scratch near 770 GiB while folding. Four retained

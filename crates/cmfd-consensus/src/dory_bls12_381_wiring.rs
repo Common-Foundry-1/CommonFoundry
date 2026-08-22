@@ -21,10 +21,11 @@ use crate::{
     StructuredWiringError, StructuredWiringStatement,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
-        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
-        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, bounded_signed_code,
+        bounded_signed_dictionary, commit_bls_dory_compact_row_source_with_scratch,
+        commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
+        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
+        verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
@@ -43,7 +44,7 @@ pub const PRODUCTION_BLS_DORY_WIRING_VARIABLES: usize = 29;
 pub const BLS_DORY_WIRING_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar wiring path.
 pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the scratch prover streams signed wiring tables with bounded evaluation memory; its canonical signed-word source preserves the exact commitment, claims, and opening proof and projects to 3,758,096,536 bytes (3.5 GiB) without first-eight-generation fold files, but n=29 latency, peak disk, and peak memory have not been measured",
+    "the scratch prover streams signed wiring tables with bounded evaluation memory; after the first Dory row its canonical authenticated source uses one-byte codes for the fixed bounded-activation dictionary, preserves the exact commitment, claims, and opening proof, and projects to 470,687,704 bytes (about 449 MiB) without first-eight-generation fold files, but n=29 latency, peak disk, and peak memory have not been measured",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar wiring transcript and packed opening path have not received an external audit",
 ];
@@ -731,7 +732,11 @@ struct WiringSignedRowSource<'a> {
     rows: usize,
     columns: usize,
     explicit_scalars: usize,
-    dictionary: [BlsDoryFr; 1],
+    word_scalar_count: usize,
+    word_group_len: usize,
+    signed_word_selectors: u64,
+    dictionary: Vec<BlsDoryFr>,
+    code_maximum: Option<u8>,
 }
 
 impl<'a> WiringSignedRowSource<'a> {
@@ -762,6 +767,24 @@ impl<'a> WiringSignedRowSource<'a> {
         if explicit_scalars > logical_scalars {
             return Err(BlsDoryWiringError::InvalidDimensions);
         }
+        let code_maximum = u8::try_from(statement.max_abs_activation)
+            .ok()
+            .filter(|maximum| *maximum <= 127);
+        let code_dictionary = code_maximum
+            .and_then(bounded_signed_dictionary)
+            .filter(|_| explicit_scalars > columns);
+        let use_codes = code_dictionary.is_some();
+        let (word_scalar_count, word_group_len, signed_word_selectors, dictionary) =
+            if let Some(dictionary) = code_dictionary {
+                (columns, columns, 1, dictionary)
+            } else {
+                (
+                    explicit_scalars,
+                    bank_elements,
+                    (1u64 << used_slots) - 1,
+                    vec![BlsDoryFr::zero()],
+                )
+            };
         Ok(Self {
             initial,
             inputs,
@@ -772,7 +795,11 @@ impl<'a> WiringSignedRowSource<'a> {
             rows,
             columns,
             explicit_scalars,
-            dictionary: [BlsDoryFr::zero()],
+            word_scalar_count,
+            word_group_len,
+            signed_word_selectors,
+            dictionary,
+            code_maximum: if use_codes { code_maximum } else { None },
         })
     }
 
@@ -805,7 +832,7 @@ impl<'a> WiringSignedRowSource<'a> {
 }
 
 impl BlsDoryCompactRowSource for WiringSignedRowSource<'_> {
-    type Error = std::convert::Infallible;
+    type Error = BlsDoryWiringError;
 
     fn rows(&self) -> usize {
         self.rows
@@ -820,15 +847,15 @@ impl BlsDoryCompactRowSource for WiringSignedRowSource<'_> {
     }
 
     fn word_scalar_count(&self) -> usize {
-        self.explicit_scalars
+        self.word_scalar_count
     }
 
     fn word_group_len(&self) -> usize {
-        self.bank_elements
+        self.word_group_len
     }
 
     fn signed_word_selectors(&self) -> u64 {
-        (1u64 << (self.banks * 2 + 1)) - 1
+        self.signed_word_selectors
     }
 
     fn dictionary(&self) -> &[BlsDoryFr] {
@@ -847,12 +874,18 @@ impl BlsDoryCompactRowSource for WiringSignedRowSource<'_> {
         Ok(output.len())
     }
 
-    fn read_code_row(
-        &mut self,
-        _row_index: usize,
-        output: &mut [u8],
-    ) -> Result<usize, Self::Error> {
-        output.fill(0);
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let maximum = self
+            .code_maximum
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, code) in output.iter_mut().enumerate() {
+            *code = bounded_signed_code(self.value(start + column), maximum).ok_or(
+                BlsDoryWiringError::Structured(StructuredWiringError::ValueOutOfRange),
+            )?;
+        }
         Ok(output.len())
     }
 }
@@ -1383,6 +1416,11 @@ mod tests {
             WiringSignedRowSource::new(statement, &initial, &inputs, &outputs, rows, columns)
                 .unwrap();
         let explicit = source.explicit_scalars;
+        assert_eq!(source.word_scalar_count, columns);
+        assert_eq!(source.word_group_len, columns);
+        assert_eq!(source.signed_word_selectors, 1);
+        assert_eq!(source.dictionary.len(), 201);
+        assert_eq!(source.code_maximum, Some(100));
         let mut streamed = Vec::new();
         let mut row = vec![BlsDoryFr::zero(); columns];
         for row_index in 0..explicit.div_ceil(columns) {
@@ -1435,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_word_scratch_source_preserves_exact_opening_proof() {
+    fn bounded_dictionary_scratch_source_preserves_exact_opening_proof() {
         let (statement, initial, inputs, outputs) = fixture();
         let variables = packed_wiring_variables(statement).unwrap();
         let setup = deterministic_bls_dory_setup(variables).unwrap();

@@ -534,22 +534,23 @@ comparison. The v2 research code now implements:
   nine returns to ordinary scalar lineages. Dense, ordinary scratch, and compressed
   paths produce the same proof bytes; corruption aborts and cleans the source. Two n=19
   release runs retained the 47,729-byte proof and measured the same 2,377,688-byte
-  opening peak, down from 18,819,084 bytes by 7.91 times. Activation, accumulator,
-  and wiring sources retain canonical signed 64-bit words instead of expanded
-  field scalars. Model weights retain the first Dory row as signed words and encode
-  every remaining bounded `[-125, 125]` value as one authenticated dictionary byte.
+  opening peak, down from 18,819,084 bytes by 7.91 times. Accumulator sources
+  retain canonical signed 64-bit words instead of expanded field scalars.
+  Activation, wiring, and model-weight sources retain the first Dory row as
+  signed words and encode every remaining bounded `[-125, 125]` value as one
+  authenticated dictionary byte.
   Challenge-bound logical views avoid writing their first eight fold artifacts.
   A complete three-bank n=19 shared-layout run preserved the 84,717-byte proof,
   measured 92.212 seconds proving and 7.045 seconds verification, matched its
   6,866,772-byte aggregate scratch projection exactly, and ended with zero scratch.
   The complete n=33 aggregate-stage projection, including every source and ordered
-  fold overlap, is 55,898,080,516 bytes (about 52.1 GiB), down 7.85 times from
+  fold overlap, is 51,204,162,052 bytes (about 47.7 GiB), down 8.57 times from
   438,943,885,320 bytes (about 408.8 GiB). Further reduction or distribution and a
   complete measured n=33 run are still required;
   two fresh complete n=19 release runs preserved the 84,717-byte proof, measured
-  108.297--108.371 seconds proving and 7.950--8.939 seconds verification,
-  observed the same 50,262,684-byte full-prover scratch peak against a
-  3,139,300-byte aggregate-stage projection, and retained zero scratch;
+  104.535--110.948 seconds proving and 8.297--9.459 seconds verification,
+  observed the same 50,036,636-byte full-prover scratch peak against a
+  2,913,252-byte aggregate-stage projection, and retained zero scratch;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

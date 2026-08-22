@@ -128,7 +128,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, signed-word activation, accumulator, and wiring sources, one-byte bounded model-weight sources, authenticated release/regeneration, and eight challenge-bound source-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 55,898,080,516 bytes (about 52.1 GiB) and the complete n=33 prover has not been run",
+    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, one-byte bounded activation, wiring, and model-weight sources after their first Dory row, signed-word accumulator sources, authenticated release/regeneration, and eight challenge-bound source-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 51,204,162,052 bytes (about 47.7 GiB) and the complete n=33 prover has not been run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -2657,6 +2657,7 @@ fn projected_shared_scratch_bytes_for_shape(
     batch: u64,
     dimension: u64,
     layers_per_bank: u64,
+    max_abs_activation: u8,
     max_abs_weight: u8,
 ) -> Result<BlsDorySharedProductionScratchProjection, BlsDorySharedLayoutError> {
     let logical_scalars = 1u64
@@ -2694,7 +2695,12 @@ fn projected_shared_scratch_bytes_for_shape(
         .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
 
     let matrix_source_per_bank = checked_projection_sum(&[
-        projected_shared_signed_word_source_bytes(logical_scalars, bank_cells, bank_cells)?,
+        projected_shared_signed_byte_source_bytes(
+            logical_scalars,
+            bank_cells,
+            row_scalars,
+            max_abs_activation,
+        )?,
         projected_shared_signed_byte_source_bytes(
             logical_scalars,
             weight_cells,
@@ -2721,8 +2727,12 @@ fn projected_shared_scratch_bytes_for_shape(
     )?
     .checked_mul(transition_count)
     .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
-    let wiring_source_bytes =
-        projected_shared_signed_word_source_bytes(logical_scalars, wiring_scalars, bank_cells)?;
+    let wiring_source_bytes = projected_shared_signed_byte_source_bytes(
+        logical_scalars,
+        wiring_scalars,
+        row_scalars,
+        max_abs_activation,
+    )?;
     let fixed_base_source_bytes =
         projected_shared_scalar_artifact_bytes(logical_scalars, initialization_cells, 1)?;
     let retained_source_bytes = checked_projection_sum(&[
@@ -2929,6 +2939,7 @@ pub fn projected_shared_production_scratch_bytes()
         u64::from(PRODUCTION_V2_BATCH),
         u64::from(PRODUCTION_V2_DIMENSION),
         u64::from(PRODUCTION_V2_LAYERS_PER_BANK),
+        125,
         125,
     )
 }
@@ -4420,6 +4431,7 @@ mod tests {
             ROWS as u64,
             COLUMNS as u64,
             LAYERS as u64,
+            u8::try_from(fixture.matrix_statement.max_abs_activation).unwrap(),
             u8::try_from(fixture.matrix_statement.max_abs_weight).unwrap(),
         )
         .unwrap();
@@ -4712,12 +4724,12 @@ mod tests {
     #[test]
     fn production_claim_accounting_and_shared_projection_are_explicit() {
         let scratch = projected_shared_production_scratch_bytes().unwrap();
-        assert_eq!(scratch.matrix_source_bytes, 9_666_454_296);
+        assert_eq!(scratch.matrix_source_bytes, 8_259_944_664);
         assert_eq!(scratch.transition_source_bytes, 39_159_073_248);
         assert_eq!(scratch.multiplicity_source_bytes, 2_576);
-        assert_eq!(scratch.wiring_source_bytes, 3_758_096_536);
+        assert_eq!(scratch.wiring_source_bytes, 470_687_704);
         assert_eq!(scratch.fixed_base_source_bytes, 16_777_348);
-        assert_eq!(scratch.retained_source_bytes, 52_600_404_004);
+        assert_eq!(scratch.retained_source_bytes, 47_906_485_540);
         assert_eq!(scratch.matrix_first_fold_bytes, 0);
         assert_eq!(scratch.transition_first_fold_bytes, 0);
         assert_eq!(scratch.multiplicity_first_fold_bytes, 1_552);
@@ -4727,7 +4739,7 @@ mod tests {
         assert_eq!(scratch.fifth_generation_fold_bytes, 525_076);
         assert_eq!(scratch.source_materialization_fold_bytes, 3_232_664_668);
         assert_eq!(scratch.aggregate_fold_peak_bytes, 3_297_676_512);
-        assert_eq!(scratch.aggregate_peak_bytes, 55_898_080_516);
+        assert_eq!(scratch.aggregate_peak_bytes, 51_204_162_052);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);

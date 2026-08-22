@@ -46,7 +46,7 @@ pub const PRODUCTION_BLS_DORY_MATRIX_VARIABLES: usize = 31;
 pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
 pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank; activations and accumulators retain canonical signed words while each bounded model weight after the first row is an authenticated one-byte dictionary code, preserving the exact commitments, claims, and proof bytes and projecting all three production matrix sources at 9,666,454,296 bytes (9.0 GiB) without first-eight-generation fold files, but the exact n=31 path still lacks production disk, memory, and latency measurements",
+    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank; bounded activations and model weights after their first Dory row use authenticated one-byte dictionary codes while accumulators retain canonical signed words, preserving the exact commitments, claims, and proof bytes and projecting all three production matrix sources at 8,259,944,664 bytes (7.7 GiB) without first-eight-generation fold files, but the exact n=31 path still lacks production disk, memory, and latency measurements",
     "the final production artifact commitments have not been generated and pinned in network parameters",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
@@ -555,8 +555,9 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     }
     let nu = padded_variables / 2;
     let sigma = padded_variables - nu;
-    let activation_polynomial = commit_signed_table(
+    let activation_polynomial = commit_bounded_signed_table(
         activations,
+        statement.max_abs_activation,
         padded_variables,
         nu,
         sigma,
@@ -1609,6 +1610,21 @@ mod tests {
         let variables = matrix_variables(statement).unwrap();
         let nu = variables / 2;
         let sigma = variables - nu;
+        let columns = 1usize << sigma;
+        let mut activation_source = padded_signed_row_source(
+            &activations,
+            1usize << nu,
+            columns,
+            Some(u8::try_from(statement.max_abs_activation).unwrap()),
+        );
+        assert_eq!(activation_source.word_scalar_count, columns);
+        assert_eq!(activation_source.word_group_len, columns);
+        assert_eq!(activation_source.dictionary.len(), 21);
+        let mut activation_codes = vec![0; columns];
+        activation_source
+            .read_code_row(1, &mut activation_codes)
+            .unwrap();
+        assert_eq!(activation_codes, [1, 12, 15, 2]);
         let setup = deterministic_bls_dory_setup(variables).unwrap();
         let scratch = ScratchDirectory::create();
         let dense = prove_bls_dory_matrix_deferred_at_variables(

@@ -418,12 +418,12 @@ comparison. The v2 research code now implements:
   verifier;
 - an optional `dory-bls12-381-prototype` backend with deterministic,
   identity-pinned BLS12-381 setup, canonical distinct-point aggregation, an
-  exact 121-constraint scalar transition sumcheck, and a packed successor-wiring
-  argument. Witness-free fixture proofs are 27,651 bytes for transition and
-  14,529 bytes for wiring; their n=33 and n=29 production grammars project to
-  89,763 and 64,097 bytes. The scalar matrix argument, packed LogUp path,
-  cross-component commitment links, streaming provers, soundness review, and
-  audit remain activation gates;
+  exact bank-batched matrix sumcheck, a 121-constraint scalar transition
+  sumcheck, and a packed successor-wiring argument. Witness-free fixture proofs
+  are 11,539, 27,651, and 14,529 bytes respectively; their n=31, n=33, and n=29
+  production grammars project to 70,483, 89,763, and 64,097 bytes. The packed
+  LogUp path, cross-component commitment links, streaming provers, soundness
+  review, and audit remain activation gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

@@ -36,7 +36,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 5] = [
-    "the matrix identities and packed LogUp argument are not yet connected over the pairing scalar field",
+    "the production packed LogUp argument is not yet connected over the pairing scalar field",
     "the scalar matrix and transition commitments are not yet linked to the packed wiring roles",
     "the production n=29/n=31/n=33 polynomials are not streamed by this in-memory implementation",
     "the aggregate soundness bound has not been independently reviewed",

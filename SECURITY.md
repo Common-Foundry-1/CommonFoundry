@@ -173,6 +173,16 @@ not ported and consensus does not accept it. Cross-field tests now evaluate
 all 121 bounded transition constraints directly in the BLS12-381 scalar field,
 including signed boundaries and invalid reductions/digits; this establishes
 arithmetic portability, not a complete proof of those constraints.
+The BLS matrix checkpoint now retains distinct activation, model-weight, and
+accumulator commitments, runs the exact degree-two common and degree-three layer
+sumcheck, and authenticates all three terminal evaluations with one aggregate.
+Its executable n=3 fixture is 11,539 bytes, including a 9,439-byte Dory proof.
+The production n=31 grammar projects to 70,483 bytes, including a 66,559-byte
+aggregate, and pins the raw matrix soundness numerator at 45. Unequal table
+geometries, every transcript role, and the canonical outer parser have mutation
+coverage. Production still needs an n=31 streaming prover, the fixed-weight
+commitment derived from `ModelPcsIdentity`, cross-component commitment links,
+soundness review, and audit.
 The BLS transition checkpoint now proves those 121 constraints with a degree-17
 sumcheck and authenticates all 110 terminal evaluations as selector-qualified
 points under one packed Dory commitment. Its canonical outer proof is 27,651
@@ -188,9 +198,9 @@ Its executable two-bank n=6 fixture uses nine openings and is 14,529 bytes. The
 production n=29 grammar uses 31 openings and projects to 64,097 bytes, including
 a 62,479-byte Dory aggregate. The verifier is witness-free and mutation tests
 cover the binding, statement, commitment, every evaluation, transcript, opening,
-and outer parser. The scalar matrix argument and the cross-component links from
-matrix/transition commitments to these wiring roles are still missing; n=29
-streaming, soundness review, and audit also remain gates.
+and outer parser. Cross-component links from the scalar matrix and transition
+commitments to these wiring roles are still missing; n=29 streaming, soundness
+review, and audit also remain gates.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

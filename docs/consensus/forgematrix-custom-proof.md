@@ -808,6 +808,22 @@ prover remains capped at n=16. This executable checkpoint confirms the curve,
 setup, aggregation, and codec route; it is still a sequential, unaudited
 reference and is not connected to consensus.
 
+The matrix checkpoint keeps activation, model-weight, and accumulator tables in
+three distinct commitments. Each table is zero-padded only in high variables to
+the largest table geometry, preserving its natural MLE coordinates while giving
+the Dory aggregate one layout. It executes the exact degree-two common rounds
+and degree-three layer rounds from Section 3, then authenticates the activation,
+weight, and accumulator evaluations together. The executable n=3 fixture is
+11,539 bytes, including a 9,439-byte three-opening aggregate. A fixture with
+unequal activation, weight, and accumulator geometries verifies the high-zero
+padding rule. The production weight table is n=31; its complete matrix grammar
+projects to 70,483 bytes, including 66,559 bytes for the aggregate, and its raw
+sumcheck error numerator is 45. The parser derives both round counts and every
+round degree from the trusted statement before group decoding. Production still
+needs the weight commitment derived from the pinned `ModelPcsIdentity` and
+equality links from the activation and accumulator commitments to the wiring and
+transition components.
+
 The transition checkpoint now goes beyond field-portability tests. It packs the
 110 canonical transition oracles into 128 selector slots under one Dory
 commitment, runs the exact degree-17 sumcheck for all 121 local arithmetic and
@@ -836,8 +852,8 @@ production table has 26 table variables plus three selector variables and needs
 for the aggregate. The verifier receives no activation tables. Its canonical
 parser preflights the statement-derived variables, evaluation count, opening
 length, and total length, and mutation tests cover every evaluation role.
-Production still needs equality links from the future scalar matrix commitments
-and existing packed transition commitments to these wiring roles.
+Production still needs equality links from the scalar matrix commitments and
+existing packed transition commitments to these wiring roles.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -847,11 +863,11 @@ the cubic Goldilocks field, the BN254 reference scalar field, and the actual
 BLS12-381 scalar field across signed boundary cases, while altered reductions
 and digits fail with the same constraint pattern in all three. The selected
 route is therefore native scalar-field re-arithmetization. The distinct-point,
-full local-transition, and successor-wiring transcripts are now ported. The
-matrix and production packed LogUp arguments, plus the cross-component scalar
-commitment links, are not yet connected. Streaming the n=29 wiring, n=33
-transition, and n=31 model polynomials, complete soundness accounting, full
-aggregate measurement, and independent audit remain mandatory activation gates.
+matrix, full local-transition, and successor-wiring transcripts are now ported.
+The production packed LogUp argument and cross-component scalar commitment links
+are not yet connected. Streaming the n=29 wiring, n=33 transition, and n=31
+model polynomials, complete soundness accounting, full aggregate measurement,
+and independent audit remain mandatory activation gates.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

@@ -102,7 +102,7 @@ impl StructuredMatrixStatement {
         Ok(())
     }
 
-    fn table_lengths(&self) -> Result<[usize; 3], StructuredSumcheckError> {
+    pub(crate) fn table_lengths(&self) -> Result<[usize; 3], StructuredSumcheckError> {
         Ok([
             checked_product(&[self.layers, self.rows, self.inner])?,
             checked_product(&[self.layers, self.inner, self.cols])?,
@@ -673,7 +673,7 @@ pub fn verify_structured_matrix_sumcheck(
     })
 }
 
-fn validate_tables(
+pub(crate) fn validate_tables(
     statement: StructuredMatrixStatement,
     activations: &[i64],
     weights: &[i64],

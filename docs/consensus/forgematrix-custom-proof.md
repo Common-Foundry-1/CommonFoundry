@@ -1017,11 +1017,11 @@ denominator before publishing the commitment. The Dory G1/G2 MSM and
 elementwise vector routines also use ordered CPU-parallel maps and normalize to
 the same group elements and proof bytes.
 
-| Cell variables | Cells | Packed variables | Recompute prover | Linear prover | Aggregate opening | Verify | Proof | Retained scratch |
+| Cell variables | Cells | Packed variables | Recompute prover | Linear prover | Aggregate opening | Verify | Proof | Scratch after proof |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 256 | 15 | 4.696 s | 1.942 s | 1.863 s | 0.684 s | 38,929 B | 1,803,148 B |
-| 10 | 1,024 | 17 | 15.160 s | 4.212 s | 3.641 s | 1.251 s | 43,329 B | 7,209,868 B |
-| 12 | 4,096 | 19 | 53.948 s | 9.923 s | 7.244 s | 2.421 s | 47,729 B | 28,836,748 B |
+| 8 | 256 | 15 | 4.696 s | 1.959 s | 1.884 s | 0.685 s | 38,929 B | 0 B |
+| 10 | 1,024 | 17 | 15.160 s | 4.243 s | 3.658 s | 1.255 s | 43,329 B | 0 B |
+| 12 | 4,096 | 19 | 53.948 s | 10.035 s | 7.428 s | 2.394 s | 47,729 B | 0 B |
 
 The current implementation derives every child file from the Fiat-Shamir
 challenge, authenticates its complete header and scalar payload, binds it to the
@@ -1033,16 +1033,21 @@ seconds opening. Bounded parallel row commitments then reduced proving to 9.952
 seconds, 76.7% below the buffered serial-row checkpoint and 81.6% below the
 rejected recomputation prover. Parallel Dory MSM/vector routines then reduce
 opening from 10.504 to 7.244 seconds, another 31.0%; combined proving and
-opening time is 67.8% below the buffered checkpoint. Proof bytes and retained
-scratch are unchanged.
+opening time in the latest consuming run is 67.2% below the buffered
+checkpoint. Proof bytes are unchanged.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
-simultaneous pair of LogUp lineage files at n=19 is exactly 21,627,144 bytes;
-retained opening sources are reported separately in the table. These are
-component measurements, not production results.
+simultaneous pair of LogUp lineage files at n=19 is exactly 21,627,144 bytes.
+Aggregate preparation now derives the complete sumcheck, combined row
+commitments, and `L^T M` vector before final Dory proving. The shared path then
+consumes its deferred openings, releases their authenticated coefficient
+artifacts, and completes the unchanged Dory transcript without borrowing those
+sources. A direct test deletes the source at that boundary and obtains the same
+proof bytes; the three standalone benchmark runs leave zero scratch bytes after
+proof completion. These are component measurements, not production results.
 
-A linear extrapolation from n=19 to n=33 gives about 1.88 CPU days for the
-LogUp prover and 1.37 days for the aggregate opening. The first two production
+A linear extrapolation from n=19 to n=33 gives about 1.90 CPU days for the
+LogUp prover and 1.41 days for the aggregate opening. The first two production
 lineage generations project to 220 and 110 GiB, so their transient overlap is
 about 330 GiB. Retained opening sources project to about 440 GiB for one LogUp
 instance, putting its combined scratch near 770 GiB while folding. Four retained
@@ -1050,9 +1055,11 @@ transition/range pairs now reuse the transition half of those sources and
 therefore project near 1.76 TiB total instead of adding another roughly 880 GiB
 of duplicate arithmetic-transition artifacts. These extrapolations reject the
 current CPU and storage pipeline for production; they are not n=33 measurements.
-The next implementation gate is GPU or distributed linear folding plus early
-aggregation/reclamation of the two remaining sources per pair, followed by a
-complete measured production run.
+The new consuming boundary removes those sources before the final Dory
+reduction and after proof completion, but it does not lower the earlier peak.
+The next implementation gate is GPU or distributed linear folding plus
+aggregation or regeneration that avoids retaining all pair sources before the
+first aggregate fold, followed by a complete measured production run.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

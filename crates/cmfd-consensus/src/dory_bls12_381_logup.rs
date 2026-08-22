@@ -69,7 +69,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel row commitments, Dory arithmetic, artifact I/O, and lineage-authenticated folds preserve exact proofs and reduce n=19 proving to 9.923 seconds and opening to 7.244 seconds, but CPU n=33 still projects to roughly 1.88 proving days plus 1.37 opening days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
+    "bounded parallel work and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 10.035 seconds proving plus 7.428 seconds opening; CPU n=33 projects to roughly 1.90 plus 1.41 days and one LogUp still reaches about 770 GiB peak scratch during preparation, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -3527,7 +3527,7 @@ mod tests {
         let setup_millis = setup_start.elapsed().as_millis();
 
         let prover_start = std::time::Instant::now();
-        let mut prepared = prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
+        let prepared = prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
             b"logup-scaling-benchmark",
             statement,
             &witness,
@@ -3543,30 +3543,32 @@ mod tests {
             b"logup-scaling-benchmark",
             &prepared.proof.transcript_digest,
         );
+        let expected_claims = prepared.openings.claims().to_vec();
+        let mut proof = prepared.proof;
         let (claims, opening_proof) =
-            crate::dory_bls12_381_aggregate::prove_bls_dory_deferred_opening_sets_with_scratch(
+            crate::dory_bls12_381_aggregate::prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
                 &opening_binding,
-                &[&prepared.openings],
+                vec![prepared.openings],
                 &setup,
                 &scratch_directory,
             )
             .unwrap();
-        assert_eq!(claims, prepared.openings.claims());
-        prepared.proof.opening_proof = opening_proof;
+        assert_eq!(claims, expected_claims);
+        proof.opening_proof = opening_proof;
         let opening_millis = opening_start.elapsed().as_millis();
 
         let verification_start = std::time::Instant::now();
         verify_bls_dory_range_logup_at_variables(
             b"logup-scaling-benchmark",
             statement,
-            prepared.proof.transition_commitment,
-            &prepared.proof,
+            proof.transition_commitment,
+            &proof,
             packed_variables,
             &setup,
         )
         .unwrap();
         let verification_millis = verification_start.elapsed().as_millis();
-        let proof_bytes = prepared.proof.encode(statement).unwrap().len();
+        let proof_bytes = proof.encode(statement).unwrap().len();
         let retained_scratch_bytes = directory_bytes(&scratch_directory);
 
         println!(
@@ -3574,7 +3576,6 @@ mod tests {
             statement.elements().unwrap()
         );
 
-        drop(prepared);
         assert_eq!(std::fs::read_dir(&scratch_directory).unwrap().count(), 0);
     }
 

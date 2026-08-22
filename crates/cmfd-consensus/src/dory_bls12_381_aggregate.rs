@@ -48,7 +48,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel row commitments and Dory arithmetic preserve exact proofs and reduce n=19 LogUp proving to 9.923 seconds and opening to 7.244 seconds, but linear n=33 extrapolation still gives roughly 1.88 proving days plus 1.37 opening days and retained opening sources near 440 GiB per range instance",
+    "bounded parallel commitments and Dory arithmetic preserve exact proofs, while consuming openings release sources before final Dory proving; n=19 still takes 10.035 seconds proving plus 7.428 seconds opening, projects to roughly 1.90 plus 1.41 CPU days at n=33, and reaches about 440 GiB of sources per range during preparation",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -1006,6 +1006,18 @@ pub fn prove_bls_dory_same_commitment_openings(
     prove_bls_dory_opening_refs_with_scratch(public_binding, &polynomial_refs, points, setup, None)
 }
 
+struct PreparedBlsDoryOpeningProof {
+    claims: Vec<BlsDoryOpeningClaim>,
+    transcript: BlsDoryTranscript,
+    sumcheck_rounds: Vec<[BlsDoryFr; 3]>,
+    random_point: Vec<BlsDoryFr>,
+    combined_rows: Vec<BlsDoryG1>,
+    vector_matrix_product: Vec<BlsDoryFr>,
+    variables: usize,
+    nu: usize,
+    sigma: usize,
+}
+
 fn prove_bls_dory_opening_refs_with_scratch(
     public_binding: &[u8],
     polynomials: &[&BlsDoryCommittedPolynomial],
@@ -1013,6 +1025,23 @@ fn prove_bls_dory_opening_refs_with_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let prepared = prepare_bls_dory_opening_refs(
+        public_binding,
+        polynomials,
+        points,
+        setup,
+        scratch_directory,
+    )?;
+    finish_prepared_bls_dory_opening(prepared, setup)
+}
+
+fn prepare_bls_dory_opening_refs(
+    public_binding: &[u8],
+    polynomials: &[&BlsDoryCommittedPolynomial],
+    points: &[Vec<BlsDoryFr>],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDoryOpeningProof, BlsDoryAggregateError> {
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
@@ -1064,28 +1093,60 @@ fn prove_bls_dory_opening_refs_with_scratch(
         scratch.as_ref(),
     )?;
 
+    let SumcheckProverOutput {
+        rounds: sumcheck_rounds,
+        terminal,
+        ..
+    } = sumcheck;
+    let SumcheckTerminal {
+        random_point,
+        final_claim,
+        equality_values,
+    } = terminal;
     let lambdas = batching
         .iter()
-        .zip(&sumcheck.terminal.equality_values)
+        .zip(&equality_values)
         .map(|(rho, equality)| *rho * equality)
         .collect::<Vec<_>>();
     let (combined_rows, combined_commitment, vector_matrix_product) =
-        combine_polynomials_for_opening(
-            polynomials,
-            &lambdas,
-            &sumcheck.terminal.random_point,
-            nu,
-            sigma,
-        )?;
+        combine_polynomials_for_opening(polynomials, &lambdas, &random_point, nu, sigma)?;
 
     append_combined_opening(
         &mut transcript,
         &combined_commitment,
-        &sumcheck.terminal.random_point,
-        &sumcheck.terminal.final_claim,
+        &random_point,
+        &final_claim,
     );
+    Ok(PreparedBlsDoryOpeningProof {
+        claims,
+        transcript,
+        sumcheck_rounds,
+        random_point,
+        combined_rows,
+        vector_matrix_product,
+        variables,
+        nu,
+        sigma,
+    })
+}
+
+fn finish_prepared_bls_dory_opening(
+    prepared: PreparedBlsDoryOpeningProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let PreparedBlsDoryOpeningProof {
+        claims,
+        mut transcript,
+        sumcheck_rounds,
+        random_point,
+        combined_rows,
+        vector_matrix_product,
+        variables,
+        nu,
+        sigma,
+    } = prepared;
     let dory_proof = prove_bls_dory_opening_from_vector_product(
-        &sumcheck.terminal.random_point,
+        &random_point,
         combined_rows,
         vector_matrix_product,
         nu,
@@ -1100,7 +1161,7 @@ fn prove_bls_dory_opening_refs_with_scratch(
         variables,
         nu,
         sigma,
-        &sumcheck.rounds,
+        &sumcheck_rounds,
         &dory_proof,
     )?;
     Ok((claims, encoded))
@@ -1116,18 +1177,103 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets(
     prove_bls_dory_deferred_opening_sets_with_optional_scratch(public_binding, sets, setup, None)
 }
 
-pub(crate) fn prove_bls_dory_deferred_opening_sets_with_scratch(
+pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming(
     public_binding: &[u8],
-    sets: &[&BlsDoryDeferredOpeningSet],
+    sets: Vec<BlsDoryDeferredOpeningSet>,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
+        public_binding,
+        sets,
+        setup,
+        None,
+    )
+}
+
+pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
+    public_binding: &[u8],
+    sets: Vec<BlsDoryDeferredOpeningSet>,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
-    prove_bls_dory_deferred_opening_sets_with_optional_scratch(
+    prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
         public_binding,
         sets,
         setup,
         Some(scratch_directory),
     )
+}
+
+fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
+    public_binding: &[u8],
+    sets: Vec<BlsDoryDeferredOpeningSet>,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    if sets.is_empty() {
+        return Err(BlsDoryAggregateError::InvalidClaimCount);
+    }
+    let claim_count = sets.iter().try_fold(0usize, |count, set| {
+        count
+            .checked_add(set.polynomial_indices.len())
+            .ok_or(BlsDoryAggregateError::InvalidClaimCount)
+    })?;
+    let polynomial_count = sets.iter().try_fold(0usize, |count, set| {
+        count
+            .checked_add(set.polynomials.len())
+            .ok_or(BlsDoryAggregateError::InvalidClaimCount)
+    })?;
+    let mut polynomials = Vec::with_capacity(polynomial_count);
+    let mut polynomial_indices = Vec::with_capacity(claim_count);
+    let mut points = Vec::with_capacity(claim_count);
+    let mut expected_claims = Vec::with_capacity(claim_count);
+    for set in sets {
+        let BlsDoryDeferredOpeningSet {
+            polynomials: set_polynomials,
+            polynomial_indices: set_indices,
+            points: set_points,
+            claims: set_claims,
+        } = set;
+        if set_indices.len() != set_points.len()
+            || set_indices.len() != set_claims.len()
+            || set_indices
+                .iter()
+                .any(|index| *index >= set_polynomials.len())
+        {
+            return Err(BlsDoryAggregateError::InvalidClaimCount);
+        }
+        let base = polynomials.len();
+        for index in set_indices {
+            polynomial_indices.push(
+                base.checked_add(index)
+                    .ok_or(BlsDoryAggregateError::InvalidClaimCount)?,
+            );
+        }
+        polynomials.extend(set_polynomials);
+        points.extend(set_points);
+        expected_claims.extend(set_claims);
+    }
+    let polynomial_refs = polynomial_indices
+        .iter()
+        .map(|index| {
+            polynomials
+                .get(*index)
+                .ok_or(BlsDoryAggregateError::InvalidClaimCount)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared = prepare_bls_dory_opening_refs(
+        public_binding,
+        &polynomial_refs,
+        &points,
+        setup,
+        scratch_directory,
+    )?;
+    if prepared.claims != expected_claims {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    drop(polynomial_refs);
+    drop(polynomials);
+    finish_prepared_bls_dory_opening(prepared, setup)
 }
 
 fn prove_bls_dory_deferred_opening_sets_with_optional_scratch(
@@ -2699,6 +2845,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chunked_proof, streamed_proof);
+    }
+
+    #[test]
+    fn prepared_opening_no_longer_borrows_authenticated_sources() {
+        let variables = 8;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let mut source = fixture_row_source(variables);
+        let materialized =
+            commit_bls_dory_polynomial(source.coefficients.clone(), nu, sigma, &setup).unwrap();
+        let artifact =
+            commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, &setup, &scratch.0)
+                .unwrap();
+        let artifact_path = artifact.coefficient_artifact_path().unwrap().to_path_buf();
+        let points = vec![
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 23))
+                .collect::<Vec<_>>(),
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 41))
+                .collect::<Vec<_>>(),
+        ];
+        let ordinary = prove_bls_dory_same_commitment_openings(
+            b"prepared-source-release",
+            &materialized,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        let artifact_refs = vec![&artifact; points.len()];
+        let prepared = prepare_bls_dory_opening_refs(
+            b"prepared-source-release",
+            &artifact_refs,
+            &points,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        drop(artifact_refs);
+        drop(artifact);
+        assert!(!artifact_path.exists());
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        let released = finish_prepared_bls_dory_opening(prepared, &setup).unwrap();
+        assert_eq!(released, ordinary);
     }
 
     #[test]

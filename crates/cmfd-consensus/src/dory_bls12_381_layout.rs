@@ -27,8 +27,8 @@ use crate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
         BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
         commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
-        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
-        prove_bls_dory_deferred_opening_sets_with_scratch, verify_bls_dory_openings,
+        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets_consuming,
+        prove_bls_dory_deferred_opening_sets_consuming_with_scratch, verify_bls_dory_openings,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof,
@@ -1494,29 +1494,48 @@ fn prove_prepared_shared_layout(
     )?;
     let mut opening_sets = Vec::new();
     let mut expected_claims = Vec::new();
-    for matrix in &matrices {
-        opening_sets.push(&matrix.openings);
-        expected_claims.extend_from_slice(matrix.openings.claims());
+    let mut matrix_proofs = Vec::with_capacity(matrices.len());
+    for PreparedBlsDoryMatrixProof { proof, openings } in matrices {
+        expected_claims.extend_from_slice(openings.claims());
+        opening_sets.push(openings);
+        matrix_proofs.push(proof);
     }
-    for (arithmetic, range) in &transitions {
-        opening_sets.push(&arithmetic.openings);
-        expected_claims.extend_from_slice(arithmetic.openings.claims());
-        opening_sets.push(&range.openings);
-        expected_claims.extend_from_slice(range.openings.claims());
+    let mut transition_proofs = Vec::with_capacity(transitions.len());
+    for (arithmetic, range) in transitions {
+        let PreparedBlsDoryTransitionProof {
+            proof: arithmetic_proof,
+            openings: arithmetic_openings,
+        } = arithmetic;
+        let PreparedBlsDoryRangeLogUpProof {
+            proof: range_proof,
+            openings: range_openings,
+        } = range;
+        expected_claims.extend_from_slice(arithmetic_openings.claims());
+        opening_sets.push(arithmetic_openings);
+        expected_claims.extend_from_slice(range_openings.claims());
+        opening_sets.push(range_openings);
+        transition_proofs.push(BlsDoryTransitionRangeProof {
+            arithmetic: arithmetic_proof,
+            range: range_proof,
+        });
     }
-    opening_sets.push(&wiring.openings);
-    expected_claims.extend_from_slice(wiring.openings.claims());
-    opening_sets.push(&fixed_base);
+    let PreparedBlsDoryWiringProof {
+        proof: wiring_proof,
+        openings: wiring_openings,
+    } = wiring;
+    expected_claims.extend_from_slice(wiring_openings.claims());
+    opening_sets.push(wiring_openings);
     expected_claims.extend_from_slice(fixed_base.claims());
+    opening_sets.push(fixed_base);
     let (claims, opening_proof) = if let Some(scratch_directory) = scratch_directory {
-        prove_bls_dory_deferred_opening_sets_with_scratch(
+        prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
             &opening_binding,
-            &opening_sets,
+            opening_sets,
             setup,
             scratch_directory,
         )?
     } else {
-        prove_bls_dory_deferred_opening_sets(&opening_binding, &opening_sets, setup)?
+        prove_bls_dory_deferred_opening_sets_consuming(&opening_binding, opening_sets, setup)?
     };
     if claims != expected_claims {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
@@ -1525,18 +1544,9 @@ fn prove_prepared_shared_layout(
         protocol_version: BLS_DORY_SHARED_LAYOUT_VERSION,
         padded_variables: u16::try_from(padded_variables)
             .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
-        matrices: matrices
-            .into_iter()
-            .map(|prepared| prepared.proof)
-            .collect(),
-        transitions: transitions
-            .into_iter()
-            .map(|(arithmetic, range)| BlsDoryTransitionRangeProof {
-                arithmetic: arithmetic.proof,
-                range: range.proof,
-            })
-            .collect(),
-        wiring: wiring.proof,
+        matrices: matrix_proofs,
+        transitions: transition_proofs,
+        wiring: wiring_proof,
         link_evaluations,
         opening_proof,
     })

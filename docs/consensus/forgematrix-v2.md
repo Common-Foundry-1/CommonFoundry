@@ -485,16 +485,20 @@ comparison. The v2 research code now implements:
   bytes;
   inverse source rows use exact batch inversion. Dory MSM and elementwise vector
   routines are CPU-parallel and preserve the normalized group elements and
-  proof bytes. At n=19 the resulting linear prover took 9.923 seconds versus
+  proof bytes. A consuming aggregate boundary now derives the sumcheck,
+  combined row commitments, and `L^T M`, then releases deferred coefficient
+  artifacts before the final Dory reduction. Direct testing preserves exact
+  proof bytes, and standalone n=15, n=17, and n=19 runs leave zero scratch after
+  completion. At n=19 the latest linear prover took 10.035 seconds versus
   42.699 seconds for the buffered serial-row checkpoint and 53.948 seconds for
-  the rejected recomputation path. Aggregate opening took 7.244 seconds and the
+  the rejected recomputation path. Aggregate opening took 7.428 seconds and the
   verified proof remained 47,729 bytes. Extrapolation to n=33 still gives
-  roughly 1.88 CPU proving days and 1.37
+  roughly 1.90 CPU proving days and 1.41
   aggregate-opening days,
   440 GiB retained scratch, and 330 GiB transient lineage overlap for one range
-  instance. This rejects the current CPU/storage pipeline for production; GPU
-  or distributed folds, early reclamation of the remaining transition and
-  inverse sources, and a complete measured n=33 run remain required;
+  instance during preparation. This rejects the current CPU/storage pipeline
+  for production; GPU or distributed folds, aggregation or regeneration before
+  all pair sources accumulate, and a complete measured n=33 run remain required;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

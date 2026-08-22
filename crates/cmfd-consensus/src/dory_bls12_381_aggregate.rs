@@ -60,7 +60,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, compact transition/mapped sources, signed-word matrix and wiring sources, authenticated release/regeneration, consuming openings, and four challenge-bound aggregate-fold views preserve exact proofs; the complete n=19 shared-layout release run retained the 84,717-byte proof, measured 92.212 seconds proving and 7.045 seconds verification, matched its 6,866,772-byte aggregate scratch projection exactly, and left zero scratch; the exact complete n=33 aggregate-stage projection is now 156,029,690,964 bytes (about 145.3 GiB), down 2.81 times from 438,943,885,320 bytes (about 408.8 GiB), but a complete measured n=33 run remains required",
+    "bounded parallel commitments, compact transition/mapped sources, signed-word activation, accumulator, and wiring sources, one-byte bounded model-weight sources, authenticated release/regeneration, consuming openings, and four challenge-bound aggregate-fold views preserve exact proofs; a complete n=19 shared-layout release run retained the 84,717-byte proof, measured 103.472 seconds proving and 8.241 seconds verification, matched its 6,546,132-byte aggregate scratch projection exactly, and left zero scratch; the exact complete n=33 aggregate-stage projection is now 110,935,310,868 bytes (about 103.3 GiB), down 3.96 times from 438,943,885,320 bytes (about 408.8 GiB), but a complete measured n=33 run remains required",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -71,6 +71,43 @@ const MAX_PUBLIC_BINDING_BYTES: usize = 4_096;
 const ROW_COMMIT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 const AGGREGATE_COMPACT_FOLD_GENERATIONS: usize = 4;
 const AGGREGATE_COMPACT_FOLD_CHUNK_VALUES: usize = 1 << 16;
+
+pub(crate) fn bounded_signed_dictionary(maximum: u8) -> Option<Vec<BlsDoryFr>> {
+    if maximum == 0 || maximum > 127 {
+        return None;
+    }
+    let mut dictionary = Vec::with_capacity(1 + 2 * usize::from(maximum));
+    dictionary.push(BlsDoryFr::zero());
+    dictionary.extend((1..=maximum).map(|value| BlsDoryFr::from_i64(-i64::from(value))));
+    dictionary.extend((1..=maximum).map(|value| BlsDoryFr::from_u64(u64::from(value))));
+    Some(dictionary)
+}
+
+pub(crate) fn bounded_signed_code(value: i64, maximum: u8) -> Option<u8> {
+    let maximum = i64::from(maximum);
+    if maximum == 0 || maximum > 127 || value.unsigned_abs() > maximum as u64 {
+        return None;
+    }
+    if value == 0 {
+        Some(0)
+    } else if value < 0 {
+        u8::try_from(-value).ok()
+    } else {
+        u8::try_from(maximum + value).ok()
+    }
+}
+
+fn is_bounded_signed_dictionary(dictionary: &[BlsDoryFr]) -> bool {
+    if dictionary.len() < 3 || dictionary.len() > 255 || dictionary.len().is_multiple_of(2) {
+        return false;
+    }
+    let maximum = (dictionary.len() - 1) / 2;
+    dictionary[0] == BlsDoryFr::zero()
+        && (1..=maximum).all(|value| {
+            dictionary[value] == BlsDoryFr::from_i64(-(value as i64))
+                && dictionary[maximum + value] == BlsDoryFr::from_u64(value as u64)
+        })
+}
 
 /// One public multilinear evaluation claim against a BLS12-381 Dory commitment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -874,8 +911,17 @@ impl BlsDoryCommittedPolynomial {
 /// matching Dory commitment. It accepts bounded scalar chunks, commits complete
 /// rows in deterministic parallel batches, and never materializes the complete
 /// polynomial.
+enum BlsDoryCommittedPolynomialArtifactWriter {
+    Scalar(BlsDoryFoldArtifactWriter),
+    SignedByte {
+        writer: BlsDoryCompactArtifactWriter,
+        word_scalar_count: usize,
+        maximum: u8,
+    },
+}
+
 pub(crate) struct BlsDoryCommittedPolynomialWriter<'a> {
-    writer: BlsDoryFoldArtifactWriter,
+    writer: BlsDoryCommittedPolynomialArtifactWriter,
     setup: &'a DeterministicBlsDorySetup,
     nu: usize,
     sigma: usize,
@@ -944,8 +990,10 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
             coefficient_count,
             explicit_count,
         )?;
-        let writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
-            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        let writer = BlsDoryCommittedPolynomialArtifactWriter::Scalar(
+            BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+        );
         let row_bytes = columns
             .checked_mul(std::mem::size_of::<BlsDoryFr>())
             .ok_or(BlsDoryAggregateError::InvalidDimension)?;
@@ -972,9 +1020,94 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         })
     }
 
+    pub(crate) fn create_signed_byte(
+        scratch_directory: &Path,
+        explicit_count: usize,
+        nu: usize,
+        sigma: usize,
+        maximum: u8,
+        setup: &'a DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        setup
+            .validate()
+            .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+        validate_layout(nu, sigma)?;
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let coefficient_count = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let dictionary = bounded_signed_dictionary(maximum)
+            .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+        if explicit_count == 0
+            || !explicit_count.is_power_of_two()
+            || explicit_count > coefficient_count
+            || setup.prover().g1_vec.len() < columns
+            || setup.prover().g2_vec.len() < rows
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let fold_spec = source_artifact_spec(
+            setup.identity(),
+            nu,
+            sigma,
+            coefficient_count,
+            explicit_count,
+        )?;
+        let word_scalar_count = explicit_count.min(columns);
+        let compact_spec = BlsDoryCompactArtifactSpec {
+            context_digest: fold_spec.context_digest,
+            scalar_count: fold_spec.scalar_count,
+            explicit_scalar_count: fold_spec.explicit_scalar_count,
+            word_scalar_count: u64::try_from(word_scalar_count)
+                .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+            word_group_len: u64::try_from(word_scalar_count)
+                .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+            signed_word_selectors: 1,
+        };
+        let writer = BlsDoryCommittedPolynomialArtifactWriter::SignedByte {
+            writer: BlsDoryCompactArtifactWriter::create(
+                scratch_directory,
+                compact_spec,
+                dictionary,
+            )
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            word_scalar_count,
+            maximum,
+        };
+        let row_bytes = columns
+            .checked_mul(std::mem::size_of::<BlsDoryFr>())
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let rows_per_chunk = (ROW_COMMIT_CHUNK_BYTES / row_bytes.max(1)).max(1);
+        let explicit_rows = explicit_count.div_ceil(columns);
+        let pending_capacity = rows_per_chunk
+            .min(explicit_rows)
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        Ok(Self {
+            writer,
+            setup,
+            nu,
+            sigma,
+            rows,
+            columns,
+            explicit_count,
+            written: 0,
+            committed_rows: 0,
+            pending_capacity,
+            pending_scalars: Vec::new(),
+            row_commitments: vec![BlsDoryG1::identity(); rows],
+            commitment: BlsDoryGt::identity(),
+        })
+    }
+
     pub(crate) fn write_scalars(
         &mut self,
-        mut scalars: &[BlsDoryFr],
+        scalars: &[BlsDoryFr],
     ) -> Result<(), BlsDoryAggregateError> {
         if scalars.is_empty()
             || self
@@ -984,14 +1117,78 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
+        let BlsDoryCommittedPolynomialArtifactWriter::Scalar(writer) = &mut self.writer else {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        };
+        writer
+            .write_scalars(scalars)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        self.buffer_commitment_scalars(scalars)
+    }
+
+    pub(crate) fn write_signed_values(
+        &mut self,
+        values: &[i64],
+    ) -> Result<(), BlsDoryAggregateError> {
+        if values.is_empty()
+            || self
+                .written
+                .checked_add(values.len())
+                .is_none_or(|end| end > self.explicit_count)
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let start = self.written;
+        let BlsDoryCommittedPolynomialArtifactWriter::SignedByte {
+            writer,
+            word_scalar_count,
+            maximum,
+        } = &mut self.writer
+        else {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        };
+        if values
+            .iter()
+            .any(|value| bounded_signed_code(*value, *maximum).is_none())
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let word_values = word_scalar_count.saturating_sub(start).min(values.len());
+        if word_values > 0 {
+            let words = values[..word_values]
+                .iter()
+                .map(|value| u64::from_le_bytes(value.to_le_bytes()))
+                .collect::<Vec<_>>();
+            writer
+                .write_words(&words)
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        }
+        if word_values < values.len() {
+            let codes = values[word_values..]
+                .iter()
+                .map(|value| bounded_signed_code(*value, *maximum).expect("validated signed code"))
+                .collect::<Vec<_>>();
+            writer
+                .write_codes(&codes)
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        }
+        let scalars = values
+            .iter()
+            .copied()
+            .map(BlsDoryFr::from_i64)
+            .collect::<Vec<_>>();
+        self.buffer_commitment_scalars(&scalars)
+    }
+
+    fn buffer_commitment_scalars(
+        &mut self,
+        mut scalars: &[BlsDoryFr],
+    ) -> Result<(), BlsDoryAggregateError> {
         while !scalars.is_empty() {
             let take = scalars
                 .len()
                 .min(self.pending_capacity - self.pending_scalars.len());
             let segment = &scalars[..take];
-            self.writer
-                .write_scalars(segment)
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
             self.pending_scalars.extend_from_slice(segment);
             self.written += take;
             scalars = &scalars[take..];
@@ -1015,12 +1212,24 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         if self.committed_rows != self.explicit_count.div_ceil(self.columns) {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
-        let artifact = self
-            .writer
-            .finish()
-            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        let coefficients = match self.writer {
+            BlsDoryCommittedPolynomialArtifactWriter::Scalar(writer) => {
+                BlsDoryCoefficientStorage::AuthenticatedArtifact(Arc::new(
+                    writer
+                        .finish()
+                        .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                ))
+            }
+            BlsDoryCommittedPolynomialArtifactWriter::SignedByte { writer, .. } => {
+                BlsDoryCoefficientStorage::CompactArtifact(Arc::new(
+                    writer
+                        .finish()
+                        .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                ))
+            }
+        };
         Ok(BlsDoryCommittedPolynomial {
-            coefficients: BlsDoryCoefficientStorage::AuthenticatedArtifact(Arc::new(artifact)),
+            coefficients,
             commitment: self.commitment,
             row_commitments: self.row_commitments,
             setup_identity: self.setup.identity(),
@@ -2913,9 +3122,7 @@ impl AggregateWordFoldView {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
         let spec = self.source.spec();
-        if spec.word_scalar_count != spec.explicit_scalar_count
-            || self.source.dictionary() != [BlsDoryFr::zero()]
-        {
+        if !aggregate_word_source_supported(&self.source) {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
         let word_group_len = usize::try_from(spec.word_group_len)
@@ -2937,26 +3144,32 @@ impl AggregateWordFoldView {
         let mut visited = 0usize;
         let mut failed = false;
         let read_result = self.source.for_each_encoded_scalar(|index, encoded| {
-            let CompactEncodedScalar::Word { value, signed } = encoded else {
-                failed = true;
-                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
-            };
-            let selector = usize::try_from(index)
-                .ok()
-                .and_then(|index| index.checked_div(word_group_len));
-            if selector.is_none_or(|selector| selector >= 64)
-                || signed
-                    != selector.is_some_and(|selector| {
-                        spec.signed_word_selectors & (1u64 << selector) != 0
-                    })
-            {
-                failed = true;
-                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
-            }
-            block[block_used] = if signed {
-                BlsDoryFr::from_i64(i64::from_le_bytes(value.to_le_bytes()))
-            } else {
-                BlsDoryFr::from_u64(value)
+            block[block_used] = match encoded {
+                CompactEncodedScalar::Word { value, signed } => {
+                    let selector = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| index.checked_div(word_group_len));
+                    if selector.is_none_or(|selector| selector >= 64)
+                        || signed
+                            != selector.is_some_and(|selector| {
+                                spec.signed_word_selectors & (1u64 << selector) != 0
+                            })
+                    {
+                        failed = true;
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
+                    if signed {
+                        BlsDoryFr::from_i64(i64::from_le_bytes(value.to_le_bytes()))
+                    } else {
+                        BlsDoryFr::from_u64(value)
+                    }
+                }
+                CompactEncodedScalar::Code(code) => self
+                    .source
+                    .dictionary()
+                    .get(usize::from(code))
+                    .copied()
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?,
             };
             block_used += 1;
             if block_used == block_len {
@@ -3005,6 +3218,16 @@ impl AggregateWordFoldView {
         }
         Ok(())
     }
+}
+
+fn aggregate_word_source_supported(source: &BlsDoryCompactArtifact) -> bool {
+    let spec = source.spec();
+    (spec.word_scalar_count == spec.explicit_scalar_count
+        && source.dictionary() == [BlsDoryFr::zero()])
+        || (spec.word_scalar_count < spec.explicit_scalar_count
+            && spec.word_scalar_count == spec.word_group_len
+            && spec.signed_word_selectors == 1
+            && is_bounded_signed_dictionary(source.dictionary()))
 }
 
 fn fold_aggregate_word_block(
@@ -3103,10 +3326,7 @@ fn find_aggregate_word_tables(polynomials: &[&BlsDoryCommittedPolynomial]) -> Ve
             else {
                 return None;
             };
-            let spec = source.spec();
-            (spec.word_scalar_count == spec.explicit_scalar_count
-                && source.dictionary() == [BlsDoryFr::zero()])
-            .then_some(table_index)
+            aggregate_word_source_supported(source).then_some(table_index)
         })
         .collect()
 }
@@ -3540,10 +3760,7 @@ fn fold_aggregate_word_table(
         let BlsDoryCoefficientStorage::CompactArtifact(source) = &polynomial.coefficients else {
             return Err(BlsDoryAggregateError::ProverStorage);
         };
-        let spec = source.spec();
-        if spec.word_scalar_count != spec.explicit_scalar_count
-            || source.dictionary() != [BlsDoryFr::zero()]
-        {
+        if !aggregate_word_source_supported(source) {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
         (Arc::clone(source), table.lineage_digest, Vec::new())
@@ -4842,6 +5059,24 @@ mod tests {
             dictionary: vec![BlsDoryFr::zero()],
             tamper_first_code: false,
         }
+    }
+
+    #[test]
+    fn bounded_signed_dictionary_has_canonical_codes_and_rejects_out_of_range_values() {
+        let dictionary = bounded_signed_dictionary(125).unwrap();
+        assert_eq!(dictionary.len(), 251);
+        assert!(is_bounded_signed_dictionary(&dictionary));
+        for value in -125..=125 {
+            let code = bounded_signed_code(value, 125).unwrap();
+            assert_eq!(dictionary[usize::from(code)], BlsDoryFr::from_i64(value));
+        }
+        assert_eq!(bounded_signed_code(-126, 125), None);
+        assert_eq!(bounded_signed_code(126, 125), None);
+        assert_eq!(bounded_signed_dictionary(0), None);
+
+        let mut reordered = dictionary;
+        reordered.swap(1, 2);
+        assert!(!is_bounded_signed_dictionary(&reordered));
     }
 
     fn fixture(variables: usize, claims: usize) -> Fixture {

@@ -129,7 +129,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, signed-word matrix and wiring sources, authenticated release/regeneration, and four challenge-bound aggregate-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 156,029,690,964 bytes (about 145.3 GiB) and the complete n=33 prover has not been run",
+    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, signed-word activation, accumulator, and wiring sources, one-byte bounded model-weight sources, authenticated release/regeneration, and four challenge-bound aggregate-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 110,935,310,868 bytes (about 103.3 GiB) and the complete n=33 prover has not been run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -378,7 +378,12 @@ struct PreparedDoryRole<'a> {
     role: ModelPcsRole,
     expected_elements: u64,
     next_offset: u64,
-    writer: BlsDoryCommittedPolynomialWriter<'a>,
+    writer: PreparedDoryWriter<'a>,
+}
+
+enum PreparedDoryWriter<'a> {
+    Scalar(BlsDoryCommittedPolynomialWriter<'a>),
+    SignedByte(BlsDoryCommittedPolynomialWriter<'a>),
 }
 
 struct BlsDoryPreparedFixedModelSink<'a> {
@@ -439,14 +444,29 @@ impl<'a> BlsDoryPreparedFixedModelSink<'a> {
             .map(|(role, expected_elements)| {
                 let explicit_count = usize::try_from(expected_elements)
                     .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
-                let writer = BlsDoryCommittedPolynomialWriter::create(
-                    scratch_directory,
-                    explicit_count,
-                    nu,
-                    sigma,
-                    setup,
-                )
-                .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+                let writer = match role {
+                    ModelPcsRole::BaseInput => PreparedDoryWriter::Scalar(
+                        BlsDoryCommittedPolynomialWriter::create(
+                            scratch_directory,
+                            explicit_count,
+                            nu,
+                            sigma,
+                            setup,
+                        )
+                        .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?,
+                    ),
+                    ModelPcsRole::WeightBank { .. } => PreparedDoryWriter::SignedByte(
+                        BlsDoryCommittedPolynomialWriter::create_signed_byte(
+                            scratch_directory,
+                            explicit_count,
+                            nu,
+                            sigma,
+                            125,
+                            setup,
+                        )
+                        .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?,
+                    ),
+                };
                 Ok(PreparedDoryRole {
                     role,
                     expected_elements,
@@ -487,15 +507,30 @@ impl StagedModelFieldSink for BlsDoryPreparedFixedModelSink<'_> {
         {
             return Err(BlsDoryFixedModelStreamError::InvalidChunk);
         }
-        let scalars = chunk
-            .elements
-            .iter()
-            .copied()
-            .map(bls_scalar_from_model_field)
-            .collect::<Result<Vec<_>, _>>()?;
-        role.writer
-            .write_scalars(&scalars)
-            .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+        match &mut role.writer {
+            PreparedDoryWriter::Scalar(writer) => {
+                let scalars = chunk
+                    .elements
+                    .iter()
+                    .copied()
+                    .map(bls_scalar_from_model_field)
+                    .collect::<Result<Vec<_>, _>>()?;
+                writer
+                    .write_scalars(&scalars)
+                    .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+            }
+            PreparedDoryWriter::SignedByte(writer) => {
+                let values = chunk
+                    .elements
+                    .iter()
+                    .copied()
+                    .map(signed_model_value)
+                    .collect::<Result<Vec<_>, _>>()?;
+                writer
+                    .write_signed_values(&values)
+                    .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+            }
+        }
         role.next_offset = chunk_end;
         if chunk_end == role.expected_elements {
             self.next_role += 1;
@@ -520,9 +555,12 @@ impl StagedModelFieldSink for BlsDoryPreparedFixedModelSink<'_> {
             return Err(BlsDoryFixedModelStreamError::ReceiptMismatch);
         }
         let mut polynomials = self.roles.into_iter().map(|role| {
-            role.writer
-                .finish()
-                .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)
+            match role.writer {
+                PreparedDoryWriter::Scalar(writer) | PreparedDoryWriter::SignedByte(writer) => {
+                    writer.finish()
+                }
+            }
+            .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)
         });
         let base_input = polynomials
             .next()
@@ -792,14 +830,20 @@ impl StagedModelFieldSink for BlsDoryFixedModelSink<'_> {
 }
 
 fn bls_scalar_from_model_field(value: u64) -> Result<BlsDoryFr, BlsDoryFixedModelStreamError> {
+    signed_model_value(value).map(BlsDoryFr::from_i64)
+}
+
+fn signed_model_value(value: u64) -> Result<i64, BlsDoryFixedModelStreamError> {
     if value <= 125 {
-        return Ok(BlsDoryFr::from_u64(value));
+        return i64::try_from(value).map_err(|_| BlsDoryFixedModelStreamError::InvalidFieldValue);
     }
     let negative_floor = GOLDILOCKS_MODULUS - 125;
     if value < negative_floor || value >= GOLDILOCKS_MODULUS {
         return Err(BlsDoryFixedModelStreamError::InvalidFieldValue);
     }
-    Ok(-BlsDoryFr::from_u64(GOLDILOCKS_MODULUS - value))
+    i64::try_from(GOLDILOCKS_MODULUS - value)
+        .map(|magnitude| -magnitude)
+        .map_err(|_| BlsDoryFixedModelStreamError::InvalidFieldValue)
 }
 
 fn commit_fixed_table(
@@ -2509,6 +2553,28 @@ fn projected_shared_signed_word_source_bytes(
     .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
 }
 
+fn projected_shared_signed_byte_source_bytes(
+    logical_scalars: u64,
+    explicit_scalars: u64,
+    row_scalars: u64,
+    maximum: u8,
+) -> Result<u64, BlsDorySharedLayoutError> {
+    let dictionary_len = usize::from(maximum)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    BlsDoryCompactArtifactSpec {
+        context_digest: [1; 32],
+        scalar_count: logical_scalars,
+        explicit_scalar_count: explicit_scalars,
+        word_scalar_count: explicit_scalars.min(row_scalars),
+        word_group_len: explicit_scalars.min(row_scalars),
+        signed_word_selectors: 1,
+    }
+    .encoded_bytes(dictionary_len)
+    .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
+}
+
 fn projected_shared_transition_source_bytes(
     logical_scalars: u64,
     cells: u64,
@@ -2617,6 +2683,7 @@ fn projected_shared_scratch_bytes_for_shape(
     batch: u64,
     dimension: u64,
     layers_per_bank: u64,
+    max_abs_weight: u8,
 ) -> Result<BlsDorySharedProductionScratchProjection, BlsDorySharedLayoutError> {
     let logical_scalars = 1u64
         .checked_shl(padded_variables as u32)
@@ -2648,10 +2715,18 @@ fn projected_shared_scratch_bytes_for_shape(
     let transition_count = banks
         .checked_add(1)
         .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let row_scalars = 1u64
+        .checked_shl((padded_variables - padded_variables / 2) as u32)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
 
     let matrix_source_per_bank = checked_projection_sum(&[
         projected_shared_signed_word_source_bytes(logical_scalars, bank_cells, bank_cells)?,
-        projected_shared_signed_word_source_bytes(logical_scalars, weight_cells, weight_cells)?,
+        projected_shared_signed_byte_source_bytes(
+            logical_scalars,
+            weight_cells,
+            row_scalars,
+            max_abs_weight,
+        )?,
         projected_shared_signed_word_source_bytes(logical_scalars, bank_cells, bank_cells)?,
     ])?;
     let matrix_source_bytes = matrix_source_per_bank
@@ -2887,6 +2962,7 @@ pub fn projected_shared_production_scratch_bytes()
         u64::from(PRODUCTION_V2_BATCH),
         u64::from(PRODUCTION_V2_DIMENSION),
         u64::from(PRODUCTION_V2_LAYERS_PER_BANK),
+        125,
     )
 }
 
@@ -3099,7 +3175,7 @@ mod tests {
 
     #[test]
     fn verified_model_stream_publishes_reusable_exact_polynomials_and_cleans_up() {
-        const PADDED_VARIABLES: usize = 5;
+        const PADDED_VARIABLES: usize = 4;
         let setup = deterministic_bls_dory_setup(6).unwrap();
         let (built, model, base, weight_banks) = authenticated_fixed_model_fixture();
         let weight_slices = weight_banks.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -4377,6 +4453,7 @@ mod tests {
             ROWS as u64,
             COLUMNS as u64,
             LAYERS as u64,
+            u8::try_from(fixture.matrix_statement.max_abs_weight).unwrap(),
         )
         .unwrap();
 
@@ -4668,12 +4745,12 @@ mod tests {
     #[test]
     fn production_claim_accounting_and_shared_projection_are_explicit() {
         let scratch = projected_shared_production_scratch_bytes().unwrap();
-        assert_eq!(scratch.matrix_source_bytes, 54_760_834_392);
+        assert_eq!(scratch.matrix_source_bytes, 9_666_454_296);
         assert_eq!(scratch.transition_source_bytes, 39_159_073_248);
         assert_eq!(scratch.multiplicity_source_bytes, 2_576);
         assert_eq!(scratch.wiring_source_bytes, 3_758_096_536);
         assert_eq!(scratch.fixed_base_source_bytes, 16_777_348);
-        assert_eq!(scratch.retained_source_bytes, 97_694_784_100);
+        assert_eq!(scratch.retained_source_bytes, 52_600_404_004);
         assert_eq!(scratch.matrix_first_fold_bytes, 0);
         assert_eq!(scratch.transition_first_fold_bytes, 48_646_062_768);
         assert_eq!(scratch.multiplicity_first_fold_bytes, 1_552);
@@ -4682,7 +4759,7 @@ mod tests {
         assert_eq!(scratch.first_generation_fold_bytes, 48_654_453_060);
         assert_eq!(scratch.fifth_generation_fold_bytes, 51_722_587_228);
         assert_eq!(scratch.aggregate_fold_peak_bytes, 58_334_906_864);
-        assert_eq!(scratch.aggregate_peak_bytes, 156_029_690_964);
+        assert_eq!(scratch.aggregate_peak_bytes, 110_935_310_868);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);

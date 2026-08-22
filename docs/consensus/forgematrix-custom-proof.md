@@ -1101,23 +1101,32 @@ retained the 47,729-byte proof, ended with zero scratch, and measured the same
 84,717-byte proof, 92.212 seconds proving, 7.045 seconds verification, and zero
 retained scratch. Its 6,866,772-byte observed peak exactly matched the executable
 aggregate-lifecycle projection, down from the 10,963,892-byte pre-compression
-baseline by 1.60 times while preserving proof bytes. Canonical signed-word matrix
-and wiring sources now authenticate the original 64-bit values without expanding
-them to 32-byte scalars. For the first four aggregate challenges, role-bound word
+baseline by 1.60 times while preserving proof bytes. Canonical signed-word
+activation, accumulator, and wiring sources authenticate the original 64-bit
+values without expanding them to 32-byte scalars. For the first four aggregate challenges, role-bound word
 views recompute their folds directly from that authenticated source and bind the
 source digest, original polynomial lineage, and every challenge; generation five
 returns to ordinary authenticated scalar artifacts. Exact differential tests
 preserve commitments, claims, and aggregate proof bytes, while altered lineage
-digests and source corruption abort.
+digests and source corruption abort. Model weights use the stricter production
+bound of `[-125, 125]`: the first Dory row remains canonical signed words and every
+remaining weight is one authenticated byte selecting the fixed dictionary
+`0, -1..-125, 1..125`. The model-bank streaming writer produces this format
+directly, so it never creates the former 32-byte-per-weight scalar artifact.
 
 The complete executable n=33 aggregate-stage projection now includes every matrix,
 transition, multiplicity, wiring, and fixed-base source plus the entire ordered
-fold-artifact lifecycle. Retained sources total 97,694,784,100 bytes (about 91.0
+fold-artifact lifecycle. Retained sources total 52,600,404,004 bytes (about 49.0
 GiB), the fold peak is 58,334,906,864 bytes (about 54.3 GiB), and their combined
-peak is 156,029,690,964 bytes (about 145.3 GiB). This is a 2.81-times reduction
-from the prior complete 438,943,885,320-byte projection (about 408.8 GiB). It is
-still a code-pinned rejection estimate, not a production measurement. Further
-reduction or distribution and a complete unchanged n=33 run remain mandatory.
+peak is 110,935,310,868 bytes (about 103.3 GiB). This is a 3.96-times reduction
+from the prior complete 438,943,885,320-byte projection (about 408.8 GiB), and a
+1.41-times reduction from the immediately preceding 156,029,690,964-byte
+projection. It is still a code-pinned rejection estimate, not a production
+measurement. Further reduction or distribution and a complete unchanged n=33
+run remain mandatory. A fresh complete n=19 release run preserved the 84,717-byte
+proof, measured 103.472 seconds proving and 8.241 seconds verification, matched
+its 6,546,132-byte aggregate scratch projection exactly, and retained zero
+scratch after completion.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

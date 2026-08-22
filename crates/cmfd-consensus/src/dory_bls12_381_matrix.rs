@@ -23,6 +23,7 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCompactRowSource,
         BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        bounded_signed_code, bounded_signed_dictionary,
         commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
@@ -45,7 +46,7 @@ pub const PRODUCTION_BLS_DORY_MATRIX_VARIABLES: usize = 31;
 pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
 pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank; canonical signed-word sources preserve the exact commitments, claims, and proof bytes and project all three production matrix sources at 54,760,834,392 bytes (51 GiB) without first-four-generation fold files, but the exact n=31 path still lacks production disk, memory, and latency measurements",
+    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank; activations and accumulators retain canonical signed words while each bounded model weight after the first row is an authenticated one-byte dictionary code, preserving the exact commitments, claims, and proof bytes and projecting all three production matrix sources at 9,666,454,296 bytes (9.0 GiB) without first-four-generation fold files, but the exact n=31 path still lacks production disk, memory, and latency measurements",
     "the final production artifact commitments have not been generated and pinned in network parameters",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
@@ -563,8 +564,9 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
         scratch_directory,
     )?;
     let weight_polynomial = match weight_source {
-        MatrixWeightProverSource::Signed(weights) => commit_signed_table(
+        MatrixWeightProverSource::Signed(weights) => commit_bounded_signed_table(
             weights,
+            statement.max_abs_weight,
             padded_variables,
             nu,
             sigma,
@@ -1098,11 +1100,14 @@ struct PaddedSignedRowSource<'a> {
     values: &'a [i64],
     rows: usize,
     columns: usize,
-    dictionary: [BlsDoryFr; 1],
+    word_scalar_count: usize,
+    word_group_len: usize,
+    dictionary: Vec<BlsDoryFr>,
+    code_maximum: Option<u8>,
 }
 
 impl BlsDoryRowSource for PaddedSignedRowSource<'_> {
-    type Error = std::convert::Infallible;
+    type Error = ();
 
     fn rows(&self) -> usize {
         self.rows
@@ -1135,7 +1140,7 @@ impl BlsDoryRowSource for PaddedSignedRowSource<'_> {
 }
 
 impl BlsDoryCompactRowSource for PaddedSignedRowSource<'_> {
-    type Error = std::convert::Infallible;
+    type Error = ();
 
     fn rows(&self) -> usize {
         self.rows
@@ -1150,11 +1155,11 @@ impl BlsDoryCompactRowSource for PaddedSignedRowSource<'_> {
     }
 
     fn word_scalar_count(&self) -> usize {
-        self.values.len()
+        self.word_scalar_count
     }
 
     fn word_group_len(&self) -> usize {
-        self.values.len()
+        self.word_group_len
     }
 
     fn signed_word_selectors(&self) -> u64 {
@@ -1182,19 +1187,95 @@ impl BlsDoryCompactRowSource for PaddedSignedRowSource<'_> {
         Ok(output.len())
     }
 
-    fn read_code_row(
-        &mut self,
-        _row_index: usize,
-        output: &mut [u8],
-    ) -> Result<usize, Self::Error> {
-        output.fill(0);
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let maximum = self.code_maximum.ok_or(())?;
+        let start = row_index * self.columns;
+        for (column, code) in output.iter_mut().enumerate() {
+            *code = match self.values.get(start + column).copied() {
+                Some(value) => bounded_signed_code(value, maximum).ok_or(())?,
+                None => 0,
+            };
+        }
         Ok(output.len())
+    }
+}
+
+fn padded_signed_row_source<'a>(
+    values: &'a [i64],
+    rows: usize,
+    columns: usize,
+    code_maximum: Option<u8>,
+) -> PaddedSignedRowSource<'a> {
+    let use_codes = code_maximum
+        .and_then(bounded_signed_dictionary)
+        .filter(|_| values.len() > columns);
+    if let Some(dictionary) = use_codes {
+        return PaddedSignedRowSource {
+            values,
+            rows,
+            columns,
+            word_scalar_count: columns,
+            word_group_len: columns,
+            dictionary,
+            code_maximum,
+        };
+    }
+    PaddedSignedRowSource {
+        values,
+        rows,
+        columns,
+        word_scalar_count: values.len(),
+        word_group_len: values.len(),
+        dictionary: vec![BlsDoryFr::zero()],
+        code_maximum: None,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn commit_signed_table(
     values: &[i64],
+    padded_variables: usize,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+    commit_signed_table_with_codes(
+        values,
+        None,
+        padded_variables,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_bounded_signed_table(
+    values: &[i64],
+    maximum: u64,
+    padded_variables: usize,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+    commit_signed_table_with_codes(
+        values,
+        u8::try_from(maximum).ok().filter(|maximum| *maximum <= 127),
+        padded_variables,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_signed_table_with_codes(
+    values: &[i64],
+    code_maximum: Option<u8>,
     padded_variables: usize,
     nu: usize,
     sigma: usize,
@@ -1214,12 +1295,7 @@ fn commit_signed_table(
         let columns = 1usize
             .checked_shl(sigma as u32)
             .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
-        let mut source = PaddedSignedRowSource {
-            values,
-            rows,
-            columns,
-            dictionary: [BlsDoryFr::zero()],
-        };
+        let mut source = padded_signed_row_source(values, rows, columns, code_maximum);
         if values.len().is_multiple_of(columns) {
             return commit_bls_dory_compact_row_source_with_scratch(
                 &mut source,
@@ -1571,8 +1647,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(compact_opening, dense_opening);
-        let weight =
-            commit_signed_table(&weights, variables, nu, sigma, &setup, Some(&scratch.0)).unwrap();
+        let weight = commit_bounded_signed_table(
+            &weights,
+            statement.max_abs_weight,
+            variables,
+            nu,
+            sigma,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        assert_eq!(
+            weight
+                .coefficient_artifact_path()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            828
+        );
         let streamed = prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
             b"precommitted-weight",
             statement,

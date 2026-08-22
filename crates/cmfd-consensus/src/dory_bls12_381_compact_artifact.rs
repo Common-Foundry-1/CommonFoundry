@@ -31,7 +31,7 @@ const MAPPED_ARTIFACT_HASH_DOMAIN: &str =
 static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
-enum CompactEncodedScalar {
+pub(crate) enum CompactEncodedScalar {
     Word { value: u64, signed: bool },
     Code(u8),
 }
@@ -346,7 +346,7 @@ impl BlsDoryCompactArtifact {
         })
     }
 
-    fn for_each_encoded_scalar(
+    pub(crate) fn for_each_encoded_scalar(
         &self,
         mut visitor: impl FnMut(u64, CompactEncodedScalar) -> Result<(), BlsDoryCompactArtifactError>,
     ) -> Result<(), BlsDoryCompactArtifactError> {

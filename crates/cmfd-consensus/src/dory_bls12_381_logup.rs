@@ -83,7 +83,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, compact transition sources, mapped inverse views, four challenge-bound compressed LogUp generations, authenticated release/regeneration between range pairs, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 takes 9.480 seconds proving, 2.267 seconds regenerating one source, and 7.043 seconds opening; CPU n=33 projects to roughly 1.80 days plus 10.32 hours per regenerated source plus 1.34 opening days, four regenerated sources still project near 48.5 GiB before aggregation, and aggregate-fold overlap is not yet measured, so GPU or distributed folds and a complete n=33 measurement remain required",
+    "bounded parallel work, compact transition sources, mapped inverse views, authenticated release/regeneration, consuming openings, and four challenge-bound shared aggregate-fold generations preserve exact proofs and leave zero scratch after completion; two n=19 release runs retained the 47,729-byte proof and measured 2,377,688 peak opening scratch, down from 18,819,084 bytes, while the exact n=33 retained-source and transition/mapped-fold lower bound fell from 1,056,025,091,748 to 126,500,212,028 bytes (about 117.8 GiB) for four pairs; multiplicity, matrix, wiring, GPU/distributed proving, and a complete measured n=33 run remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -451,6 +451,177 @@ pub fn projected_production_range_logup_four_pair_peak_bytes() -> Result<u64, Bl
         .checked_mul(4)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
     Ok(component_peak.max(regenerated_sources))
+}
+
+fn projected_aggregate_fold_artifact_bytes(
+    logical_scalars: u64,
+    explicit_scalars: u64,
+    generation: u32,
+) -> Result<u64, BlsDoryRangeLogUpError> {
+    BlsDoryFoldArtifactSpec {
+        context_digest: [1; 32],
+        table_index: 0,
+        generation,
+        scalar_count: logical_scalars,
+        explicit_scalar_count: explicit_scalars,
+        parent_digest: [2; 32],
+    }
+    .encoded_bytes()
+    .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
+/// Exact transition/range contribution to the aggregate scratch peak for one
+/// production pair. Source owners remain live while two scalar fold lineages
+/// (transition and mapped inverse) overlap generations one and two.
+pub fn projected_production_range_logup_aggregate_fold_peak_bytes()
+-> Result<u64, BlsDoryRangeLogUpError> {
+    let logical = 1u64
+        .checked_shl(PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let elements = logical
+        .checked_shr(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let explicit = elements
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let first = projected_aggregate_fold_artifact_bytes(logical / 2, explicit.div_ceil(2), 1)?;
+    let second = projected_aggregate_fold_artifact_bytes(logical / 4, explicit.div_ceil(4), 2)?;
+    let multiplicity_source =
+        projected_aggregate_fold_artifact_bytes(logical, TABLE_VALUES as u64, 1)?;
+    let multiplicity_first =
+        projected_aggregate_fold_artifact_bytes(logical / 2, (TABLE_VALUES / 2) as u64, 1)?;
+    projected_production_transition_range_source_bytes()?
+        .checked_add(multiplicity_source)
+        .and_then(|bytes| bytes.checked_add(first.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(multiplicity_first))
+        .and_then(|bytes| bytes.checked_add(second))
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
+/// Exact transition/range contribution to the shared four-pair aggregate peak.
+/// This excludes matrix and wiring polynomials, so it is a lower bound on the
+/// complete shared prover's scratch requirement.
+pub fn projected_production_shared_transition_aggregate_fold_peak_bytes()
+-> Result<u64, BlsDoryRangeLogUpError> {
+    let logical = 1u64
+        .checked_shl(PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let elements = logical
+        .checked_shr(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let explicit = elements
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let first = projected_aggregate_fold_artifact_bytes(logical / 2, explicit.div_ceil(2), 1)?;
+    let second = projected_aggregate_fold_artifact_bytes(logical / 4, explicit.div_ceil(4), 2)?;
+    let multiplicity_source =
+        projected_aggregate_fold_artifact_bytes(logical, TABLE_VALUES as u64, 1)?;
+    let multiplicity_first =
+        projected_aggregate_fold_artifact_bytes(logical / 2, (TABLE_VALUES / 2) as u64, 1)?;
+    projected_production_transition_range_source_bytes()?
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(multiplicity_source.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(first.checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(multiplicity_first.checked_mul(4)?))
+        .and_then(|bytes| bytes.checked_add(second))
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
+/// Exact retained-source and fold-lineage peak for one production
+/// transition/mapped-inverse pair after the aggregate reuses the first four
+/// compressed generations. Multiplicity, matrix, and wiring tables are not
+/// included.
+pub fn projected_production_range_logup_compressed_aggregate_pair_peak_bytes()
+-> Result<u64, BlsDoryRangeLogUpError> {
+    let logical = 1u64
+        .checked_shl(PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let elements = logical
+        .checked_shr(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let explicit = elements
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let compressed = projected_production_range_logup_compressed_lineage_bytes()?;
+    let scalar_five =
+        projected_aggregate_fold_artifact_bytes(logical >> 5, explicit.div_ceil(1 << 5), 5)?;
+    let scalar_six =
+        projected_aggregate_fold_artifact_bytes(logical >> 6, explicit.div_ceil(1 << 6), 6)?;
+    let mut fold_peak = compressed[0];
+    for pair in compressed.windows(2) {
+        fold_peak = fold_peak.max(
+            pair[0]
+                .checked_add(pair[1])
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+        );
+    }
+    fold_peak = fold_peak.max(
+        compressed[LOGUP_COMPRESSED_GENERATIONS - 1]
+            .checked_add(
+                scalar_five
+                    .checked_mul(2)
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+            )
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+    );
+    fold_peak = fold_peak.max(
+        scalar_five
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(scalar_six))
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+    );
+    projected_production_transition_range_source_bytes()?
+        .checked_add(fold_peak)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
+/// Exact retained-source and fold-lineage lower bound for four production
+/// transition/mapped-inverse pairs after aggregate compression. It models the
+/// temporary parent/child overlap created by sequential authenticated writers;
+/// multiplicity, matrix, and wiring tables remain outside this bound.
+pub fn projected_production_shared_transition_compressed_aggregate_fold_peak_bytes()
+-> Result<u64, BlsDoryRangeLogUpError> {
+    let logical = 1u64
+        .checked_shl(PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let elements = logical
+        .checked_shr(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let explicit = elements
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let compressed = projected_production_range_logup_compressed_lineage_bytes()?;
+    let scalar_five =
+        projected_aggregate_fold_artifact_bytes(logical >> 5, explicit.div_ceil(1 << 5), 5)?;
+    let scalar_six =
+        projected_aggregate_fold_artifact_bytes(logical >> 6, explicit.div_ceil(1 << 6), 6)?;
+    let mut fold_peak = compressed[0]
+        .checked_mul(4)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    for pair in compressed.windows(2) {
+        fold_peak = fold_peak.max(
+            pair[0]
+                .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(pair[1]))
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+        );
+    }
+    fold_peak = fold_peak.max(
+        scalar_five
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(compressed[LOGUP_COMPRESSED_GENERATIONS - 1]))
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+    );
+    fold_peak = fold_peak.max(
+        scalar_five
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(scalar_six))
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+    );
+    projected_production_transition_range_source_bytes()?
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(fold_peak))
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
 }
 
 pub fn prove_bls_dory_range_logup(
@@ -3884,6 +4055,16 @@ mod tests {
             .sum()
     }
 
+    fn observed_directory_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum()
+    }
+
     #[test]
     fn inverse_row_source_matches_materialized_inverse_prefix() {
         let (statement, _, witness) = fixture();
@@ -4582,6 +4763,27 @@ mod tests {
         let regeneration_millis = regeneration_start.elapsed().as_millis();
         let regenerated_scratch_bytes = directory_bytes(&scratch_directory);
 
+        let stop_observer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak_scratch_bytes =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(regenerated_scratch_bytes));
+        let observer = {
+            let path = scratch_directory.clone();
+            let stop = std::sync::Arc::clone(&stop_observer);
+            let peak = std::sync::Arc::clone(&peak_scratch_bytes);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    peak.fetch_max(
+                        observed_directory_bytes(&path),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                peak.fetch_max(
+                    observed_directory_bytes(&path),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            })
+        };
         let opening_start = std::time::Instant::now();
         let opening_binding = opening_binding(
             b"logup-scaling-benchmark",
@@ -4600,6 +4802,10 @@ mod tests {
         assert_eq!(claims, expected_claims);
         proof.opening_proof = opening_proof;
         let opening_millis = opening_start.elapsed().as_millis();
+        stop_observer.store(true, std::sync::atomic::Ordering::Relaxed);
+        observer.join().unwrap();
+        let opening_peak_scratch_bytes =
+            peak_scratch_bytes.load(std::sync::atomic::Ordering::Relaxed);
 
         let verification_start = std::time::Instant::now();
         verify_bls_dory_range_logup_at_variables(
@@ -4616,7 +4822,7 @@ mod tests {
         let retained_scratch_bytes = directory_bytes(&scratch_directory);
 
         println!(
-            "CMFD_BLS_LOGUP_BENCHMARK {{\"cell_variables\":{cell_variables},\"cells\":{},\"packed_variables\":{packed_variables},\"witness_millis\":{witness_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"prepared_scratch_bytes\":{prepared_scratch_bytes},\"released_scratch_bytes\":{released_scratch_bytes},\"regeneration_millis\":{regeneration_millis},\"regenerated_scratch_bytes\":{regenerated_scratch_bytes},\"opening_millis\":{opening_millis},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
+            "CMFD_BLS_LOGUP_BENCHMARK {{\"cell_variables\":{cell_variables},\"cells\":{},\"packed_variables\":{packed_variables},\"witness_millis\":{witness_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"prepared_scratch_bytes\":{prepared_scratch_bytes},\"released_scratch_bytes\":{released_scratch_bytes},\"regeneration_millis\":{regeneration_millis},\"regenerated_scratch_bytes\":{regenerated_scratch_bytes},\"opening_millis\":{opening_millis},\"opening_peak_scratch_bytes\":{opening_peak_scratch_bytes},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
             statement.elements().unwrap()
         );
 
@@ -4860,6 +5066,22 @@ mod tests {
         assert_eq!(
             projected_production_range_logup_four_pair_peak_bytes().unwrap(),
             52_076_480_992
+        );
+        assert_eq!(
+            projected_production_range_logup_aggregate_fold_peak_bytes().unwrap(),
+            308_298_123_276
+        );
+        assert_eq!(
+            projected_production_shared_transition_aggregate_fold_peak_bytes().unwrap(),
+            1_056_025_091_748
+        );
+        assert_eq!(
+            projected_production_range_logup_compressed_aggregate_pair_peak_bytes().unwrap(),
+            38_923_142_096
+        );
+        assert_eq!(
+            projected_production_shared_transition_compressed_aggregate_fold_peak_bytes().unwrap(),
+            126_500_212_028
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

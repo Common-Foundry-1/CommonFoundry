@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use crate::dory_bls12_381_compact_artifact::{
     BlsDoryCompactArtifact, BlsDoryCompactArtifactError, BlsDoryCompactArtifactSpec,
-    BlsDoryCompactArtifactWriter, BlsDoryMappedCompactArtifact,
+    BlsDoryCompactArtifactWriter, BlsDoryMappedCompactArtifact, CompactEncodedScalar,
 };
 use crate::dory_bls12_381_fold_artifact::{
     BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
@@ -34,6 +34,10 @@ use crate::dory_bls12_381_fold_artifact::{
 #[cfg(test)]
 use crate::dory_bls12_381_index_artifact::{
     BlsDoryIndexArtifact, BlsDoryIndexArtifactSpec, BlsDoryIndexArtifactWriter,
+};
+use crate::dory_bls12_381_logup_artifact::{
+    BlsDoryLogUpArtifact, BlsDoryLogUpArtifactError, BlsDoryLogUpArtifactSpec,
+    BlsDoryLogUpArtifactValue, BlsDoryLogUpArtifactWriter,
 };
 use crate::dory_bls12_381_prototype::{
     BlsDoryCurve, BlsDoryFr, BlsDoryG1, BlsDoryG1Routines, BlsDoryG2, BlsDoryG2Routines, BlsDoryGt,
@@ -56,7 +60,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, compact transition sources, mapped inverse views, four compressed LogUp generations, authenticated release/regeneration between range pairs, and consuming openings preserve exact proofs; n=19 takes 9.480 seconds proving, 2.267 seconds regenerating one source, and 7.043 seconds opening, projecting to roughly 1.80 days plus 10.32 hours per regenerated source plus 1.34 opening days at n=33; four regenerated sources still project near 48.5 GiB before aggregation, and aggregate-fold overlap is not yet measured",
+    "bounded parallel commitments, compact transition sources, mapped inverse views, authenticated release/regeneration, consuming openings, and four shared compressed aggregate-fold generations preserve exact proofs; two n=19 release runs retained the 47,729-byte proof, measured 7.220-7.282 seconds opening and 2.415-2.446 seconds verification, and reduced aggregate-opening scratch from 18,819,084 to 2,377,688 bytes; the exact n=33 retained-source and transition/mapped-fold lower bound is now 126,500,212,028 bytes (about 117.8 GiB) for four pairs, before multiplicity, matrix, and wiring folds, so a complete measured n=33 run remains required",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -65,6 +69,8 @@ const WIRE_MAGIC: [u8; 8] = *b"CFDBLS01";
 const WIRE_HEADER_BYTES: usize = 18;
 const MAX_PUBLIC_BINDING_BYTES: usize = 4_096;
 const ROW_COMMIT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+const AGGREGATE_COMPACT_FOLD_GENERATIONS: usize = 4;
+const AGGREGATE_COMPACT_FOLD_CHUNK_VALUES: usize = 1 << 16;
 
 /// One public multilinear evaluation claim against a BLS12-381 Dory commitment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2577,6 +2583,10 @@ struct SumcheckProverOutput {
     unique_polynomial_tables: usize,
     #[cfg(test)]
     peak_additional_coefficients: usize,
+    #[cfg(test)]
+    compressed_pair_count: usize,
+    #[cfg(test)]
+    compressed_pair_folds: usize,
 }
 
 struct FoldScratch<'a> {
@@ -2596,10 +2606,726 @@ impl<'a> FoldScratch<'a> {
     }
 }
 
+fn aggregate_compact_reconstruction_digest(
+    mapped_digest: [u8; 32],
+    challenges: &[BlsDoryFr],
+) -> Result<[u8; 32], BlsDoryAggregateError> {
+    let challenge_count =
+        u32::try_from(challenges.len()).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    let mut encoded = Vec::with_capacity(challenges.len().saturating_mul(32));
+    for challenge in challenges {
+        append_serialized(&mut encoded, challenge)?;
+    }
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryAggregateCompactFold/v1");
+    hasher.update(&mapped_digest);
+    hasher.update(&challenge_count.to_le_bytes());
+    hasher.update(&encoded);
+    let digest = *hasher.finalize().as_bytes();
+    if digest == [0; 32] {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok(digest)
+}
+
+fn aggregate_compact_source_parent_digest(
+    source_digest: [u8; 32],
+    mapped_digest: [u8; 32],
+    transition_parent: [u8; 32],
+    mapped_parent: [u8; 32],
+) -> Result<[u8; 32], BlsDoryAggregateError> {
+    let mut hasher = blake3::Hasher::new_derive_key(
+        "CommonFoundry/ForgeMatrix/BlsDoryAggregateCompactParent/v1",
+    );
+    for digest in [
+        source_digest,
+        mapped_digest,
+        transition_parent,
+        mapped_parent,
+    ] {
+        if digest == [0; 32] {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        hasher.update(&digest);
+    }
+    let digest = *hasher.finalize().as_bytes();
+    if digest == [0; 32] {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok(digest)
+}
+
+fn aggregate_compact_role_digest(
+    artifact_digest: [u8; 32],
+    role: AggregateCompactFoldRole,
+) -> Result<[u8; 32], BlsDoryAggregateError> {
+    if artifact_digest == [0; 32] {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryAggregateRole/v1");
+    hasher.update(&artifact_digest);
+    hasher.update(&[match role {
+        AggregateCompactFoldRole::Transition => 0,
+        AggregateCompactFoldRole::Mapped => 1,
+    }]);
+    let digest = *hasher.finalize().as_bytes();
+    if digest == [0; 32] {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok(digest)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateCompactFoldRole {
+    Transition,
+    Mapped,
+}
+
+fn decode_aggregate_compact_fold_code(
+    generation: usize,
+    code: u64,
+    challenges: &[BlsDoryFr],
+    mapped_dictionary: &[BlsDoryFr],
+) -> Result<(BlsDoryFr, BlsDoryFr), BlsDoryAggregateError> {
+    if generation == 0
+        || generation > AGGREGATE_COMPACT_FOLD_GENERATIONS
+        || challenges.len() != generation
+        || mapped_dictionary.len() != 16
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let leaf_count = 1usize
+        .checked_shl(
+            u32::try_from(generation).map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+        )
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let code_bits = leaf_count
+        .checked_mul(4)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    if code_bits > u64::BITS as usize
+        || (code_bits < u64::BITS as usize && code >= (1u64 << code_bits))
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let mut transition = [BlsDoryFr::zero(); 1 << AGGREGATE_COMPACT_FOLD_GENERATIONS];
+    let mut mapped = [BlsDoryFr::zero(); 1 << AGGREGATE_COMPACT_FOLD_GENERATIONS];
+    for index in 0..leaf_count {
+        let digit = usize::try_from((code >> (index * 4)) & 0xf)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        transition[index] = BlsDoryFr::from_u64(digit as u64);
+        mapped[index] = mapped_dictionary[digit];
+    }
+    let mut width = leaf_count;
+    for challenge in challenges {
+        for index in 0..width / 2 {
+            transition[index] = transition[index * 2]
+                + *challenge * (transition[index * 2 + 1] - transition[index * 2]);
+            mapped[index] =
+                mapped[index * 2] + *challenge * (mapped[index * 2 + 1] - mapped[index * 2]);
+        }
+        width /= 2;
+    }
+    if width != 1 {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok((transition[0], mapped[0]))
+}
+
+struct AggregateCompactFoldView {
+    artifact: Arc<BlsDoryLogUpArtifact>,
+    role: AggregateCompactFoldRole,
+    challenges: Vec<BlsDoryFr>,
+    mapped_dictionary: Arc<Vec<BlsDoryFr>>,
+    mapped_digest: [u8; 32],
+    explicit_len: usize,
+}
+
+impl AggregateCompactFoldView {
+    fn validate_lineage(&self, expected: [u8; 32]) -> Result<(), BlsDoryAggregateError> {
+        if aggregate_compact_role_digest(self.artifact.digest(), self.role)? != expected {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(())
+    }
+
+    fn for_each_scalar(
+        &self,
+        mut visitor: impl FnMut(BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        let spec = self.artifact.spec();
+        let generation =
+            usize::try_from(spec.generation).map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        if generation == 0
+            || generation > AGGREGATE_COMPACT_FOLD_GENERATIONS
+            || self.challenges.len() != generation
+            || spec.reconstruction_digest
+                != aggregate_compact_reconstruction_digest(self.mapped_digest, &self.challenges)?
+        {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let regular_values = usize::try_from(
+            u64::from(spec.regular_selectors)
+                .checked_mul(spec.current_cells)
+                .ok_or(BlsDoryAggregateError::ProverStorage)?,
+        )
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        let expected_values = usize::try_from(
+            u64::from(spec.regular_selectors)
+                .checked_add(u64::from(spec.range_selectors))
+                .ok_or(BlsDoryAggregateError::ProverStorage)?
+                .checked_mul(spec.current_cells)
+                .ok_or(BlsDoryAggregateError::ProverStorage)?,
+        )
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        if expected_values != self.explicit_len {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let mut visited = 0usize;
+        let mut visitor_error = None;
+        let result = self.artifact.for_each_value(|encoded| {
+            let scalar = match encoded {
+                BlsDoryLogUpArtifactValue::Regular(scalar) if visited < regular_values => {
+                    match self.role {
+                        AggregateCompactFoldRole::Transition => scalar,
+                        AggregateCompactFoldRole::Mapped => BlsDoryFr::zero(),
+                    }
+                }
+                BlsDoryLogUpArtifactValue::Range(code) if visited >= regular_values => {
+                    match decode_aggregate_compact_fold_code(
+                        generation,
+                        code,
+                        &self.challenges,
+                        &self.mapped_dictionary,
+                    ) {
+                        Ok((transition, mapped)) => match self.role {
+                            AggregateCompactFoldRole::Transition => transition,
+                            AggregateCompactFoldRole::Mapped => mapped,
+                        },
+                        Err(error) => {
+                            visitor_error = Some(error);
+                            return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                        }
+                    }
+                }
+                _ => return Err(BlsDoryLogUpArtifactError::InvalidArtifact),
+            };
+            visitor(scalar);
+            visited += 1;
+            Ok(())
+        });
+        if let Some(error) = visitor_error {
+            return Err(error);
+        }
+        result.map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        if visited != expected_values {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(())
+    }
+
+    fn for_each_pair(
+        &self,
+        mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        let mut pending = None;
+        self.for_each_scalar(|scalar| {
+            if let Some(lower) = pending.take() {
+                visitor(lower, scalar);
+            } else {
+                pending = Some(scalar);
+            }
+        })?;
+        if let Some(lower) = pending {
+            visitor(lower, BlsDoryFr::zero());
+        }
+        Ok(())
+    }
+}
+
+struct AggregateCompactPair {
+    transition_table: usize,
+    mapped_table: usize,
+    source: Arc<BlsDoryCompactArtifact>,
+    mapped_dictionary: Arc<Vec<BlsDoryFr>>,
+    mapped_digest: [u8; 32],
+}
+
+fn find_aggregate_compact_pairs(
+    polynomials: &[&BlsDoryCommittedPolynomial],
+) -> Vec<AggregateCompactPair> {
+    let mut pairs = Vec::new();
+    let mut used = vec![false; polynomials.len()];
+    for (transition_table, polynomial) in polynomials.iter().enumerate() {
+        let BlsDoryCoefficientStorage::CompactArtifact(source) = &polynomial.coefficients else {
+            continue;
+        };
+        let spec = source.spec();
+        let supported_source = source.dictionary().len() == 16
+            && source
+                .dictionary()
+                .iter()
+                .enumerate()
+                .all(|(digit, scalar)| *scalar == BlsDoryFr::from_u64(digit as u64))
+            && spec.word_group_len >= 2
+            && spec.word_group_len.is_power_of_two()
+            && spec.scalar_count.is_multiple_of(spec.word_group_len)
+            && spec
+                .explicit_scalar_count
+                .is_multiple_of(spec.word_group_len)
+            && spec.word_scalar_count.is_multiple_of(spec.word_group_len)
+            && spec.explicit_scalar_count > spec.word_scalar_count;
+        if !supported_source {
+            continue;
+        }
+        let candidates = polynomials
+            .iter()
+            .enumerate()
+            .filter_map(|(mapped_table, candidate)| {
+                let BlsDoryCoefficientStorage::MappedCompactArtifact(mapped) =
+                    &candidate.coefficients
+                else {
+                    return None;
+                };
+                (Arc::ptr_eq(source, mapped.source())
+                    && mapped.zero_prefix_count() == spec.word_scalar_count
+                    && mapped.mapped_dictionary().len() == source.dictionary().len())
+                .then_some((mapped_table, mapped))
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            continue;
+        }
+        let (mapped_table, mapped) = candidates[0];
+        if transition_table == mapped_table || used[transition_table] || used[mapped_table] {
+            continue;
+        }
+        used[transition_table] = true;
+        used[mapped_table] = true;
+        pairs.push(AggregateCompactPair {
+            transition_table,
+            mapped_table,
+            source: Arc::clone(source),
+            mapped_dictionary: Arc::new(mapped.mapped_dictionary().to_vec()),
+            mapped_digest: mapped.digest(),
+        });
+    }
+    pairs
+}
+
+#[derive(Clone, Copy)]
+struct AggregateCompactFoldGeometry {
+    selector_rows: u64,
+    current_cells: u64,
+    regular_selectors: u32,
+    range_selectors: u32,
+}
+
+fn aggregate_compact_fold_spec(
+    context_digest: [u8; 32],
+    parent_digest: [u8; 32],
+    mapped_digest: [u8; 32],
+    generation: usize,
+    geometry: AggregateCompactFoldGeometry,
+    challenges: &[BlsDoryFr],
+) -> Result<BlsDoryLogUpArtifactSpec, BlsDoryAggregateError> {
+    if generation == 0
+        || generation > AGGREGATE_COMPACT_FOLD_GENERATIONS
+        || challenges.len() != generation
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok(BlsDoryLogUpArtifactSpec {
+        context_digest,
+        parent_digest,
+        reconstruction_digest: aggregate_compact_reconstruction_digest(mapped_digest, challenges)?,
+        generation: u32::try_from(generation)
+            .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+        selector_rows: geometry.selector_rows,
+        current_cells: geometry.current_cells,
+        regular_selectors: geometry.regular_selectors,
+        range_selectors: geometry.range_selectors,
+    })
+}
+
+fn fold_aggregate_compact_source(
+    pair: &AggregateCompactPair,
+    challenge: BlsDoryFr,
+    transition_parent: [u8; 32],
+    mapped_parent: [u8; 32],
+    scratch: &FoldScratch<'_>,
+) -> Result<Arc<BlsDoryLogUpArtifact>, BlsDoryAggregateError> {
+    let source_spec = pair.source.spec();
+    let current_cells = source_spec.word_group_len;
+    let child_cells = current_cells
+        .checked_div(2)
+        .filter(|cells| *cells > 0)
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let selector_rows = source_spec
+        .scalar_count
+        .checked_div(current_cells)
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let regular_selectors = source_spec
+        .word_scalar_count
+        .checked_div(current_cells)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let range_selectors = source_spec
+        .explicit_scalar_count
+        .checked_sub(source_spec.word_scalar_count)
+        .and_then(|count| count.checked_div(current_cells))
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let challenges = [challenge];
+    let spec = aggregate_compact_fold_spec(
+        scratch.context_digest,
+        aggregate_compact_source_parent_digest(
+            pair.source.digest(),
+            pair.mapped_digest,
+            transition_parent,
+            mapped_parent,
+        )?,
+        pair.mapped_digest,
+        1,
+        AggregateCompactFoldGeometry {
+            selector_rows,
+            current_cells: child_cells,
+            regular_selectors,
+            range_selectors,
+        },
+        &challenges,
+    )?;
+    let mut writer = BlsDoryLogUpArtifactWriter::create(scratch.directory, spec)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    let mut pending_regular = None;
+    let mut pending_range = None;
+    let mut regular_chunk = Vec::with_capacity(AGGREGATE_COMPACT_FOLD_CHUNK_VALUES);
+    let mut range_chunk = Vec::with_capacity(AGGREGATE_COMPACT_FOLD_CHUNK_VALUES);
+    let mut entered_range = false;
+    let mut failed = false;
+    let read_result = pair.source.for_each_encoded_scalar(|_index, encoded| {
+        match encoded {
+            CompactEncodedScalar::Word { value, signed } if !entered_range => {
+                let scalar = if signed {
+                    BlsDoryFr::from_i64(i64::from_le_bytes(value.to_le_bytes()))
+                } else {
+                    BlsDoryFr::from_u64(value)
+                };
+                if let Some(lower) = pending_regular.take() {
+                    regular_chunk.push(lower + challenge * (scalar - lower));
+                    if regular_chunk.len() == AGGREGATE_COMPACT_FOLD_CHUNK_VALUES {
+                        if writer.write_regular_scalars(&regular_chunk).is_err() {
+                            failed = true;
+                            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                        }
+                        regular_chunk.clear();
+                    }
+                } else {
+                    pending_regular = Some(scalar);
+                }
+            }
+            CompactEncodedScalar::Code(code) => {
+                if !entered_range {
+                    entered_range = true;
+                    if pending_regular.is_some()
+                        || writer.write_regular_scalars(&regular_chunk).is_err()
+                    {
+                        failed = true;
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
+                    regular_chunk.clear();
+                }
+                if let Some(lower) = pending_range.take() {
+                    range_chunk.push(u64::from(lower) | (u64::from(code) << 4));
+                    if range_chunk.len() == AGGREGATE_COMPACT_FOLD_CHUNK_VALUES {
+                        if writer.write_range_codes(&range_chunk).is_err() {
+                            failed = true;
+                            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                        }
+                        range_chunk.clear();
+                    }
+                } else {
+                    pending_range = Some(code);
+                }
+            }
+            _ => {
+                failed = true;
+                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+            }
+        }
+        Ok(())
+    });
+    if failed
+        || read_result.is_err()
+        || !entered_range
+        || pending_regular.is_some()
+        || pending_range.is_some()
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    if !range_chunk.is_empty() {
+        writer
+            .write_range_codes(&range_chunk)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    }
+    writer
+        .finish()
+        .map(Arc::new)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)
+}
+
+fn fold_aggregate_compact_artifact(
+    artifact: &BlsDoryLogUpArtifact,
+    mapped_digest: [u8; 32],
+    challenges: &[BlsDoryFr],
+    scratch: &FoldScratch<'_>,
+) -> Result<Arc<BlsDoryLogUpArtifact>, BlsDoryAggregateError> {
+    let generation = challenges.len();
+    if !(2..=AGGREGATE_COMPACT_FOLD_GENERATIONS).contains(&generation) {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let parent_spec = artifact.spec();
+    let parent_generation = generation - 1;
+    if usize::try_from(parent_spec.generation).ok() != Some(parent_generation)
+        || parent_spec.context_digest != scratch.context_digest
+        || parent_spec.reconstruction_digest
+            != aggregate_compact_reconstruction_digest(
+                mapped_digest,
+                &challenges[..parent_generation],
+            )?
+        || parent_spec.current_cells < 2
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let child_spec = aggregate_compact_fold_spec(
+        scratch.context_digest,
+        artifact.digest(),
+        mapped_digest,
+        generation,
+        AggregateCompactFoldGeometry {
+            selector_rows: parent_spec.selector_rows,
+            current_cells: parent_spec.current_cells / 2,
+            regular_selectors: parent_spec.regular_selectors,
+            range_selectors: parent_spec.range_selectors,
+        },
+        challenges,
+    )?;
+    let mut writer = BlsDoryLogUpArtifactWriter::create(scratch.directory, child_spec)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    let challenge = challenges[parent_generation];
+    let code_shift = parent_spec
+        .code_bytes()
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?
+        .checked_mul(8)
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let mut pending_regular = None;
+    let mut pending_range = None;
+    let mut regular_chunk = Vec::with_capacity(AGGREGATE_COMPACT_FOLD_CHUNK_VALUES);
+    let mut range_chunk = Vec::with_capacity(AGGREGATE_COMPACT_FOLD_CHUNK_VALUES);
+    let mut entered_range = false;
+    let mut failed = false;
+    let read_result = artifact.for_each_value(|encoded| {
+        match encoded {
+            BlsDoryLogUpArtifactValue::Regular(value) if !entered_range => {
+                if let Some(lower) = pending_regular.take() {
+                    regular_chunk.push(lower + challenge * (value - lower));
+                    if regular_chunk.len() == AGGREGATE_COMPACT_FOLD_CHUNK_VALUES {
+                        if writer.write_regular_scalars(&regular_chunk).is_err() {
+                            failed = true;
+                            return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                        }
+                        regular_chunk.clear();
+                    }
+                } else {
+                    pending_regular = Some(value);
+                }
+            }
+            BlsDoryLogUpArtifactValue::Range(code) => {
+                if !entered_range {
+                    entered_range = true;
+                    if pending_regular.is_some()
+                        || writer.write_regular_scalars(&regular_chunk).is_err()
+                    {
+                        failed = true;
+                        return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                    }
+                    regular_chunk.clear();
+                }
+                if let Some(lower) = pending_range.take() {
+                    range_chunk.push(lower | (code << code_shift));
+                    if range_chunk.len() == AGGREGATE_COMPACT_FOLD_CHUNK_VALUES {
+                        if writer.write_range_codes(&range_chunk).is_err() {
+                            failed = true;
+                            return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                        }
+                        range_chunk.clear();
+                    }
+                } else {
+                    pending_range = Some(code);
+                }
+            }
+            _ => {
+                failed = true;
+                return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+            }
+        }
+        Ok(())
+    });
+    if failed
+        || read_result.is_err()
+        || !entered_range
+        || pending_regular.is_some()
+        || pending_range.is_some()
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    if !range_chunk.is_empty() {
+        writer
+            .write_range_codes(&range_chunk)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    }
+    writer
+        .finish()
+        .map(Arc::new)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)
+}
+
+fn two_tables_mut<T>(values: &mut [T], left: usize, right: usize) -> Option<(&mut T, &mut T)> {
+    if left == right || left >= values.len() || right >= values.len() {
+        return None;
+    }
+    if left < right {
+        let (before, after) = values.split_at_mut(right);
+        Some((&mut before[left], &mut after[0]))
+    } else {
+        let (before, after) = values.split_at_mut(left);
+        Some((&mut after[0], &mut before[right]))
+    }
+}
+
+fn install_aggregate_compact_pair(
+    tables: &mut [FoldedPolynomialTable<'_>],
+    pair: &AggregateCompactPair,
+    artifact: Arc<BlsDoryLogUpArtifact>,
+    challenges: Vec<BlsDoryFr>,
+) -> Result<(), BlsDoryAggregateError> {
+    let (transition, mapped) = two_tables_mut(tables, pair.transition_table, pair.mapped_table)
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let child_logical_len = transition
+        .logical_len
+        .checked_div(2)
+        .filter(|len| *len > 0 && mapped.logical_len / 2 == *len)
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let child_explicit_len = transition.explicit_pair_count()?;
+    if mapped.explicit_pair_count()? != child_explicit_len {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    let artifact_values = u64::from(artifact.spec().regular_selectors)
+        .checked_add(u64::from(artifact.spec().range_selectors))
+        .and_then(|selectors| selectors.checked_mul(artifact.spec().current_cells))
+        .and_then(|values| usize::try_from(values).ok())
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    if artifact_values != child_explicit_len {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    transition.lineage_digest =
+        aggregate_compact_role_digest(artifact.digest(), AggregateCompactFoldRole::Transition)?;
+    mapped.lineage_digest =
+        aggregate_compact_role_digest(artifact.digest(), AggregateCompactFoldRole::Mapped)?;
+    transition.storage = FoldedPolynomialStorage::Compact(AggregateCompactFoldView {
+        artifact: Arc::clone(&artifact),
+        role: AggregateCompactFoldRole::Transition,
+        challenges: challenges.clone(),
+        mapped_dictionary: Arc::clone(&pair.mapped_dictionary),
+        mapped_digest: pair.mapped_digest,
+        explicit_len: child_explicit_len,
+    });
+    mapped.storage = FoldedPolynomialStorage::Compact(AggregateCompactFoldView {
+        artifact,
+        role: AggregateCompactFoldRole::Mapped,
+        challenges,
+        mapped_dictionary: Arc::clone(&pair.mapped_dictionary),
+        mapped_digest: pair.mapped_digest,
+        explicit_len: child_explicit_len,
+    });
+    transition.logical_len = child_logical_len;
+    mapped.logical_len = child_logical_len;
+    Ok(())
+}
+
+fn fold_aggregate_compact_pair(
+    tables: &mut [FoldedPolynomialTable<'_>],
+    pair: &AggregateCompactPair,
+    challenge: BlsDoryFr,
+    generation: usize,
+    scratch: &FoldScratch<'_>,
+) -> Result<(), BlsDoryAggregateError> {
+    let artifact = if generation == 1 {
+        let transition_parent = tables
+            .get(pair.transition_table)
+            .ok_or(BlsDoryAggregateError::ProverStorage)?
+            .lineage_digest;
+        let mapped_parent = tables
+            .get(pair.mapped_table)
+            .ok_or(BlsDoryAggregateError::ProverStorage)?
+            .lineage_digest;
+        fold_aggregate_compact_source(pair, challenge, transition_parent, mapped_parent, scratch)?
+    } else {
+        let transition = tables
+            .get(pair.transition_table)
+            .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        let mapped = tables
+            .get(pair.mapped_table)
+            .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        let transition_view = match (&transition.storage, &mapped.storage) {
+            (
+                FoldedPolynomialStorage::Compact(transition_view),
+                FoldedPolynomialStorage::Compact(mapped_view),
+            ) if transition_view.role == AggregateCompactFoldRole::Transition
+                && mapped_view.role == AggregateCompactFoldRole::Mapped
+                && Arc::ptr_eq(&transition_view.artifact, &mapped_view.artifact)
+                && transition_view.challenges == mapped_view.challenges
+                && transition_view.mapped_digest == pair.mapped_digest
+                && mapped_view.mapped_digest == pair.mapped_digest
+                && transition_view
+                    .validate_lineage(transition.lineage_digest)
+                    .is_ok()
+                && mapped_view.validate_lineage(mapped.lineage_digest).is_ok() =>
+            {
+                transition_view
+            }
+            _ => return Err(BlsDoryAggregateError::ProverStorage),
+        };
+        let mut challenges = transition_view.challenges.clone();
+        challenges.push(challenge);
+        fold_aggregate_compact_artifact(
+            &transition_view.artifact,
+            pair.mapped_digest,
+            &challenges,
+            scratch,
+        )?
+    };
+    let challenges = if generation == 1 {
+        vec![challenge]
+    } else {
+        let transition = tables
+            .get(pair.transition_table)
+            .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        let FoldedPolynomialStorage::Compact(view) = &transition.storage else {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        };
+        let mut challenges = view.challenges.clone();
+        challenges.push(challenge);
+        challenges
+    };
+    install_aggregate_compact_pair(tables, pair, artifact, challenges)
+}
+
 enum FoldedPolynomialStorage<'a> {
     Source(&'a BlsDoryCommittedPolynomial),
     Owned(Vec<BlsDoryFr>),
     Artifact(BlsDoryFoldArtifact),
+    Compact(AggregateCompactFoldView),
 }
 
 struct FoldedPolynomialTable<'a> {
@@ -2634,6 +3360,7 @@ impl<'a> FoldedPolynomialTable<'a> {
             FoldedPolynomialStorage::Artifact(artifact) => {
                 artifact.spec().explicit_scalar_count as usize
             }
+            FoldedPolynomialStorage::Compact(view) => view.explicit_len,
         }
     }
 
@@ -2664,6 +3391,10 @@ impl<'a> FoldedPolynomialTable<'a> {
                     Ok(())
                 })
                 .map_err(|_| BlsDoryAggregateError::ProverStorage),
+            FoldedPolynomialStorage::Compact(view) => {
+                view.validate_lineage(self.lineage_digest)?;
+                view.for_each_pair(visitor)
+            }
         }
     }
 
@@ -2717,6 +3448,21 @@ impl<'a> FoldedPolynomialTable<'a> {
                         writer.write_scalar(&(lower + challenge * (upper - lower)))
                     })
                     .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                FoldedPolynomialStorage::Compact(view) => {
+                    view.validate_lineage(self.lineage_digest)?;
+                    let mut write_failed = false;
+                    view.for_each_pair(|lower, upper| {
+                        if writer
+                            .write_scalar(&(lower + challenge * (upper - lower)))
+                            .is_err()
+                        {
+                            write_failed = true;
+                        }
+                    })?;
+                    if write_failed {
+                        return Err(BlsDoryAggregateError::ProverStorage);
+                    }
+                }
             }
             let artifact = writer
                 .finish()
@@ -2745,6 +3491,9 @@ impl<'a> FoldedPolynomialTable<'a> {
             FoldedPolynomialStorage::Artifact(_) => {
                 return Err(BlsDoryAggregateError::ProverStorage);
             }
+            FoldedPolynomialStorage::Compact(_) => {
+                return Err(BlsDoryAggregateError::ProverStorage);
+            }
         }
         self.logical_len = child_logical_len;
         Ok(())
@@ -2765,6 +3514,12 @@ impl<'a> FoldedPolynomialTable<'a> {
                         Ok::<(), BlsDoryFoldArtifactError>(())
                     })
                     .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+                value.ok_or(BlsDoryAggregateError::InvalidProofShape)
+            }
+            FoldedPolynomialStorage::Compact(view) => {
+                view.validate_lineage(self.lineage_digest)?;
+                let mut value = None;
+                view.for_each_scalar(|scalar| value = Some(scalar))?;
                 value.ok_or(BlsDoryAggregateError::InvalidProofShape)
             }
         }
@@ -2868,6 +3623,11 @@ fn prove_distinct_point_sumcheck(
         .enumerate()
         .map(|(table_index, polynomial)| FoldedPolynomialTable::source(polynomial, table_index))
         .collect::<Result<Vec<_>, _>>()?;
+    let compact_pairs = if scratch.is_some() {
+        find_aggregate_compact_pairs(&unique_polynomials)
+    } else {
+        Vec::new()
+    };
     let mut table_claim_indices = vec![Vec::new(); unique_polynomials.len()];
     for (claim_index, table_index) in claim_table_indices.iter().copied().enumerate() {
         table_claim_indices[table_index].push(claim_index);
@@ -2881,6 +3641,8 @@ fn prove_distinct_point_sumcheck(
         });
     let mut rounds = Vec::with_capacity(variables);
     let mut random_point = Vec::with_capacity(variables);
+    #[cfg(test)]
+    let mut compressed_pair_folds = 0usize;
 
     for round_index in 0..variables {
         let mut message = [BlsDoryFr::zero(); 3];
@@ -2902,8 +3664,47 @@ fn prove_distinct_point_sumcheck(
         let challenge = transcript.challenge_scalar(b"sumcheck-round-challenge");
         current_claim = interpolate_quadratic(message, challenge)?;
         random_point.push(challenge);
-        for table in &mut polynomial_tables {
-            table.fold(challenge, round_index + 1, scratch)?;
+        let generation = round_index + 1;
+        if let Some(scratch) = scratch.filter(|_| {
+            generation <= AGGREGATE_COMPACT_FOLD_GENERATIONS && !compact_pairs.is_empty()
+        }) {
+            let mut compressed_tables = vec![false; polynomial_tables.len()];
+            for pair in &compact_pairs {
+                let can_compress = generation == 1
+                    || polynomial_tables
+                        .get(pair.transition_table)
+                        .and_then(|table| match &table.storage {
+                            FoldedPolynomialStorage::Compact(view) => {
+                                Some(view.artifact.spec().current_cells >= 2)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                if can_compress {
+                    fold_aggregate_compact_pair(
+                        &mut polynomial_tables,
+                        pair,
+                        challenge,
+                        generation,
+                        scratch,
+                    )?;
+                    #[cfg(test)]
+                    {
+                        compressed_pair_folds += 1;
+                    }
+                    compressed_tables[pair.transition_table] = true;
+                    compressed_tables[pair.mapped_table] = true;
+                }
+            }
+            for (table_index, table) in polynomial_tables.iter_mut().enumerate() {
+                if !compressed_tables[table_index] {
+                    table.fold(challenge, generation, Some(scratch))?;
+                }
+            }
+        } else {
+            for table in &mut polynomial_tables {
+                table.fold(challenge, generation, scratch)?;
+            }
         }
         for (prefix, claim) in equality_prefixes.iter_mut().zip(claims) {
             let coordinate = claim.point[round_index];
@@ -2938,6 +3739,10 @@ fn prove_distinct_point_sumcheck(
         } else {
             unique_polynomials.len() * (coefficient_count / 2)
         },
+        #[cfg(test)]
+        compressed_pair_count: compact_pairs.len(),
+        #[cfg(test)]
+        compressed_pair_folds,
     })
 }
 
@@ -4044,6 +4849,169 @@ mod tests {
         assert_eq!(restored, original);
         drop(regenerated);
         drop(openings);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn paired_compact_aggregate_folds_preserve_exact_proof_bytes() {
+        let variables = 8;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let mut source = fixture_compact_row_source(variables);
+        let compact = commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let mapped = commit_bls_dory_mapped_compact_polynomial(
+            &compact,
+            source.word_coefficients,
+            (0..16)
+                .map(|digit| BlsDoryFr::from_u64(digit + 101))
+                .collect(),
+            &setup,
+        )
+        .unwrap();
+        let points = vec![
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 5))
+                .collect::<Vec<_>>(),
+            (0..variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 31))
+                .collect::<Vec<_>>(),
+        ];
+        let polynomial_refs = vec![&compact, &mapped];
+        let ordinary = prove_bls_dory_opening_refs_with_scratch(
+            b"paired-compact-folds",
+            &polynomial_refs,
+            &points,
+            &setup,
+            None,
+        )
+        .unwrap();
+
+        let mut transcript = statement_transcript(
+            b"paired-compact-folds",
+            &setup.identity(),
+            &ordinary.0,
+            nu,
+            sigma,
+        )
+        .unwrap();
+        let batching = batching_challenges(&mut transcript, ordinary.0.len());
+        let fold_scratch = FoldScratch::new(&scratch.0, [9; 32]).unwrap();
+        let sumcheck = prove_distinct_point_sumcheck(
+            &polynomial_refs,
+            &ordinary.0,
+            &batching,
+            &mut transcript,
+            Some(&fold_scratch),
+        )
+        .unwrap();
+        assert_eq!(sumcheck.compressed_pair_count, 1);
+        assert_eq!(sumcheck.compressed_pair_folds, 4);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+
+        let compressed = prove_bls_dory_opening_refs_with_scratch(
+            b"paired-compact-folds",
+            &polynomial_refs,
+            &points,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        assert_eq!(compressed, ordinary);
+        verify_bls_dory_openings(
+            b"paired-compact-folds",
+            &compressed.0,
+            &compressed.1,
+            &setup,
+        )
+        .unwrap();
+        drop(mapped);
+        drop(compact);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn corrupted_paired_compact_fold_aborts_and_cleans_scratch() {
+        let variables = 8;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let mut source = fixture_compact_row_source(variables);
+        let compact = commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let mapped = commit_bls_dory_mapped_compact_polynomial(
+            &compact,
+            source.word_coefficients,
+            (0..16)
+                .map(|digit| BlsDoryFr::from_u64(digit + 211))
+                .collect(),
+            &setup,
+        )
+        .unwrap();
+        let polynomial_refs = vec![&compact, &mapped];
+        let pairs = find_aggregate_compact_pairs(&polynomial_refs);
+        assert_eq!(pairs.len(), 1);
+        let mut tables = polynomial_refs
+            .iter()
+            .enumerate()
+            .map(|(table_index, polynomial)| FoldedPolynomialTable::source(polynomial, table_index))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let fold_scratch = FoldScratch::new(&scratch.0, [7; 32]).unwrap();
+        fold_aggregate_compact_pair(
+            &mut tables,
+            &pairs[0],
+            BlsDoryFr::from_u64(23),
+            1,
+            &fold_scratch,
+        )
+        .unwrap();
+        let FoldedPolynomialStorage::Compact(view) = &tables[pairs[0].transition_table].storage
+        else {
+            panic!("transition table must use the shared compressed fold");
+        };
+        let artifact_path = view.artifact.path().to_path_buf();
+        let transition_lineage = tables[pairs[0].transition_table].lineage_digest;
+        tables[pairs[0].transition_table].lineage_digest =
+            tables[pairs[0].mapped_table].lineage_digest;
+        assert_eq!(
+            tables[pairs[0].transition_table].for_each_pair(|_, _| {}),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
+        tables[pairs[0].transition_table].lineage_digest = transition_lineage;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&artifact_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(12)).unwrap();
+        file.write_all(&[0xa5]).unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            tables[pairs[0].transition_table].for_each_pair(|_, _| {}),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
+        drop(file);
+        drop(tables);
+        assert!(!artifact_path.exists());
+        drop(pairs);
+        drop(polynomial_refs);
+        drop(mapped);
+        drop(compact);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

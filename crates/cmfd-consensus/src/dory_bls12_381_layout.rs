@@ -122,7 +122,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; its authenticated writer uses bounded parallel row batches, shared transition artifacts remove duplicate sources, and range pairs release then digest-authenticate regenerated sources, but linear LogUp scaling, four pre-aggregate sources, and unmeasured aggregate-fold overlap remain beyond a proven practical production run",
+    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, authenticated release/regeneration, and four shared compressed aggregate-fold generations preserve exact proofs, but the exact four-pair retained-source and transition/mapped-fold lower bound remains 126,500,212,028 bytes (about 117.8 GiB) before multiplicity, matrix, and wiring folds, and the complete n=33 prover has not been run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 

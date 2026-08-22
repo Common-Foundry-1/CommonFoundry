@@ -1081,10 +1081,29 @@ larger transition/range storage boundary at exactly 52,076,480,992 bytes, about
 48.5 GiB, down from 77,980,502,840 bytes or 72.62 GiB. Executable projection
 functions pin all source, lineage, and peak sizes. Exact fixtures preserve the
 complete proof bytes, reject a one-byte regenerated-source substitution, and
-leave zero scratch files. These extrapolations still reject the current CPU and
-storage pipeline for production; they are not n=33 measurements. The next
-implementation gate is GPU or distributed linear folding, measurement and
-reduction of aggregate-fold overlap, then a complete production run.
+leave zero scratch files. The distinct-point aggregate now recognizes each
+compact transition and mapped-inverse pair that shares one authenticated source.
+For its first four folds it writes one challenge-bound packed artifact and exposes
+two role-bound logical views: regular transition lanes reconstruct as scalars and
+zero inverse lanes, while every range code reconstructs both the transition digit
+and mapped inverse. The artifact binds the source/mapping identities, both parent
+lineages, dimensions, every folding challenge, and its complete payload. At fold
+five the two views split into ordinary authenticated scalar lineages. A corrupted
+shared artifact aborts proving and cleans its owned file, and dense, ordinary
+scratch, and compressed scratch paths produce exactly the same proof bytes.
+
+Two n=19 release runs measured 9.561 and 9.729 seconds for component proving,
+2.294 and 2.314 seconds for authenticated source regeneration, 7.282 and 7.220
+seconds for aggregate opening, and 2.446 and 2.415 seconds for verification. Both
+retained the 47,729-byte proof, ended with zero scratch, and measured the same
+2,377,688-byte opening peak with a 1 ms observer, down from 18,819,084 bytes by
+7.91 times. The executable production formula retains the earlier uncompressed
+1,056,025,091,748-byte four-pair comparison and pins the new retained-source plus
+transition/mapped-fold lower bound at 126,500,212,028 bytes, about 117.8 GiB, an
+8.35-times reduction. This excludes multiplicity, matrix, and wiring fold files,
+so it is not the complete prover peak. These extrapolations remain n=33 rejection
+estimates, not measurements. The next implementation gate is measuring and
+compressing the remaining aggregate lineages, then completing the production run.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

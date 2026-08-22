@@ -1,10 +1,11 @@
-//! Self-authenticating compressed artifacts for the first four LogUp folds.
+//! Self-authenticating compressed artifacts for the first four LogUp and
+//! paired aggregate folds.
 //!
 //! Regular transition selectors store one canonical scalar because their
 //! inverse lane is identically zero. Range selectors retain the original
 //! radix-16 digits behind each folded cell in one, two, four, or eight bytes.
-//! The reader reconstructs the exact folded transition and inverse values
-//! using the bound challenges.
+//! Readers reconstruct the exact folded transition and mapped values using the
+//! bound challenges and role-specific lineage.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};

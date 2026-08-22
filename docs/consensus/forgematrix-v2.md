@@ -527,9 +527,19 @@ comparison. The v2 research code now implements:
   witness is rejected. The projected transition/range storage peak is therefore
   52,076,480,992 bytes, about 48.5 GiB, rather than 72.62 GiB: one source plus
   the largest lineage overlap is about 36.25 GiB, while four regenerated sources
-  before aggregation are larger. This still rejects the current CPU/storage
-  pipeline for production; GPU or distributed folds, measured aggregate-fold
-  overlap, and a complete measured n=33 run remain required;
+  before aggregation are larger. The aggregate now recognizes each transition
+  and mapped inverse that shares a compact source, stores their first four folds
+  once as authenticated packed radix-16 lineages, and reconstructs two role-bound
+  logical views under the exact aggregate challenges. Fold five returns to two
+  ordinary scalar lineages. Dense, ordinary scratch, and compressed paths produce
+  the same proof bytes; corruption aborts and cleans the shared artifact. Two n=19
+  release runs retained the 47,729-byte proof and measured the same 2,377,688-byte
+  opening peak, down from 18,819,084 bytes by 7.91 times. The executable n=33
+  four-pair retained-source plus transition/mapped-fold lower bound falls from the
+  uncompressed 1,056,025,091,748 bytes to 126,500,212,028 bytes (about 117.8 GiB),
+  an 8.35-times reduction. Multiplicity, matrix, and wiring fold files remain
+  outside that bound, so remaining-lineage compression and a complete measured
+  n=33 run are still required;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

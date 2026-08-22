@@ -421,9 +421,13 @@ comparison. The v2 research code now implements:
   exact bank-batched matrix sumcheck, a 121-constraint scalar transition
   sumcheck, and a packed successor-wiring argument. Witness-free fixture proofs
   are 11,539, 27,651, and 14,529 bytes respectively; their n=31, n=33, and n=29
-  production grammars project to 70,483, 89,763, and 64,097 bytes. The packed
-  LogUp path, cross-component commitment links, streaming provers, soundness
-  review, and audit remain activation gates;
+  production grammars project to 70,483, 89,763, and 64,097 bytes. Exact-target
+  APIs now high-zero-pad all three to a shared n=33 geometry and reject layout
+  mismatches. One opening payload at n=33 projects to 70,639 bytes, but the
+  uncompressed production composition has 480 direct claims against the current
+  128-claim bound. The packed LogUp path, one shared aggregate, cross-component
+  commitment links, an n=33 streaming prover, soundness review, and audit remain
+  activation gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

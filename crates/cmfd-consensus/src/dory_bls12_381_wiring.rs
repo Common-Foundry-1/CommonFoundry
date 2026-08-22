@@ -69,7 +69,7 @@ impl BlsDoryWiringProof {
         &self,
         statement: StructuredWiringStatement,
     ) -> Result<Vec<u8>, BlsDoryWiringError> {
-        validate_proof_shape(statement, self)?;
+        validate_proof_shape(statement, self, usize::from(self.packed_variables))?;
         let opening_len = u32::try_from(self.opening_proof.len())
             .map_err(|_| BlsDoryWiringError::ProofTooLarge)?;
         let expected = wiring_wire_bytes(self.evaluations.len(), self.opening_proof.len())?;
@@ -96,7 +96,18 @@ impl BlsDoryWiringProof {
         encoded: &[u8],
         statement: StructuredWiringStatement,
     ) -> Result<Self, BlsDoryWiringError> {
+        let expected_variables = packed_wiring_variables(statement)?;
+        Self::decode_with_variables(encoded, statement, expected_variables)
+    }
+
+    /// Decode using the exact shared aggregate geometry selected by consensus.
+    pub fn decode_with_variables(
+        encoded: &[u8],
+        statement: StructuredWiringStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryWiringError> {
         statement.validate_verifier_shape()?;
+        validate_target_variables(packed_wiring_variables(statement)?, expected_variables)?;
         if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_WIRING_PROOF_BYTES {
             return Err(BlsDoryWiringError::ProofTooLarge);
         }
@@ -107,7 +118,6 @@ impl BlsDoryWiringProof {
         let packed_variables = read_u16(encoded, 10)?;
         let evaluation_count = read_u16(encoded, 12)? as usize;
         let opening_len = read_u32(encoded, 14)? as usize;
-        let expected_variables = packed_wiring_variables(statement)?;
         let expected_evaluations = wiring_evaluation_count(statement)?;
         if protocol_version != BLS_DORY_WIRING_VERSION
             || usize::from(packed_variables) != expected_variables
@@ -212,17 +222,46 @@ pub fn prove_bls_dory_wiring(
     outputs: &[i64],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryWiringProof, BlsDoryWiringError> {
+    let packed_variables = packed_wiring_variables(statement)?;
+    prove_bls_dory_wiring_at_variables(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+    )
+}
+
+/// Prove every wiring edge at an exact shared aggregate geometry.
+pub fn prove_bls_dory_wiring_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryWiringProof, BlsDoryWiringError> {
     if binding.len() > MAX_WIRING_BINDING_BYTES {
         return Err(BlsDoryWiringError::PublicBindingTooLarge);
     }
     validate_tables(statement, initial, inputs, outputs)?;
     validate_successors(statement, initial, inputs, outputs)?;
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
     let initial_values = signed_values(initial);
     let input_banks = bank_field_values(statement, inputs)?;
     let output_banks = bank_field_values(statement, outputs)?;
-    let packed_coefficients =
+    let mut packed_coefficients =
         pack_wiring_tables(statement, &initial_values, &input_banks, &output_banks)?;
-    let packed_variables = packed_wiring_variables(statement)?;
+    let padded_len = 1usize
+        .checked_shl(packed_variables as u32)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    packed_coefficients.resize(padded_len, BlsDoryFr::zero());
     let nu = packed_variables / 2;
     let sigma = packed_variables - nu;
     let committed = commit_bls_dory_polynomial(packed_coefficients, nu, sigma, setup)?;
@@ -241,7 +280,7 @@ pub fn prove_bls_dory_wiring(
     let flattened = evaluations.flatten(statement)?;
     absorb_evaluations(&mut transcript, &flattened);
     let transcript_digest = transcript.digest();
-    let opening_points = opening_points(statement, &points);
+    let opening_points = opening_points(statement, &points, packed_variables)?;
     let opening_binding = opening_binding(binding, &transcript_digest);
     let (claims, opening_proof) = prove_bls_dory_same_commitment_openings(
         &opening_binding,
@@ -263,7 +302,7 @@ pub fn prove_bls_dory_wiring(
         transcript_digest,
         opening_proof,
     };
-    verify_bls_dory_wiring(binding, statement, &proof, setup)?;
+    verify_bls_dory_wiring_at_variables(binding, statement, &proof, packed_variables, setup)?;
     Ok(proof)
 }
 
@@ -274,11 +313,27 @@ pub fn verify_bls_dory_wiring(
     proof: &BlsDoryWiringProof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryWiringError> {
+    let packed_variables = packed_wiring_variables(statement)?;
+    verify_bls_dory_wiring_at_variables(binding, statement, proof, packed_variables, setup)
+}
+
+/// Verify wiring against the exact shared aggregate geometry.
+pub fn verify_bls_dory_wiring_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryWiringError> {
     if binding.len() > MAX_WIRING_BINDING_BYTES {
         return Err(BlsDoryWiringError::PublicBindingTooLarge);
     }
     statement.validate_verifier_shape()?;
-    validate_proof_shape(statement, proof)?;
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    validate_proof_shape(statement, proof, packed_variables)?;
     let mut transcript = wiring_transcript(binding, statement, &proof.oracle_commitment);
     let points = WiringPoints::derive(statement, &mut transcript);
     let evaluations = WiringEvaluations::from_flat(statement, &proof.evaluations)?;
@@ -287,7 +342,7 @@ pub fn verify_bls_dory_wiring(
     if transcript.digest() != proof.transcript_digest {
         return Err(BlsDoryWiringError::Transcript);
     }
-    let points = opening_points(statement, &points);
+    let points = opening_points(statement, &points, packed_variables)?;
     let claims = opening_claims(proof.oracle_commitment, &points, &proof.evaluations)?;
     let binding = opening_binding(binding, &proof.transcript_digest);
     verify_bls_dory_openings(&binding, &claims, &proof.opening_proof, setup)?;
@@ -307,15 +362,27 @@ fn production_wiring_statement() -> StructuredWiringStatement {
 fn validate_proof_shape(
     statement: StructuredWiringStatement,
     proof: &BlsDoryWiringProof,
+    expected_variables: usize,
 ) -> Result<(), BlsDoryWiringError> {
     statement.validate_verifier_shape()?;
+    validate_target_variables(packed_wiring_variables(statement)?, expected_variables)?;
     if proof.protocol_version != BLS_DORY_WIRING_VERSION
-        || usize::from(proof.packed_variables) != packed_wiring_variables(statement)?
+        || usize::from(proof.packed_variables) != expected_variables
         || proof.evaluations.len() != wiring_evaluation_count(statement)?
         || proof.opening_proof.is_empty()
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
         return Err(BlsDoryWiringError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+fn validate_target_variables(
+    minimum_variables: usize,
+    target_variables: usize,
+) -> Result<(), BlsDoryWiringError> {
+    if target_variables < minimum_variables || target_variables > 64 {
+        return Err(BlsDoryWiringError::InvalidDimensions);
     }
     Ok(())
 }
@@ -372,6 +439,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, BlsDoryWiringError> {
 fn packed_wiring_variables(
     statement: StructuredWiringStatement,
 ) -> Result<usize, BlsDoryWiringError> {
+    statement.validate_verifier_shape()?;
     let bank_elements = statement.bank_elements()?;
     let table_variables = usize::try_from(bank_elements.ilog2())
         .map_err(|_| BlsDoryWiringError::InvalidDimensions)?;
@@ -675,21 +743,35 @@ fn verify_identities(
 fn opening_points(
     statement: StructuredWiringStatement,
     points: &WiringPoints,
-) -> Vec<Vec<BlsDoryFr>> {
+    packed_variables: usize,
+) -> Result<Vec<Vec<BlsDoryFr>>, BlsDoryWiringError> {
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
     let mut openings = Vec::with_capacity(1 + statement.banks * (points.layer.len() + 3));
-    openings.push(packed_point(&points.first_table(), INITIAL_SLOT));
+    openings.push(pad_point(
+        &packed_point(&points.first_table(), INITIAL_SLOT),
+        packed_variables,
+    )?);
     for bank in 0..statement.banks {
-        openings.push(packed_point(&points.random_table(), output_slot(bank)));
-        openings.push(packed_point(&points.last_table(), output_slot(bank)));
+        openings.push(pad_point(
+            &packed_point(&points.random_table(), output_slot(bank)),
+            packed_variables,
+        )?);
+        openings.push(pad_point(
+            &packed_point(&points.last_table(), output_slot(bank)),
+            packed_variables,
+        )?);
         for trailing_ones in 0..points.layer.len() {
-            openings.push(packed_point(
-                &points.input_shift(trailing_ones),
-                input_slot(bank),
-            ));
+            openings.push(pad_point(
+                &packed_point(&points.input_shift(trailing_ones), input_slot(bank)),
+                packed_variables,
+            )?);
         }
-        openings.push(packed_point(&points.first_table(), input_slot(bank)));
+        openings.push(pad_point(
+            &packed_point(&points.first_table(), input_slot(bank)),
+            packed_variables,
+        )?);
     }
-    openings
+    Ok(openings)
 }
 
 fn opening_claims(
@@ -730,6 +812,16 @@ fn packed_point(table_point: &[BlsDoryFr], slot: usize) -> Vec<BlsDoryFr> {
         });
     }
     point
+}
+
+fn pad_point(point: &[BlsDoryFr], variables: usize) -> Result<Vec<BlsDoryFr>, BlsDoryWiringError> {
+    if point.len() > variables {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    let mut padded = Vec::with_capacity(variables);
+    padded.extend_from_slice(point);
+    padded.resize(variables, BlsDoryFr::zero());
+    Ok(padded)
 }
 
 fn point_with_layer(cell: &[BlsDoryFr], layer: &[BlsDoryFr]) -> Vec<BlsDoryFr> {

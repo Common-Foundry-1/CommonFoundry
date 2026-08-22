@@ -73,7 +73,7 @@ impl BlsDoryMatrixProof {
         &self,
         statement: StructuredMatrixStatement,
     ) -> Result<Vec<u8>, BlsDoryMatrixError> {
-        validate_proof_shape(statement, self)?;
+        validate_proof_shape(statement, self, usize::from(self.padded_variables))?;
         let common_rounds = statement.inner.ilog2() as usize;
         let layer_rounds = statement.layers.ilog2() as usize;
         let opening_len = u32::try_from(self.opening_proof.len())
@@ -114,7 +114,18 @@ impl BlsDoryMatrixProof {
         encoded: &[u8],
         statement: StructuredMatrixStatement,
     ) -> Result<Self, BlsDoryMatrixError> {
+        let expected_variables = matrix_variables(statement)?;
+        Self::decode_with_variables(encoded, statement, expected_variables)
+    }
+
+    /// Decode using the exact shared aggregate geometry selected by consensus.
+    pub fn decode_with_variables(
+        encoded: &[u8],
+        statement: StructuredMatrixStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryMatrixError> {
         statement.validate_verifier_shape()?;
+        validate_target_variables(matrix_variables(statement)?, expected_variables)?;
         if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_MATRIX_PROOF_BYTES {
             return Err(BlsDoryMatrixError::ProofTooLarge);
         }
@@ -126,7 +137,6 @@ impl BlsDoryMatrixProof {
         let common_rounds = read_u16(encoded, 12)? as usize;
         let layer_rounds = read_u16(encoded, 14)? as usize;
         let opening_len = read_u32(encoded, 16)? as usize;
-        let expected_variables = matrix_variables(statement)?;
         let expected_common = statement.inner.ilog2() as usize;
         let expected_layer = statement.layers.ilog2() as usize;
         if protocol_version != BLS_DORY_MATRIX_VERSION
@@ -250,14 +260,40 @@ pub fn prove_bls_dory_matrix(
     accumulators: &[i64],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryMatrixProof, BlsDoryMatrixError> {
+    let padded_variables = matrix_variables(statement)?;
+    prove_bls_dory_matrix_at_variables(
+        binding,
+        statement,
+        activations,
+        weights,
+        accumulators,
+        padded_variables,
+        setup,
+    )
+}
+
+/// Prove the matrix relation at an exact shared aggregate geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_bls_dory_matrix_at_variables(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weights: &[i64],
+    accumulators: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryMatrixProof, BlsDoryMatrixError> {
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
     validate_tables(statement, activations, weights, accumulators)?;
+    validate_target_variables(matrix_variables(statement)?, padded_variables)?;
+    if padded_variables > setup.max_log_n() {
+        return Err(BlsDoryMatrixError::InvalidDimensions);
+    }
     let activation_values = signed_values(activations);
     let weight_values = signed_values(weights);
     let accumulator_values = signed_values(accumulators);
-    let padded_variables = matrix_variables(statement)?;
     let nu = padded_variables / 2;
     let sigma = padded_variables - nu;
     let activation_polynomial = commit_bls_dory_polynomial(
@@ -441,7 +477,7 @@ pub fn prove_bls_dory_matrix(
         transcript_digest,
         opening_proof,
     };
-    verify_bls_dory_matrix(binding, statement, &proof, setup)?;
+    verify_bls_dory_matrix_at_variables(binding, statement, &proof, padded_variables, setup)?;
     Ok(proof)
 }
 
@@ -452,12 +488,27 @@ pub fn verify_bls_dory_matrix(
     proof: &BlsDoryMatrixProof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryMatrixError> {
+    let padded_variables = matrix_variables(statement)?;
+    verify_bls_dory_matrix_at_variables(binding, statement, proof, padded_variables, setup)
+}
+
+/// Verify a matrix proof against the exact shared aggregate geometry.
+pub fn verify_bls_dory_matrix_at_variables(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    proof: &BlsDoryMatrixProof,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryMatrixError> {
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
     statement.validate_verifier_shape()?;
-    validate_proof_shape(statement, proof)?;
-    let padded_variables = matrix_variables(statement)?;
+    validate_target_variables(matrix_variables(statement)?, padded_variables)?;
+    if padded_variables > setup.max_log_n() {
+        return Err(BlsDoryMatrixError::InvalidDimensions);
+    }
+    validate_proof_shape(statement, proof, padded_variables)?;
     let mut transcript = matrix_transcript(
         binding,
         statement,
@@ -566,12 +617,14 @@ fn production_matrix_statement() -> StructuredMatrixStatement {
 fn validate_proof_shape(
     statement: StructuredMatrixStatement,
     proof: &BlsDoryMatrixProof,
+    expected_variables: usize,
 ) -> Result<(), BlsDoryMatrixError> {
     statement.validate_verifier_shape()?;
+    validate_target_variables(matrix_variables(statement)?, expected_variables)?;
     let common_rounds = statement.inner.ilog2() as usize;
     let layer_rounds = statement.layers.ilog2() as usize;
     if proof.protocol_version != BLS_DORY_MATRIX_VERSION
-        || usize::from(proof.padded_variables) != matrix_variables(statement)?
+        || usize::from(proof.padded_variables) != expected_variables
         || proof.rounds.len() != common_rounds + layer_rounds
         || proof
             .rounds
@@ -591,7 +644,18 @@ fn validate_proof_shape(
     Ok(())
 }
 
+fn validate_target_variables(
+    minimum_variables: usize,
+    target_variables: usize,
+) -> Result<(), BlsDoryMatrixError> {
+    if target_variables < minimum_variables || target_variables > 64 {
+        return Err(BlsDoryMatrixError::InvalidDimensions);
+    }
+    Ok(())
+}
+
 fn matrix_variables(statement: StructuredMatrixStatement) -> Result<usize, BlsDoryMatrixError> {
+    statement.validate_verifier_shape()?;
     statement
         .table_lengths()?
         .into_iter()

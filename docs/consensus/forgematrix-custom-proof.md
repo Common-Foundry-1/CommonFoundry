@@ -855,6 +855,27 @@ length, and total length, and mutation tests cover every evaluation role.
 Production still needs equality links from the scalar matrix commitments and
 existing packed transition commitments to these wiring roles.
 
+The shared-layout checkpoint removes a prerequisite mismatch between these
+three components. Each prover and verifier can now be given an exact common
+variable count, with only high-zero padding above the component's natural table
+geometry. That padding preserves the original multilinear coordinates. The
+canonical outer decoders require the same exact count and reject a different
+layout before invoking Dory verification. In the executable n=10 integration
+fixture, matrix, transition, and wiring all prove and verify at that one
+geometry; the current direct set has 122 openings, within the bounded 128-claim
+aggregate, although the three component constructors still emit separate
+21,775-byte Dory payloads.
+
+Production is pinned to the maximum component geometry, n=33. One Dory opening
+payload at n=33 projects to 70,639 bytes, but direct composition would expose 9
+matrix claims, 440 transition claims, and 31 wiring claims: 480 total, which
+exceeds the current 128-claim aggregate bound. This projection is not a complete
+proof-size or proving-time result. Packed LogUp must first compress the
+transition terminals; the constructors must then emit one shared aggregate,
+and equality openings must link the matrix, transition, and wiring commitments.
+An n=33 streaming prover, complete transcript and soundness accounting, and
+independent audit remain activation requirements.
+
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
 characteristics differ. Cross-field tests do show that the canonical
@@ -865,9 +886,9 @@ and digits fail with the same constraint pattern in all three. The selected
 route is therefore native scalar-field re-arithmetization. The distinct-point,
 matrix, full local-transition, and successor-wiring transcripts are now ported.
 The production packed LogUp argument and cross-component scalar commitment links
-are not yet connected. Streaming the n=29 wiring, n=33 transition, and n=31
-model polynomials, complete soundness accounting, full aggregate measurement,
-and independent audit remain mandatory activation gates.
+are not yet connected. The individual tables now accept the common n=33 layout,
+but streaming that shared geometry, complete soundness accounting, full
+aggregate measurement, and independent audit remain mandatory activation gates.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3

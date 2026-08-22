@@ -87,7 +87,7 @@ impl BlsDoryTransitionProof {
         &self,
         statement: StructuredTransitionStatement,
     ) -> Result<Vec<u8>, BlsDoryTransitionError> {
-        validate_proof_shape(statement, self)?;
+        validate_proof_shape(statement, self, usize::from(self.packed_variables))?;
         let opening_len = u32::try_from(self.opening_proof.len())
             .map_err(|_| BlsDoryTransitionError::ProofTooLarge)?;
         let expected = transition_wire_bytes(self.rounds.len(), self.opening_proof.len())?;
@@ -120,7 +120,18 @@ impl BlsDoryTransitionProof {
         encoded: &[u8],
         statement: StructuredTransitionStatement,
     ) -> Result<Self, BlsDoryTransitionError> {
+        let expected_variables = minimum_packed_variables(statement)?;
+        Self::decode_with_variables(encoded, statement, expected_variables)
+    }
+
+    /// Decode using the exact shared aggregate geometry selected by consensus.
+    pub fn decode_with_variables(
+        encoded: &[u8],
+        statement: StructuredTransitionStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryTransitionError> {
         statement.validate_verifier_shape()?;
+        validate_target_variables(minimum_packed_variables(statement)?, expected_variables)?;
         if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_TRANSITION_PROOF_BYTES {
             return Err(BlsDoryTransitionError::ProofTooLarge);
         }
@@ -133,11 +144,8 @@ impl BlsDoryTransitionProof {
         let terminal_count = read_u16(encoded, 14)? as usize;
         let opening_len = read_u32(encoded, 16)? as usize;
         let expected_rounds = statement.elements()?.ilog2() as usize;
-        let expected_packed = expected_rounds
-            .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
-            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
         if protocol_version != BLS_DORY_TRANSITION_VERSION
-            || usize::from(packed_variables) != expected_packed
+            || usize::from(packed_variables) != expected_variables
             || round_count != expected_rounds
             || terminal_count != STRUCTURED_TRANSITION_ORACLES
             || opening_len == 0
@@ -249,19 +257,41 @@ pub fn prove_bls_dory_transition(
     witness: &StructuredTransitionWitness,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryTransitionProof, BlsDoryTransitionError> {
+    let packed_variables = minimum_packed_variables(statement)?;
+    prove_bls_dory_transition_at_variables(
+        binding,
+        statement,
+        mask_polynomial,
+        witness,
+        packed_variables,
+        setup,
+    )
+}
+
+/// Prove all transition constraints at an exact shared aggregate geometry.
+pub fn prove_bls_dory_transition_at_variables(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    witness: &StructuredTransitionWitness,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryTransitionProof, BlsDoryTransitionError> {
     if binding.len() > MAX_TRANSITION_BINDING_BYTES {
         return Err(BlsDoryTransitionError::PublicBindingTooLarge);
     }
     mask_polynomial.validate(statement)?;
     let mut oracles = build_scalar_oracles(statement, witness)?;
     let cell_variables = statement.elements()?.ilog2() as usize;
-    let packed_variables = cell_variables
-        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
-        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryTransitionError::InvalidDimensions);
     }
-    let packed_coefficients = pack_oracles(&oracles)?;
+    let mut packed_coefficients = pack_oracles(&oracles)?;
+    let padded_len = 1usize
+        .checked_shl(packed_variables as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    packed_coefficients.resize(padded_len, BlsDoryFr::zero());
     let packed_nu = packed_variables / 2;
     let packed_sigma = packed_variables - packed_nu;
     let committed =
@@ -314,7 +344,7 @@ pub fn prove_bls_dory_transition(
     );
     let transcript_digest = transcript.digest();
 
-    let opening_points = packed_opening_points(&sumcheck_point);
+    let opening_points = packed_opening_points(&sumcheck_point, packed_variables)?;
     let opening_binding = opening_binding(binding, &transcript_digest);
     let (claims, opening_proof) = prove_bls_dory_same_commitment_openings(
         &opening_binding,
@@ -322,8 +352,12 @@ pub fn prove_bls_dory_transition(
         &opening_points,
         setup,
     )?;
-    let expected_claims =
-        transition_opening_claims(oracle_commitment, &sumcheck_point, &terminal_evaluations);
+    let expected_claims = transition_opening_claims(
+        oracle_commitment,
+        &sumcheck_point,
+        &terminal_evaluations,
+        packed_variables,
+    )?;
     if claims != expected_claims {
         return Err(BlsDoryTransitionError::Opening);
     }
@@ -348,16 +382,34 @@ pub fn verify_bls_dory_transition(
     proof: &BlsDoryTransitionProof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryTransitionError> {
+    let packed_variables = minimum_packed_variables(statement)?;
+    verify_bls_dory_transition_at_variables(
+        binding,
+        statement,
+        mask_polynomial,
+        proof,
+        packed_variables,
+        setup,
+    )
+}
+
+/// Verify transition constraints against the exact shared aggregate geometry.
+pub fn verify_bls_dory_transition_at_variables(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    proof: &BlsDoryTransitionProof,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryTransitionError> {
     if binding.len() > MAX_TRANSITION_BINDING_BYTES {
         return Err(BlsDoryTransitionError::PublicBindingTooLarge);
     }
     statement.validate_verifier_shape()?;
     mask_polynomial.validate(statement)?;
     let cell_variables = statement.elements()?.ilog2() as usize;
-    let packed_variables = cell_variables
-        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
-        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-    validate_proof_shape(statement, proof)?;
+    validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
+    validate_proof_shape(statement, proof, packed_variables)?;
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryTransitionError::InvalidProofShape);
     }
@@ -405,7 +457,8 @@ pub fn verify_bls_dory_transition(
         proof.oracle_commitment,
         &sumcheck_point,
         &proof.terminal_evaluations,
-    );
+        packed_variables,
+    )?;
     let opening_binding = opening_binding(binding, &proof.transcript_digest);
     verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
     Ok(())
@@ -414,14 +467,13 @@ pub fn verify_bls_dory_transition(
 fn validate_proof_shape(
     statement: StructuredTransitionStatement,
     proof: &BlsDoryTransitionProof,
+    expected_variables: usize,
 ) -> Result<(), BlsDoryTransitionError> {
     statement.validate_verifier_shape()?;
     let cell_variables = statement.elements()?.ilog2() as usize;
-    let packed_variables = cell_variables
-        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
-        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    validate_target_variables(minimum_packed_variables(statement)?, expected_variables)?;
     if proof.protocol_version != BLS_DORY_TRANSITION_VERSION
-        || usize::from(proof.packed_variables) != packed_variables
+        || usize::from(proof.packed_variables) != expected_variables
         || proof.rounds.len() != cell_variables
         || proof
             .rounds
@@ -432,6 +484,25 @@ fn validate_proof_shape(
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
         return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+fn minimum_packed_variables(
+    statement: StructuredTransitionStatement,
+) -> Result<usize, BlsDoryTransitionError> {
+    statement.validate_verifier_shape()?;
+    (statement.elements()?.ilog2() as usize)
+        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)
+}
+
+fn validate_target_variables(
+    minimum_variables: usize,
+    target_variables: usize,
+) -> Result<(), BlsDoryTransitionError> {
+    if target_variables < minimum_variables || target_variables > 64 {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
     }
     Ok(())
 }
@@ -661,11 +732,18 @@ fn pack_oracles(oracles: &[Vec<BlsDoryFr>]) -> Result<Vec<BlsDoryFr>, BlsDoryTra
     Ok(packed)
 }
 
-fn packed_opening_points(cell_point: &[BlsDoryFr]) -> Vec<Vec<BlsDoryFr>> {
-    (0..STRUCTURED_TRANSITION_ORACLES)
+fn packed_opening_points(
+    cell_point: &[BlsDoryFr],
+    packed_variables: usize,
+) -> Result<Vec<Vec<BlsDoryFr>>, BlsDoryTransitionError> {
+    let minimum = cell_point
+        .len()
+        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    validate_target_variables(minimum, packed_variables)?;
+    Ok((0..STRUCTURED_TRANSITION_ORACLES)
         .map(|oracle| {
-            let mut point =
-                Vec::with_capacity(cell_point.len() + BLS_DORY_TRANSITION_SELECTOR_VARIABLES);
+            let mut point = Vec::with_capacity(packed_variables);
             point.extend_from_slice(cell_point);
             for bit in 0..BLS_DORY_TRANSITION_SELECTOR_VARIABLES {
                 point.push(if (oracle >> bit) & 1 == 1 {
@@ -674,17 +752,19 @@ fn packed_opening_points(cell_point: &[BlsDoryFr]) -> Vec<Vec<BlsDoryFr>> {
                     BlsDoryFr::zero()
                 });
             }
+            point.resize(packed_variables, BlsDoryFr::zero());
             point
         })
-        .collect()
+        .collect())
 }
 
 fn transition_opening_claims(
     commitment: BlsDoryGt,
     cell_point: &[BlsDoryFr],
     evaluations: &[BlsDoryFr],
-) -> Vec<BlsDoryOpeningClaim> {
-    packed_opening_points(cell_point)
+    packed_variables: usize,
+) -> Result<Vec<BlsDoryOpeningClaim>, BlsDoryTransitionError> {
+    Ok(packed_opening_points(cell_point, packed_variables)?
         .into_iter()
         .zip(evaluations)
         .map(|(point, evaluation)| BlsDoryOpeningClaim {
@@ -692,7 +772,7 @@ fn transition_opening_claims(
             point,
             evaluation: *evaluation,
         })
-        .collect()
+        .collect())
 }
 
 fn transition_round(

@@ -201,6 +201,17 @@ cover the binding, statement, commitment, every evaluation, transcript, opening,
 and outer parser. Cross-component links from the scalar matrix and transition
 commitments to these wiring roles are still missing; n=29 streaming, soundness
 review, and audit also remain gates.
+The shared-layout checkpoint now pins all three scalar components to an exact
+verifier-selected variable count. High-zero padding preserves each component's
+natural multilinear coordinates, while canonical decoders reject a proof made
+for any other geometry before opening verification. An executable n=10 fixture
+proves and verifies matrix, transition, and wiring at one layout; their current
+direct claim set is 122 and each still carries a separate 21,775-byte Dory
+payload. Production is pinned to n=33. A single Dory opening at that geometry
+projects to 70,639 bytes, but the uncompressed production terminal set has 480
+claims, exceeding the current 128-claim aggregate bound. Packed LogUp, one
+shared opening proof, equality openings between component commitments, n=33
+streaming, complete soundness accounting, and audit remain required.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

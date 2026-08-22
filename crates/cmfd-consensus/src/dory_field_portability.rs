@@ -12,6 +12,9 @@ use std::fmt::Debug;
 use dory_pcs::backends::arkworks::ArkFr;
 use dory_pcs::primitives::arithmetic::Field;
 
+#[cfg(feature = "dory-bls12-381-prototype")]
+use crate::dory_bls12_381_prototype::BlsDoryFr;
+
 use crate::{
     STRUCTURED_TRANSITION_CONSTRAINTS, STRUCTURED_TRANSITION_RANGE_DIGITS,
     STRUCTURED_TRANSITION_RANGE_SPEC_COUNT, StructuredTransitionStatement, V2_TRANSITION_MODULUS,
@@ -63,6 +66,37 @@ impl ConstraintField for ExtensionField {
 }
 
 impl ConstraintField for ArkFr {
+    fn zero() -> Self {
+        <Self as Field>::zero()
+    }
+
+    fn one() -> Self {
+        <Self as Field>::one()
+    }
+
+    fn from_u64(value: u64) -> Self {
+        <Self as Field>::from_u64(value)
+    }
+
+    fn from_i64(value: i64) -> Self {
+        <Self as Field>::from_i64(value)
+    }
+
+    fn add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+
+    fn sub(self, rhs: Self) -> Self {
+        self - rhs
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        self * rhs
+    }
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+impl ConstraintField for BlsDoryFr {
     fn zero() -> Self {
         <Self as Field>::zero()
     }
@@ -283,16 +317,22 @@ fn all_121_bounded_transition_constraints_are_scalar_field_portable() {
 
     for fixture in fixtures {
         let goldilocks = evaluate_constraints::<ExtensionField>(statement, fixture, None);
-        let dory_scalar = evaluate_constraints::<ArkFr>(statement, fixture, None);
+        let bn254_scalar = evaluate_constraints::<ArkFr>(statement, fixture, None);
         assert!(
             goldilocks
                 .iter()
                 .all(|value| *value == ExtensionField::ZERO)
         );
         assert!(
-            dory_scalar
+            bn254_scalar
                 .iter()
                 .all(|value| *value == <ArkFr as Field>::zero())
+        );
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        assert!(
+            evaluate_constraints::<BlsDoryFr>(statement, fixture, None)
+                .iter()
+                .all(|value| *value == <BlsDoryFr as Field>::zero())
         );
     }
 
@@ -302,6 +342,13 @@ fn all_121_bounded_transition_constraints_are_scalar_field_portable() {
     let scalar_bad = evaluate_constraints::<ArkFr>(statement, bad_core, None);
     assert_eq!(zero_pattern(&goldilocks_bad), zero_pattern(&scalar_bad));
     assert!(zero_pattern(&goldilocks_bad).contains(&false));
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    assert_eq!(
+        zero_pattern(&goldilocks_bad),
+        zero_pattern(&evaluate_constraints::<BlsDoryFr>(
+            statement, bad_core, None
+        ))
+    );
 
     let bad_digit = Some(DigitMutation {
         spec: 0,
@@ -313,4 +360,13 @@ fn all_121_bounded_transition_constraints_are_scalar_field_portable() {
     let scalar_bad = evaluate_constraints::<ArkFr>(statement, fixtures[1], bad_digit);
     assert_eq!(zero_pattern(&goldilocks_bad), zero_pattern(&scalar_bad));
     assert!(zero_pattern(&goldilocks_bad).contains(&false));
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    assert_eq!(
+        zero_pattern(&goldilocks_bad),
+        zero_pattern(&evaluate_constraints::<BlsDoryFr>(
+            statement,
+            fixtures[1],
+            bad_digit
+        ))
+    );
 }

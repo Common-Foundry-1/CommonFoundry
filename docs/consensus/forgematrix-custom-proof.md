@@ -812,8 +812,10 @@ Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
 characteristics differ. Cross-field tests do show that the canonical
 bounded-integer witness makes all 121 local transition constraints vanish in
-both fields across signed boundary cases, while altered reductions and digits
-fail in both. The selected route is therefore native scalar-field
+the cubic Goldilocks field, the BN254 reference scalar field, and the actual
+BLS12-381 scalar field across signed boundary cases, while altered reductions
+and digits fail with the same constraint pattern in all three. The selected
+route is therefore native scalar-field
 re-arithmetization. The distinct-point sumcheck transcript is now ported, but
 the complete AIR and LogUp relation are not. Connecting those relations,
 streaming n=31 proving, complete soundness accounting, full aggregate

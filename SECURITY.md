@@ -169,7 +169,10 @@ claims. The fixed parser preflights the full shape and tests reject statement,
 order, setup, sumcheck, and proof mutations. The n=31 grammar projects to 66,559
 bytes, but the executable prover is still capped at n=16. This remains a
 sequential, unaudited backend checkpoint; the complete AIR and LogUp relation
-are not ported and consensus does not accept it.
+are not ported and consensus does not accept it. Cross-field tests now evaluate
+all 121 bounded transition constraints directly in the BLS12-381 scalar field,
+including signed boundaries and invalid reductions/digits; this establishes
+arithmetic portability, not a complete proof of those constraints.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

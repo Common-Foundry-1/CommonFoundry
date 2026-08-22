@@ -427,20 +427,24 @@ comparison. The v2 research code now implements:
   mismatches. One opening payload at n=33 projects to 70,639 bytes, but the
   uncompressed production composition has 480 direct claims against the current
   128-claim bound. A scalar range LogUp now reuses the transition commitment:
-  three openings prove membership, and two selector-sumcheck openings bind the
-  98 digit lanes' value/slack reconstruction to the eight regular source roles.
-  Its n=10 fixture is 26,689 bytes and its n=33 grammar projects to 79,233
-  bytes. Four arithmetic proofs need 48 claims and four range proofs need 20;
-  matrix and wiring bring the compressed subtotal to 108 claims. A composed
-  verifier requires each arithmetic/range pair to share one packed commitment.
-  Ten Fiat-Shamir equality points add 20 authenticated claims linking the
-  initialization output and each bank's matrix activation, matrix accumulator,
-  and transition activation to their corresponding transition or wiring roles.
+  three openings prove membership, and one randomly combined selector-sumcheck
+  opening binds the 98 digit lanes' value/slack reconstruction to the eight
+  regular source roles. Its n=10 fixture is 25,985 bytes and its n=33 grammar
+  projects to 78,529 bytes. Four arithmetic proofs need 48 claims and four range
+  proofs need 16; matrix and wiring bring the compressed subtotal to 104 claims.
+  A composed verifier requires each arithmetic/range pair to share one packed
+  commitment.
+  Eleven Fiat-Shamir equality points add 22 authenticated claims linking the
+  pinned base input to the virtual transition, the initialization output, and
+  each bank's matrix activation, matrix accumulator, and transition activation
+  to their corresponding transition or wiring roles. The matrix weight
+  commitments are checked directly against the trusted BLS fixed-model identity.
   A canonical shared frame authenticates the exact three-matrix,
-  four-transition, one-wiring production topology with one 128-claim aggregate
-  and projects to 136,157 bytes at n=33. Altered equality values and substituted,
-  reordered, or omitted components reject. An n=33 streaming prover, soundness
-  review, and audit remain activation gates;
+  four-transition, one-wiring production topology with one 126-claim aggregate
+  and projects to 133,373 bytes at n=33. Altered model commitments, equality
+  values, and substituted, reordered, or omitted components reject.
+  Authenticated-model derivation, an n=33 streaming prover, soundness review, and
+  audit remain activation gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

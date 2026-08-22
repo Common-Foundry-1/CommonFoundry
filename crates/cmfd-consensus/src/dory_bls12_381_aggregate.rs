@@ -78,6 +78,27 @@ pub(crate) struct BlsDoryDeferredOpeningSet {
 }
 
 impl BlsDoryDeferredOpeningSet {
+    pub(crate) fn unopened(
+        polynomials: Vec<BlsDoryCommittedPolynomial>,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        if polynomials.is_empty() {
+            return Err(BlsDoryAggregateError::InvalidClaimCount);
+        }
+        let variables = polynomials[0].variables();
+        if polynomials
+            .iter()
+            .any(|polynomial| polynomial.variables() != variables)
+        {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        Ok(Self {
+            polynomials,
+            polynomial_indices: Vec::new(),
+            points: Vec::new(),
+            claims: Vec::new(),
+        })
+    }
+
     pub(crate) fn new(
         polynomials: Vec<BlsDoryCommittedPolynomial>,
         polynomial_indices: Vec<usize>,

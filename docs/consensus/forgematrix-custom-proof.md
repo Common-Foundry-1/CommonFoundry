@@ -820,10 +820,11 @@ unequal activation, weight, and accumulator geometries verifies the high-zero
 padding rule. The production weight table is n=31; its complete matrix grammar
 projects to 70,483 bytes, including 66,559 bytes for the aggregate, and its raw
 sumcheck error numerator is 45. The parser derives both round counts and every
-round degree from the trusted statement before group decoding. Production still
-needs the weight commitment derived from the pinned `ModelPcsIdentity` and
-equality links from the activation and accumulator commitments to the wiring and
-transition components.
+round degree from the trusted statement before group decoding. The shared path
+now checks the weight commitment against a trusted BLS fixed-model identity
+bound to `ModelPcsIdentity`, and links the activation and accumulator commitments
+to the wiring and transition components. Production still needs to derive those
+fixed BLS commitments through the authenticated streamed model-bank boundary.
 
 The transition checkpoint now goes beyond field-portability tests. It packs the
 110 canonical transition oracles into 128 selector slots under one Dory
@@ -855,8 +856,8 @@ production table has 26 table variables plus three selector variables and needs
 for the aggregate. The verifier receives no activation tables. Its canonical
 parser preflights the statement-derived variables, evaluation count, opening
 length, and total length, and mutation tests cover every evaluation role.
-Production still needs equality links from the scalar matrix commitments and
-existing packed transition commitments to these wiring roles.
+The shared layout below now supplies equality links from the scalar matrix and
+packed transition commitments to these wiring roles.
 
 The shared-layout checkpoint removes a prerequisite mismatch between these
 three components. Each prover and verifier can now be given an exact common
@@ -865,8 +866,8 @@ geometry. That padding preserves the original multilinear coordinates. The
 canonical outer decoders require the same exact count and reject a different
 layout before invoking Dory verification. In the executable n=10 integration
 fixture, matrix, arithmetic transition, range, and wiring all prove and verify
-at that one geometry. The compressed fixture has 29 openings, one 21,775-byte
-Dory payload, and a complete 31,135-byte canonical frame. The parser derives
+at that one geometry. The linked fixture has 54 openings, one 21,775-byte Dory
+payload, and a complete 35,953-byte canonical frame. The parser derives
 every component shape from trusted statements and rejects malformed lengths,
 trailing bytes, omitted components, and incompatible geometry.
 
@@ -887,35 +888,43 @@ membership portion terminates in three openings: transition digit,
 multiplicity, and inverse.
 
 After those terminals are transcript-bound, the verifier samples a random cell,
-a random three-bit range-spec point, and a slack-mixing scalar. Two degree-two
-selector sumchecks prove, at those points, both the selected regular source and
-the radix-16 weighted value/slack lanes. Their public relation is
+a random three-bit range-spec point, and a slack-mixing scalar. It then samples
+another challenge after the source claim and uses it to combine the source and
+digit reconstruction identities. One degree-two selector sumcheck proves the
+combined identity at a random selector point. The underlying public relation is
 `digits = (1 - beta) * source + beta * maximum`, which simultaneously enforces
-value reconstruction and `source + slack = maximum`. Both terminal evaluations
-are authenticated as additional openings of the same transition commitment.
-The complete argument therefore uses five openings. Its executable n=10 fixture
-is 26,689 bytes, of which 21,775 bytes are the Dory proof; changing a digit to
+value reconstruction and `source + slack = maximum`; a false source or digit
+identity can cancel only at the post-claim random mixing challenge. The combined
+terminal evaluation is one additional opening of the same transition commitment.
+The complete argument therefore uses four openings. Its executable n=10 fixture
+is 25,985 bytes, of which 21,775 bytes are the Dory proof; changing a digit to
 16 or changing it to another in-range value that breaks reconstruction prevents
 the prover from preserving the claim. The canonical parser rejects incompatible
 geometry, malformed lengths, and trailing bytes. The n=33 grammar projects to
-79,233 bytes, including the 70,639-byte Dory payload.
+78,529 bytes, including the 70,639-byte Dory payload.
 
 Across the initialization transition and three banks, arithmetic needs 48
-openings and the range checkpoints need twenty. Adding nine matrix and 31 wiring
-openings gives a 108-claim compressed subtotal. The composed transition verifier
+openings and the range checkpoints need sixteen. Adding nine matrix and 31 wiring
+openings gives a 104-claim compressed subtotal. The composed transition verifier
 requires its arithmetic and range halves to use the same packed commitment. The
 shared proof grammar accepts the exact production topology of three matrix
-proofs, four arithmetic/range transition pairs, and one wiring proof. It derives
-ten equality points after absorbing every component commitment and transcript
-digest. One equality links the initialization-transition activation to the
-wiring initial table. For each bank, three more link matrix activation to wiring
-input, matrix accumulator to transition input, and transition activation to
-wiring output. Opening both independently committed representations adds twenty
-claims, filling the bounded aggregate exactly at 128. One shared Dory payload
+proofs, four arithmetic/range transition pairs, and one wiring proof. A trusted
+BLS fixed-model identity binds the existing `ModelPcsIdentity`, setup identity,
+base-input commitment, and ordered weight-bank commitments. Each matrix weight
+commitment must match it exactly. The shared transcript derives eleven equality
+points after absorbing that identity and every component commitment and digest.
+One equality links the fixed base input to the virtual transition input, another
+links that transition's activation to the wiring initial table, and three per
+bank link matrix activation to wiring input, matrix accumulator to transition
+input, and transition activation to wiring output. Opening both independently
+committed representations adds twenty-two claims, bringing the bounded aggregate
+to 126 under the unchanged cap of 128. One shared Dory payload
 authenticates every ordered base and equality claim. Its complete n=33 frame
-projects to 136,157 bytes. Tests reject changed equality values and substituted,
-reordered, or omitted components. An n=33 streaming prover, complete transcript
-and soundness accounting, and independent audit remain activation requirements.
+projects to 133,373 bytes. Tests reject changed model identities, fixed
+commitments, equality values, and substituted, reordered, or omitted components.
+Authenticated streamed fixed-model derivation, an n=33 streaming prover, complete
+transcript and soundness accounting, and independent audit remain activation
+requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -988,8 +997,9 @@ sumcheck over 26 variables (`7 layer + 7 row + 12 column`), giving numerator
 442, while mixing 121 constraints contributes at most 120 more. The split BLS
 arithmetic checkpoint lowers its sumcheck contribution to `3 * 26 = 78` and
 mixes seven constraints, but that is not the complete transition bound. The
-degree-four LogUp rounds, both degree-two selector sumchecks, lookup challenge,
-random cell/spec evaluation, slack mixing, PCS binding/list-decoding error,
+degree-four LogUp rounds, the randomly combined degree-two selector sumcheck,
+lookup and reconstruction-mixing challenges, random cell/spec evaluation, slack
+mixing, PCS binding/list-decoding error,
 wiring sumchecks, hash collision assumptions, and proof-of-work grinding must
 all be union-bounded. A machine-generated report must show total error at most
 `2^-128`; quoting the scalar-field size or only the arithmetic contribution is

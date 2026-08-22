@@ -10,18 +10,19 @@ use std::io::Cursor;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
-    arithmetic::Field,
+    arithmetic::{Field, Group},
     serialization::{Compress, Validate},
     transcript::Transcript,
 };
 use thiserror::Error;
 
 use crate::{
-    STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_INPUT_ORACLE,
+    ModelPcsIdentity, STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_INPUT_ORACLE,
     STRUCTURED_TRANSITION_ORACLES, StructuredMaskPolynomial, StructuredMatrixStatement,
     StructuredTransitionStatement, StructuredTransitionWitness, StructuredWiringStatement,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
+        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
         projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
         verify_bls_dory_openings,
     },
@@ -56,14 +57,15 @@ use crate::{
     },
 };
 
-pub const BLS_DORY_SHARED_LAYOUT_VERSION: u16 = 2;
+pub const BLS_DORY_SHARED_LAYOUT_VERSION: u16 = 3;
+pub const BLS_DORY_FIXED_MODEL_IDENTITY_VERSION: u16 = 1;
 const MAX_SHARED_LAYOUT_BINDING_BYTES: usize = 4_096;
 const SHARED_PROOF_MAGIC: [u8; 8] = *b"CFBLSS01";
 const SHARED_PROOF_HEADER_BYTES: usize = 16;
 pub const MAX_BLS_DORY_SHARED_MATRIX_PROOFS: usize = 3;
 pub const MAX_BLS_DORY_SHARED_TRANSITION_PROOFS: usize = 4;
 pub const MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES: usize = 262_128;
-pub const BLS_DORY_SHARED_INITIALIZATION_LINKS: usize = 1;
+pub const BLS_DORY_SHARED_INITIALIZATION_LINKS: usize = 2;
 pub const BLS_DORY_SHARED_LINKS_PER_BANK: usize = 3;
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
@@ -78,7 +80,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_WIRING_CLAIMS: usize = 31;
 pub const BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS: usize = BLS_DORY_SHARED_PRODUCTION_MATRIX_CLAIMS
     + BLS_DORY_SHARED_PRODUCTION_TRANSITION_CLAIMS
     + BLS_DORY_SHARED_PRODUCTION_WIRING_CLAIMS;
-/// Four scalar range checkpoints need five openings each.
+/// Four scalar range checkpoints need four openings each.
 pub const BLS_DORY_SHARED_LOGUP_RANGE_TRANSITION_CLAIMS: usize =
     4 * BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS;
 /// Four arithmetic transition checkpoints retain twelve regular openings each.
@@ -105,9 +107,163 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the common n=33 coefficient tables are not streamed by the in-memory prover",
+    "the pinned fixed-model commitments and common n=33 coefficient tables are not derived by a streamed authenticated-model prover",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
+
+/// Network-pinned BLS commitments for the authenticated fixed model.
+///
+/// The descriptor is supplied by the trusted consensus configuration, never by
+/// the block proof. Its model digest binds the existing byte/WHIR identity while
+/// the Dory commitments bind the scalar tables used by this proof backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlsDoryFixedModelIdentity {
+    pub protocol_version: u16,
+    pub model_pcs_identity_digest: [u8; 32],
+    pub setup_identity: [u8; 32],
+    pub base_input_commitment: BlsDoryGt,
+    pub weight_bank_commitments: Vec<BlsDoryGt>,
+}
+
+impl BlsDoryFixedModelIdentity {
+    pub fn validate(
+        &self,
+        trusted_model: &ModelPcsIdentity,
+        expected_banks: usize,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<(), BlsDorySharedLayoutError> {
+        setup
+            .validate()
+            .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?;
+        let model_digest = trusted_model
+            .digest()
+            .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?;
+        if self.protocol_version != BLS_DORY_FIXED_MODEL_IDENTITY_VERSION
+            || self.model_pcs_identity_digest != model_digest
+            || self.setup_identity != setup.identity()
+            || self.weight_bank_commitments.len() != expected_banks
+            || self.weight_bank_commitments.len() != trusted_model.weight_bank_commitments.len()
+            || self.base_input_commitment == BlsDoryGt::identity()
+            || self
+                .weight_bank_commitments
+                .iter()
+                .any(|commitment| *commitment == BlsDoryGt::identity())
+        {
+            return Err(BlsDorySharedLayoutError::FixedModelIdentity);
+        }
+        for (index, commitment) in self.weight_bank_commitments.iter().enumerate() {
+            if *commitment == self.base_input_commitment
+                || self.weight_bank_commitments[..index].contains(commitment)
+            {
+                return Err(BlsDorySharedLayoutError::FixedModelIdentity);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<[u8; 32], BlsDorySharedLayoutError> {
+        let bank_count = u16::try_from(self.weight_bank_commitments.len())
+            .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?;
+        let mut encoded = Vec::new();
+        append_serialized(&mut encoded, &self.base_input_commitment)?;
+        for commitment in &self.weight_bank_commitments {
+            append_serialized(&mut encoded, commitment)?;
+        }
+        let mut hasher = blake3::Hasher::new_derive_key(
+            "CommonFoundry/ForgeMatrix/BlsDoryFixedModelIdentity/v1",
+        );
+        hasher.update(&self.protocol_version.to_le_bytes());
+        hasher.update(&bank_count.to_le_bytes());
+        hasher.update(&self.model_pcs_identity_digest);
+        hasher.update(&self.setup_identity);
+        hasher.update(&encoded);
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
+
+/// Derive the network-pinned Dory commitments from already authenticated model
+/// values. Production must call this through the streamed model-bank boundary;
+/// this bounded reference helper exists for fixtures and activation tooling.
+pub fn derive_bls_dory_fixed_model_identity(
+    trusted_model: &ModelPcsIdentity,
+    base_input: &[i64],
+    weight_banks: &[&[i64]],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryFixedModelIdentity, BlsDorySharedLayoutError> {
+    trusted_model
+        .validate()
+        .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?;
+    setup
+        .validate()
+        .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?;
+    if weight_banks.len() != trusted_model.weight_bank_commitments.len()
+        || padded_variables > setup.max_log_n()
+    {
+        return Err(BlsDorySharedLayoutError::FixedModelIdentity);
+    }
+    let base_elements = usize::try_from(
+        u64::from(trusted_model.batch)
+            .checked_mul(u64::from(trusted_model.dimension))
+            .ok_or(BlsDorySharedLayoutError::FixedModelIdentity)?,
+    )
+    .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?;
+    let weight_elements = usize::try_from(
+        u64::from(trusted_model.layers_per_bank)
+            .checked_mul(u64::from(trusted_model.dimension))
+            .and_then(|value| value.checked_mul(u64::from(trusted_model.dimension)))
+            .ok_or(BlsDorySharedLayoutError::FixedModelIdentity)?,
+    )
+    .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?;
+    if base_input.len() != base_elements
+        || weight_banks
+            .iter()
+            .any(|weights| weights.len() != weight_elements)
+    {
+        return Err(BlsDorySharedLayoutError::FixedModelIdentity);
+    }
+    let base_input_commitment =
+        commit_fixed_table(base_input, padded_variables, setup)?.commitment();
+    let weight_bank_commitments = weight_banks
+        .iter()
+        .map(|weights| {
+            commit_fixed_table(weights, padded_variables, setup)
+                .map(|committed| committed.commitment())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let identity = BlsDoryFixedModelIdentity {
+        protocol_version: BLS_DORY_FIXED_MODEL_IDENTITY_VERSION,
+        model_pcs_identity_digest: trusted_model
+            .digest()
+            .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?,
+        setup_identity: setup.identity(),
+        base_input_commitment,
+        weight_bank_commitments,
+    };
+    identity.validate(trusted_model, weight_banks.len(), setup)?;
+    Ok(identity)
+}
+
+fn commit_fixed_table(
+    values: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryCommittedPolynomial, BlsDorySharedLayoutError> {
+    let padded_len = 1usize
+        .checked_shl(padded_variables as u32)
+        .ok_or(BlsDorySharedLayoutError::FixedModelIdentity)?;
+    if values.is_empty() || values.len() > padded_len || !values.len().is_power_of_two() {
+        return Err(BlsDorySharedLayoutError::FixedModelIdentity);
+    }
+    let mut coefficients = values
+        .iter()
+        .copied()
+        .map(BlsDoryFr::from_i64)
+        .collect::<Vec<_>>();
+    coefficients.resize(padded_len, BlsDoryFr::zero());
+    let nu = padded_variables / 2;
+    commit_bls_dory_polynomial(coefficients, nu, padded_variables - nu, setup).map_err(Into::into)
+}
 
 /// Arithmetic and range proofs that share the exact packed transition commitment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,6 +484,10 @@ pub enum BlsDorySharedLayoutError {
     LinkTopology,
     #[error("cross-component equality opening evaluations do not match")]
     LinkEvaluation,
+    #[error("the pinned BLS fixed-model identity is invalid or mismatched")]
+    FixedModelIdentity,
+    #[error("the proof does not use the pinned BLS fixed-model commitments")]
+    FixedModelCommitment,
     #[error("the shared BLS12-381 layout is not production ready")]
     NotProductionReady,
 }
@@ -351,6 +511,8 @@ pub struct BlsDoryTransitionProverInput<'a> {
 #[allow(clippy::too_many_arguments)]
 pub fn prove_bls_dory_shared_layout_at_variables(
     binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
     matrix_inputs: &[BlsDoryMatrixProverInput<'_>],
     transition_inputs: &[BlsDoryTransitionProverInput<'_>],
     wiring_statement: StructuredWiringStatement,
@@ -376,22 +538,46 @@ pub fn prove_bls_dory_shared_layout_at_variables(
         .map(|input| input.statement)
         .collect::<Vec<_>>();
     validate_shared_link_topology(&matrix_statements, &transition_statements, wiring_statement)?;
+    validate_fixed_model_topology(
+        trusted_model,
+        fixed_model,
+        &matrix_statements,
+        &transition_statements,
+        wiring_statement,
+        setup,
+    )?;
+    let component_binding = fixed_model_binding(binding, trusted_model, fixed_model, setup)?;
+    let fixed_base = commit_fixed_table(
+        &transition_inputs[0].witness.accumulators,
+        padded_variables,
+        setup,
+    )?;
+    if fixed_base.commitment() != fixed_model.base_input_commitment {
+        return Err(BlsDorySharedLayoutError::FixedModelCommitment);
+    }
     let mut matrices = Vec::with_capacity(matrix_inputs.len());
-    for input in matrix_inputs {
-        matrices.push(prove_bls_dory_matrix_deferred_at_variables(
-            binding,
+    for (input, expected_weight) in matrix_inputs
+        .iter()
+        .zip(&fixed_model.weight_bank_commitments)
+    {
+        let matrix = prove_bls_dory_matrix_deferred_at_variables(
+            &component_binding,
             input.statement,
             input.activations,
             input.weights,
             input.accumulators,
             padded_variables,
             setup,
-        )?);
+        )?;
+        if matrix.proof.weight_commitment != *expected_weight {
+            return Err(BlsDorySharedLayoutError::FixedModelCommitment);
+        }
+        matrices.push(matrix);
     }
     let mut transitions = Vec::with_capacity(transition_inputs.len());
     for input in transition_inputs {
         let arithmetic = prove_bls_dory_transition_deferred_at_variables(
-            binding,
+            &component_binding,
             input.statement,
             input.mask_polynomial,
             input.witness,
@@ -399,7 +585,7 @@ pub fn prove_bls_dory_shared_layout_at_variables(
             setup,
         )?;
         let range = prove_bls_dory_range_logup_deferred_at_variables(
-            binding,
+            &component_binding,
             input.statement,
             input.witness,
             padded_variables,
@@ -411,7 +597,7 @@ pub fn prove_bls_dory_shared_layout_at_variables(
         transitions.push((arithmetic, range));
     }
     let wiring = prove_bls_dory_wiring_deferred_at_variables(
-        binding,
+        &component_binding,
         wiring_statement,
         initial,
         inputs,
@@ -420,10 +606,12 @@ pub fn prove_bls_dory_shared_layout_at_variables(
         setup,
     )?;
     prove_prepared_shared_layout(
-        binding,
+        &component_binding,
         matrices,
         transitions,
         wiring,
+        fixed_base,
+        fixed_model,
         &matrix_statements,
         &transition_statements,
         wiring_statement,
@@ -441,6 +629,8 @@ fn prove_prepared_shared_layout(
         PreparedBlsDoryRangeLogUpProof,
     )>,
     mut wiring: PreparedBlsDoryWiringProof,
+    fixed_base: BlsDoryCommittedPolynomial,
+    fixed_model: &BlsDoryFixedModelIdentity,
     matrix_statements: &[StructuredMatrixStatement],
     transition_statements: &[StructuredTransitionStatement],
     wiring_statement: StructuredWiringStatement,
@@ -462,6 +652,7 @@ fn prove_prepared_shared_layout(
         &matrix_proofs,
         &transition_proofs,
         &wiring.proof,
+        fixed_model,
     )?;
     let links = derive_shared_link_points(
         &opening_binding,
@@ -470,8 +661,14 @@ fn prove_prepared_shared_layout(
         wiring_statement,
         padded_variables,
     )?;
-    let link_evaluations =
-        attach_prover_links(&links, &mut matrices, &mut transitions, &mut wiring)?;
+    let mut fixed_base = BlsDoryDeferredOpeningSet::unopened(vec![fixed_base])?;
+    let link_evaluations = attach_prover_links(
+        &links,
+        &mut matrices,
+        &mut transitions,
+        &mut wiring,
+        &mut fixed_base,
+    )?;
     let mut opening_sets = Vec::new();
     let mut expected_claims = Vec::new();
     for matrix in &matrices {
@@ -486,6 +683,8 @@ fn prove_prepared_shared_layout(
     }
     opening_sets.push(&wiring.openings);
     expected_claims.extend_from_slice(wiring.openings.claims());
+    opening_sets.push(&fixed_base);
+    expected_claims.extend_from_slice(fixed_base.claims());
     let (claims, opening_proof) =
         prove_bls_dory_deferred_opening_sets(&opening_binding, &opening_sets, setup)?;
     if claims != expected_claims {
@@ -517,6 +716,8 @@ fn prove_prepared_shared_layout(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_bls_dory_shared_layout_at_variables(
     binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
     matrix_statements: &[StructuredMatrixStatement],
     transition_statements: &[StructuredTransitionStatement],
     mask_polynomials: &[&StructuredMaskPolynomial],
@@ -533,10 +734,27 @@ pub fn verify_bls_dory_shared_layout_at_variables(
         return Err(BlsDorySharedLayoutError::InvalidProofShape);
     }
     validate_shared_link_topology(matrix_statements, transition_statements, wiring_statement)?;
+    validate_fixed_model_topology(
+        trusted_model,
+        fixed_model,
+        matrix_statements,
+        transition_statements,
+        wiring_statement,
+        setup,
+    )?;
+    if proof
+        .matrices
+        .iter()
+        .zip(&fixed_model.weight_bank_commitments)
+        .any(|(matrix, commitment)| matrix.weight_commitment != *commitment)
+    {
+        return Err(BlsDorySharedLayoutError::FixedModelCommitment);
+    }
+    let component_binding = fixed_model_binding(binding, trusted_model, fixed_model, setup)?;
     let mut matrix_claims = Vec::with_capacity(proof.matrices.len());
     for (statement, matrix) in matrix_statements.iter().zip(&proof.matrices) {
         matrix_claims.push(verify_bls_dory_matrix_deferred_at_variables(
-            binding,
+            &component_binding,
             *statement,
             matrix,
             padded_variables,
@@ -553,7 +771,7 @@ pub fn verify_bls_dory_shared_layout_at_variables(
             return Err(BlsDorySharedLayoutError::TransitionRangeCommitment);
         }
         let arithmetic = verify_bls_dory_transition_deferred_at_variables(
-            binding,
+            &component_binding,
             *statement,
             mask,
             &transition.arithmetic,
@@ -561,7 +779,7 @@ pub fn verify_bls_dory_shared_layout_at_variables(
             setup,
         )?;
         let range = verify_bls_dory_range_logup_deferred_at_variables(
-            binding,
+            &component_binding,
             *statement,
             transition.arithmetic.oracle_commitment,
             &transition.range,
@@ -571,7 +789,7 @@ pub fn verify_bls_dory_shared_layout_at_variables(
         transition_claims.push((arithmetic, range));
     }
     let mut wiring_claims = verify_bls_dory_wiring_deferred_at_variables(
-        binding,
+        &component_binding,
         wiring_statement,
         &proof.wiring,
         padded_variables,
@@ -584,12 +802,13 @@ pub fn verify_bls_dory_shared_layout_at_variables(
         .map(|proof| (&proof.arithmetic, &proof.range))
         .collect::<Vec<_>>();
     let opening_binding = shared_opening_binding(
-        binding,
+        &component_binding,
         padded_variables,
         setup,
         &matrix_proofs,
         &transition_proofs,
         &proof.wiring,
+        fixed_model,
     )?;
     let links = derive_shared_link_points(
         &opening_binding,
@@ -598,13 +817,16 @@ pub fn verify_bls_dory_shared_layout_at_variables(
         wiring_statement,
         padded_variables,
     )?;
+    let mut fixed_base_claims = Vec::with_capacity(1);
     attach_verifier_links(
         &links,
         &proof.link_evaluations,
         proof,
+        fixed_model,
         &mut matrix_claims,
         &mut transition_claims,
         &mut wiring_claims,
+        &mut fixed_base_claims,
     )?;
     let mut claims = Vec::new();
     for component in matrix_claims {
@@ -615,6 +837,7 @@ pub fn verify_bls_dory_shared_layout_at_variables(
         claims.extend(range);
     }
     claims.extend(wiring_claims);
+    claims.extend(fixed_base_claims);
     verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
     Ok(())
 }
@@ -731,6 +954,55 @@ fn take_framed<'a>(
     Ok(payload)
 }
 
+fn validate_fixed_model_topology(
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrices: &[StructuredMatrixStatement],
+    transitions: &[StructuredTransitionStatement],
+    wiring: StructuredWiringStatement,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDorySharedLayoutError> {
+    fixed_model.validate(trusted_model, matrices.len(), setup)?;
+    if usize::try_from(trusted_model.batch).ok() != Some(wiring.rows)
+        || usize::try_from(trusted_model.dimension).ok() != Some(wiring.cols)
+        || usize::try_from(trusted_model.layers_per_bank).ok() != Some(wiring.layers_per_bank)
+        || matrices.len() != trusted_model.weight_bank_commitments.len()
+        || transitions.first().map(|statement| statement.layers) != Some(1)
+    {
+        return Err(BlsDorySharedLayoutError::FixedModelIdentity);
+    }
+    Ok(())
+}
+
+fn fixed_model_binding(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<[u8; 32], BlsDorySharedLayoutError> {
+    if binding.len() > MAX_SHARED_LAYOUT_BINDING_BYTES {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    fixed_model.validate(
+        trusted_model,
+        fixed_model.weight_bank_commitments.len(),
+        setup,
+    )?;
+    let binding_len =
+        u32::try_from(binding.len()).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryFixedModelBinding/v1");
+    hasher.update(&binding_len.to_le_bytes());
+    hasher.update(binding);
+    hasher.update(
+        &trusted_model
+            .digest()
+            .map_err(|_| BlsDorySharedLayoutError::FixedModelIdentity)?,
+    );
+    hasher.update(&fixed_model.digest()?);
+    Ok(*hasher.finalize().as_bytes())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn shared_opening_binding(
     binding: &[u8],
@@ -739,6 +1011,7 @@ fn shared_opening_binding(
     matrices: &[&BlsDoryMatrixProof],
     transitions: &[(&BlsDoryTransitionProof, &BlsDoryRangeLogUpProof)],
     wiring: &BlsDoryWiringProof,
+    fixed_model: &BlsDoryFixedModelIdentity,
 ) -> Result<[u8; 32], BlsDorySharedLayoutError> {
     let variables =
         u16::try_from(padded_variables).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
@@ -751,6 +1024,7 @@ fn shared_opening_binding(
     hasher.update(&setup.identity());
     hasher.update(&binding_len.to_le_bytes());
     hasher.update(binding);
+    hasher.update(&fixed_model.digest()?);
     hasher.update(&(matrices.len() as u16).to_le_bytes());
     for matrix in matrices {
         hasher.update(&matrix.transcript_digest);
@@ -766,6 +1040,7 @@ fn shared_opening_binding(
 
 #[derive(Clone, Copy)]
 enum SharedLinkRole {
+    FixedBaseInput,
     MatrixActivation(usize),
     MatrixAccumulator(usize),
     TransitionInput(usize),
@@ -841,13 +1116,26 @@ fn derive_shared_link_points(
         .elements()
         .map_err(BlsDoryTransitionError::from)?
         .ilog2() as usize;
-    let initial_point = link_challenge_point(&mut transcript, 0, initialization_variables);
+    let base_point = link_challenge_point(&mut transcript, 0, initialization_variables);
+    let mut links = Vec::with_capacity(shared_link_count(matrices.len())?);
+    links.push(SharedEqualityLink {
+        left: SharedLinkRole::TransitionInput(0),
+        left_point: packed_link_point(
+            &base_point,
+            STRUCTURED_TRANSITION_INPUT_ORACLE,
+            7,
+            padded_variables,
+        )?,
+        right: SharedLinkRole::FixedBaseInput,
+        right_point: pad_link_point(&base_point, padded_variables)?,
+    });
+
+    let initial_point = link_challenge_point(&mut transcript, 1, initialization_variables);
     let mut wiring_initial_point = initial_point.clone();
     wiring_initial_point.resize(
         initialization_variables + wiring.layers_per_bank.ilog2() as usize,
         BlsDoryFr::zero(),
     );
-    let mut links = Vec::with_capacity(shared_link_count(matrices.len())?);
     links.push(SharedEqualityLink {
         left: SharedLinkRole::TransitionActivation(0),
         left_point: packed_link_point(
@@ -866,7 +1154,9 @@ fn derive_shared_link_points(
             .map_err(BlsDoryTransitionError::from)?
             .ilog2() as usize;
         for relation in 0..BLS_DORY_SHARED_LINKS_PER_BANK {
-            let link_index = 1 + bank * BLS_DORY_SHARED_LINKS_PER_BANK + relation;
+            let link_index = BLS_DORY_SHARED_INITIALIZATION_LINKS
+                + bank * BLS_DORY_SHARED_LINKS_PER_BANK
+                + relation;
             let point = link_challenge_point(&mut transcript, link_index, table_variables);
             let direct_point = pad_link_point(&point, padded_variables)?;
             let transition_index = bank + 1;
@@ -961,6 +1251,7 @@ fn attach_prover_links(
         PreparedBlsDoryRangeLogUpProof,
     )],
     wiring: &mut PreparedBlsDoryWiringProof,
+    fixed_base: &mut BlsDoryDeferredOpeningSet,
 ) -> Result<Vec<BlsDoryFr>, BlsDorySharedLayoutError> {
     let mut evaluations = Vec::with_capacity(links.len());
     for link in links {
@@ -970,6 +1261,7 @@ fn attach_prover_links(
             matrices,
             transitions,
             wiring,
+            fixed_base,
         )?;
         let right = push_prover_role_opening(
             link.right,
@@ -977,6 +1269,7 @@ fn attach_prover_links(
             matrices,
             transitions,
             wiring,
+            fixed_base,
         )?;
         if left.evaluation != right.evaluation {
             return Err(BlsDorySharedLayoutError::LinkEvaluation);
@@ -995,8 +1288,10 @@ fn push_prover_role_opening(
         PreparedBlsDoryRangeLogUpProof,
     )],
     wiring: &mut PreparedBlsDoryWiringProof,
+    fixed_base: &mut BlsDoryDeferredOpeningSet,
 ) -> Result<BlsDoryOpeningClaim, BlsDorySharedLayoutError> {
     Ok(match role {
+        SharedLinkRole::FixedBaseInput => fixed_base.push_opening(0, point)?,
         SharedLinkRole::MatrixActivation(bank) => matrices
             .get_mut(bank)
             .ok_or(BlsDorySharedLayoutError::LinkTopology)?
@@ -1021,13 +1316,16 @@ fn push_prover_role_opening(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach_verifier_links(
     links: &[SharedEqualityLink],
     evaluations: &[BlsDoryFr],
     proof: &BlsDorySharedLayoutProof,
+    fixed_model: &BlsDoryFixedModelIdentity,
     matrices: &mut [Vec<BlsDoryOpeningClaim>],
     transitions: &mut [(Vec<BlsDoryOpeningClaim>, Vec<BlsDoryOpeningClaim>)],
     wiring: &mut Vec<BlsDoryOpeningClaim>,
+    fixed_base: &mut Vec<BlsDoryOpeningClaim>,
 ) -> Result<(), BlsDorySharedLayoutError> {
     if links.len() != evaluations.len() {
         return Err(BlsDorySharedLayoutError::InvalidProofShape);
@@ -1038,18 +1336,22 @@ fn attach_verifier_links(
             link.left_point.clone(),
             *evaluation,
             proof,
+            fixed_model,
             matrices,
             transitions,
             wiring,
+            fixed_base,
         )?;
         push_verifier_role_claim(
             link.right,
             link.right_point.clone(),
             *evaluation,
             proof,
+            fixed_model,
             matrices,
             transitions,
             wiring,
+            fixed_base,
         )?;
     }
     Ok(())
@@ -1061,17 +1363,20 @@ fn push_verifier_role_claim(
     point: Vec<BlsDoryFr>,
     evaluation: BlsDoryFr,
     proof: &BlsDorySharedLayoutProof,
+    fixed_model: &BlsDoryFixedModelIdentity,
     matrices: &mut [Vec<BlsDoryOpeningClaim>],
     transitions: &mut [(Vec<BlsDoryOpeningClaim>, Vec<BlsDoryOpeningClaim>)],
     wiring: &mut Vec<BlsDoryOpeningClaim>,
+    fixed_base: &mut Vec<BlsDoryOpeningClaim>,
 ) -> Result<(), BlsDorySharedLayoutError> {
-    let commitment = role_commitment(role, proof)?;
+    let commitment = role_commitment(role, proof, fixed_model)?;
     let claim = BlsDoryOpeningClaim {
         commitment,
         point,
         evaluation,
     };
     match role {
+        SharedLinkRole::FixedBaseInput => fixed_base.push(claim),
         SharedLinkRole::MatrixActivation(bank) | SharedLinkRole::MatrixAccumulator(bank) => {
             matrices
                 .get_mut(bank)
@@ -1095,8 +1400,10 @@ fn push_verifier_role_claim(
 fn role_commitment(
     role: SharedLinkRole,
     proof: &BlsDorySharedLayoutProof,
+    fixed_model: &BlsDoryFixedModelIdentity,
 ) -> Result<BlsDoryGt, BlsDorySharedLayoutError> {
     Ok(match role {
+        SharedLinkRole::FixedBaseInput => fixed_model.base_input_commitment,
         SharedLinkRole::MatrixActivation(bank) => {
             proof
                 .matrices
@@ -1540,6 +1847,38 @@ mod tests {
         }
     }
 
+    fn fixed_model_fixture(
+        fixture: &LinkedFixture,
+        setup: &DeterministicBlsDorySetup,
+    ) -> (ModelPcsIdentity, BlsDoryFixedModelIdentity) {
+        let model = ModelPcsIdentity {
+            model_version: 1,
+            batch: fixture.wiring_statement.rows as u32,
+            dimension: fixture.wiring_statement.cols as u32,
+            layers_per_bank: fixture.wiring_statement.layers_per_bank as u32,
+            model_byte_root: [0x11; 32],
+            pcs_suite_parameter_digest: [0x22; 32],
+            base_input_commitment: [0x33; 32],
+            weight_bank_commitments: (0..fixture.matrices.len())
+                .map(|bank| [0x40 + bank as u8; 32])
+                .collect(),
+        };
+        let weights = fixture
+            .matrices
+            .iter()
+            .map(|matrix| matrix.weights.as_slice())
+            .collect::<Vec<_>>();
+        let fixed = derive_bls_dory_fixed_model_identity(
+            &model,
+            &fixture.transitions[0].witness.accumulators,
+            &weights,
+            FIXTURE_VARIABLES,
+            setup,
+        )
+        .unwrap();
+        (model, fixed)
+    }
+
     fn transition_witness_from_accumulators(
         statement: StructuredTransitionStatement,
         mask: &StructuredMaskPolynomial,
@@ -1683,7 +2022,7 @@ mod tests {
         assert_eq!(wiring.opening_proof.len(), 21_775);
         let fixture_claims =
             3 + BLS_DORY_TRANSITION_OPENING_CLAIMS + BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS + 9;
-        assert_eq!(fixture_claims, 29);
+        assert_eq!(fixture_claims, 28);
         assert!(fixture_claims <= MAX_BLS_DORY_AGGREGATE_CLAIMS);
 
         let matrix_encoded = matrix.encode(matrix_statement).unwrap();
@@ -1722,6 +2061,7 @@ mod tests {
     fn scalar_components_share_one_opening_payload() {
         let setup = deterministic_bls_dory_setup(FIXTURE_VARIABLES).unwrap();
         let fixture = linked_fixture(1);
+        let (model, fixed_model) = fixed_model_fixture(&fixture, &setup);
         let matrix_statements = vec![fixture.matrix_statement; fixture.matrices.len()];
         let transition_statements = fixture
             .transitions
@@ -1754,6 +2094,8 @@ mod tests {
             .collect::<Vec<_>>();
         let proof = prove_bls_dory_shared_layout_at_variables(
             b"shared-opening",
+            &model,
+            &fixed_model,
             &matrix_inputs,
             &transition_inputs,
             fixture.wiring_statement,
@@ -1766,6 +2108,8 @@ mod tests {
         .unwrap();
         verify_bls_dory_shared_layout_at_variables(
             b"shared-opening",
+            &model,
+            &fixed_model,
             &matrix_statements,
             &transition_statements,
             &masks,
@@ -1783,7 +2127,7 @@ mod tests {
                 fixture.wiring_statement,
             )
             .unwrap();
-        assert_eq!(encoded.len(), 37_329);
+        assert_eq!(encoded.len(), 35_953);
         let decoded = BlsDorySharedLayoutProof::decode_with_variables(
             &encoded,
             &matrix_statements,
@@ -1795,6 +2139,8 @@ mod tests {
         assert_eq!(decoded, proof);
         verify_bls_dory_shared_layout_at_variables(
             b"shared-opening",
+            &model,
+            &fixed_model,
             &matrix_statements,
             &transition_statements,
             &masks,
@@ -1811,7 +2157,7 @@ mod tests {
         assert!(proof.transitions[1].arithmetic.opening_proof.is_empty());
         assert!(proof.transitions[1].range.opening_proof.is_empty());
         assert!(proof.wiring.opening_proof.is_empty());
-        assert_eq!(proof.link_evaluations.len(), 4);
+        assert_eq!(proof.link_evaluations.len(), 5);
         assert_eq!(proof.opening_proof.len(), 21_775);
 
         let mut malformed = encoded.clone();
@@ -1873,11 +2219,70 @@ mod tests {
         assert!(
             verify_bls_dory_shared_layout_at_variables(
                 b"shared-opening",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
                 fixture.wiring_statement,
                 &changed,
+                FIXTURE_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut wrong_model = model.clone();
+        wrong_model.model_byte_root[0] ^= 1;
+        assert_eq!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"shared-opening",
+                &wrong_model,
+                &fixed_model,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                &proof,
+                FIXTURE_VARIABLES,
+                &setup,
+            ),
+            Err(BlsDorySharedLayoutError::FixedModelIdentity)
+        );
+
+        let mut wrong_weight = fixed_model.clone();
+        wrong_weight.weight_bank_commitments[0] =
+            wrong_weight.weight_bank_commitments[0].scale(&BlsDoryFr::from_u64(2));
+        assert_eq!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"shared-opening",
+                &model,
+                &wrong_weight,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                &proof,
+                FIXTURE_VARIABLES,
+                &setup,
+            ),
+            Err(BlsDorySharedLayoutError::FixedModelCommitment)
+        );
+
+        let mut wrong_base = fixed_model.clone();
+        wrong_base.base_input_commitment = wrong_base
+            .base_input_commitment
+            .scale(&BlsDoryFr::from_u64(2));
+        assert!(
+            verify_bls_dory_shared_layout_at_variables(
+                b"shared-opening",
+                &model,
+                &wrong_base,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                &proof,
                 FIXTURE_VARIABLES,
                 &setup,
             )
@@ -1890,6 +2295,8 @@ mod tests {
         assert!(
             verify_bls_dory_shared_layout_at_variables(
                 b"shared-opening",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
@@ -1906,6 +2313,8 @@ mod tests {
         assert!(
             verify_bls_dory_shared_layout_at_variables(
                 b"shared-opening",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
@@ -1923,6 +2332,8 @@ mod tests {
         assert_eq!(
             verify_bls_dory_shared_layout_at_variables(
                 b"shared-opening",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
@@ -1939,6 +2350,8 @@ mod tests {
         assert_eq!(
             verify_bls_dory_shared_layout_at_variables(
                 b"shared-opening",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
@@ -1952,6 +2365,8 @@ mod tests {
         assert!(
             verify_bls_dory_shared_layout_at_variables(
                 b"other-binding",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
@@ -1998,6 +2413,7 @@ mod tests {
     fn production_component_counts_share_one_payload() {
         let setup = deterministic_bls_dory_setup(FIXTURE_VARIABLES).unwrap();
         let fixture = linked_fixture(3);
+        let (model, fixed_model) = fixed_model_fixture(&fixture, &setup);
         let matrix_statements = vec![fixture.matrix_statement; fixture.matrices.len()];
         let transition_statements = fixture
             .transitions
@@ -2030,6 +2446,8 @@ mod tests {
             .collect::<Vec<_>>();
         let proof = prove_bls_dory_shared_layout_at_variables(
             b"production-topology",
+            &model,
+            &fixed_model,
             &matrix_inputs,
             &transition_inputs,
             fixture.wiring_statement,
@@ -2042,6 +2460,8 @@ mod tests {
         .unwrap();
         verify_bls_dory_shared_layout_at_variables(
             b"production-topology",
+            &model,
+            &fixed_model,
             &matrix_statements,
             &transition_statements,
             &masks,
@@ -2053,9 +2473,9 @@ mod tests {
         .unwrap();
         assert_eq!(proof.matrices.len(), 3);
         assert_eq!(proof.transitions.len(), 4);
-        assert_eq!(proof.link_evaluations.len(), 10);
+        assert_eq!(proof.link_evaluations.len(), 11);
         assert_eq!(proof.opening_proof.len(), 21_775);
-        assert_eq!(3 * 3 + 4 * (12 + 5) + 13 + 20, 110);
+        assert_eq!(3 * 3 + 4 * (12 + 4) + 13 + 22, 108);
 
         let encoded = proof
             .encode(
@@ -2079,6 +2499,8 @@ mod tests {
         assert!(
             verify_bls_dory_shared_layout_at_variables(
                 b"production-topology",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
@@ -2095,6 +2517,8 @@ mod tests {
         assert!(
             verify_bls_dory_shared_layout_at_variables(
                 b"production-topology",
+                &model,
+                &fixed_model,
                 &matrix_statements,
                 &transition_statements,
                 &masks,
@@ -2211,15 +2635,15 @@ mod tests {
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);
-        assert_eq!(BLS_DORY_SHARED_LOGUP_RANGE_TRANSITION_CLAIMS, 20);
-        assert_eq!(BLS_DORY_SHARED_COMPRESSED_TRANSITION_CLAIMS, 68);
-        assert_eq!(BLS_DORY_SHARED_COMPRESSED_CHECKPOINT_CLAIMS, 108);
-        assert_eq!(BLS_DORY_SHARED_PRODUCTION_EQUALITY_LINKS, 10);
-        assert_eq!(BLS_DORY_SHARED_PRODUCTION_EQUALITY_CLAIMS, 20);
-        assert_eq!(BLS_DORY_SHARED_PRODUCTION_CLAIMS, 128);
+        assert_eq!(BLS_DORY_SHARED_LOGUP_RANGE_TRANSITION_CLAIMS, 16);
+        assert_eq!(BLS_DORY_SHARED_COMPRESSED_TRANSITION_CLAIMS, 64);
+        assert_eq!(BLS_DORY_SHARED_COMPRESSED_CHECKPOINT_CLAIMS, 104);
+        assert_eq!(BLS_DORY_SHARED_PRODUCTION_EQUALITY_LINKS, 11);
+        assert_eq!(BLS_DORY_SHARED_PRODUCTION_EQUALITY_CLAIMS, 22);
+        assert_eq!(BLS_DORY_SHARED_PRODUCTION_CLAIMS, 126);
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         assert_eq!(projected_shared_production_opening_bytes().unwrap(), 70_639);
-        assert_eq!(projected_shared_production_proof_bytes().unwrap(), 136_157);
+        assert_eq!(projected_shared_production_proof_bytes().unwrap(), 133_373);
         assert!(
             projected_shared_production_proof_bytes().unwrap()
                 < MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES

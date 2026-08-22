@@ -8,6 +8,7 @@
 //! table.
 
 use std::io::Cursor;
+use std::path::Path;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -24,7 +25,7 @@ use crate::{
     V2_TRANSITION_MODULUS,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_padded_prefix_with_optional_scratch,
         projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
         verify_bls_dory_openings,
     },
@@ -50,7 +51,7 @@ pub const PRODUCTION_BLS_DORY_TRANSITION_VARIABLES: usize = 33;
 pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
 /// Remaining gates on this transition path.
 pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the n=33 packed transition polynomial is not streamed by the in-memory prover",
+    "the scratch commitment omits packed zero padding, but the n=33 transition prover still materializes and folds all source oracle tables",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar transition transcript and packed opening path have not received an external audit",
 ];
@@ -363,6 +364,48 @@ pub(crate) fn prove_bls_dory_transition_deferred_at_variables(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        mask_polynomial,
+        witness,
+        packed_variables,
+        setup,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_transition_deferred_at_variables_with_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    witness: &StructuredTransitionWitness,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        mask_polynomial,
+        witness,
+        packed_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    witness: &StructuredTransitionWitness,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
     if binding.len() > MAX_TRANSITION_BINDING_BYTES {
         return Err(BlsDoryTransitionError::PublicBindingTooLarge);
     }
@@ -373,15 +416,16 @@ pub(crate) fn prove_bls_dory_transition_deferred_at_variables(
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryTransitionError::InvalidDimensions);
     }
-    let mut packed_coefficients = pack_oracles(&oracles)?;
-    let padded_len = 1usize
-        .checked_shl(packed_variables as u32)
-        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-    packed_coefficients.resize(padded_len, BlsDoryFr::zero());
+    let packed_coefficients = pack_oracles(&oracles)?;
     let packed_nu = packed_variables / 2;
     let packed_sigma = packed_variables - packed_nu;
-    let committed =
-        commit_bls_dory_polynomial(packed_coefficients, packed_nu, packed_sigma, setup)?;
+    let committed = commit_bls_dory_padded_prefix_with_optional_scratch(
+        &packed_coefficients,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+    )?;
     let oracle_commitment = committed.commitment();
 
     let mut transcript = transition_transcript(

@@ -47,7 +47,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "transition, LogUp, and wiring construction still materialize their production source tables; the authenticated row-source path currently covers aggregate, matrix, and fixed-base commitments",
+    "authenticated scratch commitments cover every component and omit padded zero suffixes, but transition, LogUp, and wiring still materialize production witness and sumcheck tables",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -454,6 +454,86 @@ pub fn commit_bls_dory_polynomial(
         nu,
         sigma,
     })
+}
+
+struct BlsDoryCoefficientPrefixRowSource<'a> {
+    coefficients: &'a [BlsDoryFr],
+    rows: usize,
+    columns: usize,
+}
+
+impl BlsDoryRowSource for BlsDoryCoefficientPrefixRowSource<'_> {
+    type Error = std::convert::Infallible;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.coefficients.len()
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index * self.columns;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            *scalar = self
+                .coefficients
+                .get(start + column)
+                .copied()
+                .unwrap_or_else(BlsDoryFr::zero);
+        }
+        Ok(output.len())
+    }
+}
+
+/// Commit a non-empty coefficient prefix at a larger power-of-two geometry.
+/// Scratch mode authenticates only the explicit prefix and treats the omitted
+/// suffix as canonical zeros; memory mode preserves the original dense path.
+pub(crate) fn commit_bls_dory_padded_prefix_with_optional_scratch(
+    coefficients: &[BlsDoryFr],
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let rows = 1usize
+        .checked_shl(u32::try_from(nu).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let columns = 1usize
+        .checked_shl(u32::try_from(sigma).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let coefficient_count = rows
+        .checked_mul(columns)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    if coefficients.is_empty() || coefficients.len() > coefficient_count {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    if let Some(scratch_directory) = scratch_directory {
+        let mut source = BlsDoryCoefficientPrefixRowSource {
+            coefficients,
+            rows,
+            columns,
+        };
+        return commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        );
+    }
+
+    let mut padded = coefficients.to_vec();
+    padded.resize(coefficient_count, BlsDoryFr::zero());
+    commit_bls_dory_polynomial(padded, nu, sigma, setup)
 }
 
 /// Commit a canonical row source while retaining its coefficients only in a

@@ -9,6 +9,7 @@
 //! checkpoint uses four Dory openings.
 
 use std::io::Cursor;
+use std::path::Path;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -23,7 +24,7 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_padded_prefix_with_optional_scratch,
         projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
         verify_bls_dory_openings,
     },
@@ -57,7 +58,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the n=33 transition, multiplicity, and inverse polynomials are not streamed",
+    "scratch commitments omit zero tails, but the n=33 LogUp prover still materializes its padded transition, inverse, selector, and equality working tables",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -353,7 +354,33 @@ pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables(
     setup: &DeterministicBlsDorySetup,
 ) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
     let oracles = build_scalar_oracles(statement, witness)?;
-    prove_from_oracles_deferred(binding, statement, &oracles, packed_variables, setup)
+    prove_from_oracles_deferred_with_optional_scratch(
+        binding,
+        statement,
+        &oracles,
+        packed_variables,
+        setup,
+        None,
+    )
+}
+
+pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    witness: &StructuredTransitionWitness,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    let oracles = build_scalar_oracles(statement, witness)?;
+    prove_from_oracles_deferred_with_optional_scratch(
+        binding,
+        statement,
+        &oracles,
+        packed_variables,
+        setup,
+        Some(scratch_directory),
+    )
 }
 
 fn prove_from_oracles(
@@ -390,6 +417,24 @@ fn prove_from_oracles_deferred(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    prove_from_oracles_deferred_with_optional_scratch(
+        binding,
+        statement,
+        oracles,
+        packed_variables,
+        setup,
+        None,
+    )
+}
+
+fn prove_from_oracles_deferred_with_optional_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    oracles: &[Vec<BlsDoryFr>],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
     if binding.len() > MAX_LOGUP_BINDING_BYTES {
         return Err(BlsDoryRangeLogUpError::PublicBindingTooLarge);
     }
@@ -403,9 +448,16 @@ fn prove_from_oracles_deferred(
         .checked_shl(packed_variables as u32)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
     let mut transition_coefficients = pack_oracles(oracles)?;
-    transition_coefficients.resize(padded_len, BlsDoryFr::zero());
+    let transition_explicit_len = transition_coefficients.len();
     let (nu, sigma) = dory_layout(packed_variables);
-    let transition = commit_bls_dory_polynomial(transition_coefficients.clone(), nu, sigma, setup)?;
+    let transition = commit_bls_dory_padded_prefix_with_optional_scratch(
+        &transition_coefficients,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+    )?;
+    transition_coefficients.resize(padded_len, BlsDoryFr::zero());
 
     let mut counts = [0_u64; TABLE_VALUES];
     for oracle in &oracles[STRUCTURED_TRANSITION_REGULAR_ORACLES..] {
@@ -419,12 +471,18 @@ fn prove_from_oracles_deferred(
             }
         }
     }
-    let mut multiplicity_coefficients = vec![BlsDoryFr::zero(); padded_len];
-    for (index, count) in counts.into_iter().enumerate() {
-        multiplicity_coefficients[index] = BlsDoryFr::from_u64(count);
-    }
-    let multiplicity =
-        commit_bls_dory_polynomial(multiplicity_coefficients.clone(), nu, sigma, setup)?;
+    let mut multiplicity_coefficients = counts
+        .into_iter()
+        .map(BlsDoryFr::from_u64)
+        .collect::<Vec<_>>();
+    let multiplicity = commit_bls_dory_padded_prefix_with_optional_scratch(
+        &multiplicity_coefficients,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+    )?;
+    multiplicity_coefficients.resize(padded_len, BlsDoryFr::zero());
 
     let mut transcript = logup_transcript(
         binding,
@@ -446,7 +504,13 @@ fn prove_from_oracles_deferred(
                 .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?;
         }
     }
-    let inverse = commit_bls_dory_polynomial(inverse_coefficients.clone(), nu, sigma, setup)?;
+    let inverse = commit_bls_dory_padded_prefix_with_optional_scratch(
+        &inverse_coefficients[..transition_explicit_len],
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+    )?;
     transcript.append_group(b"inverse-commitment", &inverse.commitment());
     let local_mixing = challenge_vector(&mut transcript, b"local-mixing", 3);
     let rational_mixing = transcript.challenge_scalar(b"rational-mixing");

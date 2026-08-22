@@ -7,6 +7,7 @@
 //! evaluations used by those identities.
 
 use std::io::Cursor;
+use std::path::Path;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -20,7 +21,7 @@ use crate::{
     StructuredWiringError, StructuredWiringStatement,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_padded_prefix_with_optional_scratch,
         projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
         verify_bls_dory_openings,
     },
@@ -40,7 +41,7 @@ pub const PRODUCTION_BLS_DORY_WIRING_VARIABLES: usize = 29;
 pub const BLS_DORY_WIRING_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar wiring path.
 pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the n=29 packed wiring polynomial is not streamed by the in-memory prover",
+    "the scratch commitment omits zero padding, but the n=29 packed wiring prefix is still materialized and has not run at production geometry",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar wiring transcript and packed opening path have not received an external audit",
 ];
@@ -326,6 +327,52 @@ pub(crate) fn prove_bls_dory_wiring_deferred_at_variables(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_wiring_deferred_at_variables_with_scratch(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
     if binding.len() > MAX_WIRING_BINDING_BYTES {
         return Err(BlsDoryWiringError::PublicBindingTooLarge);
     }
@@ -338,15 +385,17 @@ pub(crate) fn prove_bls_dory_wiring_deferred_at_variables(
     let initial_values = signed_values(initial);
     let input_banks = bank_field_values(statement, inputs)?;
     let output_banks = bank_field_values(statement, outputs)?;
-    let mut packed_coefficients =
+    let packed_coefficients =
         pack_wiring_tables(statement, &initial_values, &input_banks, &output_banks)?;
-    let padded_len = 1usize
-        .checked_shl(packed_variables as u32)
-        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
-    packed_coefficients.resize(padded_len, BlsDoryFr::zero());
     let nu = packed_variables / 2;
     let sigma = packed_variables - nu;
-    let committed = commit_bls_dory_polynomial(packed_coefficients, nu, sigma, setup)?;
+    let committed = commit_bls_dory_padded_prefix_with_optional_scratch(
+        &packed_coefficients,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+    )?;
     let oracle_commitment = committed.commitment();
 
     let mut transcript = wiring_transcript(binding, statement, &oracle_commitment);

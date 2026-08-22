@@ -953,14 +953,14 @@ commitments while writing the canonical explicit coefficient prefix to the same
 self-authenticating storage boundary. The artifact header binds both its logical
 power-of-two length and explicit length, making the omitted suffix canonical
 zeros; every later fold preserves that implicit tail instead of writing padded
-zeros. The scratch-enabled shared prover uses it
-for all matrix activation, weight, and accumulator tables and for the fixed base
-table; it evaluates the matrix terminal directly from signed witness slices and
-does not allocate padded scalar copies. The standalone aggregate and complete
+zeros. The scratch-enabled shared prover uses it for every matrix, fixed-base,
+transition, LogUp, and wiring commitment. Matrix terminal evaluation reads
+signed witness slices directly, while the remaining components avoid
+power-of-two-padded commitment copies. The standalone aggregate and complete
 shared-layout fixture produce exactly the same proof through that path.
-Transition, LogUp, and wiring constructors still materialize their source
+Transition, LogUp, and wiring still materialize witness or sumcheck working
 tables, so this is not yet the complete n=33 out-of-core prover. Streaming those
-remaining sources, executing the final model
+remaining working sets, executing the final model
 commitment ceremony, independent review of the transcript and soundness
 accounting, and external audit remain activation requirements.
 

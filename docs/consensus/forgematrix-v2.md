@@ -456,10 +456,11 @@ comparison. The v2 research code now implements:
   computing the unchanged commitments. Each artifact authenticates its logical
   and explicit lengths, and every fold keeps the remaining zero tail implicit
   instead of allocating or writing it. The scratch-enabled shared path uses it
-  for matrix activation, weight, and accumulator tables and the fixed base,
-  without padded scalar copies. Transition, LogUp, and wiring tables remain
-  materialized, so the final production artifact still needs an n=33 commitment
-  run and streaming for those remaining components;
+  for every matrix, fixed-base, transition, LogUp, and wiring commitment,
+  without power-of-two-padded coefficient copies. Transition, LogUp, and wiring
+  witness or sumcheck working tables remain materialized, so the final
+  production artifact still needs an n=33 commitment run and streaming for
+  those remaining working sets;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

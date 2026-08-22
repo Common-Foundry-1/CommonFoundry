@@ -35,7 +35,8 @@ use crate::{
         PreparedBlsDoryRangeLogUpProof, projected_production_range_logup_opening_bytes,
         projected_production_range_logup_proof_bytes, prove_bls_dory_range_logup,
         prove_bls_dory_range_logup_at_variables, prove_bls_dory_range_logup_deferred_at_variables,
-        verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
+        prove_bls_dory_range_logup_deferred_at_variables_with_scratch, verify_bls_dory_range_logup,
+        verify_bls_dory_range_logup_at_variables,
         verify_bls_dory_range_logup_deferred_at_variables,
     },
     dory_bls12_381_matrix::{
@@ -54,13 +55,15 @@ use crate::{
         PreparedBlsDoryTransitionProof, projected_production_transition_opening_bytes,
         projected_production_transition_proof_bytes, prove_bls_dory_transition,
         prove_bls_dory_transition_at_variables, prove_bls_dory_transition_deferred_at_variables,
-        verify_bls_dory_transition, verify_bls_dory_transition_at_variables,
-        verify_bls_dory_transition_deferred_at_variables,
+        prove_bls_dory_transition_deferred_at_variables_with_scratch, verify_bls_dory_transition,
+        verify_bls_dory_transition_at_variables, verify_bls_dory_transition_deferred_at_variables,
     },
     dory_bls12_381_wiring::{
         BlsDoryWiringError, BlsDoryWiringProof, PreparedBlsDoryWiringProof,
         projected_production_wiring_opening_bytes, projected_production_wiring_proof_bytes,
-        prove_bls_dory_wiring_deferred_at_variables, verify_bls_dory_wiring_deferred_at_variables,
+        prove_bls_dory_wiring_deferred_at_variables,
+        prove_bls_dory_wiring_deferred_at_variables_with_scratch,
+        verify_bls_dory_wiring_deferred_at_variables,
     },
     sumcheck::GOLDILOCKS_MODULUS,
     verify_model_bank_into_staged_field_sink,
@@ -116,7 +119,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and transition, LogUp, and wiring construction still materialize production source tables",
+    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and transition, LogUp, and wiring still materialize production witness and sumcheck tables",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -896,8 +899,8 @@ pub fn prove_bls_dory_shared_layout_at_variables(
 }
 
 /// Prove the shared scalar layout with authenticated source and fold artifacts.
-/// Matrix and fixed-base commitments stream directly from their signed witness
-/// slices; transition, LogUp, and wiring construction remain in memory.
+/// Every padded component commitment streams directly into authenticated
+/// source artifacts. Component sumcheck working tables remain in memory.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_bls_dory_shared_layout_at_variables_with_scratch(
     binding: &[u8],
@@ -1012,35 +1015,72 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
     }
     let mut transitions = Vec::with_capacity(transition_inputs.len());
     for input in transition_inputs {
-        let arithmetic = prove_bls_dory_transition_deferred_at_variables(
-            &component_binding,
-            input.statement,
-            input.mask_polynomial,
-            input.witness,
-            padded_variables,
-            setup,
-        )?;
-        let range = prove_bls_dory_range_logup_deferred_at_variables(
-            &component_binding,
-            input.statement,
-            input.witness,
-            padded_variables,
-            setup,
-        )?;
+        let (arithmetic, range) = if let Some(scratch_directory) = scratch_directory {
+            (
+                prove_bls_dory_transition_deferred_at_variables_with_scratch(
+                    &component_binding,
+                    input.statement,
+                    input.mask_polynomial,
+                    input.witness,
+                    padded_variables,
+                    setup,
+                    scratch_directory,
+                )?,
+                prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
+                    &component_binding,
+                    input.statement,
+                    input.witness,
+                    padded_variables,
+                    setup,
+                    scratch_directory,
+                )?,
+            )
+        } else {
+            (
+                prove_bls_dory_transition_deferred_at_variables(
+                    &component_binding,
+                    input.statement,
+                    input.mask_polynomial,
+                    input.witness,
+                    padded_variables,
+                    setup,
+                )?,
+                prove_bls_dory_range_logup_deferred_at_variables(
+                    &component_binding,
+                    input.statement,
+                    input.witness,
+                    padded_variables,
+                    setup,
+                )?,
+            )
+        };
         if arithmetic.proof.oracle_commitment != range.proof.transition_commitment {
             return Err(BlsDorySharedLayoutError::TransitionRangeCommitment);
         }
         transitions.push((arithmetic, range));
     }
-    let wiring = prove_bls_dory_wiring_deferred_at_variables(
-        &component_binding,
-        wiring_statement,
-        initial,
-        inputs,
-        outputs,
-        padded_variables,
-        setup,
-    )?;
+    let wiring = if let Some(scratch_directory) = scratch_directory {
+        prove_bls_dory_wiring_deferred_at_variables_with_scratch(
+            &component_binding,
+            wiring_statement,
+            initial,
+            inputs,
+            outputs,
+            padded_variables,
+            setup,
+            scratch_directory,
+        )?
+    } else {
+        prove_bls_dory_wiring_deferred_at_variables(
+            &component_binding,
+            wiring_statement,
+            initial,
+            inputs,
+            outputs,
+            padded_variables,
+            setup,
+        )?
+    };
     prove_prepared_shared_layout(
         &component_binding,
         matrices,

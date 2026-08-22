@@ -9,14 +9,13 @@ use std::io::Cursor;
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
     arithmetic::{Field, Group},
-    poly::Polynomial,
+    poly::{Polynomial, compute_left_right_vectors},
     serialization::{Compress, Validate},
     transcript::Transcript,
 };
 use dory_pcs::proof::DoryProof;
 use dory_pcs::{
-    FirstReduceMessage, ScalarProductMessage, SecondReduceMessage, Transparent, VMVMessage, prove,
-    verify,
+    FirstReduceMessage, ScalarProductMessage, SecondReduceMessage, Transparent, VMVMessage, verify,
 };
 use thiserror::Error;
 
@@ -24,6 +23,10 @@ use crate::dory_bls12_381_prototype::{
     BlsDoryCurve, BlsDoryFr, BlsDoryG1, BlsDoryG1Routines, BlsDoryG2, BlsDoryG2Routines, BlsDoryGt,
     BlsDoryPolynomial, BlsDoryTranscript, DeterministicBlsDorySetup,
     MAX_BLS_DORY_PROTOTYPE_VARIABLES,
+};
+use crate::dory_bls12_381_streaming::{
+    BlsDoryRowSource, prove_bls_dory_opening_from_vector_product,
+    stream_bls_dory_vector_matrix_product,
 };
 
 /// Version of the bounded BLS12-381 aggregate wire grammar.
@@ -58,7 +61,6 @@ pub struct BlsDoryOpeningClaim {
 /// A committed evaluation table retained only by the aggregate prover.
 #[derive(Clone, Debug)]
 pub struct BlsDoryCommittedPolynomial {
-    coefficients: Vec<BlsDoryFr>,
     polynomial: BlsDoryPolynomial,
     commitment: BlsDoryGt,
     row_commitments: Vec<BlsDoryG1>,
@@ -251,7 +253,7 @@ pub fn commit_bls_dory_polynomial(
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
 
-    let polynomial = BlsDoryPolynomial::new(coefficients.clone())
+    let polynomial = BlsDoryPolynomial::new(coefficients)
         .map_err(|error| BlsDoryAggregateError::Dory(error.to_string()))?;
     let (commitment, row_commitments, blind) = polynomial
         .commit::<BlsDoryCurve, Transparent, BlsDoryG1Routines>(nu, sigma, setup.prover())
@@ -261,7 +263,6 @@ pub fn commit_bls_dory_polynomial(
     }
 
     Ok(BlsDoryCommittedPolynomial {
-        coefficients,
         polynomial,
         commitment,
         row_commitments,
@@ -348,8 +349,14 @@ pub(crate) fn prove_bls_dory_opening_refs(
         .zip(&sumcheck.terminal.equality_values)
         .map(|(rho, equality)| *rho * equality)
         .collect::<Vec<_>>();
-    let (combined_polynomial, combined_rows, combined_commitment) =
-        combine_polynomials(polynomials, &lambdas, nu)?;
+    let (combined_rows, combined_commitment, vector_matrix_product) =
+        combine_polynomials_for_opening(
+            polynomials,
+            &lambdas,
+            &sumcheck.terminal.random_point,
+            nu,
+            sigma,
+        )?;
 
     append_combined_opening(
         &mut transcript,
@@ -357,21 +364,16 @@ pub(crate) fn prove_bls_dory_opening_refs(
         &sumcheck.terminal.random_point,
         &sumcheck.terminal.final_claim,
     );
-    let (dory_proof, hidden_evaluation) =
-        prove::<_, BlsDoryCurve, BlsDoryG1Routines, BlsDoryG2Routines, _, _, Transparent>(
-            &combined_polynomial,
-            &sumcheck.terminal.random_point,
-            combined_rows,
-            BlsDoryFr::zero(),
-            nu,
-            sigma,
-            setup.prover(),
-            &mut transcript,
-        )
-        .map_err(dory_error)?;
-    if hidden_evaluation.is_some() {
-        return Err(BlsDoryAggregateError::InvalidProofShape);
-    }
+    let dory_proof = prove_bls_dory_opening_from_vector_product(
+        &sumcheck.terminal.random_point,
+        combined_rows,
+        vector_matrix_product,
+        nu,
+        sigma,
+        setup,
+        &mut transcript,
+    )
+    .map_err(|error| BlsDoryAggregateError::Dory(error.to_string()))?;
 
     let encoded = encode_aggregate_proof(
         claims.len(),
@@ -580,7 +582,7 @@ fn prove_distinct_point_sumcheck(
     let variables = claims[0].point.len();
     let mut polynomial_tables = polynomials
         .iter()
-        .map(|polynomial| polynomial.coefficients.clone())
+        .map(|polynomial| polynomial.polynomial.coefficients().to_vec())
         .collect::<Vec<_>>();
     let mut equality_tables = claims
         .iter()
@@ -732,32 +734,94 @@ fn interpolate_quadratic(
         + point * (point - BlsDoryFr::one()) * two_inverse * second_difference)
 }
 
-fn combine_polynomials(
+struct CombinedMaterializedRows<'a> {
+    polynomials: &'a [&'a BlsDoryCommittedPolynomial],
+    lambdas: &'a [BlsDoryFr],
+    rows: usize,
+    columns: usize,
+}
+
+impl BlsDoryRowSource for CombinedMaterializedRows<'_> {
+    type Error = std::convert::Infallible;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        output.fill(BlsDoryFr::zero());
+        let start = row_index * self.columns;
+        let end = start + self.columns;
+        for (polynomial, lambda) in self.polynomials.iter().zip(self.lambdas) {
+            for (combined, coefficient) in output
+                .iter_mut()
+                .zip(&polynomial.polynomial.coefficients()[start..end])
+            {
+                *combined = *combined + *lambda * *coefficient;
+            }
+        }
+        Ok(output.len())
+    }
+}
+
+fn combine_polynomials_for_opening(
     polynomials: &[&BlsDoryCommittedPolynomial],
     lambdas: &[BlsDoryFr],
+    point: &[BlsDoryFr],
     nu: usize,
-) -> Result<(BlsDoryPolynomial, Vec<BlsDoryG1>, BlsDoryGt), BlsDoryAggregateError> {
-    let coefficient_count = polynomials[0].coefficients.len();
-    let mut coefficients = vec![BlsDoryFr::zero(); coefficient_count];
-    let mut rows = vec![BlsDoryG1::identity(); 1usize << nu];
+    sigma: usize,
+) -> Result<(Vec<BlsDoryG1>, BlsDoryGt, Vec<BlsDoryFr>), BlsDoryAggregateError> {
+    let nu = u32::try_from(nu).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    let sigma = u32::try_from(sigma).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    let row_count = 1usize
+        .checked_shl(nu)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let column_count = 1usize
+        .checked_shl(sigma)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let coefficient_count = row_count
+        .checked_mul(column_count)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    if polynomials.is_empty()
+        || polynomials.len() != lambdas.len()
+        || point.len() != (nu + sigma) as usize
+        || polynomials
+            .iter()
+            .any(|polynomial| polynomial.polynomial.coefficients().len() != coefficient_count)
+    {
+        return Err(BlsDoryAggregateError::MixedStatement);
+    }
+
+    let mut rows = vec![BlsDoryG1::identity(); row_count];
     let mut commitment = BlsDoryGt::identity();
     for (polynomial, lambda) in polynomials.iter().zip(lambdas) {
-        if polynomial.coefficients.len() != coefficient_count
-            || polynomial.row_commitments.len() != rows.len()
-        {
+        if polynomial.row_commitments.len() != rows.len() {
             return Err(BlsDoryAggregateError::MixedStatement);
-        }
-        for (combined, value) in coefficients.iter_mut().zip(&polynomial.coefficients) {
-            *combined = *combined + *lambda * value;
         }
         for (combined, row) in rows.iter_mut().zip(&polynomial.row_commitments) {
             *combined = *combined + row.scale(lambda);
         }
         commitment = commitment + polynomial.commitment.scale(lambda);
     }
-    let polynomial = BlsDoryPolynomial::new(coefficients)
-        .map_err(|error| BlsDoryAggregateError::Dory(error.to_string()))?;
-    Ok((polynomial, rows, commitment))
+
+    let (left, _) = compute_left_right_vectors(point, nu as usize, sigma as usize);
+    let mut source = CombinedMaterializedRows {
+        polynomials,
+        lambdas,
+        rows: row_count,
+        columns: column_count,
+    };
+    let product = stream_bls_dory_vector_matrix_product(&mut source, &left)
+        .map_err(|_| BlsDoryAggregateError::MixedStatement)?;
+    Ok((rows, commitment, product))
 }
 
 type BlsDoryProof = DoryProof<BlsDoryG1, BlsDoryG2, BlsDoryGt>;
@@ -1154,9 +1218,13 @@ mod tests {
         let other_setup = deterministic_bls_dory_setup(8).unwrap();
         assert!(verify_bls_dory_openings(b"binding-a", &claims, &proof, &other_setup).is_err());
 
-        let foreign =
-            commit_bls_dory_polynomial(polynomials[0].coefficients.clone(), 3, 3, &other_setup)
-                .unwrap();
+        let foreign = commit_bls_dory_polynomial(
+            polynomials[0].polynomial.coefficients().to_vec(),
+            3,
+            3,
+            &other_setup,
+        )
+        .unwrap();
         let mut mixed = polynomials.clone();
         mixed[0] = foreign;
         assert_eq!(

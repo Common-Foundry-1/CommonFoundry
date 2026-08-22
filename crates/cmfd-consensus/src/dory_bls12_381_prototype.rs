@@ -470,6 +470,10 @@ impl BlsDoryPolynomial {
             variables,
         })
     }
+
+    pub(crate) fn coefficients(&self) -> &[BlsDoryFr] {
+        &self.coefficients
+    }
 }
 
 impl Polynomial<BlsDoryFr> for BlsDoryPolynomial {

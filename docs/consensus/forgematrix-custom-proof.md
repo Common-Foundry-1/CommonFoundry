@@ -961,11 +961,17 @@ directly from the witness. Its arithmetic sumcheck reads raw rows for the first
 round, keeps equality-selector weights implicit, and authenticates later folds
 in scratch artifacts with 12 live lanes inside a 16-scalar row. The standalone
 aggregate and complete shared-layout fixture produce exactly the same proof
-through that path. LogUp still materializes its sumcheck working tables, so this
-is not yet the complete n=33 out-of-core prover. Streaming that remaining
-working set, executing the final model
-commitment ceremony, independent review of the transcript and soundness
-accounting, and external audit remain activation requirements.
+through that path. The scratch LogUp prover streams the transition and inverse
+commitments, recomputes each cell-variable sumcheck round directly from the
+validated witness with constant-size accumulators, and retains only the 128
+selector-boundary values at production geometry. Its reconstruction evaluations
+also stream from the witness. Dense and scratch fixtures match exactly at both
+the minimum layout and an extra padded variable. The complete n=33 run has not
+yet measured proving latency, verification latency, peak memory, scratch use, or
+final proof size; recomputation cost is therefore still an activation gate.
+Executing the final model commitment ceremony, independent review of the
+transcript and soundness accounting, and external audit also remain activation
+requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

@@ -462,9 +462,12 @@ comparison. The v2 research code now implements:
   transition commitment derives all 110 regular and radix-16 lanes directly
   from its witness. The transition arithmetic sumcheck also keeps selector
   weights implicit and folds 12 live lanes in authenticated 16-scalar scratch
-  rows. LogUp sumcheck working tables remain materialized, so the final
-  production artifact still needs an n=33 commitment run and streaming for that
-  remaining working set;
+  rows. LogUp now streams its transition and inverse commitments, recomputes
+  cell-variable sumcheck rounds from the validated witness with bounded memory,
+  retains only the 128 production selector-boundary values, and streams its
+  reconstruction evaluations. The final production artifact still needs a
+  complete n=33 run with proving time, verification time, peak memory, scratch
+  use, and proof size recorded;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

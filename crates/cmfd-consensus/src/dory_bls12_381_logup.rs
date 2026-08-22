@@ -25,13 +25,17 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
         MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_padded_prefix_with_optional_scratch,
-        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
-        verify_bls_dory_openings,
+        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
-    dory_bls12_381_transition::{BlsDoryTransitionError, build_scalar_oracles, pack_oracles},
+    dory_bls12_381_streaming::BlsDoryRowSource,
+    dory_bls12_381_transition::{
+        BlsDoryTransitionError, BlsDoryTransitionWitnessRowSource, build_scalar_oracles,
+        pack_oracles,
+    },
     structured_transition::structured_transition_range_specs,
 };
 
@@ -58,7 +62,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "scratch commitments omit zero tails, but the n=33 LogUp prover still materializes its padded transition, inverse, selector, and equality working tables",
+    "the scratch LogUp prover streams commitments and recomputes cell-variable rounds with bounded memory, but complete n=33 proving latency, peak memory and scratch use, proof size, and verification latency remain unmeasured",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -354,10 +358,10 @@ pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables(
     setup: &DeterministicBlsDorySetup,
 ) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
     let oracles = build_scalar_oracles(statement, witness)?;
-    prove_from_oracles_deferred_with_optional_scratch(
+    prove_from_source_deferred(
         binding,
         statement,
-        &oracles,
+        LogUpProverSource::Materialized(&oracles),
         packed_variables,
         setup,
         None,
@@ -372,11 +376,10 @@ pub(crate) fn prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
-    let oracles = build_scalar_oracles(statement, witness)?;
-    prove_from_oracles_deferred_with_optional_scratch(
+    prove_from_source_deferred(
         binding,
         statement,
-        &oracles,
+        LogUpProverSource::Witness(witness),
         packed_variables,
         setup,
         Some(scratch_directory),
@@ -417,20 +420,26 @@ fn prove_from_oracles_deferred(
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
-    prove_from_oracles_deferred_with_optional_scratch(
+    prove_from_source_deferred(
         binding,
         statement,
-        oracles,
+        LogUpProverSource::Materialized(oracles),
         packed_variables,
         setup,
         None,
     )
 }
 
-fn prove_from_oracles_deferred_with_optional_scratch(
+#[derive(Clone, Copy)]
+enum LogUpProverSource<'a> {
+    Materialized(&'a [Vec<BlsDoryFr>]),
+    Witness(&'a StructuredTransitionWitness),
+}
+
+fn prove_from_source_deferred(
     binding: &[u8],
     statement: StructuredTransitionStatement,
-    oracles: &[Vec<BlsDoryFr>],
+    source: LogUpProverSource<'_>,
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
@@ -444,30 +453,83 @@ fn prove_from_oracles_deferred_with_optional_scratch(
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
+    if matches!(source, LogUpProverSource::Witness(_)) != scratch_directory.is_some() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
     let padded_len = 1usize
         .checked_shl(packed_variables as u32)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    let mut transition_coefficients = pack_oracles(oracles)?;
-    let transition_explicit_len = transition_coefficients.len();
     let (nu, sigma) = dory_layout(packed_variables);
-    let transition = commit_bls_dory_padded_prefix_with_optional_scratch(
-        &transition_coefficients,
-        nu,
-        sigma,
-        setup,
-        scratch_directory,
-    )?;
-    transition_coefficients.resize(padded_len, BlsDoryFr::zero());
+    let rows = 1usize
+        .checked_shl(nu as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let columns = 1usize
+        .checked_shl(sigma as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let mut witness_source = match source {
+        LogUpProverSource::Materialized(_) => None,
+        LogUpProverSource::Witness(witness) => Some(BlsDoryTransitionWitnessRowSource::new(
+            statement, witness, rows, columns,
+        )?),
+    };
+    let mut transition_coefficients = match source {
+        LogUpProverSource::Materialized(oracles) => Some(pack_oracles(oracles)?),
+        LogUpProverSource::Witness(_) => None,
+    };
+    let transition = if let Some(scratch_directory) = scratch_directory {
+        commit_bls_dory_row_source_with_scratch(
+            witness_source
+                .as_mut()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )?
+    } else {
+        commit_bls_dory_padded_prefix_with_optional_scratch(
+            transition_coefficients
+                .as_ref()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+            nu,
+            sigma,
+            setup,
+            None,
+        )?
+    };
+    if let Some(coefficients) = transition_coefficients.as_mut() {
+        coefficients.resize(padded_len, BlsDoryFr::zero());
+    }
 
     let mut counts = [0_u64; TABLE_VALUES];
-    for oracle in &oracles[STRUCTURED_TRANSITION_REGULAR_ORACLES..] {
-        for value in oracle {
-            if let Some(digit) =
-                (0..TABLE_VALUES).find(|digit| *value == BlsDoryFr::from_u64(*digit as u64))
-            {
-                counts[digit] = counts[digit]
-                    .checked_add(1)
-                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    match source {
+        LogUpProverSource::Materialized(oracles) => {
+            for oracle in &oracles[STRUCTURED_TRANSITION_REGULAR_ORACLES..] {
+                for value in oracle {
+                    if let Some(digit) =
+                        (0..TABLE_VALUES).find(|digit| *value == BlsDoryFr::from_u64(*digit as u64))
+                    {
+                        counts[digit] = counts[digit]
+                            .checked_add(1)
+                            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+                    }
+                }
+            }
+        }
+        LogUpProverSource::Witness(_) => {
+            let witness_source = witness_source
+                .as_ref()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+            for oracle in STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES {
+                for index in 0..elements {
+                    let value = witness_source.scalar(oracle, index)?;
+                    let digit = (0..TABLE_VALUES)
+                        .find(|digit| value == BlsDoryFr::from_u64(*digit as u64))
+                        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+                    counts[digit] = counts[digit]
+                        .checked_add(1)
+                        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+                }
             }
         }
     }
@@ -482,7 +544,9 @@ fn prove_from_oracles_deferred_with_optional_scratch(
         setup,
         scratch_directory,
     )?;
-    multiplicity_coefficients.resize(padded_len, BlsDoryFr::zero());
+    if matches!(source, LogUpProverSource::Materialized(_)) {
+        multiplicity_coefficients.resize(padded_len, BlsDoryFr::zero());
+    }
 
     let mut transcript = logup_transcript(
         binding,
@@ -493,71 +557,140 @@ fn prove_from_oracles_deferred_with_optional_scratch(
         &multiplicity.commitment(),
     );
     let alpha = transcript.challenge_scalar(b"lookup-alpha");
-    let active = query_active_table(elements, padded_len)?;
-    let table = table_active_table(padded_len)?;
-    let table_inverse = table_inverse_table(alpha, padded_len)?;
-    let mut inverse_coefficients = vec![BlsDoryFr::zero(); padded_len];
-    for index in 0..padded_len {
-        if active[index] == BlsDoryFr::one() {
-            inverse_coefficients[index] = (alpha - transition_coefficients[index])
-                .inv()
-                .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?;
-        }
-    }
-    let inverse = commit_bls_dory_padded_prefix_with_optional_scratch(
-        &inverse_coefficients[..transition_explicit_len],
-        nu,
-        sigma,
-        setup,
-        scratch_directory,
-    )?;
+    let (active, table, table_inverse, inverse_coefficients) =
+        if let Some(transition_coefficients) = transition_coefficients.as_ref() {
+            let active = query_active_table(elements, padded_len)?;
+            let table = table_active_table(padded_len)?;
+            let table_inverse = table_inverse_table(alpha, padded_len)?;
+            let mut inverse_coefficients = vec![BlsDoryFr::zero(); padded_len];
+            for index in 0..padded_len {
+                if active[index] == BlsDoryFr::one() {
+                    inverse_coefficients[index] = (alpha - transition_coefficients[index])
+                        .inv()
+                        .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?;
+                }
+            }
+            (
+                Some(active),
+                Some(table),
+                Some(table_inverse),
+                Some(inverse_coefficients),
+            )
+        } else {
+            (None, None, None, None)
+        };
+    let inverse = if let Some(scratch_directory) = scratch_directory {
+        let mut inverse_source = LogUpInverseRowSource::new(
+            witness_source
+                .as_ref()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+            alpha,
+            elements,
+            rows,
+            columns,
+        )?;
+        commit_bls_dory_row_source_with_scratch(
+            &mut inverse_source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )?
+    } else {
+        let transition_explicit_len = elements
+            .checked_mul(STRUCTURED_TRANSITION_ORACLES)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        commit_bls_dory_padded_prefix_with_optional_scratch(
+            &inverse_coefficients
+                .as_ref()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?[..transition_explicit_len],
+            nu,
+            sigma,
+            setup,
+            None,
+        )?
+    };
     transcript.append_group(b"inverse-commitment", &inverse.commitment());
     let local_mixing = challenge_vector(&mut transcript, b"local-mixing", 3);
     let rational_mixing = transcript.challenge_scalar(b"rational-mixing");
     let count_mixing = transcript.challenge_scalar(b"count-mixing");
     let equality_point = challenge_vector(&mut transcript, b"equality-point", packed_variables);
-    let equality = equality_table(&equality_point);
-
-    let mut tables = LogUpTables {
-        transition: transition_coefficients,
-        multiplicity: multiplicity_coefficients,
-        inverse: inverse_coefficients,
-        active,
-        table,
-        table_inverse,
-        equality,
-    };
-    let mut claim = BlsDoryFr::zero();
-    let mut rounds = Vec::with_capacity(packed_variables);
-    let mut sumcheck_point = Vec::with_capacity(packed_variables);
-    for round_index in 0..packed_variables {
-        let evaluations =
-            logup_round(&tables, alpha, &local_mixing, rational_mixing, count_mixing)?;
-        if evaluations[0] + evaluations[1] != claim {
-            return Err(BlsDoryRangeLogUpError::RoundClaim);
+    let (rounds, sumcheck_point, terminal_evaluations, terminal, claim) = match source {
+        LogUpProverSource::Witness(_) => {
+            let output = prove_logup_sumcheck_with_recomputation(
+                witness_source
+                    .as_ref()
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                &counts,
+                alpha,
+                elements,
+                packed_variables,
+                &equality_point,
+                &local_mixing,
+                rational_mixing,
+                count_mixing,
+                &mut transcript,
+            )?;
+            (
+                output.rounds,
+                output.point,
+                output.terminal_evaluations,
+                output.terminal,
+                output.final_claim,
+            )
         }
-        absorb_round(&mut transcript, round_index, &evaluations);
-        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
-        claim = evaluate_samples(&evaluations, challenge)?;
-        sumcheck_point.push(challenge);
-        tables.fold(challenge)?;
-        rounds.push(evaluations);
-    }
-    let terminal_evaluations = [
-        tables.transition[0],
-        tables.multiplicity[0],
-        tables.inverse[0],
-    ];
+        LogUpProverSource::Materialized(_) => {
+            let mut tables = LogUpTables {
+                transition: transition_coefficients
+                    .take()
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                multiplicity: multiplicity_coefficients,
+                inverse: inverse_coefficients.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                active: active.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                table: table.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                table_inverse: table_inverse.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                equality: equality_table(&equality_point),
+            };
+            let mut claim = BlsDoryFr::zero();
+            let mut rounds = Vec::with_capacity(packed_variables);
+            let mut sumcheck_point = Vec::with_capacity(packed_variables);
+            for round_index in 0..packed_variables {
+                let evaluations =
+                    logup_round(&tables, alpha, &local_mixing, rational_mixing, count_mixing)?;
+                if evaluations[0] + evaluations[1] != claim {
+                    return Err(BlsDoryRangeLogUpError::RoundClaim);
+                }
+                absorb_round(&mut transcript, round_index, &evaluations);
+                let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+                claim = evaluate_samples(&evaluations, challenge)?;
+                sumcheck_point.push(challenge);
+                tables.fold(challenge)?;
+                rounds.push(evaluations);
+            }
+            let terminal_evaluations = [
+                tables.transition[0],
+                tables.multiplicity[0],
+                tables.inverse[0],
+            ];
+            (
+                rounds,
+                sumcheck_point,
+                terminal_evaluations,
+                TerminalValues {
+                    transition: terminal_evaluations[0],
+                    multiplicity: terminal_evaluations[1],
+                    inverse: terminal_evaluations[2],
+                    active: tables.active[0],
+                    table: tables.table[0],
+                    table_inverse: tables.table_inverse[0],
+                    equality: tables.equality[0],
+                },
+                claim,
+            )
+        }
+    };
     let expected = logup_constraint(
-        TerminalValues {
-            transition: terminal_evaluations[0],
-            multiplicity: terminal_evaluations[1],
-            inverse: terminal_evaluations[2],
-            active: tables.active[0],
-            table: tables.table[0],
-            table_inverse: tables.table_inverse[0],
-            equality: tables.equality[0],
-        },
+        terminal,
         alpha,
         &local_mixing,
         rational_mixing,
@@ -580,8 +713,20 @@ fn prove_from_oracles_deferred_with_optional_scratch(
     );
     let spec_point = challenge_vector(&mut transcript, b"reconstruction-spec-point", 3);
     let slack_mixing = transcript.challenge_scalar(b"reconstruction-slack-mixing");
-    let reconstruction =
-        reconstruction_tables(statement, oracles, &cell_point, &spec_point, slack_mixing)?;
+    let reconstruction = match source {
+        LogUpProverSource::Materialized(oracles) => {
+            reconstruction_tables(statement, oracles, &cell_point, &spec_point, slack_mixing)?
+        }
+        LogUpProverSource::Witness(_) => reconstruction_tables_from_witness(
+            statement,
+            witness_source
+                .as_ref()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+            &cell_point,
+            &spec_point,
+            slack_mixing,
+        )?,
+    };
     let source_claim = inner_product(&reconstruction.source_weights, &reconstruction.role_values)?;
     transcript.append_field(b"source-claim", &source_claim);
     let digit_claim = (BlsDoryFr::one() - slack_mixing) * source_claim
@@ -893,6 +1038,510 @@ fn dory_layout(variables: usize) -> (usize, usize) {
     (nu, variables - nu)
 }
 
+struct LogUpInverseRowSource<'a, 'w> {
+    transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
+    alpha: BlsDoryFr,
+    elements: usize,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+}
+
+impl<'a, 'w> LogUpInverseRowSource<'a, 'w> {
+    fn new(
+        transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
+        alpha: BlsDoryFr,
+        elements: usize,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryRangeLogUpError> {
+        if (0..TABLE_VALUES)
+            .any(|digit| (alpha - BlsDoryFr::from_u64(digit as u64)).inv().is_none())
+        {
+            return Err(BlsDoryRangeLogUpError::ChallengeCollision);
+        }
+        let explicit_scalars = elements
+            .checked_mul(STRUCTURED_TRANSITION_ORACLES)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        if explicit_scalars
+            > rows
+                .checked_mul(columns)
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?
+        {
+            return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+        }
+        Ok(Self {
+            transition,
+            alpha,
+            elements,
+            rows,
+            columns,
+            explicit_scalars,
+        })
+    }
+}
+
+impl BlsDoryRowSource for LogUpInverseRowSource<'_, '_> {
+    type Error = BlsDoryRangeLogUpError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            let packed_index = start + column;
+            let oracle = packed_index / self.elements;
+            let index = packed_index % self.elements;
+            *scalar = if (STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES)
+                .contains(&oracle)
+            {
+                (self.alpha - self.transition.scalar(oracle, index)?)
+                    .inv()
+                    .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?
+            } else {
+                BlsDoryFr::zero()
+            };
+        }
+        Ok(output.len())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LogUpCoreValues {
+    transition: BlsDoryFr,
+    multiplicity: BlsDoryFr,
+    inverse: BlsDoryFr,
+    active: BlsDoryFr,
+    table: BlsDoryFr,
+    table_inverse: BlsDoryFr,
+}
+
+impl LogUpCoreValues {
+    fn zero() -> Self {
+        Self {
+            transition: BlsDoryFr::zero(),
+            multiplicity: BlsDoryFr::zero(),
+            inverse: BlsDoryFr::zero(),
+            active: BlsDoryFr::zero(),
+            table: BlsDoryFr::zero(),
+            table_inverse: BlsDoryFr::zero(),
+        }
+    }
+
+    fn add_scaled(&mut self, other: Self, scale: BlsDoryFr) {
+        self.transition = self.transition + other.transition * scale;
+        self.multiplicity = self.multiplicity + other.multiplicity * scale;
+        self.inverse = self.inverse + other.inverse * scale;
+        self.active = self.active + other.active * scale;
+        self.table = self.table + other.table * scale;
+        self.table_inverse = self.table_inverse + other.table_inverse * scale;
+    }
+
+    fn interpolate(lower: Self, upper: Self, point: BlsDoryFr) -> Self {
+        let mut value = lower;
+        value.transition = lower.transition + point * (upper.transition - lower.transition);
+        value.multiplicity = lower.multiplicity + point * (upper.multiplicity - lower.multiplicity);
+        value.inverse = lower.inverse + point * (upper.inverse - lower.inverse);
+        value.active = lower.active + point * (upper.active - lower.active);
+        value.table = lower.table + point * (upper.table - lower.table);
+        value.table_inverse =
+            lower.table_inverse + point * (upper.table_inverse - lower.table_inverse);
+        value
+    }
+
+    fn terminal(self, equality: BlsDoryFr) -> TerminalValues {
+        TerminalValues {
+            transition: self.transition,
+            multiplicity: self.multiplicity,
+            inverse: self.inverse,
+            active: self.active,
+            table: self.table,
+            table_inverse: self.table_inverse,
+            equality,
+        }
+    }
+}
+
+struct LogUpEqualityWeightIterator<'a> {
+    point: &'a [BlsDoryFr],
+    stack: Vec<(usize, BlsDoryFr)>,
+}
+
+impl<'a> LogUpEqualityWeightIterator<'a> {
+    fn new(point: &'a [BlsDoryFr]) -> Self {
+        Self {
+            point,
+            stack: vec![(point.len(), BlsDoryFr::one())],
+        }
+    }
+}
+
+impl Iterator for LogUpEqualityWeightIterator<'_> {
+    type Item = BlsDoryFr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((remaining, prefix)) = self.stack.pop() {
+            if remaining == 0 {
+                return Some(prefix);
+            }
+            let coordinate = self.point[remaining - 1];
+            self.stack.push((remaining - 1, prefix * coordinate));
+            self.stack
+                .push((remaining - 1, prefix * (BlsDoryFr::one() - coordinate)));
+        }
+        None
+    }
+}
+
+struct LogUpScratchSumcheck {
+    rounds: Vec<[BlsDoryFr; LOGUP_ROUND_VALUES]>,
+    point: Vec<BlsDoryFr>,
+    terminal: TerminalValues,
+    terminal_evaluations: [BlsDoryFr; 3],
+    final_claim: BlsDoryFr,
+}
+
+fn raw_logup_values(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    counts: &[u64; TABLE_VALUES],
+    alpha: BlsDoryFr,
+    elements: usize,
+    packed_index: usize,
+) -> Result<LogUpCoreValues, BlsDoryRangeLogUpError> {
+    let oracle = packed_index / elements;
+    let index = packed_index % elements;
+    let transition = if oracle < STRUCTURED_TRANSITION_ORACLES {
+        source.scalar(oracle, index)?
+    } else {
+        BlsDoryFr::zero()
+    };
+    let active =
+        (STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES).contains(&oracle);
+    let table = packed_index < TABLE_VALUES;
+    let inverse = if active {
+        (alpha - transition)
+            .inv()
+            .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?
+    } else {
+        BlsDoryFr::zero()
+    };
+    let table_inverse = if table {
+        (alpha - BlsDoryFr::from_u64(packed_index as u64))
+            .inv()
+            .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?
+    } else {
+        BlsDoryFr::zero()
+    };
+    Ok(LogUpCoreValues {
+        transition,
+        multiplicity: counts
+            .get(packed_index)
+            .copied()
+            .map_or_else(BlsDoryFr::zero, BlsDoryFr::from_u64),
+        inverse,
+        active: if active {
+            BlsDoryFr::one()
+        } else {
+            BlsDoryFr::zero()
+        },
+        table: if table {
+            BlsDoryFr::one()
+        } else {
+            BlsDoryFr::zero()
+        },
+        table_inverse,
+    })
+}
+
+fn folded_raw_logup_values(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    counts: &[u64; TABLE_VALUES],
+    alpha: BlsDoryFr,
+    elements: usize,
+    current_index: usize,
+    prefix_point: &[BlsDoryFr],
+) -> Result<LogUpCoreValues, BlsDoryRangeLogUpError> {
+    let block = 1usize
+        .checked_shl(prefix_point.len() as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let start = current_index
+        .checked_mul(block)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let mut weights = LogUpEqualityWeightIterator::new(prefix_point);
+    let mut folded = LogUpCoreValues::zero();
+    for offset in 0..block {
+        let weight = weights
+            .next()
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        folded.add_scaled(
+            raw_logup_values(source, counts, alpha, elements, start + offset)?,
+            weight,
+        );
+    }
+    if weights.next().is_some() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(folded)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_logup_pair(
+    lower: LogUpCoreValues,
+    upper: LogUpCoreValues,
+    equality_lower: BlsDoryFr,
+    equality_upper: BlsDoryFr,
+    alpha: BlsDoryFr,
+    local_mixing: &[BlsDoryFr],
+    rational_mixing: BlsDoryFr,
+    count_mixing: BlsDoryFr,
+    evaluations: &mut [BlsDoryFr; LOGUP_ROUND_VALUES],
+) {
+    for (sample, evaluation) in evaluations.iter_mut().enumerate() {
+        let point = BlsDoryFr::from_u64(sample as u64);
+        let values = LogUpCoreValues::interpolate(lower, upper, point);
+        let equality = equality_lower + point * (equality_upper - equality_lower);
+        *evaluation = *evaluation
+            + logup_constraint(
+                values.terminal(equality),
+                alpha,
+                local_mixing,
+                rational_mixing,
+                count_mixing,
+            );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recomputed_logup_round(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    counts: &[u64; TABLE_VALUES],
+    alpha: BlsDoryFr,
+    elements: usize,
+    current_rows: usize,
+    prefix_point: &[BlsDoryFr],
+    equality_point: &[BlsDoryFr],
+    equality_prefix: BlsDoryFr,
+    local_mixing: &[BlsDoryFr],
+    rational_mixing: BlsDoryFr,
+    count_mixing: BlsDoryFr,
+) -> Result<[BlsDoryFr; LOGUP_ROUND_VALUES], BlsDoryRangeLogUpError> {
+    let round_index = prefix_point.len();
+    let coordinate = *equality_point
+        .get(round_index)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let mut suffix_weights = LogUpEqualityWeightIterator::new(&equality_point[round_index + 1..]);
+    let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+    for pair_index in 0..current_rows / 2 {
+        let suffix = suffix_weights
+            .next()
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        let equality_scale = equality_prefix * suffix;
+        accumulate_logup_pair(
+            folded_raw_logup_values(
+                source,
+                counts,
+                alpha,
+                elements,
+                pair_index * 2,
+                prefix_point,
+            )?,
+            folded_raw_logup_values(
+                source,
+                counts,
+                alpha,
+                elements,
+                pair_index * 2 + 1,
+                prefix_point,
+            )?,
+            equality_scale * (BlsDoryFr::one() - coordinate),
+            equality_scale * coordinate,
+            alpha,
+            local_mixing,
+            rational_mixing,
+            count_mixing,
+            &mut evaluations,
+        );
+    }
+    if suffix_weights.next().is_some() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(evaluations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialized_core_logup_round(
+    values: &[LogUpCoreValues],
+    round_index: usize,
+    equality_point: &[BlsDoryFr],
+    equality_prefix: BlsDoryFr,
+    alpha: BlsDoryFr,
+    local_mixing: &[BlsDoryFr],
+    rational_mixing: BlsDoryFr,
+    count_mixing: BlsDoryFr,
+) -> Result<[BlsDoryFr; LOGUP_ROUND_VALUES], BlsDoryRangeLogUpError> {
+    if values.len() < 2 || !values.len().is_multiple_of(2) {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let coordinate = *equality_point
+        .get(round_index)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let mut suffix_weights = LogUpEqualityWeightIterator::new(&equality_point[round_index + 1..]);
+    let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+    for pair in values.chunks_exact(2) {
+        let suffix = suffix_weights
+            .next()
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        let equality_scale = equality_prefix * suffix;
+        accumulate_logup_pair(
+            pair[0],
+            pair[1],
+            equality_scale * (BlsDoryFr::one() - coordinate),
+            equality_scale * coordinate,
+            alpha,
+            local_mixing,
+            rational_mixing,
+            count_mixing,
+            &mut evaluations,
+        );
+    }
+    if suffix_weights.next().is_some() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(evaluations)
+}
+
+fn fold_logup_core_values(values: &mut Vec<LogUpCoreValues>, challenge: BlsDoryFr) {
+    let folded_len = values.len() / 2;
+    for index in 0..folded_len {
+        values[index] =
+            LogUpCoreValues::interpolate(values[index * 2], values[index * 2 + 1], challenge);
+    }
+    values.truncate(folded_len);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_logup_sumcheck_with_recomputation(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    counts: &[u64; TABLE_VALUES],
+    alpha: BlsDoryFr,
+    elements: usize,
+    packed_variables: usize,
+    equality_point: &[BlsDoryFr],
+    local_mixing: &[BlsDoryFr],
+    rational_mixing: BlsDoryFr,
+    count_mixing: BlsDoryFr,
+    transcript: &mut BlsDoryTranscript,
+) -> Result<LogUpScratchSumcheck, BlsDoryRangeLogUpError> {
+    let cell_variables = elements.ilog2() as usize;
+    let padded_len = 1usize
+        .checked_shl(packed_variables as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let selector_rows = padded_len >> cell_variables;
+    if selector_rows < SELECTOR_SLOTS {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let mut claim = BlsDoryFr::zero();
+    let mut rounds = Vec::with_capacity(packed_variables);
+    let mut point = Vec::with_capacity(packed_variables);
+    let mut equality_prefix = BlsDoryFr::one();
+    let mut selector_values = if cell_variables == 0 {
+        Some(
+            (0..selector_rows)
+                .map(|index| folded_raw_logup_values(source, counts, alpha, elements, index, &[]))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    } else {
+        None
+    };
+    for round_index in 0..packed_variables {
+        let current_rows = padded_len >> round_index;
+        let evaluations = if round_index < cell_variables {
+            recomputed_logup_round(
+                source,
+                counts,
+                alpha,
+                elements,
+                current_rows,
+                &point,
+                equality_point,
+                equality_prefix,
+                local_mixing,
+                rational_mixing,
+                count_mixing,
+            )?
+        } else {
+            materialized_core_logup_round(
+                selector_values
+                    .as_ref()
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                round_index,
+                equality_point,
+                equality_prefix,
+                alpha,
+                local_mixing,
+                rational_mixing,
+                count_mixing,
+            )?
+        };
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryRangeLogUpError::RoundClaim);
+        }
+        absorb_round(transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = evaluate_samples(&evaluations, challenge)?;
+        point.push(challenge);
+        let coordinate = equality_point[round_index];
+        equality_prefix = equality_prefix
+            * ((BlsDoryFr::one() - challenge) * (BlsDoryFr::one() - coordinate)
+                + challenge * coordinate);
+        if round_index + 1 == cell_variables {
+            selector_values = Some(
+                (0..selector_rows)
+                    .map(|index| {
+                        folded_raw_logup_values(source, counts, alpha, elements, index, &point)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        } else if round_index >= cell_variables {
+            fold_logup_core_values(
+                selector_values
+                    .as_mut()
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                challenge,
+            );
+        }
+        rounds.push(evaluations);
+    }
+    let core = *selector_values
+        .as_ref()
+        .and_then(|values| values.first())
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let terminal = core.terminal(equality_prefix);
+    Ok(LogUpScratchSumcheck {
+        rounds,
+        point,
+        terminal,
+        terminal_evaluations: [core.transition, core.multiplicity, core.inverse],
+        final_claim: claim,
+    })
+}
+
 struct LogUpTables {
     transition: Vec<BlsDoryFr>,
     multiplicity: Vec<BlsDoryFr>,
@@ -992,6 +1641,47 @@ fn reconstruction_tables(
     let mut role_values = vec![BlsDoryFr::zero(); SELECTOR_SLOTS];
     for (target, oracle) in role_values.iter_mut().zip(oracles) {
         *target = evaluate_mle(oracle, cell_point)?;
+    }
+    Ok(ReconstructionTables {
+        source_weights: weights.source_weights,
+        digit_weights: weights.digit_weights,
+        role_values,
+        maximum_evaluation: weights.maximum_evaluation,
+    })
+}
+
+fn reconstruction_tables_from_witness(
+    statement: StructuredTransitionStatement,
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    cell_point: &[BlsDoryFr],
+    spec_point: &[BlsDoryFr],
+    slack_mixing: BlsDoryFr,
+) -> Result<ReconstructionTables, BlsDoryRangeLogUpError> {
+    let elements = statement.elements()?;
+    if elements
+        != 1usize
+            .checked_shl(cell_point.len() as u32)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?
+    {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let weights = reconstruction_weights(statement, spec_point, slack_mixing)?;
+    let mut role_values = vec![BlsDoryFr::zero(); SELECTOR_SLOTS];
+    for (oracle, target) in role_values
+        .iter_mut()
+        .enumerate()
+        .take(STRUCTURED_TRANSITION_ORACLES)
+    {
+        let mut equality_weights = LogUpEqualityWeightIterator::new(cell_point);
+        for index in 0..elements {
+            let equality_weight = equality_weights
+                .next()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+            *target = *target + source.scalar(oracle, index)? * equality_weight;
+        }
+        if equality_weights.next().is_some() {
+            return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+        }
     }
     Ok(ReconstructionTables {
         source_weights: weights.source_weights,
@@ -1577,6 +2267,28 @@ mod tests {
         dory_bls12_381_transition::prove_bls_dory_transition,
     };
 
+    static SCRATCH_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn create() -> Self {
+            let nonce = SCRATCH_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-logup-scratch-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     const OUTPUT_MODULUS: u64 = 251;
     const OUTPUT_CENTER: i64 = 125;
 
@@ -1642,6 +2354,113 @@ mod tests {
                 .push(i64::try_from(output_remainder).unwrap() - OUTPUT_CENTER);
         }
         (statement, mask, witness)
+    }
+
+    #[test]
+    fn inverse_row_source_matches_materialized_inverse_prefix() {
+        let (statement, _, witness) = fixture();
+        let variables = minimum_packed_variables(statement).unwrap();
+        let (nu, sigma) = dory_layout(variables);
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let padded_len = 1usize << variables;
+        let elements = statement.elements().unwrap();
+        let alpha = BlsDoryFr::from_u64(19);
+        let oracles = build_scalar_oracles(statement, &witness).unwrap();
+        let mut transition = pack_oracles(&oracles).unwrap();
+        transition.resize(padded_len, BlsDoryFr::zero());
+        let active = query_active_table(elements, padded_len).unwrap();
+        let mut expected = vec![BlsDoryFr::zero(); padded_len];
+        for index in 0..padded_len {
+            if active[index] == BlsDoryFr::one() {
+                expected[index] = (alpha - transition[index]).inv().unwrap();
+            }
+        }
+
+        let source =
+            BlsDoryTransitionWitnessRowSource::new(statement, &witness, rows, columns).unwrap();
+        let mut inverse =
+            LogUpInverseRowSource::new(&source, alpha, elements, rows, columns).unwrap();
+        let explicit = inverse.explicit_scalar_count();
+        let mut streamed = Vec::new();
+        let mut row = vec![BlsDoryFr::zero(); columns];
+        for row_index in 0..explicit.div_ceil(columns) {
+            inverse.read_row(row_index, &mut row).unwrap();
+            streamed.extend_from_slice(&row);
+        }
+        streamed.truncate(explicit);
+        assert_eq!(streamed, expected[..explicit]);
+    }
+
+    #[test]
+    fn witness_reconstruction_matches_materialized_tables() {
+        let (statement, _, witness) = fixture();
+        let variables = minimum_packed_variables(statement).unwrap();
+        let (nu, sigma) = dory_layout(variables);
+        let source = BlsDoryTransitionWitnessRowSource::new(
+            statement,
+            &witness,
+            1usize << nu,
+            1usize << sigma,
+        )
+        .unwrap();
+        let oracles = build_scalar_oracles(statement, &witness).unwrap();
+        let cell_point = [
+            BlsDoryFr::from_u64(3),
+            BlsDoryFr::from_u64(5),
+            BlsDoryFr::from_u64(7),
+        ];
+        let spec_point = [
+            BlsDoryFr::from_u64(11),
+            BlsDoryFr::from_u64(13),
+            BlsDoryFr::from_u64(17),
+        ];
+        let slack_mixing = BlsDoryFr::from_u64(23);
+        let materialized =
+            reconstruction_tables(statement, &oracles, &cell_point, &spec_point, slack_mixing)
+                .unwrap();
+        let streamed = reconstruction_tables_from_witness(
+            statement,
+            &source,
+            &cell_point,
+            &spec_point,
+            slack_mixing,
+        )
+        .unwrap();
+        assert_eq!(streamed.source_weights, materialized.source_weights);
+        assert_eq!(streamed.digit_weights, materialized.digit_weights);
+        assert_eq!(streamed.role_values, materialized.role_values);
+        assert_eq!(streamed.maximum_evaluation, materialized.maximum_evaluation);
+    }
+
+    #[test]
+    fn scratch_logup_matches_dense_proof_and_cleans_artifacts() {
+        let (statement, _, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(11).unwrap();
+        let scratch_directory = ScratchDirectory::create();
+        for packed_variables in [10, 11] {
+            let ordinary = prove_bls_dory_range_logup_deferred_at_variables(
+                b"scratch-logup",
+                statement,
+                &witness,
+                packed_variables,
+                &setup,
+            )
+            .unwrap();
+            let scratch = prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
+                b"scratch-logup",
+                statement,
+                &witness,
+                packed_variables,
+                &setup,
+                &scratch_directory.0,
+            )
+            .unwrap();
+            assert_eq!(scratch.proof, ordinary.proof);
+            assert_eq!(scratch.openings.claims(), ordinary.openings.claims());
+            drop(scratch);
+            assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
+        }
     }
 
     #[test]

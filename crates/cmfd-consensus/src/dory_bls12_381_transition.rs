@@ -29,6 +29,10 @@ use crate::{
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
+    dory_bls12_381_fold_artifact::{
+        BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
+        BlsDoryFoldArtifactWriter,
+    },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
@@ -52,7 +56,7 @@ pub const PRODUCTION_BLS_DORY_TRANSITION_VARIABLES: usize = 33;
 pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
 /// Remaining gates on this transition path.
 pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the scratch commitment derives all 110 lanes directly from the witness, but the n=33 transition sumcheck still materializes and folds its oracle tables",
+    "the authenticated out-of-core transition sumcheck preserves exact proofs, but n=33 latency, peak disk, and peak memory have not been measured",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar transition transcript and packed opening path have not received an external audit",
 ];
@@ -76,6 +80,7 @@ const OUTPUT_REMAINDER: usize = 8;
 const NEGATIVE: usize = 9;
 const ACTIVATION: usize = STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
 const SHIFTED_ACCUMULATOR: usize = 11;
+const TRANSITION_FOLD_SLOTS: usize = 16;
 
 /// In-memory transition proof plus its canonical Dory opening payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -411,7 +416,11 @@ fn prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
         return Err(BlsDoryTransitionError::PublicBindingTooLarge);
     }
     mask_polynomial.validate(statement)?;
-    let mut oracles = build_scalar_oracles(statement, witness)?;
+    let mut oracles = if scratch_directory.is_none() {
+        Some(build_scalar_oracles(statement, witness)?)
+    } else {
+        None
+    };
     let cell_variables = statement.elements()?.ilog2() as usize;
     validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
     if packed_variables > setup.max_log_n() {
@@ -419,23 +428,38 @@ fn prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
     }
     let packed_nu = packed_variables / 2;
     let packed_sigma = packed_variables - packed_nu;
+    let packed_rows = 1usize
+        .checked_shl(packed_nu as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let packed_columns = 1usize
+        .checked_shl(packed_sigma as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let mut witness_source = if scratch_directory.is_some() {
+        Some(BlsDoryTransitionWitnessRowSource::new(
+            statement,
+            witness,
+            packed_rows,
+            packed_columns,
+        )?)
+    } else {
+        None
+    };
     let committed = if let Some(scratch_directory) = scratch_directory {
-        let rows = 1usize
-            .checked_shl(packed_nu as u32)
-            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-        let columns = 1usize
-            .checked_shl(packed_sigma as u32)
-            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-        let mut source = BlsDoryTransitionWitnessRowSource::new(statement, witness, rows, columns)?;
         commit_bls_dory_row_source_with_scratch(
-            &mut source,
+            witness_source
+                .as_mut()
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
             packed_nu,
             packed_sigma,
             setup,
             scratch_directory,
         )?
     } else {
-        let packed_coefficients = pack_oracles(&oracles)?;
+        let packed_coefficients = pack_oracles(
+            oracles
+                .as_ref()
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
+        )?;
         commit_bls_dory_padded_prefix_with_optional_scratch(
             &packed_coefficients,
             packed_nu,
@@ -455,34 +479,62 @@ fn prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
     let mixing = transcript.challenge_scalar(b"constraint-mixing");
     let mixing_powers = powers(mixing, BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS);
     let cell_point = challenge_vector(&mut transcript, b"cell-point", cell_variables);
-    let mut selector = equality_table(&cell_point);
-    let mut claim = BlsDoryFr::zero();
-    let mut rounds = Vec::with_capacity(cell_variables);
-    let mut sumcheck_point = Vec::with_capacity(cell_variables);
-
-    oracles.truncate(STRUCTURED_TRANSITION_REGULAR_ORACLES);
-    for round_index in 0..cell_variables {
-        let evaluations = transition_round(statement, &selector, &oracles, &mixing_powers)?;
-        if evaluations[0] + evaluations[1] != claim {
-            return Err(BlsDoryTransitionError::RoundClaim);
-        }
-        absorb_round(&mut transcript, round_index, &evaluations);
-        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
-        claim = evaluate_samples(&evaluations, challenge)?;
-        sumcheck_point.push(challenge);
-        selector = fold_table(&selector, challenge);
-        for oracle in &mut oracles {
-            *oracle = fold_table(oracle, challenge);
-        }
-        rounds.push(evaluations);
-    }
-
-    let terminal_evaluations = oracles.iter().map(|oracle| oracle[0]).collect::<Vec<_>>();
+    let (rounds, sumcheck_point, terminal_evaluations, selector_terminal, claim) =
+        if let Some(scratch_directory) = scratch_directory {
+            let output = prove_transition_sumcheck_with_scratch(
+                statement,
+                witness_source
+                    .as_ref()
+                    .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
+                &cell_point,
+                &mixing_powers,
+                &mut transcript,
+                scratch_directory,
+            )?;
+            (
+                output.rounds,
+                output.point,
+                output.terminal_evaluations,
+                output.selector_terminal,
+                output.final_claim,
+            )
+        } else {
+            let oracles = oracles
+                .as_mut()
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+            oracles.truncate(STRUCTURED_TRANSITION_REGULAR_ORACLES);
+            let mut selector = equality_table(&cell_point);
+            let mut claim = BlsDoryFr::zero();
+            let mut rounds = Vec::with_capacity(cell_variables);
+            let mut sumcheck_point = Vec::with_capacity(cell_variables);
+            for round_index in 0..cell_variables {
+                let evaluations = transition_round(statement, &selector, oracles, &mixing_powers)?;
+                if evaluations[0] + evaluations[1] != claim {
+                    return Err(BlsDoryTransitionError::RoundClaim);
+                }
+                absorb_round(&mut transcript, round_index, &evaluations);
+                let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+                claim = evaluate_samples(&evaluations, challenge)?;
+                sumcheck_point.push(challenge);
+                selector = fold_table(&selector, challenge);
+                for oracle in oracles.iter_mut() {
+                    *oracle = fold_table(oracle, challenge);
+                }
+                rounds.push(evaluations);
+            }
+            (
+                rounds,
+                sumcheck_point,
+                oracles.iter().map(|oracle| oracle[0]).collect::<Vec<_>>(),
+                selector[0],
+                claim,
+            )
+        };
     if terminal_evaluations[MASK] != evaluate_mask(mask_polynomial, statement, &sumcheck_point)? {
         return Err(BlsDoryTransitionError::MaskPolynomial);
     }
-    let expected =
-        selector[0] * arithmetic_constraint(statement, &terminal_evaluations, &mixing_powers)?;
+    let expected = selector_terminal
+        * arithmetic_constraint(statement, &terminal_evaluations, &mixing_powers)?;
     if claim != expected {
         return Err(BlsDoryTransitionError::TerminalClaim);
     }
@@ -1169,6 +1221,442 @@ fn transition_opening_claims(
         .collect())
 }
 
+type TransitionRegularRow = [BlsDoryFr; STRUCTURED_TRANSITION_REGULAR_ORACLES];
+
+struct TransitionScratchSumcheck {
+    rounds: Vec<Vec<BlsDoryFr>>,
+    point: Vec<BlsDoryFr>,
+    terminal_evaluations: Vec<BlsDoryFr>,
+    selector_terminal: BlsDoryFr,
+    final_claim: BlsDoryFr,
+}
+
+struct TransitionEqualityWeightIterator<'a> {
+    point: &'a [BlsDoryFr],
+    stack: Vec<(usize, BlsDoryFr)>,
+}
+
+impl<'a> TransitionEqualityWeightIterator<'a> {
+    fn new(point: &'a [BlsDoryFr]) -> Self {
+        Self {
+            point,
+            stack: vec![(point.len(), BlsDoryFr::one())],
+        }
+    }
+}
+
+impl Iterator for TransitionEqualityWeightIterator<'_> {
+    type Item = BlsDoryFr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((remaining, prefix)) = self.stack.pop() {
+            if remaining == 0 {
+                return Some(prefix);
+            }
+            let coordinate = self.point[remaining - 1];
+            self.stack.push((remaining - 1, prefix * coordinate));
+            self.stack
+                .push((remaining - 1, prefix * (BlsDoryFr::one() - coordinate)));
+        }
+        None
+    }
+}
+
+fn transition_storage_error() -> BlsDoryTransitionError {
+    BlsDoryAggregateError::ProverStorage.into()
+}
+
+fn regular_row(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    index: usize,
+) -> Result<TransitionRegularRow, BlsDoryTransitionError> {
+    let mut row = [BlsDoryFr::zero(); STRUCTURED_TRANSITION_REGULAR_ORACLES];
+    for (oracle, value) in row.iter_mut().enumerate() {
+        *value = source.scalar(oracle, index)?;
+    }
+    Ok(row)
+}
+
+fn accumulate_transition_pair(
+    statement: StructuredTransitionStatement,
+    lower: TransitionRegularRow,
+    upper: TransitionRegularRow,
+    selector_lower: BlsDoryFr,
+    selector_upper: BlsDoryFr,
+    mixing_powers: &[BlsDoryFr],
+    evaluations: &mut [BlsDoryFr],
+) -> Result<(), BlsDoryTransitionError> {
+    for (sample, evaluation) in evaluations.iter_mut().enumerate() {
+        let point = BlsDoryFr::from_u64(sample as u64);
+        let mut values = [BlsDoryFr::zero(); STRUCTURED_TRANSITION_REGULAR_ORACLES];
+        for oracle in 0..STRUCTURED_TRANSITION_REGULAR_ORACLES {
+            values[oracle] = lower[oracle] + point * (upper[oracle] - lower[oracle]);
+        }
+        let selector = selector_lower + point * (selector_upper - selector_lower);
+        *evaluation =
+            *evaluation + selector * arithmetic_constraint(statement, &values, mixing_powers)?;
+    }
+    Ok(())
+}
+
+fn transition_raw_round(
+    statement: StructuredTransitionStatement,
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    current_rows: usize,
+    round_index: usize,
+    cell_point: &[BlsDoryFr],
+    selector_prefix: BlsDoryFr,
+    mixing_powers: &[BlsDoryFr],
+) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
+    if current_rows < 2 || !current_rows.is_power_of_two() || round_index >= cell_point.len() {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+    let coordinate = cell_point[round_index];
+    let mut suffix_weights = TransitionEqualityWeightIterator::new(&cell_point[round_index + 1..]);
+    let mut evaluations = vec![BlsDoryFr::zero(); BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1];
+    for pair_index in 0..current_rows / 2 {
+        let suffix = suffix_weights
+            .next()
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+        let equality_scale = selector_prefix * suffix;
+        accumulate_transition_pair(
+            statement,
+            regular_row(source, pair_index * 2)?,
+            regular_row(source, pair_index * 2 + 1)?,
+            equality_scale * (BlsDoryFr::one() - coordinate),
+            equality_scale * coordinate,
+            mixing_powers,
+            &mut evaluations,
+        )?;
+    }
+    if suffix_weights.next().is_some() {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    Ok(evaluations)
+}
+
+fn for_each_transition_artifact_pair(
+    artifact: &BlsDoryFoldArtifact,
+    mut visitor: impl FnMut(
+        TransitionRegularRow,
+        TransitionRegularRow,
+    ) -> Result<(), BlsDoryTransitionError>,
+) -> Result<(), BlsDoryTransitionError> {
+    let scalar_count = usize::try_from(artifact.spec().scalar_count)
+        .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+    if scalar_count < TRANSITION_FOLD_SLOTS * 2
+        || !scalar_count.is_multiple_of(TRANSITION_FOLD_SLOTS * 2)
+        || artifact.spec().explicit_scalar_count != artifact.spec().scalar_count
+    {
+        return Err(transition_storage_error());
+    }
+    let expected_rows = scalar_count / TRANSITION_FOLD_SLOTS;
+    let mut row = [BlsDoryFr::zero(); STRUCTURED_TRANSITION_REGULAR_ORACLES];
+    let mut slot = 0usize;
+    let mut pending = None;
+    let mut visited_rows = 0usize;
+    let mut visitor_error = None;
+    let artifact_result = artifact.for_each_scalar(|scalar| {
+        if slot < STRUCTURED_TRANSITION_REGULAR_ORACLES {
+            row[slot] = scalar;
+        } else if !scalar.is_zero() {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        slot += 1;
+        if slot == TRANSITION_FOLD_SLOTS {
+            visited_rows += 1;
+            if let Some(lower) = pending.take() {
+                if let Err(error) = visitor(lower, row) {
+                    visitor_error = Some(error);
+                    return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                }
+            } else {
+                pending = Some(row);
+            }
+            row.fill(BlsDoryFr::zero());
+            slot = 0;
+        }
+        Ok(())
+    });
+    if let Some(error) = visitor_error {
+        return Err(error);
+    }
+    artifact_result.map_err(|_| transition_storage_error())?;
+    if slot != 0 || pending.is_some() || visited_rows != expected_rows {
+        return Err(transition_storage_error());
+    }
+    Ok(())
+}
+
+fn transition_artifact_round(
+    statement: StructuredTransitionStatement,
+    artifact: &BlsDoryFoldArtifact,
+    round_index: usize,
+    cell_point: &[BlsDoryFr],
+    selector_prefix: BlsDoryFr,
+    mixing_powers: &[BlsDoryFr],
+) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
+    let coordinate = *cell_point
+        .get(round_index)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let mut suffix_weights = TransitionEqualityWeightIterator::new(&cell_point[round_index + 1..]);
+    let mut evaluations = vec![BlsDoryFr::zero(); BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1];
+    let mut visited = 0usize;
+    for_each_transition_artifact_pair(artifact, |lower, upper| {
+        let suffix = suffix_weights
+            .next()
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+        let equality_scale = selector_prefix * suffix;
+        accumulate_transition_pair(
+            statement,
+            lower,
+            upper,
+            equality_scale * (BlsDoryFr::one() - coordinate),
+            equality_scale * coordinate,
+            mixing_powers,
+            &mut evaluations,
+        )?;
+        visited += 1;
+        Ok(())
+    })?;
+    let expected_pairs = usize::try_from(artifact.spec().scalar_count)
+        .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?
+        / TRANSITION_FOLD_SLOTS
+        / 2;
+    if suffix_weights.next().is_some() || visited != expected_pairs {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    Ok(evaluations)
+}
+
+fn transition_fold_spec(
+    context_digest: [u8; 32],
+    generation: usize,
+    rows: usize,
+    parent_digest: [u8; 32],
+) -> Result<BlsDoryFoldArtifactSpec, BlsDoryTransitionError> {
+    let scalar_count = rows
+        .checked_mul(TRANSITION_FOLD_SLOTS)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    Ok(BlsDoryFoldArtifactSpec {
+        context_digest,
+        table_index: 0,
+        generation: u32::try_from(generation)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        scalar_count: u64::try_from(scalar_count)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        explicit_scalar_count: u64::try_from(scalar_count)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        parent_digest,
+    })
+}
+
+fn write_transition_fold_row(
+    writer: &mut BlsDoryFoldArtifactWriter,
+    lower: TransitionRegularRow,
+    upper: TransitionRegularRow,
+    challenge: BlsDoryFr,
+) -> Result<(), BlsDoryTransitionError> {
+    for oracle in 0..STRUCTURED_TRANSITION_REGULAR_ORACLES {
+        writer
+            .write_scalar(&(lower[oracle] + challenge * (upper[oracle] - lower[oracle])))
+            .map_err(|_| transition_storage_error())?;
+    }
+    for _ in STRUCTURED_TRANSITION_REGULAR_ORACLES..TRANSITION_FOLD_SLOTS {
+        writer
+            .write_scalar(&BlsDoryFr::zero())
+            .map_err(|_| transition_storage_error())?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_raw_transition_rows(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    current_rows: usize,
+    challenge: BlsDoryFr,
+    context_digest: [u8; 32],
+    generation: usize,
+    parent_digest: [u8; 32],
+    scratch_directory: &Path,
+) -> Result<BlsDoryFoldArtifact, BlsDoryTransitionError> {
+    let child_rows = current_rows
+        .checked_div(2)
+        .filter(|rows| *rows > 0)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let spec = transition_fold_spec(context_digest, generation, child_rows, parent_digest)?;
+    let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
+        .map_err(|_| transition_storage_error())?;
+    for pair_index in 0..child_rows {
+        write_transition_fold_row(
+            &mut writer,
+            regular_row(source, pair_index * 2)?,
+            regular_row(source, pair_index * 2 + 1)?,
+            challenge,
+        )?;
+    }
+    writer.finish().map_err(|_| transition_storage_error())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_transition_artifact(
+    artifact: &BlsDoryFoldArtifact,
+    challenge: BlsDoryFr,
+    context_digest: [u8; 32],
+    generation: usize,
+    parent_digest: [u8; 32],
+    scratch_directory: &Path,
+) -> Result<BlsDoryFoldArtifact, BlsDoryTransitionError> {
+    let current_rows = usize::try_from(artifact.spec().scalar_count)
+        .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?
+        / TRANSITION_FOLD_SLOTS;
+    let child_rows = current_rows
+        .checked_div(2)
+        .filter(|rows| *rows > 0)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let spec = transition_fold_spec(context_digest, generation, child_rows, parent_digest)?;
+    let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
+        .map_err(|_| transition_storage_error())?;
+    for_each_transition_artifact_pair(artifact, |lower, upper| {
+        write_transition_fold_row(&mut writer, lower, upper, challenge)
+    })?;
+    writer.finish().map_err(|_| transition_storage_error())
+}
+
+fn transition_terminal_row(
+    artifact: &BlsDoryFoldArtifact,
+) -> Result<TransitionRegularRow, BlsDoryTransitionError> {
+    if artifact.spec().scalar_count != TRANSITION_FOLD_SLOTS as u64
+        || artifact.spec().explicit_scalar_count != TRANSITION_FOLD_SLOTS as u64
+    {
+        return Err(transition_storage_error());
+    }
+    let mut row = [BlsDoryFr::zero(); STRUCTURED_TRANSITION_REGULAR_ORACLES];
+    let mut slot = 0usize;
+    artifact
+        .for_each_scalar(|scalar| {
+            if slot < STRUCTURED_TRANSITION_REGULAR_ORACLES {
+                row[slot] = scalar;
+            } else if !scalar.is_zero() {
+                return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+            }
+            slot += 1;
+            Ok(())
+        })
+        .map_err(|_| transition_storage_error())?;
+    if slot != TRANSITION_FOLD_SLOTS {
+        return Err(transition_storage_error());
+    }
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_transition_sumcheck_with_scratch(
+    statement: StructuredTransitionStatement,
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    cell_point: &[BlsDoryFr],
+    mixing_powers: &[BlsDoryFr],
+    transcript: &mut BlsDoryTranscript,
+    scratch_directory: &Path,
+) -> Result<TransitionScratchSumcheck, BlsDoryTransitionError> {
+    let mut claim = BlsDoryFr::zero();
+    let mut rounds = Vec::with_capacity(cell_point.len());
+    let mut point = Vec::with_capacity(cell_point.len());
+    let mut selector_prefix = BlsDoryFr::one();
+    if cell_point.is_empty() {
+        let terminal = regular_row(source, 0)?.to_vec();
+        return Ok(TransitionScratchSumcheck {
+            rounds,
+            point,
+            terminal_evaluations: terminal,
+            selector_terminal: selector_prefix,
+            final_claim: claim,
+        });
+    }
+
+    let context_digest = transcript.digest();
+    if context_digest == [0; 32] {
+        return Err(transition_storage_error());
+    }
+    let mut parent =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryTransitionFoldParent/v1");
+    parent.update(&context_digest);
+    let mut parent_digest = *parent.finalize().as_bytes();
+    let mut artifact = None;
+    let mut current_rows = source.elements;
+    for round_index in 0..cell_point.len() {
+        let evaluations = if let Some(current) = artifact.as_ref() {
+            transition_artifact_round(
+                statement,
+                current,
+                round_index,
+                cell_point,
+                selector_prefix,
+                mixing_powers,
+            )?
+        } else {
+            transition_raw_round(
+                statement,
+                source,
+                current_rows,
+                round_index,
+                cell_point,
+                selector_prefix,
+                mixing_powers,
+            )?
+        };
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryTransitionError::RoundClaim);
+        }
+        absorb_round(transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = evaluate_samples(&evaluations, challenge)?;
+        point.push(challenge);
+        let generation = round_index + 1;
+        let child = if let Some(current) = artifact.as_ref() {
+            fold_transition_artifact(
+                current,
+                challenge,
+                context_digest,
+                generation,
+                parent_digest,
+                scratch_directory,
+            )?
+        } else {
+            fold_raw_transition_rows(
+                source,
+                current_rows,
+                challenge,
+                context_digest,
+                generation,
+                parent_digest,
+                scratch_directory,
+            )?
+        };
+        parent_digest = child.digest();
+        artifact = Some(child);
+        current_rows /= 2;
+        let coordinate = cell_point[round_index];
+        selector_prefix = selector_prefix
+            * ((BlsDoryFr::one() - challenge) * (BlsDoryFr::one() - coordinate)
+                + challenge * coordinate);
+        rounds.push(evaluations);
+    }
+    let terminal_evaluations = transition_terminal_row(
+        artifact
+            .as_ref()
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?,
+    )?
+    .to_vec();
+    Ok(TransitionScratchSumcheck {
+        rounds,
+        point,
+        terminal_evaluations,
+        selector_terminal: selector_prefix,
+        final_claim: claim,
+    })
+}
+
 fn transition_round(
     statement: StructuredTransitionStatement,
     selector: &[BlsDoryFr],
@@ -1353,6 +1841,28 @@ mod tests {
     use super::*;
     use crate::dory_bls12_381_prototype::deterministic_bls_dory_setup;
 
+    static SCRATCH_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn create() -> Self {
+            let nonce = SCRATCH_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-transition-scratch-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn fixture() -> (
         StructuredTransitionStatement,
         StructuredMaskPolynomial,
@@ -1432,6 +1942,36 @@ mod tests {
         }
         streamed.truncate(explicit);
         assert_eq!(streamed, packed[..explicit]);
+    }
+
+    #[test]
+    fn scratch_transition_sumcheck_preserves_transcript_and_cleans_artifacts() {
+        let (statement, mask, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let ordinary = prove_bls_dory_transition_deferred_at_variables(
+            b"scratch-transition",
+            statement,
+            &mask,
+            &witness,
+            10,
+            &setup,
+        )
+        .unwrap();
+        let scratch_directory = ScratchDirectory::create();
+        let scratch = prove_bls_dory_transition_deferred_at_variables_with_scratch(
+            b"scratch-transition",
+            statement,
+            &mask,
+            &witness,
+            10,
+            &setup,
+            &scratch_directory.0,
+        )
+        .unwrap();
+        assert_eq!(scratch.proof, ordinary.proof);
+        assert_eq!(scratch.openings.claims(), ordinary.openings.claims());
+        drop(scratch);
+        assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
     }
 
     #[test]

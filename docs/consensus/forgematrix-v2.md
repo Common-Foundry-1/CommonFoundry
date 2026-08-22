@@ -460,9 +460,11 @@ comparison. The v2 research code now implements:
   without power-of-two-padded coefficient copies. Wiring additionally reads its
   signed tables directly for commitment and multilinear evaluation, and the
   transition commitment derives all 110 regular and radix-16 lanes directly
-  from its witness. Transition and LogUp sumcheck working tables remain
-  materialized, so the final production artifact still needs an n=33 commitment
-  run and streaming for those remaining working sets;
+  from its witness. The transition arithmetic sumcheck also keeps selector
+  weights implicit and folds 12 live lanes in authenticated 16-scalar scratch
+  rows. LogUp sumcheck working tables remain materialized, so the final
+  production artifact still needs an n=33 commitment run and streaming for that
+  remaining working set;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

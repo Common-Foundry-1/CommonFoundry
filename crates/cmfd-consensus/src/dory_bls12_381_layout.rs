@@ -119,7 +119,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and transition and LogUp still materialize production witness and sumcheck tables",
+    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and LogUp still materializes production sumcheck tables",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 

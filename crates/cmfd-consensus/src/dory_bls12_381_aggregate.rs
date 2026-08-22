@@ -47,7 +47,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "authenticated scratch commitments cover every component and wiring reads signed tables directly, but transition and LogUp still materialize production witness and sumcheck tables",
+    "authenticated scratch paths cover every component, transition is out of core, and wiring reads signed tables directly, but LogUp still materializes production sumcheck tables",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];

@@ -97,7 +97,9 @@ impl BlsDoryModelCommitmentRecord {
         Ok(())
     }
 
-    fn fixed_identity(
+    /// Reconstruct the fixed BLS commitment identity after validating its
+    /// canonical encodings and commitment count.
+    pub fn fixed_identity(
         &self,
     ) -> Result<BlsDoryFixedModelIdentity, BlsDoryModelCommitmentRecordError> {
         if self.fixed_model_protocol_version != BLS_DORY_FIXED_MODEL_IDENTITY_VERSION {
@@ -127,7 +129,8 @@ impl BlsDoryModelCommitmentRecord {
         })
     }
 
-    fn canonical_digest(&self) -> Result<[u8; 32], BlsDoryModelCommitmentRecordError> {
+    /// Return the canonical digest that a network configuration must pin.
+    pub fn canonical_digest(&self) -> Result<[u8; 32], BlsDoryModelCommitmentRecordError> {
         let manifest_digest = decode_hex_32("manifest", &self.manifest_digest)?;
         let model_digest = decode_hex_32("model PCS identity", &self.model_pcs_identity_digest)?;
         let setup_identity = decode_hex_32("setup", &self.setup_identity)?;

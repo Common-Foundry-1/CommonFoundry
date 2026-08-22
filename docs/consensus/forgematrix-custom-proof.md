@@ -1225,6 +1225,18 @@ Production therefore still requires final V3 parser/verifier integration,
 production-shape resource limits and load tests, protected executable
 deployment, and independent review.
 
+The feature-gated BLS/Dory candidate now has a narrower, explicitly
+non-consensus verifier boundary. It validates an authenticated model-commitment
+record at the exact n=33 production geometry, recomputes the block challenge
+and work digest, enforces the target, derives each transition bank's masks from
+its global layer offset, canonically decodes the shared Dory payload, and runs
+the real algebraic verifier. Its result type cannot be converted into the
+chain-admission capability. This is intentional: the current Dory layout and
+Goldilocks BLAKE3 STARK do not yet prove that they authenticate the same final
+activation table. Until that same-table link is implemented and reviewed, a
+successful algebraic preverification is not a valid V3 block proof and V3
+remains unselectable by `PowParameters`.
+
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
 `StructuredWhirPcsVerifier` authenticates both scoped claim sets. This closes

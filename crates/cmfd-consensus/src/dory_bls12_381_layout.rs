@@ -4110,6 +4110,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded, proof);
+        crate::dory_bls12_381_candidate::verify_algebraic_payload(
+            b"shared-opening",
+            &model,
+            &fixed_model,
+            &matrix_statements,
+            &transition_statements,
+            &masks,
+            fixture.wiring_statement,
+            &encoded,
+            FIXTURE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        assert!(
+            crate::dory_bls12_381_candidate::verify_algebraic_payload(
+                b"replayed-binding",
+                &model,
+                &fixed_model,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                &encoded,
+                FIXTURE_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
+        let mut substituted = encoded.clone();
+        let last = substituted.len() - 1;
+        substituted[last] ^= 1;
+        assert!(
+            crate::dory_bls12_381_candidate::verify_algebraic_payload(
+                b"shared-opening",
+                &model,
+                &fixed_model,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                &substituted,
+                FIXTURE_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
         verify_bls_dory_shared_layout_at_variables(
             b"shared-opening",
             &model,

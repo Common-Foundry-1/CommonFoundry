@@ -97,6 +97,23 @@ impl StructuredMaskPolynomial {
         rows: usize,
         cols: usize,
     ) -> Result<Self, StructuredTransitionError> {
+        Self::from_challenge_at_layer_offset(challenge, 0, layers, rows, cols)
+    }
+
+    /// Derive one contiguous bank of masks using the authoritative global
+    /// ForgeMatrix layer numbers.
+    ///
+    /// A multi-bank proof must not restart mask derivation at layer zero for
+    /// every bank: the reference evaluator derives each layer from its global
+    /// index. This constructor preserves that identity while keeping each
+    /// bank's compact polynomial independently verifiable.
+    pub fn from_challenge_at_layer_offset(
+        challenge: &[u8; 32],
+        first_layer: u32,
+        layers: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, StructuredTransitionError> {
         if layers == 0
             || rows == 0
             || cols == 0
@@ -116,13 +133,24 @@ impl StructuredMaskPolynomial {
         let row_bits = rows.ilog2();
         let col_bits = cols.ilog2();
         let coefficient_count = 1 + row_bits as usize + col_bits as usize;
+        let layer_count =
+            u32::try_from(layers).map_err(|_| StructuredTransitionError::ArithmeticOverflow)?;
+        first_layer
+            .checked_add(layer_count)
+            .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
         let mut coefficients = Vec::with_capacity(
             layers
                 .checked_mul(coefficient_count)
                 .ok_or(StructuredTransitionError::ArithmeticOverflow)?,
         );
         for layer in 0..layers {
-            coefficients.extend(mask_coefficients(challenge, layer as u32, rows, cols));
+            let layer = first_layer
+                .checked_add(
+                    u32::try_from(layer)
+                        .map_err(|_| StructuredTransitionError::ArithmeticOverflow)?,
+                )
+                .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
+            coefficients.extend(mask_coefficients(challenge, layer, rows, cols));
         }
         Ok(Self {
             layers,
@@ -1677,6 +1705,33 @@ mod tests {
             mask_coefficients(&challenge, 0, 2, 4)
         );
         assert_ne!(virtual_mask.digest(), layer_zero.digest());
+    }
+
+    #[test]
+    fn banked_masks_preserve_global_layer_numbers() {
+        let challenge = [0x5c; 32];
+        let first =
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(&challenge, 0, 2, 2, 4)
+                .unwrap();
+        let second =
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(&challenge, 2, 2, 2, 4)
+                .unwrap();
+        let all = StructuredMaskPolynomial::from_challenge(&challenge, 4, 2, 4).unwrap();
+        let coefficients_per_layer = 1 + 2usize.ilog2() as usize + 4usize.ilog2() as usize;
+
+        assert_eq!(
+            first.coefficients,
+            all.coefficients[..2 * coefficients_per_layer]
+        );
+        assert_eq!(
+            second.coefficients,
+            all.coefficients[2 * coefficients_per_layer..]
+        );
+        assert_ne!(first.digest(), second.digest());
+        assert_eq!(
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(&challenge, u32::MAX, 1, 2, 4,),
+            Err(StructuredTransitionError::ArithmeticOverflow)
+        );
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, compact transition sources with authenticated 32-bit transition words and packed radix-16 nibbles, mapped inverse views, authenticated release/regeneration, consuming openings, and eight challenge-bound shared source-fold generations preserve exact proofs and leave zero scratch after completion; after authenticated one-byte bounded activation, wiring, and model-weight sources plus signed-word accumulator sources, a fresh n=19 shared-layout release run observed a 48,819,868-byte full-prover scratch peak against a 1,696,484-byte aggregate-stage projection, and the exact complete n=33 aggregate-stage projection is 31,624,626,692 bytes (about 29.5 GiB), down 13.88 times from 438,943,885,320 bytes (about 408.8 GiB); GPU or distributed proving and a complete measured n=33 run remain required",
+    "bounded parallel work, compact transition sources with authenticated per-selector transition words and packed radix-16 nibbles, mapped inverse views, authenticated release/regeneration, consuming openings, and eight challenge-bound shared source-fold generations preserve exact proofs and leave zero scratch after completion; after authenticated one-byte bounded activation, wiring, and model-weight sources plus signed-word accumulator sources, a fresh n=19 shared-layout release run observed a 48,669,452-byte full-prover scratch peak against a 1,546,068-byte aggregate-stage projection, and the exact complete n=33 aggregate-stage projection is 29,202,416,244 bytes (about 27.2 GiB), down 15.03 times from 438,943,885,320 bytes (about 408.8 GiB); GPU or distributed proving and a complete measured n=33 run remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -5053,7 +5053,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_transition_range_source_bytes().unwrap(),
-            6_509_560_440
+            5_704_254_080
         );
         assert_eq!(
             projected_production_range_logup_compressed_lineage_bytes().unwrap(),
@@ -5065,23 +5065,23 @@ mod tests {
         );
         assert_eq!(
             projected_production_range_logup_four_pair_peak_bytes().unwrap(),
-            32_413_582_288
+            31_608_275_928
         );
         assert_eq!(
             projected_production_range_logup_aggregate_fold_peak_bytes().unwrap(),
-            301_788_563_468
+            300_983_257_108
         );
         assert_eq!(
             projected_production_shared_transition_aggregate_fold_peak_bytes().unwrap(),
-            1_029_986_852_516
+            1_026_765_627_076
         );
         assert_eq!(
             projected_production_range_logup_compressed_aggregate_pair_peak_bytes().unwrap(),
-            32_413_582_288
+            31_608_275_928
         );
         assert_eq!(
             projected_production_shared_transition_compressed_aggregate_fold_peak_bytes().unwrap(),
-            100_461_972_796
+            97_240_747_356
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

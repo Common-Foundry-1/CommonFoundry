@@ -20,13 +20,13 @@ use thiserror::Error;
 use crate::dory_bls12_381_prototype::BlsDoryFr;
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSC1";
-const ARTIFACT_VERSION: u16 = 3;
-const ARTIFACT_HEADER_BYTES: usize = 88;
+const ARTIFACT_VERSION: u16 = 4;
+const ARTIFACT_HEADER_BYTES: usize = 96;
 const ARTIFACT_DIGEST_BYTES: usize = 32;
 const ARTIFACT_SCALAR_BYTES: usize = 32;
 const ARTIFACT_MAX_WORD_BYTES: usize = 8;
 const ARTIFACT_IO_BUFFER_BYTES: usize = 1024 * 1024;
-const ARTIFACT_HASH_DOMAIN: &str = "CommonFoundry/ForgeMatrix/BlsDoryCompactArtifact/v3";
+const ARTIFACT_HASH_DOMAIN: &str = "CommonFoundry/ForgeMatrix/BlsDoryCompactArtifact/v4";
 const MAPPED_ARTIFACT_HASH_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryMappedCompactArtifact/v1";
 static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -46,10 +46,13 @@ pub struct BlsDoryCompactArtifactSpec {
     pub explicit_scalar_count: u64,
     /// Initial coefficients stored as canonical fixed-width words.
     pub word_scalar_count: u64,
-    /// Canonical byte width of every word: 4 or 8.
+    /// Canonical default byte width of each word: 4 or 8.
     pub word_bytes: u8,
     /// Canonical bit width of each dictionary code: 4 or 8.
     pub code_bits: u8,
+    /// Two-bit per-selector word-width overrides for the first 32 selectors.
+    /// Codes 0, 1, 2, and 3 select the default, 1, 2, and 3 bytes.
+    pub word_width_codes: u64,
     /// Coefficients per selector in the word prefix.
     pub word_group_len: u64,
     /// Bit `i` is one when selector `i` decodes its words as signed `i64`.
@@ -79,6 +82,13 @@ impl BlsDoryCompactArtifactSpec {
         } else {
             return Err(BlsDoryCompactArtifactError::InvalidSpec);
         };
+        let allowed_width_codes = if word_selectors >= 32 {
+            u64::MAX
+        } else {
+            1u64.checked_shl((word_selectors * 2) as u32)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?
+        };
         if self.context_digest == [0; 32]
             || self.scalar_count == 0
             || !self.scalar_count.is_power_of_two()
@@ -94,12 +104,28 @@ impl BlsDoryCompactArtifactSpec {
             || !self.word_scalar_count.is_multiple_of(self.word_group_len)
             || word_selectors == 0
             || self.signed_word_selectors & !allowed_mask != 0
+            || self.word_width_codes & !allowed_width_codes != 0
             || !(1..=256).contains(&dictionary_len)
         {
             return Err(BlsDoryCompactArtifactError::InvalidSpec);
         }
         artifact_file_bytes(self, dictionary_len)?;
         Ok(())
+    }
+
+    fn selector_word_bytes(self, selector: u64) -> Result<u8, BlsDoryCompactArtifactError> {
+        let code = if selector < 32 {
+            (self.word_width_codes >> (selector * 2)) & 0x03
+        } else {
+            0
+        };
+        match code {
+            0 => Ok(self.word_bytes),
+            1 => Ok(1),
+            2 => Ok(2),
+            3 => Ok(3),
+            _ => Err(BlsDoryCompactArtifactError::InvalidSpec),
+        }
     }
 
     fn encode(
@@ -120,7 +146,8 @@ impl BlsDoryCompactArtifactSpec {
         header[60..68].copy_from_slice(&self.word_scalar_count.to_le_bytes());
         header[68..76].copy_from_slice(&self.word_group_len.to_le_bytes());
         header[76..84].copy_from_slice(&self.signed_word_selectors.to_le_bytes());
-        header[84..86].copy_from_slice(&dictionary_len.to_le_bytes());
+        header[84..92].copy_from_slice(&self.word_width_codes.to_le_bytes());
+        header[92..94].copy_from_slice(&dictionary_len.to_le_bytes());
         Ok(header)
     }
 }
@@ -206,8 +233,7 @@ impl BlsDoryCompactArtifactWriter {
         if next > self.spec.word_scalar_count {
             return Err(BlsDoryCompactArtifactError::InvalidArtifact);
         }
-        let word_bytes = usize::from(self.spec.word_bytes);
-        let words_per_chunk = ARTIFACT_IO_BUFFER_BYTES / word_bytes;
+        let words_per_chunk = ARTIFACT_IO_BUFFER_BYTES / usize::from(self.spec.word_bytes);
         for (offset, word) in words.iter().enumerate() {
             let word_index = self
                 .written_words
@@ -218,13 +244,22 @@ impl BlsDoryCompactArtifactWriter {
                 .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
             let selector = word_index / self.spec.word_group_len;
             let signed = self.spec.signed_word_selectors & (1u64 << selector) != 0;
-            validate_word(*word, signed, self.spec.word_bytes)?;
+            validate_word(*word, signed, self.spec.selector_word_bytes(selector)?)?;
         }
         let mut encoded = Vec::with_capacity(ARTIFACT_IO_BUFFER_BYTES);
+        let mut word_index = self.written_words;
         for chunk in words.chunks(words_per_chunk) {
             encoded.clear();
             for word in chunk {
-                append_word(*word, self.spec.word_bytes, &mut encoded);
+                let selector = word_index / self.spec.word_group_len;
+                append_word(
+                    *word,
+                    self.spec.selector_word_bytes(selector)?,
+                    &mut encoded,
+                );
+                word_index = word_index
+                    .checked_add(1)
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
             }
             self.file_mut()?.write_all(&encoded)?;
             self.hasher.update(&encoded);
@@ -410,21 +445,30 @@ impl BlsDoryCompactArtifact {
         mut visitor: impl FnMut(u64, CompactEncodedScalar) -> Result<(), BlsDoryCompactArtifactError>,
     ) -> Result<(), BlsDoryCompactArtifactError> {
         self.validate_live_file(|reader, hasher| {
-            let word_bytes = usize::from(self.spec.word_bytes);
-            let words_per_chunk = ARTIFACT_IO_BUFFER_BYTES / word_bytes;
             let mut encoded_words = vec![0u8; ARTIFACT_IO_BUFFER_BYTES];
             let mut remaining = self.spec.word_scalar_count;
             let mut word_index = 0u64;
             while remaining > 0 {
-                let words = usize::try_from(remaining.min(words_per_chunk as u64))
-                    .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+                let selector = word_index / self.spec.word_group_len;
+                let selector_remaining = self
+                    .spec
+                    .word_group_len
+                    .checked_sub(word_index % self.spec.word_group_len)
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+                let word_bytes = usize::from(self.spec.selector_word_bytes(selector)?);
+                let words_per_chunk = ARTIFACT_IO_BUFFER_BYTES / word_bytes;
+                let words = usize::try_from(
+                    remaining
+                        .min(selector_remaining)
+                        .min(words_per_chunk as u64),
+                )
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
                 let bytes = words
                     .checked_mul(word_bytes)
                     .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
                 reader.read_exact(&mut encoded_words[..bytes])?;
                 hasher.update(&encoded_words[..bytes]);
                 for encoded in encoded_words[..bytes].chunks_exact(word_bytes) {
-                    let selector = word_index / self.spec.word_group_len;
                     let signed = self.spec.signed_word_selectors & (1u64 << selector) != 0;
                     visitor(
                         word_index,
@@ -433,9 +477,13 @@ impl BlsDoryCompactArtifact {
                             signed,
                         },
                     )?;
-                    word_index += 1;
+                    word_index = word_index
+                        .checked_add(1)
+                        .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
                 }
-                remaining -= words as u64;
+                let words = u64::try_from(words)
+                    .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+                remaining -= words;
             }
             let mut remaining = self
                 .spec
@@ -758,9 +806,17 @@ fn artifact_file_bytes(
         .ok()
         .and_then(|count| count.checked_mul(ARTIFACT_SCALAR_BYTES as u64))
         .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
-    let word_bytes = spec
+    let word_selectors = spec
         .word_scalar_count
-        .checked_mul(u64::from(spec.word_bytes))
+        .checked_div(spec.word_group_len)
+        .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+    let selector_bytes = (0..word_selectors).try_fold(0u64, |sum, selector| {
+        sum.checked_add(u64::from(spec.selector_word_bytes(selector)?))
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)
+    })?;
+    let word_bytes = spec
+        .word_group_len
+        .checked_mul(selector_bytes)
         .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
     let code_count = spec
         .explicit_scalar_count
@@ -794,12 +850,18 @@ fn validate_word(
     let fits = if signed {
         let value = i64::from_le_bytes(value.to_le_bytes());
         match word_bytes {
+            1 => i8::try_from(value).is_ok(),
+            2 => i16::try_from(value).is_ok(),
+            3 => (-8_388_608..=8_388_607).contains(&value),
             4 => i32::try_from(value).is_ok(),
             8 => true,
             _ => false,
         }
     } else {
         match word_bytes {
+            1 => u8::try_from(value).is_ok(),
+            2 => u16::try_from(value).is_ok(),
+            3 => value <= 0x00ff_ffff,
             4 => u32::try_from(value).is_ok(),
             8 => true,
             _ => false,
@@ -812,7 +874,7 @@ fn validate_word(
 }
 
 fn decode_word(encoded: &[u8], signed: bool) -> Result<u64, BlsDoryCompactArtifactError> {
-    if !matches!(encoded.len(), 4 | 8) {
+    if !matches!(encoded.len(), 1 | 2 | 3 | 4 | 8) {
         return Err(BlsDoryCompactArtifactError::InvalidArtifact);
     }
     let fill = if signed && encoded[encoded.len() - 1] & 0x80 != 0 {
@@ -881,6 +943,7 @@ mod tests {
             word_scalar_count: 16,
             word_bytes: 4,
             code_bits: 4,
+            word_width_codes: 1 | (2 << 2) | (3 << 4),
             word_group_len: 4,
             signed_word_selectors: 0b0101,
         }
@@ -890,28 +953,30 @@ mod tests {
     fn signed_unsigned_words_and_codes_round_trip_and_clean_up() {
         let directory = TestDirectory::create();
         let words = [
-            i64::from(i32::MIN) as u64,
-            i64::from(i32::MAX) as u64,
+            (-128i64) as u64,
+            127,
             0,
             7,
             11,
-            u64::from(u32::MAX),
+            u64::from(u16::MAX),
             19,
             23,
-            (-31i64) as u64,
+            (-8_388_608i64) as u64,
             37,
+            8_388_607,
             (-41i64) as u64,
-            43,
             47,
             53,
             59,
-            61,
+            u64::from(u32::MAX),
         ];
         let codes = [0, 1, 2, 3, 3, 2, 1, 0];
         let dictionary = (0..4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
         let mut writer =
             BlsDoryCompactArtifactWriter::create(&directory.0, spec(), dictionary).unwrap();
-        writer.write_words(&words).unwrap();
+        writer.write_words(&words[..5]).unwrap();
+        writer.write_words(&words[5..11]).unwrap();
+        writer.write_words(&words[11..]).unwrap();
         writer.write_codes(&codes).unwrap();
         let artifact = writer.finish().unwrap();
         let path = artifact.path().to_path_buf();
@@ -959,7 +1024,7 @@ mod tests {
         writer.write_codes(&codes[3..]).unwrap();
         let mut artifact = writer.finish().unwrap();
         let mut encoded = std::fs::read(artifact.path()).unwrap();
-        let code_offset = ARTIFACT_HEADER_BYTES + 4 * ARTIFACT_SCALAR_BYTES + 16 * 4;
+        let code_offset = ARTIFACT_HEADER_BYTES + 4 * ARTIFACT_SCALAR_BYTES + 4 * (1 + 2 + 3 + 4);
         assert_eq!(encoded[code_offset + 3], 3);
         assert_eq!(encoded.len() as u64, odd_spec.encoded_bytes(4).unwrap());
         let mut decoded = Vec::new();
@@ -1013,6 +1078,16 @@ mod tests {
             )
             .is_err()
         );
+        let mut unused_width_code = spec();
+        unused_width_code.word_width_codes |= 1 << 8;
+        assert!(
+            BlsDoryCompactArtifactWriter::create(
+                &directory.0,
+                unused_width_code,
+                dictionary.clone(),
+            )
+            .is_err()
+        );
         assert!(
             BlsDoryCompactArtifactWriter::create(
                 &directory.0,
@@ -1030,8 +1105,12 @@ mod tests {
                 .is_err()
         );
         writer.write_words(&[0; 4]).unwrap();
+        assert!(writer.write_words(&[u64::from(u16::MAX) + 1]).is_err());
+        writer.write_words(&[0; 4]).unwrap();
+        assert!(writer.write_words(&[8_388_608]).is_err());
+        writer.write_words(&[0; 4]).unwrap();
         assert!(writer.write_words(&[u64::from(u32::MAX) + 1]).is_err());
-        writer.write_words(&[0; 12]).unwrap();
+        writer.write_words(&[0; 4]).unwrap();
         assert!(writer.write_codes(&[4]).is_err());
         drop(writer);
         assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
@@ -1104,9 +1183,8 @@ mod tests {
             BlsDoryMappedCompactArtifact::new(Arc::clone(&source), 8, mapped_dictionary).unwrap();
         assert!(signed_suffix.for_each_scalar(|_| Ok(())).is_err());
 
-        let code_offset = ARTIFACT_HEADER_BYTES as u64
-            + 4 * ARTIFACT_SCALAR_BYTES as u64
-            + 16 * u64::from(spec().word_bytes);
+        let code_offset =
+            ARTIFACT_HEADER_BYTES as u64 + 4 * ARTIFACT_SCALAR_BYTES as u64 + 4 * (1 + 2 + 3 + 4);
         let mut file = OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(code_offset)).unwrap();
         file.write_all(&[0xff]).unwrap();

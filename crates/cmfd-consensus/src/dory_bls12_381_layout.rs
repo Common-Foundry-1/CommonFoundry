@@ -59,7 +59,8 @@ use crate::{
     dory_bls12_381_streaming::BlsDoryRowSource,
     dory_bls12_381_transition::{
         BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryTransitionError, BlsDoryTransitionProof,
-        BlsDoryTransitionWitnessRowSource, PreparedBlsDoryTransitionProof,
+        BlsDoryTransitionWitnessRowSource, PRODUCTION_TRANSITION_WORD_WIDTH_CODES,
+        PreparedBlsDoryTransitionProof, TRANSITION_SIGNED_WORD_SELECTORS,
         projected_production_transition_opening_bytes, projected_production_transition_proof_bytes,
         prove_bls_dory_transition, prove_bls_dory_transition_at_variables,
         prove_bls_dory_transition_deferred_at_variables,
@@ -128,7 +129,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources with authenticated 32-bit transition words and packed radix-16 nibbles, one-byte bounded activation, wiring, and model-weight sources after their first Dory row, signed-word accumulator sources, authenticated release/regeneration, and eight challenge-bound source-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 31,624,626,692 bytes (about 29.5 GiB) and the complete n=33 prover has not been run",
+    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources with authenticated per-selector transition words and packed radix-16 nibbles, one-byte bounded activation, wiring, and model-weight sources after their first Dory row, signed-word accumulator sources, authenticated release/regeneration, and eight challenge-bound source-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 29,202,416,244 bytes (about 27.2 GiB) and the complete n=33 prover has not been run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -2548,6 +2549,7 @@ fn projected_shared_signed_word_source_bytes(
         word_scalar_count: explicit_scalars,
         word_bytes: 8,
         code_bits: 8,
+        word_width_codes: 0,
         word_group_len,
         signed_word_selectors: 1,
     }
@@ -2572,6 +2574,7 @@ fn projected_shared_signed_byte_source_bytes(
         word_scalar_count: explicit_scalars.min(row_scalars),
         word_bytes: 8,
         code_bits: 8,
+        word_width_codes: 0,
         word_group_len: explicit_scalars.min(row_scalars),
         signed_word_selectors: 1,
     }
@@ -2596,8 +2599,9 @@ fn projected_shared_transition_source_bytes(
         word_scalar_count: word_scalars,
         word_bytes: 4,
         code_bits: 4,
+        word_width_codes: PRODUCTION_TRANSITION_WORD_WIDTH_CODES,
         word_group_len: cells,
-        signed_word_selectors: 0,
+        signed_word_selectors: TRANSITION_SIGNED_WORD_SELECTORS,
     }
     .encoded_bytes(BLS_DORY_RANGE_LOGUP_TABLE_VALUES)
     .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
@@ -4730,12 +4734,12 @@ mod tests {
     #[test]
     fn production_claim_accounting_and_shared_projection_are_explicit() {
         let scratch = projected_shared_production_scratch_bytes().unwrap();
-        assert_eq!(scratch.matrix_source_bytes, 8_259_944_664);
-        assert_eq!(scratch.transition_source_bytes, 19_579_537_888);
+        assert_eq!(scratch.matrix_source_bytes, 8_259_944_736);
+        assert_eq!(scratch.transition_source_bytes, 17_157_327_360);
         assert_eq!(scratch.multiplicity_source_bytes, 2_576);
-        assert_eq!(scratch.wiring_source_bytes, 470_687_704);
+        assert_eq!(scratch.wiring_source_bytes, 470_687_712);
         assert_eq!(scratch.fixed_base_source_bytes, 16_777_348);
-        assert_eq!(scratch.retained_source_bytes, 28_326_950_180);
+        assert_eq!(scratch.retained_source_bytes, 25_904_739_732);
         assert_eq!(scratch.matrix_first_fold_bytes, 0);
         assert_eq!(scratch.transition_first_fold_bytes, 0);
         assert_eq!(scratch.multiplicity_first_fold_bytes, 1_552);
@@ -4745,7 +4749,7 @@ mod tests {
         assert_eq!(scratch.fifth_generation_fold_bytes, 525_076);
         assert_eq!(scratch.source_materialization_fold_bytes, 3_232_664_668);
         assert_eq!(scratch.aggregate_fold_peak_bytes, 3_297_676_512);
-        assert_eq!(scratch.aggregate_peak_bytes, 31_624_626_692);
+        assert_eq!(scratch.aggregate_peak_bytes, 29_202_416_244);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);

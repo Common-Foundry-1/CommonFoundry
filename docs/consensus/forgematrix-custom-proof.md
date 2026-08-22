@@ -1067,21 +1067,22 @@ production lineages are exactly 16,173,236,396, 9,730,785,452,
 the first two at 25,904,021,848 bytes, or about 24.125 GiB. Delaying the first
 ordinary scalar artifact until generation five removes the former 64.06 GiB
 transition overlap.
-Exact production geometry stores the transition's 805,306,368
-regular 32-bit words and 6,576,668,672 packed digit codes in 6,509,560,440 bytes,
-about 6.063 GiB including framing.
+Exact production geometry stores the transition's 805,306,368 regular values
+in authenticated per-selector 1-, 2-, 3-, and 4-byte words totaling 36 bytes
+per cell, plus 6,576,668,672 packed digit codes, in 5,704,254,080 bytes, about
+5.313 GiB including framing.
 The mapped inverse reuses those authenticated digits and adds no coefficient
-file. One retained transition/inverse pair is about 6.063 GiB and four sources
-are exactly 26,038,241,760 bytes, about 24.25 GiB. The shared prover now retains
+file. One retained transition/inverse pair is about 5.313 GiB and four sources
+are exactly 22,817,016,320 bytes, about 21.25 GiB. The shared prover now retains
 each compact source's exact
 format, dictionary, and BLAKE3 digest, releases the completed source before the
 next pair builds its lineage, and regenerates all four immediately before shared
 openings. Regeneration writes only the canonical word/code artifact and reuses
 the original Dory commitment and row commitments; a changed witness or any
 identity mismatch aborts. The construction-phase source-plus-lineage peak is
-32,413,582,288 bytes, about 30.19 GiB, and is now larger than the four-source
+31,608,275,928 bytes, about 29.44 GiB, and is now larger than the four-source
 regeneration boundary. The transition/range storage peak is therefore
-32,413,582,288 bytes, down from 77,980,502,840 bytes or 72.62 GiB. Executable
+31,608,275,928 bytes, down from 77,980,502,840 bytes or 72.62 GiB. Executable
 projection
 functions pin all source, lineage, and peak sizes. Exact fixtures preserve the
 complete proof bytes, reject a one-byte regenerated-source substitution, and
@@ -1123,20 +1124,20 @@ directly, so it never creates the former 32-byte-per-weight scalar artifact.
 The complete executable n=33 aggregate-stage projection now includes every matrix,
 transition, multiplicity, wiring, and fixed-base source plus the entire ordered
 fold-artifact lifecycle. Authenticated dictionary coding reduces the three matrix
-sources from 9,666,454,296 to 8,259,944,664 bytes, transition sources from
-29,470,231,008 to 19,579,537,888 bytes, and wiring from 3,758,096,536 to
-470,687,704 bytes. Retained sources total 28,326,950,180 bytes (about 26.4
+sources from 9,666,454,296 to 8,259,944,736 bytes, transition sources from
+29,470,231,008 to 17,157,327,360 bytes, and wiring from 3,758,096,536 to
+470,687,712 bytes. Retained sources total 25,904,739,732 bytes (about 24.1
 GiB), the fold peak remains 3,297,676,512 bytes (about 3.1 GiB), and their
-combined peak is 31,624,626,692 bytes (about 29.5 GiB). This is a 13.88-times
+combined peak is 29,202,416,244 bytes (about 27.2 GiB). This is a 15.03-times
 reduction from the prior complete 438,943,885,320-byte projection (about 408.8
-GiB), a 3.51-times reduction from the earlier 110,935,310,868-byte projection,
-and a 23.82% reduction from the immediately preceding 41,515,319,812-byte
+GiB), a 3.80-times reduction from the earlier 110,935,310,868-byte projection,
+and a 7.66% reduction from the immediately preceding 31,624,626,692-byte
 projection. It is still a code-pinned rejection estimate, not a production
 measurement. Further reduction or distribution and a complete unchanged n=33
 run remain mandatory. A fresh complete n=19 release run preserved the
-84,717-byte proof, measured 105.911 seconds proving and 8.071 seconds
-verification, observed a 48,819,868-byte full-prover scratch peak
-against a 1,696,484-byte aggregate-stage projection, and retained zero scratch
+84,717-byte proof, measured 100.568 seconds proving and 7.299 seconds
+verification, observed a 48,669,452-byte full-prover scratch peak
+against a 1,546,068-byte aggregate-stage projection, and retained zero scratch
 after completion.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic

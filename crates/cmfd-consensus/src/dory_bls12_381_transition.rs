@@ -85,7 +85,23 @@ const NEGATIVE: usize = 9;
 const ACTIVATION: usize = STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
 const SHIFTED_ACCUMULATOR: usize = 11;
 const TRANSITION_FOLD_SLOTS: usize = 16;
-const TRANSITION_SIGNED_WORD_SELECTORS: u64 = (1u64 << ACCUMULATOR) | (1u64 << ACTIVATION);
+pub(crate) const TRANSITION_SIGNED_WORD_SELECTORS: u64 =
+    (1u64 << ACCUMULATOR) | (1u64 << ACTIVATION);
+const TRANSITION_FIXED_WORD_WIDTH_CODES: u64 = (3u64 << (OUTPUT_QUOTIENT * 2))
+    | (1u64 << (OUTPUT_REMAINDER * 2))
+    | (1u64 << (NEGATIVE * 2))
+    | (1u64 << (ACTIVATION * 2));
+pub(crate) const PRODUCTION_TRANSITION_WORD_WIDTH_CODES: u64 =
+    TRANSITION_FIXED_WORD_WIDTH_CODES | (2u64 << (MASK * 2));
+
+fn transition_word_width_codes(max_mask: u64) -> u64 {
+    TRANSITION_FIXED_WORD_WIDTH_CODES
+        | if max_mask <= u64::from(u16::MAX) {
+            2u64 << (MASK * 2)
+        } else {
+            0
+        }
+}
 
 /// In-memory transition proof plus its canonical Dory opening payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,6 +359,7 @@ pub fn projected_production_transition_source_artifact_bytes() -> Result<u64, Bl
         word_scalar_count: literal_scalar_count,
         word_bytes: 4,
         code_bits: 4,
+        word_width_codes: PRODUCTION_TRANSITION_WORD_WIDTH_CODES,
         word_group_len: cells,
         signed_word_selectors: TRANSITION_SIGNED_WORD_SELECTORS,
     }
@@ -1301,6 +1318,10 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
         4
     }
 
+    fn word_width_codes(&self) -> u64 {
+        transition_word_width_codes(self.statement.max_mask)
+    }
+
     fn word_group_len(&self) -> usize {
         self.elements
     }
@@ -2222,12 +2243,12 @@ mod tests {
                 .unwrap()
                 .len();
         let elements = u64::try_from(statement.elements().unwrap()).unwrap();
-        let word_scalars = elements * STRUCTURED_TRANSITION_REGULAR_ORACLES as u64;
+        let word_bytes = elements * 36;
         let code_scalars = elements
             * (STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES) as u64;
         assert_eq!(
             artifact_bytes,
-            88 + 16 * 32 + word_scalars * 4 + code_scalars.div_ceil(2) + 32
+            96 + 16 * 32 + word_bytes + code_scalars.div_ceil(2) + 32
         );
         let former_scalar_bytes = 100 + elements * STRUCTURED_TRANSITION_ORACLES as u64 * 32 + 32;
         assert!(artifact_bytes * 10 < former_scalar_bytes);
@@ -2313,6 +2334,14 @@ mod tests {
 
     #[test]
     fn production_geometry_and_gate_remain_explicit() {
+        assert_eq!(
+            transition_word_width_codes(u64::from(u16::MAX)),
+            PRODUCTION_TRANSITION_WORD_WIDTH_CODES
+        );
+        assert_eq!(
+            transition_word_width_codes(u64::from(u16::MAX) + 1),
+            TRANSITION_FIXED_WORD_WIDTH_CODES
+        );
         assert_eq!(PRODUCTION_BLS_DORY_TRANSITION_VARIABLES, 26 + 7);
         assert_eq!(
             projected_production_transition_opening_bytes().unwrap(),
@@ -2324,7 +2353,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_transition_source_artifact_bytes().unwrap(),
-            6_509_560_440
+            5_704_254_080
         );
         assert!(projected_production_transition_opening_bytes().unwrap() < 262_128);
         assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 3);

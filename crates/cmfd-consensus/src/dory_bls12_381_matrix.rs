@@ -1680,7 +1680,7 @@ mod tests {
                 .metadata()
                 .unwrap()
                 .len(),
-            828
+            836
         );
         let streamed = prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
             b"precommitted-weight",

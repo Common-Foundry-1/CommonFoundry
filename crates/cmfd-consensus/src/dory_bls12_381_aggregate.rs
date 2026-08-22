@@ -56,7 +56,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, compact transition/mapped sources with authenticated 32-bit transition words and packed radix-16 nibbles, one-byte bounded activation, wiring, and model-weight sources after their first Dory row, signed-word accumulator sources, authenticated release/regeneration, consuming openings, and eight challenge-bound source-fold views preserve exact proofs; a fresh n=19 shared-layout release run retained the 84,717-byte proof, measured 105.911 seconds proving and 8.071 seconds verification, observed a 48,819,868-byte full-prover scratch peak against a 1,696,484-byte aggregate-stage projection, and left zero scratch; the exact complete n=33 aggregate-stage projection is now 31,624,626,692 bytes (about 29.5 GiB), down 13.88 times from 438,943,885,320 bytes (about 408.8 GiB), but a complete measured n=33 run remains required",
+    "bounded parallel commitments, compact transition/mapped sources with authenticated per-selector transition words and packed radix-16 nibbles, one-byte bounded activation, wiring, and model-weight sources after their first Dory row, signed-word accumulator sources, authenticated release/regeneration, consuming openings, and eight challenge-bound source-fold views preserve exact proofs; a fresh n=19 shared-layout release run retained the 84,717-byte proof, measured 100.568 seconds proving and 7.299 seconds verification, observed a 48,669,452-byte full-prover scratch peak against a 1,546,068-byte aggregate-stage projection, and left zero scratch; the exact complete n=33 aggregate-stage projection is now 29,202,416,244 bytes (about 27.2 GiB), down 15.03 times from 438,943,885,320 bytes (about 408.8 GiB), but a complete measured n=33 run remains required",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -1062,6 +1062,7 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
                 .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
             word_bytes: 8,
             code_bits: 8,
+            word_width_codes: 0,
             word_group_len: u64::try_from(word_scalar_count)
                 .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
             signed_word_selectors: 1,
@@ -1613,6 +1614,9 @@ pub(crate) trait BlsDoryCompactRowSource {
     fn code_bits(&self) -> u8 {
         8
     }
+    fn word_width_codes(&self) -> u64 {
+        0
+    }
     fn word_group_len(&self) -> usize;
     fn signed_word_selectors(&self) -> u64;
     fn dictionary(&self) -> &[BlsDoryFr];
@@ -1825,6 +1829,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
     let word_coefficient_count = source.word_scalar_count();
     let word_bytes = source.word_bytes();
     let code_bits = source.code_bits();
+    let word_width_codes = source.word_width_codes();
     let word_group_len = source.word_group_len();
     let signed_word_selectors = source.signed_word_selectors();
     if source.rows() != rows
@@ -1863,6 +1868,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
             .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
         word_bytes,
         code_bits,
+        word_width_codes,
         word_group_len: u64::try_from(word_group_len)
             .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
         signed_word_selectors,
@@ -2035,6 +2041,7 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
     let word_coefficient_count = source.word_scalar_count();
     let word_bytes = source.word_bytes();
     let code_bits = source.code_bits();
+    let word_width_codes = source.word_width_codes();
     let word_group_len = source.word_group_len();
     let signed_word_selectors = source.signed_word_selectors();
     if source.rows() != rows
@@ -2070,6 +2077,7 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
             .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
         word_bytes,
         code_bits,
+        word_width_codes,
         word_group_len: u64::try_from(word_group_len)
             .map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
         signed_word_selectors,

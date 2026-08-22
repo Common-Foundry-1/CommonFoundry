@@ -309,6 +309,14 @@ bits to retain 128 proven bits; those operationally prohibitive searches are not
 activation candidates. This remains a correctness checkpoint rather than a
 production-size claim. Production still needs a substantially narrower bridge
 or a different aggregation/recursion strategy before V3 can activate.
+A separate 56-point release-mode sweep held log blowup seven and the
+128-proven-bit query margin fixed while varying FRI terminal lengths zero
+through seven and maximum fold arities one through seven. Every tiny-fixture
+proof verified under its exact configuration. The best canonical compressed
+bridge was 154,606 bytes at terminal length six and maximum fold arity two.
+Together with the 133,409-byte Dory projection and 18-byte candidate envelope,
+it totals 288,033 bytes, still 25,905 bytes over the structured-proof cap. FRI
+transport geometry therefore does not close the activation gap.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

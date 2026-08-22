@@ -794,4 +794,114 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[ignore = "FRI geometry proof-size and soundness measurement"]
+    fn bridge_fri_geometry_measurement() {
+        use std::time::Instant;
+
+        fn proven_security(
+            air: &BlsDoryNarrowBlake3Air,
+            queries: usize,
+            log_final_poly_len: usize,
+            max_log_arity: usize,
+        ) -> ProvenSecurity {
+            let perm = default_poseidon2();
+            let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm), 0);
+            let fri = fri_parameters_with_geometry(
+                FRI_LOG_BLOWUP,
+                queries,
+                log_final_poly_len,
+                max_log_arity,
+                ChallengeMmcs::new(val),
+            );
+            let params = StarkSecurityParams::from_air::<F, EF, _, _>(
+                &fri,
+                air,
+                AirLayout::from_air::<F>(air),
+                192,
+                128,
+                2,
+            );
+            ProvenSecurity::compute(&params, air.base.trace_rows)
+        }
+
+        let activation = (0..32).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let bridge_statement = statement(&activation, point(5));
+        let production_activation = vec![0_u8; 1 << 19];
+        let production_statement = statement(&production_activation, point(19));
+        let production_air = BlsDoryNarrowBlake3Air::new(&production_statement).unwrap();
+        let fixture_air = BlsDoryNarrowBlake3Air::new(&bridge_statement).unwrap();
+        let fixture_public = bridge_public_values(&bridge_statement);
+        let fixture_key = pinned_preprocessed_verifier_key(&fixture_air.base).unwrap();
+        let mut best = None;
+
+        for log_final_poly_len in 0..=7 {
+            for max_log_arity in 1..=7 {
+                let minimum_queries = (1..=64)
+                    .find(|queries| {
+                        proven_security(
+                            &production_air,
+                            *queries,
+                            log_final_poly_len,
+                            max_log_arity,
+                        )
+                        .security_bits()
+                            >= 128
+                    })
+                    .unwrap();
+                let queries = minimum_queries + 1;
+                let security =
+                    proven_security(&production_air, queries, log_final_poly_len, max_log_arity);
+                let config = build_config_with_fri_geometry(
+                    NarrowDft::default(),
+                    FRI_LOG_BLOWUP,
+                    queries,
+                    log_final_poly_len,
+                    max_log_arity,
+                );
+                let started = Instant::now();
+                let native = prove_bls_dory_narrow_blake3_with_config(
+                    &bridge_statement,
+                    &activation,
+                    &config,
+                    false,
+                )
+                .unwrap();
+                let prove_ms = started.elapsed().as_millis();
+                let encoded = compress_bridge_proof(&native).unwrap();
+                let proof = decode_native_proof_with_identity(
+                    &native,
+                    BRIDGE_PROOF_MAGIC,
+                    BRIDGE_PROOF_VERSION,
+                )
+                .unwrap();
+                verify_with_preprocessed(
+                    &config,
+                    &fixture_air,
+                    &proof,
+                    &fixture_public,
+                    Some(&fixture_key),
+                )
+                .unwrap();
+                eprintln!(
+                    "kind=bls-bridge-fri-geometry log_final_poly_len={log_final_poly_len} max_log_arity={max_log_arity} queries={queries} proven_bits={} native_bytes={} wire_bytes={} prove_ms={prove_ms}",
+                    security.security_bits(),
+                    native.len(),
+                    encoded.len(),
+                );
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_bytes, _, _, _)| encoded.len() < *best_bytes)
+                {
+                    best = Some((encoded.len(), log_final_poly_len, max_log_arity, queries));
+                }
+            }
+        }
+
+        let (wire_bytes, log_final_poly_len, max_log_arity, queries) = best.unwrap();
+        eprintln!(
+            "kind=bls-bridge-fri-geometry-best log_final_poly_len={log_final_poly_len} max_log_arity={max_log_arity} queries={queries} wire_bytes={wire_bytes}"
+        );
+    }
 }

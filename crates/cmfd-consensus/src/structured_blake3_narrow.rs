@@ -2659,6 +2659,33 @@ fn build_config_with_dft_and_fri(dft: NarrowDft, log_blowup: usize, num_queries:
     build_config_with_backends_and_fri(dft, NarrowCommitBackend::default(), log_blowup, num_queries)
 }
 
+#[cfg(test)]
+fn build_config_with_fri_geometry(
+    dft: NarrowDft,
+    log_blowup: usize,
+    num_queries: usize,
+    log_final_poly_len: usize,
+    max_log_arity: usize,
+) -> Config {
+    let perm = default_poseidon2();
+    let val = ValMmcs::new(FieldHash::new(perm.clone()), Compress::new(perm.clone()), 0);
+    let challenge = ChallengeMmcs::new(val.clone());
+    let pcs = NarrowPcs::new(
+        dft,
+        val,
+        fri_parameters_with_geometry(
+            log_blowup,
+            num_queries,
+            log_final_poly_len,
+            max_log_arity,
+            challenge,
+        ),
+        NarrowCommitBackend::default(),
+    )
+    .with_log_blowup(log_blowup);
+    Config::new(pcs, Challenger::new(perm))
+}
+
 fn build_config_with_backends_and_fri(
     dft: NarrowDft,
     commit_backend: NarrowCommitBackend,
@@ -2688,10 +2715,26 @@ fn fri_parameters_with(
     num_queries: usize,
     mmcs: ChallengeMmcs,
 ) -> FriParameters<ChallengeMmcs> {
+    fri_parameters_with_geometry(
+        log_blowup,
+        num_queries,
+        FRI_LOG_FINAL_POLY_LEN,
+        FRI_MAX_LOG_ARITY,
+        mmcs,
+    )
+}
+
+fn fri_parameters_with_geometry(
+    log_blowup: usize,
+    num_queries: usize,
+    log_final_poly_len: usize,
+    max_log_arity: usize,
+    mmcs: ChallengeMmcs,
+) -> FriParameters<ChallengeMmcs> {
     FriParameters {
         log_blowup,
-        log_final_poly_len: FRI_LOG_FINAL_POLY_LEN,
-        max_log_arity: FRI_MAX_LOG_ARITY,
+        log_final_poly_len,
+        max_log_arity,
         num_queries,
         commit_proof_of_work_bits: FRI_COMMIT_POW_BITS,
         query_proof_of_work_bits: FRI_QUERY_POW_BITS,

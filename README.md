@@ -258,7 +258,11 @@ measured 156,500 to 156,650 bytes on the 32-byte bridge fixture, down from
 222,256 to 222,384 native bytes. The resulting cross-shape composition remains
 27,799 to 27,949 bytes over the 262,128-byte payload cap. Query/grinding and
 higher-blowup sweeps do not close that gap at an operationally acceptable cost,
-so the V3 selector remains absent and consensus fails closed. A narrower bridge
+and a 56-point sweep across FRI terminal lengths zero through seven and maximum
+fold arities one through seven found a best 154,606-byte bridge at terminal
+length six and maximum fold arity two. That still composes to 288,033 bytes,
+25,905 bytes over the cap. The V3 selector therefore remains absent and
+consensus fails closed. A narrower bridge
 or different sound aggregation layer, a complete n=33 run, independent review,
 and audits remain activation gates.
 

@@ -1012,6 +1012,15 @@ operationally prohibitive grinding as completion. A narrower non-native range
 argument or another sound aggregation/recursion strategy remains the next
 proof-size gate.
 
+A separate 56-point release-mode sweep held log blowup seven and the
+128-proven-bit query margin fixed while varying FRI terminal lengths zero
+through seven and maximum fold arities one through seven. Every tiny-fixture
+proof verified under its exact configuration. The best canonical compressed
+bridge was 154,606 bytes at terminal length six and maximum fold arity two. It
+would produce a 288,033-byte candidate with the 133,409-byte Dory projection and
+18-byte envelope, still 25,905 bytes over the cap. FRI folding geometry is
+therefore a measured rejection rather than the missing size optimization.
+
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate
 prover no longer retains a duplicate coefficient vector or builds a full

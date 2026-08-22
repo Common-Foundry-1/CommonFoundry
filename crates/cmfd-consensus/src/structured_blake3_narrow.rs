@@ -1300,6 +1300,11 @@ impl NarrowBlake3Air {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) const fn trace_rows(&self) -> usize {
+        self.trace_rows
+    }
+
     fn activation_high_weight_at_row(
         &self,
         row_index: usize,

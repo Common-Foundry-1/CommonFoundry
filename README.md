@@ -274,8 +274,15 @@ cannot be unrelated. Conservative accounting adds 662 execution claims and 580
 adjacency claims to the existing 128, projects 33,332- and 21,748-byte component
 frames, and places the complete V3 payload at 188,497 bytes with 73,450 bytes of
 headroom. This is a budget, not an implemented proof: the active parser remains
-capped at 128 claims until the BLS constraint translation, adjacency argument,
-soundness analysis, end-to-end verification, and audit are complete.
+capped at 128 claims. A test-only canonical translator now regenerates all 1,305
+existing BLAKE3 AIR equations as centered integer expressions and evaluates
+them over BLS12-381. A nonconstant 32-byte activation at a nonzero point
+satisfies every translated equation across all 256 rows; changing either one
+trace cell or one public point value is rejected. The largest translated
+constant is exactly `2^33`. This differential checkpoint does not yet replace
+the three Goldilocks evaluation limbs with one BLS scalar or implement the Dory
+execution sumcheck, adjacency argument, soundness analysis, end-to-end
+verification, or audit.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

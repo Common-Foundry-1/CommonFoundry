@@ -327,10 +327,14 @@ claims, the design requires a future bounded maximum of at least 1,370 claims.
 Its conservative component projections are 33,332 and 21,748 bytes, placing the
 complete V3 payload at 188,497 bytes with 73,450 bytes below the exact V3
 allowance of 261,947 bytes. The current aggregate limit remains 128. No
-claim-limit change
-or V3 activation is permitted until the 1,305 BLAKE3 constraints are translated
-and differentially tested over the BLS12-381 scalar field, the adjacency
-argument and union bound are reviewed, and a complete proof verifies.
+claim-limit change or V3 activation is permitted. A test-only canonical
+translation now evaluates all 1,305 existing BLAKE3 constraints over BLS12-381:
+a nonconstant 32-byte, 256-row trace at a nonzero point satisfies every equation,
+while trace-cell and public-point mutations fail. The exact largest centered
+constant is `2^33`. This closes the field-translation checkpoint only; the
+one-scalar accumulator, Dory execution sumcheck, adjacency argument and union
+bound, complete proof, independent review, and audit remain required.
+
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

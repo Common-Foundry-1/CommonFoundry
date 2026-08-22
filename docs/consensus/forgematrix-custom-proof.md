@@ -1034,6 +1034,15 @@ V3 payload at 188,497 bytes with 73,450 bytes of headroom. The current parser
 remains capped at 128. These values are an executable layout projection, not a
 proof-size measurement or an activation result.
 
+A test-only canonical translator now converts all 1,305 existing BLAKE3 AIR
+equations to centered integer expressions and evaluates them over BLS12-381.
+An honest nonconstant 32-byte trace at a nonzero point satisfies every equation
+on all 256 rows; a changed trace cell and a changed public point are both
+rejected. The largest centered constant is exactly `2^33`. The three-limb
+evaluation accumulator still must be replaced by one BLS scalar and wired into
+the Dory execution sumcheck; adjacency soundness, a complete n=33 run,
+independent review, and audit also remain.
+
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate
 prover no longer retains a duplicate coefficient vector or builds a full

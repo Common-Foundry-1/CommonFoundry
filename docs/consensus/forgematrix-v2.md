@@ -471,20 +471,21 @@ comparison. The v2 research code now implements:
   in LogUp, and the aggregate folds and streams cloned handles only once. A
   mismatched same-shape artifact is rejected. Canonical, self-authenticating
   formats support either a literal-scalar prefix or signed/unsigned
-  32- or 64-bit words followed by dictionary codes. The transition stores twelve
-  consensus-bounded lanes as 32-bit words and its 98
-  radix-16 lanes as checked `0..15` bytes. LogUp's inverse coefficients are
+  32- or 64-bit words followed by four- or eight-bit dictionary codes. The
+  transition stores twelve consensus-bounded lanes as 32-bit words and packs
+  its 98 radix-16 lanes two checked `0..15` digits per byte. LogUp's inverse
+  coefficients are
   restricted to zero plus sixteen `1 / (alpha - digit)` values. A
   challenge-bound mapped view reuses the transition's authenticated digit
   codes instead of writing a second coefficient file. Every read authenticates the complete header, dictionary,
   words or literal scalars, codes, digest, length, and EOF. Differential tests match the
   former 32-byte-scalar artifacts' commitments, claims, and exact proof bytes
   and reject corruption, truncation, non-canonical scalars, and forged codes.
-  Exact production projections put the transition at 9,797,894,776 bytes,
-  about 9.125 GiB including framing, and the mapped inverse at zero additional
+  Exact production projections put the transition at 6,509,560,440 bytes,
+  about 6.063 GiB including framing, and the mapped inverse at zero additional
   coefficient-file bytes. One retained transition/range pair is therefore about
-  9.125 GiB and all four are exactly 39,191,579,104 bytes, about 36.5 GiB,
-  instead of 1.76 TiB.
+  6.063 GiB and all four sources are exactly 26,038,241,760 bytes, about
+  24.25 GiB, instead of 1.76 TiB.
   LogUp streams its inverse commitment and folds cell-variable rounds in linear
   work. Its first authenticated lineage stores regular selectors as one scalar
   and range cells as one-byte codes for two original radix-16 digits. The next
@@ -526,9 +527,9 @@ comparison. The v2 research code now implements:
   writes only canonical words and codes, reuses the original Dory commitments,
   and aborts unless the complete BLAKE3-authenticated artifact matches. A changed
   witness is rejected. The projected transition/range storage peak is therefore
-  39,191,579,104 bytes, about 36.5 GiB, rather than 72.62 GiB: one source plus
-  the largest lineage overlap is about 33.25 GiB, while four regenerated sources
-  before aggregation are larger. The aggregate now recognizes each transition
+  32,413,582,288 bytes, about 30.19 GiB, rather than 72.62 GiB: one source plus
+  the largest lineage overlap is now larger than four regenerated sources.
+  The aggregate recognizes each transition
   and mapped inverse that shares a compact source, reconstructs their first eight
   folds as authenticated role-bound logical views under the exact aggregate
   challenges, and writes no packed aggregate-fold artifact for those rounds. Fold
@@ -544,18 +545,18 @@ comparison. The v2 research code now implements:
   A complete three-bank n=19 shared-layout run preserved the 84,717-byte proof,
   measured 92.212 seconds proving and 7.045 seconds verification, matched its
   6,866,772-byte aggregate scratch projection exactly, and ended with zero scratch.
-  Encoding the twelve bounded transition lanes as authenticated 32-bit words
-  reduces transition sources from 39,159,073,248 to 29,470,231,008 bytes.
-  Retained sources are now 38,217,643,300 bytes and the ordered fold peak remains
+  Packing two authenticated radix-16 digits per byte reduces transition sources
+  from 29,470,231,008 to 19,579,537,888 bytes. Retained sources are now
+  28,326,950,180 bytes and the ordered fold peak remains
   3,297,676,512 bytes. The complete n=33 aggregate-stage projection is therefore
-  41,515,319,812 bytes (about 38.7 GiB), down 10.57 times from
-  438,943,885,320 bytes (about 408.8 GiB) and 18.92% from the immediately
+  31,624,626,692 bytes (about 29.5 GiB), down 13.88 times from
+  438,943,885,320 bytes (about 408.8 GiB) and 23.82% from the immediately
   preceding projection. Further reduction or distribution and a
   complete measured n=33 run are still required;
   a fresh complete n=19 release run preserved the 84,717-byte proof, measured
-  104.635 seconds proving and 8.861 seconds verification,
-  observed a 49,434,524-byte full-prover scratch peak against a
-  2,311,140-byte aggregate-stage projection, and retained zero scratch;
+  105.911 seconds proving and 8.071 seconds verification,
+  observed a 48,819,868-byte full-prover scratch peak against a
+  1,696,484-byte aggregate-stage projection, and retained zero scratch;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

@@ -528,27 +528,28 @@ comparison. The v2 research code now implements:
   52,076,480,992 bytes, about 48.5 GiB, rather than 72.62 GiB: one source plus
   the largest lineage overlap is about 36.25 GiB, while four regenerated sources
   before aggregation are larger. The aggregate now recognizes each transition
-  and mapped inverse that shares a compact source, stores their first four folds
-  once as authenticated packed radix-16 lineages, and reconstructs two role-bound
-  logical views under the exact aggregate challenges. Fold five returns to two
-  ordinary scalar lineages. Dense, ordinary scratch, and compressed paths produce
-  the same proof bytes; corruption aborts and cleans the shared artifact. Two n=19
+  and mapped inverse that shares a compact source, reconstructs their first eight
+  folds as authenticated role-bound logical views under the exact aggregate
+  challenges, and writes no packed aggregate-fold artifact for those rounds. Fold
+  nine returns to ordinary scalar lineages. Dense, ordinary scratch, and compressed
+  paths produce the same proof bytes; corruption aborts and cleans the source. Two n=19
   release runs retained the 47,729-byte proof and measured the same 2,377,688-byte
   opening peak, down from 18,819,084 bytes by 7.91 times. Activation, accumulator,
   and wiring sources retain canonical signed 64-bit words instead of expanded
   field scalars. Model weights retain the first Dory row as signed words and encode
   every remaining bounded `[-125, 125]` value as one authenticated dictionary byte.
-  Challenge-bound logical views avoid writing their first four fold artifacts.
+  Challenge-bound logical views avoid writing their first eight fold artifacts.
   A complete three-bank n=19 shared-layout run preserved the 84,717-byte proof,
   measured 92.212 seconds proving and 7.045 seconds verification, matched its
   6,866,772-byte aggregate scratch projection exactly, and ended with zero scratch.
   The complete n=33 aggregate-stage projection, including every source and ordered
-  fold overlap, is 110,935,310,868 bytes (about 103.3 GiB), down 3.96 times from
+  fold overlap, is 55,898,080,516 bytes (about 52.1 GiB), down 7.85 times from
   438,943,885,320 bytes (about 408.8 GiB). Further reduction or distribution and a
   complete measured n=33 run are still required;
-  a fresh complete n=19 release run preserved the 84,717-byte proof, measured
-  103.472 seconds proving and 8.241 seconds verification, matched its exact
-  6,546,132-byte aggregate scratch projection, and retained zero scratch;
+  two fresh complete n=19 release runs preserved the 84,717-byte proof, measured
+  108.297--108.371 seconds proving and 7.950--8.939 seconds verification,
+  observed the same 50,262,684-byte full-prover scratch peak against a
+  3,139,300-byte aggregate-stage projection, and retained zero scratch;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

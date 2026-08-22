@@ -45,7 +45,6 @@ use crate::{
         verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
         verify_bls_dory_range_logup_deferred_at_variables,
     },
-    dory_bls12_381_logup_artifact::BlsDoryLogUpArtifactSpec,
     dory_bls12_381_matrix::{
         BlsDoryMatrixError, BlsDoryMatrixProof, PreparedBlsDoryMatrixProof,
         projected_production_matrix_opening_bytes, projected_production_matrix_proof_bytes,
@@ -88,7 +87,7 @@ pub const MAX_BLS_DORY_SHARED_TRANSITION_PROOFS: usize = 4;
 pub const MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES: usize = 262_128;
 pub const BLS_DORY_SHARED_INITIALIZATION_LINKS: usize = 2;
 pub const BLS_DORY_SHARED_LINKS_PER_BANK: usize = 3;
-const BLS_DORY_SHARED_COMPRESSED_FOLD_GENERATIONS: u32 = 4;
+const BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS: u32 = 8;
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
 pub const BLS_DORY_SHARED_PRODUCTION_VARIABLES: usize = 33;
@@ -129,7 +128,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, signed-word activation, accumulator, and wiring sources, one-byte bounded model-weight sources, authenticated release/regeneration, and four challenge-bound aggregate-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 110,935,310,868 bytes (about 103.3 GiB) and the complete n=33 prover has not been run",
+    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, signed-word activation, accumulator, and wiring sources, one-byte bounded model-weight sources, authenticated release/regeneration, and eight challenge-bound source-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 55,898,080,516 bytes (about 52.1 GiB) and the complete n=33 prover has not been run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -155,6 +154,7 @@ pub struct BlsDorySharedProductionScratchProjection {
     pub fixed_base_first_fold_bytes: u64,
     pub first_generation_fold_bytes: u64,
     pub fifth_generation_fold_bytes: u64,
+    pub source_materialization_fold_bytes: u64,
     pub aggregate_fold_peak_bytes: u64,
     pub aggregate_peak_bytes: u64,
 }
@@ -2597,32 +2597,6 @@ fn projected_shared_transition_source_bytes(
     .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
 }
 
-fn projected_shared_transition_compressed_fold_bytes(
-    logical_scalars: u64,
-    cells: u64,
-    generation: u32,
-) -> Result<u64, BlsDorySharedLayoutError> {
-    let selector_rows = logical_scalars
-        .checked_div(cells)
-        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
-    BlsDoryLogUpArtifactSpec {
-        context_digest: [1; 32],
-        parent_digest: [2; 32],
-        reconstruction_digest: [3; 32],
-        generation,
-        selector_rows,
-        current_cells: cells
-            .checked_shr(generation)
-            .filter(|value| *value > 0)
-            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?,
-        regular_selectors: STRUCTURED_TRANSITION_REGULAR_ORACLES as u32,
-        range_selectors: (STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES)
-            as u32,
-    }
-    .encoded_bytes()
-    .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)
-}
-
 fn checked_projection_sum(values: &[u64]) -> Result<u64, BlsDorySharedLayoutError> {
     values.iter().try_fold(0u64, |sum, value| {
         sum.checked_add(*value)
@@ -2763,14 +2737,7 @@ fn projected_shared_scratch_bytes_for_shape(
     transition_cells.push(initialization_cells);
     transition_cells.extend(std::iter::repeat_n(bank_cells, banks as usize));
     let matrix_first_fold_bytes = 0;
-    let transition_first_fold_bytes = transition_cells.iter().try_fold(0u64, |sum, cells| {
-        sum.checked_add(projected_shared_transition_compressed_fold_bytes(
-            logical_scalars,
-            *cells,
-            1,
-        )?)
-        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)
-    })?;
+    let transition_first_fold_bytes = 0;
     let multiplicity_first_fold_bytes = projected_shared_scalar_fold_bytes(
         logical_scalars,
         BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
@@ -2790,24 +2757,9 @@ fn projected_shared_scratch_bytes_for_shape(
     ])?;
     let mut current_fold_bytes = first_generation_fold_bytes;
     let mut aggregate_fold_peak_bytes = current_fold_bytes;
+    let mut fifth_generation_fold_bytes = 0;
 
-    for generation in 2..=BLS_DORY_SHARED_COMPRESSED_FOLD_GENERATIONS {
-        for cells in &transition_cells {
-            replace_projected_fold(
-                &mut current_fold_bytes,
-                &mut aggregate_fold_peak_bytes,
-                projected_shared_transition_compressed_fold_bytes(
-                    logical_scalars,
-                    *cells,
-                    generation - 1,
-                )?,
-                projected_shared_transition_compressed_fold_bytes(
-                    logical_scalars,
-                    *cells,
-                    generation,
-                )?,
-            )?;
-        }
+    for generation in 2..=BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS {
         for _ in 0..transition_count {
             replace_projected_fold(
                 &mut current_fold_bytes,
@@ -2834,12 +2786,20 @@ fn projected_shared_scratch_bytes_for_shape(
             )?,
             projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, generation)?,
         )?;
+        if generation == 5 {
+            fifth_generation_fold_bytes = current_fold_bytes;
+        }
     }
 
+    let materialization_generation = BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS + 1;
     let mut ordinary_folds = Vec::new();
     for _ in 0..banks {
         for explicit in [bank_cells, weight_cells, bank_cells] {
-            let child = projected_shared_scalar_fold_bytes(logical_scalars, explicit, 5)?;
+            let child = projected_shared_scalar_fold_bytes(
+                logical_scalars,
+                explicit,
+                materialization_generation,
+            )?;
             add_projected_fold(
                 &mut current_fold_bytes,
                 &mut aggregate_fold_peak_bytes,
@@ -2852,13 +2812,11 @@ fn projected_shared_scratch_bytes_for_shape(
         let transition_explicit = cells
             .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
             .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
-        let compact_parent = projected_shared_transition_compressed_fold_bytes(
+        let transition_child = projected_shared_scalar_fold_bytes(
             logical_scalars,
-            *cells,
-            BLS_DORY_SHARED_COMPRESSED_FOLD_GENERATIONS,
+            transition_explicit,
+            materialization_generation,
         )?;
-        let transition_child =
-            projected_shared_scalar_fold_bytes(logical_scalars, transition_explicit, 5)?;
         add_projected_fold(
             &mut current_fold_bytes,
             &mut aggregate_fold_peak_bytes,
@@ -2869,12 +2827,12 @@ fn projected_shared_scratch_bytes_for_shape(
         let multiplicity_parent = projected_shared_scalar_fold_bytes(
             logical_scalars,
             BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
-            4,
+            BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS,
         )?;
         let multiplicity_child = projected_shared_scalar_fold_bytes(
             logical_scalars,
             BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
-            5,
+            materialization_generation,
         )?;
         replace_projected_fold(
             &mut current_fold_bytes,
@@ -2890,21 +2848,29 @@ fn projected_shared_scratch_bytes_for_shape(
             &mut aggregate_fold_peak_bytes,
             mapped_child,
         )?;
-        current_fold_bytes = current_fold_bytes
-            .checked_sub(compact_parent)
-            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
         ordinary_folds.push((transition_explicit, mapped_child));
     }
-    let wiring_child = projected_shared_scalar_fold_bytes(logical_scalars, wiring_scalars, 5)?;
+    let wiring_child = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        wiring_scalars,
+        materialization_generation,
+    )?;
     add_projected_fold(
         &mut current_fold_bytes,
         &mut aggregate_fold_peak_bytes,
         wiring_child,
     )?;
     ordinary_folds.push((wiring_scalars, wiring_child));
-    let fixed_parent =
-        projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, 4)?;
-    let fixed_child = projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, 5)?;
+    let fixed_parent = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        initialization_cells,
+        BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS,
+    )?;
+    let fixed_child = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        initialization_cells,
+        materialization_generation,
+    )?;
     replace_projected_fold(
         &mut current_fold_bytes,
         &mut aggregate_fold_peak_bytes,
@@ -2912,9 +2878,9 @@ fn projected_shared_scratch_bytes_for_shape(
         fixed_child,
     )?;
     ordinary_folds.push((initialization_cells, fixed_child));
-    let fifth_generation_fold_bytes = current_fold_bytes;
+    let source_materialization_fold_bytes = current_fold_bytes;
 
-    for generation in 6..=padded_variables as u32 {
+    for generation in materialization_generation + 1..=padded_variables as u32 {
         for (explicit, parent) in &mut ordinary_folds {
             let child = projected_shared_scalar_fold_bytes(logical_scalars, *explicit, generation)?;
             replace_projected_fold(
@@ -2944,6 +2910,7 @@ fn projected_shared_scratch_bytes_for_shape(
         fixed_base_first_fold_bytes,
         first_generation_fold_bytes,
         fifth_generation_fold_bytes,
+        source_materialization_fold_bytes,
         aggregate_fold_peak_bytes,
         aggregate_peak_bytes,
     })
@@ -4752,14 +4719,15 @@ mod tests {
         assert_eq!(scratch.fixed_base_source_bytes, 16_777_348);
         assert_eq!(scratch.retained_source_bytes, 52_600_404_004);
         assert_eq!(scratch.matrix_first_fold_bytes, 0);
-        assert_eq!(scratch.transition_first_fold_bytes, 48_646_062_768);
+        assert_eq!(scratch.transition_first_fold_bytes, 0);
         assert_eq!(scratch.multiplicity_first_fold_bytes, 1_552);
         assert_eq!(scratch.wiring_first_fold_bytes, 0);
         assert_eq!(scratch.fixed_base_first_fold_bytes, 8_388_740);
-        assert_eq!(scratch.first_generation_fold_bytes, 48_654_453_060);
-        assert_eq!(scratch.fifth_generation_fold_bytes, 51_722_587_228);
-        assert_eq!(scratch.aggregate_fold_peak_bytes, 58_334_906_864);
-        assert_eq!(scratch.aggregate_peak_bytes, 110_935_310_868);
+        assert_eq!(scratch.first_generation_fold_bytes, 8_390_292);
+        assert_eq!(scratch.fifth_generation_fold_bytes, 525_076);
+        assert_eq!(scratch.source_materialization_fold_bytes, 3_232_664_668);
+        assert_eq!(scratch.aggregate_fold_peak_bytes, 3_297_676_512);
+        assert_eq!(scratch.aggregate_peak_bytes, 55_898_080_516);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);

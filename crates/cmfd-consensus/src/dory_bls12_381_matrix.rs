@@ -46,7 +46,7 @@ pub const PRODUCTION_BLS_DORY_MATRIX_VARIABLES: usize = 31;
 pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
 pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank; activations and accumulators retain canonical signed words while each bounded model weight after the first row is an authenticated one-byte dictionary code, preserving the exact commitments, claims, and proof bytes and projecting all three production matrix sources at 9,666,454,296 bytes (9.0 GiB) without first-four-generation fold files, but the exact n=31 path still lacks production disk, memory, and latency measurements",
+    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank; activations and accumulators retain canonical signed words while each bounded model weight after the first row is an authenticated one-byte dictionary code, preserving the exact commitments, claims, and proof bytes and projecting all three production matrix sources at 9,666,454,296 bytes (9.0 GiB) without first-eight-generation fold files, but the exact n=31 path still lacks production disk, memory, and latency measurements",
     "the final production artifact commitments have not been generated and pinned in network parameters",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",

@@ -43,7 +43,7 @@ pub const PRODUCTION_BLS_DORY_WIRING_VARIABLES: usize = 29;
 pub const BLS_DORY_WIRING_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar wiring path.
 pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the scratch prover streams signed wiring tables with bounded evaluation memory; its canonical signed-word source preserves the exact commitment, claims, and opening proof and projects to 3,758,096,536 bytes (3.5 GiB) without first-four-generation fold files, but n=29 latency, peak disk, and peak memory have not been measured",
+    "the scratch prover streams signed wiring tables with bounded evaluation memory; its canonical signed-word source preserves the exact commitment, claims, and opening proof and projects to 3,758,096,536 bytes (3.5 GiB) without first-eight-generation fold files, but n=29 latency, peak disk, and peak memory have not been measured",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar wiring transcript and packed opening path have not received an external audit",
 ];

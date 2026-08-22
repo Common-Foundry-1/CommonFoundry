@@ -1083,14 +1083,14 @@ functions pin all source, lineage, and peak sizes. Exact fixtures preserve the
 complete proof bytes, reject a one-byte regenerated-source substitution, and
 leave zero scratch files. The distinct-point aggregate now recognizes each
 compact transition and mapped-inverse pair that shares one authenticated source.
-For its first four folds it writes one challenge-bound packed artifact and exposes
+For its first eight folds it scans the authenticated compact source and exposes
 two role-bound logical views: regular transition lanes reconstruct as scalars and
 zero inverse lanes, while every range code reconstructs both the transition digit
-and mapped inverse. The artifact binds the source/mapping identities, both parent
-lineages, dimensions, every folding challenge, and its complete payload. At fold
-five the two views split into ordinary authenticated scalar lineages. A corrupted
-shared artifact aborts proving and cleans its owned file, and dense, ordinary
-scratch, and compressed scratch paths produce exactly the same proof bytes.
+and mapped inverse. Each view lineage binds the transcript context, source and
+mapping identities, both original parent lineages, role, and every folding
+challenge. At fold nine the two views materialize as ordinary authenticated scalar
+lineages. Corrupting the shared source aborts proving, and dense, ordinary scratch,
+and compressed scratch paths produce exactly the same proof bytes.
 
 Two n=19 release runs measured 9.561 and 9.729 seconds for component proving,
 2.294 and 2.314 seconds for authenticated source regeneration, 7.282 and 7.220
@@ -1103,9 +1103,10 @@ retained scratch. Its 6,866,772-byte observed peak exactly matched the executabl
 aggregate-lifecycle projection, down from the 10,963,892-byte pre-compression
 baseline by 1.60 times while preserving proof bytes. Canonical signed-word
 activation, accumulator, and wiring sources authenticate the original 64-bit
-values without expanding them to 32-byte scalars. For the first four aggregate challenges, role-bound word
+values without expanding them to 32-byte scalars. For the first eight aggregate challenges, role-bound source
 views recompute their folds directly from that authenticated source and bind the
-source digest, original polynomial lineage, and every challenge; generation five
+source digest, original polynomial lineage, mapped-inverse identity where applicable,
+Fiat-Shamir context, and every challenge; generation nine
 returns to ordinary authenticated scalar artifacts. Exact differential tests
 preserve commitments, claims, and aggregate proof bytes, while altered lineage
 digests and source corruption abort. Model weights use the stricter production
@@ -1117,16 +1118,17 @@ directly, so it never creates the former 32-byte-per-weight scalar artifact.
 The complete executable n=33 aggregate-stage projection now includes every matrix,
 transition, multiplicity, wiring, and fixed-base source plus the entire ordered
 fold-artifact lifecycle. Retained sources total 52,600,404,004 bytes (about 49.0
-GiB), the fold peak is 58,334,906,864 bytes (about 54.3 GiB), and their combined
-peak is 110,935,310,868 bytes (about 103.3 GiB). This is a 3.96-times reduction
+GiB), the fold peak is 3,297,676,512 bytes (about 3.1 GiB), and their combined
+peak is 55,898,080,516 bytes (about 52.1 GiB). This is a 7.85-times reduction
 from the prior complete 438,943,885,320-byte projection (about 408.8 GiB), and a
-1.41-times reduction from the immediately preceding 156,029,690,964-byte
+1.98-times reduction from the immediately preceding 110,935,310,868-byte
 projection. It is still a code-pinned rejection estimate, not a production
 measurement. Further reduction or distribution and a complete unchanged n=33
-run remain mandatory. A fresh complete n=19 release run preserved the 84,717-byte
-proof, measured 103.472 seconds proving and 8.241 seconds verification, matched
-its 6,546,132-byte aggregate scratch projection exactly, and retained zero
-scratch after completion.
+run remain mandatory. Two fresh complete n=19 release runs preserved the
+84,717-byte proof, measured 108.297--108.371 seconds proving and 7.950--8.939
+seconds verification, observed the same 50,262,684-byte full-prover scratch peak
+against a 3,139,300-byte aggregate-stage projection, and retained zero scratch
+after completion.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

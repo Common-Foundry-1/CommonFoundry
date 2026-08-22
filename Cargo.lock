@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-cuda"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.12"
 dependencies = [
  "cmfd-consensus",
  "libloading 0.8.9",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-miner"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-node"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.12"
 dependencies = [
  "blake3",
  "clap",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "common-foundry-wallet"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.12"
 dependencies = [
  "cmfd-consensus",
  "cmfd-cuda",

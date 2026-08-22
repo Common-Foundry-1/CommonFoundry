@@ -11,12 +11,14 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use ark_ff::batch_inversion;
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
     arithmetic::{Field, Group},
     serialization::{Compress, Validate},
     transcript::Transcript,
 };
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::{
@@ -67,7 +69,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded artifact I/O and lineage-authenticated linear folds preserve exact proofs and reduce n=19 proving to 42.699 seconds and opening to 10.618 seconds, but CPU n=33 still projects to roughly 8.1 proving days plus 2.0 opening days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
+    "bounded parallel row commitments, artifact I/O, and lineage-authenticated folds preserve exact proofs and reduce n=19 proving to 9.952 seconds and opening to 10.504 seconds, but CPU n=33 still projects to roughly 1.89 proving days plus 1.99 opening days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -85,6 +87,7 @@ const RECONSTRUCTION_WIRE_FIELDS: usize = 1 + SELECTOR_ROUNDS * SELECTOR_ROUND_V
 const TABLE_VALUES: usize = BLS_DORY_RANGE_LOGUP_TABLE_VALUES;
 const SELECTOR_SLOTS: usize = 1 << BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
 const LOGUP_FOLD_SLOTS: usize = 2;
+const LOGUP_PARALLEL_FOLD_CHUNK_VALUES: usize = 1 << 16;
 
 /// Witness-free scalar range-membership proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1107,6 +1110,8 @@ struct LogUpInverseRowSource<'a, 'w> {
     rows: usize,
     columns: usize,
     explicit_scalars: usize,
+    active_columns: Vec<usize>,
+    denominators: Vec<BlsDoryFr>,
 }
 
 impl<'a, 'w> LogUpInverseRowSource<'a, 'w> {
@@ -1139,6 +1144,8 @@ impl<'a, 'w> LogUpInverseRowSource<'a, 'w> {
             rows,
             columns,
             explicit_scalars,
+            active_columns: Vec::with_capacity(columns),
+            denominators: Vec::with_capacity(columns),
         })
     }
 }
@@ -1166,6 +1173,8 @@ impl BlsDoryRowSource for LogUpInverseRowSource<'_, '_> {
         let start = row_index
             .checked_mul(self.columns)
             .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        self.active_columns.clear();
+        self.denominators.clear();
         for (column, scalar) in output.iter_mut().enumerate() {
             let packed_index = start + column;
             let oracle = packed_index / self.elements;
@@ -1173,12 +1182,17 @@ impl BlsDoryRowSource for LogUpInverseRowSource<'_, '_> {
             *scalar = if (STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES)
                 .contains(&oracle)
             {
-                (self.alpha - self.transition.scalar(oracle, index)?)
-                    .inv()
-                    .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?
+                self.active_columns.push(column);
+                self.denominators
+                    .push(self.alpha - self.transition.scalar(oracle, index)?);
+                BlsDoryFr::zero()
             } else {
                 BlsDoryFr::zero()
             };
+        }
+        batch_invert_logup_denominators(&mut self.denominators)?;
+        for (column, inverse) in self.active_columns.iter().copied().zip(&self.denominators) {
+            output[column] = *inverse;
         }
         Ok(output.len())
     }
@@ -1188,6 +1202,26 @@ impl BlsDoryRowSource for LogUpInverseRowSource<'_, '_> {
 struct LogUpFoldValues {
     transition: BlsDoryFr,
     inverse: BlsDoryFr,
+}
+
+fn batch_invert_logup_denominators(
+    denominators: &mut [BlsDoryFr],
+) -> Result<(), BlsDoryRangeLogUpError> {
+    if denominators
+        .iter()
+        .any(|denominator| *denominator == BlsDoryFr::zero())
+    {
+        return Err(BlsDoryRangeLogUpError::ChallengeCollision);
+    }
+    let mut inner = denominators
+        .iter()
+        .map(|denominator| denominator.0)
+        .collect::<Vec<_>>();
+    batch_inversion(&mut inner);
+    for (denominator, inverse) in denominators.iter_mut().zip(inner) {
+        *denominator = BlsDoryFr(inverse);
+    }
+    Ok(())
 }
 
 struct LogUpSparseTables {
@@ -1372,18 +1406,29 @@ fn fold_raw_logup_values(
     )?;
     let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
         .map_err(|_| logup_storage_error())?;
-    for selector in 0..STRUCTURED_TRANSITION_ORACLES {
-        for child_cell in 0..child_cells {
-            let lower = raw_logup_fold_values(source, alpha, selector, child_cell * 2)?;
-            let upper = raw_logup_fold_values(source, alpha, selector, child_cell * 2 + 1)?;
-            write_logup_fold_values(
-                &mut writer,
-                LogUpFoldValues {
+    let explicit_child_values = STRUCTURED_TRANSITION_ORACLES
+        .checked_mul(child_cells)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    for chunk_start in (0..explicit_child_values).step_by(LOGUP_PARALLEL_FOLD_CHUNK_VALUES) {
+        let chunk_end = chunk_start
+            .saturating_add(LOGUP_PARALLEL_FOLD_CHUNK_VALUES)
+            .min(explicit_child_values);
+        let folded = (chunk_start..chunk_end)
+            .into_par_iter()
+            .map(|packed_child| {
+                let selector = packed_child / child_cells;
+                let child_cell = packed_child % child_cells;
+                let lower = raw_logup_fold_values(source, alpha, selector, child_cell * 2)?;
+                let upper = raw_logup_fold_values(source, alpha, selector, child_cell * 2 + 1)?;
+                Ok(LogUpFoldValues {
                     transition: lower.transition
                         + challenge * (upper.transition - lower.transition),
                     inverse: lower.inverse + challenge * (upper.inverse - lower.inverse),
-                },
-            )?;
+                })
+            })
+            .collect::<Result<Vec<_>, BlsDoryRangeLogUpError>>()?;
+        for values in folded {
+            write_logup_fold_values(&mut writer, values)?;
         }
     }
     writer.finish().map_err(|_| logup_storage_error())
@@ -1587,6 +1632,31 @@ impl Iterator for LogUpEqualityWeightIterator<'_> {
     }
 }
 
+fn logup_equality_weight_at(
+    point: &[BlsDoryFr],
+    index: usize,
+) -> Result<BlsDoryFr, BlsDoryRangeLogUpError> {
+    let variables =
+        u32::try_from(point.len()).map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let domain = 1usize
+        .checked_shl(variables)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    if index >= domain {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(point
+        .iter()
+        .enumerate()
+        .fold(BlsDoryFr::one(), |weight, (bit, coordinate)| {
+            weight
+                * if (index >> bit) & 1 == 1 {
+                    *coordinate
+                } else {
+                    BlsDoryFr::one() - *coordinate
+                }
+        }))
+}
+
 struct LogUpScratchSumcheck {
     rounds: Vec<[BlsDoryFr; LOGUP_ROUND_VALUES]>,
     point: Vec<BlsDoryFr>,
@@ -1745,42 +1815,73 @@ fn raw_logup_artifact_round(
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
     validate_logup_suffix_pairs(equality_point, round_index, total_pairs)?;
     let coordinate = equality_point[round_index];
-    let mut suffix_weights = LogUpEqualityWeightIterator::new(&equality_point[round_index + 1..]);
-    let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
-    let mut visited = 0usize;
-    for selector in 0..STRUCTURED_TRANSITION_ORACLES {
-        for pair_cell in 0..current_cells / 2 {
-            let suffix = suffix_weights
-                .next()
-                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-            let equality_scale = equality_prefix * suffix;
-            let lower_cell = pair_cell * 2;
-            accumulate_logup_pair(
-                logup_core_from_fold(
-                    raw_logup_fold_values(source, alpha, selector, lower_cell)?,
-                    selector,
-                    lower_cell,
-                    sparse,
-                ),
-                logup_core_from_fold(
-                    raw_logup_fold_values(source, alpha, selector, lower_cell + 1)?,
-                    selector,
-                    lower_cell + 1,
-                    sparse,
-                ),
-                equality_scale * (BlsDoryFr::one() - coordinate),
-                equality_scale * coordinate,
-                alpha,
-                local_mixing,
-                rational_mixing,
-                count_mixing,
-                &mut evaluations,
-            );
-            visited += 1;
-        }
-    }
-    if visited > total_pairs {
+    let selector_start = round_index
+        .checked_add(current_cells.ilog2() as usize)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let cell_suffix_point = equality_point
+        .get(round_index + 1..selector_start)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let selector_point = equality_point
+        .get(selector_start..)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let child_cells = current_cells / 2;
+    if 1usize
+        .checked_shl(
+            u32::try_from(cell_suffix_point.len())
+                .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        )
+        .filter(|cells| *cells == child_cells)
+        .is_none()
+        || STRUCTURED_TRANSITION_ORACLES > selector_rows
+    {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let partials = (0..STRUCTURED_TRANSITION_ORACLES)
+        .into_par_iter()
+        .map(|selector| {
+            let selector_weight = logup_equality_weight_at(selector_point, selector)?;
+            let mut cell_weights = LogUpEqualityWeightIterator::new(cell_suffix_point);
+            let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+            for pair_cell in 0..child_cells {
+                let suffix = cell_weights
+                    .next()
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?
+                    * selector_weight;
+                let equality_scale = equality_prefix * suffix;
+                let lower_cell = pair_cell * 2;
+                accumulate_logup_pair(
+                    logup_core_from_fold(
+                        raw_logup_fold_values(source, alpha, selector, lower_cell)?,
+                        selector,
+                        lower_cell,
+                        sparse,
+                    ),
+                    logup_core_from_fold(
+                        raw_logup_fold_values(source, alpha, selector, lower_cell + 1)?,
+                        selector,
+                        lower_cell + 1,
+                        sparse,
+                    ),
+                    equality_scale * (BlsDoryFr::one() - coordinate),
+                    equality_scale * coordinate,
+                    alpha,
+                    local_mixing,
+                    rational_mixing,
+                    count_mixing,
+                    &mut evaluations,
+                );
+            }
+            if cell_weights.next().is_some() {
+                return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+            }
+            Ok(evaluations)
+        })
+        .collect::<Result<Vec<_>, BlsDoryRangeLogUpError>>()?;
+    let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+    for partial in partials {
+        for (evaluation, value) in evaluations.iter_mut().zip(partial) {
+            *evaluation = *evaluation + value;
+        }
     }
     Ok(evaluations)
 }
@@ -3232,6 +3333,113 @@ mod tests {
         assert_eq!(streamed.digit_weights, materialized.digit_weights);
         assert_eq!(streamed.role_values, materialized.role_values);
         assert_eq!(streamed.maximum_evaluation, materialized.maximum_evaluation);
+    }
+
+    #[test]
+    fn indexed_equality_weights_match_canonical_iterator_order() {
+        let point = (0..7)
+            .map(|index| BlsDoryFr::from_u64(index * 13 + 3))
+            .collect::<Vec<_>>();
+        let iterated = LogUpEqualityWeightIterator::new(&point).collect::<Vec<_>>();
+        let indexed = (0..1usize << point.len())
+            .map(|index| logup_equality_weight_at(&point, index).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(indexed, iterated);
+        assert!(matches!(
+            logup_equality_weight_at(&point, indexed.len()),
+            Err(BlsDoryRangeLogUpError::InvalidDimensions)
+        ));
+    }
+
+    #[test]
+    fn batched_logup_inversion_matches_individual_inverses_and_rejects_zero() {
+        let original = (1..=257)
+            .map(|value| BlsDoryFr::from_u64(value * 17))
+            .collect::<Vec<_>>();
+        let expected = original
+            .iter()
+            .map(|value| value.inv().unwrap())
+            .collect::<Vec<_>>();
+        let mut batched = original;
+        batch_invert_logup_denominators(&mut batched).unwrap();
+        assert_eq!(batched, expected);
+
+        let mut with_zero = vec![BlsDoryFr::one(), BlsDoryFr::zero()];
+        assert!(matches!(
+            batch_invert_logup_denominators(&mut with_zero),
+            Err(BlsDoryRangeLogUpError::ChallengeCollision)
+        ));
+    }
+
+    #[test]
+    fn parallel_raw_fold_preserves_serial_order_and_cleans_on_error() {
+        let (statement, witness) = scaled_fixture(4);
+        let packed_variables = 11;
+        let (nu, sigma) = dory_layout(packed_variables);
+        let source = BlsDoryTransitionWitnessRowSource::new(
+            statement,
+            &witness,
+            1usize << nu,
+            1usize << sigma,
+        )
+        .unwrap();
+        let elements = statement.elements().unwrap();
+        let selector_rows = 1usize << (packed_variables - elements.ilog2() as usize);
+        let alpha = BlsDoryFr::from_u64(19);
+        let challenge = BlsDoryFr::from_u64(23);
+        let scratch_directory = ScratchDirectory::create();
+        let artifact = fold_raw_logup_values(
+            &source,
+            alpha,
+            challenge,
+            selector_rows,
+            elements,
+            [3; 32],
+            1,
+            [9; 32],
+            &scratch_directory.0,
+        )
+        .unwrap();
+        let mut parallel = Vec::new();
+        artifact
+            .for_each_scalar(|scalar| {
+                parallel.push(scalar);
+                Ok(())
+            })
+            .unwrap();
+        let mut serial = Vec::new();
+        for selector in 0..STRUCTURED_TRANSITION_ORACLES {
+            for child_cell in 0..elements / 2 {
+                let lower =
+                    raw_logup_fold_values(&source, alpha, selector, child_cell * 2).unwrap();
+                let upper =
+                    raw_logup_fold_values(&source, alpha, selector, child_cell * 2 + 1).unwrap();
+                serial.push(lower.transition + challenge * (upper.transition - lower.transition));
+                serial.push(lower.inverse + challenge * (upper.inverse - lower.inverse));
+            }
+        }
+        assert_eq!(parallel, serial);
+        drop(artifact);
+        assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
+
+        let collision_alpha = source
+            .scalar(STRUCTURED_TRANSITION_REGULAR_ORACLES, 0)
+            .unwrap();
+        assert!(matches!(
+            fold_raw_logup_values(
+                &source,
+                collision_alpha,
+                challenge,
+                selector_rows,
+                elements,
+                [3; 32],
+                1,
+                [9; 32],
+                &scratch_directory.0,
+            ),
+            Err(BlsDoryRangeLogUpError::ChallengeCollision)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
     }
 
     #[test]

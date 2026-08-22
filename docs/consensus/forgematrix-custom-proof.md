@@ -1002,30 +1002,37 @@ Release-mode scaling makes the remaining LogUp problem concrete. On a Ryzen 9
 opening, and unchanged verifier produced these complete results. "Recompute"
 is the rejected `O(N log N)` implementation; "linear" is the current
 lineage-authenticated two-lane artifact implementation with bounded 1 MiB
-artifact reads and writes.
+artifact reads and writes. Row commitments are computed in deterministic
+parallel batches behind a bounded 256 MiB coefficient window; source reads,
+artifact writes, and target-group accumulation remain in canonical row order.
+Inverse source rows use exact Montgomery batch inversion and reject a zero
+denominator before publishing the commitment.
 
 | Cell variables | Cells | Packed variables | Recompute prover | Linear prover | Aggregate opening | Verify | Proof | Retained scratch |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 256 | 15 | 4.696 s | 4.364 s | 2.862 s | 0.729 s | 38,929 B | 1,803,148 B |
-| 10 | 1,024 | 17 | 15.160 s | 13.879 s | 5.742 s | 1.337 s | 43,329 B | 7,209,868 B |
-| 12 | 4,096 | 19 | 53.948 s | 42.699 s | 10.618 s | 2.378 s | 47,729 B | 28,836,748 B |
+| 8 | 256 | 15 | 4.696 s | 1.954 s | 2.669 s | 0.682 s | 38,929 B | 1,803,148 B |
+| 10 | 1,024 | 17 | 15.160 s | 4.239 s | 5.274 s | 1.254 s | 43,329 B | 7,209,868 B |
+| 12 | 4,096 | 19 | 53.948 s | 9.952 s | 10.504 s | 2.402 s | 47,729 B | 28,836,748 B |
 
 The current implementation derives every child file from the Fiat-Shamir
 challenge, authenticates its complete header and scalar payload, binds it to the
 previous generation's digest, and deletes the parent as ownership leaves scope.
 The buffered implementation produces byte-identical artifact files and digests
-across the buffer boundary. At n=19 it improves the previous direct-I/O linear
-measurement of 48.385 seconds proving and 19.315 seconds opening by 11.8% and
-45.0%, respectively; combined time falls by 21.2%. The proof size and retained
-scratch are unchanged.
+across the buffer boundary. Buffering alone reduced the prior direct-I/O n=19
+measurement from 48.385 to 42.699 seconds proving and from 19.315 to 10.618
+seconds opening. Bounded parallel row commitments then reduced proving to 9.952
+seconds, 76.7% below the buffered serial-row checkpoint and 81.6% below the
+rejected recomputation prover. Opening remains effectively unchanged at 10.504
+seconds; combined proving and opening time is 61.6% below the buffered
+checkpoint. Proof bytes and retained scratch are unchanged.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
 simultaneous pair of LogUp lineage files at n=19 is exactly 21,627,144 bytes;
 retained opening sources are reported separately in the table. These are
 component measurements, not production results.
 
-A linear extrapolation from n=19 to n=33 gives about 8.10 CPU days for the
-LogUp prover and 2.01 days for the aggregate opening. The first two production
+A linear extrapolation from n=19 to n=33 gives about 1.89 CPU days for the
+LogUp prover and 1.99 days for the aggregate opening. The first two production
 lineage generations project to 220 and 110 GiB, so their transient overlap is
 about 330 GiB. Retained opening sources project to about 440 GiB for one LogUp
 instance, putting its combined scratch near 770 GiB while folding. Four retained

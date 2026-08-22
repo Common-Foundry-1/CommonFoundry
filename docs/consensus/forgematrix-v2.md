@@ -475,12 +475,15 @@ comparison. The v2 research code now implements:
   lineage-authenticated two-lane artifacts with bounded 1 MiB I/O to fold
   cell-variable rounds in linear work, retains only the 128 production
   selector-boundary values, and streams reconstruction evaluations. Dense and
-  scratch outputs match exactly. At n=19 the buffered linear prover took 42.699
-  seconds versus 53.948 seconds for the rejected recomputation path; aggregate
-  opening took 10.618 seconds and the verified proof remained 47,729 bytes.
-  The prior direct-I/O linear measurement was 48.385 seconds proving and 19.315
-  seconds opening. Extrapolation to n=33 still gives roughly 8.10 CPU proving
-  days, 2.01 aggregate-opening days,
+  scratch outputs match exactly. Commitment rows now execute in deterministic
+  parallel batches behind a bounded 256 MiB coefficient window, while source
+  reads, artifact writes, and target-group accumulation retain canonical order;
+  inverse source rows use exact batch inversion. At n=19 the resulting linear
+  prover took 9.952 seconds versus 42.699 seconds for the buffered serial-row
+  checkpoint and 53.948 seconds for the rejected recomputation path. Aggregate
+  opening took 10.504 seconds and the verified proof remained 47,729 bytes.
+  Extrapolation to n=33 still gives roughly 1.89 CPU proving days and 1.99
+  aggregate-opening days,
   440 GiB retained scratch, and 330 GiB transient lineage overlap for one range
   instance. This rejects the current CPU/storage pipeline for production; GPU
   or distributed folds, early reclamation of the remaining transition and

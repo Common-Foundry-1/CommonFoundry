@@ -20,6 +20,7 @@ use dory_pcs::proof::DoryProof;
 use dory_pcs::{
     FirstReduceMessage, ScalarProductMessage, SecondReduceMessage, Transparent, VMVMessage, verify,
 };
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::dory_bls12_381_fold_artifact::{
@@ -47,7 +48,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "authenticated scratch paths cover every component, but n=19 scaling projects the linear LogUp fold near 9.2 CPU days and retained opening sources near 440 GiB per range instance at n=33",
+    "bounded parallel row commitments preserve exact proofs and reduce n=19 LogUp proving to 9.952 seconds, but linear n=33 extrapolation still gives roughly 1.89 proving days plus 1.99 opening days and retained opening sources near 440 GiB per range instance",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -55,6 +56,7 @@ pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
 const WIRE_MAGIC: [u8; 8] = *b"CFDBLS01";
 const WIRE_HEADER_BYTES: usize = 18;
 const MAX_PUBLIC_BINDING_BYTES: usize = 4_096;
+const ROW_COMMIT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
 /// One public multilinear evaluation claim against a BLS12-381 Dory commitment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -801,35 +803,59 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
     )?;
     let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
         .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-    let mut row = vec![BlsDoryFr::zero(); columns];
     let mut row_commitments = vec![BlsDoryG1::identity(); rows];
     let mut commitment = BlsDoryGt::identity();
     let explicit_rows = explicit_coefficient_count.div_ceil(columns);
-    for (row_index, row_commitment_slot) in
-        row_commitments.iter_mut().take(explicit_rows).enumerate()
-    {
-        row.fill(BlsDoryFr::zero());
-        let written = source
-            .read_row(row_index, &mut row)
-            .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
-        if written != columns {
-            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    let row_bytes = columns
+        .checked_mul(std::mem::size_of::<BlsDoryFr>())
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let rows_per_chunk = (ROW_COMMIT_CHUNK_BYTES / row_bytes.max(1)).max(1);
+    for chunk_start in (0..explicit_rows).step_by(rows_per_chunk) {
+        let chunk_end = chunk_start
+            .saturating_add(rows_per_chunk)
+            .min(explicit_rows);
+        let chunk_rows = chunk_end - chunk_start;
+        let chunk_scalars = chunk_rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let mut coefficients = vec![BlsDoryFr::zero(); chunk_scalars];
+        for (local_row, row) in coefficients.chunks_exact_mut(columns).enumerate() {
+            let row_index = chunk_start + local_row;
+            let written = source
+                .read_row(row_index, row)
+                .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
+            if written != columns {
+                return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+            }
+            let explicit_in_row = explicit_coefficient_count
+                .saturating_sub(row_index * columns)
+                .min(columns);
+            row[explicit_in_row..].fill(BlsDoryFr::zero());
         }
-        let explicit_in_row = explicit_coefficient_count
-            .saturating_sub(row_index * columns)
-            .min(columns);
-        row[explicit_in_row..].fill(BlsDoryFr::zero());
-        let row_commitment = setup
-            .commit_row_segment(0, &row)
-            .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
-        commitment = commitment
-            + setup
-                .pair_committed_row(row_index, &row_commitment)
-                .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
-        *row_commitment_slot = row_commitment;
-        for coefficient in &row[..explicit_in_row] {
+        let committed_rows = coefficients
+            .par_chunks_exact(columns)
+            .enumerate()
+            .map(|(local_row, row)| {
+                let row_index = chunk_start + local_row;
+                let row_commitment = setup
+                    .commit_row_segment(0, row)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                let paired = setup
+                    .pair_committed_row(row_index, &row_commitment)
+                    .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+                Ok((row_commitment, paired))
+            })
+            .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        for (local_row, (row_commitment, paired)) in committed_rows.into_iter().enumerate() {
+            let row_index = chunk_start + local_row;
+            let explicit_in_row = explicit_coefficient_count
+                .saturating_sub(row_index * columns)
+                .min(columns);
+            commitment = commitment + paired;
+            row_commitments[row_index] = row_commitment;
+            let row_start = local_row * columns;
             writer
-                .write_scalar(coefficient)
+                .write_scalars(&coefficients[row_start..row_start + explicit_in_row])
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
         }
     }

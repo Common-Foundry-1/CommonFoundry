@@ -443,8 +443,12 @@ comparison. The v2 research code now implements:
   four-transition, one-wiring production topology with one 126-claim aggregate
   and projects to 133,373 bytes at n=33. Altered model commitments, equality
   values, and substituted, reordered, or omitted components reject.
-  Authenticated-model derivation, an n=33 streaming prover, soundness review, and
-  audit remain activation gates;
+  The authenticated model-bank stream now derives the BLS commitments
+  incrementally and publishes them only after full bank verification; bounded
+  fixtures match the in-memory commitment path and reject corrupt, trailing, or
+  reordered input. The final production artifact still needs an n=33 commitment
+  run, and an n=33 streaming prover, soundness review, and audit remain activation
+  gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

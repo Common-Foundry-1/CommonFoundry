@@ -6,7 +6,7 @@
 //! checkpoint against one commitment, and binds every component opening into a
 //! single aggregate.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -17,9 +17,11 @@ use dory_pcs::primitives::{
 use thiserror::Error;
 
 use crate::{
-    ModelPcsIdentity, STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_INPUT_ORACLE,
-    STRUCTURED_TRANSITION_ORACLES, StructuredMaskPolynomial, StructuredMatrixStatement,
-    StructuredTransitionStatement, StructuredTransitionWitness, StructuredWiringStatement,
+    ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk, ModelPcsIdentity, ModelPcsRole,
+    STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_INPUT_ORACLE,
+    STRUCTURED_TRANSITION_ORACLES, StagedModelFieldSink, StructuredMaskPolynomial,
+    StructuredMatrixStatement, StructuredTransitionStatement, StructuredTransitionWitness,
+    StructuredWiringStatement, VerifiedModelBankReceipt,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
         BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
@@ -40,7 +42,7 @@ use crate::{
         prove_bls_dory_matrix_deferred_at_variables, verify_bls_dory_matrix_deferred_at_variables,
     },
     dory_bls12_381_prototype::{
-        BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
+        BlsDoryFr, BlsDoryG1, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
     dory_bls12_381_transition::{
         BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryTransitionError, BlsDoryTransitionProof,
@@ -55,6 +57,8 @@ use crate::{
         projected_production_wiring_opening_bytes, projected_production_wiring_proof_bytes,
         prove_bls_dory_wiring_deferred_at_variables, verify_bls_dory_wiring_deferred_at_variables,
     },
+    sumcheck::GOLDILOCKS_MODULUS,
+    verify_model_bank_into_staged_field_sink,
 };
 
 pub const BLS_DORY_SHARED_LAYOUT_VERSION: u16 = 3;
@@ -107,7 +111,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the pinned fixed-model commitments and common n=33 coefficient tables are not derived by a streamed authenticated-model prover",
+    "the final production model bank has not been streamed through the n=33 setup to publish pinned BLS commitments, and the common n=33 coefficient tables are not streamed by the prover",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -242,6 +246,284 @@ pub fn derive_bls_dory_fixed_model_identity(
     };
     identity.validate(trusted_model, weight_banks.len(), setup)?;
     Ok(identity)
+}
+
+/// Authenticate one canonical model bank and derive its BLS commitments without
+/// materializing any fixed polynomial.
+///
+/// Chunks remain provisional until the model-bank verifier checks the trusted
+/// roots, exact payload length, and EOF. The returned identity is therefore the
+/// only publication point for the incrementally accumulated commitments.
+pub fn derive_bls_dory_fixed_model_identity_from_verified_bank<R: Read>(
+    reader: R,
+    expected_manifest: &ModelBankManifest,
+    trusted_model: &ModelPcsIdentity,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryFixedModelIdentity, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>> {
+    let sink = BlsDoryFixedModelSink::new(trusted_model, padded_variables, setup)
+        .map_err(ModelBankFieldStreamError::Sink)?;
+    verify_model_bank_into_staged_field_sink(reader, expected_manifest, trusted_model, sink)
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BlsDoryFixedModelStreamError {
+    #[error("the streamed fixed-model setup or padded geometry is invalid")]
+    InvalidGeometry,
+    #[error("the streamed fixed-model chunk order, offset, or length is invalid")]
+    InvalidChunk,
+    #[error("the streamed fixed-model field value is not a centered model byte")]
+    InvalidFieldValue,
+    #[error("the verified model-bank receipt does not match the requested identity")]
+    ReceiptMismatch,
+    #[error("the authenticated fixed-model commitments do not form a valid identity")]
+    InvalidIdentity,
+}
+
+struct StreamedDoryRole {
+    role: ModelPcsRole,
+    expected_elements: u64,
+    next_offset: u64,
+    row_index: usize,
+    column_offset: usize,
+    row_commitment: BlsDoryG1,
+    commitment: BlsDoryGt,
+}
+
+impl StreamedDoryRole {
+    fn new(role: ModelPcsRole, expected_elements: u64) -> Self {
+        Self {
+            role,
+            expected_elements,
+            next_offset: 0,
+            row_index: 0,
+            column_offset: 0,
+            row_commitment: BlsDoryG1::identity(),
+            commitment: BlsDoryGt::identity(),
+        }
+    }
+
+    fn write(
+        &mut self,
+        elements: &[u64],
+        columns: usize,
+        rows: usize,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<(), BlsDoryFixedModelStreamError> {
+        let mut remaining = elements;
+        while !remaining.is_empty() {
+            if self.row_index >= rows {
+                return Err(BlsDoryFixedModelStreamError::InvalidChunk);
+            }
+            let take = remaining.len().min(columns - self.column_offset);
+            let scalars = remaining[..take]
+                .iter()
+                .copied()
+                .map(bls_scalar_from_model_field)
+                .collect::<Result<Vec<_>, _>>()?;
+            let partial = setup
+                .commit_row_segment(self.column_offset, &scalars)
+                .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+            self.row_commitment = self.row_commitment + partial;
+            self.column_offset += take;
+            remaining = &remaining[take..];
+
+            if self.column_offset == columns {
+                self.commitment = self.commitment
+                    + setup
+                        .pair_committed_row(self.row_index, &self.row_commitment)
+                        .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+                self.row_index += 1;
+                self.column_offset = 0;
+                self.row_commitment = BlsDoryG1::identity();
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        rows: usize,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<BlsDoryGt, BlsDoryFixedModelStreamError> {
+        if self.next_offset != self.expected_elements || self.row_index > rows {
+            return Err(BlsDoryFixedModelStreamError::InvalidChunk);
+        }
+        if self.column_offset != 0 {
+            if self.row_index >= rows {
+                return Err(BlsDoryFixedModelStreamError::InvalidChunk);
+            }
+            self.commitment = self.commitment
+                + setup
+                    .pair_committed_row(self.row_index, &self.row_commitment)
+                    .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        }
+        Ok(self.commitment)
+    }
+}
+
+struct BlsDoryFixedModelSink<'a> {
+    expected_model: ModelPcsIdentity,
+    setup: &'a DeterministicBlsDorySetup,
+    columns: usize,
+    rows: usize,
+    roles: Vec<StreamedDoryRole>,
+    next_role: usize,
+}
+
+impl<'a> BlsDoryFixedModelSink<'a> {
+    fn new(
+        trusted_model: &ModelPcsIdentity,
+        padded_variables: usize,
+        setup: &'a DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryFixedModelStreamError> {
+        trusted_model
+            .validate()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        setup
+            .validate()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if padded_variables == 0 || padded_variables > setup.max_log_n() {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+        let padded_elements = 1_u64
+            .checked_shl(padded_variables as u32)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let nu = padded_variables / 2;
+        let sigma = padded_variables - nu;
+        let rows = 1_usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let columns = 1_usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let base_elements = u64::from(trusted_model.batch)
+            .checked_mul(u64::from(trusted_model.dimension))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let weight_elements = u64::from(trusted_model.layers_per_bank)
+            .checked_mul(u64::from(trusted_model.dimension))
+            .and_then(|value| value.checked_mul(u64::from(trusted_model.dimension)))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if !base_elements.is_power_of_two()
+            || !weight_elements.is_power_of_two()
+            || base_elements > padded_elements
+            || weight_elements > padded_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+
+        let mut roles = Vec::with_capacity(1 + trusted_model.weight_bank_commitments.len());
+        roles.push(StreamedDoryRole::new(
+            ModelPcsRole::BaseInput,
+            base_elements,
+        ));
+        roles.extend(
+            trusted_model
+                .weight_bank_commitments
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let index = u32::try_from(index)
+                        .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+                    Ok(StreamedDoryRole::new(
+                        ModelPcsRole::WeightBank { index },
+                        weight_elements,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(Self {
+            expected_model: trusted_model.clone(),
+            setup,
+            columns,
+            rows,
+            roles,
+            next_role: 0,
+        })
+    }
+}
+
+impl StagedModelFieldSink for BlsDoryFixedModelSink<'_> {
+    type Error = BlsDoryFixedModelStreamError;
+    type Output = BlsDoryFixedModelIdentity;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        let role = self
+            .roles
+            .get_mut(self.next_role)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_len = u64::try_from(chunk.elements.len())
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_end = chunk
+            .role_offset
+            .checked_add(chunk_len)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        if chunk.elements.is_empty()
+            || chunk.role != role.role
+            || chunk.role_elements != role.expected_elements
+            || chunk.role_offset != role.next_offset
+            || chunk_end > role.expected_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidChunk);
+        }
+        role.write(chunk.elements, self.columns, self.rows, self.setup)?;
+        role.next_offset = chunk_end;
+        if chunk_end == role.expected_elements {
+            self.next_role += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_verified(
+        self,
+        receipt: VerifiedModelBankReceipt,
+    ) -> Result<Self::Output, Self::Error> {
+        if self.next_role != self.roles.len()
+            || receipt.identity() != &self.expected_model
+            || usize::try_from(receipt.layout().weight_bank_count()).ok()
+                != Some(self.expected_model.weight_bank_commitments.len())
+            || receipt.layout().layers_per_bank() != self.expected_model.layers_per_bank
+        {
+            return Err(BlsDoryFixedModelStreamError::ReceiptMismatch);
+        }
+        let mut commitments = self
+            .roles
+            .into_iter()
+            .map(|role| role.finish(self.rows, self.setup));
+        let base_input_commitment = commitments
+            .next()
+            .ok_or(BlsDoryFixedModelStreamError::InvalidIdentity)??;
+        let weight_bank_commitments = commitments.collect::<Result<Vec<_>, _>>()?;
+        let identity = BlsDoryFixedModelIdentity {
+            protocol_version: BLS_DORY_FIXED_MODEL_IDENTITY_VERSION,
+            model_pcs_identity_digest: self
+                .expected_model
+                .digest()
+                .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?,
+            setup_identity: self.setup.identity(),
+            base_input_commitment,
+            weight_bank_commitments,
+        };
+        identity
+            .validate(
+                &self.expected_model,
+                self.expected_model.weight_bank_commitments.len(),
+                self.setup,
+            )
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        Ok(identity)
+    }
+}
+
+fn bls_scalar_from_model_field(value: u64) -> Result<BlsDoryFr, BlsDoryFixedModelStreamError> {
+    if value <= 125 {
+        return Ok(BlsDoryFr::from_u64(value));
+    }
+    let negative_floor = GOLDILOCKS_MODULUS - 125;
+    if value < negative_floor || value >= GOLDILOCKS_MODULUS {
+        return Err(BlsDoryFixedModelStreamError::InvalidFieldValue);
+    }
+    Ok(-BlsDoryFr::from_u64(GOLDILOCKS_MODULUS - value))
 }
 
 fn commit_fixed_table(
@@ -1595,23 +1877,177 @@ pub fn require_bls_dory_shared_layout_production_ready() -> Result<(), BlsDorySh
 mod tests {
     use super::*;
     use crate::{
-        StructuredMaskPolynomial, StructuredMatrixStatement, StructuredTransitionStatement,
-        StructuredTransitionWitness, StructuredWiringStatement, V2_TRANSITION_MODULUS,
+        BuiltModelBankFixture, SmallModelBankFixture, StructuredMaskPolynomial,
+        StructuredMatrixStatement, StructuredTransitionStatement, StructuredTransitionWitness,
+        StructuredWiringStatement, V2_TRANSITION_MODULUS, build_small_model_bank,
         dory_bls12_381_aggregate::MAX_BLS_DORY_AGGREGATE_CLAIMS,
         dory_bls12_381_matrix::{
             BlsDoryMatrixProof, prove_bls_dory_matrix_at_variables,
             verify_bls_dory_matrix_at_variables,
         },
-        dory_bls12_381_prototype::deterministic_bls_dory_setup,
+        dory_bls12_381_prototype::{MAX_BLS_DORY_SETUP_VARIABLES, deterministic_bls_dory_setup},
         dory_bls12_381_wiring::{
             BlsDoryWiringProof, prove_bls_dory_wiring_at_variables,
             verify_bls_dory_wiring_at_variables,
         },
+        model_bank::{MODEL_BANK_HEADER_BYTES, ModelBankError},
     };
 
     const FIXTURE_VARIABLES: usize = 10;
     const OUTPUT_MODULUS: u64 = 251;
     const OUTPUT_CENTER: i64 = 125;
+
+    fn authenticated_fixed_model_fixture() -> (
+        BuiltModelBankFixture,
+        ModelPcsIdentity,
+        Vec<i64>,
+        Vec<Vec<i64>>,
+    ) {
+        let base = [0, 125, 250, 126];
+        let layers = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ];
+        let layer_slices = layers
+            .iter()
+            .map(|layer| layer.as_slice())
+            .collect::<Vec<_>>();
+        let suite = [0x51; 32];
+        let provisional = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: [0x52; 32],
+        })
+        .unwrap();
+        let identity = ModelPcsIdentity {
+            model_version: 2,
+            batch: 2,
+            dimension: 2,
+            layers_per_bank: 2,
+            model_byte_root: provisional.manifest.raw_blake3_root,
+            pcs_suite_parameter_digest: suite,
+            base_input_commitment: [0x61; 32],
+            weight_bank_commitments: vec![[0x71; 32], [0x72; 32]],
+        };
+        let built = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: suite,
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        })
+        .unwrap();
+        let base_values = base
+            .iter()
+            .map(|value| i64::from(*value) - 125)
+            .collect::<Vec<_>>();
+        let weight_banks = layers
+            .chunks_exact(2)
+            .map(|bank| {
+                bank.iter()
+                    .flat_map(|layer| layer.iter())
+                    .map(|value| i64::from(*value) - 125)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        (built, identity, base_values, weight_banks)
+    }
+
+    #[test]
+    fn authenticated_model_stream_matches_in_memory_fixed_commitments() {
+        const PADDED_VARIABLES: usize = 5;
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let (built, model, base, weight_banks) = authenticated_fixed_model_fixture();
+        let weight_slices = weight_banks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let expected = derive_bls_dory_fixed_model_identity(
+            &model,
+            &base,
+            &weight_slices,
+            PADDED_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        let streamed = derive_bls_dory_fixed_model_identity_from_verified_bank(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            &model,
+            PADDED_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+
+        assert_eq!(streamed, expected);
+        assert_eq!(streamed.digest().unwrap(), expected.digest().unwrap());
+        assert_eq!(MAX_BLS_DORY_SETUP_VARIABLES, 33);
+        assert_eq!(
+            BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+            MAX_BLS_DORY_SETUP_VARIABLES
+        );
+    }
+
+    #[test]
+    fn authenticated_model_stream_never_publishes_failed_or_reordered_input() {
+        const PADDED_VARIABLES: usize = 5;
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let (built, model, _, _) = authenticated_fixed_model_fixture();
+
+        let mut corrupted = built.bytes.clone();
+        corrupted[MODEL_BANK_HEADER_BYTES] ^= 1;
+        assert!(matches!(
+            derive_bls_dory_fixed_model_identity_from_verified_bank(
+                Cursor::new(corrupted),
+                &built.manifest,
+                &model,
+                PADDED_VARIABLES,
+                &setup,
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::RawRootMismatch
+            ))
+        ));
+
+        let mut trailing = built.bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            derive_bls_dory_fixed_model_identity_from_verified_bank(
+                Cursor::new(trailing),
+                &built.manifest,
+                &model,
+                PADDED_VARIABLES,
+                &setup,
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::TrailingBytes
+            ))
+        ));
+
+        let mut sink = BlsDoryFixedModelSink::new(&model, PADDED_VARIABLES, &setup).unwrap();
+        assert_eq!(
+            sink.write_chunk(ModelFieldChunk {
+                role: ModelPcsRole::WeightBank { index: 0 },
+                role_offset: 0,
+                role_elements: 8,
+                elements: &[GOLDILOCKS_MODULUS - 124],
+            }),
+            Err(BlsDoryFixedModelStreamError::InvalidChunk)
+        );
+        assert_eq!(
+            bls_scalar_from_model_field(126),
+            Err(BlsDoryFixedModelStreamError::InvalidFieldValue)
+        );
+        assert_eq!(
+            bls_scalar_from_model_field(GOLDILOCKS_MODULUS),
+            Err(BlsDoryFixedModelStreamError::InvalidFieldValue)
+        );
+    }
 
     fn matrix_fixture() -> (StructuredMatrixStatement, Vec<i64>, Vec<i64>, Vec<i64>) {
         let statement = StructuredMatrixStatement {

@@ -44,8 +44,14 @@ use thiserror::Error;
 pub const BLS_DORY_SETUP_VERSION: u16 = 1;
 /// This backend is a research checkpoint and cannot activate consensus.
 pub const BLS_DORY_PROTOTYPE_PRODUCTION_READY: bool = false;
-/// Largest setup accepted by this in-memory reference implementation.
+/// Largest fully materialized polynomial accepted by the reference prover.
 pub const MAX_BLS_DORY_PROTOTYPE_VARIABLES: usize = 16;
+/// Largest deterministic setup needed by the shared production layout.
+///
+/// The setup contains only square-root-sized generator vectors. Polynomial
+/// materialization remains independently capped by
+/// [`MAX_BLS_DORY_PROTOTYPE_VARIABLES`].
+pub const MAX_BLS_DORY_SETUP_VARIABLES: usize = 33;
 
 const G1_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G1_XMD:SHA-256_SSWU_RO_V1";
 const G2_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G2_XMD:SHA-256_SSWU_RO_V1";
@@ -645,9 +651,38 @@ impl DeterministicBlsDorySetup {
         &self.verifier
     }
 
+    pub(crate) fn commit_row_segment(
+        &self,
+        column_offset: usize,
+        scalars: &[BlsDoryFr],
+    ) -> Result<BlsDoryG1, BlsDoryPrototypeError> {
+        let end = column_offset
+            .checked_add(scalars.len())
+            .ok_or(BlsDoryPrototypeError::InvalidSize)?;
+        let generators = self
+            .prover
+            .g1_vec
+            .get(column_offset..end)
+            .ok_or(BlsDoryPrototypeError::InvalidSize)?;
+        Ok(BlsDoryG1Routines::msm(generators, scalars))
+    }
+
+    pub(crate) fn pair_committed_row(
+        &self,
+        row_index: usize,
+        commitment: &BlsDoryG1,
+    ) -> Result<BlsDoryGt, BlsDoryPrototypeError> {
+        let generator = self
+            .prover
+            .g2_vec
+            .get(row_index)
+            .ok_or(BlsDoryPrototypeError::InvalidSize)?;
+        Ok(BlsDoryCurve::pair(commitment, generator))
+    }
+
     /// Recompute every derived setup invariant before the setup is trusted.
     pub fn validate(&self) -> Result<(), BlsDoryPrototypeError> {
-        if self.max_log_n == 0 || self.max_log_n > MAX_BLS_DORY_PROTOTYPE_VARIABLES {
+        if self.max_log_n == 0 || self.max_log_n > MAX_BLS_DORY_SETUP_VARIABLES {
             return Err(BlsDoryPrototypeError::InvalidSetup);
         }
         let generator_count = 1usize << self.max_log_n.div_ceil(2);
@@ -694,7 +729,7 @@ pub enum BlsDoryPrototypeError {
 pub fn deterministic_bls_dory_setup(
     max_log_n: usize,
 ) -> Result<DeterministicBlsDorySetup, BlsDoryPrototypeError> {
-    if max_log_n == 0 || max_log_n > MAX_BLS_DORY_PROTOTYPE_VARIABLES {
+    if max_log_n == 0 || max_log_n > MAX_BLS_DORY_SETUP_VARIABLES {
         return Err(BlsDoryPrototypeError::InvalidSize);
     }
     let generator_count = 1usize << max_log_n.div_ceil(2);
@@ -952,6 +987,10 @@ mod tests {
         assert!(matches!(
             stale_verifier.validate(),
             Err(BlsDoryPrototypeError::InvalidSetup)
+        ));
+        assert!(matches!(
+            deterministic_bls_dory_setup(MAX_BLS_DORY_SETUP_VARIABLES + 1),
+            Err(BlsDoryPrototypeError::InvalidSize)
         ));
     }
 

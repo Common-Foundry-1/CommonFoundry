@@ -181,8 +181,14 @@ The production n=31 grammar projects to 70,483 bytes, including a 66,559-byte
 aggregate, and pins the raw matrix soundness numerator at 45. Unequal table
 geometries, every transcript role, and the canonical outer parser have mutation
 coverage. The shared layout now checks each weight commitment against a trusted
-BLS fixed-model identity bound to `ModelPcsIdentity`. Production still needs an
-authenticated streamed derivation of that identity, soundness review, and audit.
+BLS fixed-model identity bound to `ModelPcsIdentity`. The model-bank verifier now
+feeds its authenticated, ordered field stream directly into incremental Dory row
+commitments and publishes the resulting identity only after roots, exact length,
+and EOF verify. The streamed and in-memory commitments agree on an executable
+fixture; corruption, trailing bytes, role reordering, and noncanonical field
+values reject. Production still needs the final model artifact streamed through
+the n=33 setup to publish its network-pinned commitments, plus soundness review
+and audit.
 The BLS arithmetic transition checkpoint now proves the seven regular
 constraints with degree-three rounds and authenticates twelve terminal roles as
 selector-qualified points under the commitment that still packs all 110
@@ -239,8 +245,8 @@ and range needs 16; adding nine matrix and 31 wiring claims gives a compressed
 subtotal of 104. The composed transition verifier requires arithmetic and range
 proofs to share one commitment. The shared layout adds 22 fixed-model and
 cross-component equality claims and authenticates all 126 claims with one opening
-proof. Authenticated-model derivation, n=33 streaming, complete soundness
-accounting, and audit remain required.
+proof. Final-model commitment publication, n=33 prover streaming, complete
+soundness accounting, and audit remain required.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

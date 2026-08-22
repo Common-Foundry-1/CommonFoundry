@@ -823,8 +823,14 @@ sumcheck error numerator is 45. The parser derives both round counts and every
 round degree from the trusted statement before group decoding. The shared path
 now checks the weight commitment against a trusted BLS fixed-model identity
 bound to `ModelPcsIdentity`, and links the activation and accumulator commitments
-to the wiring and transition components. Production still needs to derive those
-fixed BLS commitments through the authenticated streamed model-bank boundary.
+to the wiring and transition components. The authenticated model-bank reader now
+drives an incremental Dory commitment sink in exact base-input and weight-bank
+order. It retains only a bounded field chunk and one partial row, and it cannot
+publish the BLS identity until the trusted roots, exact payload length, and EOF
+verify. Its executable fixture matches the existing in-memory commitment path
+exactly and rejects corrupted, trailing, reordered, or noncanonical input. The
+final production artifact still must be run through the n=33 setup to publish
+the actual network-pinned commitments.
 
 The transition checkpoint now goes beyond field-portability tests. It packs the
 110 canonical transition oracles into 128 selector slots under one Dory
@@ -922,9 +928,10 @@ to 126 under the unchanged cap of 128. One shared Dory payload
 authenticates every ordered base and equality claim. Its complete n=33 frame
 projects to 133,373 bytes. Tests reject changed model identities, fixed
 commitments, equality values, and substituted, reordered, or omitted components.
-Authenticated streamed fixed-model derivation, an n=33 streaming prover, complete
-transcript and soundness accounting, and independent audit remain activation
-requirements.
+The deterministic setup now admits the required n=33 square-root generator
+geometry separately from the n=16 materialized-polynomial cap. An n=33 streaming
+prover, execution of the final model commitment ceremony, complete transcript and
+soundness accounting, and independent audit remain activation requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -937,8 +944,8 @@ route is therefore native scalar-field re-arithmetization. The distinct-point,
 matrix, full local-transition, and successor-wiring transcripts are now ported.
 The scalar LogUp membership and source/slack reconstruction identities and the
 seven-constraint arithmetic sumcheck are connected through the same packed
-transition commitment. The shared layout also authenticates the ten
-matrix-transition-wiring equalities described above. The individual tables
+transition commitment. The shared layout also authenticates the eleven
+fixed-model and cross-component equalities described above. The individual tables
 accept the common n=33 layout, but streaming that shared geometry, complete
 soundness accounting, production latency and peak-memory measurement, and
 independent audit remain mandatory activation gates.

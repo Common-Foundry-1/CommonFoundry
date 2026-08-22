@@ -1039,11 +1039,11 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         }
     }
 
-    fn range_value(
+    fn range_digit_for_descriptor(
         &self,
         descriptor: RangeOracleDescriptor,
         index: usize,
-    ) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+    ) -> Result<u8, BlsDoryTransitionError> {
         let value = if descriptor.source_oracle == SHIFTED_ACCUMULATOR {
             let accumulator = self
                 .witness
@@ -1066,9 +1066,24 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         } else {
             value
         };
-        Ok(BlsDoryFr::from_u64(
-            (bounded >> (descriptor.digit * 4)) & 0xf,
-        ))
+        u8::try_from((bounded >> (descriptor.digit * 4)) & 0xf)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)
+    }
+
+    pub(crate) fn range_digit(
+        &self,
+        oracle: usize,
+        index: usize,
+    ) -> Result<u8, BlsDoryTransitionError> {
+        if index >= self.elements || oracle < STRUCTURED_TRANSITION_REGULAR_ORACLES {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        let descriptor = self
+            .range_oracles
+            .get(oracle - STRUCTURED_TRANSITION_REGULAR_ORACLES)
+            .copied()
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+        self.range_digit_for_descriptor(descriptor, index)
     }
 
     pub(crate) fn scalar(
@@ -1087,7 +1102,8 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
             .get(oracle - STRUCTURED_TRANSITION_REGULAR_ORACLES)
             .copied()
             .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
-        self.range_value(descriptor, index)
+        self.range_digit_for_descriptor(descriptor, index)
+            .map(|digit| BlsDoryFr::from_u64(u64::from(digit)))
     }
 }
 

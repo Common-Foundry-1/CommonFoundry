@@ -5,6 +5,8 @@ pub mod dory_bls12_381_aggregate;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_fold_artifact;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_bls12_381_index_artifact;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_layout;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_logup;

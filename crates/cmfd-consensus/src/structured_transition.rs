@@ -877,6 +877,7 @@ pub(crate) fn validate_witness(
     validate_witness_after_shape(statement, witness)
 }
 
+#[cfg(any(test, feature = "dory-bls12-381-prototype"))]
 pub(crate) fn validate_streaming_witness(
     statement: StructuredTransitionStatement,
     witness: &StructuredTransitionWitness,

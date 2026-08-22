@@ -745,6 +745,7 @@ pub(crate) fn validate_tables(
     validate_tables_after_shape(statement, initial, inputs, outputs)
 }
 
+#[cfg(any(test, feature = "dory-bls12-381-prototype"))]
 pub(crate) fn validate_streaming_tables(
     statement: StructuredWiringStatement,
     initial: &[i64],

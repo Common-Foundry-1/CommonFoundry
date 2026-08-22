@@ -11,6 +11,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+#[cfg(test)]
 use ark_ff::batch_inversion;
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -26,7 +27,8 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        BlsDoryIndexedRowSource, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_indexed_row_source_with_scratch,
         commit_bls_dory_padded_prefix_with_optional_scratch,
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
@@ -38,13 +40,15 @@ use crate::{
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
-    dory_bls12_381_streaming::BlsDoryRowSource,
     dory_bls12_381_transition::{
         BlsDoryTransitionError, BlsDoryTransitionWitnessRowSource, build_scalar_oracles,
         pack_oracles,
     },
     structured_transition::structured_transition_range_specs,
 };
+
+#[cfg(test)]
+use crate::dory_bls12_381_streaming::BlsDoryRowSource;
 
 /// Version of the scalar LogUp transcript and reconstruction wire grammar.
 pub const BLS_DORY_RANGE_LOGUP_VERSION: u16 = 3;
@@ -69,7 +73,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 10.035 seconds proving plus 7.428 seconds opening; CPU n=33 projects to roughly 1.90 plus 1.41 days and one LogUp still reaches about 770 GiB peak scratch during preparation, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
+    "bounded parallel work, indexed inverse artifacts, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.746 seconds proving plus 7.161 seconds opening; CPU n=33 projects to roughly 1.85 plus 1.36 days and the fourth range pair still projects near 1.21 TiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -570,10 +574,7 @@ fn prove_from_source_deferred(
                 .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
             for oracle in STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES {
                 for index in 0..elements {
-                    let value = witness_source.scalar(oracle, index)?;
-                    let digit = (0..TABLE_VALUES)
-                        .find(|digit| value == BlsDoryFr::from_u64(*digit as u64))
-                        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+                    let digit = usize::from(witness_source.range_digit(oracle, index)?);
                     counts[digit] = counts[digit]
                         .checked_add(1)
                         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
@@ -628,7 +629,7 @@ fn prove_from_source_deferred(
             (None, None, None, None)
         };
     let inverse = if let Some(scratch_directory) = scratch_directory {
-        let mut inverse_source = LogUpInverseRowSource::new(
+        let mut inverse_source = LogUpInverseCodeRowSource::new(
             witness_source
                 .as_ref()
                 .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
@@ -637,7 +638,7 @@ fn prove_from_source_deferred(
             rows,
             columns,
         )?;
-        commit_bls_dory_row_source_with_scratch(
+        commit_bls_dory_indexed_row_source_with_scratch(
             &mut inverse_source,
             nu,
             sigma,
@@ -1103,6 +1104,7 @@ fn dory_layout(variables: usize) -> (usize, usize) {
     (nu, variables - nu)
 }
 
+#[cfg(test)]
 struct LogUpInverseRowSource<'a, 'w> {
     transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
     alpha: BlsDoryFr,
@@ -1114,6 +1116,96 @@ struct LogUpInverseRowSource<'a, 'w> {
     denominators: Vec<BlsDoryFr>,
 }
 
+struct LogUpInverseCodeRowSource<'a, 'w> {
+    transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
+    elements: usize,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+    dictionary: Vec<BlsDoryFr>,
+}
+
+impl<'a, 'w> LogUpInverseCodeRowSource<'a, 'w> {
+    fn new(
+        transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
+        alpha: BlsDoryFr,
+        elements: usize,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryRangeLogUpError> {
+        let mut dictionary = Vec::with_capacity(TABLE_VALUES + 1);
+        dictionary.push(BlsDoryFr::zero());
+        for digit in 0..TABLE_VALUES {
+            dictionary.push(
+                (alpha - BlsDoryFr::from_u64(digit as u64))
+                    .inv()
+                    .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?,
+            );
+        }
+        let explicit_scalars = elements
+            .checked_mul(STRUCTURED_TRANSITION_ORACLES)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        if explicit_scalars
+            > rows
+                .checked_mul(columns)
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?
+        {
+            return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+        }
+        Ok(Self {
+            transition,
+            elements,
+            rows,
+            columns,
+            explicit_scalars,
+            dictionary,
+        })
+    }
+}
+
+impl BlsDoryIndexedRowSource for LogUpInverseCodeRowSource<'_, '_> {
+    type Error = BlsDoryRangeLogUpError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        for (column, code) in output.iter_mut().enumerate() {
+            let packed_index = start + column;
+            let oracle = packed_index / self.elements;
+            let index = packed_index % self.elements;
+            *code = if (STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES)
+                .contains(&oracle)
+            {
+                self.transition
+                    .range_digit(oracle, index)?
+                    .checked_add(1)
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?
+            } else {
+                0
+            };
+        }
+        Ok(output.len())
+    }
+}
+
+#[cfg(test)]
 impl<'a, 'w> LogUpInverseRowSource<'a, 'w> {
     fn new(
         transition: &'a BlsDoryTransitionWitnessRowSource<'w>,
@@ -1150,6 +1242,7 @@ impl<'a, 'w> LogUpInverseRowSource<'a, 'w> {
     }
 }
 
+#[cfg(test)]
 impl BlsDoryRowSource for LogUpInverseRowSource<'_, '_> {
     type Error = BlsDoryRangeLogUpError;
 
@@ -1204,6 +1297,7 @@ struct LogUpFoldValues {
     inverse: BlsDoryFr,
 }
 
+#[cfg(test)]
 fn batch_invert_logup_denominators(
     denominators: &mut [BlsDoryFr],
 ) -> Result<(), BlsDoryRangeLogUpError> {
@@ -3292,6 +3386,74 @@ mod tests {
         }
         streamed.truncate(explicit);
         assert_eq!(streamed, expected[..explicit]);
+
+        let mut indexed =
+            LogUpInverseCodeRowSource::new(&source, alpha, elements, rows, columns).unwrap();
+        let indexed_explicit = indexed.explicit_scalar_count();
+        let dictionary = indexed.dictionary().to_vec();
+        let mut decoded = Vec::new();
+        let mut codes = vec![0u8; columns];
+        for row_index in 0..indexed_explicit.div_ceil(columns) {
+            indexed.read_code_row(row_index, &mut codes).unwrap();
+            decoded.extend(codes.iter().map(|code| dictionary[usize::from(*code)]));
+        }
+        decoded.truncate(indexed_explicit);
+        assert_eq!(decoded, expected[..indexed_explicit]);
+        assert_eq!(decoded, streamed);
+    }
+
+    #[test]
+    fn indexed_inverse_commitment_matches_scalar_and_reduces_storage() {
+        let (statement, _, witness) = fixture();
+        let variables = minimum_packed_variables(statement).unwrap();
+        let (nu, sigma) = dory_layout(variables);
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let elements = statement.elements().unwrap();
+        let alpha = BlsDoryFr::from_u64(19);
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let source =
+            BlsDoryTransitionWitnessRowSource::new(statement, &witness, rows, columns).unwrap();
+        let scalar_scratch = ScratchDirectory::create();
+        let indexed_scratch = ScratchDirectory::create();
+
+        let mut scalar_source =
+            LogUpInverseRowSource::new(&source, alpha, elements, rows, columns).unwrap();
+        let scalar = commit_bls_dory_row_source_with_scratch(
+            &mut scalar_source,
+            nu,
+            sigma,
+            &setup,
+            &scalar_scratch.0,
+        )
+        .unwrap();
+        let mut indexed_source =
+            LogUpInverseCodeRowSource::new(&source, alpha, elements, rows, columns).unwrap();
+        let indexed = commit_bls_dory_indexed_row_source_with_scratch(
+            &mut indexed_source,
+            nu,
+            sigma,
+            &setup,
+            &indexed_scratch.0,
+        )
+        .unwrap();
+
+        assert_eq!(indexed.commitment(), scalar.commitment());
+        assert_eq!(indexed.row_commitments(), scalar.row_commitments());
+        let scalar_bytes = std::fs::metadata(scalar.coefficient_artifact_path().unwrap())
+            .unwrap()
+            .len();
+        let indexed_bytes = std::fs::metadata(indexed.coefficient_artifact_path().unwrap())
+            .unwrap()
+            .len();
+        let explicit = u64::try_from(elements * STRUCTURED_TRANSITION_ORACLES).unwrap();
+        assert_eq!(indexed_bytes, explicit + 64 + 17 * 32 + 32);
+        assert!(indexed_bytes * 10 < scalar_bytes);
+
+        drop(scalar);
+        drop(indexed);
+        assert_eq!(std::fs::read_dir(&scalar_scratch.0).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&indexed_scratch.0).unwrap().count(), 0);
     }
 
     #[test]
@@ -3537,6 +3699,7 @@ mod tests {
         )
         .unwrap();
         let prover_millis = prover_start.elapsed().as_millis();
+        let prepared_scratch_bytes = directory_bytes(&scratch_directory);
 
         let opening_start = std::time::Instant::now();
         let opening_binding = opening_binding(
@@ -3572,7 +3735,7 @@ mod tests {
         let retained_scratch_bytes = directory_bytes(&scratch_directory);
 
         println!(
-            "CMFD_BLS_LOGUP_BENCHMARK {{\"cell_variables\":{cell_variables},\"cells\":{},\"packed_variables\":{packed_variables},\"witness_millis\":{witness_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"opening_millis\":{opening_millis},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
+            "CMFD_BLS_LOGUP_BENCHMARK {{\"cell_variables\":{cell_variables},\"cells\":{},\"packed_variables\":{packed_variables},\"witness_millis\":{witness_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"prepared_scratch_bytes\":{prepared_scratch_bytes},\"opening_millis\":{opening_millis},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
             statement.elements().unwrap()
         );
 

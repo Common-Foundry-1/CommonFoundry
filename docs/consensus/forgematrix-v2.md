@@ -469,9 +469,17 @@ comparison. The v2 research code now implements:
   weights implicit and folds 12 live lanes in authenticated 16-scalar scratch
   rows. The shared prover reuses that exact authenticated transition artifact
   in LogUp, and the aggregate folds and streams cloned handles only once. A
-  mismatched same-shape artifact is rejected. This removes one projected
-  220 GiB source per production transition/range pair, or roughly 880 GiB over
-  the four-pair layout. LogUp now streams its inverse commitment, uses
+  mismatched same-shape artifact is rejected. LogUp's inverse coefficients are
+  restricted to zero plus sixteen `1 / (alpha - digit)` values. A canonical,
+  self-authenticating indexed artifact stores that 17-scalar dictionary once
+  and one checked byte per coefficient; every read authenticates the complete
+  header, dictionary, codes, digest, length, and EOF. Differential tests match
+  the former 32-byte-scalar artifact's commitments, claims, and exact proof
+  bytes and reject corruption, truncation, and forged out-of-range codes. This
+  reduces the production inverse source from about 220 GiB to 6.875 GiB plus
+  640 framing bytes. One retained transition/range source pair is therefore
+  about 226.875 GiB and all four are about 907.5 GiB instead of 1.76 TiB.
+  LogUp streams its inverse commitment, uses
   lineage-authenticated two-lane artifacts with bounded 1 MiB I/O to fold
   cell-variable rounds in linear work, retains only the 128 production
   selector-boundary values, and streams reconstruction evaluations. Dense and
@@ -482,21 +490,21 @@ comparison. The v2 research code now implements:
   across arbitrary verified input chunks. Three n=19 release A/B repeats gave
   serial and parallel medians of 822 and 385 ms, respectively, a 53.2%
   reduction, with identical artifact digest, commitments, claims, and proof
-  bytes;
-  inverse source rows use exact batch inversion. Dory MSM and elementwise vector
+  bytes. The indexed inverse computes the sixteen dictionary inverses once and
+  emits witness-derived radix-16 codes. Dory MSM and elementwise vector
   routines are CPU-parallel and preserve the normalized group elements and
   proof bytes. A consuming aggregate boundary now derives the sumcheck,
   combined row commitments, and `L^T M`, then releases deferred coefficient
   artifacts before the final Dory reduction. Direct testing preserves exact
   proof bytes, and standalone n=15, n=17, and n=19 runs leave zero scratch after
-  completion. At n=19 the latest linear prover took 10.035 seconds versus
+  completion. At n=19 the latest linear prover took 9.746 seconds versus
   42.699 seconds for the buffered serial-row checkpoint and 53.948 seconds for
-  the rejected recomputation path. Aggregate opening took 7.428 seconds and the
-  verified proof remained 47,729 bytes. Extrapolation to n=33 still gives
-  roughly 1.90 CPU proving days and 1.41
-  aggregate-opening days,
-  440 GiB retained scratch, and 330 GiB transient lineage overlap for one range
-  instance during preparation. This rejects the current CPU/storage pipeline
+  the rejected recomputation path. Aggregate opening took 7.161 seconds,
+  prepared scratch was 14,869,896 bytes, and the verified proof remained
+  47,729 bytes. Extrapolation to n=33 still gives roughly 1.85 CPU proving days
+  and 1.36 aggregate-opening days. The 330 GiB transient lineage overlap puts
+  the projected fourth-pair scratch peak near 1.21 TiB. This rejects the current
+  CPU/storage pipeline
   for production; GPU or distributed folds, aggregation or regeneration before
   all pair sources accumulate, and a complete measured n=33 run remain required;
   independent soundness review and audit also remain activation gates. The

@@ -453,7 +453,23 @@ current 184-byte format authenticates the complete payload rather than each
 prefix, so sink writes remain provisional: the sink receives an unforgeable
 completion receipt and may publish only after the raw root, indexed layer-root
 aggregate, exact payload length, and EOF all match. Reader and sink failures
-abort before that publication barrier. The feature-gated WHIR sink now writes
+abort before that publication barrier.
+
+The BLS12-381 sink now uses that same publication barrier to build one
+self-authenticating coefficient artifact for the base input and each ordered
+weight bank while computing the corresponding Dory row and tier-two
+commitments. No polynomial or identity is returned unless the full model bank
+authenticates. Corrupt and trailing inputs clean every provisional artifact.
+The matrix prover consumes a precommitted weight artifact sequentially to form
+its random-column partials, reuses the same artifact in the shared aggregate
+opening, and checks its commitment against the pinned bank role before proving.
+Bounded fixtures produce the exact materialized proof and reject a substituted
+bank commitment. At production geometry this removes the roughly 16 GiB
+materialized `i64` slice per bank; the required canonical scalar artifact is
+still roughly 64 GiB per n=31 bank and its complete preparation/proving latency
+and peak disk use remain unmeasured.
+
+The feature-gated WHIR sink now writes
 one authenticated source artifact for the base input and each ordered weight
 bank. It seals them in an unpublished attempt directory, binds their exact digests,
 roles, expected commitment aliases, model identity, and manifest into a

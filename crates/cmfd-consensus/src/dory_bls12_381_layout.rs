@@ -24,11 +24,11 @@ use crate::{
     StructuredMatrixStatement, StructuredTransitionStatement, StructuredTransitionWitness,
     StructuredWiringStatement, VerifiedModelBankReceipt,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
-        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
-        prove_bls_dory_deferred_opening_sets, prove_bls_dory_deferred_opening_sets_with_scratch,
-        verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
+        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
+        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
+        prove_bls_dory_deferred_opening_sets_with_scratch, verify_bls_dory_openings,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BlsDoryRangeLogUpError, BlsDoryRangeLogUpProof,
@@ -44,6 +44,7 @@ use crate::{
         projected_production_matrix_opening_bytes, projected_production_matrix_proof_bytes,
         prove_bls_dory_matrix_deferred_at_variables,
         prove_bls_dory_matrix_deferred_at_variables_with_scratch,
+        prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch,
         verify_bls_dory_matrix_deferred_at_variables,
     },
     dory_bls12_381_prototype::{
@@ -274,6 +275,54 @@ pub fn derive_bls_dory_fixed_model_identity_from_verified_bank<R: Read>(
     verify_model_bank_into_staged_field_sink(reader, expected_manifest, trusted_model, sink)
 }
 
+/// Authenticated fixed-model commitments plus reusable coefficient artifacts.
+/// Dropping this capability removes its owned scratch files after every matrix
+/// and shared opening clone has also been dropped.
+#[derive(Debug)]
+pub struct BlsDoryPreparedFixedModel {
+    identity: BlsDoryFixedModelIdentity,
+    base_input: BlsDoryCommittedPolynomial,
+    weight_banks: Vec<BlsDoryCommittedPolynomial>,
+}
+
+impl BlsDoryPreparedFixedModel {
+    #[must_use]
+    pub const fn identity(&self) -> &BlsDoryFixedModelIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn base_input(&self) -> &BlsDoryCommittedPolynomial {
+        &self.base_input
+    }
+
+    #[must_use]
+    pub fn weight_banks(&self) -> &[BlsDoryCommittedPolynomial] {
+        &self.weight_banks
+    }
+}
+
+/// Authenticate one canonical model bank and transactionally publish the exact
+/// coefficient artifacts later consumed by matrix proving and aggregation.
+/// No identity or polynomial escapes if the bank, sink, or EOF check fails.
+pub fn prepare_bls_dory_fixed_model_from_verified_bank_with_scratch<R: Read>(
+    reader: R,
+    expected_manifest: &ModelBankManifest,
+    trusted_model: &ModelPcsIdentity,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BlsDoryPreparedFixedModel, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>> {
+    let sink = BlsDoryPreparedFixedModelSink::new(
+        trusted_model,
+        padded_variables,
+        setup,
+        scratch_directory,
+    )
+    .map_err(ModelBankFieldStreamError::Sink)?;
+    verify_model_bank_into_staged_field_sink(reader, expected_manifest, trusted_model, sink)
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BlsDoryFixedModelStreamError {
     #[error("the streamed fixed-model setup or padded geometry is invalid")]
@@ -286,6 +335,190 @@ pub enum BlsDoryFixedModelStreamError {
     ReceiptMismatch,
     #[error("the authenticated fixed-model commitments do not form a valid identity")]
     InvalidIdentity,
+    #[error("authenticated fixed-model prover storage failed")]
+    ProverStorage,
+}
+
+struct PreparedDoryRole<'a> {
+    role: ModelPcsRole,
+    expected_elements: u64,
+    next_offset: u64,
+    writer: BlsDoryCommittedPolynomialWriter<'a>,
+}
+
+struct BlsDoryPreparedFixedModelSink<'a> {
+    expected_model: ModelPcsIdentity,
+    setup: &'a DeterministicBlsDorySetup,
+    roles: Vec<PreparedDoryRole<'a>>,
+    next_role: usize,
+}
+
+impl<'a> BlsDoryPreparedFixedModelSink<'a> {
+    fn new(
+        trusted_model: &ModelPcsIdentity,
+        padded_variables: usize,
+        setup: &'a DeterministicBlsDorySetup,
+        scratch_directory: &Path,
+    ) -> Result<Self, BlsDoryFixedModelStreamError> {
+        trusted_model
+            .validate()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        setup
+            .validate()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if padded_variables == 0 || padded_variables > setup.max_log_n() {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+        let padded_elements = 1_u64
+            .checked_shl(padded_variables as u32)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let base_elements = u64::from(trusted_model.batch)
+            .checked_mul(u64::from(trusted_model.dimension))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let weight_elements = u64::from(trusted_model.layers_per_bank)
+            .checked_mul(u64::from(trusted_model.dimension))
+            .and_then(|value| value.checked_mul(u64::from(trusted_model.dimension)))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if !base_elements.is_power_of_two()
+            || !weight_elements.is_power_of_two()
+            || base_elements > padded_elements
+            || weight_elements > padded_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+        let nu = padded_variables / 2;
+        let sigma = padded_variables - nu;
+        let mut role_specs = Vec::with_capacity(1 + trusted_model.weight_bank_commitments.len());
+        role_specs.push((ModelPcsRole::BaseInput, base_elements));
+        for index in 0..trusted_model.weight_bank_commitments.len() {
+            role_specs.push((
+                ModelPcsRole::WeightBank {
+                    index: u32::try_from(index)
+                        .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?,
+                },
+                weight_elements,
+            ));
+        }
+        let roles = role_specs
+            .into_iter()
+            .map(|(role, expected_elements)| {
+                let explicit_count = usize::try_from(expected_elements)
+                    .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+                let writer = BlsDoryCommittedPolynomialWriter::create(
+                    scratch_directory,
+                    explicit_count,
+                    nu,
+                    sigma,
+                    setup,
+                )
+                .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+                Ok(PreparedDoryRole {
+                    role,
+                    expected_elements,
+                    next_offset: 0,
+                    writer,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            expected_model: trusted_model.clone(),
+            setup,
+            roles,
+            next_role: 0,
+        })
+    }
+}
+
+impl StagedModelFieldSink for BlsDoryPreparedFixedModelSink<'_> {
+    type Error = BlsDoryFixedModelStreamError;
+    type Output = BlsDoryPreparedFixedModel;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        let role = self
+            .roles
+            .get_mut(self.next_role)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_len = u64::try_from(chunk.elements.len())
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_end = chunk
+            .role_offset
+            .checked_add(chunk_len)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        if chunk.elements.is_empty()
+            || chunk.role != role.role
+            || chunk.role_elements != role.expected_elements
+            || chunk.role_offset != role.next_offset
+            || chunk_end > role.expected_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidChunk);
+        }
+        let scalars = chunk
+            .elements
+            .iter()
+            .copied()
+            .map(bls_scalar_from_model_field)
+            .collect::<Result<Vec<_>, _>>()?;
+        role.writer
+            .write_scalars(&scalars)
+            .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+        role.next_offset = chunk_end;
+        if chunk_end == role.expected_elements {
+            self.next_role += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_verified(
+        self,
+        receipt: VerifiedModelBankReceipt,
+    ) -> Result<Self::Output, Self::Error> {
+        if self.next_role != self.roles.len()
+            || receipt.identity() != &self.expected_model
+            || usize::try_from(receipt.layout().weight_bank_count()).ok()
+                != Some(self.expected_model.weight_bank_commitments.len())
+            || receipt.layout().layers_per_bank() != self.expected_model.layers_per_bank
+            || self
+                .roles
+                .iter()
+                .any(|role| role.next_offset != role.expected_elements)
+        {
+            return Err(BlsDoryFixedModelStreamError::ReceiptMismatch);
+        }
+        let mut polynomials = self.roles.into_iter().map(|role| {
+            role.writer
+                .finish()
+                .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)
+        });
+        let base_input = polynomials
+            .next()
+            .ok_or(BlsDoryFixedModelStreamError::InvalidIdentity)??;
+        let weight_banks = polynomials.collect::<Result<Vec<_>, _>>()?;
+        let identity = BlsDoryFixedModelIdentity {
+            protocol_version: BLS_DORY_FIXED_MODEL_IDENTITY_VERSION,
+            model_pcs_identity_digest: self
+                .expected_model
+                .digest()
+                .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?,
+            setup_identity: self.setup.identity(),
+            base_input_commitment: base_input.commitment(),
+            weight_bank_commitments: weight_banks
+                .iter()
+                .map(BlsDoryCommittedPolynomial::commitment)
+                .collect(),
+        };
+        identity
+            .validate(
+                &self.expected_model,
+                self.expected_model.weight_bank_commitments.len(),
+                self.setup,
+            )
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        Ok(BlsDoryPreparedFixedModel {
+            identity,
+            base_input,
+            weight_banks,
+        })
+    }
 }
 
 struct StreamedDoryRole {
@@ -859,6 +1092,30 @@ pub struct BlsDoryMatrixProverInput<'a> {
     pub accumulators: &'a [i64],
 }
 
+/// Matrix witness whose authenticated fixed-weight polynomial has already been
+/// prepared from the pinned model bank. The polynomial is reused for the
+/// matrix transcript, terminal evaluation, and shared aggregate opening.
+pub struct BlsDoryPrecommittedMatrixProverInput<'a> {
+    pub statement: StructuredMatrixStatement,
+    pub activations: &'a [i64],
+    pub weight: &'a BlsDoryCommittedPolynomial,
+    pub accumulators: &'a [i64],
+}
+
+#[derive(Clone, Copy)]
+enum SharedMatrixWeight<'a> {
+    Signed(&'a [i64]),
+    Precommitted(&'a BlsDoryCommittedPolynomial),
+}
+
+#[derive(Clone, Copy)]
+struct SharedMatrixProverInput<'a> {
+    statement: StructuredMatrixStatement,
+    activations: &'a [i64],
+    weight: SharedMatrixWeight<'a>,
+    accumulators: &'a [i64],
+}
+
 pub struct BlsDoryTransitionProverInput<'a> {
     pub statement: StructuredTransitionStatement,
     pub mask_polynomial: &'a StructuredMaskPolynomial,
@@ -882,11 +1139,20 @@ pub fn prove_bls_dory_shared_layout_at_variables(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let matrix_inputs = matrix_inputs
+        .iter()
+        .map(|input| SharedMatrixProverInput {
+            statement: input.statement,
+            activations: input.activations,
+            weight: SharedMatrixWeight::Signed(input.weights),
+            accumulators: input.accumulators,
+        })
+        .collect::<Vec<_>>();
     prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         binding,
         trusted_model,
         fixed_model,
-        matrix_inputs,
+        &matrix_inputs,
         transition_inputs,
         wiring_statement,
         initial,
@@ -917,11 +1183,63 @@ pub fn prove_bls_dory_shared_layout_at_variables_with_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let matrix_inputs = matrix_inputs
+        .iter()
+        .map(|input| SharedMatrixProverInput {
+            statement: input.statement,
+            activations: input.activations,
+            weight: SharedMatrixWeight::Signed(input.weights),
+            accumulators: input.accumulators,
+        })
+        .collect::<Vec<_>>();
     prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         binding,
         trusted_model,
         fixed_model,
-        matrix_inputs,
+        &matrix_inputs,
+        transition_inputs,
+        wiring_statement,
+        initial,
+        inputs,
+        outputs,
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+/// Prove the shared layout while reusing weight polynomials prepared by an
+/// authenticated fixed-model stream. No materialized weight slice is accepted
+/// on this path, and every supplied commitment must match the pinned identity.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_inputs: &[BlsDoryPrecommittedMatrixProverInput<'_>],
+    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
+    wiring_statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let matrix_inputs = matrix_inputs
+        .iter()
+        .map(|input| SharedMatrixProverInput {
+            statement: input.statement,
+            activations: input.activations,
+            weight: SharedMatrixWeight::Precommitted(input.weight),
+            accumulators: input.accumulators,
+        })
+        .collect::<Vec<_>>();
+    prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
+        binding,
+        trusted_model,
+        fixed_model,
+        &matrix_inputs,
         transition_inputs,
         wiring_statement,
         initial,
@@ -938,7 +1256,7 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
     binding: &[u8],
     trusted_model: &ModelPcsIdentity,
     fixed_model: &BlsDoryFixedModelIdentity,
-    matrix_inputs: &[BlsDoryMatrixProverInput<'_>],
+    matrix_inputs: &[SharedMatrixProverInput<'_>],
     transition_inputs: &[BlsDoryTransitionProverInput<'_>],
     wiring_statement: StructuredWiringStatement,
     initial: &[i64],
@@ -987,27 +1305,48 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         .iter()
         .zip(&fixed_model.weight_bank_commitments)
     {
-        let matrix = if let Some(scratch_directory) = scratch_directory {
-            prove_bls_dory_matrix_deferred_at_variables_with_scratch(
-                &component_binding,
-                input.statement,
-                input.activations,
-                input.weights,
-                input.accumulators,
-                padded_variables,
-                setup,
-                scratch_directory,
-            )?
-        } else {
-            prove_bls_dory_matrix_deferred_at_variables(
-                &component_binding,
-                input.statement,
-                input.activations,
-                input.weights,
-                input.accumulators,
-                padded_variables,
-                setup,
-            )?
+        let matrix = match (input.weight, scratch_directory) {
+            (SharedMatrixWeight::Signed(weights), Some(scratch_directory)) => {
+                prove_bls_dory_matrix_deferred_at_variables_with_scratch(
+                    &component_binding,
+                    input.statement,
+                    input.activations,
+                    weights,
+                    input.accumulators,
+                    padded_variables,
+                    setup,
+                    scratch_directory,
+                )?
+            }
+            (SharedMatrixWeight::Signed(weights), None) => {
+                prove_bls_dory_matrix_deferred_at_variables(
+                    &component_binding,
+                    input.statement,
+                    input.activations,
+                    weights,
+                    input.accumulators,
+                    padded_variables,
+                    setup,
+                )?
+            }
+            (SharedMatrixWeight::Precommitted(weight), Some(scratch_directory)) => {
+                if weight.commitment() != *expected_weight {
+                    return Err(BlsDorySharedLayoutError::FixedModelCommitment);
+                }
+                prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
+                    &component_binding,
+                    input.statement,
+                    input.activations,
+                    weight,
+                    input.accumulators,
+                    padded_variables,
+                    setup,
+                    scratch_directory,
+                )?
+            }
+            (SharedMatrixWeight::Precommitted(_), None) => {
+                return Err(BlsDorySharedLayoutError::FixedModelCommitment);
+            }
         };
         if matrix.proof.weight_commitment != *expected_weight {
             return Err(BlsDorySharedLayoutError::FixedModelCommitment);
@@ -2222,6 +2561,141 @@ mod tests {
     }
 
     #[test]
+    fn verified_model_stream_publishes_reusable_exact_polynomials_and_cleans_up() {
+        const PADDED_VARIABLES: usize = 5;
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let (built, model, base, weight_banks) = authenticated_fixed_model_fixture();
+        let weight_slices = weight_banks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let expected = derive_bls_dory_fixed_model_identity(
+            &model,
+            &base,
+            &weight_slices,
+            PADDED_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        let scratch = ScratchDirectory::create();
+        let prepared = prepare_bls_dory_fixed_model_from_verified_bank_with_scratch(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            &model,
+            PADDED_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(prepared.identity(), &expected);
+        assert_eq!(
+            prepared.base_input().commitment(),
+            expected.base_input_commitment
+        );
+        assert_eq!(prepared.weight_banks().len(), weight_banks.len());
+        assert_eq!(
+            prepared
+                .weight_banks()
+                .iter()
+                .map(BlsDoryCommittedPolynomial::commitment)
+                .collect::<Vec<_>>(),
+            expected.weight_bank_commitments
+        );
+        let statement = StructuredMatrixStatement {
+            layers: 2,
+            rows: 2,
+            inner: 2,
+            cols: 2,
+            max_abs_activation: 10,
+            max_abs_weight: 125,
+            max_abs_accumulator: 2_000,
+        };
+        let activations = vec![1, 2, 3, 4, -1, 2, 5, -2];
+        let weights = &weight_banks[0];
+        let mut accumulators = Vec::with_capacity(8);
+        for layer in 0..statement.layers {
+            for row in 0..statement.rows {
+                for column in 0..statement.cols {
+                    let mut sum = 0i64;
+                    for common in 0..statement.inner {
+                        sum += activations
+                            [(layer * statement.rows + row) * statement.inner + common]
+                            * weights[(layer * statement.inner + common) * statement.cols + column];
+                    }
+                    accumulators.push(sum);
+                }
+            }
+        }
+        let ordinary = prove_bls_dory_matrix_deferred_at_variables_with_scratch(
+            b"verified-model-matrix",
+            statement,
+            &activations,
+            weights,
+            &accumulators,
+            PADDED_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let streamed = prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
+            b"verified-model-matrix",
+            statement,
+            &activations,
+            &prepared.weight_banks()[0],
+            &accumulators,
+            PADDED_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(streamed.proof, ordinary.proof);
+        assert_eq!(streamed.openings.claims(), ordinary.openings.claims());
+        drop(streamed);
+        drop(ordinary);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 3);
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_verified_model_stream_publishes_no_polynomial_artifacts() {
+        const PADDED_VARIABLES: usize = 5;
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let (built, model, _, _) = authenticated_fixed_model_fixture();
+        let scratch = ScratchDirectory::create();
+        let mut corrupted = built.bytes.clone();
+        corrupted[MODEL_BANK_HEADER_BYTES] ^= 1;
+        assert!(matches!(
+            prepare_bls_dory_fixed_model_from_verified_bank_with_scratch(
+                Cursor::new(corrupted),
+                &built.manifest,
+                &model,
+                PADDED_VARIABLES,
+                &setup,
+                &scratch.0,
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::RawRootMismatch
+            ))
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let mut trailing = built.bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            prepare_bls_dory_fixed_model_from_verified_bank_with_scratch(
+                Cursor::new(trailing),
+                &built.manifest,
+                &model,
+                PADDED_VARIABLES,
+                &setup,
+                &scratch.0,
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::TrailingBytes
+            ))
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
     fn authenticated_model_stream_never_publishes_failed_or_reordered_input() {
         const PADDED_VARIABLES: usize = 5;
         let setup = deterministic_bls_dory_setup(6).unwrap();
@@ -2787,6 +3261,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scratch_proof, proof);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        let precommitted_weights = fixture
+            .matrices
+            .iter()
+            .map(|matrix| {
+                commit_fixed_table_with_optional_scratch(
+                    &matrix.weights,
+                    FIXTURE_VARIABLES,
+                    &setup,
+                    Some(&scratch.0),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let precommitted_inputs = matrix_inputs
+            .iter()
+            .zip(&precommitted_weights)
+            .map(|(input, weight)| BlsDoryPrecommittedMatrixProverInput {
+                statement: input.statement,
+                activations: input.activations,
+                weight,
+                accumulators: input.accumulators,
+            })
+            .collect::<Vec<_>>();
+        let precommitted_proof =
+            prove_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+                b"shared-opening",
+                &model,
+                &fixed_model,
+                &precommitted_inputs,
+                &transition_inputs,
+                fixture.wiring_statement,
+                &fixture.initial,
+                &fixture.inputs,
+                &fixture.outputs,
+                FIXTURE_VARIABLES,
+                &setup,
+                &scratch.0,
+            )
+            .unwrap();
+        assert_eq!(precommitted_proof, proof);
+        drop(precommitted_inputs);
+        let mut wrong_values = fixture.matrices[0].weights.clone();
+        wrong_values[0] += 1;
+        let wrong_weight = commit_fixed_table_with_optional_scratch(
+            &wrong_values,
+            FIXTURE_VARIABLES,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        let wrong_inputs = matrix_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| BlsDoryPrecommittedMatrixProverInput {
+                statement: input.statement,
+                activations: input.activations,
+                weight: if index == 0 {
+                    &wrong_weight
+                } else {
+                    &precommitted_weights[index]
+                },
+                accumulators: input.accumulators,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            prove_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+                b"shared-opening",
+                &model,
+                &fixed_model,
+                &wrong_inputs,
+                &transition_inputs,
+                fixture.wiring_statement,
+                &fixture.initial,
+                &fixture.inputs,
+                &fixture.outputs,
+                FIXTURE_VARIABLES,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDorySharedLayoutError::FixedModelCommitment)
+        ));
+        drop(wrong_inputs);
+        drop(wrong_weight);
+        drop(precommitted_weights);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
         verify_bls_dory_shared_layout_at_variables(
             b"shared-opening",

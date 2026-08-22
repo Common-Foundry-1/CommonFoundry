@@ -9,6 +9,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use ark_ff::PrimeField;
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
     arithmetic::{Field, Group},
@@ -40,7 +41,7 @@ pub const PRODUCTION_BLS_DORY_MATRIX_VARIABLES: usize = 31;
 pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
 pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "scratch commitments stream signed rows, but the matrix prover still requires each n=31 weight bank as a materialized i64 slice and lacks production disk, memory, and latency measurements",
+    "the verified model-bank stream now publishes reusable authenticated coefficient artifacts and the matrix prover consumes them without a materialized i64 weight bank, but the exact n=31 path still lacks production disk, memory, and latency measurements",
     "the final production artifact commitments have not been generated and pinned in network parameters",
     "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
@@ -72,6 +73,12 @@ pub struct BlsDoryMatrixProof {
 pub(crate) struct PreparedBlsDoryMatrixProof {
     pub(crate) proof: BlsDoryMatrixProof,
     pub(crate) openings: BlsDoryDeferredOpeningSet,
+}
+
+#[derive(Clone, Copy)]
+enum MatrixWeightProverSource<'a> {
+    Signed(&'a [i64]),
+    Precommitted(&'a BlsDoryCommittedPolynomial),
 }
 
 impl BlsDoryMatrixProof {
@@ -371,7 +378,7 @@ pub(crate) fn prove_bls_dory_matrix_deferred_at_variables(
         binding,
         statement,
         activations,
-        weights,
+        MatrixWeightProverSource::Signed(weights),
         accumulators,
         padded_variables,
         setup,
@@ -394,7 +401,7 @@ pub(crate) fn prove_bls_dory_matrix_deferred_at_variables_with_scratch(
         binding,
         statement,
         activations,
-        weights,
+        MatrixWeightProverSource::Signed(weights),
         accumulators,
         padded_variables,
         setup,
@@ -403,11 +410,121 @@ pub(crate) fn prove_bls_dory_matrix_deferred_at_variables_with_scratch(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weight: &BlsDoryCommittedPolynomial,
+    accumulators: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        activations,
+        MatrixWeightProverSource::Precommitted(weight),
+        accumulators,
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+fn validate_precommitted_matrix_tables(
+    statement: StructuredMatrixStatement,
+    activations: &[i64],
+    weight: &BlsDoryCommittedPolynomial,
+    accumulators: &[i64],
+) -> Result<(), BlsDoryMatrixError> {
+    statement.validate_verifier_shape()?;
+    let [activation_len, weight_len, accumulator_len] = statement.table_lengths()?;
+    if activations.len() != activation_len
+        || weight.explicit_coefficient_count() != weight_len
+        || accumulators.len() != accumulator_len
+    {
+        return Err(BlsDoryMatrixError::Structured(
+            StructuredSumcheckError::InvalidLength,
+        ));
+    }
+    if activations
+        .iter()
+        .any(|value| value.unsigned_abs() > statement.max_abs_activation)
+        || accumulators
+            .iter()
+            .any(|value| value.unsigned_abs() > statement.max_abs_accumulator)
+    {
+        return Err(BlsDoryMatrixError::Structured(
+            StructuredSumcheckError::ValueOutOfRange,
+        ));
+    }
+    Ok(())
+}
+
+fn accumulate_weight_partials(
+    statement: StructuredMatrixStatement,
+    source: MatrixWeightProverSource<'_>,
+    column_weights: &[BlsDoryFr],
+    output: &mut [BlsDoryFr],
+) -> Result<(), BlsDoryMatrixError> {
+    let expected = statement
+        .layers
+        .checked_mul(statement.inner)
+        .and_then(|count| count.checked_mul(statement.cols))
+        .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+    if column_weights.len() != statement.cols || output.len() != statement.layers * statement.inner
+    {
+        return Err(BlsDoryMatrixError::InvalidDimensions);
+    }
+    let mut visited = 0usize;
+    let mut value_out_of_range = false;
+    let mut accumulate = |index: usize, coefficient: BlsDoryFr| {
+        let partial = index / statement.cols;
+        let column = index % statement.cols;
+        output[partial] = output[partial] + coefficient * column_weights[column];
+        visited += 1;
+    };
+    match source {
+        MatrixWeightProverSource::Signed(weights) => {
+            for (index, weight) in weights.iter().copied().enumerate() {
+                accumulate(index, BlsDoryFr::from_i64(weight));
+            }
+        }
+        MatrixWeightProverSource::Precommitted(weight) => {
+            weight.for_each_explicit_coefficient(&mut |index, coefficient| {
+                if !scalar_within_signed_bound(coefficient, statement.max_abs_weight) {
+                    value_out_of_range = true;
+                }
+                accumulate(index, coefficient);
+            })?;
+        }
+    }
+    if value_out_of_range {
+        return Err(BlsDoryMatrixError::Structured(
+            StructuredSumcheckError::ValueOutOfRange,
+        ));
+    }
+    if visited != expected {
+        return Err(BlsDoryMatrixError::InvalidDimensions);
+    }
+    Ok(())
+}
+
+fn scalar_within_signed_bound(value: BlsDoryFr, maximum: u64) -> bool {
+    [value, -value].into_iter().any(|candidate| {
+        let limbs = candidate.0.into_bigint();
+        let limbs = limbs.as_ref();
+        limbs[0] <= maximum && limbs[1..].iter().all(|limb| *limb == 0)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     binding: &[u8],
     statement: StructuredMatrixStatement,
     activations: &[i64],
-    weights: &[i64],
+    weight_source: MatrixWeightProverSource<'_>,
     accumulators: &[i64],
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
@@ -416,10 +533,16 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
-    if scratch_directory.is_some() {
-        validate_streaming_tables(statement, activations, weights, accumulators)?;
-    } else {
-        validate_tables(statement, activations, weights, accumulators)?;
+    match weight_source {
+        MatrixWeightProverSource::Signed(weights) if scratch_directory.is_some() => {
+            validate_streaming_tables(statement, activations, weights, accumulators)?;
+        }
+        MatrixWeightProverSource::Signed(weights) => {
+            validate_tables(statement, activations, weights, accumulators)?;
+        }
+        MatrixWeightProverSource::Precommitted(weight) => {
+            validate_precommitted_matrix_tables(statement, activations, weight, accumulators)?;
+        }
     }
     validate_target_variables(matrix_variables(statement)?, padded_variables)?;
     if padded_variables > setup.max_log_n() {
@@ -435,14 +558,22 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
         setup,
         scratch_directory,
     )?;
-    let weight_polynomial = commit_signed_table(
-        weights,
-        padded_variables,
-        nu,
-        sigma,
-        setup,
-        scratch_directory,
-    )?;
+    let weight_polynomial = match weight_source {
+        MatrixWeightProverSource::Signed(weights) => commit_signed_table(
+            weights,
+            padded_variables,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )?,
+        MatrixWeightProverSource::Precommitted(weight) => {
+            if scratch_directory.is_none() || weight.variables() != padded_variables {
+                return Err(BlsDoryMatrixError::InvalidDimensions);
+            }
+            weight.clone()
+        }
+    };
     let accumulator_polynomial = commit_signed_table(
         accumulators,
         padded_variables,
@@ -495,7 +626,7 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
         .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
     let mut layer_selector = Vec::with_capacity(partial_len);
     let mut activation_partial = Vec::with_capacity(partial_len);
-    let mut weight_partial = Vec::with_capacity(partial_len);
+    let mut weight_partial = vec![BlsDoryFr::zero(); partial_len];
     for (layer, layer_weight) in layer_weights.iter().copied().enumerate() {
         for common in 0..statement.inner {
             layer_selector.push(layer_weight);
@@ -505,15 +636,9 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
                 activation = activation + BlsDoryFr::from_i64(activations[index]) * row_weight;
             }
             activation_partial.push(activation);
-
-            let mut weight = BlsDoryFr::zero();
-            for (col, col_weight) in col_weights.iter().copied().enumerate() {
-                let index = (layer * statement.inner + common) * statement.cols + col;
-                weight = weight + BlsDoryFr::from_i64(weights[index]) * col_weight;
-            }
-            weight_partial.push(weight);
         }
     }
+    accumulate_weight_partials(statement, weight_source, &col_weights, &mut weight_partial)?;
 
     let mut claim = accumulator_evaluation;
     let common_rounds = statement.inner.ilog2() as usize;
@@ -1238,6 +1363,28 @@ mod tests {
     use super::*;
     use crate::dory_bls12_381_prototype::deterministic_bls_dory_setup;
 
+    static SCRATCH_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn create() -> Self {
+            let nonce = SCRATCH_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-dory-matrix-source-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn fixture() -> (StructuredMatrixStatement, Vec<i64>, Vec<i64>, Vec<i64>) {
         let statement = StructuredMatrixStatement {
             layers: 2,
@@ -1304,6 +1451,76 @@ mod tests {
         let decoded = BlsDoryMatrixProof::decode(&encoded, statement).unwrap();
         assert_eq!(decoded, proof);
         verify_bls_dory_matrix(b"block-binding", statement, &decoded, &setup).unwrap();
+    }
+
+    #[test]
+    fn precommitted_weight_preserves_exact_proof_and_cleans_artifacts() {
+        let (statement, activations, weights, accumulators) = fixture();
+        let variables = matrix_variables(statement).unwrap();
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let ordinary = prove_bls_dory_matrix_deferred_at_variables_with_scratch(
+            b"precommitted-weight",
+            statement,
+            &activations,
+            &weights,
+            &accumulators,
+            variables,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let weight =
+            commit_signed_table(&weights, variables, nu, sigma, &setup, Some(&scratch.0)).unwrap();
+        let streamed = prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
+            b"precommitted-weight",
+            statement,
+            &activations,
+            &weight,
+            &accumulators,
+            variables,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(streamed.proof, ordinary.proof);
+        assert_eq!(streamed.openings.claims(), ordinary.openings.claims());
+        drop(streamed);
+        drop(weight);
+
+        let mut out_of_range_weights = weights;
+        out_of_range_weights[0] = statement.max_abs_weight as i64 + 1;
+        let out_of_range_accumulators =
+            computed_accumulators(statement, &activations, &out_of_range_weights);
+        let out_of_range_weight = commit_signed_table(
+            &out_of_range_weights,
+            variables,
+            nu,
+            sigma,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        assert!(matches!(
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
+                b"precommitted-weight",
+                statement,
+                &activations,
+                &out_of_range_weight,
+                &out_of_range_accumulators,
+                variables,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryMatrixError::Structured(
+                StructuredSumcheckError::ValueOutOfRange
+            ))
+        ));
+        drop(out_of_range_weight);
+        drop(ordinary);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     #[test]

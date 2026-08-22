@@ -233,13 +233,39 @@ impl BlsDoryCommittedPolynomial {
         }
     }
 
-    fn explicit_coefficient_count(&self) -> usize {
+    pub(crate) fn explicit_coefficient_count(&self) -> usize {
         match &self.coefficients {
             BlsDoryCoefficientStorage::Materialized(polynomial) => polynomial.coefficients().len(),
             BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => {
                 artifact.spec().explicit_scalar_count as usize
             }
         }
+    }
+
+    pub(crate) fn for_each_explicit_coefficient(
+        &self,
+        mut visitor: impl FnMut(usize, BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        let mut visited = 0usize;
+        match &self.coefficients {
+            BlsDoryCoefficientStorage::Materialized(polynomial) => {
+                for coefficient in polynomial.coefficients().iter().copied() {
+                    visitor(visited, coefficient);
+                    visited += 1;
+                }
+            }
+            BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => artifact
+                .for_each_scalar(|coefficient| {
+                    visitor(visited, coefficient);
+                    visited += 1;
+                    Ok(())
+                })
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+        }
+        if visited != self.explicit_coefficient_count() {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(())
     }
 
     fn evaluate(&self, point: &[BlsDoryFr]) -> Result<BlsDoryFr, BlsDoryAggregateError> {
@@ -360,6 +386,157 @@ impl BlsDoryCommittedPolynomial {
             BlsDoryCoefficientStorage::Materialized(_) => None,
             BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => Some(artifact.path()),
         }
+    }
+}
+
+/// Transactional builder for one authenticated coefficient artifact and its
+/// matching Dory commitment. It accepts bounded scalar chunks so a verified
+/// model-bank stream never materializes the complete polynomial.
+pub(crate) struct BlsDoryCommittedPolynomialWriter<'a> {
+    writer: BlsDoryFoldArtifactWriter,
+    setup: &'a DeterministicBlsDorySetup,
+    nu: usize,
+    sigma: usize,
+    rows: usize,
+    columns: usize,
+    explicit_count: usize,
+    written: usize,
+    row_index: usize,
+    column_offset: usize,
+    current_row_commitment: BlsDoryG1,
+    row_commitments: Vec<BlsDoryG1>,
+    commitment: BlsDoryGt,
+}
+
+impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
+    pub(crate) fn create(
+        scratch_directory: &Path,
+        explicit_count: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &'a DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        setup
+            .validate()
+            .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+        validate_layout(nu, sigma)?;
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let coefficient_count = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        if explicit_count == 0
+            || !explicit_count.is_power_of_two()
+            || explicit_count > coefficient_count
+            || setup.prover().g1_vec.len() < columns
+            || setup.prover().g2_vec.len() < rows
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let spec = source_artifact_spec(
+            setup.identity(),
+            nu,
+            sigma,
+            coefficient_count,
+            explicit_count,
+        )?;
+        let writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        Ok(Self {
+            writer,
+            setup,
+            nu,
+            sigma,
+            rows,
+            columns,
+            explicit_count,
+            written: 0,
+            row_index: 0,
+            column_offset: 0,
+            current_row_commitment: BlsDoryG1::identity(),
+            row_commitments: vec![BlsDoryG1::identity(); rows],
+            commitment: BlsDoryGt::identity(),
+        })
+    }
+
+    pub(crate) fn write_scalars(
+        &mut self,
+        mut scalars: &[BlsDoryFr],
+    ) -> Result<(), BlsDoryAggregateError> {
+        if scalars.is_empty()
+            || self
+                .written
+                .checked_add(scalars.len())
+                .is_none_or(|end| end > self.explicit_count)
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        while !scalars.is_empty() {
+            if self.row_index >= self.rows {
+                return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+            }
+            let take = scalars.len().min(self.columns - self.column_offset);
+            let segment = &scalars[..take];
+            let partial = self
+                .setup
+                .commit_row_segment(self.column_offset, segment)
+                .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+            self.current_row_commitment = self.current_row_commitment + partial;
+            for scalar in segment {
+                self.writer
+                    .write_scalar(scalar)
+                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+            }
+            self.column_offset += take;
+            self.written += take;
+            scalars = &scalars[take..];
+            if self.column_offset == self.columns {
+                self.finish_row()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+        if self.written != self.explicit_count {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        if self.column_offset != 0 {
+            self.finish_row()?;
+        }
+        if self.row_index != self.explicit_count.div_ceil(self.columns) {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let artifact = self
+            .writer
+            .finish()
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        Ok(BlsDoryCommittedPolynomial {
+            coefficients: BlsDoryCoefficientStorage::AuthenticatedArtifact(Arc::new(artifact)),
+            commitment: self.commitment,
+            row_commitments: self.row_commitments,
+            setup_identity: self.setup.identity(),
+            nu: self.nu,
+            sigma: self.sigma,
+        })
+    }
+
+    fn finish_row(&mut self) -> Result<(), BlsDoryAggregateError> {
+        let row_commitment = self.current_row_commitment;
+        self.commitment = self.commitment
+            + self
+                .setup
+                .pair_committed_row(self.row_index, &row_commitment)
+                .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+        self.row_commitments[self.row_index] = row_commitment;
+        self.row_index += 1;
+        self.column_offset = 0;
+        self.current_row_commitment = BlsDoryG1::identity();
+        Ok(())
     }
 }
 

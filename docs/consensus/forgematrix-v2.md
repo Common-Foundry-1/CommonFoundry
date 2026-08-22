@@ -453,11 +453,16 @@ comparison. The v2 research code now implements:
   self-authenticating artifact, aborts on storage corruption without a dense
   fallback, and preserves complete shared-layout proof bytes. A row-source
   constructor now writes canonical authenticated source prefixes while
-  computing the unchanged commitments. Each artifact authenticates its logical
-  and explicit lengths, and every fold keeps the remaining zero tail implicit
-  instead of allocating or writing it. The scratch-enabled shared path uses it
-  for every matrix, fixed-base, transition, LogUp, and wiring commitment,
-  without power-of-two-padded coefficient copies. Wiring additionally reads its
+  computing the unchanged commitments. The verified model-bank sink now
+  transactionally publishes reusable base and ordered weight coefficient
+  artifacts only after roots, lengths, and EOF authenticate. Matrix proving
+  consumes those artifacts directly, matches the materialized proof exactly,
+  and rejects a commitment from the wrong bank before proving. Each artifact
+  authenticates its logical and explicit lengths, and every fold keeps the
+  remaining zero tail implicit instead of allocating or writing it. The
+  scratch-enabled shared path uses it for every matrix, fixed-base, transition,
+  LogUp, and wiring commitment, without power-of-two-padded coefficient copies.
+  Wiring additionally reads its
   signed tables directly for commitment and multilinear evaluation, and the
   transition commitment derives all 110 regular and radix-16 lanes directly
   from its witness. The transition arithmetic sumcheck also keeps selector

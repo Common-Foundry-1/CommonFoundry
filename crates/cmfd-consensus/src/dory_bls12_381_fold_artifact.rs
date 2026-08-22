@@ -44,6 +44,11 @@ pub struct BlsDoryFoldArtifactSpec {
 }
 
 impl BlsDoryFoldArtifactSpec {
+    pub(crate) fn encoded_bytes(self) -> Result<u64, BlsDoryFoldArtifactError> {
+        self.validate()?;
+        artifact_file_bytes(self.explicit_scalar_count)
+    }
+
     fn validate(self) -> Result<(), BlsDoryFoldArtifactError> {
         if self.context_digest == [0; 32]
             || self.parent_digest == [0; 32]

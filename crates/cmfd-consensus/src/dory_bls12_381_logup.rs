@@ -37,6 +37,10 @@ use crate::{
         BlsDoryFoldArtifactWriter,
     },
     dory_bls12_381_index_artifact::BlsDoryIndexArtifactSpec,
+    dory_bls12_381_logup_artifact::{
+        BlsDoryLogUpArtifact, BlsDoryLogUpArtifactError, BlsDoryLogUpArtifactSpec,
+        BlsDoryLogUpArtifactValue, BlsDoryLogUpArtifactWriter,
+    },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
@@ -76,7 +80,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, hybrid transition/inverse artifacts, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.714 seconds proving plus 7.072 seconds opening; CPU n=33 projects to roughly 1.84 plus 1.34 days and the fourth range pair still projects near 478 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
+    "bounded parallel work, hybrid transition/inverse sources, challenge-bound compressed early LogUp lineages, and consuming openings preserve exact proofs and leave zero scratch after standalone completion, but n=19 still takes 9.484 seconds proving plus 7.066 seconds opening; CPU n=33 projects to roughly 1.80 plus 1.34 days and the fourth range pair still projects near 212.06 GiB peak scratch, so GPU or distributed folds, pre-fold aggregation or regeneration, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -95,6 +99,7 @@ const TABLE_VALUES: usize = BLS_DORY_RANGE_LOGUP_TABLE_VALUES;
 const SELECTOR_SLOTS: usize = 1 << BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
 const LOGUP_FOLD_SLOTS: usize = 2;
 const LOGUP_PARALLEL_FOLD_CHUNK_VALUES: usize = 1 << 16;
+const LOGUP_COMPRESSED_GENERATIONS: usize = 2;
 
 /// Witness-free scalar range-membership proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,6 +384,83 @@ pub fn projected_production_range_logup_inverse_artifact_bytes()
 pub fn projected_production_transition_range_source_bytes() -> Result<u64, BlsDoryRangeLogUpError> {
     projected_production_transition_source_artifact_bytes()?
         .checked_add(projected_production_range_logup_inverse_artifact_bytes()?)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
+/// Exact encoded bytes for the first two compressed production LogUp lineages.
+pub fn projected_production_range_logup_compressed_lineage_bytes()
+-> Result<[u64; LOGUP_COMPRESSED_GENERATIONS], BlsDoryRangeLogUpError> {
+    let cell_variables = PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES
+        .checked_sub(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let selector_rows = 1u64
+        .checked_shl(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let mut output = [0u64; LOGUP_COMPRESSED_GENERATIONS];
+    for generation in 1..=LOGUP_COMPRESSED_GENERATIONS {
+        let current_cells = 1u64
+            .checked_shl(
+                u32::try_from(cell_variables - generation)
+                    .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+            )
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        output[generation - 1] = BlsDoryLogUpArtifactSpec {
+            context_digest: [1; 32],
+            parent_digest: [2; 32],
+            reconstruction_digest: [3; 32],
+            generation: u32::try_from(generation)
+                .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+            selector_rows,
+            current_cells,
+            regular_selectors: STRUCTURED_TRANSITION_REGULAR_ORACLES as u32,
+            range_selectors: (STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES)
+                as u32,
+        }
+        .encoded_bytes()
+        .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?;
+    }
+    Ok(output)
+}
+
+/// Peak overlap while replacing the two compressed lineages with scalar folds.
+pub fn projected_production_range_logup_early_lineage_peak_bytes()
+-> Result<u64, BlsDoryRangeLogUpError> {
+    let compressed = projected_production_range_logup_compressed_lineage_bytes()?;
+    let selector_rows = 1usize
+        .checked_shl(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let cell_variables = PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES
+        .checked_sub(BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let generation = LOGUP_COMPRESSED_GENERATIONS + 1;
+    let current_cells = 1usize
+        .checked_shl(
+            u32::try_from(cell_variables - generation)
+                .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        )
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let scalar_generation =
+        logup_fold_spec([1; 32], generation, selector_rows, current_cells, [2; 32])?
+            .encoded_bytes()
+            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?;
+    compressed[0]
+        .checked_add(compressed[1])
+        .and_then(|first_overlap| {
+            compressed[1]
+                .checked_add(scalar_generation)
+                .map(|second_overlap| first_overlap.max(second_overlap))
+        })
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
+}
+
+/// Four retained transition/inverse pairs plus the fourth pair's lineage peak.
+pub fn projected_production_range_logup_four_pair_peak_bytes() -> Result<u64, BlsDoryRangeLogUpError>
+{
+    let sources = projected_production_transition_range_source_bytes()?
+        .checked_mul(4)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    sources
+        .checked_add(projected_production_range_logup_early_lineage_peak_bytes()?)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)
 }
 
@@ -1349,6 +1431,149 @@ struct LogUpFoldValues {
     inverse: BlsDoryFr,
 }
 
+enum LogUpLineageArtifact {
+    Compressed(BlsDoryLogUpArtifact),
+    Scalar(BlsDoryFoldArtifact),
+}
+
+impl LogUpLineageArtifact {
+    const fn digest(&self) -> [u8; 32] {
+        match self {
+            Self::Compressed(artifact) => artifact.digest(),
+            Self::Scalar(artifact) => artifact.digest(),
+        }
+    }
+}
+
+fn interpolate_logup_fold_values(
+    lower: LogUpFoldValues,
+    upper: LogUpFoldValues,
+    challenge: BlsDoryFr,
+) -> LogUpFoldValues {
+    LogUpFoldValues {
+        transition: lower.transition + challenge * (upper.transition - lower.transition),
+        inverse: lower.inverse + challenge * (upper.inverse - lower.inverse),
+    }
+}
+
+fn logup_reconstruction_digest(
+    alpha: BlsDoryFr,
+    challenges: &[BlsDoryFr],
+) -> Result<[u8; 32], BlsDoryRangeLogUpError> {
+    let challenge_count =
+        u32::try_from(challenges.len()).map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let mut encoded = Vec::with_capacity((challenges.len() + 1) * 32);
+    append_serialized(&mut encoded, &alpha)?;
+    for challenge in challenges {
+        append_serialized(&mut encoded, challenge)?;
+    }
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryLogUpReconstruction/v1");
+    hasher.update(&challenge_count.to_le_bytes());
+    hasher.update(&encoded);
+    let digest = *hasher.finalize().as_bytes();
+    if digest == [0; 32] {
+        return Err(logup_storage_error());
+    }
+    Ok(digest)
+}
+
+fn compressed_logup_spec(
+    context_digest: [u8; 32],
+    generation: usize,
+    selector_rows: usize,
+    current_cells: usize,
+    parent_digest: [u8; 32],
+    alpha: BlsDoryFr,
+    challenges: &[BlsDoryFr],
+) -> Result<BlsDoryLogUpArtifactSpec, BlsDoryRangeLogUpError> {
+    if generation == 0
+        || generation > LOGUP_COMPRESSED_GENERATIONS
+        || challenges.len() != generation
+    {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(BlsDoryLogUpArtifactSpec {
+        context_digest,
+        parent_digest,
+        reconstruction_digest: logup_reconstruction_digest(alpha, challenges)?,
+        generation: u32::try_from(generation)
+            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        selector_rows: u64::try_from(selector_rows)
+            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        current_cells: u64::try_from(current_cells)
+            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        regular_selectors: u32::try_from(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        range_selectors: u32::try_from(
+            STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES,
+        )
+        .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+    })
+}
+
+fn logup_range_fold_dictionary(
+    generation: usize,
+    alpha: BlsDoryFr,
+    challenges: &[BlsDoryFr],
+) -> Result<Vec<LogUpFoldValues>, BlsDoryRangeLogUpError> {
+    if generation == 0
+        || generation > LOGUP_COMPRESSED_GENERATIONS
+        || challenges.len() != generation
+    {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let mut digits = [LogUpFoldValues {
+        transition: BlsDoryFr::zero(),
+        inverse: BlsDoryFr::zero(),
+    }; TABLE_VALUES];
+    for (digit, values) in digits.iter_mut().enumerate() {
+        let transition = BlsDoryFr::from_u64(digit as u64);
+        *values = LogUpFoldValues {
+            transition,
+            inverse: (alpha - transition)
+                .inv()
+                .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?,
+        };
+    }
+    let leaf_count = 1usize
+        .checked_shl(generation as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let code_bits = leaf_count
+        .checked_mul(4)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let dictionary_len = 1usize
+        .checked_shl(code_bits as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let zero = LogUpFoldValues {
+        transition: BlsDoryFr::zero(),
+        inverse: BlsDoryFr::zero(),
+    };
+    let mut dictionary = Vec::with_capacity(dictionary_len);
+    for code in 0..dictionary_len {
+        let mut level = [zero; 4];
+        for (index, target) in level.iter_mut().take(leaf_count).enumerate() {
+            *target = digits[(code >> (index * 4)) & 0xf];
+        }
+        let mut width = leaf_count;
+        for challenge in challenges {
+            for index in 0..width / 2 {
+                level[index] = interpolate_logup_fold_values(
+                    level[index * 2],
+                    level[index * 2 + 1],
+                    *challenge,
+                );
+            }
+            width /= 2;
+        }
+        if width != 1 {
+            return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+        }
+        dictionary.push(level[0]);
+    }
+    Ok(dictionary)
+}
+
 #[cfg(test)]
 fn batch_invert_logup_denominators(
     denominators: &mut [BlsDoryFr],
@@ -1528,166 +1753,398 @@ fn write_logup_fold_values(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fold_raw_logup_values(
+fn fold_raw_logup_values_compressed(
     source: &BlsDoryTransitionWitnessRowSource<'_>,
     alpha: BlsDoryFr,
-    challenge: BlsDoryFr,
+    challenges: &[BlsDoryFr],
     selector_rows: usize,
     current_cells: usize,
     context_digest: [u8; 32],
-    generation: usize,
     parent_digest: [u8; 32],
     scratch_directory: &Path,
-) -> Result<BlsDoryFoldArtifact, BlsDoryRangeLogUpError> {
+) -> Result<BlsDoryLogUpArtifact, BlsDoryRangeLogUpError> {
+    if challenges.len() != 1 {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let challenge = challenges[0];
     let child_cells = current_cells
         .checked_div(2)
         .filter(|cells| *cells > 0)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    let spec = logup_fold_spec(
+    let spec = compressed_logup_spec(
         context_digest,
-        generation,
+        1,
         selector_rows,
         child_cells,
         parent_digest,
+        alpha,
+        challenges,
     )?;
-    let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
+    drop(logup_range_fold_dictionary(1, alpha, challenges)?);
+    let mut writer = BlsDoryLogUpArtifactWriter::create(scratch_directory, spec)
         .map_err(|_| logup_storage_error())?;
-    let explicit_child_values = STRUCTURED_TRANSITION_ORACLES
+
+    let regular_child_values = STRUCTURED_TRANSITION_REGULAR_ORACLES
         .checked_mul(child_cells)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    for chunk_start in (0..explicit_child_values).step_by(LOGUP_PARALLEL_FOLD_CHUNK_VALUES) {
+    for chunk_start in (0..regular_child_values).step_by(LOGUP_PARALLEL_FOLD_CHUNK_VALUES) {
         let chunk_end = chunk_start
             .saturating_add(LOGUP_PARALLEL_FOLD_CHUNK_VALUES)
-            .min(explicit_child_values);
+            .min(regular_child_values);
         let folded = (chunk_start..chunk_end)
             .into_par_iter()
             .map(|packed_child| {
                 let selector = packed_child / child_cells;
                 let child_cell = packed_child % child_cells;
-                let lower = raw_logup_fold_values(source, alpha, selector, child_cell * 2)?;
-                let upper = raw_logup_fold_values(source, alpha, selector, child_cell * 2 + 1)?;
-                Ok(LogUpFoldValues {
-                    transition: lower.transition
-                        + challenge * (upper.transition - lower.transition),
-                    inverse: lower.inverse + challenge * (upper.inverse - lower.inverse),
-                })
+                let lower = source.scalar(selector, child_cell * 2)?;
+                let upper = source.scalar(selector, child_cell * 2 + 1)?;
+                Ok(lower + challenge * (upper - lower))
             })
             .collect::<Result<Vec<_>, BlsDoryRangeLogUpError>>()?;
-        for values in folded {
-            write_logup_fold_values(&mut writer, values)?;
-        }
+        writer
+            .write_regular_scalars(&folded)
+            .map_err(|_| logup_storage_error())?;
+    }
+
+    let range_child_values = (STRUCTURED_TRANSITION_ORACLES
+        - STRUCTURED_TRANSITION_REGULAR_ORACLES)
+        .checked_mul(child_cells)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    for chunk_start in (0..range_child_values).step_by(LOGUP_PARALLEL_FOLD_CHUNK_VALUES) {
+        let chunk_end = chunk_start
+            .saturating_add(LOGUP_PARALLEL_FOLD_CHUNK_VALUES)
+            .min(range_child_values);
+        let codes = (chunk_start..chunk_end)
+            .into_par_iter()
+            .map(|packed_child| {
+                let selector = STRUCTURED_TRANSITION_REGULAR_ORACLES + packed_child / child_cells;
+                let child_cell = packed_child % child_cells;
+                let lower = u16::from(source.range_digit(selector, child_cell * 2)?);
+                let upper = u16::from(source.range_digit(selector, child_cell * 2 + 1)?);
+                Ok(lower | (upper << 4))
+            })
+            .collect::<Result<Vec<_>, BlsDoryRangeLogUpError>>()?;
+        writer
+            .write_range_codes(&codes)
+            .map_err(|_| logup_storage_error())?;
     }
     writer.finish().map_err(|_| logup_storage_error())
 }
 
-fn for_each_logup_artifact_pair(
-    artifact: &BlsDoryFoldArtifact,
-    expected_spec: BlsDoryFoldArtifactSpec,
+#[allow(clippy::too_many_arguments)]
+fn fold_first_compressed_logup_artifact(
+    artifact: &BlsDoryLogUpArtifact,
+    alpha: BlsDoryFr,
+    challenges: &[BlsDoryFr],
+    selector_rows: usize,
     current_cells: usize,
+    context_digest: [u8; 32],
+    parent_digest: [u8; 32],
+    scratch_directory: &Path,
+) -> Result<BlsDoryLogUpArtifact, BlsDoryRangeLogUpError> {
+    if challenges.len() != 2 || current_cells < 2 || !current_cells.is_power_of_two() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let expected_spec = compressed_logup_spec(
+        context_digest,
+        1,
+        selector_rows,
+        current_cells,
+        parent_digest,
+        alpha,
+        &challenges[..1],
+    )?;
+    if artifact.spec() != expected_spec {
+        return Err(logup_storage_error());
+    }
+    let child_cells = current_cells / 2;
+    let child_spec = compressed_logup_spec(
+        context_digest,
+        2,
+        selector_rows,
+        child_cells,
+        artifact.digest(),
+        alpha,
+        challenges,
+    )?;
+    let mut writer = BlsDoryLogUpArtifactWriter::create(scratch_directory, child_spec)
+        .map_err(|_| logup_storage_error())?;
+    let challenge = challenges[1];
+    let mut pending_regular = None;
+    let mut pending_range = None;
+    let mut regular_chunk = Vec::with_capacity(LOGUP_PARALLEL_FOLD_CHUNK_VALUES);
+    let mut range_chunk = Vec::with_capacity(LOGUP_PARALLEL_FOLD_CHUNK_VALUES);
+    let mut fold_error = None;
+    let read_result = artifact.for_each_value(|value| {
+        let result = match value {
+            BlsDoryLogUpArtifactValue::Regular(value) => {
+                if pending_range.is_some() || !range_chunk.is_empty() {
+                    Err(logup_storage_error())
+                } else if let Some(lower) = pending_regular.take() {
+                    regular_chunk.push(lower + challenge * (value - lower));
+                    if regular_chunk.len() == LOGUP_PARALLEL_FOLD_CHUNK_VALUES {
+                        if writer.write_regular_scalars(&regular_chunk).is_err() {
+                            return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                        }
+                        regular_chunk.clear();
+                    }
+                    Ok(())
+                } else {
+                    pending_regular = Some(value);
+                    Ok(())
+                }
+            }
+            BlsDoryLogUpArtifactValue::Range(code) => {
+                if pending_regular.is_some() {
+                    Err(logup_storage_error())
+                } else {
+                    if !regular_chunk.is_empty() {
+                        if writer.write_regular_scalars(&regular_chunk).is_err() {
+                            return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                        }
+                        regular_chunk.clear();
+                    }
+                    if let Some(lower) = pending_range.take() {
+                        range_chunk.push(lower | (code << 8));
+                        if range_chunk.len() == LOGUP_PARALLEL_FOLD_CHUNK_VALUES {
+                            if writer.write_range_codes(&range_chunk).is_err() {
+                                return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                            }
+                            range_chunk.clear();
+                        }
+                    } else {
+                        pending_range = Some(code);
+                    }
+                    Ok(())
+                }
+            }
+        };
+        if let Err(error) = result {
+            fold_error = Some(error);
+            return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+        }
+        Ok(())
+    });
+    if let Some(error) = fold_error {
+        return Err(error);
+    }
+    read_result.map_err(|_| logup_storage_error())?;
+    if pending_regular.is_some() || pending_range.is_some() {
+        return Err(logup_storage_error());
+    }
+    if !regular_chunk.is_empty() {
+        writer
+            .write_regular_scalars(&regular_chunk)
+            .map_err(|_| logup_storage_error())?;
+    }
+    if !range_chunk.is_empty() {
+        writer
+            .write_range_codes(&range_chunk)
+            .map_err(|_| logup_storage_error())?;
+    }
+    writer.finish().map_err(|_| logup_storage_error())
+}
+
+#[derive(Clone, Copy)]
+struct LogUpLineageReadSpec<'a> {
+    context_digest: [u8; 32],
+    generation: usize,
+    selector_rows: usize,
+    current_cells: usize,
+    parent_digest: [u8; 32],
+    alpha: BlsDoryFr,
+    challenges: &'a [BlsDoryFr],
+}
+
+fn for_each_logup_lineage_value(
+    artifact: &LogUpLineageArtifact,
+    expected: LogUpLineageReadSpec<'_>,
+    mut visitor: impl FnMut(usize, LogUpFoldValues) -> Result<(), BlsDoryRangeLogUpError>,
+) -> Result<(), BlsDoryRangeLogUpError> {
+    if expected.challenges.len() != expected.generation {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let expected_values = STRUCTURED_TRANSITION_ORACLES
+        .checked_mul(expected.current_cells)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    match artifact {
+        LogUpLineageArtifact::Compressed(artifact)
+            if expected.generation <= LOGUP_COMPRESSED_GENERATIONS =>
+        {
+            let expected_spec = compressed_logup_spec(
+                expected.context_digest,
+                expected.generation,
+                expected.selector_rows,
+                expected.current_cells,
+                expected.parent_digest,
+                expected.alpha,
+                expected.challenges,
+            )?;
+            if artifact.spec() != expected_spec {
+                return Err(logup_storage_error());
+            }
+            let dictionary = logup_range_fold_dictionary(
+                expected.generation,
+                expected.alpha,
+                expected.challenges,
+            )?;
+            let regular_values = STRUCTURED_TRANSITION_REGULAR_ORACLES
+                .checked_mul(expected.current_cells)
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+            let mut value_index = 0usize;
+            let mut visitor_error = None;
+            let artifact_result = artifact.for_each_value(|encoded| {
+                let values = match encoded {
+                    BlsDoryLogUpArtifactValue::Regular(transition)
+                        if value_index < regular_values =>
+                    {
+                        LogUpFoldValues {
+                            transition,
+                            inverse: BlsDoryFr::zero(),
+                        }
+                    }
+                    BlsDoryLogUpArtifactValue::Range(code) if value_index >= regular_values => {
+                        match dictionary.get(usize::from(code)).copied() {
+                            Some(values) => values,
+                            None => return Err(BlsDoryLogUpArtifactError::InvalidArtifact),
+                        }
+                    }
+                    _ => return Err(BlsDoryLogUpArtifactError::InvalidArtifact),
+                };
+                if let Err(error) = visitor(value_index, values) {
+                    visitor_error = Some(error);
+                    return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
+                }
+                value_index += 1;
+                Ok(())
+            });
+            if let Some(error) = visitor_error {
+                return Err(error);
+            }
+            artifact_result.map_err(|_| logup_storage_error())?;
+            if value_index != expected_values {
+                return Err(logup_storage_error());
+            }
+        }
+        LogUpLineageArtifact::Scalar(artifact)
+            if expected.generation > LOGUP_COMPRESSED_GENERATIONS =>
+        {
+            let expected_spec = logup_fold_spec(
+                expected.context_digest,
+                expected.generation,
+                expected.selector_rows,
+                expected.current_cells,
+                expected.parent_digest,
+            )?;
+            if artifact.spec() != expected_spec {
+                return Err(logup_storage_error());
+            }
+            let mut values = LogUpFoldValues {
+                transition: BlsDoryFr::zero(),
+                inverse: BlsDoryFr::zero(),
+            };
+            let mut scalar_slot = 0usize;
+            let mut value_index = 0usize;
+            let mut visitor_error = None;
+            let artifact_result = artifact.for_each_scalar(|scalar| {
+                match scalar_slot {
+                    0 => values.transition = scalar,
+                    1 => values.inverse = scalar,
+                    _ => return Err(BlsDoryFoldArtifactError::InvalidArtifact),
+                }
+                scalar_slot += 1;
+                if scalar_slot == LOGUP_FOLD_SLOTS {
+                    if let Err(error) = visitor(value_index, values) {
+                        visitor_error = Some(error);
+                        return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                    }
+                    value_index += 1;
+                    scalar_slot = 0;
+                    values = LogUpFoldValues {
+                        transition: BlsDoryFr::zero(),
+                        inverse: BlsDoryFr::zero(),
+                    };
+                }
+                Ok(())
+            });
+            if let Some(error) = visitor_error {
+                return Err(error);
+            }
+            artifact_result.map_err(|_| logup_storage_error())?;
+            if scalar_slot != 0 || value_index != expected_values {
+                return Err(logup_storage_error());
+            }
+        }
+        _ => return Err(logup_storage_error()),
+    }
+    Ok(())
+}
+
+fn for_each_logup_lineage_pair(
+    artifact: &LogUpLineageArtifact,
+    expected: LogUpLineageReadSpec<'_>,
     mut visitor: impl FnMut(
         usize,
         LogUpFoldValues,
         LogUpFoldValues,
     ) -> Result<(), BlsDoryRangeLogUpError>,
 ) -> Result<(), BlsDoryRangeLogUpError> {
-    if current_cells < 2 || !current_cells.is_power_of_two() {
+    if expected.current_cells < 2 || !expected.current_cells.is_power_of_two() {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
-    if artifact.spec() != expected_spec
-        || !artifact
-            .spec()
-            .explicit_scalar_count
-            .is_multiple_of((LOGUP_FOLD_SLOTS * 2) as u64)
-    {
-        return Err(logup_storage_error());
-    }
-    let mut values = LogUpFoldValues {
-        transition: BlsDoryFr::zero(),
-        inverse: BlsDoryFr::zero(),
-    };
-    let mut scalar_slot = 0usize;
+    let expected_pairs = STRUCTURED_TRANSITION_ORACLES
+        .checked_mul(expected.current_cells / 2)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
     let mut pending = None;
     let mut pair_index = 0usize;
-    let mut visitor_error = None;
-    let artifact_result = artifact.for_each_scalar(|scalar| {
-        match scalar_slot {
-            0 => values.transition = scalar,
-            1 => values.inverse = scalar,
-            _ => return Err(BlsDoryFoldArtifactError::InvalidArtifact),
-        }
-        scalar_slot += 1;
-        if scalar_slot == LOGUP_FOLD_SLOTS {
-            if let Some(lower) = pending.take() {
-                if let Err(error) = visitor(pair_index, lower, values) {
-                    visitor_error = Some(error);
-                    return Err(BlsDoryFoldArtifactError::InvalidArtifact);
-                }
-                pair_index += 1;
-            } else {
-                pending = Some(values);
-            }
-            values = LogUpFoldValues {
-                transition: BlsDoryFr::zero(),
-                inverse: BlsDoryFr::zero(),
-            };
-            scalar_slot = 0;
+    for_each_logup_lineage_value(artifact, expected, |_value_index, values| {
+        if let Some(lower) = pending.take() {
+            visitor(pair_index, lower, values)?;
+            pair_index += 1;
+        } else {
+            pending = Some(values);
         }
         Ok(())
-    });
-    if let Some(error) = visitor_error {
-        return Err(error);
-    }
-    artifact_result.map_err(|_| logup_storage_error())?;
-    let expected_pairs = usize::try_from(expected_spec.explicit_scalar_count)
-        .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?
-        / LOGUP_FOLD_SLOTS
-        / 2;
-    if scalar_slot != 0 || pending.is_some() || pair_index != expected_pairs {
+    })?;
+    if pending.is_some() || pair_index != expected_pairs {
         return Err(logup_storage_error());
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn fold_logup_artifact(
-    artifact: &BlsDoryFoldArtifact,
-    expected_spec: BlsDoryFoldArtifactSpec,
+fn fold_logup_lineage_artifact(
+    artifact: &LogUpLineageArtifact,
+    expected: LogUpLineageReadSpec<'_>,
     challenge: BlsDoryFr,
-    selector_rows: usize,
-    current_cells: usize,
-    context_digest: [u8; 32],
-    generation: usize,
-    parent_digest: [u8; 32],
     scratch_directory: &Path,
 ) -> Result<BlsDoryFoldArtifact, BlsDoryRangeLogUpError> {
-    let child_cells = current_cells
+    let child_cells = expected
+        .current_cells
         .checked_div(2)
         .filter(|cells| *cells > 0)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let generation = expected
+        .generation
+        .checked_add(1)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    if generation <= LOGUP_COMPRESSED_GENERATIONS {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
     let spec = logup_fold_spec(
-        context_digest,
+        expected.context_digest,
         generation,
-        selector_rows,
+        expected.selector_rows,
         child_cells,
-        parent_digest,
+        artifact.digest(),
     )?;
     let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
         .map_err(|_| logup_storage_error())?;
-    for_each_logup_artifact_pair(
-        artifact,
-        expected_spec,
-        current_cells,
-        |_pair_index, lower, upper| {
-            write_logup_fold_values(
-                &mut writer,
-                LogUpFoldValues {
-                    transition: lower.transition
-                        + challenge * (upper.transition - lower.transition),
-                    inverse: lower.inverse + challenge * (upper.inverse - lower.inverse),
-                },
-            )
-        },
-    )?;
+    for_each_logup_lineage_pair(artifact, expected, |_pair_index, lower, upper| {
+        write_logup_fold_values(
+            &mut writer,
+            interpolate_logup_fold_values(lower, upper, challenge),
+        )
+    })?;
     writer.finish().map_err(|_| logup_storage_error())
 }
 
@@ -2034,12 +2491,9 @@ fn raw_logup_artifact_round(
 
 #[allow(clippy::too_many_arguments)]
 fn logup_artifact_round(
-    artifact: &BlsDoryFoldArtifact,
-    expected_spec: BlsDoryFoldArtifactSpec,
+    artifact: &LogUpLineageArtifact,
+    expected: LogUpLineageReadSpec<'_>,
     sparse: &LogUpSparseTables,
-    alpha: BlsDoryFr,
-    selector_rows: usize,
-    current_cells: usize,
     round_index: usize,
     equality_point: &[BlsDoryFr],
     equality_prefix: BlsDoryFr,
@@ -2047,43 +2501,39 @@ fn logup_artifact_round(
     rational_mixing: BlsDoryFr,
     count_mixing: BlsDoryFr,
 ) -> Result<[BlsDoryFr; LOGUP_ROUND_VALUES], BlsDoryRangeLogUpError> {
-    let total_pairs = selector_rows
-        .checked_mul(current_cells / 2)
+    let total_pairs = expected
+        .selector_rows
+        .checked_mul(expected.current_cells / 2)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
     validate_logup_suffix_pairs(equality_point, round_index, total_pairs)?;
     let coordinate = equality_point[round_index];
     let mut suffix_weights = LogUpEqualityWeightIterator::new(&equality_point[round_index + 1..]);
     let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
     let mut visited = 0usize;
-    for_each_logup_artifact_pair(
-        artifact,
-        expected_spec,
-        current_cells,
-        |pair_index, lower, upper| {
-            let suffix = suffix_weights
-                .next()
-                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-            let equality_scale = equality_prefix * suffix;
-            let lower_index = pair_index
-                .checked_mul(2)
-                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-            let selector = lower_index / current_cells;
-            let lower_cell = lower_index % current_cells;
-            accumulate_logup_pair(
-                logup_core_from_fold(lower, selector, lower_cell, sparse),
-                logup_core_from_fold(upper, selector, lower_cell + 1, sparse),
-                equality_scale * (BlsDoryFr::one() - coordinate),
-                equality_scale * coordinate,
-                alpha,
-                local_mixing,
-                rational_mixing,
-                count_mixing,
-                &mut evaluations,
-            );
-            visited += 1;
-            Ok(())
-        },
-    )?;
+    for_each_logup_lineage_pair(artifact, expected, |pair_index, lower, upper| {
+        let suffix = suffix_weights
+            .next()
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        let equality_scale = equality_prefix * suffix;
+        let lower_index = pair_index
+            .checked_mul(2)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        let selector = lower_index / expected.current_cells;
+        let lower_cell = lower_index % expected.current_cells;
+        accumulate_logup_pair(
+            logup_core_from_fold(lower, selector, lower_cell, sparse),
+            logup_core_from_fold(upper, selector, lower_cell + 1, sparse),
+            equality_scale * (BlsDoryFr::one() - coordinate),
+            equality_scale * coordinate,
+            expected.alpha,
+            local_mixing,
+            rational_mixing,
+            count_mixing,
+            &mut evaluations,
+        );
+        visited += 1;
+        Ok(())
+    })?;
     if visited > total_pairs {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
@@ -2091,48 +2541,24 @@ fn logup_artifact_round(
 }
 
 fn logup_selector_values_from_artifact(
-    artifact: &BlsDoryFoldArtifact,
-    expected_spec: BlsDoryFoldArtifactSpec,
+    artifact: &LogUpLineageArtifact,
+    expected: LogUpLineageReadSpec<'_>,
     sparse: &LogUpSparseTables,
-    selector_rows: usize,
 ) -> Result<Vec<LogUpCoreValues>, BlsDoryRangeLogUpError> {
-    if artifact.spec() != expected_spec
-        || expected_spec.explicit_scalar_count
-            != (STRUCTURED_TRANSITION_ORACLES * LOGUP_FOLD_SLOTS) as u64
-    {
-        return Err(logup_storage_error());
+    if expected.current_cells != 1 {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
-    let mut selectors = vec![LogUpCoreValues::zero(); selector_rows];
-    let mut values = LogUpFoldValues {
-        transition: BlsDoryFr::zero(),
-        inverse: BlsDoryFr::zero(),
-    };
-    let mut scalar_slot = 0usize;
+    let mut selectors = vec![LogUpCoreValues::zero(); expected.selector_rows];
     let mut selector = 0usize;
-    artifact
-        .for_each_scalar(|scalar| {
-            match scalar_slot {
-                0 => values.transition = scalar,
-                1 => values.inverse = scalar,
-                _ => return Err(BlsDoryFoldArtifactError::InvalidArtifact),
-            }
-            scalar_slot += 1;
-            if scalar_slot == LOGUP_FOLD_SLOTS {
-                let target = selectors
-                    .get_mut(selector)
-                    .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
-                *target = logup_core_from_fold(values, selector, 0, sparse);
-                selector += 1;
-                scalar_slot = 0;
-                values = LogUpFoldValues {
-                    transition: BlsDoryFr::zero(),
-                    inverse: BlsDoryFr::zero(),
-                };
-            }
-            Ok(())
-        })
-        .map_err(|_| logup_storage_error())?;
-    if scalar_slot != 0 || selector != STRUCTURED_TRANSITION_ORACLES {
+    for_each_logup_lineage_value(artifact, expected, |_value_index, values| {
+        let target = selectors
+            .get_mut(selector)
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        *target = logup_core_from_fold(values, selector, 0, sparse);
+        selector += 1;
+        Ok(())
+    })?;
+    if selector != STRUCTURED_TRANSITION_ORACLES {
         return Err(logup_storage_error());
     }
     Ok(selectors)
@@ -2396,31 +2822,25 @@ fn prove_logup_sumcheck_with_artifacts(
     let mut point = Vec::with_capacity(packed_variables);
     let mut equality_prefix = BlsDoryFr::one();
     let mut sparse = LogUpSparseTables::new(counts, alpha)?;
-    let mut artifact = None;
+    let mut artifact: Option<LogUpLineageArtifact> = None;
     let mut artifact_parent_digest = root_parent_digest;
     let mut current_cells = elements;
 
     for round_index in 0..cell_variables {
-        let expected_spec = artifact
-            .as_ref()
-            .map(|_| {
-                logup_fold_spec(
-                    context_digest,
-                    round_index,
-                    selector_rows,
-                    current_cells,
-                    artifact_parent_digest,
-                )
-            })
-            .transpose()?;
+        let round_expected = artifact.as_ref().map(|_| LogUpLineageReadSpec {
+            context_digest,
+            generation: round_index,
+            selector_rows,
+            current_cells,
+            parent_digest: artifact_parent_digest,
+            alpha,
+            challenges: &point,
+        });
         let evaluations = if let Some(current) = artifact.as_ref() {
             logup_artifact_round(
                 current,
-                expected_spec.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                round_expected.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
                 &sparse,
-                alpha,
-                selector_rows,
-                current_cells,
                 round_index,
                 equality_point,
                 equality_prefix,
@@ -2451,34 +2871,51 @@ fn prove_logup_sumcheck_with_artifacts(
         claim = evaluate_samples(&evaluations, challenge)?;
         point.push(challenge);
 
+        let current_expected = artifact.as_ref().map(|_| LogUpLineageReadSpec {
+            context_digest,
+            generation: round_index,
+            selector_rows,
+            current_cells,
+            parent_digest: artifact_parent_digest,
+            alpha,
+            challenges: &point[..round_index],
+        });
+
         let child_parent_digest = artifact
             .as_ref()
-            .map_or(root_parent_digest, BlsDoryFoldArtifact::digest);
+            .map_or(root_parent_digest, LogUpLineageArtifact::digest);
         let generation = round_index + 1;
-        let child = if let Some(current) = artifact.as_ref() {
-            fold_logup_artifact(
-                current,
-                expected_spec.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
-                challenge,
-                selector_rows,
-                current_cells,
-                context_digest,
-                generation,
-                child_parent_digest,
-                scratch_directory,
-            )?
-        } else {
-            fold_raw_logup_values(
+        let child = match artifact.as_ref() {
+            None => LogUpLineageArtifact::Compressed(fold_raw_logup_values_compressed(
                 source,
                 alpha,
-                challenge,
+                &point,
                 selector_rows,
                 current_cells,
                 context_digest,
-                generation,
                 child_parent_digest,
                 scratch_directory,
-            )?
+            )?),
+            Some(LogUpLineageArtifact::Compressed(current))
+                if generation == LOGUP_COMPRESSED_GENERATIONS =>
+            {
+                LogUpLineageArtifact::Compressed(fold_first_compressed_logup_artifact(
+                    current,
+                    alpha,
+                    &point,
+                    selector_rows,
+                    current_cells,
+                    context_digest,
+                    artifact_parent_digest,
+                    scratch_directory,
+                )?)
+            }
+            Some(current) => LogUpLineageArtifact::Scalar(fold_logup_lineage_artifact(
+                current,
+                current_expected.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                challenge,
+                scratch_directory,
+            )?),
         };
         artifact_parent_digest = child_parent_digest;
         artifact = Some(child);
@@ -2491,20 +2928,21 @@ fn prove_logup_sumcheck_with_artifacts(
         rounds.push(evaluations);
     }
 
-    let expected_spec = logup_fold_spec(
+    let expected_spec = LogUpLineageReadSpec {
         context_digest,
-        cell_variables,
+        generation: cell_variables,
         selector_rows,
-        1,
-        artifact_parent_digest,
-    )?;
+        current_cells: 1,
+        parent_digest: artifact_parent_digest,
+        alpha,
+        challenges: &point,
+    };
     let mut selector_values = logup_selector_values_from_artifact(
         artifact
             .as_ref()
             .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
         expected_spec,
         &sparse,
-        selector_rows,
     )?;
     drop(artifact);
 
@@ -3602,25 +4040,39 @@ mod tests {
         let alpha = BlsDoryFr::from_u64(19);
         let challenge = BlsDoryFr::from_u64(23);
         let scratch_directory = ScratchDirectory::create();
-        let artifact = fold_raw_logup_values(
-            &source,
-            alpha,
-            challenge,
-            selector_rows,
-            elements,
-            [3; 32],
-            1,
-            [9; 32],
-            &scratch_directory.0,
+        let challenges = [challenge];
+        let artifact = LogUpLineageArtifact::Compressed(
+            fold_raw_logup_values_compressed(
+                &source,
+                alpha,
+                &challenges,
+                selector_rows,
+                elements,
+                [3; 32],
+                [9; 32],
+                &scratch_directory.0,
+            )
+            .unwrap(),
+        );
+        let mut parallel = Vec::new();
+        for_each_logup_lineage_value(
+            &artifact,
+            LogUpLineageReadSpec {
+                context_digest: [3; 32],
+                generation: 1,
+                selector_rows,
+                current_cells: elements / 2,
+                parent_digest: [9; 32],
+                alpha,
+                challenges: &challenges,
+            },
+            |_value_index, values| {
+                parallel.push(values.transition);
+                parallel.push(values.inverse);
+                Ok(())
+            },
         )
         .unwrap();
-        let mut parallel = Vec::new();
-        artifact
-            .for_each_scalar(|scalar| {
-                parallel.push(scalar);
-                Ok(())
-            })
-            .unwrap();
         let mut serial = Vec::new();
         for selector in 0..STRUCTURED_TRANSITION_ORACLES {
             for child_cell in 0..elements / 2 {
@@ -3640,19 +4092,128 @@ mod tests {
             .scalar(STRUCTURED_TRANSITION_REGULAR_ORACLES, 0)
             .unwrap();
         assert!(matches!(
-            fold_raw_logup_values(
+            fold_raw_logup_values_compressed(
                 &source,
                 collision_alpha,
-                challenge,
+                &challenges,
                 selector_rows,
                 elements,
                 [3; 32],
-                1,
                 [9; 32],
                 &scratch_directory.0,
             ),
             Err(BlsDoryRangeLogUpError::ChallengeCollision)
         ));
+        assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn second_compressed_fold_matches_scalar_order_and_binds_challenges() {
+        let (statement, witness) = scaled_fixture(4);
+        let packed_variables = 11;
+        let (nu, sigma) = dory_layout(packed_variables);
+        let source = BlsDoryTransitionWitnessRowSource::new(
+            statement,
+            &witness,
+            1usize << nu,
+            1usize << sigma,
+        )
+        .unwrap();
+        let elements = statement.elements().unwrap();
+        let selector_rows = 1usize << (packed_variables - elements.ilog2() as usize);
+        let alpha = BlsDoryFr::from_u64(19);
+        let challenges = [BlsDoryFr::from_u64(23), BlsDoryFr::from_u64(29)];
+        let scratch_directory = ScratchDirectory::create();
+        let first = fold_raw_logup_values_compressed(
+            &source,
+            alpha,
+            &challenges[..1],
+            selector_rows,
+            elements,
+            [3; 32],
+            [9; 32],
+            &scratch_directory.0,
+        )
+        .unwrap();
+        let first_digest = first.digest();
+        let second = fold_first_compressed_logup_artifact(
+            &first,
+            alpha,
+            &challenges,
+            selector_rows,
+            elements / 2,
+            [3; 32],
+            [9; 32],
+            &scratch_directory.0,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(second.path()).unwrap().len(),
+            compressed_logup_spec(
+                [3; 32],
+                2,
+                selector_rows,
+                elements / 4,
+                first_digest,
+                alpha,
+                &challenges,
+            )
+            .unwrap()
+            .encoded_bytes()
+            .unwrap()
+        );
+
+        let lineage = LogUpLineageArtifact::Compressed(second);
+        let expected = LogUpLineageReadSpec {
+            context_digest: [3; 32],
+            generation: 2,
+            selector_rows,
+            current_cells: elements / 4,
+            parent_digest: first_digest,
+            alpha,
+            challenges: &challenges,
+        };
+        let mut compressed = Vec::new();
+        for_each_logup_lineage_value(&lineage, expected, |_index, values| {
+            compressed.push((values.transition, values.inverse));
+            Ok(())
+        })
+        .unwrap();
+
+        let mut scalar = Vec::new();
+        for selector in 0..STRUCTURED_TRANSITION_ORACLES {
+            for child_cell in 0..elements / 4 {
+                let mut level = [LogUpFoldValues {
+                    transition: BlsDoryFr::zero(),
+                    inverse: BlsDoryFr::zero(),
+                }; 4];
+                for (offset, values) in level.iter_mut().enumerate() {
+                    *values =
+                        raw_logup_fold_values(&source, alpha, selector, child_cell * 4 + offset)
+                            .unwrap();
+                }
+                let lower = interpolate_logup_fold_values(level[0], level[1], challenges[0]);
+                let upper = interpolate_logup_fold_values(level[2], level[3], challenges[0]);
+                let values = interpolate_logup_fold_values(lower, upper, challenges[1]);
+                scalar.push((values.transition, values.inverse));
+            }
+        }
+        assert_eq!(compressed, scalar);
+
+        let wrong_challenges = [challenges[0], challenges[1] + BlsDoryFr::one()];
+        assert!(
+            for_each_logup_lineage_value(
+                &lineage,
+                LogUpLineageReadSpec {
+                    challenges: &wrong_challenges,
+                    ..expected
+                },
+                |_index, _values| Ok(()),
+            )
+            .is_err()
+        );
+        drop(lineage);
+        drop(first);
         assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
     }
 
@@ -4019,6 +4580,18 @@ mod tests {
         assert_eq!(
             projected_production_transition_range_source_bytes().unwrap(),
             39_728_448_752
+        );
+        assert_eq!(
+            projected_production_range_logup_compressed_lineage_bytes().unwrap(),
+            [16_173_236_396, 9_730_785_452]
+        );
+        assert_eq!(
+            projected_production_range_logup_early_lineage_peak_bytes().unwrap(),
+            68_786_585_904
+        );
+        assert_eq!(
+            projected_production_range_logup_four_pair_peak_bytes().unwrap(),
+            227_700_380_912
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

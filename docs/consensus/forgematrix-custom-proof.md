@@ -986,8 +986,12 @@ source directly into LogUp instead of writing the same 110-lane table again.
 LogUp still checks its terminal and reconstruction evaluations against the
 shared commitment, and tests reject a same-shape artifact with different
 coefficients. It streams the inverse commitment and folds each cell-variable
-sumcheck round through authenticated
-two-lane artifacts with linear work, and retains only the 128 selector-boundary
+sumcheck round with linear work. The first lineage stores each regular selector
+as one scalar and each range cell as the two original radix-16 digits in one
+byte; the second stores four digits in two bytes. Both formats bind the
+Fiat-Shamir context, reconstruction challenges, dimensions, parent digest, and
+complete payload. Generation three reconstructs the exact two scalar lanes and
+returns to the ordinary fold format. LogUp retains only the 128 selector-boundary
 values at production geometry. Its reconstruction evaluations also stream from
 the witness. Dense and scratch fixtures match exactly at both the minimum layout
 and an extra padded variable. The complete n=33 run has not measured proving
@@ -1001,8 +1005,8 @@ Release-mode scaling makes the remaining LogUp problem concrete. On a Ryzen 9
 9950X3D with 64 GiB RAM under Windows, the exact scratch prover, aggregate
 opening, and unchanged verifier produced these complete results. "Recompute"
 is the rejected `O(N log N)` implementation; "linear" is the current
-lineage-authenticated two-lane artifact implementation with bounded 1 MiB
-artifact reads and writes. Row commitments are computed in deterministic
+lineage-authenticated scalar/compact hybrid with bounded 1 MiB artifact reads
+and writes. Row commitments are computed in deterministic
 parallel batches behind a bounded 256 MiB coefficient window; source reads,
 artifact writes, and target-group accumulation remain in canonical row order.
 The verified model-bank writer now uses the same bounded row-batch boundary:
@@ -1023,9 +1027,9 @@ the same group elements and proof bytes.
 
 | Cell variables | Cells | Packed variables | Recompute prover | Indexed prover | Prepared scratch | Aggregate opening | Verify | Proof | Scratch after proof |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 256 | 15 | 4.696 s | 1.942 s | 153,460 B | 1.805 s | 0.686 s | 38,929 B | 0 B |
-| 10 | 1,024 | 17 | 15.160 s | 4.160 s | 608,116 B | 3.505 s | 1.272 s | 43,329 B | 0 B |
-| 12 | 4,096 | 19 | 53.948 s | 9.714 s | 2,426,740 B | 7.072 s | 2.398 s | 47,729 B | 0 B |
+| 8 | 256 | 15 | 4.696 s | 1.930 s | 153,460 B | 1.799 s | 0.684 s | 38,929 B | 0 B |
+| 10 | 1,024 | 17 | 15.160 s | 4.190 s | 608,116 B | 3.551 s | 1.258 s | 43,329 B | 0 B |
+| 12 | 4,096 | 19 | 53.948 s | 9.484 s | 2,426,740 B | 7.066 s | 2.391 s | 47,729 B | 0 B |
 
 The current implementation derives every child file from the Fiat-Shamir
 challenge, authenticates its complete header and scalar payload, binds it to the
@@ -1035,13 +1039,13 @@ across the buffer boundary. Buffering alone reduced the prior direct-I/O n=19
 measurement from 48.385 to 42.699 seconds proving and from 19.315 to 10.618
 seconds opening. Bounded parallel row commitments reduced proving to 9.952
 seconds, and parallel Dory MSM/vector routines reduced opening from 10.504 to
-7.244 seconds. Hybrid transition and inverse artifacts then measured 9.714
-seconds proving and 7.072 seconds opening; combined time is 68.5% below the
+7.244 seconds. Hybrid source artifacts and compressed early lineages now measure
+9.484 seconds proving and 7.066 seconds opening; combined time is 69.0% below the
 buffered checkpoint. Proof bytes are unchanged, while prepared n=19 scratch is
 83.7% below the inverse-only indexed checkpoint.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
-simultaneous pair of LogUp lineage files at n=19 is exactly 21,627,144 bytes.
+simultaneous LogUp lineage overlap at n=19 is now exactly 4,198,704 bytes.
 Aggregate preparation now derives the complete sumcheck, combined row
 commitments, and `L^T M` vector before final Dory proving. The shared path then
 consumes its deferred openings, releases their authenticated coefficient
@@ -1050,16 +1054,18 @@ sources. A direct test deletes the source at that boundary and obtains the same
 proof bytes; the three standalone benchmark runs leave zero scratch bytes after
 proof completion. These are component measurements, not production results.
 
-A linear extrapolation from n=19 to n=33 gives about 1.84 CPU days for the
-LogUp prover and 1.34 days for the aggregate opening. The first two production
-lineage generations project to 220 and 110 GiB, so their transient overlap is
-about 330 GiB. Exact production geometry stores the transition's 805,306,368
+A linear extrapolation from n=19 to n=33 gives about 1.80 CPU days for the
+LogUp prover and 1.34 days for the aggregate opening. The first two compressed
+production lineages are exactly 16,173,236,396 and 9,730,785,452 bytes. Their
+overlap is 24.125 GiB; the larger overlap with the generation-three scalar child
+is 68,786,585,904 bytes, or about 64.06 GiB, instead of the former 330 GiB.
+Exact production geometry stores the transition's 805,306,368
 regular scalars and 6,576,668,672 digit codes in 30.125 GiB plus framing. Its
 7,381,975,040 inverse codes occupy 6.875 GiB plus 648 framing bytes. One
 retained transition/inverse pair is about 37 GiB; four pairs project to about
-148 GiB, with the fourth-pair lineage overlap putting the earlier peak near
-478 GiB. Executable projection functions pin the exact artifact sizes at
-32,346,473,064 and 7,381,975,688 bytes. These extrapolations reject the
+148 GiB, with the fourth-pair lineage overlap putting the earlier peak at
+227,700,380,912 bytes, or about 212.06 GiB. Executable projection functions pin
+all source, lineage, and peak sizes. These extrapolations still reject the
 current CPU and storage pipeline for production; they are not n=33 measurements.
 The new consuming boundary removes those sources before the final Dory
 reduction and after proof completion, but it does not lower the earlier peak.

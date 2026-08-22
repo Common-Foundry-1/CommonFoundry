@@ -56,7 +56,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel commitments, compact transition sources, mapped inverse views, compressed early LogUp lineages, and consuming openings preserve exact proofs; n=19 still takes 9.479 seconds proving plus 7.048 seconds opening, projects to roughly 1.80 plus 1.34 CPU days at n=33, and the fourth range pair still projects near 112.56 GiB peak scratch",
+    "bounded parallel commitments, compact transition sources, mapped inverse views, four compressed LogUp generations, and consuming openings preserve exact proofs; n=19 still takes 9.431 seconds proving plus 7.064 seconds opening, projects to roughly 1.79 plus 1.34 CPU days at n=33, and the fourth range pair still projects near 72.62 GiB peak scratch",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];

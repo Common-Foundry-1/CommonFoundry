@@ -986,12 +986,13 @@ source directly into LogUp instead of writing the same 110-lane table again.
 LogUp still checks its terminal and reconstruction evaluations against the
 shared commitment, and tests reject a same-shape artifact with different
 coefficients. It streams the inverse commitment and folds each cell-variable
-sumcheck round with linear work. The first lineage stores each regular selector
-as one scalar and each range cell as the two original radix-16 digits in one
-byte; the second stores four digits in two bytes. Both formats bind the
-Fiat-Shamir context, reconstruction challenges, dimensions, parent digest, and
-complete payload. Generation three reconstructs the exact two scalar lanes and
-returns to the ordinary fold format. LogUp retains only the 128 selector-boundary
+sumcheck round with linear work. The first four lineages store each regular
+selector as one scalar and each range cell as the original radix-16 digits in
+one-, two-, four-, and eight-byte codes. They represent two, four, eight, and
+sixteen digits respectively. Every format binds the Fiat-Shamir context,
+reconstruction challenges, dimensions, parent digest, and complete payload.
+Generation five reconstructs the exact two scalar lanes and returns to the
+ordinary fold format. LogUp retains only the 128 selector-boundary
 values at production geometry. Its reconstruction evaluations also stream from
 the witness. Dense and scratch fixtures match exactly at both the minimum layout
 and an extra padded variable. The complete n=33 run has not measured proving
@@ -1028,9 +1029,9 @@ the same group elements and proof bytes.
 
 | Cell variables | Cells | Packed variables | Recompute prover | Compact prover | Prepared scratch | Aggregate opening | Verify | Proof | Scratch after proof |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 256 | 15 | 4.696 s | 1.942 s | 50,940 B | 1.773 s | 0.684 s | 38,929 B | 0 B |
-| 10 | 1,024 | 17 | 15.160 s | 4.117 s | 199,932 B | 3.534 s | 1.284 s | 43,329 B | 0 B |
-| 12 | 4,096 | 19 | 53.948 s | 9.479 s | 795,900 B | 7.048 s | 2.391 s | 47,729 B | 0 B |
+| 8 | 256 | 15 | 4.696 s | 1.925 s | 50,940 B | 1.803 s | 0.681 s | 38,929 B | 0 B |
+| 10 | 1,024 | 17 | 15.160 s | 4.097 s | 199,932 B | 3.513 s | 1.254 s | 43,329 B | 0 B |
+| 12 | 4,096 | 19 | 53.948 s | 9.431 s | 795,900 B | 7.064 s | 2.377 s | 47,729 B | 0 B |
 
 The current implementation derives every child file from the Fiat-Shamir
 challenge, authenticates its complete header and scalar payload, binds it to the
@@ -1040,13 +1041,13 @@ across the buffer boundary. Buffering alone reduced the prior direct-I/O n=19
 measurement from 48.385 to 42.699 seconds proving and from 19.315 to 10.618
 seconds opening. Bounded parallel row commitments reduced proving to 9.952
 seconds, and parallel Dory MSM/vector routines reduced opening from 10.504 to
-7.244 seconds. Compact transition artifacts, mapped inverse views, and compressed
-early lineages now measure 9.479 seconds proving and 7.048 seconds opening;
+7.244 seconds. Compact transition artifacts, mapped inverse views, and four
+compressed lineage generations now measure 9.431 seconds proving and 7.064 seconds opening;
 combined time is 69.0% below the buffered checkpoint. Proof bytes are unchanged,
 while prepared n=19 scratch is 36.2% below the preceding compact-source checkpoint.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
-simultaneous LogUp lineage overlap at n=19 is now exactly 4,198,704 bytes.
+simultaneous LogUp lineage overlap at n=19 is now exactly 1,581,400 bytes.
 Aggregate preparation now derives the complete sumcheck, combined row
 commitments, and `L^T M` vector before final Dory proving. The shared path then
 consumes its deferred openings, releases their authenticated coefficient
@@ -1055,17 +1056,19 @@ sources. A direct test deletes the source at that boundary and obtains the same
 proof bytes; the three standalone benchmark runs leave zero scratch bytes after
 proof completion. These are component measurements, not production results.
 
-A linear extrapolation from n=19 to n=33 gives about 1.80 CPU days for the
-LogUp prover and 1.34 days for the aggregate opening. The first two compressed
-production lineages are exactly 16,173,236,396 and 9,730,785,452 bytes. Their
-overlap is 24.125 GiB; the larger overlap with the generation-three scalar child
-is 68,786,585,904 bytes, or about 64.06 GiB, instead of the former 330 GiB.
+A linear extrapolation from n=19 to n=33 gives about 1.79 CPU days for the
+LogUp prover and 1.34 days for the aggregate opening. The four compressed
+production lineages are exactly 16,173,236,396, 9,730,785,452,
+6,509,559,980, and 4,898,947,244 bytes. Their maximum adjacent overlap remains
+the first two at 25,904,021,848 bytes, or about 24.125 GiB. Delaying the first
+ordinary scalar artifact until generation five removes the former 64.06 GiB
+transition overlap.
 Exact production geometry stores the transition's 805,306,368
 regular 64-bit words and 6,576,668,672 digit codes in 12.125 GiB plus framing.
 The mapped inverse reuses those authenticated digits and adds no coefficient
 file. One retained transition/inverse pair is about 12.125 GiB; four pairs
 project to about 48.5 GiB, with the fourth-pair lineage overlap putting the
-earlier peak at 120,863,066,896 bytes, or about 112.56 GiB. Executable projection functions pin
+earlier peak at 77,980,502,840 bytes, or about 72.62 GiB. Executable projection functions pin
 all source, lineage, and peak sizes. These extrapolations still reject the
 current CPU and storage pipeline for production; they are not n=33 measurements.
 The new consuming boundary removes those sources before the final Dory

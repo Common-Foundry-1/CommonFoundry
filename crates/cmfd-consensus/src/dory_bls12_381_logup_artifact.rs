@@ -1,10 +1,10 @@
-//! Self-authenticating compressed artifacts for the first two LogUp folds.
+//! Self-authenticating compressed artifacts for the first four LogUp folds.
 //!
 //! Regular transition selectors store one canonical scalar because their
-//! inverse lane is identically zero. Range selectors store the two original
-//! radix-16 digits behind a generation-one cell in one byte, or the four
-//! digits behind a generation-two cell in two bytes. The reader reconstructs
-//! the exact folded transition and inverse values using the bound challenges.
+//! inverse lane is identically zero. Range selectors retain the original
+//! radix-16 digits behind each folded cell in one, two, four, or eight bytes.
+//! The reader reconstructs the exact folded transition and inverse values
+//! using the bound challenges.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -51,6 +51,8 @@ impl BlsDoryLogUpArtifactSpec {
         match self.generation {
             1 => Ok(1),
             2 => Ok(2),
+            3 => Ok(4),
+            4 => Ok(8),
             _ => Err(BlsDoryLogUpArtifactError::InvalidSpec),
         }
     }
@@ -124,7 +126,7 @@ pub enum BlsDoryLogUpArtifactError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlsDoryLogUpArtifactValue {
     Regular(BlsDoryFr),
-    Range(u16),
+    Range(u64),
 }
 
 pub struct BlsDoryLogUpArtifactWriter {
@@ -196,7 +198,7 @@ impl BlsDoryLogUpArtifactWriter {
         Ok(())
     }
 
-    pub fn write_range_codes(&mut self, codes: &[u16]) -> Result<(), BlsDoryLogUpArtifactError> {
+    pub fn write_range_codes(&mut self, codes: &[u64]) -> Result<(), BlsDoryLogUpArtifactError> {
         if self.written_regular != self.spec.regular_value_count()? {
             return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
         }
@@ -206,12 +208,15 @@ impl BlsDoryLogUpArtifactWriter {
             .written_range
             .checked_add(count)
             .ok_or(BlsDoryLogUpArtifactError::InvalidArtifact)?;
-        if next > self.spec.range_value_count()?
-            || (self.spec.generation == 1 && codes.iter().any(|code| *code > u16::from(u8::MAX)))
-        {
+        let code_bytes = self.spec.code_bytes()?;
+        let maximum_code = if code_bytes == std::mem::size_of::<u64>() {
+            u64::MAX
+        } else {
+            (1u64 << (code_bytes * 8)) - 1
+        };
+        if next > self.spec.range_value_count()? || codes.iter().any(|code| *code > maximum_code) {
             return Err(BlsDoryLogUpArtifactError::InvalidArtifact);
         }
-        let code_bytes = self.spec.code_bytes()?;
         let mut encoded = Vec::with_capacity(codes.len().saturating_mul(code_bytes));
         for code in codes {
             encoded.extend_from_slice(&code.to_le_bytes()[..code_bytes]);
@@ -313,11 +318,9 @@ impl BlsDoryLogUpArtifact {
                 reader.read_exact(&mut buffer[..bytes])?;
                 hasher.update(&buffer[..bytes]);
                 for encoded in buffer[..bytes].chunks_exact(code_bytes) {
-                    let code = if code_bytes == 1 {
-                        u16::from(encoded[0])
-                    } else {
-                        u16::from_le_bytes([encoded[0], encoded[1]])
-                    };
+                    let mut word = [0u8; std::mem::size_of::<u64>()];
+                    word[..code_bytes].copy_from_slice(encoded);
+                    let code = u64::from_le_bytes(word);
                     visitor(BlsDoryLogUpArtifactValue::Range(code))?;
                 }
                 remaining -= values as u64;
@@ -470,12 +473,12 @@ mod tests {
             .map(|value| BlsDoryFr::from_u64(value * 17 + 1))
             .collect::<Vec<_>>();
         let range = (0..artifact_spec.range_value_count()?)
-            .map(|value| {
-                if generation == 1 {
-                    (value * 19) as u16 & 0xff
-                } else {
-                    (value * 4099) as u16
-                }
+            .map(|value| match generation {
+                1 => value.wrapping_mul(19) & 0xff,
+                2 => value.wrapping_mul(4_099) & 0xffff,
+                3 => value.wrapping_mul(1_000_003) & 0xffff_ffff,
+                4 => value.wrapping_mul(1_000_000_007),
+                _ => unreachable!(),
             })
             .collect::<Vec<_>>();
         let mut writer = BlsDoryLogUpArtifactWriter::create(directory, artifact_spec)?;
@@ -485,8 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn both_generations_round_trip_and_clean_on_drop() {
-        for generation in [1, 2] {
+    fn every_generation_round_trips_and_cleans_on_drop() {
+        for generation in [1, 2, 3, 4] {
             let directory = TestDirectory::create();
             let artifact = artifact(&directory.0, generation).unwrap();
             let path = artifact.path().to_path_buf();
@@ -518,24 +521,26 @@ mod tests {
 
     #[test]
     fn corruption_and_truncation_abort_without_leaking_files() {
-        for truncate in [false, true] {
-            let directory = TestDirectory::create();
-            let artifact = artifact(&directory.0, 2).unwrap();
-            let path = artifact.path().to_path_buf();
-            if truncate {
-                let file = OpenOptions::new().write(true).open(&path).unwrap();
-                file.set_len(std::fs::metadata(&path).unwrap().len() - 1)
-                    .unwrap();
-            } else {
-                let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-                file.seek(SeekFrom::Start(ARTIFACT_HEADER_BYTES as u64 + 3))
-                    .unwrap();
-                file.write_all(&[0xa5]).unwrap();
-                file.flush().unwrap();
+        for generation in [1, 2, 3, 4] {
+            for truncate in [false, true] {
+                let directory = TestDirectory::create();
+                let artifact = artifact(&directory.0, generation).unwrap();
+                let path = artifact.path().to_path_buf();
+                if truncate {
+                    let file = OpenOptions::new().write(true).open(&path).unwrap();
+                    file.set_len(std::fs::metadata(&path).unwrap().len() - 1)
+                        .unwrap();
+                } else {
+                    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+                    file.seek(SeekFrom::Start(ARTIFACT_HEADER_BYTES as u64 + 3))
+                        .unwrap();
+                    file.write_all(&[0xa5]).unwrap();
+                    file.flush().unwrap();
+                }
+                assert!(artifact.for_each_value(|_| Ok(())).is_err());
+                drop(artifact);
+                assert!(!path.exists());
             }
-            assert!(artifact.for_each_value(|_| Ok(())).is_err());
-            drop(artifact);
-            assert!(!path.exists());
         }
     }
 
@@ -570,8 +575,34 @@ mod tests {
         writer
             .write_regular_scalars(&vec![BlsDoryFr::one(); 8])
             .unwrap();
-        assert!(writer.write_range_codes(&[u16::MAX]).is_err());
+        assert!(writer.write_range_codes(&[u64::MAX]).is_err());
         drop(writer);
         assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn generation_code_widths_are_canonical_and_bounded() {
+        for (generation, code_bytes) in [(1, 1usize), (2, 2), (3, 4), (4, 8)] {
+            assert_eq!(spec(generation).code_bytes().unwrap(), code_bytes);
+            let directory = TestDirectory::create();
+            let mut writer =
+                BlsDoryLogUpArtifactWriter::create(&directory.0, spec(generation)).unwrap();
+            writer
+                .write_regular_scalars(&vec![BlsDoryFr::one(); 8])
+                .unwrap();
+            if code_bytes < std::mem::size_of::<u64>() {
+                assert!(
+                    writer
+                        .write_range_codes(&[1u64 << (code_bytes * 8)])
+                        .is_err()
+                );
+            } else {
+                writer.write_range_codes(&[u64::MAX]).unwrap();
+            }
+            drop(writer);
+            assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+        }
+        assert!(spec(0).validate().is_err());
+        assert!(spec(5).validate().is_err());
     }
 }

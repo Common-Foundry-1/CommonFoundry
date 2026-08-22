@@ -486,11 +486,13 @@ comparison. The v2 research code now implements:
   48.5 GiB instead of 1.76 TiB.
   LogUp streams its inverse commitment and folds cell-variable rounds in linear
   work. Its first authenticated lineage stores regular selectors as one scalar
-  and range cells as one-byte codes for two original radix-16 digits; its second
-  uses two-byte codes for four digits. The header binds the transcript context,
-  reconstruction challenges, dimensions, parent digest, and complete payload.
-  Generation three reconstructs the exact two scalar lanes and returns to the
-  ordinary bounded-I/O fold artifact. LogUp retains only the 128 production
+  and range cells as one-byte codes for two original radix-16 digits. The next
+  three generations use two-, four-, and eight-byte codes for four, eight, and
+  sixteen digits. The header binds the transcript context, reconstruction
+  challenges, dimensions, parent digest, and complete payload. Each reader
+  reconstructs the exact transition and inverse scalars from the bound digit
+  sequence, and generation five returns to the ordinary bounded-I/O fold
+  artifact. LogUp retains only the 128 production
   selector-boundary values, and streams reconstruction evaluations. Dense and
   scratch outputs match exactly. Commitment rows now execute in deterministic
   parallel batches behind a bounded 256 MiB coefficient window, while source
@@ -506,15 +508,16 @@ comparison. The v2 research code now implements:
   combined row commitments, and `L^T M`, then releases deferred coefficient
   artifacts before the final Dory reduction. Direct testing preserves exact
   proof bytes, and standalone n=15, n=17, and n=19 runs leave zero scratch after
-  completion. At n=19 the latest linear prover took 9.479 seconds versus
+  completion. At n=19 the latest linear prover took 9.431 seconds versus
   42.699 seconds for the buffered serial-row checkpoint and 53.948 seconds for
-  the rejected recomputation path. Aggregate opening took 7.048 seconds,
+  the rejected recomputation path. Aggregate opening took 7.064 seconds,
   prepared scratch was 795,900 bytes, and the verified proof remained 47,729
-  bytes. Extrapolation to n=33 still gives roughly 1.80 CPU proving days and
-  1.34 aggregate-opening days. Exact projection puts the first two compressed
-  lineages at 15.06 and 9.06 GiB and their maximum overlap with the first scalar
-  child at 64.06 GiB. With four retained source pairs, the projected scratch
-  peak is about 112.56 GiB instead of 478 GiB. This rejects the current
+  bytes. Extrapolation to n=33 still gives roughly 1.79 CPU proving days and
+  1.34 aggregate-opening days. Exact projection puts the four compressed
+  lineages at 15.06, 9.06, 6.06, and 4.56 GiB. Their maximum overlap is the
+  first two at 24.125 GiB; the first ordinary scalar child is delayed until
+  generation five. With four retained source pairs, the projected scratch
+  peak is about 72.62 GiB instead of 478 GiB. This rejects the current
   CPU/storage pipeline
   for production; GPU or distributed folds, aggregation or regeneration before
   all pair sources accumulate, and a complete measured n=33 run remain required;

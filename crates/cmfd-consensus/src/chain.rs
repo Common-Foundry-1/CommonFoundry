@@ -1343,7 +1343,8 @@ fn encode_bytes(bytes: &[u8], hasher: &mut Hasher) {
 mod tests {
     use super::*;
     use crate::{
-        DEFAULT_MONETARY_POLICY, ForgeMatrixProfile, PowParameters, TEST_PROFILE, v2_test_reference,
+        DEFAULT_MONETARY_POLICY, ForgeMatrixProfile, ForgeMatrixV3CandidateProof, PowParameters,
+        TEST_PROFILE, v2_test_reference,
     };
     use cmfd_marketplace::{ChannelTerms, Settlement, SignedPaymentState};
 
@@ -2143,6 +2144,44 @@ mod tests {
         );
         assert_eq!(state.tip(), tip);
         assert_eq!(state.next_height(), 2);
+    }
+
+    #[test]
+    fn v3_candidate_block_id_binds_public_fields_length_and_structured_bytes() {
+        let verifier = legacy_verifier();
+        let mut block = block_with_transactions(1, [0; 32], vec![], 0, &verifier);
+        block.proof = BlockProof::V3Candidate(Box::new(ForgeMatrixV3CandidateProof {
+            algorithm_version: 3,
+            proof_version: 1,
+            nonce: 7,
+            model_manifest_digest: [1; 32],
+            challenge_digest: [2; 32],
+            final_activation_digest: [3; 32],
+            work_digest: [4; 32],
+            structured_proof: vec![5, 6, 7],
+        }));
+        let original_id = block.block_id();
+
+        let mut changed_public_field = block.clone();
+        let BlockProof::V3Candidate(proof) = &mut changed_public_field.proof else {
+            unreachable!();
+        };
+        proof.final_activation_digest[0] ^= 1;
+        assert_ne!(changed_public_field.block_id(), original_id);
+
+        let mut changed_structured_byte = block.clone();
+        let BlockProof::V3Candidate(proof) = &mut changed_structured_byte.proof else {
+            unreachable!();
+        };
+        proof.structured_proof[0] ^= 1;
+        assert_ne!(changed_structured_byte.block_id(), original_id);
+
+        let mut changed_structured_length = block;
+        let BlockProof::V3Candidate(proof) = &mut changed_structured_length.proof else {
+            unreachable!();
+        };
+        proof.structured_proof.push(8);
+        assert_ne!(changed_structured_length.block_id(), original_id);
     }
 
     #[test]

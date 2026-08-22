@@ -1182,18 +1182,25 @@ For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
 proof is bounded at 87,556 bytes, and the remaining aggregate components are
 exactly 16,804 bytes. The aggregate maximum is therefore 258,612 bytes.
-Retaining the current 193-byte V2 proof frame and adding a four-byte aggregate
-length gives a 258,809-byte full-wire maximum, leaving 3,335 bytes below the
-256 KiB cap. This bound does not use the smaller path dictionaries observed in
-individual prover runs and applies only to the tiny research fixture, not the
-production shape.
+The reserved `BlockProof::V3Candidate` frame keeps the same 177-byte public
+payload, adds a canonical four-byte aggregate length, and remains under the
+same 16-byte outer header. It therefore gives the tiny fixture a 258,809-byte
+full-wire maximum, leaving 3,335 bytes below the 256 KiB cap. The executable
+codec admits at most 261,947 structured-proof bytes, rejects zero length and
+oversize declarations before allocation, and binds the proof type, public
+fields, aggregate length, and exact aggregate bytes into the block ID. This
+bound does not use the smaller path dictionaries observed in individual prover
+runs and applies only to the tiny research fixture, not the production shape.
 
 Native proof v2, structured aggregate v3, split v3, and the revised suite
 identity are a hard cutover for research artifacts. Older explicit proofs,
 structured proofs, model bundles, and source pointers must be regenerated. This
-does not fork the current Devnet block format because succinct WHIR is not yet a
-block-proof variant; activation requires a new proof tag rather than reusing
-the compact reference tag.
+does not fork the current Devnet block format. Proof tag 3 is reserved for the
+candidate envelope, but `PowParameters` exposes no V3 selection and
+`ConsensusPowVerifier` rejects it as the wrong proof type. Activation still
+requires a pinned structured-proof parser, final model and verifier parameters,
+resource-bounded verification, network fingerprint changes, and explicit
+consensus selection rather than reusing the compact reference tag.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and

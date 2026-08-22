@@ -12,6 +12,8 @@ use crate::{
 
 pub const POW_TYPE_V1_LEGACY: u16 = 1;
 pub const POW_TYPE_V2_REFERENCE: u16 = 2;
+/// Reserved wire identity for the fail-closed structured production candidate.
+pub const POW_TYPE_V3_CANDIDATE: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowParameters {
@@ -23,6 +25,25 @@ pub enum PowParameters {
 pub enum BlockProof {
     V1Legacy(ForgeMatrixProof),
     V2Reference(ForgeMatrixV2CompactProof),
+    /// Length-bounded production candidate. No consensus verifier can select
+    /// this variant until the final model and proof parameters are pinned.
+    V3Candidate(Box<ForgeMatrixV3CandidateProof>),
+}
+
+/// Existing V2 public fields plus one canonical structured aggregate encoding.
+///
+/// The aggregate stays opaque at the block framing layer so expensive parsing
+/// and cryptographic verification can run in a separately bounded verifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeMatrixV3CandidateProof {
+    pub algorithm_version: u32,
+    pub proof_version: u32,
+    pub nonce: u64,
+    pub model_manifest_digest: [u8; 32],
+    pub challenge_digest: [u8; 32],
+    pub final_activation_digest: [u8; 32],
+    pub work_digest: [u8; 32],
+    pub structured_proof: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -101,6 +122,7 @@ impl BlockProof {
         match self {
             Self::V1Legacy(_) => POW_TYPE_V1_LEGACY,
             Self::V2Reference(_) => POW_TYPE_V2_REFERENCE,
+            Self::V3Candidate(_) => POW_TYPE_V3_CANDIDATE,
         }
     }
 
@@ -110,6 +132,7 @@ impl BlockProof {
         match self {
             Self::V1Legacy(proof) => proof.work_digest,
             Self::V2Reference(proof) => proof.work_digest,
+            Self::V3Candidate(proof) => proof.work_digest,
         }
     }
 
@@ -132,6 +155,17 @@ impl BlockProof {
                 hasher.update(&proof.challenge_digest);
                 hasher.update(&proof.final_activation_digest);
                 hasher.update(&proof.work_digest);
+            }
+            Self::V3Candidate(proof) => {
+                hasher.update(&proof.algorithm_version.to_le_bytes());
+                hasher.update(&proof.proof_version.to_le_bytes());
+                hasher.update(&proof.nonce.to_le_bytes());
+                hasher.update(&proof.model_manifest_digest);
+                hasher.update(&proof.challenge_digest);
+                hasher.update(&proof.final_activation_digest);
+                hasher.update(&proof.work_digest);
+                hasher.update(&(proof.structured_proof.len() as u64).to_le_bytes());
+                hasher.update(&proof.structured_proof);
             }
         }
     }

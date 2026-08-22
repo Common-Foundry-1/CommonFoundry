@@ -3959,6 +3959,7 @@ mod tests {
         let proof_nonce = match &block.proof {
             BlockProof::V1Legacy(proof) => proof.nonce,
             BlockProof::V2Reference(proof) => proof.nonce,
+            BlockProof::V3Candidate(proof) => proof.nonce,
         };
         assert_eq!(attempts_completed, proof_nonce.wrapping_add(1));
         assert_eq!(next_nonce, proof_nonce.wrapping_add(1));
@@ -4156,6 +4157,7 @@ mod tests {
         match &mut mutated_work {
             BlockProof::V1Legacy(proof) => proof.work_digest[0] ^= 1,
             BlockProof::V2Reference(proof) => proof.work_digest[0] ^= 1,
+            BlockProof::V3Candidate(proof) => proof.work_digest[0] ^= 1,
         }
         assert!(job.build_block_if_chain_valid(&mutated_work).is_err());
 
@@ -4163,6 +4165,7 @@ mod tests {
         match &mut mutated_nonce {
             BlockProof::V1Legacy(proof) => proof.nonce = proof.nonce.wrapping_add(1),
             BlockProof::V2Reference(proof) => proof.nonce = proof.nonce.wrapping_add(1),
+            BlockProof::V3Candidate(proof) => proof.nonce = proof.nonce.wrapping_add(1),
         }
         assert!(job.build_block_if_chain_valid(&mutated_nonce).is_err());
 

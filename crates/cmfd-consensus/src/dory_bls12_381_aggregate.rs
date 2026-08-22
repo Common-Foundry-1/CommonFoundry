@@ -29,7 +29,7 @@ use crate::dory_bls12_381_fold_artifact::{
 use crate::dory_bls12_381_prototype::{
     BlsDoryCurve, BlsDoryFr, BlsDoryG1, BlsDoryG1Routines, BlsDoryG2, BlsDoryG2Routines, BlsDoryGt,
     BlsDoryPolynomial, BlsDoryTranscript, DeterministicBlsDorySetup,
-    MAX_BLS_DORY_PROTOTYPE_VARIABLES,
+    MAX_BLS_DORY_PROTOTYPE_VARIABLES, MAX_BLS_DORY_SETUP_VARIABLES,
 };
 use crate::dory_bls12_381_streaming::{
     BlsDoryRowSource, prove_bls_dory_opening_from_vector_product,
@@ -47,7 +47,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "authenticated scratch paths cover every component and LogUp now recomputes its cell-variable rounds with bounded memory, but the complete n=33 proof has not been measured end to end",
+    "authenticated scratch paths cover every component, but n=19 scaling projects the linear LogUp fold near 9.2 CPU days and retained opening sources near 440 GiB per range instance at n=33",
     "the executable algebraic aggregate bound exists, but Dory and Fiat-Shamir soundness have not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
 ];
@@ -424,6 +424,9 @@ pub fn commit_bls_dory_polynomial(
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
     validate_layout(nu, sigma)?;
     let variables = nu + sigma;
+    if variables > MAX_BLS_DORY_PROTOTYPE_VARIABLES {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
     let expected = 1usize
         .checked_shl(variables as u32)
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
@@ -529,6 +532,9 @@ pub(crate) fn commit_bls_dory_padded_prefix_with_optional_scratch(
             setup,
             scratch_directory,
         );
+    }
+    if nu + sigma > MAX_BLS_DORY_PROTOTYPE_VARIABLES {
+        return Err(BlsDoryAggregateError::InvalidDimension);
     }
 
     let mut padded = coefficients.to_vec();
@@ -940,7 +946,7 @@ fn validate_layout(nu: usize, sigma: usize) -> Result<(), BlsDoryAggregateError>
     let variables = nu
         .checked_add(sigma)
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-    if variables == 0 || variables > MAX_BLS_DORY_PROTOTYPE_VARIABLES || nu > sigma {
+    if variables == 0 || variables > MAX_BLS_DORY_SETUP_VARIABLES || nu > sigma {
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
     Ok(())
@@ -2253,6 +2259,57 @@ mod tests {
         )
         .unwrap();
         drop(sparse);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn aggregate_layout_allows_the_setup_cap() {
+        validate_layout(8, MAX_BLS_DORY_SETUP_VARIABLES - 8).unwrap();
+        assert_eq!(
+            validate_layout(8, MAX_BLS_DORY_SETUP_VARIABLES - 7),
+            Err(BlsDoryAggregateError::InvalidDimension)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only integration above the dense Dory variable cap"]
+    fn authenticated_scratch_accepts_above_the_dense_variable_cap() {
+        let variables = MAX_BLS_DORY_PROTOTYPE_VARIABLES + 1;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let coefficients = (0..64)
+            .map(|index| BlsDoryFr::from_u64(index + 1))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            commit_bls_dory_padded_prefix_with_optional_scratch(
+                &coefficients,
+                nu,
+                sigma,
+                &setup,
+                None,
+            ),
+            Err(BlsDoryAggregateError::InvalidDimension)
+        ));
+        let polynomial = commit_bls_dory_padded_prefix_with_optional_scratch(
+            &coefficients,
+            nu,
+            sigma,
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        let point = (0..variables)
+            .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 3) * 11))
+            .collect::<Vec<_>>();
+        let claim = BlsDoryOpeningClaim {
+            commitment: polynomial.commitment(),
+            evaluation: polynomial.evaluate(&point).unwrap(),
+            point,
+        };
+        statement_transcript(b"above-dense-cap", &setup.identity(), &[claim], nu, sigma).unwrap();
+        drop(polynomial);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

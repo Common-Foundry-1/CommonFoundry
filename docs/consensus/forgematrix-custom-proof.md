@@ -962,16 +962,49 @@ round, keeps equality-selector weights implicit, and authenticates later folds
 in scratch artifacts with 12 live lanes inside a 16-scalar row. The standalone
 aggregate and complete shared-layout fixture produce exactly the same proof
 through that path. The scratch LogUp prover streams the transition and inverse
-commitments, recomputes each cell-variable sumcheck round directly from the
-validated witness with constant-size accumulators, and retains only the 128
-selector-boundary values at production geometry. Its reconstruction evaluations
-also stream from the witness. Dense and scratch fixtures match exactly at both
-the minimum layout and an extra padded variable. The complete n=33 run has not
-yet measured proving latency, verification latency, peak memory, scratch use, or
-final proof size; recomputation cost is therefore still an activation gate.
+commitments, folds each cell-variable sumcheck round through authenticated
+two-lane artifacts with linear work, and retains only the 128 selector-boundary
+values at production geometry. Its reconstruction evaluations also stream from
+the witness. Dense and scratch fixtures match exactly at both the minimum layout
+and an extra padded variable. The complete n=33 run has not measured proving
+latency, verification latency, peak memory, scratch use, or final proof size;
+CPU fold latency and retained source storage therefore remain activation gates.
 Executing the final model commitment ceremony, independent review of the
 transcript and soundness accounting, and external audit also remain activation
 requirements.
+
+Release-mode scaling makes the remaining LogUp problem concrete. On a Ryzen 9
+9950X3D with 64 GiB RAM under Windows, the exact scratch prover, aggregate
+opening, and unchanged verifier produced these complete results. "Recompute"
+is the rejected `O(N log N)` implementation; "linear" is the current
+lineage-authenticated two-lane artifact implementation.
+
+| Cell variables | Cells | Packed variables | Recompute prover | Linear prover | Aggregate opening | Verify | Proof | Retained scratch |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 256 | 15 | 4.696 s | 4.489 s | 3.139 s | 0.681 s | 38,929 B | 1,803,148 B |
+| 10 | 1,024 | 17 | 15.160 s | 14.069 s | 7.408 s | 1.265 s | 43,329 B | 7,209,868 B |
+| 12 | 4,096 | 19 | 53.948 s | 48.385 s | 19.315 s | 2.403 s | 47,729 B | 28,836,748 B |
+
+The current implementation derives every child file from the Fiat-Shamir
+challenge, authenticates its complete header and scalar payload, binds it to the
+previous generation's digest, and deletes the parent as ownership leaves scope.
+Dense and scratch proofs and opening claims match exactly at the minimum
+production selector width and with an extra padded selector bit. The largest
+simultaneous pair of LogUp lineage files at n=19 is exactly 21,627,144 bytes;
+retained opening sources are reported separately in the table. These are
+component measurements, not production results.
+
+A linear extrapolation from n=19 to n=33 gives about 9.18 CPU days for the
+LogUp prover and 3.66 days for the aggregate opening. The first two production
+lineage generations project to 220 and 110 GiB, so their transient overlap is
+about 330 GiB. Retained opening sources project to about 440 GiB for one LogUp
+instance, putting its combined scratch near 770 GiB while folding. Four retained
+range instances alone project near 1.76 TiB before matrix, transition, wiring,
+or aggregate artifacts. These extrapolations reject the current CPU and storage
+pipeline for production; they are not n=33 measurements. The next implementation
+gate is GPU or distributed linear folding plus early aggregation/reclamation of
+opening sources, shared transition artifacts, reusable fixed-model prover
+artifacts, and then a complete measured production run.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the

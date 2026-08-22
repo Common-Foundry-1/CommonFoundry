@@ -462,12 +462,17 @@ comparison. The v2 research code now implements:
   transition commitment derives all 110 regular and radix-16 lanes directly
   from its witness. The transition arithmetic sumcheck also keeps selector
   weights implicit and folds 12 live lanes in authenticated 16-scalar scratch
-  rows. LogUp now streams its transition and inverse commitments, recomputes
-  cell-variable sumcheck rounds from the validated witness with bounded memory,
-  retains only the 128 production selector-boundary values, and streams its
-  reconstruction evaluations. The final production artifact still needs a
-  complete n=33 run with proving time, verification time, peak memory, scratch
-  use, and proof size recorded;
+  rows. LogUp now streams its transition and inverse commitments, uses
+  lineage-authenticated two-lane artifacts to fold cell-variable rounds in
+  linear work, retains only the 128 production selector-boundary values, and
+  streams reconstruction evaluations. Dense and scratch outputs match exactly.
+  At n=19 the linear prover took 48.385 seconds versus 53.948 seconds for the
+  rejected recomputation path, with a verified 47,729-byte proof. Extrapolation
+  to n=33 still gives roughly 9.18 CPU proving days, 3.66 aggregate-opening days,
+  440 GiB retained scratch, and 330 GiB transient lineage overlap for one range
+  instance. This rejects the current CPU/storage pipeline for production; GPU
+  or distributed folds, early source reclamation, shared source artifacts, and
+  a complete measured n=33 run remain required;
   independent soundness review and audit also remain activation gates. The
   executable BLS algebraic report uses exact
   nonzero-scalar rejection sampling and bounds the production numerator at

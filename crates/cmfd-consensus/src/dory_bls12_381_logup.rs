@@ -28,6 +28,10 @@ use crate::{
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
+    dory_bls12_381_fold_artifact::{
+        BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
+        BlsDoryFoldArtifactWriter,
+    },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
@@ -62,7 +66,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "the scratch LogUp prover streams commitments and recomputes cell-variable rounds with bounded memory, but complete n=33 proving latency, peak memory and scratch use, proof size, and verification latency remain unmeasured",
+    "lineage-authenticated linear folds preserve exact proofs and improve n=19 proving by 10.3%, but CPU n=33 still projects to roughly 9.2 days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -79,6 +83,7 @@ const SELECTOR_ROUND_VALUES: usize = 3;
 const RECONSTRUCTION_WIRE_FIELDS: usize = 1 + SELECTOR_ROUNDS * SELECTOR_ROUND_VALUES + 1;
 const TABLE_VALUES: usize = BLS_DORY_RANGE_LOGUP_TABLE_VALUES;
 const SELECTOR_SLOTS: usize = 1 << BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
+const LOGUP_FOLD_SLOTS: usize = 2;
 
 /// Witness-free scalar range-membership proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,20 +622,37 @@ fn prove_from_source_deferred(
     let equality_point = challenge_vector(&mut transcript, b"equality-point", packed_variables);
     let (rounds, sumcheck_point, terminal_evaluations, terminal, claim) = match source {
         LogUpProverSource::Witness(_) => {
-            let output = prove_logup_sumcheck_with_recomputation(
-                witness_source
-                    .as_ref()
-                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
-                &counts,
-                alpha,
-                elements,
-                packed_variables,
-                &equality_point,
-                &local_mixing,
-                rational_mixing,
-                count_mixing,
-                &mut transcript,
-            )?;
+            let witness_source = witness_source
+                .as_ref()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+            let output = if elements >= TABLE_VALUES {
+                prove_logup_sumcheck_with_artifacts(
+                    witness_source,
+                    &counts,
+                    alpha,
+                    elements,
+                    packed_variables,
+                    &equality_point,
+                    &local_mixing,
+                    rational_mixing,
+                    count_mixing,
+                    &mut transcript,
+                    scratch_directory.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                )?
+            } else {
+                prove_logup_sumcheck_with_recomputation(
+                    witness_source,
+                    &counts,
+                    alpha,
+                    elements,
+                    packed_variables,
+                    &equality_point,
+                    &local_mixing,
+                    rational_mixing,
+                    count_mixing,
+                    &mut transcript,
+                )?
+            };
             (
                 output.rounds,
                 output.point,
@@ -1123,6 +1145,323 @@ impl BlsDoryRowSource for LogUpInverseRowSource<'_, '_> {
 }
 
 #[derive(Clone, Copy)]
+struct LogUpFoldValues {
+    transition: BlsDoryFr,
+    inverse: BlsDoryFr,
+}
+
+struct LogUpSparseTables {
+    multiplicity: Vec<BlsDoryFr>,
+    table: Vec<BlsDoryFr>,
+    table_inverse: Vec<BlsDoryFr>,
+}
+
+impl LogUpSparseTables {
+    fn new(counts: &[u64; TABLE_VALUES], alpha: BlsDoryFr) -> Result<Self, BlsDoryRangeLogUpError> {
+        Ok(Self {
+            multiplicity: counts.iter().copied().map(BlsDoryFr::from_u64).collect(),
+            table: vec![BlsDoryFr::one(); TABLE_VALUES],
+            table_inverse: (0..TABLE_VALUES)
+                .map(|digit| {
+                    (alpha - BlsDoryFr::from_u64(digit as u64))
+                        .inv()
+                        .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    fn values(&self, selector: usize, cell: usize) -> (BlsDoryFr, BlsDoryFr, BlsDoryFr) {
+        if selector != 0 {
+            return (BlsDoryFr::zero(), BlsDoryFr::zero(), BlsDoryFr::zero());
+        }
+        (
+            self.multiplicity
+                .get(cell)
+                .copied()
+                .unwrap_or_else(BlsDoryFr::zero),
+            self.table
+                .get(cell)
+                .copied()
+                .unwrap_or_else(BlsDoryFr::zero),
+            self.table_inverse
+                .get(cell)
+                .copied()
+                .unwrap_or_else(BlsDoryFr::zero),
+        )
+    }
+
+    fn fold(&mut self, challenge: BlsDoryFr) {
+        for table in [
+            &mut self.multiplicity,
+            &mut self.table,
+            &mut self.table_inverse,
+        ] {
+            if table.len() == 1 {
+                table[0] = table[0] * (BlsDoryFr::one() - challenge);
+                continue;
+            }
+            let folded_len = table.len() / 2;
+            for index in 0..folded_len {
+                table[index] =
+                    table[index * 2] + challenge * (table[index * 2 + 1] - table[index * 2]);
+            }
+            table.truncate(folded_len);
+        }
+    }
+}
+
+fn logup_storage_error() -> BlsDoryRangeLogUpError {
+    BlsDoryAggregateError::ProverStorage.into()
+}
+
+fn raw_logup_fold_values(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    alpha: BlsDoryFr,
+    selector: usize,
+    cell: usize,
+) -> Result<LogUpFoldValues, BlsDoryRangeLogUpError> {
+    let transition = if selector < STRUCTURED_TRANSITION_ORACLES {
+        source.scalar(selector, cell)?
+    } else {
+        BlsDoryFr::zero()
+    };
+    let inverse = if (STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES)
+        .contains(&selector)
+    {
+        (alpha - transition)
+            .inv()
+            .ok_or(BlsDoryRangeLogUpError::ChallengeCollision)?
+    } else {
+        BlsDoryFr::zero()
+    };
+    Ok(LogUpFoldValues {
+        transition,
+        inverse,
+    })
+}
+
+fn logup_core_from_fold(
+    values: LogUpFoldValues,
+    selector: usize,
+    cell: usize,
+    sparse: &LogUpSparseTables,
+) -> LogUpCoreValues {
+    let (multiplicity, table, table_inverse) = sparse.values(selector, cell);
+    LogUpCoreValues {
+        transition: values.transition,
+        multiplicity,
+        inverse: values.inverse,
+        active: if (STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES)
+            .contains(&selector)
+        {
+            BlsDoryFr::one()
+        } else {
+            BlsDoryFr::zero()
+        },
+        table,
+        table_inverse,
+    }
+}
+
+fn logup_fold_spec(
+    context_digest: [u8; 32],
+    generation: usize,
+    selector_rows: usize,
+    current_cells: usize,
+    parent_digest: [u8; 32],
+) -> Result<BlsDoryFoldArtifactSpec, BlsDoryRangeLogUpError> {
+    let logical_values = selector_rows
+        .checked_mul(current_cells)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let explicit_values = STRUCTURED_TRANSITION_ORACLES
+        .checked_mul(current_cells)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    Ok(BlsDoryFoldArtifactSpec {
+        context_digest,
+        table_index: 0,
+        generation: u32::try_from(generation)
+            .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        scalar_count: u64::try_from(
+            logical_values
+                .checked_mul(LOGUP_FOLD_SLOTS)
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+        )
+        .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        explicit_scalar_count: u64::try_from(
+            explicit_values
+                .checked_mul(LOGUP_FOLD_SLOTS)
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+        )
+        .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?,
+        parent_digest,
+    })
+}
+
+fn write_logup_fold_values(
+    writer: &mut BlsDoryFoldArtifactWriter,
+    values: LogUpFoldValues,
+) -> Result<(), BlsDoryRangeLogUpError> {
+    writer
+        .write_scalar(&values.transition)
+        .and_then(|()| writer.write_scalar(&values.inverse))
+        .map_err(|_| logup_storage_error())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_raw_logup_values(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    alpha: BlsDoryFr,
+    challenge: BlsDoryFr,
+    selector_rows: usize,
+    current_cells: usize,
+    context_digest: [u8; 32],
+    generation: usize,
+    parent_digest: [u8; 32],
+    scratch_directory: &Path,
+) -> Result<BlsDoryFoldArtifact, BlsDoryRangeLogUpError> {
+    let child_cells = current_cells
+        .checked_div(2)
+        .filter(|cells| *cells > 0)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let spec = logup_fold_spec(
+        context_digest,
+        generation,
+        selector_rows,
+        child_cells,
+        parent_digest,
+    )?;
+    let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
+        .map_err(|_| logup_storage_error())?;
+    for selector in 0..STRUCTURED_TRANSITION_ORACLES {
+        for child_cell in 0..child_cells {
+            let lower = raw_logup_fold_values(source, alpha, selector, child_cell * 2)?;
+            let upper = raw_logup_fold_values(source, alpha, selector, child_cell * 2 + 1)?;
+            write_logup_fold_values(
+                &mut writer,
+                LogUpFoldValues {
+                    transition: lower.transition
+                        + challenge * (upper.transition - lower.transition),
+                    inverse: lower.inverse + challenge * (upper.inverse - lower.inverse),
+                },
+            )?;
+        }
+    }
+    writer.finish().map_err(|_| logup_storage_error())
+}
+
+fn for_each_logup_artifact_pair(
+    artifact: &BlsDoryFoldArtifact,
+    expected_spec: BlsDoryFoldArtifactSpec,
+    current_cells: usize,
+    mut visitor: impl FnMut(
+        usize,
+        LogUpFoldValues,
+        LogUpFoldValues,
+    ) -> Result<(), BlsDoryRangeLogUpError>,
+) -> Result<(), BlsDoryRangeLogUpError> {
+    if current_cells < 2 || !current_cells.is_power_of_two() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    if artifact.spec() != expected_spec
+        || !artifact
+            .spec()
+            .explicit_scalar_count
+            .is_multiple_of((LOGUP_FOLD_SLOTS * 2) as u64)
+    {
+        return Err(logup_storage_error());
+    }
+    let mut values = LogUpFoldValues {
+        transition: BlsDoryFr::zero(),
+        inverse: BlsDoryFr::zero(),
+    };
+    let mut scalar_slot = 0usize;
+    let mut pending = None;
+    let mut pair_index = 0usize;
+    let mut visitor_error = None;
+    let artifact_result = artifact.for_each_scalar(|scalar| {
+        match scalar_slot {
+            0 => values.transition = scalar,
+            1 => values.inverse = scalar,
+            _ => return Err(BlsDoryFoldArtifactError::InvalidArtifact),
+        }
+        scalar_slot += 1;
+        if scalar_slot == LOGUP_FOLD_SLOTS {
+            if let Some(lower) = pending.take() {
+                if let Err(error) = visitor(pair_index, lower, values) {
+                    visitor_error = Some(error);
+                    return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                }
+                pair_index += 1;
+            } else {
+                pending = Some(values);
+            }
+            values = LogUpFoldValues {
+                transition: BlsDoryFr::zero(),
+                inverse: BlsDoryFr::zero(),
+            };
+            scalar_slot = 0;
+        }
+        Ok(())
+    });
+    if let Some(error) = visitor_error {
+        return Err(error);
+    }
+    artifact_result.map_err(|_| logup_storage_error())?;
+    let expected_pairs = usize::try_from(expected_spec.explicit_scalar_count)
+        .map_err(|_| BlsDoryRangeLogUpError::InvalidDimensions)?
+        / LOGUP_FOLD_SLOTS
+        / 2;
+    if scalar_slot != 0 || pending.is_some() || pair_index != expected_pairs {
+        return Err(logup_storage_error());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_logup_artifact(
+    artifact: &BlsDoryFoldArtifact,
+    expected_spec: BlsDoryFoldArtifactSpec,
+    challenge: BlsDoryFr,
+    selector_rows: usize,
+    current_cells: usize,
+    context_digest: [u8; 32],
+    generation: usize,
+    parent_digest: [u8; 32],
+    scratch_directory: &Path,
+) -> Result<BlsDoryFoldArtifact, BlsDoryRangeLogUpError> {
+    let child_cells = current_cells
+        .checked_div(2)
+        .filter(|cells| *cells > 0)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let spec = logup_fold_spec(
+        context_digest,
+        generation,
+        selector_rows,
+        child_cells,
+        parent_digest,
+    )?;
+    let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
+        .map_err(|_| logup_storage_error())?;
+    for_each_logup_artifact_pair(
+        artifact,
+        expected_spec,
+        current_cells,
+        |_pair_index, lower, upper| {
+            write_logup_fold_values(
+                &mut writer,
+                LogUpFoldValues {
+                    transition: lower.transition
+                        + challenge * (upper.transition - lower.transition),
+                    inverse: lower.inverse + challenge * (upper.inverse - lower.inverse),
+                },
+            )
+        },
+    )?;
+    writer.finish().map_err(|_| logup_storage_error())
+}
+
+#[derive(Clone, Copy)]
 struct LogUpCoreValues {
     transition: BlsDoryFr,
     multiplicity: BlsDoryFr,
@@ -1325,6 +1664,192 @@ fn accumulate_logup_pair(
                 count_mixing,
             );
     }
+}
+
+fn validate_logup_suffix_pairs(
+    equality_point: &[BlsDoryFr],
+    round_index: usize,
+    expected_pairs: usize,
+) -> Result<(), BlsDoryRangeLogUpError> {
+    let suffix_variables = equality_point
+        .len()
+        .checked_sub(round_index + 1)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let suffix_pairs = 1usize
+        .checked_shl(suffix_variables as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    if suffix_pairs != expected_pairs {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_logup_artifact_round(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    sparse: &LogUpSparseTables,
+    alpha: BlsDoryFr,
+    selector_rows: usize,
+    current_cells: usize,
+    round_index: usize,
+    equality_point: &[BlsDoryFr],
+    equality_prefix: BlsDoryFr,
+    local_mixing: &[BlsDoryFr],
+    rational_mixing: BlsDoryFr,
+    count_mixing: BlsDoryFr,
+) -> Result<[BlsDoryFr; LOGUP_ROUND_VALUES], BlsDoryRangeLogUpError> {
+    if current_cells < 2 || !current_cells.is_power_of_two() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let total_pairs = selector_rows
+        .checked_mul(current_cells / 2)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    validate_logup_suffix_pairs(equality_point, round_index, total_pairs)?;
+    let coordinate = equality_point[round_index];
+    let mut suffix_weights = LogUpEqualityWeightIterator::new(&equality_point[round_index + 1..]);
+    let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+    let mut visited = 0usize;
+    for selector in 0..STRUCTURED_TRANSITION_ORACLES {
+        for pair_cell in 0..current_cells / 2 {
+            let suffix = suffix_weights
+                .next()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+            let equality_scale = equality_prefix * suffix;
+            let lower_cell = pair_cell * 2;
+            accumulate_logup_pair(
+                logup_core_from_fold(
+                    raw_logup_fold_values(source, alpha, selector, lower_cell)?,
+                    selector,
+                    lower_cell,
+                    sparse,
+                ),
+                logup_core_from_fold(
+                    raw_logup_fold_values(source, alpha, selector, lower_cell + 1)?,
+                    selector,
+                    lower_cell + 1,
+                    sparse,
+                ),
+                equality_scale * (BlsDoryFr::one() - coordinate),
+                equality_scale * coordinate,
+                alpha,
+                local_mixing,
+                rational_mixing,
+                count_mixing,
+                &mut evaluations,
+            );
+            visited += 1;
+        }
+    }
+    if visited > total_pairs {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(evaluations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn logup_artifact_round(
+    artifact: &BlsDoryFoldArtifact,
+    expected_spec: BlsDoryFoldArtifactSpec,
+    sparse: &LogUpSparseTables,
+    alpha: BlsDoryFr,
+    selector_rows: usize,
+    current_cells: usize,
+    round_index: usize,
+    equality_point: &[BlsDoryFr],
+    equality_prefix: BlsDoryFr,
+    local_mixing: &[BlsDoryFr],
+    rational_mixing: BlsDoryFr,
+    count_mixing: BlsDoryFr,
+) -> Result<[BlsDoryFr; LOGUP_ROUND_VALUES], BlsDoryRangeLogUpError> {
+    let total_pairs = selector_rows
+        .checked_mul(current_cells / 2)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    validate_logup_suffix_pairs(equality_point, round_index, total_pairs)?;
+    let coordinate = equality_point[round_index];
+    let mut suffix_weights = LogUpEqualityWeightIterator::new(&equality_point[round_index + 1..]);
+    let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+    let mut visited = 0usize;
+    for_each_logup_artifact_pair(
+        artifact,
+        expected_spec,
+        current_cells,
+        |pair_index, lower, upper| {
+            let suffix = suffix_weights
+                .next()
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+            let equality_scale = equality_prefix * suffix;
+            let lower_index = pair_index
+                .checked_mul(2)
+                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+            let selector = lower_index / current_cells;
+            let lower_cell = lower_index % current_cells;
+            accumulate_logup_pair(
+                logup_core_from_fold(lower, selector, lower_cell, sparse),
+                logup_core_from_fold(upper, selector, lower_cell + 1, sparse),
+                equality_scale * (BlsDoryFr::one() - coordinate),
+                equality_scale * coordinate,
+                alpha,
+                local_mixing,
+                rational_mixing,
+                count_mixing,
+                &mut evaluations,
+            );
+            visited += 1;
+            Ok(())
+        },
+    )?;
+    if visited > total_pairs {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(evaluations)
+}
+
+fn logup_selector_values_from_artifact(
+    artifact: &BlsDoryFoldArtifact,
+    expected_spec: BlsDoryFoldArtifactSpec,
+    sparse: &LogUpSparseTables,
+    selector_rows: usize,
+) -> Result<Vec<LogUpCoreValues>, BlsDoryRangeLogUpError> {
+    if artifact.spec() != expected_spec
+        || expected_spec.explicit_scalar_count
+            != (STRUCTURED_TRANSITION_ORACLES * LOGUP_FOLD_SLOTS) as u64
+    {
+        return Err(logup_storage_error());
+    }
+    let mut selectors = vec![LogUpCoreValues::zero(); selector_rows];
+    let mut values = LogUpFoldValues {
+        transition: BlsDoryFr::zero(),
+        inverse: BlsDoryFr::zero(),
+    };
+    let mut scalar_slot = 0usize;
+    let mut selector = 0usize;
+    artifact
+        .for_each_scalar(|scalar| {
+            match scalar_slot {
+                0 => values.transition = scalar,
+                1 => values.inverse = scalar,
+                _ => return Err(BlsDoryFoldArtifactError::InvalidArtifact),
+            }
+            scalar_slot += 1;
+            if scalar_slot == LOGUP_FOLD_SLOTS {
+                let target = selectors
+                    .get_mut(selector)
+                    .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
+                *target = logup_core_from_fold(values, selector, 0, sparse);
+                selector += 1;
+                scalar_slot = 0;
+                values = LogUpFoldValues {
+                    transition: BlsDoryFr::zero(),
+                    inverse: BlsDoryFr::zero(),
+                };
+            }
+            Ok(())
+        })
+        .map_err(|_| logup_storage_error())?;
+    if scalar_slot != 0 || selector != STRUCTURED_TRANSITION_ORACLES {
+        return Err(logup_storage_error());
+    }
+    Ok(selectors)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1537,6 +2062,199 @@ fn prove_logup_sumcheck_with_recomputation(
         rounds,
         point,
         terminal,
+        terminal_evaluations: [core.transition, core.multiplicity, core.inverse],
+        final_claim: claim,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_logup_sumcheck_with_artifacts(
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    counts: &[u64; TABLE_VALUES],
+    alpha: BlsDoryFr,
+    elements: usize,
+    packed_variables: usize,
+    equality_point: &[BlsDoryFr],
+    local_mixing: &[BlsDoryFr],
+    rational_mixing: BlsDoryFr,
+    count_mixing: BlsDoryFr,
+    transcript: &mut BlsDoryTranscript,
+    scratch_directory: &Path,
+) -> Result<LogUpScratchSumcheck, BlsDoryRangeLogUpError> {
+    if elements < TABLE_VALUES || !elements.is_power_of_two() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let cell_variables = elements.ilog2() as usize;
+    let padded_len = 1usize
+        .checked_shl(packed_variables as u32)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    let selector_rows = padded_len >> cell_variables;
+    if selector_rows < SELECTOR_SLOTS || equality_point.len() != packed_variables {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+
+    let context_digest = transcript.digest();
+    if context_digest == [0; 32] {
+        return Err(logup_storage_error());
+    }
+    let mut root_parent =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/BlsDoryLogUpFoldParent/v1");
+    root_parent.update(&context_digest);
+    let root_parent_digest = *root_parent.finalize().as_bytes();
+    if root_parent_digest == [0; 32] {
+        return Err(logup_storage_error());
+    }
+
+    let mut claim = BlsDoryFr::zero();
+    let mut rounds = Vec::with_capacity(packed_variables);
+    let mut point = Vec::with_capacity(packed_variables);
+    let mut equality_prefix = BlsDoryFr::one();
+    let mut sparse = LogUpSparseTables::new(counts, alpha)?;
+    let mut artifact = None;
+    let mut artifact_parent_digest = root_parent_digest;
+    let mut current_cells = elements;
+
+    for round_index in 0..cell_variables {
+        let expected_spec = artifact
+            .as_ref()
+            .map(|_| {
+                logup_fold_spec(
+                    context_digest,
+                    round_index,
+                    selector_rows,
+                    current_cells,
+                    artifact_parent_digest,
+                )
+            })
+            .transpose()?;
+        let evaluations = if let Some(current) = artifact.as_ref() {
+            logup_artifact_round(
+                current,
+                expected_spec.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                &sparse,
+                alpha,
+                selector_rows,
+                current_cells,
+                round_index,
+                equality_point,
+                equality_prefix,
+                local_mixing,
+                rational_mixing,
+                count_mixing,
+            )?
+        } else {
+            raw_logup_artifact_round(
+                source,
+                &sparse,
+                alpha,
+                selector_rows,
+                current_cells,
+                round_index,
+                equality_point,
+                equality_prefix,
+                local_mixing,
+                rational_mixing,
+                count_mixing,
+            )?
+        };
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryRangeLogUpError::RoundClaim);
+        }
+        absorb_round(transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = evaluate_samples(&evaluations, challenge)?;
+        point.push(challenge);
+
+        let child_parent_digest = artifact
+            .as_ref()
+            .map_or(root_parent_digest, BlsDoryFoldArtifact::digest);
+        let generation = round_index + 1;
+        let child = if let Some(current) = artifact.as_ref() {
+            fold_logup_artifact(
+                current,
+                expected_spec.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                challenge,
+                selector_rows,
+                current_cells,
+                context_digest,
+                generation,
+                child_parent_digest,
+                scratch_directory,
+            )?
+        } else {
+            fold_raw_logup_values(
+                source,
+                alpha,
+                challenge,
+                selector_rows,
+                current_cells,
+                context_digest,
+                generation,
+                child_parent_digest,
+                scratch_directory,
+            )?
+        };
+        artifact_parent_digest = child_parent_digest;
+        artifact = Some(child);
+        current_cells /= 2;
+        sparse.fold(challenge);
+        let coordinate = equality_point[round_index];
+        equality_prefix = equality_prefix
+            * ((BlsDoryFr::one() - challenge) * (BlsDoryFr::one() - coordinate)
+                + challenge * coordinate);
+        rounds.push(evaluations);
+    }
+
+    let expected_spec = logup_fold_spec(
+        context_digest,
+        cell_variables,
+        selector_rows,
+        1,
+        artifact_parent_digest,
+    )?;
+    let mut selector_values = logup_selector_values_from_artifact(
+        artifact
+            .as_ref()
+            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+        expected_spec,
+        &sparse,
+        selector_rows,
+    )?;
+    drop(artifact);
+
+    for round_index in cell_variables..packed_variables {
+        let evaluations = materialized_core_logup_round(
+            &selector_values,
+            round_index,
+            equality_point,
+            equality_prefix,
+            alpha,
+            local_mixing,
+            rational_mixing,
+            count_mixing,
+        )?;
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryRangeLogUpError::RoundClaim);
+        }
+        absorb_round(transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = evaluate_samples(&evaluations, challenge)?;
+        point.push(challenge);
+        fold_logup_core_values(&mut selector_values, challenge);
+        let coordinate = equality_point[round_index];
+        equality_prefix = equality_prefix
+            * ((BlsDoryFr::one() - challenge) * (BlsDoryFr::one() - coordinate)
+                + challenge * coordinate);
+        rounds.push(evaluations);
+    }
+
+    let core = *selector_values
+        .first()
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    Ok(LogUpScratchSumcheck {
+        rounds,
+        point,
+        terminal: core.terminal(equality_prefix),
         terminal_evaluations: [core.transition, core.multiplicity, core.inverse],
         final_claim: claim,
     })
@@ -2356,6 +3074,50 @@ mod tests {
         (statement, mask, witness)
     }
 
+    fn scaled_fixture(
+        cell_variables: usize,
+    ) -> (StructuredTransitionStatement, StructuredTransitionWitness) {
+        assert!((3..=26).contains(&cell_variables));
+        let (_, _, base) = fixture();
+        let columns_variables = cell_variables.min(12);
+        let remaining = cell_variables - columns_variables;
+        let rows_variables = remaining.min(7);
+        let layers_variables = remaining - rows_variables;
+        assert!(layers_variables <= 7);
+        let elements = 1usize << cell_variables;
+        let repeat = |values: &[u64]| values.iter().copied().cycle().take(elements).collect();
+        let repeat_signed =
+            |values: &[i64]| values.iter().copied().cycle().take(elements).collect();
+        let statement = StructuredTransitionStatement {
+            layers: 1usize << layers_variables,
+            rows: 1usize << rows_variables,
+            cols: 1usize << columns_variables,
+            max_abs_accumulator: 65_536,
+            max_mask: 5_000,
+        };
+        let witness = StructuredTransitionWitness {
+            accumulators: repeat_signed(&base.accumulators),
+            masks: repeat(&base.masks),
+            encoded: repeat(&base.encoded),
+            square_quotients: repeat(&base.square_quotients),
+            square_remainders: repeat(&base.square_remainders),
+            cube_quotients: repeat(&base.cube_quotients),
+            cube_remainders: repeat(&base.cube_remainders),
+            output_quotients: repeat(&base.output_quotients),
+            output_remainders: repeat(&base.output_remainders),
+            negative: repeat(&base.negative),
+            activations: repeat_signed(&base.activations),
+        };
+        (statement, witness)
+    }
+
+    fn directory_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    }
+
     #[test]
     fn inverse_row_source_matches_materialized_inverse_prefix() {
         let (statement, _, witness) = fixture();
@@ -2461,6 +3223,112 @@ mod tests {
             drop(scratch);
             assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn scratch_logup_linear_artifacts_match_dense_proof_and_clean_up() {
+        let (statement, witness) = scaled_fixture(4);
+        let setup = deterministic_bls_dory_setup(12).unwrap();
+        let scratch_directory = ScratchDirectory::create();
+        for packed_variables in [11, 12] {
+            let ordinary = prove_bls_dory_range_logup_deferred_at_variables(
+                b"scratch-logup-linear",
+                statement,
+                &witness,
+                packed_variables,
+                &setup,
+            )
+            .unwrap();
+            let scratch = prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
+                b"scratch-logup-linear",
+                statement,
+                &witness,
+                packed_variables,
+                &setup,
+                &scratch_directory.0,
+            )
+            .unwrap();
+            assert_eq!(scratch.proof, ordinary.proof);
+            assert_eq!(scratch.openings.claims(), ordinary.openings.claims());
+            drop(scratch);
+            assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only scaling benchmark selected through CMFD_BLS_LOGUP_BENCH_* variables"]
+    fn scratch_logup_release_scaling_benchmark() {
+        let cell_variables = std::env::var("CMFD_BLS_LOGUP_BENCH_CELL_LOG")
+            .expect("CMFD_BLS_LOGUP_BENCH_CELL_LOG is required")
+            .parse::<usize>()
+            .expect("cell log must be an integer");
+        let scratch_directory = std::path::PathBuf::from(
+            std::env::var("CMFD_BLS_LOGUP_BENCH_SCRATCH")
+                .expect("CMFD_BLS_LOGUP_BENCH_SCRATCH is required"),
+        );
+        assert!(scratch_directory.is_absolute());
+        assert!(scratch_directory.is_dir());
+        assert_eq!(std::fs::read_dir(&scratch_directory).unwrap().count(), 0);
+
+        let witness_start = std::time::Instant::now();
+        let (statement, witness) = scaled_fixture(cell_variables);
+        let witness_millis = witness_start.elapsed().as_millis();
+        let packed_variables = cell_variables + BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
+
+        let setup_start = std::time::Instant::now();
+        let setup = deterministic_bls_dory_setup(packed_variables).unwrap();
+        let setup_millis = setup_start.elapsed().as_millis();
+
+        let prover_start = std::time::Instant::now();
+        let mut prepared = prove_bls_dory_range_logup_deferred_at_variables_with_scratch(
+            b"logup-scaling-benchmark",
+            statement,
+            &witness,
+            packed_variables,
+            &setup,
+            &scratch_directory,
+        )
+        .unwrap();
+        let prover_millis = prover_start.elapsed().as_millis();
+
+        let opening_start = std::time::Instant::now();
+        let opening_binding = opening_binding(
+            b"logup-scaling-benchmark",
+            &prepared.proof.transcript_digest,
+        );
+        let (claims, opening_proof) =
+            crate::dory_bls12_381_aggregate::prove_bls_dory_deferred_opening_sets_with_scratch(
+                &opening_binding,
+                &[&prepared.openings],
+                &setup,
+                &scratch_directory,
+            )
+            .unwrap();
+        assert_eq!(claims, prepared.openings.claims());
+        prepared.proof.opening_proof = opening_proof;
+        let opening_millis = opening_start.elapsed().as_millis();
+
+        let verification_start = std::time::Instant::now();
+        verify_bls_dory_range_logup_at_variables(
+            b"logup-scaling-benchmark",
+            statement,
+            prepared.proof.transition_commitment,
+            &prepared.proof,
+            packed_variables,
+            &setup,
+        )
+        .unwrap();
+        let verification_millis = verification_start.elapsed().as_millis();
+        let proof_bytes = prepared.proof.encode(statement).unwrap().len();
+        let retained_scratch_bytes = directory_bytes(&scratch_directory);
+
+        println!(
+            "CMFD_BLS_LOGUP_BENCHMARK {{\"cell_variables\":{cell_variables},\"cells\":{},\"packed_variables\":{packed_variables},\"witness_millis\":{witness_millis},\"setup_millis\":{setup_millis},\"prover_millis\":{prover_millis},\"opening_millis\":{opening_millis},\"verification_millis\":{verification_millis},\"proof_bytes\":{proof_bytes},\"retained_scratch_bytes\":{retained_scratch_bytes}}}",
+            statement.elements().unwrap()
+        );
+
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&scratch_directory).unwrap().count(), 0);
     }
 
     #[test]

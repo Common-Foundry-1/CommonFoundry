@@ -963,7 +963,9 @@ full equality tables. Its pre-change 17,695-byte fixture remains pinned
 at BLAKE3 digest
 `6aa99fd095e70180b6b2fdd94dc96fc420f99eb529ec03ad5dfa978731d9cfac`.
 An explicit scratch API now writes every post-challenge unique-table fold to a
-self-authenticating, lineage-bound artifact. It uses a two-scalar fold working set,
+self-authenticating, lineage-bound artifact. It uses a two-decoded-scalar fold
+working set plus a bounded 1 MiB encoded buffer per open reader or writer (2 MiB
+for simultaneous fold input and output),
 rejects corruption, truncation, non-canonical fields, and trailing bytes, removes
 partial or completed files only while it still owns them, and aborts without a
 dense fallback. A row-source constructor now computes ordinary row and tier-two
@@ -999,25 +1001,31 @@ Release-mode scaling makes the remaining LogUp problem concrete. On a Ryzen 9
 9950X3D with 64 GiB RAM under Windows, the exact scratch prover, aggregate
 opening, and unchanged verifier produced these complete results. "Recompute"
 is the rejected `O(N log N)` implementation; "linear" is the current
-lineage-authenticated two-lane artifact implementation.
+lineage-authenticated two-lane artifact implementation with bounded 1 MiB
+artifact reads and writes.
 
 | Cell variables | Cells | Packed variables | Recompute prover | Linear prover | Aggregate opening | Verify | Proof | Retained scratch |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 256 | 15 | 4.696 s | 4.489 s | 3.139 s | 0.681 s | 38,929 B | 1,803,148 B |
-| 10 | 1,024 | 17 | 15.160 s | 14.069 s | 7.408 s | 1.265 s | 43,329 B | 7,209,868 B |
-| 12 | 4,096 | 19 | 53.948 s | 48.385 s | 19.315 s | 2.403 s | 47,729 B | 28,836,748 B |
+| 8 | 256 | 15 | 4.696 s | 4.364 s | 2.862 s | 0.729 s | 38,929 B | 1,803,148 B |
+| 10 | 1,024 | 17 | 15.160 s | 13.879 s | 5.742 s | 1.337 s | 43,329 B | 7,209,868 B |
+| 12 | 4,096 | 19 | 53.948 s | 42.699 s | 10.618 s | 2.378 s | 47,729 B | 28,836,748 B |
 
 The current implementation derives every child file from the Fiat-Shamir
 challenge, authenticates its complete header and scalar payload, binds it to the
 previous generation's digest, and deletes the parent as ownership leaves scope.
+The buffered implementation produces byte-identical artifact files and digests
+across the buffer boundary. At n=19 it improves the previous direct-I/O linear
+measurement of 48.385 seconds proving and 19.315 seconds opening by 11.8% and
+45.0%, respectively; combined time falls by 21.2%. The proof size and retained
+scratch are unchanged.
 Dense and scratch proofs and opening claims match exactly at the minimum
 production selector width and with an extra padded selector bit. The largest
 simultaneous pair of LogUp lineage files at n=19 is exactly 21,627,144 bytes;
 retained opening sources are reported separately in the table. These are
 component measurements, not production results.
 
-A linear extrapolation from n=19 to n=33 gives about 9.18 CPU days for the
-LogUp prover and 3.66 days for the aggregate opening. The first two production
+A linear extrapolation from n=19 to n=33 gives about 8.10 CPU days for the
+LogUp prover and 2.01 days for the aggregate opening. The first two production
 lineage generations project to 220 and 110 GiB, so their transient overlap is
 about 330 GiB. Retained opening sources project to about 440 GiB for one LogUp
 instance, putting its combined scratch near 770 GiB while folding. Four retained

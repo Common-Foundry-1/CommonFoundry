@@ -472,12 +472,15 @@ comparison. The v2 research code now implements:
   mismatched same-shape artifact is rejected. This removes one projected
   220 GiB source per production transition/range pair, or roughly 880 GiB over
   the four-pair layout. LogUp now streams its inverse commitment, uses
-  lineage-authenticated two-lane artifacts to fold cell-variable rounds in
-  linear work, retains only the 128 production selector-boundary values, and
-  streams reconstruction evaluations. Dense and scratch outputs match exactly.
-  At n=19 the linear prover took 48.385 seconds versus 53.948 seconds for the
-  rejected recomputation path, with a verified 47,729-byte proof. Extrapolation
-  to n=33 still gives roughly 9.18 CPU proving days, 3.66 aggregate-opening days,
+  lineage-authenticated two-lane artifacts with bounded 1 MiB I/O to fold
+  cell-variable rounds in linear work, retains only the 128 production
+  selector-boundary values, and streams reconstruction evaluations. Dense and
+  scratch outputs match exactly. At n=19 the buffered linear prover took 42.699
+  seconds versus 53.948 seconds for the rejected recomputation path; aggregate
+  opening took 10.618 seconds and the verified proof remained 47,729 bytes.
+  The prior direct-I/O linear measurement was 48.385 seconds proving and 19.315
+  seconds opening. Extrapolation to n=33 still gives roughly 8.10 CPU proving
+  days, 2.01 aggregate-opening days,
   440 GiB retained scratch, and 330 GiB transient lineage overlap for one range
   instance. This rejects the current CPU/storage pipeline for production; GPU
   or distributed folds, early reclamation of the remaining transition and

@@ -5,7 +5,7 @@
 //! attempt; callers must not retry from an unauthenticated or dense fallback.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,10 +24,11 @@ const ARTIFACT_VERSION: u16 = 2;
 const ARTIFACT_HEADER_BYTES: usize = 100;
 const ARTIFACT_DIGEST_BYTES: usize = 32;
 const ARTIFACT_SCALAR_BYTES: usize = 32;
+const ARTIFACT_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const ARTIFACT_HASH_DOMAIN: &str = "CommonFoundry/ForgeMatrix/BlsDoryFoldArtifact/v2";
 static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
 
-/// A fold retains only the current decoded scalar pair plus one 32-byte buffer.
+/// A fold retains only the current decoded scalar pair plus bounded encoded I/O buffering.
 pub const BLS_DORY_FOLD_ARTIFACT_MAX_WORKING_SCALARS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +90,7 @@ pub enum BlsDoryFoldArtifactError {
 
 pub struct BlsDoryFoldArtifactWriter {
     path: Option<PathBuf>,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
     spec: BlsDoryFoldArtifactSpec,
     hasher: blake3::Hasher,
     written: u64,
@@ -123,7 +124,7 @@ impl BlsDoryFoldArtifactWriter {
         hasher.update(&header);
         Ok(Self {
             path: Some(path),
-            file: Some(file),
+            file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
             spec,
             hasher,
             written: 0,
@@ -131,13 +132,25 @@ impl BlsDoryFoldArtifactWriter {
     }
 
     pub fn write_scalar(&mut self, scalar: &BlsDoryFr) -> Result<(), BlsDoryFoldArtifactError> {
-        if self.written >= self.spec.explicit_scalar_count {
+        self.write_scalars(std::slice::from_ref(scalar))
+    }
+
+    pub fn write_scalars(&mut self, scalars: &[BlsDoryFr]) -> Result<(), BlsDoryFoldArtifactError> {
+        let scalar_count =
+            u64::try_from(scalars.len()).map_err(|_| BlsDoryFoldArtifactError::InvalidArtifact)?;
+        let next_written = self
+            .written
+            .checked_add(scalar_count)
+            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
+        if next_written > self.spec.explicit_scalar_count {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
-        let encoded = encode_scalar(scalar)?;
-        self.file_mut()?.write_all(&encoded)?;
-        self.hasher.update(&encoded);
-        self.written += 1;
+        for scalar in scalars {
+            let encoded = encode_scalar(scalar)?;
+            self.file_mut()?.write_all(&encoded)?;
+            self.hasher.update(&encoded);
+            self.written += 1;
+        }
         Ok(())
     }
 
@@ -149,18 +162,22 @@ impl BlsDoryFoldArtifactWriter {
         let file = self.file_mut()?;
         file.write_all(&digest)?;
         file.flush()?;
-        file.sync_all()?;
-        if file.metadata()?.len() != artifact_file_bytes(self.spec.explicit_scalar_count)? {
+        file.get_ref().sync_all()?;
+        if file.get_ref().metadata()?.len() != artifact_file_bytes(self.spec.explicit_scalar_count)?
+        {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
         let file = self
             .file
-            .take()
-            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
+            .as_ref()
+            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?
+            .get_ref()
+            .try_clone()?;
         let path = self
             .path
             .take()
             .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
+        drop(self.file.take());
         Ok(BlsDoryFoldArtifact {
             path,
             file,
@@ -169,7 +186,7 @@ impl BlsDoryFoldArtifactWriter {
         })
     }
 
-    fn file_mut(&mut self) -> Result<&mut File, BlsDoryFoldArtifactError> {
+    fn file_mut(&mut self) -> Result<&mut BufWriter<File>, BlsDoryFoldArtifactError> {
         self.file
             .as_mut()
             .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)
@@ -179,7 +196,7 @@ impl BlsDoryFoldArtifactWriter {
 impl Drop for BlsDoryFoldArtifactWriter {
     fn drop(&mut self) {
         if let (Some(path), Some(file)) = (&self.path, &self.file) {
-            remove_if_owned(path, file);
+            remove_if_owned(path, file.get_ref());
         }
     }
 }
@@ -241,14 +258,18 @@ impl BlsDoryFoldArtifact {
 
     fn validate_live_file(
         &self,
-        consume: impl FnOnce(&mut File, &mut blake3::Hasher) -> Result<(), BlsDoryFoldArtifactError>,
+        consume: impl FnOnce(
+            &mut BufReader<File>,
+            &mut blake3::Hasher,
+        ) -> Result<(), BlsDoryFoldArtifactError>,
     ) -> Result<(), BlsDoryFoldArtifactError> {
         let expected_len = artifact_file_bytes(self.spec.explicit_scalar_count)?;
         if self.file.metadata()?.len() != expected_len {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
-        let mut reader = self.file.try_clone()?;
-        reader.seek(SeekFrom::Start(0))?;
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file);
         let mut header = [0u8; ARTIFACT_HEADER_BYTES];
         reader.read_exact(&mut header)?;
         if header != self.spec.encode()? {
@@ -393,6 +414,64 @@ mod tests {
         assert_eq!(BLS_DORY_FOLD_ARTIFACT_MAX_WORKING_SCALARS, 2);
         drop(artifact);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn buffered_batch_and_scalar_writes_are_byte_identical() {
+        let directory = TestDirectory::create();
+        let values = (0..32_768)
+            .map(|index| BlsDoryFr::from_u64(index * 17 + 5))
+            .collect::<Vec<_>>();
+        let artifact_spec = spec(u64::try_from(values.len()).unwrap());
+
+        let mut scalar_writer =
+            BlsDoryFoldArtifactWriter::create(&directory.0, artifact_spec).unwrap();
+        for value in &values {
+            scalar_writer.write_scalar(value).unwrap();
+        }
+        let scalar_artifact = scalar_writer.finish().unwrap();
+
+        let mut batch_writer =
+            BlsDoryFoldArtifactWriter::create(&directory.0, artifact_spec).unwrap();
+        batch_writer.write_scalars(&values).unwrap();
+        let batch_artifact = batch_writer.finish().unwrap();
+
+        assert_eq!(batch_artifact.digest(), scalar_artifact.digest());
+        assert_eq!(
+            std::fs::read(batch_artifact.path()).unwrap(),
+            std::fs::read(scalar_artifact.path()).unwrap()
+        );
+        let mut decoded = Vec::with_capacity(values.len());
+        batch_artifact
+            .for_each_scalar(|scalar| {
+                decoded.push(scalar);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn rejected_batch_overrun_does_not_partially_advance_writer() {
+        let directory = TestDirectory::create();
+        let values = (1..=4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+        let mut writer = BlsDoryFoldArtifactWriter::create(&directory.0, spec(4)).unwrap();
+        let mut too_many = values.clone();
+        too_many.push(BlsDoryFr::from_u64(5));
+        assert!(matches!(
+            writer.write_scalars(&too_many),
+            Err(BlsDoryFoldArtifactError::InvalidArtifact)
+        ));
+        writer.write_scalars(&values).unwrap();
+        let artifact = writer.finish().unwrap();
+        let mut decoded = Vec::new();
+        artifact
+            .for_each_scalar(|scalar| {
+                decoded.push(scalar);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(decoded, values);
     }
 
     #[test]

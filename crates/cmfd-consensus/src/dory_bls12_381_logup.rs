@@ -67,7 +67,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "lineage-authenticated linear folds preserve exact proofs and improve n=19 proving by 10.3%, but CPU n=33 still projects to roughly 9.2 days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
+    "bounded artifact I/O and lineage-authenticated linear folds preserve exact proofs and reduce n=19 proving to 42.699 seconds and opening to 10.618 seconds, but CPU n=33 still projects to roughly 8.1 proving days plus 2.0 opening days and one LogUp projects near 770 GiB peak scratch; GPU or distributed folds, reclaimed opening sources, and a complete measurement remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -1343,8 +1343,7 @@ fn write_logup_fold_values(
     values: LogUpFoldValues,
 ) -> Result<(), BlsDoryRangeLogUpError> {
     writer
-        .write_scalar(&values.transition)
-        .and_then(|()| writer.write_scalar(&values.inverse))
+        .write_scalars(&[values.transition, values.inverse])
         .map_err(|_| logup_storage_error())
 }
 

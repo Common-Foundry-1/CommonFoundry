@@ -8,7 +8,7 @@ use cmfd_node::{
 use tauri::State;
 
 use crate::mining::{MiningStartRequest, MiningStatus};
-use crate::runtime::{RuntimeState, startup_error};
+use crate::runtime::{PeerSettings, RuntimeState, UpdatePeerSettingsRequest, startup_error};
 
 async fn with_node<T, F>(node: Arc<Mutex<Node>>, operation: F) -> Result<T, NodeClientError>
 where
@@ -36,6 +36,30 @@ pub async fn get_node_status(
 ) -> Result<NodeStatus, NodeClientError> {
     let node = state.node()?;
     with_node(node, |node| node.status()).await
+}
+
+#[tauri::command]
+pub async fn get_peer_settings(
+    state: State<'_, RuntimeState>,
+) -> Result<PeerSettings, NodeClientError> {
+    state.peers()?.settings()
+}
+
+#[tauri::command]
+pub async fn update_peer_settings(
+    state: State<'_, RuntimeState>,
+    request: UpdatePeerSettingsRequest,
+) -> Result<PeerSettings, NodeClientError> {
+    let peers = state.peers()?;
+    tauri::async_runtime::spawn_blocking(move || peers.update(request))
+        .await
+        .map_err(|_| {
+            startup_error(
+                "peer_settings_worker_failed",
+                "The peer settings worker stopped unexpectedly. Reopen the wallet.",
+                true,
+            )
+        })?
 }
 
 #[tauri::command]

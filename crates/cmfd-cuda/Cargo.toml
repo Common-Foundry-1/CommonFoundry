@@ -1,6 +1,6 @@
 [package]
 name = "cmfd-cuda"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.13"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

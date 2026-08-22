@@ -14,6 +14,12 @@ export interface PeerObservation {
   remote_tip: string | null;
 }
 
+export interface PeerSettings {
+  peers: string[];
+  bootstrap_peer: string;
+  max_peers: number;
+}
+
 export interface NodeStatus {
   network: string;
   network_id: string;

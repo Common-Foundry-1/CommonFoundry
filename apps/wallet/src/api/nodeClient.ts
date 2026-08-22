@@ -4,6 +4,7 @@ import type {
   MempoolSnapshot,
   MineResult,
   NodeStatus,
+  PeerSettings,
   WalletSendRequest,
   WalletSendResult,
   WalletSnapshot,
@@ -42,6 +43,8 @@ export interface NodeTransport {
   getNodeStatus(signal?: AbortSignal): Promise<NodeStatus>;
   getWalletSnapshot(signal?: AbortSignal): Promise<WalletSnapshot>;
   getMempool(signal?: AbortSignal): Promise<MempoolSnapshot>;
+  getPeerSettings(): Promise<PeerSettings>;
+  updatePeerSettings(peers: string[]): Promise<PeerSettings>;
   sendWalletTransaction(payload: WalletSendRequest): Promise<WalletSendResult>;
   consolidateWallet(payload: ConsolidationRequest): Promise<ConsolidationResult>;
   mineDevnetBlock(miner: string, attempts?: number): Promise<MineResult>;
@@ -81,6 +84,16 @@ export const httpNodeTransport: NodeTransport = {
   getNodeStatus: (signal) => request<NodeStatus>("/v1/status", { signal }),
   getWalletSnapshot: (signal) => request<WalletSnapshot>("/v1/wallet", { signal }),
   getMempool: (signal) => request<MempoolSnapshot>("/v1/mempool", { signal }),
+  getPeerSettings: () => Promise.reject(new NodeApiError(
+    "Peer settings are available in the desktop wallet.",
+    501,
+    "peer_settings_unavailable",
+  )),
+  updatePeerSettings: () => Promise.reject(new NodeApiError(
+    "Peer settings are available in the desktop wallet.",
+    501,
+    "peer_settings_unavailable",
+  )),
   sendWalletTransaction: (payload) => request<WalletSendResult>("/v1/wallet/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -180,6 +193,15 @@ export function createTauriNodeTransport(invoke: NativeInvoke): NodeTransport {
       nativeCall<MempoolSnapshot>(invoke, "get_mempool_snapshot"),
       signal,
     ),
+    getPeerSettings: () => nativeCall<PeerSettings>(
+      invoke,
+      "get_peer_settings",
+    ),
+    updatePeerSettings: (peers) => nativeCall<PeerSettings>(
+      invoke,
+      "update_peer_settings",
+      { request: { peers } },
+    ),
     sendWalletTransaction: (payload) => nativeCall<WalletSendResult>(
       invoke,
       "send_wallet_transaction",
@@ -216,6 +238,14 @@ export function getWalletSnapshot(signal?: AbortSignal): Promise<WalletSnapshot>
 
 export function getMempool(signal?: AbortSignal): Promise<MempoolSnapshot> {
   return transport.getMempool(signal);
+}
+
+export function getPeerSettings(): Promise<PeerSettings> {
+  return transport.getPeerSettings();
+}
+
+export function updatePeerSettings(peers: string[]): Promise<PeerSettings> {
+  return transport.updatePeerSettings(peers);
 }
 
 export function sendWalletTransaction(payload: WalletSendRequest): Promise<WalletSendResult> {

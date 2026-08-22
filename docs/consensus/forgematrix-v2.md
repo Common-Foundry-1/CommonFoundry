@@ -431,12 +431,16 @@ comparison. The v2 research code now implements:
   98 digit lanes' value/slack reconstruction to the eight regular source roles.
   Its n=10 fixture is 26,689 bytes and its n=33 grammar projects to 79,233
   bytes. Four arithmetic proofs need 48 claims and four range proofs need 20;
-  matrix and wiring bring the correct compressed total to 108 claims. A
-  composed verifier requires each arithmetic/range pair to share one packed
-  commitment. A canonical shared frame now authenticates the exact three-matrix,
-  four-transition, one-wiring production topology with one aggregate and
-  projects to 135,833 bytes at n=33. Cross-component commitment links, an n=33
-  streaming prover, soundness review, and audit remain activation gates;
+  matrix and wiring bring the compressed subtotal to 108 claims. A composed
+  verifier requires each arithmetic/range pair to share one packed commitment.
+  Ten Fiat-Shamir equality points add 20 authenticated claims linking the
+  initialization output and each bank's matrix activation, matrix accumulator,
+  and transition activation to their corresponding transition or wiring roles.
+  A canonical shared frame authenticates the exact three-matrix,
+  four-transition, one-wiring production topology with one 128-claim aggregate
+  and projects to 136,157 bytes at n=33. Altered equality values and substituted,
+  reordered, or omitted components reject. An n=33 streaming prover, soundness
+  review, and audit remain activation gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

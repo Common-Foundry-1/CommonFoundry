@@ -181,8 +181,7 @@ The production n=31 grammar projects to 70,483 bytes, including a 66,559-byte
 aggregate, and pins the raw matrix soundness numerator at 45. Unequal table
 geometries, every transcript role, and the canonical outer parser have mutation
 coverage. Production still needs an n=31 streaming prover, the fixed-weight
-commitment derived from `ModelPcsIdentity`, cross-component commitment links,
-soundness review, and audit.
+commitment derived from `ModelPcsIdentity`, soundness review, and audit.
 The BLS arithmetic transition checkpoint now proves the seven regular
 constraints with degree-three rounds and authenticates twelve terminal roles as
 selector-qualified points under the commitment that still packs all 110
@@ -201,22 +200,26 @@ Its executable two-bank n=6 fixture uses nine openings and is 14,529 bytes. The
 production n=29 grammar uses 31 openings and projects to 64,097 bytes, including
 a 62,479-byte Dory aggregate. The verifier is witness-free and mutation tests
 cover the binding, statement, commitment, every evaluation, transcript, opening,
-and outer parser. Cross-component links from the scalar matrix and transition
-commitments to these wiring roles are still missing; n=29 streaming, soundness
-review, and audit also remain gates.
+and outer parser. The shared layout below now links the scalar matrix and
+transition commitments to these wiring roles; n=29 streaming, soundness review,
+and audit remain gates.
 The shared-layout checkpoint now pins all scalar components to an exact
 verifier-selected variable count. High-zero padding preserves each component's
 natural multilinear coordinates, while canonical decoders reject a proof made
 for any other geometry before opening verification. An executable n=10 fixture
 proves and verifies matrix, arithmetic transition, range, and wiring at one
-layout with 29 claims and one 21,775-byte Dory payload. Its complete canonical
-frame is 31,135 bytes. The shared grammar admits the exact production topology
+layout with 54 claims and one 21,775-byte Dory payload. Its complete canonical
+frame is 37,329 bytes. The shared grammar admits the exact production topology
 of three matrix proofs, four arithmetic/range transition pairs, and one wiring
-proof, binds their transcript digests and ordered claims into one aggregate,
-and rejects omitted or reordered components. Production is pinned to n=33.
-Range compression reduces the former 480 direct claims to 108, below the
-128-claim bound; the complete production frame projects to 135,833 bytes,
-including one 70,639-byte shared Dory payload.
+proof. Ten Fiat-Shamir equality points link the initialization output to wiring
+and, for every bank, link matrix activation to wiring input, matrix accumulator
+to transition input, and transition activation to wiring output. Each equality
+opens both independently committed representations, so range compression first
+reduces the former 480 direct claims to 108 and the 20 link claims then fill the
+128-claim aggregate exactly. The grammar binds every transcript digest, ordered
+claim, and link evaluation, and rejects altered links and omitted or reordered
+components. Production is pinned to n=33. The complete production frame projects
+to 136,157 bytes, including one 70,639-byte shared Dory payload.
 The scalar range checkpoint now reuses the exact packed transition commitment,
 commits the sixteen table multiplicities before sampling `alpha`, and commits
 an inverse polynomial afterward. A degree-four sumcheck proves the inverse,

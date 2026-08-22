@@ -756,10 +756,11 @@ bincode baseline. Repeated best-zlib runs measured 160,461 to 160,667 bytes;
 tests enforce a 165,000-byte ceiling. These are diagnostic fixture sizes, not the
 production native codec or production-shape bound. Tests mutate every core column and reject changed arithmetic,
 mask, active digits, padding, table multiplicities, lookup topology, table
-values, and untrusted degree vectors. This remains test-only: the production
-argument still needs exact initialization input and cross-component wiring,
-actual pinned preprocessing roots, native canonical encoding, aggregate size
-and latency measurements, and verifier integration.
+values, and untrusted degree vectors. This remains test-only: that FRI transport
+still needs exact initialization input, actual pinned preprocessing roots,
+native canonical encoding, aggregate size and latency measurements, and verifier
+integration. The scalar Dory path below separately implements the
+cross-component wiring equalities.
 
 The executable wire budget also rejects ordinary batch-STARK FRI as the
 production transport for this reduction. At the production bank geometry the
@@ -901,15 +902,20 @@ geometry, malformed lengths, and trailing bytes. The n=33 grammar projects to
 
 Across the initialization transition and three banks, arithmetic needs 48
 openings and the range checkpoints need twenty. Adding nine matrix and 31 wiring
-openings gives the correct 108-claim compressed checkpoint, below the bounded
-128-claim aggregate. The composed transition verifier requires its arithmetic
-and range halves to use the same packed commitment. The shared proof grammar
-accepts the exact production topology of three matrix proofs, four
-arithmetic/range transition pairs, and one wiring proof, and authenticates all
-ordered claims with one aggregate. Its complete n=33 frame projects to 135,833
-bytes. Equality openings must still link matrix, transition, and wiring
-commitments. An n=33 streaming prover, complete transcript and soundness
-accounting, and independent audit remain activation requirements.
+openings gives a 108-claim compressed subtotal. The composed transition verifier
+requires its arithmetic and range halves to use the same packed commitment. The
+shared proof grammar accepts the exact production topology of three matrix
+proofs, four arithmetic/range transition pairs, and one wiring proof. It derives
+ten equality points after absorbing every component commitment and transcript
+digest. One equality links the initialization-transition activation to the
+wiring initial table. For each bank, three more link matrix activation to wiring
+input, matrix accumulator to transition input, and transition activation to
+wiring output. Opening both independently committed representations adds twenty
+claims, filling the bounded aggregate exactly at 128. One shared Dory payload
+authenticates every ordered base and equality claim. Its complete n=33 frame
+projects to 136,157 bytes. Tests reject changed equality values and substituted,
+reordered, or omitted components. An n=33 streaming prover, complete transcript
+and soundness accounting, and independent audit remain activation requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -922,9 +928,10 @@ route is therefore native scalar-field re-arithmetization. The distinct-point,
 matrix, full local-transition, and successor-wiring transcripts are now ported.
 The scalar LogUp membership and source/slack reconstruction identities and the
 seven-constraint arithmetic sumcheck are connected through the same packed
-transition commitment, but the cross-component scalar commitment links are not.
-The individual tables accept the common n=33 layout, but streaming that shared
-geometry, complete soundness accounting, full aggregate measurement, and
+transition commitment. The shared layout also authenticates the ten
+matrix-transition-wiring equalities described above. The individual tables
+accept the common n=33 layout, but streaming that shared geometry, complete
+soundness accounting, production latency and peak-memory measurement, and
 independent audit remain mandatory activation gates.
 
 For the complete tiny structured fixture, the enforced component bounds give a

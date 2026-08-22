@@ -39,9 +39,8 @@ pub const PRODUCTION_BLS_DORY_WIRING_VARIABLES: usize = 29;
 /// This checkpoint is not accepted by consensus.
 pub const BLS_DORY_WIRING_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar wiring path.
-pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 4] = [
+pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the n=29 packed wiring polynomial is not streamed by the in-memory prover",
-    "the scalar matrix and transition commitments are not yet linked to the packed wiring roles",
     "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
     "the scalar wiring transcript and packed opening path have not received an external audit",
 ];
@@ -1076,7 +1075,7 @@ mod tests {
             require_bls_dory_wiring_production_ready(),
             Err(BlsDoryWiringError::NotProductionReady)
         );
-        assert_eq!(BLS_DORY_WIRING_PRODUCTION_BLOCKERS.len(), 4);
+        assert_eq!(BLS_DORY_WIRING_PRODUCTION_BLOCKERS.len(), 3);
     }
 
     #[test]

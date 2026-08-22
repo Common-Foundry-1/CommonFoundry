@@ -37,10 +37,9 @@ pub const PRODUCTION_BLS_DORY_MATRIX_VARIABLES: usize = 31;
 /// This checkpoint is not accepted by consensus.
 pub const BLS_DORY_MATRIX_PRODUCTION_READY: bool = false;
 /// Remaining gates on the scalar matrix path.
-pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 5] = [
+pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the n=31 activation, weight, and accumulator polynomials are not streamed by the in-memory prover",
     "the model-weight commitment is not yet derived from the pinned production ModelPcsIdentity",
-    "the activation and accumulator commitments are not yet linked to wiring and transition roles",
     "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
 ];
@@ -1295,7 +1294,7 @@ mod tests {
             require_bls_dory_matrix_production_ready(),
             Err(BlsDoryMatrixError::NotProductionReady)
         );
-        assert_eq!(BLS_DORY_MATRIX_PRODUCTION_BLOCKERS.len(), 5);
+        assert_eq!(BLS_DORY_MATRIX_PRODUCTION_BLOCKERS.len(), 4);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::{
     ForgeMatrixError, HeaderWork, MAX_BLOCK_AGGREGATE_INPUTS, MAX_BLOCK_AGGREGATE_OUTPUTS,
     MAX_BLOCK_SIGNATURE_CHECKS, MAX_BLOCK_TRANSACTIONS, MAX_COINBASE_OUTPUTS,
     MAX_TRANSACTION_INPUTS, MAX_TRANSACTION_OUTPUTS, NetworkError, NetworkParams, PowError,
-    next_work_target,
+    PreverifiedBlockProof, next_work_target,
 };
 
 const TX_SIGNING_DOMAIN: &str = "CMFD/TRANSACTION/SIGNING/V1";
@@ -183,6 +183,8 @@ pub enum ChainError {
     WrongProofType,
     #[error("proof verifier identity does not match the immutable network parameters")]
     PowParameterMismatch,
+    #[error("preverified proof capability does not match this exact block")]
+    PreverifiedProofMismatch,
     #[error("economics validation failed: {0}")]
     Economics(#[from] EconomicsError),
     #[error("inference channel validation failed: {0}")]
@@ -397,6 +399,26 @@ impl UtxoSet {
         verifier: &ConsensusPowVerifier,
         params: &NetworkParams,
     ) -> Result<(u64, UtxoDelta), ChainError> {
+        self.validate_delta_with_preverification(block, verifier, params, None)
+    }
+
+    fn validate_delta_preverified(
+        &self,
+        block: &Block,
+        verifier: &ConsensusPowVerifier,
+        params: &NetworkParams,
+        preverified: &PreverifiedBlockProof,
+    ) -> Result<(u64, UtxoDelta), ChainError> {
+        self.validate_delta_with_preverification(block, verifier, params, Some(preverified))
+    }
+
+    fn validate_delta_with_preverification(
+        &self,
+        block: &Block,
+        verifier: &ConsensusPowVerifier,
+        params: &NetworkParams,
+        preverified: Option<&PreverifiedBlockProof>,
+    ) -> Result<(u64, UtxoDelta), ChainError> {
         validate_block_resources(block)?;
         if block.version != BLOCK_VERSION {
             return Err(ChainError::UnsupportedBlockVersion);
@@ -419,9 +441,15 @@ impl UtxoSet {
         if block.transaction_root() != block.challenge.transaction_root {
             return Err(ChainError::MerkleRoot);
         }
-        verifier
-            .verify(&block.challenge, &block.proof)
-            .map_err(map_pow_error)?;
+        if let Some(preverified) = preverified {
+            verifier
+                .verify_preverified(&block.challenge, &block.proof, preverified)
+                .map_err(map_pow_error)?;
+        } else {
+            verifier
+                .verify(&block.challenge, &block.proof)
+                .map_err(map_pow_error)?;
+        }
 
         let mut candidate = UtxoOverlay::new(self);
         let mut spent = HashSet::new();
@@ -940,6 +968,27 @@ impl ChainState {
         block: &Block,
         context: BlockValidationContext,
     ) -> Result<ValidatedBlock, ChainError> {
+        self.validate_block_with_preverification(block, context, None)
+    }
+
+    /// Validates a successor block after an exact proof capability was issued
+    /// by the chain's configured verifier. All state-dependent consensus checks
+    /// still execute here; only duplicate cryptographic proof work is skipped.
+    pub fn validate_block_preverified(
+        &self,
+        block: &Block,
+        context: BlockValidationContext,
+        preverified: &PreverifiedBlockProof,
+    ) -> Result<ValidatedBlock, ChainError> {
+        self.validate_block_with_preverification(block, context, Some(preverified))
+    }
+
+    fn validate_block_with_preverification(
+        &self,
+        block: &Block,
+        context: BlockValidationContext,
+        preverified: Option<&PreverifiedBlockProof>,
+    ) -> Result<ValidatedBlock, ChainError> {
         if block.version != BLOCK_VERSION {
             return Err(ChainError::UnsupportedBlockVersion);
         }
@@ -979,9 +1028,17 @@ impl ChainState {
             return Err(ChainError::UnexpectedTarget);
         }
 
-        let (fees, delta) = self
-            .utxos
-            .validate_delta(block, &self.verifier, &self.params)?;
+        let (fees, delta) = if let Some(preverified) = preverified {
+            self.utxos.validate_delta_preverified(
+                block,
+                &self.verifier,
+                &self.params,
+                preverified,
+            )?
+        } else {
+            self.utxos
+                .validate_delta(block, &self.verifier, &self.params)?
+        };
         let window_start = self
             .raw_timestamps
             .len()
@@ -1082,6 +1139,7 @@ fn map_pow_error(error: PowError) -> ChainError {
         PowError::V2(_) => ChainError::InvalidV2Proof,
         PowError::WrongProofType => ChainError::WrongProofType,
         PowError::ParameterMismatch => ChainError::PowParameterMismatch,
+        PowError::PreverificationMismatch => ChainError::PreverifiedProofMismatch,
         PowError::WrongNetwork => ChainError::WrongNetwork,
     }
 }
@@ -2142,6 +2200,45 @@ mod tests {
             state.validate_and_apply(&mutated, validation_context(120)),
             Err(ChainError::InvalidV2Proof)
         );
+        assert_eq!(state.tip(), tip);
+        assert_eq!(state.next_height(), 2);
+    }
+
+    #[test]
+    fn preverified_successor_keeps_state_checks_and_rejects_capability_reuse() {
+        let reference = v2_test_reference().unwrap();
+        let descriptor = reference.descriptor();
+        let mut params = network_params();
+        params.network_id = descriptor.network_id;
+        params.pow = PowParameters::V2Reference(descriptor);
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let mut state = ChainState::new(params, verifier).unwrap();
+
+        let first = block_for_state(&state, 60, miner_destination(), vec![], 0, 7);
+        let preverified = state
+            .verifier
+            .preverify(&first.challenge, &first.proof)
+            .unwrap();
+        let validated = state
+            .validate_block_preverified(&first, validation_context(60), &preverified)
+            .unwrap();
+        state.commit_validated(validated).unwrap();
+        assert_eq!(state.tip(), first.block_id());
+
+        let mut second = block_for_state(&state, 120, miner_destination(), vec![], 0, 8);
+        let preverified = state
+            .verifier
+            .preverify(&second.challenge, &second.proof)
+            .unwrap();
+        let BlockProof::V2Reference(proof) = &mut second.proof else {
+            unreachable!();
+        };
+        proof.work_digest[0] ^= 1;
+        let tip = state.tip();
+        assert!(matches!(
+            state.validate_block_preverified(&second, validation_context(120), &preverified),
+            Err(ChainError::PreverifiedProofMismatch)
+        ));
         assert_eq!(state.tip(), tip);
         assert_eq!(state.next_height(), 2);
     }

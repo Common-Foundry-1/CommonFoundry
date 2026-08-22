@@ -1202,6 +1202,22 @@ requires a pinned structured-proof parser, final model and verifier parameters,
 resource-bounded verification, network fingerprint changes, and explicit
 consensus selection rather than reusing the compact reference tag.
 
+External block admission now separates proof verification from mutable node
+state. The verifier issues a nonserializable process-local capability bound to
+the exact verifier parameters, block challenge, proof type, public fields, and
+proof bytes. Outbound synchronization, inbound `SubmitBlock`, and the shared
+loopback block RPC verify before acquiring the node mutex, then consume that
+capability while rerunning every parent, height, target, timestamp,
+transaction, UTXO, coinbase, fork-choice, and persistence check. Admission is
+serialized to one active proof with at most eight waiting callers and a
+five-second queue timeout; saturation is retryable, verifier panics reject only
+the candidate, and active/queued counts are observable in node status. This is
+bounded in-process admission, not a production sandbox: an active verifier has
+no killable wall-time or memory boundary, and side-branch reconstruction still
+replays historical blocks synchronously. Production therefore still requires
+an OS-contained verifier worker, hard execution budgets, load tests, and the
+final V3 parser/verifier selection.
+
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and
 `StructuredWhirPcsVerifier` authenticates both scoped claim sets. This closes

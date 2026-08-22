@@ -14,6 +14,8 @@ pub const POW_TYPE_V1_LEGACY: u16 = 1;
 pub const POW_TYPE_V2_REFERENCE: u16 = 2;
 /// Reserved wire identity for the fail-closed structured production candidate.
 pub const POW_TYPE_V3_CANDIDATE: u16 = 3;
+const PREVERIFIED_VERIFIER_DOMAIN: &str = "CMFD/POW/PREVERIFIED-VERIFIER/V1";
+const PREVERIFIED_STATEMENT_DOMAIN: &str = "CMFD/POW/PREVERIFIED-STATEMENT/V1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowParameters {
@@ -46,6 +48,18 @@ pub struct ForgeMatrixV3CandidateProof {
     pub structured_proof: Vec<u8>,
 }
 
+/// Process-local evidence that the configured verifier accepted one exact
+/// challenge and proof.
+///
+/// The fields are deliberately private and this type implements neither
+/// serialization nor a public constructor. Network bytes can therefore never
+/// manufacture the capability used by the chain's preverified path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreverifiedBlockProof {
+    verifier_identity: [u8; 32],
+    statement_identity: [u8; 32],
+}
+
 #[derive(Debug, Error)]
 pub enum PowError {
     #[error("legacy ForgeMatrix v1 failed: {0}")]
@@ -56,6 +70,8 @@ pub enum PowError {
     WrongProofType,
     #[error("proof verifier identity does not match the network parameters")]
     ParameterMismatch,
+    #[error("preverified proof does not match the verifier, challenge, or proof bytes")]
+    PreverificationMismatch,
     #[error("ForgeMatrix v2 descriptor belongs to another network")]
     WrongNetwork,
 }
@@ -201,6 +217,40 @@ impl ConsensusPowVerifier {
         }
     }
 
+    /// Performs the expensive proof verification and returns a process-local
+    /// capability bound to this verifier and the exact statement bytes.
+    pub fn preverify(
+        &self,
+        block: &BlockChallenge,
+        proof: &BlockProof,
+    ) -> Result<PreverifiedBlockProof, PowError> {
+        self.verify(block, proof)?;
+        Ok(PreverifiedBlockProof {
+            verifier_identity: self.preverification_identity(block.network_id)?,
+            statement_identity: preverified_statement_identity(block, proof),
+        })
+    }
+
+    pub(crate) fn verify_preverified(
+        &self,
+        block: &BlockChallenge,
+        proof: &BlockProof,
+        preverified: &PreverifiedBlockProof,
+    ) -> Result<(), PowError> {
+        if preverified.verifier_identity != self.preverification_identity(block.network_id)?
+            || preverified.statement_identity != preverified_statement_identity(block, proof)
+        {
+            return Err(PowError::PreverificationMismatch);
+        }
+        Ok(())
+    }
+
+    fn preverification_identity(&self, network_id: [u8; 32]) -> Result<[u8; 32], PowError> {
+        let mut hasher = Hasher::new_derive_key(PREVERIFIED_VERIFIER_DOMAIN);
+        self.parameters().absorb(network_id, &mut hasher)?;
+        Ok(*hasher.finalize().as_bytes())
+    }
+
     /// Deterministically evaluates the configured proof relation for one
     /// nonce. This deliberately does not apply `block.target`; it is suitable
     /// for recomputing pool shares, not for accepting blocks.
@@ -309,6 +359,18 @@ impl ConsensusPowVerifier {
     }
 }
 
+fn preverified_statement_identity(block: &BlockChallenge, proof: &BlockProof) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(PREVERIFIED_STATEMENT_DOMAIN);
+    hasher.update(&block.network_id);
+    hasher.update(&block.previous_block);
+    hasher.update(&block.transaction_root);
+    hasher.update(&block.height.to_le_bytes());
+    hasher.update(&block.timestamp.to_le_bytes());
+    hasher.update(&block.target);
+    proof.absorb(&mut hasher);
+    *hasher.finalize().as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +408,41 @@ mod tests {
         let proof = verifier.mine(&block(network_id), 7, 1).unwrap();
         verifier.verify(&block(network_id), &proof).unwrap();
         assert_eq!(proof.proof_type(), POW_TYPE_V2_REFERENCE);
+    }
+
+    #[test]
+    fn preverification_capability_is_bound_to_verifier_challenge_and_proof() {
+        let reference = v2_test_reference().unwrap();
+        let network_id = reference.descriptor().network_id;
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let challenge = block(network_id);
+        let proof = verifier.mine(&challenge, 7, 1).unwrap();
+        let preverified = verifier.preverify(&challenge, &proof).unwrap();
+        verifier
+            .verify_preverified(&challenge, &proof, &preverified)
+            .unwrap();
+
+        let mut changed_challenge = challenge;
+        changed_challenge.timestamp += 1;
+        assert!(matches!(
+            verifier.verify_preverified(&changed_challenge, &proof, &preverified),
+            Err(PowError::PreverificationMismatch)
+        ));
+
+        let mut changed_proof = proof;
+        let BlockProof::V2Reference(proof) = &mut changed_proof else {
+            unreachable!();
+        };
+        proof.work_digest[0] ^= 1;
+        assert!(matches!(
+            verifier.verify_preverified(&challenge, &changed_proof, &preverified),
+            Err(PowError::PreverificationMismatch)
+        ));
+
+        let legacy = ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap();
+        assert!(matches!(
+            legacy.verify_preverified(&challenge, &changed_proof, &preverified),
+            Err(PowError::PreverificationMismatch | PowError::WrongNetwork)
+        ));
     }
 }

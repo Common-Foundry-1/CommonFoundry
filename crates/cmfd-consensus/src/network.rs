@@ -211,9 +211,10 @@ fn map_pow_parameter_error(error: PowError) -> NetworkError {
     match error {
         PowError::V1(error) => NetworkError::ForgeMatrix(error),
         PowError::WrongNetwork => NetworkError::WrongPowNetwork,
-        PowError::V2(_) | PowError::WrongProofType | PowError::ParameterMismatch => {
-            NetworkError::InvalidPowParameters
-        }
+        PowError::V2(_)
+        | PowError::WrongProofType
+        | PowError::ParameterMismatch
+        | PowError::PreverificationMismatch => NetworkError::InvalidPowParameters,
     }
 }
 

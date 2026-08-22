@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
@@ -16,9 +17,9 @@ use cmfd_consensus::{
     ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, InputWitness, MAX_BLOCK_BYTES,
     MAX_FUTURE_OFFSET_SECS, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS,
     NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
-    PowParameters, TRANSACTION_VERSION, Transaction, TxInput, TxOutput, WireError, add_chain_work,
-    chain_work_bytes, decode_block, decode_transaction, encode_block, encode_transaction,
-    merkle_root, v2_test_reference,
+    PowParameters, PreverifiedBlockProof, TRANSACTION_VERSION, Transaction, TxInput, TxOutput,
+    WireError, add_chain_work, chain_work_bytes, decode_block, decode_transaction, encode_block,
+    encode_transaction, merkle_root, v2_test_reference, validate_block_resources,
 };
 use fs2::FileExt;
 use k256::schnorr::{SigningKey, VerifyingKey};
@@ -46,6 +47,11 @@ pub const MAX_MEMPOOL_BYTES: usize = 512 * 1024;
 pub const MIN_RELAY_FEE_PER_KIB: u64 = 1;
 pub const MAX_WALLET_HISTORY: usize = 100;
 pub const MAX_OBSERVED_PEERS: usize = 64;
+/// Proof verification is intentionally serialized until production resource
+/// measurements justify a larger parallel allowance.
+pub const MAX_CONCURRENT_PROOF_VERIFICATIONS: usize = 1;
+/// Bounded waiters prevent peer floods from creating unbounded verifier work.
+pub const MAX_QUEUED_PROOF_VERIFICATIONS: usize = 8;
 
 const METADATA_FILE: &str = "network.meta";
 const BLOCK_LOG_FILE: &str = "blocks.log";
@@ -64,6 +70,7 @@ const RPC_HEADER_LIMIT: usize = 8 * 1024;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
 const LEGACY_DEV_WALLET_WARNING: &str = "Devnet-0 legacy wallet: this upgraded data directory retains its original demonstration key so existing test coins remain available.";
 const LOCAL_DEV_WALLET_WARNING: &str =
@@ -152,6 +159,14 @@ pub enum NodeError {
     RpcIo(#[source] io::Error),
     #[error("shared node mutex is poisoned")]
     SharedNodePoisoned,
+    #[error("proof verification queue is full")]
+    ProofVerificationQueueFull,
+    #[error("timed out waiting for proof verification capacity")]
+    ProofVerificationQueueTimeout,
+    #[error("proof verification queue state is poisoned")]
+    ProofVerificationQueuePoisoned,
+    #[error("proof verifier panicked; the candidate was rejected")]
+    ProofVerifierPanicked,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -212,6 +227,10 @@ impl NodeError {
             Self::InvalidRpcRequest(_) => ("invalid_request", 400, false),
             Self::RpcIo(_) => ("rpc_io", 500, true),
             Self::SharedNodePoisoned => ("shared_node_poisoned", 500, false),
+            Self::ProofVerificationQueueFull => ("proof_queue_full", 503, true),
+            Self::ProofVerificationQueueTimeout => ("proof_queue_timeout", 503, true),
+            Self::ProofVerificationQueuePoisoned => ("proof_queue_poisoned", 500, false),
+            Self::ProofVerifierPanicked => ("proof_verifier_panicked", 500, false),
             Self::Json(_) => ("invalid_json", 400, false),
             Self::Network(_) => ("network_parameters", 500, false),
             Self::Chain(_) => ("chain_rejected", 422, false),
@@ -239,6 +258,137 @@ impl NodeError {
     }
 }
 
+#[derive(Debug)]
+struct ProofVerificationQueueState {
+    active: usize,
+    queued: usize,
+}
+
+#[derive(Debug)]
+struct ProofVerificationQueue {
+    state: Mutex<ProofVerificationQueueState>,
+    wake: Condvar,
+    max_active: usize,
+    max_queued: usize,
+    wait_timeout: Duration,
+}
+
+impl ProofVerificationQueue {
+    fn new(max_active: usize, max_queued: usize, wait_timeout: Duration) -> Self {
+        assert!(max_active > 0, "proof verification needs active capacity");
+        Self {
+            state: Mutex::new(ProofVerificationQueueState {
+                active: 0,
+                queued: 0,
+            }),
+            wake: Condvar::new(),
+            max_active,
+            max_queued,
+            wait_timeout,
+        }
+    }
+
+    fn acquire(&self) -> Result<ProofVerificationPermit<'_>, NodeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        if state.active < self.max_active {
+            state.active += 1;
+            return Ok(ProofVerificationPermit { queue: self });
+        }
+        if state.queued >= self.max_queued {
+            return Err(NodeError::ProofVerificationQueueFull);
+        }
+
+        state.queued += 1;
+        let (mut state, wait_result) = self
+            .wake
+            .wait_timeout_while(state, self.wait_timeout, |state| {
+                state.active >= self.max_active
+            })
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        state.queued -= 1;
+        if wait_result.timed_out() && state.active >= self.max_active {
+            return Err(NodeError::ProofVerificationQueueTimeout);
+        }
+        state.active += 1;
+        Ok(ProofVerificationPermit { queue: self })
+    }
+
+    fn counts(&self) -> Result<(usize, usize), NodeError> {
+        self.state
+            .lock()
+            .map(|state| (state.active, state.queued))
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)
+    }
+}
+
+struct ProofVerificationPermit<'a> {
+    queue: &'a ProofVerificationQueue,
+}
+
+impl Drop for ProofVerificationPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.queue.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            self.queue.wake.notify_one();
+        }
+    }
+}
+
+/// Cloneable, immutable admission handle for proof verification outside the
+/// node's global state lock.
+#[derive(Clone)]
+pub struct BlockPreverifier {
+    verifier: ConsensusPowVerifier,
+    queue: Arc<ProofVerificationQueue>,
+}
+
+impl BlockPreverifier {
+    fn new(verifier: ConsensusPowVerifier) -> Self {
+        Self::with_limits(
+            verifier,
+            MAX_CONCURRENT_PROOF_VERIFICATIONS,
+            MAX_QUEUED_PROOF_VERIFICATIONS,
+            PROOF_VERIFICATION_QUEUE_TIMEOUT,
+        )
+    }
+
+    fn with_limits(
+        verifier: ConsensusPowVerifier,
+        max_active: usize,
+        max_queued: usize,
+        wait_timeout: Duration,
+    ) -> Self {
+        Self {
+            verifier,
+            queue: Arc::new(ProofVerificationQueue::new(
+                max_active,
+                max_queued,
+                wait_timeout,
+            )),
+        }
+    }
+
+    pub fn preverify(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
+        validate_block_resources(block)?;
+        encode_block(block)?;
+        self.run_guarded(|| self.verifier.preverify(&block.challenge, &block.proof))
+    }
+
+    fn run_guarded<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, PowError>,
+    ) -> Result<T, NodeError> {
+        let _permit = self.queue.acquire()?;
+        match catch_unwind(AssertUnwindSafe(operation)) {
+            Ok(result) => result.map_err(NodeError::from),
+            Err(_) => Err(NodeError::ProofVerifierPanicked),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeStatus {
     pub network: &'static str,
@@ -253,6 +403,10 @@ pub struct NodeStatus {
     pub utxo_count: usize,
     pub mempool_transactions: usize,
     pub mempool_bytes: usize,
+    pub proof_verification_active: usize,
+    pub proof_verification_queued: usize,
+    pub proof_verification_capacity: usize,
+    pub proof_verification_queue_capacity: usize,
     pub storage_healthy: bool,
     pub public_peer_mode: bool,
     pub peers: Vec<PeerObservation>,
@@ -925,6 +1079,7 @@ pub struct Node {
     wallet_signing_key: SigningKey,
     legacy_shared_wallet: bool,
     verifier: ConsensusPowVerifier,
+    block_preverifier: BlockPreverifier,
     state: ChainState,
     index: BlockIndex,
     mempool: BTreeMap<[u8; 32], MempoolEntry>,
@@ -1030,6 +1185,13 @@ struct PreparedBlock {
     candidate: ValidatedCandidate,
 }
 
+struct BlockPreparationContext<'a> {
+    params: NetworkParams,
+    verifier: &'a ConsensusPowVerifier,
+    accepted_at: u64,
+    preverified: Option<&'a PreverifiedBlockProof>,
+}
+
 pub fn devnet_params() -> Result<NetworkParams, NodeError> {
     let reference = v2_test_reference().map_err(PowError::from)?;
     let params = NetworkParams {
@@ -1089,6 +1251,7 @@ impl Node {
 
         let reference = v2_test_reference().map_err(PowError::from)?;
         let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let block_preverifier = BlockPreverifier::new(verifier.clone());
         let mut state = ChainState::new(params, verifier.clone())?;
         let mut index = BlockIndex::new(params.genesis_hash);
         replay_log(
@@ -1117,6 +1280,7 @@ impl Node {
             wallet_signing_key,
             legacy_shared_wallet,
             verifier,
+            block_preverifier,
             state,
             index,
             mempool: BTreeMap::new(),
@@ -1131,6 +1295,10 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn block_preverifier(&self) -> BlockPreverifier {
+        self.block_preverifier.clone()
     }
 
     pub fn wallet_destination(&self) -> [u8; 32] {
@@ -1150,6 +1318,8 @@ impl Node {
     }
 
     pub fn status(&self) -> Result<NodeStatus, NodeError> {
+        let (proof_verification_active, proof_verification_queued) =
+            self.block_preverifier.queue.counts()?;
         Ok(NodeStatus {
             network: "CommonFoundry Devnet-0",
             network_id: hex::encode(self.params.network_id),
@@ -1163,6 +1333,10 @@ impl Node {
             utxo_count: self.state.utxos().len(),
             mempool_transactions: self.mempool.len(),
             mempool_bytes: self.mempool_bytes,
+            proof_verification_active,
+            proof_verification_queued,
+            proof_verification_capacity: self.block_preverifier.queue.max_active,
+            proof_verification_queue_capacity: self.block_preverifier.queue.max_queued,
             storage_healthy: !self.storage_faulted,
             public_peer_mode: self.public_peer_mode,
             peers: self.peer_observations(),
@@ -2088,6 +2262,27 @@ impl Node {
     }
 
     pub fn submit_block(&mut self, block: Block, accepted_at: u64) -> Result<u64, NodeError> {
+        self.submit_block_with_preverification(block, accepted_at, None)
+    }
+
+    /// Consumes process-local proof evidence produced outside the node lock.
+    /// Every state-dependent consensus and durability check remains identical
+    /// to [`Self::submit_block`].
+    pub fn submit_preverified_block(
+        &mut self,
+        block: Block,
+        accepted_at: u64,
+        preverified: PreverifiedBlockProof,
+    ) -> Result<u64, NodeError> {
+        self.submit_block_with_preverification(block, accepted_at, Some(&preverified))
+    }
+
+    fn submit_block_with_preverification(
+        &mut self,
+        block: Block,
+        accepted_at: u64,
+        preverified: Option<&PreverifiedBlockProof>,
+    ) -> Result<u64, NodeError> {
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
@@ -2098,11 +2293,14 @@ impl Node {
         let prepared = prepare_block(
             &self.state,
             &self.index,
-            self.params,
-            &self.verifier,
             &block,
-            accepted_at,
             canonical.clone(),
+            BlockPreparationContext {
+                params: self.params,
+                verifier: &self.verifier,
+                accepted_at,
+                preverified,
+            },
         )?;
         let record = encode_record(accepted_at, &canonical)?;
         let log_path = self.data_dir.join(BLOCK_LOG_FILE);
@@ -2283,12 +2481,16 @@ fn retain_newest_wallet_history(
 fn prepare_block(
     active_state: &ChainState,
     index: &BlockIndex,
-    params: NetworkParams,
-    verifier: &ConsensusPowVerifier,
     block: &Block,
-    accepted_at: u64,
     canonical: Vec<u8>,
+    context: BlockPreparationContext<'_>,
 ) -> Result<PreparedBlock, NodeError> {
+    let BlockPreparationContext {
+        params,
+        verifier,
+        accepted_at,
+        preverified,
+    } = context;
     let block_id = block.block_id();
     if index.contains(block_id) {
         return Err(NodeError::DuplicateBlock(block_id));
@@ -2301,13 +2503,22 @@ fn prepare_block(
         now_unix_seconds: accepted_at,
     };
     let candidate = if parent == active_state.tip() {
-        ValidatedCandidate::Active(active_state.validate_block(block, context)?)
+        let validated = if let Some(preverified) = preverified {
+            active_state.validate_block_preverified(block, context, preverified)?
+        } else {
+            active_state.validate_block(block, context)?
+        };
+        ValidatedCandidate::Active(validated)
     } else {
         // Devnet-0 intentionally replays the complete side branch here. This
         // keeps fork validation simple and prevents an unvalidated header-only
         // branch from entering the index or influencing fork choice.
         let branch_state = rebuild_state_to(index, params, verifier, parent)?;
-        let validated = branch_state.validate_block(block, context)?;
+        let validated = if let Some(preverified) = preverified {
+            branch_state.validate_block_preverified(block, context, preverified)?
+        } else {
+            branch_state.validate_block(block, context)?
+        };
         ValidatedCandidate::Branch {
             state: Box::new(branch_state),
             validated,
@@ -2533,7 +2744,9 @@ fn handle_rpc_connection_shared(
             return write_rpc_response(stream, RpcResponse::node_error(error));
         }
     };
-    let response = {
+    let response = if request.method == "POST" && request.target == "/v1/block" {
+        route_shared_block_request(request, shared)
+    } else {
         let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
         route_rpc_request(request, &mut node)
     };
@@ -2709,28 +2922,10 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             }
         }
         ("POST", "/v1/block") => {
-            if !has_octet_stream_content_type(request.content_type.as_deref()) {
-                return RpcResponse::json_error(
-                    415,
-                    "Unsupported Media Type",
-                    "Content-Type must be application/octet-stream",
-                );
-            }
-            let block = match decode_block(&request.body, DEVNET_NETWORK_ID) {
+            let block = match decode_canonical_rpc_block(&request) {
                 Ok(block) => block,
-                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+                Err(response) => return response,
             };
-            match encode_block(&block) {
-                Ok(canonical) if canonical == request.body => {}
-                Ok(_) => {
-                    return RpcResponse::json_error(
-                        400,
-                        "Bad Request",
-                        "block frame is not canonical",
-                    );
-                }
-                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
-            }
             let accepted_at = match unix_time_seconds() {
                 Ok(accepted_at) => accepted_at,
                 Err(error) => {
@@ -2738,19 +2933,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
                 }
             };
             match node.submit_block(block, accepted_at) {
-                Ok(fees_burned) => match node.status() {
-                    Ok(status) => RpcResponse::json(
-                        200,
-                        "OK",
-                        json!({
-                            "accepted": true,
-                            "height": status.accepted_height,
-                            "tip": status.tip,
-                            "fees_burned": fees_burned,
-                        }),
-                    ),
-                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
-                },
+                Ok(fees_burned) => accepted_block_rpc_response(node, fees_burned),
                 Err(NodeError::Chain(error)) => {
                     RpcResponse::json_error(422, "Unprocessable Content", error)
                 }
@@ -2759,6 +2942,74 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
         }
         ("GET" | "POST", _) => RpcResponse::json_error(404, "Not Found", "unknown endpoint"),
         _ => RpcResponse::json_error(405, "Method Not Allowed", "method not allowed"),
+    }
+}
+
+fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) -> RpcResponse {
+    let block = match decode_canonical_rpc_block(&request) {
+        Ok(block) => block,
+        Err(response) => return response,
+    };
+    let block_id = block.block_id();
+    let block_preverifier = match shared.lock() {
+        Ok(node) if node.contains_block(block_id) => {
+            return RpcResponse::node_error(NodeError::DuplicateBlock(block_id));
+        }
+        Ok(node) => node.block_preverifier(),
+        Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
+    };
+    let preverified = match block_preverifier.preverify(&block) {
+        Ok(preverified) => preverified,
+        Err(error) => return RpcResponse::node_error(error),
+    };
+    let accepted_at = match unix_time_seconds() {
+        Ok(accepted_at) => accepted_at,
+        Err(error) => return RpcResponse::node_error(error),
+    };
+    let mut node = match shared.lock() {
+        Ok(node) => node,
+        Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
+    };
+    match node.submit_preverified_block(block, accepted_at, preverified) {
+        Ok(fees_burned) => accepted_block_rpc_response(&node, fees_burned),
+        Err(error) => RpcResponse::node_error(error),
+    }
+}
+
+fn decode_canonical_rpc_block(request: &RpcRequest) -> Result<Block, RpcResponse> {
+    if !has_octet_stream_content_type(request.content_type.as_deref()) {
+        return Err(RpcResponse::json_error(
+            415,
+            "Unsupported Media Type",
+            "Content-Type must be application/octet-stream",
+        ));
+    }
+    let block = decode_block(&request.body, DEVNET_NETWORK_ID)
+        .map_err(|error| RpcResponse::json_error(400, "Bad Request", error))?;
+    match encode_block(&block) {
+        Ok(canonical) if canonical == request.body => Ok(block),
+        Ok(_) => Err(RpcResponse::json_error(
+            400,
+            "Bad Request",
+            "block frame is not canonical",
+        )),
+        Err(error) => Err(RpcResponse::json_error(400, "Bad Request", error)),
+    }
+}
+
+fn accepted_block_rpc_response(node: &Node, fees_burned: u64) -> RpcResponse {
+    match node.status() {
+        Ok(status) => RpcResponse::json(
+            200,
+            "OK",
+            json!({
+                "accepted": true,
+                "height": status.accepted_height,
+                "tip": status.tip,
+                "fees_burned": fees_burned,
+            }),
+        ),
+        Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
     }
 }
 
@@ -3376,11 +3627,14 @@ fn replay_log(
         let prepared = prepare_block(
             state,
             index,
-            params,
-            verifier,
             &block,
-            accepted_at,
             block_bytes,
+            BlockPreparationContext {
+                params,
+                verifier,
+                accepted_at,
+                preverified: None,
+            },
         )
         .map_err(|error| {
             NodeError::CorruptLog(format!("record {record_index} fails fork replay: {error}"))
@@ -3406,6 +3660,7 @@ fn log_read_error(path: &Path, source: io::Error, truncated_message: String) -> 
 mod tests {
     use std::io::{Seek, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
 
     use cmfd_consensus::{
         ForgeMatrixV2CompactProof, InputWitness, TEST_PROFILE, TRANSACTION_VERSION, TxInput,
@@ -3427,11 +3682,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn proof_verification_queue_is_bounded_releases_capacity_and_contains_panics() {
+        let queue = Arc::new(ProofVerificationQueue::new(1, 1, Duration::from_secs(2)));
+        let active = queue.acquire().unwrap();
+        let waiter_queue = Arc::clone(&queue);
+        let waiter = thread::spawn(move || waiter_queue.acquire().map(drop));
+        for _ in 0..10_000 {
+            if queue.counts().unwrap() == (1, 1) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert_eq!(queue.counts().unwrap(), (1, 1));
+        assert!(matches!(
+            queue.acquire(),
+            Err(NodeError::ProofVerificationQueueFull)
+        ));
+        drop(active);
+        waiter.join().unwrap().unwrap();
+        assert_eq!(queue.counts().unwrap(), (0, 0));
+
+        let timeout_queue = ProofVerificationQueue::new(1, 1, Duration::from_millis(1));
+        let active = timeout_queue.acquire().unwrap();
+        assert!(matches!(
+            timeout_queue.acquire(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        drop(active);
+        assert_eq!(timeout_queue.counts().unwrap(), (0, 0));
+
+        let verifier = BlockPreverifier::with_limits(
+            ConsensusPowVerifier::v2_reference(v2_test_reference().unwrap()),
+            1,
+            0,
+            Duration::from_secs(1),
+        );
+        assert!(matches!(
+            verifier.run_guarded(|| -> Result<(), PowError> { panic!("isolated verifier panic") }),
+            Err(NodeError::ProofVerifierPanicked)
+        ));
+        assert_eq!(verifier.queue.counts().unwrap(), (0, 0));
+    }
+
     fn mined_candidate(node: &Node, now: u64) -> Block {
         let template = node
             .build_template(default_miner_destination(), now)
             .unwrap();
-        let proof = node.verifier.mine(&template.challenge, 0, 100).unwrap();
+        let proof = node
+            .verifier
+            .mine(&template.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
         Block {
             version: BLOCK_VERSION,
             challenge: template.challenge,
@@ -3844,11 +4145,52 @@ mod tests {
     }
 
     #[test]
+    fn preverified_submission_consumes_only_exact_process_local_proof_evidence() {
+        let path = test_dir("preverified-submission");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let timestamp = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, timestamp);
+        let preverified = node.block_preverifier().preverify(&block).unwrap();
+
+        let mut mutated = block.clone();
+        let BlockProof::V2Reference(proof) = &mut mutated.proof else {
+            unreachable!();
+        };
+        proof.work_digest[0] ^= 1;
+        assert!(matches!(
+            node.submit_preverified_block(mutated, timestamp, preverified.clone()),
+            Err(NodeError::Chain(ChainError::PreverifiedProofMismatch))
+        ));
+        assert_eq!(node.state.next_height(), 1);
+        assert!(node.index.blocks.is_empty());
+
+        node.submit_preverified_block(block.clone(), timestamp, preverified)
+            .unwrap();
+        assert_eq!(node.state.tip(), block.block_id());
+        assert_eq!(node.state.next_height(), 2);
+        assert!(node.index.contains(block.block_id()));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn public_peer_mode_is_runtime_only_and_visible_in_status() {
         let path = test_dir("public-peer-status");
         clean_test_dir(&path);
         let mut node = Node::open(&path).unwrap();
-        assert!(!node.status().unwrap().public_peer_mode);
+        let status = node.status().unwrap();
+        assert!(!status.public_peer_mode);
+        assert_eq!(status.proof_verification_active, 0);
+        assert_eq!(status.proof_verification_queued, 0);
+        assert_eq!(
+            status.proof_verification_capacity,
+            MAX_CONCURRENT_PROOF_VERIFICATIONS
+        );
+        assert_eq!(
+            status.proof_verification_queue_capacity,
+            MAX_QUEUED_PROOF_VERIFICATIONS
+        );
         node.set_public_peer_mode(true);
         assert!(node.status().unwrap().public_peer_mode);
         drop(node);
@@ -5184,6 +5526,32 @@ mod tests {
         let replayed = Node::open(&path).unwrap();
         assert_eq!(replayed.status().unwrap().accepted_height, 1);
         drop(replayed);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn shared_block_route_preverifies_then_submits_through_the_atomic_path() {
+        let path = test_dir("shared-block-route");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let now = unix_time_seconds().unwrap();
+        let block = mined_candidate(&node, now);
+        let request = RpcRequest {
+            method: "POST".to_owned(),
+            target: "/v1/block".to_owned(),
+            content_type: Some("application/octet-stream".to_owned()),
+            body: encode_block(&block).unwrap(),
+        };
+        let shared = Arc::new(Mutex::new(node));
+
+        let response = route_shared_block_request(request, &shared);
+        assert_eq!(response.status, 200);
+        let node = shared.lock().unwrap();
+        assert_eq!(node.state.tip(), block.block_id());
+        assert_eq!(node.state.next_height(), 2);
+        assert!(node.log.metadata().unwrap().len() > 0);
+        drop(node);
+        drop(shared);
         clean_test_dir(&path);
     }
 

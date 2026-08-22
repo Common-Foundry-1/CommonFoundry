@@ -659,9 +659,14 @@ both the outer structured aggregate decoder and the nested BLS shared-layout
 decoder. Initial bounded Windows MSVC campaigns completed one million inputs per
 target without a crash, panic, timeout, or sanitizer report and reached nested
 matrix, transition, LogUp, wiring, and field-element parsing. These smoke runs
-establish a repeatable harness, not exhaustive assurance; sustained independent
-campaigns, regression preservation, and the production network verification
-queue remain activation work.
+establish a repeatable harness, not exhaustive assurance. External block
+admission now uses a one-active/eight-waiter in-process proof queue with a
+five-second admission timeout and panic containment. Verification runs outside
+the global node mutex and returns a nonserializable capability bound to the
+exact verifier, challenge, and proof; atomic chain validation consumes it
+without repeating the expensive proof. Sustained independent campaigns, an
+OS-contained verifier with killable execution and memory budgets, and final V3
+parser/verifier integration remain activation work.
 
 An optional prover-only CUDA path now implements the exact Goldilocks DFT and coset-LDE semantics used by this STARK and supplies the value-MMCS Poseidon2 first digest layer to actual proof generation. Merkle parent compression, openings, transcript operations, and verification remain on the CPU, and every resulting encoded proof must pass the unchanged CPU verifier. At the 32,768-row checkpoint on an RTX 5090, the same unoptimized Cargo test profile took 348.28 seconds on CPU (64.503 setup, 283.416 prove; 238,698-byte canonical zlib payload) and 76.71 seconds with CUDA DFT plus Poseidon2 (7.700 setup, 68.551 prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. The direct API loads native code in-process and is for trusted development only. The hash-pinned, bounded worker path has been tested with a 64-byte tree proof and terminates its whole process tree on timeout or overflow; this is crash containment, not an operating-system sandbox or a change to consensus.
 
@@ -968,7 +973,7 @@ It does not assume miners follow a reference kernel. Any implementation computin
 | Forge polynomial openings | Transparent PCS with canonical openings | Feature-gated WHIR research adapter authenticates canonical openings; production selection, soundness review, and audit remain absent |
 | Fake raw-to-PCS equivalence | Verifiable link certificate | Component-level authenticated source/codeword/tree/alias link implemented; production-scale activation certificate and audit absent |
 | Transcript grinding | Canonical transcript, post-commit challenges, large extension field | Feature-gated custom and WHIR transcripts bind post-commitment points; complete aggregate soundness and production review remain absent |
-| Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; candidate n19/n31 native grammar is bounded; the fail-closed V3 network envelope caps the aggregate at 261,947 bytes before allocation, but canonical aggregate parsing and the hardened verification queue are not connected to consensus |
+| Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; candidate n19/n31 native grammar is bounded; the fail-closed V3 envelope caps the aggregate at 261,947 bytes before allocation; external proofs use bounded admission and identity-bound preverification outside the node lock, but final V3 parsing and killable OS isolation remain absent |
 | False remote height or work | Treat advertisement as hint and recompute locally | Implemented |
 | Peer spoofing, eclipse, MITM | Authenticated encrypted peer layer, discovery, reputation | Not implemented; private static peers only |
 | Local wallet compromise | Encrypted custody, backup/recovery, and process isolation | Distinct unencrypted Devnet keys only; production custody not implemented |
@@ -979,7 +984,7 @@ Devnet fork choice is functionally testable, but its tiny CPU-recomputed work pr
 
 ### 12.3 Public-network gaps
 
-Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened verification queue. Side-branch reconstruction replays from genesis. RPC is single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability are minimal.
+Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, bounded proof admission, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened share verifier. External block proof verification no longer holds the global node mutex: one proof runs while at most eight wait, a five-second admission timeout rejects excess work, panics are contained, and an identity-bound process-local capability prevents proof substitution before atomic submission. The active verifier still lacks a killable wall-time or memory sandbox. Side-branch reconstruction replays from genesis, and non-block RPC dispatch remains single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability remain limited.
 
 Release artifacts have SHA-256 checksums, and CI contains checked-in Windows
 and Linux desktop build jobs. The release tag and binaries remain unsigned,

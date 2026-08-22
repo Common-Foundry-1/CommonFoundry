@@ -114,7 +114,7 @@ pub use network::{
 };
 pub use pow::{
     BlockProof, ConsensusPowVerifier, ForgeMatrixV3CandidateProof, POW_TYPE_V1_LEGACY,
-    POW_TYPE_V2_REFERENCE, POW_TYPE_V3_CANDIDATE, PowError, PowParameters,
+    POW_TYPE_V2_REFERENCE, POW_TYPE_V3_CANDIDATE, PowError, PowParameters, PreverifiedBlockProof,
 };
 #[cfg(feature = "remainder-prototype")]
 pub use remainder_proof::{

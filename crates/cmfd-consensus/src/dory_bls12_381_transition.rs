@@ -1,0 +1,1082 @@
+//! BLS12-381 scalar-field transition sumcheck authenticated by Dory.
+//!
+//! The 110 canonical transition oracles are packed into 128 selector slots
+//! under one Dory commitment. The transition sumcheck proves the exact 121
+//! local arithmetic and range constraints, then one distinct-point aggregate
+//! authenticates every terminal oracle evaluation against that commitment.
+//! The executable prover remains capped below the production n=33 table.
+
+use std::io::Cursor;
+
+use dory_pcs::primitives::{
+    DoryDeserialize, DorySerialize,
+    arithmetic::{Field, Group},
+    serialization::{Compress, Validate},
+    transcript::Transcript,
+};
+use thiserror::Error;
+
+use crate::{
+    STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_CONSTRAINTS,
+    STRUCTURED_TRANSITION_INPUT_ORACLE, STRUCTURED_TRANSITION_MAX_DEGREE,
+    STRUCTURED_TRANSITION_ORACLES, STRUCTURED_TRANSITION_REGULAR_ORACLES, StructuredMaskPolynomial,
+    StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
+    V2_TRANSITION_MODULUS,
+    dory_bls12_381_aggregate::{
+        BlsDoryAggregateError, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_polynomial, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
+    },
+    dory_bls12_381_prototype::{
+        BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
+    },
+    structured_transition::{structured_transition_range_specs, validate_witness},
+};
+
+/// Version of the scalar-field transition transcript.
+pub const BLS_DORY_TRANSITION_VERSION: u16 = 1;
+/// Seven bits address 128 slots, covering all 110 transition oracles.
+pub const BLS_DORY_TRANSITION_SELECTOR_VARIABLES: usize = 7;
+/// Production transition banks contain 2^26 cells and therefore pack to n=33.
+pub const PRODUCTION_BLS_DORY_TRANSITION_VARIABLES: usize = 33;
+/// This checkpoint is not accepted by consensus.
+pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
+/// Remaining gates on this transition path.
+pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 4] = [
+    "the n=33 packed transition polynomial is not streamed by the in-memory prover",
+    "the production packed LogUp layout is not yet connected to this direct range argument",
+    "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
+    "the scalar transition transcript and packed opening path have not received an external audit",
+];
+
+const ORACLE_SLOTS: usize = 1 << BLS_DORY_TRANSITION_SELECTOR_VARIABLES;
+const PROOF_MAGIC: [u8; 8] = *b"CFBLST01";
+const PROOF_HEADER_BYTES: usize = 20;
+const MAX_TRANSITION_PROOF_BYTES: usize = 262_128;
+const MAX_TRANSITION_BINDING_BYTES: usize = 4_096;
+const OUTPUT_MODULUS: u64 = 251;
+const OUTPUT_CENTER: u64 = 125;
+const ACCUMULATOR: usize = STRUCTURED_TRANSITION_INPUT_ORACLE;
+const MASK: usize = 1;
+const ENCODED: usize = 2;
+const SQUARE_QUOTIENT: usize = 3;
+const SQUARE_REMAINDER: usize = 4;
+const CUBE_QUOTIENT: usize = 5;
+const CUBE_REMAINDER: usize = 6;
+const OUTPUT_QUOTIENT: usize = 7;
+const OUTPUT_REMAINDER: usize = 8;
+const NEGATIVE: usize = 9;
+const ACTIVATION: usize = STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
+const SHIFTED_ACCUMULATOR: usize = 11;
+
+/// In-memory transition proof plus its canonical Dory opening payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlsDoryTransitionProof {
+    pub protocol_version: u16,
+    pub packed_variables: u16,
+    pub oracle_commitment: BlsDoryGt,
+    pub rounds: Vec<Vec<BlsDoryFr>>,
+    pub terminal_evaluations: Vec<BlsDoryFr>,
+    pub transcript_digest: [u8; 32],
+    pub opening_proof: Vec<u8>,
+}
+
+impl BlsDoryTransitionProof {
+    /// Encode the exact statement-bound proof shape canonically.
+    pub fn encode(
+        &self,
+        statement: StructuredTransitionStatement,
+    ) -> Result<Vec<u8>, BlsDoryTransitionError> {
+        validate_proof_shape(statement, self)?;
+        let opening_len = u32::try_from(self.opening_proof.len())
+            .map_err(|_| BlsDoryTransitionError::ProofTooLarge)?;
+        let expected = transition_wire_bytes(self.rounds.len(), self.opening_proof.len())?;
+        let mut encoded = Vec::with_capacity(expected);
+        encoded.extend_from_slice(&PROOF_MAGIC);
+        encoded.extend_from_slice(&self.protocol_version.to_le_bytes());
+        encoded.extend_from_slice(&self.packed_variables.to_le_bytes());
+        encoded.extend_from_slice(&(self.rounds.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&(self.terminal_evaluations.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&opening_len.to_le_bytes());
+        append_serialized(&mut encoded, &self.oracle_commitment)?;
+        for round in &self.rounds {
+            for evaluation in round {
+                append_serialized(&mut encoded, evaluation)?;
+            }
+        }
+        for evaluation in &self.terminal_evaluations {
+            append_serialized(&mut encoded, evaluation)?;
+        }
+        encoded.extend_from_slice(&self.transcript_digest);
+        encoded.extend_from_slice(&self.opening_proof);
+        if encoded.len() != expected || encoded.len() > MAX_TRANSITION_PROOF_BYTES {
+            return Err(BlsDoryTransitionError::ProofTooLarge);
+        }
+        Ok(encoded)
+    }
+
+    /// Decode only the exact bounded shape implied by the trusted statement.
+    pub fn decode(
+        encoded: &[u8],
+        statement: StructuredTransitionStatement,
+    ) -> Result<Self, BlsDoryTransitionError> {
+        statement.validate_verifier_shape()?;
+        if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_TRANSITION_PROOF_BYTES {
+            return Err(BlsDoryTransitionError::ProofTooLarge);
+        }
+        if encoded[..8] != PROOF_MAGIC {
+            return Err(BlsDoryTransitionError::InvalidEncoding);
+        }
+        let protocol_version = read_u16(encoded, 8)?;
+        let packed_variables = read_u16(encoded, 10)?;
+        let round_count = read_u16(encoded, 12)? as usize;
+        let terminal_count = read_u16(encoded, 14)? as usize;
+        let opening_len = read_u32(encoded, 16)? as usize;
+        let expected_rounds = statement.elements()?.ilog2() as usize;
+        let expected_packed = expected_rounds
+            .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if protocol_version != BLS_DORY_TRANSITION_VERSION
+            || usize::from(packed_variables) != expected_packed
+            || round_count != expected_rounds
+            || terminal_count != STRUCTURED_TRANSITION_ORACLES
+            || opening_len == 0
+            || opening_len > MAX_BLS_DORY_AGGREGATE_BYTES
+            || encoded.len() != transition_wire_bytes(round_count, opening_len)?
+        {
+            return Err(BlsDoryTransitionError::InvalidProofShape);
+        }
+
+        let mut reader = Cursor::new(&encoded[PROOF_HEADER_BYTES..]);
+        let oracle_commitment = read_serialized(&mut reader)?;
+        let mut rounds = Vec::with_capacity(round_count);
+        for _ in 0..round_count {
+            let mut round = Vec::with_capacity(STRUCTURED_TRANSITION_MAX_DEGREE + 1);
+            for _ in 0..=STRUCTURED_TRANSITION_MAX_DEGREE {
+                round.push(read_serialized(&mut reader)?);
+            }
+            rounds.push(round);
+        }
+        let mut terminal_evaluations = Vec::with_capacity(terminal_count);
+        for _ in 0..terminal_count {
+            terminal_evaluations.push(read_serialized(&mut reader)?);
+        }
+        let payload_offset = PROOF_HEADER_BYTES + reader.position() as usize;
+        let digest_end = payload_offset
+            .checked_add(32)
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+        let transcript_digest = encoded
+            .get(payload_offset..digest_end)
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?
+            .try_into()
+            .map_err(|_| BlsDoryTransitionError::InvalidProofShape)?;
+        let opening_proof = encoded
+            .get(digest_end..)
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?
+            .to_vec();
+        if opening_proof.len() != opening_len {
+            return Err(BlsDoryTransitionError::InvalidProofShape);
+        }
+        let proof = Self {
+            protocol_version,
+            packed_variables,
+            oracle_commitment,
+            rounds,
+            terminal_evaluations,
+            transcript_digest,
+            opening_proof,
+        };
+        if proof.encode(statement)? != encoded {
+            return Err(BlsDoryTransitionError::InvalidEncoding);
+        }
+        Ok(proof)
+    }
+}
+
+/// Errors from the scalar transition checkpoint.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BlsDoryTransitionError {
+    #[error("structured transition input is invalid: {0}")]
+    Structured(#[from] StructuredTransitionError),
+    #[error("Dory opening authentication failed: {0}")]
+    Aggregate(#[from] BlsDoryAggregateError),
+    #[error("packed transition dimensions overflow or exceed this checkpoint")]
+    InvalidDimensions,
+    #[error("scalar transition proof has the wrong fixed shape")]
+    InvalidProofShape,
+    #[error("transition round does not preserve the current claim")]
+    RoundClaim,
+    #[error("transition terminal relation is invalid")]
+    TerminalClaim,
+    #[error("transition mask opening does not equal the challenge-derived polynomial")]
+    MaskPolynomial,
+    #[error("transition transcript digest mismatch")]
+    Transcript,
+    #[error("Dory claims do not match the transition terminal evaluations")]
+    Opening,
+    #[error("transition public binding exceeds the bounded transcript limit")]
+    PublicBindingTooLarge,
+    #[error("transition proof exceeds the network payload cap")]
+    ProofTooLarge,
+    #[error("transition proof encoding is malformed or non-canonical")]
+    InvalidEncoding,
+    #[error("the BLS12-381 transition checkpoint is not production ready")]
+    NotProductionReady,
+}
+
+/// Fail closed while any production blocker remains.
+pub fn require_bls_dory_transition_production_ready() -> Result<(), BlsDoryTransitionError> {
+    Err(BlsDoryTransitionError::NotProductionReady)
+}
+
+/// Project only the canonical Dory opening payload for a transition bank.
+pub fn projected_production_transition_opening_bytes() -> Result<usize, BlsDoryTransitionError> {
+    projected_bls_dory_aggregate_bytes(PRODUCTION_BLS_DORY_TRANSITION_VARIABLES)
+        .map_err(BlsDoryTransitionError::Aggregate)
+}
+
+/// Project the complete canonical transition proof at production geometry.
+pub fn projected_production_transition_proof_bytes() -> Result<usize, BlsDoryTransitionError> {
+    let opening = projected_production_transition_opening_bytes()?;
+    transition_wire_bytes(26, opening)
+}
+
+/// Prove all 121 transition/range constraints and authenticate all 110 terminal openings.
+pub fn prove_bls_dory_transition(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    witness: &StructuredTransitionWitness,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryTransitionProof, BlsDoryTransitionError> {
+    if binding.len() > MAX_TRANSITION_BINDING_BYTES {
+        return Err(BlsDoryTransitionError::PublicBindingTooLarge);
+    }
+    mask_polynomial.validate(statement)?;
+    let mut oracles = build_scalar_oracles(statement, witness)?;
+    let cell_variables = statement.elements()?.ilog2() as usize;
+    let packed_variables = cell_variables
+        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+    let packed_coefficients = pack_oracles(&oracles)?;
+    let packed_nu = packed_variables / 2;
+    let packed_sigma = packed_variables - packed_nu;
+    let committed =
+        commit_bls_dory_polynomial(packed_coefficients, packed_nu, packed_sigma, setup)?;
+    let oracle_commitment = committed.commitment();
+
+    let mut transcript = transition_transcript(
+        binding,
+        statement,
+        mask_polynomial.digest(),
+        &oracle_commitment,
+    );
+    let mixing = transcript.challenge_scalar(b"constraint-mixing");
+    let mixing_powers = powers(mixing, STRUCTURED_TRANSITION_CONSTRAINTS);
+    let cell_point = challenge_vector(&mut transcript, b"cell-point", cell_variables);
+    let mut selector = equality_table(&cell_point);
+    let mut claim = BlsDoryFr::zero();
+    let mut rounds = Vec::with_capacity(cell_variables);
+    let mut sumcheck_point = Vec::with_capacity(cell_variables);
+
+    for round_index in 0..cell_variables {
+        let evaluations = transition_round(statement, &selector, &oracles, &mixing_powers)?;
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryTransitionError::RoundClaim);
+        }
+        absorb_round(&mut transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = evaluate_samples(&evaluations, challenge)?;
+        sumcheck_point.push(challenge);
+        selector = fold_table(&selector, challenge);
+        for oracle in &mut oracles {
+            *oracle = fold_table(oracle, challenge);
+        }
+        rounds.push(evaluations);
+    }
+
+    let terminal_evaluations = oracles.iter().map(|oracle| oracle[0]).collect::<Vec<_>>();
+    if terminal_evaluations[MASK] != evaluate_mask(mask_polynomial, statement, &sumcheck_point)? {
+        return Err(BlsDoryTransitionError::MaskPolynomial);
+    }
+    let expected =
+        selector[0] * mixed_constraint(statement, &terminal_evaluations, &mixing_powers)?;
+    if claim != expected {
+        return Err(BlsDoryTransitionError::TerminalClaim);
+    }
+    absorb_fields(
+        &mut transcript,
+        b"terminal-evaluation",
+        &terminal_evaluations,
+    );
+    let transcript_digest = transcript.digest();
+
+    let opening_points = packed_opening_points(&sumcheck_point);
+    let opening_binding = opening_binding(binding, &transcript_digest);
+    let (claims, opening_proof) = prove_bls_dory_same_commitment_openings(
+        &opening_binding,
+        &committed,
+        &opening_points,
+        setup,
+    )?;
+    let expected_claims =
+        transition_opening_claims(oracle_commitment, &sumcheck_point, &terminal_evaluations);
+    if claims != expected_claims {
+        return Err(BlsDoryTransitionError::Opening);
+    }
+
+    Ok(BlsDoryTransitionProof {
+        protocol_version: BLS_DORY_TRANSITION_VERSION,
+        packed_variables: u16::try_from(packed_variables)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        oracle_commitment,
+        rounds,
+        terminal_evaluations,
+        transcript_digest,
+        opening_proof,
+    })
+}
+
+/// Verify the transition sumcheck and every packed Dory opening without the witness.
+pub fn verify_bls_dory_transition(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    proof: &BlsDoryTransitionProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryTransitionError> {
+    if binding.len() > MAX_TRANSITION_BINDING_BYTES {
+        return Err(BlsDoryTransitionError::PublicBindingTooLarge);
+    }
+    statement.validate_verifier_shape()?;
+    mask_polynomial.validate(statement)?;
+    let cell_variables = statement.elements()?.ilog2() as usize;
+    let packed_variables = cell_variables
+        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    validate_proof_shape(statement, proof)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+
+    let mut transcript = transition_transcript(
+        binding,
+        statement,
+        mask_polynomial.digest(),
+        &proof.oracle_commitment,
+    );
+    let mixing = transcript.challenge_scalar(b"constraint-mixing");
+    let mixing_powers = powers(mixing, STRUCTURED_TRANSITION_CONSTRAINTS);
+    let cell_point = challenge_vector(&mut transcript, b"cell-point", cell_variables);
+    let mut claim = BlsDoryFr::zero();
+    let mut sumcheck_point = Vec::with_capacity(cell_variables);
+    for (round_index, evaluations) in proof.rounds.iter().enumerate() {
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryTransitionError::RoundClaim);
+        }
+        absorb_round(&mut transcript, round_index, evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = evaluate_samples(evaluations, challenge)?;
+        sumcheck_point.push(challenge);
+    }
+    if proof.terminal_evaluations[MASK]
+        != evaluate_mask(mask_polynomial, statement, &sumcheck_point)?
+    {
+        return Err(BlsDoryTransitionError::MaskPolynomial);
+    }
+    let selector = equality_evaluation(&cell_point, &sumcheck_point);
+    if claim != selector * mixed_constraint(statement, &proof.terminal_evaluations, &mixing_powers)?
+    {
+        return Err(BlsDoryTransitionError::TerminalClaim);
+    }
+    absorb_fields(
+        &mut transcript,
+        b"terminal-evaluation",
+        &proof.terminal_evaluations,
+    );
+    if transcript.digest() != proof.transcript_digest {
+        return Err(BlsDoryTransitionError::Transcript);
+    }
+
+    let claims = transition_opening_claims(
+        proof.oracle_commitment,
+        &sumcheck_point,
+        &proof.terminal_evaluations,
+    );
+    let opening_binding = opening_binding(binding, &proof.transcript_digest);
+    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
+    Ok(())
+}
+
+fn validate_proof_shape(
+    statement: StructuredTransitionStatement,
+    proof: &BlsDoryTransitionProof,
+) -> Result<(), BlsDoryTransitionError> {
+    statement.validate_verifier_shape()?;
+    let cell_variables = statement.elements()?.ilog2() as usize;
+    let packed_variables = cell_variables
+        .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    if proof.protocol_version != BLS_DORY_TRANSITION_VERSION
+        || usize::from(proof.packed_variables) != packed_variables
+        || proof.rounds.len() != cell_variables
+        || proof
+            .rounds
+            .iter()
+            .any(|round| round.len() != STRUCTURED_TRANSITION_MAX_DEGREE + 1)
+        || proof.terminal_evaluations.len() != STRUCTURED_TRANSITION_ORACLES
+        || proof.opening_proof.is_empty()
+        || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
+    {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+fn transition_wire_bytes(
+    rounds: usize,
+    opening_bytes: usize,
+) -> Result<usize, BlsDoryTransitionError> {
+    PROOF_HEADER_BYTES
+        .checked_add(BlsDoryGt::identity().compressed_size())
+        .and_then(|size| {
+            size.checked_add(
+                rounds
+                    .checked_mul(STRUCTURED_TRANSITION_MAX_DEGREE + 1)?
+                    .checked_mul(BlsDoryFr::zero().compressed_size())?,
+            )
+        })
+        .and_then(|size| {
+            size.checked_add(
+                STRUCTURED_TRANSITION_ORACLES.checked_mul(BlsDoryFr::zero().compressed_size())?,
+            )
+        })
+        .and_then(|size| size.checked_add(32))
+        .and_then(|size| size.checked_add(opening_bytes))
+        .filter(|size| *size <= MAX_TRANSITION_PROOF_BYTES)
+        .ok_or(BlsDoryTransitionError::ProofTooLarge)
+}
+
+fn append_serialized<T: DorySerialize>(
+    output: &mut Vec<u8>,
+    value: &T,
+) -> Result<(), BlsDoryTransitionError> {
+    value
+        .serialize_compressed(output)
+        .map_err(|_| BlsDoryTransitionError::InvalidEncoding)
+}
+
+fn read_serialized<T: DoryDeserialize>(
+    reader: &mut Cursor<&[u8]>,
+) -> Result<T, BlsDoryTransitionError> {
+    T::deserialize_with_mode(reader, Compress::Yes, Validate::Yes)
+        .map_err(|_| BlsDoryTransitionError::InvalidEncoding)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, BlsDoryTransitionError> {
+    let value: [u8; 2] = bytes
+        .get(offset..offset + 2)
+        .ok_or(BlsDoryTransitionError::InvalidProofShape)?
+        .try_into()
+        .map_err(|_| BlsDoryTransitionError::InvalidProofShape)?;
+    Ok(u16::from_le_bytes(value))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, BlsDoryTransitionError> {
+    let value: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .ok_or(BlsDoryTransitionError::InvalidProofShape)?
+        .try_into()
+        .map_err(|_| BlsDoryTransitionError::InvalidProofShape)?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn transition_transcript(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_digest: [u8; 32],
+    commitment: &BlsDoryGt,
+) -> BlsDoryTranscript {
+    let mut transcript = BlsDoryTranscript::new(b"transition-sumcheck");
+    transcript.append_bytes(
+        b"protocol-version",
+        &BLS_DORY_TRANSITION_VERSION.to_le_bytes(),
+    );
+    transcript.append_bytes(b"public-binding", binding);
+    for value in [
+        statement.layers as u64,
+        statement.rows as u64,
+        statement.cols as u64,
+        statement.max_abs_accumulator,
+        statement.max_mask,
+    ] {
+        transcript.append_bytes(b"statement-field", &value.to_le_bytes());
+    }
+    transcript.append_bytes(b"mask-polynomial", &mask_digest);
+    transcript.append_group(b"packed-oracle-commitment", commitment);
+    transcript
+}
+
+fn challenge_vector(
+    transcript: &mut BlsDoryTranscript,
+    label: &[u8],
+    count: usize,
+) -> Vec<BlsDoryFr> {
+    (0..count)
+        .map(|index| {
+            transcript.append_bytes(b"point-index", &(index as u64).to_le_bytes());
+            transcript.challenge_scalar(label)
+        })
+        .collect()
+}
+
+fn absorb_round(transcript: &mut BlsDoryTranscript, index: usize, values: &[BlsDoryFr]) {
+    transcript.append_bytes(b"round-index", &(index as u64).to_le_bytes());
+    transcript.append_bytes(b"round-count", &(values.len() as u64).to_le_bytes());
+    for value in values {
+        transcript.append_field(b"round-evaluation", value);
+    }
+}
+
+fn absorb_fields(transcript: &mut BlsDoryTranscript, label: &[u8], values: &[BlsDoryFr]) {
+    transcript.append_bytes(b"field-count", &(values.len() as u64).to_le_bytes());
+    for value in values {
+        transcript.append_field(label, value);
+    }
+}
+
+fn opening_binding(binding: &[u8], transcript_digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CMFD/FORGEMATRIX/BLS-DORY-TRANSITION-OPENING-BINDING/V1");
+    hasher.update(&(binding.len() as u64).to_le_bytes());
+    hasher.update(binding);
+    hasher.update(transcript_digest);
+    *hasher.finalize().as_bytes()
+}
+
+fn build_scalar_oracles(
+    statement: StructuredTransitionStatement,
+    witness: &StructuredTransitionWitness,
+) -> Result<Vec<Vec<BlsDoryFr>>, BlsDoryTransitionError> {
+    validate_witness(statement, witness)?;
+    let shifted_accumulators = witness
+        .accumulators
+        .iter()
+        .map(|value| {
+            u64::try_from(i128::from(*value) + i128::from(statement.max_abs_accumulator))
+                .map_err(|_| BlsDoryTransitionError::InvalidDimensions)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut oracles = vec![
+        signed_values(&witness.accumulators),
+        unsigned_values(&witness.masks),
+        unsigned_values(&witness.encoded),
+        unsigned_values(&witness.square_quotients),
+        unsigned_values(&witness.square_remainders),
+        unsigned_values(&witness.cube_quotients),
+        unsigned_values(&witness.cube_remainders),
+        unsigned_values(&witness.output_quotients),
+        unsigned_values(&witness.output_remainders),
+        unsigned_values(&witness.negative),
+        signed_values(&witness.activations),
+        unsigned_values(&shifted_accumulators),
+    ];
+    for spec in structured_transition_range_specs(statement)? {
+        let values = if spec.oracle == SHIFTED_ACCUMULATOR {
+            shifted_accumulators.as_slice()
+        } else {
+            witness_unsigned_values(witness, spec.oracle)?
+        };
+        for digit in 0..spec.digits {
+            oracles.push(unsigned_values(
+                &values
+                    .iter()
+                    .map(|value| (value >> (digit * 4)) & 0xf)
+                    .collect::<Vec<_>>(),
+            ));
+            oracles.push(unsigned_values(
+                &values
+                    .iter()
+                    .map(|value| ((spec.maximum - value) >> (digit * 4)) & 0xf)
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+    if oracles.len() != STRUCTURED_TRANSITION_ORACLES {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    Ok(oracles)
+}
+
+fn witness_unsigned_values(
+    witness: &StructuredTransitionWitness,
+    oracle: usize,
+) -> Result<&[u64], BlsDoryTransitionError> {
+    Ok(match oracle {
+        ENCODED => &witness.encoded,
+        SQUARE_QUOTIENT => &witness.square_quotients,
+        SQUARE_REMAINDER => &witness.square_remainders,
+        CUBE_QUOTIENT => &witness.cube_quotients,
+        CUBE_REMAINDER => &witness.cube_remainders,
+        OUTPUT_QUOTIENT => &witness.output_quotients,
+        OUTPUT_REMAINDER => &witness.output_remainders,
+        _ => return Err(BlsDoryTransitionError::InvalidProofShape),
+    })
+}
+
+fn signed_values(values: &[i64]) -> Vec<BlsDoryFr> {
+    values.iter().copied().map(BlsDoryFr::from_i64).collect()
+}
+
+fn unsigned_values(values: &[u64]) -> Vec<BlsDoryFr> {
+    values.iter().copied().map(BlsDoryFr::from_u64).collect()
+}
+
+fn pack_oracles(oracles: &[Vec<BlsDoryFr>]) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
+    let elements = oracles
+        .first()
+        .ok_or(BlsDoryTransitionError::InvalidProofShape)?
+        .len();
+    if oracles.len() != STRUCTURED_TRANSITION_ORACLES
+        || elements == 0
+        || !elements.is_power_of_two()
+        || oracles.iter().any(|oracle| oracle.len() != elements)
+    {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    let total = elements
+        .checked_mul(ORACLE_SLOTS)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let mut packed = Vec::with_capacity(total);
+    for slot in 0..ORACLE_SLOTS {
+        if let Some(oracle) = oracles.get(slot) {
+            packed.extend_from_slice(oracle);
+        } else {
+            packed.resize(packed.len() + elements, BlsDoryFr::zero());
+        }
+    }
+    Ok(packed)
+}
+
+fn packed_opening_points(cell_point: &[BlsDoryFr]) -> Vec<Vec<BlsDoryFr>> {
+    (0..STRUCTURED_TRANSITION_ORACLES)
+        .map(|oracle| {
+            let mut point =
+                Vec::with_capacity(cell_point.len() + BLS_DORY_TRANSITION_SELECTOR_VARIABLES);
+            point.extend_from_slice(cell_point);
+            for bit in 0..BLS_DORY_TRANSITION_SELECTOR_VARIABLES {
+                point.push(if (oracle >> bit) & 1 == 1 {
+                    BlsDoryFr::one()
+                } else {
+                    BlsDoryFr::zero()
+                });
+            }
+            point
+        })
+        .collect()
+}
+
+fn transition_opening_claims(
+    commitment: BlsDoryGt,
+    cell_point: &[BlsDoryFr],
+    evaluations: &[BlsDoryFr],
+) -> Vec<BlsDoryOpeningClaim> {
+    packed_opening_points(cell_point)
+        .into_iter()
+        .zip(evaluations)
+        .map(|(point, evaluation)| BlsDoryOpeningClaim {
+            commitment,
+            point,
+            evaluation: *evaluation,
+        })
+        .collect()
+}
+
+fn transition_round(
+    statement: StructuredTransitionStatement,
+    selector: &[BlsDoryFr],
+    oracles: &[Vec<BlsDoryFr>],
+    mixing_powers: &[BlsDoryFr],
+) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
+    let mut evaluations = Vec::with_capacity(STRUCTURED_TRANSITION_MAX_DEGREE + 1);
+    for sample in 0..=STRUCTURED_TRANSITION_MAX_DEGREE {
+        let point = BlsDoryFr::from_u64(sample as u64);
+        let mut sum = BlsDoryFr::zero();
+        for pair_index in 0..selector.len() / 2 {
+            let offset = pair_index * 2;
+            let values = oracles
+                .iter()
+                .map(|oracle| interpolate_pair(&oracle[offset..offset + 2], point))
+                .collect::<Vec<_>>();
+            sum = sum
+                + interpolate_pair(&selector[offset..offset + 2], point)
+                    * mixed_constraint(statement, &values, mixing_powers)?;
+        }
+        evaluations.push(sum);
+    }
+    Ok(evaluations)
+}
+
+fn mixed_constraint(
+    statement: StructuredTransitionStatement,
+    values: &[BlsDoryFr],
+    powers: &[BlsDoryFr],
+) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+    let modulus = BlsDoryFr::from_u64(u64::from(V2_TRANSITION_MODULUS));
+    let output_modulus = BlsDoryFr::from_u64(OUTPUT_MODULUS);
+    let center = BlsDoryFr::from_u64(OUTPUT_CENTER);
+    let mut constraints = Vec::with_capacity(STRUCTURED_TRANSITION_CONSTRAINTS);
+    constraints
+        .push(values[ENCODED] - values[ACCUMULATOR] - values[MASK] - values[NEGATIVE] * modulus);
+    constraints.push(
+        values[ENCODED] * values[ENCODED]
+            - values[SQUARE_QUOTIENT] * modulus
+            - values[SQUARE_REMAINDER],
+    );
+    constraints.push(
+        values[SQUARE_REMAINDER] * values[ENCODED]
+            - values[CUBE_QUOTIENT] * modulus
+            - values[CUBE_REMAINDER],
+    );
+    constraints.push(
+        values[CUBE_REMAINDER]
+            - values[OUTPUT_QUOTIENT] * output_modulus
+            - values[OUTPUT_REMAINDER],
+    );
+    constraints.push(values[ACTIVATION] - values[OUTPUT_REMAINDER] + center);
+    constraints.push(values[NEGATIVE] * (values[NEGATIVE] - BlsDoryFr::one()));
+    constraints.push(
+        values[SHIFTED_ACCUMULATOR]
+            - values[ACCUMULATOR]
+            - BlsDoryFr::from_u64(statement.max_abs_accumulator),
+    );
+
+    let mut digit_cursor = STRUCTURED_TRANSITION_REGULAR_ORACLES;
+    for spec in structured_transition_range_specs(statement)? {
+        let mut reconstructed = BlsDoryFr::zero();
+        let mut reconstructed_slack = BlsDoryFr::zero();
+        let mut radix = BlsDoryFr::one();
+        for _ in 0..spec.digits {
+            reconstructed = reconstructed + values[digit_cursor] * radix;
+            reconstructed_slack = reconstructed_slack + values[digit_cursor + 1] * radix;
+            digit_cursor += 2;
+            radix = radix * BlsDoryFr::from_u64(16);
+        }
+        constraints.push(reconstructed - values[spec.oracle]);
+        constraints
+            .push(reconstructed_slack + values[spec.oracle] - BlsDoryFr::from_u64(spec.maximum));
+    }
+    for digit in &values[STRUCTURED_TRANSITION_REGULAR_ORACLES..] {
+        let membership = (0..16).fold(BlsDoryFr::one(), |product, allowed| {
+            product * (*digit - BlsDoryFr::from_u64(allowed))
+        });
+        constraints.push(membership);
+    }
+    debug_assert_eq!(constraints.len(), STRUCTURED_TRANSITION_CONSTRAINTS);
+    Ok(constraints
+        .into_iter()
+        .zip(powers)
+        .fold(BlsDoryFr::zero(), |sum, (constraint, coefficient)| {
+            sum + constraint * coefficient
+        }))
+}
+
+fn evaluate_mask(
+    mask: &StructuredMaskPolynomial,
+    statement: StructuredTransitionStatement,
+    point: &[BlsDoryFr],
+) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+    let coefficients = mask.affine_coefficients(statement)?;
+    let col_bits = statement.cols.ilog2() as usize;
+    let row_bits = statement.rows.ilog2() as usize;
+    let row_end = col_bits + row_bits;
+    if point.len() != row_end + statement.layers.ilog2() as usize {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+    let layer_weights = equality_table(&point[row_end..]);
+    let coefficient_count = 1 + row_bits + col_bits;
+    Ok(layer_weights
+        .into_iter()
+        .enumerate()
+        .fold(BlsDoryFr::zero(), |sum, (layer, weight)| {
+            let layer_coefficients =
+                &coefficients[layer * coefficient_count..(layer + 1) * coefficient_count];
+            let mut value = BlsDoryFr::from_u64(u64::from(layer_coefficients[0]));
+            for (bit, challenge) in point[col_bits..row_end].iter().enumerate() {
+                value =
+                    value + BlsDoryFr::from_u64(u64::from(layer_coefficients[1 + bit])) * challenge;
+            }
+            for (bit, challenge) in point[..col_bits].iter().enumerate() {
+                value = value
+                    + BlsDoryFr::from_u64(u64::from(layer_coefficients[1 + row_bits + bit]))
+                        * challenge;
+            }
+            sum + weight * value
+        }))
+}
+
+fn equality_table(point: &[BlsDoryFr]) -> Vec<BlsDoryFr> {
+    let mut table = vec![BlsDoryFr::one(); 1usize << point.len()];
+    let mut active = 1usize;
+    for coordinate in point {
+        for index in (0..active).rev() {
+            let value = table[index];
+            table[index] = value * (BlsDoryFr::one() - *coordinate);
+            table[index + active] = value * coordinate;
+        }
+        active *= 2;
+    }
+    table
+}
+
+fn equality_evaluation(left: &[BlsDoryFr], right: &[BlsDoryFr]) -> BlsDoryFr {
+    left.iter()
+        .zip(right)
+        .fold(BlsDoryFr::one(), |product, (left, right)| {
+            product * ((BlsDoryFr::one() - *left) * (BlsDoryFr::one() - *right) + *left * right)
+        })
+}
+
+fn interpolate_pair(pair: &[BlsDoryFr], point: BlsDoryFr) -> BlsDoryFr {
+    pair[0] + point * (pair[1] - pair[0])
+}
+
+fn fold_table(table: &[BlsDoryFr], point: BlsDoryFr) -> Vec<BlsDoryFr> {
+    table
+        .chunks_exact(2)
+        .map(|pair| interpolate_pair(pair, point))
+        .collect()
+}
+
+fn powers(base: BlsDoryFr, count: usize) -> Vec<BlsDoryFr> {
+    let mut result = Vec::with_capacity(count);
+    let mut value = BlsDoryFr::one();
+    for _ in 0..count {
+        result.push(value);
+        value = value * base;
+    }
+    result
+}
+
+fn evaluate_samples(
+    values: &[BlsDoryFr],
+    point: BlsDoryFr,
+) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+    if values.len() != STRUCTURED_TRANSITION_MAX_DEGREE + 1 {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    let mut result = BlsDoryFr::zero();
+    for (index, value) in values.iter().copied().enumerate() {
+        let mut numerator = BlsDoryFr::one();
+        let mut denominator = BlsDoryFr::one();
+        for other in 0..values.len() {
+            if other == index {
+                continue;
+            }
+            numerator = numerator * (point - BlsDoryFr::from_u64(other as u64));
+            denominator = denominator * BlsDoryFr::from_i64(index as i64 - other as i64);
+        }
+        let inverse = denominator
+            .inv()
+            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+        result = result + value * numerator * inverse;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dory_bls12_381_prototype::deterministic_bls_dory_setup;
+
+    fn fixture() -> (
+        StructuredTransitionStatement,
+        StructuredMaskPolynomial,
+        StructuredTransitionWitness,
+    ) {
+        let statement = StructuredTransitionStatement {
+            layers: 2,
+            rows: 2,
+            cols: 2,
+            max_abs_accumulator: 65_536,
+            max_mask: 5_000,
+        };
+        let mask = StructuredMaskPolynomial::from_challenge(&[0x5a; 32], 2, 2, 2).unwrap();
+        let mut witness = StructuredTransitionWitness {
+            accumulators: Vec::new(),
+            masks: Vec::new(),
+            encoded: Vec::new(),
+            square_quotients: Vec::new(),
+            square_remainders: Vec::new(),
+            cube_quotients: Vec::new(),
+            cube_remainders: Vec::new(),
+            output_quotients: Vec::new(),
+            output_remainders: Vec::new(),
+            negative: Vec::new(),
+            activations: Vec::new(),
+        };
+        let modulus = u64::from(V2_TRANSITION_MODULUS);
+        for index in 0..statement.layers * statement.rows * statement.cols {
+            let accumulator = index as i64 * 113 - 390;
+            let mask_value = mask.value_at_boolean_index(statement, index).unwrap();
+            let z = i128::from(accumulator) + i128::from(mask_value);
+            let negative = u64::from(z < 0);
+            let encoded = u64::try_from(if z < 0 { i128::from(modulus) + z } else { z }).unwrap();
+            let square = encoded * encoded;
+            let square_quotient = square / modulus;
+            let square_remainder = square % modulus;
+            let cube = square_remainder * encoded;
+            let cube_quotient = cube / modulus;
+            let cube_remainder = cube % modulus;
+            let output_quotient = cube_remainder / OUTPUT_MODULUS;
+            let output_remainder = cube_remainder % OUTPUT_MODULUS;
+            let activation = i64::try_from(output_remainder).unwrap() - OUTPUT_CENTER as i64;
+
+            witness.accumulators.push(accumulator);
+            witness.masks.push(mask_value);
+            witness.encoded.push(encoded);
+            witness.square_quotients.push(square_quotient);
+            witness.square_remainders.push(square_remainder);
+            witness.cube_quotients.push(cube_quotient);
+            witness.cube_remainders.push(cube_remainder);
+            witness.output_quotients.push(output_quotient);
+            witness.output_remainders.push(output_remainder);
+            witness.negative.push(negative);
+            witness.activations.push(activation);
+        }
+        (statement, mask, witness)
+    }
+
+    #[test]
+    fn exact_transition_sumcheck_is_authenticated_by_one_packed_commitment() {
+        let (statement, mask, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let proof = prove_bls_dory_transition(b"block-binding", statement, &mask, &witness, &setup)
+            .unwrap();
+        verify_bls_dory_transition(b"block-binding", statement, &mask, &proof, &setup).unwrap();
+        assert_eq!(proof.rounds.len(), 3);
+        assert_eq!(
+            proof.terminal_evaluations.len(),
+            STRUCTURED_TRANSITION_ORACLES
+        );
+        assert_eq!(proof.packed_variables, 10);
+        assert_eq!(proof.opening_proof.len(), 21_775);
+        let encoded = proof.encode(statement).unwrap();
+        assert_eq!(encoded.len(), 27_651);
+        let decoded = BlsDoryTransitionProof::decode(&encoded, statement).unwrap();
+        assert_eq!(decoded, proof);
+        verify_bls_dory_transition(b"block-binding", statement, &mask, &decoded, &setup).unwrap();
+    }
+
+    #[test]
+    fn transition_statement_round_terminal_commitment_and_opening_are_bound() {
+        let (statement, mask, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let proof =
+            prove_bls_dory_transition(b"binding-a", statement, &mask, &witness, &setup).unwrap();
+        assert!(
+            verify_bls_dory_transition(b"binding-b", statement, &mask, &proof, &setup).is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.rounds[0][0] = changed.rounds[0][0] + BlsDoryFr::one();
+        assert!(
+            verify_bls_dory_transition(b"binding-a", statement, &mask, &changed, &setup).is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.terminal_evaluations[ENCODED] =
+            changed.terminal_evaluations[ENCODED] + BlsDoryFr::one();
+        assert!(
+            verify_bls_dory_transition(b"binding-a", statement, &mask, &changed, &setup).is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.oracle_commitment = changed.oracle_commitment.scale(&BlsDoryFr::from_u64(2));
+        assert!(
+            verify_bls_dory_transition(b"binding-a", statement, &mask, &changed, &setup).is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.opening_proof[0] ^= 1;
+        assert!(
+            verify_bls_dory_transition(b"binding-a", statement, &mask, &changed, &setup).is_err()
+        );
+
+        let other_mask = StructuredMaskPolynomial::from_challenge(&[0xa5; 32], 2, 2, 2).unwrap();
+        assert!(
+            verify_bls_dory_transition(b"binding-a", statement, &other_mask, &proof, &setup)
+                .is_err()
+        );
+
+        let mut invalid_witness = witness;
+        invalid_witness.square_remainders[0] += 1;
+        assert!(
+            prove_bls_dory_transition(b"binding-a", statement, &mask, &invalid_witness, &setup,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn production_geometry_and_gate_remain_explicit() {
+        assert_eq!(PRODUCTION_BLS_DORY_TRANSITION_VARIABLES, 26 + 7);
+        assert_eq!(
+            projected_production_transition_opening_bytes().unwrap(),
+            70_639
+        );
+        assert_eq!(
+            projected_production_transition_proof_bytes().unwrap(),
+            89_763
+        );
+        assert!(projected_production_transition_opening_bytes().unwrap() < 262_128);
+        assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 4);
+        assert_eq!(
+            require_bls_dory_transition_production_ready(),
+            Err(BlsDoryTransitionError::NotProductionReady)
+        );
+    }
+
+    #[test]
+    fn outer_parser_rejects_shape_mutations_before_curve_decoding() {
+        let (statement, mask, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let proof =
+            prove_bls_dory_transition(b"parser", statement, &mask, &witness, &setup).unwrap();
+        let encoded = proof.encode(statement).unwrap();
+
+        let mut wrong_rounds = encoded.clone();
+        wrong_rounds[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            BlsDoryTransitionProof::decode(&wrong_rounds, statement),
+            Err(BlsDoryTransitionError::InvalidProofShape)
+        );
+
+        let mut wrong_opening = encoded.clone();
+        wrong_opening[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            BlsDoryTransitionProof::decode(&wrong_opening, statement),
+            Err(BlsDoryTransitionError::InvalidProofShape)
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            BlsDoryTransitionProof::decode(&trailing, statement),
+            Err(BlsDoryTransitionError::InvalidProofShape)
+        );
+
+        assert_eq!(
+            verify_bls_dory_transition(
+                &vec![0; MAX_TRANSITION_BINDING_BYTES + 1],
+                statement,
+                &mask,
+                &proof,
+                &setup,
+            ),
+            Err(BlsDoryTransitionError::PublicBindingTooLarge)
+        );
+    }
+}

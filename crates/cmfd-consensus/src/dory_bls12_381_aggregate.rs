@@ -29,14 +29,14 @@ use crate::dory_bls12_381_prototype::{
 /// Version of the bounded BLS12-381 aggregate wire grammar.
 pub const BLS_DORY_AGGREGATE_VERSION: u16 = 1;
 /// Maximum number of claims admitted by the research verifier.
-pub const MAX_BLS_DORY_AGGREGATE_CLAIMS: usize = 8;
+pub const MAX_BLS_DORY_AGGREGATE_CLAIMS: usize = 128;
 /// Same proof-payload ceiling enforced by the production candidate frame.
 pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 /// This aggregate remains unavailable to consensus activation.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the full aggregate AIR and LogUp argument are not yet re-arithmetized over the pairing scalar field",
+    "the matrix, successor-wiring, and packed LogUp arguments are not yet connected over the pairing scalar field",
     "the production n=31 polynomial is not streamed by this in-memory implementation",
     "the aggregate soundness bound has not been independently reviewed",
     "the replacement PCS and wire grammar have not received an external audit",
@@ -174,6 +174,27 @@ pub fn commit_bls_dory_polynomial(
 pub fn prove_bls_dory_openings(
     public_binding: &[u8],
     polynomials: &[BlsDoryCommittedPolynomial],
+    points: &[Vec<BlsDoryFr>],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let polynomial_refs = polynomials.iter().collect::<Vec<_>>();
+    prove_bls_dory_opening_refs(public_binding, &polynomial_refs, points, setup)
+}
+
+/// Prove many points of one commitment without cloning its coefficient table.
+pub fn prove_bls_dory_same_commitment_openings(
+    public_binding: &[u8],
+    polynomial: &BlsDoryCommittedPolynomial,
+    points: &[Vec<BlsDoryFr>],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let polynomial_refs = vec![polynomial; points.len()];
+    prove_bls_dory_opening_refs(public_binding, &polynomial_refs, points, setup)
+}
+
+fn prove_bls_dory_opening_refs(
+    public_binding: &[u8],
+    polynomials: &[&BlsDoryCommittedPolynomial],
     points: &[Vec<BlsDoryFr>],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
@@ -413,7 +434,7 @@ struct SumcheckProverOutput {
 }
 
 fn prove_distinct_point_sumcheck(
-    polynomials: &[BlsDoryCommittedPolynomial],
+    polynomials: &[&BlsDoryCommittedPolynomial],
     claims: &[BlsDoryOpeningClaim],
     batching: &[BlsDoryFr],
     transcript: &mut BlsDoryTranscript,
@@ -574,7 +595,7 @@ fn interpolate_quadratic(
 }
 
 fn combine_polynomials(
-    polynomials: &[BlsDoryCommittedPolynomial],
+    polynomials: &[&BlsDoryCommittedPolynomial],
     lambdas: &[BlsDoryFr],
     nu: usize,
 ) -> Result<(BlsDoryPolynomial, Vec<BlsDoryG1>, BlsDoryGt), BlsDoryAggregateError> {

@@ -168,11 +168,20 @@ and its distinct-point aggregate produces a 17,695-byte proof for three n=8
 claims. The fixed parser preflights the full shape and tests reject statement,
 order, setup, sumcheck, and proof mutations. The n=31 grammar projects to 66,559
 bytes, but the executable prover is still capped at n=16. This remains a
-sequential, unaudited backend checkpoint; the complete AIR and LogUp relation
-are not ported and consensus does not accept it. Cross-field tests now evaluate
+sequential, unaudited backend checkpoint; the complete production aggregate is
+not ported and consensus does not accept it. Cross-field tests now evaluate
 all 121 bounded transition constraints directly in the BLS12-381 scalar field,
 including signed boundaries and invalid reductions/digits; this establishes
 arithmetic portability, not a complete proof of those constraints.
+The BLS transition checkpoint now proves those 121 constraints with a degree-17
+sumcheck and authenticates all 110 terminal evaluations as selector-qualified
+points under one packed Dory commitment. Its canonical outer proof is 27,651
+bytes for an executable n=10 packed fixture. The same grammar projects to 89,763
+bytes for the production n=33 transition table. The verifier is witness-free and
+tests reject statement, mask, round, terminal, commitment, opening, length, and
+trailing-byte mutations. This still does not provide a streamed n=33 prover,
+the production packed LogUp path, the matrix/wiring scalar arguments, a complete
+soundness analysis, or an audit.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

@@ -157,7 +157,7 @@ impl StructuredMaskPolynomial {
         })
     }
 
-    fn validate(
+    pub(crate) fn validate(
         &self,
         statement: StructuredTransitionStatement,
     ) -> Result<(), StructuredTransitionError> {
@@ -184,7 +184,7 @@ impl StructuredMaskPolynomial {
         Ok(())
     }
 
-    fn digest(&self) -> [u8; 32] {
+    pub(crate) fn digest(&self) -> [u8; 32] {
         let mut hasher = Hasher::new_derive_key("CMFD/FORGEMATRIX/STRUCTURED-MASK/V1");
         hasher.update(&(self.layers as u64).to_le_bytes());
         hasher.update(&self.row_bits.to_le_bytes());
@@ -194,7 +194,10 @@ impl StructuredMaskPolynomial {
         *hasher.finalize().as_bytes()
     }
 
-    #[cfg(all(test, feature = "production-whir-candidate"))]
+    #[cfg(any(
+        all(test, feature = "production-whir-candidate"),
+        feature = "dory-bls12-381-prototype"
+    ))]
     pub(crate) fn affine_coefficients(
         &self,
         statement: StructuredTransitionStatement,
@@ -342,7 +345,7 @@ impl StructuredTransitionStatement {
         Ok(())
     }
 
-    fn elements(&self) -> Result<usize, StructuredTransitionError> {
+    pub(crate) fn elements(&self) -> Result<usize, StructuredTransitionError> {
         self.layers
             .checked_mul(self.rows)
             .and_then(|value| value.checked_mul(self.cols))
@@ -866,7 +869,7 @@ fn build_oracles(
     Ok(oracles)
 }
 
-fn validate_witness(
+pub(crate) fn validate_witness(
     statement: StructuredTransitionStatement,
     witness: &StructuredTransitionWitness,
 ) -> Result<(), StructuredTransitionError> {

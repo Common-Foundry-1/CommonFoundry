@@ -556,6 +556,12 @@ impl BlsDoryTranscript {
         absorb_bytes(&mut hasher, b"domain", domain);
         Self { hasher }
     }
+
+    /// Current transcript digest for binding a following protocol phase.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        *self.hasher.finalize().as_bytes()
+    }
 }
 
 impl Transcript for BlsDoryTranscript {

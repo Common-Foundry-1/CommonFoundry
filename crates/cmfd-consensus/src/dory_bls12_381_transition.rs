@@ -1,10 +1,11 @@
 //! BLS12-381 scalar-field transition sumcheck authenticated by Dory.
 //!
 //! The 110 canonical transition oracles are packed into 128 selector slots
-//! under one Dory commitment. The transition sumcheck proves the exact 121
-//! local arithmetic and range constraints, then one distinct-point aggregate
-//! authenticates every terminal oracle evaluation against that commitment.
-//! The executable prover remains capped below the production n=33 table.
+//! under one Dory commitment. The arithmetic sumcheck proves the seven regular
+//! transition constraints and authenticates their twelve terminal roles. The
+//! range LogUp checkpoint proves membership and reconstruction against the same
+//! commitment. The executable prover remains capped below the production n=33
+//! table.
 
 use std::io::Cursor;
 
@@ -17,8 +18,7 @@ use dory_pcs::primitives::{
 use thiserror::Error;
 
 use crate::{
-    STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_CONSTRAINTS,
-    STRUCTURED_TRANSITION_INPUT_ORACLE, STRUCTURED_TRANSITION_MAX_DEGREE,
+    STRUCTURED_TRANSITION_ACTIVATION_ORACLE, STRUCTURED_TRANSITION_INPUT_ORACLE,
     STRUCTURED_TRANSITION_ORACLES, STRUCTURED_TRANSITION_REGULAR_ORACLES, StructuredMaskPolynomial,
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     V2_TRANSITION_MODULUS,
@@ -33,10 +33,16 @@ use crate::{
     structured_transition::{structured_transition_range_specs, validate_witness},
 };
 
-/// Version of the scalar-field transition transcript.
-pub const BLS_DORY_TRANSITION_VERSION: u16 = 1;
+/// Version of the arithmetic-only scalar-field transition transcript.
+pub const BLS_DORY_TRANSITION_VERSION: u16 = 2;
 /// Seven bits address 128 slots, covering all 110 transition oracles.
 pub const BLS_DORY_TRANSITION_SELECTOR_VARIABLES: usize = 7;
+/// Seven regular constraints define the non-range transition arithmetic.
+pub const BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS: usize = 7;
+/// The arithmetic proof opens the twelve regular transition roles.
+pub const BLS_DORY_TRANSITION_OPENING_CLAIMS: usize = STRUCTURED_TRANSITION_REGULAR_ORACLES;
+/// Equality weighting raises the quadratic arithmetic relation to degree three.
+pub const BLS_DORY_TRANSITION_SUMCHECK_DEGREE: usize = 3;
 /// Production transition banks contain 2^26 cells and therefore pack to n=33.
 pub const PRODUCTION_BLS_DORY_TRANSITION_VARIABLES: usize = 33;
 /// This checkpoint is not accepted by consensus.
@@ -44,7 +50,7 @@ pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
 /// Remaining gates on this transition path.
 pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the n=33 packed transition polynomial is not streamed by the in-memory prover",
-    "the scalar LogUp membership checkpoint still needs source/slack reconstruction before replacing this direct range argument",
+    "the arithmetic and range checkpoints still emit separate Dory proofs instead of one shared block aggregate",
     "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
     "the scalar transition transcript and packed opening path have not received an external audit",
 ];
@@ -147,7 +153,7 @@ impl BlsDoryTransitionProof {
         if protocol_version != BLS_DORY_TRANSITION_VERSION
             || usize::from(packed_variables) != expected_variables
             || round_count != expected_rounds
-            || terminal_count != STRUCTURED_TRANSITION_ORACLES
+            || terminal_count != BLS_DORY_TRANSITION_OPENING_CLAIMS
             || opening_len == 0
             || opening_len > MAX_BLS_DORY_AGGREGATE_BYTES
             || encoded.len() != transition_wire_bytes(round_count, opening_len)?
@@ -159,8 +165,8 @@ impl BlsDoryTransitionProof {
         let oracle_commitment = read_serialized(&mut reader)?;
         let mut rounds = Vec::with_capacity(round_count);
         for _ in 0..round_count {
-            let mut round = Vec::with_capacity(STRUCTURED_TRANSITION_MAX_DEGREE + 1);
-            for _ in 0..=STRUCTURED_TRANSITION_MAX_DEGREE {
+            let mut round = Vec::with_capacity(BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1);
+            for _ in 0..=BLS_DORY_TRANSITION_SUMCHECK_DEGREE {
                 round.push(read_serialized(&mut reader)?);
             }
             rounds.push(round);
@@ -249,7 +255,7 @@ pub fn projected_production_transition_proof_bytes() -> Result<usize, BlsDoryTra
     transition_wire_bytes(26, opening)
 }
 
-/// Prove all 121 transition/range constraints and authenticate all 110 terminal openings.
+/// Prove the seven regular transition constraints and authenticate twelve terminals.
 pub fn prove_bls_dory_transition(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -268,7 +274,7 @@ pub fn prove_bls_dory_transition(
     )
 }
 
-/// Prove all transition constraints at an exact shared aggregate geometry.
+/// Prove regular transition arithmetic at an exact shared aggregate geometry.
 pub fn prove_bls_dory_transition_at_variables(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -305,13 +311,14 @@ pub fn prove_bls_dory_transition_at_variables(
         &oracle_commitment,
     );
     let mixing = transcript.challenge_scalar(b"constraint-mixing");
-    let mixing_powers = powers(mixing, STRUCTURED_TRANSITION_CONSTRAINTS);
+    let mixing_powers = powers(mixing, BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS);
     let cell_point = challenge_vector(&mut transcript, b"cell-point", cell_variables);
     let mut selector = equality_table(&cell_point);
     let mut claim = BlsDoryFr::zero();
     let mut rounds = Vec::with_capacity(cell_variables);
     let mut sumcheck_point = Vec::with_capacity(cell_variables);
 
+    oracles.truncate(STRUCTURED_TRANSITION_REGULAR_ORACLES);
     for round_index in 0..cell_variables {
         let evaluations = transition_round(statement, &selector, &oracles, &mixing_powers)?;
         if evaluations[0] + evaluations[1] != claim {
@@ -333,7 +340,7 @@ pub fn prove_bls_dory_transition_at_variables(
         return Err(BlsDoryTransitionError::MaskPolynomial);
     }
     let expected =
-        selector[0] * mixed_constraint(statement, &terminal_evaluations, &mixing_powers)?;
+        selector[0] * arithmetic_constraint(statement, &terminal_evaluations, &mixing_powers)?;
     if claim != expected {
         return Err(BlsDoryTransitionError::TerminalClaim);
     }
@@ -374,7 +381,7 @@ pub fn prove_bls_dory_transition_at_variables(
     })
 }
 
-/// Verify the transition sumcheck and every packed Dory opening without the witness.
+/// Verify regular transition arithmetic and its packed Dory openings without the witness.
 pub fn verify_bls_dory_transition(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -393,7 +400,7 @@ pub fn verify_bls_dory_transition(
     )
 }
 
-/// Verify transition constraints against the exact shared aggregate geometry.
+/// Verify regular transition arithmetic at the exact shared aggregate geometry.
 pub fn verify_bls_dory_transition_at_variables(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -421,7 +428,7 @@ pub fn verify_bls_dory_transition_at_variables(
         &proof.oracle_commitment,
     );
     let mixing = transcript.challenge_scalar(b"constraint-mixing");
-    let mixing_powers = powers(mixing, STRUCTURED_TRANSITION_CONSTRAINTS);
+    let mixing_powers = powers(mixing, BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS);
     let cell_point = challenge_vector(&mut transcript, b"cell-point", cell_variables);
     let mut claim = BlsDoryFr::zero();
     let mut sumcheck_point = Vec::with_capacity(cell_variables);
@@ -440,7 +447,8 @@ pub fn verify_bls_dory_transition_at_variables(
         return Err(BlsDoryTransitionError::MaskPolynomial);
     }
     let selector = equality_evaluation(&cell_point, &sumcheck_point);
-    if claim != selector * mixed_constraint(statement, &proof.terminal_evaluations, &mixing_powers)?
+    if claim
+        != selector * arithmetic_constraint(statement, &proof.terminal_evaluations, &mixing_powers)?
     {
         return Err(BlsDoryTransitionError::TerminalClaim);
     }
@@ -478,8 +486,8 @@ fn validate_proof_shape(
         || proof
             .rounds
             .iter()
-            .any(|round| round.len() != STRUCTURED_TRANSITION_MAX_DEGREE + 1)
-        || proof.terminal_evaluations.len() != STRUCTURED_TRANSITION_ORACLES
+            .any(|round| round.len() != BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1)
+        || proof.terminal_evaluations.len() != BLS_DORY_TRANSITION_OPENING_CLAIMS
         || proof.opening_proof.is_empty()
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
@@ -516,13 +524,14 @@ fn transition_wire_bytes(
         .and_then(|size| {
             size.checked_add(
                 rounds
-                    .checked_mul(STRUCTURED_TRANSITION_MAX_DEGREE + 1)?
+                    .checked_mul(BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1)?
                     .checked_mul(BlsDoryFr::zero().compressed_size())?,
             )
         })
         .and_then(|size| {
             size.checked_add(
-                STRUCTURED_TRANSITION_ORACLES.checked_mul(BlsDoryFr::zero().compressed_size())?,
+                BLS_DORY_TRANSITION_OPENING_CLAIMS
+                    .checked_mul(BlsDoryFr::zero().compressed_size())?,
             )
         })
         .and_then(|size| size.checked_add(32))
@@ -621,7 +630,7 @@ fn absorb_fields(transcript: &mut BlsDoryTranscript, label: &[u8], values: &[Bls
 
 fn opening_binding(binding: &[u8], transcript_digest: &[u8; 32]) -> [u8; 32] {
     let mut hasher =
-        blake3::Hasher::new_derive_key("CMFD/FORGEMATRIX/BLS-DORY-TRANSITION-OPENING-BINDING/V1");
+        blake3::Hasher::new_derive_key("CMFD/FORGEMATRIX/BLS-DORY-TRANSITION-OPENING-BINDING/V2");
     hasher.update(&(binding.len() as u64).to_le_bytes());
     hasher.update(binding);
     hasher.update(transcript_digest);
@@ -743,7 +752,7 @@ fn packed_opening_points(
         .checked_add(BLS_DORY_TRANSITION_SELECTOR_VARIABLES)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
     validate_target_variables(minimum, packed_variables)?;
-    Ok((0..STRUCTURED_TRANSITION_ORACLES)
+    Ok((0..BLS_DORY_TRANSITION_OPENING_CLAIMS)
         .map(|oracle| {
             let mut point = Vec::with_capacity(packed_variables);
             point.extend_from_slice(cell_point);
@@ -783,8 +792,8 @@ fn transition_round(
     oracles: &[Vec<BlsDoryFr>],
     mixing_powers: &[BlsDoryFr],
 ) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
-    let mut evaluations = Vec::with_capacity(STRUCTURED_TRANSITION_MAX_DEGREE + 1);
-    for sample in 0..=STRUCTURED_TRANSITION_MAX_DEGREE {
+    let mut evaluations = Vec::with_capacity(BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1);
+    for sample in 0..=BLS_DORY_TRANSITION_SUMCHECK_DEGREE {
         let point = BlsDoryFr::from_u64(sample as u64);
         let mut sum = BlsDoryFr::zero();
         for pair_index in 0..selector.len() / 2 {
@@ -795,14 +804,14 @@ fn transition_round(
                 .collect::<Vec<_>>();
             sum = sum
                 + interpolate_pair(&selector[offset..offset + 2], point)
-                    * mixed_constraint(statement, &values, mixing_powers)?;
+                    * arithmetic_constraint(statement, &values, mixing_powers)?;
         }
         evaluations.push(sum);
     }
     Ok(evaluations)
 }
 
-fn mixed_constraint(
+fn arithmetic_constraint(
     statement: StructuredTransitionStatement,
     values: &[BlsDoryFr],
     powers: &[BlsDoryFr],
@@ -810,7 +819,12 @@ fn mixed_constraint(
     let modulus = BlsDoryFr::from_u64(u64::from(V2_TRANSITION_MODULUS));
     let output_modulus = BlsDoryFr::from_u64(OUTPUT_MODULUS);
     let center = BlsDoryFr::from_u64(OUTPUT_CENTER);
-    let mut constraints = Vec::with_capacity(STRUCTURED_TRANSITION_CONSTRAINTS);
+    if values.len() != STRUCTURED_TRANSITION_REGULAR_ORACLES
+        || powers.len() != BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS
+    {
+        return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    let mut constraints = Vec::with_capacity(BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS);
     constraints
         .push(values[ENCODED] - values[ACCUMULATOR] - values[MASK] - values[NEGATIVE] * modulus);
     constraints.push(
@@ -836,28 +850,10 @@ fn mixed_constraint(
             - BlsDoryFr::from_u64(statement.max_abs_accumulator),
     );
 
-    let mut digit_cursor = STRUCTURED_TRANSITION_REGULAR_ORACLES;
-    for spec in structured_transition_range_specs(statement)? {
-        let mut reconstructed = BlsDoryFr::zero();
-        let mut reconstructed_slack = BlsDoryFr::zero();
-        let mut radix = BlsDoryFr::one();
-        for _ in 0..spec.digits {
-            reconstructed = reconstructed + values[digit_cursor] * radix;
-            reconstructed_slack = reconstructed_slack + values[digit_cursor + 1] * radix;
-            digit_cursor += 2;
-            radix = radix * BlsDoryFr::from_u64(16);
-        }
-        constraints.push(reconstructed - values[spec.oracle]);
-        constraints
-            .push(reconstructed_slack + values[spec.oracle] - BlsDoryFr::from_u64(spec.maximum));
-    }
-    for digit in &values[STRUCTURED_TRANSITION_REGULAR_ORACLES..] {
-        let membership = (0..16).fold(BlsDoryFr::one(), |product, allowed| {
-            product * (*digit - BlsDoryFr::from_u64(allowed))
-        });
-        constraints.push(membership);
-    }
-    debug_assert_eq!(constraints.len(), STRUCTURED_TRANSITION_CONSTRAINTS);
+    debug_assert_eq!(
+        constraints.len(),
+        BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS
+    );
     Ok(constraints
         .into_iter()
         .zip(powers)
@@ -947,7 +943,7 @@ fn evaluate_samples(
     values: &[BlsDoryFr],
     point: BlsDoryFr,
 ) -> Result<BlsDoryFr, BlsDoryTransitionError> {
-    if values.len() != STRUCTURED_TRANSITION_MAX_DEGREE + 1 {
+    if values.len() != BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1 {
         return Err(BlsDoryTransitionError::InvalidProofShape);
     }
     let mut result = BlsDoryFr::zero();
@@ -1033,21 +1029,27 @@ mod tests {
     }
 
     #[test]
-    fn exact_transition_sumcheck_is_authenticated_by_one_packed_commitment() {
+    fn exact_transition_arithmetic_is_authenticated_by_one_packed_commitment() {
         let (statement, mask, witness) = fixture();
         let setup = deterministic_bls_dory_setup(10).unwrap();
         let proof = prove_bls_dory_transition(b"block-binding", statement, &mask, &witness, &setup)
             .unwrap();
         verify_bls_dory_transition(b"block-binding", statement, &mask, &proof, &setup).unwrap();
         assert_eq!(proof.rounds.len(), 3);
+        assert!(
+            proof
+                .rounds
+                .iter()
+                .all(|round| round.len() == BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1)
+        );
         assert_eq!(
             proof.terminal_evaluations.len(),
-            STRUCTURED_TRANSITION_ORACLES
+            BLS_DORY_TRANSITION_OPENING_CLAIMS
         );
         assert_eq!(proof.packed_variables, 10);
         assert_eq!(proof.opening_proof.len(), 21_775);
         let encoded = proof.encode(statement).unwrap();
-        assert_eq!(encoded.len(), 27_651);
+        assert_eq!(encoded.len(), 23_171);
         let decoded = BlsDoryTransitionProof::decode(&encoded, statement).unwrap();
         assert_eq!(decoded, proof);
         verify_bls_dory_transition(b"block-binding", statement, &mask, &decoded, &setup).unwrap();
@@ -1111,7 +1113,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_transition_proof_bytes().unwrap(),
-            89_763
+            74_979
         );
         assert!(projected_production_transition_opening_bytes().unwrap() < 262_128);
         assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 4);

@@ -36,7 +36,7 @@ pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 pub const BLS_DORY_AGGREGATE_PRODUCTION_READY: bool = false;
 /// Remaining activation blockers after replacing BN254 and random setup.
 pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 5] = [
-    "the scalar LogUp membership checkpoint still needs source/slack reconstruction and shared composition",
+    "the 108 compressed matrix, arithmetic, range, and wiring claims are not yet emitted through one shared block aggregate",
     "the scalar matrix and transition commitments are not yet linked to the packed wiring roles",
     "the production n=29/n=31/n=33 polynomials are not streamed by this in-memory implementation",
     "the aggregate soundness bound has not been independently reviewed",
@@ -193,7 +193,11 @@ pub fn prove_bls_dory_same_commitment_openings(
     prove_bls_dory_opening_refs(public_binding, &polynomial_refs, points, setup)
 }
 
-fn prove_bls_dory_opening_refs(
+/// Prove an ordered selection that may repeat committed polynomials.
+///
+/// This avoids cloning coefficient tables when several protocol claims open
+/// the same commitment at different points.
+pub(crate) fn prove_bls_dory_opening_refs(
     public_binding: &[u8],
     polynomials: &[&BlsDoryCommittedPolynomial],
     points: &[Vec<BlsDoryFr>],

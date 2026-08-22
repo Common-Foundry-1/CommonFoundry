@@ -826,18 +826,20 @@ transition components.
 
 The transition checkpoint now goes beyond field-portability tests. It packs the
 110 canonical transition oracles into 128 selector slots under one Dory
-commitment, runs the exact degree-17 sumcheck for all 121 local arithmetic and
-range constraints in the BLS12-381 scalar field, and authenticates every
-terminal evaluation as a distinct point of that packed commitment. The verifier
-reconstructs all selector-qualified points from the transition transcript; no
-witness table is supplied to verification. A bounded canonical outer parser
-preflights the statement-derived round count, terminal count, opening length,
-and complete byte length before decoding curve elements, then re-encodes the
-proof canonically. The executable 2x2x2-cell fixture packs to n=10 and is 27,651
-bytes, including a 21,775-byte Dory opening aggregate. A production bank has 26
-cell variables plus seven selector variables; the unchanged n=33 grammar
-projects to 89,763 bytes, of which 70,639 bytes are the opening aggregate. This
-is size accounting, not a production-scale proving result.
+commitment, but its arithmetic sumcheck folds only the twelve regular roles.
+Seven local arithmetic constraints produce degree-three rounds, and twelve
+terminal evaluations are authenticated as distinct points of the packed
+commitment. Range membership and reconstruction are delegated to the scalar
+range checkpoint below. The composed verifier requires both proofs to carry the
+exact same commitment. No witness table is supplied to verification. A bounded
+canonical outer parser preflights the statement-derived round count, terminal
+count, opening length, and complete byte length before decoding curve elements,
+then re-encodes the arithmetic proof canonically. The executable 2x2x2-cell
+fixture packs to n=10 and is 23,171 bytes, including a 21,775-byte Dory opening
+aggregate. A production bank has 26 cell variables plus seven selector
+variables; the n=33 arithmetic grammar projects to 74,979 bytes, of which
+70,639 bytes are the opening aggregate. This is size accounting, not a
+production-scale proving result.
 
 The successor-wiring checkpoint uses the same scalar field and Dory backend. It
 packs the initial activation table and up to three input/output bank pairs into
@@ -861,10 +863,9 @@ variable count, with only high-zero padding above the component's natural table
 geometry. That padding preserves the original multilinear coordinates. The
 canonical outer decoders require the same exact count and reject a different
 layout before invoking Dory verification. In the executable n=10 integration
-fixture, matrix, transition, and wiring all prove and verify at that one
-geometry; the current direct set has 122 openings, within the bounded 128-claim
-aggregate, although the three component constructors still emit separate
-21,775-byte Dory payloads.
+fixture, matrix, arithmetic transition, range, and wiring all prove and verify
+at that one geometry. The compressed fixture has 29 openings, although the four
+component constructors still emit separate 21,775-byte Dory payloads.
 
 Production is pinned to the maximum component geometry, n=33. One Dory opening
 payload at n=33 projects to 70,639 bytes, but direct composition would expose 9
@@ -872,28 +873,37 @@ matrix claims, 440 transition claims, and 31 wiring claims: 480 total, which
 exceeds the current 128-claim aggregate bound. This projection is not a complete
 proof-size or proving-time result.
 
-The first scalar LogUp bridge now proves range-digit membership against that
-same transition commitment. The prover commits the sixteen `0..15` table
-multiplicities before sampling `alpha`, derives and commits one inverse
-polynomial afterward, and runs a degree-four sumcheck over inverse correctness,
-support, rational-sum, and total-count identities. The verifier derives the
-active digit-selector and fixed table polynomials itself. The argument terminates
-in three openings: transition digit, multiplicity, and inverse. Its executable
-n=10 fixture is 25,249 bytes, of which 21,775 bytes are the Dory proof; changing
-one committed digit to 16 prevents the prover from preserving the zero claim.
-The canonical parser rejects incompatible geometry, malformed lengths, and
-trailing bytes. The membership-only n=33 grammar projects to 77,793 bytes,
-including the 70,639-byte Dory payload.
+The scalar range bridge now proves digit membership and radix reconstruction
+against that same transition commitment. The prover commits the sixteen
+`0..15` table multiplicities before sampling `alpha`, derives and commits one
+inverse polynomial afterward, and runs a degree-four sumcheck over inverse
+correctness, support, rational-sum, and total-count identities. The verifier
+derives the active digit-selector and fixed table polynomials itself. This
+membership portion terminates in three openings: transition digit,
+multiplicity, and inverse.
 
-Across the initialization transition and three banks, membership therefore
-needs twelve openings. Adding nine matrix and 31 wiring openings gives a
-52-claim checkpoint, below the bounded 128-claim aggregate. This does not yet
-replace the 480 direct claims: the packed digits and slack digits must still be
-linked to their eight regular source roles by a reconstruction argument. Once
-that link is proved, the constructors must emit one shared aggregate and
-equality openings must link matrix, transition, and wiring commitments. An n=33
-streaming prover, complete transcript and soundness accounting, and independent
-audit remain activation requirements.
+After those terminals are transcript-bound, the verifier samples a random cell,
+a random three-bit range-spec point, and a slack-mixing scalar. Two degree-two
+selector sumchecks prove, at those points, both the selected regular source and
+the radix-16 weighted value/slack lanes. Their public relation is
+`digits = (1 - beta) * source + beta * maximum`, which simultaneously enforces
+value reconstruction and `source + slack = maximum`. Both terminal evaluations
+are authenticated as additional openings of the same transition commitment.
+The complete argument therefore uses five openings. Its executable n=10 fixture
+is 26,689 bytes, of which 21,775 bytes are the Dory proof; changing a digit to
+16 or changing it to another in-range value that breaks reconstruction prevents
+the prover from preserving the claim. The canonical parser rejects incompatible
+geometry, malformed lengths, and trailing bytes. The n=33 grammar projects to
+79,233 bytes, including the 70,639-byte Dory payload.
+
+Across the initialization transition and three banks, arithmetic needs 48
+openings and the range checkpoints need twenty. Adding nine matrix and 31 wiring
+openings gives the correct 108-claim compressed checkpoint, below the bounded
+128-claim aggregate. The composed transition verifier requires its arithmetic
+and range halves to use the same packed commitment. The constructors must still
+emit one shared aggregate, and equality openings must link matrix, transition,
+and wiring commitments. An n=33 streaming prover, complete transcript and
+soundness accounting, and independent audit remain activation requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -904,11 +914,12 @@ BLS12-381 scalar field across signed boundary cases, while altered reductions
 and digits fail with the same constraint pattern in all three. The selected
 route is therefore native scalar-field re-arithmetization. The distinct-point,
 matrix, full local-transition, and successor-wiring transcripts are now ported.
-The scalar LogUp membership identity is now connected to the packed transition
-commitment, but its source/slack reconstruction and the cross-component scalar
-commitment links are not. The individual tables accept the common n=33 layout,
-but streaming that shared geometry, complete soundness accounting, full
-aggregate measurement, and independent audit remain mandatory activation gates.
+The scalar LogUp membership and source/slack reconstruction identities and the
+seven-constraint arithmetic sumcheck are connected through the same packed
+transition commitment, but the cross-component scalar commitment links are not.
+The individual tables accept the common n=33 layout, but streaming that shared
+geometry, complete soundness accounting, full aggregate measurement, and
+independent audit remain mandatory activation gates.
 
 For the complete tiny structured fixture, the enforced component bounds give a
 154,252-byte maximum for the split WHIR proof. The canonical one-block BLAKE3
@@ -959,14 +970,17 @@ For one matrix bank, the raw sumcheck error is bounded by
 ```
 
 At `D=4096` and `L=128`, the numerator is 45. The final report must add all
-three matrix banks. For one production transition bank, the degree-17
-sumcheck has 26 variables (`7 layer + 7 row + 12 column`) and numerator 442.
-Mixing 121 constraints with powers of one post-commitment challenge contributes
-an additional polynomial-identity term with numerator at most 120. The final
-report must also add wiring sumchecks, PCS binding/list-decoding error, hash
-collision assumptions, and any proof-of-work grinding term. A machine-generated
-report must show total error at most `2^-128`; quoting the extension-field size
-alone is insufficient.
+three matrix banks. The original direct transition baseline uses a degree-17
+sumcheck over 26 variables (`7 layer + 7 row + 12 column`), giving numerator
+442, while mixing 121 constraints contributes at most 120 more. The split BLS
+arithmetic checkpoint lowers its sumcheck contribution to `3 * 26 = 78` and
+mixes seven constraints, but that is not the complete transition bound. The
+degree-four LogUp rounds, both degree-two selector sumchecks, lookup challenge,
+random cell/spec evaluation, slack mixing, PCS binding/list-decoding error,
+wiring sumchecks, hash collision assumptions, and proof-of-work grinding must
+all be union-bounded. A machine-generated report must show total error at most
+`2^-128`; quoting the scalar-field size or only the arithmetic contribution is
+insufficient.
 
 The successor argument contributes numerator 135 for the production shape:
 three 26-variable within-bank identities, two 19-variable bank-boundary

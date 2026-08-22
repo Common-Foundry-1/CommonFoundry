@@ -183,14 +183,17 @@ geometries, every transcript role, and the canonical outer parser have mutation
 coverage. Production still needs an n=31 streaming prover, the fixed-weight
 commitment derived from `ModelPcsIdentity`, cross-component commitment links,
 soundness review, and audit.
-The BLS transition checkpoint now proves those 121 constraints with a degree-17
-sumcheck and authenticates all 110 terminal evaluations as selector-qualified
-points under one packed Dory commitment. Its canonical outer proof is 27,651
-bytes for an executable n=10 packed fixture. The same grammar projects to 89,763
-bytes for the production n=33 transition table. The verifier is witness-free and
-tests reject statement, mask, round, terminal, commitment, opening, length, and
-trailing-byte mutations. This still does not provide a streamed n=33 prover,
-the production packed LogUp path, a complete soundness analysis, or an audit.
+The BLS arithmetic transition checkpoint now proves the seven regular
+constraints with degree-three rounds and authenticates twelve terminal roles as
+selector-qualified points under the commitment that still packs all 110
+oracles. Its canonical outer proof is 23,171 bytes for an executable n=10
+fixture. The same grammar projects to 74,979 bytes for the production n=33
+transition table. A composed verifier requires this arithmetic proof and the
+range proof below to carry the exact same commitment. The verifier is
+witness-free, and tests reject statement, mask, round, terminal, commitment,
+opening, length, and trailing-byte mutations. This still does not provide a
+streamed n=33 prover, one shared opening aggregate, a complete soundness
+analysis, or an audit.
 The scalar wiring checkpoint packs the initial activation plus three input/output
 bank pairs into eight selector slots under one Dory commitment. It authenticates
 all initialization, within-bank successor, and cross-bank boundary evaluations.
@@ -201,29 +204,33 @@ cover the binding, statement, commitment, every evaluation, transcript, opening,
 and outer parser. Cross-component links from the scalar matrix and transition
 commitments to these wiring roles are still missing; n=29 streaming, soundness
 review, and audit also remain gates.
-The shared-layout checkpoint now pins all three scalar components to an exact
+The shared-layout checkpoint now pins all scalar components to an exact
 verifier-selected variable count. High-zero padding preserves each component's
 natural multilinear coordinates, while canonical decoders reject a proof made
 for any other geometry before opening verification. An executable n=10 fixture
-proves and verifies matrix, transition, and wiring at one layout; their current
-direct claim set is 122 and each still carries a separate 21,775-byte Dory
+proves and verifies matrix, arithmetic transition, range, and wiring at one
+layout with 29 claims; each component still carries a separate 21,775-byte Dory
 payload. Production is pinned to n=33. A single Dory opening at that geometry
 projects to 70,639 bytes, but the uncompressed production terminal set has 480
 claims, exceeding the current 128-claim aggregate bound.
-The scalar LogUp membership checkpoint now reuses the exact packed transition
-commitment, commits the sixteen table multiplicities before sampling `alpha`,
-and commits an inverse polynomial afterward. A degree-four sumcheck proves the
-inverse, rational-sum, support, and total-count identities; three Dory openings
-authenticate the transition, multiplicity, and inverse evaluations. The n=10
-fixture is 25,249 bytes, including a 21,775-byte Dory proof, and rejects an
-out-of-table digit before proof emission. The n=33 membership-only grammar
-projects to 77,793 bytes, including the shared 70,639-byte opening payload. Four
-such membership arguments need twelve claims, so matrix plus membership plus
-wiring would expose 52 claims. This is not the completed range proof: digit and
-slack reconstruction is not yet linked to the regular transition sources, and
-the direct 480-claim path remains active. That link, one shared opening proof,
-cross-component equality openings, n=33 streaming, complete soundness
-accounting, and audit remain required.
+The scalar range checkpoint now reuses the exact packed transition commitment,
+commits the sixteen table multiplicities before sampling `alpha`, and commits
+an inverse polynomial afterward. A degree-four sumcheck proves the inverse,
+rational-sum, support, and total-count identities; three Dory openings
+authenticate the transition, multiplicity, and inverse evaluations. Two
+degree-two selector sumchecks then bind the radix-16 value and slack
+reconstructions to their eight regular source roles under that same transition
+commitment, adding two transition openings. The n=10 fixture is 26,689 bytes,
+including a 21,775-byte Dory proof, and rejects both an out-of-table digit and
+an in-range digit that no longer reconstructs its source before proof emission.
+The complete n=33 range grammar projects to 79,233 bytes, including the shared
+70,639-byte opening payload. Across four transitions, arithmetic needs 48 claims
+and range needs 20; adding nine matrix and 31 wiring claims gives the correct
+compressed total of 108. The composed transition verifier requires arithmetic
+and range proofs to share one commitment, but those components still carry
+separate Dory proofs. One shared opening proof, cross-component equality
+openings, n=33 streaming, complete soundness accounting, and audit remain
+required.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

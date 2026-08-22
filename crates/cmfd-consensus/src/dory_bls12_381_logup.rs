@@ -3,8 +3,10 @@
 //! The 98 value/slack digit lanes already occupy selector slots in the packed
 //! transition commitment. This argument commits their `0..15` table
 //! multiplicities before sampling the lookup challenge, proves the logarithmic
-//! derivative identity with one inverse polynomial, and reduces membership to
-//! three Dory openings. Source/slack reconstruction remains a separate gate.
+//! derivative identity with one inverse polynomial. Two selector sumchecks bind
+//! the packed value/slack reconstruction to the regular source roles under the
+//! same transition commitment. The complete range checkpoint uses five Dory
+//! openings.
 
 use std::io::Cursor;
 
@@ -21,32 +23,37 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_polynomial, projected_bls_dory_aggregate_bytes, prove_bls_dory_openings,
-        verify_bls_dory_openings,
+        commit_bls_dory_polynomial, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_opening_refs, verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
     dory_bls12_381_transition::{BlsDoryTransitionError, build_scalar_oracles, pack_oracles},
+    structured_transition::structured_transition_range_specs,
 };
 
-/// Version of the scalar LogUp transcript.
-pub const BLS_DORY_RANGE_LOGUP_VERSION: u16 = 1;
+/// Version of the scalar LogUp transcript and reconstruction wire grammar.
+pub const BLS_DORY_RANGE_LOGUP_VERSION: u16 = 2;
 /// Seven bits select the 110 used transition roles inside 128 slots.
 pub const BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES: usize = 7;
 /// Production transition cells have 26 variables and seven selector variables.
 pub const PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES: usize = 33;
-/// Membership reduces to the transition, multiplicity, and inverse commitments.
-pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize = 3;
+/// Membership opens transition, multiplicity, and inverse commitments.
+pub const BLS_DORY_RANGE_LOGUP_MEMBERSHIP_CLAIMS: usize = 3;
+/// Source and digit selector reductions open the transition commitment twice.
+pub const BLS_DORY_RANGE_LOGUP_RECONSTRUCTION_CLAIMS: usize = 2;
+/// Complete range checkpoint claim count.
+pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
+    BLS_DORY_RANGE_LOGUP_MEMBERSHIP_CLAIMS + BLS_DORY_RANGE_LOGUP_RECONSTRUCTION_CLAIMS;
 /// This checkpoint is not accepted by consensus.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
-pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 5] = [
-    "digit and slack reconstruction is not yet linked to the regular transition source roles",
-    "the direct transition argument still opens all 110 terminal roles",
-    "the three LogUp openings are not yet folded into the block-wide shared Dory aggregate",
+pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 4] = [
+    "the five range openings are not yet folded into the block-wide shared Dory aggregate",
     "the n=33 transition, multiplicity, and inverse polynomials are not streamed",
     "the lookup soundness accounting, transcript, and implementation have not received independent audit",
+    "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
 
 const PROOF_MAGIC: [u8; 8] = *b"CFBLSL01";
@@ -56,6 +63,10 @@ const MAX_LOGUP_BINDING_BYTES: usize = 4_096;
 const LOGUP_ROUND_DEGREE: usize = 4;
 const LOGUP_ROUND_VALUES: usize = LOGUP_ROUND_DEGREE + 1;
 const LOGUP_TERMINALS: usize = 3;
+const SELECTOR_ROUNDS: usize = BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
+const SELECTOR_ROUND_VALUES: usize = 3;
+const RECONSTRUCTION_WIRE_FIELDS: usize =
+    1 + SELECTOR_ROUNDS * SELECTOR_ROUND_VALUES + 1 + SELECTOR_ROUNDS * SELECTOR_ROUND_VALUES + 1;
 const TABLE_VALUES: usize = 16;
 const SELECTOR_SLOTS: usize = 1 << BLS_DORY_RANGE_LOGUP_SELECTOR_VARIABLES;
 
@@ -69,6 +80,11 @@ pub struct BlsDoryRangeLogUpProof {
     pub inverse_commitment: BlsDoryGt,
     pub rounds: Vec<[BlsDoryFr; LOGUP_ROUND_VALUES]>,
     pub terminal_evaluations: [BlsDoryFr; LOGUP_TERMINALS],
+    pub source_claim: BlsDoryFr,
+    pub source_rounds: Vec<[BlsDoryFr; SELECTOR_ROUND_VALUES]>,
+    pub source_evaluation: BlsDoryFr,
+    pub digit_rounds: Vec<[BlsDoryFr; SELECTOR_ROUND_VALUES]>,
+    pub digit_evaluation: BlsDoryFr,
     pub transcript_digest: [u8; 32],
     pub opening_proof: Vec<u8>,
 }
@@ -104,6 +120,19 @@ impl BlsDoryRangeLogUpProof {
         for evaluation in &self.terminal_evaluations {
             append_serialized(&mut encoded, evaluation)?;
         }
+        append_serialized(&mut encoded, &self.source_claim)?;
+        for round in &self.source_rounds {
+            for evaluation in round {
+                append_serialized(&mut encoded, evaluation)?;
+            }
+        }
+        append_serialized(&mut encoded, &self.source_evaluation)?;
+        for round in &self.digit_rounds {
+            for evaluation in round {
+                append_serialized(&mut encoded, evaluation)?;
+            }
+        }
+        append_serialized(&mut encoded, &self.digit_evaluation)?;
         encoded.extend_from_slice(&self.transcript_digest);
         encoded.extend_from_slice(&self.opening_proof);
         if encoded.len() != expected || encoded.len() > MAX_LOGUP_PROOF_BYTES {
@@ -158,6 +187,17 @@ impl BlsDoryRangeLogUpProof {
             rounds.push(read_field_array(&mut reader)?);
         }
         let terminal_evaluations = read_field_array(&mut reader)?;
+        let source_claim = read_serialized(&mut reader)?;
+        let mut source_rounds = Vec::with_capacity(SELECTOR_ROUNDS);
+        for _ in 0..SELECTOR_ROUNDS {
+            source_rounds.push(read_field_array(&mut reader)?);
+        }
+        let source_evaluation = read_serialized(&mut reader)?;
+        let mut digit_rounds = Vec::with_capacity(SELECTOR_ROUNDS);
+        for _ in 0..SELECTOR_ROUNDS {
+            digit_rounds.push(read_field_array(&mut reader)?);
+        }
+        let digit_evaluation = read_serialized(&mut reader)?;
         let payload_offset = PROOF_HEADER_BYTES + reader.position() as usize;
         let digest_end = payload_offset
             .checked_add(32)
@@ -182,6 +222,11 @@ impl BlsDoryRangeLogUpProof {
             inverse_commitment,
             rounds,
             terminal_evaluations,
+            source_claim,
+            source_rounds,
+            source_evaluation,
+            digit_rounds,
+            digit_evaluation,
             transcript_digest,
             opening_proof,
         };
@@ -224,7 +269,7 @@ pub enum BlsDoryRangeLogUpError {
     NotProductionReady,
 }
 
-/// Fail closed while the membership checkpoint is not the complete range argument.
+/// Fail closed while the range checkpoint is not integrated and audited.
 pub fn require_bls_dory_range_logup_production_ready() -> Result<(), BlsDoryRangeLogUpError> {
     Err(BlsDoryRangeLogUpError::NotProductionReady)
 }
@@ -235,7 +280,7 @@ pub fn projected_production_range_logup_opening_bytes() -> Result<usize, BlsDory
         .map_err(BlsDoryRangeLogUpError::Aggregate)
 }
 
-/// Project the complete membership-only outer proof at production geometry.
+/// Project the complete scalar range-checkpoint proof at production geometry.
 pub fn projected_production_range_logup_proof_bytes() -> Result<usize, BlsDoryRangeLogUpError> {
     logup_wire_bytes(
         PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES,
@@ -388,17 +433,66 @@ fn prove_from_oracles(
         b"terminal-evaluation",
         &terminal_evaluations,
     );
+
+    let cell_variables = elements.ilog2() as usize;
+    let cell_point = challenge_vector(
+        &mut transcript,
+        b"reconstruction-cell-point",
+        cell_variables,
+    );
+    let spec_point = challenge_vector(&mut transcript, b"reconstruction-spec-point", 3);
+    let slack_mixing = transcript.challenge_scalar(b"reconstruction-slack-mixing");
+    let reconstruction =
+        reconstruction_tables(statement, oracles, &cell_point, &spec_point, slack_mixing)?;
+    let source_claim = inner_product(&reconstruction.source_weights, &reconstruction.role_values)?;
+    transcript.append_field(b"source-claim", &source_claim);
+    let source = prove_selector_sumcheck(
+        source_claim,
+        reconstruction.source_weights,
+        reconstruction.role_values.clone(),
+        &mut transcript,
+        b"source",
+    )?;
+    transcript.append_field(b"source-evaluation", &source.evaluation);
+    let digit_claim = (BlsDoryFr::one() - slack_mixing) * source_claim
+        + slack_mixing * reconstruction.maximum_evaluation;
+    transcript.append_field(b"digit-claim", &digit_claim);
+    let digit = prove_selector_sumcheck(
+        digit_claim,
+        reconstruction.digit_weights,
+        reconstruction.role_values,
+        &mut transcript,
+        b"digit",
+    )?;
+    transcript.append_field(b"digit-evaluation", &digit.evaluation);
+
     let transcript_digest = transcript.digest();
     let opening_binding = opening_binding(binding, &transcript_digest);
-    let points = vec![sumcheck_point; BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS];
+    let source_point = reconstruction_opening_point(&cell_point, &source.point, packed_variables)?;
+    let digit_point = reconstruction_opening_point(&cell_point, &digit.point, packed_variables)?;
+    let points = vec![
+        sumcheck_point.clone(),
+        sumcheck_point.clone(),
+        sumcheck_point,
+        source_point,
+        digit_point,
+    ];
     let expected_commitments = [
         transition.commitment(),
         multiplicity.commitment(),
         inverse.commitment(),
+        transition.commitment(),
+        transition.commitment(),
     ];
-    let (claims, opening_proof) = prove_bls_dory_openings(
+    let (claims, opening_proof) = prove_bls_dory_opening_refs(
         &opening_binding,
-        &[transition, multiplicity, inverse],
+        &[
+            &transition,
+            &multiplicity,
+            &inverse,
+            &transition,
+            &transition,
+        ],
         &points,
         setup,
     )?;
@@ -409,7 +503,13 @@ fn prove_from_oracles(
     if commitments.as_slice() != expected_commitments
         || claims
             .iter()
-            .zip(terminal_evaluations)
+            .zip([
+                terminal_evaluations[0],
+                terminal_evaluations[1],
+                terminal_evaluations[2],
+                source.evaluation,
+                digit.evaluation,
+            ])
             .any(|(claim, evaluation)| claim.evaluation != evaluation)
     {
         return Err(BlsDoryRangeLogUpError::Opening);
@@ -424,6 +524,11 @@ fn prove_from_oracles(
         inverse_commitment: expected_commitments[2],
         rounds,
         terminal_evaluations,
+        source_claim,
+        source_rounds: source.rounds,
+        source_evaluation: source.evaluation,
+        digit_rounds: digit.rounds,
+        digit_evaluation: digit.evaluation,
         transcript_digest,
         opening_proof,
     })
@@ -519,9 +624,45 @@ pub fn verify_bls_dory_range_logup_at_variables(
         b"terminal-evaluation",
         &proof.terminal_evaluations,
     );
+
+    let cell_variables = elements.ilog2() as usize;
+    let cell_point = challenge_vector(
+        &mut transcript,
+        b"reconstruction-cell-point",
+        cell_variables,
+    );
+    let spec_point = challenge_vector(&mut transcript, b"reconstruction-spec-point", 3);
+    let slack_mixing = transcript.challenge_scalar(b"reconstruction-slack-mixing");
+    let weights = reconstruction_weights(statement, &spec_point, slack_mixing)?;
+    transcript.append_field(b"source-claim", &proof.source_claim);
+    let source_point = verify_selector_sumcheck(
+        proof.source_claim,
+        &weights.source_weights,
+        &proof.source_rounds,
+        proof.source_evaluation,
+        &mut transcript,
+        b"source",
+    )?;
+    transcript.append_field(b"source-evaluation", &proof.source_evaluation);
+    let digit_claim = (BlsDoryFr::one() - slack_mixing) * proof.source_claim
+        + slack_mixing * weights.maximum_evaluation;
+    transcript.append_field(b"digit-claim", &digit_claim);
+    let digit_point = verify_selector_sumcheck(
+        digit_claim,
+        &weights.digit_weights,
+        &proof.digit_rounds,
+        proof.digit_evaluation,
+        &mut transcript,
+        b"digit",
+    )?;
+    transcript.append_field(b"digit-evaluation", &proof.digit_evaluation);
+
     if transcript.digest() != proof.transcript_digest {
         return Err(BlsDoryRangeLogUpError::Transcript);
     }
+    let source_opening =
+        reconstruction_opening_point(&cell_point, &source_point, packed_variables)?;
+    let digit_opening = reconstruction_opening_point(&cell_point, &digit_point, packed_variables)?;
     let claims = [
         BlsDoryOpeningClaim {
             commitment: proof.transition_commitment,
@@ -537,6 +678,16 @@ pub fn verify_bls_dory_range_logup_at_variables(
             commitment: proof.inverse_commitment,
             point: sumcheck_point,
             evaluation: proof.terminal_evaluations[2],
+        },
+        BlsDoryOpeningClaim {
+            commitment: proof.transition_commitment,
+            point: source_opening,
+            evaluation: proof.source_evaluation,
+        },
+        BlsDoryOpeningClaim {
+            commitment: proof.transition_commitment,
+            point: digit_opening,
+            evaluation: proof.digit_evaluation,
         },
     ];
     let opening_binding = opening_binding(binding, &proof.transcript_digest);
@@ -554,6 +705,8 @@ fn validate_proof_shape(
     if proof.protocol_version != BLS_DORY_RANGE_LOGUP_VERSION
         || usize::from(proof.packed_variables) != expected_variables
         || proof.rounds.len() != expected_variables
+        || proof.source_rounds.len() != SELECTOR_ROUNDS
+        || proof.digit_rounds.len() != SELECTOR_ROUNDS
         || proof.opening_proof.is_empty()
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
     {
@@ -608,6 +761,208 @@ impl LogUpTables {
         }
         Ok(())
     }
+}
+
+struct ReconstructionWeights {
+    source_weights: Vec<BlsDoryFr>,
+    digit_weights: Vec<BlsDoryFr>,
+    maximum_evaluation: BlsDoryFr,
+}
+
+struct ReconstructionTables {
+    source_weights: Vec<BlsDoryFr>,
+    digit_weights: Vec<BlsDoryFr>,
+    role_values: Vec<BlsDoryFr>,
+    maximum_evaluation: BlsDoryFr,
+}
+
+struct SelectorProverOutput {
+    rounds: Vec<[BlsDoryFr; SELECTOR_ROUND_VALUES]>,
+    point: Vec<BlsDoryFr>,
+    evaluation: BlsDoryFr,
+}
+
+fn reconstruction_weights(
+    statement: StructuredTransitionStatement,
+    spec_point: &[BlsDoryFr],
+    slack_mixing: BlsDoryFr,
+) -> Result<ReconstructionWeights, BlsDoryRangeLogUpError> {
+    if spec_point.len() != 3 {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let specs = structured_transition_range_specs(statement)?;
+    let spec_weights = equality_table(spec_point);
+    if specs.len() != spec_weights.len() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let mut source_weights = vec![BlsDoryFr::zero(); SELECTOR_SLOTS];
+    let mut digit_weights = vec![BlsDoryFr::zero(); SELECTOR_SLOTS];
+    let mut maximum_evaluation = BlsDoryFr::zero();
+    let mut digit_slot = STRUCTURED_TRANSITION_REGULAR_ORACLES;
+    for (spec, spec_weight) in specs.into_iter().zip(spec_weights) {
+        source_weights[spec.oracle] = source_weights[spec.oracle] + spec_weight;
+        maximum_evaluation = maximum_evaluation + spec_weight * BlsDoryFr::from_u64(spec.maximum);
+        let mut radix = BlsDoryFr::one();
+        for _ in 0..spec.digits {
+            digit_weights[digit_slot] = digit_weights[digit_slot] + spec_weight * radix;
+            digit_weights[digit_slot + 1] =
+                digit_weights[digit_slot + 1] + spec_weight * slack_mixing * radix;
+            digit_slot += 2;
+            radix = radix * BlsDoryFr::from_u64(16);
+        }
+    }
+    if digit_slot != STRUCTURED_TRANSITION_ORACLES {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(ReconstructionWeights {
+        source_weights,
+        digit_weights,
+        maximum_evaluation,
+    })
+}
+
+fn reconstruction_tables(
+    statement: StructuredTransitionStatement,
+    oracles: &[Vec<BlsDoryFr>],
+    cell_point: &[BlsDoryFr],
+    spec_point: &[BlsDoryFr],
+    slack_mixing: BlsDoryFr,
+) -> Result<ReconstructionTables, BlsDoryRangeLogUpError> {
+    if oracles.len() != STRUCTURED_TRANSITION_ORACLES {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let weights = reconstruction_weights(statement, spec_point, slack_mixing)?;
+    let mut role_values = vec![BlsDoryFr::zero(); SELECTOR_SLOTS];
+    for (target, oracle) in role_values.iter_mut().zip(oracles) {
+        *target = evaluate_mle(oracle, cell_point)?;
+    }
+    Ok(ReconstructionTables {
+        source_weights: weights.source_weights,
+        digit_weights: weights.digit_weights,
+        role_values,
+        maximum_evaluation: weights.maximum_evaluation,
+    })
+}
+
+fn inner_product(
+    left: &[BlsDoryFr],
+    right: &[BlsDoryFr],
+) -> Result<BlsDoryFr, BlsDoryRangeLogUpError> {
+    if left.len() != right.len() || left.is_empty() {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(left
+        .iter()
+        .zip(right)
+        .fold(BlsDoryFr::zero(), |sum, (left, right)| sum + *left * *right))
+}
+
+fn prove_selector_sumcheck(
+    initial_claim: BlsDoryFr,
+    mut weights: Vec<BlsDoryFr>,
+    mut values: Vec<BlsDoryFr>,
+    transcript: &mut BlsDoryTranscript,
+    kind: &'static [u8],
+) -> Result<SelectorProverOutput, BlsDoryRangeLogUpError> {
+    if weights.len() != SELECTOR_SLOTS || values.len() != SELECTOR_SLOTS {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    transcript.append_bytes(b"selector-kind", kind);
+    let mut claim = initial_claim;
+    let mut rounds = Vec::with_capacity(SELECTOR_ROUNDS);
+    let mut point = Vec::with_capacity(SELECTOR_ROUNDS);
+    for round_index in 0..SELECTOR_ROUNDS {
+        let evaluations = selector_round(&weights, &values)?;
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryRangeLogUpError::RoundClaim);
+        }
+        absorb_selector_round(transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"selector-sumcheck-challenge");
+        claim = evaluate_selector_samples(&evaluations, challenge)?;
+        point.push(challenge);
+        weights = fold_table(&weights, challenge)?;
+        values = fold_table(&values, challenge)?;
+        rounds.push(evaluations);
+    }
+    if claim != weights[0] * values[0] {
+        return Err(BlsDoryRangeLogUpError::TerminalClaim);
+    }
+    Ok(SelectorProverOutput {
+        rounds,
+        point,
+        evaluation: values[0],
+    })
+}
+
+fn verify_selector_sumcheck(
+    initial_claim: BlsDoryFr,
+    weights: &[BlsDoryFr],
+    rounds: &[[BlsDoryFr; SELECTOR_ROUND_VALUES]],
+    evaluation: BlsDoryFr,
+    transcript: &mut BlsDoryTranscript,
+    kind: &'static [u8],
+) -> Result<Vec<BlsDoryFr>, BlsDoryRangeLogUpError> {
+    if weights.len() != SELECTOR_SLOTS || rounds.len() != SELECTOR_ROUNDS {
+        return Err(BlsDoryRangeLogUpError::InvalidProofShape);
+    }
+    transcript.append_bytes(b"selector-kind", kind);
+    let mut claim = initial_claim;
+    let mut point = Vec::with_capacity(SELECTOR_ROUNDS);
+    for (round_index, evaluations) in rounds.iter().enumerate() {
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryRangeLogUpError::RoundClaim);
+        }
+        absorb_selector_round(transcript, round_index, evaluations);
+        let challenge = transcript.challenge_scalar(b"selector-sumcheck-challenge");
+        claim = evaluate_selector_samples(evaluations, challenge)?;
+        point.push(challenge);
+    }
+    if claim != evaluate_mle(weights, &point)? * evaluation {
+        return Err(BlsDoryRangeLogUpError::TerminalClaim);
+    }
+    Ok(point)
+}
+
+fn selector_round(
+    weights: &[BlsDoryFr],
+    values: &[BlsDoryFr],
+) -> Result<[BlsDoryFr; SELECTOR_ROUND_VALUES], BlsDoryRangeLogUpError> {
+    if weights.len() != values.len() || weights.len() < 2 || !weights.len().is_multiple_of(2) {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    Ok(std::array::from_fn(|sample| {
+        let point = BlsDoryFr::from_u64(sample as u64);
+        weights.chunks_exact(2).zip(values.chunks_exact(2)).fold(
+            BlsDoryFr::zero(),
+            |sum, (weights, values)| {
+                sum + interpolate_pair(weights, point) * interpolate_pair(values, point)
+            },
+        )
+    }))
+}
+
+fn evaluate_selector_samples(
+    values: &[BlsDoryFr; SELECTOR_ROUND_VALUES],
+    point: BlsDoryFr,
+) -> Result<BlsDoryFr, BlsDoryRangeLogUpError> {
+    interpolate_samples(values, point)
+}
+
+fn reconstruction_opening_point(
+    cell_point: &[BlsDoryFr],
+    selector_point: &[BlsDoryFr],
+    packed_variables: usize,
+) -> Result<Vec<BlsDoryFr>, BlsDoryRangeLogUpError> {
+    if selector_point.len() != SELECTOR_ROUNDS
+        || cell_point.len() + selector_point.len() > packed_variables
+    {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let mut point = Vec::with_capacity(packed_variables);
+    point.extend_from_slice(cell_point);
+    point.extend_from_slice(selector_point);
+    point.resize(packed_variables, BlsDoryFr::zero());
+    Ok(point)
 }
 
 #[derive(Clone, Copy)]
@@ -851,6 +1206,17 @@ fn absorb_round(
     }
 }
 
+fn absorb_selector_round(
+    transcript: &mut BlsDoryTranscript,
+    index: usize,
+    evaluations: &[BlsDoryFr; SELECTOR_ROUND_VALUES],
+) {
+    transcript.append_bytes(b"selector-round-index", &(index as u64).to_le_bytes());
+    for evaluation in evaluations {
+        transcript.append_field(b"selector-round-evaluation", evaluation);
+    }
+}
+
 fn absorb_fields(transcript: &mut BlsDoryTranscript, label: &[u8], values: &[BlsDoryFr]) {
     transcript.append_bytes(b"field-count", &(values.len() as u64).to_le_bytes());
     for value in values {
@@ -932,6 +1298,13 @@ fn evaluate_samples(
     values: &[BlsDoryFr; LOGUP_ROUND_VALUES],
     point: BlsDoryFr,
 ) -> Result<BlsDoryFr, BlsDoryRangeLogUpError> {
+    interpolate_samples(values, point)
+}
+
+fn interpolate_samples<const N: usize>(
+    values: &[BlsDoryFr; N],
+    point: BlsDoryFr,
+) -> Result<BlsDoryFr, BlsDoryRangeLogUpError> {
     let mut result = BlsDoryFr::zero();
     for (index, value) in values.iter().copied().enumerate() {
         let mut numerator = BlsDoryFr::one();
@@ -970,6 +1343,7 @@ fn logup_wire_bytes(rounds: usize, opening_bytes: usize) -> Result<usize, BlsDor
             )
         })
         .and_then(|value| value.checked_add(LOGUP_TERMINALS.checked_mul(field_bytes)?))
+        .and_then(|value| value.checked_add(RECONSTRUCTION_WIRE_FIELDS.checked_mul(field_bytes)?))
         .and_then(|value| value.checked_add(32))
         .and_then(|value| value.checked_add(opening_bytes))
         .filter(|bytes| *bytes <= MAX_LOGUP_PROOF_BYTES)
@@ -1099,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_digits_reduce_to_three_authenticated_openings() {
+    fn packed_ranges_reduce_to_five_authenticated_openings() {
         let (statement, mask, witness) = fixture();
         let setup = deterministic_bls_dory_setup(10).unwrap();
         let transition =
@@ -1119,7 +1493,7 @@ mod tests {
         assert_eq!(proof.rounds.len(), 10);
         assert_eq!(proof.opening_proof.len(), 21_775);
         let encoded = proof.encode(statement).unwrap();
-        assert_eq!(encoded.len(), 25_249);
+        assert_eq!(encoded.len(), 26_689);
         let decoded = BlsDoryRangeLogUpProof::decode(&encoded, statement).unwrap();
         assert_eq!(decoded, proof);
     }
@@ -1132,6 +1506,23 @@ mod tests {
         oracles[STRUCTURED_TRANSITION_REGULAR_ORACLES][0] = BlsDoryFr::from_u64(16);
         assert_eq!(
             prove_from_oracles(b"invalid-digit", statement, &oracles, 10, &setup),
+            Err(BlsDoryRangeLogUpError::RoundClaim)
+        );
+    }
+
+    #[test]
+    fn in_range_digit_tampering_cannot_satisfy_reconstruction() {
+        let (statement, _, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let mut oracles = build_scalar_oracles(statement, &witness).unwrap();
+        let digit = &mut oracles[STRUCTURED_TRANSITION_REGULAR_ORACLES][0];
+        *digit = if *digit == BlsDoryFr::zero() {
+            BlsDoryFr::one()
+        } else {
+            BlsDoryFr::zero()
+        };
+        assert_eq!(
+            prove_from_oracles(b"invalid-reconstruction", statement, &oracles, 10, &setup),
             Err(BlsDoryRangeLogUpError::RoundClaim)
         );
     }
@@ -1167,6 +1558,71 @@ mod tests {
 
         let mut changed = proof.clone();
         changed.terminal_evaluations[0] = changed.terminal_evaluations[0] + BlsDoryFr::one();
+        assert!(
+            verify_bls_dory_range_logup(
+                b"binding-a",
+                statement,
+                proof.transition_commitment,
+                &changed,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.source_claim = changed.source_claim + BlsDoryFr::one();
+        assert!(
+            verify_bls_dory_range_logup(
+                b"binding-a",
+                statement,
+                proof.transition_commitment,
+                &changed,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.source_rounds[0][0] = changed.source_rounds[0][0] + BlsDoryFr::one();
+        assert!(
+            verify_bls_dory_range_logup(
+                b"binding-a",
+                statement,
+                proof.transition_commitment,
+                &changed,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.source_evaluation = changed.source_evaluation + BlsDoryFr::one();
+        assert!(
+            verify_bls_dory_range_logup(
+                b"binding-a",
+                statement,
+                proof.transition_commitment,
+                &changed,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.digit_rounds[0][0] = changed.digit_rounds[0][0] + BlsDoryFr::one();
+        assert!(
+            verify_bls_dory_range_logup(
+                b"binding-a",
+                statement,
+                proof.transition_commitment,
+                &changed,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed = proof.clone();
+        changed.digit_evaluation = changed.digit_evaluation + BlsDoryFr::one();
         assert!(
             verify_bls_dory_range_logup(
                 b"binding-a",
@@ -1247,7 +1703,9 @@ mod tests {
             Err(BlsDoryRangeLogUpError::InvalidProofShape)
         );
 
-        assert_eq!(BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, 3);
+        assert_eq!(BLS_DORY_RANGE_LOGUP_MEMBERSHIP_CLAIMS, 3);
+        assert_eq!(BLS_DORY_RANGE_LOGUP_RECONSTRUCTION_CLAIMS, 2);
+        assert_eq!(BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, 5);
         assert_eq!(PRODUCTION_BLS_DORY_RANGE_LOGUP_VARIABLES, 33);
         assert_eq!(
             projected_production_range_logup_opening_bytes().unwrap(),
@@ -1255,9 +1713,9 @@ mod tests {
         );
         assert_eq!(
             projected_production_range_logup_proof_bytes().unwrap(),
-            77_793
+            79_233
         );
-        assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 5);
+        assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 4);
         assert_eq!(
             require_bls_dory_range_logup_production_ready(),
             Err(BlsDoryRangeLogUpError::NotProductionReady)

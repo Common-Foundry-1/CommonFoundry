@@ -3,13 +3,14 @@
 //! Matrix, transition, and wiring commitments must use one variable count before
 //! their openings can be reduced by a single Dory aggregate. This module pins
 //! the production n=33 geometry and keeps the remaining direct-claim deficit
-//! explicit until packed LogUp replaces the 440 transition terminal claims.
+//! explicit until LogUp membership also proves source/slack reconstruction.
 
 use thiserror::Error;
 
 use crate::{
     STRUCTURED_TRANSITION_ORACLES,
     dory_bls12_381_aggregate::{BlsDoryAggregateError, projected_bls_dory_aggregate_bytes},
+    dory_bls12_381_logup::BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS,
 };
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
@@ -24,11 +25,19 @@ pub const BLS_DORY_SHARED_PRODUCTION_WIRING_CLAIMS: usize = 31;
 pub const BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS: usize = BLS_DORY_SHARED_PRODUCTION_MATRIX_CLAIMS
     + BLS_DORY_SHARED_PRODUCTION_TRANSITION_CLAIMS
     + BLS_DORY_SHARED_PRODUCTION_WIRING_CLAIMS;
+/// Four membership-only LogUp arguments need three openings each.
+pub const BLS_DORY_SHARED_LOGUP_MEMBERSHIP_TRANSITION_CLAIMS: usize =
+    4 * BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS;
+/// Claim count after membership compression, before source reconstruction is added.
+pub const BLS_DORY_SHARED_LOGUP_MEMBERSHIP_CHECKPOINT_CLAIMS: usize =
+    BLS_DORY_SHARED_PRODUCTION_MATRIX_CLAIMS
+        + BLS_DORY_SHARED_LOGUP_MEMBERSHIP_TRANSITION_CLAIMS
+        + BLS_DORY_SHARED_PRODUCTION_WIRING_CLAIMS;
 /// Shared transport is not yet accepted by consensus.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 5] = [
-    "the direct 480-claim terminal set exceeds the bounded 128-claim aggregate and needs packed LogUp compression",
+    "the three-claim LogUp membership checkpoint still needs source/slack reconstruction before it can replace the direct 480-claim range terminals",
     "component constructors still emit separate opening proofs instead of one shared Dory aggregate",
     "matrix, transition, and wiring commitments are not yet linked by equality openings",
     "the common n=33 coefficient tables are not streamed by the in-memory prover",
@@ -386,6 +395,8 @@ mod tests {
     fn production_claim_deficit_and_opening_projection_are_explicit() {
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
+        assert_eq!(BLS_DORY_SHARED_LOGUP_MEMBERSHIP_TRANSITION_CLAIMS, 12);
+        assert_eq!(BLS_DORY_SHARED_LOGUP_MEMBERSHIP_CHECKPOINT_CLAIMS, 52);
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         assert_eq!(projected_shared_production_opening_bytes().unwrap(), 70_639);
         assert_eq!(BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS.len(), 5);

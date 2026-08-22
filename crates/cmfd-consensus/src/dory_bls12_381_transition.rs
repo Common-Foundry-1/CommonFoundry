@@ -44,7 +44,7 @@ pub const BLS_DORY_TRANSITION_PRODUCTION_READY: bool = false;
 /// Remaining gates on this transition path.
 pub const BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the n=33 packed transition polynomial is not streamed by the in-memory prover",
-    "the production packed LogUp layout is not yet connected to this direct range argument",
+    "the scalar LogUp membership checkpoint still needs source/slack reconstruction before replacing this direct range argument",
     "the complete union-bound and Dory knowledge-soundness analysis is not independently reviewed",
     "the scalar transition transcript and packed opening path have not received an external audit",
 ];
@@ -628,7 +628,7 @@ fn opening_binding(binding: &[u8], transcript_digest: &[u8; 32]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn build_scalar_oracles(
+pub(crate) fn build_scalar_oracles(
     statement: StructuredTransitionStatement,
     witness: &StructuredTransitionWitness,
 ) -> Result<Vec<Vec<BlsDoryFr>>, BlsDoryTransitionError> {
@@ -706,7 +706,9 @@ fn unsigned_values(values: &[u64]) -> Vec<BlsDoryFr> {
     values.iter().copied().map(BlsDoryFr::from_u64).collect()
 }
 
-fn pack_oracles(oracles: &[Vec<BlsDoryFr>]) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
+pub(crate) fn pack_oracles(
+    oracles: &[Vec<BlsDoryFr>],
+) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
     let elements = oracles
         .first()
         .ok_or(BlsDoryTransitionError::InvalidProofShape)?

@@ -209,9 +209,21 @@ proves and verifies matrix, transition, and wiring at one layout; their current
 direct claim set is 122 and each still carries a separate 21,775-byte Dory
 payload. Production is pinned to n=33. A single Dory opening at that geometry
 projects to 70,639 bytes, but the uncompressed production terminal set has 480
-claims, exceeding the current 128-claim aggregate bound. Packed LogUp, one
-shared opening proof, equality openings between component commitments, n=33
-streaming, complete soundness accounting, and audit remain required.
+claims, exceeding the current 128-claim aggregate bound.
+The scalar LogUp membership checkpoint now reuses the exact packed transition
+commitment, commits the sixteen table multiplicities before sampling `alpha`,
+and commits an inverse polynomial afterward. A degree-four sumcheck proves the
+inverse, rational-sum, support, and total-count identities; three Dory openings
+authenticate the transition, multiplicity, and inverse evaluations. The n=10
+fixture is 25,249 bytes, including a 21,775-byte Dory proof, and rejects an
+out-of-table digit before proof emission. The n=33 membership-only grammar
+projects to 77,793 bytes, including the shared 70,639-byte opening payload. Four
+such membership arguments need twelve claims, so matrix plus membership plus
+wiring would expose 52 claims. This is not the completed range proof: digit and
+slack reconstruction is not yet linked to the regular transition sources, and
+the direct 480-claim path remains active. That link, one shared opening proof,
+cross-component equality openings, n=33 streaming, complete soundness
+accounting, and audit remain required.
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

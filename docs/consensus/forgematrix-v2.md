@@ -425,9 +425,12 @@ comparison. The v2 research code now implements:
   APIs now high-zero-pad all three to a shared n=33 geometry and reject layout
   mismatches. One opening payload at n=33 projects to 70,639 bytes, but the
   uncompressed production composition has 480 direct claims against the current
-  128-claim bound. The packed LogUp path, one shared aggregate, cross-component
-  commitment links, an n=33 streaming prover, soundness review, and audit remain
-  activation gates;
+  128-claim bound. A scalar membership-only LogUp now reuses the transition
+  commitment and reduces 98 digit lanes to three openings; its n=10 fixture is
+  25,249 bytes and its n=33 grammar projects to 77,793 bytes. Four membership
+  proofs plus matrix and wiring would expose 52 claims. Source/slack
+  reconstruction, one shared aggregate, cross-component commitment links, an
+  n=33 streaming prover, soundness review, and audit remain activation gates;
 - a version-3 structured envelope that replaces the bounded public final table
   with a BLAKE3 STARK, absorbs the challenge/model
   roots/digests/target/length before sampling, links the private hash input to

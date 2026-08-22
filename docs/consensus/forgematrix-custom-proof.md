@@ -870,11 +870,30 @@ Production is pinned to the maximum component geometry, n=33. One Dory opening
 payload at n=33 projects to 70,639 bytes, but direct composition would expose 9
 matrix claims, 440 transition claims, and 31 wiring claims: 480 total, which
 exceeds the current 128-claim aggregate bound. This projection is not a complete
-proof-size or proving-time result. Packed LogUp must first compress the
-transition terminals; the constructors must then emit one shared aggregate,
-and equality openings must link the matrix, transition, and wiring commitments.
-An n=33 streaming prover, complete transcript and soundness accounting, and
-independent audit remain activation requirements.
+proof-size or proving-time result.
+
+The first scalar LogUp bridge now proves range-digit membership against that
+same transition commitment. The prover commits the sixteen `0..15` table
+multiplicities before sampling `alpha`, derives and commits one inverse
+polynomial afterward, and runs a degree-four sumcheck over inverse correctness,
+support, rational-sum, and total-count identities. The verifier derives the
+active digit-selector and fixed table polynomials itself. The argument terminates
+in three openings: transition digit, multiplicity, and inverse. Its executable
+n=10 fixture is 25,249 bytes, of which 21,775 bytes are the Dory proof; changing
+one committed digit to 16 prevents the prover from preserving the zero claim.
+The canonical parser rejects incompatible geometry, malformed lengths, and
+trailing bytes. The membership-only n=33 grammar projects to 77,793 bytes,
+including the 70,639-byte Dory payload.
+
+Across the initialization transition and three banks, membership therefore
+needs twelve openings. Adding nine matrix and 31 wiring openings gives a
+52-claim checkpoint, below the bounded 128-claim aggregate. This does not yet
+replace the 480 direct claims: the packed digits and slack digits must still be
+linked to their eight regular source roles by a reconstruction argument. Once
+that link is proved, the constructors must emit one shared aggregate and
+equality openings must link matrix, transition, and wiring commitments. An n=33
+streaming prover, complete transcript and soundness accounting, and independent
+audit remain activation requirements.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic
 Goldilocks extension. A direct field embedding is impossible because the
@@ -885,8 +904,9 @@ BLS12-381 scalar field across signed boundary cases, while altered reductions
 and digits fail with the same constraint pattern in all three. The selected
 route is therefore native scalar-field re-arithmetization. The distinct-point,
 matrix, full local-transition, and successor-wiring transcripts are now ported.
-The production packed LogUp argument and cross-component scalar commitment links
-are not yet connected. The individual tables now accept the common n=33 layout,
+The scalar LogUp membership identity is now connected to the packed transition
+commitment, but its source/slack reconstruction and the cross-component scalar
+commitment links are not. The individual tables accept the common n=33 layout,
 but streaming that shared geometry, complete soundness accounting, full
 aggregate measurement, and independent audit remain mandatory activation gates.
 

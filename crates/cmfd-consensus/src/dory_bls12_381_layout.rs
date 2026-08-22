@@ -128,7 +128,7 @@ pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize =
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_BLOCKERS: [&str; 2] = [
-    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources, one-byte bounded activation, wiring, and model-weight sources after their first Dory row, signed-word accumulator sources, authenticated release/regeneration, and eight challenge-bound source-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 51,204,162,052 bytes (about 47.7 GiB) and the complete n=33 prover has not been run",
+    "the final model bank lacks pinned n=33 BLS commitments; bounded parallel writers, shared compact transition/mapped sources with authenticated 32-bit transition words, one-byte bounded activation, wiring, and model-weight sources after their first Dory row, signed-word accumulator sources, authenticated release/regeneration, and eight challenge-bound source-fold views preserve exact proofs, but the exact complete aggregate-stage projection remains 41,515,319,812 bytes (about 38.7 GiB) and the complete n=33 prover has not been run",
     "the complete shared transcript, soundness accounting, and implementation have not received independent audit",
 ];
 
@@ -2546,6 +2546,7 @@ fn projected_shared_signed_word_source_bytes(
         scalar_count: logical_scalars,
         explicit_scalar_count: explicit_scalars,
         word_scalar_count: explicit_scalars,
+        word_bytes: 8,
         word_group_len,
         signed_word_selectors: 1,
     }
@@ -2568,6 +2569,7 @@ fn projected_shared_signed_byte_source_bytes(
         scalar_count: logical_scalars,
         explicit_scalar_count: explicit_scalars,
         word_scalar_count: explicit_scalars.min(row_scalars),
+        word_bytes: 8,
         word_group_len: explicit_scalars.min(row_scalars),
         signed_word_selectors: 1,
     }
@@ -2590,6 +2592,7 @@ fn projected_shared_transition_source_bytes(
         scalar_count: logical_scalars,
         explicit_scalar_count: explicit_scalars,
         word_scalar_count: word_scalars,
+        word_bytes: 4,
         word_group_len: cells,
         signed_word_selectors: 0,
     }
@@ -4725,11 +4728,11 @@ mod tests {
     fn production_claim_accounting_and_shared_projection_are_explicit() {
         let scratch = projected_shared_production_scratch_bytes().unwrap();
         assert_eq!(scratch.matrix_source_bytes, 8_259_944_664);
-        assert_eq!(scratch.transition_source_bytes, 39_159_073_248);
+        assert_eq!(scratch.transition_source_bytes, 29_470_231_008);
         assert_eq!(scratch.multiplicity_source_bytes, 2_576);
         assert_eq!(scratch.wiring_source_bytes, 470_687_704);
         assert_eq!(scratch.fixed_base_source_bytes, 16_777_348);
-        assert_eq!(scratch.retained_source_bytes, 47_906_485_540);
+        assert_eq!(scratch.retained_source_bytes, 38_217_643_300);
         assert_eq!(scratch.matrix_first_fold_bytes, 0);
         assert_eq!(scratch.transition_first_fold_bytes, 0);
         assert_eq!(scratch.multiplicity_first_fold_bytes, 1_552);
@@ -4739,7 +4742,7 @@ mod tests {
         assert_eq!(scratch.fifth_generation_fold_bytes, 525_076);
         assert_eq!(scratch.source_materialization_fold_bytes, 3_232_664_668);
         assert_eq!(scratch.aggregate_fold_peak_bytes, 3_297_676_512);
-        assert_eq!(scratch.aggregate_peak_bytes, 51_204_162_052);
+        assert_eq!(scratch.aggregate_peak_bytes, 41_515_319_812);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_VARIABLES, 33);
         assert_eq!(BLS_DORY_SHARED_PRODUCTION_DIRECT_CLAIMS, 480);
         assert_eq!(BLS_DORY_SHARED_ARITHMETIC_TRANSITION_CLAIMS, 48);

@@ -83,7 +83,7 @@ pub const BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS: usize =
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_READY: bool = false;
 /// Remaining gates before this can replace the direct range terminals.
 pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
-    "bounded parallel work, compact transition sources, mapped inverse views, authenticated release/regeneration, consuming openings, and eight challenge-bound shared source-fold generations preserve exact proofs and leave zero scratch after completion; after authenticated one-byte bounded activation, wiring, and model-weight sources plus signed-word accumulator sources, two fresh n=19 shared-layout runs observed the same 50,036,636-byte full-prover scratch peak against a 2,913,252-byte aggregate-stage projection, and the exact complete n=33 aggregate-stage projection is 51,204,162,052 bytes (about 47.7 GiB), down 8.57 times from 438,943,885,320 bytes (about 408.8 GiB); GPU or distributed proving and a complete measured n=33 run remain required",
+    "bounded parallel work, compact transition sources with authenticated 32-bit transition words, mapped inverse views, authenticated release/regeneration, consuming openings, and eight challenge-bound shared source-fold generations preserve exact proofs and leave zero scratch after completion; after authenticated one-byte bounded activation, wiring, and model-weight sources plus signed-word accumulator sources, a fresh n=19 shared-layout release run observed a 49,434,524-byte full-prover scratch peak against a 2,311,140-byte aggregate-stage projection, and the exact complete n=33 aggregate-stage projection is 41,515,319,812 bytes (about 38.7 GiB), down 10.57 times from 438,943,885,320 bytes (about 408.8 GiB); GPU or distributed proving and a complete measured n=33 run remain required",
     "the executable lookup bound exists, but its transcript and algebra have not received independent review",
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
@@ -5053,7 +5053,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_transition_range_source_bytes().unwrap(),
-            13_019_120_248
+            9_797_894_776
         );
         assert_eq!(
             projected_production_range_logup_compressed_lineage_bytes().unwrap(),
@@ -5065,23 +5065,23 @@ mod tests {
         );
         assert_eq!(
             projected_production_range_logup_four_pair_peak_bytes().unwrap(),
-            52_076_480_992
+            39_191_579_104
         );
         assert_eq!(
             projected_production_range_logup_aggregate_fold_peak_bytes().unwrap(),
-            308_298_123_276
+            305_076_897_804
         );
         assert_eq!(
             projected_production_shared_transition_aggregate_fold_peak_bytes().unwrap(),
-            1_056_025_091_748
+            1_043_140_189_860
         );
         assert_eq!(
             projected_production_range_logup_compressed_aggregate_pair_peak_bytes().unwrap(),
-            38_923_142_096
+            35_701_916_624
         );
         assert_eq!(
             projected_production_shared_transition_compressed_aggregate_fold_peak_bytes().unwrap(),
-            126_500_212_028
+            113_615_310_140
         );
         assert_eq!(BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS.len(), 3);
         assert_eq!(

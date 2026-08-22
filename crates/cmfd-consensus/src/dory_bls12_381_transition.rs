@@ -341,6 +341,7 @@ pub fn projected_production_transition_source_artifact_bytes() -> Result<u64, Bl
         scalar_count,
         explicit_scalar_count,
         word_scalar_count: literal_scalar_count,
+        word_bytes: 4,
         word_group_len: cells,
         signed_word_selectors: TRANSITION_SIGNED_WORD_SELECTORS,
     }
@@ -1291,6 +1292,10 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
         self.literal_scalar_count()
     }
 
+    fn word_bytes(&self) -> u8 {
+        4
+    }
+
     fn word_group_len(&self) -> usize {
         self.elements
     }
@@ -2217,7 +2222,7 @@ mod tests {
             * (STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES) as u64;
         assert_eq!(
             artifact_bytes,
-            88 + 16 * 32 + word_scalars * 8 + code_scalars + 32
+            88 + 16 * 32 + word_scalars * 4 + code_scalars + 32
         );
         let former_scalar_bytes = 100 + elements * STRUCTURED_TRANSITION_ORACLES as u64 * 32 + 32;
         assert!(artifact_bytes * 10 < former_scalar_bytes);
@@ -2314,7 +2319,7 @@ mod tests {
         );
         assert_eq!(
             projected_production_transition_source_artifact_bytes().unwrap(),
-            13_019_120_248
+            9_797_894_776
         );
         assert!(projected_production_transition_opening_bytes().unwrap() < 262_128);
         assert_eq!(BLS_DORY_TRANSITION_PRODUCTION_BLOCKERS.len(), 3);

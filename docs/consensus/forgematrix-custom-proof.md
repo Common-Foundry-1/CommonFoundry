@@ -1018,9 +1018,9 @@ writer and 377--391 ms for the parallel writer. Their 822 and 385 ms medians
 give a 53.2% reduction, with identical artifact digest, row commitments,
 tier-two commitment, opening claims, and proof bytes.
 The authenticated indexed formats support either a literal-scalar prefix or
-signed/unsigned 64-bit words followed by dictionary codes. Transition artifacts
-store twelve unrestricted lanes as words and the remaining 98 radix-16 lanes as
-one-byte `0..15` codes. The inverse stores zero and the sixteen possible
+signed/unsigned 32- or 64-bit words followed by dictionary codes. Transition
+artifacts store twelve consensus-bounded lanes as 32-bit words and the remaining
+98 radix-16 lanes as one-byte `0..15` codes. The inverse stores zero and the sixteen possible
 `1 / (alpha - digit)` values once, rejects a zero denominator before publishing
 the commitment, and maps the transition's authenticated digit codes without a
 second coefficient file. The Dory G1/G2 MSM and
@@ -1067,18 +1067,19 @@ the first two at 25,904,021,848 bytes, or about 24.125 GiB. Delaying the first
 ordinary scalar artifact until generation five removes the former 64.06 GiB
 transition overlap.
 Exact production geometry stores the transition's 805,306,368
-regular 64-bit words and 6,576,668,672 digit codes in 12.125 GiB plus framing.
+regular 32-bit words and 6,576,668,672 digit codes in 9,797,894,776 bytes,
+about 9.125 GiB including framing.
 The mapped inverse reuses those authenticated digits and adds no coefficient
-file. One retained transition/inverse pair is about 12.125 GiB and four pairs
-are about 48.5 GiB. The shared prover now retains each compact source's exact
+file. One retained transition/inverse pair is about 9.125 GiB and four pairs
+are exactly 39,191,579,104 bytes, about 36.5 GiB. The shared prover now retains each compact source's exact
 format, dictionary, and BLAKE3 digest, releases the completed source before the
 next pair builds its lineage, and regenerates all four immediately before shared
 openings. Regeneration writes only the canonical word/code artifact and reuses
 the original Dory commitment and row commitments; a changed witness or any
 identity mismatch aborts. The construction-phase source-plus-lineage peak is
-38,923,142,096 bytes, about 36.25 GiB. Reconstructing all four sources is the
-larger transition/range storage boundary at exactly 52,076,480,992 bytes, about
-48.5 GiB, down from 77,980,502,840 bytes or 72.62 GiB. Executable projection
+35,701,916,624 bytes, about 33.25 GiB. Reconstructing all four sources is the
+larger transition/range storage boundary at exactly 39,191,579,104 bytes, about
+36.5 GiB, down from 77,980,502,840 bytes or 72.62 GiB. Executable projection
 functions pin all source, lineage, and peak sizes. Exact fixtures preserve the
 complete proof bytes, reject a one-byte regenerated-source substitution, and
 leave zero scratch files. The distinct-point aggregate now recognizes each
@@ -1119,19 +1120,20 @@ directly, so it never creates the former 32-byte-per-weight scalar artifact.
 The complete executable n=33 aggregate-stage projection now includes every matrix,
 transition, multiplicity, wiring, and fixed-base source plus the entire ordered
 fold-artifact lifecycle. Authenticated dictionary coding reduces the three matrix
-sources from 9,666,454,296 to 8,259,944,664 bytes and wiring from 3,758,096,536
-to 470,687,704 bytes. Retained sources total 47,906,485,540 bytes (about 44.6
+sources from 9,666,454,296 to 8,259,944,664 bytes, transition sources from
+39,159,073,248 to 29,470,231,008 bytes, and wiring from 3,758,096,536 to
+470,687,704 bytes. Retained sources total 38,217,643,300 bytes (about 35.6
 GiB), the fold peak remains 3,297,676,512 bytes (about 3.1 GiB), and their
-combined peak is 51,204,162,052 bytes (about 47.7 GiB). This is an 8.57-times
+combined peak is 41,515,319,812 bytes (about 38.7 GiB). This is a 10.57-times
 reduction from the prior complete 438,943,885,320-byte projection (about 408.8
-GiB), a 2.17-times reduction from the earlier 110,935,310,868-byte projection,
-and an 8.4% reduction from the immediately preceding 55,898,080,516-byte
+GiB), a 2.67-times reduction from the earlier 110,935,310,868-byte projection,
+and an 18.92% reduction from the immediately preceding 51,204,162,052-byte
 projection. It is still a code-pinned rejection estimate, not a production
 measurement. Further reduction or distribution and a complete unchanged n=33
-run remain mandatory. Two fresh complete n=19 release runs preserved the
-84,717-byte proof, measured 104.535--110.948 seconds proving and 8.297--9.459
-seconds verification, observed the same 50,036,636-byte full-prover scratch peak
-against a 2,913,252-byte aggregate-stage projection, and retained zero scratch
+run remain mandatory. A fresh complete n=19 release run preserved the
+84,717-byte proof, measured 104.635 seconds proving and 8.861 seconds
+verification, observed a 49,434,524-byte full-prover scratch peak
+against a 2,311,140-byte aggregate-stage projection, and retained zero scratch
 after completion.
 
 Dory works over the pairing scalar field, while the packed AIR uses the cubic

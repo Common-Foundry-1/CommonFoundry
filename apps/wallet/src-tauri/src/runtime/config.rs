@@ -71,33 +71,6 @@ impl NodeRuntimeConfig {
                 "-V" | "--version" => {
                     asked_for_version = true;
                 }
-                "-v" => {
-                    has_control_arg = true;
-                    if verbosity == 0 {
-                        verbosity = 1;
-                    } else {
-                        return Err(ConfigError::DuplicateVerbosity);
-                    }
-                }
-                "-vv" => {
-                    has_control_arg = true;
-                    if verbosity == 0 {
-                        verbosity = 2;
-                    } else {
-                        return Err(ConfigError::DuplicateVerbosity);
-                    }
-                }
-                "-vvv" => {
-                    has_control_arg = true;
-                    if verbosity == 0 {
-                        verbosity = 3;
-                    } else {
-                        return Err(ConfigError::DuplicateVerbosity);
-                    }
-                }
-                "-vvvv" | "--verbose" => {
-                    return Err(ConfigError::InvalidVerbosity(argument));
-                }
                 "--p2p-bind" => {
                     has_control_arg = true;
                     if p2p_bind.is_some() {
@@ -122,8 +95,12 @@ impl NodeRuntimeConfig {
                     }
                     allow_public_peers = true;
                 }
-                "--verbose" => verbose = verbose.saturating_add(1),
+                "--verbose" => {
+                    has_control_arg = true;
+                    verbose = verbose.saturating_add(1);
+                }
                 _ if is_short_verbose_flag(&argument) => {
+                    has_control_arg = true;
                     verbose = verbose.saturating_add(argument.len() as u8 - 1);
                 }
                 _ if argument.starts_with("--p2p-bind=") => {
@@ -232,8 +209,6 @@ pub(crate) enum ConfigError {
     InvalidPeerConfiguration(String),
     HelpWithArguments,
     VersionWithArguments,
-    DuplicateVerbosity,
-    InvalidVerbosity(String),
 }
 
 impl From<cmfd_node::peer::PeerError> for ConfigError {
@@ -270,15 +245,6 @@ impl fmt::Display for ConfigError {
             }
             Self::VersionWithArguments => {
                 formatter.write_str("--version cannot be combined with other arguments")
-            }
-            Self::DuplicateVerbosity => {
-                formatter.write_str("verbosity was specified multiple times")
-            }
-            Self::InvalidVerbosity(argument) => {
-                write!(
-                    formatter,
-                    "{argument} is not supported; use -v, -vv, or -vvv"
-                )
             }
         }
     }

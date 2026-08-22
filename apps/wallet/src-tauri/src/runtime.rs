@@ -207,13 +207,11 @@ pub(crate) fn parse_command() -> Result<ProcessCommand, ConfigError> {
 pub(crate) fn command_help_text() -> &'static str {
     const HELP: &str = concat!(
         "Common Foundry Wallet\n",
-        "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v|-vv|-vvv]\n",
+        "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v...]\n",
         "Arguments:\n",
         "  --help (-h)             Show this help\n",
         "  --version (-V)          Print version\n",
-        "  -v                      Set warning-level verbosity\n",
-        "  -vv                     Set info-level verbosity\n",
-        "  -vvv                    Set debug-level verbosity\n",
+        "  -v, --verbose           Increase console verbosity (repeatable)\n",
         "  --p2p-bind <addr>       Local P2P bind address (default 127.0.0.1:18444)\n",
         "  --peer <addr>           Public or private outbound peer (repeatable)\n",
         "  --allow-public-peers     Allow public peers for explicit --peer entries\n",

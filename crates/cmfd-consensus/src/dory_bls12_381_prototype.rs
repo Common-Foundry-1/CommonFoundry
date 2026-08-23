@@ -768,9 +768,11 @@ pub fn deterministic_bls_dory_setup(
         .map_err(|error| BlsDoryPrototypeError::HashToCurve(error.to_string()))?;
 
     let g1_vec = (0..generator_count)
+        .into_par_iter()
         .map(|index| hash_g1(&g1_hasher, b"column-generator", index as u64))
         .collect::<Result<Vec<_>, _>>()?;
     let g2_vec = (0..generator_count)
+        .into_par_iter()
         .map(|index| hash_g2(&g2_hasher, b"row-generator", index as u64))
         .collect::<Result<Vec<_>, _>>()?;
     let h1 = hash_g1(&g1_hasher, b"blinding-generator", 0)?;
@@ -1021,6 +1023,34 @@ mod tests {
             deterministic_bls_dory_setup(MAX_BLS_DORY_SETUP_VARIABLES + 1),
             Err(BlsDoryPrototypeError::InvalidSize)
         ));
+    }
+
+    #[test]
+    fn parallel_setup_derivation_matches_serial_index_order() {
+        const VARIABLES: usize = 8;
+        let generator_count = 1usize << VARIABLES.div_ceil(2);
+        let g1_hasher = G1Hasher::new(G1_DOMAIN).unwrap();
+        let g2_hasher = G2Hasher::new(G2_DOMAIN).unwrap();
+        let serial_g1 = (0..generator_count)
+            .map(|index| hash_g1(&g1_hasher, b"column-generator", index as u64))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let serial_g2 = (0..generator_count)
+            .map(|index| hash_g2(&g2_hasher, b"row-generator", index as u64))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let parallel = pool
+            .install(|| deterministic_bls_dory_setup(VARIABLES))
+            .unwrap();
+
+        assert_eq!(parallel.prover.g1_vec, serial_g1);
+        assert_eq!(parallel.prover.g2_vec, serial_g2);
+        parallel.validate().unwrap();
     }
 
     #[test]

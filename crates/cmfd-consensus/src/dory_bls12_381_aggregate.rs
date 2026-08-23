@@ -1844,7 +1844,6 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
         || word_group_len == 0
         || !word_group_len.is_power_of_two()
         || !word_coefficient_count.is_multiple_of(word_group_len)
-        || word_coefficient_count / word_group_len > 64
         || setup.max_log_n() < nu + sigma
         || setup.prover().g1_vec.len() < columns
         || setup.prover().g2_vec.len() < rows
@@ -2056,7 +2055,6 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
         || word_group_len == 0
         || !word_group_len.is_power_of_two()
         || !word_coefficient_count.is_multiple_of(word_group_len)
-        || word_coefficient_count / word_group_len > 64
         || setup.max_log_n() < nu + sigma
     {
         return Err(BlsDoryAggregateError::InvalidDimension);
@@ -2261,9 +2259,13 @@ fn compact_word_scalar(
 ) -> Result<BlsDoryFr, BlsDoryAggregateError> {
     let selector = packed_index
         .checked_div(word_group_len)
-        .filter(|selector| *selector < 64)
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-    if signed_word_selectors & (1u64 << selector) != 0 {
+    let signed = if selector < 64 {
+        signed_word_selectors & (1u64 << selector) != 0
+    } else {
+        signed_word_selectors == u64::MAX
+    };
+    if signed {
         Ok(BlsDoryFr::from_i64(i64::from_le_bytes(word.to_le_bytes())))
     } else {
         Ok(BlsDoryFr::from_u64(word))

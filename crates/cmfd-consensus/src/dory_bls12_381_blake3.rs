@@ -676,10 +676,11 @@ mod tests {
     use crate::dory_bls12_381_aggregate::MAX_BLS_DORY_AGGREGATE_CLAIMS;
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
-        prove_bls_dory_deferred_opening_sets, prove_bls_dory_same_commitment_openings,
-        verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCompactRowSource,
+        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
+        commit_bls_dory_row_source_with_scratch, prove_bls_dory_deferred_opening_sets,
+        prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
     };
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_prototype::{BlsDoryGt, DeterministicBlsDorySetup};
@@ -1749,6 +1750,82 @@ mod tests {
             } else {
                 output.len()
             })
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    struct DensePackedSignedWordRowSource<'a> {
+        tables: &'a [Vec<i64>],
+        trace_rows: usize,
+        selector_slots: usize,
+        dictionary: [BlsDoryFr; 1],
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    impl<'a> DensePackedSignedWordRowSource<'a> {
+        fn new(tables: &'a [Vec<i64>], trace_rows: usize, selector_slots: usize) -> Self {
+            Self {
+                tables,
+                trace_rows,
+                selector_slots,
+                dictionary: [BlsDoryFr::zero()],
+            }
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    impl BlsDoryCompactRowSource for DensePackedSignedWordRowSource<'_> {
+        type Error = ();
+
+        fn rows(&self) -> usize {
+            self.selector_slots
+        }
+
+        fn columns(&self) -> usize {
+            self.trace_rows
+        }
+
+        fn explicit_scalar_count(&self) -> usize {
+            self.tables.len().saturating_mul(self.trace_rows)
+        }
+
+        fn word_scalar_count(&self) -> usize {
+            self.tables.len().saturating_mul(self.trace_rows)
+        }
+
+        fn word_group_len(&self) -> usize {
+            self.trace_rows
+        }
+
+        fn signed_word_selectors(&self) -> u64 {
+            u64::MAX
+        }
+
+        fn dictionary(&self) -> &[BlsDoryFr] {
+            &self.dictionary
+        }
+
+        fn read_word_row(
+            &mut self,
+            row_index: usize,
+            output: &mut [u64],
+        ) -> Result<usize, Self::Error> {
+            let table = self.tables.get(row_index).ok_or(())?;
+            if output.len() != self.trace_rows || table.len() != self.trace_rows {
+                return Err(());
+            }
+            for (word, value) in output.iter_mut().zip(table) {
+                *word = u64::from_le_bytes(value.to_le_bytes());
+            }
+            Ok(output.len())
+        }
+
+        fn read_code_row(
+            &mut self,
+            _row_index: usize,
+            _output: &mut [u8],
+        ) -> Result<usize, Self::Error> {
+            Err(())
         }
     }
 
@@ -3253,6 +3330,102 @@ mod tests {
             Err(BlsDoryAggregateError::ProverStorage)
         );
         drop(streamed);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "the exact 16-variable compact Dory comparison is intentionally expensive"]
+    fn blake3_signed_word_source_preserves_commitment_and_opening_bytes() {
+        const TRACE_VARIABLES: usize = 8;
+        const SELECTOR_VARIABLES: usize = 8;
+        const TRACE_ROWS: usize = 1 << TRACE_VARIABLES;
+        const SELECTOR_SLOTS: usize = 1 << SELECTOR_VARIABLES;
+        let signed_tables = (0..137)
+            .map(|selector| {
+                (0..TRACE_ROWS)
+                    .map(|row| {
+                        let magnitude = ((selector * TRACE_ROWS + row + 1) % 1_000_003) as i64;
+                        if (selector + row).is_multiple_of(3) {
+                            -magnitude
+                        } else {
+                            magnitude
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let field_tables = signed_tables
+            .iter()
+            .map(|table| {
+                table
+                    .iter()
+                    .copied()
+                    .map(BlsDoryFr::from_i64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+        let materialized = commit_bls_dory_polynomial(
+            dense_pack_adjacency_tables(&field_tables, TRACE_ROWS, SELECTOR_SLOTS).unwrap(),
+            SELECTOR_VARIABLES,
+            TRACE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        let mut source =
+            DensePackedSignedWordRowSource::new(&signed_tables, TRACE_ROWS, SELECTOR_SLOTS);
+        let compact = commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            SELECTOR_VARIABLES,
+            TRACE_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(compact.commitment(), materialized.commitment());
+        let artifact_path = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let compact_bytes = std::fs::metadata(artifact_path).unwrap().len();
+        let literal_bytes = (signed_tables.len() * TRACE_ROWS * 32) as u64;
+        assert!(compact_bytes * 3 < literal_bytes);
+
+        let points = vec![
+            (0..16)
+                .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 5) * 13))
+                .collect::<Vec<_>>(),
+            (0..16)
+                .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 7) * 17))
+                .collect::<Vec<_>>(),
+        ];
+        let ordinary = prove_bls_dory_same_commitment_openings(
+            b"blake3-compact-source-equivalence",
+            &materialized,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        let artifact_backed = prove_bls_dory_same_commitment_openings(
+            b"blake3-compact-source-equivalence",
+            &compact,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(artifact_backed, ordinary);
+        verify_bls_dory_openings(
+            b"blake3-compact-source-equivalence",
+            &artifact_backed.0,
+            &artifact_backed.1,
+            &setup,
+        )
+        .unwrap();
+        drop(compact);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

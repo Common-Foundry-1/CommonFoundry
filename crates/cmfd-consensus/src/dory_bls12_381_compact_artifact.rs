@@ -56,6 +56,9 @@ pub struct BlsDoryCompactArtifactSpec {
     /// Coefficients per selector in the word prefix.
     pub word_group_len: u64,
     /// Bit `i` is one when selector `i` decodes its words as signed `i64`.
+    /// For prefixes longer than 64 selectors, `u64::MAX` marks every selector
+    /// signed; any other mask applies to the first 64 and leaves the rest
+    /// unsigned.
     pub signed_word_selectors: u64,
 }
 
@@ -73,14 +76,12 @@ impl BlsDoryCompactArtifactSpec {
             .word_scalar_count
             .checked_div(self.word_group_len.max(1))
             .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
-        let allowed_mask = if word_selectors == 64 {
+        let allowed_mask = if word_selectors >= 64 {
             u64::MAX
-        } else if word_selectors < 64 {
+        } else {
             1u64.checked_shl(word_selectors as u32)
                 .and_then(|value| value.checked_sub(1))
                 .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?
-        } else {
-            return Err(BlsDoryCompactArtifactError::InvalidSpec);
         };
         let allowed_width_codes = if word_selectors >= 32 {
             u64::MAX
@@ -126,6 +127,21 @@ impl BlsDoryCompactArtifactSpec {
             3 => Ok(3),
             _ => Err(BlsDoryCompactArtifactError::InvalidSpec),
         }
+    }
+
+    fn selector_is_signed(self, selector: u64) -> Result<bool, BlsDoryCompactArtifactError> {
+        let word_selectors = self
+            .word_scalar_count
+            .checked_div(self.word_group_len)
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        if selector >= word_selectors {
+            return Err(BlsDoryCompactArtifactError::InvalidSpec);
+        }
+        Ok(if selector < 64 {
+            self.signed_word_selectors & (1u64 << selector) != 0
+        } else {
+            self.signed_word_selectors == u64::MAX
+        })
     }
 
     fn encode(
@@ -243,7 +259,7 @@ impl BlsDoryCompactArtifactWriter {
                 )
                 .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
             let selector = word_index / self.spec.word_group_len;
-            let signed = self.spec.signed_word_selectors & (1u64 << selector) != 0;
+            let signed = self.spec.selector_is_signed(selector)?;
             validate_word(*word, signed, self.spec.selector_word_bytes(selector)?)?;
         }
         let mut encoded = Vec::with_capacity(ARTIFACT_IO_BUFFER_BYTES);
@@ -469,7 +485,7 @@ impl BlsDoryCompactArtifact {
                 reader.read_exact(&mut encoded_words[..bytes])?;
                 hasher.update(&encoded_words[..bytes]);
                 for encoded in encoded_words[..bytes].chunks_exact(word_bytes) {
-                    let signed = self.spec.signed_word_selectors & (1u64 << selector) != 0;
+                    let signed = self.spec.selector_is_signed(selector)?;
                     visitor(
                         word_index,
                         CompactEncodedScalar::Word {
@@ -1008,6 +1024,48 @@ mod tests {
         assert_eq!(decoded, expected);
         drop(artifact);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn all_signed_word_prefix_supports_more_than_sixty_four_selectors() {
+        let directory = TestDirectory::create();
+        let extended = BlsDoryCompactArtifactSpec {
+            context_digest: [7; 32],
+            scalar_count: 256,
+            explicit_scalar_count: 130,
+            word_scalar_count: 130,
+            word_bytes: 8,
+            code_bits: 4,
+            word_width_codes: 0,
+            word_group_len: 1,
+            signed_word_selectors: u64::MAX,
+        };
+        let signed = (0..130)
+            .map(|index| -i64::from(index + 1))
+            .collect::<Vec<_>>();
+        let words = signed
+            .iter()
+            .map(|value| u64::from_le_bytes(value.to_le_bytes()))
+            .collect::<Vec<_>>();
+        let mut writer =
+            BlsDoryCompactArtifactWriter::create(&directory.0, extended, vec![BlsDoryFr::zero()])
+                .unwrap();
+        writer.write_words(&words).unwrap();
+        let artifact = writer.finish().unwrap();
+        let mut decoded = Vec::new();
+        artifact
+            .for_each_scalar(|scalar| {
+                decoded.push(scalar);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            decoded,
+            signed
+                .into_iter()
+                .map(BlsDoryFr::from_i64)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

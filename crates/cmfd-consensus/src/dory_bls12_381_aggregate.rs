@@ -2258,15 +2258,19 @@ fn compact_word_scalar(
     let selector = packed_index
         .checked_div(word_group_len)
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-    let signed = if selector < 64 {
-        signed_word_selectors & (1u64 << selector) != 0
-    } else {
-        signed_word_selectors == u64::MAX
-    };
+    let signed = compact_selector_is_signed(selector, signed_word_selectors);
     if signed {
         Ok(BlsDoryFr::from_i64(i64::from_le_bytes(word.to_le_bytes())))
     } else {
         Ok(BlsDoryFr::from_u64(word))
+    }
+}
+
+fn compact_selector_is_signed(selector: usize, signed_word_selectors: u64) -> bool {
+    if selector < 64 {
+        signed_word_selectors & (1u64 << selector) != 0
+    } else {
+        signed_word_selectors == u64::MAX
     }
 }
 
@@ -3144,15 +3148,14 @@ impl AggregateWordFoldView {
         let read_result = self.source.for_each_encoded_scalar(|index, encoded| {
             block[block_used] = match encoded {
                 CompactEncodedScalar::Word { value, signed } => {
-                    let selector = usize::try_from(index)
+                    let Some(selector) = usize::try_from(index)
                         .ok()
-                        .and_then(|index| index.checked_div(word_group_len));
-                    if selector.is_none_or(|selector| selector >= 64)
-                        || signed
-                            != selector.is_some_and(|selector| {
-                                spec.signed_word_selectors & (1u64 << selector) != 0
-                            })
-                    {
+                        .and_then(|index| index.checked_div(word_group_len))
+                    else {
+                        failed = true;
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    };
+                    if signed != compact_selector_is_signed(selector, spec.signed_word_selectors) {
                         failed = true;
                         return Err(BlsDoryCompactArtifactError::InvalidArtifact);
                     }
@@ -4705,6 +4708,8 @@ mod tests {
         columns: usize,
         explicit_coefficients: usize,
         word_coefficients: usize,
+        word_group_len: usize,
+        signed_word_selectors: u64,
         dictionary: Vec<BlsDoryFr>,
         tamper_first_code: bool,
     }
@@ -4729,11 +4734,11 @@ mod tests {
         }
 
         fn word_group_len(&self) -> usize {
-            self.columns
+            self.word_group_len
         }
 
         fn signed_word_selectors(&self) -> u64 {
-            0
+            self.signed_word_selectors
         }
 
         fn dictionary(&self) -> &[BlsDoryFr] {
@@ -4749,7 +4754,16 @@ mod tests {
                 return Err(FixtureSourceError::Injected);
             }
             for (column, word) in output.iter_mut().enumerate() {
-                *word = (row_index * self.columns + column + 17) as u64;
+                let packed_index = row_index * self.columns + column;
+                let value = (packed_index + 17) as i64;
+                *word = if compact_selector_is_signed(
+                    packed_index / self.word_group_len,
+                    self.signed_word_selectors,
+                ) {
+                    u64::from_le_bytes((-value).to_le_bytes())
+                } else {
+                    value as u64
+                };
             }
             Ok(output.len())
         }
@@ -4789,6 +4803,8 @@ mod tests {
             columns,
             explicit_coefficients: 6 * columns,
             word_coefficients: 2 * columns,
+            word_group_len: columns,
+            signed_word_selectors: 0,
             dictionary: (0..16).map(BlsDoryFr::from_u64).collect(),
             tamper_first_code: false,
         }
@@ -4802,6 +4818,8 @@ mod tests {
             columns,
             explicit_coefficients: rows * columns,
             word_coefficients: rows * columns,
+            word_group_len: columns,
+            signed_word_selectors: 0,
             dictionary: vec![BlsDoryFr::zero()],
             tamper_first_code: false,
         }
@@ -5278,6 +5296,69 @@ mod tests {
             Err(BlsDoryAggregateError::ProverStorage)
         );
         drop(table);
+        drop(compact);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn wide_signed_word_compact_folds_preserve_scratch_proof_bytes() {
+        let variables = 8;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let coefficients = (0..rows * columns)
+            .map(|index| BlsDoryFr::from_i64(-((index + 17) as i64)))
+            .collect::<Vec<_>>();
+        let dense = commit_bls_dory_polynomial(coefficients, nu, sigma, &setup).unwrap();
+        let mut source = FixtureCompactRowSource {
+            rows,
+            columns,
+            explicit_coefficients: rows * columns,
+            word_coefficients: rows * columns,
+            word_group_len: 1,
+            signed_word_selectors: u64::MAX,
+            dictionary: vec![BlsDoryFr::zero()],
+            tamper_first_code: false,
+        };
+        let compact = commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(compact.commitment(), dense.commitment());
+        let point = (0..variables)
+            .map(|index| BlsDoryFr::from_u64(index as u64 + 41))
+            .collect::<Vec<_>>();
+        let dense_result = prove_bls_dory_opening_refs_with_scratch(
+            b"wide-signed-word-compact-folds",
+            &[&dense],
+            std::slice::from_ref(&point),
+            &setup,
+            None,
+        )
+        .unwrap();
+        let compact_result = prove_bls_dory_opening_refs_with_scratch(
+            b"wide-signed-word-compact-folds",
+            &[&compact],
+            &[point],
+            &setup,
+            Some(&scratch.0),
+        )
+        .unwrap();
+        assert_eq!(compact_result, dense_result);
+        verify_bls_dory_openings(
+            b"wide-signed-word-compact-folds",
+            &compact_result.0,
+            &compact_result.1,
+            &setup,
+        )
+        .unwrap();
         drop(compact);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }

@@ -825,10 +825,18 @@ fn artifact_file_bytes(
         .word_scalar_count
         .checked_div(spec.word_group_len)
         .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
-    let selector_bytes = (0..word_selectors).try_fold(0u64, |sum, selector| {
+    let overridden_selectors = word_selectors.min(32);
+    let overridden_bytes = (0..overridden_selectors).try_fold(0u64, |sum, selector| {
         sum.checked_add(u64::from(spec.selector_word_bytes(selector)?))
             .ok_or(BlsDoryCompactArtifactError::InvalidSpec)
     })?;
+    let default_bytes = word_selectors
+        .checked_sub(overridden_selectors)
+        .and_then(|selectors| selectors.checked_mul(u64::from(spec.word_bytes)))
+        .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+    let selector_bytes = overridden_bytes
+        .checked_add(default_bytes)
+        .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
     let word_bytes = spec
         .word_group_len
         .checked_mul(selector_bytes)
@@ -1065,6 +1073,48 @@ mod tests {
                 .map(BlsDoryFr::from_i64)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn wide_selector_length_is_computed_without_scanning_every_selector() {
+        let selector_count = 1u64 << 40;
+        let wide = BlsDoryCompactArtifactSpec {
+            context_digest: [9; 32],
+            scalar_count: selector_count,
+            explicit_scalar_count: selector_count,
+            word_scalar_count: selector_count,
+            word_bytes: 8,
+            code_bits: 4,
+            word_width_codes: u64::MAX,
+            word_group_len: 1,
+            signed_word_selectors: u64::MAX,
+        };
+        let word_bytes = 32 * 3 + (selector_count - 32) * 8;
+        let expected = ARTIFACT_HEADER_BYTES as u64
+            + ARTIFACT_SCALAR_BYTES as u64
+            + word_bytes
+            + ARTIFACT_DIGEST_BYTES as u64;
+        assert_eq!(wide.encoded_bytes(1).unwrap(), expected);
+    }
+
+    #[test]
+    fn wide_selector_length_overflow_fails_without_scanning_every_selector() {
+        let selector_count = 1u64 << 63;
+        let wide = BlsDoryCompactArtifactSpec {
+            context_digest: [10; 32],
+            scalar_count: selector_count,
+            explicit_scalar_count: selector_count,
+            word_scalar_count: selector_count,
+            word_bytes: 8,
+            code_bits: 4,
+            word_width_codes: 0,
+            word_group_len: 1,
+            signed_word_selectors: u64::MAX,
+        };
+        assert!(matches!(
+            wide.encoded_bytes(1),
+            Err(BlsDoryCompactArtifactError::InvalidSpec)
+        ));
     }
 
     #[test]

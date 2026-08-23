@@ -7,8 +7,6 @@
 use super::*;
 use dory_pcs::primitives::arithmetic::Field;
 
-const BLS_DORY_BLAKE3_ADJACENCY_ROUND_ROW_STRIDE: u64 = 1_024;
-const BLS_DORY_BLAKE3_ADJACENCY_ROUND_TABLE_INDEX: u32 = 1;
 const BLS_DORY_BLAKE3_ADJACENCY_ROUND_CONTEXT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3AdjacencyRoundContext/v1";
 

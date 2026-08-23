@@ -26,6 +26,8 @@ const BLOCK_HASH_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryWordTransposeAuthenticatedBlock/v1";
 const IO_BUFFER_BYTES: usize = 1024 * 1024;
 const AUTHENTICATION_BLOCK_ROWS: usize = 1 << 17;
+/// Preferred authentication-block row cap used by bounded transpose streams.
+pub(crate) const BLS_DORY_TRANSPOSE_AUTHENTICATION_BLOCK_ROWS: usize = AUTHENTICATION_BLOCK_ROWS;
 pub const BLS_DORY_TRANSPOSE_MAX_ROWS: usize = 1 << 20;
 pub const BLS_DORY_TRANSPOSE_MAX_COLUMNS: usize = 1 << 9;
 pub const BLS_DORY_TRANSPOSE_MAX_DATA_BYTES: u64 = 4 * 1024 * 1024 * 1024;

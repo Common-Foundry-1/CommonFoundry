@@ -1085,7 +1085,7 @@ const SCALAR_BYTES: usize = 32;
 const GT_BYTES: usize = 576;
 const COMPONENT_HEADER_BYTES: usize = 20;
 const TRANSCRIPT_DIGEST_BYTES: usize = 32;
-const FRAME_LENGTH_BYTES: usize = 4;
+const CANDIDATE_PAYLOAD_HEADER_BYTES: usize = 18;
 const CURRENT_SHARED_PRODUCTION_BYTES: usize = 133_409;
 #[cfg(feature = "whir-prototype")]
 const BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC: [u8; 8] = *b"CFB3EX01";
@@ -1115,7 +1115,7 @@ pub const BLS_DORY_BLAKE3_ADJACENCY_PROOF_BYTES: usize = COMPONENT_HEADER_BYTES
     + TRANSCRIPT_DIGEST_BYTES;
 /// Projected V3 payload after replacing, rather than composing with, the FRI bridge.
 pub const BLS_DORY_BLAKE3_PROJECTED_V3_BYTES: usize = CURRENT_SHARED_PRODUCTION_BYTES
-    + 2 * FRAME_LENGTH_BYTES
+    + CANDIDATE_PAYLOAD_HEADER_BYTES
     + BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES
     + BLS_DORY_BLAKE3_ADJACENCY_PROOF_BYTES;
 /// Remaining room under the existing V3 structured-proof allowance.
@@ -1150,9 +1150,9 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical routing and tamper rejection, and leaves zero retained scratch; the real production preprocessing-pin registry, top-level candidate integration, a complete production out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; the version-2 top-level candidate envelope routes its shared frame and native frame through that atomic composer and rejects the legacy separate bridge; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical envelope routing and tamper rejection, and leaves zero retained scratch; the real production preprocessing-pin registry, a complete production out-of-core prover, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
-    "the public shared aggregate parser still intentionally caps claim count at 128; a specialized internal verifier now accepts exactly 134 only after deriving the native suffix from an opaque replay statement, but the generic cap must remain closed until the top-level candidate wire and verifier use that composed path",
+    "the public shared aggregate parser intentionally remains capped at 128; only the version-2 top-level candidate route reaches the specialized exact-134 verifier after deriving the native six-claim suffix from opaque replay, so unrelated callers cannot widen the aggregate boundary",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
 
@@ -7159,9 +7159,9 @@ mod tests {
             crate::dory_bls12_381_layout::projected_shared_production_proof_bytes().unwrap(),
             133_409
         );
-        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES, 192_337);
+        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES, 192_347);
         assert_eq!(MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES, 261_947);
-        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 69_610);
+        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 69_600);
         assert_eq!(
             projected_bls_dory_blake3_source_storage(),
             BlsDoryBlake3SourceStorageProjection {

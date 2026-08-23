@@ -1,10 +1,11 @@
-//! Non-consensus verifier boundary for the production-shaped BLS/Dory proof.
+//! Non-consensus verifier boundary for the production-shaped composed BLS/Dory proof.
 //!
 //! The composed research path verifies both the shared ForgeMatrix arithmetic
-//! layout and the final-output BLAKE3 bridge. This module intentionally cannot
-//! produce [`crate::PreverifiedBlockProof`]: the production proof still exceeds
-//! its wire budget, has not completed an n=33 run, and has not passed the
-//! required independent review and audit gates.
+//! layout and the native final-output BLAKE3 argument in one aggregate. This
+//! module intentionally cannot produce [`crate::PreverifiedBlockProof`]: the
+//! production prover and preprocessing registry are not complete, the exact
+//! n=33 run has not completed, and the required review and audit gates remain
+//! open.
 
 use std::sync::Arc;
 
@@ -34,17 +35,15 @@ use crate::{
 };
 
 #[cfg(feature = "whir-prototype")]
-use crate::{
-    dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
-    structured_blake3_narrow::bls_bridge::{
-        prove_bls_dory_narrow_blake3, verify_bls_dory_narrow_blake3,
-    },
+use crate::dory_bls12_381_layout::{
+    prepare_bls_dory_shared_layout_verifier_state,
+    verify_prepared_bls_dory_shared_layout_with_native_proof,
 };
 
 const ALGEBRAIC_BINDING_VERSION: u16 = 1;
 const ALGEBRAIC_BINDING_DOMAIN: &str = "CommonFoundry/ForgeMatrix/V3/BlsDoryAlgebraicBinding/v1";
-const CANDIDATE_PAYLOAD_MAGIC: [u8; 8] = *b"CFV3CP01";
-const CANDIDATE_PAYLOAD_VERSION: u16 = 1;
+const CANDIDATE_PAYLOAD_MAGIC: [u8; 8] = *b"CFV3CP02";
+const CANDIDATE_PAYLOAD_VERSION: u16 = 2;
 const CANDIDATE_PAYLOAD_HEADER_BYTES: usize = 18;
 
 /// Production-shaped verifier for only the algebraic portion of a V3 candidate.
@@ -61,6 +60,13 @@ pub struct BlsDoryV3AlgebraicVerifier {
     setup: Arc<DeterministicBlsDorySetup>,
 }
 
+struct ValidatedBlsDoryV3CandidateStatement {
+    binding: [u8; 32],
+    shape: StructuredForgeMatrixResearchShape,
+    transition_statements: Vec<StructuredTransitionStatement>,
+    masks: Vec<StructuredMaskPolynomial>,
+}
+
 /// Opaque evidence that one exact candidate passed only the Dory algebraic checks.
 ///
 /// This value is intentionally unrelated to the chain-admission capability.
@@ -73,21 +79,21 @@ pub struct VerifiedBlsDoryV3AlgebraicCandidate {
     final_output: VerifiedBlsDoryFinalOutputOpening,
 }
 
-/// Canonical candidate envelope carrying both proof systems.
+/// Canonical candidate envelope carrying the shared proof and native BLAKE3 frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlsDoryV3CandidatePayload {
     pub dory_proof: Vec<u8>,
-    pub blake3_bridge_proof: Vec<u8>,
+    pub native_blake3_proof: Vec<u8>,
 }
 
-/// Opaque evidence that both the Dory execution proof and the BLAKE3 bridge
-/// proof verified against one candidate statement. Consensus activation stays
+/// Opaque evidence that the Dory execution proof and native BLAKE3 argument
+/// verified in one aggregate against one candidate statement. Consensus activation stays
 /// disabled until the remaining benchmark and review gates are complete.
 #[must_use]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedBlsDoryV3Candidate {
     algebraic: VerifiedBlsDoryV3AlgebraicCandidate,
-    blake3_proof_digest: [u8; 32],
+    native_blake3_proof_digest: [u8; 32],
 }
 
 impl VerifiedBlsDoryV3Candidate {
@@ -95,8 +101,8 @@ impl VerifiedBlsDoryV3Candidate {
         &self.algebraic
     }
 
-    pub const fn blake3_proof_digest(&self) -> [u8; 32] {
-        self.blake3_proof_digest
+    pub const fn native_blake3_proof_digest(&self) -> [u8; 32] {
+        self.native_blake3_proof_digest
     }
 }
 
@@ -150,22 +156,20 @@ pub enum BlsDoryV3CandidateError {
     Mask(#[from] StructuredTransitionError),
     #[error("candidate Dory proof failed: {0}")]
     Dory(#[from] BlsDorySharedLayoutError),
-    #[error("candidate BLAKE3 final-output bridge proof failed")]
-    Blake3Bridge,
 }
 
 impl BlsDoryV3CandidatePayload {
     pub fn encode(&self) -> Result<Vec<u8>, BlsDoryV3CandidateError> {
-        if self.dory_proof.is_empty() || self.blake3_bridge_proof.is_empty() {
+        if self.dory_proof.is_empty() || self.native_blake3_proof.is_empty() {
             return Err(BlsDoryV3CandidateError::Payload);
         }
         let dory_len =
             u32::try_from(self.dory_proof.len()).map_err(|_| BlsDoryV3CandidateError::Payload)?;
-        let blake3_len = u32::try_from(self.blake3_bridge_proof.len())
+        let blake3_len = u32::try_from(self.native_blake3_proof.len())
             .map_err(|_| BlsDoryV3CandidateError::Payload)?;
         let total = CANDIDATE_PAYLOAD_HEADER_BYTES
             .checked_add(self.dory_proof.len())
-            .and_then(|total| total.checked_add(self.blake3_bridge_proof.len()))
+            .and_then(|total| total.checked_add(self.native_blake3_proof.len()))
             .ok_or(BlsDoryV3CandidateError::Payload)?;
         if total > MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES {
             return Err(BlsDoryV3CandidateError::ProofSize);
@@ -176,7 +180,7 @@ impl BlsDoryV3CandidatePayload {
         encoded.extend_from_slice(&dory_len.to_le_bytes());
         encoded.extend_from_slice(&blake3_len.to_le_bytes());
         encoded.extend_from_slice(&self.dory_proof);
-        encoded.extend_from_slice(&self.blake3_bridge_proof);
+        encoded.extend_from_slice(&self.native_blake3_proof);
         Ok(encoded)
     }
 
@@ -217,7 +221,7 @@ impl BlsDoryV3CandidatePayload {
         }
         Ok(Self {
             dory_proof: encoded[CANDIDATE_PAYLOAD_HEADER_BYTES..dory_end].to_vec(),
-            blake3_bridge_proof: encoded[dory_end..end].to_vec(),
+            native_blake3_proof: encoded[dory_end..end].to_vec(),
         })
     }
 }
@@ -244,15 +248,11 @@ impl BlsDoryV3AlgebraicVerifier {
         })
     }
 
-    /// Verify the exact block/public fields and the real shared Dory payload.
-    ///
-    /// Success deliberately does not establish the final-activation BLAKE3
-    /// relation and is therefore insufficient for chain admission.
-    pub fn verify_algebraic_candidate(
+    fn validate_candidate_statement(
         &self,
         block: &BlockChallenge,
         proof: &ForgeMatrixV3CandidateProof,
-    ) -> Result<VerifiedBlsDoryV3AlgebraicCandidate, BlsDoryV3CandidateError> {
+    ) -> Result<ValidatedBlsDoryV3CandidateStatement, BlsDoryV3CandidateError> {
         if block.network_id != self.network_id {
             return Err(BlsDoryV3CandidateError::WrongNetwork);
         }
@@ -308,34 +308,46 @@ impl BlsDoryV3AlgebraicVerifier {
         shape
             .validate_verifier_shape()
             .map_err(|_| BlsDoryV3CandidateError::ProductionGeometry)?;
-        let matrix_statements = shape.matrix_statements;
         let mut transition_statements = Vec::with_capacity(PRODUCTION_V2_BANKS as usize + 1);
         transition_statements.push(shape.initialization_statement);
         transition_statements.extend_from_slice(&shape.transition_statements);
         let masks = production_masks(expected_challenge, &shape)?;
-        let mask_refs = masks.iter().collect::<Vec<_>>();
+        Ok(ValidatedBlsDoryV3CandidateStatement {
+            binding,
+            shape,
+            transition_statements,
+            masks,
+        })
+    }
+
+    /// Verify the exact block/public fields and the real shared Dory payload.
+    ///
+    /// Success deliberately does not establish the final-activation BLAKE3
+    /// relation and is therefore insufficient for chain admission.
+    pub fn verify_algebraic_candidate(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixV3CandidateProof,
+    ) -> Result<VerifiedBlsDoryV3AlgebraicCandidate, BlsDoryV3CandidateError> {
+        let validated = self.validate_candidate_statement(block, proof)?;
+        let mask_refs = validated.masks.iter().collect::<Vec<_>>();
         let final_output = verify_algebraic_payload_with_final_output(
-            &binding,
+            &validated.binding,
             &self.trusted_model,
             &self.fixed_model,
-            &matrix_statements,
-            &transition_statements,
+            &validated.shape.matrix_statements,
+            &validated.transition_statements,
             &mask_refs,
-            shape.wiring_statement,
+            validated.shape.wiring_statement,
             &proof.structured_proof,
             BLS_DORY_SHARED_PRODUCTION_VARIABLES,
             &self.setup,
         )?;
-        let mut proof_hasher =
-            blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/V3/BlsDoryAlgebraicProof/v1");
-        proof_hasher.update(&binding);
-        proof_hasher.update(&(proof.structured_proof.len() as u64).to_le_bytes());
-        proof_hasher.update(&proof.structured_proof);
-        Ok(VerifiedBlsDoryV3AlgebraicCandidate {
-            binding,
-            proof_digest: *proof_hasher.finalize().as_bytes(),
+        Ok(verified_algebraic_candidate(
+            validated.binding,
+            &proof.structured_proof,
             final_output,
-        })
+        ))
     }
 
     /// Verify the composed V3 research candidate. This establishes the
@@ -347,66 +359,79 @@ impl BlsDoryV3AlgebraicVerifier {
         block: &BlockChallenge,
         proof: &ForgeMatrixV3CandidateProof,
     ) -> Result<VerifiedBlsDoryV3Candidate, BlsDoryV3CandidateError> {
+        let validated = self.validate_candidate_statement(block, proof)?;
         let payload = BlsDoryV3CandidatePayload::decode(&proof.structured_proof)?;
-        let mut algebraic_proof = proof.clone();
-        algebraic_proof.structured_proof = payload.dory_proof;
-        let algebraic = self.verify_algebraic_candidate(block, &algebraic_proof)?;
-        let bridge = output_bridge_statement(proof, &algebraic)?;
-        verify_bls_dory_narrow_blake3(&bridge, &payload.blake3_bridge_proof)
-            .map_err(|_| BlsDoryV3CandidateError::Blake3Bridge)?;
+        let shared_proof = BlsDorySharedLayoutProof::decode_with_variables(
+            &payload.dory_proof,
+            &validated.shape.matrix_statements,
+            &validated.transition_statements,
+            validated.shape.wiring_statement,
+            BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+        )?;
+        let mask_refs = validated.masks.iter().collect::<Vec<_>>();
+        let prepared = prepare_bls_dory_shared_layout_verifier_state(
+            &validated.binding,
+            &self.trusted_model,
+            &self.fixed_model,
+            &validated.shape.matrix_statements,
+            &validated.transition_statements,
+            &mask_refs,
+            validated.shape.wiring_statement,
+            &shared_proof,
+            BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+            &self.setup,
+        )?;
+        let final_output = verify_prepared_bls_dory_shared_layout_with_native_proof(
+            prepared,
+            proof.challenge_digest,
+            proof.final_activation_digest,
+            production_final_activation_len()?,
+            &payload.native_blake3_proof,
+            &shared_proof.opening_proof,
+            &self.setup,
+        )?;
+        let algebraic =
+            verified_algebraic_candidate(validated.binding, &payload.dory_proof, final_output);
         let mut hasher = blake3::Hasher::new_derive_key(
-            "CommonFoundry/ForgeMatrix/V3/BlsDoryBlake3BridgeProof/v1",
+            "CommonFoundry/ForgeMatrix/V3/BlsDoryNativeBlake3Proof/v1",
         );
         hasher.update(&algebraic.binding());
-        hasher.update(&(payload.blake3_bridge_proof.len() as u64).to_le_bytes());
-        hasher.update(&payload.blake3_bridge_proof);
+        hasher.update(&(payload.native_blake3_proof.len() as u64).to_le_bytes());
+        hasher.update(&payload.native_blake3_proof);
         Ok(VerifiedBlsDoryV3Candidate {
             algebraic,
-            blake3_proof_digest: *hasher.finalize().as_bytes(),
+            native_blake3_proof_digest: *hasher.finalize().as_bytes(),
         })
     }
+}
 
-    /// Verify a raw Dory candidate, prove its BLAKE3 bridge from the supplied
-    /// final activation, and return the canonical two-proof envelope.
-    #[cfg(feature = "whir-prototype")]
-    pub fn build_candidate_payload(
-        &self,
-        block: &BlockChallenge,
-        algebraic_proof: &ForgeMatrixV3CandidateProof,
-        final_activation: &[u8],
-    ) -> Result<Vec<u8>, BlsDoryV3CandidateError> {
-        let algebraic = self.verify_algebraic_candidate(block, algebraic_proof)?;
-        let bridge = output_bridge_statement(algebraic_proof, &algebraic)?;
-        let blake3_bridge_proof = prove_bls_dory_narrow_blake3(&bridge, final_activation)
-            .map_err(|_| BlsDoryV3CandidateError::Blake3Bridge)?;
-        BlsDoryV3CandidatePayload {
-            dory_proof: algebraic_proof.structured_proof.clone(),
-            blake3_bridge_proof,
-        }
-        .encode()
+fn verified_algebraic_candidate(
+    binding: [u8; 32],
+    encoded_proof: &[u8],
+    final_output: VerifiedBlsDoryFinalOutputOpening,
+) -> VerifiedBlsDoryV3AlgebraicCandidate {
+    let mut proof_hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/V3/BlsDoryAlgebraicProof/v1");
+    proof_hasher.update(&binding);
+    proof_hasher.update(&(encoded_proof.len() as u64).to_le_bytes());
+    proof_hasher.update(encoded_proof);
+    VerifiedBlsDoryV3AlgebraicCandidate {
+        binding,
+        proof_digest: *proof_hasher.finalize().as_bytes(),
+        final_output,
     }
 }
 
 #[cfg(feature = "whir-prototype")]
-fn output_bridge_statement(
-    proof: &ForgeMatrixV3CandidateProof,
-    algebraic: &VerifiedBlsDoryV3AlgebraicCandidate,
-) -> Result<BlsDoryOutputBridgeStatement, BlsDoryV3CandidateError> {
-    let final_activation_len = usize::try_from(PRODUCTION_V2_BATCH)
+fn production_final_activation_len() -> Result<usize, BlsDoryV3CandidateError> {
+    usize::try_from(PRODUCTION_V2_BATCH)
         .ok()
         .and_then(|rows| {
             usize::try_from(PRODUCTION_V2_DIMENSION)
                 .ok()
                 .and_then(|cols| rows.checked_mul(cols))
         })
-        .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?;
-    BlsDoryOutputBridgeStatement::from_verified_dory(
-        proof.challenge_digest,
-        proof.final_activation_digest,
-        final_activation_len,
-        algebraic.final_output(),
-    )
-    .map_err(|_| BlsDoryV3CandidateError::Blake3Bridge)
+        .ok_or(BlsDoryV3CandidateError::ProductionGeometry)
 }
 
 fn validate_production_record(
@@ -635,7 +660,7 @@ mod tests {
     fn candidate_payload_codec_is_canonical_and_bounded() {
         let payload = BlsDoryV3CandidatePayload {
             dory_proof: vec![0x31; 7],
-            blake3_bridge_proof: vec![0x42; 11],
+            native_blake3_proof: vec![0x42; 11],
         };
         let encoded = payload.encode().unwrap();
         assert_eq!(encoded.len(), CANDIDATE_PAYLOAD_HEADER_BYTES + 18);
@@ -656,8 +681,27 @@ mod tests {
             BlsDoryV3CandidatePayload::decode(&malformed),
             Err(BlsDoryV3CandidateError::Payload)
         ));
+        let mut legacy = encoded.clone();
+        legacy[..8].copy_from_slice(b"CFV3CP01");
+        legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(matches!(
+            BlsDoryV3CandidatePayload::decode(&legacy),
+            Err(BlsDoryV3CandidateError::Payload)
+        ));
         let mut malformed = encoded.clone();
         malformed[10..14].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            BlsDoryV3CandidatePayload::decode(&malformed),
+            Err(BlsDoryV3CandidateError::Payload)
+        ));
+        let mut malformed = encoded.clone();
+        malformed[14..18].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            BlsDoryV3CandidatePayload::decode(&malformed),
+            Err(BlsDoryV3CandidateError::Payload)
+        ));
+        let mut malformed = encoded.clone();
+        malformed[14..18].copy_from_slice(&12_u32.to_le_bytes());
         assert!(matches!(
             BlsDoryV3CandidatePayload::decode(&malformed),
             Err(BlsDoryV3CandidateError::Payload)
@@ -675,7 +719,7 @@ mod tests {
 
         let exact = BlsDoryV3CandidatePayload {
             dory_proof: vec![1],
-            blake3_bridge_proof: vec![
+            native_blake3_proof: vec![
                 2;
                 MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES
                     - CANDIDATE_PAYLOAD_HEADER_BYTES
@@ -688,7 +732,7 @@ mod tests {
         );
         let over = BlsDoryV3CandidatePayload {
             dory_proof: vec![1],
-            blake3_bridge_proof: vec![
+            native_blake3_proof: vec![
                 2;
                 MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES
                     - CANDIDATE_PAYLOAD_HEADER_BYTES

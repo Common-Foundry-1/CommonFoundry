@@ -68,7 +68,7 @@ use crate::{
     },
 };
 
-#[cfg(feature = "dory-bls12-381-prototype")]
+#[cfg(all(test, feature = "dory-bls12-381-prototype"))]
 pub(crate) mod bls_bridge;
 
 #[cfg(feature = "gpu-proof-prover")]

@@ -3970,6 +3970,7 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use crate::{
         dory_bls12_381_blake3::prepare_native_blake3_test_opening_at_layout,
+        dory_bls12_381_candidate::BlsDoryV3CandidatePayload,
         dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
     };
 
@@ -6188,8 +6189,36 @@ mod tests {
                 fixture.wiring_statement,
             )
             .unwrap();
+        let encoded_candidate = BlsDoryV3CandidatePayload {
+            dory_proof: encoded.clone(),
+            native_blake3_proof: encoded_native_proof.clone(),
+        }
+        .encode()
+        .unwrap();
+        let candidate = BlsDoryV3CandidatePayload::decode(&encoded_candidate).unwrap();
+        assert_eq!(candidate.dory_proof, encoded);
+        assert_eq!(candidate.native_blake3_proof, encoded_native_proof);
+        assert!(
+            BlsDoryV3CandidatePayload::decode(&encoded_candidate[..encoded_candidate.len() - 1])
+                .is_err()
+        );
+        let mut trailing_candidate = encoded_candidate.clone();
+        trailing_candidate.push(0);
+        assert!(BlsDoryV3CandidatePayload::decode(&trailing_candidate).is_err());
+        let mut changed_native_candidate = encoded_candidate.clone();
+        let changed_native_index = changed_native_candidate.len() - 1;
+        changed_native_candidate[changed_native_index] ^= 1;
+        let changed_native_candidate =
+            BlsDoryV3CandidatePayload::decode(&changed_native_candidate).unwrap();
+        assert!(
+            replay_native(
+                &changed_native_candidate.native_blake3_proof,
+                trusted_preprocessing_commitment,
+            )
+            .is_err()
+        );
         let decoded = BlsDorySharedLayoutProof::decode_with_variables(
-            &encoded,
+            &candidate.dory_proof,
             &matrix_statements,
             &transition_statements,
             fixture.wiring_statement,
@@ -6238,7 +6267,7 @@ mod tests {
             challenge_digest,
             activation_digest,
             FINAL_ACTIVATION_BYTES,
-            &encoded_native_proof,
+            &candidate.native_blake3_proof,
             trusted_preprocessing_commitment,
             &proof.opening_proof,
             &setup,

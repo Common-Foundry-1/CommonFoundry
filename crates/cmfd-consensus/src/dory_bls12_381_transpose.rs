@@ -32,6 +32,14 @@ pub const BLS_DORY_TRANSPOSE_MAX_DATA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const BLS_DORY_TRANSPOSE_MAX_CHUNK_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// Exact framed size of a valid transpose artifact without creating it.
+pub fn projected_bls_dory_transpose_artifact_bytes(
+    rows: usize,
+    columns: usize,
+) -> Result<u64, BlsDoryTransposeError> {
+    Ok(validate_geometry(rows, columns, 1)?.total_bytes)
+}
+
 struct TransposeGeometry {
     data_bytes: u64,
     total_bytes: u64,
@@ -774,6 +782,14 @@ mod tests {
         let production =
             validate_geometry(BLS_DORY_TRANSPOSE_MAX_ROWS, 288, AUTHENTICATION_BLOCK_ROWS).unwrap();
         assert!(production.data_bytes <= BLS_DORY_TRANSPOSE_MAX_DATA_BYTES);
+        assert_eq!(
+            projected_bls_dory_transpose_artifact_bytes(BLS_DORY_TRANSPOSE_MAX_ROWS, 288).unwrap(),
+            2_415_919_176
+        );
+        assert_eq!(
+            projected_bls_dory_transpose_artifact_bytes(BLS_DORY_TRANSPOSE_MAX_ROWS, 84).unwrap(),
+            704_643_144
+        );
         assert!(
             production.row_buffer_words * std::mem::size_of::<u64>()
                 <= BLS_DORY_TRANSPOSE_MAX_CHUNK_BUFFER_BYTES

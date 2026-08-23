@@ -19,6 +19,7 @@ use p3_air::symbolic::{
 };
 #[cfg(all(test, feature = "whir-prototype"))]
 use p3_field::PrimeField64;
+use thiserror::Error;
 
 #[cfg(all(test, feature = "whir-prototype"))]
 use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryTranscript};
@@ -33,10 +34,16 @@ use crate::{
     },
 };
 use crate::{
-    dory_bls12_381_layout::BLS_DORY_SHARED_PRODUCTION_CLAIMS,
+    dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
+    dory_bls12_381_fold_artifact::BlsDoryFoldArtifactSpec,
+    dory_bls12_381_layout::{
+        BLS_DORY_SHARED_PRODUCTION_CLAIMS, BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+        projected_shared_production_scratch_bytes,
+    },
     dory_bls12_381_soundness::{
         BlsDorySoundnessError, BlsDorySoundnessTerm, production_bls_dory_soundness_report,
     },
+    dory_bls12_381_transpose::projected_bls_dory_transpose_artifact_bytes,
     wire::MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
 };
 
@@ -208,7 +215,7 @@ pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
     "bounded row streams now transpose every ordinary main and preprocessing column, derive next rows without duplicate scratch, preserve exact commitment and opening bytes, reject non-Boolean codes, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact; signed-word and preprocessing streams have materialized commitment/opening equivalence for bounded shared-layout reblocking analogs and pin the exact n=33 topology, a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches, and a bounded four-source/six-claim test demonstrates canonical statement rejection of freshly reproved wrong routes and nonzero lift coordinates; production-owned source construction and source-role/point/evaluation binding, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
-    "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
+    "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources, 3,120,562,320 bytes of source-construction transposes, and a 34,319,467,740-byte aggregate-stage lower bound; it rejects caller-supplied resource measurements below provisional 50 GiB scratch and 4 GiB available-memory floors but is not yet wired to a production run and cannot authorize one until BLAKE3 fold scratch and peak memory are completely projected; the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
 
 /// Executable algebraic union bound for the shared proof plus BLAKE3 replacement.
@@ -805,6 +812,205 @@ pub const fn projected_bls_dory_blake3_source_storage() -> BlsDoryBlake3SourceSt
     }
 }
 
+/// Operational scratch floor used while the exact composed fold lifecycle is
+/// still being modeled. Passing this floor never authorizes a production run.
+pub const BLS_DORY_BLAKE3_PROVISIONAL_SCRATCH_GATE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+/// Provisional free-memory floor. The complete prover's peak resident memory
+/// remains unmeasured, so passing this floor never authorizes a production run.
+pub const BLS_DORY_BLAKE3_PROVISIONAL_AVAILABLE_MEMORY_GATE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Nonallocating resource accounting for the proposed shared plus BLAKE3 proof.
+///
+/// `aggregate_stage_lower_bound_bytes` includes the exact current shared peak
+/// and every framed BLAKE3 source, but no BLAKE3 fold artifacts. Transpose
+/// artifacts belong to source construction and may be released before the
+/// aggregate. `source_construction_coexistence_bytes` conservatively sums all
+/// known source and transpose artifacts without claiming that this is their
+/// implemented lifetime or a measured peak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlsDoryBlake3ProductionResourceProjection {
+    pub shared_aggregate_peak_bytes: u64,
+    pub compact_source_payload_bytes: u64,
+    pub framed_source_artifact_bytes: u64,
+    pub transpose_artifact_bytes: u64,
+    pub source_construction_coexistence_bytes: u64,
+    pub aggregate_stage_lower_bound_bytes: u64,
+    pub provisional_scratch_gate_bytes: u64,
+    pub provisional_available_memory_gate_bytes: u64,
+    pub fold_scratch_projection_complete: bool,
+    pub peak_memory_projection_complete: bool,
+    pub composed_prover_implemented: bool,
+}
+
+impl BlsDoryBlake3ProductionResourceProjection {
+    /// A run remains blocked until all three independently testable gates close.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.fold_scratch_projection_complete
+            && self.peak_memory_projection_complete
+            && self.composed_prover_implemented
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum BlsDoryBlake3ProductionPreflightError {
+    #[error("the BLAKE3 production resource projection is invalid")]
+    InvalidProjection,
+    #[error(
+        "insufficient scratch space for the provisional BLAKE3 production gate: need {required} bytes, have {available} bytes"
+    )]
+    InsufficientScratch { required: u64, available: u64 },
+    #[error(
+        "insufficient available memory for the provisional BLAKE3 production gate: need {required} bytes, have {available} bytes"
+    )]
+    InsufficientMemory { required: u64, available: u64 },
+    #[error(
+        "the production run remains blocked until BLAKE3 fold scratch, peak memory, and the composed prover are complete"
+    )]
+    IncompleteProjection,
+}
+
+/// Project every currently known framed artifact without allocating production
+/// setup, trace, source, or fold storage.
+pub fn projected_bls_dory_blake3_production_resources()
+-> Result<BlsDoryBlake3ProductionResourceProjection, BlsDoryBlake3ProductionPreflightError> {
+    let logical_scalars = 1u64
+        .checked_shl(BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let trace_rows = BLS_DORY_BLAKE3_TRACE_ROWS_U64;
+    let main_explicit_scalars = (BLS_DORY_BLAKE3_SIGNED_WORD_TABLES as u64)
+        .checked_mul(trace_rows)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let preprocessed_word_scalars = (BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES as u64)
+        .checked_mul(trace_rows)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let preprocessed_explicit_scalars = ((BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+        + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES)
+        as u64)
+        .checked_mul(trace_rows)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let accumulator_explicit_scalars = (BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES as u64)
+        .checked_mul(trace_rows)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let inverse_explicit_scalars = (BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES as u64)
+        .checked_mul(trace_rows)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+
+    let main_bytes = BlsDoryCompactArtifactSpec {
+        context_digest: [1; 32],
+        scalar_count: logical_scalars,
+        explicit_scalar_count: main_explicit_scalars,
+        word_scalar_count: main_explicit_scalars,
+        word_bytes: 8,
+        code_bits: 8,
+        word_width_codes: 0,
+        word_group_len: trace_rows,
+        signed_word_selectors: u64::MAX,
+    }
+    .encoded_bytes(1)
+    .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let preprocessed_bytes = BlsDoryCompactArtifactSpec {
+        context_digest: [1; 32],
+        scalar_count: logical_scalars,
+        explicit_scalar_count: preprocessed_explicit_scalars,
+        word_scalar_count: preprocessed_word_scalars,
+        word_bytes: 8,
+        code_bits: 4,
+        word_width_codes: 0,
+        word_group_len: trace_rows,
+        signed_word_selectors: 0,
+    }
+    .encoded_bytes(2)
+    .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let scalar_source_bytes = |table_index, explicit_scalar_count| {
+        BlsDoryFoldArtifactSpec {
+            context_digest: [1; 32],
+            table_index,
+            generation: 1,
+            scalar_count: logical_scalars,
+            explicit_scalar_count,
+            parent_digest: [2; 32],
+        }
+        .encoded_bytes()
+        .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)
+    };
+    let accumulator_bytes = scalar_source_bytes(0, accumulator_explicit_scalars)?;
+    let inverse_bytes = scalar_source_bytes(1, inverse_explicit_scalars)?;
+    let framed_source_artifact_bytes = main_bytes
+        .checked_add(preprocessed_bytes)
+        .and_then(|bytes| bytes.checked_add(accumulator_bytes))
+        .and_then(|bytes| bytes.checked_add(inverse_bytes))
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let transpose_artifact_bytes = projected_bls_dory_transpose_artifact_bytes(
+        BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+        BLS_DORY_BLAKE3_MAIN_WIDTH - 1,
+    )
+    .and_then(|main| {
+        projected_bls_dory_transpose_artifact_bytes(
+            BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+            BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+        )
+        .and_then(|preprocessed| {
+            main.checked_add(preprocessed)
+                .ok_or(crate::dory_bls12_381_transpose::BlsDoryTransposeError::InvalidShape)
+        })
+    })
+    .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let shared_aggregate_peak_bytes = projected_shared_production_scratch_bytes()
+        .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)?
+        .aggregate_peak_bytes;
+    let source_construction_coexistence_bytes = framed_source_artifact_bytes
+        .checked_add(transpose_artifact_bytes)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let aggregate_stage_lower_bound_bytes = shared_aggregate_peak_bytes
+        .checked_add(framed_source_artifact_bytes)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+
+    let provisional_scratch_gate_bytes = BLS_DORY_BLAKE3_PROVISIONAL_SCRATCH_GATE_BYTES
+        .max(source_construction_coexistence_bytes)
+        .max(aggregate_stage_lower_bound_bytes);
+
+    Ok(BlsDoryBlake3ProductionResourceProjection {
+        shared_aggregate_peak_bytes,
+        compact_source_payload_bytes: BLS_DORY_BLAKE3_COMPACT_SOURCE_PAYLOAD_BYTES,
+        framed_source_artifact_bytes,
+        transpose_artifact_bytes,
+        source_construction_coexistence_bytes,
+        aggregate_stage_lower_bound_bytes,
+        provisional_scratch_gate_bytes,
+        provisional_available_memory_gate_bytes:
+            BLS_DORY_BLAKE3_PROVISIONAL_AVAILABLE_MEMORY_GATE_BYTES,
+        fold_scratch_projection_complete: false,
+        peak_memory_projection_complete: false,
+        composed_prover_implemented: false,
+    })
+}
+
+/// Fail closed before any production allocation or file creation. The caller
+/// supplies already measured free resources; this function does no I/O.
+pub fn preflight_bls_dory_blake3_production_resources(
+    available_scratch_bytes: u64,
+    available_memory_bytes: u64,
+) -> Result<BlsDoryBlake3ProductionResourceProjection, BlsDoryBlake3ProductionPreflightError> {
+    let projection = projected_bls_dory_blake3_production_resources()?;
+    if available_scratch_bytes < projection.provisional_scratch_gate_bytes {
+        return Err(BlsDoryBlake3ProductionPreflightError::InsufficientScratch {
+            required: projection.provisional_scratch_gate_bytes,
+            available: available_scratch_bytes,
+        });
+    }
+    if available_memory_bytes < projection.provisional_available_memory_gate_bytes {
+        return Err(BlsDoryBlake3ProductionPreflightError::InsufficientMemory {
+            required: projection.provisional_available_memory_gate_bytes,
+            available: available_memory_bytes,
+        });
+    }
+    if !projection.is_complete() {
+        return Err(BlsDoryBlake3ProductionPreflightError::IncompleteProjection);
+    }
+    Ok(projection)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,7 +1024,6 @@ mod tests {
         prove_bls_dory_deferred_opening_sets, prove_bls_dory_same_commitment_openings,
         verify_bls_dory_openings,
     };
-    use crate::dory_bls12_381_layout::BLS_DORY_SHARED_PRODUCTION_VARIABLES;
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_prototype::{BlsDoryGt, DeterministicBlsDorySetup};
     #[cfg(feature = "whir-prototype")]
@@ -3511,6 +3716,62 @@ mod tests {
         );
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS.len(), 4);
+    }
+
+    #[test]
+    fn production_resource_preflight_accounts_known_artifacts_and_stays_closed() {
+        let projection = projected_bls_dory_blake3_production_resources().unwrap();
+        assert_eq!(projection.shared_aggregate_peak_bytes, 29_202_416_244);
+        assert_eq!(projection.compact_source_payload_bytes, 5_117_050_880);
+        assert_eq!(projection.framed_source_artifact_bytes, 5_117_051_496);
+        assert_eq!(projection.transpose_artifact_bytes, 3_120_562_320);
+        assert_eq!(
+            projection.source_construction_coexistence_bytes,
+            8_237_613_816
+        );
+        assert_eq!(projection.aggregate_stage_lower_bound_bytes, 34_319_467_740);
+        assert_eq!(projection.provisional_scratch_gate_bytes, 53_687_091_200);
+        assert!(
+            projection.provisional_scratch_gate_bytes
+                >= projection.source_construction_coexistence_bytes
+        );
+        assert!(
+            projection.provisional_scratch_gate_bytes
+                >= projection.aggregate_stage_lower_bound_bytes
+        );
+        assert_eq!(
+            projection.provisional_available_memory_gate_bytes,
+            4_294_967_296
+        );
+        assert!(!projection.fold_scratch_projection_complete);
+        assert!(!projection.peak_memory_projection_complete);
+        assert!(!projection.composed_prover_implemented);
+        assert!(!projection.is_complete());
+
+        assert_eq!(
+            preflight_bls_dory_blake3_production_resources(
+                projection.provisional_scratch_gate_bytes - 1,
+                projection.provisional_available_memory_gate_bytes,
+            ),
+            Err(BlsDoryBlake3ProductionPreflightError::InsufficientScratch {
+                required: projection.provisional_scratch_gate_bytes,
+                available: projection.provisional_scratch_gate_bytes - 1,
+            })
+        );
+        assert_eq!(
+            preflight_bls_dory_blake3_production_resources(
+                projection.provisional_scratch_gate_bytes,
+                projection.provisional_available_memory_gate_bytes - 1,
+            ),
+            Err(BlsDoryBlake3ProductionPreflightError::InsufficientMemory {
+                required: projection.provisional_available_memory_gate_bytes,
+                available: projection.provisional_available_memory_gate_bytes - 1,
+            })
+        );
+        assert_eq!(
+            preflight_bls_dory_blake3_production_resources(u64::MAX, u64::MAX,),
+            Err(BlsDoryBlake3ProductionPreflightError::IncompleteProjection)
+        );
     }
 
     #[test]

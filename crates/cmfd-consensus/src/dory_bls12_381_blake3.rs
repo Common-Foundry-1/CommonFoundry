@@ -770,6 +770,10 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_streaming::BlsDoryRowSource;
     #[cfg(feature = "whir-prototype")]
+    use crate::dory_bls12_381_transpose::{
+        BlsDoryTransposeError, BlsDoryWordTransposeArtifact, BlsDoryWordTransposeWriter,
+    };
+    #[cfg(feature = "whir-prototype")]
     use crate::structured_blake3_narrow::{generate_main_trace, public_values};
     #[cfg(feature = "whir-prototype")]
     use crate::structured_blake3_tree::build_tree_witness;
@@ -1837,19 +1841,17 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
-    struct DensePackedSignedWordRowSource<'a> {
-        tables: &'a [Vec<i64>],
-        trace_rows: usize,
+    struct TransposedSignedWordRowSource<'a> {
+        artifact: &'a mut BlsDoryWordTransposeArtifact,
         selector_slots: usize,
         dictionary: [BlsDoryFr; 1],
     }
 
     #[cfg(feature = "whir-prototype")]
-    impl<'a> DensePackedSignedWordRowSource<'a> {
-        fn new(tables: &'a [Vec<i64>], trace_rows: usize, selector_slots: usize) -> Self {
+    impl<'a> TransposedSignedWordRowSource<'a> {
+        fn new(artifact: &'a mut BlsDoryWordTransposeArtifact, selector_slots: usize) -> Self {
             Self {
-                tables,
-                trace_rows,
+                artifact,
                 selector_slots,
                 dictionary: [BlsDoryFr::zero()],
             }
@@ -1857,27 +1859,27 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
-    impl BlsDoryCompactRowSource for DensePackedSignedWordRowSource<'_> {
-        type Error = ();
+    impl BlsDoryCompactRowSource for TransposedSignedWordRowSource<'_> {
+        type Error = BlsDoryTransposeError;
 
         fn rows(&self) -> usize {
             self.selector_slots
         }
 
         fn columns(&self) -> usize {
-            self.trace_rows
+            self.artifact.rows()
         }
 
         fn explicit_scalar_count(&self) -> usize {
-            self.tables.len().saturating_mul(self.trace_rows)
+            self.artifact.columns().saturating_mul(self.artifact.rows())
         }
 
         fn word_scalar_count(&self) -> usize {
-            self.tables.len().saturating_mul(self.trace_rows)
+            self.explicit_scalar_count()
         }
 
         fn word_group_len(&self) -> usize {
-            self.trace_rows
+            self.artifact.rows()
         }
 
         fn signed_word_selectors(&self) -> u64 {
@@ -1893,14 +1895,10 @@ mod tests {
             row_index: usize,
             output: &mut [u64],
         ) -> Result<usize, Self::Error> {
-            let table = self.tables.get(row_index).ok_or(())?;
-            if output.len() != self.trace_rows || table.len() != self.trace_rows {
-                return Err(());
+            if row_index >= self.artifact.columns() {
+                return Err(BlsDoryTransposeError::InvalidShape);
             }
-            for (word, value) in output.iter_mut().zip(table) {
-                *word = u64::from_le_bytes(value.to_le_bytes());
-            }
-            Ok(output.len())
+            self.artifact.read_column(row_index, output)
         }
 
         fn read_code_row(
@@ -1908,7 +1906,7 @@ mod tests {
             _row_index: usize,
             _output: &mut [u8],
         ) -> Result<usize, Self::Error> {
-            Err(())
+            Err(BlsDoryTransposeError::InvalidShape)
         }
     }
 
@@ -3560,16 +3558,30 @@ mod tests {
             &setup,
         )
         .unwrap();
-        let mut source =
-            DensePackedSignedWordRowSource::new(&signed_tables, TRACE_ROWS, SELECTOR_SLOTS);
-        let compact = commit_bls_dory_compact_row_source_with_scratch(
-            &mut source,
-            SELECTOR_VARIABLES,
-            TRACE_VARIABLES,
-            &setup,
-            &scratch.0,
-        )
-        .unwrap();
+        let mut transpose_writer =
+            BlsDoryWordTransposeWriter::create(&scratch.0, TRACE_ROWS, signed_tables.len(), 17)
+                .unwrap();
+        for row in 0..TRACE_ROWS {
+            let values = signed_tables
+                .iter()
+                .map(|table| u64::from_le_bytes(table[row].to_le_bytes()))
+                .collect::<Vec<_>>();
+            transpose_writer.write_row(&values).unwrap();
+        }
+        let mut transpose = transpose_writer.finish().unwrap();
+        transpose.authenticate().unwrap();
+        let compact = {
+            let mut source = TransposedSignedWordRowSource::new(&mut transpose, SELECTOR_SLOTS);
+            commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                SELECTOR_VARIABLES,
+                TRACE_VARIABLES,
+                &setup,
+                &scratch.0,
+            )
+            .unwrap()
+        };
+        drop(transpose);
         assert_eq!(compact.commitment(), materialized.commitment());
         let artifact_path = std::fs::read_dir(&scratch.0)
             .unwrap()

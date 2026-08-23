@@ -124,13 +124,15 @@ pub const BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE: usize = 3;
 /// Local and next terminal evaluations exposed by the execution sumcheck.
 pub const BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS: usize =
     2 * (BLS_DORY_BLAKE3_MAIN_WIDTH + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
-/// One transcript-random selector batches every execution terminal evaluation.
-pub const BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS: usize = 1;
+/// Main words, the native accumulator, and preprocessing use three physical
+/// sources and therefore require three execution openings.
+pub const BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS: usize = 3;
 /// Local/next and inverse terminal evaluations exposed by the adjacency sumcheck.
 pub const BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS: usize =
     2 * BLS_DORY_BLAKE3_MAIN_WIDTH + 2;
-/// Separate source and post-challenge inverse commitments require two openings.
-pub const BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS: usize = 2;
+/// Main words, the native accumulator, and post-challenge inverses require
+/// three adjacency openings. Preprocessing is not part of adjacency.
+pub const BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS: usize = 3;
 /// Complete Dory opening-claim count after composition with the shared proof.
 pub const BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS: usize = BLS_DORY_SHARED_PRODUCTION_CLAIMS
     + BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS
@@ -147,7 +149,7 @@ const CURRENT_SHARED_PRODUCTION_BYTES: usize = 133_409;
 
 /// Conservative execution-component wire projection.
 pub const BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES: usize = COMPONENT_HEADER_BYTES
-    + GT_BYTES
+    + BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS * GT_BYTES
     + BLS_DORY_BLAKE3_TRACE_VARIABLES
         * (BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1)
         * SCALAR_BYTES
@@ -194,9 +196,9 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the bounded composed fixture makes execution and adjacency reuse the exact same Dory-authenticated main commitments; bounded literal, signed-word, and code-only row sources preserve exact commitment and opening bytes with fail-closed scratch authentication, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact, but the unified 31-variable production source/inverse commitment and complete out-of-core opening path are not implemented or measured",
+    "bounded row streams now transpose every ordinary main and preprocessing column, derive next rows without duplicate scratch, preserve exact commitment and opening bytes, reject non-Boolean codes, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact; native-accumulator and inverse scalar streams, the n=31 to shared-n=33 lift, canonical four-source/six-claim composition, and a complete out-of-core opening are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
-    "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
+    "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
 
@@ -2947,7 +2949,7 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES, 524_288);
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS, 1_048_576);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS, 746);
-        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS, 1);
+        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS, 3);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS, 1_299);
         assert_eq!(BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES, 11);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES, 10);
@@ -2960,17 +2962,17 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES, 160);
         assert_eq!(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES, 2);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS, 580);
-        assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS, 2);
-        assert_eq!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, 131);
-        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES, 36_020);
+        assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS, 3);
+        assert_eq!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, 134);
+        assert_eq!(BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES, 37_172);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_PROOF_BYTES, 21_748);
         assert_eq!(
             crate::dory_bls12_381_layout::projected_shared_production_proof_bytes().unwrap(),
             133_409
         );
-        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES, 191_185);
+        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES, 192_337);
         assert_eq!(MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES, 261_947);
-        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 70_762);
+        assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 69_610);
         assert_eq!(
             projected_bls_dory_blake3_source_storage(),
             BlsDoryBlake3SourceStorageProjection {
@@ -3047,7 +3049,7 @@ mod tests {
         assert_eq!(report.algebraic_soundness_bits, 219);
         assert_eq!(report.required_algebraic_soundness_bits, 128);
         assert_eq!(report.grinding_headroom_bits, 91);
-        assert_eq!(report.composed_opening_claims, 131);
+        assert_eq!(report.composed_opening_claims, 134);
         assert_eq!(report.proposed_maximum_opening_claims, 256);
         assert!(!report.independently_reviewed);
     }

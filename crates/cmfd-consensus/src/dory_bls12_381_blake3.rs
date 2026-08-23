@@ -705,6 +705,27 @@ struct PreparedBlsDoryBlake3Sources {
     binding: PreparedBlsDoryBlake3SourceBinding,
 }
 
+/// Four authenticated sources after both native sumchecks have been produced.
+/// The source artifacts remain owned until verifier replay fixes all six
+/// opening points and consumes them into one deferred opening set.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ProvenBlsDoryNativeBlake3Sources {
+    sources: BlsDoryBlake3CommittedSources,
+    proof: BlsDoryNativeBlake3Proof,
+    geometry: BlsDoryBlake3ReplayGeometry,
+}
+
+/// Native proof bytes plus the exact verifier-derived six-opening witness used
+/// by the shared 128+6 aggregate composer.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PreparedBlsDoryNativeBlake3Opening {
+    pub(crate) opening_statement: BlsDoryBlake3OpeningStatement,
+    pub(crate) opening_set: BlsDoryDeferredOpeningSet,
+    pub(crate) encoded_native_proof: Vec<u8>,
+}
+
 #[cfg(feature = "whir-prototype")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreparedBlsDoryBlake3SourceBinding {
@@ -5895,6 +5916,125 @@ fn prepare_native_blake3_sources_at_layout(
     )
 }
 
+/// Produce both native arguments while the authenticated source transposes are
+/// still retained, then release those transposes before the deferred Dory
+/// opening stage begins.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn prove_prepared_native_blake3_sources(
+    mut prepared: PreparedBlsDoryBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+) -> Result<ProvenBlsDoryNativeBlake3Sources, BlsDoryAggregateError> {
+    let trace_rows = prepared.binding.trace_rows;
+    if maximum_block_rows == 0
+        || !scratch_directory.is_absolute()
+        || !scratch_directory.is_dir()
+        || !trace_rows.is_power_of_two()
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let geometry = BlsDoryBlake3ReplayGeometry {
+        trace_variables: trace_rows.ilog2() as usize,
+        source_variables: (trace_rows.ilog2() as usize)
+            .checked_add(BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?,
+        shared_variables: prepared.binding.layout.variables(),
+    };
+    if geometry.shared_variables != geometry.source_variables + 2 {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+
+    let source_commitments = prepared.commitments();
+    let execution = prove_native_blake3_execution_sumcheck_out_of_core(
+        &mut prepared,
+        bridge,
+        scratch_directory,
+        maximum_block_rows,
+    )?;
+    let adjacency = prove_native_blake3_adjacency_sumcheck_out_of_core(
+        &mut prepared,
+        bridge,
+        scratch_directory,
+        maximum_block_rows,
+    )?;
+    let sources = prepared.into_committed_sources()?;
+    if sources.commitments() != source_commitments {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    Ok(ProvenBlsDoryNativeBlake3Sources {
+        sources,
+        proof: BlsDoryNativeBlake3Proof {
+            source_commitments,
+            execution,
+            adjacency,
+        },
+        geometry,
+    })
+}
+
+/// Replay the two native arguments, derive the six canonical opening points,
+/// and consume the four authenticated sources into one deferred opening set.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn finalize_native_blake3_opening(
+    proven: ProvenBlsDoryNativeBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    verifier: BlsDoryBlake3ReplayVerifier<'_>,
+) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    let ProvenBlsDoryNativeBlake3Sources {
+        sources,
+        proof,
+        geometry,
+    } = proven;
+    if verifier.geometry != geometry || sources.commitments() != proof.source_commitments {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+
+    let replay = verify_native_blake3_opening_replay_at_geometry(
+        bridge,
+        &proof.source_commitments,
+        verifier,
+        &proof.execution,
+        &proof.adjacency,
+    )?;
+    let points = [
+        replay.execution_points[0].clone(),
+        replay.execution_points[1].clone(),
+        replay.execution_points[2].clone(),
+        replay.adjacency_points[0].clone(),
+        replay.adjacency_points[1].clone(),
+        replay.adjacency_points[2].clone(),
+    ];
+    let opening_statement = BlsDoryBlake3OpeningStatement::from_verified_replay_with_geometry(
+        proof.source_commitments.clone(),
+        replay,
+        geometry,
+    )?;
+    let encoded_native_proof = proof.encode_at_trace_variables(geometry.trace_variables)?;
+    if BlsDoryNativeBlake3Proof::decode_at_trace_variables(
+        &encoded_native_proof,
+        geometry.trace_variables,
+    )? != proof
+    {
+        return Err(BlsDoryAggregateError::InvalidEncoding);
+    }
+    BlsDoryBlake3CommittedSources::validate_lifted_points(
+        &points,
+        geometry.source_variables,
+        geometry.shared_variables,
+    )?;
+    let opening_set = sources.into_deferred_openings(points)?;
+    opening_statement.validate_claims(opening_set.claims())?;
+
+    Ok(PreparedBlsDoryNativeBlake3Opening {
+        opening_statement,
+        opening_set,
+        encoded_native_proof,
+    })
+}
+
 #[cfg(feature = "whir-prototype")]
 fn commit_native_blake3_sources_at_layout(
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
@@ -6408,7 +6548,7 @@ pub(crate) struct BlsDoryNativeBlake3TestTelemetry {
     pub(crate) fixture_millis: u128,
     pub(crate) source_millis: u128,
     pub(crate) sumcheck_millis: u128,
-    pub(crate) replay_millis: u128,
+    pub(crate) finalize_millis: u128,
     pub(crate) total_millis: u128,
     pub(crate) retained_scratch_entries: usize,
     pub(crate) retained_scratch_bytes: u64,
@@ -9557,16 +9697,15 @@ mod tests {
         let verifier_context = BlsDoryBlake3VerifierContext::new(layout, setup)?;
 
         let source_started = std::time::Instant::now();
-        let sources = commit_native_blake3_sources_at_layout(
+        let prepared = prepare_native_blake3_sources_at_layout(
             &fixture.witness,
             &fixture.bridge,
             layout,
             setup,
             scratch_directory,
         )?;
-        sources.validate_layout(fixture.air.trace_rows(), layout, setup)?;
         let source_millis = source_started.elapsed().as_millis();
-        let commitments = sources.commitments();
+        let commitments = prepared.commitments();
         let preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
             &fixture.bridge,
             fixture.air.trace_rows(),
@@ -9576,54 +9715,30 @@ mod tests {
         );
 
         let sumcheck_started = std::time::Instant::now();
-        let (execution, adjacency) = try_named_replay_sumcheck_proofs(fixture, &commitments)?;
+        let proven =
+            prove_prepared_native_blake3_sources(prepared, &fixture.bridge, scratch_directory, 31)?;
         let sumcheck_millis = sumcheck_started.elapsed().as_millis();
-        let replay_started = std::time::Instant::now();
-        let replay = verify_native_blake3_opening_replay_at_geometry(
+        if proven.proof.source_commitments != commitments {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        let execution = proven.proof.execution.clone();
+        let adjacency = proven.proof.adjacency.clone();
+
+        let finalize_started = std::time::Instant::now();
+        let PreparedBlsDoryNativeBlake3Opening {
+            opening_statement,
+            opening_set,
+            encoded_native_proof,
+        } = finalize_native_blake3_opening(
+            proven,
             &fixture.bridge,
-            &commitments,
             BlsDoryBlake3ReplayVerifier {
                 context: &verifier_context,
                 preprocessing_pin: &preprocessing_pin,
                 geometry,
             },
-            &execution,
-            &adjacency,
         )?;
-        let replay_millis = replay_started.elapsed().as_millis();
-        let points = [
-            replay.execution_points[0].clone(),
-            replay.execution_points[1].clone(),
-            replay.execution_points[2].clone(),
-            replay.adjacency_points[0].clone(),
-            replay.adjacency_points[1].clone(),
-            replay.adjacency_points[2].clone(),
-        ];
-        let opening_statement = BlsDoryBlake3OpeningStatement::from_verified_replay_at_geometry(
-            commitments.clone(),
-            replay,
-            geometry,
-        )?;
-        let native_proof = BlsDoryNativeBlake3Proof {
-            source_commitments: commitments.clone(),
-            execution: execution.clone(),
-            adjacency: adjacency.clone(),
-        };
-        let encoded_native_proof =
-            native_proof.encode_at_trace_variables(geometry.trace_variables)?;
-        if BlsDoryNativeBlake3Proof::decode_at_trace_variables(
-            &encoded_native_proof,
-            geometry.trace_variables,
-        )? != native_proof
-        {
-            return Err(BlsDoryAggregateError::InvalidEncoding);
-        }
-        let opening_set = sources.into_canonical_deferred_openings_at_variables(
-            points,
-            geometry.source_variables,
-            geometry.shared_variables,
-        )?;
-        opening_statement.validate_claims(opening_set.claims())?;
+        let finalize_millis = finalize_started.elapsed().as_millis();
 
         let (retained_scratch_entries, retained_scratch_bytes) =
             std::fs::read_dir(scratch_directory)
@@ -9645,7 +9760,7 @@ mod tests {
                 fixture_millis,
                 source_millis,
                 sumcheck_millis,
-                replay_millis,
+                finalize_millis,
                 total_millis: total_started.elapsed().as_millis(),
                 retained_scratch_entries,
                 retained_scratch_bytes,
@@ -12489,6 +12604,7 @@ mod tests {
             &scratch.0,
         )
         .unwrap();
+        assert_eq!(encoded_native_proof.len(), 50_472);
         let decoded_native_proof = BlsDoryNativeBlake3Proof::decode_at_trace_variables(
             &encoded_native_proof,
             geometry.trace_variables,
@@ -12590,11 +12706,11 @@ mod tests {
         );
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         eprintln!(
-            "native six-claim E2E: setup={setup_elapsed:?}, fixture_millis={}, sources_millis={}, sumcheck_millis={}, replay_millis={}, opening={opening_elapsed:?}, total={:?}, retained_scratch_entries={}, retained_scratch_bytes={}, proof_bytes={}",
+            "native six-claim E2E: setup={setup_elapsed:?}, fixture_millis={}, sources_millis={}, sumcheck_millis={}, finalize_millis={}, opening={opening_elapsed:?}, total={:?}, retained_scratch_entries={}, retained_scratch_bytes={}, proof_bytes={}",
             telemetry.fixture_millis,
             telemetry.source_millis,
             telemetry.sumcheck_millis,
-            telemetry.replay_millis,
+            telemetry.finalize_millis,
             total_started.elapsed(),
             telemetry.retained_scratch_entries,
             telemetry.retained_scratch_bytes,

@@ -6354,11 +6354,11 @@ mod tests {
         );
 
         eprintln!(
-            "CMFD_SHARED_NATIVE_E2E {{\"fixture_ms\":{fixture_millis},\"setup_ms\":{setup_millis},\"shared_prepare_ms\":{shared_millis},\"native_fixture_ms\":{},\"native_source_ms\":{},\"native_sumcheck_ms\":{},\"native_replay_ms\":{},\"aggregate_ms\":{aggregate_millis},\"verify_ms\":{verifier_millis},\"total_ms\":{},\"claims\":134,\"opening_proof_bytes\":{},\"outer_proof_bytes\":{},\"native_proof_bytes\":{},\"peak_scratch_bytes\":{peak_scratch_bytes},\"scratch_entries\":{},\"scratch_bytes\":{}}}",
+            "CMFD_SHARED_NATIVE_E2E {{\"fixture_ms\":{fixture_millis},\"setup_ms\":{setup_millis},\"shared_prepare_ms\":{shared_millis},\"native_fixture_ms\":{},\"native_source_ms\":{},\"native_sumcheck_ms\":{},\"native_finalize_ms\":{},\"aggregate_ms\":{aggregate_millis},\"verify_ms\":{verifier_millis},\"total_ms\":{},\"claims\":134,\"opening_proof_bytes\":{},\"outer_proof_bytes\":{},\"native_proof_bytes\":{},\"peak_scratch_bytes\":{peak_scratch_bytes},\"scratch_entries\":{},\"scratch_bytes\":{}}}",
             native_telemetry.fixture_millis,
             native_telemetry.source_millis,
             native_telemetry.sumcheck_millis,
-            native_telemetry.replay_millis,
+            native_telemetry.finalize_millis,
             total_started.elapsed().as_millis(),
             proof.opening_proof.len(),
             encoded.len(),

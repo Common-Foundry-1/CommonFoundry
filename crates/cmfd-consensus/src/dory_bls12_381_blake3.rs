@@ -57,6 +57,10 @@ pub const BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES: usize = 11;
 pub const BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES: usize = 10;
 /// Twenty trace variables plus eleven source selectors define the shared commitment.
 pub const BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES: usize = 31;
+/// Dory rows address the eleven high-order selector variables.
+pub const BLS_DORY_BLAKE3_SOURCE_DORY_NU: usize = BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES;
+/// Dory columns address the twenty low-order trace-row variables.
+pub const BLS_DORY_BLAKE3_SOURCE_DORY_SIGMA: usize = BLS_DORY_BLAKE3_TRACE_VARIABLES;
 /// The translated execution constraints have degree at most sixteen.
 pub const BLS_DORY_BLAKE3_EXECUTION_CONSTRAINT_DEGREE: usize = 16;
 /// The native relation keeps 1,296 BLAKE3 constraints and replaces nine
@@ -119,6 +123,10 @@ pub const BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES: usize =
 const _: () = {
     assert!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES < MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES);
     assert!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS <= BLS_DORY_BLAKE3_PROPOSED_MAX_OPENING_CLAIMS);
+    assert!(
+        BLS_DORY_BLAKE3_SOURCE_DORY_NU + BLS_DORY_BLAKE3_SOURCE_DORY_SIGMA
+            == BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES
+    );
     assert!(!BLS_DORY_BLAKE3_PRODUCTION_READY);
 };
 
@@ -126,7 +134,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the bounded composed fixture makes execution and adjacency reuse the exact same Dory-authenticated main commitments, but the unified 31-variable production source/inverse commitment and out-of-core opening path are not implemented or measured",
+    "the bounded composed fixture makes execution and adjacency reuse the exact same Dory-authenticated main commitments, and a bounded row source preserves exact commitment and opening bytes with fail-closed scratch authentication; the unified 31-variable production source/inverse commitment and out-of-core opening path are not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -669,11 +677,14 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, commit_bls_dory_polynomial, prove_bls_dory_deferred_opening_sets,
+        BlsDoryOpeningClaim, commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
+        prove_bls_dory_deferred_opening_sets, prove_bls_dory_same_commitment_openings,
         verify_bls_dory_openings,
     };
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_prototype::{BlsDoryGt, DeterministicBlsDorySetup};
+    #[cfg(feature = "whir-prototype")]
+    use crate::dory_bls12_381_streaming::BlsDoryRowSource;
     #[cfg(feature = "whir-prototype")]
     use crate::structured_blake3_narrow::{generate_main_trace, public_values};
     #[cfg(feature = "whir-prototype")]
@@ -682,9 +693,40 @@ mod tests {
     use p3_air::BaseAir;
     #[cfg(feature = "whir-prototype")]
     use p3_matrix::Matrix;
+    #[cfg(feature = "whir-prototype")]
+    use std::{
+        io::{Seek, SeekFrom, Write},
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     #[cfg(feature = "whir-prototype")]
     const OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
+
+    #[cfg(feature = "whir-prototype")]
+    static BLAKE3_SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(feature = "whir-prototype")]
+    struct Blake3ScratchDirectory(std::path::PathBuf);
+
+    #[cfg(feature = "whir-prototype")]
+    impl Blake3ScratchDirectory {
+        fn create() -> Self {
+            let nonce = BLAKE3_SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-dory-blake3-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    impl Drop for Blake3ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[cfg(feature = "whir-prototype")]
     fn bls_values(values: impl IntoIterator<Item = Goldilocks>) -> Vec<BlsDoryFr> {
@@ -1649,6 +1691,68 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
+    struct DensePackedTableRowSource<'a> {
+        tables: &'a [Vec<BlsDoryFr>],
+        trace_rows: usize,
+        selector_slots: usize,
+        reads: usize,
+        fail_at: Option<usize>,
+        short_at: Option<usize>,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    impl<'a> DensePackedTableRowSource<'a> {
+        fn new(tables: &'a [Vec<BlsDoryFr>], trace_rows: usize, selector_slots: usize) -> Self {
+            Self {
+                tables,
+                trace_rows,
+                selector_slots,
+                reads: 0,
+                fail_at: None,
+                short_at: None,
+            }
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    impl BlsDoryRowSource for DensePackedTableRowSource<'_> {
+        type Error = ();
+
+        fn rows(&self) -> usize {
+            self.selector_slots
+        }
+
+        fn columns(&self) -> usize {
+            self.trace_rows
+        }
+
+        fn explicit_scalar_count(&self) -> usize {
+            self.tables.len().saturating_mul(self.trace_rows)
+        }
+
+        fn read_row(
+            &mut self,
+            row_index: usize,
+            output: &mut [BlsDoryFr],
+        ) -> Result<usize, Self::Error> {
+            if self.fail_at == Some(row_index) {
+                return Err(());
+            }
+            let table = self.tables.get(row_index).ok_or(())?;
+            if output.len() != self.trace_rows || table.len() != self.trace_rows {
+                return Err(());
+            }
+            output.copy_from_slice(table);
+            self.reads += 1;
+            Ok(if self.short_at == Some(row_index) {
+                output.len() - 1
+            } else {
+                output.len()
+            })
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
     fn dense_adjacency_opening_selector_points(
         sumcheck_digest: [u8; 32],
         batches: &[DenseAdjacencyOpeningBatch],
@@ -2486,6 +2590,8 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES, 11);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES, 10);
         assert_eq!(BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES, 31);
+        assert_eq!(BLS_DORY_BLAKE3_SOURCE_DORY_NU, 11);
+        assert_eq!(BLS_DORY_BLAKE3_SOURCE_DORY_SIGMA, 20);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS, 580);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS, 2);
         assert_eq!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, 131);
@@ -3008,6 +3114,146 @@ mod tests {
         changed_boundary[next_start][final_row] =
             changed_boundary[next_start][final_row] + BlsDoryFr::from_u64(1);
         assert!(prove_dense_adjacency_sumcheck(changed_boundary, &bridge, &[], &[]).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn blake3_streamed_source_rejects_failed_short_and_malformed_rows() {
+        const TRACE_ROWS: usize = 1 << 3;
+        const SELECTOR_SLOTS: usize = 1 << 3;
+        let tables = (0..5)
+            .map(|selector| {
+                (0..TRACE_ROWS)
+                    .map(|row| BlsDoryFr::from_u64((selector * TRACE_ROWS + row + 1) as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(6).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+
+        let mut failed = DensePackedTableRowSource::new(&tables, TRACE_ROWS, SELECTOR_SLOTS);
+        failed.fail_at = Some(1);
+        assert!(matches!(
+            commit_bls_dory_row_source_with_scratch(&mut failed, 3, 3, &setup, &scratch.0,),
+            Err(BlsDoryAggregateError::CoefficientSource)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let mut short = DensePackedTableRowSource::new(&tables, TRACE_ROWS, SELECTOR_SLOTS);
+        short.short_at = Some(0);
+        assert!(matches!(
+            commit_bls_dory_row_source_with_scratch(&mut short, 3, 3, &setup, &scratch.0,),
+            Err(BlsDoryAggregateError::InvalidCoefficientCount)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let mut malformed_tables = tables;
+        malformed_tables[0].pop();
+        let mut malformed =
+            DensePackedTableRowSource::new(&malformed_tables, TRACE_ROWS, SELECTOR_SLOTS);
+        assert!(matches!(
+            commit_bls_dory_row_source_with_scratch(&mut malformed, 3, 3, &setup, &scratch.0,),
+            Err(BlsDoryAggregateError::CoefficientSource)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "the exact 16-variable Dory commitment and opening comparison is intentionally expensive"]
+    fn blake3_streamed_source_preserves_commitment_and_exact_opening_bytes() {
+        const TRACE_VARIABLES: usize = 8;
+        const SELECTOR_VARIABLES: usize = 8;
+        const TRACE_ROWS: usize = 1 << TRACE_VARIABLES;
+        const SELECTOR_SLOTS: usize = 1 << SELECTOR_VARIABLES;
+        let tables = (0..137)
+            .map(|selector| {
+                (0..TRACE_ROWS)
+                    .map(|row| {
+                        BlsDoryFr::from_u64(
+                            ((selector as u64 + 3) * 65_537 + (row as u64 + 5) * 257) % 65_521,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+        let materialized = commit_bls_dory_polynomial(
+            dense_pack_adjacency_tables(&tables, TRACE_ROWS, SELECTOR_SLOTS).unwrap(),
+            SELECTOR_VARIABLES,
+            TRACE_VARIABLES,
+            &setup,
+        )
+        .unwrap();
+        let mut source = DensePackedTableRowSource::new(&tables, TRACE_ROWS, SELECTOR_SLOTS);
+        let streamed = commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            SELECTOR_VARIABLES,
+            TRACE_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert_eq!(source.reads, tables.len());
+        assert_eq!(streamed.commitment(), materialized.commitment());
+
+        let points = vec![
+            (0..16)
+                .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 2) * 7))
+                .collect::<Vec<_>>(),
+            (0..16)
+                .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 3) * 11))
+                .collect::<Vec<_>>(),
+        ];
+        let ordinary = prove_bls_dory_same_commitment_openings(
+            b"blake3-row-source-equivalence",
+            &materialized,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        let artifact_backed = prove_bls_dory_same_commitment_openings(
+            b"blake3-row-source-equivalence",
+            &streamed,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(artifact_backed, ordinary);
+        verify_bls_dory_openings(
+            b"blake3-row-source-equivalence",
+            &artifact_backed.0,
+            &artifact_backed.1,
+            &setup,
+        )
+        .unwrap();
+
+        let artifact_path = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut artifact = std::fs::OpenOptions::new()
+            .write(true)
+            .open(artifact_path)
+            .unwrap();
+        artifact.seek(SeekFrom::Start(100)).unwrap();
+        artifact.write_all(&[0xff]).unwrap();
+        artifact.flush().unwrap();
+        drop(artifact);
+        assert_eq!(
+            prove_bls_dory_same_commitment_openings(
+                b"blake3-row-source-corruption",
+                &streamed,
+                &points,
+                &setup,
+            ),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
+        drop(streamed);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     #[test]

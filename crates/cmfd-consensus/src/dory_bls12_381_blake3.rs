@@ -897,6 +897,8 @@ mod tests {
     const DENSE_EXECUTION_SUMCHECK_DEGREE: usize = BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE;
     #[cfg(feature = "whir-prototype")]
     const DENSE_ADJACENCY_SUMCHECK_DEGREE: usize = BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE;
+    #[cfg(feature = "whir-prototype")]
+    const DENSE_EXECUTION_BATCH_TERMINAL_COUNTS: [usize; 4] = [256, 256, 66, 168];
 
     #[cfg(feature = "whir-prototype")]
     #[derive(Clone)]
@@ -1977,10 +1979,42 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
+    fn preprocessed_physical_role(physical_slot: usize) -> Option<(usize, usize)> {
+        let word_columns = TEST_PREPROCESSED_WORD_COLUMNS.len();
+        let boolean_columns = BLS_DORY_BLAKE3_PREPROCESSED_WIDTH.checked_sub(word_columns)?;
+        if physical_slot < word_columns {
+            return Some((0, TEST_PREPROCESSED_WORD_COLUMNS[physical_slot]));
+        }
+        if physical_slot < 2 * word_columns {
+            return Some((
+                1,
+                TEST_PREPROCESSED_WORD_COLUMNS[physical_slot - word_columns],
+            ));
+        }
+        let code_slot = physical_slot.checked_sub(2 * word_columns)?;
+        if code_slot >= 2 * boolean_columns {
+            return None;
+        }
+        let direction = code_slot / boolean_columns;
+        let boolean_index = code_slot % boolean_columns;
+        let column = (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
+            .filter(|column| !TEST_PREPROCESSED_WORD_COLUMNS.contains(column))
+            .nth(boolean_index)?;
+        Some((direction, column))
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn preprocessed_physical_terminal_index(physical_slot: usize) -> Option<usize> {
+        let (direction, column) = preprocessed_physical_role(physical_slot)?;
+        direction
+            .checked_mul(BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)?
+            .checked_add(column)
+    }
+
+    #[cfg(feature = "whir-prototype")]
     struct TransposedPreprocessedRowSource<'a> {
         artifact: &'a mut BlsDoryWordTransposeArtifact,
         selector_slots: usize,
-        boolean_columns: Vec<usize>,
         code_scratch: Vec<u64>,
         dictionary: [BlsDoryFr; 2],
     }
@@ -1988,13 +2022,10 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     impl<'a> TransposedPreprocessedRowSource<'a> {
         fn new(artifact: &'a mut BlsDoryWordTransposeArtifact, selector_slots: usize) -> Self {
-            let boolean_columns = (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
-                .filter(|column| !TEST_PREPROCESSED_WORD_COLUMNS.contains(column))
-                .collect::<Vec<_>>();
             assert!(selector_slots.is_power_of_two());
             assert_eq!(artifact.columns(), BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
             assert_eq!(
-                boolean_columns.len() * 2,
+                2 * (BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - TEST_PREPROCESSED_WORD_COLUMNS.len()),
                 BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES
             );
             assert!(
@@ -2005,7 +2036,6 @@ mod tests {
                 code_scratch: vec![0; artifact.rows()],
                 artifact,
                 selector_slots,
-                boolean_columns,
                 dictionary: [BlsDoryFr::zero(), BlsDoryFr::from_u64(1)],
             }
         }
@@ -2053,15 +2083,14 @@ mod tests {
             row_index: usize,
             output: &mut [u64],
         ) -> Result<usize, Self::Error> {
-            let columns_per_direction = TEST_PREPROCESSED_WORD_COLUMNS.len();
-            if row_index >= 2 * columns_per_direction {
+            let (direction, column) = preprocessed_physical_role(row_index)
+                .filter(|(_, column)| TEST_PREPROCESSED_WORD_COLUMNS.contains(column))
+                .ok_or(BlsDoryTransposeError::InvalidShape)?;
+            if row_index >= BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES {
                 return Err(BlsDoryTransposeError::InvalidShape);
             }
-            let read = self.artifact.read_column(
-                TEST_PREPROCESSED_WORD_COLUMNS[row_index % columns_per_direction],
-                output,
-            )?;
-            if row_index >= columns_per_direction {
+            let read = self.artifact.read_column(column, output)?;
+            if direction == 1 {
                 output.rotate_left(1);
             }
             Ok(read)
@@ -2072,16 +2101,16 @@ mod tests {
             row_index: usize,
             output: &mut [u8],
         ) -> Result<usize, Self::Error> {
-            let code_index = row_index
-                .checked_sub(BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES)
+            let (direction, column) = preprocessed_physical_role(row_index)
+                .filter(|(_, column)| !TEST_PREPROCESSED_WORD_COLUMNS.contains(column))
                 .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            let columns_per_direction = self.boolean_columns.len();
-            if code_index >= 2 * columns_per_direction || output.len() != self.artifact.rows() {
+            if row_index < BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+                || output.len() != self.artifact.rows()
+            {
                 return Err(BlsDoryTransposeError::InvalidShape);
             }
-            let column = self.boolean_columns[code_index % columns_per_direction];
             let read = self.artifact.read_column(column, &mut self.code_scratch)?;
-            if code_index >= columns_per_direction {
+            if direction == 1 {
                 self.code_scratch.rotate_left(1);
             }
             for (code, value) in output.iter_mut().zip(&self.code_scratch) {
@@ -2434,6 +2463,46 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
+    fn dense_execution_batch_selector_evaluation(
+        terminal: &[BlsDoryFr],
+        batch_index: usize,
+        selector_point: &[BlsDoryFr],
+    ) -> Option<BlsDoryFr> {
+        if terminal.len() != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+            || selector_point.len() != 8
+        {
+            return None;
+        }
+        match batch_index {
+            0 => Some(dense_terminal_selector_evaluation(
+                &terminal[..256],
+                selector_point,
+            )),
+            1 => Some(dense_terminal_selector_evaluation(
+                &terminal[256..512],
+                selector_point,
+            )),
+            2 => Some(dense_terminal_selector_evaluation(
+                &terminal[512..2 * BLS_DORY_BLAKE3_MAIN_WIDTH],
+                selector_point,
+            )),
+            3 => {
+                let preprocessed_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+                let mut physical = Vec::with_capacity(2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
+                for physical_slot in 0..2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+                    let logical = preprocessed_physical_terminal_index(physical_slot)?;
+                    physical.push(terminal[preprocessed_start + logical]);
+                }
+                Some(dense_terminal_selector_evaluation(
+                    &physical,
+                    selector_point,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
     fn dense_opening_selector_points(
         sumcheck_digest: [u8; 32],
         batches: &[DenseExecutionOpeningBatch],
@@ -2484,18 +2553,39 @@ mod tests {
         let mut committed_batches = Vec::new();
         let mut opening_batches = Vec::new();
         let main_terminals = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
-        for group in [&tables[..main_terminals], &tables[main_terminals..]] {
-            for batch in group.chunks(PACKED_SLOTS) {
-                let packed = dense_pack_adjacency_tables(batch, ROWS, PACKED_SLOTS)
+        for batch in tables[..main_terminals].chunks(PACKED_SLOTS) {
+            let packed = dense_pack_adjacency_tables(batch, ROWS, PACKED_SLOTS)
+                .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+            let committed = commit_bls_dory_polynomial(packed, 8, 8, setup)?;
+            opening_batches.push(DenseExecutionOpeningBatch {
+                commitment: committed.commitment(),
+                terminal_count: batch.len(),
+            });
+            committed_batches.push(committed);
+        }
+        let mut packed_preprocessed = Vec::with_capacity(ROWS * PACKED_SLOTS);
+        for physical_slot in 0..PACKED_SLOTS {
+            if physical_slot < 2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+                let logical = preprocessed_physical_terminal_index(physical_slot)
                     .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
-                let committed = commit_bls_dory_polynomial(packed, 8, 8, setup)?;
-                opening_batches.push(DenseExecutionOpeningBatch {
-                    commitment: committed.commitment(),
-                    terminal_count: batch.len(),
-                });
-                committed_batches.push(committed);
+                packed_preprocessed.extend_from_slice(&tables[main_terminals + logical]);
+            } else {
+                packed_preprocessed.resize(packed_preprocessed.len() + ROWS, BlsDoryFr::zero());
             }
         }
+        let committed = commit_bls_dory_polynomial(packed_preprocessed, 8, 8, setup)?;
+        opening_batches.push(DenseExecutionOpeningBatch {
+            commitment: committed.commitment(),
+            terminal_count: 2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+        });
+        committed_batches.push(committed);
+        debug_assert_eq!(
+            opening_batches
+                .iter()
+                .map(|batch| batch.terminal_count)
+                .collect::<Vec<_>>(),
+            DENSE_EXECUTION_BATCH_TERMINAL_COUNTS
+        );
         Ok((committed_batches, opening_batches))
     }
 
@@ -2528,22 +2618,25 @@ mod tests {
             (0..opening_batches.len()).collect(),
             points,
         )?;
-        let mut terminal_start = 0usize;
-        for ((claim, selector), batch) in openings
+        for (batch_index, ((claim, selector), batch)) in openings
             .claims()
             .iter()
             .zip(&selector_points)
             .zip(&opening_batches)
+            .enumerate()
         {
-            let terminal_end = terminal_start + batch.terminal_count;
-            let expected = dense_terminal_selector_evaluation(
-                &sumcheck.terminal_evaluations[terminal_start..terminal_end],
+            if batch.terminal_count != DENSE_EXECUTION_BATCH_TERMINAL_COUNTS[batch_index] {
+                return Err(BlsDoryAggregateError::InvalidProofShape);
+            }
+            let expected = dense_execution_batch_selector_evaluation(
+                &sumcheck.terminal_evaluations,
+                batch_index,
                 selector,
-            );
+            )
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
             if claim.evaluation != expected {
                 return Err(BlsDoryAggregateError::InvalidProofShape);
             }
-            terminal_start = terminal_end;
         }
         let (_, opening_proof) = prove_bls_dory_deferred_opening_sets(
             &opening_binding,
@@ -2565,10 +2658,13 @@ mod tests {
         public: &[BlsDoryFr],
         constraints: &[BlsDoryBlake3ConstraintExpr],
         bridge: &BlsDoryOutputBridgeStatement,
+        expected_preprocessed_commitment: BlsDoryGt,
         setup: &DeterministicBlsDorySetup,
     ) -> bool {
-        let expected_counts = [256, 256, 66, 168];
-        if proof.opening_batches.len() != expected_counts.len() || proof.opening_proof.is_empty() {
+        if proof.opening_batches.len() != DENSE_EXECUTION_BATCH_TERMINAL_COUNTS.len()
+            || proof.opening_proof.is_empty()
+            || proof.opening_batches[3].commitment != expected_preprocessed_commitment
+        {
             return false;
         }
         let commitments = proof
@@ -2593,33 +2689,29 @@ mod tests {
         };
         let (selector_points, opening_binding) =
             dense_opening_selector_points(proof.sumcheck.transcript_digest, &proof.opening_batches);
-        let mut terminal_start = 0usize;
-        let mut claims = Vec::with_capacity(expected_counts.len());
-        for (((batch, selector), expected_count), batch_index) in proof
+        let mut claims = Vec::with_capacity(DENSE_EXECUTION_BATCH_TERMINAL_COUNTS.len());
+        for (batch_index, ((batch, selector), expected_count)) in proof
             .opening_batches
             .iter()
             .zip(&selector_points)
-            .zip(expected_counts)
-            .zip(0..)
+            .zip(DENSE_EXECUTION_BATCH_TERMINAL_COUNTS)
+            .enumerate()
         {
             if batch.terminal_count != expected_count {
                 return false;
             }
-            let terminal_end = terminal_start + expected_count;
+            let Some(evaluation) = dense_execution_batch_selector_evaluation(
+                &proof.sumcheck.terminal_evaluations,
+                batch_index,
+                selector,
+            ) else {
+                return false;
+            };
             claims.push(BlsDoryOpeningClaim {
                 commitment: batch.commitment,
                 point: dense_opening_point(&sumcheck_point, selector),
-                evaluation: dense_terminal_selector_evaluation(
-                    &proof.sumcheck.terminal_evaluations[terminal_start..terminal_end],
-                    selector,
-                ),
+                evaluation,
             });
-            terminal_start = terminal_end;
-            if batch_index + 1 == expected_counts.len()
-                && terminal_start != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
-            {
-                return false;
-            }
         }
         verify_bls_dory_openings(
             &opening_binding,
@@ -2637,10 +2729,10 @@ mod tests {
         inverse_commitment: BlsDoryGt,
     ) -> Option<Vec<DenseAdjacencyOpeningBatch>> {
         let source_counts = [256, 256, 66];
-        if execution_batches.len() != 4
+        if execution_batches.len() != DENSE_EXECUTION_BATCH_TERMINAL_COUNTS.len()
             || execution_batches
                 .iter()
-                .zip([256, 256, 66, 168])
+                .zip(DENSE_EXECUTION_BATCH_TERMINAL_COUNTS)
                 .any(|(batch, count)| batch.terminal_count != count)
         {
             return None;
@@ -2787,17 +2879,23 @@ mod tests {
         let openings =
             BlsDoryDeferredOpeningSet::new(committed_batches, polynomial_indices, points)?;
         let mut opening_index = 0usize;
-        let mut terminal_start = 0usize;
-        for (batch, selector) in execution_batches.iter().zip(&execution_selectors) {
-            let terminal_end = terminal_start + batch.terminal_count;
-            let expected = dense_terminal_selector_evaluation(
-                &execution_sumcheck.terminal_evaluations[terminal_start..terminal_end],
+        for (batch_index, (batch, selector)) in execution_batches
+            .iter()
+            .zip(&execution_selectors)
+            .enumerate()
+        {
+            if batch.terminal_count != DENSE_EXECUTION_BATCH_TERMINAL_COUNTS[batch_index] {
+                return Err(BlsDoryAggregateError::InvalidProofShape);
+            }
+            let expected = dense_execution_batch_selector_evaluation(
+                &execution_sumcheck.terminal_evaluations,
+                batch_index,
                 selector,
-            );
+            )
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
             if openings.claims()[opening_index].evaluation != expected {
                 return Err(BlsDoryAggregateError::InvalidProofShape);
             }
-            terminal_start = terminal_end;
             opening_index += 1;
         }
         for (batch, selector) in adjacency_batches.iter().zip(&adjacency_selectors) {
@@ -2842,16 +2940,18 @@ mod tests {
         public: &[BlsDoryFr],
         constraints: &[BlsDoryBlake3ConstraintExpr],
         bridge: &BlsDoryOutputBridgeStatement,
+        expected_preprocessed_commitment: BlsDoryGt,
         setup: &DeterministicBlsDorySetup,
     ) -> bool {
         const ROWS: usize = 1 << 8;
         if proof.opening_proof.is_empty()
-            || proof.execution_batches.len() != 4
+            || proof.execution_batches.len() != DENSE_EXECUTION_BATCH_TERMINAL_COUNTS.len()
             || proof
                 .execution_batches
                 .iter()
-                .zip([256, 256, 66, 168])
+                .zip(DENSE_EXECUTION_BATCH_TERMINAL_COUNTS)
                 .any(|(batch, count)| batch.terminal_count != count)
+            || proof.execution_batches[3].commitment != expected_preprocessed_commitment
         {
             return false;
         }
@@ -2907,18 +3007,24 @@ mod tests {
                 &adjacency_batches,
             );
         let mut claims = Vec::with_capacity(8);
-        let mut terminal_start = 0usize;
-        for (batch, selector) in proof.execution_batches.iter().zip(&execution_selectors) {
-            let terminal_end = terminal_start + batch.terminal_count;
+        for (batch_index, (batch, selector)) in proof
+            .execution_batches
+            .iter()
+            .zip(&execution_selectors)
+            .enumerate()
+        {
+            let Some(evaluation) = dense_execution_batch_selector_evaluation(
+                &proof.execution_sumcheck.terminal_evaluations,
+                batch_index,
+                selector,
+            ) else {
+                return false;
+            };
             claims.push(BlsDoryOpeningClaim {
                 commitment: batch.commitment,
                 point: dense_opening_point(&execution_point, selector),
-                evaluation: dense_terminal_selector_evaluation(
-                    &proof.execution_sumcheck.terminal_evaluations[terminal_start..terminal_end],
-                    selector,
-                ),
+                evaluation,
             });
-            terminal_start = terminal_end;
         }
         for (batch, selector) in adjacency_batches.iter().zip(&adjacency_selectors) {
             let terminal_end = batch.terminal_start + batch.terminal_count;
@@ -3087,6 +3193,53 @@ mod tests {
                 assert!(table.iter().all(|value| *value == zero || *value == one));
             }
         }
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn preprocessing_physical_mapping_is_bijective_and_complete() {
+        let word_columns = TEST_PREPROCESSED_WORD_COLUMNS.len();
+        let boolean_columns = BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - word_columns;
+        let physical_tables = 2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+        let mut logical_indices = Vec::with_capacity(physical_tables);
+
+        for physical_slot in 0..physical_tables {
+            let (direction, column) = preprocessed_physical_role(physical_slot).unwrap();
+            assert!(direction <= 1);
+            if physical_slot < word_columns {
+                assert_eq!(direction, 0);
+                assert!(TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+            } else if physical_slot < 2 * word_columns {
+                assert_eq!(direction, 1);
+                assert!(TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+            } else if physical_slot < 2 * word_columns + boolean_columns {
+                assert_eq!(direction, 0);
+                assert!(!TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+            } else {
+                assert_eq!(direction, 1);
+                assert!(!TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+            }
+
+            let logical = preprocessed_physical_terminal_index(physical_slot).unwrap();
+            assert_eq!(
+                logical,
+                direction * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH + column
+            );
+            assert_eq!(
+                (0..physical_tables)
+                    .find(|candidate| {
+                        preprocessed_physical_terminal_index(*candidate) == Some(logical)
+                    })
+                    .unwrap(),
+                physical_slot
+            );
+            logical_indices.push(logical);
+        }
+
+        logical_indices.sort_unstable();
+        assert_eq!(logical_indices, (0..physical_tables).collect::<Vec<_>>());
+        assert_eq!(preprocessed_physical_role(physical_tables), None);
+        assert_eq!(preprocessed_physical_terminal_index(physical_tables), None);
     }
 
     #[test]
@@ -4078,22 +4231,12 @@ mod tests {
         let fixture = dense_blake3_fixture();
         assert_eq!(fixture.air.trace_rows(), TRACE_ROWS);
         let local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
-        let next_start = local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
-        let boolean_columns = (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
-            .filter(|column| !TEST_PREPROCESSED_WORD_COLUMNS.contains(column))
-            .collect::<Vec<_>>();
         let mut field_tables = Vec::with_capacity(
             BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES,
         );
-        for start in [local_start, next_start] {
-            for column in TEST_PREPROCESSED_WORD_COLUMNS {
-                field_tables.push(fixture.tables[start + column].clone());
-            }
-        }
-        for start in [local_start, next_start] {
-            for column in &boolean_columns {
-                field_tables.push(fixture.tables[start + *column].clone());
-            }
+        for physical_slot in 0..2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+            let logical = preprocessed_physical_terminal_index(physical_slot).unwrap();
+            field_tables.push(fixture.tables[local_start + logical].clone());
         }
         assert_eq!(
             field_tables.len(),
@@ -4353,7 +4496,7 @@ mod tests {
         let constraints = bls_dory_native_blake3_constraint_ir(activation.len()).unwrap();
         let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
         let authenticated = prove_dense_authenticated_execution(
-            tables,
+            tables.clone(),
             &air,
             &public,
             &constraints,
@@ -4370,12 +4513,14 @@ mod tests {
                 .sum::<usize>(),
             BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
         );
+        let expected_preprocessed_commitment = authenticated.opening_batches[3].commitment;
         assert!(verify_dense_authenticated_execution(
             &authenticated,
             &air,
             &public,
             &constraints,
             &bridge,
+            expected_preprocessed_commitment,
             &setup,
         ));
 
@@ -4387,6 +4532,49 @@ mod tests {
             &public,
             &constraints,
             &bridge,
+            expected_preprocessed_commitment,
+            &setup,
+        ));
+
+        let mut altered_tables = tables;
+        let local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+        let next_start = local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+        let counter_low = TEST_PREPROCESSED_WORD_COLUMNS[0];
+        let delta = BlsDoryFr::from_u64(1);
+        altered_tables[local_start + counter_low][1] =
+            altered_tables[local_start + counter_low][1] + delta;
+        altered_tables[next_start + counter_low][0] =
+            altered_tables[next_start + counter_low][0] + delta;
+        let altered = prove_dense_authenticated_execution(
+            altered_tables,
+            &air,
+            &public,
+            &constraints,
+            &bridge,
+            &setup,
+        )
+        .unwrap();
+        let altered_preprocessed_commitment = altered.opening_batches[3].commitment;
+        assert_ne!(
+            altered_preprocessed_commitment,
+            expected_preprocessed_commitment
+        );
+        assert!(verify_dense_authenticated_execution(
+            &altered,
+            &air,
+            &public,
+            &constraints,
+            &bridge,
+            altered_preprocessed_commitment,
+            &setup,
+        ));
+        assert!(!verify_dense_authenticated_execution(
+            &altered,
+            &air,
+            &public,
+            &constraints,
+            &bridge,
+            expected_preprocessed_commitment,
             &setup,
         ));
     }
@@ -4411,6 +4599,7 @@ mod tests {
         assert_eq!(authenticated.execution_batches.len(), 4);
         assert_eq!(authenticated.execution_sumcheck.rounds.len(), 8);
         assert_eq!(authenticated.adjacency_sumcheck.rounds.len(), 8);
+        let expected_preprocessed_commitment = authenticated.execution_batches[3].commitment;
         let verification_started = std::time::Instant::now();
         let verified = verify_dense_authenticated_blake3(
             &authenticated,
@@ -4418,6 +4607,7 @@ mod tests {
             &fixture.public,
             &fixture.constraints,
             &fixture.bridge,
+            expected_preprocessed_commitment,
             &setup,
         );
         let verification_elapsed = verification_started.elapsed();
@@ -4428,6 +4618,15 @@ mod tests {
             authenticated.opening_proof.len(),
         );
         assert!(verified);
+        assert!(!verify_dense_authenticated_blake3(
+            &authenticated,
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
+            authenticated.execution_batches[0].commitment,
+            &setup,
+        ));
 
         let mut changed_shared_source = authenticated.clone();
         changed_shared_source.execution_batches[0].commitment =
@@ -4438,6 +4637,7 @@ mod tests {
             &fixture.public,
             &fixture.constraints,
             &fixture.bridge,
+            expected_preprocessed_commitment,
             &setup,
         ));
 
@@ -4454,6 +4654,7 @@ mod tests {
             &fixture.public,
             &fixture.constraints,
             &fixture.bridge,
+            expected_preprocessed_commitment,
             &setup,
         ));
 
@@ -4465,6 +4666,7 @@ mod tests {
             &fixture.public,
             &fixture.constraints,
             &fixture.bridge,
+            expected_preprocessed_commitment,
             &setup,
         ));
 
@@ -4476,6 +4678,7 @@ mod tests {
             &fixture.public,
             &fixture.constraints,
             &fixture.bridge,
+            expected_preprocessed_commitment,
             &setup,
         ));
     }

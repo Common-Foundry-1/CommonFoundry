@@ -200,6 +200,8 @@ pub const BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS: usize =
 
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE: u64 = 1_024;
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_TABLE_INDEX: u32 = 0;
+/// Equality, first/last/transition selectors, and eight byte-coefficient tables.
+const BLS_DORY_BLAKE3_EXECUTION_AUXILIARY_TABLES: usize = 1 + 3 + 8;
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_CONTEXT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundContext/v1";
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_ROOT_DOMAIN: &str =
@@ -1852,10 +1854,10 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and loads an opaque preprocessing pin from the byte-identical two-run ceremony record; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; the version-2 top-level candidate envelope routes its shared frame and native frame through that atomic composer and rejects the legacy separate bridge; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical envelope routing and tamper rejection, and leaves zero retained scratch; a complete production out-of-core prover and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and loads an opaque preprocessing pin from the byte-identical two-run ceremony record; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; the version-2 top-level candidate envelope routes its shared frame and native frame through that atomic composer and rejects the legacy separate bridge; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical envelope routing and tamper rejection, and leaves zero retained scratch; the authenticated out-of-core execution sumcheck now matches the dense v2 proof byte for byte and cleans all round scratch, but the production out-of-core adjacency prover, composed witness adapter, and exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the public shared aggregate parser intentionally remains capped at 128; only the version-2 top-level candidate route reaches the specialized exact-134 verifier after deriving the native six-claim suffix from opaque replay, so unrelated callers cannot widen the aggregate boundary",
-    "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
+    "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; authenticated execution rounds require an 18,773,704,968-byte maximum parent/child overlap, placing the complete execution-stage scratch projection at 27,011,318,784 bytes while its twelve initialized auxiliary vectors retain 402,653,184 bytes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
 
 /// Version of the reproducible native-BLAKE3 preprocessing commitment record.
@@ -5514,8 +5516,10 @@ pub const BLS_DORY_BLAKE3_PROVISIONAL_AVAILABLE_MEMORY_GATE_BYTES: u64 = 4 * 102
 /// `aggregate_stage_lower_bound_bytes` retains the earlier source-only floor.
 /// `aggregate_stage_projected_peak_bytes` additionally follows every scalar
 /// fold parent/child overlap in canonical source order. Transpose artifacts
-/// belong to source construction and may be released before the aggregate;
-/// the coexistence fields remain conservative accounting, not measurements.
+/// remain live through the streamed execution root. The execution-stage peak
+/// conservatively retains both transposes, all four framed sources, and the
+/// largest authenticated execution-round parent/child overlap. Coexistence
+/// fields are deterministic projections, not peak-RSS measurements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlsDoryBlake3ProductionResourceProjection {
     pub shared_aggregate_peak_bytes: u64,
@@ -5523,6 +5527,13 @@ pub struct BlsDoryBlake3ProductionResourceProjection {
     pub framed_source_artifact_bytes: u64,
     pub transpose_artifact_bytes: u64,
     pub source_construction_coexistence_bytes: u64,
+    pub first_execution_round_artifact_bytes: u64,
+    pub second_execution_round_artifact_bytes: u64,
+    pub execution_round_peak_scratch_bytes: u64,
+    pub execution_stage_projected_peak_scratch_bytes: u64,
+    /// Initialized scalar-vector payload only; excludes allocator overhead,
+    /// streaming slabs, setup, Rayon, and I/O buffers.
+    pub execution_auxiliary_resident_bytes: u64,
     pub aggregate_stage_lower_bound_bytes: u64,
     pub first_generation_fold_bytes: u64,
     pub second_generation_fold_bytes: u64,
@@ -5542,7 +5553,7 @@ pub struct BlsDoryBlake3ProductionResourceProjection {
 }
 
 impl BlsDoryBlake3ProductionResourceProjection {
-    /// A run remains blocked until all three independently testable gates close.
+    /// A run remains blocked until every independently testable gate closes.
     #[must_use]
     pub const fn is_complete(self) -> bool {
         self.fold_scratch_model_complete
@@ -5578,6 +5589,50 @@ pub fn projected_bls_dory_blake3_production_resources()
         .checked_shl(BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32)
         .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
     let trace_rows = BLS_DORY_BLAKE3_TRACE_ROWS_U64;
+    if trace_rows < 4 || !trace_rows.is_power_of_two() {
+        return Err(BlsDoryBlake3ProductionPreflightError::InvalidProjection);
+    }
+    let execution_terminals = u64::try_from(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS)
+        .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let execution_round_artifact_bytes = |active_rows: u64, generation: u32| {
+        let explicit_scalar_count = active_rows
+            .checked_mul(execution_terminals)
+            .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+        let scalar_count = active_rows
+            .checked_mul(BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE)
+            .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+        BlsDoryFoldArtifactSpec {
+            context_digest: [1; 32],
+            table_index: BLS_DORY_BLAKE3_EXECUTION_ROUND_TABLE_INDEX,
+            generation,
+            scalar_count,
+            explicit_scalar_count,
+            parent_digest: [2; 32],
+        }
+        .encoded_bytes()
+        .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)
+    };
+    let first_execution_round_rows = trace_rows
+        .checked_div(2)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let second_execution_round_rows = trace_rows
+        .checked_div(4)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let first_execution_round_artifact_bytes =
+        execution_round_artifact_bytes(first_execution_round_rows, 1)?;
+    let second_execution_round_artifact_bytes =
+        execution_round_artifact_bytes(second_execution_round_rows, 2)?;
+    let execution_round_peak_scratch_bytes = first_execution_round_artifact_bytes
+        .checked_add(second_execution_round_artifact_bytes)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let resident_scalar_bytes = u64::try_from(std::mem::size_of::<BlsDoryFr>())
+        .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let execution_auxiliary_tables = u64::try_from(BLS_DORY_BLAKE3_EXECUTION_AUXILIARY_TABLES)
+        .map_err(|_| BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let execution_auxiliary_resident_bytes = trace_rows
+        .checked_mul(execution_auxiliary_tables)
+        .and_then(|scalars| scalars.checked_mul(resident_scalar_bytes))
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
     let main_explicit_scalars = (BLS_DORY_BLAKE3_SIGNED_WORD_TABLES as u64)
         .checked_mul(trace_rows)
         .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
@@ -5684,6 +5739,9 @@ pub fn projected_bls_dory_blake3_production_resources()
     let source_construction_coexistence_bytes = framed_source_artifact_bytes
         .checked_add(transpose_artifact_bytes)
         .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
+    let execution_stage_projected_peak_scratch_bytes = source_construction_coexistence_bytes
+        .checked_add(execution_round_peak_scratch_bytes)
+        .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
     let aggregate_stage_lower_bound_bytes = shared_aggregate_peak_bytes
         .checked_add(framed_source_artifact_bytes)
         .ok_or(BlsDoryBlake3ProductionPreflightError::InvalidProjection)?;
@@ -5694,7 +5752,11 @@ pub fn projected_bls_dory_blake3_production_resources()
 
     let provisional_scratch_gate_bytes = BLS_DORY_BLAKE3_PROVISIONAL_SCRATCH_GATE_BYTES
         .max(source_construction_coexistence_bytes)
+        .max(execution_stage_projected_peak_scratch_bytes)
         .max(aggregate_with_transpose_coexistence_bytes);
+    let provisional_available_memory_gate_bytes =
+        BLS_DORY_BLAKE3_PROVISIONAL_AVAILABLE_MEMORY_GATE_BYTES
+            .max(execution_auxiliary_resident_bytes);
 
     Ok(BlsDoryBlake3ProductionResourceProjection {
         shared_aggregate_peak_bytes,
@@ -5702,6 +5764,11 @@ pub fn projected_bls_dory_blake3_production_resources()
         framed_source_artifact_bytes,
         transpose_artifact_bytes,
         source_construction_coexistence_bytes,
+        first_execution_round_artifact_bytes,
+        second_execution_round_artifact_bytes,
+        execution_round_peak_scratch_bytes,
+        execution_stage_projected_peak_scratch_bytes,
+        execution_auxiliary_resident_bytes,
         aggregate_stage_lower_bound_bytes,
         first_generation_fold_bytes: composed_scratch.first_generation_fold_bytes,
         second_generation_fold_bytes: composed_scratch.second_generation_fold_bytes,
@@ -5713,8 +5780,7 @@ pub fn projected_bls_dory_blake3_production_resources()
         aggregate_stage_projected_peak_bytes: composed_scratch.aggregate_peak_bytes,
         aggregate_with_transpose_coexistence_bytes,
         provisional_scratch_gate_bytes,
-        provisional_available_memory_gate_bytes:
-            BLS_DORY_BLAKE3_PROVISIONAL_AVAILABLE_MEMORY_GATE_BYTES,
+        provisional_available_memory_gate_bytes,
         fold_scratch_model_complete: true,
         fold_scratch_measurement_complete: false,
         peak_memory_projection_complete: false,
@@ -9587,6 +9653,23 @@ mod tests {
             projection.source_construction_coexistence_bytes,
             8_237_613_816
         );
+        assert_eq!(
+            projection.first_execution_round_artifact_bytes,
+            12_515_803_268
+        );
+        assert_eq!(
+            projection.second_execution_round_artifact_bytes,
+            6_257_901_700
+        );
+        assert_eq!(
+            projection.execution_round_peak_scratch_bytes,
+            18_773_704_968
+        );
+        assert_eq!(
+            projection.execution_stage_projected_peak_scratch_bytes,
+            27_011_318_784
+        );
+        assert_eq!(projection.execution_auxiliary_resident_bytes, 402_653_184);
         assert_eq!(projection.aggregate_stage_lower_bound_bytes, 34_319_467_740);
         assert_eq!(projection.first_generation_fold_bytes, 2_894_071_840);
         assert_eq!(projection.second_generation_fold_bytes, 1_447_036_448);
@@ -9610,11 +9693,19 @@ mod tests {
         );
         assert!(
             projection.provisional_scratch_gate_bytes
+                >= projection.execution_stage_projected_peak_scratch_bytes
+        );
+        assert!(
+            projection.provisional_scratch_gate_bytes
                 >= projection.aggregate_with_transpose_coexistence_bytes
         );
         assert_eq!(
             projection.provisional_available_memory_gate_bytes,
             4_294_967_296
+        );
+        assert!(
+            projection.provisional_available_memory_gate_bytes
+                >= projection.execution_auxiliary_resident_bytes
         );
         assert!(projection.fold_scratch_model_complete);
         assert!(!projection.fold_scratch_measurement_complete);

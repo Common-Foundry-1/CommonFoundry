@@ -835,7 +835,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; bounded tests preserve exact commitment and opening bytes for shared-layout reblocking analogs, while a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches, and production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; production-owned accumulator and inverse construction, a named four-source bundle, verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; production-owned accumulator and bounded-batch adjacency-inverse constructors preserve exact dense commitment/opening bytes and reject mismatched statements, terminal evaluations, zero denominators, corrupt sources, and setup mismatches; production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; a named four-source bundle, verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -1475,6 +1475,121 @@ fn commit_native_accumulator_source(
     writer.finish()
 }
 
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS: usize = 1 << 15;
+
+#[cfg(feature = "whir-prototype")]
+fn batch_invert_nonzero(values: &mut [BlsDoryFr]) -> Option<()> {
+    for batch in values.chunks_mut(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
+        let mut prefixes = Vec::with_capacity(batch.len());
+        let mut product = BlsDoryFr::from_u64(1);
+        for value in batch.iter().copied() {
+            prefixes.push(product);
+            product = product * value;
+        }
+        let mut suffix = product.inv()?;
+        for index in (0..batch.len()).rev() {
+            let value = batch[index];
+            batch[index] = suffix * prefixes[index];
+            suffix = suffix * value;
+        }
+    }
+    Some(())
+}
+
+/// Commit the two LogUp inverse tables from authenticated ordinary-main and
+/// accumulator sources. A denominator collision fails before any inverse
+/// artifact is created.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn commit_native_adjacency_inverse_source(
+    ordinary_main: &mut BlsDoryWordTransposeArtifact,
+    accumulator: &BlsDoryCommittedPolynomial,
+    compression: BlsDoryFr,
+    alpha: BlsDoryFr,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let trace_rows = ordinary_main.rows();
+    let explicit_scalars = trace_rows
+        .checked_mul(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let physical_rows = 1usize
+        .checked_shl(layout.nu() as u32)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let physical_columns = 1usize
+        .checked_shl(layout.sigma() as u32)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let capacity = physical_rows
+        .checked_mul(physical_columns)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    if ordinary_main.columns() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1
+        || !trace_rows.is_power_of_two()
+        || explicit_scalars > capacity
+        || accumulator.explicit_coefficient_count() != explicit_scalars
+        || !accumulator.matches_layout(layout, setup)
+    {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+
+    let trace_rows_u64 =
+        u64::try_from(trace_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    let mut keys = Vec::with_capacity(explicit_scalars);
+    keys.extend((0..trace_rows).map(|row| {
+        BlsDoryFr::from_u64(if row == 0 {
+            trace_rows_u64 - 1
+        } else {
+            row as u64 - 1
+        })
+    }));
+    keys.extend((0..trace_rows).map(|row| BlsDoryFr::from_u64(row as u64)));
+
+    let mut words = vec![0u64; trace_rows];
+    let mut artifact_column = 0usize;
+    for native_column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
+        if native_column == NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START {
+            accumulator.for_each_explicit_coefficient(|index, value| {
+                keys[index] = keys[index] * compression + value;
+            })?;
+            continue;
+        }
+        ordinary_main
+            .read_column(artifact_column, &mut words)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        for row in 0..trace_rows {
+            let local = BlsDoryFr::from_i64(i64::from_le_bytes(words[row].to_le_bytes()));
+            let next_word = words[(row + 1) % trace_rows];
+            let next = BlsDoryFr::from_i64(i64::from_le_bytes(next_word.to_le_bytes()));
+            keys[row] = keys[row] * compression + local;
+            keys[trace_rows + row] = keys[trace_rows + row] * compression + next;
+        }
+        artifact_column += 1;
+    }
+    if artifact_column != ordinary_main.columns() {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+
+    for key in &mut keys {
+        *key = alpha - *key;
+    }
+    batch_invert_nonzero(&mut keys).ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+
+    let row_bytes = physical_columns
+        .checked_mul(std::mem::size_of::<BlsDoryFr>())
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let mut writer = BlsDoryCommittedPolynomialWriter::create_with_chunk_bytes(
+        scratch_directory,
+        explicit_scalars,
+        layout.nu(),
+        layout.sigma(),
+        setup,
+        row_bytes,
+    )?;
+    writer.write_scalars(&keys)?;
+    writer.finish()
+}
+
 /// Exact projection values exposed to tests and activation tooling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlsDoryBlake3Projection {
@@ -1784,9 +1899,7 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_streaming::BlsDoryRowSource;
     #[cfg(feature = "whir-prototype")]
-    use crate::dory_bls12_381_transpose::{
-        BlsDoryTransposeError, BlsDoryWordTransposeArtifact, BlsDoryWordTransposeWriter,
-    };
+    use crate::dory_bls12_381_transpose::{BlsDoryTransposeError, BlsDoryWordTransposeWriter};
     #[cfg(feature = "whir-prototype")]
     use crate::structured_blake3_narrow::{
         for_each_main_trace_row, for_each_preprocessed_trace_row, generate_main_trace,
@@ -2956,28 +3069,6 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
-    const BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS: usize = 1 << 15;
-
-    #[cfg(feature = "whir-prototype")]
-    fn batch_invert_nonzero(values: &mut [BlsDoryFr]) -> Option<()> {
-        for batch in values.chunks_mut(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
-            let mut prefixes = Vec::with_capacity(batch.len());
-            let mut product = BlsDoryFr::from_u64(1);
-            for value in batch.iter().copied() {
-                prefixes.push(product);
-                product = product * value;
-            }
-            let mut suffix = product.inv()?;
-            for index in (0..batch.len()).rev() {
-                let value = batch[index];
-                batch[index] = suffix * prefixes[index];
-                suffix = suffix * value;
-            }
-        }
-        Some(())
-    }
-
-    #[cfg(feature = "whir-prototype")]
     fn flip_file_byte(path: &std::path::Path, offset: u64) -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -3007,96 +3098,6 @@ mod tests {
             adjacency_points: [points[3].clone(), points[4].clone(), points[5].clone()],
             adjacency_evaluations: [evaluations[3], evaluations[4], evaluations[5]],
         }
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    fn commit_native_adjacency_inverse_source(
-        ordinary_main: &mut BlsDoryWordTransposeArtifact,
-        accumulator: &BlsDoryCommittedPolynomial,
-        compression: BlsDoryFr,
-        alpha: BlsDoryFr,
-        layout: BlsDoryAggregateLayout,
-        setup: &DeterministicBlsDorySetup,
-        scratch_directory: &std::path::Path,
-    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
-        let trace_rows = ordinary_main.rows();
-        let explicit_scalars = trace_rows
-            .checked_mul(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)
-            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-        let physical_rows = 1usize
-            .checked_shl(layout.nu() as u32)
-            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-        let physical_columns = 1usize
-            .checked_shl(layout.sigma() as u32)
-            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-        let capacity = physical_rows
-            .checked_mul(physical_columns)
-            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-        if ordinary_main.columns() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1
-            || !trace_rows.is_power_of_two()
-            || explicit_scalars > capacity
-            || accumulator.explicit_coefficient_count() != explicit_scalars
-            || !accumulator.matches_layout(layout, setup)
-            || accumulator.row_commitments().len() != physical_rows
-        {
-            return Err(BlsDoryAggregateError::InvalidDimension);
-        }
-
-        let trace_rows_u64 =
-            u64::try_from(trace_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
-        let mut keys = Vec::with_capacity(explicit_scalars);
-        keys.extend((0..trace_rows).map(|row| {
-            BlsDoryFr::from_u64(if row == 0 {
-                trace_rows_u64 - 1
-            } else {
-                row as u64 - 1
-            })
-        }));
-        keys.extend((0..trace_rows).map(|row| BlsDoryFr::from_u64(row as u64)));
-
-        let mut words = vec![0u64; trace_rows];
-        let mut artifact_column = 0usize;
-        for native_column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
-            if native_column == NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START {
-                accumulator.for_each_explicit_coefficient(|index, value| {
-                    keys[index] = keys[index] * compression + value;
-                })?;
-                continue;
-            }
-            ordinary_main
-                .read_column(artifact_column, &mut words)
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-            for row in 0..trace_rows {
-                let local = BlsDoryFr::from_i64(i64::from_le_bytes(words[row].to_le_bytes()));
-                let next_word = words[(row + 1) % trace_rows];
-                let next = BlsDoryFr::from_i64(i64::from_le_bytes(next_word.to_le_bytes()));
-                keys[row] = keys[row] * compression + local;
-                keys[trace_rows + row] = keys[trace_rows + row] * compression + next;
-            }
-            artifact_column += 1;
-        }
-        if artifact_column != ordinary_main.columns() {
-            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
-        }
-
-        for key in &mut keys {
-            *key = alpha - *key;
-        }
-        batch_invert_nonzero(&mut keys).ok_or(BlsDoryAggregateError::InvalidProofShape)?;
-
-        let row_bytes = physical_columns
-            .checked_mul(std::mem::size_of::<BlsDoryFr>())
-            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
-        let mut writer = BlsDoryCommittedPolynomialWriter::create_with_chunk_bytes(
-            scratch_directory,
-            explicit_scalars,
-            layout.nu(),
-            layout.sigma(),
-            setup,
-            row_bytes,
-        )?;
-        writer.write_scalars(&keys)?;
-        writer.finish()
     }
 
     #[cfg(feature = "whir-prototype")]

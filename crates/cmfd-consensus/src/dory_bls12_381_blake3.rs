@@ -598,6 +598,225 @@ impl PreparedBlsDoryBlake3Sources {
         Ok(())
     }
 
+    /// Stream the 746 execution terminals for every trace row in canonical
+    /// dense-table order without materializing the complete 746-column field
+    /// matrix.
+    ///
+    /// Both retained transposes are completely authenticated before the first
+    /// row callback. Each bounded batch then retains one local row segment plus
+    /// its cyclic successor for all 372 word columns. `maximum_block_rows` may
+    /// lower the artifact's preferred authentication-block batch size, but
+    /// cannot raise it. Both complete accumulator tables are snapshotted before
+    /// callbacks so their authenticated storage is scanned only once per table.
+    /// Corruption present on entry therefore yields zero callbacks. Callbacks
+    /// remain provisional until this method returns `Ok`: a concurrent mutation
+    /// of a later slab can still fail after earlier authenticated rows were
+    /// delivered, because an incremental callback cannot be rolled back.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn for_each_authenticated_execution_row(
+        &mut self,
+        maximum_block_rows: usize,
+        mut emit: impl FnMut(
+            usize,
+            &[BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS],
+        ) -> Result<(), BlsDoryAggregateError>,
+    ) -> Result<(), BlsDoryAggregateError> {
+        let trace_rows = self.binding.trace_rows;
+        if maximum_block_rows == 0
+            || !trace_rows.is_power_of_two()
+            || self.binding.main_transpose_digest != self.main_transpose.digest()
+            || self.binding.preprocessing_transpose_digest != self.preprocessing_transpose.digest()
+            || self.binding.source_commitments != self.sources.commitments()
+            || self.main_transpose.rows() != trace_rows
+            || self.main_transpose.columns() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1
+            || self.preprocessing_transpose.rows() != trace_rows
+            || self.preprocessing_transpose.columns() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH
+            || self.sources.accumulator.explicit_coefficient_count()
+                != trace_rows
+                    .checked_mul(BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES)
+                    .ok_or(BlsDoryAggregateError::InvalidDimension)?
+        {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+
+        // Authentication is deliberately a preflight operation. Corruption
+        // present on entry cannot produce a partial row stream.
+        self.main_transpose
+            .authenticate()
+            .map_err(blake3_transpose_error)?;
+        self.preprocessing_transpose
+            .authenticate()
+            .map_err(blake3_transpose_error)?;
+
+        let block_rows = maximum_block_rows
+            .min(self.main_transpose.preferred_authenticated_segment_rows())
+            .min(
+                self.preprocessing_transpose
+                    .preferred_authenticated_segment_rows(),
+            );
+        if block_rows == 0 {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        let stride = block_rows;
+        let main_word_count = (BLS_DORY_BLAKE3_MAIN_WIDTH - 1)
+            .checked_mul(stride)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let preprocessing_word_count = BLS_DORY_BLAKE3_PREPROCESSED_WIDTH
+            .checked_mul(stride)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+
+        let mut accumulator_local = Vec::new();
+        accumulator_local
+            .try_reserve_exact(trace_rows)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        accumulator_local.resize(trace_rows, BlsDoryFr::zero());
+        let mut accumulator_next = Vec::new();
+        accumulator_next
+            .try_reserve_exact(trace_rows)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        accumulator_next.resize(trace_rows, BlsDoryFr::zero());
+
+        // Snapshot both complete accumulator tables before external callbacks.
+        // The range reader authenticates the complete backing artifact before
+        // exposing either retained range, so released or corrupt storage fails
+        // transactionally here.
+        self.sources
+            .accumulator
+            .for_each_authenticated_coefficient_range(0, trace_rows, |index, coefficient| {
+                accumulator_local[index] = coefficient;
+                Ok(())
+            })?;
+        self.sources
+            .accumulator
+            .for_each_authenticated_coefficient_range(
+                trace_rows,
+                trace_rows,
+                |index, coefficient| {
+                    accumulator_next[index - trace_rows] = coefficient;
+                    Ok(())
+                },
+            )?;
+
+        // Allocate the large transpose slabs only after both accumulator
+        // snapshots have authenticated, keeping the range reader's temporary
+        // authentication buffer out of the slab peak.
+        let mut main_words = Vec::new();
+        main_words
+            .try_reserve_exact(main_word_count)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        main_words.resize(main_word_count, 0u64);
+        let mut preprocessing_words = Vec::new();
+        preprocessing_words
+            .try_reserve_exact(preprocessing_word_count)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        preprocessing_words.resize(preprocessing_word_count, 0u64);
+
+        let mut main_local = vec![0u64; BLS_DORY_BLAKE3_MAIN_WIDTH - 1];
+        let mut main_next = vec![0u64; BLS_DORY_BLAKE3_MAIN_WIDTH - 1];
+        let mut pending_main = vec![0u64; BLS_DORY_BLAKE3_MAIN_WIDTH - 1];
+        let mut first_main = vec![0u64; BLS_DORY_BLAKE3_MAIN_WIDTH - 1];
+        let mut preprocessing_local = vec![0u64; BLS_DORY_BLAKE3_PREPROCESSED_WIDTH];
+        let mut preprocessing_next = vec![0u64; BLS_DORY_BLAKE3_PREPROCESSED_WIDTH];
+        let mut pending_preprocessing = vec![0u64; BLS_DORY_BLAKE3_PREPROCESSED_WIDTH];
+        let mut first_preprocessing = vec![0u64; BLS_DORY_BLAKE3_PREPROCESSED_WIDTH];
+        let mut pending_row = None;
+        let mut terminal = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+
+        for block_start in (0..trace_rows).step_by(block_rows) {
+            let rows = block_rows.min(trace_rows - block_start);
+            for column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH - 1 {
+                let start = column * stride;
+                self.main_transpose
+                    .read_column_segment(column, block_start, &mut main_words[start..start + rows])
+                    .map_err(blake3_transpose_error)?;
+            }
+            for column in 0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+                let start = column * stride;
+                self.preprocessing_transpose
+                    .read_column_segment(
+                        column,
+                        block_start,
+                        &mut preprocessing_words[start..start + rows],
+                    )
+                    .map_err(blake3_transpose_error)?;
+            }
+
+            copy_transposed_execution_row(&main_words, stride, 0, &mut main_local)?;
+            copy_transposed_execution_row(
+                &preprocessing_words,
+                stride,
+                0,
+                &mut preprocessing_local,
+            )?;
+            if block_start == 0 {
+                first_main.copy_from_slice(&main_local);
+                first_preprocessing.copy_from_slice(&preprocessing_local);
+            }
+            if let Some(row) = pending_row {
+                fill_bls_dory_execution_terminal(
+                    &pending_main,
+                    &main_local,
+                    accumulator_local[row],
+                    accumulator_next[row],
+                    &pending_preprocessing,
+                    &preprocessing_local,
+                    &mut terminal,
+                )?;
+                emit(row, &terminal)?;
+            }
+
+            for row_offset in 0..rows.saturating_sub(1) {
+                copy_transposed_execution_row(&main_words, stride, row_offset, &mut main_local)?;
+                copy_transposed_execution_row(&main_words, stride, row_offset + 1, &mut main_next)?;
+                copy_transposed_execution_row(
+                    &preprocessing_words,
+                    stride,
+                    row_offset,
+                    &mut preprocessing_local,
+                )?;
+                copy_transposed_execution_row(
+                    &preprocessing_words,
+                    stride,
+                    row_offset + 1,
+                    &mut preprocessing_next,
+                )?;
+                let row = block_start + row_offset;
+                fill_bls_dory_execution_terminal(
+                    &main_local,
+                    &main_next,
+                    accumulator_local[row],
+                    accumulator_next[row],
+                    &preprocessing_local,
+                    &preprocessing_next,
+                    &mut terminal,
+                )?;
+                emit(row, &terminal)?;
+            }
+
+            copy_transposed_execution_row(&main_words, stride, rows - 1, &mut pending_main)?;
+            copy_transposed_execution_row(
+                &preprocessing_words,
+                stride,
+                rows - 1,
+                &mut pending_preprocessing,
+            )?;
+            pending_row = Some(block_start + rows - 1);
+        }
+
+        let final_row = pending_row.ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+        fill_bls_dory_execution_terminal(
+            &pending_main,
+            &first_main,
+            accumulator_local[final_row],
+            accumulator_next[final_row],
+            &pending_preprocessing,
+            &first_preprocessing,
+            &mut terminal,
+        )?;
+        emit(final_row, &terminal)?;
+        Ok(())
+    }
+
     fn into_committed_sources(
         self,
     ) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
@@ -610,6 +829,91 @@ impl PreparedBlsDoryBlake3Sources {
         drop((main_transpose, preprocessing_transpose));
         Ok(sources)
     }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn copy_transposed_execution_row(
+    columns: &[u64],
+    stride: usize,
+    row: usize,
+    output: &mut [u64],
+) -> Result<(), BlsDoryAggregateError> {
+    if stride == 0
+        || row >= stride
+        || columns.len()
+            != output
+                .len()
+                .checked_mul(stride)
+                .ok_or(BlsDoryAggregateError::InvalidDimension)?
+    {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    for (column, value) in output.iter_mut().enumerate() {
+        *value = columns[column * stride + row];
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn fill_bls_dory_execution_terminal(
+    main_local: &[u64],
+    main_next: &[u64],
+    accumulator_local: BlsDoryFr,
+    accumulator_next: BlsDoryFr,
+    preprocessing_local: &[u64],
+    preprocessing_next: &[u64],
+    terminal: &mut [BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS],
+) -> Result<(), BlsDoryAggregateError> {
+    if main_local.len() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1
+        || main_next.len() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1
+        || preprocessing_local.len() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH
+        || preprocessing_next.len() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH
+    {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let mut artifact_column = 0usize;
+    for logical_column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
+        let local_terminal = logical_column;
+        let next_terminal = BLS_DORY_BLAKE3_MAIN_WIDTH + logical_column;
+        if logical_column == NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START {
+            terminal[local_terminal] = accumulator_local;
+            terminal[next_terminal] = accumulator_next;
+        } else {
+            terminal[local_terminal] = BlsDoryFr::from_i64(i64::from_le_bytes(
+                main_local[artifact_column].to_le_bytes(),
+            ));
+            terminal[next_terminal] =
+                BlsDoryFr::from_i64(i64::from_le_bytes(main_next[artifact_column].to_le_bytes()));
+            artifact_column += 1;
+        }
+    }
+    if artifact_column != BLS_DORY_BLAKE3_MAIN_WIDTH - 1 {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+
+    let preprocessing_local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+    let preprocessing_next_start = preprocessing_local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+    for column in 0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+        terminal[preprocessing_local_start + column] =
+            bls_dory_centered_goldilocks_word(preprocessing_local[column])?;
+        terminal[preprocessing_next_start + column] =
+            bls_dory_centered_goldilocks_word(preprocessing_next[column])?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn bls_dory_centered_goldilocks_word(canonical: u64) -> Result<BlsDoryFr, BlsDoryAggregateError> {
+    if canonical >= GOLDILOCKS_MODULUS {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let centered = if canonical <= GOLDILOCKS_MODULUS / 2 {
+        i64::try_from(canonical).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?
+    } else {
+        -i64::try_from(GOLDILOCKS_MODULUS - canonical)
+            .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?
+    };
+    Ok(BlsDoryFr::from_i64(centered))
 }
 
 /// Six points and evaluations emitted by successful verifier transcript replay.
@@ -5499,7 +5803,20 @@ mod tests {
             )?;
             writer.finish()
         };
-        let accumulator = commit_scalar_source(10_003, BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES)?;
+        let mut accumulator_writer = BlsDoryCommittedPolynomialWriter::create_signed_byte(
+            scratch_directory,
+            TRACE_ROWS * BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES,
+            layout.nu(),
+            layout.sigma(),
+            127,
+            &setup,
+        )?;
+        accumulator_writer.write_signed_values(
+            &(0..TRACE_ROWS * BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES)
+                .map(|index| index as i64 - TRACE_ROWS as i64)
+                .collect::<Vec<_>>(),
+        )?;
+        let accumulator = accumulator_writer.finish()?;
         let inverse = commit_scalar_source(20_003, BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)?;
         let sources = BlsDoryBlake3CommittedSources {
             main,
@@ -10148,6 +10465,126 @@ mod tests {
             bounded_prepared_source_bundle(&scratch.0, true),
             Err(BlsDoryAggregateError::ProverStorage)
         ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn prepared_execution_rows_stream_exact_dense_order_across_blocks_and_wrap() {
+        const BLOCK_ROWS: usize = 31;
+        let fixture = dense_blake3_fixture();
+        assert_eq!(fixture.air.trace_rows(), 1 << 8);
+        let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+        let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+        let mut prepared = prepare_native_blake3_sources_at_layout(
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+
+        let mut seen = Vec::new();
+        prepared
+            .for_each_authenticated_execution_row(BLOCK_ROWS, |row, terminal| {
+                assert_eq!(
+                    terminal.len(),
+                    BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+                );
+                for (table, value) in fixture.tables.iter().zip(terminal) {
+                    assert_eq!(*value, table[row], "terminal mismatch at row {row}");
+                }
+                if row + 1 == fixture.air.trace_rows() {
+                    for column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
+                        assert_eq!(
+                            terminal[BLS_DORY_BLAKE3_MAIN_WIDTH + column],
+                            fixture.tables[column][0]
+                        );
+                    }
+                    let preprocessing_local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+                    let preprocessing_next_start =
+                        preprocessing_local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+                    for column in 0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+                        assert_eq!(
+                            terminal[preprocessing_next_start + column],
+                            fixture.tables[preprocessing_local_start + column][0]
+                        );
+                    }
+                }
+                seen.push(row);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, (0..fixture.air.trace_rows()).collect::<Vec<_>>());
+        for boundary in [
+            BLOCK_ROWS - 1,
+            BLOCK_ROWS,
+            2 * BLOCK_ROWS - 1,
+            2 * BLOCK_ROWS,
+        ] {
+            assert_eq!(seen[boundary], boundary);
+        }
+
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn prepared_execution_row_stream_fails_before_callbacks_for_corrupt_transposes() {
+        for corrupt_main in [true, false] {
+            let scratch = Blake3ScratchDirectory::create();
+            let BoundedPreparedSourceFixture { mut prepared, .. } =
+                bounded_prepared_source_bundle(&scratch.0, false).unwrap();
+            let path = if corrupt_main {
+                prepared.main_transpose.path()
+            } else {
+                prepared.preprocessing_transpose.path()
+            };
+            flip_file_byte(path, 100).unwrap();
+            let mut callbacks = 0usize;
+            assert!(matches!(
+                prepared.for_each_authenticated_execution_row(3, |_row, _terminal| {
+                    callbacks += 1;
+                    Ok(())
+                }),
+                Err(BlsDoryAggregateError::ProverStorage)
+            ));
+            assert_eq!(callbacks, 0);
+            drop(prepared);
+            assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn prepared_execution_row_stream_fails_before_callbacks_for_released_accumulator() {
+        let scratch = Blake3ScratchDirectory::create();
+        let BoundedPreparedSourceFixture { mut prepared, .. } =
+            bounded_prepared_source_bundle(&scratch.0, false).unwrap();
+        prepared
+            .sources
+            .accumulator
+            .release_compact_source_for_test();
+        assert!(
+            prepared
+                .sources
+                .accumulator
+                .coefficient_artifact_path()
+                .is_none()
+        );
+        let mut callbacks = 0usize;
+        assert!(matches!(
+            prepared.for_each_authenticated_execution_row(3, |_row, _terminal| {
+                callbacks += 1;
+                Ok(())
+            }),
+            Err(BlsDoryAggregateError::ProverStorage)
+        ));
+        assert_eq!(callbacks, 0);
+        drop(prepared);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

@@ -249,6 +249,18 @@ impl BlsDoryWordTransposeArtifact {
         self.columns
     }
 
+    /// Preferred row batch for callers that consume authenticated column
+    /// segments. One batch reuses the artifact's existing authentication
+    /// buffer without retaining a complete column or matrix in memory.
+    #[cfg(feature = "whir-prototype")]
+    pub(crate) const fn preferred_authenticated_segment_rows(&self) -> usize {
+        if self.rows < AUTHENTICATION_BLOCK_ROWS {
+            self.rows
+        } else {
+            AUTHENTICATION_BLOCK_ROWS
+        }
+    }
+
     pub fn read_column(
         &mut self,
         column: usize,

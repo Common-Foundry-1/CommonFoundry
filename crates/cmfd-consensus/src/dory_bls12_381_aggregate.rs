@@ -482,6 +482,11 @@ impl BlsDoryCommittedPolynomial {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn release_compact_source_for_test(&mut self) {
+        self.release_compact_source();
+    }
+
     fn restored_compact_coefficients(
         &self,
         source: &Arc<BlsDoryCompactArtifact>,

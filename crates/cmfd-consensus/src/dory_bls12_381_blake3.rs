@@ -1268,7 +1268,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; the version-2 top-level candidate envelope routes its shared frame and native frame through that atomic composer and rejects the legacy separate bridge; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical envelope routing and tamper rejection, and leaves zero retained scratch; the real production preprocessing-pin registry, a complete production out-of-core prover, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and loads an opaque preprocessing pin from the byte-identical two-run ceremony record; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; the version-2 top-level candidate envelope routes its shared frame and native frame through that atomic composer and rejects the legacy separate bridge; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical envelope routing and tamper rejection, and leaves zero retained scratch; a complete production out-of-core prover and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the public shared aggregate parser intentionally remains capped at 128; only the version-2 top-level candidate route reaches the specialized exact-134 verifier after deriving the native six-claim suffix from opaque replay, so unrelated callers cannot widen the aggregate boundary",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -1280,11 +1280,20 @@ pub const BLS_DORY_BLAKE3_PREPROCESSING_RECORD_VERSION: u16 = 1;
 #[cfg(feature = "whir-prototype")]
 const BLS_DORY_BLAKE3_PREPROCESSING_RECORD_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3PreprocessingRecord/v1";
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD: &[u8] =
+    include_bytes!("../data/bls_dory_blake3_preprocessing_record_v1.json");
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD_DIGEST: [u8; 32] = [
+    0x98, 0x7a, 0xcd, 0x2e, 0xca, 0x3e, 0x41, 0xbb, 0xc2, 0xab, 0xbd, 0xf6, 0xf9, 0x1a, 0x5f, 0x7b,
+    0xa9, 0x07, 0x55, 0x52, 0x33, 0x35, 0x3e, 0xda, 0x10, 0x9c, 0x28, 0x11, 0x4b, 0xb4, 0xb8, 0xb1,
+];
 
 /// Auditable output of the deterministic production preprocessing-only job.
 ///
-/// This record is a reproducibility artifact, not a consensus registry entry.
-/// Producing or validating it does not enable the production verifier pin.
+/// This record is a reproducibility artifact. Producing or validating a new
+/// record does not replace the twice-reproduced embedded registry
+/// entry used by the production verifier pin.
 #[cfg(feature = "whir-prototype")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1330,8 +1339,8 @@ impl BlsDoryBlake3PreprocessingRecord {
     /// Validate canonical encodings and every production geometry constant.
     ///
     /// This is a self-consistency check. Trusting the resulting record still
-    /// requires independent reproduction before a future consensus registry
-    /// pins its digest.
+    /// requires a byte-identical reproduction and reviewed registry-digest
+    /// update before it can replace the embedded production record.
     pub fn validate(&self) -> Result<(), BlsDoryBlake3PreprocessingRecordError> {
         let expected_terminal_count =
             BLS_DORY_BLAKE3_SOURCE_TERMINALS[BlsDoryBlake3SourceRole::Preprocessing.index()];
@@ -2586,9 +2595,8 @@ impl BlsDoryBlake3VerifierContext {
 }
 
 /// Opaque verifier authority for the deterministic preprocessing polynomial.
-///
-/// Production construction remains unavailable until consensus pins a registry
-/// entry for the exact commitment and geometry below.
+/// Production construction is restricted to the two-run-reproduced embedded registry
+/// record and an already-validated verifier context.
 #[cfg(feature = "whir-prototype")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BlsDoryBlake3TrustedPreprocessingPin {
@@ -2660,10 +2668,61 @@ impl BlsDoryBlake3TrustedPreprocessingPin {
     }
 }
 
-/// No production pin is registered yet, so the production wrapper fails closed.
 #[cfg(feature = "whir-prototype")]
-fn native_blake3_production_preprocessing_pin() -> Option<BlsDoryBlake3TrustedPreprocessingPin> {
-    None
+fn native_blake3_production_preprocessing_pin_from_record(
+    encoded_record: &[u8],
+    verifier_context: &BlsDoryBlake3VerifierContext,
+) -> Result<BlsDoryBlake3TrustedPreprocessingPin, BlsDoryBlake3PreprocessingRecordError> {
+    let record: BlsDoryBlake3PreprocessingRecord =
+        serde_json::from_slice(encoded_record).map_err(|_| {
+            BlsDoryBlake3PreprocessingRecordError::InvalidMetadata("embedded record JSON")
+        })?;
+    record.validate()?;
+    require_blake3_record_digest(
+        "pinned production record",
+        BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD_DIGEST,
+        &record.record_digest,
+    )?;
+
+    let expected_layout = BlsDoryAggregateLayout::new(
+        BLS_DORY_BLAKE3_SHARED_DORY_NU,
+        BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
+    )?;
+    verifier_context.validate_geometry(BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY)?;
+    if verifier_context.layout != expected_layout
+        || verifier_context.setup_identity
+            != decode_blake3_record_hex_32("setup identity", &record.setup_identity)?
+        || verifier_context.setup_max_log_n != record.setup_max_log_n as usize
+    {
+        return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+            "verifier context",
+        ));
+    }
+
+    Ok(BlsDoryBlake3TrustedPreprocessingPin {
+        projection_version: record.projection_version,
+        activation_len: BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES,
+        cell_point_variables: BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES.ilog2() as usize,
+        trace_rows: BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+        geometry: BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+        verifier_context: verifier_context.clone(),
+        source_role: BlsDoryBlake3SourceRole::Preprocessing,
+        terminal_count: BLS_DORY_BLAKE3_SOURCE_TERMINALS
+            [BlsDoryBlake3SourceRole::Preprocessing.index()],
+        commitment: decode_blake3_record_commitment(&record.preprocessing_bls_commitment)?,
+    })
+}
+
+/// Load the two-run-reproduced production pin. Any parse, digest, metadata, setup, or
+/// commitment mismatch keeps the production wrapper fail-closed.
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_production_preprocessing_pin(
+    verifier_context: &BlsDoryBlake3VerifierContext,
+) -> Result<BlsDoryBlake3TrustedPreprocessingPin, BlsDoryBlake3PreprocessingRecordError> {
+    native_blake3_production_preprocessing_pin_from_record(
+        BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD,
+        verifier_context,
+    )
 }
 
 #[cfg(feature = "whir-prototype")]
@@ -3577,8 +3636,8 @@ pub(crate) fn verify_native_blake3_opening_statement(
         )?,
         setup,
     )?;
-    let preprocessing_pin = native_blake3_production_preprocessing_pin()
-        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let preprocessing_pin = native_blake3_production_preprocessing_pin(&verifier_context)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     let replay = verify_native_blake3_opening_replay_at_geometry(
         bridge,
         &proof.source_commitments,
@@ -4766,6 +4825,187 @@ mod tests {
         };
         record.record_digest = hex::encode(record.canonical_digest().unwrap());
         record
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn pinned_production_preprocessing_context() -> BlsDoryBlake3VerifierContext {
+        let record: BlsDoryBlake3PreprocessingRecord =
+            serde_json::from_slice(BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD).unwrap();
+        BlsDoryBlake3VerifierContext::for_test_metadata(
+            BlsDoryAggregateLayout::new(
+                BLS_DORY_BLAKE3_SHARED_DORY_NU,
+                BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
+            )
+            .unwrap(),
+            decode_blake3_record_hex_32("setup identity", &record.setup_identity).unwrap(),
+            record.setup_max_log_n as usize,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn production_preprocessing_pin_loads_exact_pinned_record() {
+        let record: BlsDoryBlake3PreprocessingRecord =
+            serde_json::from_slice(BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD).unwrap();
+        let context = pinned_production_preprocessing_context();
+        let pin = native_blake3_production_preprocessing_pin(&context).unwrap();
+        let mut canonical_json = serde_json::to_vec_pretty(&record).unwrap();
+        canonical_json.push(b'\n');
+
+        assert_eq!(
+            canonical_json,
+            BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD
+        );
+        assert_eq!(
+            record.canonical_digest().unwrap(),
+            BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD_DIGEST
+        );
+        assert_eq!(
+            decode_blake3_record_hex_32("record", &record.record_digest).unwrap(),
+            BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD_DIGEST
+        );
+        assert_eq!(
+            encode_blake3_record_commitment(&pin.commitment).unwrap(),
+            record.preprocessing_bls_commitment
+        );
+        assert_ne!(pin.commitment, BlsDoryGt::identity());
+        assert_eq!(pin.verifier_context, context);
+        assert_eq!(pin.geometry, BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY);
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn production_preprocessing_pin_rejects_mutated_embedded_records() {
+        let mut record: BlsDoryBlake3PreprocessingRecord =
+            serde_json::from_slice(BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD).unwrap();
+        record.compact_artifact_digest = hex::encode([0x42; 32]);
+        record.record_digest = hex::encode(record.canonical_digest().unwrap());
+        record.validate().unwrap();
+        let mutated = serde_json::to_vec_pretty(&record).unwrap();
+        assert!(matches!(
+            native_blake3_production_preprocessing_pin_from_record(
+                &mutated,
+                &pinned_production_preprocessing_context(),
+            ),
+            Err(BlsDoryBlake3PreprocessingRecordError::DigestMismatch(
+                "pinned production record"
+            ))
+        ));
+
+        let mut unknown_field: serde_json::Value =
+            serde_json::from_slice(BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD).unwrap();
+        unknown_field
+            .as_object_mut()
+            .unwrap()
+            .insert("unreviewed".to_owned(), serde_json::Value::Bool(true));
+        assert!(matches!(
+            native_blake3_production_preprocessing_pin_from_record(
+                &serde_json::to_vec(&unknown_field).unwrap(),
+                &pinned_production_preprocessing_context(),
+            ),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "embedded record JSON"
+            ))
+        ));
+
+        let truncated = &BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD
+            [..BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD.len() - 2];
+        assert!(matches!(
+            native_blake3_production_preprocessing_pin_from_record(
+                truncated,
+                &pinned_production_preprocessing_context(),
+            ),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "embedded record JSON"
+            ))
+        ));
+
+        let mut duplicate_field = br#"{"record_version":1,"#.to_vec();
+        duplicate_field.extend_from_slice(&BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD[1..]);
+        assert!(matches!(
+            native_blake3_production_preprocessing_pin_from_record(
+                &duplicate_field,
+                &pinned_production_preprocessing_context(),
+            ),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "embedded record JSON"
+            ))
+        ));
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn production_preprocessing_pin_rejects_wrong_context_and_commitment() {
+        let context = pinned_production_preprocessing_context();
+        let mut wrong_context = context.clone();
+        wrong_context.setup_identity[0] ^= 1;
+        assert!(matches!(
+            native_blake3_production_preprocessing_pin(&wrong_context),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "verifier context"
+            ))
+        ));
+        let mut wrong_max_log_n = context.clone();
+        wrong_max_log_n.setup_max_log_n += 1;
+        assert!(matches!(
+            native_blake3_production_preprocessing_pin(&wrong_max_log_n),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "verifier context"
+            ))
+        ));
+        let wrong_layout = BlsDoryBlake3VerifierContext::for_test_metadata(
+            BlsDoryAggregateLayout::new(15, 18).unwrap(),
+            context.setup_identity,
+            context.setup_max_log_n,
+        )
+        .unwrap();
+        assert!(matches!(
+            native_blake3_production_preprocessing_pin(&wrong_layout),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "verifier context"
+            ))
+        ));
+
+        let pin = native_blake3_production_preprocessing_pin(&context).unwrap();
+        let activation = vec![0_u8; BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES];
+        let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            [0x11; 32],
+            [0x22; 32],
+            &activation,
+            [0x33; 32],
+            vec![BlsDoryFr::zero(); BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES.ilog2() as usize],
+        )
+        .unwrap();
+        let commitments = BlsDoryBlake3SourceCommitments {
+            main: pin.commitment,
+            accumulator: pin.commitment,
+            preprocessing: pin.commitment,
+            inverse: pin.commitment,
+        };
+        pin.validate(
+            &bridge,
+            BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+            BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+            &context,
+            &commitments,
+        )
+        .unwrap();
+
+        let wrong_commitments = BlsDoryBlake3SourceCommitments {
+            preprocessing: BlsDoryGt::identity(),
+            ..commitments
+        };
+        assert_eq!(
+            pin.validate(
+                &bridge,
+                BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+                BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+                &context,
+                &wrong_commitments,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
     }
 
     #[cfg(feature = "whir-prototype")]

@@ -43,6 +43,9 @@ use crate::{
     dory_bls12_381_blake3::{
         PreparedBlsDoryNativeBlake3Opening, prepare_production_native_blake3_opening,
     },
+    dory_bls12_381_execution_artifact::{
+        BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorArtifactError,
+    },
     dory_bls12_381_layout::{
         BlsDoryPrecommittedMatrixProverInput, BlsDoryPreparedFixedModel,
         BlsDoryTransitionProverInput, prepare_bls_dory_shared_layout_verifier_state,
@@ -207,6 +210,9 @@ pub enum BlsDoryV3CandidateError {
     #[cfg(feature = "whir-prototype")]
     #[error("candidate final activation is outside the canonical centered-byte range")]
     FinalActivation,
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate execution-accumulator artifact context is invalid: {0}")]
+    ExecutionArtifact(#[from] BlsDoryExecutionAccumulatorArtifactError),
 }
 
 impl BlsDoryV3CandidatePayload {
@@ -299,6 +305,28 @@ impl BlsDoryV3AlgebraicVerifier {
         })
     }
 
+    /// Derive the only execution-artifact context accepted for this pinned
+    /// verifier and candidate. Callers supply no network, model, setup, or
+    /// challenge identities.
+    #[cfg(feature = "whir-prototype")]
+    pub(crate) fn execution_artifact_context(
+        &self,
+        block: &BlockChallenge,
+        nonce: u64,
+    ) -> Result<BlsDoryExecutionAccumulatorArtifactContext, BlsDoryV3CandidateError> {
+        if block.network_id != self.network_id {
+            return Err(BlsDoryV3CandidateError::WrongNetwork);
+        }
+        let challenge = challenge_digest(&self.descriptor(), block, nonce)
+            .map_err(|_| BlsDoryV3CandidateError::ChallengeDigest)?;
+        Ok(BlsDoryExecutionAccumulatorArtifactContext::production(
+            self.network_id,
+            self.record_digest,
+            self.setup.identity(),
+            challenge,
+        )?)
+    }
+
     /// Construct and self-verify one exact production-shaped research
     /// candidate. All public fields, statements, masks, and fixed commitments
     /// are derived from this verifier's pinned configuration. This method does
@@ -337,8 +365,9 @@ impl BlsDoryV3AlgebraicVerifier {
         validate_production_witness_shape(&shape, &witness)?;
         let final_activation = production_final_activation(witness.wiring_outputs)?;
         let manifest_digest = self.manifest.digest()?;
-        let challenge_digest = challenge_digest(&self.descriptor(), block, nonce)
-            .map_err(|_| BlsDoryV3CandidateError::ChallengeDigest)?;
+        let challenge_digest = self
+            .execution_artifact_context(block, nonce)?
+            .challenge_identity();
         let final_activation_digest = output_digest(challenge_digest, &final_activation);
         let work_digest = work_digest_from_roots(
             challenge_digest,
@@ -879,6 +908,12 @@ fn algebraic_binding(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "whir-prototype")]
+    use dory_pcs::primitives::arithmetic::Group;
+
+    #[cfg(feature = "whir-prototype")]
+    use crate::dory_bls12_381_prototype::{BlsDoryGt, deterministic_bls_dory_setup};
+
     fn block() -> BlockChallenge {
         BlockChallenge {
             network_id: [0x31; 32],
@@ -901,6 +936,141 @@ mod tests {
             work_digest: [0x97; 32],
             structured_proof: vec![1],
         }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn execution_context_verifier(
+        record_digest: [u8; 32],
+        setup_variables: usize,
+    ) -> BlsDoryV3AlgebraicVerifier {
+        let setup = Arc::new(deterministic_bls_dory_setup(setup_variables).unwrap());
+        let base_input_bytes = u64::from(PRODUCTION_V2_BATCH * PRODUCTION_V2_DIMENSION);
+        let bytes_per_layer = u64::from(PRODUCTION_V2_DIMENSION).pow(2);
+        let payload_bytes = base_input_bytes
+            + u64::from(PRODUCTION_V2_LAYERS)
+                .checked_mul(bytes_per_layer)
+                .unwrap();
+        let manifest = ModelBankManifest {
+            model_version: 2,
+            dimension: PRODUCTION_V2_DIMENSION,
+            batch: PRODUCTION_V2_BATCH,
+            layers: PRODUCTION_V2_LAYERS,
+            base_input_bytes,
+            bytes_per_layer,
+            payload_bytes,
+            raw_blake3_root: [0x81; 32],
+            layer_roots_aggregate: [0x82; 32],
+            pcs_parameter_digest: [0x83; 32],
+            pcs_commitment_root: [0x84; 32],
+        };
+        let trusted_model = ModelPcsIdentity {
+            model_version: 2,
+            batch: PRODUCTION_V2_BATCH,
+            dimension: PRODUCTION_V2_DIMENSION,
+            layers_per_bank: PRODUCTION_V2_LAYERS_PER_BANK,
+            model_byte_root: manifest.raw_blake3_root,
+            pcs_suite_parameter_digest: manifest.pcs_parameter_digest,
+            base_input_commitment: [0x85; 32],
+            weight_bank_commitments: vec![[0x86; 32]; PRODUCTION_V2_BANKS as usize],
+        };
+        let fixed_model = BlsDoryFixedModelIdentity {
+            protocol_version: crate::dory_bls12_381_layout::BLS_DORY_FIXED_MODEL_IDENTITY_VERSION,
+            model_pcs_identity_digest: [0x87; 32],
+            setup_identity: setup.identity(),
+            base_input_commitment: BlsDoryGt::identity(),
+            weight_bank_commitments: Vec::new(),
+        };
+        BlsDoryV3AlgebraicVerifier {
+            network_id: [0x31; 32],
+            manifest,
+            trusted_model,
+            fixed_model,
+            record_digest,
+            setup,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn execution_artifact_context_uses_only_pinned_candidate_identities() {
+        let verifier = execution_context_verifier([0x91; 32], 6);
+        let candidate = block();
+        let nonce = 29;
+        let context = verifier
+            .execution_artifact_context(&candidate, nonce)
+            .unwrap();
+        let expected_challenge =
+            challenge_digest(&verifier.descriptor(), &candidate, nonce).unwrap();
+
+        assert_eq!(context.network_identity(), verifier.network_id);
+        assert_eq!(context.model_record_identity(), verifier.record_digest);
+        assert_eq!(context.setup_identity(), verifier.setup.identity());
+        assert_eq!(context.challenge_identity(), expected_challenge);
+
+        let changed_nonce = verifier
+            .execution_artifact_context(&candidate, nonce + 1)
+            .unwrap();
+        assert_eq!(changed_nonce.network_identity(), context.network_identity());
+        assert_eq!(
+            changed_nonce.model_record_identity(),
+            context.model_record_identity()
+        );
+        assert_eq!(changed_nonce.setup_identity(), context.setup_identity());
+        assert_ne!(
+            changed_nonce.challenge_identity(),
+            context.challenge_identity()
+        );
+
+        let mut changed_block = candidate;
+        changed_block.previous_block[0] ^= 1;
+        let changed_statement = verifier
+            .execution_artifact_context(&changed_block, nonce)
+            .unwrap();
+        assert_ne!(
+            changed_statement.challenge_identity(),
+            context.challenge_identity()
+        );
+
+        let changed_model = execution_context_verifier([0x92; 32], 6)
+            .execution_artifact_context(&candidate, nonce)
+            .unwrap();
+        assert_eq!(
+            changed_model.challenge_identity(),
+            context.challenge_identity()
+        );
+        assert_ne!(
+            changed_model.model_record_identity(),
+            context.model_record_identity()
+        );
+
+        let changed_setup = execution_context_verifier([0x91; 32], 7)
+            .execution_artifact_context(&candidate, nonce)
+            .unwrap();
+        assert_eq!(
+            changed_setup.challenge_identity(),
+            context.challenge_identity()
+        );
+        assert_ne!(changed_setup.setup_identity(), context.setup_identity());
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn execution_artifact_context_rejects_mismatched_or_invalid_pinned_identity() {
+        let verifier = execution_context_verifier([0x91; 32], 6);
+        let mut wrong_network = block();
+        wrong_network.network_id[0] ^= 1;
+        assert!(matches!(
+            verifier.execution_artifact_context(&wrong_network, 29),
+            Err(BlsDoryV3CandidateError::WrongNetwork)
+        ));
+
+        let invalid_model = execution_context_verifier([0; 32], 6);
+        assert!(matches!(
+            invalid_model.execution_artifact_context(&block(), 29),
+            Err(BlsDoryV3CandidateError::ExecutionArtifact(
+                BlsDoryExecutionAccumulatorArtifactError::InvalidContext
+            ))
+        ));
     }
 
     #[test]

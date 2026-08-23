@@ -19,7 +19,8 @@ use dory_pcs::primitives::{
 use thiserror::Error;
 
 use crate::{
-    StructuredMatrixStatement, StructuredSumcheckError,
+    StructuredMaskPolynomial, StructuredMatrixStatement, StructuredSumcheckError,
+    StructuredTransitionStatement,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
         BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
@@ -28,10 +29,15 @@ use crate::{
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
+    dory_bls12_381_execution_artifact::{
+        BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
+        BlsDoryExecutionAccumulatorColumn,
+    },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
     },
     dory_bls12_381_streaming::BlsDoryRowSource,
+    dory_bls12_381_transition::derive_transition_regular_row_from_mask,
     structured_sumcheck::{validate_streaming_tables, validate_tables},
 };
 
@@ -78,6 +84,18 @@ pub struct BlsDoryMatrixProof {
 pub(crate) struct PreparedBlsDoryMatrixProof {
     pub(crate) proof: BlsDoryMatrixProof,
     pub(crate) openings: BlsDoryDeferredOpeningSet,
+}
+
+/// The two transition tables that determine one matrix bank's input
+/// activations. Layer zero consumes the last activation from `prior`; every
+/// later layer consumes the preceding activation from `current`.
+#[derive(Clone, Copy)]
+pub(crate) struct BlsDoryExecutionArtifactMatrixInput<'a> {
+    pub(crate) bank: usize,
+    pub(crate) prior_statement: StructuredTransitionStatement,
+    pub(crate) prior_mask: &'a StructuredMaskPolynomial,
+    pub(crate) current_statement: StructuredTransitionStatement,
+    pub(crate) current_mask: &'a StructuredMaskPolynomial,
 }
 
 #[derive(Clone, Copy)]
@@ -285,6 +303,8 @@ pub enum BlsDoryMatrixError {
     ProofTooLarge,
     #[error("matrix proof encoding is malformed or non-canonical")]
     InvalidEncoding,
+    #[error("authenticated execution-accumulator artifact failed")]
+    ExecutionArtifact,
     #[error("the BLS12-381 matrix checkpoint is not production ready")]
     NotProductionReady,
 }
@@ -445,18 +465,59 @@ pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratc
     )
 }
 
+/// Prove one matrix bank directly from the authenticated execution trace.
+/// Only one Dory row is expanded at a time; the production activation and
+/// accumulator vectors are never materialized.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    weight: &BlsDoryCommittedPolynomial,
+    artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+    expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+    input: BlsDoryExecutionArtifactMatrixInput<'_>,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    validate_precommitted_matrix_weight(statement, weight)?;
+    let mut tables =
+        ExecutionArtifactMatrixTables::new(statement, artifact, expected_context, input, setup)?;
+    prove_bls_dory_matrix_deferred_from_table_source(
+        binding,
+        statement,
+        &mut tables,
+        MatrixWeightProverSource::Precommitted(weight),
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+fn validate_precommitted_matrix_weight(
+    statement: StructuredMatrixStatement,
+    weight: &BlsDoryCommittedPolynomial,
+) -> Result<(), BlsDoryMatrixError> {
+    statement.validate_verifier_shape()?;
+    let weight_len = statement.table_lengths()?[1];
+    if weight.explicit_coefficient_count() != weight_len {
+        return Err(BlsDoryMatrixError::Structured(
+            StructuredSumcheckError::InvalidLength,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_precommitted_matrix_tables(
     statement: StructuredMatrixStatement,
     activations: &[i64],
     weight: &BlsDoryCommittedPolynomial,
     accumulators: &[i64],
 ) -> Result<(), BlsDoryMatrixError> {
-    statement.validate_verifier_shape()?;
-    let [activation_len, weight_len, accumulator_len] = statement.table_lengths()?;
-    if activations.len() != activation_len
-        || weight.explicit_coefficient_count() != weight_len
-        || accumulators.len() != accumulator_len
-    {
+    validate_precommitted_matrix_weight(statement, weight)?;
+    let [activation_len, _, accumulator_len] = statement.table_lengths()?;
+    if activations.len() != activation_len || accumulators.len() != accumulator_len {
         return Err(BlsDoryMatrixError::Structured(
             StructuredSumcheckError::InvalidLength,
         ));
@@ -532,6 +593,133 @@ fn scalar_within_signed_bound(value: BlsDoryFr, maximum: u64) -> bool {
     })
 }
 
+trait MatrixTableProverSource {
+    #[allow(clippy::too_many_arguments)]
+    fn commit_activation(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_accumulator(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError>;
+
+    fn evaluate_accumulator(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        layer_weights: &[BlsDoryFr],
+        row_weights: &[BlsDoryFr],
+        column_weights: &[BlsDoryFr],
+    ) -> Result<BlsDoryFr, BlsDoryMatrixError>;
+
+    fn activation_partials(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        row_weights: &[BlsDoryFr],
+    ) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError>;
+}
+
+struct MaterializedMatrixTables<'a> {
+    activations: &'a [i64],
+    accumulators: &'a [i64],
+}
+
+impl MatrixTableProverSource for MaterializedMatrixTables<'_> {
+    fn commit_activation(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+        commit_bounded_signed_table(
+            self.activations,
+            statement.max_abs_activation,
+            padded_variables,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )
+    }
+
+    fn commit_accumulator(
+        &mut self,
+        _statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+        commit_signed_table(
+            self.accumulators,
+            padded_variables,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )
+    }
+
+    fn evaluate_accumulator(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        layer_weights: &[BlsDoryFr],
+        row_weights: &[BlsDoryFr],
+        column_weights: &[BlsDoryFr],
+    ) -> Result<BlsDoryFr, BlsDoryMatrixError> {
+        evaluate_accumulators(
+            statement,
+            self.accumulators,
+            layer_weights,
+            row_weights,
+            column_weights,
+        )
+    }
+
+    fn activation_partials(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        row_weights: &[BlsDoryFr],
+    ) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {
+        if row_weights.len() != statement.rows {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let partial_len = statement
+            .layers
+            .checked_mul(statement.inner)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut partials = Vec::with_capacity(partial_len);
+        for layer in 0..statement.layers {
+            for common in 0..statement.inner {
+                let mut activation = BlsDoryFr::zero();
+                for (row, row_weight) in row_weights.iter().copied().enumerate() {
+                    let index = (layer * statement.rows + row) * statement.inner + common;
+                    activation =
+                        activation + BlsDoryFr::from_i64(self.activations[index]) * row_weight;
+                }
+                partials.push(activation);
+            }
+        }
+        Ok(partials)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     binding: &[u8],
@@ -543,9 +731,6 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
 ) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
-    if binding.len() > MAX_MATRIX_BINDING_BYTES {
-        return Err(BlsDoryMatrixError::PublicBindingTooLarge);
-    }
     match weight_source {
         MatrixWeightProverSource::Signed(weights) if scratch_directory.is_some() => {
             validate_streaming_tables(statement, activations, weights, accumulators)?;
@@ -557,6 +742,34 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
             validate_precommitted_matrix_tables(statement, activations, weight, accumulators)?;
         }
     }
+    let mut tables = MaterializedMatrixTables {
+        activations,
+        accumulators,
+    };
+    prove_bls_dory_matrix_deferred_from_table_source(
+        binding,
+        statement,
+        &mut tables,
+        weight_source,
+        padded_variables,
+        setup,
+        scratch_directory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    tables: &mut T,
+    weight_source: MatrixWeightProverSource<'_>,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    if binding.len() > MAX_MATRIX_BINDING_BYTES {
+        return Err(BlsDoryMatrixError::PublicBindingTooLarge);
+    }
     validate_target_variables(matrix_variables(statement)?, padded_variables)?;
     if padded_variables > setup.max_log_n() {
         return Err(BlsDoryMatrixError::InvalidDimensions);
@@ -564,9 +777,8 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     let nu = padded_variables / 2;
     let sigma = padded_variables - nu;
     let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma)?;
-    let activation_polynomial = commit_bounded_signed_table(
-        activations,
-        statement.max_abs_activation,
+    let activation_polynomial = tables.commit_activation(
+        statement,
         padded_variables,
         nu,
         sigma,
@@ -590,8 +802,8 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
             weight.clone()
         }
     };
-    let accumulator_polynomial = commit_signed_table(
-        accumulators,
+    let accumulator_polynomial = tables.commit_accumulator(
+        statement,
         padded_variables,
         nu,
         sigma,
@@ -628,31 +840,18 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     let layer_weights = equality_weights(&layer_point);
     let row_weights = equality_weights(&row_point);
     let col_weights = equality_weights(&col_point);
-    let accumulator_evaluation = evaluate_accumulators(
-        statement,
-        accumulators,
-        &layer_weights,
-        &row_weights,
-        &col_weights,
-    )?;
+    let accumulator_evaluation =
+        tables.evaluate_accumulator(statement, &layer_weights, &row_weights, &col_weights)?;
     transcript.append_field(b"accumulator-evaluation", &accumulator_evaluation);
     let partial_len = statement
         .layers
         .checked_mul(statement.inner)
         .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
     let mut layer_selector = Vec::with_capacity(partial_len);
-    let mut activation_partial = Vec::with_capacity(partial_len);
+    let mut activation_partial = tables.activation_partials(statement, &row_weights)?;
     let mut weight_partial = vec![BlsDoryFr::zero(); partial_len];
-    for (layer, layer_weight) in layer_weights.iter().copied().enumerate() {
-        for common in 0..statement.inner {
-            layer_selector.push(layer_weight);
-            let mut activation = BlsDoryFr::zero();
-            for (row, row_weight) in row_weights.iter().copied().enumerate() {
-                let index = (layer * statement.rows + row) * statement.inner + common;
-                activation = activation + BlsDoryFr::from_i64(activations[index]) * row_weight;
-            }
-            activation_partial.push(activation);
-        }
+    for layer_weight in layer_weights.iter().copied() {
+        layer_selector.extend(std::iter::repeat_n(layer_weight, statement.inner));
     }
     accumulate_weight_partials(statement, weight_source, &col_weights, &mut weight_partial)?;
 
@@ -1114,6 +1313,580 @@ fn opening_binding(binding: &[u8], transcript_digest: &[u8; 32]) -> [u8; 32] {
     hasher.update(binding);
     hasher.update(transcript_digest);
     *hasher.finalize().as_bytes()
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionArtifactMatrixTable {
+    Activation,
+    Accumulator,
+}
+
+struct ExecutionArtifactMatrixTables<'a, 'm> {
+    artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+    context: BlsDoryExecutionAccumulatorArtifactContext,
+    input: BlsDoryExecutionArtifactMatrixInput<'m>,
+    statement: StructuredMatrixStatement,
+    cells_per_layer: usize,
+    cached_column: Option<BlsDoryExecutionAccumulatorColumn>,
+    cached_start: usize,
+    cached_len: usize,
+    io: Vec<i32>,
+}
+
+impl<'a, 'm> ExecutionArtifactMatrixTables<'a, 'm> {
+    fn new(
+        statement: StructuredMatrixStatement,
+        artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+        expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+        input: BlsDoryExecutionArtifactMatrixInput<'m>,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryMatrixError> {
+        statement.validate_verifier_shape()?;
+        let cells_per_layer = statement
+            .rows
+            .checked_mul(statement.cols)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let prior_layers = if input.bank == 0 {
+            1
+        } else {
+            expected_context.layers_per_bank()
+        };
+        if artifact.context() != expected_context
+            || expected_context.setup_identity() != setup.identity()
+            || input.bank >= expected_context.banks()
+            || statement.layers != expected_context.layers_per_bank()
+            || statement.rows != expected_context.canonical_rows()
+            || statement.inner != expected_context.canonical_columns()
+            || statement.cols != expected_context.canonical_columns()
+            || cells_per_layer != expected_context.cells_per_column()
+            || input.current_statement.layers != statement.layers
+            || input.current_statement.rows != statement.rows
+            || input.current_statement.cols != statement.cols
+            || input.current_statement.max_abs_accumulator != statement.max_abs_accumulator
+            || input.prior_statement.layers != prior_layers
+            || input.prior_statement.rows != statement.rows
+            || input.prior_statement.cols != statement.cols
+            || (input.bank > 0
+                && input.prior_statement.max_abs_accumulator != statement.max_abs_accumulator)
+        {
+            return Err(BlsDoryMatrixError::ExecutionArtifact);
+        }
+        input
+            .prior_mask
+            .validate(input.prior_statement)
+            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        input
+            .current_mask
+            .validate(input.current_statement)
+            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        let challenge = expected_context.challenge_identity();
+        let expected_virtual = StructuredMaskPolynomial::from_virtual_challenge(
+            &challenge,
+            expected_context.canonical_rows(),
+            expected_context.canonical_columns(),
+        )
+        .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        let current_layer_offset = input
+            .bank
+            .checked_mul(expected_context.layers_per_bank())
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        let expected_current = StructuredMaskPolynomial::from_challenge_at_layer_offset(
+            &challenge,
+            current_layer_offset,
+            expected_context.layers_per_bank(),
+            expected_context.canonical_rows(),
+            expected_context.canonical_columns(),
+        )
+        .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        let expected_prior = if input.bank == 0 {
+            expected_virtual
+        } else {
+            let prior_layer_offset = (input.bank - 1)
+                .checked_mul(expected_context.layers_per_bank())
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                &challenge,
+                prior_layer_offset,
+                expected_context.layers_per_bank(),
+                expected_context.canonical_rows(),
+                expected_context.canonical_columns(),
+            )
+            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?
+        };
+        if input.prior_mask != &expected_prior || input.current_mask != &expected_current {
+            return Err(BlsDoryMatrixError::ExecutionArtifact);
+        }
+        Ok(Self {
+            artifact,
+            context: expected_context,
+            input,
+            statement,
+            cells_per_layer,
+            cached_column: None,
+            cached_start: 0,
+            cached_len: 0,
+            io: vec![0; expected_context.authentication_chunk_cells()],
+        })
+    }
+
+    fn ensure_cached_chunk(
+        &mut self,
+        column: BlsDoryExecutionAccumulatorColumn,
+        cell: usize,
+    ) -> Result<(), BlsDoryMatrixError> {
+        if cell >= self.cells_per_layer {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let chunk_cells = self.context.authentication_chunk_cells();
+        let chunk_start = cell / chunk_cells * chunk_cells;
+        let chunk_len = (self.cells_per_layer - chunk_start).min(chunk_cells);
+        if self.cached_column == Some(column)
+            && self.cached_start == chunk_start
+            && self.cached_len == chunk_len
+        {
+            return Ok(());
+        }
+        self.cached_column = None;
+        self.cached_start = 0;
+        self.cached_len = 0;
+        self.artifact
+            .read_column_segment(column, chunk_start, &mut self.io[..chunk_len])
+            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        self.cached_column = Some(column);
+        self.cached_start = chunk_start;
+        self.cached_len = chunk_len;
+        Ok(())
+    }
+
+    fn table_len(&self, table: ExecutionArtifactMatrixTable) -> Result<usize, BlsDoryMatrixError> {
+        let lengths = self.statement.table_lengths()?;
+        Ok(match table {
+            ExecutionArtifactMatrixTable::Activation => lengths[0],
+            ExecutionArtifactMatrixTable::Accumulator => lengths[2],
+        })
+    }
+
+    fn read_values(
+        &mut self,
+        table: ExecutionArtifactMatrixTable,
+        start: usize,
+        output: &mut [i64],
+    ) -> Result<(), BlsDoryMatrixError> {
+        let table_len = self.table_len(table)?;
+        let end = start
+            .checked_add(output.len())
+            .filter(|end| *end <= table_len)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut cursor = start;
+        let mut written = 0usize;
+        while cursor < end {
+            let matrix_layer = cursor / self.cells_per_layer;
+            let cell = cursor % self.cells_per_layer;
+            let column = match table {
+                ExecutionArtifactMatrixTable::Accumulator => {
+                    BlsDoryExecutionAccumulatorColumn::BankLayer {
+                        bank: self.input.bank,
+                        layer: matrix_layer,
+                    }
+                }
+                ExecutionArtifactMatrixTable::Activation if matrix_layer == 0 => {
+                    if self.input.bank == 0 {
+                        BlsDoryExecutionAccumulatorColumn::Initialization
+                    } else {
+                        BlsDoryExecutionAccumulatorColumn::BankLayer {
+                            bank: self.input.bank - 1,
+                            layer: self.context.layers_per_bank() - 1,
+                        }
+                    }
+                }
+                ExecutionArtifactMatrixTable::Activation => {
+                    BlsDoryExecutionAccumulatorColumn::BankLayer {
+                        bank: self.input.bank,
+                        layer: matrix_layer - 1,
+                    }
+                }
+            };
+            self.ensure_cached_chunk(column, cell)?;
+            let cache_offset = cell
+                .checked_sub(self.cached_start)
+                .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+            let take = (end - cursor)
+                .min(self.cells_per_layer - cell)
+                .min(self.cached_len - cache_offset);
+            let cached = &self.io[cache_offset..cache_offset + take];
+            match table {
+                ExecutionArtifactMatrixTable::Accumulator => {
+                    for (destination, value) in
+                        output[written..written + take].iter_mut().zip(cached)
+                    {
+                        let value = i64::from(*value);
+                        if value.unsigned_abs() > self.statement.max_abs_accumulator {
+                            return Err(BlsDoryMatrixError::Structured(
+                                StructuredSumcheckError::ValueOutOfRange,
+                            ));
+                        }
+                        *destination = value;
+                    }
+                }
+                ExecutionArtifactMatrixTable::Activation => {
+                    let (transition_statement, mask, transition_layer) = if matrix_layer == 0 {
+                        (
+                            self.input.prior_statement,
+                            self.input.prior_mask,
+                            self.input.prior_statement.layers - 1,
+                        )
+                    } else {
+                        (
+                            self.input.current_statement,
+                            self.input.current_mask,
+                            matrix_layer - 1,
+                        )
+                    };
+                    let transition_start = transition_layer
+                        .checked_mul(self.cells_per_layer)
+                        .and_then(|start| start.checked_add(cell))
+                        .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+                    for (offset, (destination, accumulator)) in output[written..written + take]
+                        .iter_mut()
+                        .zip(cached)
+                        .enumerate()
+                    {
+                        let index = transition_start
+                            .checked_add(offset)
+                            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+                        let mask_value = mask
+                            .value_at_boolean_index_prevalidated(transition_statement, index)
+                            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+                        let activation = derive_transition_regular_row_from_mask(
+                            transition_statement,
+                            index,
+                            i64::from(*accumulator),
+                            mask_value,
+                        )
+                        .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?
+                        .activation;
+                        if activation.unsigned_abs() > self.statement.max_abs_activation {
+                            return Err(BlsDoryMatrixError::Structured(
+                                StructuredSumcheckError::ValueOutOfRange,
+                            ));
+                        }
+                        *destination = activation;
+                    }
+                }
+            }
+            cursor += take;
+            written += take;
+        }
+        Ok(())
+    }
+
+    fn row_source<'s>(
+        &'s mut self,
+        table: ExecutionArtifactMatrixTable,
+        rows: usize,
+        columns: usize,
+        code_maximum: Option<u8>,
+    ) -> Result<ExecutionArtifactMatrixRowSource<'s, 'a, 'm>, BlsDoryMatrixError> {
+        let explicit_scalars = self.table_len(table)?;
+        let dictionary = code_maximum
+            .and_then(bounded_signed_dictionary)
+            .filter(|_| explicit_scalars > columns)
+            .unwrap_or_else(|| vec![BlsDoryFr::zero()]);
+        let use_codes = dictionary.len() > 1;
+        Ok(ExecutionArtifactMatrixRowSource {
+            tables: self,
+            table,
+            rows,
+            columns,
+            explicit_scalars,
+            word_scalar_count: if use_codes { columns } else { explicit_scalars },
+            word_group_len: if use_codes { columns } else { explicit_scalars },
+            dictionary,
+            code_maximum: use_codes.then_some(code_maximum).flatten(),
+            values: vec![0; columns],
+        })
+    }
+}
+
+struct ExecutionArtifactMatrixRowSource<'s, 'a, 'm> {
+    tables: &'s mut ExecutionArtifactMatrixTables<'a, 'm>,
+    table: ExecutionArtifactMatrixTable,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+    word_scalar_count: usize,
+    word_group_len: usize,
+    dictionary: Vec<BlsDoryFr>,
+    code_maximum: Option<u8>,
+    values: Vec<i64>,
+}
+
+impl ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+    fn load_row(&mut self, row_index: usize) -> Result<(), BlsDoryMatrixError> {
+        if row_index >= self.rows || self.values.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        self.values.fill(0);
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let count = self
+            .explicit_scalars
+            .saturating_sub(start)
+            .min(self.columns);
+        if count > 0 {
+            self.tables
+                .read_values(self.table, start, &mut self.values[..count])?;
+        }
+        Ok(())
+    }
+}
+
+impl BlsDoryRowSource for ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+    type Error = BlsDoryMatrixError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        if output.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        self.load_row(row_index)?;
+        for (scalar, value) in output.iter_mut().zip(&self.values) {
+            *scalar = BlsDoryFr::from_i64(*value);
+        }
+        Ok(output.len())
+    }
+}
+
+impl BlsDoryCompactRowSource for ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+    type Error = BlsDoryMatrixError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.word_scalar_count
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.word_group_len
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        1
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        if output.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        self.load_row(row_index)?;
+        for (word, value) in output.iter_mut().zip(&self.values) {
+            *word = u64::from_le_bytes(value.to_le_bytes());
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        if output.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let maximum = self
+            .code_maximum
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        self.load_row(row_index)?;
+        for (code, value) in output.iter_mut().zip(&self.values) {
+            *code = bounded_signed_code(*value, maximum)
+                .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        }
+        Ok(output.len())
+    }
+}
+
+fn map_execution_artifact_commit_error(error: BlsDoryAggregateError) -> BlsDoryMatrixError {
+    if error == BlsDoryAggregateError::CoefficientSource {
+        BlsDoryMatrixError::ExecutionArtifact
+    } else {
+        BlsDoryMatrixError::Aggregate(error)
+    }
+}
+
+impl MatrixTableProverSource for ExecutionArtifactMatrixTables<'_, '_> {
+    fn commit_activation(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+        let scratch_directory = scratch_directory.ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        let padded_len = 1usize
+            .checked_shl(padded_variables as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let activation_len = statement.table_lengths()?[0];
+        if activation_len == 0 || !activation_len.is_power_of_two() || activation_len > padded_len {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let code_maximum = u8::try_from(statement.max_abs_activation)
+            .ok()
+            .filter(|maximum| *maximum <= 127);
+        let mut source = self.row_source(
+            ExecutionArtifactMatrixTable::Activation,
+            rows,
+            columns,
+            code_maximum,
+        )?;
+        if source.code_maximum.is_some() && activation_len.is_multiple_of(columns) {
+            return commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )
+            .map_err(map_execution_artifact_commit_error);
+        }
+        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)
+            .map_err(map_execution_artifact_commit_error)
+    }
+
+    fn commit_accumulator(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+        let scratch_directory = scratch_directory.ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        let padded_len = 1usize
+            .checked_shl(padded_variables as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let accumulator_len = statement.table_lengths()?[2];
+        if accumulator_len == 0
+            || !accumulator_len.is_power_of_two()
+            || accumulator_len > padded_len
+        {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut source = self.row_source(
+            ExecutionArtifactMatrixTable::Accumulator,
+            rows,
+            columns,
+            None,
+        )?;
+        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)
+            .map_err(map_execution_artifact_commit_error)
+    }
+
+    fn evaluate_accumulator(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        layer_weights: &[BlsDoryFr],
+        row_weights: &[BlsDoryFr],
+        column_weights: &[BlsDoryFr],
+    ) -> Result<BlsDoryFr, BlsDoryMatrixError> {
+        if layer_weights.len() != statement.layers
+            || row_weights.len() != statement.rows
+            || column_weights.len() != statement.cols
+        {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let mut values = vec![0; statement.cols];
+        let mut evaluation = BlsDoryFr::zero();
+        for (layer, layer_weight) in layer_weights.iter().copied().enumerate() {
+            for (row, row_weight) in row_weights.iter().copied().enumerate() {
+                let start = (layer * statement.rows + row) * statement.cols;
+                self.read_values(
+                    ExecutionArtifactMatrixTable::Accumulator,
+                    start,
+                    &mut values,
+                )?;
+                for (value, column_weight) in values.iter().zip(column_weights) {
+                    evaluation = evaluation
+                        + BlsDoryFr::from_i64(*value) * *column_weight * row_weight * layer_weight;
+                }
+            }
+        }
+        Ok(evaluation)
+    }
+
+    fn activation_partials(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        row_weights: &[BlsDoryFr],
+    ) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {
+        if row_weights.len() != statement.rows {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let partial_len = statement
+            .layers
+            .checked_mul(statement.inner)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut partials = vec![BlsDoryFr::zero(); partial_len];
+        let mut values = vec![0; statement.inner];
+        for layer in 0..statement.layers {
+            for (row, row_weight) in row_weights.iter().copied().enumerate() {
+                let start = (layer * statement.rows + row) * statement.inner;
+                self.read_values(ExecutionArtifactMatrixTable::Activation, start, &mut values)?;
+                for (common, value) in values.iter().copied().enumerate() {
+                    partials[layer * statement.inner + common] = partials
+                        [layer * statement.inner + common]
+                        + BlsDoryFr::from_i64(value) * row_weight;
+                }
+            }
+        }
+        Ok(partials)
+    }
 }
 
 struct PaddedSignedRowSource<'a> {
@@ -1596,6 +2369,49 @@ mod tests {
         accumulators
     }
 
+    fn computed_layer_accumulators(
+        rows: usize,
+        inner: usize,
+        cols: usize,
+        activations: &[i64],
+        weights: &[i64],
+    ) -> Vec<i64> {
+        let mut accumulators = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut sum = 0_i64;
+                for common in 0..inner {
+                    sum += activations[row * inner + common] * weights[common * cols + col];
+                }
+                accumulators.push(sum);
+            }
+        }
+        accumulators
+    }
+
+    fn transition_activations(
+        statement: StructuredTransitionStatement,
+        mask: &StructuredMaskPolynomial,
+        layer: usize,
+        accumulators: &[i64],
+    ) -> Vec<i64> {
+        let cells = statement.rows * statement.cols;
+        accumulators
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(cell, accumulator)| {
+                let index = layer * cells + cell;
+                let mask_value = mask
+                    .value_at_boolean_index_prevalidated(statement, index)
+                    .unwrap();
+                derive_transition_regular_row_from_mask(statement, index, accumulator, mask_value)
+                    .unwrap()
+                    .activation
+            })
+            .collect()
+    }
+
     #[test]
     fn exact_matrix_sumcheck_is_authenticated_by_three_commitments() {
         let (statement, activations, weights, accumulators) = fixture();
@@ -1754,6 +2570,247 @@ mod tests {
         drop(out_of_range_weight);
         drop(dense);
         drop(ordinary);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn execution_artifact_banks_preserve_matrix_proof_bytes_and_cleanup() {
+        use crate::dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorArtifactWriter;
+
+        let statement = StructuredMatrixStatement {
+            layers: 2,
+            rows: 2,
+            inner: 2,
+            cols: 2,
+            max_abs_activation: 125,
+            max_abs_weight: 10,
+            max_abs_accumulator: 10_000,
+        };
+        let initialization_statement = StructuredTransitionStatement {
+            layers: 1,
+            rows: 2,
+            cols: 2,
+            max_abs_accumulator: 125,
+            max_mask: 5_000,
+        };
+        let transition_statement = StructuredTransitionStatement {
+            layers: 2,
+            rows: 2,
+            cols: 2,
+            max_abs_accumulator: statement.max_abs_accumulator,
+            max_mask: 5_000,
+        };
+        let challenge = [0x5a; 32];
+        let initialization_mask =
+            StructuredMaskPolynomial::from_virtual_challenge(&challenge, 2, 2).unwrap();
+        let bank_masks = [
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(&challenge, 0, 2, 2, 2)
+                .unwrap(),
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(&challenge, 2, 2, 2, 2)
+                .unwrap(),
+        ];
+        let layer_weights = [
+            vec![1, 2, -1, 1],
+            vec![2, -1, 1, 2],
+            vec![1, 0, 2, -2],
+            vec![-1, 2, 2, 1],
+        ];
+        let initialization_accumulators = vec![3, -4, 5, 1];
+        let mut activation = transition_activations(
+            initialization_statement,
+            &initialization_mask,
+            0,
+            &initialization_accumulators,
+        );
+        let mut bank_activations = [Vec::new(), Vec::new()];
+        let mut bank_weights = [Vec::new(), Vec::new()];
+        let mut bank_accumulators = [Vec::new(), Vec::new()];
+        for (global_layer, weights) in layer_weights.iter().enumerate() {
+            let bank = global_layer / statement.layers;
+            let layer = global_layer % statement.layers;
+            bank_activations[bank].extend_from_slice(&activation);
+            bank_weights[bank].extend_from_slice(weights);
+            let accumulators = computed_layer_accumulators(2, 2, 2, &activation, weights);
+            bank_accumulators[bank].extend_from_slice(&accumulators);
+            activation = transition_activations(
+                transition_statement,
+                &bank_masks[bank],
+                layer,
+                &accumulators,
+            );
+        }
+
+        let variables = matrix_variables(statement).unwrap();
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
+            [[0x11; 32], [0x22; 32], setup.identity(), challenge],
+            statement.rows,
+            statement.cols,
+            2,
+            statement.layers,
+            2,
+        )
+        .unwrap();
+        let mut writer =
+            BlsDoryExecutionAccumulatorArtifactWriter::create_new(&scratch.0, context).unwrap();
+        for chunk in initialization_accumulators.chunks_exact(2) {
+            writer
+                .write_column_chunk(
+                    BlsDoryExecutionAccumulatorColumn::Initialization,
+                    &chunk
+                        .iter()
+                        .copied()
+                        .map(i32::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let cells = statement.rows * statement.cols;
+        for (bank, accumulators) in bank_accumulators.iter().enumerate() {
+            for layer in 0..statement.layers {
+                let values = &accumulators[layer * cells..(layer + 1) * cells];
+                for chunk in values.chunks_exact(2) {
+                    writer
+                        .write_column_chunk(
+                            BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
+                            &chunk
+                                .iter()
+                                .copied()
+                                .map(i32::try_from)
+                                .collect::<Result<Vec<_>, _>>()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let mut artifact = writer.finish().unwrap();
+
+        let weights = bank_weights
+            .iter()
+            .map(|values| {
+                commit_bounded_signed_table(
+                    values,
+                    statement.max_abs_weight,
+                    variables,
+                    nu,
+                    sigma,
+                    &setup,
+                    Some(&scratch.0),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut dense_proofs = Vec::new();
+        let mut artifact_proofs = Vec::new();
+        for bank in 0..2 {
+            let binding = format!("artifact-matrix-bank-{bank}");
+            let dense = prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
+                binding.as_bytes(),
+                statement,
+                &bank_activations[bank],
+                &weights[bank],
+                &bank_accumulators[bank],
+                variables,
+                &setup,
+                &scratch.0,
+            )
+            .unwrap();
+            let (prior_statement, prior_mask) = if bank == 0 {
+                (initialization_statement, &initialization_mask)
+            } else {
+                (transition_statement, &bank_masks[bank - 1])
+            };
+            let streamed = prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch(
+                binding.as_bytes(),
+                statement,
+                &weights[bank],
+                &mut artifact,
+                context,
+                BlsDoryExecutionArtifactMatrixInput {
+                    bank,
+                    prior_statement,
+                    prior_mask,
+                    current_statement: transition_statement,
+                    current_mask: &bank_masks[bank],
+                },
+                variables,
+                &setup,
+                &scratch.0,
+            )
+            .unwrap();
+            assert_eq!(streamed.proof, dense.proof);
+            assert_eq!(
+                streamed.proof.encode_deferred(statement).unwrap(),
+                dense.proof.encode_deferred(statement).unwrap()
+            );
+            assert_eq!(streamed.openings.claims(), dense.openings.claims());
+            dense_proofs.push(dense);
+            artifact_proofs.push(streamed);
+        }
+
+        let wrong_current_mask =
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(&[0x6b; 32], 0, 2, 2, 2)
+                .unwrap();
+        assert!(matches!(
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch(
+                b"wrong-challenge-mask",
+                statement,
+                &weights[0],
+                &mut artifact,
+                context,
+                BlsDoryExecutionArtifactMatrixInput {
+                    bank: 0,
+                    prior_statement: initialization_statement,
+                    prior_mask: &initialization_mask,
+                    current_statement: transition_statement,
+                    current_mask: &wrong_current_mask,
+                },
+                variables,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryMatrixError::ExecutionArtifact)
+        ));
+
+        let wrong_context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
+            [[0x11; 32], [0x22; 32], setup.identity(), [0x55; 32]],
+            statement.rows,
+            statement.cols,
+            2,
+            statement.layers,
+            2,
+        )
+        .unwrap();
+        assert!(matches!(
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch(
+                b"wrong-context",
+                statement,
+                &weights[0],
+                &mut artifact,
+                wrong_context,
+                BlsDoryExecutionArtifactMatrixInput {
+                    bank: 0,
+                    prior_statement: initialization_statement,
+                    prior_mask: &initialization_mask,
+                    current_statement: transition_statement,
+                    current_mask: &bank_masks[0],
+                },
+                variables,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryMatrixError::ExecutionArtifact)
+        ));
+
+        drop(artifact_proofs);
+        drop(dense_proofs);
+        drop(weights);
+        drop(artifact);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

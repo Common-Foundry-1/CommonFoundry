@@ -1216,7 +1216,7 @@ pub(crate) fn derive_transition_regular_row(
     derive_transition_regular_row_from_mask(statement, index, accumulator, mask)
 }
 
-fn derive_transition_regular_row_from_mask(
+pub(crate) fn derive_transition_regular_row_from_mask(
     statement: StructuredTransitionStatement,
     index: usize,
     accumulator: i64,
@@ -1483,6 +1483,33 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
     ) -> Result<Self, BlsDoryTransitionError> {
         statement.validate_verifier_shape()?;
         mask_polynomial.validate(statement)?;
+        let challenge = expected_context.challenge_identity();
+        let expected_mask = match transition {
+            BlsDoryExecutionAccumulatorTransition::Initialization => {
+                StructuredMaskPolynomial::from_virtual_challenge(
+                    &challenge,
+                    expected_context.canonical_rows(),
+                    expected_context.canonical_columns(),
+                )
+            }
+            BlsDoryExecutionAccumulatorTransition::Bank(bank) => {
+                let first_layer = bank
+                    .checked_mul(expected_context.layers_per_bank())
+                    .and_then(|layer| u32::try_from(layer).ok())
+                    .ok_or(BlsDoryTransitionError::ExecutionArtifact)?;
+                StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                    &challenge,
+                    first_layer,
+                    expected_context.layers_per_bank(),
+                    expected_context.canonical_rows(),
+                    expected_context.canonical_columns(),
+                )
+            }
+        }
+        .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+        if mask_polynomial != &expected_mask {
+            return Err(BlsDoryTransitionError::ExecutionArtifact);
+        }
         let reader = BlsDoryExecutionAccumulatorReader::new(
             statement,
             artifact,
@@ -1644,6 +1671,66 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         } else {
             Ok(BlsDoryFr::from_u64(word))
         }
+    }
+
+    fn regular_row_values(
+        &self,
+        index: usize,
+    ) -> Result<TransitionRegularRow, BlsDoryTransitionError> {
+        if index >= self.elements {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        let derived = match &self.backing {
+            TransitionWitnessBacking::Materialized(_) => None,
+            TransitionWitnessBacking::Derived {
+                mask_polynomial,
+                accumulators,
+            } => {
+                let accumulator = accumulators
+                    .get(index)
+                    .copied()
+                    .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                Some(derive_transition_regular_row_from_mask(
+                    self.statement,
+                    index,
+                    accumulator,
+                    mask,
+                )?)
+            }
+            TransitionWitnessBacking::ExecutionArtifact {
+                mask_polynomial,
+                reader,
+            } => {
+                let accumulator = reader
+                    .lock()
+                    .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
+                    .accumulator(index)?;
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                Some(derive_transition_regular_row_from_mask(
+                    self.statement,
+                    index,
+                    accumulator,
+                    mask,
+                )?)
+            }
+        };
+        let mut values = [BlsDoryFr::zero(); STRUCTURED_TRANSITION_REGULAR_ORACLES];
+        for (oracle, value) in values.iter_mut().enumerate() {
+            if let Some(derived) = derived {
+                let word = derived.word(oracle)?;
+                *value = if TRANSITION_SIGNED_WORD_SELECTORS & (1u64 << oracle) != 0 {
+                    BlsDoryFr::from_i64(i64::from_le_bytes(word.to_le_bytes()))
+                } else {
+                    BlsDoryFr::from_u64(word)
+                };
+            } else {
+                *value = self.regular_value(oracle, index)?;
+            }
+        }
+        Ok(values)
     }
 
     fn range_digit_for_descriptor(
@@ -1865,6 +1952,31 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
         if output.len() != self.columns || end > self.literal_scalar_count() {
             return Err(BlsDoryTransitionError::InvalidDimensions);
         }
+        if let TransitionWitnessBacking::ExecutionArtifact {
+            mask_polynomial,
+            reader,
+        } = &mut self.backing
+        {
+            let statement = self.statement;
+            let elements = self.elements;
+            let reader = reader
+                .get_mut()
+                .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+            for (column, word) in output.iter_mut().enumerate() {
+                let packed_index = start + column;
+                let oracle = packed_index / elements;
+                let index = packed_index % elements;
+                if oracle >= STRUCTURED_TRANSITION_REGULAR_ORACLES {
+                    return Err(BlsDoryTransitionError::InvalidProofShape);
+                }
+                let accumulator = reader.accumulator(index)?;
+                let mask = mask_polynomial.value_at_boolean_index_prevalidated(statement, index)?;
+                *word =
+                    derive_transition_regular_row_from_mask(statement, index, accumulator, mask)?
+                        .word(oracle)?;
+            }
+            return Ok(output.len());
+        }
         for (column, word) in output.iter_mut().enumerate() {
             let packed_index = start + column;
             let oracle = packed_index / self.elements;
@@ -1884,6 +1996,51 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
             .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
         if output.len() != self.columns || start < self.literal_scalar_count() {
             return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        if let TransitionWitnessBacking::ExecutionArtifact {
+            mask_polynomial,
+            reader,
+        } = &mut self.backing
+        {
+            let statement = self.statement;
+            let elements = self.elements;
+            let range_oracles = &self.range_oracles;
+            let reader = reader
+                .get_mut()
+                .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+            for (column, code) in output.iter_mut().enumerate() {
+                let packed_index = start + column;
+                if packed_index >= self.explicit_scalars {
+                    *code = 0;
+                    continue;
+                }
+                let oracle = packed_index / elements;
+                let index = packed_index % elements;
+                let descriptor = range_oracles
+                    .get(
+                        oracle
+                            .checked_sub(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+                            .ok_or(BlsDoryTransitionError::InvalidProofShape)?,
+                    )
+                    .copied()
+                    .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+                let accumulator = reader.accumulator(index)?;
+                let mask = mask_polynomial.value_at_boolean_index_prevalidated(statement, index)?;
+                let value =
+                    derive_transition_regular_row_from_mask(statement, index, accumulator, mask)?
+                        .word(descriptor.source_oracle)?;
+                let bounded = if descriptor.slack {
+                    descriptor
+                        .maximum
+                        .checked_sub(value)
+                        .ok_or(BlsDoryTransitionError::InvalidDimensions)?
+                } else {
+                    value
+                };
+                *code = u8::try_from((bounded >> (descriptor.digit * 4)) & 0xf)
+                    .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+            }
+            return Ok(output.len());
         }
         for (column, code) in output.iter_mut().enumerate() {
             let packed_index = start + column;
@@ -2043,11 +2200,7 @@ fn regular_row(
     source: &BlsDoryTransitionWitnessRowSource<'_>,
     index: usize,
 ) -> Result<TransitionRegularRow, BlsDoryTransitionError> {
-    let mut row = [BlsDoryFr::zero(); STRUCTURED_TRANSITION_REGULAR_ORACLES];
-    for (oracle, value) in row.iter_mut().enumerate() {
-        *value = source.scalar(oracle, index)?;
-    }
-    Ok(row)
+    source.regular_row_values(index)
 }
 
 fn accumulate_transition_pair(
@@ -2706,7 +2859,7 @@ mod tests {
         use crate::dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorArtifactWriter;
 
         let context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
-            [[0x11; 32], [0x22; 32], setup_identity, [0x44; 32]],
+            [[0x11; 32], [0x22; 32], setup_identity, [0x5a; 32]],
             statement.rows,
             statement.cols,
             1,
@@ -2861,6 +3014,21 @@ mod tests {
             assert_eq!(actual, expected, "packed row {row_index}");
         }
         drop(streamed);
+
+        let wrong_mask = StructuredMaskPolynomial::from_challenge(&[0x5b; 32], 2, 2, 2).unwrap();
+        assert_eq!(
+            BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+                statement,
+                &wrong_mask,
+                &mut artifact,
+                context,
+                BlsDoryExecutionAccumulatorTransition::Bank(0),
+                rows,
+                columns,
+            )
+            .err(),
+            Some(BlsDoryTransitionError::ExecutionArtifact)
+        );
 
         let wrong_context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
             [[0x11; 32], [0x22; 32], [0x33; 32], [0x45; 32]],

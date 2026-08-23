@@ -4093,7 +4093,7 @@ mod tests {
     ) {
         let cells = statement.rows * statement.cols;
         let context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
-            [[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32]],
+            [[0x11; 32], [0x22; 32], [0x33; 32], [0x5a; 32]],
             statement.rows,
             statement.cols,
             1,

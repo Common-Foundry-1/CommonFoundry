@@ -552,6 +552,10 @@ pub const BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES: [BlsDoryBlake3SourceRole; 6] = [
     BlsDoryBlake3SourceRole::Accumulator,
     BlsDoryBlake3SourceRole::Inverse,
 ];
+pub const BLS_DORY_BLAKE3_SOURCE_ORDER: &str =
+    "main_words,accumulator,preprocessing,adjacency_inverses";
+pub const BLS_DORY_BLAKE3_OPENING_SOURCE_ORDER: &str =
+    "execution:main,accumulator,preprocessing; adjacency:main,accumulator,inverses";
 /// Canonical source selected by each execution then adjacency opening claim.
 pub const BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES: [usize; 6] = [
     BlsDoryBlake3SourceRole::Main.index(),
@@ -1878,15 +1882,13 @@ impl BlsDoryCompactRowSource for TransposedPreprocessedRowSource<'_> {
 }
 
 const SCALAR_BYTES: usize = 32;
-const GT_BYTES: usize = 576;
-const COMPONENT_HEADER_BYTES: usize = 20;
+pub(crate) const GT_BYTES: usize = 576;
+pub(crate) const COMPONENT_HEADER_BYTES: usize = 20;
 const TRANSCRIPT_DIGEST_BYTES: usize = 32;
 const CANDIDATE_PAYLOAD_HEADER_BYTES: usize = 18;
 const CURRENT_SHARED_PRODUCTION_BYTES: usize = 133_409;
-#[cfg(feature = "whir-prototype")]
-const BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC: [u8; 8] = *b"CFB3EX01";
-#[cfg(feature = "whir-prototype")]
-const BLS_DORY_BLAKE3_ADJACENCY_PROOF_MAGIC: [u8; 8] = *b"CFB3AD01";
+pub(crate) const BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC: [u8; 8] = *b"CFB3EX01";
+pub(crate) const BLS_DORY_BLAKE3_ADJACENCY_PROOF_MAGIC: [u8; 8] = *b"CFB3AD01";
 #[cfg(feature = "whir-prototype")]
 const BLS_DORY_BLAKE3_COMPONENT_RESERVED: u16 = 0;
 
@@ -1966,7 +1968,7 @@ const BLS_DORY_BLAKE3_PREPROCESSING_RECORD_DOMAIN: &str =
 const BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD: &[u8] =
     include_bytes!("../data/bls_dory_blake3_preprocessing_record_v1.json");
 #[cfg(feature = "whir-prototype")]
-const BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD_DIGEST: [u8; 32] = [
+pub(crate) const BLS_DORY_BLAKE3_PRODUCTION_PREPROCESSING_RECORD_DIGEST: [u8; 32] = [
     0x98, 0x7a, 0xcd, 0x2e, 0xca, 0x3e, 0x41, 0xbb, 0xc2, 0xab, 0xbd, 0xf6, 0xf9, 0x1a, 0x5f, 0x7b,
     0xa9, 0x07, 0x55, 0x52, 0x33, 0x35, 0x3e, 0xda, 0x10, 0x9c, 0x28, 0x11, 0x4b, 0xb4, 0xb8, 0xb1,
 ];

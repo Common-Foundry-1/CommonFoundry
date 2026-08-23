@@ -93,7 +93,7 @@ pub const BLS_DORY_RANGE_LOGUP_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the scalar range checkpoint has not received independent implementation or cryptographic review",
 ];
 
-const PROOF_MAGIC: [u8; 8] = *b"CFBLSL01";
+pub(crate) const PROOF_MAGIC: [u8; 8] = *b"CFBLSL01";
 const PROOF_HEADER_BYTES: usize = 18;
 const MAX_LOGUP_PROOF_BYTES: usize = 262_128;
 const MAX_LOGUP_BINDING_BYTES: usize = 4_096;

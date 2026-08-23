@@ -12,6 +12,8 @@ use crate::{
 
 pub const WIRE_HEADER_BYTES: usize = 16;
 pub const WIRE_VERSION: u16 = 1;
+pub const WIRE_HEADER_FIELDS: &str =
+    "magic[4],network_magic[4],version_u16le,kind_u8,reserved_zero_u8,payload_length_u32le";
 pub const TRANSACTION_KIND: u8 = 1;
 pub const FORGEMATRIX_PROOF_KIND: u8 = 2;
 pub const BLOCK_KIND: u8 = 3;
@@ -24,16 +26,19 @@ pub const MAX_TRANSACTION_BYTES: usize = 64 * 1024;
 pub const MAX_PROOF_BYTES: usize = 256 * 1024;
 pub const MAX_BLOCK_BYTES: usize = 1024 * 1024;
 
-const FORGEMATRIX_V2_PUBLIC_PAYLOAD_BYTES: usize = 1 + 32 + 4 + 4 + 8 + 4 * 32;
-const FORGEMATRIX_V3_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+pub(crate) const FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES: usize = 1 + 32 + 4 + 4 + 8 + 4 * 32;
+pub(crate) const FORGEMATRIX_V3_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+pub(crate) const FORGEMATRIX_V3_WIRE_PREFIX_FIELDS: &str = "v3_wire_tag_u8,network_id[32],algorithm_version_u32le,proof_version_u32le,nonce_u64le,model_manifest_digest[32],challenge_digest[32],final_activation_digest[32],work_digest[32]";
+pub(crate) const FORGEMATRIX_V3_WIRE_TAIL_FIELDS: &str =
+    "structured_length_u32le,structured_bytes; exact EOF";
 /// Exact V3 aggregate allowance beneath the complete 256 KiB proof-frame cap.
 pub const MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES: usize = MAX_PROOF_BYTES
     - WIRE_HEADER_BYTES
-    - FORGEMATRIX_V2_PUBLIC_PAYLOAD_BYTES
+    - FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES
     - FORGEMATRIX_V3_LENGTH_BYTES;
 
-const FRAME_MAGIC: [u8; 4] = *b"CMFD";
-const NETWORK_MAGIC_DOMAIN: &str = "CMFD/WIRE/NETWORK-MAGIC/V1";
+pub(crate) const FRAME_MAGIC: [u8; 4] = *b"CMFD";
+pub(crate) const NETWORK_MAGIC_DOMAIN: &str = "CMFD/WIRE/NETWORK-MAGIC/V1";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {
@@ -1418,7 +1423,7 @@ mod tests {
     fn v3_candidate_frame_has_an_exact_whole_frame_cap_and_stays_fail_closed() {
         assert_eq!(
             WIRE_HEADER_BYTES
-                + FORGEMATRIX_V2_PUBLIC_PAYLOAD_BYTES
+                + FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES
                 + FORGEMATRIX_V3_LENGTH_BYTES
                 + MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
             MAX_PROOF_BYTES
@@ -1458,7 +1463,7 @@ mod tests {
         );
 
         let encoded_candidate = encode_forgematrix_proof(&v3_proof(), NETWORK_ID).unwrap();
-        let structured_length_offset = WIRE_HEADER_BYTES + FORGEMATRIX_V2_PUBLIC_PAYLOAD_BYTES;
+        let structured_length_offset = WIRE_HEADER_BYTES + FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES;
         let mut declared_oversized = encoded_candidate.clone();
         declared_oversized[structured_length_offset..structured_length_offset + 4].copy_from_slice(
             &u32::try_from(MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES + 1)

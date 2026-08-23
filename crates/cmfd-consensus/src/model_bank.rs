@@ -18,6 +18,10 @@ pub const MODEL_BANK_MAGIC: [u8; 8] = *b"CMFDBNK2";
 pub const MODEL_BANK_FORMAT_VERSION: u32 = 2;
 pub const MODEL_BANK_HEADER_BYTES: usize = 184;
 pub const MAX_MODEL_BYTE: u8 = 250;
+pub const MODEL_BANK_INTEGER_ENDIAN: &str = "little-endian";
+pub const MODEL_BANK_HEADER_FIELDS: &str = "magic[8],format_version_u32le,header_bytes_u32le,model_version_u32le,dimension_u32le,batch_u32le,layers_u32le,base_input_bytes_u64le,bytes_per_layer_u64le,payload_bytes_u64le,raw_blake3_root[32],layer_roots_aggregate[32],pcs_parameter_digest[32],pcs_commitment_root[32]";
+pub const MODEL_BANK_RAW_ROOT_RULE: &str =
+    "plain BLAKE3 over base bytes followed by layers in ascending order; header excluded";
 
 /// The writer is intentionally limited to test/research fixtures. Production
 /// banks must be produced by a separately reviewed, reproducible ceremony.
@@ -42,8 +46,8 @@ pub const MODEL_PCS_BASE_INPUT_AXIS_ORDER: &str =
 pub const MODEL_PCS_WEIGHT_BANK_AXIS_ORDER: &str =
     "[column,common,layer-within-bank] least-significant/fastest-changing first";
 
-const LAYER_ROOTS_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/LAYER-ROOTS";
-const MANIFEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MANIFEST";
+pub(crate) const LAYER_ROOTS_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/LAYER-ROOTS";
+pub(crate) const MANIFEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MANIFEST";
 const MODEL_PCS_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-PCS-COMMITMENTS/V1";
 const MODEL_PCS_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-PCS-IDENTITY/V1";
 const VERIFY_CHUNK_BYTES: usize = 64 * 1024;
@@ -136,6 +140,7 @@ pub trait StagedModelFieldSink: Sized {
 /// carried by the current 184-byte model-bank header and does not activate a
 /// production proof format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelPcsIdentity {
     pub model_version: u32,
     pub batch: u32,
@@ -261,6 +266,7 @@ impl ModelPcsIdentity {
 /// cannot be reconstructed by this byte-integrity verifier, so callers must
 /// supply the trusted manifest instead of trusting the copy inside a bank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelBankManifest {
     pub model_version: u32,
     pub dimension: u32,

@@ -60,10 +60,13 @@ pub const MAX_BLS_DORY_PROTOTYPE_VARIABLES: usize = 16;
 /// [`MAX_BLS_DORY_PROTOTYPE_VARIABLES`].
 pub const MAX_BLS_DORY_SETUP_VARIABLES: usize = 33;
 
-const G1_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G1_XMD:SHA-256_SSWU_RO_V1";
-const G2_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G2_XMD:SHA-256_SSWU_RO_V1";
-const SETUP_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/DORY-BLS12-381-SETUP/V1";
-const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/DORY-BLS12-381-OPENING/V2";
+pub(crate) const G1_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G1_XMD:SHA-256_SSWU_RO_V1";
+pub(crate) const G2_DOMAIN: &[u8] = b"CMFD_DORY_BLS12381G2_XMD:SHA-256_SSWU_RO_V1";
+pub(crate) const SETUP_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/DORY-BLS12-381-SETUP/V1";
+pub(crate) const TRANSCRIPT_DOMAIN: &str = "CMFD/FORGEMATRIX/DORY-BLS12-381-OPENING/V2";
+pub const BLS_DORY_GENERATOR_MESSAGE_FIELDS: &str =
+    "setup_version_u16le,role_length_u64le,role,index_u64le";
+pub const BLS_DORY_SETUP_IDENTITY_FIELDS: &str = "setup_version_u16le,max_log_n_u64le,framed g1 label and length then ordered canonical g1 elements,framed g2 label and length then ordered canonical g2 elements,framed canonical h1,framed canonical h2,framed canonical pairing(h1,h2); every frame is label_length_u64le,label,value_length_u64le,value";
 
 type G1Hasher =
     MapToCurveBasedHasher<G1Projective, DefaultFieldHasher<Sha256, 128>, WBMap<g1::Config>>;
@@ -814,7 +817,7 @@ pub fn deterministic_bls_dory_setup(
     if max_log_n == 0 || max_log_n > MAX_BLS_DORY_SETUP_VARIABLES {
         return Err(BlsDoryPrototypeError::InvalidSize);
     }
-    let generator_count = 1usize << max_log_n.div_ceil(2);
+    let generator_count = bls_dory_setup_generator_count(max_log_n);
     let g1_hasher = G1Hasher::new(G1_DOMAIN)
         .map_err(|error| BlsDoryPrototypeError::HashToCurve(error.to_string()))?;
     let g2_hasher = G2Hasher::new(G2_DOMAIN)
@@ -846,6 +849,10 @@ pub fn deterministic_bls_dory_setup(
         identity,
         max_log_n,
     })
+}
+
+pub const fn bls_dory_setup_generator_count(max_log_n: usize) -> usize {
+    1usize << max_log_n.div_ceil(2)
 }
 
 fn hash_g1(hasher: &G1Hasher, role: &[u8], index: u64) -> Result<BlsDoryG1, BlsDoryPrototypeError> {

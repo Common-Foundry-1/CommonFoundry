@@ -57,7 +57,7 @@ pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
 
 const WIRING_SLOTS: usize = 1 << BLS_DORY_WIRING_SELECTOR_VARIABLES;
 const INITIAL_SLOT: usize = 0;
-const PROOF_MAGIC: [u8; 8] = *b"CFBLSW01";
+pub(crate) const PROOF_MAGIC: [u8; 8] = *b"CFBLSW01";
 const PROOF_HEADER_BYTES: usize = 18;
 const MAX_WIRING_PROOF_BYTES: usize = 262_128;
 const MAX_WIRING_BINDING_BYTES: usize = 4_096;

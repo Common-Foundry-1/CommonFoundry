@@ -115,8 +115,8 @@ use crate::dory_bls12_381_blake3::verify_encoded_native_blake3_test_opening_stat
 pub const BLS_DORY_SHARED_LAYOUT_VERSION: u16 = 4;
 pub const BLS_DORY_FIXED_MODEL_IDENTITY_VERSION: u16 = 1;
 pub const BLS_DORY_FINAL_OUTPUT_BRIDGE_VERSION: u16 = 1;
-const MAX_SHARED_LAYOUT_BINDING_BYTES: usize = 4_096;
-const SHARED_PROOF_MAGIC: [u8; 8] = *b"CFBLSS01";
+pub(crate) const MAX_SHARED_LAYOUT_BINDING_BYTES: usize = 4_096;
+pub(crate) const SHARED_PROOF_MAGIC: [u8; 8] = *b"CFBLSS01";
 const SHARED_PROOF_HEADER_BYTES: usize = 16;
 pub const MAX_BLS_DORY_SHARED_MATRIX_PROOFS: usize = 3;
 pub const MAX_BLS_DORY_SHARED_TRANSITION_PROOFS: usize = 4;
@@ -125,10 +125,8 @@ pub const BLS_DORY_SHARED_INITIALIZATION_LINKS: usize = 2;
 pub const BLS_DORY_SHARED_LINKS_PER_BANK: usize = 3;
 const BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS: u32 = 8;
 
-#[cfg(any(test, feature = "whir-prototype"))]
-const BLS_DORY_SHARED_NATIVE_COMPOSITION_VERSION: u16 = 1;
-#[cfg(any(test, feature = "whir-prototype"))]
-const BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS: usize = 6;
+pub(crate) const BLS_DORY_SHARED_NATIVE_COMPOSITION_VERSION: u16 = 1;
+pub(crate) const BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS: usize = 6;
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
 pub const BLS_DORY_SHARED_PRODUCTION_VARIABLES: usize = 33;
@@ -5982,6 +5980,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(encoded.len(), 35_989);
+        assert_eq!(
+            blake3::hash(&encoded).to_hex().as_str(),
+            "6c5dae3e431d41b88f8f49c2bcdc4c598578d1975e49190bad9f19e70dbb3e83"
+        );
         let decoded = BlsDorySharedLayoutProof::decode_with_variables(
             &encoded,
             &matrix_statements,

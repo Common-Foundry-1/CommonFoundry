@@ -44,6 +44,10 @@ pub mod dory_bls12_381_wiring;
 mod dory_field_portability;
 #[cfg(feature = "dory-opening-prototype")]
 pub mod dory_opening_prototype;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_suite;
 pub mod economics;
 pub mod forgematrix;
 pub mod forgematrix_v2;

@@ -72,11 +72,13 @@ use crate::{
     forgematrix_v2::output_digest,
 };
 
-const ALGEBRAIC_BINDING_VERSION: u16 = 1;
-const ALGEBRAIC_BINDING_DOMAIN: &str = "CommonFoundry/ForgeMatrix/V3/BlsDoryAlgebraicBinding/v1";
-const CANDIDATE_PAYLOAD_MAGIC: [u8; 8] = *b"CFV3CP02";
-const CANDIDATE_PAYLOAD_VERSION: u16 = 2;
-const CANDIDATE_PAYLOAD_HEADER_BYTES: usize = 18;
+pub(crate) const ALGEBRAIC_BINDING_VERSION: u16 = 1;
+pub(crate) const ALGEBRAIC_BINDING_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/V3/BlsDoryAlgebraicBinding/v1";
+pub(crate) const CANDIDATE_PAYLOAD_MAGIC: [u8; 8] = *b"CFV3CP02";
+pub(crate) const CANDIDATE_PAYLOAD_VERSION: u16 = 2;
+pub(crate) const CANDIDATE_PAYLOAD_HEADER_BYTES: usize = 18;
+pub(crate) const CANDIDATE_PAYLOAD_FIELDS: &str = "magic[8],version_u16le,dory_length_u32le,native_blake3_length_u32le,dory_bytes,native_blake3_bytes; exact EOF";
 
 /// Production-shaped verifier for only the algebraic portion of a V3 candidate.
 ///

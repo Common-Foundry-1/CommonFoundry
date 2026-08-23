@@ -33,15 +33,17 @@ pub const V2_TEST_BATCH: u32 = 2;
 pub const V2_TEST_LAYERS: u32 = 4;
 pub const V2_ACCELERATOR_MAX_BATCH: u32 = 65_536;
 
-const CHALLENGE_DOMAIN: &str = "CMFD/FORGEMATRIX/CHALLENGE/V2";
-const MASK_DOMAIN: &str = "CMFD/FORGEMATRIX/MASKCOEFF/V2";
-const OUTPUT_DOMAIN: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
-const WORK_DOMAIN: &str = "CMFD/FORGEMATRIX/WORK/V2";
+pub(crate) const CHALLENGE_DOMAIN: &str = "CMFD/FORGEMATRIX/CHALLENGE/V2";
+pub(crate) const MASK_DOMAIN: &str = "CMFD/FORGEMATRIX/MASKCOEFF/V2";
+pub(crate) const OUTPUT_DOMAIN: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
+pub(crate) const WORK_DOMAIN: &str = "CMFD/FORGEMATRIX/WORK/V2";
 
 pub const V2_TRANSITION_MODULUS: u32 = 134_217_689;
-const OUTPUT_MODULUS: u64 = 251;
-const CENTER: i16 = 125;
-const MAX_OUTPUT_QUOTIENT: u32 = 534_731;
+pub const V2_OUTPUT_MODULUS: u64 = 251;
+pub const V2_MODEL_VALUE_CENTER: i16 = 125;
+pub const V2_MAX_OUTPUT_QUOTIENT: u32 = 534_731;
+pub const V2_MODEL_VALUE_ENCODING: &str =
+    "u8 x in 0..=250 maps to the canonical signed integer x - 125";
 
 /// Consensus-owned public identity of the v2 relation.
 ///
@@ -912,8 +914,8 @@ fn reduction_witness(z: i32) -> Result<ReductionWitness, ForgeMatrixV2Error> {
     let cube_product = square_remainder * u64::from(encoded_z);
     let cube_quotient = cube_product / u64::from(V2_TRANSITION_MODULUS);
     let cube_remainder = cube_product % u64::from(V2_TRANSITION_MODULUS);
-    let output_quotient = cube_remainder / OUTPUT_MODULUS;
-    let output_remainder = cube_remainder % OUTPUT_MODULUS;
+    let output_quotient = cube_remainder / V2_OUTPUT_MODULUS;
+    let output_remainder = cube_remainder % V2_OUTPUT_MODULUS;
     let witness = ReductionWitness {
         z,
         encoded_z,
@@ -944,7 +946,7 @@ fn check_reduction(z: i32, witness: &ReductionWitness) -> Result<(), ForgeMatrix
     {
         return Err(ForgeMatrixV2Error::TransitionFieldRange);
     }
-    if witness.output_quotient > MAX_OUTPUT_QUOTIENT || witness.output_remainder > 250 {
+    if witness.output_quotient > V2_MAX_OUTPUT_QUOTIENT || witness.output_remainder > 250 {
         return Err(ForgeMatrixV2Error::OutputRange);
     }
     let expected_encoded = if z >= 0 {
@@ -967,7 +969,8 @@ fn check_reduction(z: i32, witness: &ReductionWitness) -> Result<(), ForgeMatrix
         return Err(ForgeMatrixV2Error::CubeRelation);
     }
     if u64::from(witness.cube_remainder)
-        != OUTPUT_MODULUS * u64::from(witness.output_quotient) + u64::from(witness.output_remainder)
+        != V2_OUTPUT_MODULUS * u64::from(witness.output_quotient)
+            + u64::from(witness.output_remainder)
     {
         return Err(ForgeMatrixV2Error::OutputRelation);
     }
@@ -978,18 +981,21 @@ fn centered_activation(value: u16) -> Result<i16, ForgeMatrixV2Error> {
     if value > 250 {
         return Err(ForgeMatrixV2Error::OutputRange);
     }
-    Ok(i16::try_from(value).map_err(|_| ForgeMatrixV2Error::ActivationEncoding)? - CENTER)
+    Ok(
+        i16::try_from(value).map_err(|_| ForgeMatrixV2Error::ActivationEncoding)?
+            - V2_MODEL_VALUE_CENTER,
+    )
 }
 
 fn decode_model_byte(value: u8) -> i16 {
-    i16::from(value) - CENTER
+    i16::from(value) - V2_MODEL_VALUE_CENTER
 }
 
 fn activation_bytes(values: &[i16]) -> Result<Vec<u8>, ForgeMatrixV2Error> {
     values
         .iter()
         .map(|value| {
-            let encoded = *value + CENTER;
+            let encoded = *value + V2_MODEL_VALUE_CENTER;
             u8::try_from(encoded)
                 .ok()
                 .filter(|byte| *byte <= 250)

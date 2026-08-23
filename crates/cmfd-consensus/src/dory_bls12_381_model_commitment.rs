@@ -26,6 +26,7 @@ const RECORD_DIGEST_DOMAIN: &str = "CommonFoundry/ForgeMatrix/BlsDoryModelCommit
 /// does not activate production consensus and must be independently reproduced
 /// before its digest is pinned by a network configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlsDoryModelCommitmentRecord {
     pub record_version: u16,
     pub padded_variables: u32,
@@ -413,11 +414,50 @@ mod tests {
 
         assert_eq!(first, second);
         let encoded = serde_json::to_vec_pretty(&first).unwrap();
+        assert_eq!(
+            first.record_digest,
+            "bfe12aebd5e3cb83f62101c741a0678c210b0f94c7860aaa9ea8c077e1abaf32"
+        );
+        assert_eq!(
+            first.fixed_model_identity_digest,
+            "219f2f597f11799e78fa440190babf9a8073c5ea6a87bb627a37fa358b085b14"
+        );
+        assert_eq!(encoded.len(), 7_851);
+        assert_eq!(
+            blake3::hash(&encoded).to_hex().as_str(),
+            "dd491e6f8f2f5d74ae7cd24f4844250d41f073be47b47244dde1c988cb080d0e"
+        );
         assert_eq!(encoded, serde_json::to_vec_pretty(&second).unwrap());
         let decoded: BlsDoryModelCommitmentRecord = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, first);
         decoded.validate(&setup).unwrap();
         first.validate(&setup).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        for path in ["record", "manifest", "model_pcs_identity"] {
+            let mut with_unknown = parsed.clone();
+            let object = match path {
+                "record" => with_unknown.as_object_mut().unwrap(),
+                nested => with_unknown
+                    .get_mut(nested)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap(),
+            };
+            object.insert("v2_only_field".into(), serde_json::Value::Bool(true));
+            assert!(
+                serde_json::from_value::<BlsDoryModelCommitmentRecord>(with_unknown).is_err(),
+                "unknown {path} field must fail closed"
+            );
+        }
+
+        let text = String::from_utf8(encoded.clone()).unwrap();
+        let duplicate = text.replacen(
+            "  \"record_version\": 1,",
+            "  \"record_version\": 1,\n  \"record_version\": 1,",
+            1,
+        );
+        assert!(serde_json::from_str::<BlsDoryModelCommitmentRecord>(&duplicate).is_err());
 
         let mut changed = first.clone();
         changed.base_input_bls_commitment.replace_range(0..2, "00");

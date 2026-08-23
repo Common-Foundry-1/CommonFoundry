@@ -58,7 +58,7 @@ pub const BLS_DORY_MATRIX_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the scalar matrix transcript, padding rule, and opening path have not received an external audit",
 ];
 
-const PROOF_MAGIC: [u8; 8] = *b"CFBLSM01";
+pub(crate) const PROOF_MAGIC: [u8; 8] = *b"CFBLSM01";
 const PROOF_HEADER_BYTES: usize = 20;
 const MAX_MATRIX_PROOF_BYTES: usize = 262_128;
 const MAX_MATRIX_BINDING_BYTES: usize = 4_096;

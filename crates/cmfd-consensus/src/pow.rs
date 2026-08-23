@@ -14,6 +14,7 @@ pub const POW_TYPE_V1_LEGACY: u16 = 1;
 pub const POW_TYPE_V2_REFERENCE: u16 = 2;
 /// Reserved wire identity for the fail-closed structured production candidate.
 pub const POW_TYPE_V3_CANDIDATE: u16 = 3;
+pub(crate) const FORGEMATRIX_V3_BLOCK_ID_PROOF_FIELDS: &str = "pow_type_u16le,algorithm_version_u32le,proof_version_u32le,nonce_u64le,model_manifest_digest[32],challenge_digest[32],final_activation_digest[32],work_digest[32],structured_length_u64le,structured_bytes";
 const PREVERIFIED_VERIFIER_DOMAIN: &str = "CMFD/POW/PREVERIFIED-VERIFIER/V1";
 const PREVERIFIED_STATEMENT_DOMAIN: &str = "CMFD/POW/PREVERIFIED-STATEMENT/V1";
 

@@ -65,7 +65,7 @@ pub const BLS_DORY_AGGREGATE_PRODUCTION_BLOCKERS: [&str; 3] = [
     "the replacement PCS and wire grammar have not received an external audit",
 ];
 
-const WIRE_MAGIC: [u8; 8] = *b"CFDBLS01";
+pub(crate) const WIRE_MAGIC: [u8; 8] = *b"CFDBLS01";
 const WIRE_HEADER_BYTES: usize = 18;
 const MAX_PUBLIC_BINDING_BYTES: usize = 4_096;
 const ROW_COMMIT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
@@ -4996,7 +4996,7 @@ fn dory_wire_bytes(rounds: usize) -> usize {
         + 2 * size_of::<u32>()
 }
 
-fn scalar_bytes() -> usize {
+pub(crate) fn scalar_bytes() -> usize {
     BlsDoryFr::zero().compressed_size()
 }
 

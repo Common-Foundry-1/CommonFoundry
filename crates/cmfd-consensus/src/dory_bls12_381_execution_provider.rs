@@ -24,7 +24,7 @@ use crate::{
     },
     dory_bls12_381_layout::signed_model_value,
     dory_bls12_381_transition::{BlsDoryTransitionError, derive_transition_regular_row_from_mask},
-    forgematrix_v2::{output_digest, work_digest_from_roots},
+    forgematrix_v2::{V2_MODEL_VALUE_CENTER, output_digest, work_digest_from_roots},
     model_bank::{
         ModelBankError, ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk,
         ModelPcsIdentity, ModelPcsRole, StagedModelFieldSink, VerifiedModelBankReceipt,
@@ -35,7 +35,6 @@ use crate::{
     },
 };
 
-const MODEL_VALUE_CENTER: i16 = 125;
 const MAX_TRANSITION_MASK: u64 = 5_000;
 
 /// Untrusted accelerator claim for one possible winning nonce.
@@ -264,7 +263,7 @@ impl<'a> WinningNonceReplaySink<'a> {
             layers: 1,
             rows,
             cols: columns,
-            max_abs_accumulator: u64::from(MODEL_VALUE_CENTER.unsigned_abs()),
+            max_abs_accumulator: u64::from(V2_MODEL_VALUE_CENTER.unsigned_abs()),
             max_mask: MAX_TRANSITION_MASK,
         };
         let transition_statement = StructuredTransitionStatement {
@@ -600,7 +599,7 @@ impl StagedModelFieldSink for WinningNonceReplaySink<'_> {
         let mut final_activation = reserved_vector(self.cells)?;
         for activation in &self.activations {
             let encoded = i16::from(*activation)
-                .checked_add(MODEL_VALUE_CENTER)
+                .checked_add(V2_MODEL_VALUE_CENTER)
                 .and_then(|value| u8::try_from(value).ok())
                 .filter(|value| *value <= 250)
                 .ok_or(BlsDoryWinningNonceReplayError::ModelShape)?;
@@ -871,7 +870,7 @@ mod tests {
         let expected_initial = fixture
             .base
             .iter()
-            .map(|value| i32::from(*value) - i32::from(MODEL_VALUE_CENTER))
+            .map(|value| i32::from(*value) - i32::from(V2_MODEL_VALUE_CENTER))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected_initial);
 

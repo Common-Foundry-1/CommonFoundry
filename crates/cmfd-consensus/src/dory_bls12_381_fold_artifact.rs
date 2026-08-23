@@ -118,22 +118,22 @@ impl BlsDoryFoldArtifactWriter {
             spec.generation,
             std::process::id(),
         ));
-        let mut file = OpenOptions::new()
+        let header = spec.encode()?;
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let header = spec.encode()?;
-        file.write_all(&header)?;
-        let mut hasher = blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN);
-        hasher.update(&header);
-        Ok(Self {
+        let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
             spec,
-            hasher,
+            hasher: blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN),
             written: 0,
-        })
+        };
+        writer.file_mut()?.write_all(&header)?;
+        writer.hasher.update(&header);
+        Ok(writer)
     }
 
     pub fn write_scalar(&mut self, scalar: &BlsDoryFr) -> Result<(), BlsDoryFoldArtifactError> {
@@ -316,13 +316,15 @@ fn artifact_file_bytes(scalar_count: u64) -> Result<u64, BlsDoryFoldArtifactErro
 }
 
 fn encode_scalar(scalar: &BlsDoryFr) -> Result<[u8; 32], BlsDoryFoldArtifactError> {
-    let mut encoded = Vec::with_capacity(ARTIFACT_SCALAR_BYTES);
+    let mut encoded = [0u8; ARTIFACT_SCALAR_BYTES];
+    let mut writer = Cursor::new(encoded.as_mut_slice());
     scalar
-        .serialize_compressed(&mut encoded)
+        .serialize_compressed(&mut writer)
         .map_err(|_| BlsDoryFoldArtifactError::InvalidScalar)?;
-    encoded
-        .try_into()
-        .map_err(|_| BlsDoryFoldArtifactError::InvalidScalar)
+    if writer.position() != ARTIFACT_SCALAR_BYTES as u64 {
+        return Err(BlsDoryFoldArtifactError::InvalidScalar);
+    }
+    Ok(encoded)
 }
 
 fn decode_scalar(encoded: [u8; 32]) -> Result<BlsDoryFr, BlsDoryFoldArtifactError> {
@@ -422,38 +424,62 @@ mod tests {
     }
 
     #[test]
-    fn buffered_batch_and_scalar_writes_are_byte_identical() {
+    fn buffered_batch_and_scalar_writes_are_byte_identical_across_boundaries() {
         let directory = TestDirectory::create();
-        let values = (0..32_768)
-            .map(|index| BlsDoryFr::from_u64(index * 17 + 5))
-            .collect::<Vec<_>>();
-        let artifact_spec = spec(u64::try_from(values.len()).unwrap());
+        let scalars_per_io_buffer = ARTIFACT_IO_BUFFER_BYTES / ARTIFACT_SCALAR_BYTES;
+        for count in [
+            1,
+            scalars_per_io_buffer - 1,
+            scalars_per_io_buffer,
+            scalars_per_io_buffer + 1,
+        ] {
+            let values = (0..count)
+                .map(|index| BlsDoryFr::from_u64((index as u64) * 17 + 5))
+                .collect::<Vec<_>>();
+            let mut artifact_spec = spec(u64::try_from(count.next_power_of_two()).unwrap());
+            artifact_spec.explicit_scalar_count = u64::try_from(count).unwrap();
 
-        let mut scalar_writer =
-            BlsDoryFoldArtifactWriter::create(&directory.0, artifact_spec).unwrap();
-        for value in &values {
-            scalar_writer.write_scalar(value).unwrap();
+            let mut scalar_writer =
+                BlsDoryFoldArtifactWriter::create(&directory.0, artifact_spec).unwrap();
+            for value in &values {
+                scalar_writer.write_scalar(value).unwrap();
+            }
+            let scalar_artifact = scalar_writer.finish().unwrap();
+
+            let mut batch_writer =
+                BlsDoryFoldArtifactWriter::create(&directory.0, artifact_spec).unwrap();
+            batch_writer.write_scalars(&values).unwrap();
+            let batch_artifact = batch_writer.finish().unwrap();
+
+            assert_eq!(batch_artifact.digest(), scalar_artifact.digest());
+            assert_eq!(
+                std::fs::read(batch_artifact.path()).unwrap(),
+                std::fs::read(scalar_artifact.path()).unwrap()
+            );
+            let mut decoded = Vec::with_capacity(values.len());
+            batch_artifact
+                .for_each_scalar(|scalar| {
+                    decoded.push(scalar);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(decoded, values);
         }
-        let scalar_artifact = scalar_writer.finish().unwrap();
+    }
 
-        let mut batch_writer =
-            BlsDoryFoldArtifactWriter::create(&directory.0, artifact_spec).unwrap();
-        batch_writer.write_scalars(&values).unwrap();
-        let batch_artifact = batch_writer.finish().unwrap();
-
-        assert_eq!(batch_artifact.digest(), scalar_artifact.digest());
-        assert_eq!(
-            std::fs::read(batch_artifact.path()).unwrap(),
-            std::fs::read(scalar_artifact.path()).unwrap()
-        );
-        let mut decoded = Vec::with_capacity(values.len());
-        batch_artifact
-            .for_each_scalar(|scalar| {
-                decoded.push(scalar);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(decoded, values);
+    #[test]
+    fn fixed_scalar_encoding_matches_canonical_serializer() {
+        for scalar in [
+            BlsDoryFr::zero(),
+            BlsDoryFr::one(),
+            BlsDoryFr::from_u64(u64::MAX),
+        ] {
+            let mut canonical = Vec::new();
+            scalar.serialize_compressed(&mut canonical).unwrap();
+            let encoded = encode_scalar(&scalar).unwrap();
+            assert_eq!(encoded.as_slice(), canonical.as_slice());
+            assert_eq!(decode_scalar(encoded).unwrap(), scalar);
+        }
     }
 
     #[test]
@@ -467,6 +493,7 @@ mod tests {
             writer.write_scalars(&too_many),
             Err(BlsDoryFoldArtifactError::InvalidArtifact)
         ));
+        assert_eq!(writer.written, 0);
         writer.write_scalars(&values).unwrap();
         let artifact = writer.finish().unwrap();
         let mut decoded = Vec::new();
@@ -477,6 +504,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn incomplete_finish_failure_publishes_nothing() {
+        let directory = TestDirectory::create();
+        let mut writer = BlsDoryFoldArtifactWriter::create(&directory.0, spec(4)).unwrap();
+        writer.write_scalar(&BlsDoryFr::one()).unwrap();
+        let path = writer.path.as_ref().unwrap().clone();
+        assert!(matches!(
+            writer.finish(),
+            Err(BlsDoryFoldArtifactError::InvalidArtifact)
+        ));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
     }
 
     #[test]

@@ -34,6 +34,48 @@ pub struct DoryV3TranscriptContext {
     model_record_digest: Digest32,
 }
 
+/// Opaque evidence that one V3 challenge digest was derived from an
+/// authenticated transcript context, one block challenge, and one nonce.
+///
+/// The private transcript context retains every model and network identity
+/// that was absorbed into the digest. Callers cannot construct this capability
+/// from raw digest bytes.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DoryV3ChallengeContext {
+    transcript_context: DoryV3TranscriptContext,
+    digest: [u8; 32],
+}
+
+impl DoryV3ChallengeContext {
+    /// Return the exact derived challenge digest.
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// Hash one canonical centered-byte activation under this exact challenge.
+    #[allow(dead_code)]
+    pub(crate) fn output_digest(
+        self,
+        activation: &[u8],
+    ) -> Result<[u8; 32], DoryV3TranscriptError> {
+        self.transcript_context
+            .output_digest(self.digest, activation)
+    }
+
+    /// Hash the V3 work fields under this exact challenge.
+    #[allow(dead_code)]
+    pub(crate) fn work_digest(self, final_activation_digest: [u8; 32]) -> [u8; 32] {
+        self.transcript_context
+            .work_digest(self.digest, final_activation_digest)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn transcript_context(self) -> DoryV3TranscriptContext {
+        self.transcript_context
+    }
+}
+
 impl DoryV3TranscriptContext {
     pub fn from_bank_authenticated_record(
         network_id: [u8; 32],
@@ -76,12 +118,13 @@ impl DoryV3TranscriptContext {
         self.model_record_digest
     }
 
-    /// Hash the exact challenge fields frozen by the V3 suite.
-    pub fn challenge_digest(
+    /// Derive a typed challenge capability from the exact fields frozen by the
+    /// V3 suite.
+    pub(crate) fn challenge_context(
         self,
         block: &BlockChallenge,
         nonce: u64,
-    ) -> Result<[u8; 32], DoryV3TranscriptError> {
+    ) -> Result<DoryV3ChallengeContext, DoryV3TranscriptError> {
         if block.network_id != self.network_id {
             return Err(DoryV3TranscriptError::WrongNetwork);
         }
@@ -99,7 +142,22 @@ impl DoryV3TranscriptContext {
         hasher.update(&block.timestamp.to_le_bytes());
         hasher.update(&block.target);
         hasher.update(&nonce.to_le_bytes());
-        Ok(*hasher.finalize().as_bytes())
+        Ok(DoryV3ChallengeContext {
+            transcript_context: self,
+            digest: *hasher.finalize().as_bytes(),
+        })
+    }
+
+    /// Hash the exact challenge fields frozen by the V3 suite.
+    ///
+    /// This raw-digest compatibility wrapper derives the same typed challenge
+    /// capability used by V3 artifact consumers and then returns its digest.
+    pub fn challenge_digest(
+        self,
+        block: &BlockChallenge,
+        nonce: u64,
+    ) -> Result<[u8; 32], DoryV3TranscriptError> {
+        Ok(self.challenge_context(block, nonce)?.digest())
     }
 
     /// Hash one canonical centered-byte final activation.
@@ -285,6 +343,37 @@ mod tests {
         ) -> Result<DoryV3TranscriptContext, DoryV3TranscriptError> =
             DoryV3TranscriptContext::from_bank_authenticated_record;
         let _ = constructor;
+    }
+
+    #[test]
+    fn typed_challenge_preserves_context_and_raw_digest_compatibility() {
+        let context = context();
+        let block = block();
+        let nonce = 0x2122_2324_2526_2728;
+        let typed = context.challenge_context(&block, nonce).unwrap();
+        assert_eq!(typed.transcript_context(), context);
+        assert_eq!(
+            typed.digest(),
+            context.challenge_digest(&block, nonce).unwrap()
+        );
+        assert_eq!(
+            hex::encode(typed.digest()),
+            "ad91a6d599cdf73e0bd2ec56fb23ad66d0d97ab14fead9b09607d374e52e2535"
+        );
+        let activation = production_activation();
+        let output = context.output_digest(typed.digest(), &activation).unwrap();
+        assert_eq!(typed.output_digest(&activation).unwrap(), output);
+        assert_eq!(
+            typed.work_digest(output),
+            context.work_digest(typed.digest(), output)
+        );
+
+        let mut wrong_network = block;
+        wrong_network.network_id[0] ^= 1;
+        assert!(matches!(
+            context.challenge_context(&wrong_network, nonce),
+            Err(DoryV3TranscriptError::WrongNetwork)
+        ));
     }
 
     #[test]

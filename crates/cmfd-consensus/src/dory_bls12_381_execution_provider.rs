@@ -23,7 +23,10 @@ use crate::{
         BlsDoryExecutionAccumulatorArtifactWriter, BlsDoryExecutionAccumulatorColumn,
     },
     dory_bls12_381_layout::signed_model_value,
+    dory_bls12_381_prototype::DeterministicBlsDorySetup,
     dory_bls12_381_transition::{BlsDoryTransitionError, derive_transition_regular_row_from_mask},
+    dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    dory_v3_transcript::DoryV3ChallengeContext,
     forgematrix_v2::{V2_MODEL_VALUE_CENTER, output_digest, work_digest_from_roots},
     model_bank::{
         ModelBankError, ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk,
@@ -36,6 +39,55 @@ use crate::{
 };
 
 const MAX_TRANSITION_MASK: u64 = 5_000;
+
+/// Opaque authority for one exact production V3 execution-artifact context.
+///
+/// A future V3 replay provider must reject a claimed output/work pair that
+/// does not derive under the typed challenge, and reject high work, before
+/// constructing this capability. After replay it must recompute the output and
+/// work digests before publishing a verified execution. The legacy raw context
+/// is retained privately and cannot be substituted at typed V3 call sites.
+/// The setup and exact production record were already validated when the
+/// non-constructible bank-authentication capability was minted.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct BlsDoryV3ExecutionAccumulatorArtifactContext {
+    raw: BlsDoryExecutionAccumulatorArtifactContext,
+}
+
+#[allow(dead_code)]
+impl BlsDoryV3ExecutionAccumulatorArtifactContext {
+    pub(crate) fn from_challenge(
+        challenge: DoryV3ChallengeContext,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryExecutionAccumulatorArtifactError> {
+        let record = authenticated.record();
+        let transcript = challenge.transcript_context();
+        if transcript.suite_digest() != record.suite_digest()
+            || transcript.manifest_digest() != record.manifest_digest()
+            || transcript.model_identity_digest() != record.model_identity_digest()
+            || transcript.model_record_digest() != record.record_digest()
+            || record.setup_identity().into_bytes() != setup.identity()
+            || usize::try_from(record.padded_variables()).ok() != Some(setup.max_log_n())
+        {
+            return Err(BlsDoryExecutionAccumulatorArtifactError::WrongContext);
+        }
+        Ok(Self {
+            raw: BlsDoryExecutionAccumulatorArtifactContext::production(
+                transcript.network_id(),
+                record.record_digest().into_bytes(),
+                setup.identity(),
+                challenge.digest(),
+            )?,
+        })
+    }
+
+    pub(crate) const fn raw(&self) -> &BlsDoryExecutionAccumulatorArtifactContext {
+        &self.raw
+    }
+}
 
 /// Untrusted accelerator claim for one possible winning nonce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -472,6 +472,14 @@ mod tests {
         dory_v3_transcript::{DoryV3TranscriptContext, DoryV3TranscriptError},
     };
 
+    #[cfg(feature = "whir-prototype")]
+    use crate::{
+        BlockChallenge,
+        dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorArtifactError,
+        dory_bls12_381_execution_provider::BlsDoryV3ExecutionAccumulatorArtifactContext,
+        dory_v3_transcript::DoryV3ChallengeContext,
+    };
+
     const VARIABLES: usize = 5;
     const MODEL_VERSION: u32 = 2;
     const BATCH: u32 = 2;
@@ -626,6 +634,18 @@ mod tests {
         )
     }
 
+    fn production_suite_fixture() -> Fixture {
+        let setup = deterministic_bls_dory_setup(VARIABLES).unwrap();
+        let (base_input, weight_banks) = actual_commitments(&setup);
+        fixture_with_commitments(
+            setup,
+            base_input,
+            weight_banks,
+            LAYERS_PER_BANK,
+            DORY_V3_PRODUCTION_SUITE_DIGEST.into_bytes(),
+        )
+    }
+
     fn derive_fixture(fixture: &Fixture) -> BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
         derive_with_reader(fixture, Cursor::new(&fixture.bytes)).unwrap()
     }
@@ -672,15 +692,7 @@ mod tests {
             Err(DoryV3TranscriptError::SuiteDigest)
         ));
 
-        let setup = deterministic_bls_dory_setup(VARIABLES).unwrap();
-        let (base_input, weight_banks) = actual_commitments(&setup);
-        let production_suite_fixture = fixture_with_commitments(
-            setup,
-            base_input,
-            weight_banks,
-            LAYERS_PER_BANK,
-            DORY_V3_PRODUCTION_SUITE_DIGEST.into_bytes(),
-        );
+        let production_suite_fixture = production_suite_fixture();
         let authenticated = derive_fixture(&production_suite_fixture);
         let record = authenticated.record();
         let context =
@@ -694,6 +706,79 @@ mod tests {
             record.model_identity_digest()
         );
         assert_eq!(context.model_record_digest(), record.record_digest());
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn typed_challenge_artifact_context_is_exact_and_rejects_substitution() {
+        let typed_constructor: fn(
+            DoryV3ChallengeContext,
+            &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            &DeterministicBlsDorySetup,
+        ) -> Result<
+            BlsDoryV3ExecutionAccumulatorArtifactContext,
+            BlsDoryExecutionAccumulatorArtifactError,
+        > = BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge;
+        let _ = typed_constructor;
+
+        let fixture = production_suite_fixture();
+        let authenticated = derive_fixture(&fixture);
+        let transcript =
+            DoryV3TranscriptContext::from_bank_authenticated_record([0x11; 32], &authenticated)
+                .unwrap();
+        let block = BlockChallenge {
+            network_id: [0x11; 32],
+            previous_block: [0x21; 32],
+            transaction_root: [0x22; 32],
+            height: 23,
+            timestamp: 24,
+            target: [0x25; 32],
+        };
+        let challenge = transcript.challenge_context(&block, 26).unwrap();
+
+        let typed = BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+            challenge,
+            &authenticated,
+            &fixture.setup,
+        )
+        .unwrap();
+        assert_eq!(typed.raw().network_identity(), block.network_id);
+        assert_eq!(
+            typed.raw().model_record_identity(),
+            authenticated.record().record_digest().into_bytes()
+        );
+        assert_eq!(typed.raw().setup_identity(), fixture.setup.identity());
+        assert_eq!(typed.raw().challenge_identity(), challenge.digest());
+
+        let mut changed_manifest = *authenticated.record().manifest();
+        changed_manifest.model_version += 1;
+        let mut changed_identity =
+            serde_json::to_value(authenticated.record().model_identity()).unwrap();
+        changed_identity["model_version"] = Value::from(changed_manifest.model_version);
+        let changed_identity = serde_json::from_value(changed_identity).unwrap();
+        let changed_record =
+            DoryV3ModelCommitmentRecordV2::new(changed_manifest, changed_identity).unwrap();
+        let changed_authenticated = BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
+            record: changed_record,
+        };
+        assert!(matches!(
+            BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+                challenge,
+                &changed_authenticated,
+                &fixture.setup,
+            ),
+            Err(BlsDoryExecutionAccumulatorArtifactError::WrongContext)
+        ));
+
+        let wrong_setup = deterministic_bls_dory_setup(VARIABLES + 1).unwrap();
+        assert!(matches!(
+            BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+                challenge,
+                &authenticated,
+                &wrong_setup,
+            ),
+            Err(BlsDoryExecutionAccumulatorArtifactError::WrongContext)
+        ));
     }
 
     #[test]
@@ -1053,13 +1138,13 @@ mod tests {
             .model_identity()
             .validate_production_structure(pinned.manifest(), &setup)
             .unwrap();
-        let first = derive_bank_authenticated_dory_v3_model_commitment_record_v2(
+        let first_authenticated = derive_bank_authenticated_dory_v3_model_commitment_record_v2(
             File::open(&bank_path).unwrap(),
             &structural,
             &setup,
         )
-        .unwrap()
-        .into_record();
+        .unwrap();
+        let first = first_authenticated.record().clone();
         let second = derive_bank_authenticated_dory_v3_model_commitment_record_v2(
             File::open(bank_path).unwrap(),
             &structural,
@@ -1069,5 +1154,37 @@ mod tests {
         .into_record();
         assert_eq!(first, second);
         assert_eq!(first, pinned);
+
+        #[cfg(feature = "whir-prototype")]
+        {
+            let network_id = [0x31; 32];
+            let transcript = DoryV3TranscriptContext::from_bank_authenticated_record(
+                network_id,
+                &first_authenticated,
+            )
+            .unwrap();
+            let block = BlockChallenge {
+                network_id,
+                previous_block: [0x32; 32],
+                transaction_root: [0x33; 32],
+                height: 34,
+                timestamp: 35,
+                target: [0xff; 32],
+            };
+            let challenge = transcript.challenge_context(&block, 36).unwrap();
+            let typed = BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+                challenge,
+                &first_authenticated,
+                &setup,
+            )
+            .unwrap();
+            assert_eq!(typed.raw().network_identity(), network_id);
+            assert_eq!(
+                typed.raw().model_record_identity(),
+                first.record_digest().into_bytes()
+            );
+            assert_eq!(typed.raw().setup_identity(), setup.identity());
+            assert_eq!(typed.raw().challenge_identity(), challenge.digest());
+        }
     }
 }

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+use cmfd_consensus::dory_bls12_381_blake3::derive_bls_dory_blake3_preprocessing_record;
 use cmfd_consensus::forgematrix::CANDIDATE_16GB_PROFILE;
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
@@ -72,6 +74,16 @@ enum Command {
         /// Fixed-table geometry and deterministic setup size.
         #[arg(long, default_value_t = 33)]
         padded_variables: usize,
+        /// New JSON record path; omit for stdout. Existing files are never overwritten.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
+    /// Derive the reproducible production BLAKE3 preprocessing-only BLS record.
+    #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+    BlsBlake3PreprocessingCommitment {
+        /// Existing absolute directory for owned temporary artifacts.
+        #[arg(long)]
+        scratch: std::path::PathBuf,
         /// New JSON record path; omit for stdout. Existing files are never overwritten.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
@@ -181,6 +193,54 @@ fn main() -> Result<()> {
                     .with_context(|| format!("failed to write {}", output.display()))?;
                 file.sync_all()
                     .with_context(|| format!("failed to sync {}", output.display()))?;
+                println!("wrote {}", output.display());
+                println!("record digest {}", record.record_digest);
+            } else {
+                print!("{}", String::from_utf8(encoded)?);
+            }
+        }
+        #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+        Command::BlsBlake3PreprocessingCommitment { scratch, output } => {
+            if let Some(output) = &output {
+                match std::fs::symlink_metadata(output) {
+                    Ok(_) => anyhow::bail!(
+                        "refusing to run the ceremony because output already exists: {}",
+                        output.display()
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to inspect output path {}", output.display())
+                        });
+                    }
+                }
+            }
+            let record = derive_bls_dory_blake3_preprocessing_record(&scratch)
+                .context("failed to derive production BLAKE3 preprocessing commitment")?;
+            let mut encoded = serde_json::to_vec_pretty(&record)?;
+            encoded.push(b'\n');
+            if let Some(output) = output {
+                use std::io::Write as _;
+
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&output)
+                    .with_context(|| {
+                        format!("failed to create new output file {}", output.display())
+                    })?;
+                file.write_all(&encoded).with_context(|| {
+                    format!(
+                        "failed to write {}; the newly created output may be incomplete",
+                        output.display()
+                    )
+                })?;
+                file.sync_all().with_context(|| {
+                    format!(
+                        "failed to sync {}; the newly created output may be incomplete",
+                        output.display()
+                    )
+                })?;
                 println!("wrote {}", output.display());
                 println!("record digest {}", record.record_digest);
             } else {

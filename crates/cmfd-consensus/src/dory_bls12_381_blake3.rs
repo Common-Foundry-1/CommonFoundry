@@ -17,6 +17,8 @@ use std::io::Cursor;
 
 use dory_pcs::primitives::arithmetic::Field as DoryField;
 #[cfg(feature = "whir-prototype")]
+use dory_pcs::primitives::arithmetic::Group as DoryGroup;
+#[cfg(feature = "whir-prototype")]
 use dory_pcs::primitives::transcript::Transcript;
 #[cfg(feature = "whir-prototype")]
 use dory_pcs::primitives::{
@@ -29,8 +31,12 @@ use p3_air::symbolic::{
 };
 #[cfg(feature = "whir-prototype")]
 use p3_field::PrimeField64;
+#[cfg(feature = "whir-prototype")]
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(feature = "whir-prototype")]
+use crate::dory_bls12_381_compact_artifact::BlsDoryCompactArtifactError;
 #[cfg(feature = "whir-prototype")]
 use crate::dory_bls12_381_prototype::BlsDoryTranscript;
 use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt};
@@ -42,13 +48,16 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateLayout, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
         BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
-        commit_bls_dory_compact_row_source_with_scratch,
+        commit_bls_dory_compact_row_source_with_scratch, source_artifact_spec,
     },
     dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
-    dory_bls12_381_prototype::DeterministicBlsDorySetup,
+    dory_bls12_381_prototype::{
+        BlsDoryPrototypeError, DeterministicBlsDorySetup, deterministic_bls_dory_setup,
+    },
     dory_bls12_381_transpose::{
         BlsDoryTransposeError, BlsDoryWordTransposeArtifact, BlsDoryWordTransposeWriter,
     },
+    structured_blake3_identity::{pinned_preprocessed_key, pinned_preprocessed_registry_digest},
     structured_blake3_narrow::{
         F as Goldilocks, NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START, NARROW_BLAKE3_MAIN_WIDTH,
         NARROW_BLAKE3_ORIGINAL_NIBBLES_START, NARROW_BLAKE3_PREPROCESSED_WIDTH,
@@ -94,6 +103,10 @@ pub const BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES: usize = 31;
 pub const BLS_DORY_BLAKE3_SOURCE_DORY_NU: usize = BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES;
 /// Dory columns address the twenty low-order trace-row variables.
 pub const BLS_DORY_BLAKE3_SOURCE_DORY_SIGMA: usize = BLS_DORY_BLAKE3_TRACE_VARIABLES;
+/// Shared production aggregate rows address sixteen variables.
+pub const BLS_DORY_BLAKE3_SHARED_DORY_NU: usize = 16;
+/// Shared production aggregate columns address seventeen variables.
+pub const BLS_DORY_BLAKE3_SHARED_DORY_SIGMA: usize = 17;
 /// Ordinary main columns, excluding the native full-field accumulator, for local and next rows.
 pub const BLS_DORY_BLAKE3_SIGNED_WORD_TABLES: usize = 2 * (BLS_DORY_BLAKE3_MAIN_WIDTH - 1);
 /// Local and next native accumulators require canonical full-field scalars.
@@ -1130,6 +1143,10 @@ const _: () = {
             == BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES
     );
     assert!(
+        BLS_DORY_BLAKE3_SHARED_DORY_NU + BLS_DORY_BLAKE3_SHARED_DORY_SIGMA
+            == BLS_DORY_SHARED_PRODUCTION_VARIABLES
+    );
+    assert!(
         BLS_DORY_BLAKE3_SIGNED_WORD_TABLES
             + BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES
             + BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
@@ -1155,6 +1172,409 @@ pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the public shared aggregate parser intentionally remains capped at 128; only the version-2 top-level candidate route reaches the specialized exact-134 verifier after deriving the native six-claim suffix from opaque replay, so unrelated callers cannot widen the aggregate boundary",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
+
+/// Version of the reproducible native-BLAKE3 preprocessing commitment record.
+#[cfg(feature = "whir-prototype")]
+pub const BLS_DORY_BLAKE3_PREPROCESSING_RECORD_VERSION: u16 = 1;
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_PREPROCESSING_RECORD_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/BlsDoryBlake3PreprocessingRecord/v1";
+
+/// Auditable output of the deterministic production preprocessing-only job.
+///
+/// This record is a reproducibility artifact, not a consensus registry entry.
+/// Producing or validating it does not enable the production verifier pin.
+#[cfg(feature = "whir-prototype")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlsDoryBlake3PreprocessingRecord {
+    pub record_version: u16,
+    pub projection_version: u16,
+    pub native_proof_version: u16,
+    pub activation_len: u64,
+    pub cell_point_variables: u32,
+    pub trace_rows: u64,
+    pub preprocessed_width: u32,
+    pub preprocessed_word_tables: u32,
+    pub preprocessed_code_tables: u32,
+    pub preprocessing_terminal_count: u32,
+    pub trace_variables: u32,
+    pub source_variables: u32,
+    pub shared_variables: u32,
+    pub dory_nu: u32,
+    pub dory_sigma: u32,
+    pub setup_max_log_n: u32,
+    pub setup_identity: String,
+    pub preprocessing_bls_commitment: String,
+    pub transpose_digest: String,
+    pub transpose_bytes: u64,
+    pub compact_artifact_context_digest: String,
+    pub compact_artifact_digest: String,
+    pub compact_artifact_bytes: u64,
+    pub compact_scalar_count: u64,
+    pub compact_explicit_scalar_count: u64,
+    pub compact_word_scalar_count: u64,
+    pub compact_word_bytes: u8,
+    pub compact_code_bits: u8,
+    pub compact_word_width_codes: u64,
+    pub compact_word_group_len: u64,
+    pub compact_signed_word_selectors: u64,
+    pub fri_preprocessed_registry_digest: String,
+    pub fri_preprocessed_root: [String; 4],
+    pub record_digest: String,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryBlake3PreprocessingRecord {
+    /// Validate canonical encodings and every production geometry constant.
+    ///
+    /// This is a self-consistency check. Trusting the resulting record still
+    /// requires independent reproduction before a future consensus registry
+    /// pins its digest.
+    pub fn validate(&self) -> Result<(), BlsDoryBlake3PreprocessingRecordError> {
+        let expected_terminal_count =
+            BLS_DORY_BLAKE3_SOURCE_TERMINALS[BlsDoryBlake3SourceRole::Preprocessing.index()];
+        let expected_explicit_scalars = expected_terminal_count
+            .checked_mul(BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS)
+            .ok_or(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "compact explicit scalar count",
+            ))?;
+        let expected_word_scalars = BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+            .checked_mul(BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS)
+            .ok_or(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "compact word scalar count",
+            ))?;
+        let expected_scalar_count = 1_u64
+            .checked_shl(BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32)
+            .ok_or(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "compact scalar count",
+            ))?;
+        if self.record_version != BLS_DORY_BLAKE3_PREPROCESSING_RECORD_VERSION
+            || self.projection_version != BLS_DORY_BLAKE3_PROJECTION_VERSION
+            || self.native_proof_version != BLS_DORY_BLAKE3_NATIVE_PROOF_VERSION
+            || self.activation_len != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES as u64
+            || self.cell_point_variables != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES.ilog2()
+            || self.trace_rows != BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS as u64
+            || self.preprocessed_width != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH as u32
+            || self.preprocessed_word_tables != BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES as u32
+            || self.preprocessed_code_tables != BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES as u32
+            || self.preprocessing_terminal_count != expected_terminal_count as u32
+            || self.trace_variables != BLS_DORY_BLAKE3_TRACE_VARIABLES as u32
+            || self.source_variables != BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES as u32
+            || self.shared_variables != BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32
+            || self.dory_nu != BLS_DORY_BLAKE3_SHARED_DORY_NU as u32
+            || self.dory_sigma != BLS_DORY_BLAKE3_SHARED_DORY_SIGMA as u32
+            || self.setup_max_log_n != BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32
+            || self.compact_scalar_count != expected_scalar_count
+            || self.compact_explicit_scalar_count != expected_explicit_scalars as u64
+            || self.compact_word_scalar_count != expected_word_scalars as u64
+            || self.compact_word_bytes != 8
+            || self.compact_code_bits != 4
+            || self.compact_word_width_codes != 0
+            || self.compact_word_group_len != BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS as u64
+            || self.compact_signed_word_selectors != 0
+        {
+            return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "production geometry",
+            ));
+        }
+
+        let setup_identity = decode_blake3_record_hex_32("setup identity", &self.setup_identity)?;
+        if setup_identity == [0; 32] {
+            return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "setup identity",
+            ));
+        }
+        let preprocessing_commitment =
+            decode_blake3_record_commitment(&self.preprocessing_bls_commitment)?;
+        if preprocessing_commitment == BlsDoryGt::identity() {
+            return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "preprocessing BLS commitment",
+            ));
+        }
+        let _ = decode_blake3_record_hex_32("transpose digest", &self.transpose_digest)?;
+        let compact_spec = self.compact_artifact_spec()?;
+        let expected_source_spec = source_artifact_spec(
+            setup_identity,
+            BLS_DORY_BLAKE3_SHARED_DORY_NU,
+            BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
+            usize::try_from(expected_scalar_count).map_err(|_| {
+                BlsDoryBlake3PreprocessingRecordError::InvalidMetadata("compact scalar count")
+            })?,
+            expected_explicit_scalars,
+        )?;
+        if compact_spec.context_digest != expected_source_spec.context_digest {
+            return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "compact artifact context",
+            ));
+        }
+        let _ =
+            decode_blake3_record_hex_32("compact artifact digest", &self.compact_artifact_digest)?;
+        let expected_transpose_bytes = projected_bls_dory_transpose_artifact_bytes(
+            BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+            BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+        )?;
+        if self.transpose_bytes != expected_transpose_bytes
+            || self.compact_artifact_bytes != compact_spec.encoded_bytes(2)?
+        {
+            return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "artifact bytes",
+            ));
+        }
+
+        let fri_key = pinned_preprocessed_key(
+            BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES,
+            BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+        )
+        .ok_or(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+            "FRI preprocessing key",
+        ))?;
+        require_blake3_record_digest(
+            "FRI registry",
+            pinned_preprocessed_registry_digest(),
+            &self.fri_preprocessed_registry_digest,
+        )?;
+        if self.decoded_fri_preprocessed_root()? != fri_key.root {
+            return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "FRI preprocessing root",
+            ));
+        }
+        require_blake3_record_digest("record", self.canonical_digest()?, &self.record_digest)
+    }
+
+    /// Validate the record against the exact deterministic setup used to derive it.
+    pub fn validate_for_setup(
+        &self,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<(), BlsDoryBlake3PreprocessingRecordError> {
+        self.validate()?;
+        setup.validate()?;
+        if setup.max_log_n() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
+            || decode_blake3_record_hex_32("setup identity", &self.setup_identity)?
+                != setup.identity()
+        {
+            return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "deterministic setup",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Canonical digest independent of JSON map ordering and whitespace.
+    pub fn canonical_digest(&self) -> Result<[u8; 32], BlsDoryBlake3PreprocessingRecordError> {
+        let setup_identity = decode_blake3_record_hex_32("setup identity", &self.setup_identity)?;
+        let commitment = decode_blake3_record_commitment_bytes(
+            "preprocessing BLS commitment",
+            &self.preprocessing_bls_commitment,
+        )?;
+        let transpose_digest =
+            decode_blake3_record_hex_32("transpose digest", &self.transpose_digest)?;
+        let compact_context = decode_blake3_record_hex_32(
+            "compact artifact context",
+            &self.compact_artifact_context_digest,
+        )?;
+        let compact_digest =
+            decode_blake3_record_hex_32("compact artifact digest", &self.compact_artifact_digest)?;
+        let fri_registry =
+            decode_blake3_record_hex_32("FRI registry", &self.fri_preprocessed_registry_digest)?;
+
+        let mut hasher =
+            blake3::Hasher::new_derive_key(BLS_DORY_BLAKE3_PREPROCESSING_RECORD_DOMAIN);
+        hasher.update(&self.record_version.to_le_bytes());
+        hasher.update(&self.projection_version.to_le_bytes());
+        hasher.update(&self.native_proof_version.to_le_bytes());
+        hasher.update(&self.activation_len.to_le_bytes());
+        hasher.update(&self.cell_point_variables.to_le_bytes());
+        hasher.update(&self.trace_rows.to_le_bytes());
+        hasher.update(&self.preprocessed_width.to_le_bytes());
+        hasher.update(&self.preprocessed_word_tables.to_le_bytes());
+        hasher.update(&self.preprocessed_code_tables.to_le_bytes());
+        hasher.update(&self.preprocessing_terminal_count.to_le_bytes());
+        hasher.update(&self.trace_variables.to_le_bytes());
+        hasher.update(&self.source_variables.to_le_bytes());
+        hasher.update(&self.shared_variables.to_le_bytes());
+        hasher.update(&self.dory_nu.to_le_bytes());
+        hasher.update(&self.dory_sigma.to_le_bytes());
+        hasher.update(&self.setup_max_log_n.to_le_bytes());
+        hasher.update(&setup_identity);
+        absorb_blake3_record_bytes(&mut hasher, &commitment)?;
+        hasher.update(&transpose_digest);
+        hasher.update(&self.transpose_bytes.to_le_bytes());
+        hasher.update(&compact_context);
+        hasher.update(&compact_digest);
+        hasher.update(&self.compact_artifact_bytes.to_le_bytes());
+        hasher.update(&self.compact_scalar_count.to_le_bytes());
+        hasher.update(&self.compact_explicit_scalar_count.to_le_bytes());
+        hasher.update(&self.compact_word_scalar_count.to_le_bytes());
+        hasher.update(&[self.compact_word_bytes]);
+        hasher.update(&[self.compact_code_bits]);
+        hasher.update(&self.compact_word_width_codes.to_le_bytes());
+        hasher.update(&self.compact_word_group_len.to_le_bytes());
+        hasher.update(&self.compact_signed_word_selectors.to_le_bytes());
+        hasher.update(&fri_registry);
+        for word in self.decoded_fri_preprocessed_root()? {
+            hasher.update(&word.to_le_bytes());
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn decoded_fri_preprocessed_root(
+        &self,
+    ) -> Result<[u64; 4], BlsDoryBlake3PreprocessingRecordError> {
+        let mut decoded = [0_u64; 4];
+        for (target, encoded) in decoded.iter_mut().zip(&self.fri_preprocessed_root) {
+            if encoded.len() != 16 {
+                return Err(BlsDoryBlake3PreprocessingRecordError::InvalidHex(
+                    "FRI preprocessing root",
+                ));
+            }
+            let value = u64::from_str_radix(encoded, 16).map_err(|_| {
+                BlsDoryBlake3PreprocessingRecordError::InvalidHex("FRI preprocessing root")
+            })?;
+            if format!("{value:016x}") != *encoded {
+                return Err(BlsDoryBlake3PreprocessingRecordError::InvalidHex(
+                    "FRI preprocessing root",
+                ));
+            }
+            *target = value;
+        }
+        Ok(decoded)
+    }
+
+    fn compact_artifact_spec(
+        &self,
+    ) -> Result<BlsDoryCompactArtifactSpec, BlsDoryBlake3PreprocessingRecordError> {
+        Ok(BlsDoryCompactArtifactSpec {
+            context_digest: decode_blake3_record_hex_32(
+                "compact artifact context",
+                &self.compact_artifact_context_digest,
+            )?,
+            scalar_count: self.compact_scalar_count,
+            explicit_scalar_count: self.compact_explicit_scalar_count,
+            word_scalar_count: self.compact_word_scalar_count,
+            word_bytes: self.compact_word_bytes,
+            code_bits: self.compact_code_bits,
+            word_width_codes: self.compact_word_width_codes,
+            word_group_len: self.compact_word_group_len,
+            signed_word_selectors: self.compact_signed_word_selectors,
+        })
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Debug, Error)]
+pub enum BlsDoryBlake3PreprocessingRecordError {
+    #[error("native BLAKE3 preprocessing record metadata is invalid: {0}")]
+    InvalidMetadata(&'static str),
+    #[error("native BLAKE3 preprocessing record hex is noncanonical: {0}")]
+    InvalidHex(&'static str),
+    #[error("native BLAKE3 preprocessing record digest mismatch: {0}")]
+    DigestMismatch(&'static str),
+    #[error("native BLAKE3 preprocessing commitment serialization failed: {0}")]
+    CommitmentSerialization(String),
+    #[error("deterministic BLS setup derivation failed: {0}")]
+    Setup(#[from] BlsDoryPrototypeError),
+    #[error("native BLAKE3 preprocessing aggregate failed: {0}")]
+    Aggregate(#[from] BlsDoryAggregateError),
+    #[error("native BLAKE3 preprocessing transpose failed: {0}")]
+    Transpose(#[from] BlsDoryTransposeError),
+    #[error("native BLAKE3 compact artifact validation failed: {0}")]
+    CompactArtifact(#[from] BlsDoryCompactArtifactError),
+    #[error("native BLAKE3 AIR construction failed: {0}")]
+    Air(String),
+}
+
+#[cfg(feature = "whir-prototype")]
+fn require_blake3_record_digest(
+    label: &'static str,
+    expected: [u8; 32],
+    encoded: &str,
+) -> Result<(), BlsDoryBlake3PreprocessingRecordError> {
+    if decode_blake3_record_hex_32(label, encoded)? != expected {
+        return Err(BlsDoryBlake3PreprocessingRecordError::DigestMismatch(label));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn decode_blake3_record_hex_32(
+    label: &'static str,
+    encoded: &str,
+) -> Result<[u8; 32], BlsDoryBlake3PreprocessingRecordError> {
+    let bytes = decode_blake3_record_hex(label, encoded)?;
+    bytes
+        .try_into()
+        .map_err(|_| BlsDoryBlake3PreprocessingRecordError::InvalidHex(label))
+}
+
+#[cfg(feature = "whir-prototype")]
+fn decode_blake3_record_hex(
+    label: &'static str,
+    encoded: &str,
+) -> Result<Vec<u8>, BlsDoryBlake3PreprocessingRecordError> {
+    let bytes = hex::decode(encoded)
+        .map_err(|_| BlsDoryBlake3PreprocessingRecordError::InvalidHex(label))?;
+    if hex::encode(&bytes) != encoded {
+        return Err(BlsDoryBlake3PreprocessingRecordError::InvalidHex(label));
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn encode_blake3_record_commitment(
+    commitment: &BlsDoryGt,
+) -> Result<String, BlsDoryBlake3PreprocessingRecordError> {
+    let mut encoded = Vec::new();
+    commitment
+        .serialize_compressed(&mut encoded)
+        .map_err(|error| {
+            BlsDoryBlake3PreprocessingRecordError::CommitmentSerialization(error.to_string())
+        })?;
+    Ok(hex::encode(encoded))
+}
+
+#[cfg(feature = "whir-prototype")]
+fn decode_blake3_record_commitment_bytes(
+    label: &'static str,
+    encoded: &str,
+) -> Result<Vec<u8>, BlsDoryBlake3PreprocessingRecordError> {
+    if encoded.len() != GT_BYTES * 2 {
+        return Err(BlsDoryBlake3PreprocessingRecordError::InvalidHex(label));
+    }
+    decode_blake3_record_hex(label, encoded)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn decode_blake3_record_commitment(
+    encoded: &str,
+) -> Result<BlsDoryGt, BlsDoryBlake3PreprocessingRecordError> {
+    let bytes = decode_blake3_record_commitment_bytes("preprocessing BLS commitment", encoded)?;
+    let mut cursor = Cursor::new(bytes.as_slice());
+    let commitment = BlsDoryGt::deserialize_compressed(&mut cursor).map_err(|error| {
+        BlsDoryBlake3PreprocessingRecordError::CommitmentSerialization(error.to_string())
+    })?;
+    if cursor.position() != bytes.len() as u64
+        || encode_blake3_record_commitment(&commitment)? != encoded
+    {
+        return Err(BlsDoryBlake3PreprocessingRecordError::InvalidHex(
+            "preprocessing BLS commitment",
+        ));
+    }
+    Ok(commitment)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn absorb_blake3_record_bytes(
+    hasher: &mut blake3::Hasher,
+    bytes: &[u8],
+) -> Result<(), BlsDoryBlake3PreprocessingRecordError> {
+    let len = u64::try_from(bytes.len()).map_err(|_| {
+        BlsDoryBlake3PreprocessingRecordError::InvalidMetadata("encoded byte length")
+    })?;
+    hasher.update(&len.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
 
 /// Executable algebraic union bound for the shared proof plus BLAKE3 replacement.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3049,8 +3469,13 @@ pub(crate) fn verify_native_blake3_opening_statement(
     if bridge.final_activation_len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    let verifier_context =
-        BlsDoryBlake3VerifierContext::new(BlsDoryAggregateLayout::new(16, 17)?, setup)?;
+    let verifier_context = BlsDoryBlake3VerifierContext::new(
+        BlsDoryAggregateLayout::new(
+            BLS_DORY_BLAKE3_SHARED_DORY_NU,
+            BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
+        )?,
+        setup,
+    )?;
     let preprocessing_pin = native_blake3_production_preprocessing_pin()
         .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
     let replay = verify_native_blake3_opening_replay_at_geometry(
@@ -3531,6 +3956,113 @@ fn create_native_preprocessed_transpose(
     writer.finish().map_err(blake3_transpose_error)
 }
 
+/// Derive the deterministic production preprocessing commitment without
+/// constructing any witness-dependent native BLAKE3 source.
+///
+/// The returned record is deliberately not installed as a verifier pin. Every
+/// scratch artifact created by this job remains owned by its RAII wrapper and
+/// is removed on success or error.
+#[cfg(feature = "whir-prototype")]
+pub fn derive_bls_dory_blake3_preprocessing_record(
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryBlake3PreprocessingRecord, BlsDoryBlake3PreprocessingRecordError> {
+    if !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
+        return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+            "scratch directory",
+        ));
+    }
+
+    let setup = deterministic_bls_dory_setup(BLS_DORY_SHARED_PRODUCTION_VARIABLES)?;
+    let layout = BlsDoryAggregateLayout::new(
+        BLS_DORY_BLAKE3_SHARED_DORY_NU,
+        BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
+    )?;
+    let zero = ExtensionElement { limbs: [0; 3] };
+    let statement = StructuredBlake3Statement {
+        challenge_digest: [0; 32],
+        final_activation_len: BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES,
+        final_activation_digest: [0; 32],
+        final_activation_point: vec![
+            zero;
+            BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES.ilog2() as usize
+        ],
+        final_activation_evaluation: zero,
+    };
+    let air = NarrowBlake3Air::new(&statement)
+        .map_err(|error| BlsDoryBlake3PreprocessingRecordError::Air(error.to_string()))?;
+    if air.trace_rows() != BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS {
+        return Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+            "AIR trace rows",
+        ));
+    }
+    validate_native_blake3_source_layout(air.trace_rows(), layout, &setup)?;
+
+    let mut transpose = create_native_preprocessed_transpose(&air, scratch_directory)?;
+    let transpose_digest = transpose.digest();
+    let transpose_bytes = transpose.file_bytes()?;
+    let preprocessing = {
+        let mut source = TransposedPreprocessedRowSource::new_for_layout(&mut transpose, layout)?;
+        commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            layout.nu(),
+            layout.sigma(),
+            &setup,
+            scratch_directory,
+        )?
+    };
+    let (compact_spec, compact_artifact_digest, compact_artifact_bytes) =
+        preprocessing.compact_artifact_audit_metadata()?;
+    let fri_key = pinned_preprocessed_key(
+        BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES,
+        BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+    )
+    .ok_or(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+        "FRI preprocessing key",
+    ))?;
+
+    let mut record = BlsDoryBlake3PreprocessingRecord {
+        record_version: BLS_DORY_BLAKE3_PREPROCESSING_RECORD_VERSION,
+        projection_version: BLS_DORY_BLAKE3_PROJECTION_VERSION,
+        native_proof_version: BLS_DORY_BLAKE3_NATIVE_PROOF_VERSION,
+        activation_len: BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES as u64,
+        cell_point_variables: BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES.ilog2(),
+        trace_rows: BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS as u64,
+        preprocessed_width: BLS_DORY_BLAKE3_PREPROCESSED_WIDTH as u32,
+        preprocessed_word_tables: BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES as u32,
+        preprocessed_code_tables: BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES as u32,
+        preprocessing_terminal_count: BLS_DORY_BLAKE3_SOURCE_TERMINALS
+            [BlsDoryBlake3SourceRole::Preprocessing.index()]
+            as u32,
+        trace_variables: BLS_DORY_BLAKE3_TRACE_VARIABLES as u32,
+        source_variables: BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES as u32,
+        shared_variables: BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32,
+        dory_nu: layout.nu() as u32,
+        dory_sigma: layout.sigma() as u32,
+        setup_max_log_n: setup.max_log_n() as u32,
+        setup_identity: hex::encode(setup.identity()),
+        preprocessing_bls_commitment: encode_blake3_record_commitment(&preprocessing.commitment())?,
+        transpose_digest: hex::encode(transpose_digest),
+        transpose_bytes,
+        compact_artifact_context_digest: hex::encode(compact_spec.context_digest),
+        compact_artifact_digest: hex::encode(compact_artifact_digest),
+        compact_artifact_bytes,
+        compact_scalar_count: compact_spec.scalar_count,
+        compact_explicit_scalar_count: compact_spec.explicit_scalar_count,
+        compact_word_scalar_count: compact_spec.word_scalar_count,
+        compact_word_bytes: compact_spec.word_bytes,
+        compact_code_bits: compact_spec.code_bits,
+        compact_word_width_codes: compact_spec.word_width_codes,
+        compact_word_group_len: compact_spec.word_group_len,
+        compact_signed_word_selectors: compact_spec.signed_word_selectors,
+        fri_preprocessed_registry_digest: hex::encode(pinned_preprocessed_registry_digest()),
+        fri_preprocessed_root: fri_key.root.map(|word| format!("{word:016x}")),
+        record_digest: String::new(),
+    };
+    record.record_digest = hex::encode(record.canonical_digest()?);
+    record.validate_for_setup(&setup)?;
+    Ok(record)
+}
+
 #[cfg(feature = "whir-prototype")]
 fn commit_native_blake3_sources_at_layout(
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
@@ -3633,8 +4165,8 @@ fn commit_native_blake3_sources(
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     let layout = BlsDoryAggregateLayout::new(
-        BLS_DORY_SHARED_PRODUCTION_VARIABLES / 2,
-        BLS_DORY_SHARED_PRODUCTION_VARIABLES - BLS_DORY_SHARED_PRODUCTION_VARIABLES / 2,
+        BLS_DORY_BLAKE3_SHARED_DORY_NU,
+        BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
     )?;
     commit_native_blake3_sources_at_layout(witness, bridge, layout, setup, scratch_directory)
 }
@@ -4036,6 +4568,255 @@ mod tests {
 
     #[cfg(feature = "whir-prototype")]
     static BLAKE3_SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(feature = "whir-prototype")]
+    fn bounded_preprocessing_record_fixture() -> BlsDoryBlake3PreprocessingRecord {
+        let terminal_count =
+            BLS_DORY_BLAKE3_SOURCE_TERMINALS[BlsDoryBlake3SourceRole::Preprocessing.index()];
+        let setup_identity = [0xab; 32];
+        let scalar_count = 1usize << BLS_DORY_SHARED_PRODUCTION_VARIABLES;
+        let explicit_scalar_count = terminal_count * BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS;
+        let source_spec = source_artifact_spec(
+            setup_identity,
+            BLS_DORY_BLAKE3_SHARED_DORY_NU,
+            BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
+            scalar_count,
+            explicit_scalar_count,
+        )
+        .unwrap();
+        let compact_spec = BlsDoryCompactArtifactSpec {
+            context_digest: source_spec.context_digest,
+            scalar_count: scalar_count as u64,
+            explicit_scalar_count: explicit_scalar_count as u64,
+            word_scalar_count: (BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+                * BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS) as u64,
+            word_bytes: 8,
+            code_bits: 4,
+            word_width_codes: 0,
+            word_group_len: BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS as u64,
+            signed_word_selectors: 0,
+        };
+        let fri_key = pinned_preprocessed_key(
+            BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES,
+            BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+        )
+        .unwrap();
+        let mut record = BlsDoryBlake3PreprocessingRecord {
+            record_version: BLS_DORY_BLAKE3_PREPROCESSING_RECORD_VERSION,
+            projection_version: BLS_DORY_BLAKE3_PROJECTION_VERSION,
+            native_proof_version: BLS_DORY_BLAKE3_NATIVE_PROOF_VERSION,
+            activation_len: BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES as u64,
+            cell_point_variables: BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES.ilog2(),
+            trace_rows: BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS as u64,
+            preprocessed_width: BLS_DORY_BLAKE3_PREPROCESSED_WIDTH as u32,
+            preprocessed_word_tables: BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES as u32,
+            preprocessed_code_tables: BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES as u32,
+            preprocessing_terminal_count: terminal_count as u32,
+            trace_variables: BLS_DORY_BLAKE3_TRACE_VARIABLES as u32,
+            source_variables: BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES as u32,
+            shared_variables: BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32,
+            dory_nu: BLS_DORY_BLAKE3_SHARED_DORY_NU as u32,
+            dory_sigma: BLS_DORY_BLAKE3_SHARED_DORY_SIGMA as u32,
+            setup_max_log_n: BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32,
+            setup_identity: hex::encode(setup_identity),
+            preprocessing_bls_commitment: encode_blake3_record_commitment(&loop {
+                let commitment = BlsDoryGt::random();
+                if commitment != BlsDoryGt::identity() {
+                    break commitment;
+                }
+            })
+            .unwrap(),
+            transpose_digest: hex::encode([0x11; 32]),
+            transpose_bytes: projected_bls_dory_transpose_artifact_bytes(
+                BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+                BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+            )
+            .unwrap(),
+            compact_artifact_context_digest: hex::encode(compact_spec.context_digest),
+            compact_artifact_digest: hex::encode([0x22; 32]),
+            compact_artifact_bytes: compact_spec.encoded_bytes(2).unwrap(),
+            compact_scalar_count: compact_spec.scalar_count,
+            compact_explicit_scalar_count: compact_spec.explicit_scalar_count,
+            compact_word_scalar_count: compact_spec.word_scalar_count,
+            compact_word_bytes: compact_spec.word_bytes,
+            compact_code_bits: compact_spec.code_bits,
+            compact_word_width_codes: compact_spec.word_width_codes,
+            compact_word_group_len: compact_spec.word_group_len,
+            compact_signed_word_selectors: compact_spec.signed_word_selectors,
+            fri_preprocessed_registry_digest: hex::encode(pinned_preprocessed_registry_digest()),
+            fri_preprocessed_root: fri_key.root.map(|word| format!("{word:016x}")),
+            record_digest: String::new(),
+        };
+        record.record_digest = hex::encode(record.canonical_digest().unwrap());
+        record
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn preprocessing_record_is_canonical_and_json_round_trips() {
+        let record = bounded_preprocessing_record_fixture();
+        record.validate().unwrap();
+        let encoded = serde_json::to_vec_pretty(&record).unwrap();
+        let decoded: BlsDoryBlake3PreprocessingRecord = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, record);
+        decoded.validate().unwrap();
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn preprocessing_record_rejects_mutated_or_noncanonical_fields() {
+        let record = bounded_preprocessing_record_fixture();
+
+        let mut wrong_geometry = record.clone();
+        wrong_geometry.trace_rows += 1;
+        assert!(matches!(
+            wrong_geometry.validate(),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(_))
+        ));
+
+        let mut wrong_fri_root = record.clone();
+        wrong_fri_root.fri_preprocessed_root[0] = "0000000000000000".to_owned();
+        wrong_fri_root.record_digest = hex::encode(wrong_fri_root.canonical_digest().unwrap());
+        assert!(matches!(
+            wrong_fri_root.validate(),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "FRI preprocessing root"
+            ))
+        ));
+
+        let mut wrong_context = record.clone();
+        wrong_context.compact_artifact_context_digest = hex::encode([0x66; 32]);
+        wrong_context.record_digest = hex::encode(wrong_context.canonical_digest().unwrap());
+        assert!(matches!(
+            wrong_context.validate(),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "compact artifact context"
+            ))
+        ));
+
+        let mut identity_commitment = record.clone();
+        identity_commitment.preprocessing_bls_commitment =
+            encode_blake3_record_commitment(&BlsDoryGt::identity()).unwrap();
+        identity_commitment.record_digest =
+            hex::encode(identity_commitment.canonical_digest().unwrap());
+        assert!(matches!(
+            identity_commitment.validate(),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidMetadata(
+                "preprocessing BLS commitment"
+            ))
+        ));
+
+        let mut uppercase_hex = record.clone();
+        uppercase_hex.setup_identity.make_ascii_uppercase();
+        assert!(matches!(
+            uppercase_hex.validate(),
+            Err(BlsDoryBlake3PreprocessingRecordError::InvalidHex(
+                "setup identity"
+            ))
+        ));
+
+        let mut wrong_digest = record;
+        wrong_digest.record_digest = hex::encode([0x55; 32]);
+        assert!(matches!(
+            wrong_digest.validate(),
+            Err(BlsDoryBlake3PreprocessingRecordError::DigestMismatch(
+                "record"
+            ))
+        ));
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn preprocessing_record_digest_binds_every_record_field() {
+        let record = bounded_preprocessing_record_fixture();
+        let expected = record.canonical_digest().unwrap();
+
+        macro_rules! assert_numeric_field_bound {
+            ($field:ident) => {{
+                let mut mutated = record.clone();
+                mutated.$field = mutated.$field.wrapping_add(1);
+                assert_ne!(
+                    mutated.canonical_digest().unwrap(),
+                    expected,
+                    "{} is not bound",
+                    stringify!($field)
+                );
+            }};
+        }
+        macro_rules! assert_hex_field_bound {
+            ($field:ident) => {{
+                let mut mutated = record.clone();
+                let replacement = if mutated.$field.starts_with('0') {
+                    "1"
+                } else {
+                    "0"
+                };
+                mutated.$field.replace_range(..1, replacement);
+                assert_ne!(
+                    mutated.canonical_digest().unwrap(),
+                    expected,
+                    "{} is not bound",
+                    stringify!($field)
+                );
+            }};
+        }
+
+        assert_numeric_field_bound!(record_version);
+        assert_numeric_field_bound!(projection_version);
+        assert_numeric_field_bound!(native_proof_version);
+        assert_numeric_field_bound!(activation_len);
+        assert_numeric_field_bound!(cell_point_variables);
+        assert_numeric_field_bound!(trace_rows);
+        assert_numeric_field_bound!(preprocessed_width);
+        assert_numeric_field_bound!(preprocessed_word_tables);
+        assert_numeric_field_bound!(preprocessed_code_tables);
+        assert_numeric_field_bound!(preprocessing_terminal_count);
+        assert_numeric_field_bound!(trace_variables);
+        assert_numeric_field_bound!(source_variables);
+        assert_numeric_field_bound!(shared_variables);
+        assert_numeric_field_bound!(dory_nu);
+        assert_numeric_field_bound!(dory_sigma);
+        assert_numeric_field_bound!(setup_max_log_n);
+        assert_numeric_field_bound!(transpose_bytes);
+        assert_numeric_field_bound!(compact_artifact_bytes);
+        assert_numeric_field_bound!(compact_scalar_count);
+        assert_numeric_field_bound!(compact_explicit_scalar_count);
+        assert_numeric_field_bound!(compact_word_scalar_count);
+        assert_numeric_field_bound!(compact_word_bytes);
+        assert_numeric_field_bound!(compact_code_bits);
+        assert_numeric_field_bound!(compact_word_width_codes);
+        assert_numeric_field_bound!(compact_word_group_len);
+        assert_numeric_field_bound!(compact_signed_word_selectors);
+
+        assert_hex_field_bound!(setup_identity);
+        assert_hex_field_bound!(transpose_digest);
+        assert_hex_field_bound!(compact_artifact_context_digest);
+        assert_hex_field_bound!(compact_artifact_digest);
+        assert_hex_field_bound!(fri_preprocessed_registry_digest);
+
+        let mut mutated_commitment = record.clone();
+        mutated_commitment.preprocessing_bls_commitment = encode_blake3_record_commitment(&loop {
+            let commitment = BlsDoryGt::random();
+            let encoded = encode_blake3_record_commitment(&commitment).unwrap();
+            if commitment != BlsDoryGt::identity() && encoded != record.preprocessing_bls_commitment
+            {
+                break commitment;
+            }
+        })
+        .unwrap();
+        assert_ne!(mutated_commitment.canonical_digest().unwrap(), expected);
+
+        for root_index in 0..record.fri_preprocessed_root.len() {
+            let mut mutated = record.clone();
+            let word = u64::from_str_radix(&mutated.fri_preprocessed_root[root_index], 16).unwrap();
+            mutated.fri_preprocessed_root[root_index] = format!("{:016x}", word.wrapping_add(1));
+            assert_ne!(
+                mutated.canonical_digest().unwrap(),
+                expected,
+                "FRI root word {root_index} is not bound"
+            );
+        }
+    }
 
     #[test]
     fn canonical_opening_binding_rejects_semantic_mismatches() {

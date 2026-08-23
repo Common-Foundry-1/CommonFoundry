@@ -203,36 +203,39 @@ impl BlsDoryCompactArtifactWriter {
         if !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
             return Err(BlsDoryCompactArtifactError::InvalidSpec);
         }
+        let header = spec.encode(dictionary.len())?;
+        let encoded_dictionary = dictionary
+            .iter()
+            .map(encode_scalar)
+            .collect::<Result<Vec<_>, _>>()?;
         let nonce = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
         let context = hex::encode(&spec.context_digest[..8]);
         let path = scratch_directory.join(format!(
             "cmfd-dory-compact-{context}-{}-{nonce}.tmp",
             std::process::id(),
         ));
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let header = spec.encode(dictionary.len())?;
-        file.write_all(&header)?;
-        let mut hasher = blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN);
-        hasher.update(&header);
-        for scalar in &dictionary {
-            let encoded = encode_scalar(scalar)?;
-            file.write_all(&encoded)?;
-            hasher.update(&encoded);
-        }
-        Ok(Self {
+        let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
             spec,
             dictionary,
-            hasher,
+            hasher: blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN),
             written_words: 0,
             written_codes: 0,
             pending_code: None,
-        })
+        };
+        writer.file_mut()?.write_all(&header)?;
+        writer.hasher.update(&header);
+        for encoded in encoded_dictionary {
+            writer.file_mut()?.write_all(&encoded)?;
+            writer.hasher.update(&encoded);
+        }
+        Ok(writer)
     }
 
     pub fn write_words(&mut self, words: &[u64]) -> Result<(), BlsDoryCompactArtifactError> {

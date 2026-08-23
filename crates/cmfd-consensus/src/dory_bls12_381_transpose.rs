@@ -230,6 +230,17 @@ pub struct BlsDoryWordTransposeArtifact {
 }
 
 impl BlsDoryWordTransposeArtifact {
+    #[cfg(feature = "whir-prototype")]
+    #[must_use]
+    pub(crate) const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    pub(crate) fn file_bytes(&self) -> Result<u64, BlsDoryTransposeError> {
+        Ok(self.file.metadata()?.len())
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }

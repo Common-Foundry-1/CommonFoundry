@@ -420,6 +420,20 @@ impl BlsDoryDeferredOpeningSet {
 }
 
 impl BlsDoryCommittedPolynomial {
+    #[cfg(feature = "whir-prototype")]
+    pub(crate) fn compact_artifact_audit_metadata(
+        &self,
+    ) -> Result<(BlsDoryCompactArtifactSpec, [u8; 32], u64), BlsDoryAggregateError> {
+        let BlsDoryCoefficientStorage::CompactArtifact(artifact) = &self.coefficients else {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        };
+        let bytes = artifact
+            .spec()
+            .encoded_bytes(artifact.dictionary().len())
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        Ok((artifact.spec(), artifact.digest(), bytes))
+    }
+
     fn compact_source_identity(&self) -> Option<BlsDoryReleasedCompactSource> {
         match &self.coefficients {
             BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
@@ -2316,7 +2330,7 @@ fn compact_selector_is_signed(selector: usize, signed_word_selectors: u64) -> bo
     }
 }
 
-fn source_artifact_spec(
+pub(crate) fn source_artifact_spec(
     setup_identity: [u8; 32],
     nu: usize,
     sigma: usize,

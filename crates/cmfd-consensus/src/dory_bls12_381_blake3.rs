@@ -393,6 +393,30 @@ struct BlsDoryBlake3CommittedSources {
     inverse: BlsDoryCommittedPolynomial,
 }
 
+/// Construction-time source bundle retained for the future out-of-core native
+/// sumchecks. The transposes remain private and RAII-owned: callers can only
+/// validate the complete bundle or consume it into the existing four committed
+/// sources.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct PreparedBlsDoryBlake3Sources {
+    sources: BlsDoryBlake3CommittedSources,
+    main_transpose: BlsDoryWordTransposeArtifact,
+    preprocessing_transpose: BlsDoryWordTransposeArtifact,
+    binding: PreparedBlsDoryBlake3SourceBinding,
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedBlsDoryBlake3SourceBinding {
+    trace_rows: usize,
+    layout: BlsDoryAggregateLayout,
+    setup_identity: [u8; 32],
+    main_transpose_digest: [u8; 32],
+    preprocessing_transpose_digest: [u8; 32],
+    source_commitments: BlsDoryBlake3SourceCommitments,
+}
+
 #[cfg(feature = "whir-prototype")]
 #[cfg_attr(not(test), allow(dead_code))]
 impl BlsDoryBlake3CommittedSources {
@@ -508,6 +532,83 @@ impl BlsDoryBlake3CommittedSources {
             BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.to_vec(),
             points.into_iter().collect(),
         )
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl PreparedBlsDoryBlake3Sources {
+    fn new(
+        sources: BlsDoryBlake3CommittedSources,
+        main_transpose: BlsDoryWordTransposeArtifact,
+        preprocessing_transpose: BlsDoryWordTransposeArtifact,
+        trace_rows: usize,
+        layout: BlsDoryAggregateLayout,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        let binding = PreparedBlsDoryBlake3SourceBinding {
+            trace_rows,
+            layout,
+            setup_identity: setup.identity(),
+            main_transpose_digest: main_transpose.digest(),
+            preprocessing_transpose_digest: preprocessing_transpose.digest(),
+            source_commitments: sources.commitments(),
+        };
+        let mut prepared = Self {
+            sources,
+            main_transpose,
+            preprocessing_transpose,
+            binding,
+        };
+        prepared.validate(trace_rows, layout, setup)?;
+        Ok(prepared)
+    }
+
+    fn commitments(&self) -> BlsDoryBlake3SourceCommitments {
+        self.sources.commitments()
+    }
+
+    fn validate(
+        &mut self,
+        trace_rows: usize,
+        layout: BlsDoryAggregateLayout,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<(), BlsDoryAggregateError> {
+        validate_native_blake3_source_layout(trace_rows, layout, setup)?;
+        self.sources.validate_layout(trace_rows, layout, setup)?;
+        if self.binding.trace_rows != trace_rows
+            || self.binding.layout != layout
+            || self.binding.setup_identity != setup.identity()
+            || self.binding.main_transpose_digest != self.main_transpose.digest()
+            || self.binding.preprocessing_transpose_digest != self.preprocessing_transpose.digest()
+            || self.binding.source_commitments != self.sources.commitments()
+            || self.main_transpose.rows() != trace_rows
+            || self.main_transpose.columns() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1
+            || self.preprocessing_transpose.rows() != trace_rows
+            || self.preprocessing_transpose.columns() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH
+        {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        self.main_transpose
+            .authenticate()
+            .map_err(blake3_transpose_error)?;
+        self.preprocessing_transpose
+            .authenticate()
+            .map_err(blake3_transpose_error)?;
+        Ok(())
+    }
+
+    fn into_committed_sources(
+        self,
+    ) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
+        let Self {
+            sources,
+            main_transpose,
+            preprocessing_transpose,
+            binding: _,
+        } = self;
+        drop((main_transpose, preprocessing_transpose));
+        Ok(sources)
     }
 }
 
@@ -4064,13 +4165,13 @@ pub fn derive_bls_dory_blake3_preprocessing_record(
 }
 
 #[cfg(feature = "whir-prototype")]
-fn commit_native_blake3_sources_at_layout(
+fn prepare_native_blake3_sources_at_layout(
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
     bridge: &BlsDoryOutputBridgeStatement,
     layout: BlsDoryAggregateLayout,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
-) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
+) -> Result<PreparedBlsDoryBlake3Sources, BlsDoryAggregateError> {
     if witness.digest != bridge.final_activation_digest() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
@@ -4092,7 +4193,6 @@ fn commit_native_blake3_sources_at_layout(
             scratch_directory,
         )?
     };
-    drop(preprocessed_transpose);
 
     let mut main_transpose =
         create_native_main_transpose(&air, &native_statement, witness, scratch_directory)?;
@@ -4128,7 +4228,6 @@ fn commit_native_blake3_sources_at_layout(
         setup,
         scratch_directory,
     )?;
-    drop(main_transpose);
 
     let sources = BlsDoryBlake3CommittedSources {
         main,
@@ -4136,8 +4235,26 @@ fn commit_native_blake3_sources_at_layout(
         preprocessing,
         inverse,
     };
-    sources.validate_layout(air.trace_rows(), layout, setup)?;
-    Ok(sources)
+    PreparedBlsDoryBlake3Sources::new(
+        sources,
+        main_transpose,
+        preprocessed_transpose,
+        air.trace_rows(),
+        layout,
+        setup,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn commit_native_blake3_sources_at_layout(
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
+    prepare_native_blake3_sources_at_layout(witness, bridge, layout, setup, scratch_directory)?
+        .into_committed_sources()
 }
 
 /// Build the four production sources at the immutable shared 33-variable
@@ -5029,6 +5146,146 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    struct BoundedPreparedSourceFixture {
+        prepared: PreparedBlsDoryBlake3Sources,
+        main_rows: Vec<Vec<u64>>,
+        preprocessing_rows: Vec<Vec<u64>>,
+        layout: BlsDoryAggregateLayout,
+        setup: DeterministicBlsDorySetup,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn bounded_prepared_source_bundle(
+        scratch_directory: &std::path::Path,
+        corrupt_main_before_binding: bool,
+    ) -> Result<BoundedPreparedSourceFixture, BlsDoryAggregateError> {
+        const TRACE_ROWS: usize = 16;
+        let layout = BlsDoryAggregateLayout::new(7, 7)?;
+        let setup =
+            deterministic_bls_dory_setup(14).map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+        let main_rows = (0..TRACE_ROWS)
+            .map(|row| {
+                (0..BLS_DORY_BLAKE3_MAIN_WIDTH - 1)
+                    .map(|column| {
+                        let value = column as i64 * 13 + row as i64 - 1_337;
+                        u64::from_le_bytes(value.to_le_bytes())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let preprocessing_rows = (0..TRACE_ROWS)
+            .map(|row| {
+                (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
+                    .map(|column| {
+                        if NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(&column) {
+                            (column * 101 + row * 17) as u64
+                        } else {
+                            ((column + row) & 1) as u64
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut main_writer = BlsDoryWordTransposeWriter::create(
+            scratch_directory,
+            TRACE_ROWS,
+            BLS_DORY_BLAKE3_MAIN_WIDTH - 1,
+            TRACE_ROWS,
+        )
+        .map_err(blake3_transpose_error)?;
+        for row in &main_rows {
+            main_writer.write_row(row).map_err(blake3_transpose_error)?;
+        }
+        let mut main_transpose = main_writer.finish().map_err(blake3_transpose_error)?;
+        let main = {
+            let mut source =
+                TransposedLocalNextSignedWordRowSource::new_for_layout(&mut main_transpose, layout)
+                    .map_err(blake3_transpose_error)?;
+            commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                layout.nu(),
+                layout.sigma(),
+                &setup,
+                scratch_directory,
+            )?
+        };
+
+        let mut preprocessing_writer = BlsDoryWordTransposeWriter::create(
+            scratch_directory,
+            TRACE_ROWS,
+            BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+            TRACE_ROWS,
+        )
+        .map_err(blake3_transpose_error)?;
+        for row in &preprocessing_rows {
+            preprocessing_writer
+                .write_row(row)
+                .map_err(blake3_transpose_error)?;
+        }
+        let mut preprocessing_transpose = preprocessing_writer
+            .finish()
+            .map_err(blake3_transpose_error)?;
+        let preprocessing = {
+            let mut source = TransposedPreprocessedRowSource::new_for_layout(
+                &mut preprocessing_transpose,
+                layout,
+            )
+            .map_err(blake3_transpose_error)?;
+            commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                layout.nu(),
+                layout.sigma(),
+                &setup,
+                scratch_directory,
+            )?
+        };
+
+        let commit_scalar_source = |seed: u64, scalar_tables: usize| {
+            let mut writer = BlsDoryCommittedPolynomialWriter::create(
+                scratch_directory,
+                TRACE_ROWS * scalar_tables,
+                layout.nu(),
+                layout.sigma(),
+                &setup,
+            )?;
+            writer.write_scalars(
+                &(0..TRACE_ROWS * scalar_tables)
+                    .map(|index| BlsDoryFr::from_u64(seed + index as u64 * 19))
+                    .collect::<Vec<_>>(),
+            )?;
+            writer.finish()
+        };
+        let accumulator = commit_scalar_source(10_003, BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES)?;
+        let inverse = commit_scalar_source(20_003, BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)?;
+        let sources = BlsDoryBlake3CommittedSources {
+            main,
+            accumulator,
+            preprocessing,
+            inverse,
+        };
+        if corrupt_main_before_binding {
+            flip_file_byte(main_transpose.path(), 100)
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        }
+        let prepared = PreparedBlsDoryBlake3Sources::new(
+            sources,
+            main_transpose,
+            preprocessing_transpose,
+            TRACE_ROWS,
+            layout,
+            &setup,
+        )?;
+        Ok(BoundedPreparedSourceFixture {
+            prepared,
+            main_rows,
+            preprocessing_rows,
+            layout,
+            setup,
+        })
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -9524,6 +9781,133 @@ mod tests {
             );
         }
         drop(sources);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn prepared_native_sources_retain_authenticated_transposes_without_changing_commitments() {
+        let scratch = Blake3ScratchDirectory::create();
+        let BoundedPreparedSourceFixture {
+            mut prepared,
+            main_rows,
+            preprocessing_rows,
+            layout,
+            setup,
+        } = bounded_prepared_source_bundle(&scratch.0, false).unwrap();
+        prepared.validate(16, layout, &setup).unwrap();
+        let main_path = prepared.main_transpose.path().to_path_buf();
+        let preprocessing_path = prepared.preprocessing_transpose.path().to_path_buf();
+        assert!(main_path.is_file());
+        assert!(preprocessing_path.is_file());
+
+        {
+            let mut main_source = TransposedLocalNextSignedWordRowSource::new_for_layout(
+                &mut prepared.main_transpose,
+                layout,
+            )
+            .unwrap();
+            let mut actual = vec![0; main_source.columns()];
+            main_source.read_word_row(0, &mut actual).unwrap();
+            let mut expected_local = Vec::new();
+            for column in 0..8 {
+                expected_local.extend(main_rows.iter().map(|row| row[column]));
+            }
+            assert_eq!(actual, expected_local);
+            main_source.read_word_row(36, &mut actual).unwrap();
+            let mut expected_next = Vec::new();
+            for column in 0..8 {
+                expected_next.extend(
+                    main_rows
+                        .iter()
+                        .cycle()
+                        .skip(1)
+                        .take(16)
+                        .map(|row| row[column]),
+                );
+            }
+            assert_eq!(actual, expected_next);
+        }
+
+        {
+            let mut preprocessing_source = TransposedPreprocessedRowSource::new_for_layout(
+                &mut prepared.preprocessing_transpose,
+                layout,
+            )
+            .unwrap();
+            let mut actual_words = vec![0; preprocessing_source.columns()];
+            preprocessing_source
+                .read_word_row(0, &mut actual_words)
+                .unwrap();
+            let mut expected_words = Vec::new();
+            for slot in 0..BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES {
+                let (direction, column) = preprocessed_physical_role(slot).unwrap();
+                for row in 0..16 {
+                    expected_words.push(preprocessing_rows[(row + direction) % 16][column]);
+                }
+            }
+            assert_eq!(actual_words, expected_words);
+            let mut actual_codes = vec![0; preprocessing_source.columns()];
+            preprocessing_source
+                .read_code_row(1, &mut actual_codes)
+                .unwrap();
+            let mut expected_codes = Vec::new();
+            for slot in BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+                ..BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES + 8
+            {
+                let (direction, column) = preprocessed_physical_role(slot).unwrap();
+                for row in 0..16 {
+                    expected_codes.push(preprocessing_rows[(row + direction) % 16][column] as u8);
+                }
+            }
+            assert_eq!(actual_codes, expected_codes);
+        }
+
+        let commitments_before = prepared.commitments();
+        let sources = prepared.into_committed_sources().unwrap();
+        assert_eq!(sources.commitments(), commitments_before);
+        assert!(!main_path.exists());
+        assert!(!preprocessing_path.exists());
+        assert!(std::fs::read_dir(&scratch.0).unwrap().count() > 0);
+        drop(sources);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn prepared_native_source_binding_and_drop_are_fail_closed() {
+        let scratch = Blake3ScratchDirectory::create();
+        let BoundedPreparedSourceFixture {
+            mut prepared,
+            layout,
+            setup,
+            ..
+        } = bounded_prepared_source_bundle(&scratch.0, false).unwrap();
+        let wrong_setup = deterministic_bls_dory_setup(layout.variables() + 1).unwrap();
+        assert!(matches!(
+            prepared.validate(16, layout, &wrong_setup),
+            Err(BlsDoryAggregateError::InvalidDimension)
+        ));
+        let original_main = prepared.binding.source_commitments.main;
+        prepared.binding.source_commitments.main = prepared.binding.source_commitments.accumulator;
+        assert!(matches!(
+            prepared.validate(16, layout, &setup),
+            Err(BlsDoryAggregateError::InvalidDimension)
+        ));
+        prepared.binding.source_commitments.main = original_main;
+        prepared.validate(16, layout, &setup).unwrap();
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn prepared_native_source_construction_cleans_every_artifact_on_authentication_failure() {
+        let scratch = Blake3ScratchDirectory::create();
+        assert!(matches!(
+            bounded_prepared_source_bundle(&scratch.0, true),
+            Err(BlsDoryAggregateError::ProverStorage)
+        ));
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

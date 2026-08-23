@@ -9,6 +9,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Mutex;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -31,6 +32,10 @@ use crate::{
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
     dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
+    dory_bls12_381_execution_artifact::{
+        BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
+        BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorColumn,
+    },
     dory_bls12_381_fold_artifact::{
         BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
         BlsDoryFoldArtifactWriter,
@@ -308,6 +313,8 @@ pub enum BlsDoryTransitionError {
     ProofTooLarge,
     #[error("transition proof encoding is malformed or non-canonical")]
     InvalidEncoding,
+    #[error("authenticated execution-accumulator artifact failed")]
+    ExecutionArtifact,
     #[error("the BLS12-381 transition checkpoint is not production ready")]
     NotProductionReady,
 }
@@ -458,15 +465,167 @@ pub(crate) fn prove_bls_dory_transition_deferred_at_variables_with_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
-    prove_bls_dory_transition_deferred_at_variables_with_optional_scratch(
+    let packed_nu = packed_variables / 2;
+    let packed_sigma = packed_variables - packed_nu;
+    let packed_rows = 1usize
+        .checked_shl(packed_nu as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let packed_columns = 1usize
+        .checked_shl(packed_sigma as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let source =
+        BlsDoryTransitionWitnessRowSource::new(statement, witness, packed_rows, packed_columns)?;
+    prove_bls_dory_transition_deferred_from_row_source_with_scratch(
         binding,
         statement,
         mask_polynomial,
-        witness,
+        source,
         packed_variables,
         setup,
-        Some(scratch_directory),
+        scratch_directory,
     )
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+    expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+    transition: BlsDoryExecutionAccumulatorTransition,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    if expected_context.setup_identity() != setup.identity() {
+        return Err(BlsDoryTransitionError::ExecutionArtifact);
+    }
+    let packed_nu = packed_variables / 2;
+    let packed_sigma = packed_variables - packed_nu;
+    let packed_rows = 1usize
+        .checked_shl(packed_nu as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let packed_columns = 1usize
+        .checked_shl(packed_sigma as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+        statement,
+        mask_polynomial,
+        artifact,
+        expected_context,
+        transition,
+        packed_rows,
+        packed_columns,
+    )?;
+    prove_bls_dory_transition_deferred_from_row_source_with_scratch(
+        binding,
+        statement,
+        mask_polynomial,
+        source,
+        packed_variables,
+        setup,
+        scratch_directory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_transition_deferred_from_row_source_with_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    mut source: BlsDoryTransitionWitnessRowSource<'_>,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    if binding.len() > MAX_TRANSITION_BINDING_BYTES {
+        return Err(BlsDoryTransitionError::PublicBindingTooLarge);
+    }
+    mask_polynomial.validate(statement)?;
+    let cell_variables = statement.elements()?.ilog2() as usize;
+    validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+    let packed_nu = packed_variables / 2;
+    let packed_sigma = packed_variables - packed_nu;
+    let committed = commit_bls_dory_compact_row_source_with_scratch(
+        &mut source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+    )?;
+    let oracle_commitment = committed.commitment();
+
+    let mut transcript = transition_transcript(
+        binding,
+        statement,
+        mask_polynomial.digest(),
+        &oracle_commitment,
+    );
+    let mixing = transcript.challenge_scalar(b"constraint-mixing");
+    let mixing_powers = powers(mixing, BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS);
+    let cell_point = challenge_vector(&mut transcript, b"cell-point", cell_variables);
+    let output = prove_transition_sumcheck_with_scratch(
+        statement,
+        &source,
+        &cell_point,
+        &mixing_powers,
+        &mut transcript,
+        scratch_directory,
+    )?;
+    let terminal_evaluations = output.terminal_evaluations;
+    if terminal_evaluations[MASK] != evaluate_mask(mask_polynomial, statement, &output.point)? {
+        return Err(BlsDoryTransitionError::MaskPolynomial);
+    }
+    let expected = output.selector_terminal
+        * arithmetic_constraint(statement, &terminal_evaluations, &mixing_powers)?;
+    if output.final_claim != expected {
+        return Err(BlsDoryTransitionError::TerminalClaim);
+    }
+    absorb_fields(
+        &mut transcript,
+        b"terminal-evaluation",
+        &terminal_evaluations,
+    );
+    let transcript_digest = transcript.digest();
+    let opening_points = packed_opening_points(&output.point, packed_variables)?;
+    let expected_claims = transition_opening_claims(
+        oracle_commitment,
+        &output.point,
+        &terminal_evaluations,
+        packed_variables,
+    )?;
+    let openings = BlsDoryDeferredOpeningSet::new(
+        vec![committed],
+        vec![0; opening_points.len()],
+        opening_points,
+    )?;
+    if openings.claims() != expected_claims {
+        return Err(BlsDoryTransitionError::Opening);
+    }
+    let proof = BlsDoryTransitionProof {
+        protocol_version: BLS_DORY_TRANSITION_VERSION,
+        packed_variables: u16::try_from(packed_variables)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        oracle_commitment,
+        rounds: output.rounds,
+        terminal_evaluations,
+        transcript_digest,
+        opening_proof: Vec::new(),
+    };
+    verify_bls_dory_transition_deferred_at_variables(
+        binding,
+        statement,
+        mask_polynomial,
+        &proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryTransitionProof { proof, openings })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1005,9 +1164,266 @@ struct RangeOracleDescriptor {
     slack: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DerivedTransitionRegularRow {
+    pub(crate) accumulator: i64,
+    pub(crate) mask: u64,
+    pub(crate) encoded: u64,
+    pub(crate) square_quotient: u64,
+    pub(crate) square_remainder: u64,
+    pub(crate) cube_quotient: u64,
+    pub(crate) cube_remainder: u64,
+    pub(crate) output_quotient: u64,
+    pub(crate) output_remainder: u64,
+    pub(crate) negative: u64,
+    pub(crate) activation: i64,
+    pub(crate) shifted_accumulator: u64,
+}
+
+impl DerivedTransitionRegularRow {
+    pub(crate) fn word(self, oracle: usize) -> Result<u64, BlsDoryTransitionError> {
+        Ok(match oracle {
+            ACCUMULATOR => u64::from_le_bytes(self.accumulator.to_le_bytes()),
+            MASK => self.mask,
+            ENCODED => self.encoded,
+            SQUARE_QUOTIENT => self.square_quotient,
+            SQUARE_REMAINDER => self.square_remainder,
+            CUBE_QUOTIENT => self.cube_quotient,
+            CUBE_REMAINDER => self.cube_remainder,
+            OUTPUT_QUOTIENT => self.output_quotient,
+            OUTPUT_REMAINDER => self.output_remainder,
+            NEGATIVE => self.negative,
+            ACTIVATION => u64::from_le_bytes(self.activation.to_le_bytes()),
+            SHIFTED_ACCUMULATOR => self.shifted_accumulator,
+            _ => return Err(BlsDoryTransitionError::InvalidProofShape),
+        })
+    }
+}
+
+/// Derive the twelve canonical regular transition-oracle values for one cell.
+///
+/// `index` uses the transition table's canonical column-first, then row, then
+/// layer order. The challenge-derived mask is authoritative; callers supply
+/// only the signed accumulator retained by the execution trace.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn derive_transition_regular_row(
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    index: usize,
+    accumulator: i64,
+) -> Result<DerivedTransitionRegularRow, BlsDoryTransitionError> {
+    let mask = mask_polynomial.value_at_boolean_index(statement, index)?;
+    derive_transition_regular_row_from_mask(statement, index, accumulator, mask)
+}
+
+fn derive_transition_regular_row_from_mask(
+    statement: StructuredTransitionStatement,
+    index: usize,
+    accumulator: i64,
+    mask: u64,
+) -> Result<DerivedTransitionRegularRow, BlsDoryTransitionError> {
+    if index >= statement.elements()? {
+        return Err(StructuredTransitionError::InvalidDimensions.into());
+    }
+    if accumulator.unsigned_abs() > statement.max_abs_accumulator {
+        return Err(StructuredTransitionError::ValueOutOfRange.into());
+    }
+
+    if mask > statement.max_mask {
+        return Err(StructuredTransitionError::ValueOutOfRange.into());
+    }
+
+    let arithmetic_overflow = || StructuredTransitionError::ArithmeticOverflow;
+    let transition_modulus = u64::from(V2_TRANSITION_MODULUS);
+    let signed_reduction = i128::from(accumulator)
+        .checked_add(i128::from(mask))
+        .ok_or_else(arithmetic_overflow)?;
+    let negative = u64::from(signed_reduction < 0);
+    let encoded = if signed_reduction < 0 {
+        i128::from(transition_modulus)
+            .checked_add(signed_reduction)
+            .ok_or_else(arithmetic_overflow)?
+    } else {
+        signed_reduction
+    };
+    let encoded = u64::try_from(encoded).map_err(|_| arithmetic_overflow())?;
+    if encoded >= transition_modulus {
+        return Err(StructuredTransitionError::ValueOutOfRange.into());
+    }
+
+    let square = encoded
+        .checked_mul(encoded)
+        .ok_or_else(arithmetic_overflow)?;
+    let square_quotient = square / transition_modulus;
+    let square_remainder = square % transition_modulus;
+    let cube = square_remainder
+        .checked_mul(encoded)
+        .ok_or_else(arithmetic_overflow)?;
+    let cube_quotient = cube / transition_modulus;
+    let cube_remainder = cube % transition_modulus;
+    let output_quotient = cube_remainder / OUTPUT_MODULUS;
+    let output_remainder = cube_remainder % OUTPUT_MODULUS;
+    let activation = i64::try_from(output_remainder)
+        .map_err(|_| arithmetic_overflow())?
+        .checked_sub(i64::try_from(OUTPUT_CENTER).map_err(|_| arithmetic_overflow())?)
+        .ok_or_else(arithmetic_overflow)?;
+    let shifted_accumulator = i128::from(accumulator)
+        .checked_add(i128::from(statement.max_abs_accumulator))
+        .ok_or_else(arithmetic_overflow)?;
+    let shifted_accumulator =
+        u64::try_from(shifted_accumulator).map_err(|_| arithmetic_overflow())?;
+    let maximum_shifted = statement
+        .max_abs_accumulator
+        .checked_mul(2)
+        .ok_or_else(arithmetic_overflow)?;
+    if shifted_accumulator > maximum_shifted {
+        return Err(StructuredTransitionError::ValueOutOfRange.into());
+    }
+
+    Ok(DerivedTransitionRegularRow {
+        accumulator,
+        mask,
+        encoded,
+        square_quotient,
+        square_remainder,
+        cube_quotient,
+        cube_remainder,
+        output_quotient,
+        output_remainder,
+        negative,
+        activation,
+        shifted_accumulator,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum BlsDoryExecutionAccumulatorTransition {
+    Initialization,
+    Bank(usize),
+}
+
+struct BlsDoryExecutionAccumulatorReader<'a> {
+    artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+    context: BlsDoryExecutionAccumulatorArtifactContext,
+    transition: BlsDoryExecutionAccumulatorTransition,
+    cells_per_layer: usize,
+    elements: usize,
+    cached_column: Option<BlsDoryExecutionAccumulatorColumn>,
+    cached_start: usize,
+    cached_len: usize,
+    cache: Vec<i32>,
+}
+
+impl<'a> BlsDoryExecutionAccumulatorReader<'a> {
+    fn new(
+        statement: StructuredTransitionStatement,
+        artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+        expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+        transition: BlsDoryExecutionAccumulatorTransition,
+    ) -> Result<Self, BlsDoryTransitionError> {
+        statement.validate_verifier_shape()?;
+        if artifact.context() != expected_context
+            || statement.max_abs_accumulator > u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS)
+        {
+            return Err(BlsDoryTransitionError::ExecutionArtifact);
+        }
+        let cells_per_layer = statement
+            .rows
+            .checked_mul(statement.cols)
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if statement.rows != expected_context.canonical_rows()
+            || statement.cols != expected_context.canonical_columns()
+            || cells_per_layer != expected_context.cells_per_column()
+        {
+            return Err(BlsDoryTransitionError::ExecutionArtifact);
+        }
+        match transition {
+            BlsDoryExecutionAccumulatorTransition::Initialization if statement.layers == 1 => {}
+            BlsDoryExecutionAccumulatorTransition::Bank(bank)
+                if bank < expected_context.banks()
+                    && statement.layers == expected_context.layers_per_bank() => {}
+            BlsDoryExecutionAccumulatorTransition::Initialization
+            | BlsDoryExecutionAccumulatorTransition::Bank(_) => {
+                return Err(BlsDoryTransitionError::ExecutionArtifact);
+            }
+        }
+        let mut cache = Vec::new();
+        cache
+            .try_reserve_exact(expected_context.authentication_chunk_cells())
+            .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+        cache.resize(expected_context.authentication_chunk_cells(), 0);
+        Ok(Self {
+            artifact,
+            context: expected_context,
+            transition,
+            cells_per_layer,
+            elements: statement.elements()?,
+            cached_column: None,
+            cached_start: 0,
+            cached_len: 0,
+            cache,
+        })
+    }
+
+    fn accumulator(&mut self, index: usize) -> Result<i64, BlsDoryTransitionError> {
+        if index >= self.elements {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        let layer = index / self.cells_per_layer;
+        let cell = index % self.cells_per_layer;
+        let column = match self.transition {
+            BlsDoryExecutionAccumulatorTransition::Initialization => {
+                BlsDoryExecutionAccumulatorColumn::Initialization
+            }
+            BlsDoryExecutionAccumulatorTransition::Bank(bank) => {
+                BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer }
+            }
+        };
+        let chunk_cells = self.context.authentication_chunk_cells();
+        let chunk_start = cell / chunk_cells * chunk_cells;
+        let chunk_len = self
+            .cells_per_layer
+            .checked_sub(chunk_start)
+            .map(|remaining| remaining.min(chunk_cells))
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if self.cached_column != Some(column)
+            || self.cached_start != chunk_start
+            || self.cached_len != chunk_len
+        {
+            self.cached_column = None;
+            self.cached_start = 0;
+            self.cached_len = 0;
+            self.artifact
+                .read_column_segment(column, chunk_start, &mut self.cache[..chunk_len])
+                .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+            self.cached_column = Some(column);
+            self.cached_start = chunk_start;
+            self.cached_len = chunk_len;
+        }
+        self.cache
+            .get(cell - chunk_start)
+            .copied()
+            .map(i64::from)
+            .ok_or(BlsDoryTransitionError::ExecutionArtifact)
+    }
+}
+
+enum TransitionWitnessBacking<'a> {
+    Materialized(&'a StructuredTransitionWitness),
+    Derived {
+        mask_polynomial: &'a StructuredMaskPolynomial,
+        accumulators: &'a [i64],
+    },
+    ExecutionArtifact {
+        mask_polynomial: &'a StructuredMaskPolynomial,
+        reader: Box<Mutex<BlsDoryExecutionAccumulatorReader<'a>>>,
+    },
+}
+
 pub(crate) struct BlsDoryTransitionWitnessRowSource<'a> {
     statement: StructuredTransitionStatement,
-    witness: &'a StructuredTransitionWitness,
+    backing: TransitionWitnessBacking<'a>,
     range_oracles: Vec<RangeOracleDescriptor>,
     elements: usize,
     rows: usize,
@@ -1024,6 +1440,72 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         columns: usize,
     ) -> Result<Self, BlsDoryTransitionError> {
         validate_streaming_witness(statement, witness)?;
+        Self::from_backing(
+            statement,
+            TransitionWitnessBacking::Materialized(witness),
+            rows,
+            columns,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn new_from_accumulators(
+        statement: StructuredTransitionStatement,
+        mask_polynomial: &'a StructuredMaskPolynomial,
+        accumulators: &'a [i64],
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryTransitionError> {
+        statement.validate_verifier_shape()?;
+        mask_polynomial.validate(statement)?;
+        if accumulators.len() != statement.elements()? {
+            return Err(StructuredTransitionError::InvalidLength.into());
+        }
+        Self::from_backing(
+            statement,
+            TransitionWitnessBacking::Derived {
+                mask_polynomial,
+                accumulators,
+            },
+            rows,
+            columns,
+        )
+    }
+
+    pub(crate) fn new_from_execution_artifact(
+        statement: StructuredTransitionStatement,
+        mask_polynomial: &'a StructuredMaskPolynomial,
+        artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+        expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+        transition: BlsDoryExecutionAccumulatorTransition,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryTransitionError> {
+        statement.validate_verifier_shape()?;
+        mask_polynomial.validate(statement)?;
+        let reader = BlsDoryExecutionAccumulatorReader::new(
+            statement,
+            artifact,
+            expected_context,
+            transition,
+        )?;
+        Self::from_backing(
+            statement,
+            TransitionWitnessBacking::ExecutionArtifact {
+                mask_polynomial,
+                reader: Box::new(Mutex::new(reader)),
+            },
+            rows,
+            columns,
+        )
+    }
+
+    fn from_backing(
+        statement: StructuredTransitionStatement,
+        backing: TransitionWitnessBacking<'a>,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryTransitionError> {
         let elements = statement.elements()?;
         let mut range_oracles = Vec::with_capacity(
             STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES,
@@ -1058,7 +1540,7 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         }
         Ok(Self {
             statement,
-            witness,
+            backing,
             range_oracles,
             elements,
             rows,
@@ -1079,45 +1561,75 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
     }
 
     fn regular_word(&self, oracle: usize, index: usize) -> Result<u64, BlsDoryTransitionError> {
-        let unsigned = |values: &[u64]| {
-            values
-                .get(index)
-                .copied()
-                .ok_or(BlsDoryTransitionError::InvalidDimensions)
-        };
-        let signed = |values: &[i64]| {
-            values
-                .get(index)
-                .copied()
-                .map(|value| u64::from_le_bytes(value.to_le_bytes()))
-                .ok_or(BlsDoryTransitionError::InvalidDimensions)
-        };
-        match oracle {
-            ACCUMULATOR => signed(&self.witness.accumulators),
-            MASK => unsigned(&self.witness.masks),
-            ENCODED => unsigned(&self.witness.encoded),
-            SQUARE_QUOTIENT => unsigned(&self.witness.square_quotients),
-            SQUARE_REMAINDER => unsigned(&self.witness.square_remainders),
-            CUBE_QUOTIENT => unsigned(&self.witness.cube_quotients),
-            CUBE_REMAINDER => unsigned(&self.witness.cube_remainders),
-            OUTPUT_QUOTIENT => unsigned(&self.witness.output_quotients),
-            OUTPUT_REMAINDER => unsigned(&self.witness.output_remainders),
-            NEGATIVE => unsigned(&self.witness.negative),
-            ACTIVATION => signed(&self.witness.activations),
-            SHIFTED_ACCUMULATOR => {
-                let accumulator = self
-                    .witness
-                    .accumulators
+        match &self.backing {
+            TransitionWitnessBacking::Materialized(witness) => {
+                let unsigned = |values: &[u64]| {
+                    values
+                        .get(index)
+                        .copied()
+                        .ok_or(BlsDoryTransitionError::InvalidDimensions)
+                };
+                let signed = |values: &[i64]| {
+                    values
+                        .get(index)
+                        .copied()
+                        .map(|value| u64::from_le_bytes(value.to_le_bytes()))
+                        .ok_or(BlsDoryTransitionError::InvalidDimensions)
+                };
+                match oracle {
+                    ACCUMULATOR => signed(&witness.accumulators),
+                    MASK => unsigned(&witness.masks),
+                    ENCODED => unsigned(&witness.encoded),
+                    SQUARE_QUOTIENT => unsigned(&witness.square_quotients),
+                    SQUARE_REMAINDER => unsigned(&witness.square_remainders),
+                    CUBE_QUOTIENT => unsigned(&witness.cube_quotients),
+                    CUBE_REMAINDER => unsigned(&witness.cube_remainders),
+                    OUTPUT_QUOTIENT => unsigned(&witness.output_quotients),
+                    OUTPUT_REMAINDER => unsigned(&witness.output_remainders),
+                    NEGATIVE => unsigned(&witness.negative),
+                    ACTIVATION => signed(&witness.activations),
+                    SHIFTED_ACCUMULATOR => {
+                        let accumulator = witness
+                            .accumulators
+                            .get(index)
+                            .copied()
+                            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+                        let shifted = u64::try_from(
+                            i128::from(accumulator)
+                                + i128::from(self.statement.max_abs_accumulator),
+                        )
+                        .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+                        Ok(shifted)
+                    }
+                    _ => Err(BlsDoryTransitionError::InvalidProofShape),
+                }
+            }
+            TransitionWitnessBacking::Derived {
+                mask_polynomial,
+                accumulators,
+            } => {
+                let accumulator = accumulators
                     .get(index)
                     .copied()
                     .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-                let shifted = u64::try_from(
-                    i128::from(accumulator) + i128::from(self.statement.max_abs_accumulator),
-                )
-                .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
-                Ok(shifted)
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                derive_transition_regular_row_from_mask(self.statement, index, accumulator, mask)?
+                    .word(oracle)
             }
-            _ => Err(BlsDoryTransitionError::InvalidProofShape),
+            TransitionWitnessBacking::ExecutionArtifact {
+                mask_polynomial,
+                reader,
+            } => {
+                let accumulator = reader
+                    .lock()
+                    .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
+                    .accumulator(index)?;
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                derive_transition_regular_row_from_mask(self.statement, index, accumulator, mask)?
+                    .word(oracle)
+            }
         }
     }
 
@@ -1139,20 +1651,7 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         descriptor: RangeOracleDescriptor,
         index: usize,
     ) -> Result<u8, BlsDoryTransitionError> {
-        let value = if descriptor.source_oracle == SHIFTED_ACCUMULATOR {
-            let accumulator = self
-                .witness
-                .accumulators
-                .get(index)
-                .copied()
-                .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-            u64::try_from(i128::from(accumulator) + i128::from(self.statement.max_abs_accumulator))
-                .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?
-        } else {
-            *witness_unsigned_values(self.witness, descriptor.source_oracle)?
-                .get(index)
-                .ok_or(BlsDoryTransitionError::InvalidDimensions)?
-        };
+        let value = self.regular_word(descriptor.source_oracle, index)?;
         let bounded = if descriptor.slack {
             descriptor
                 .maximum
@@ -2195,9 +2694,53 @@ mod tests {
         (statement, mask, witness)
     }
 
+    fn execution_artifact_for_fixture(
+        statement: StructuredTransitionStatement,
+        witness: &StructuredTransitionWitness,
+        directory: &Path,
+        setup_identity: [u8; 32],
+    ) -> (
+        BlsDoryExecutionAccumulatorArtifactContext,
+        BlsDoryExecutionAccumulatorArtifact,
+    ) {
+        use crate::dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorArtifactWriter;
+
+        let context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
+            [[0x11; 32], [0x22; 32], setup_identity, [0x44; 32]],
+            statement.rows,
+            statement.cols,
+            1,
+            statement.layers,
+            2,
+        )
+        .unwrap();
+        let mut writer =
+            BlsDoryExecutionAccumulatorArtifactWriter::create_new(directory, context).unwrap();
+        for values in [[0, 0], [0, 0]] {
+            writer
+                .write_column_chunk(BlsDoryExecutionAccumulatorColumn::Initialization, &values)
+                .unwrap();
+        }
+        let cells = statement.rows * statement.cols;
+        for layer in 0..statement.layers {
+            let column = BlsDoryExecutionAccumulatorColumn::BankLayer { bank: 0, layer };
+            let layer_values = &witness.accumulators[layer * cells..(layer + 1) * cells];
+            for chunk in layer_values.chunks_exact(context.authentication_chunk_cells()) {
+                let values = chunk
+                    .iter()
+                    .copied()
+                    .map(i32::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                writer.write_column_chunk(column, &values).unwrap();
+            }
+        }
+        (context, writer.finish().unwrap())
+    }
+
     #[test]
     fn witness_row_source_matches_every_materialized_transition_oracle() {
-        let (statement, _, witness) = fixture();
+        let (statement, mask, witness) = fixture();
         let variables = minimum_packed_variables(statement).unwrap();
         let nu = variables / 2;
         let sigma = variables - nu;
@@ -2216,6 +2759,385 @@ mod tests {
         }
         streamed.truncate(explicit);
         assert_eq!(streamed, packed[..explicit]);
+
+        let mut derived = BlsDoryTransitionWitnessRowSource::new_from_accumulators(
+            statement,
+            &mask,
+            &witness.accumulators,
+            rows,
+            columns,
+        )
+        .unwrap();
+        let mut derived_scalars = Vec::new();
+        for row_index in 0..explicit.div_ceil(columns) {
+            derived.read_row(row_index, &mut row).unwrap();
+            derived_scalars.extend_from_slice(&row);
+        }
+        derived_scalars.truncate(explicit);
+        assert_eq!(derived_scalars, packed[..explicit]);
+        assert_eq!(derived_scalars, streamed);
+
+        let literal_rows = source.literal_scalar_count() / columns;
+        let explicit_rows = explicit.div_ceil(columns);
+        let mut materialized_words = vec![0; columns];
+        let mut derived_words = vec![0; columns];
+        for row_index in 0..literal_rows {
+            BlsDoryCompactRowSource::read_word_row(&mut source, row_index, &mut materialized_words)
+                .unwrap();
+            BlsDoryCompactRowSource::read_word_row(&mut derived, row_index, &mut derived_words)
+                .unwrap();
+            assert_eq!(derived_words, materialized_words);
+        }
+        let mut materialized_codes = vec![0; columns];
+        let mut derived_codes = vec![0; columns];
+        for row_index in literal_rows..explicit_rows {
+            BlsDoryCompactRowSource::read_code_row(&mut source, row_index, &mut materialized_codes)
+                .unwrap();
+            BlsDoryCompactRowSource::read_code_row(&mut derived, row_index, &mut derived_codes)
+                .unwrap();
+            assert_eq!(derived_codes, materialized_codes);
+        }
+    }
+
+    #[test]
+    fn derived_transition_regular_rows_match_every_materialized_value() {
+        let (statement, mask, witness) = fixture();
+        for index in 0..statement.elements().unwrap() {
+            let derived =
+                derive_transition_regular_row(statement, &mask, index, witness.accumulators[index])
+                    .unwrap();
+            let expected = [
+                u64::from_le_bytes(witness.accumulators[index].to_le_bytes()),
+                witness.masks[index],
+                witness.encoded[index],
+                witness.square_quotients[index],
+                witness.square_remainders[index],
+                witness.cube_quotients[index],
+                witness.cube_remainders[index],
+                witness.output_quotients[index],
+                witness.output_remainders[index],
+                witness.negative[index],
+                u64::from_le_bytes(witness.activations[index].to_le_bytes()),
+                u64::try_from(
+                    i128::from(witness.accumulators[index])
+                        + i128::from(statement.max_abs_accumulator),
+                )
+                .unwrap(),
+            ];
+            for (oracle, expected) in expected.into_iter().enumerate() {
+                assert_eq!(derived.word(oracle).unwrap(), expected, "oracle {oracle}");
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_backed_transition_source_matches_materialized_oracles() {
+        let (statement, mask, witness) = fixture();
+        let scratch = ScratchDirectory::create();
+        let (context, mut artifact) =
+            execution_artifact_for_fixture(statement, &witness, &scratch.0, [0x33; 32]);
+        let variables = minimum_packed_variables(statement).unwrap();
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let mut materialized =
+            BlsDoryTransitionWitnessRowSource::new(statement, &witness, rows, columns).unwrap();
+        let mut streamed = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+            statement,
+            &mask,
+            &mut artifact,
+            context,
+            BlsDoryExecutionAccumulatorTransition::Bank(0),
+            rows,
+            columns,
+        )
+        .unwrap();
+        let mut expected = vec![BlsDoryFr::zero(); columns];
+        let mut actual = vec![BlsDoryFr::zero(); columns];
+        for row_index in 0..rows {
+            materialized.read_row(row_index, &mut expected).unwrap();
+            streamed.read_row(row_index, &mut actual).unwrap();
+            assert_eq!(actual, expected, "packed row {row_index}");
+        }
+        drop(streamed);
+
+        let wrong_context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
+            [[0x11; 32], [0x22; 32], [0x33; 32], [0x45; 32]],
+            statement.rows,
+            statement.cols,
+            1,
+            statement.layers,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+                statement,
+                &mask,
+                &mut artifact,
+                wrong_context,
+                BlsDoryExecutionAccumulatorTransition::Bank(0),
+                rows,
+                columns,
+            )
+            .err(),
+            Some(BlsDoryTransitionError::ExecutionArtifact)
+        );
+
+        let aliased_statement = StructuredTransitionStatement {
+            rows: 1,
+            cols: statement.rows * statement.cols,
+            ..statement
+        };
+        assert_eq!(
+            BlsDoryExecutionAccumulatorReader::new(
+                aliased_statement,
+                &mut artifact,
+                context,
+                BlsDoryExecutionAccumulatorTransition::Bank(0),
+            )
+            .err(),
+            Some(BlsDoryTransitionError::ExecutionArtifact)
+        );
+    }
+
+    #[test]
+    fn artifact_reader_does_not_reuse_cached_chunk_after_authentication_failure() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let (statement, _mask, witness) = fixture();
+        let scratch = ScratchDirectory::create();
+        let (context, mut artifact) =
+            execution_artifact_for_fixture(statement, &witness, &scratch.0, [0x33; 32]);
+        let artifact_path = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let artifact_bytes = std::fs::metadata(&artifact_path).unwrap().len();
+        let value_bytes = std::mem::size_of::<i32>() as u64;
+        let data_bytes = (context.columns() * context.cells_per_column()) as u64 * value_bytes;
+        let chunks_per_column = context
+            .cells_per_column()
+            .div_ceil(context.authentication_chunk_cells());
+        let digest_bytes = (context.columns() * chunks_per_column * 32) as u64;
+        let data_start = artifact_bytes - data_bytes - digest_bytes - 64;
+        let chunk_b_cell = context.cells_per_column() + context.authentication_chunk_cells();
+        let chunk_b_offset = data_start + chunk_b_cell as u64 * value_bytes;
+        let mut reader = BlsDoryExecutionAccumulatorReader::new(
+            statement,
+            &mut artifact,
+            context,
+            BlsDoryExecutionAccumulatorTransition::Bank(0),
+        )
+        .unwrap();
+
+        assert_eq!(reader.accumulator(0).unwrap(), witness.accumulators[0]);
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&artifact_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(chunk_b_offset)).unwrap();
+        let mut byte = [0; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(chunk_b_offset)).unwrap();
+        file.write_all(&[byte[0] ^ 0x80]).unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+
+        assert_eq!(
+            reader.accumulator(context.authentication_chunk_cells()),
+            Err(BlsDoryTransitionError::ExecutionArtifact)
+        );
+        assert_eq!(reader.cached_column, None);
+        assert_eq!(reader.cached_len, 0);
+        assert_eq!(
+            reader.accumulator(0),
+            Err(BlsDoryTransitionError::ExecutionArtifact)
+        );
+    }
+
+    #[test]
+    fn artifact_backed_transition_proof_matches_materialized_proof_bytes() {
+        let (statement, mask, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let materialized_scratch = ScratchDirectory::create();
+        let artifact_scratch = ScratchDirectory::create();
+        let streamed_scratch = ScratchDirectory::create();
+        let wrong_setup_scratch = ScratchDirectory::create();
+        let binding = b"artifact-transition-proof";
+
+        let (wrong_context, mut wrong_artifact) =
+            execution_artifact_for_fixture(statement, &witness, &wrong_setup_scratch.0, [0x55; 32]);
+        assert!(matches!(
+            prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
+                binding,
+                statement,
+                &mask,
+                &mut wrong_artifact,
+                wrong_context,
+                BlsDoryExecutionAccumulatorTransition::Bank(0),
+                10,
+                &setup,
+                &wrong_setup_scratch.0,
+            ),
+            Err(BlsDoryTransitionError::ExecutionArtifact)
+        ));
+        drop(wrong_artifact);
+        assert_eq!(
+            std::fs::read_dir(&wrong_setup_scratch.0).unwrap().count(),
+            0
+        );
+
+        let materialized = prove_bls_dory_transition_deferred_at_variables_with_scratch(
+            binding,
+            statement,
+            &mask,
+            &witness,
+            10,
+            &setup,
+            &materialized_scratch.0,
+        )
+        .unwrap();
+        let (context, mut artifact) = execution_artifact_for_fixture(
+            statement,
+            &witness,
+            &artifact_scratch.0,
+            setup.identity(),
+        );
+        let streamed = prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
+            binding,
+            statement,
+            &mask,
+            &mut artifact,
+            context,
+            BlsDoryExecutionAccumulatorTransition::Bank(0),
+            10,
+            &setup,
+            &streamed_scratch.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            streamed.proof.encode_deferred(statement).unwrap(),
+            materialized.proof.encode_deferred(statement).unwrap()
+        );
+        assert_eq!(
+            streamed.proof.oracle_commitment,
+            materialized.proof.oracle_commitment
+        );
+        assert_eq!(streamed.proof.rounds, materialized.proof.rounds);
+        assert_eq!(
+            streamed.proof.terminal_evaluations,
+            materialized.proof.terminal_evaluations
+        );
+        assert_eq!(
+            streamed.proof.transcript_digest,
+            materialized.proof.transcript_digest
+        );
+        assert_eq!(streamed.openings.claims(), materialized.openings.claims());
+        assert_eq!(
+            streamed.openings.polynomial(0).unwrap().row_commitments(),
+            materialized
+                .openings
+                .polynomial(0)
+                .unwrap()
+                .row_commitments()
+        );
+
+        drop(streamed);
+        drop(materialized);
+        drop(artifact);
+        assert_eq!(std::fs::read_dir(&streamed_scratch.0).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(&materialized_scratch.0).unwrap().count(),
+            0
+        );
+        assert_eq!(std::fs::read_dir(&artifact_scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn derived_transition_regular_row_rejects_invalid_boundaries() {
+        let (statement, mask, witness) = fixture();
+        let negative_boundary = derive_transition_regular_row(
+            statement,
+            &mask,
+            0,
+            -(statement.max_abs_accumulator as i64),
+        )
+        .unwrap();
+        assert_eq!(negative_boundary.shifted_accumulator, 0);
+        let positive_boundary = derive_transition_regular_row(
+            statement,
+            &mask,
+            0,
+            statement.max_abs_accumulator as i64,
+        )
+        .unwrap();
+        assert_eq!(
+            positive_boundary.shifted_accumulator,
+            statement.max_abs_accumulator * 2
+        );
+
+        assert_eq!(
+            derive_transition_regular_row(
+                statement,
+                &mask,
+                statement.elements().unwrap(),
+                witness.accumulators[0],
+            ),
+            Err(BlsDoryTransitionError::Structured(
+                StructuredTransitionError::InvalidDimensions
+            ))
+        );
+        assert_eq!(
+            derive_transition_regular_row(
+                statement,
+                &mask,
+                0,
+                statement.max_abs_accumulator as i64 + 1,
+            ),
+            Err(BlsDoryTransitionError::Structured(
+                StructuredTransitionError::ValueOutOfRange
+            ))
+        );
+        assert_eq!(
+            derive_transition_regular_row(
+                statement,
+                &mask,
+                0,
+                -(statement.max_abs_accumulator as i64) - 1,
+            ),
+            Err(BlsDoryTransitionError::Structured(
+                StructuredTransitionError::ValueOutOfRange
+            ))
+        );
+
+        let wrong_mask = StructuredMaskPolynomial::from_challenge(&[0x5a; 32], 1, 2, 2).unwrap();
+        assert_eq!(
+            derive_transition_regular_row(statement, &wrong_mask, 0, witness.accumulators[0]),
+            Err(BlsDoryTransitionError::Structured(
+                StructuredTransitionError::MaskPolynomial
+            ))
+        );
+
+        assert_eq!(
+            BlsDoryTransitionWitnessRowSource::new_from_accumulators(
+                statement,
+                &mask,
+                &witness.accumulators[..witness.accumulators.len() - 1],
+                32,
+                32,
+            )
+            .err(),
+            Some(BlsDoryTransitionError::Structured(
+                StructuredTransitionError::InvalidLength
+            ))
+        );
     }
 
     #[test]

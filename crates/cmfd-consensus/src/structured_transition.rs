@@ -276,6 +276,16 @@ impl StructuredMaskPolynomial {
         index: usize,
     ) -> Result<u64, StructuredTransitionError> {
         self.validate(statement)?;
+        self.value_at_boolean_index_prevalidated(statement, index)
+    }
+
+    /// Evaluate one Boolean cell after the caller has validated this mask
+    /// against `statement` once for the lifetime of the source.
+    pub(crate) fn value_at_boolean_index_prevalidated(
+        &self,
+        statement: StructuredTransitionStatement,
+        index: usize,
+    ) -> Result<u64, StructuredTransitionError> {
         let cells_per_layer = statement
             .rows
             .checked_mul(statement.cols)

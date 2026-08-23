@@ -9,6 +9,8 @@ pub mod dory_bls12_381_candidate;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_compact_artifact;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_bls12_381_execution_artifact;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_fold_artifact;
 #[cfg(all(feature = "dory-bls12-381-prototype", test))]
 pub mod dory_bls12_381_index_artifact;

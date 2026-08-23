@@ -705,6 +705,28 @@ pub(crate) fn prove_bls_dory_range_logup_deferred_with_precommitted_transition_a
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    transition: &BlsDoryCommittedPolynomial,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    prove_from_source_deferred(
+        binding,
+        statement,
+        LogUpProverSource::RowSource(source),
+        packed_variables,
+        setup,
+        Some(scratch_directory),
+        Some(transition),
+    )
+}
+
 fn prove_from_oracles(
     binding: &[u8],
     statement: StructuredTransitionStatement,
@@ -757,15 +779,33 @@ fn prove_from_oracles_deferred(
 }
 
 #[derive(Clone, Copy)]
-enum LogUpProverSource<'a> {
+#[cfg_attr(not(test), allow(dead_code))]
+enum LogUpProverSource<'a, 'w> {
     Materialized(&'a [Vec<BlsDoryFr>]),
     Witness(&'a StructuredTransitionWitness),
+    RowSource(&'a BlsDoryTransitionWitnessRowSource<'w>),
+}
+
+trait LogUpTransitionSource: Sync {
+    fn range_digit(&self, oracle: usize, index: usize) -> Result<u8, BlsDoryTransitionError>;
+
+    fn scalar(&self, oracle: usize, index: usize) -> Result<BlsDoryFr, BlsDoryTransitionError>;
+}
+
+impl LogUpTransitionSource for BlsDoryTransitionWitnessRowSource<'_> {
+    fn range_digit(&self, oracle: usize, index: usize) -> Result<u8, BlsDoryTransitionError> {
+        BlsDoryTransitionWitnessRowSource::range_digit(self, oracle, index)
+    }
+
+    fn scalar(&self, oracle: usize, index: usize) -> Result<BlsDoryFr, BlsDoryTransitionError> {
+        BlsDoryTransitionWitnessRowSource::scalar(self, oracle, index)
+    }
 }
 
 fn prove_from_source_deferred(
     binding: &[u8],
     statement: StructuredTransitionStatement,
-    source: LogUpProverSource<'_>,
+    source: LogUpProverSource<'_, '_>,
     packed_variables: usize,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
@@ -780,9 +820,11 @@ fn prove_from_source_deferred(
     if packed_variables > setup.max_log_n() {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
-    if matches!(source, LogUpProverSource::Witness(_)) != scratch_directory.is_some()
-        || (precommitted_transition.is_some()
-            && (!matches!(source, LogUpProverSource::Witness(_)) || scratch_directory.is_none()))
+    let materialized_source = matches!(source, LogUpProverSource::Materialized(_));
+    let row_source = matches!(source, LogUpProverSource::RowSource(_));
+    if (materialized_source && (scratch_directory.is_some() || precommitted_transition.is_some()))
+        || (!materialized_source && scratch_directory.is_none())
+        || (row_source && precommitted_transition.is_none())
     {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }
@@ -802,10 +844,11 @@ fn prove_from_source_deferred(
         LogUpProverSource::Witness(witness) => Some(BlsDoryTransitionWitnessRowSource::new(
             statement, witness, rows, columns,
         )?),
+        LogUpProverSource::RowSource(_) => None,
     };
     let mut transition_coefficients = match source {
         LogUpProverSource::Materialized(oracles) => Some(pack_oracles(oracles)?),
-        LogUpProverSource::Witness(_) => None,
+        LogUpProverSource::Witness(_) | LogUpProverSource::RowSource(_) => None,
     };
     let transition = if let Some(transition) = precommitted_transition {
         let explicit_scalars = elements
@@ -842,6 +885,14 @@ fn prove_from_source_deferred(
         coefficients.resize(padded_len, BlsDoryFr::zero());
     }
 
+    let streamed_source: Option<&dyn LogUpTransitionSource> = match source {
+        LogUpProverSource::Materialized(_) => None,
+        LogUpProverSource::Witness(_) => witness_source
+            .as_ref()
+            .map(|source| source as &dyn LogUpTransitionSource),
+        LogUpProverSource::RowSource(source) => Some(source),
+    };
+
     let mut counts = [0_u64; TABLE_VALUES];
     match source {
         LogUpProverSource::Materialized(oracles) => {
@@ -857,10 +908,9 @@ fn prove_from_source_deferred(
                 }
             }
         }
-        LogUpProverSource::Witness(_) => {
-            let witness_source = witness_source
-                .as_ref()
-                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        LogUpProverSource::Witness(_) | LogUpProverSource::RowSource(_) => {
+            let witness_source =
+                streamed_source.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
             for oracle in STRUCTURED_TRANSITION_REGULAR_ORACLES..STRUCTURED_TRANSITION_ORACLES {
                 for index in 0..elements {
                     let digit = usize::from(witness_source.range_digit(oracle, index)?);
@@ -882,7 +932,7 @@ fn prove_from_source_deferred(
         setup,
         scratch_directory,
     )?;
-    if matches!(source, LogUpProverSource::Materialized(_)) {
+    if materialized_source {
         multiplicity_coefficients.resize(padded_len, BlsDoryFr::zero());
     }
 
@@ -954,10 +1004,9 @@ fn prove_from_source_deferred(
     let count_mixing = transcript.challenge_scalar(b"count-mixing");
     let equality_point = challenge_vector(&mut transcript, b"equality-point", packed_variables);
     let (rounds, sumcheck_point, terminal_evaluations, terminal, claim) = match source {
-        LogUpProverSource::Witness(_) => {
-            let witness_source = witness_source
-                .as_ref()
-                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+        LogUpProverSource::Witness(_) | LogUpProverSource::RowSource(_) => {
+            let witness_source =
+                streamed_source.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
             let output = if elements >= TABLE_VALUES {
                 prove_logup_sumcheck_with_artifacts(
                     witness_source,
@@ -1072,15 +1121,15 @@ fn prove_from_source_deferred(
         LogUpProverSource::Materialized(oracles) => {
             reconstruction_tables(statement, oracles, &cell_point, &spec_point, slack_mixing)?
         }
-        LogUpProverSource::Witness(_) => reconstruction_tables_from_witness(
-            statement,
-            witness_source
-                .as_ref()
-                .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
-            &cell_point,
-            &spec_point,
-            slack_mixing,
-        )?,
+        LogUpProverSource::Witness(_) | LogUpProverSource::RowSource(_) => {
+            reconstruction_tables_from_witness(
+                statement,
+                streamed_source.ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
+                &cell_point,
+                &spec_point,
+                slack_mixing,
+            )?
+        }
     };
     let source_claim = inner_product(&reconstruction.source_weights, &reconstruction.role_values)?;
     transcript.append_field(b"source-claim", &source_claim);
@@ -1864,7 +1913,7 @@ fn logup_storage_error() -> BlsDoryRangeLogUpError {
 }
 
 fn raw_logup_fold_values(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     alpha: BlsDoryFr,
     selector: usize,
     cell: usize,
@@ -1957,7 +2006,7 @@ fn write_logup_fold_values(
 
 #[allow(clippy::too_many_arguments)]
 fn fold_raw_logup_values_compressed(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     alpha: BlsDoryFr,
     challenges: &[BlsDoryFr],
     selector_rows: usize,
@@ -2497,7 +2546,7 @@ struct LogUpScratchSumcheck {
 }
 
 fn raw_logup_values(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     counts: &[u64; TABLE_VALUES],
     alpha: BlsDoryFr,
     elements: usize,
@@ -2549,7 +2598,7 @@ fn raw_logup_values(
 }
 
 fn folded_raw_logup_values(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     counts: &[u64; TABLE_VALUES],
     alpha: BlsDoryFr,
     elements: usize,
@@ -2626,7 +2675,7 @@ fn validate_logup_suffix_pairs(
 
 #[allow(clippy::too_many_arguments)]
 fn raw_logup_artifact_round(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     sparse: &LogUpSparseTables,
     alpha: BlsDoryFr,
     selector_rows: usize,
@@ -2794,7 +2843,7 @@ fn logup_selector_values_from_artifact(
 
 #[allow(clippy::too_many_arguments)]
 fn recomputed_logup_round(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     counts: &[u64; TABLE_VALUES],
     alpha: BlsDoryFr,
     elements: usize,
@@ -2902,7 +2951,7 @@ fn fold_logup_core_values(values: &mut Vec<LogUpCoreValues>, challenge: BlsDoryF
 
 #[allow(clippy::too_many_arguments)]
 fn prove_logup_sumcheck_with_recomputation(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     counts: &[u64; TABLE_VALUES],
     alpha: BlsDoryFr,
     elements: usize,
@@ -3009,7 +3058,7 @@ fn prove_logup_sumcheck_with_recomputation(
 
 #[allow(clippy::too_many_arguments)]
 fn prove_logup_sumcheck_with_artifacts(
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     counts: &[u64; TABLE_VALUES],
     alpha: BlsDoryFr,
     elements: usize,
@@ -3322,7 +3371,7 @@ fn reconstruction_tables(
 
 fn reconstruction_tables_from_witness(
     statement: StructuredTransitionStatement,
-    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    source: &dyn LogUpTransitionSource,
     cell_point: &[BlsDoryFr],
     spec_point: &[BlsDoryFr],
     slack_mixing: BlsDoryFr,
@@ -3933,8 +3982,16 @@ mod tests {
     use super::*;
     use crate::{
         StructuredMaskPolynomial, V2_TRANSITION_MODULUS,
+        dory_bls12_381_execution_artifact::{
+            BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
+            BlsDoryExecutionAccumulatorArtifactWriter, BlsDoryExecutionAccumulatorColumn,
+        },
         dory_bls12_381_prototype::deterministic_bls_dory_setup,
-        dory_bls12_381_transition::prove_bls_dory_transition,
+        dory_bls12_381_transition::{
+            BlsDoryExecutionAccumulatorTransition, BlsDoryTransitionWitnessRowSource,
+            prove_bls_dory_transition,
+            prove_bls_dory_transition_deferred_at_variables_with_scratch,
+        },
     };
 
     static SCRATCH_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -4024,6 +4081,49 @@ mod tests {
                 .push(i64::try_from(output_remainder).unwrap() - OUTPUT_CENTER);
         }
         (statement, mask, witness)
+    }
+
+    fn execution_artifact_for_fixture(
+        directory: &Path,
+        statement: StructuredTransitionStatement,
+        witness: &StructuredTransitionWitness,
+    ) -> (
+        BlsDoryExecutionAccumulatorArtifactContext,
+        BlsDoryExecutionAccumulatorArtifact,
+    ) {
+        let cells = statement.rows * statement.cols;
+        let context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
+            [[0x11; 32], [0x22; 32], [0x33; 32], [0x44; 32]],
+            statement.rows,
+            statement.cols,
+            1,
+            statement.layers,
+            2,
+        )
+        .unwrap();
+        let mut writer =
+            BlsDoryExecutionAccumulatorArtifactWriter::create_new(directory, context).unwrap();
+        for chunk in vec![0_i32; cells].chunks(context.authentication_chunk_cells()) {
+            writer
+                .write_column_chunk(BlsDoryExecutionAccumulatorColumn::Initialization, chunk)
+                .unwrap();
+        }
+        for layer in 0..statement.layers {
+            let start = layer * cells;
+            let values = witness.accumulators[start..start + cells]
+                .iter()
+                .map(|value| i32::try_from(*value).unwrap())
+                .collect::<Vec<_>>();
+            for chunk in values.chunks(context.authentication_chunk_cells()) {
+                writer
+                    .write_column_chunk(
+                        BlsDoryExecutionAccumulatorColumn::BankLayer { bank: 0, layer },
+                        chunk,
+                    )
+                    .unwrap();
+            }
+        }
+        (context, writer.finish().unwrap())
     }
 
     fn scaled_fixture(
@@ -4683,6 +4783,87 @@ mod tests {
             drop(scratch);
             assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn execution_artifact_logup_matches_witness_proof_and_cleans_artifacts() {
+        let (statement, mask, witness) = fixture();
+        let packed_variables = 10;
+        let setup = deterministic_bls_dory_setup(packed_variables).unwrap();
+        let transition_scratch = ScratchDirectory::create();
+        let witness_scratch = ScratchDirectory::create();
+        let artifact_scratch = ScratchDirectory::create();
+
+        let arithmetic = prove_bls_dory_transition_deferred_at_variables_with_scratch(
+            b"artifact-logup",
+            statement,
+            &mask,
+            &witness,
+            packed_variables,
+            &setup,
+            &transition_scratch.0,
+        )
+        .unwrap();
+        let transition = arithmetic.openings.polynomial(0).unwrap();
+        let witness_range =
+            prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch(
+                b"artifact-logup",
+                statement,
+                &witness,
+                transition,
+                packed_variables,
+                &setup,
+                &witness_scratch.0,
+            )
+            .unwrap();
+
+        let (context, mut artifact) =
+            execution_artifact_for_fixture(&artifact_scratch.0, statement, &witness);
+        let (rows_variables, columns_variables) = dory_layout(packed_variables);
+        let source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+            statement,
+            &mask,
+            &mut artifact,
+            context,
+            BlsDoryExecutionAccumulatorTransition::Bank(0),
+            1usize << rows_variables,
+            1usize << columns_variables,
+        )
+        .unwrap();
+        let artifact_range =
+            prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch(
+                b"artifact-logup",
+                statement,
+                &source,
+                transition,
+                packed_variables,
+                &setup,
+                &artifact_scratch.0,
+            )
+            .unwrap();
+
+        assert_eq!(artifact_range.proof, witness_range.proof);
+        assert_eq!(
+            artifact_range.proof.encode_deferred(statement).unwrap(),
+            witness_range.proof.encode_deferred(statement).unwrap()
+        );
+        assert_eq!(
+            artifact_range.proof.transcript_digest,
+            witness_range.proof.transcript_digest
+        );
+        assert_eq!(
+            artifact_range.openings.claims(),
+            witness_range.openings.claims()
+        );
+
+        drop(source);
+        drop(artifact_range);
+        drop(artifact);
+        drop(witness_range);
+        drop(arithmetic);
+        assert_eq!(std::fs::read_dir(&artifact_scratch.0).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&witness_scratch.0).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&transition_scratch.0).unwrap().count(), 0);
     }
 
     #[test]

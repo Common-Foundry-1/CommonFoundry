@@ -987,7 +987,7 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         )
     }
 
-    fn create_with_chunk_bytes(
+    pub(crate) fn create_with_chunk_bytes(
         scratch_directory: &Path,
         explicit_count: usize,
         nu: usize,

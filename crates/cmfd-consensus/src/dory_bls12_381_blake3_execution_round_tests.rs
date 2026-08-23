@@ -359,3 +359,19 @@ fn failed_parent_authentication_removes_unfinished_child() {
     drop(parent);
     assert_eq!(directory.entries(), 0);
 }
+
+#[test]
+fn transactional_artifact_fold_rejects_corrupt_parent_and_removes_child() {
+    let directory = TestDirectory::create();
+    let parent = root_artifact(&directory, [0x91; 32], &[row(0), row(1_000)]);
+    let parent_length = std::fs::metadata(parent.path()).unwrap().len();
+    flip_at(parent.path(), parent_length - 1);
+
+    assert!(matches!(
+        fold_native_blake3_execution_artifact(&parent, &directory.0, BlsDoryFr::from_u64(7),),
+        Err(BlsDoryAggregateError::ProverStorage)
+    ));
+    assert_eq!(directory.entries(), 1);
+    drop(parent);
+    assert_eq!(directory.entries(), 0);
+}

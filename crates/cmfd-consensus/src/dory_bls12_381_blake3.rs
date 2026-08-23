@@ -202,6 +202,8 @@ const BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE: u64 = 1_024;
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_TABLE_INDEX: u32 = 0;
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_CONTEXT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundContext/v1";
+const BLS_DORY_BLAKE3_EXECUTION_ROUND_ROOT_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundRoot/v1";
 
 const _: () = {
     assert!(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS == 746);
@@ -3571,6 +3573,530 @@ fn native_blake3_execution_relation_value(
         mixed = mixed + residual * *coefficient;
     }
     Ok(mixed)
+}
+
+#[cfg(feature = "whir-prototype")]
+struct BlsDoryBlake3ExecutionAuxiliaryTables {
+    equality: Vec<BlsDoryFr>,
+    first: Vec<BlsDoryFr>,
+    last: Vec<BlsDoryFr>,
+    transition: Vec<BlsDoryFr>,
+    byte_coefficients: [Vec<BlsDoryFr>; 8],
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryBlake3ExecutionAuxiliaryTables {
+    fn new(
+        air: &NarrowBlake3Air,
+        equality_point: &[BlsDoryFr],
+        coefficient_point: &[BlsDoryFr],
+    ) -> Result<Self, BlsDoryAggregateError> {
+        let rows = air.trace_rows();
+        if !rows.is_power_of_two() || equality_point.len() != rows.ilog2() as usize {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+
+        let mut equality = allocate_native_blake3_auxiliary_table(rows, BlsDoryFr::zero())?;
+        equality[0] = BlsDoryFr::from_u64(1);
+        let mut active = 1usize;
+        for coordinate in equality_point {
+            for index in (0..active).rev() {
+                let value = equality[index];
+                equality[index] = value * (BlsDoryFr::from_u64(1) - *coordinate);
+                equality[index + active] = value * *coordinate;
+            }
+            active = active
+                .checked_mul(2)
+                .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        }
+        if active != rows {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+
+        let mut first = allocate_native_blake3_auxiliary_table(rows, BlsDoryFr::zero())?;
+        first[0] = BlsDoryFr::from_u64(1);
+        let mut last = allocate_native_blake3_auxiliary_table(rows, BlsDoryFr::zero())?;
+        last[rows - 1] = BlsDoryFr::from_u64(1);
+        let mut transition = allocate_native_blake3_auxiliary_table(rows, BlsDoryFr::from_u64(1))?;
+        transition[rows - 1] = BlsDoryFr::zero();
+
+        let mut byte_coefficients: [Vec<BlsDoryFr>; 8] = std::array::from_fn(|_| Vec::new());
+        for table in &mut byte_coefficients {
+            table
+                .try_reserve_exact(rows)
+                .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+            table.resize(rows, BlsDoryFr::zero());
+        }
+        for row in 0..rows {
+            let coefficients =
+                native_byte_coefficients(air.activation_group_index_at_row(row), coefficient_point);
+            for (table, coefficient) in byte_coefficients.iter_mut().zip(coefficients) {
+                table[row] = coefficient;
+            }
+        }
+
+        Ok(Self {
+            equality,
+            first,
+            last,
+            transition,
+            byte_coefficients,
+        })
+    }
+
+    fn active_rows(&self) -> Result<usize, BlsDoryAggregateError> {
+        let rows = self.equality.len();
+        if rows == 0
+            || self.first.len() != rows
+            || self.last.len() != rows
+            || self.transition.len() != rows
+            || self
+                .byte_coefficients
+                .iter()
+                .any(|table| table.len() != rows)
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        Ok(rows)
+    }
+
+    fn fold(&mut self, challenge: BlsDoryFr) -> Result<(), BlsDoryAggregateError> {
+        let rows = self.active_rows()?;
+        if rows < 2 || rows & 1 != 0 {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        fold_native_blake3_auxiliary_table(&mut self.equality, challenge);
+        fold_native_blake3_auxiliary_table(&mut self.first, challenge);
+        fold_native_blake3_auxiliary_table(&mut self.last, challenge);
+        fold_native_blake3_auxiliary_table(&mut self.transition, challenge);
+        for table in &mut self.byte_coefficients {
+            fold_native_blake3_auxiliary_table(table, challenge);
+        }
+        Ok(())
+    }
+
+    fn terminal(
+        &self,
+    ) -> Result<(BlsDoryFr, [BlsDoryFr; 3], [BlsDoryFr; 8]), BlsDoryAggregateError> {
+        if self.active_rows()? != 1 {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        Ok((
+            self.equality[0],
+            [self.first[0], self.last[0], self.transition[0]],
+            std::array::from_fn(|byte| self.byte_coefficients[byte][0]),
+        ))
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn allocate_native_blake3_auxiliary_table(
+    rows: usize,
+    value: BlsDoryFr,
+) -> Result<Vec<BlsDoryFr>, BlsDoryAggregateError> {
+    let mut table = Vec::new();
+    table
+        .try_reserve_exact(rows)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    table.resize(rows, value);
+    Ok(table)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn fold_native_blake3_auxiliary_table(table: &mut Vec<BlsDoryFr>, challenge: BlsDoryFr) {
+    let folded = table.len() / 2;
+    for pair in 0..folded {
+        let lower = table[2 * pair];
+        let upper = table[2 * pair + 1];
+        table[pair] = lower + challenge * (upper - lower);
+    }
+    table.truncate(folded);
+}
+
+#[cfg(feature = "whir-prototype")]
+fn for_each_authenticated_execution_root_pair(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    maximum_block_rows: usize,
+    mut visitor: impl FnMut(
+        usize,
+        &BlsDoryBlake3ExecutionRoundRow,
+        &BlsDoryBlake3ExecutionRoundRow,
+    ) -> Result<(), BlsDoryAggregateError>,
+) -> Result<(), BlsDoryAggregateError> {
+    let trace_rows = prepared.binding.trace_rows;
+    if trace_rows < 2 || !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let mut lower = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+    let mut visited = 0usize;
+    let mut pair_index = 0usize;
+    prepared.for_each_authenticated_execution_row(maximum_block_rows, |row, terminal| {
+        if row != visited {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        if row & 1 == 0 {
+            lower.copy_from_slice(terminal);
+        } else {
+            visitor(pair_index, &lower, terminal)?;
+            pair_index += 1;
+        }
+        visited += 1;
+        Ok(())
+    })?;
+    if visited != trace_rows || pair_index != trace_rows / 2 {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn for_each_authenticated_execution_round_pair(
+    artifact: &BlsDoryBlake3ExecutionRoundArtifact,
+    mut visitor: impl FnMut(
+        usize,
+        &BlsDoryBlake3ExecutionRoundRow,
+        &BlsDoryBlake3ExecutionRoundRow,
+    ) -> Result<(), BlsDoryAggregateError>,
+) -> Result<(), BlsDoryAggregateError> {
+    let mut pair_index = 0usize;
+    let mut visitor_error = None;
+    let traversal = artifact.for_each_row_pair(|lower, upper| {
+        match visitor(pair_index, lower, upper) {
+            Ok(()) => pair_index += 1,
+            Err(error) => {
+                visitor_error = Some(error);
+                return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+            }
+        }
+        Ok(())
+    });
+    if let Some(error) = visitor_error {
+        return Err(error);
+    }
+    traversal.map_err(native_blake3_fold_artifact_error)?;
+    let expected_pairs = usize::try_from(artifact.active_rows / 2)
+        .map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    if pair_index != expected_pairs {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_accumulate_execution_pair(
+    pair_index: usize,
+    lower: &BlsDoryBlake3ExecutionRoundRow,
+    upper: &BlsDoryBlake3ExecutionRoundRow,
+    auxiliary: &BlsDoryBlake3ExecutionAuxiliaryTables,
+    relation: &BlsDoryBlake3ExecutionRelation<'_>,
+    evaluations: &mut [BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1],
+) -> Result<(), BlsDoryAggregateError> {
+    let offset = pair_index
+        .checked_mul(2)
+        .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+    let rows = auxiliary.active_rows()?;
+    if offset + 1 >= rows {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+
+    let mut terminal = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+    for (sample_index, evaluation) in evaluations.iter_mut().enumerate() {
+        let sample = BlsDoryFr::from_u64(sample_index as u64);
+        for column in 0..BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS {
+            terminal[column] = lower[column] + sample * (upper[column] - lower[column]);
+        }
+        let interpolate =
+            |table: &[BlsDoryFr]| table[offset] + sample * (table[offset + 1] - table[offset]);
+        let selectors = [
+            interpolate(&auxiliary.first),
+            interpolate(&auxiliary.last),
+            interpolate(&auxiliary.transition),
+        ];
+        let coefficients =
+            std::array::from_fn(|byte| interpolate(&auxiliary.byte_coefficients[byte]));
+        let equality = interpolate(&auxiliary.equality);
+        *evaluation = *evaluation
+            + equality
+                * native_blake3_execution_relation_value(
+                    &terminal,
+                    selectors,
+                    &coefficients,
+                    relation,
+                )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn evaluate_native_blake3_execution_root_round(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    maximum_block_rows: usize,
+    auxiliary: &BlsDoryBlake3ExecutionAuxiliaryTables,
+    relation: &BlsDoryBlake3ExecutionRelation<'_>,
+) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
+    let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1];
+    for_each_authenticated_execution_root_pair(
+        prepared,
+        maximum_block_rows,
+        |pair_index, lower, upper| {
+            native_blake3_accumulate_execution_pair(
+                pair_index,
+                lower,
+                upper,
+                auxiliary,
+                relation,
+                &mut evaluations,
+            )
+        },
+    )?;
+    Ok(evaluations)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn evaluate_native_blake3_execution_artifact_round(
+    artifact: &BlsDoryBlake3ExecutionRoundArtifact,
+    auxiliary: &BlsDoryBlake3ExecutionAuxiliaryTables,
+    relation: &BlsDoryBlake3ExecutionRelation<'_>,
+) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
+    let artifact_rows = usize::try_from(artifact.active_rows)
+        .map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    if artifact_rows != auxiliary.active_rows()? {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1];
+    for_each_authenticated_execution_round_pair(artifact, |pair_index, lower, upper| {
+        native_blake3_accumulate_execution_pair(
+            pair_index,
+            lower,
+            upper,
+            auxiliary,
+            relation,
+            &mut evaluations,
+        )
+    })?;
+    Ok(evaluations)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn fold_native_blake3_execution_root(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    maximum_block_rows: usize,
+    scratch_directory: &std::path::Path,
+    root_lineage: [u8; 32],
+    challenge: BlsDoryFr,
+) -> Result<BlsDoryBlake3ExecutionRoundArtifact, BlsDoryAggregateError> {
+    let active_rows = prepared.binding.trace_rows / 2;
+    let active_rows =
+        u64::try_from(active_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    let mut writer = BlsDoryBlake3ExecutionRoundArtifactWriter::create(
+        scratch_directory,
+        active_rows,
+        0,
+        BlsDoryBlake3ExecutionRoundParent::Root(root_lineage),
+    )
+    .map_err(native_blake3_fold_artifact_error)?;
+    let mut folded = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+    for_each_authenticated_execution_root_pair(
+        prepared,
+        maximum_block_rows,
+        |_pair_index, lower, upper| {
+            for column in 0..BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS {
+                folded[column] = lower[column] + challenge * (upper[column] - lower[column]);
+            }
+            writer
+                .write_row(&folded)
+                .map_err(native_blake3_fold_artifact_error)
+        },
+    )?;
+    writer.finish().map_err(native_blake3_fold_artifact_error)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn fold_native_blake3_execution_artifact(
+    parent: &BlsDoryBlake3ExecutionRoundArtifact,
+    scratch_directory: &std::path::Path,
+    challenge: BlsDoryFr,
+) -> Result<BlsDoryBlake3ExecutionRoundArtifact, BlsDoryAggregateError> {
+    if parent.active_rows < 2 {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    let round_index = parent
+        .round_index
+        .checked_add(1)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let mut writer = BlsDoryBlake3ExecutionRoundArtifactWriter::create(
+        scratch_directory,
+        parent.active_rows / 2,
+        round_index,
+        BlsDoryBlake3ExecutionRoundParent::Previous(parent),
+    )
+    .map_err(native_blake3_fold_artifact_error)?;
+    let mut folded = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+
+    // The writer remains locally owned until the complete parent traversal,
+    // including footer authentication, succeeds. Any read or callback error
+    // therefore drops and deletes the unfinished child before returning.
+    parent
+        .for_each_row_pair(|lower, upper| {
+            for column in 0..BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS {
+                folded[column] = lower[column] + challenge * (upper[column] - lower[column]);
+            }
+            writer.write_row(&folded)
+        })
+        .map_err(native_blake3_fold_artifact_error)?;
+    writer.finish().map_err(native_blake3_fold_artifact_error)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_execution_round_root_lineage(
+    transcript_digest: [u8; 32],
+    trace_rows: usize,
+) -> Result<[u8; 32], BlsDoryAggregateError> {
+    if transcript_digest == [0; 32] || !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let mut hasher = blake3::Hasher::new_derive_key(BLS_DORY_BLAKE3_EXECUTION_ROUND_ROOT_DOMAIN);
+    hasher.update(&transcript_digest);
+    let trace_rows =
+        u64::try_from(trace_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    hasher.update(&trace_rows.to_le_bytes());
+    hasher.update(&(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS as u64).to_le_bytes());
+    let digest = *hasher.finalize().as_bytes();
+    if digest == [0; 32] {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    Ok(digest)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_fold_artifact_error(error: BlsDoryFoldArtifactError) -> BlsDoryAggregateError {
+    match error {
+        BlsDoryFoldArtifactError::InvalidSpec => BlsDoryAggregateError::InvalidProofShape,
+        BlsDoryFoldArtifactError::InvalidArtifact
+        | BlsDoryFoldArtifactError::InvalidScalar
+        | BlsDoryFoldArtifactError::Authentication
+        | BlsDoryFoldArtifactError::Io(_) => BlsDoryAggregateError::ProverStorage,
+    }
+}
+
+/// Produce the native execution sumcheck without materializing the 746-column
+/// terminal matrix. The streamed root is read twice; each later authenticated
+/// round artifact is also read twice, first for the round polynomial and then
+/// transactionally for the challenge fold.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn prove_native_blake3_execution_sumcheck_out_of_core(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+) -> Result<BlsDoryBlake3ExecutionSumcheckProof, BlsDoryAggregateError> {
+    if maximum_block_rows == 0 || !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let native_statement = native_blake3_statement_from_bridge(bridge);
+    let air = NarrowBlake3Air::new(&native_statement)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let trace_rows = air.trace_rows();
+    if trace_rows != prepared.binding.trace_rows || !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let variables = trace_rows.ilog2() as usize;
+    let public = native_blake3_public_values(bridge)?;
+    let constraints = bls_dory_native_blake3_constraint_ir(bridge.final_activation_len())
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    if constraints.len() + 3 != BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+
+    let commitments = prepared.commitments();
+    let mut transcript = native_blake3_execution_transcript(bridge, &commitments);
+    let mixing_powers = native_blake3_constraint_powers(&mut transcript);
+    let cell_point = native_blake3_cell_point(&mut transcript, variables);
+    let root_lineage = native_blake3_execution_round_root_lineage(transcript.digest(), trace_rows)?;
+    let relation = BlsDoryBlake3ExecutionRelation {
+        public: &public,
+        constraints: &constraints,
+        mixing_powers: &mixing_powers,
+        raw_evaluation: bridge.raw_byte_evaluation(),
+    };
+    let mut auxiliary =
+        BlsDoryBlake3ExecutionAuxiliaryTables::new(&air, &cell_point, bridge.cell_point())?;
+    let mut rounds = Vec::new();
+    rounds
+        .try_reserve_exact(variables)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    let mut claim = BlsDoryFr::zero();
+    let mut current_artifact = None;
+
+    for round_index in 0..variables {
+        let evaluations = if let Some(parent) = current_artifact.as_ref() {
+            evaluate_native_blake3_execution_artifact_round(parent, &auxiliary, &relation)?
+        } else {
+            evaluate_native_blake3_execution_root_round(
+                prepared,
+                maximum_block_rows,
+                &auxiliary,
+                &relation,
+            )?
+        };
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryAggregateError::SumcheckFailed);
+        }
+        native_blake3_absorb_sumcheck_round(&mut transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = native_blake3_evaluate_samples(
+            &evaluations,
+            BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1,
+            challenge,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+
+        let child = if let Some(parent) = current_artifact.as_ref() {
+            fold_native_blake3_execution_artifact(parent, scratch_directory, challenge)?
+        } else {
+            fold_native_blake3_execution_root(
+                prepared,
+                maximum_block_rows,
+                scratch_directory,
+                root_lineage,
+                challenge,
+            )?
+        };
+        auxiliary.fold(challenge)?;
+        current_artifact = Some(child);
+        rounds.push(evaluations.to_vec());
+    }
+
+    let terminal = current_artifact
+        .as_ref()
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?
+        .terminal_row()
+        .map_err(native_blake3_fold_artifact_error)?;
+    let (equality, selectors, coefficients) = auxiliary.terminal()?;
+    let expected = equality
+        * native_blake3_execution_relation_value(&terminal, selectors, &coefficients, &relation)?;
+    if claim != expected {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    native_blake3_absorb_terminal(&mut transcript, &terminal);
+    let proof = BlsDoryBlake3ExecutionSumcheckProof {
+        rounds,
+        terminal_evaluations: terminal.to_vec(),
+        transcript_digest: transcript.digest(),
+    };
+    let verified = verify_native_blake3_execution_sumcheck(
+        &proof,
+        &air,
+        &public,
+        &constraints,
+        bridge,
+        &commitments,
+    )?;
+    if verified.point.len() != variables || verified.transcript_digest != proof.transcript_digest {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    Ok(proof)
 }
 
 #[cfg(feature = "whir-prototype")]
@@ -10807,6 +11333,143 @@ mod tests {
 
         drop(prepared);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn out_of_core_execution_sumcheck_matches_dense_v2_at_256_rows() {
+        let fixture = dense_blake3_fixture();
+        assert_eq!(fixture.air.trace_rows(), 1 << 8);
+        let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+        let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+        let source_scratch = Blake3ScratchDirectory::create();
+        let round_scratch = Blake3ScratchDirectory::create();
+        let mut prepared = prepare_native_blake3_sources_at_layout(
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &source_scratch.0,
+        )
+        .unwrap();
+        let commitments = prepared.commitments();
+        let native_statement = native_blake3_statement_from_bridge(&fixture.bridge);
+        let native_air = NarrowBlake3Air::new(&native_statement).unwrap();
+        let native_public = native_blake3_public_values(&fixture.bridge).unwrap();
+        let native_constraints =
+            bls_dory_native_blake3_constraint_ir(fixture.bridge.final_activation_len()).unwrap();
+        let dense = prove_dense_execution_sumcheck_with_transcript(
+            fixture.tables.clone(),
+            &native_air,
+            &native_public,
+            &native_constraints,
+            &fixture.bridge,
+            native_blake3_execution_transcript(&fixture.bridge, &commitments),
+        );
+        let expected = BlsDoryBlake3ExecutionSumcheckProof {
+            rounds: dense.rounds,
+            terminal_evaluations: dense.terminal_evaluations,
+            transcript_digest: dense.transcript_digest,
+        };
+
+        let first = prove_native_blake3_execution_sumcheck_out_of_core(
+            &mut prepared,
+            &fixture.bridge,
+            &round_scratch.0,
+            31,
+        )
+        .unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(std::fs::read_dir(&round_scratch.0).unwrap().count(), 0);
+        let second = prove_native_blake3_execution_sumcheck_out_of_core(
+            &mut prepared,
+            &fixture.bridge,
+            &round_scratch.0,
+            17,
+        )
+        .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_dir(&round_scratch.0).unwrap().count(), 0);
+
+        let execution_commitments = [
+            *commitments.commitment(BlsDoryBlake3SourceRole::Main),
+            *commitments.commitment(BlsDoryBlake3SourceRole::Accumulator),
+            *commitments.commitment(BlsDoryBlake3SourceRole::Preprocessing),
+        ];
+        let encode = |proof: &BlsDoryBlake3ExecutionSumcheckProof| {
+            encode_native_blake3_component(
+                BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC,
+                &execution_commitments,
+                &proof.rounds,
+                BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1,
+                &proof.terminal_evaluations,
+                BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS,
+                proof.transcript_digest,
+                native_air.trace_rows().ilog2() as usize,
+            )
+            .unwrap()
+        };
+        let first_encoded = encode(&first);
+        assert_eq!(first_encoded, encode(&expected));
+        assert_eq!(first_encoded, encode(&second));
+        let decoded = decode_native_blake3_component(
+            &first_encoded,
+            BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC,
+            BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS,
+            native_air.trace_rows().ilog2() as usize,
+            BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1,
+            BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS,
+        )
+        .unwrap();
+        assert_eq!(decoded.commitments, execution_commitments);
+        assert_eq!(decoded.rounds, first.rounds);
+        assert_eq!(decoded.terminal_evaluations, first.terminal_evaluations);
+        assert_eq!(decoded.transcript_digest, first.transcript_digest);
+        let verified = verify_native_blake3_execution_sumcheck(
+            &first,
+            &native_air,
+            &native_public,
+            &native_constraints,
+            &fixture.bridge,
+            &commitments,
+        )
+        .unwrap();
+        assert_eq!(verified.point.len(), 8);
+        assert_eq!(verified.transcript_digest, first.transcript_digest);
+
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&source_scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn out_of_core_execution_sumcheck_rejects_corrupt_source_without_scratch_leaks() {
+        let fixture = dense_blake3_fixture();
+        let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+        let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+        let source_scratch = Blake3ScratchDirectory::create();
+        let round_scratch = Blake3ScratchDirectory::create();
+        let mut prepared = prepare_native_blake3_sources_at_layout(
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &source_scratch.0,
+        )
+        .unwrap();
+        flip_file_byte(prepared.main_transpose.path(), 100).unwrap();
+        assert!(matches!(
+            prove_native_blake3_execution_sumcheck_out_of_core(
+                &mut prepared,
+                &fixture.bridge,
+                &round_scratch.0,
+                31,
+            ),
+            Err(BlsDoryAggregateError::ProverStorage)
+        ));
+        assert_eq!(std::fs::read_dir(&round_scratch.0).unwrap().count(), 0);
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&source_scratch.0).unwrap().count(), 0);
     }
 
     #[test]

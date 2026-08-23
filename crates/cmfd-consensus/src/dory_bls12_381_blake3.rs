@@ -12,9 +12,17 @@
 //! The adjacency argument is required. Merely placing local and next values in
 //! one prover-supplied table would not prove that adjacent rows are related.
 
+#[cfg(feature = "whir-prototype")]
+use std::io::Cursor;
+
 use dory_pcs::primitives::arithmetic::Field as DoryField;
 #[cfg(feature = "whir-prototype")]
 use dory_pcs::primitives::transcript::Transcript;
+#[cfg(feature = "whir-prototype")]
+use dory_pcs::primitives::{
+    DoryDeserialize, DorySerialize,
+    serialization::{Compress, Validate},
+};
 #[cfg(feature = "whir-prototype")]
 use p3_air::symbolic::{
     AirLayout, BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression, get_symbolic_constraints,
@@ -624,6 +632,21 @@ impl BlsDoryBlake3OpeningStatement {
         self.opening_binding
     }
 
+    /// Reconstruct the exact ordered suffix accepted by the composed verifier.
+    /// Callers cannot choose a commitment, point, evaluation, or source role.
+    pub(crate) fn claims(&self) -> Vec<BlsDoryOpeningClaim> {
+        BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES
+            .into_iter()
+            .zip(&self.points)
+            .zip(&self.evaluations)
+            .map(|((role, point), evaluation)| BlsDoryOpeningClaim {
+                commitment: *self.source_commitments.commitment(role),
+                point: point.clone(),
+                evaluation: *evaluation,
+            })
+            .collect()
+    }
+
     /// Bind each claim to its semantic source role, exact lifted point, and
     /// transcript-replayed terminal evaluation.
     pub(crate) fn validate_claims(
@@ -1064,6 +1087,15 @@ const COMPONENT_HEADER_BYTES: usize = 20;
 const TRANSCRIPT_DIGEST_BYTES: usize = 32;
 const FRAME_LENGTH_BYTES: usize = 4;
 const CURRENT_SHARED_PRODUCTION_BYTES: usize = 133_409;
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC: [u8; 8] = *b"CFB3EX01";
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_ADJACENCY_PROOF_MAGIC: [u8; 8] = *b"CFB3AD01";
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_COMPONENT_RESERVED: u16 = 0;
+
+/// Version of the canonical native BLAKE3 component wire grammar.
+pub const BLS_DORY_BLAKE3_NATIVE_PROOF_VERSION: u16 = 1;
 
 /// Conservative execution-component wire projection.
 pub const BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES: usize = COMPONENT_HEADER_BYTES
@@ -1118,9 +1150,9 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded release-only 21-variable regression now composes the authentic 128-claim shared topology with all six verifier-replayed native claims in one consuming 134-claim aggregate, verifies canonical routing and tamper rejection, and leaves zero retained scratch; the real production preprocessing-pin registry, a production composed verifier and wire integration, a complete production out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical routing and tamper rejection, and leaves zero retained scratch; the real production preprocessing-pin registry, top-level candidate integration, a complete production out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
-    "the public shared aggregate parser still intentionally caps claim count at 128; the bounded test-only 134-claim aggregate composition now verifies end to end, but the cap must remain closed until the production verifier derives the native suffix from its replay proof and the composed wire path is integrated",
+    "the public shared aggregate parser still intentionally caps claim count at 128; a specialized internal verifier now accepts exactly 134 only after deriving the native suffix from an opaque replay statement, but the generic cap must remain closed until the top-level candidate wire and verifier use that composed path",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
 
@@ -1627,6 +1659,320 @@ struct BlsDoryBlake3AdjacencySumcheckProof {
     rounds: Vec<Vec<BlsDoryFr>>,
     terminal_evaluations: Vec<BlsDoryFr>,
     transcript_digest: [u8; 32],
+}
+
+/// Canonical native BLAKE3 proof material. The four source commitments are
+/// named internally, and the verifier derives every opening point and
+/// evaluation by replaying the two sumchecks.
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlsDoryNativeBlake3Proof {
+    source_commitments: BlsDoryBlake3SourceCommitments,
+    execution: BlsDoryBlake3ExecutionSumcheckProof,
+    adjacency: BlsDoryBlake3AdjacencySumcheckProof,
+}
+
+#[cfg(feature = "whir-prototype")]
+struct DecodedBlsDoryBlake3Component {
+    commitments: Vec<BlsDoryGt>,
+    rounds: Vec<Vec<BlsDoryFr>>,
+    terminal_evaluations: Vec<BlsDoryFr>,
+    transcript_digest: [u8; 32],
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryNativeBlake3Proof {
+    /// Encode the immutable production geometry.
+    #[allow(dead_code)]
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, BlsDoryAggregateError> {
+        self.encode_at_trace_variables(BLS_DORY_BLAKE3_TRACE_VARIABLES)
+    }
+
+    /// Decode only the immutable production geometry.
+    pub(crate) fn decode(encoded: &[u8]) -> Result<Self, BlsDoryAggregateError> {
+        Self::decode_at_trace_variables(encoded, BLS_DORY_BLAKE3_TRACE_VARIABLES)
+    }
+
+    fn encode_at_trace_variables(
+        &self,
+        trace_variables: usize,
+    ) -> Result<Vec<u8>, BlsDoryAggregateError> {
+        let execution_commitments = [
+            self.source_commitments.main,
+            self.source_commitments.accumulator,
+            self.source_commitments.preprocessing,
+        ];
+        let execution = encode_native_blake3_component(
+            BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC,
+            &execution_commitments,
+            &self.execution.rounds,
+            BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1,
+            &self.execution.terminal_evaluations,
+            BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS,
+            self.execution.transcript_digest,
+            trace_variables,
+        )?;
+        let adjacency_commitments = [self.source_commitments.inverse];
+        let adjacency = encode_native_blake3_component(
+            BLS_DORY_BLAKE3_ADJACENCY_PROOF_MAGIC,
+            &adjacency_commitments,
+            &self.adjacency.rounds,
+            BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1,
+            &self.adjacency.terminal_evaluations,
+            BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS,
+            self.adjacency.transcript_digest,
+            trace_variables,
+        )?;
+        let total = execution
+            .len()
+            .checked_add(adjacency.len())
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+        let mut encoded = Vec::with_capacity(total);
+        encoded.extend_from_slice(&execution);
+        encoded.extend_from_slice(&adjacency);
+        Ok(encoded)
+    }
+
+    fn decode_at_trace_variables(
+        encoded: &[u8],
+        trace_variables: usize,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        let execution_bytes = native_blake3_component_wire_bytes(
+            3,
+            trace_variables,
+            BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1,
+            BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS,
+        )
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+        let adjacency_bytes = native_blake3_component_wire_bytes(
+            1,
+            trace_variables,
+            BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1,
+            BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS,
+        )
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+        if encoded.len()
+            != execution_bytes
+                .checked_add(adjacency_bytes)
+                .ok_or(BlsDoryAggregateError::InvalidProofShape)?
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        let execution = decode_native_blake3_component(
+            &encoded[..execution_bytes],
+            BLS_DORY_BLAKE3_EXECUTION_PROOF_MAGIC,
+            3,
+            trace_variables,
+            BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1,
+            BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS,
+        )?;
+        let adjacency = decode_native_blake3_component(
+            &encoded[execution_bytes..],
+            BLS_DORY_BLAKE3_ADJACENCY_PROOF_MAGIC,
+            1,
+            trace_variables,
+            BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1,
+            BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS,
+        )?;
+        let [main, accumulator, preprocessing]: [BlsDoryGt; 3] =
+            execution
+                .commitments
+                .try_into()
+                .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+        let [inverse]: [BlsDoryGt; 1] = adjacency
+            .commitments
+            .try_into()
+            .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+        let proof = Self {
+            source_commitments: BlsDoryBlake3SourceCommitments {
+                main,
+                accumulator,
+                preprocessing,
+                inverse,
+            },
+            execution: BlsDoryBlake3ExecutionSumcheckProof {
+                rounds: execution.rounds,
+                terminal_evaluations: execution.terminal_evaluations,
+                transcript_digest: execution.transcript_digest,
+            },
+            adjacency: BlsDoryBlake3AdjacencySumcheckProof {
+                rounds: adjacency.rounds,
+                terminal_evaluations: adjacency.terminal_evaluations,
+                transcript_digest: adjacency.transcript_digest,
+            },
+        };
+        if proof.encode_at_trace_variables(trace_variables)? != encoded {
+            return Err(BlsDoryAggregateError::InvalidEncoding);
+        }
+        Ok(proof)
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_component_wire_bytes(
+    commitments: usize,
+    rounds: usize,
+    round_width: usize,
+    terminal_evaluations: usize,
+) -> Option<usize> {
+    COMPONENT_HEADER_BYTES
+        .checked_add(commitments.checked_mul(GT_BYTES)?)?
+        .checked_add(rounds.checked_mul(round_width)?.checked_mul(SCALAR_BYTES)?)?
+        .checked_add(terminal_evaluations.checked_mul(SCALAR_BYTES)?)?
+        .checked_add(TRANSCRIPT_DIGEST_BYTES)
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn encode_native_blake3_component(
+    magic: [u8; 8],
+    commitments: &[BlsDoryGt],
+    rounds: &[Vec<BlsDoryFr>],
+    round_width: usize,
+    terminal_evaluations: &[BlsDoryFr],
+    expected_terminal_evaluations: usize,
+    transcript_digest: [u8; 32],
+    expected_rounds: usize,
+) -> Result<Vec<u8>, BlsDoryAggregateError> {
+    if rounds.len() != expected_rounds
+        || terminal_evaluations.len() != expected_terminal_evaluations
+        || rounds.iter().any(|round| round.len() != round_width)
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let commitment_count =
+        u16::try_from(commitments.len()).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let round_count =
+        u16::try_from(rounds.len()).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let round_width =
+        u16::try_from(round_width).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let terminal_count = u16::try_from(terminal_evaluations.len())
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let expected_bytes = native_blake3_component_wire_bytes(
+        commitments.len(),
+        rounds.len(),
+        usize::from(round_width),
+        terminal_evaluations.len(),
+    )
+    .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let mut encoded = Vec::with_capacity(expected_bytes);
+    encoded.extend_from_slice(&magic);
+    encoded.extend_from_slice(&BLS_DORY_BLAKE3_NATIVE_PROOF_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&commitment_count.to_le_bytes());
+    encoded.extend_from_slice(&round_count.to_le_bytes());
+    encoded.extend_from_slice(&round_width.to_le_bytes());
+    encoded.extend_from_slice(&terminal_count.to_le_bytes());
+    encoded.extend_from_slice(&BLS_DORY_BLAKE3_COMPONENT_RESERVED.to_le_bytes());
+    for commitment in commitments {
+        append_native_blake3_wire_value(&mut encoded, commitment)?;
+    }
+    for round in rounds {
+        for evaluation in round {
+            append_native_blake3_wire_value(&mut encoded, evaluation)?;
+        }
+    }
+    for evaluation in terminal_evaluations {
+        append_native_blake3_wire_value(&mut encoded, evaluation)?;
+    }
+    encoded.extend_from_slice(&transcript_digest);
+    if encoded.len() != expected_bytes {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    Ok(encoded)
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn decode_native_blake3_component(
+    encoded: &[u8],
+    expected_magic: [u8; 8],
+    expected_commitments: usize,
+    expected_rounds: usize,
+    expected_round_width: usize,
+    expected_terminal_evaluations: usize,
+) -> Result<DecodedBlsDoryBlake3Component, BlsDoryAggregateError> {
+    let expected_bytes = native_blake3_component_wire_bytes(
+        expected_commitments,
+        expected_rounds,
+        expected_round_width,
+        expected_terminal_evaluations,
+    )
+    .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    if encoded.len() != expected_bytes || encoded[..8] != expected_magic {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let version = read_native_blake3_wire_u16(encoded, 8)?;
+    let commitments = read_native_blake3_wire_u16(encoded, 10)? as usize;
+    let rounds = read_native_blake3_wire_u16(encoded, 12)? as usize;
+    let round_width = read_native_blake3_wire_u16(encoded, 14)? as usize;
+    let terminal_evaluations = read_native_blake3_wire_u16(encoded, 16)? as usize;
+    let reserved = read_native_blake3_wire_u16(encoded, 18)?;
+    if version != BLS_DORY_BLAKE3_NATIVE_PROOF_VERSION
+        || commitments != expected_commitments
+        || rounds != expected_rounds
+        || round_width != expected_round_width
+        || terminal_evaluations != expected_terminal_evaluations
+        || reserved != BLS_DORY_BLAKE3_COMPONENT_RESERVED
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let mut reader = Cursor::new(&encoded[COMPONENT_HEADER_BYTES..]);
+    let commitments = (0..commitments)
+        .map(|_| read_native_blake3_wire_value(&mut reader))
+        .collect::<Result<Vec<_>, _>>()?;
+    let rounds = (0..rounds)
+        .map(|_| {
+            (0..round_width)
+                .map(|_| read_native_blake3_wire_value(&mut reader))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let terminal_evaluations = (0..terminal_evaluations)
+        .map(|_| read_native_blake3_wire_value(&mut reader))
+        .collect::<Result<Vec<_>, _>>()?;
+    let digest_offset = COMPONENT_HEADER_BYTES
+        .checked_add(reader.position() as usize)
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let transcript_digest: [u8; 32] = encoded
+        .get(digest_offset..)
+        .and_then(|digest| digest.try_into().ok())
+        .ok_or(BlsDoryAggregateError::InvalidEncoding)?;
+    Ok(DecodedBlsDoryBlake3Component {
+        commitments,
+        rounds,
+        terminal_evaluations,
+        transcript_digest,
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn append_native_blake3_wire_value<T: DorySerialize>(
+    encoded: &mut Vec<u8>,
+    value: &T,
+) -> Result<(), BlsDoryAggregateError> {
+    value
+        .serialize_compressed(encoded)
+        .map_err(|_| BlsDoryAggregateError::InvalidEncoding)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn read_native_blake3_wire_value<T: DoryDeserialize>(
+    reader: &mut Cursor<&[u8]>,
+) -> Result<T, BlsDoryAggregateError> {
+    T::deserialize_with_mode(reader, Compress::Yes, Validate::Yes)
+        .map_err(|_| BlsDoryAggregateError::InvalidEncoding)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn read_native_blake3_wire_u16(
+    encoded: &[u8],
+    offset: usize,
+) -> Result<u16, BlsDoryAggregateError> {
+    encoded
+        .get(offset..offset + 2)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or(BlsDoryAggregateError::InvalidEncoding)
 }
 
 #[cfg(feature = "whir-prototype")]
@@ -2695,11 +3041,9 @@ fn verify_native_blake3_opening_replay_at_geometry(
 /// openings at the immutable production geometry.
 #[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
-fn verify_native_blake3_opening_statement(
+pub(crate) fn verify_native_blake3_opening_statement(
     bridge: &BlsDoryOutputBridgeStatement,
-    commitments: BlsDoryBlake3SourceCommitments,
-    execution: &BlsDoryBlake3ExecutionSumcheckProof,
-    adjacency: &BlsDoryBlake3AdjacencySumcheckProof,
+    proof: &BlsDoryNativeBlake3Proof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
     if bridge.final_activation_len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES {
@@ -2711,16 +3055,79 @@ fn verify_native_blake3_opening_statement(
         .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
     let replay = verify_native_blake3_opening_replay_at_geometry(
         bridge,
-        &commitments,
+        &proof.source_commitments,
         BlsDoryBlake3ReplayVerifier {
             context: &verifier_context,
             preprocessing_pin: &preprocessing_pin,
             geometry: BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
         },
-        execution,
-        adjacency,
+        &proof.execution,
+        &proof.adjacency,
     )?;
-    BlsDoryBlake3OpeningStatement::from_verified_replay(commitments, replay)
+    BlsDoryBlake3OpeningStatement::from_verified_replay(proof.source_commitments.clone(), replay)
+}
+
+/// Decode the canonical production native proof before verifier-owned replay.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+pub(crate) fn verify_encoded_native_blake3_opening_statement(
+    bridge: &BlsDoryOutputBridgeStatement,
+    encoded: &[u8],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
+    let proof = BlsDoryNativeBlake3Proof::decode(encoded)?;
+    verify_native_blake3_opening_statement(bridge, &proof, setup)
+}
+
+/// Exercise the same opaque wire-to-replay boundary at a bounded test
+/// geometry while supplying preprocessing authority out of band.
+#[cfg(all(test, feature = "whir-prototype"))]
+pub(crate) fn verify_encoded_native_blake3_test_opening_statement_at_layout(
+    bridge: &BlsDoryOutputBridgeStatement,
+    encoded: &[u8],
+    trusted_preprocessing_commitment: BlsDoryGt,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
+    let native_statement = native_blake3_statement_from_bridge(bridge);
+    let air = NarrowBlake3Air::new(&native_statement)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    if !air.trace_rows().is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let trace_variables = air.trace_rows().ilog2() as usize;
+    let geometry = BlsDoryBlake3ReplayGeometry {
+        trace_variables,
+        source_variables: trace_variables + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES,
+        shared_variables: layout.variables(),
+    };
+    let proof = BlsDoryNativeBlake3Proof::decode_at_trace_variables(encoded, trace_variables)?;
+    let verifier_context = BlsDoryBlake3VerifierContext::new(layout, setup)?;
+    let mut trusted_commitments = proof.source_commitments.clone();
+    trusted_commitments.preprocessing = trusted_preprocessing_commitment;
+    let preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+        bridge,
+        air.trace_rows(),
+        geometry,
+        &verifier_context,
+        &trusted_commitments,
+    );
+    let replay = verify_native_blake3_opening_replay_at_geometry(
+        bridge,
+        &proof.source_commitments,
+        BlsDoryBlake3ReplayVerifier {
+            context: &verifier_context,
+            preprocessing_pin: &preprocessing_pin,
+            geometry,
+        },
+        &proof.execution,
+        &proof.adjacency,
+    )?;
+    BlsDoryBlake3OpeningStatement::from_verified_replay_at_geometry(
+        proof.source_commitments,
+        replay,
+        geometry,
+    )
 }
 
 #[cfg(all(test, feature = "whir-prototype"))]
@@ -3544,6 +3951,8 @@ pub(crate) struct BlsDoryNativeBlake3TestTelemetry {
 pub(crate) struct PreparedBlsDoryNativeBlake3TestOpening {
     pub(crate) opening_statement: BlsDoryBlake3OpeningStatement,
     pub(crate) opening_set: BlsDoryDeferredOpeningSet,
+    pub(crate) encoded_native_proof: Vec<u8>,
+    pub(crate) trusted_preprocessing_commitment: BlsDoryGt,
     pub(crate) telemetry: BlsDoryNativeBlake3TestTelemetry,
     commitments: BlsDoryBlake3SourceCommitments,
     execution: BlsDoryBlake3ExecutionSumcheckProof,
@@ -3687,6 +4096,7 @@ mod tests {
                 evaluation: evaluations[index],
             })
             .collect::<Vec<_>>();
+        assert_eq!(statement.claims(), claims);
         statement.validate_claims(&claims).unwrap();
 
         let mut wrong_count = claims.clone();
@@ -3754,6 +4164,67 @@ mod tests {
             ),
             Err(BlsDoryAggregateError::InvalidProofShape)
         );
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn native_blake3_proof_wire_is_exact_canonical_and_bounded() {
+        let execution_rounds = (0..BLS_DORY_BLAKE3_TRACE_VARIABLES)
+            .map(|round| {
+                (0..=BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE)
+                    .map(|sample| BlsDoryFr::from_u64((round * 101 + sample + 1) as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let adjacency_rounds = (0..BLS_DORY_BLAKE3_TRACE_VARIABLES)
+            .map(|round| {
+                (0..=BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE)
+                    .map(|sample| BlsDoryFr::from_u64((round * 17 + sample + 10_001) as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let proof = BlsDoryNativeBlake3Proof {
+            source_commitments: BlsDoryBlake3SourceCommitments {
+                main: BlsDoryGt::random(),
+                accumulator: BlsDoryGt::random(),
+                preprocessing: BlsDoryGt::random(),
+                inverse: BlsDoryGt::random(),
+            },
+            execution: BlsDoryBlake3ExecutionSumcheckProof {
+                rounds: execution_rounds,
+                terminal_evaluations: (0..BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS)
+                    .map(|index| BlsDoryFr::from_u64(index as u64 + 20_001))
+                    .collect(),
+                transcript_digest: [0x31; 32],
+            },
+            adjacency: BlsDoryBlake3AdjacencySumcheckProof {
+                rounds: adjacency_rounds,
+                terminal_evaluations: (0..BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS)
+                    .map(|index| BlsDoryFr::from_u64(index as u64 + 30_001))
+                    .collect(),
+                transcript_digest: [0x42; 32],
+            },
+        };
+        let encoded = proof.encode().unwrap();
+        assert_eq!(
+            encoded.len(),
+            BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES + BLS_DORY_BLAKE3_ADJACENCY_PROOF_BYTES
+        );
+        assert_eq!(BlsDoryNativeBlake3Proof::decode(&encoded).unwrap(), proof);
+
+        let mut malformed = encoded.clone();
+        malformed[8] ^= 1;
+        assert!(BlsDoryNativeBlake3Proof::decode(&malformed).is_err());
+        let mut malformed = encoded.clone();
+        malformed[10..12].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(BlsDoryNativeBlake3Proof::decode(&malformed).is_err());
+        let mut malformed = encoded.clone();
+        malformed[18..20].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(BlsDoryNativeBlake3Proof::decode(&malformed).is_err());
+        assert!(BlsDoryNativeBlake3Proof::decode(&encoded[..encoded.len() - 1]).is_err());
+        let mut overlong = encoded;
+        overlong.push(0);
+        assert!(BlsDoryNativeBlake3Proof::decode(&overlong).is_err());
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -6081,6 +6552,20 @@ mod tests {
             replay,
             geometry,
         )?;
+        let native_proof = BlsDoryNativeBlake3Proof {
+            source_commitments: commitments.clone(),
+            execution: execution.clone(),
+            adjacency: adjacency.clone(),
+        };
+        let encoded_native_proof =
+            native_proof.encode_at_trace_variables(geometry.trace_variables)?;
+        if BlsDoryNativeBlake3Proof::decode_at_trace_variables(
+            &encoded_native_proof,
+            geometry.trace_variables,
+        )? != native_proof
+        {
+            return Err(BlsDoryAggregateError::InvalidEncoding);
+        }
         let opening_set = sources.into_canonical_deferred_openings_at_variables(
             points,
             geometry.source_variables,
@@ -6102,6 +6587,8 @@ mod tests {
         Ok(PreparedBlsDoryNativeBlake3TestOpening {
             opening_statement,
             opening_set,
+            encoded_native_proof,
+            trusted_preprocessing_commitment: commitments.preprocessing,
             telemetry: BlsDoryNativeBlake3TestTelemetry {
                 fixture_millis,
                 source_millis,
@@ -8276,6 +8763,8 @@ mod tests {
         let PreparedBlsDoryNativeBlake3TestOpening {
             opening_statement,
             opening_set,
+            encoded_native_proof,
+            trusted_preprocessing_commitment,
             telemetry,
             commitments,
             execution,
@@ -8290,6 +8779,18 @@ mod tests {
             &scratch.0,
         )
         .unwrap();
+        let decoded_native_proof = BlsDoryNativeBlake3Proof::decode_at_trace_variables(
+            &encoded_native_proof,
+            geometry.trace_variables,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded_native_proof
+                .encode_at_trace_variables(geometry.trace_variables)
+                .unwrap(),
+            encoded_native_proof
+        );
+        assert_eq!(trusted_preprocessing_commitment, commitments.preprocessing);
         assert_ne!(commitments.main, commitments.preprocessing);
         let wrong_pin_commitments = BlsDoryBlake3SourceCommitments {
             preprocessing: commitments.main,

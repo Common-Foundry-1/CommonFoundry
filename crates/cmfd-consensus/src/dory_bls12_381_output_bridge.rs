@@ -11,6 +11,8 @@ use ark_ff::{BigInteger, PrimeField};
 use dory_pcs::primitives::arithmetic::Field;
 use thiserror::Error;
 
+#[cfg(feature = "whir-prototype")]
+use crate::dory_bls12_381_layout::PendingBlsDoryFinalOutputOpening;
 use crate::dory_bls12_381_layout::VerifiedBlsDoryFinalOutputOpening;
 use crate::dory_bls12_381_prototype::BlsDoryFr;
 
@@ -40,6 +42,26 @@ impl BlsDoryOutputBridgeStatement {
         final_activation_digest: [u8; 32],
         final_activation_len: usize,
         opening: &VerifiedBlsDoryFinalOutputOpening,
+    ) -> Result<Self, BlsDoryOutputBridgeError> {
+        Self::new(
+            challenge_digest,
+            final_activation_digest,
+            final_activation_len,
+            opening.transcript_binding(),
+            opening.cell_point().to_vec(),
+            opening.signed_evaluation(),
+        )
+    }
+
+    /// Construct the bridge statement before aggregate verification so the
+    /// native replay can derive its six claims. Possession of this statement
+    /// does not promote the pending Dory opening.
+    #[cfg(feature = "whir-prototype")]
+    pub(crate) fn from_pending_dory(
+        challenge_digest: [u8; 32],
+        final_activation_digest: [u8; 32],
+        final_activation_len: usize,
+        opening: &PendingBlsDoryFinalOutputOpening,
     ) -> Result<Self, BlsDoryOutputBridgeError> {
         Self::new(
             challenge_digest,

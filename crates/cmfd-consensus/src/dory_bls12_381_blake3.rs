@@ -28,7 +28,8 @@ use crate::{
     dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
     structured_blake3_narrow::{
         F as Goldilocks, NarrowBlake3Air, NarrowBlake3Error, TEST_EVALUATION_ACCUMULATOR_START,
-        TEST_MAIN_WIDTH, TEST_ORIGINAL_NIBBLES_START, TEST_STACK_START,
+        TEST_MAIN_WIDTH, TEST_ORIGINAL_NIBBLES_START, TEST_PREPROCESSED_WORD_COLUMNS,
+        TEST_STACK_START,
     },
 };
 use crate::{
@@ -40,7 +41,7 @@ use crate::{
 };
 
 /// Version of this projection only; no wire proof uses it.
-pub const BLS_DORY_BLAKE3_PROJECTION_VERSION: u16 = 1;
+pub const BLS_DORY_BLAKE3_PROJECTION_VERSION: u16 = 2;
 /// The production final activation contains 128 * 4096 bytes.
 pub const BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES: usize = 1 << 19;
 /// The narrow tree schedule pads the production computation to 2^20 rows.
@@ -61,6 +62,55 @@ pub const BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES: usize = 31;
 pub const BLS_DORY_BLAKE3_SOURCE_DORY_NU: usize = BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES;
 /// Dory columns address the twenty low-order trace-row variables.
 pub const BLS_DORY_BLAKE3_SOURCE_DORY_SIGMA: usize = BLS_DORY_BLAKE3_TRACE_VARIABLES;
+/// Ordinary main columns, excluding the native full-field accumulator, for local and next rows.
+pub const BLS_DORY_BLAKE3_SIGNED_WORD_TABLES: usize = 2 * (BLS_DORY_BLAKE3_MAIN_WIDTH - 1);
+/// Local and next native accumulators require canonical full-field scalars.
+pub const BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES: usize = 2;
+/// Counter low/high, block length, and flags for local and next preprocessing rows.
+pub const BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES: usize = 8;
+/// Remaining local and next preprocessing tables are Boolean dictionary codes.
+pub const BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES: usize =
+    2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES;
+/// Two post-challenge LogUp inverse tables require canonical full-field scalars.
+pub const BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES: usize = 2;
+
+const BLS_DORY_SCALAR_BYTES: u64 = 32;
+const BLS_DORY_SIGNED_WORD_BYTES: u64 = 8;
+const BLS_DORY_BOOLEAN_CODE_BITS: u64 = 4;
+const BLS_DORY_BLAKE3_TRACE_ROWS_U64: u64 = BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS as u64;
+/// Literal payload for all execution and inverse tables before authenticated framing.
+pub const BLS_DORY_BLAKE3_LITERAL_SOURCE_PAYLOAD_BYTES: u64 =
+    (2 * (BLS_DORY_BLAKE3_MAIN_WIDTH + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
+        + BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES) as u64
+        * BLS_DORY_BLAKE3_TRACE_ROWS_U64
+        * BLS_DORY_SCALAR_BYTES;
+/// Fixed-width payload for ordinary main local/next tables.
+pub const BLS_DORY_BLAKE3_SIGNED_WORD_PAYLOAD_BYTES: u64 = BLS_DORY_BLAKE3_SIGNED_WORD_TABLES
+    as u64
+    * BLS_DORY_BLAKE3_TRACE_ROWS_U64
+    * BLS_DORY_SIGNED_WORD_BYTES;
+/// Full-field payload for local/next accumulators and the two inverse tables.
+pub const BLS_DORY_BLAKE3_FULL_FIELD_PAYLOAD_BYTES: u64 =
+    (BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES + BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES) as u64
+        * BLS_DORY_BLAKE3_TRACE_ROWS_U64
+        * BLS_DORY_SCALAR_BYTES;
+/// Fixed-width payload for the eight non-Boolean preprocessing tables.
+pub const BLS_DORY_BLAKE3_PREPROCESSED_WORD_PAYLOAD_BYTES: u64 =
+    BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES as u64
+        * BLS_DORY_BLAKE3_TRACE_ROWS_U64
+        * BLS_DORY_SIGNED_WORD_BYTES;
+/// Packed nibble payload for Boolean preprocessing tables.
+pub const BLS_DORY_BLAKE3_PREPROCESSED_CODE_PAYLOAD_BYTES: u64 =
+    BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES as u64
+        * BLS_DORY_BLAKE3_TRACE_ROWS_U64
+        * BLS_DORY_BOOLEAN_CODE_BITS
+        / 8;
+/// Projected authenticated source payload, excluding small framing and later polynomial-fold scratch.
+pub const BLS_DORY_BLAKE3_COMPACT_SOURCE_PAYLOAD_BYTES: u64 =
+    BLS_DORY_BLAKE3_SIGNED_WORD_PAYLOAD_BYTES
+        + BLS_DORY_BLAKE3_FULL_FIELD_PAYLOAD_BYTES
+        + BLS_DORY_BLAKE3_PREPROCESSED_WORD_PAYLOAD_BYTES
+        + BLS_DORY_BLAKE3_PREPROCESSED_CODE_PAYLOAD_BYTES;
 /// The translated execution constraints have degree at most sixteen.
 pub const BLS_DORY_BLAKE3_EXECUTION_CONSTRAINT_DEGREE: usize = 16;
 /// The native relation keeps 1,296 BLAKE3 constraints and replaces nine
@@ -127,6 +177,16 @@ const _: () = {
         BLS_DORY_BLAKE3_SOURCE_DORY_NU + BLS_DORY_BLAKE3_SOURCE_DORY_SIGMA
             == BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES
     );
+    assert!(
+        BLS_DORY_BLAKE3_SIGNED_WORD_TABLES
+            + BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES
+            + BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+            + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES
+            == BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+    );
+    assert!(
+        BLS_DORY_BLAKE3_COMPACT_SOURCE_PAYLOAD_BYTES < BLS_DORY_BLAKE3_LITERAL_SOURCE_PAYLOAD_BYTES
+    );
     assert!(!BLS_DORY_BLAKE3_PRODUCTION_READY);
 };
 
@@ -134,7 +194,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the bounded composed fixture makes execution and adjacency reuse the exact same Dory-authenticated main commitments, and a bounded row source preserves exact commitment and opening bytes with fail-closed scratch authentication; the unified 31-variable production source/inverse commitment and out-of-core opening path are not implemented or measured",
+    "the bounded composed fixture makes execution and adjacency reuse the exact same Dory-authenticated main commitments; bounded literal, signed-word, and code-only row sources preserve exact commitment and opening bytes with fail-closed scratch authentication, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact, but the unified 31-variable production source/inverse commitment and complete out-of-core opening path are not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -667,6 +727,29 @@ pub const fn projected_bls_dory_blake3_v3() -> BlsDoryBlake3Projection {
         adjacency_proof_bytes: BLS_DORY_BLAKE3_ADJACENCY_PROOF_BYTES,
         projected_v3_bytes: BLS_DORY_BLAKE3_PROJECTED_V3_BYTES,
         projected_headroom_bytes: BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES,
+    }
+}
+
+/// Source-payload accounting only. Artifact framing and later Dory fold scratch
+/// remain outside this projection and must be measured in a complete run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlsDoryBlake3SourceStorageProjection {
+    pub literal_payload_bytes: u64,
+    pub signed_word_payload_bytes: u64,
+    pub full_field_payload_bytes: u64,
+    pub preprocessed_word_payload_bytes: u64,
+    pub preprocessed_code_payload_bytes: u64,
+    pub compact_payload_bytes: u64,
+}
+
+pub const fn projected_bls_dory_blake3_source_storage() -> BlsDoryBlake3SourceStorageProjection {
+    BlsDoryBlake3SourceStorageProjection {
+        literal_payload_bytes: BLS_DORY_BLAKE3_LITERAL_SOURCE_PAYLOAD_BYTES,
+        signed_word_payload_bytes: BLS_DORY_BLAKE3_SIGNED_WORD_PAYLOAD_BYTES,
+        full_field_payload_bytes: BLS_DORY_BLAKE3_FULL_FIELD_PAYLOAD_BYTES,
+        preprocessed_word_payload_bytes: BLS_DORY_BLAKE3_PREPROCESSED_WORD_PAYLOAD_BYTES,
+        preprocessed_code_payload_bytes: BLS_DORY_BLAKE3_PREPROCESSED_CODE_PAYLOAD_BYTES,
+        compact_payload_bytes: BLS_DORY_BLAKE3_COMPACT_SOURCE_PAYLOAD_BYTES,
     }
 }
 
@@ -2735,6 +2818,11 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES, 31);
         assert_eq!(BLS_DORY_BLAKE3_SOURCE_DORY_NU, 11);
         assert_eq!(BLS_DORY_BLAKE3_SOURCE_DORY_SIGMA, 20);
+        assert_eq!(BLS_DORY_BLAKE3_SIGNED_WORD_TABLES, 576);
+        assert_eq!(BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES, 2);
+        assert_eq!(BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES, 8);
+        assert_eq!(BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES, 160);
+        assert_eq!(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES, 2);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS, 580);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS, 2);
         assert_eq!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, 131);
@@ -2747,8 +2835,40 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_PROJECTED_V3_BYTES, 191_185);
         assert_eq!(MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES, 261_947);
         assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 70_762);
+        assert_eq!(
+            projected_bls_dory_blake3_source_storage(),
+            BlsDoryBlake3SourceStorageProjection {
+                literal_payload_bytes: 25_098_715_136,
+                signed_word_payload_bytes: 4_831_838_208,
+                full_field_payload_bytes: 134_217_728,
+                preprocessed_word_payload_bytes: 67_108_864,
+                preprocessed_code_payload_bytes: 83_886_080,
+                compact_payload_bytes: 5_117_050_880,
+            }
+        );
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS.len(), 4);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn preprocessing_storage_split_leaves_only_boolean_code_tables() {
+        let fixture = dense_blake3_fixture();
+        let local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+        let next_start = local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+        let zero = BlsDoryFr::zero();
+        let one = BlsDoryFr::from_u64(1);
+        for column in 0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+            if TEST_PREPROCESSED_WORD_COLUMNS.contains(&column) {
+                continue;
+            }
+            for table in [
+                &fixture.tables[local_start + column],
+                &fixture.tables[next_start + column],
+            ] {
+                assert!(table.iter().all(|value| *value == zero || *value == one));
+            }
+        }
     }
 
     #[test]

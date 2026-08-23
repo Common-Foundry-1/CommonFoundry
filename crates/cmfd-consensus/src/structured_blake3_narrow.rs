@@ -1225,6 +1225,13 @@ struct PrepCols<T> {
 }
 
 const PREP_WIDTH: usize = size_of::<PrepCols<u8>>();
+#[cfg(test)]
+pub(crate) const TEST_PREPROCESSED_WORD_COLUMNS: [usize; 4] = [
+    std::mem::offset_of!(PrepCols<u8>, counter_low),
+    std::mem::offset_of!(PrepCols<u8>, counter_high),
+    std::mem::offset_of!(PrepCols<u8>, block_len),
+    std::mem::offset_of!(PrepCols<u8>, flags),
+];
 
 impl<T> Borrow<MainCols<T>> for [T] {
     fn borrow(&self) -> &MainCols<T> {

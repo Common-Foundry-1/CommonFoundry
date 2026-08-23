@@ -1118,7 +1118,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin in bounded tests; the real production preprocessing-pin registry, a six-claim proof and verification against the named source bundle in one end-to-end path, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; a bounded release-only 21-variable regression now commits the actual four named sources, replays the six claims, proves and verifies them through the consuming scratch lifecycle, and rejects wrong preprocessing pins plus binding, route, point, evaluation, and proof tampering; the native boundary must still normalize away the unused legacy Goldilocks point and evaluation fields before activation; the real production preprocessing-pin registry, composition with the shared 128 claims, a complete production out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -3545,6 +3545,7 @@ mod tests {
         BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
         commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
         commit_bls_dory_row_source_with_scratch, prove_bls_dory_deferred_opening_sets,
+        prove_bls_dory_deferred_opening_sets_consuming_with_scratch,
         prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
     };
     #[cfg(feature = "whir-prototype")]
@@ -7907,6 +7908,188 @@ mod tests {
         }
         drop(sources);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "real 21-variable four-source replay and Dory opening; run explicitly in --release"]
+    fn native_six_claim_replay_authenticates_named_sources_end_to_end() {
+        let total_started = std::time::Instant::now();
+        let fixture = dense_blake3_fixture();
+        assert_eq!(fixture.air.trace_rows(), 1 << 8);
+        let geometry = BlsDoryBlake3ReplayGeometry {
+            trace_variables: 8,
+            source_variables: 19,
+            shared_variables: 21,
+        };
+        let layout = BlsDoryAggregateLayout::new(10, 11).unwrap();
+
+        let setup_started = std::time::Instant::now();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(21).unwrap();
+        let verifier_context = BlsDoryBlake3VerifierContext::new(layout, &setup).unwrap();
+        let setup_elapsed = setup_started.elapsed();
+
+        let scratch = Blake3ScratchDirectory::create();
+        let source_started = std::time::Instant::now();
+        let sources = commit_native_blake3_sources_at_layout(
+            &fixture.statement,
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        sources
+            .validate_layout(fixture.air.trace_rows(), layout, &setup)
+            .unwrap();
+        let source_elapsed = source_started.elapsed();
+        let commitments = sources.commitments();
+
+        let preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.statement,
+            fixture.air.trace_rows(),
+            geometry,
+            &verifier_context,
+            &commitments,
+        );
+        let replay_started = std::time::Instant::now();
+        let (execution, adjacency) = named_replay_sumcheck_proofs(&fixture, &commitments);
+        assert_ne!(commitments.main, commitments.preprocessing);
+        let wrong_pin_commitments = BlsDoryBlake3SourceCommitments {
+            preprocessing: commitments.main,
+            ..commitments.clone()
+        };
+        let wrong_preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.statement,
+            fixture.air.trace_rows(),
+            geometry,
+            &verifier_context,
+            &wrong_pin_commitments,
+        );
+        assert_eq!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                BlsDoryBlake3ReplayVerifier {
+                    context: &verifier_context,
+                    preprocessing_pin: &wrong_preprocessing_pin,
+                    geometry,
+                },
+                &execution,
+                &adjacency,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let replay = verify_native_blake3_opening_replay_at_geometry(
+            &fixture.statement,
+            &fixture.bridge,
+            &commitments,
+            BlsDoryBlake3ReplayVerifier {
+                context: &verifier_context,
+                preprocessing_pin: &preprocessing_pin,
+                geometry,
+            },
+            &execution,
+            &adjacency,
+        )
+        .unwrap();
+        let replay_elapsed = replay_started.elapsed();
+        let points = [
+            replay.execution_points[0].clone(),
+            replay.execution_points[1].clone(),
+            replay.execution_points[2].clone(),
+            replay.adjacency_points[0].clone(),
+            replay.adjacency_points[1].clone(),
+            replay.adjacency_points[2].clone(),
+        ];
+        let opening_statement = BlsDoryBlake3OpeningStatement::from_verified_replay_at_geometry(
+            commitments.clone(),
+            replay,
+            geometry,
+        )
+        .unwrap();
+        let opening_set = sources
+            .into_canonical_deferred_openings_at_variables(
+                points,
+                geometry.source_variables,
+                geometry.shared_variables,
+            )
+            .unwrap();
+        let expected_claims = opening_set.claims().to_vec();
+        opening_statement.validate_claims(&expected_claims).unwrap();
+        let opening_binding = opening_statement.opening_binding();
+        let (retained_scratch_entries, retained_scratch_bytes) = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .fold((0usize, 0u64), |(entries, bytes), len| {
+                (entries + 1, bytes + len)
+            });
+
+        let opening_started = std::time::Instant::now();
+        let (claims, proof) = prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
+            &opening_binding,
+            layout,
+            vec![opening_set],
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let opening_elapsed = opening_started.elapsed();
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        assert_eq!(claims, expected_claims);
+        opening_statement.validate_claims(&claims).unwrap();
+        verify_bls_dory_openings(&opening_binding, layout, &claims, &proof, &setup).unwrap();
+
+        let mut changed_binding = opening_binding;
+        changed_binding[0] ^= 1;
+        assert!(
+            verify_bls_dory_openings(&changed_binding, layout, &claims, &proof, &setup).is_err()
+        );
+        let mut wrong_route = claims.clone();
+        wrong_route[0].commitment = commitments.inverse;
+        assert_eq!(
+            opening_statement.validate_claims(&wrong_route),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        assert!(
+            verify_bls_dory_openings(&opening_binding, layout, &wrong_route, &proof, &setup)
+                .is_err()
+        );
+        let mut wrong_point = claims.clone();
+        wrong_point[0].point[0] = wrong_point[0].point[0] + BlsDoryFr::from_u64(1);
+        assert_eq!(
+            opening_statement.validate_claims(&wrong_point),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        assert!(
+            verify_bls_dory_openings(&opening_binding, layout, &wrong_point, &proof, &setup)
+                .is_err()
+        );
+        let mut wrong_evaluation = claims.clone();
+        wrong_evaluation[0].evaluation = wrong_evaluation[0].evaluation + BlsDoryFr::from_u64(1);
+        assert_eq!(
+            opening_statement.validate_claims(&wrong_evaluation),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        assert!(
+            verify_bls_dory_openings(&opening_binding, layout, &wrong_evaluation, &proof, &setup)
+                .is_err()
+        );
+        let mut changed_proof = proof.clone();
+        let changed_proof_index = changed_proof.len() / 2;
+        changed_proof[changed_proof_index] ^= 1;
+        assert!(
+            verify_bls_dory_openings(&opening_binding, layout, &claims, &changed_proof, &setup,)
+                .is_err()
+        );
+        assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
+        eprintln!(
+            "native six-claim E2E: setup={setup_elapsed:?}, sources={source_elapsed:?}, replay={replay_elapsed:?}, opening={opening_elapsed:?}, total={:?}, retained_scratch_entries={retained_scratch_entries}, retained_scratch_bytes={retained_scratch_bytes}, proof_bytes={}",
+            total_started.elapsed(),
+            proof.len(),
+        );
     }
 
     #[test]

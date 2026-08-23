@@ -17,7 +17,7 @@ use ark_bls12_381::{Bls12_381, Fr, G1Projective, G2Projective, g1, g2};
 use ark_ec::{
     AffineRepr,
     hashing::{HashToCurve, curve_maps::wb::WBMap, map_to_curve_hasher::MapToCurveBasedHasher},
-    pairing::{Pairing, PairingOutput},
+    pairing::{MillerLoopOutput, Pairing, PairingOutput},
 };
 use ark_ff::{
     BigInteger, Field as ArkField, PrimeField, UniformRand, Zero, field_hashers::DefaultFieldHasher,
@@ -390,6 +390,35 @@ impl Group for BlsDoryGt {
 #[derive(Clone, Debug, Default)]
 pub struct BlsDoryCurve;
 
+const MIN_PARALLEL_PAIRINGS: usize = 32;
+const MAX_PAIRING_CHUNK_SIZE: usize = 128;
+
+fn pairing_chunk_size(total: usize) -> usize {
+    debug_assert!(total >= MIN_PARALLEL_PAIRINGS);
+    total
+        .div_ceil(rayon::current_num_threads())
+        .clamp(MIN_PARALLEL_PAIRINGS, MAX_PAIRING_CHUNK_SIZE)
+}
+
+fn bls_miller_loop(points: &[BlsDoryG1], twists: &[BlsDoryG2]) -> MillerLoopOutput<Bls12_381> {
+    let prepared_points = points
+        .iter()
+        .map(|point| <Bls12_381 as Pairing>::G1Prepared::from(&point.0))
+        .collect::<Vec<_>>();
+    let prepared_twists = twists
+        .iter()
+        .map(|twist| <Bls12_381 as Pairing>::G2Prepared::from(&twist.0))
+        .collect::<Vec<_>>();
+    Bls12_381::multi_miller_loop(prepared_points, prepared_twists)
+}
+
+fn finish_bls_multi_pairing(miller_output: MillerLoopOutput<Bls12_381>) -> BlsDoryGt {
+    BlsDoryGt(
+        Bls12_381::final_exponentiation(miller_output)
+            .expect("a Miller loop over valid BLS12-381 group points is nonzero"),
+    )
+}
+
 impl PairingCurve for BlsDoryCurve {
     type G1 = BlsDoryG1;
     type G2 = BlsDoryG2;
@@ -397,6 +426,30 @@ impl PairingCurve for BlsDoryCurve {
 
     fn pair(point: &Self::G1, twist: &Self::G2) -> Self::GT {
         BlsDoryGt(Bls12_381::pairing(point.0, twist.0))
+    }
+
+    fn multi_pair(points: &[Self::G1], twists: &[Self::G2]) -> Self::GT {
+        assert_eq!(
+            points.len(),
+            twists.len(),
+            "multi_pair requires equal length vectors"
+        );
+        if points.is_empty() {
+            return Self::GT::identity();
+        }
+
+        let miller_output = if points.len() < MIN_PARALLEL_PAIRINGS {
+            bls_miller_loop(points, twists)
+        } else {
+            let chunk_size = pairing_chunk_size(points.len());
+            points
+                .par_chunks(chunk_size)
+                .zip(twists.par_chunks(chunk_size))
+                .map(|(point_chunk, twist_chunk)| bls_miller_loop(point_chunk, twist_chunk))
+                .reduce_with(|left, right| MillerLoopOutput(left.0 * right.0))
+                .expect("nonempty inputs produce at least one Miller-loop chunk")
+        };
+        finish_bls_multi_pairing(miller_output)
     }
 }
 
@@ -967,6 +1020,47 @@ fn append_serialized<T: DorySerialize>(
 mod tests {
     use super::*;
 
+    fn deterministic_pairing_inputs(len: usize) -> (Vec<BlsDoryG1>, Vec<BlsDoryG2>) {
+        let g1 = ark_bls12_381::G1Affine::generator().into_group();
+        let g2 = ark_bls12_381::G2Affine::generator().into_group();
+        let points = (0..len)
+            .map(|index| {
+                let scalar = if index % 11 == 0 {
+                    Fr::zero()
+                } else {
+                    Fr::from((index as u64).wrapping_mul(17).wrapping_add(3))
+                };
+                BlsDoryG1(g1 * scalar)
+            })
+            .collect();
+        let twists = (0..len)
+            .map(|index| {
+                let scalar = if index % 13 == 0 {
+                    Fr::zero()
+                } else {
+                    Fr::from((index as u64).wrapping_mul(29).wrapping_add(5))
+                };
+                BlsDoryG2(g2 * scalar)
+            })
+            .collect();
+        (points, twists)
+    }
+
+    fn serial_pair_and_add(points: &[BlsDoryG1], twists: &[BlsDoryG2]) -> BlsDoryGt {
+        points
+            .iter()
+            .zip(twists)
+            .fold(BlsDoryGt::identity(), |sum, (point, twist)| {
+                sum + BlsDoryCurve::pair(point, twist)
+            })
+    }
+
+    fn compressed_gt(value: &BlsDoryGt) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        value.serialize_compressed(&mut encoded).unwrap();
+        encoded
+    }
+
     struct OpeningFixture {
         setup: DeterministicBlsDorySetup,
         commitment: BlsDoryGt,
@@ -1050,6 +1144,47 @@ mod tests {
             deterministic_bls_dory_setup(MAX_BLS_DORY_SETUP_VARIABLES + 1),
             Err(BlsDoryPrototypeError::InvalidSize)
         ));
+    }
+
+    #[test]
+    fn optimized_multi_pair_is_byte_identical_to_serial_pair_and_add() {
+        for len in [0, 1, 2, 3, 7, 31, 32, 33, 65, 129] {
+            let (points, twists) = deterministic_pairing_inputs(len);
+            let expected = serial_pair_and_add(&points, &twists);
+            let actual = BlsDoryCurve::multi_pair(&points, &twists);
+            assert_eq!(actual, expected, "pairing result differs at length {len}");
+            assert_eq!(
+                compressed_gt(&actual),
+                compressed_gt(&expected),
+                "canonical bytes differ at length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_multi_pair_is_independent_of_parallel_reduction_width() {
+        let (points, twists) = deterministic_pairing_inputs(129);
+        let expected = serial_pair_and_add(&points, &twists);
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let actual = pool.install(|| BlsDoryCurve::multi_pair(&points, &twists));
+            assert_eq!(
+                compressed_gt(&actual),
+                compressed_gt(&expected),
+                "canonical bytes differ with {threads} Rayon threads"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "multi_pair requires equal length vectors")]
+    fn optimized_multi_pair_rejects_mismatched_inputs() {
+        let (points, mut twists) = deterministic_pairing_inputs(3);
+        twists.pop();
+        let _ = BlsDoryCurve::multi_pair(&points, &twists);
     }
 
     #[test]

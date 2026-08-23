@@ -44,7 +44,8 @@ pub struct BlsDoryCompactArtifactSpec {
     pub scalar_count: u64,
     /// Canonically stored coefficient prefix length.
     pub explicit_scalar_count: u64,
-    /// Initial coefficients stored as canonical fixed-width words.
+    /// Initial coefficients stored as canonical fixed-width words. Zero means
+    /// every explicit coefficient is a dictionary code.
     pub word_scalar_count: u64,
     /// Canonical default byte width of each word: 4 or 8.
     pub word_bytes: u8,
@@ -95,7 +96,6 @@ impl BlsDoryCompactArtifactSpec {
             || !self.scalar_count.is_power_of_two()
             || self.explicit_scalar_count == 0
             || self.explicit_scalar_count > self.scalar_count
-            || self.word_scalar_count == 0
             || self.word_scalar_count > self.explicit_scalar_count
             || !matches!(self.word_bytes, 4 | 8)
             || !matches!(self.code_bits, 4 | 8)
@@ -103,7 +103,6 @@ impl BlsDoryCompactArtifactSpec {
             || self.word_group_len == 0
             || !self.word_group_len.is_power_of_two()
             || !self.word_scalar_count.is_multiple_of(self.word_group_len)
-            || word_selectors == 0
             || self.signed_word_selectors & !allowed_mask != 0
             || self.word_width_codes & !allowed_width_codes != 0
             || !(1..=256).contains(&dictionary_len)
@@ -1064,6 +1063,49 @@ mod tests {
             signed
                 .into_iter()
                 .map(BlsDoryFr::from_i64)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn code_only_artifact_round_trips_without_a_dummy_word_prefix() {
+        let directory = TestDirectory::create();
+        let code_only = BlsDoryCompactArtifactSpec {
+            context_digest: [8; 32],
+            scalar_count: 32,
+            explicit_scalar_count: 19,
+            word_scalar_count: 0,
+            word_bytes: 8,
+            code_bits: 4,
+            word_width_codes: 0,
+            word_group_len: 8,
+            signed_word_selectors: 0,
+        };
+        let dictionary = std::iter::once(BlsDoryFr::zero())
+            .chain((-7..=-1).chain(1..=8).map(BlsDoryFr::from_i64))
+            .collect::<Vec<_>>();
+        let codes = (0..19).map(|index| (index % 16) as u8).collect::<Vec<_>>();
+        let mut writer =
+            BlsDoryCompactArtifactWriter::create(&directory.0, code_only, dictionary.clone())
+                .unwrap();
+        writer.write_codes(&codes).unwrap();
+        let artifact = writer.finish().unwrap();
+        assert_eq!(
+            std::fs::metadata(artifact.path()).unwrap().len(),
+            code_only.encoded_bytes(dictionary.len()).unwrap()
+        );
+        let mut decoded = Vec::new();
+        artifact
+            .for_each_scalar(|scalar| {
+                decoded.push(scalar);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            decoded,
+            codes
+                .into_iter()
+                .map(|code| dictionary[usize::from(code)])
                 .collect::<Vec<_>>()
         );
     }

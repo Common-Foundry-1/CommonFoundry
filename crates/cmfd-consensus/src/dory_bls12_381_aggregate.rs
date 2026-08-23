@@ -1836,7 +1836,6 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
         || source.columns() != columns
         || explicit_coefficient_count == 0
         || explicit_coefficient_count > coefficient_count
-        || word_coefficient_count == 0
         || word_coefficient_count > explicit_coefficient_count
         || !matches!(word_bytes, 4 | 8)
         || !matches!(code_bits, 4 | 8)
@@ -2047,7 +2046,6 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
         || source.columns() != columns
         || explicit_coefficient_count == 0
         || explicit_coefficient_count > coefficient_count
-        || word_coefficient_count == 0
         || word_coefficient_count > explicit_coefficient_count
         || !matches!(word_bytes, 4 | 8)
         || !matches!(code_bits, 4 | 8)

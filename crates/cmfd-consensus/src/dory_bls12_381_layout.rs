@@ -76,6 +76,12 @@ use crate::{
         prove_bls_dory_wiring_deferred_at_variables_with_scratch,
         verify_bls_dory_wiring_deferred_at_variables,
     },
+    dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    dory_v3_suite::{
+        DORY_V3_FIXED_MODEL_BINDING_DOMAIN, DORY_V3_FIXED_MODEL_BINDING_VERSION,
+        DORY_V3_NATIVE_COMPOSITION_BINDING_DOMAIN, DORY_V3_NATIVE_COMPOSITION_VERSION,
+        DORY_V3_SHARED_LAYOUT_VERSION, DORY_V3_SHARED_OPENING_BINDING_DOMAIN, Digest32,
+    },
     model_bank::{
         StagedModelFieldLayoutSink, VerifiedModelBankLayoutReceipt,
         verify_model_bank_into_staged_field_layout_sink,
@@ -135,6 +141,210 @@ const BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS: u32 = 8;
 
 pub(crate) const BLS_DORY_SHARED_NATIVE_COMPOSITION_VERSION: u16 = 1;
 pub(crate) const BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS: usize = 6;
+
+/// Bank-authenticated public inputs for the Dory-native shared Layout V5
+/// transcripts.
+///
+/// Construction requires the non-serializable capability produced after one
+/// complete model-bank reader has reproduced every ordered Record V2
+/// commitment. The context deliberately carries no legacy V4 identity or
+/// binding state.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlsDorySharedLayoutV5Context {
+    suite_digest: Digest32,
+    model_identity_digest: Digest32,
+    setup_identity: Digest32,
+    padded_variables: u32,
+}
+
+/// Typed output of the fixed-model Binding V2 transcript. A shared Layout V5
+/// opening can only be derived from this value, preventing a legacy V4 binding
+/// or an unrelated 32-byte digest from being substituted accidentally.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlsDoryFixedModelBindingV2([u8; 32]);
+
+impl BlsDoryFixedModelBindingV2 {
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Typed output of the shared-opening Layout V5 transcript. Native composition
+/// accepts this value rather than an untyped digest so its shared prefix cannot
+/// be replaced with a V4 opening binding.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlsDorySharedOpeningBindingV5([u8; 32]);
+
+impl BlsDorySharedOpeningBindingV5 {
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl BlsDorySharedLayoutV5Context {
+    /// Copy the exact Record V2 identities only after the record has passed the
+    /// compiled production suite, setup, geometry, manifest, and commitment
+    /// checks represented by the bank-authentication capability.
+    pub fn from_bank_authenticated_record(
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDorySharedLayoutError> {
+        let record = authenticated.record();
+        record
+            .validate_production(setup)
+            .map_err(|_| BlsDorySharedLayoutError::V3Context)?;
+        Ok(Self {
+            suite_digest: record.suite_digest(),
+            model_identity_digest: record.model_identity_digest(),
+            setup_identity: record.setup_identity(),
+            padded_variables: record.padded_variables(),
+        })
+    }
+
+    pub const fn suite_digest(self) -> Digest32 {
+        self.suite_digest
+    }
+
+    pub const fn model_identity_digest(self) -> Digest32 {
+        self.model_identity_digest
+    }
+
+    pub const fn setup_identity(self) -> Digest32 {
+        self.setup_identity
+    }
+
+    pub const fn padded_variables(self) -> u32 {
+        self.padded_variables
+    }
+
+    /// Derive the exact fixed-model Binding V2 transcript frozen by
+    /// `DORY_V3_FIXED_MODEL_BINDING_FIELDS`.
+    pub fn fixed_model_binding(
+        self,
+        outer_binding: &[u8],
+    ) -> Result<BlsDoryFixedModelBindingV2, BlsDorySharedLayoutError> {
+        if outer_binding.len() > MAX_SHARED_LAYOUT_BINDING_BYTES {
+            return Err(BlsDorySharedLayoutError::InvalidProofShape);
+        }
+        let outer_binding_length = u32::try_from(outer_binding.len())
+            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+        let mut hasher = blake3::Hasher::new_derive_key(DORY_V3_FIXED_MODEL_BINDING_DOMAIN);
+        hasher.update(&DORY_V3_FIXED_MODEL_BINDING_VERSION.to_le_bytes());
+        hasher.update(&DORY_V3_SHARED_LAYOUT_VERSION.to_le_bytes());
+        hasher.update(self.suite_digest.as_bytes());
+        hasher.update(self.model_identity_digest.as_bytes());
+        hasher.update(self.setup_identity.as_bytes());
+        hasher.update(&self.padded_variables.to_le_bytes());
+        hasher.update(&outer_binding_length.to_le_bytes());
+        hasher.update(outer_binding);
+        Ok(BlsDoryFixedModelBindingV2(*hasher.finalize().as_bytes()))
+    }
+
+    /// Derive the exact shared-opening Layout V5 transcript from the ordered
+    /// component transcript digests. The V3 production suite has exactly three
+    /// matrix proofs followed by four arithmetic/range transition pairs.
+    pub fn shared_opening_binding(
+        self,
+        component_binding: BlsDoryFixedModelBindingV2,
+        matrices: &[&BlsDoryMatrixProof],
+        transitions: &[(&BlsDoryTransitionProof, &BlsDoryRangeLogUpProof)],
+        wiring: &BlsDoryWiringProof,
+    ) -> Result<BlsDorySharedOpeningBindingV5, BlsDorySharedLayoutError> {
+        let matrix_transcript_digests = matrices
+            .iter()
+            .map(|proof| proof.transcript_digest)
+            .collect::<Vec<_>>();
+        let transition_transcript_digests = transitions
+            .iter()
+            .map(|(arithmetic, range)| (arithmetic.transcript_digest, range.transcript_digest))
+            .collect::<Vec<_>>();
+        self.shared_opening_binding_from_digests(
+            component_binding,
+            &matrix_transcript_digests,
+            &transition_transcript_digests,
+            wiring.transcript_digest,
+        )
+    }
+
+    fn shared_opening_binding_from_digests(
+        self,
+        component_binding: BlsDoryFixedModelBindingV2,
+        matrix_transcript_digests: &[[u8; 32]],
+        transition_transcript_digests: &[([u8; 32], [u8; 32])],
+        wiring_transcript_digest: [u8; 32],
+    ) -> Result<BlsDorySharedOpeningBindingV5, BlsDorySharedLayoutError> {
+        if matrix_transcript_digests.len() != MAX_BLS_DORY_SHARED_MATRIX_PROOFS
+            || transition_transcript_digests.len() != MAX_BLS_DORY_SHARED_TRANSITION_PROOFS
+        {
+            return Err(BlsDorySharedLayoutError::InvalidProofShape);
+        }
+        let matrix_count = u16::try_from(matrix_transcript_digests.len())
+            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+        let transition_count = u16::try_from(transition_transcript_digests.len())
+            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+        let mut hasher = blake3::Hasher::new_derive_key(DORY_V3_SHARED_OPENING_BINDING_DOMAIN);
+        hasher.update(&DORY_V3_SHARED_LAYOUT_VERSION.to_le_bytes());
+        hasher.update(&self.padded_variables.to_le_bytes());
+        hasher.update(self.setup_identity.as_bytes());
+        hasher.update(component_binding.as_bytes());
+        hasher.update(&matrix_count.to_le_bytes());
+        for transcript_digest in matrix_transcript_digests {
+            hasher.update(transcript_digest);
+        }
+        hasher.update(&transition_count.to_le_bytes());
+        for (arithmetic_transcript_digest, range_transcript_digest) in transition_transcript_digests
+        {
+            hasher.update(arithmetic_transcript_digest);
+            hasher.update(range_transcript_digest);
+        }
+        hasher.update(&wiring_transcript_digest);
+        Ok(BlsDorySharedOpeningBindingV5(*hasher.finalize().as_bytes()))
+    }
+
+    /// Derive the exact native-composition Binding V1 transcript for the
+    /// canonical Dory row/column split of this Layout V5 context.
+    pub fn native_composition_binding(
+        self,
+        shared_opening_binding: BlsDorySharedOpeningBindingV5,
+        native_opening_binding: [u8; 32],
+        layout: BlsDoryAggregateLayout,
+    ) -> Result<[u8; 32], BlsDorySharedLayoutError> {
+        if native_opening_binding == [0; 32] {
+            return Err(BlsDorySharedLayoutError::OpeningClaims);
+        }
+        let padded_variables = usize::try_from(self.padded_variables)
+            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+        let expected_nu = padded_variables / 2;
+        let expected_sigma = padded_variables - expected_nu;
+        if layout.nu() != expected_nu || layout.sigma() != expected_sigma {
+            return Err(BlsDorySharedLayoutError::InvalidProofShape);
+        }
+        let dory_nu =
+            u16::try_from(layout.nu()).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+        let dory_sigma = u16::try_from(layout.sigma())
+            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+        let mut hasher = blake3::Hasher::new_derive_key(DORY_V3_NATIVE_COMPOSITION_BINDING_DOMAIN);
+        hasher.update(&DORY_V3_SHARED_LAYOUT_VERSION.to_le_bytes());
+        hasher.update(&DORY_V3_NATIVE_COMPOSITION_VERSION.to_le_bytes());
+        hasher.update(&dory_nu.to_le_bytes());
+        hasher.update(&dory_sigma.to_le_bytes());
+        hasher.update(self.setup_identity.as_bytes());
+        hasher.update(shared_opening_binding.as_bytes());
+        hasher.update(&native_opening_binding);
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
 pub const BLS_DORY_SHARED_PRODUCTION_VARIABLES: usize = 33;
@@ -1549,6 +1759,8 @@ pub enum BlsDorySharedLayoutError {
     LinkEvaluation,
     #[error("the pinned BLS fixed-model identity is invalid or mismatched")]
     FixedModelIdentity,
+    #[error("the authenticated Dory V3 shared-layout context is invalid or mismatched")]
+    V3Context,
     #[error("the proof does not use the pinned BLS fixed-model commitments")]
     FixedModelCommitment,
     #[error("authenticated execution-accumulator artifact failed")]
@@ -7126,6 +7338,234 @@ mod tests {
         assert_eq!(
             require_bls_dory_shared_layout_production_ready(),
             Err(BlsDorySharedLayoutError::NotProductionReady)
+        );
+    }
+
+    fn layout_v5_context() -> BlsDorySharedLayoutV5Context {
+        BlsDorySharedLayoutV5Context {
+            suite_digest: Digest32::new([0x11; 32]),
+            model_identity_digest: Digest32::new([0x22; 32]),
+            setup_identity: Digest32::new([0x33; 32]),
+            padded_variables: 6,
+        }
+    }
+
+    fn digest_hex(digest: [u8; 32]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn layout_v5_context_requires_a_bank_authenticated_record() {
+        let constructor: fn(
+            &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            &DeterministicBlsDorySetup,
+        )
+            -> Result<BlsDorySharedLayoutV5Context, BlsDorySharedLayoutError> =
+            BlsDorySharedLayoutV5Context::from_bank_authenticated_record;
+        let _ = constructor;
+
+        assert_eq!(BLS_DORY_SHARED_LAYOUT_VERSION, 4);
+        assert_eq!(DORY_V3_SHARED_LAYOUT_VERSION, 5);
+        assert_eq!(DORY_V3_FIXED_MODEL_BINDING_VERSION, 2);
+    }
+
+    #[test]
+    fn fixed_model_binding_v2_is_exact_and_context_bound() {
+        let context = layout_v5_context();
+        let binding = context.fixed_model_binding(b"outer-binding").unwrap();
+
+        assert_eq!(
+            digest_hex(binding.into_bytes()),
+            "d21685b8b19c9fd45195c6449ef749700565fdd8b632ae000b42348615e52fac"
+        );
+        assert_eq!(
+            binding,
+            context.fixed_model_binding(b"outer-binding").unwrap()
+        );
+        assert_ne!(
+            binding,
+            context.fixed_model_binding(b"outer-bindinh").unwrap()
+        );
+
+        let mut changed = context;
+        changed.suite_digest = Digest32::new([0x12; 32]);
+        assert_ne!(
+            binding,
+            changed.fixed_model_binding(b"outer-binding").unwrap()
+        );
+        let mut changed = context;
+        changed.model_identity_digest = Digest32::new([0x23; 32]);
+        assert_ne!(
+            binding,
+            changed.fixed_model_binding(b"outer-binding").unwrap()
+        );
+        let mut changed = context;
+        changed.setup_identity = Digest32::new([0x34; 32]);
+        assert_ne!(
+            binding,
+            changed.fixed_model_binding(b"outer-binding").unwrap()
+        );
+        let mut changed = context;
+        changed.padded_variables = 7;
+        assert_ne!(
+            binding,
+            changed.fixed_model_binding(b"outer-binding").unwrap()
+        );
+
+        assert_eq!(
+            context.fixed_model_binding(&vec![0; MAX_SHARED_LAYOUT_BINDING_BYTES + 1]),
+            Err(BlsDorySharedLayoutError::InvalidProofShape)
+        );
+    }
+
+    #[test]
+    fn shared_opening_binding_v5_is_exact_ordered_and_fixed_shape() {
+        let context = layout_v5_context();
+        let component_binding = context.fixed_model_binding(b"outer-binding").unwrap();
+        let matrices = [[0x41; 32], [0x42; 32], [0x43; 32]];
+        let transitions = [
+            ([0x51; 32], [0x61; 32]),
+            ([0x52; 32], [0x62; 32]),
+            ([0x53; 32], [0x63; 32]),
+            ([0x54; 32], [0x64; 32]),
+        ];
+        let wiring = [0x71; 32];
+        let binding = context
+            .shared_opening_binding_from_digests(component_binding, &matrices, &transitions, wiring)
+            .unwrap();
+
+        assert_eq!(
+            digest_hex(binding.into_bytes()),
+            "f31c1dc19ec71e176201fa1ad4d4931d59652348edcf0fc3f350784a27eed76d"
+        );
+
+        let mut changed_matrices = matrices;
+        changed_matrices.swap(0, 1);
+        assert_ne!(
+            binding,
+            context
+                .shared_opening_binding_from_digests(
+                    component_binding,
+                    &changed_matrices,
+                    &transitions,
+                    wiring,
+                )
+                .unwrap()
+        );
+        let mut changed_transitions = transitions;
+        changed_transitions[2].1[0] ^= 1;
+        assert_ne!(
+            binding,
+            context
+                .shared_opening_binding_from_digests(
+                    component_binding,
+                    &matrices,
+                    &changed_transitions,
+                    wiring,
+                )
+                .unwrap()
+        );
+        let mut changed_wiring = wiring;
+        changed_wiring[0] ^= 1;
+        assert_ne!(
+            binding,
+            context
+                .shared_opening_binding_from_digests(
+                    component_binding,
+                    &matrices,
+                    &transitions,
+                    changed_wiring,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            context.shared_opening_binding_from_digests(
+                component_binding,
+                &matrices[..2],
+                &transitions,
+                wiring,
+            ),
+            Err(BlsDorySharedLayoutError::InvalidProofShape)
+        );
+        assert_eq!(
+            context.shared_opening_binding_from_digests(
+                component_binding,
+                &matrices,
+                &transitions[..3],
+                wiring,
+            ),
+            Err(BlsDorySharedLayoutError::InvalidProofShape)
+        );
+    }
+
+    #[test]
+    fn native_composition_binding_v1_is_exact_and_uses_the_canonical_v5_split() {
+        let context = layout_v5_context();
+        let component_binding = context.fixed_model_binding(b"outer-binding").unwrap();
+        let matrices = [[0x41; 32], [0x42; 32], [0x43; 32]];
+        let transitions = [
+            ([0x51; 32], [0x61; 32]),
+            ([0x52; 32], [0x62; 32]),
+            ([0x53; 32], [0x63; 32]),
+            ([0x54; 32], [0x64; 32]),
+        ];
+        let shared = context
+            .shared_opening_binding_from_digests(
+                component_binding,
+                &matrices,
+                &transitions,
+                [0x71; 32],
+            )
+            .unwrap();
+        let native = [0x81; 32];
+        let layout = BlsDoryAggregateLayout::new(3, 3).unwrap();
+        let binding = context
+            .native_composition_binding(shared, native, layout)
+            .unwrap();
+
+        assert_eq!(
+            digest_hex(binding),
+            "8d80f196546910d53a964dec22e1311587aab8bb474362c8c35d3eb8b20a8caa"
+        );
+        let mut changed_native = native;
+        changed_native[0] ^= 1;
+        assert_ne!(
+            binding,
+            context
+                .native_composition_binding(shared, changed_native, layout)
+                .unwrap()
+        );
+        let mut changed_shared = shared.into_bytes();
+        changed_shared[0] ^= 1;
+        assert_ne!(
+            binding,
+            context
+                .native_composition_binding(
+                    BlsDorySharedOpeningBindingV5(changed_shared),
+                    native,
+                    layout,
+                )
+                .unwrap()
+        );
+        let mut changed_context = context;
+        changed_context.setup_identity = Digest32::new([0x34; 32]);
+        assert_ne!(
+            binding,
+            changed_context
+                .native_composition_binding(shared, native, layout)
+                .unwrap()
+        );
+        assert_eq!(
+            context.native_composition_binding(
+                shared,
+                native,
+                BlsDoryAggregateLayout::new(2, 4).unwrap(),
+            ),
+            Err(BlsDorySharedLayoutError::InvalidProofShape)
+        );
+        assert_eq!(
+            context.native_composition_binding(shared, [0; 32], layout),
+            Err(BlsDorySharedLayoutError::OpeningClaims)
         );
     }
 

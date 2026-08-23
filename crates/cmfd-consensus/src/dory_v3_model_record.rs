@@ -465,7 +465,11 @@ mod tests {
         dory_bls12_381_aggregate::commit_bls_dory_polynomial,
         dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt, deterministic_bls_dory_setup},
         dory_v3_model::CanonicalBlsDoryGtHex,
-        dory_v3_suite::{DORY_V3_MODEL_IDENTITY_VERSION, DORY_V3_PADDED_VARIABLES},
+        dory_v3_suite::{
+            DORY_V3_MODEL_IDENTITY_VERSION, DORY_V3_PADDED_VARIABLES,
+            DORY_V3_PRODUCTION_SUITE_DIGEST,
+        },
+        dory_v3_transcript::{DoryV3TranscriptContext, DoryV3TranscriptError},
     };
 
     const VARIABLES: usize = 5;
@@ -529,6 +533,7 @@ mod tests {
         base_input: BlsDoryGt,
         weight_banks: &[BlsDoryGt],
         layers_per_bank: u32,
+        suite_digest: [u8; 32],
     ) -> DoryV3ModelIdentityV1 {
         let base_input = CanonicalBlsDoryGtHex::from_commitment(base_input)
             .unwrap()
@@ -552,7 +557,7 @@ mod tests {
             "layers_per_bank": layers_per_bank,
             "model_byte_root": manifest.raw_blake3_root,
             "layer_roots_aggregate": manifest.layer_roots_aggregate,
-            "suite_parameter_digest": SUITE_DIGEST,
+            "suite_parameter_digest": suite_digest,
             "setup_identity": setup.identity(),
             "padded_variables": VARIABLES,
             "base_input_commitment": base_input,
@@ -566,6 +571,7 @@ mod tests {
         base_input: BlsDoryGt,
         weight_banks: Vec<BlsDoryGt>,
         layers_per_bank: u32,
+        suite_digest: [u8; 32],
     ) -> Fixture {
         let layer_slices = LAYERS
             .iter()
@@ -577,7 +583,7 @@ mod tests {
             batch: BATCH,
             base_input: &BASE,
             layers: &layer_slices,
-            pcs_parameter_digest: SUITE_DIGEST,
+            pcs_parameter_digest: suite_digest,
             pcs_commitment_root: [0x52; 32],
         })
         .unwrap();
@@ -587,6 +593,7 @@ mod tests {
             base_input,
             &weight_banks,
             layers_per_bank,
+            suite_digest,
         );
         let built = build_small_model_bank(SmallModelBankFixture {
             model_version: MODEL_VERSION,
@@ -594,7 +601,7 @@ mod tests {
             batch: BATCH,
             base_input: &BASE,
             layers: &layer_slices,
-            pcs_parameter_digest: SUITE_DIGEST,
+            pcs_parameter_digest: suite_digest,
             pcs_commitment_root: identity.commitment_root().unwrap(),
         })
         .unwrap();
@@ -610,7 +617,13 @@ mod tests {
     fn fixture() -> Fixture {
         let setup = deterministic_bls_dory_setup(VARIABLES).unwrap();
         let (base_input, weight_banks) = actual_commitments(&setup);
-        fixture_with_commitments(setup, base_input, weight_banks, LAYERS_PER_BANK)
+        fixture_with_commitments(
+            setup,
+            base_input,
+            weight_banks,
+            LAYERS_PER_BANK,
+            SUITE_DIGEST,
+        )
     }
 
     fn derive_fixture(fixture: &Fixture) -> BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
@@ -644,6 +657,43 @@ mod tests {
             fixture.setup.identity()
         );
         assert_eq!(record.model_identity().weight_bank_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn transcript_context_requires_and_copies_the_authenticated_record() {
+        let fixture = fixture();
+        let authenticated = derive_fixture(&fixture);
+        assert!(matches!(
+            DoryV3TranscriptContext::from_bank_authenticated_record([0; 32], &authenticated),
+            Err(DoryV3TranscriptError::NetworkIdentity)
+        ));
+        assert!(matches!(
+            DoryV3TranscriptContext::from_bank_authenticated_record([0x11; 32], &authenticated),
+            Err(DoryV3TranscriptError::SuiteDigest)
+        ));
+
+        let setup = deterministic_bls_dory_setup(VARIABLES).unwrap();
+        let (base_input, weight_banks) = actual_commitments(&setup);
+        let production_suite_fixture = fixture_with_commitments(
+            setup,
+            base_input,
+            weight_banks,
+            LAYERS_PER_BANK,
+            DORY_V3_PRODUCTION_SUITE_DIGEST.into_bytes(),
+        );
+        let authenticated = derive_fixture(&production_suite_fixture);
+        let record = authenticated.record();
+        let context =
+            DoryV3TranscriptContext::from_bank_authenticated_record([0x11; 32], &authenticated)
+                .unwrap();
+        assert_eq!(context.network_id(), [0x11; 32]);
+        assert_eq!(context.suite_digest(), record.suite_digest());
+        assert_eq!(context.manifest_digest(), record.manifest_digest());
+        assert_eq!(
+            context.model_identity_digest(),
+            record.model_identity_digest()
+        );
+        assert_eq!(context.model_record_digest(), record.record_digest());
     }
 
     #[test]
@@ -788,6 +838,7 @@ mod tests {
             actual_weights[0],
             vec![actual_base, actual_weights[1], actual_weights[2]],
             LAYERS_PER_BANK,
+            SUITE_DIGEST,
         );
         assert!(matches!(
             derive_bank_authenticated_record_v2(
@@ -804,6 +855,7 @@ mod tests {
             actual_base,
             vec![actual_weights[1], actual_weights[0], actual_weights[2]],
             LAYERS_PER_BANK,
+            SUITE_DIGEST,
         );
         assert!(matches!(
             derive_bank_authenticated_record_v2(
@@ -822,6 +874,7 @@ mod tests {
             actual_base,
             vec![actual_weights[0], actual_weights[1], alternate_third],
             LAYERS_PER_BANK,
+            SUITE_DIGEST,
         );
         assert!(matches!(
             derive_bank_authenticated_record_v2(

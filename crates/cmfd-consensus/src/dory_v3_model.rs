@@ -961,7 +961,7 @@ mod tests {
         let (_, _, identity, _) = fixture();
         assert_eq!(
             DORY_V3_PRODUCTION_SUITE_MANIFEST.digest().to_hex(),
-            "c7e5efbc3bb747393dcaa45b529484fb37de5a716e7dd5d78fae9cbf1bd0d1d5"
+            "6c0950d4b5dcffef9f3296f9c0718a8d5124877719b3af76b2f68b3fcb64764a"
         );
         let commitment_encoding = identity
             .encoded_base_input_commitment()
@@ -973,15 +973,15 @@ mod tests {
         );
         assert_eq!(
             hex::encode(identity.suite_parameter_digest()),
-            "60cc29606ac8584f2bfd127bb29dd97604c3bf6585a72ebca669450ad872cb1a"
+            "daecc7170c8b45b711e6127aba276ecde387685587bb5733ca3292cdee68681c"
         );
         assert_eq!(
             hex::encode(identity.commitment_root().unwrap()),
-            "5cb94681c303b6d7733c9baccca8183a1c188846ad2297182d1dc98651932e2d"
+            "36a3b3261ecf38ad0b68f6ec09c880ced0c2da693379ab1aa22e7d006d99c6c3"
         );
         assert_eq!(
             hex::encode(identity.digest().unwrap()),
-            "0b3ee4e5f8a289e6c9836ea4c49ba43e5301311061ddcca99d4684056124678e"
+            "0a0387844c2dc0d9c4d70a7f1a4b618f3ac80f05f98e0badd090ce05f2171482"
         );
     }
 

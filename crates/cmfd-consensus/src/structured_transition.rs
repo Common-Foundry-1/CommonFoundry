@@ -9,6 +9,8 @@ use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(feature = "dory-bls12-381-prototype")]
+use crate::dory_v3_transcript::dory_v3_mask_coefficients;
 use crate::{
     V2_TRANSITION_MODULUS,
     forgematrix_v2::mask_coefficients,
@@ -114,6 +116,50 @@ impl StructuredMaskPolynomial {
         rows: usize,
         cols: usize,
     ) -> Result<Self, StructuredTransitionError> {
+        Self::from_challenge_at_layer_offset_with_sampler(
+            challenge,
+            first_layer,
+            layers,
+            rows,
+            cols,
+            |challenge, layer, rows, cols| Ok(mask_coefficients(challenge, layer, rows, cols)),
+        )
+    }
+
+    /// Derive one contiguous bank with the dedicated Dory V3 mask domain.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    pub fn from_dory_v3_challenge_at_layer_offset(
+        challenge: &[u8; 32],
+        first_layer: u32,
+        layers: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, StructuredTransitionError> {
+        Self::from_challenge_at_layer_offset_with_sampler(
+            challenge,
+            first_layer,
+            layers,
+            rows,
+            cols,
+            |challenge, layer, rows, cols| {
+                dory_v3_mask_coefficients(challenge, layer, rows, cols)
+                    .map_err(|_| StructuredTransitionError::MaskPolynomial)
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_challenge_at_layer_offset_with_sampler<F>(
+        challenge: &[u8; 32],
+        first_layer: u32,
+        layers: usize,
+        rows: usize,
+        cols: usize,
+        mut sampler: F,
+    ) -> Result<Self, StructuredTransitionError>
+    where
+        F: FnMut(&[u8; 32], u32, usize, usize) -> Result<Vec<u8>, StructuredTransitionError>,
+    {
         if layers == 0
             || rows == 0
             || cols == 0
@@ -150,7 +196,7 @@ impl StructuredMaskPolynomial {
                         .map_err(|_| StructuredTransitionError::ArithmeticOverflow)?,
                 )
                 .ok_or(StructuredTransitionError::ArithmeticOverflow)?;
-            coefficients.extend(mask_coefficients(challenge, layer, rows, cols));
+            coefficients.extend(sampler(challenge, layer, rows, cols)?);
         }
         Ok(Self {
             layers,
@@ -169,6 +215,33 @@ impl StructuredMaskPolynomial {
         rows: usize,
         cols: usize,
     ) -> Result<Self, StructuredTransitionError> {
+        Self::from_virtual_challenge_with_sampler(challenge, rows, cols, |challenge, rows, cols| {
+            Ok(mask_coefficients(challenge, u32::MAX, rows, cols))
+        })
+    }
+
+    /// Build the reserved virtual-input mask with the Dory V3 mask domain.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    pub fn from_dory_v3_virtual_challenge(
+        challenge: &[u8; 32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, StructuredTransitionError> {
+        Self::from_virtual_challenge_with_sampler(challenge, rows, cols, |challenge, rows, cols| {
+            dory_v3_mask_coefficients(challenge, u32::MAX, rows, cols)
+                .map_err(|_| StructuredTransitionError::MaskPolynomial)
+        })
+    }
+
+    fn from_virtual_challenge_with_sampler<F>(
+        challenge: &[u8; 32],
+        rows: usize,
+        cols: usize,
+        sampler: F,
+    ) -> Result<Self, StructuredTransitionError>
+    where
+        F: FnOnce(&[u8; 32], usize, usize) -> Result<Vec<u8>, StructuredTransitionError>,
+    {
         if rows == 0 || cols == 0 || !rows.is_power_of_two() || !cols.is_power_of_two() {
             return Err(StructuredTransitionError::InvalidDimensions);
         }
@@ -181,7 +254,7 @@ impl StructuredMaskPolynomial {
             layers: 1,
             row_bits,
             col_bits,
-            coefficients: mask_coefficients(challenge, u32::MAX, rows, cols),
+            coefficients: sampler(challenge, rows, cols)?,
         })
     }
 
@@ -1742,6 +1815,43 @@ mod tests {
             StructuredMaskPolynomial::from_challenge_at_layer_offset(&challenge, u32::MAX, 1, 2, 4,),
             Err(StructuredTransitionError::ArithmeticOverflow)
         );
+    }
+
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    #[test]
+    fn dory_v3_masks_preserve_global_layers_and_never_reuse_v2() {
+        let challenge = [0x6d; 32];
+        let first = StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+            &challenge, 0, 2, 2, 4,
+        )
+        .unwrap();
+        let second = StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+            &challenge, 2, 2, 2, 4,
+        )
+        .unwrap();
+        let all = StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+            &challenge, 0, 4, 2, 4,
+        )
+        .unwrap();
+        let v2 = StructuredMaskPolynomial::from_challenge(&challenge, 4, 2, 4).unwrap();
+        let virtual_v3 =
+            StructuredMaskPolynomial::from_dory_v3_virtual_challenge(&challenge, 2, 4).unwrap();
+        let coefficients_per_layer = 1 + 2usize.ilog2() as usize + 4usize.ilog2() as usize;
+
+        assert_eq!(
+            first.coefficients,
+            all.coefficients[..2 * coefficients_per_layer]
+        );
+        assert_eq!(
+            second.coefficients,
+            all.coefficients[2 * coefficients_per_layer..]
+        );
+        assert_ne!(all.coefficients, v2.coefficients);
+        assert_eq!(
+            virtual_v3.coefficients,
+            dory_v3_mask_coefficients(&challenge, u32::MAX, 2, 4).unwrap()
+        );
+        assert_ne!(virtual_v3.digest(), first.digest());
     }
 
     #[test]

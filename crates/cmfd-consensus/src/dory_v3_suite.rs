@@ -88,6 +88,13 @@ pub const DORY_V3_MODEL_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/DORY-MODEL-
 pub const DORY_V3_MODEL_RECORD_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/DORY-MODEL-COMMITMENT-RECORD/V2";
 pub const DORY_V3_FIXED_MODEL_BINDING_DOMAIN: &str =
     "CMFD/FORGEMATRIX/V3/DORY-FIXED-MODEL-BINDING/V2";
+pub const DORY_V3_FIXED_MODEL_BINDING_FIELDS: &str = "binding_version_u16le,shared_layout_version_u16le,suite_digest[32],model_identity_digest[32],setup_identity[32],padded_variables_u32le,outer_binding_length_u32le,outer_binding[outer_binding_length]";
+pub const DORY_V3_SHARED_OPENING_BINDING_DOMAIN: &str =
+    "CMFD/FORGEMATRIX/V3/DORY-SHARED-OPENING-BINDING/V5";
+pub const DORY_V3_SHARED_OPENING_BINDING_FIELDS: &str = "shared_layout_version_u16le,padded_variables_u32le,setup_identity[32],component_binding[32],matrix_count_u16le,then each matrix_transcript_digest[32],transition_count_u16le,then each arithmetic_transcript_digest[32],range_transcript_digest[32],wiring_transcript_digest[32]";
+pub const DORY_V3_NATIVE_COMPOSITION_BINDING_DOMAIN: &str =
+    "CMFD/FORGEMATRIX/V3/DORY-NATIVE-COMPOSITION-BINDING/V1";
+pub const DORY_V3_NATIVE_COMPOSITION_BINDING_FIELDS: &str = "shared_layout_version_u16le,native_composition_version_u16le,dory_nu_u16le,dory_sigma_u16le,setup_identity[32],shared_opening_binding[32],native_opening_binding[32]";
 pub const DORY_V3_ALGEBRAIC_BINDING_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/DORY-ALGEBRAIC-BINDING/V2";
 
 pub const DORY_V3_SETUP_IDENTITY: Digest32 = Digest32::new([
@@ -742,9 +749,12 @@ impl DescriptorHasher {
 }
 
 pub fn relation_parameters_digest() -> Digest32 {
-    use crate::forgematrix_v2::{
-        V2_MAX_OUTPUT_QUOTIENT, V2_MODEL_VALUE_CENTER, V2_MODEL_VALUE_ENCODING, V2_OUTPUT_MODULUS,
-        V2_TRANSITION_MODULUS,
+    use crate::{
+        dory_bls12_381_blake3::BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES,
+        forgematrix_v2::{
+            V2_MAX_OUTPUT_QUOTIENT, V2_MODEL_VALUE_CENTER, V2_MODEL_VALUE_ENCODING,
+            V2_OUTPUT_MODULUS, V2_TRANSITION_MODULUS,
+        },
     };
 
     let mut descriptor = DescriptorHasher::new(DORY_V3_RELATION_PARAMETERS_DOMAIN);
@@ -785,9 +795,14 @@ pub fn relation_parameters_digest() -> Digest32 {
         "BLAKE3 XOF over challenge_digest[32],layer_u32le; accept each XOF byte <=250 until count=1+log2(rows)+log2(columns)",
     );
     descriptor.str("output-domain", DORY_V3_OUTPUT_DOMAIN);
+    descriptor.u64(
+        "output-activation-bytes",
+        u64::try_from(BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES)
+            .expect("production activation length fits u64"),
+    );
     descriptor.str(
         "output-fields",
-        "challenge_digest[32],activation_length_u64le,activation_bytes[activation_length] each 0..=250",
+        "challenge_digest[32],activation_length_u64le equal to output-activation-bytes,activation_bytes[activation_length] each 0..=250",
     );
     descriptor.str("work-domain", DORY_V3_WORK_DOMAIN);
     descriptor.str(
@@ -982,6 +997,26 @@ pub fn shared_algebra_parameters_digest() -> Digest32 {
     descriptor.str(
         "fixed-model-binding-domain",
         DORY_V3_FIXED_MODEL_BINDING_DOMAIN,
+    );
+    descriptor.str(
+        "fixed-model-binding-fields",
+        DORY_V3_FIXED_MODEL_BINDING_FIELDS,
+    );
+    descriptor.str(
+        "shared-opening-binding-domain",
+        DORY_V3_SHARED_OPENING_BINDING_DOMAIN,
+    );
+    descriptor.str(
+        "shared-opening-binding-fields",
+        DORY_V3_SHARED_OPENING_BINDING_FIELDS,
+    );
+    descriptor.str(
+        "native-composition-binding-domain",
+        DORY_V3_NATIVE_COMPOSITION_BINDING_DOMAIN,
+    );
+    descriptor.str(
+        "native-composition-binding-fields",
+        DORY_V3_NATIVE_COMPOSITION_BINDING_FIELDS,
     );
     descriptor.u32(
         "maximum-shared-binding-bytes",
@@ -1320,11 +1355,11 @@ mod tests {
         let manifest = production_dory_v3_suite_manifest();
         assert_eq!(
             manifest.digest().to_hex(),
-            "c7e5efbc3bb747393dcaa45b529484fb37de5a716e7dd5d78fae9cbf1bd0d1d5"
+            "6c0950d4b5dcffef9f3296f9c0718a8d5124877719b3af76b2f68b3fcb64764a"
         );
         assert_eq!(
             manifest.relation_parameters_digest.to_hex(),
-            "d47bdd713fb85a3798a0d1f4acb1801c0da7a6b74ca936f842856d8977bf7f3f"
+            "27f838def695b558663679c556a6e1183fd73a52244d87668d33975a2cabe0b1"
         );
         assert_eq!(
             manifest.model_codec_parameters_digest.to_hex(),
@@ -1336,7 +1371,7 @@ mod tests {
         );
         assert_eq!(
             manifest.shared_algebra_parameters_digest.to_hex(),
-            "e24628443119cb7d9628226a92780538879382e5f2715ee459eb4df2aa2cb1c0"
+            "3540c35f987e32890a29e22839be03dec0f0cde5aa560d73e96c270e58a7b171"
         );
         assert_eq!(
             manifest.native_blake3_parameters_digest.to_hex(),
@@ -1363,6 +1398,22 @@ mod tests {
         assert_eq!(
             DORY_V3_MODEL_RECORD_DOMAIN,
             "CMFD/FORGEMATRIX/V3/DORY-MODEL-COMMITMENT-RECORD/V2"
+        );
+    }
+
+    #[test]
+    fn layout_v5_binding_transcript_grammars_are_exactly_frozen() {
+        assert_eq!(
+            DORY_V3_FIXED_MODEL_BINDING_FIELDS,
+            "binding_version_u16le,shared_layout_version_u16le,suite_digest[32],model_identity_digest[32],setup_identity[32],padded_variables_u32le,outer_binding_length_u32le,outer_binding[outer_binding_length]"
+        );
+        assert_eq!(
+            DORY_V3_SHARED_OPENING_BINDING_FIELDS,
+            "shared_layout_version_u16le,padded_variables_u32le,setup_identity[32],component_binding[32],matrix_count_u16le,then each matrix_transcript_digest[32],transition_count_u16le,then each arithmetic_transcript_digest[32],range_transcript_digest[32],wiring_transcript_digest[32]"
+        );
+        assert_eq!(
+            DORY_V3_NATIVE_COMPOSITION_BINDING_FIELDS,
+            "shared_layout_version_u16le,native_composition_version_u16le,dory_nu_u16le,dory_sigma_u16le,setup_identity[32],shared_opening_binding[32],native_opening_binding[32]"
         );
     }
 

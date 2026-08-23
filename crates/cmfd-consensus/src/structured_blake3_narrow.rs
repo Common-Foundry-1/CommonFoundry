@@ -1184,15 +1184,15 @@ struct MainCols<T> {
 }
 
 const MAIN_WIDTH: usize = size_of::<MainCols<u8>>();
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const NARROW_BLAKE3_MAIN_WIDTH: usize = MAIN_WIDTH;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const NARROW_BLAKE3_ORIGINAL_NIBBLES_START: usize =
     std::mem::offset_of!(MainCols<u8>, original_nibbles);
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START: usize =
     std::mem::offset_of!(MainCols<u8>, evaluation_accumulator);
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const NARROW_BLAKE3_STACK_START: usize = std::mem::offset_of!(MainCols<u8>, stack);
 
 #[repr(C)]
@@ -1225,9 +1225,11 @@ struct PrepCols<T> {
 }
 
 const PREP_WIDTH: usize = size_of::<PrepCols<u8>>();
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(feature = "dory-bls12-381-prototype")]
+// Rust 1.88 does not count the combined-path anonymous const assertion as a use.
+#[allow(dead_code)]
 pub(crate) const NARROW_BLAKE3_PREPROCESSED_WIDTH: usize = PREP_WIDTH;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS: [usize; 4] = [
     std::mem::offset_of!(PrepCols<u8>, counter_low),
     std::mem::offset_of!(PrepCols<u8>, counter_high),
@@ -1319,10 +1321,12 @@ impl NarrowBlake3Air {
         })
     }
 
+    #[cfg(feature = "dory-bls12-381-prototype")]
     pub(crate) const fn trace_rows(&self) -> usize {
         self.trace_rows
     }
 
+    #[cfg(feature = "dory-bls12-381-prototype")]
     pub(crate) fn activation_group_index_at_row(&self, row_index: usize) -> Option<usize> {
         let operation_index = row_index / ROWS_PER_COMPRESSION;
         let step = row_index % ROWS_PER_COMPRESSION;
@@ -2720,7 +2724,7 @@ fn build_config_with_dft_and_fri(dft: NarrowDft, log_blowup: usize, num_queries:
     build_config_with_backends_and_fri(dft, NarrowCommitBackend::default(), log_blowup, num_queries)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dory-bls12-381-prototype"))]
 fn build_config_with_fri_geometry(
     dft: NarrowDft,
     log_blowup: usize,

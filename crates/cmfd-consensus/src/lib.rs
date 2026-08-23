@@ -50,6 +50,8 @@ pub mod dory_v3_model;
 pub mod dory_v3_model_record;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_suite;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_transcript;
 pub mod economics;
 pub mod forgematrix;
 pub mod forgematrix_v2;

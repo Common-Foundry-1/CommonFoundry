@@ -14,6 +14,7 @@ pub const POW_TYPE_V1_LEGACY: u16 = 1;
 pub const POW_TYPE_V2_REFERENCE: u16 = 2;
 /// Reserved wire identity for the fail-closed structured production candidate.
 pub const POW_TYPE_V3_CANDIDATE: u16 = 3;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const FORGEMATRIX_V3_BLOCK_ID_PROOF_FIELDS: &str = "pow_type_u16le,algorithm_version_u32le,proof_version_u32le,nonce_u64le,model_manifest_digest[32],challenge_digest[32],final_activation_digest[32],work_digest[32],structured_length_u64le,structured_bytes";
 const PREVERIFIED_VERIFIER_DOMAIN: &str = "CMFD/POW/PREVERIFIED-VERIFIER/V1";
 const PREVERIFIED_STATEMENT_DOMAIN: &str = "CMFD/POW/PREVERIFIED-STATEMENT/V1";
@@ -261,6 +262,7 @@ impl ConsensusPowVerifier {
         block: &BlockChallenge,
         proof: &BlockProof,
     ) -> Result<ExternalPreverificationBinding, PowError> {
+        self.require_matching_proof_type(proof)?;
         Ok(ExternalPreverificationBinding {
             verifier_identity: self.preverification_identity(block.network_id)?,
             statement_identity: preverified_statement_identity(block, proof),
@@ -298,12 +300,25 @@ impl ConsensusPowVerifier {
         proof: &BlockProof,
         preverified: &PreverifiedBlockProof,
     ) -> Result<(), PowError> {
+        self.require_matching_proof_type(proof)?;
         if preverified.verifier_identity != self.preverification_identity(block.network_id)?
             || preverified.statement_identity != preverified_statement_identity(block, proof)
         {
             return Err(PowError::PreverificationMismatch);
         }
         Ok(())
+    }
+
+    fn require_matching_proof_type(&self, proof: &BlockProof) -> Result<(), PowError> {
+        if matches!(
+            (self, proof),
+            (Self::V1Legacy(_), BlockProof::V1Legacy(_))
+                | (Self::V2Reference(_), BlockProof::V2Reference(_))
+        ) {
+            Ok(())
+        } else {
+            Err(PowError::WrongProofType)
+        }
     }
 
     fn preverification_identity(&self, network_id: [u8; 32]) -> Result<[u8; 32], PowError> {
@@ -503,7 +518,7 @@ mod tests {
         let legacy = ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap();
         assert!(matches!(
             legacy.verify_preverified(&challenge, &changed_proof, &preverified),
-            Err(PowError::PreverificationMismatch | PowError::WrongNetwork)
+            Err(PowError::WrongProofType)
         ));
     }
 
@@ -536,6 +551,48 @@ mod tests {
         assert!(matches!(
             unsafe { verifier.issue_external_preverification(&challenge, &proof, substituted) },
             Err(PowError::PreverificationMismatch)
+        ));
+    }
+
+    #[test]
+    fn external_preverification_rejects_v3_before_binding_or_capability_use() {
+        let reference = v2_test_reference().unwrap();
+        let network_id = reference.descriptor().network_id;
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let challenge = block(network_id);
+        let v2_proof = verifier.mine(&challenge, 7, 1).unwrap();
+        let preverified = verifier.preverify(&challenge, &v2_proof).unwrap();
+        let v3_proof = BlockProof::V3Candidate(Box::new(ForgeMatrixV3CandidateProof {
+            algorithm_version: 2,
+            proof_version: 1,
+            nonce: 7,
+            model_manifest_digest: [1; 32],
+            challenge_digest: [2; 32],
+            final_activation_digest: [3; 32],
+            work_digest: [4; 32],
+            structured_proof: vec![5],
+        }));
+
+        assert!(matches!(
+            verifier.external_preverification_binding(&challenge, &v3_proof),
+            Err(PowError::WrongProofType)
+        ));
+        assert!(matches!(
+            verifier.verify_preverified(&challenge, &v3_proof, &preverified),
+            Err(PowError::WrongProofType)
+        ));
+
+        let forged_binding = ExternalPreverificationBinding {
+            verifier_identity: [6; 32],
+            statement_identity: [7; 32],
+        };
+        // SAFETY: the deliberately incompatible proof type must be rejected
+        // before the untrusted binding is compared or any capability exists.
+        assert!(matches!(
+            unsafe {
+                verifier.issue_external_preverification(&challenge, &v3_proof, forged_binding)
+            },
+            Err(PowError::WrongProofType)
         ));
     }
 }

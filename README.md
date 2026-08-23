@@ -300,6 +300,19 @@ all 746 values authenticate in one three-claim Dory proof, and an opening-proof
 mutation fails. Production geometry uses one 30-variable packed commitment and
 one opening claim, but its out-of-core prover is not implemented or measured.
 
+The companion bounded algebraic adjacency fixture reserves transcript placement
+for source commitments before compressing each complete main row, then proves
+equality of the cyclic row-indexed multisets `(r, next[r])` and
+`((r - 1) mod N, local[r])`. Two inverse tables
+enforce the LogUp denominators locally, while their global sum binds the
+permutation. The 256-row fixture verifies in eight degree-three rounds with four
+samples per round and exposes 580 terminal evaluations. It rejects a changed
+cell, reordered or duplicated rows, a changed wrap boundary, and altered round
+or terminal values. This checkpoint is exercised without Dory source
+commitments: its 580 adjacency terminals are not yet authenticated, so an
+adaptive prover is not yet excluded. The production out-of-core path and
+complete soundness bound remain open.
+
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the
 network limit. Geometry-derived maxima are 154,252 bytes for WHIR and 87,556

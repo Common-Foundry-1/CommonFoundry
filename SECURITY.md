@@ -358,6 +358,20 @@ geometry, before the still-missing complete union bound. The production
 out-of-core commitment/opening path is not implemented or measured, so this
 fixture does not authorize V3.
 
+The bounded algebraic row-adjacency checkpoint now places the compression
+challenge after a reserved source-commitment transcript section and compares
+the cyclic indexed multisets
+`(r, next[r])` and `((r - 1) mod N, local[r])`. Two inverse tables prove the
+LogUp denominator relations under an equality-weighted local check, and their
+global rational sum binds the permutation. The 256-row fixture verifies in
+eight degree-three rounds with four samples per round. Changed cells, row
+reordering, duplication, wrap-boundary changes, and altered round or terminal
+values are rejected. The current fixture supplies no Dory source commitments,
+and its 580 terminal evaluations are not authenticated by Dory openings; it
+therefore does not yet exclude an adaptive prover. The row-compression and
+lookup-challenge errors also need the complete Fiat-Shamir union bound and
+independent review.
+
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

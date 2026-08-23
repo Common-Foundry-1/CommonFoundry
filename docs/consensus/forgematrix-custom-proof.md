@@ -1065,6 +1065,22 @@ adds at most degree-10 error over the BLS12-381 scalar field at production
 geometry, before the complete union bound. This checkpoint remains
 non-admissible.
 
+The bounded algebraic adjacency argument now reserves a source-commitment
+transcript section before compressing complete main rows and forms the two
+cyclic indexed multisets
+`(r, next[r])` and `((r - 1) mod N, local[r])`. The row index prevents a prover
+from hiding reordering behind ordinary multiset equality, and the modular label
+also binds the final-row-to-first-row wrap. Two inverse tables enforce the
+LogUp denominator equations through an equality-weighted local relation; the
+sum of their difference enforces the global permutation identity. Its 256-row
+sumcheck uses eight degree-three rounds with four evaluations per round and
+exposes the projected 580 terminals. A changed cell, reordered or duplicated
+row, changed wrap boundary, round substitution, or terminal substitution is
+rejected. The current fixture supplies no Dory source commitment and does not
+authenticate its terminal values, so it does not yet exclude an adaptive
+prover. The production out-of-core path and the complete row-compression and
+lookup-challenge soundness bound remain to be implemented and reviewed.
+
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate
 prover no longer retains a duplicate coefficient vector or builds a full

@@ -118,7 +118,7 @@ pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the bounded fixture Dory-authenticates all 746 execution terminal evaluations by random-selector batching, but the production out-of-core commitment and opening path is not implemented or measured",
-    "the row-indexed LogUp adjacency argument and its complete Fiat-Shamir soundness bound have not been implemented or independently reviewed",
+    "the bounded row-indexed LogUp adjacency sumcheck verifies fixed row-substitution, reordering, duplication, and wrap-boundary tests, but its sources and 580 terminal evaluations are not yet Dory-authenticated, so adaptive proving and the complete Fiat-Shamir soundness bound remain open",
     "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
@@ -577,10 +577,20 @@ mod tests {
 
     #[cfg(feature = "whir-prototype")]
     const DENSE_EXECUTION_SUMCHECK_DEGREE: usize = BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE;
+    #[cfg(feature = "whir-prototype")]
+    const DENSE_ADJACENCY_SUMCHECK_DEGREE: usize = BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE;
 
     #[cfg(feature = "whir-prototype")]
     #[derive(Clone)]
     struct DenseExecutionSumcheckProof {
+        rounds: Vec<Vec<BlsDoryFr>>,
+        terminal_evaluations: Vec<BlsDoryFr>,
+        transcript_digest: [u8; 32],
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[derive(Clone)]
+    struct DenseAdjacencySumcheckProof {
         rounds: Vec<Vec<BlsDoryFr>>,
         terminal_evaluations: Vec<BlsDoryFr>,
         transcript_digest: [u8; 32],
@@ -607,6 +617,16 @@ mod tests {
         constraints: &'a [BlsDoryBlake3ConstraintExpr],
         mixing_powers: &'a [BlsDoryFr],
         raw_evaluation: BlsDoryFr,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[derive(Clone, Copy)]
+    struct DenseAdjacencyRelation {
+        trace_rows: BlsDoryFr,
+        compression: BlsDoryFr,
+        alpha: BlsDoryFr,
+        local_mixing: [BlsDoryFr; 2],
+        rational_mixing: BlsDoryFr,
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -1029,6 +1049,329 @@ mod tests {
                     &relation,
                 )
         {
+            return false;
+        }
+        dense_absorb_terminal(&mut transcript, &proof.terminal_evaluations);
+        transcript.digest() == proof.transcript_digest
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_adjacency_source_tables(execution_tables: &[Vec<BlsDoryFr>]) -> Vec<Vec<BlsDoryFr>> {
+        assert_eq!(
+            execution_tables.len(),
+            BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+        );
+        execution_tables[..2 * BLS_DORY_BLAKE3_MAIN_WIDTH].to_vec()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_adjacency_transcript(
+        bridge: &BlsDoryOutputBridgeStatement,
+        source_commitments: &[BlsDoryGt],
+    ) -> BlsDoryTranscript {
+        let mut transcript = BlsDoryTranscript::new(b"blake3-native-row-adjacency-sumcheck");
+        transcript.append_bytes(b"protocol-version", &1_u16.to_le_bytes());
+        transcript.append_bytes(b"challenge-digest", &bridge.challenge_digest());
+        transcript.append_bytes(
+            b"activation-length",
+            &(bridge.final_activation_len() as u64).to_le_bytes(),
+        );
+        transcript.append_bytes(b"activation-digest", &bridge.final_activation_digest());
+        transcript.append_bytes(b"dory-binding", &bridge.transcript_binding());
+        transcript.append_bytes(
+            b"source-commitment-count",
+            &(source_commitments.len() as u64).to_le_bytes(),
+        );
+        for commitment in source_commitments {
+            transcript.append_group(b"packed-adjacency-source-commitment", commitment);
+        }
+        transcript
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_adjacency_key(
+        values: impl IntoIterator<Item = BlsDoryFr>,
+        row_label: BlsDoryFr,
+        compression: BlsDoryFr,
+    ) -> BlsDoryFr {
+        values
+            .into_iter()
+            .fold(row_label, |key, value| key * compression + value)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_adjacency_relation(
+        terminal: &[BlsDoryFr],
+        row_index: BlsDoryFr,
+        first_row: BlsDoryFr,
+        equality: BlsDoryFr,
+        relation: DenseAdjacencyRelation,
+    ) -> BlsDoryFr {
+        let next_start = BLS_DORY_BLAKE3_MAIN_WIDTH;
+        let inverse_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+        assert_eq!(terminal.len(), inverse_start + 2);
+        let local_key = dense_adjacency_key(
+            terminal[..next_start].iter().copied(),
+            row_index - BlsDoryFr::from_u64(1) + relation.trace_rows * first_row,
+            relation.compression,
+        );
+        let next_key = dense_adjacency_key(
+            terminal[next_start..inverse_start].iter().copied(),
+            row_index,
+            relation.compression,
+        );
+        let local_inverse = terminal[inverse_start];
+        let next_inverse = terminal[inverse_start + 1];
+        let local_constraint =
+            local_inverse * (relation.alpha - local_key) - BlsDoryFr::from_u64(1);
+        let next_constraint = next_inverse * (relation.alpha - next_key) - BlsDoryFr::from_u64(1);
+        equality
+            * (relation.local_mixing[0] * local_constraint
+                + relation.local_mixing[1] * next_constraint)
+            + relation.rational_mixing * (next_inverse - local_inverse)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_adjacency_inverse_tables(
+        source_tables: &[Vec<BlsDoryFr>],
+        compression: BlsDoryFr,
+        alpha: BlsDoryFr,
+    ) -> Option<[Vec<BlsDoryFr>; 2]> {
+        if source_tables.len() != 2 * BLS_DORY_BLAKE3_MAIN_WIDTH || source_tables.is_empty() {
+            return None;
+        }
+        let rows = source_tables[0].len();
+        if !rows.is_power_of_two() || source_tables.iter().any(|table| table.len() != rows) {
+            return None;
+        }
+        let mut local_inverse = Vec::with_capacity(rows);
+        let mut next_inverse = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let first = u64::from(row == 0);
+            let local_label = row as u64 - u64::from(row != 0) + (rows as u64 - 1) * first;
+            let local_key = dense_adjacency_key(
+                source_tables[..BLS_DORY_BLAKE3_MAIN_WIDTH]
+                    .iter()
+                    .map(|table| table[row]),
+                BlsDoryFr::from_u64(local_label),
+                compression,
+            );
+            let next_key = dense_adjacency_key(
+                source_tables[BLS_DORY_BLAKE3_MAIN_WIDTH..]
+                    .iter()
+                    .map(|table| table[row]),
+                BlsDoryFr::from_u64(row as u64),
+                compression,
+            );
+            local_inverse.push((alpha - local_key).inv()?);
+            next_inverse.push((alpha - next_key).inv()?);
+        }
+        Some([local_inverse, next_inverse])
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_evaluate_adjacency_samples(values: &[BlsDoryFr], point: BlsDoryFr) -> BlsDoryFr {
+        assert_eq!(values.len(), DENSE_ADJACENCY_SUMCHECK_DEGREE + 1);
+        values
+            .iter()
+            .copied()
+            .enumerate()
+            .fold(BlsDoryFr::zero(), |result, (index, value)| {
+                let mut numerator = BlsDoryFr::from_u64(1);
+                let mut denominator = BlsDoryFr::from_u64(1);
+                for other in 0..values.len() {
+                    if other != index {
+                        numerator = numerator * (point - BlsDoryFr::from_u64(other as u64));
+                        denominator =
+                            denominator * BlsDoryFr::from_i64(index as i64 - other as i64);
+                    }
+                }
+                result + value * numerator * denominator.inv().unwrap()
+            })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_adjacency_row_index_evaluation(point: &[BlsDoryFr]) -> BlsDoryFr {
+        point
+            .iter()
+            .enumerate()
+            .fold(BlsDoryFr::zero(), |value, (variable, coordinate)| {
+                value + BlsDoryFr::from_u64(1_u64 << variable) * *coordinate
+            })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn prove_dense_adjacency_sumcheck(
+        mut source_tables: Vec<Vec<BlsDoryFr>>,
+        bridge: &BlsDoryOutputBridgeStatement,
+        source_commitments: &[BlsDoryGt],
+        inverse_commitments: &[BlsDoryGt],
+    ) -> Option<DenseAdjacencySumcheckProof> {
+        let rows = source_tables.first()?.len();
+        if source_tables.len() != 2 * BLS_DORY_BLAKE3_MAIN_WIDTH
+            || !rows.is_power_of_two()
+            || source_tables.iter().any(|table| table.len() != rows)
+        {
+            return None;
+        }
+        let variables = rows.ilog2() as usize;
+        let mut transcript = dense_adjacency_transcript(bridge, source_commitments);
+        let compression = transcript.challenge_scalar(b"row-compression");
+        let alpha = transcript.challenge_scalar(b"lookup-alpha");
+        let inverses = dense_adjacency_inverse_tables(&source_tables, compression, alpha)?;
+        source_tables.extend(inverses);
+        transcript.append_bytes(
+            b"inverse-commitment-count",
+            &(inverse_commitments.len() as u64).to_le_bytes(),
+        );
+        for commitment in inverse_commitments {
+            transcript.append_group(b"packed-adjacency-inverse-commitment", commitment);
+        }
+        let local_mixing = [
+            transcript.challenge_scalar(b"local-mixing"),
+            transcript.challenge_scalar(b"local-mixing"),
+        ];
+        let rational_mixing = transcript.challenge_scalar(b"rational-mixing");
+        let equality_point = dense_cell_point(&mut transcript, variables);
+        let relation = DenseAdjacencyRelation {
+            trace_rows: BlsDoryFr::from_u64(rows as u64),
+            compression,
+            alpha,
+            local_mixing,
+            rational_mixing,
+        };
+        let mut equality = dense_equality_table(&equality_point);
+        let mut row_index = (0..rows)
+            .map(|row| BlsDoryFr::from_u64(row as u64))
+            .collect::<Vec<_>>();
+        let mut first = vec![BlsDoryFr::zero(); rows];
+        first[0] = BlsDoryFr::from_u64(1);
+        let mut claim = BlsDoryFr::zero();
+        let mut rounds = Vec::with_capacity(variables);
+        for round_index in 0..variables {
+            let pair_count = equality.len() / 2;
+            let evaluations = (0..=DENSE_ADJACENCY_SUMCHECK_DEGREE)
+                .map(|sample| {
+                    let sample = BlsDoryFr::from_u64(sample as u64);
+                    (0..pair_count).fold(BlsDoryFr::zero(), |sum, pair| {
+                        let offset = 2 * pair;
+                        let terminal = source_tables
+                            .iter()
+                            .map(|table| dense_interpolate(&table[offset..offset + 2], sample))
+                            .collect::<Vec<_>>();
+                        sum + dense_adjacency_relation(
+                            &terminal,
+                            dense_interpolate(&row_index[offset..offset + 2], sample),
+                            dense_interpolate(&first[offset..offset + 2], sample),
+                            dense_interpolate(&equality[offset..offset + 2], sample),
+                            relation,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if evaluations[0] + evaluations[1] != claim {
+                return None;
+            }
+            dense_absorb_round(&mut transcript, round_index, &evaluations);
+            let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+            claim = dense_evaluate_adjacency_samples(&evaluations, challenge);
+            for table in &mut source_tables {
+                *table = dense_fold(table, challenge);
+            }
+            equality = dense_fold(&equality, challenge);
+            row_index = dense_fold(&row_index, challenge);
+            first = dense_fold(&first, challenge);
+            rounds.push(evaluations);
+        }
+        let terminal_evaluations = source_tables
+            .iter()
+            .map(|table| table[0])
+            .collect::<Vec<_>>();
+        if claim
+            != dense_adjacency_relation(
+                &terminal_evaluations,
+                row_index[0],
+                first[0],
+                equality[0],
+                relation,
+            )
+        {
+            return None;
+        }
+        dense_absorb_terminal(&mut transcript, &terminal_evaluations);
+        Some(DenseAdjacencySumcheckProof {
+            rounds,
+            terminal_evaluations,
+            transcript_digest: transcript.digest(),
+        })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn verify_dense_adjacency_sumcheck(
+        proof: &DenseAdjacencySumcheckProof,
+        trace_rows: usize,
+        bridge: &BlsDoryOutputBridgeStatement,
+        source_commitments: &[BlsDoryGt],
+        inverse_commitments: &[BlsDoryGt],
+    ) -> bool {
+        if !trace_rows.is_power_of_two()
+            || proof.rounds.len() != trace_rows.ilog2() as usize
+            || proof.terminal_evaluations.len() != BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS
+            || proof
+                .rounds
+                .iter()
+                .any(|round| round.len() != DENSE_ADJACENCY_SUMCHECK_DEGREE + 1)
+        {
+            return false;
+        }
+        let variables = trace_rows.ilog2() as usize;
+        let mut transcript = dense_adjacency_transcript(bridge, source_commitments);
+        let compression = transcript.challenge_scalar(b"row-compression");
+        let alpha = transcript.challenge_scalar(b"lookup-alpha");
+        transcript.append_bytes(
+            b"inverse-commitment-count",
+            &(inverse_commitments.len() as u64).to_le_bytes(),
+        );
+        for commitment in inverse_commitments {
+            transcript.append_group(b"packed-adjacency-inverse-commitment", commitment);
+        }
+        let local_mixing = [
+            transcript.challenge_scalar(b"local-mixing"),
+            transcript.challenge_scalar(b"local-mixing"),
+        ];
+        let rational_mixing = transcript.challenge_scalar(b"rational-mixing");
+        let equality_point = dense_cell_point(&mut transcript, variables);
+        let relation = DenseAdjacencyRelation {
+            trace_rows: BlsDoryFr::from_u64(trace_rows as u64),
+            compression,
+            alpha,
+            local_mixing,
+            rational_mixing,
+        };
+        let mut claim = BlsDoryFr::zero();
+        let mut sumcheck_point = Vec::with_capacity(variables);
+        for (round_index, evaluations) in proof.rounds.iter().enumerate() {
+            if evaluations[0] + evaluations[1] != claim {
+                return false;
+            }
+            dense_absorb_round(&mut transcript, round_index, evaluations);
+            let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+            claim = dense_evaluate_adjacency_samples(evaluations, challenge);
+            sumcheck_point.push(challenge);
+        }
+        let first = sumcheck_point
+            .iter()
+            .fold(BlsDoryFr::from_u64(1), |value, coordinate| {
+                value * (BlsDoryFr::from_u64(1) - *coordinate)
+            });
+        let expected = dense_adjacency_relation(
+            &proof.terminal_evaluations,
+            dense_adjacency_row_index_evaluation(&sumcheck_point),
+            first,
+            dense_equality_evaluation(&equality_point, &sumcheck_point),
+            relation,
+        );
+        if claim != expected {
             return false;
         }
         dense_absorb_terminal(&mut transcript, &proof.terminal_evaluations);
@@ -1684,6 +2027,73 @@ mod tests {
             &bridge,
             &[],
         ));
+
+        let adjacency_tables = dense_adjacency_source_tables(&tables);
+        let adjacency =
+            prove_dense_adjacency_sumcheck(adjacency_tables.clone(), &bridge, &[], &[]).unwrap();
+        assert_eq!(adjacency.rounds.len(), 8);
+        assert!(
+            adjacency
+                .rounds
+                .iter()
+                .all(|round| round.len() == DENSE_ADJACENCY_SUMCHECK_DEGREE + 1)
+        );
+        assert_eq!(
+            adjacency.terminal_evaluations.len(),
+            BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS
+        );
+        assert!(verify_dense_adjacency_sumcheck(
+            &adjacency,
+            air.trace_rows(),
+            &bridge,
+            &[],
+            &[],
+        ));
+
+        let mut changed_adjacency_round = adjacency.clone();
+        changed_adjacency_round.rounds[0][0] =
+            changed_adjacency_round.rounds[0][0] + BlsDoryFr::from_u64(1);
+        assert!(!verify_dense_adjacency_sumcheck(
+            &changed_adjacency_round,
+            air.trace_rows(),
+            &bridge,
+            &[],
+            &[],
+        ));
+
+        let mut changed_adjacency_terminal = adjacency.clone();
+        changed_adjacency_terminal.terminal_evaluations[0] =
+            changed_adjacency_terminal.terminal_evaluations[0] + BlsDoryFr::from_u64(1);
+        assert!(!verify_dense_adjacency_sumcheck(
+            &changed_adjacency_terminal,
+            air.trace_rows(),
+            &bridge,
+            &[],
+            &[],
+        ));
+
+        let next_start = BLS_DORY_BLAKE3_MAIN_WIDTH;
+        let mut substituted_next = adjacency_tables.clone();
+        substituted_next[next_start][7] = substituted_next[next_start][7] + BlsDoryFr::from_u64(1);
+        assert!(prove_dense_adjacency_sumcheck(substituted_next, &bridge, &[], &[]).is_none());
+
+        let mut reordered_next = adjacency_tables.clone();
+        for table in &mut reordered_next[next_start..] {
+            table.swap(4, 5);
+        }
+        assert!(prove_dense_adjacency_sumcheck(reordered_next, &bridge, &[], &[]).is_none());
+
+        let mut duplicated_next = adjacency_tables.clone();
+        for table in &mut duplicated_next[next_start..] {
+            table[9] = table[8];
+        }
+        assert!(prove_dense_adjacency_sumcheck(duplicated_next, &bridge, &[], &[]).is_none());
+
+        let mut changed_boundary = adjacency_tables;
+        let final_row = air.trace_rows() - 1;
+        changed_boundary[next_start][final_row] =
+            changed_boundary[next_start][final_row] + BlsDoryFr::from_u64(1);
+        assert!(prove_dense_adjacency_sumcheck(changed_boundary, &bridge, &[], &[]).is_none());
     }
 
     #[test]

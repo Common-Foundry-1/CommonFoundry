@@ -703,6 +703,22 @@ most degree-10 error over the BLS12-381 scalar field at that geometry, before
 the complete union bound. The production out-of-core commitment/opening path is
 not implemented or measured, so this is not yet an admissible proof.
 
+A companion bounded algebraic LogUp sumcheck now specifies how to bind the
+prover-supplied local and next main rows. Its transcript reserves source
+commitments before one challenge compresses each 289-scalar row. The argument
+compares the cyclic row-indexed multisets
+`(r, next[r])` and `((r - 1) mod N, local[r])`; including the row label prevents
+ordinary multiset equality from concealing reordering and also binds the final
+wrap to the first row. Two inverse tables enforce their denominator identities
+locally, and equality of the inverse sums enforces the permutation globally.
+The 256-row fixture verifies in eight degree-three rounds with four samples per
+round and exposes 580 terminal evaluations. Cell substitution, reordering,
+duplication, wrap-boundary changes, and round or terminal mutations are
+rejected. The current fixture supplies no Dory source commitment, so these
+mutation tests do not yet exclude an adaptive prover. Dory authentication of
+the sources and terminals, the production out-of-core path, a complete
+Fiat-Shamir union bound, and independent review remain open.
+
 The verified model-bank reader can now transactionally publish reusable BLS coefficient artifacts as well as the fixed identity. It builds the base input and every ordered weight bank while checking the canonical byte roots and EOF, returns nothing on failure, and cleans provisional files. Its writer reassembles arbitrary authenticated input chunks into canonical rows, commits complete rows in deterministic parallel batches behind a bounded 256 MiB window, and preserves canonical artifact and target-group accumulation order. Three n=19 release A/B repeats measured 814--826 ms for the former serial writer and 377--391 ms for the parallel writer; their 822 and 385 ms medians give a 53.2% reduction while producing the identical artifact digest, row commitments, tier-two commitment, opening claims, and proof bytes. Matrix proving consumes the authenticated weight artifact sequentially, reuses it in the shared aggregate opening, and rejects a commitment from the wrong pinned bank before proving. Bounded fixtures match materialized proof bytes exactly. This removes the roughly 16 GiB in-memory `i64` slice for an n=31 weight bank. It also replaces the former 32-byte-per-weight scalar artifact: the first Dory row is stored as canonical signed words and each remaining model weight in the consensus range `[-125, 125]` is one authenticated byte selecting the fixed dictionary `0, -1..-125, 1..125`. Every read reauthenticates the dictionary, codes, dimensions, source digest, and EOF before expansion.
 
 The aggregate memory path has nevertheless moved toward that gate. The prover computes the final combined `L^T M` by streaming authenticated coefficients, without a duplicate committed coefficient vector or a materialized combined polynomial. Claims backed by the same authenticated artifact combine their opening scales first, so the final vector-matrix product reads that physical source once. Its distinct-point sumcheck recognizes cloned artifact handles, folds each physical polynomial once, and generates factorized equality weights without equality tables; the unchanged 17,695-byte fixture is pinned at BLAKE3 digest `6aa99fd095e70180b6b2fdd94dc96fc420f99eb529ec03ad5dfa978731d9cfac`. An explicit scratch path writes every post-challenge fold to a self-authenticating, lineage-bound artifact with a two-decoded-scalar fold working set plus a bounded 1 MiB encoded buffer per open reader or writer (2 MiB for simultaneous fold input and output). It rejects corruption, truncation, non-canonical fields, and trailing bytes, cleans owned partial and completed files, and aborts without a dense retry. Scalar and batch writes remain byte- and digest-identical across the buffer boundary. A row-source constructor simultaneously computes the ordinary Dory row and tier-two commitments and writes the canonical explicit coefficient prefix into that authenticated storage boundary. The header binds logical and explicit lengths, so a canonical zero suffix remains implicit through every fold.

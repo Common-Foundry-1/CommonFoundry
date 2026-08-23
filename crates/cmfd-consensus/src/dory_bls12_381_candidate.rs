@@ -44,11 +44,15 @@ use crate::{
         PreparedBlsDoryNativeBlake3Opening, prepare_production_native_blake3_opening,
     },
     dory_bls12_381_execution_artifact::{
-        BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorArtifactError,
+        BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
+        BlsDoryExecutionAccumulatorArtifactError,
     },
     dory_bls12_381_layout::{
         BlsDoryPrecommittedMatrixProverInput, BlsDoryPreparedFixedModel,
-        BlsDoryTransitionProverInput, prepare_bls_dory_shared_layout_verifier_state,
+        BlsDoryTransitionProverInput, PreparedBlsDorySharedLayoutProverState,
+        extract_bls_dory_final_activation_from_execution_artifact,
+        prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch,
+        prepare_bls_dory_shared_layout_verifier_state,
         prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch,
         prove_prepared_bls_dory_shared_layout_with_composition,
         verify_prepared_bls_dory_shared_layout_with_native_proof,
@@ -342,21 +346,12 @@ impl BlsDoryV3AlgebraicVerifier {
         scratch_directory: &Path,
         maximum_native_block_rows: usize,
     ) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
-        if block.network_id != self.network_id {
-            return Err(BlsDoryV3CandidateError::WrongNetwork);
-        }
-        if maximum_native_block_rows == 0
-            || !scratch_directory.is_absolute()
-            || !scratch_directory.is_dir()
-            || self.setup.max_log_n() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
-        {
-            return Err(BlsDoryV3CandidateError::ProverConfiguration);
-        }
-        if prepared_model.identity() != &self.fixed_model
-            || prepared_model.weight_banks().len() != PRODUCTION_V2_BANKS as usize
-        {
-            return Err(BlsDorySharedLayoutError::FixedModelIdentity.into());
-        }
+        self.validate_prover_configuration(
+            block,
+            prepared_model,
+            scratch_directory,
+            maximum_native_block_rows,
+        )?;
 
         let shape = StructuredForgeMatrixResearchShape::production_candidate();
         shape
@@ -379,7 +374,7 @@ impl BlsDoryV3AlgebraicVerifier {
             return Err(BlsDoryV3CandidateError::HighHash);
         }
 
-        let mut proof = ForgeMatrixV3CandidateProof {
+        let proof = ForgeMatrixV3CandidateProof {
             algorithm_version: FORGEMATRIX_V2_ALGORITHM_VERSION,
             proof_version: FORGEMATRIX_V2_PROOF_VERSION,
             nonce,
@@ -434,19 +429,165 @@ impl BlsDoryV3AlgebraicVerifier {
                 &self.setup,
                 scratch_directory,
             )?;
-        let bridge = BlsDoryOutputBridgeStatement::from_pending_dory(
+        self.finish_prepared_candidate(
+            block,
+            proof,
+            &validated,
+            shared,
+            &final_activation,
+            scratch_directory,
+            maximum_native_block_rows,
+        )
+    }
+
+    /// Construct and self-verify one exact production-shaped research
+    /// candidate directly from an authenticated execution artifact. The
+    /// artifact is consumed so its large accumulator file is deleted before
+    /// native BLAKE3 proving begins. Callers cannot supply any artifact
+    /// identity, public statement, mask, or dense witness table.
+    #[cfg(feature = "whir-prototype")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_candidate_from_execution_artifact(
+        &self,
+        block: &BlockChallenge,
+        nonce: u64,
+        prepared_model: &BlsDoryPreparedFixedModel,
+        mut artifact: BlsDoryExecutionAccumulatorArtifact,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+    ) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+        self.validate_prover_configuration(
+            block,
+            prepared_model,
+            scratch_directory,
+            maximum_native_block_rows,
+        )?;
+
+        let shape = StructuredForgeMatrixResearchShape::production_candidate();
+        shape
+            .validate_verifier_shape()
+            .map_err(|_| BlsDoryV3CandidateError::ProductionGeometry)?;
+        let expected_context = self.execution_artifact_context(block, nonce)?;
+        let challenge_digest = expected_context.challenge_identity();
+        let mut transition_statements = Vec::with_capacity(PRODUCTION_V2_BANKS as usize + 1);
+        transition_statements.push(shape.initialization_statement);
+        transition_statements.extend_from_slice(&shape.transition_statements);
+        let masks = production_masks(challenge_digest, &shape)?;
+        let final_activation = extract_bls_dory_final_activation_from_execution_artifact(
+            *transition_statements
+                .last()
+                .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?,
+            masks
+                .last()
+                .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?,
+            &mut artifact,
+            expected_context,
+        )?;
+        let manifest_digest = self.manifest.digest()?;
+        let final_activation_digest = output_digest(challenge_digest, &final_activation);
+        let work_digest = work_digest_from_roots(
+            challenge_digest,
+            self.manifest.raw_blake3_root,
+            self.manifest.pcs_commitment_root,
+            final_activation_digest,
+        );
+        if work_digest > block.target {
+            return Err(BlsDoryV3CandidateError::HighHash);
+        }
+
+        let proof = ForgeMatrixV3CandidateProof {
+            algorithm_version: FORGEMATRIX_V2_ALGORITHM_VERSION,
+            proof_version: FORGEMATRIX_V2_PROOF_VERSION,
+            nonce,
+            model_manifest_digest: manifest_digest,
             challenge_digest,
             final_activation_digest,
+            work_digest,
+            structured_proof: Vec::new(),
+        };
+        let validated = self.validate_candidate_public_statement(block, &proof)?;
+        let mask_refs = validated.masks.iter().collect::<Vec<_>>();
+        let shared = prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch(
+            &validated.binding,
+            &self.trusted_model,
+            prepared_model,
+            &validated.shape.matrix_statements,
+            &validated.transition_statements,
+            &mask_refs,
+            validated.shape.wiring_statement,
+            &mut artifact,
+            expected_context,
+            BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+            &self.setup,
+            scratch_directory,
+        )?;
+
+        // The prepared layout owns its opening capabilities. Releasing the
+        // consumed execution artifact here removes its production-sized file
+        // before the independent native BLAKE3 proof allocates scratch space.
+        drop(artifact);
+        self.finish_prepared_candidate(
+            block,
+            proof,
+            &validated,
+            shared,
+            &final_activation,
+            scratch_directory,
+            maximum_native_block_rows,
+        )
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn validate_prover_configuration(
+        &self,
+        block: &BlockChallenge,
+        prepared_model: &BlsDoryPreparedFixedModel,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+    ) -> Result<(), BlsDoryV3CandidateError> {
+        if block.network_id != self.network_id {
+            return Err(BlsDoryV3CandidateError::WrongNetwork);
+        }
+        if maximum_native_block_rows == 0
+            || !scratch_directory.is_absolute()
+            || !scratch_directory.is_dir()
+            || self.setup.max_log_n() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
+        {
+            return Err(BlsDoryV3CandidateError::ProverConfiguration);
+        }
+        if prepared_model.identity() != &self.fixed_model
+            || prepared_model.weight_banks().len() != PRODUCTION_V2_BANKS as usize
+        {
+            return Err(BlsDorySharedLayoutError::FixedModelIdentity.into());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[allow(clippy::too_many_arguments)]
+    fn finish_prepared_candidate(
+        &self,
+        block: &BlockChallenge,
+        mut proof: ForgeMatrixV3CandidateProof,
+        validated: &ValidatedBlsDoryV3CandidateStatement,
+        shared: PreparedBlsDorySharedLayoutProverState,
+        final_activation: &[u8],
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+    ) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+        let bridge = BlsDoryOutputBridgeStatement::from_pending_dory(
+            proof.challenge_digest,
+            proof.final_activation_digest,
             final_activation.len(),
             shared.pending_final_output(),
         )?;
-        bridge.validate_activation(&final_activation)?;
+        bridge.validate_activation(final_activation)?;
         let PreparedBlsDoryNativeBlake3Opening {
             opening_statement,
             opening_set,
             encoded_native_proof,
         } = prepare_production_native_blake3_opening(
-            &final_activation,
+            final_activation,
             &bridge,
             &self.setup,
             scratch_directory,

@@ -9,7 +9,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -25,13 +25,16 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     V2_TRANSITION_MODULUS,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCompactRowSource,
-        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_compact_row_source_with_scratch,
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
+        BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        BlsDoryReleasedCompactSource, MAX_BLS_DORY_AGGREGATE_BYTES,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_existing_compact_artifact,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
-        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
+        prove_bls_dory_deferred_opening_sets, source_artifact_spec, verify_bls_dory_openings,
     },
-    dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
+    dory_bls12_381_compact_artifact::{
+        BlsDoryCompactArtifact, BlsDoryCompactArtifactSpec, BlsDoryGroupedCompactArtifactWriter,
+    },
     dory_bls12_381_execution_artifact::{
         BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
         BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorColumn,
@@ -90,6 +93,7 @@ const NEGATIVE: usize = 9;
 const ACTIVATION: usize = STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
 const SHIFTED_ACCUMULATOR: usize = 11;
 const TRANSITION_FOLD_SLOTS: usize = 16;
+const TRANSITION_GROUPED_COMPACT_CHUNK_CELLS: usize = 1 << 17;
 pub(crate) const TRANSITION_SIGNED_WORD_SELECTORS: u64 =
     (1u64 << ACCUMULATOR) | (1u64 << ACTIVATION);
 const TRANSITION_FIXED_WORD_WIDTH_CODES: u64 = (3u64 << (OUTPUT_QUOTIENT * 2))
@@ -486,7 +490,6 @@ pub(crate) fn prove_bls_dory_transition_deferred_at_variables_with_scratch(
     )
 }
 
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
     binding: &[u8],
@@ -499,8 +502,20 @@ pub(crate) fn prove_bls_dory_transition_deferred_from_execution_artifact_with_sc
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    setup
+        .validate()
+        .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
     if expected_context.setup_identity() != setup.identity() {
         return Err(BlsDoryTransitionError::ExecutionArtifact);
+    }
+    if binding.len() > MAX_TRANSITION_BINDING_BYTES {
+        return Err(BlsDoryTransitionError::PublicBindingTooLarge);
+    }
+    mask_polynomial.validate(statement)?;
+    let cell_variables = statement.elements()?.ilog2() as usize;
+    validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
     }
     let packed_nu = packed_variables / 2;
     let packed_sigma = packed_variables - packed_nu;
@@ -510,7 +525,7 @@ pub(crate) fn prove_bls_dory_transition_deferred_from_execution_artifact_with_sc
     let packed_columns = 1usize
         .checked_shl(packed_sigma as u32)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-    let source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+    let mut source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
         statement,
         mask_polynomial,
         artifact,
@@ -519,15 +534,264 @@ pub(crate) fn prove_bls_dory_transition_deferred_from_execution_artifact_with_sc
         packed_rows,
         packed_columns,
     )?;
-    prove_bls_dory_transition_deferred_from_row_source_with_scratch(
+    let grouped = build_grouped_transition_compact_artifact_with_scratch(
+        &mut source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+    )?;
+    if grouped.derived_cells != statement.elements()? {
+        return Err(transition_storage_error());
+    }
+    let committed = commit_bls_dory_existing_compact_artifact(
+        grouped.artifact,
+        packed_nu,
+        packed_sigma,
+        setup,
+    )?;
+    prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch(
         binding,
         statement,
         mask_polynomial,
         source,
         packed_variables,
+        cell_variables,
+        committed,
         setup,
         scratch_directory,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn regenerate_bls_dory_transition_compact_source_from_execution_artifact_with_scratch(
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+    expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+    transition: BlsDoryExecutionAccumulatorTransition,
+    packed_variables: usize,
+    expected: &BlsDoryReleasedCompactSource,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<Arc<BlsDoryCompactArtifact>, BlsDoryTransitionError> {
+    setup
+        .validate()
+        .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+    if expected_context.setup_identity() != setup.identity() {
+        return Err(BlsDoryTransitionError::ExecutionArtifact);
+    }
+    mask_polynomial.validate(statement)?;
+    validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+    let packed_nu = packed_variables / 2;
+    let packed_sigma = packed_variables - packed_nu;
+    let packed_rows = 1usize
+        .checked_shl(packed_nu as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let packed_columns = 1usize
+        .checked_shl(packed_sigma as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let mut source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+        statement,
+        mask_polynomial,
+        artifact,
+        expected_context,
+        transition,
+        packed_rows,
+        packed_columns,
+    )?;
+    let grouped = build_grouped_transition_compact_artifact_with_scratch(
+        &mut source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+    )?;
+    if grouped.derived_cells != statement.elements()? {
+        return Err(transition_storage_error());
+    }
+    drop(source);
+    expected.validate_artifact(grouped.artifact.as_ref())?;
+    Ok(grouped.artifact)
+}
+
+struct BuiltGroupedTransitionArtifact {
+    artifact: Arc<BlsDoryCompactArtifact>,
+    derived_cells: usize,
+}
+
+fn build_grouped_transition_compact_artifact_with_scratch(
+    source: &mut BlsDoryTransitionWitnessRowSource<'_>,
+    packed_nu: usize,
+    packed_sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BuiltGroupedTransitionArtifact, BlsDoryTransitionError> {
+    build_grouped_transition_compact_artifact_with_chunk_cells(
+        source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+        TRANSITION_GROUPED_COMPACT_CHUNK_CELLS,
+    )
+}
+
+fn build_grouped_transition_compact_artifact_with_chunk_cells(
+    source: &mut BlsDoryTransitionWitnessRowSource<'_>,
+    packed_nu: usize,
+    packed_sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    maximum_chunk_cells: usize,
+) -> Result<BuiltGroupedTransitionArtifact, BlsDoryTransitionError> {
+    let packed_rows = 1usize
+        .checked_shl(packed_nu as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let packed_columns = 1usize
+        .checked_shl(packed_sigma as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let coefficient_count = packed_rows
+        .checked_mul(packed_columns)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let elements = source.elements;
+    let word_scalar_count = elements
+        .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let explicit_scalar_count = elements
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let code_selectors = STRUCTURED_TRANSITION_ORACLES
+        .checked_sub(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    if source.rows != packed_rows
+        || source.columns != packed_columns
+        || source.explicit_scalars != explicit_scalar_count
+        || source.literal_scalar_count() != word_scalar_count
+        || source.range_oracles.len() != code_selectors
+        || source.range_dictionary.len() != 16
+        || explicit_scalar_count > coefficient_count
+        || !matches!(
+            &source.backing,
+            TransitionWitnessBacking::ExecutionArtifact { .. }
+        )
+    {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+
+    let source_spec = source_artifact_spec(
+        setup.identity(),
+        packed_nu,
+        packed_sigma,
+        coefficient_count,
+        explicit_scalar_count,
+    )?;
+    let compact_spec = BlsDoryCompactArtifactSpec {
+        context_digest: source_spec.context_digest,
+        scalar_count: source_spec.scalar_count,
+        explicit_scalar_count: source_spec.explicit_scalar_count,
+        word_scalar_count: u64::try_from(word_scalar_count)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        word_bytes: 4,
+        code_bits: 4,
+        word_width_codes: transition_word_width_codes(source.statement.max_mask),
+        word_group_len: u64::try_from(elements)
+            .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        signed_word_selectors: TRANSITION_SIGNED_WORD_SELECTORS,
+    };
+    let mut writer = BlsDoryGroupedCompactArtifactWriter::create(
+        scratch_directory,
+        compact_spec,
+        source.range_dictionary.clone(),
+    )
+    .map_err(|_| transition_storage_error())?;
+    let chunk_cells = maximum_chunk_cells.min(elements);
+    if chunk_cells == 0 {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+    let maximum_word_scalars = chunk_cells
+        .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let maximum_codes = chunk_cells
+        .checked_mul(code_selectors)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let mut selector_words = Vec::new();
+    selector_words
+        .try_reserve_exact(maximum_word_scalars)
+        .map_err(|_| transition_storage_error())?;
+    let mut selector_codes = Vec::new();
+    selector_codes
+        .try_reserve_exact(maximum_codes)
+        .map_err(|_| transition_storage_error())?;
+    let range_oracles = source.range_oracles.clone();
+    let mut derived_cells = 0usize;
+    for cell_start in (0..elements).step_by(chunk_cells) {
+        let cell_count = (elements - cell_start).min(chunk_cells);
+        selector_words.resize(
+            cell_count
+                .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
+            0,
+        );
+        selector_codes.resize(
+            cell_count
+                .checked_mul(code_selectors)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
+            0,
+        );
+        for local_cell in 0..cell_count {
+            let index = cell_start
+                .checked_add(local_cell)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+            let derived = source.execution_derived_regular_row(index)?;
+            let mut regular_words = [0u64; STRUCTURED_TRANSITION_REGULAR_ORACLES];
+            for (oracle, word) in regular_words.iter_mut().enumerate() {
+                *word = derived.word(oracle)?;
+                selector_words[oracle * cell_count + local_cell] = *word;
+            }
+            for (selector, descriptor) in range_oracles.iter().copied().enumerate() {
+                let value = *regular_words
+                    .get(descriptor.source_oracle)
+                    .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+                let bounded = if descriptor.slack {
+                    descriptor
+                        .maximum
+                        .checked_sub(value)
+                        .ok_or(BlsDoryTransitionError::InvalidDimensions)?
+                } else {
+                    value
+                };
+                selector_codes[selector * cell_count + local_cell] =
+                    u8::try_from((bounded >> (descriptor.digit * 4)) & 0xf)
+                        .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+            }
+            derived_cells = derived_cells
+                .checked_add(1)
+                .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        }
+        writer
+            .write_cell_chunk(
+                u64::try_from(cell_start).map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+                cell_count,
+                &selector_words,
+                &selector_codes,
+            )
+            .map_err(|_| transition_storage_error())?;
+    }
+    if derived_cells != elements {
+        return Err(transition_storage_error());
+    }
+    let artifact = writer.finish().map_err(|_| transition_storage_error())?;
+    if artifact.spec() != compact_spec {
+        return Err(transition_storage_error());
+    }
+    Ok(BuiltGroupedTransitionArtifact {
+        artifact: Arc::new(artifact),
+        derived_cells,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -558,6 +822,31 @@ fn prove_bls_dory_transition_deferred_from_row_source_with_scratch(
         setup,
         scratch_directory,
     )?;
+    prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch(
+        binding,
+        statement,
+        mask_polynomial,
+        source,
+        packed_variables,
+        cell_variables,
+        committed,
+        setup,
+        scratch_directory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    source: BlsDoryTransitionWitnessRowSource<'_>,
+    packed_variables: usize,
+    cell_variables: usize,
+    committed: BlsDoryCommittedPolynomial,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
     let oracle_commitment = committed.commitment();
 
     let mut transcript = transition_transcript(
@@ -1579,6 +1868,28 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
 
     pub(crate) const fn explicit_scalar_count(&self) -> usize {
         self.explicit_scalars
+    }
+
+    fn execution_derived_regular_row(
+        &mut self,
+        index: usize,
+    ) -> Result<DerivedTransitionRegularRow, BlsDoryTransitionError> {
+        if index >= self.elements {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        let TransitionWitnessBacking::ExecutionArtifact {
+            mask_polynomial,
+            reader,
+        } = &mut self.backing
+        else {
+            return Err(BlsDoryTransitionError::InvalidProofShape);
+        };
+        let accumulator = reader
+            .get_mut()
+            .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
+            .accumulator(index)?;
+        let mask = mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+        derive_transition_regular_row_from_mask(self.statement, index, accumulator, mask)
     }
 
     fn literal_scalar_count(&self) -> usize {
@@ -3071,6 +3382,180 @@ mod tests {
     }
 
     #[test]
+    fn grouped_execution_artifact_matches_legacy_bytes_and_commitment() {
+        let (statement, mask, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let execution_scratch = ScratchDirectory::create();
+        let grouped_scratch = ScratchDirectory::create();
+        let legacy_scratch = ScratchDirectory::create();
+        let (context, mut execution_artifact) = execution_artifact_for_fixture(
+            statement,
+            &witness,
+            &execution_scratch.0,
+            setup.identity(),
+        );
+        let variables = minimum_packed_variables(statement).unwrap();
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+
+        let mut grouped_source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+            statement,
+            &mask,
+            &mut execution_artifact,
+            context,
+            BlsDoryExecutionAccumulatorTransition::Bank(0),
+            rows,
+            columns,
+        )
+        .unwrap();
+        let grouped = build_grouped_transition_compact_artifact_with_chunk_cells(
+            &mut grouped_source,
+            nu,
+            sigma,
+            &setup,
+            &grouped_scratch.0,
+            2,
+        )
+        .unwrap();
+        assert_eq!(grouped.derived_cells, statement.elements().unwrap());
+        let grouped_path = grouped.artifact.path().to_path_buf();
+        let grouped_digest = grouped.artifact.digest();
+        let grouped_bytes = std::fs::read(&grouped_path).unwrap();
+        drop(grouped_source);
+
+        let mut legacy_source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+            statement,
+            &mask,
+            &mut execution_artifact,
+            context,
+            BlsDoryExecutionAccumulatorTransition::Bank(0),
+            rows,
+            columns,
+        )
+        .unwrap();
+        let legacy = commit_bls_dory_compact_row_source_with_scratch(
+            &mut legacy_source,
+            nu,
+            sigma,
+            &setup,
+            &legacy_scratch.0,
+        )
+        .unwrap();
+        drop(legacy_source);
+        let legacy_path = legacy.coefficient_artifact_path().unwrap().to_path_buf();
+        let legacy_bytes = std::fs::read(&legacy_path).unwrap();
+        assert_eq!(grouped_bytes, legacy_bytes);
+        assert_eq!(grouped_digest, legacy_bytes[legacy_bytes.len() - 32..]);
+
+        let grouped_committed = commit_bls_dory_existing_compact_artifact(
+            Arc::clone(&grouped.artifact),
+            nu,
+            sigma,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(grouped_committed.commitment(), legacy.commitment());
+        assert_eq!(
+            grouped_committed.row_commitments(),
+            legacy.row_commitments()
+        );
+        assert_eq!(
+            grouped_committed.coefficient_artifact_path(),
+            Some(grouped_path.as_path())
+        );
+        assert_eq!(std::fs::read(&grouped_path).unwrap(), grouped_bytes);
+        assert_eq!(std::fs::read_dir(&grouped_scratch.0).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&legacy_scratch.0).unwrap().count(), 1);
+
+        drop(grouped_committed);
+        drop(grouped);
+        drop(legacy);
+        drop(execution_artifact);
+        assert_eq!(std::fs::read_dir(&grouped_scratch.0).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&legacy_scratch.0).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&execution_scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn grouped_execution_artifact_fails_closed_and_cleans_partial_file() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let (statement, mask, witness) = fixture();
+        let setup = deterministic_bls_dory_setup(10).unwrap();
+        let execution_scratch = ScratchDirectory::create();
+        let grouped_scratch = ScratchDirectory::create();
+        let (context, mut execution_artifact) = execution_artifact_for_fixture(
+            statement,
+            &witness,
+            &execution_scratch.0,
+            setup.identity(),
+        );
+        let execution_path = std::fs::read_dir(&execution_scratch.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let artifact_bytes = std::fs::metadata(&execution_path).unwrap().len();
+        let value_bytes = std::mem::size_of::<i32>() as u64;
+        let data_bytes = (context.columns() * context.cells_per_column()) as u64 * value_bytes;
+        let chunks_per_column = context
+            .cells_per_column()
+            .div_ceil(context.authentication_chunk_cells());
+        let digest_bytes = (context.columns() * chunks_per_column * 32) as u64;
+        let data_start = artifact_bytes - data_bytes - digest_bytes - 64;
+        let second_bank_chunk_cell =
+            context.cells_per_column() + context.authentication_chunk_cells();
+        let corrupt_offset = data_start + second_bank_chunk_cell as u64 * value_bytes;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&execution_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        let mut byte = [0; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        file.write_all(&[byte[0] ^ 0x80]).unwrap();
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let variables = minimum_packed_variables(statement).unwrap();
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let mut source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+            statement,
+            &mask,
+            &mut execution_artifact,
+            context,
+            BlsDoryExecutionAccumulatorTransition::Bank(0),
+            rows,
+            columns,
+        )
+        .unwrap();
+        assert!(matches!(
+            build_grouped_transition_compact_artifact_with_chunk_cells(
+                &mut source,
+                nu,
+                sigma,
+                &setup,
+                &grouped_scratch.0,
+                2,
+            ),
+            Err(BlsDoryTransitionError::ExecutionArtifact)
+        ));
+        assert_eq!(std::fs::read_dir(&grouped_scratch.0).unwrap().count(), 0);
+        drop(source);
+        drop(execution_artifact);
+        assert_eq!(std::fs::read_dir(&execution_scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
     fn artifact_reader_does_not_reuse_cached_chunk_after_authentication_failure() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -3177,7 +3662,7 @@ mod tests {
             &artifact_scratch.0,
             setup.identity(),
         );
-        let streamed = prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
+        let mut streamed = prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
             binding,
             statement,
             &mask,
@@ -3216,6 +3701,52 @@ mod tests {
                 .unwrap()
                 .row_commitments()
         );
+        let materialized_path = materialized
+            .openings
+            .polynomial(0)
+            .unwrap()
+            .coefficient_artifact_path()
+            .unwrap()
+            .to_path_buf();
+        let streamed_path = streamed
+            .openings
+            .polynomial(0)
+            .unwrap()
+            .coefficient_artifact_path()
+            .unwrap()
+            .to_path_buf();
+        let streamed_bytes = std::fs::read(&streamed_path).unwrap();
+        assert_eq!(std::fs::read(&materialized_path).unwrap(), streamed_bytes);
+        assert_eq!(std::fs::read_dir(&streamed_scratch.0).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(&materialized_scratch.0).unwrap().count(),
+            1
+        );
+
+        let released = streamed.openings.release_compact_source().unwrap().unwrap();
+        assert!(!streamed_path.exists());
+        assert_eq!(std::fs::read_dir(&streamed_scratch.0).unwrap().count(), 0);
+        let regenerated =
+            regenerate_bls_dory_transition_compact_source_from_execution_artifact_with_scratch(
+                statement,
+                &mask,
+                &mut artifact,
+                context,
+                BlsDoryExecutionAccumulatorTransition::Bank(0),
+                10,
+                &released,
+                &setup,
+                &streamed_scratch.0,
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(regenerated.path()).unwrap(), streamed_bytes);
+        streamed
+            .openings
+            .restore_compact_source(&regenerated)
+            .unwrap();
+        assert_eq!(streamed.openings.claims(), materialized.openings.claims());
+        drop(regenerated);
+        assert_eq!(std::fs::read_dir(&streamed_scratch.0).unwrap().count(), 1);
 
         drop(streamed);
         drop(materialized);

@@ -35,6 +35,10 @@ use crate::{
         regenerate_bls_dory_compact_row_source_with_scratch, verify_bls_dory_openings,
     },
     dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
+    dory_bls12_381_execution_artifact::{
+        BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
+        BlsDoryExecutionAccumulatorColumn,
+    },
     dory_bls12_381_fold_artifact::BlsDoryFoldArtifactSpec,
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
@@ -42,16 +46,18 @@ use crate::{
         projected_production_range_logup_opening_bytes,
         projected_production_range_logup_proof_bytes, prove_bls_dory_range_logup,
         prove_bls_dory_range_logup_at_variables, prove_bls_dory_range_logup_deferred_at_variables,
+        prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch,
         prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
         verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
         verify_bls_dory_range_logup_deferred_at_variables,
     },
     dory_bls12_381_matrix::{
-        BlsDoryMatrixError, BlsDoryMatrixProof, PreparedBlsDoryMatrixProof,
-        projected_production_matrix_opening_bytes, projected_production_matrix_proof_bytes,
-        prove_bls_dory_matrix_deferred_at_variables,
+        BlsDoryExecutionArtifactMatrixInput, BlsDoryMatrixError, BlsDoryMatrixProof,
+        PreparedBlsDoryMatrixProof, projected_production_matrix_opening_bytes,
+        projected_production_matrix_proof_bytes, prove_bls_dory_matrix_deferred_at_variables,
         prove_bls_dory_matrix_deferred_at_variables_with_scratch,
         prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch,
+        prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch,
         verify_bls_dory_matrix_deferred_at_variables,
     },
     dory_bls12_381_prototype::{
@@ -59,20 +65,25 @@ use crate::{
     },
     dory_bls12_381_streaming::BlsDoryRowSource,
     dory_bls12_381_transition::{
-        BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryTransitionError, BlsDoryTransitionProof,
-        BlsDoryTransitionWitnessRowSource, PRODUCTION_TRANSITION_WORD_WIDTH_CODES,
-        PreparedBlsDoryTransitionProof, TRANSITION_SIGNED_WORD_SELECTORS,
+        BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryExecutionAccumulatorTransition,
+        BlsDoryTransitionError, BlsDoryTransitionProof, BlsDoryTransitionWitnessRowSource,
+        PRODUCTION_TRANSITION_WORD_WIDTH_CODES, PreparedBlsDoryTransitionProof,
+        TRANSITION_SIGNED_WORD_SELECTORS, derive_transition_regular_row_from_mask,
         projected_production_transition_opening_bytes, projected_production_transition_proof_bytes,
         prove_bls_dory_transition, prove_bls_dory_transition_at_variables,
         prove_bls_dory_transition_deferred_at_variables,
-        prove_bls_dory_transition_deferred_at_variables_with_scratch, verify_bls_dory_transition,
-        verify_bls_dory_transition_at_variables, verify_bls_dory_transition_deferred_at_variables,
+        prove_bls_dory_transition_deferred_at_variables_with_scratch,
+        prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch,
+        regenerate_bls_dory_transition_compact_source_from_execution_artifact_with_scratch,
+        verify_bls_dory_transition, verify_bls_dory_transition_at_variables,
+        verify_bls_dory_transition_deferred_at_variables,
     },
     dory_bls12_381_wiring::{
         BlsDoryWiringError, BlsDoryWiringProof, PreparedBlsDoryWiringProof,
         projected_production_wiring_opening_bytes, projected_production_wiring_proof_bytes,
         prove_bls_dory_wiring_deferred_at_variables,
         prove_bls_dory_wiring_deferred_at_variables_with_scratch,
+        prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch,
         verify_bls_dory_wiring_deferred_at_variables,
     },
     sumcheck::GOLDILOCKS_MODULUS,
@@ -1320,6 +1331,10 @@ pub enum BlsDorySharedLayoutError {
     FixedModelIdentity,
     #[error("the proof does not use the pinned BLS fixed-model commitments")]
     FixedModelCommitment,
+    #[error("authenticated execution-accumulator artifact failed")]
+    ExecutionArtifact,
+    #[error("the final activation cannot be derived as canonical bytes")]
+    FinalActivation,
     #[cfg(feature = "whir-prototype")]
     #[error("the final-output bridge statement is invalid: {0}")]
     OutputBridge(#[from] BlsDoryOutputBridgeError),
@@ -1536,6 +1551,423 @@ pub(crate) fn prepare_bls_dory_shared_layout_with_precommitted_weights_at_variab
         setup,
         Some(scratch_directory),
     )
+}
+
+/// Read the final bank's final activation directly from the authenticated
+/// execution trace. Only one authentication chunk is buffered in addition to
+/// the returned canonical byte string.
+pub(crate) fn extract_bls_dory_final_activation_from_execution_artifact(
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+    expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+) -> Result<Vec<u8>, BlsDorySharedLayoutError> {
+    statement
+        .validate_verifier_shape()
+        .map_err(BlsDoryTransitionError::from)?;
+    mask_polynomial
+        .validate(statement)
+        .map_err(BlsDoryTransitionError::from)?;
+    let final_bank = expected_context
+        .banks()
+        .checked_sub(1)
+        .ok_or(BlsDorySharedLayoutError::FinalActivation)?;
+    let final_layer = expected_context
+        .layers_per_bank()
+        .checked_sub(1)
+        .ok_or(BlsDorySharedLayoutError::FinalActivation)?;
+    let cells = expected_context.cells_per_column();
+    if artifact.context() != expected_context
+        || statement.layers != expected_context.layers_per_bank()
+        || statement.rows != expected_context.canonical_rows()
+        || statement.cols != expected_context.canonical_columns()
+        || statement.elements().map_err(BlsDoryTransitionError::from)?
+            != cells
+                .checked_mul(expected_context.layers_per_bank())
+                .ok_or(BlsDorySharedLayoutError::FinalActivation)?
+    {
+        return Err(BlsDorySharedLayoutError::ExecutionArtifact);
+    }
+    let first_layer = final_bank
+        .checked_mul(expected_context.layers_per_bank())
+        .and_then(|layer| u32::try_from(layer).ok())
+        .ok_or(BlsDorySharedLayoutError::FinalActivation)?;
+    let expected_mask = StructuredMaskPolynomial::from_challenge_at_layer_offset(
+        &expected_context.challenge_identity(),
+        first_layer,
+        expected_context.layers_per_bank(),
+        expected_context.canonical_rows(),
+        expected_context.canonical_columns(),
+    )
+    .map_err(|_| BlsDorySharedLayoutError::ExecutionArtifact)?;
+    if mask_polynomial != &expected_mask {
+        return Err(BlsDorySharedLayoutError::ExecutionArtifact);
+    }
+
+    let chunk_cells = expected_context.authentication_chunk_cells();
+    let mut accumulators = Vec::new();
+    accumulators
+        .try_reserve_exact(chunk_cells)
+        .map_err(|_| BlsDorySharedLayoutError::FinalActivation)?;
+    accumulators.resize(chunk_cells, 0_i32);
+    let mut activation = Vec::new();
+    activation
+        .try_reserve_exact(cells)
+        .map_err(|_| BlsDorySharedLayoutError::FinalActivation)?;
+    let layer_offset = final_layer
+        .checked_mul(cells)
+        .ok_or(BlsDorySharedLayoutError::FinalActivation)?;
+    let column = BlsDoryExecutionAccumulatorColumn::BankLayer {
+        bank: final_bank,
+        layer: final_layer,
+    };
+    let mut start = 0usize;
+    while start < cells {
+        let take = (cells - start).min(chunk_cells);
+        artifact
+            .read_column_segment(column, start, &mut accumulators[..take])
+            .map_err(|_| BlsDorySharedLayoutError::ExecutionArtifact)?;
+        for (offset, accumulator) in accumulators[..take].iter().copied().enumerate() {
+            let index = layer_offset
+                .checked_add(start)
+                .and_then(|index| index.checked_add(offset))
+                .ok_or(BlsDorySharedLayoutError::FinalActivation)?;
+            let mask = mask_polynomial
+                .value_at_boolean_index_prevalidated(statement, index)
+                .map_err(|_| BlsDorySharedLayoutError::FinalActivation)?;
+            let signed = derive_transition_regular_row_from_mask(
+                statement,
+                index,
+                i64::from(accumulator),
+                mask,
+            )?
+            .activation;
+            let byte = signed
+                .checked_add(125)
+                .filter(|value| *value <= 250)
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or(BlsDorySharedLayoutError::FinalActivation)?;
+            activation.push(byte);
+        }
+        start += take;
+    }
+    if activation.len() != cells {
+        return Err(BlsDorySharedLayoutError::FinalActivation);
+    }
+    Ok(activation)
+}
+
+/// Prepare the complete shared layout directly from one authenticated
+/// execution trace. The returned state owns every coefficient capability it
+/// needs for aggregation and therefore does not retain a borrow of `artifact`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    prepared_model: &BlsDoryPreparedFixedModel,
+    matrix_statements: &[StructuredMatrixStatement],
+    transition_statements: &[StructuredTransitionStatement],
+    mask_polynomials: &[&StructuredMaskPolynomial],
+    wiring_statement: StructuredWiringStatement,
+    artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+    expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDorySharedLayoutProverState, BlsDorySharedLayoutError> {
+    validate_execution_artifact_shared_layout(
+        binding,
+        trusted_model,
+        prepared_model,
+        matrix_statements,
+        transition_statements,
+        mask_polynomials,
+        wiring_statement,
+        artifact,
+        expected_context,
+        padded_variables,
+        setup,
+    )?;
+    let fixed_model = prepared_model.identity();
+    let component_binding = fixed_model_binding(binding, trusted_model, fixed_model, setup)?;
+    let fixed_base = prepared_model.base_input().clone();
+
+    let mut matrices = Vec::with_capacity(matrix_statements.len());
+    for (bank, (statement, weight)) in matrix_statements
+        .iter()
+        .zip(prepared_model.weight_banks())
+        .enumerate()
+    {
+        let prior_index = if bank == 0 { 0 } else { bank };
+        let matrix = prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch(
+            &component_binding,
+            *statement,
+            weight,
+            artifact,
+            expected_context,
+            BlsDoryExecutionArtifactMatrixInput {
+                bank,
+                prior_statement: transition_statements[prior_index],
+                prior_mask: mask_polynomials[prior_index],
+                current_statement: transition_statements[bank + 1],
+                current_mask: mask_polynomials[bank + 1],
+            },
+            padded_variables,
+            setup,
+            scratch_directory,
+        )?;
+        if matrix.proof.weight_commitment != fixed_model.weight_bank_commitments[bank] {
+            return Err(BlsDorySharedLayoutError::FixedModelCommitment);
+        }
+        matrices.push(matrix);
+    }
+
+    let nu = padded_variables / 2;
+    let sigma = padded_variables - nu;
+    let rows = 1usize
+        .checked_shl(u32::try_from(nu).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let columns = 1usize
+        .checked_shl(u32::try_from(sigma).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let mut transitions = Vec::with_capacity(transition_statements.len());
+    let mut released_transition_sources = Vec::with_capacity(transition_statements.len());
+    for (index, (statement, mask_polynomial)) in transition_statements
+        .iter()
+        .zip(mask_polynomials)
+        .enumerate()
+    {
+        let transition = execution_artifact_transition(index);
+        let mut arithmetic =
+            prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
+                &component_binding,
+                *statement,
+                mask_polynomial,
+                artifact,
+                expected_context,
+                transition,
+                padded_variables,
+                setup,
+                scratch_directory,
+            )?;
+        let committed_transition = arithmetic
+            .openings
+            .polynomial(0)
+            .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+        let source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+            *statement,
+            mask_polynomial,
+            artifact,
+            expected_context,
+            transition,
+            rows,
+            columns,
+        )?;
+        let mut range =
+            prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch(
+                &component_binding,
+                *statement,
+                &source,
+                committed_transition,
+                padded_variables,
+                setup,
+                scratch_directory,
+            )?;
+        drop(source);
+        if arithmetic.proof.oracle_commitment != range.proof.transition_commitment {
+            return Err(BlsDorySharedLayoutError::TransitionRangeCommitment);
+        }
+        let arithmetic_source = arithmetic
+            .openings
+            .release_compact_source()?
+            .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+        let range_source = range
+            .openings
+            .release_compact_source()?
+            .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+        if arithmetic_source != range_source {
+            return Err(BlsDorySharedLayoutError::OpeningClaims);
+        }
+        transitions.push((arithmetic, range));
+        released_transition_sources.push(arithmetic_source);
+    }
+
+    let wiring = prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch(
+        &component_binding,
+        wiring_statement,
+        transition_statements,
+        mask_polynomials,
+        artifact,
+        expected_context,
+        padded_variables,
+        setup,
+        scratch_directory,
+    )?;
+
+    for (index, ((((arithmetic, range), statement), mask_polynomial), expected)) in transitions
+        .iter_mut()
+        .zip(transition_statements)
+        .zip(mask_polynomials)
+        .zip(&released_transition_sources)
+        .enumerate()
+    {
+        let restored =
+            regenerate_bls_dory_transition_compact_source_from_execution_artifact_with_scratch(
+                *statement,
+                mask_polynomial,
+                artifact,
+                expected_context,
+                execution_artifact_transition(index),
+                padded_variables,
+                expected,
+                setup,
+                scratch_directory,
+            )?;
+        arithmetic.openings.restore_compact_source(&restored)?;
+        range.openings.restore_compact_source(&restored)?;
+    }
+
+    prepare_prepared_shared_layout(
+        &component_binding,
+        matrices,
+        transitions,
+        wiring,
+        fixed_base,
+        fixed_model,
+        matrix_statements,
+        transition_statements,
+        wiring_statement,
+        padded_variables,
+        setup,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_execution_artifact_shared_layout(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    prepared_model: &BlsDoryPreparedFixedModel,
+    matrix_statements: &[StructuredMatrixStatement],
+    transition_statements: &[StructuredTransitionStatement],
+    mask_polynomials: &[&StructuredMaskPolynomial],
+    wiring_statement: StructuredWiringStatement,
+    artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+    expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDorySharedLayoutError> {
+    if binding.len() > MAX_SHARED_LAYOUT_BINDING_BYTES
+        || !(1..=MAX_BLS_DORY_SHARED_MATRIX_PROOFS).contains(&matrix_statements.len())
+        || !(1..=MAX_BLS_DORY_SHARED_TRANSITION_PROOFS).contains(&transition_statements.len())
+        || transition_statements.len() != matrix_statements.len() + 1
+        || mask_polynomials.len() != transition_statements.len()
+        || prepared_model.weight_banks().len() != matrix_statements.len()
+        || padded_variables == 0
+        || padded_variables > setup.max_log_n()
+    {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    validate_shared_link_topology(matrix_statements, transition_statements, wiring_statement)?;
+    validate_fixed_model_topology(
+        trusted_model,
+        prepared_model.identity(),
+        matrix_statements,
+        transition_statements,
+        wiring_statement,
+        setup,
+    )?;
+    if artifact.context() != expected_context
+        || expected_context.setup_identity() != setup.identity()
+        || expected_context.banks() != matrix_statements.len()
+        || expected_context.layers_per_bank() != wiring_statement.layers_per_bank
+        || expected_context.canonical_rows() != wiring_statement.rows
+        || expected_context.canonical_columns() != wiring_statement.cols
+    {
+        return Err(BlsDorySharedLayoutError::ExecutionArtifact);
+    }
+    wiring_statement
+        .validate_verifier_shape()
+        .map_err(BlsDoryWiringError::from)?;
+    for statement in matrix_statements {
+        statement
+            .validate_verifier_shape()
+            .map_err(BlsDoryMatrixError::from)?;
+    }
+    for statement in transition_statements {
+        statement
+            .validate_verifier_shape()
+            .map_err(BlsDoryTransitionError::from)?;
+    }
+    for (index, (statement, mask_polynomial)) in transition_statements
+        .iter()
+        .zip(mask_polynomials)
+        .enumerate()
+    {
+        mask_polynomial
+            .validate(*statement)
+            .map_err(BlsDoryTransitionError::from)?;
+        let expected_mask = if index == 0 {
+            StructuredMaskPolynomial::from_virtual_challenge(
+                &expected_context.challenge_identity(),
+                expected_context.canonical_rows(),
+                expected_context.canonical_columns(),
+            )
+        } else {
+            let first_layer = (index - 1)
+                .checked_mul(expected_context.layers_per_bank())
+                .and_then(|layer| u32::try_from(layer).ok())
+                .ok_or(BlsDorySharedLayoutError::ExecutionArtifact)?;
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                &expected_context.challenge_identity(),
+                first_layer,
+                expected_context.layers_per_bank(),
+                expected_context.canonical_rows(),
+                expected_context.canonical_columns(),
+            )
+        }
+        .map_err(|_| BlsDorySharedLayoutError::ExecutionArtifact)?;
+        if *mask_polynomial != &expected_mask {
+            return Err(BlsDorySharedLayoutError::ExecutionArtifact);
+        }
+    }
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        padded_variables / 2,
+        padded_variables - padded_variables / 2,
+    )?;
+    let fixed_model = prepared_model.identity();
+    if !prepared_model
+        .base_input()
+        .matches_layout(aggregate_layout, setup)
+        || prepared_model.base_input().commitment() != fixed_model.base_input_commitment
+        || prepared_model.base_input().explicit_coefficient_count()
+            != transition_statements[0]
+                .elements()
+                .map_err(BlsDoryTransitionError::from)?
+        || prepared_model
+            .weight_banks()
+            .iter()
+            .zip(matrix_statements)
+            .zip(&fixed_model.weight_bank_commitments)
+            .any(|((weight, statement), expected)| {
+                let expected_len = statement.table_lengths().ok().map(|lengths| lengths[1]);
+                !weight.matches_layout(aggregate_layout, setup)
+                    || weight.commitment() != *expected
+                    || Some(weight.explicit_coefficient_count()) != expected_len
+            })
+    {
+        return Err(BlsDorySharedLayoutError::FixedModelCommitment);
+    }
+    artifact
+        .authenticate(&expected_context)
+        .map_err(|_| BlsDorySharedLayoutError::ExecutionArtifact)
+}
+
+const fn execution_artifact_transition(index: usize) -> BlsDoryExecutionAccumulatorTransition {
+    if index == 0 {
+        BlsDoryExecutionAccumulatorTransition::Initialization
+    } else {
+        BlsDoryExecutionAccumulatorTransition::Bank(index - 1)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3954,6 +4386,7 @@ mod tests {
         dory_bls12_381_aggregate::{
             MAX_BLS_DORY_AGGREGATE_CLAIMS, commit_bls_dory_padded_prefix_with_optional_scratch,
         },
+        dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorArtifactWriter,
         dory_bls12_381_matrix::{
             BlsDoryMatrixProof, prove_bls_dory_matrix_at_variables,
             verify_bls_dory_matrix_at_variables,
@@ -4736,6 +5169,227 @@ mod tests {
         (model, fixed)
     }
 
+    fn execution_artifact_linked_fixture(challenge: [u8; 32]) -> LinkedFixture {
+        const BANKS: usize = 1;
+        const LAYERS: usize = 2;
+        const ROWS: usize = 4;
+        const COLS: usize = 4;
+
+        let initialization_statement = StructuredTransitionStatement {
+            layers: 1,
+            rows: ROWS,
+            cols: COLS,
+            max_abs_accumulator: 65_536,
+            max_mask: 5_000,
+        };
+        let transition_statement = StructuredTransitionStatement {
+            layers: LAYERS,
+            ..initialization_statement
+        };
+        let initialization_mask =
+            StructuredMaskPolynomial::from_virtual_challenge(&challenge, ROWS, COLS).unwrap();
+        let initialization_accumulators = (0..ROWS * COLS)
+            .map(|index| (index as i64 * 17) % 47 - 23)
+            .collect::<Vec<_>>();
+        let initialization_witness = transition_witness_from_accumulators(
+            initialization_statement,
+            &initialization_mask,
+            &initialization_accumulators,
+        );
+        let initial = initialization_witness.activations.clone();
+        let mut current = initial.clone();
+        let mut matrices = Vec::with_capacity(BANKS);
+        let mut transitions = vec![LinkedTransitionWitness {
+            statement: initialization_statement,
+            mask: initialization_mask,
+            witness: initialization_witness,
+        }];
+        let mut wiring_inputs = Vec::new();
+        let mut wiring_outputs = Vec::new();
+        for bank in 0..BANKS {
+            let first_layer = u32::try_from(bank * LAYERS).unwrap();
+            let mask = StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                &challenge,
+                first_layer,
+                LAYERS,
+                ROWS,
+                COLS,
+            )
+            .unwrap();
+            let weights = (0..LAYERS * COLS * COLS)
+                .map(|index| ((index + bank) % 5) as i64 - 2)
+                .collect::<Vec<_>>();
+            let mut activations = Vec::with_capacity(LAYERS * ROWS * COLS);
+            let mut accumulators = Vec::with_capacity(LAYERS * ROWS * COLS);
+            let mut outputs = Vec::with_capacity(LAYERS * ROWS * COLS);
+            for layer in 0..LAYERS {
+                activations.extend_from_slice(&current);
+                let mut layer_accumulators = Vec::with_capacity(ROWS * COLS);
+                for row in 0..ROWS {
+                    for col in 0..COLS {
+                        let mut accumulator = 0_i64;
+                        for common in 0..COLS {
+                            accumulator += current[row * COLS + common]
+                                * weights[(layer * COLS + common) * COLS + col];
+                        }
+                        layer_accumulators.push(accumulator);
+                    }
+                }
+                let layer_witness = transition_witness_from_accumulators_at_offset(
+                    transition_statement,
+                    &mask,
+                    &layer_accumulators,
+                    layer * ROWS * COLS,
+                );
+                accumulators.extend_from_slice(&layer_accumulators);
+                outputs.extend_from_slice(&layer_witness.activations);
+                current = layer_witness.activations;
+            }
+            let witness =
+                transition_witness_from_accumulators(transition_statement, &mask, &accumulators);
+            assert_eq!(witness.activations, outputs);
+            wiring_inputs.extend_from_slice(&activations);
+            wiring_outputs.extend_from_slice(&outputs);
+            matrices.push(LinkedMatrixWitness {
+                activations,
+                weights,
+                accumulators,
+            });
+            transitions.push(LinkedTransitionWitness {
+                statement: transition_statement,
+                mask,
+                witness,
+            });
+        }
+        LinkedFixture {
+            matrix_statement: StructuredMatrixStatement {
+                layers: LAYERS,
+                rows: ROWS,
+                inner: COLS,
+                cols: COLS,
+                max_abs_activation: 125,
+                max_abs_weight: 10,
+                max_abs_accumulator: 65_536,
+            },
+            matrices,
+            transitions,
+            wiring_statement: StructuredWiringStatement {
+                banks: BANKS,
+                layers_per_bank: LAYERS,
+                rows: ROWS,
+                cols: COLS,
+                max_abs_activation: 125,
+            },
+            initial,
+            inputs: wiring_inputs,
+            outputs: wiring_outputs,
+        }
+    }
+
+    fn prepared_fixed_model_fixture(
+        fixture: &LinkedFixture,
+        setup: &DeterministicBlsDorySetup,
+        padded_variables: usize,
+        scratch_directory: &Path,
+    ) -> (ModelPcsIdentity, BlsDoryPreparedFixedModel) {
+        let model = ModelPcsIdentity {
+            model_version: 1,
+            batch: fixture.wiring_statement.rows as u32,
+            dimension: fixture.wiring_statement.cols as u32,
+            layers_per_bank: fixture.wiring_statement.layers_per_bank as u32,
+            model_byte_root: [0x11; 32],
+            pcs_suite_parameter_digest: [0x22; 32],
+            base_input_commitment: [0x33; 32],
+            weight_bank_commitments: (0..fixture.matrices.len())
+                .map(|bank| [0x40 + bank as u8; 32])
+                .collect(),
+        };
+        let base_input = commit_fixed_table_with_optional_scratch(
+            &fixture.transitions[0].witness.accumulators,
+            padded_variables,
+            setup,
+            Some(scratch_directory),
+        )
+        .unwrap();
+        let weight_banks = fixture
+            .matrices
+            .iter()
+            .map(|matrix| {
+                commit_fixed_table_with_optional_scratch(
+                    &matrix.weights,
+                    padded_variables,
+                    setup,
+                    Some(scratch_directory),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let identity = BlsDoryFixedModelIdentity {
+            protocol_version: BLS_DORY_FIXED_MODEL_IDENTITY_VERSION,
+            model_pcs_identity_digest: model.digest().unwrap(),
+            setup_identity: setup.identity(),
+            base_input_commitment: base_input.commitment(),
+            weight_bank_commitments: weight_banks
+                .iter()
+                .map(BlsDoryCommittedPolynomial::commitment)
+                .collect(),
+        };
+        identity
+            .validate(&model, fixture.matrices.len(), setup)
+            .unwrap();
+        (
+            model,
+            BlsDoryPreparedFixedModel {
+                identity,
+                base_input,
+                weight_banks,
+            },
+        )
+    }
+
+    fn execution_artifact_for_linked_fixture(
+        fixture: &LinkedFixture,
+        context: BlsDoryExecutionAccumulatorArtifactContext,
+        directory: &Path,
+    ) -> BlsDoryExecutionAccumulatorArtifact {
+        let mut writer =
+            BlsDoryExecutionAccumulatorArtifactWriter::create_new(directory, context).unwrap();
+        let chunk_cells = context.authentication_chunk_cells();
+        for chunk in fixture.transitions[0]
+            .witness
+            .accumulators
+            .chunks(chunk_cells)
+        {
+            let chunk = chunk
+                .iter()
+                .copied()
+                .map(i32::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            writer
+                .write_column_chunk(BlsDoryExecutionAccumulatorColumn::Initialization, &chunk)
+                .unwrap();
+        }
+        let cells = context.cells_per_column();
+        for (bank, matrix) in fixture.matrices.iter().enumerate() {
+            for layer in 0..context.layers_per_bank() {
+                let column = BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer };
+                for chunk in
+                    matrix.accumulators[layer * cells..(layer + 1) * cells].chunks(chunk_cells)
+                {
+                    let chunk = chunk
+                        .iter()
+                        .copied()
+                        .map(i32::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    writer.write_column_chunk(column, &chunk).unwrap();
+                }
+            }
+        }
+        writer.finish().unwrap()
+    }
+
     fn transition_witness_from_accumulators(
         statement: StructuredTransitionStatement,
         mask: &StructuredMaskPolynomial,
@@ -4912,6 +5566,186 @@ mod tests {
             .unwrap(),
             wiring
         );
+    }
+
+    #[test]
+    fn execution_artifact_shared_layout_matches_complete_materialized_proof_and_lifecycle() {
+        const ARTIFACT_VARIABLES: usize = 12;
+        let setup = deterministic_bls_dory_setup(ARTIFACT_VARIABLES).unwrap();
+        let challenge = [0x5a; 32];
+        let fixture = execution_artifact_linked_fixture(challenge);
+        let matrix_statements = vec![fixture.matrix_statement; fixture.matrices.len()];
+        let transition_statements = fixture
+            .transitions
+            .iter()
+            .map(|transition| transition.statement)
+            .collect::<Vec<_>>();
+        let masks = fixture
+            .transitions
+            .iter()
+            .map(|transition| &transition.mask)
+            .collect::<Vec<_>>();
+        let transition_inputs = fixture
+            .transitions
+            .iter()
+            .map(|transition| BlsDoryTransitionProverInput {
+                statement: transition.statement,
+                mask_polynomial: &transition.mask,
+                witness: &transition.witness,
+            })
+            .collect::<Vec<_>>();
+
+        let materialized_scratch = ScratchDirectory::create();
+        let (model, prepared_model) = prepared_fixed_model_fixture(
+            &fixture,
+            &setup,
+            ARTIFACT_VARIABLES,
+            &materialized_scratch.0,
+        );
+        let materialized_matrix_inputs = fixture
+            .matrices
+            .iter()
+            .zip(prepared_model.weight_banks())
+            .map(|(matrix, weight)| BlsDoryPrecommittedMatrixProverInput {
+                statement: fixture.matrix_statement,
+                activations: &matrix.activations,
+                weight,
+                accumulators: &matrix.accumulators,
+            })
+            .collect::<Vec<_>>();
+        let materialized_prepared =
+            prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+                b"artifact-shared-layout",
+                &model,
+                prepared_model.identity(),
+                &materialized_matrix_inputs,
+                &transition_inputs,
+                fixture.wiring_statement,
+                &fixture.initial,
+                &fixture.inputs,
+                &fixture.outputs,
+                ARTIFACT_VARIABLES,
+                &setup,
+                &materialized_scratch.0,
+            )
+            .unwrap();
+        let materialized_components = materialized_prepared.proof.clone();
+        let materialized_proof = finish_prepared_shared_layout(
+            materialized_prepared,
+            &setup,
+            Some(&materialized_scratch.0),
+        )
+        .unwrap();
+        drop(materialized_matrix_inputs);
+        drop(prepared_model);
+        assert_eq!(
+            std::fs::read_dir(&materialized_scratch.0).unwrap().count(),
+            0
+        );
+
+        let artifact_scratch = ScratchDirectory::create();
+        let (artifact_model, artifact_prepared_model) =
+            prepared_fixed_model_fixture(&fixture, &setup, ARTIFACT_VARIABLES, &artifact_scratch.0);
+        assert_eq!(artifact_model, model);
+        let artifact_fixed_model = artifact_prepared_model.identity().clone();
+        let context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
+            [[0x81; 32], [0x82; 32], setup.identity(), challenge],
+            fixture.wiring_statement.rows,
+            fixture.wiring_statement.cols,
+            fixture.wiring_statement.banks,
+            fixture.wiring_statement.layers_per_bank,
+            2,
+        )
+        .unwrap();
+        let mut artifact =
+            execution_artifact_for_linked_fixture(&fixture, context, &artifact_scratch.0);
+
+        let wrong_mask = StructuredMaskPolynomial::from_challenge_at_layer_offset(
+            &[0x6b; 32],
+            0,
+            fixture.wiring_statement.layers_per_bank,
+            fixture.wiring_statement.rows,
+            fixture.wiring_statement.cols,
+        )
+        .unwrap();
+        let mut wrong_masks = masks.clone();
+        wrong_masks[1] = &wrong_mask;
+        let entries_before_rejection = std::fs::read_dir(&artifact_scratch.0).unwrap().count();
+        assert!(matches!(
+            prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch(
+                b"artifact-shared-layout",
+                &artifact_model,
+                &artifact_prepared_model,
+                &matrix_statements,
+                &transition_statements,
+                &wrong_masks,
+                fixture.wiring_statement,
+                &mut artifact,
+                context,
+                ARTIFACT_VARIABLES,
+                &setup,
+                &artifact_scratch.0,
+            ),
+            Err(BlsDorySharedLayoutError::ExecutionArtifact)
+        ));
+        assert_eq!(
+            std::fs::read_dir(&artifact_scratch.0).unwrap().count(),
+            entries_before_rejection
+        );
+
+        let artifact_prepared =
+            prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch(
+                b"artifact-shared-layout",
+                &artifact_model,
+                &artifact_prepared_model,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                &mut artifact,
+                context,
+                ARTIFACT_VARIABLES,
+                &setup,
+                &artifact_scratch.0,
+            )
+            .unwrap();
+        assert_eq!(artifact_prepared.proof, materialized_components);
+        let final_activation = extract_bls_dory_final_activation_from_execution_artifact(
+            *transition_statements.last().unwrap(),
+            masks.last().unwrap(),
+            &mut artifact,
+            context,
+        )
+        .unwrap();
+        let cells = fixture.wiring_statement.rows * fixture.wiring_statement.cols;
+        let expected_activation = fixture.outputs[fixture.outputs.len() - cells..]
+            .iter()
+            .copied()
+            .map(|value| u8::try_from(value + 125).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(final_activation, expected_activation);
+
+        // The prepared state owns all capabilities needed by aggregation.
+        drop(artifact);
+        drop(artifact_prepared_model);
+        let artifact_proof =
+            finish_prepared_shared_layout(artifact_prepared, &setup, Some(&artifact_scratch.0))
+                .unwrap();
+        assert_eq!(artifact_proof, materialized_proof);
+        assert_eq!(std::fs::read_dir(&artifact_scratch.0).unwrap().count(), 0);
+        verify_bls_dory_shared_layout_at_variables(
+            b"artifact-shared-layout",
+            &artifact_model,
+            &artifact_fixed_model,
+            &matrix_statements,
+            &transition_statements,
+            &masks,
+            fixture.wiring_statement,
+            &artifact_proof,
+            ARTIFACT_VARIABLES,
+            &setup,
+        )
+        .unwrap();
     }
 
     #[test]

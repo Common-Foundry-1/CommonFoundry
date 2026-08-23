@@ -402,6 +402,497 @@ impl Drop for BlsDoryCompactArtifactWriter {
     }
 }
 
+/// Writes selector-major compact coefficients from monotonically increasing
+/// cell chunks while retaining the ordinary canonical v4 artifact layout.
+pub struct BlsDoryGroupedCompactArtifactWriter {
+    path: Option<PathBuf>,
+    file: Option<File>,
+    spec: BlsDoryCompactArtifactSpec,
+    dictionary: Vec<BlsDoryFr>,
+    word_offsets: Vec<u64>,
+    code_offset: u64,
+    expected_word_hashes: Vec<blake3::Hasher>,
+    expected_code_hashes: Vec<blake3::Hasher>,
+    next_cell: u64,
+    failed: bool,
+}
+
+impl BlsDoryGroupedCompactArtifactWriter {
+    pub fn create(
+        scratch_directory: &Path,
+        spec: BlsDoryCompactArtifactSpec,
+        dictionary: Vec<BlsDoryFr>,
+    ) -> Result<Self, BlsDoryCompactArtifactError> {
+        validate_dictionary(&dictionary)?;
+        spec.validate(dictionary.len())?;
+        if !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
+            return Err(BlsDoryCompactArtifactError::InvalidSpec);
+        }
+        let code_count = spec
+            .explicit_scalar_count
+            .checked_sub(spec.word_scalar_count)
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        if !code_count.is_multiple_of(spec.word_group_len) {
+            return Err(BlsDoryCompactArtifactError::InvalidSpec);
+        }
+        let word_selectors = spec
+            .word_scalar_count
+            .checked_div(spec.word_group_len)
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        let code_selectors = code_count
+            .checked_div(spec.word_group_len)
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        let word_selectors = usize::try_from(word_selectors)
+            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+        let code_selectors = usize::try_from(code_selectors)
+            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+        let header = spec.encode(dictionary.len())?;
+        let encoded_dictionary = dictionary
+            .iter()
+            .map(encode_scalar)
+            .collect::<Result<Vec<_>, _>>()?;
+        let dictionary_bytes = u64::try_from(dictionary.len())
+            .ok()
+            .and_then(|count| count.checked_mul(ARTIFACT_SCALAR_BYTES as u64))
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        let mut next_offset = (ARTIFACT_HEADER_BYTES as u64)
+            .checked_add(dictionary_bytes)
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        let mut word_offsets = Vec::new();
+        word_offsets
+            .try_reserve_exact(word_selectors)
+            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+        for selector in 0..word_selectors {
+            word_offsets.push(next_offset);
+            let selector =
+                u64::try_from(selector).map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+            next_offset = next_offset
+                .checked_add(
+                    spec.word_group_len
+                        .checked_mul(u64::from(spec.selector_word_bytes(selector)?))
+                        .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?,
+                )
+                .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        }
+        let expected_len = artifact_file_bytes(spec, dictionary.len())?;
+        let digest_offset = expected_len
+            .checked_sub(ARTIFACT_DIGEST_BYTES as u64)
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+        let code_bytes = if spec.code_bits == 4 {
+            code_count.div_ceil(2)
+        } else {
+            code_count
+        };
+        if next_offset
+            .checked_add(code_bytes)
+            .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?
+            != digest_offset
+        {
+            return Err(BlsDoryCompactArtifactError::InvalidSpec);
+        }
+
+        let nonce = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
+        let context = hex::encode(&spec.context_digest[..8]);
+        let path = scratch_directory.join(format!(
+            "cmfd-dory-compact-{context}-{}-{nonce}.tmp",
+            std::process::id(),
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let mut expected_word_hashes = Vec::new();
+        expected_word_hashes
+            .try_reserve_exact(word_selectors)
+            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+        expected_word_hashes.resize_with(word_selectors, blake3::Hasher::new);
+        let mut expected_code_hashes = Vec::new();
+        expected_code_hashes
+            .try_reserve_exact(code_selectors)
+            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+        expected_code_hashes.resize_with(code_selectors, blake3::Hasher::new);
+        let mut writer = Self {
+            path: Some(path),
+            file: Some(file),
+            spec,
+            dictionary,
+            word_offsets,
+            code_offset: next_offset,
+            expected_word_hashes,
+            expected_code_hashes,
+            next_cell: 0,
+            failed: false,
+        };
+        writer.file_mut()?.set_len(expected_len)?;
+        writer.file_mut()?.seek(SeekFrom::Start(0))?;
+        writer.file_mut()?.write_all(&header)?;
+        for encoded in encoded_dictionary {
+            writer.file_mut()?.write_all(&encoded)?;
+        }
+        Ok(writer)
+    }
+
+    /// Write one cell interval. Both buffers are selector-major and must
+    /// contain exactly `cell_count` entries for every respective selector.
+    pub fn write_cell_chunk(
+        &mut self,
+        cell_start: u64,
+        cell_count: usize,
+        selector_words: &[u64],
+        selector_codes: &[u8],
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        if self.failed {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        let result =
+            self.write_cell_chunk_inner(cell_start, cell_count, selector_words, selector_codes);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn write_cell_chunk_inner(
+        &mut self,
+        cell_start: u64,
+        cell_count: usize,
+        selector_words: &[u64],
+        selector_codes: &[u8],
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        let cell_count_u64 =
+            u64::try_from(cell_count).map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+        let cell_end = cell_start
+            .checked_add(cell_count_u64)
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+        if cell_count == 0
+            || cell_start != self.next_cell
+            || cell_end > self.spec.word_group_len
+            || selector_words.len()
+                != self
+                    .word_offsets
+                    .len()
+                    .checked_mul(cell_count)
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
+            || selector_codes.len()
+                != self
+                    .expected_code_hashes
+                    .len()
+                    .checked_mul(cell_count)
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
+        {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        for (selector, words) in selector_words.chunks_exact(cell_count).enumerate() {
+            let selector_u64 = u64::try_from(selector)
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+            let word_bytes = self.spec.selector_word_bytes(selector_u64)?;
+            let signed = self.spec.selector_is_signed(selector_u64)?;
+            for word in words {
+                validate_word(*word, signed, word_bytes)?;
+            }
+        }
+        if selector_codes.iter().any(|code| {
+            usize::from(*code) >= self.dictionary.len()
+                || (self.spec.code_bits == 4 && *code > 0x0f)
+        }) {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+
+        for selector in 0..self.word_offsets.len() {
+            let selector_u64 = u64::try_from(selector)
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+            let word_bytes = self.spec.selector_word_bytes(selector_u64)?;
+            let words = &selector_words[selector * cell_count..(selector + 1) * cell_count];
+            let mut encoded = Vec::with_capacity(
+                cell_count
+                    .checked_mul(usize::from(word_bytes))
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?,
+            );
+            for word in words {
+                append_word(*word, word_bytes, &mut encoded);
+            }
+            let offset = self.word_offsets[selector]
+                .checked_add(
+                    cell_start
+                        .checked_mul(u64::from(word_bytes))
+                        .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?,
+                )
+                .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+            self.file_mut()?.seek(SeekFrom::Start(offset))?;
+            self.file_mut()?.write_all(&encoded)?;
+            self.expected_word_hashes[selector].update(&encoded);
+        }
+        for selector in 0..self.expected_code_hashes.len() {
+            let codes = &selector_codes[selector * cell_count..(selector + 1) * cell_count];
+            let selector_u64 = u64::try_from(selector)
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+            let logical_start = selector_u64
+                .checked_mul(self.spec.word_group_len)
+                .and_then(|index| index.checked_add(cell_start))
+                .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+            if self.spec.code_bits == 8 {
+                let offset = self
+                    .code_offset
+                    .checked_add(logical_start)
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+                self.file_mut()?.seek(SeekFrom::Start(offset))?;
+                self.file_mut()?.write_all(codes)?;
+            } else {
+                self.write_packed_codes(logical_start, codes)?;
+            }
+            self.expected_code_hashes[selector].update(codes);
+        }
+        self.next_cell = cell_end;
+        Ok(())
+    }
+
+    fn write_packed_codes(
+        &mut self,
+        logical_start: u64,
+        codes: &[u8],
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        let logical_end = logical_start
+            .checked_add(
+                u64::try_from(codes.len())
+                    .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?,
+            )
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+        let byte_start = logical_start / 2;
+        let byte_end = logical_end.div_ceil(2);
+        let packed_len = usize::try_from(
+            byte_end
+                .checked_sub(byte_start)
+                .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?,
+        )
+        .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+        let offset = self
+            .code_offset
+            .checked_add(byte_start)
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+        let mut packed = vec![0u8; packed_len];
+        if logical_start % 2 == 1 {
+            self.file_mut()?.seek(SeekFrom::Start(offset))?;
+            self.file_mut()?.read_exact(&mut packed[..1])?;
+        }
+        if logical_end % 2 == 1 {
+            let last = packed_len
+                .checked_sub(1)
+                .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+            if logical_start % 2 != 1 || last != 0 {
+                let last_offset = offset
+                    .checked_add(
+                        u64::try_from(last)
+                            .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?,
+                    )
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+                self.file_mut()?.seek(SeekFrom::Start(last_offset))?;
+                self.file_mut()?.read_exact(&mut packed[last..=last])?;
+            }
+        }
+        for (index, code) in codes.iter().enumerate() {
+            let logical_index = logical_start
+                .checked_add(
+                    u64::try_from(index)
+                        .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?,
+                )
+                .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+            let packed_index = usize::try_from(logical_index / 2 - byte_start)
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+            if logical_index % 2 == 0 {
+                packed[packed_index] = (packed[packed_index] & 0xf0) | *code;
+            } else {
+                packed[packed_index] = (packed[packed_index] & 0x0f) | (*code << 4);
+            }
+        }
+        self.file_mut()?.seek(SeekFrom::Start(offset))?;
+        self.file_mut()?.write_all(&packed)?;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<BlsDoryCompactArtifact, BlsDoryCompactArtifactError> {
+        if self.failed || self.next_cell != self.spec.word_group_len {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        self.file_mut()?.flush()?;
+        let digest = self.authenticate_preallocated_file()?;
+        let expected_len = artifact_file_bytes(self.spec, self.dictionary.len())?;
+        let digest_offset = expected_len
+            .checked_sub(ARTIFACT_DIGEST_BYTES as u64)
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+        let file = self.file_mut()?;
+        file.seek(SeekFrom::Start(digest_offset))?;
+        file.write_all(&digest)?;
+        file.flush()?;
+        file.sync_all()?;
+        if file.metadata()?.len() != expected_len {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
+            .try_clone()?;
+        let path = self
+            .path
+            .take()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+        drop(self.file.take());
+        Ok(BlsDoryCompactArtifact {
+            path,
+            file,
+            spec: self.spec,
+            dictionary: std::mem::take(&mut self.dictionary),
+            digest,
+        })
+    }
+
+    fn authenticate_preallocated_file(
+        &self,
+    ) -> Result<[u8; ARTIFACT_DIGEST_BYTES], BlsDoryCompactArtifactError> {
+        let expected_len = artifact_file_bytes(self.spec, self.dictionary.len())?;
+        let mut file = self
+            .file
+            .as_ref()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
+            .try_clone()?;
+        if file.metadata()?.len() != expected_len {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file);
+        let mut hasher = blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN);
+        let mut header = [0u8; ARTIFACT_HEADER_BYTES];
+        reader.read_exact(&mut header)?;
+        if header != self.spec.encode(self.dictionary.len())? {
+            return Err(BlsDoryCompactArtifactError::Authentication);
+        }
+        hasher.update(&header);
+        for scalar in &self.dictionary {
+            let expected = encode_scalar(scalar)?;
+            let mut encoded = [0u8; ARTIFACT_SCALAR_BYTES];
+            reader.read_exact(&mut encoded)?;
+            if encoded != expected {
+                return Err(BlsDoryCompactArtifactError::Authentication);
+            }
+            hasher.update(&encoded);
+        }
+        let mut buffer = vec![0u8; ARTIFACT_IO_BUFFER_BYTES];
+        for selector in 0..self.word_offsets.len() {
+            let selector_u64 = u64::try_from(selector)
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+            let word_bytes = usize::from(self.spec.selector_word_bytes(selector_u64)?);
+            let signed = self.spec.selector_is_signed(selector_u64)?;
+            let mut remaining = usize::try_from(self.spec.word_group_len)
+                .ok()
+                .and_then(|cells| cells.checked_mul(word_bytes))
+                .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+            let mut selector_hasher = blake3::Hasher::new();
+            while remaining > 0 {
+                let take = remaining.min(buffer.len() / word_bytes * word_bytes);
+                reader.read_exact(&mut buffer[..take])?;
+                hasher.update(&buffer[..take]);
+                selector_hasher.update(&buffer[..take]);
+                for encoded in buffer[..take].chunks_exact(word_bytes) {
+                    let word = decode_word(encoded, signed)?;
+                    validate_word(word, signed, word_bytes as u8)?;
+                }
+                remaining -= take;
+            }
+            if selector_hasher.finalize() != self.expected_word_hashes[selector].finalize() {
+                return Err(BlsDoryCompactArtifactError::Authentication);
+            }
+        }
+        let code_count = self
+            .spec
+            .explicit_scalar_count
+            .checked_sub(self.spec.word_scalar_count)
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+        let code_bytes = if self.spec.code_bits == 4 {
+            code_count.div_ceil(2)
+        } else {
+            code_count
+        };
+        let mut physical_remaining = code_bytes;
+        let mut logical_index = 0u64;
+        let mut actual_code_hashes = std::iter::repeat_with(blake3::Hasher::new)
+            .take(self.expected_code_hashes.len())
+            .collect::<Vec<_>>();
+        while physical_remaining > 0 {
+            let take = usize::try_from(physical_remaining.min(buffer.len() as u64))
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+            reader.read_exact(&mut buffer[..take])?;
+            hasher.update(&buffer[..take]);
+            for encoded in &buffer[..take] {
+                let digits = if self.spec.code_bits == 4 {
+                    [*encoded & 0x0f, *encoded >> 4]
+                } else {
+                    [*encoded, 0]
+                };
+                let digits_to_read = if self.spec.code_bits == 4 { 2 } else { 1 };
+                for code in &digits[..digits_to_read] {
+                    if logical_index == code_count {
+                        if *code != 0 {
+                            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                        }
+                        continue;
+                    }
+                    if usize::from(*code) >= self.dictionary.len() {
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
+                    let selector = usize::try_from(logical_index / self.spec.word_group_len)
+                        .map_err(|_| BlsDoryCompactArtifactError::InvalidArtifact)?;
+                    actual_code_hashes
+                        .get_mut(selector)
+                        .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
+                        .update(&[*code]);
+                    logical_index += 1;
+                }
+            }
+            physical_remaining -= take as u64;
+        }
+        if logical_index != code_count
+            || actual_code_hashes
+                .iter()
+                .zip(&self.expected_code_hashes)
+                .any(|(actual, expected)| actual.finalize() != expected.finalize())
+        {
+            return Err(BlsDoryCompactArtifactError::Authentication);
+        }
+        let mut empty_digest = [0u8; ARTIFACT_DIGEST_BYTES];
+        reader.read_exact(&mut empty_digest)?;
+        if empty_digest != [0; ARTIFACT_DIGEST_BYTES] {
+            return Err(BlsDoryCompactArtifactError::Authentication);
+        }
+        let mut trailing = [0u8; 1];
+        if reader.read(&mut trailing)? != 0 {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File, BlsDoryCompactArtifactError> {
+        self.file
+            .as_mut()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)
+    }
+
+    #[cfg(test)]
+    fn path(&self) -> Result<&Path, BlsDoryCompactArtifactError> {
+        self.path
+            .as_deref()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)
+    }
+}
+
+impl Drop for BlsDoryGroupedCompactArtifactWriter {
+    fn drop(&mut self) {
+        if let (Some(path), Some(file)) = (&self.path, &self.file) {
+            remove_if_owned(path, file);
+        }
+    }
+}
+
 pub struct BlsDoryCompactArtifact {
     path: PathBuf,
     file: File,
@@ -975,6 +1466,21 @@ mod tests {
         }
     }
 
+    fn selector_major_chunk<T: Copy>(
+        values: &[T],
+        selectors: usize,
+        group_len: usize,
+        cell_start: usize,
+        cell_count: usize,
+    ) -> Vec<T> {
+        (0..selectors)
+            .flat_map(|selector| {
+                let start = selector * group_len + cell_start;
+                values[start..start + cell_count].iter().copied()
+            })
+            .collect()
+    }
+
     #[test]
     fn signed_unsigned_words_and_codes_round_trip_and_clean_up() {
         let directory = TestDirectory::create();
@@ -1033,6 +1539,230 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(decoded, expected);
         drop(artifact);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn grouped_chunks_match_sequential_writer_bytes_and_digest() {
+        let directory = TestDirectory::create();
+        let words = [
+            (-128i64) as u64,
+            127,
+            0,
+            7,
+            11,
+            u64::from(u16::MAX),
+            19,
+            23,
+            (-8_388_608i64) as u64,
+            37,
+            8_388_607,
+            (-41i64) as u64,
+            47,
+            53,
+            59,
+            u64::from(u32::MAX),
+        ];
+        let codes = [0, 1, 2, 3, 3, 2, 1, 0];
+        let dictionary = (0..4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+        let mut sequential =
+            BlsDoryCompactArtifactWriter::create(&directory.0, spec(), dictionary.clone()).unwrap();
+        sequential.write_words(&words).unwrap();
+        sequential.write_codes(&codes).unwrap();
+        let sequential = sequential.finish().unwrap();
+
+        let mut grouped =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, spec(), dictionary).unwrap();
+        assert_eq!(
+            std::fs::metadata(grouped.path().unwrap()).unwrap().len(),
+            spec().encoded_bytes(4).unwrap()
+        );
+        for (cell_start, cell_count) in [(0, 1), (1, 2), (3, 1)] {
+            grouped
+                .write_cell_chunk(
+                    cell_start as u64,
+                    cell_count,
+                    &selector_major_chunk(&words, 4, 4, cell_start, cell_count),
+                    &selector_major_chunk(&codes, 2, 4, cell_start, cell_count),
+                )
+                .unwrap();
+        }
+        let grouped = grouped.finish().unwrap();
+        assert_eq!(grouped.digest(), sequential.digest());
+        assert_eq!(
+            std::fs::read(grouped.path()).unwrap(),
+            std::fs::read(sequential.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn grouped_nibbles_match_when_selectors_share_bytes() {
+        let directory = TestDirectory::create();
+        let one_cell = BlsDoryCompactArtifactSpec {
+            context_digest: [4; 32],
+            scalar_count: 8,
+            explicit_scalar_count: 6,
+            word_scalar_count: 2,
+            word_bytes: 4,
+            code_bits: 4,
+            word_width_codes: 0,
+            word_group_len: 1,
+            signed_word_selectors: 0,
+        };
+        let words = [11, 22];
+        let codes = [0, 1, 2, 3];
+        let dictionary = (0..4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+        let mut sequential =
+            BlsDoryCompactArtifactWriter::create(&directory.0, one_cell, dictionary.clone())
+                .unwrap();
+        sequential.write_words(&words).unwrap();
+        sequential.write_codes(&codes).unwrap();
+        let sequential = sequential.finish().unwrap();
+        let mut grouped =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, one_cell, dictionary)
+                .unwrap();
+        grouped.write_cell_chunk(0, 1, &words, &codes).unwrap();
+        let grouped = grouped.finish().unwrap();
+        assert_eq!(grouped.digest(), sequential.digest());
+        assert_eq!(
+            std::fs::read(grouped.path()).unwrap(),
+            std::fs::read(sequential.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn grouped_packed_write_preserves_both_partial_byte_boundaries() {
+        let directory = TestDirectory::create();
+        let one_cell = BlsDoryCompactArtifactSpec {
+            context_digest: [5; 32],
+            scalar_count: 8,
+            explicit_scalar_count: 4,
+            word_scalar_count: 0,
+            word_bytes: 4,
+            code_bits: 4,
+            word_width_codes: 0,
+            word_group_len: 1,
+            signed_word_selectors: 0,
+        };
+        let dictionary = (0..4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+        let mut writer =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, one_cell, dictionary)
+                .unwrap();
+        let offset = writer.code_offset;
+        writer
+            .file_mut()
+            .unwrap()
+            .seek(SeekFrom::Start(offset))
+            .unwrap();
+        writer.file_mut().unwrap().write_all(&[0x20]).unwrap();
+        writer.write_packed_codes(0, &[3]).unwrap();
+        let mut packed = [0u8; 1];
+        writer
+            .file_mut()
+            .unwrap()
+            .seek(SeekFrom::Start(offset))
+            .unwrap();
+        writer.file_mut().unwrap().read_exact(&mut packed).unwrap();
+        assert_eq!(packed, [0x23]);
+
+        writer
+            .file_mut()
+            .unwrap()
+            .seek(SeekFrom::Start(offset))
+            .unwrap();
+        writer.file_mut().unwrap().write_all(&[0x03]).unwrap();
+        writer.write_packed_codes(1, &[2]).unwrap();
+        writer
+            .file_mut()
+            .unwrap()
+            .seek(SeekFrom::Start(offset))
+            .unwrap();
+        writer.file_mut().unwrap().read_exact(&mut packed).unwrap();
+        assert_eq!(packed, [0x23]);
+    }
+
+    #[test]
+    fn grouped_writer_rejects_incomplete_duplicate_gapped_and_missing_selector_chunks() {
+        let words = [0; 16];
+        let codes = [0; 8];
+        let dictionary = (0..4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+
+        let directory = TestDirectory::create();
+        let mut writer =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, spec(), dictionary.clone())
+                .unwrap();
+        writer
+            .write_cell_chunk(
+                0,
+                2,
+                &selector_major_chunk(&words, 4, 4, 0, 2),
+                &selector_major_chunk(&codes, 2, 4, 0, 2),
+            )
+            .unwrap();
+        assert!(writer.finish().is_err());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+
+        let directory = TestDirectory::create();
+        let mut writer =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, spec(), dictionary.clone())
+                .unwrap();
+        let first_words = selector_major_chunk(&words, 4, 4, 0, 1);
+        let first_codes = selector_major_chunk(&codes, 2, 4, 0, 1);
+        writer
+            .write_cell_chunk(0, 1, &first_words, &first_codes)
+            .unwrap();
+        assert!(
+            writer
+                .write_cell_chunk(0, 1, &first_words, &first_codes)
+                .is_err()
+        );
+        assert!(writer.finish().is_err());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+
+        let directory = TestDirectory::create();
+        let mut writer =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, spec(), dictionary.clone())
+                .unwrap();
+        assert!(
+            writer
+                .write_cell_chunk(1, 1, &first_words, &first_codes)
+                .is_err()
+        );
+        assert!(writer.finish().is_err());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+
+        let directory = TestDirectory::create();
+        let mut writer =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, spec(), dictionary).unwrap();
+        assert!(
+            writer
+                .write_cell_chunk(0, 1, &first_words[..3], &first_codes)
+                .is_err()
+        );
+        assert!(writer.finish().is_err());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn grouped_writer_detects_scratch_corruption_before_authentication() {
+        let directory = TestDirectory::create();
+        let words = [0; 16];
+        let codes = [0; 8];
+        let dictionary = (0..4).map(BlsDoryFr::from_u64).collect::<Vec<_>>();
+        let mut writer =
+            BlsDoryGroupedCompactArtifactWriter::create(&directory.0, spec(), dictionary).unwrap();
+        writer.write_cell_chunk(0, 4, &words, &codes).unwrap();
+        let path = writer.path().unwrap().to_path_buf();
+        let first_word = ARTIFACT_HEADER_BYTES as u64 + 4 * ARTIFACT_SCALAR_BYTES as u64;
+        let mut corrupt = OpenOptions::new().write(true).open(&path).unwrap();
+        corrupt.seek(SeekFrom::Start(first_word)).unwrap();
+        corrupt.write_all(&[1]).unwrap();
+        corrupt.flush().unwrap();
+        drop(corrupt);
+        assert!(matches!(
+            writer.finish(),
+            Err(BlsDoryCompactArtifactError::Authentication)
+        ));
         assert!(!path.exists());
     }
 
@@ -1118,6 +1848,33 @@ mod tests {
             wide.encoded_bytes(1),
             Err(BlsDoryCompactArtifactError::InvalidSpec)
         ));
+    }
+
+    #[test]
+    fn grouped_writer_rejects_selector_capacity_overflow_before_creating_a_file() {
+        let directory = TestDirectory::create();
+        let selector_count = 1u64 << 60;
+        let wide = BlsDoryCompactArtifactSpec {
+            context_digest: [11; 32],
+            scalar_count: 1u64 << 62,
+            explicit_scalar_count: selector_count,
+            word_scalar_count: selector_count,
+            word_bytes: 4,
+            code_bits: 4,
+            word_width_codes: 0,
+            word_group_len: 1,
+            signed_word_selectors: 0,
+        };
+        assert!(wide.encoded_bytes(1).is_ok());
+        assert!(matches!(
+            BlsDoryGroupedCompactArtifactWriter::create(
+                &directory.0,
+                wide,
+                vec![BlsDoryFr::zero()],
+            ),
+            Err(BlsDoryCompactArtifactError::InvalidSpec)
+        ));
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
     }
 
     #[test]

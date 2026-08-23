@@ -33,6 +33,9 @@ use crate::{
 };
 use crate::{
     dory_bls12_381_layout::BLS_DORY_SHARED_PRODUCTION_CLAIMS,
+    dory_bls12_381_soundness::{
+        BlsDorySoundnessError, BlsDorySoundnessTerm, production_bls_dory_soundness_report,
+    },
     wire::MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
 };
 
@@ -124,10 +127,136 @@ pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the bounded composed fixture makes execution and adjacency reuse the exact same Dory-authenticated main commitments, but the unified 31-variable production source/inverse commitment and out-of-core opening path are not implemented or measured",
-    "the execution, row-compression, lookup, sumcheck, and selector-batching errors do not yet have one complete independently reviewed Fiat-Shamir union bound",
+    "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
+
+/// Executable algebraic union bound for the shared proof plus BLAKE3 replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlsDoryBlake3SoundnessReport {
+    pub shared_algebraic_numerator_upper_bound: u64,
+    pub blake3_terms: Vec<BlsDorySoundnessTerm>,
+    pub blake3_algebraic_numerator_upper_bound: u64,
+    pub composed_algebraic_numerator_upper_bound: u64,
+    pub nonzero_challenge_space_lower_bound_bits: u32,
+    pub algebraic_soundness_bits: u32,
+    pub required_algebraic_soundness_bits: u32,
+    pub grinding_headroom_bits: u32,
+    pub composed_opening_claims: usize,
+    pub proposed_maximum_opening_claims: usize,
+    pub independently_reviewed: bool,
+}
+
+/// Conservative algebraic terms for the exact projected BLAKE3 topology.
+pub fn projected_bls_dory_blake3_soundness_report()
+-> Result<BlsDoryBlake3SoundnessReport, BlsDorySoundnessError> {
+    const NONZERO_CHALLENGE_BITS: u32 = 254;
+    const REQUIRED_BITS: u32 = 128;
+    let rows = u64::try_from(BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS)
+        .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?;
+    let trace_variables = u64::try_from(BLS_DORY_BLAKE3_TRACE_VARIABLES)
+        .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?;
+    let terms = vec![
+        blake3_soundness_term(
+            "BLAKE3 execution constraint mixing",
+            u64::try_from(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS - 1)
+                .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+        blake3_soundness_term("BLAKE3 execution local equality point", trace_variables),
+        blake3_soundness_term(
+            "BLAKE3 execution sumcheck",
+            u64::try_from(BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE)
+                .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?
+                .checked_mul(trace_variables)
+                .ok_or(BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+        blake3_soundness_term(
+            "BLAKE3 execution source selector batching",
+            u64::try_from(BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES)
+                .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+        blake3_soundness_term(
+            "BLAKE3 adjacency row compression",
+            rows.checked_mul(
+                u64::try_from(BLS_DORY_BLAKE3_MAIN_WIDTH)
+                    .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?,
+            )
+            .ok_or(BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+        blake3_soundness_term(
+            "BLAKE3 adjacency lookup-alpha rational identity",
+            rows.checked_mul(2)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+        blake3_soundness_term("BLAKE3 adjacency local relation mixing", 1),
+        blake3_soundness_term("BLAKE3 adjacency global relation mixing", 1),
+        blake3_soundness_term("BLAKE3 adjacency local equality point", trace_variables),
+        blake3_soundness_term(
+            "BLAKE3 adjacency sumcheck",
+            u64::try_from(BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE)
+                .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?
+                .checked_mul(trace_variables)
+                .ok_or(BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+        blake3_soundness_term(
+            "BLAKE3 adjacency source selector batching",
+            u64::try_from(BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES)
+                .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+        blake3_soundness_term(
+            "BLAKE3 adjacency inverse selector batching",
+            u64::try_from(BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES)
+                .map_err(|_| BlsDorySoundnessError::ArithmeticOverflow)?,
+        ),
+    ];
+    let blake3_algebraic_numerator_upper_bound = terms.iter().try_fold(0_u64, |total, term| {
+        total
+            .checked_add(term.total_numerator_upper_bound()?)
+            .ok_or(BlsDorySoundnessError::ArithmeticOverflow)
+    })?;
+    let shared = production_bls_dory_soundness_report()?;
+    let composed_algebraic_numerator_upper_bound = shared
+        .total_algebraic_numerator_upper_bound
+        .checked_add(blake3_algebraic_numerator_upper_bound)
+        .ok_or(BlsDorySoundnessError::ArithmeticOverflow)?;
+    let algebraic_soundness_bits = NONZERO_CHALLENGE_BITS
+        .checked_sub(blake3_ceil_log2(composed_algebraic_numerator_upper_bound))
+        .ok_or(BlsDorySoundnessError::InvalidProductionGeometry)?;
+    let grinding_headroom_bits = algebraic_soundness_bits
+        .checked_sub(REQUIRED_BITS)
+        .ok_or(BlsDorySoundnessError::InvalidProductionGeometry)?;
+    Ok(BlsDoryBlake3SoundnessReport {
+        shared_algebraic_numerator_upper_bound: shared.total_algebraic_numerator_upper_bound,
+        blake3_terms: terms,
+        blake3_algebraic_numerator_upper_bound,
+        composed_algebraic_numerator_upper_bound,
+        nonzero_challenge_space_lower_bound_bits: NONZERO_CHALLENGE_BITS,
+        algebraic_soundness_bits,
+        required_algebraic_soundness_bits: REQUIRED_BITS,
+        grinding_headroom_bits,
+        composed_opening_claims: BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS,
+        proposed_maximum_opening_claims: BLS_DORY_BLAKE3_PROPOSED_MAX_OPENING_CLAIMS,
+        independently_reviewed: false,
+    })
+}
+
+fn blake3_soundness_term(label: &'static str, numerator: u64) -> BlsDorySoundnessTerm {
+    BlsDorySoundnessTerm {
+        label,
+        instances: 1,
+        numerator_upper_bound_per_instance: numerator,
+    }
+}
+
+const fn blake3_ceil_log2(value: u64) -> u32 {
+    if value <= 1 {
+        0
+    } else {
+        u64::BITS - (value - 1).leading_zeros()
+    }
+}
 
 /// Field-independent variable reference emitted by the existing BLAKE3 AIR.
 #[cfg(all(test, feature = "whir-prototype"))]
@@ -2371,6 +2500,51 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_PROJECTED_HEADROOM_BYTES, 70_762);
         assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
         assert_eq!(BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS.len(), 4);
+    }
+
+    #[test]
+    fn composed_blake3_soundness_report_pins_every_algebraic_term() {
+        let report = projected_bls_dory_blake3_soundness_report().unwrap();
+        let expected = [
+            ("BLAKE3 execution constraint mixing", 1_298),
+            ("BLAKE3 execution local equality point", 20),
+            ("BLAKE3 execution sumcheck", 340),
+            ("BLAKE3 execution source selector batching", 11),
+            ("BLAKE3 adjacency row compression", 303_038_464),
+            ("BLAKE3 adjacency lookup-alpha rational identity", 2_097_151),
+            ("BLAKE3 adjacency local relation mixing", 1),
+            ("BLAKE3 adjacency global relation mixing", 1),
+            ("BLAKE3 adjacency local equality point", 20),
+            ("BLAKE3 adjacency sumcheck", 60),
+            ("BLAKE3 adjacency source selector batching", 10),
+            ("BLAKE3 adjacency inverse selector batching", 10),
+        ];
+        assert_eq!(report.blake3_terms.len(), expected.len());
+        for (term, (label, numerator)) in report.blake3_terms.iter().zip(expected) {
+            assert_eq!(term.label, label);
+            assert_eq!(term.instances, 1);
+            assert_eq!(term.numerator_upper_bound_per_instance, numerator);
+        }
+        assert_eq!(
+            report.shared_algebraic_numerator_upper_bound,
+            19_781_388_263
+        );
+        assert_eq!(report.blake3_algebraic_numerator_upper_bound, 305_137_386);
+        assert_eq!(
+            report.composed_algebraic_numerator_upper_bound,
+            20_086_525_649
+        );
+        assert_eq!(report.nonzero_challenge_space_lower_bound_bits, 254);
+        assert_eq!(
+            blake3_ceil_log2(report.composed_algebraic_numerator_upper_bound),
+            35
+        );
+        assert_eq!(report.algebraic_soundness_bits, 219);
+        assert_eq!(report.required_algebraic_soundness_bits, 128);
+        assert_eq!(report.grinding_headroom_bits, 91);
+        assert_eq!(report.composed_opening_claims, 131);
+        assert_eq!(report.proposed_maximum_opening_claims, 256);
+        assert!(!report.independently_reviewed);
     }
 
     #[test]

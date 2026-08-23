@@ -330,6 +330,15 @@ compresses the four bounded execution groups into the one 31-variable source
 commitment described above; this remains a projection until the out-of-core
 path is implemented.
 
+An executable production-geometry union bound now itemizes every added
+algebraic reduction. The largest terms are 303,038,464 for row compression and
+2,097,151 for the LogUp lookup challenge; all BLAKE3 terms total 305,137,386.
+Adding the existing shared proof's 19,781,388,263 numerator gives
+20,086,525,649 over at least `2^254` nonzero scalar challenges. The resulting
+floor remains 219 algebraic bits, with 91 bits above the 128-bit requirement.
+This is not an end-to-end security claim: independent review, Dory knowledge
+soundness, the BLAKE3 Fiat-Shamir transcript, and external audit remain open.
+
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the
 network limit. Geometry-derived maxima are 154,252 bytes for WHIR and 87,556

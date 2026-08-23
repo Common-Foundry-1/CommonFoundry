@@ -389,6 +389,17 @@ terminal, inverse commitment, or aggregate proof fails. This closes the
 independent-trace substitution in the bounded fixture; the unified production
 commitment path and its measurements remain activation gates.
 
+The composed algebraic soundness report now includes constraint mixing,
+execution and adjacency equality points, both sumchecks, row compression, the
+LogUp lookup challenge, local/global mixing, and all three production selector
+batches. The BLAKE3 numerator is 305,137,386; unioning it with the existing
+19,781,388,263 shared-proof numerator gives 20,086,525,649 over at least
+`2^254` nonzero challenges. The conservative floor remains 219 algebraic bits,
+or 91 bits above the 128-bit requirement. This accounting is executable but not
+independently reviewed. It excludes Dory knowledge soundness, Fiat-Shamir
+security, implementation correctness, and external audit, so it does not open
+the activation gate.
+
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its
 268,640-byte dictionary-free floor is larger than the entire 262,128-byte proof

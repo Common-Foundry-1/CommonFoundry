@@ -1101,6 +1101,19 @@ all rejected. At production geometry the four bounded source groups project to
 one 31-variable source commitment with main and preprocessing tables in separate
 halves. That unification and its out-of-core prover are not implemented.
 
+The executable production-geometry algebraic report now closes the accounting
+list, though not its review gate. Execution contributes constraint-mixing,
+local-equality, degree-17 sumcheck, and 11-selector batching terms. Adjacency
+contributes the conservative `2^20 * 289 = 303,038,464` row-compression term,
+the `2 * 2^20 - 1 = 2,097,151` lookup-alpha rational-identity term, local and
+global mixing, its equality point, degree-three sumcheck, and two 10-selector
+batches. The custom numerator is 305,137,386. Unioning it with the existing
+19,781,388,263 shared-proof numerator gives 20,086,525,649 over at least
+`2^254` nonzero BLS12-381 scalar challenges, retaining a 219-bit algebraic floor
+and 91 bits of grinding headroom above the 128-bit requirement. Dory knowledge
+soundness, Fiat-Shamir security, implementation correctness, and external audit
+remain separate unreviewed assumptions.
+
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate
 prover no longer retains a duplicate coefficient vector or builds a full

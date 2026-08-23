@@ -68,7 +68,10 @@ use crate::{
 use crate::{
     dory_bls12_381_aggregate::{BlsDoryAggregateError, BlsDoryOpeningClaim},
     dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
-    dory_bls12_381_fold_artifact::BlsDoryFoldArtifactSpec,
+    dory_bls12_381_fold_artifact::{
+        BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
+        BlsDoryFoldArtifactWriter,
+    },
     dory_bls12_381_layout::{
         BLS_DORY_SHARED_PRODUCTION_CLAIMS, BLS_DORY_SHARED_PRODUCTION_VARIABLES,
         BlsDoryAdditionalFoldSourceProjection, projected_shared_production_scratch_bytes,
@@ -194,6 +197,281 @@ pub const BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS: usize = 3;
 /// Local/next and inverse terminal evaluations exposed by the adjacency sumcheck.
 pub const BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS: usize =
     2 * BLS_DORY_BLAKE3_MAIN_WIDTH + 2;
+
+const BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE: u64 = 1_024;
+const BLS_DORY_BLAKE3_EXECUTION_ROUND_TABLE_INDEX: u32 = 0;
+const BLS_DORY_BLAKE3_EXECUTION_ROUND_CONTEXT_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundContext/v1";
+
+const _: () = {
+    assert!(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS == 746);
+    assert!(
+        (BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS as u64)
+            < BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE
+    );
+};
+
+type BlsDoryBlake3ExecutionRoundRow = [BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+
+/// Private lineage selector for an out-of-core execution sumcheck round.
+#[cfg_attr(not(test), allow(dead_code))]
+enum BlsDoryBlake3ExecutionRoundParent<'a> {
+    /// The first stored generation is the result of folding the streamed root
+    /// rows once, so it binds directly to the root row-stream lineage.
+    Root([u8; 32]),
+    /// Later generations bind to the authenticated digest of the immediately
+    /// preceding round artifact.
+    Previous(&'a BlsDoryBlake3ExecutionRoundArtifact),
+}
+
+/// RAII writer for a packed row-major execution-round artifact.
+///
+/// Each physical row stores exactly 746 explicit scalars. The 1,024-scalar
+/// logical stride exists only in the authenticated specification; the unused
+/// tail is implicit and is never written.
+#[cfg_attr(not(test), allow(dead_code))]
+struct BlsDoryBlake3ExecutionRoundArtifactWriter {
+    inner: BlsDoryFoldArtifactWriter,
+    root_lineage: [u8; 32],
+    parent_digest: [u8; 32],
+    round_index: usize,
+    active_rows: u64,
+    written_rows: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BlsDoryBlake3ExecutionRoundArtifactWriter {
+    fn create(
+        scratch_directory: &std::path::Path,
+        active_rows: u64,
+        round_index: usize,
+        parent: BlsDoryBlake3ExecutionRoundParent<'_>,
+    ) -> Result<Self, BlsDoryFoldArtifactError> {
+        if active_rows == 0 || !active_rows.is_power_of_two() {
+            return Err(BlsDoryFoldArtifactError::InvalidSpec);
+        }
+        let generation = u32::try_from(round_index)
+            .ok()
+            .and_then(|round| round.checked_add(1))
+            .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+        let (root_lineage, parent_digest) = match parent {
+            BlsDoryBlake3ExecutionRoundParent::Root(root_lineage) => {
+                if round_index != 0 || root_lineage == [0; 32] {
+                    return Err(BlsDoryFoldArtifactError::InvalidSpec);
+                }
+                (root_lineage, root_lineage)
+            }
+            BlsDoryBlake3ExecutionRoundParent::Previous(previous) => {
+                previous.validate_shape()?;
+                let expected_round = previous
+                    .round_index
+                    .checked_add(1)
+                    .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+                let expected_parent_rows = active_rows
+                    .checked_mul(2)
+                    .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+                if round_index == 0
+                    || round_index != expected_round
+                    || previous.active_rows != expected_parent_rows
+                {
+                    return Err(BlsDoryFoldArtifactError::InvalidSpec);
+                }
+                (previous.root_lineage, previous.digest())
+            }
+        };
+        let context_digest = bls_dory_blake3_execution_round_context(root_lineage);
+        if context_digest == [0; 32] || parent_digest == [0; 32] {
+            return Err(BlsDoryFoldArtifactError::InvalidSpec);
+        }
+        let explicit_scalar_count = active_rows
+            .checked_mul(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS as u64)
+            .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+        let scalar_count = active_rows
+            .checked_mul(BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE)
+            .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+        let spec = BlsDoryFoldArtifactSpec {
+            context_digest,
+            table_index: BLS_DORY_BLAKE3_EXECUTION_ROUND_TABLE_INDEX,
+            generation,
+            scalar_count,
+            explicit_scalar_count,
+            parent_digest,
+        };
+        Ok(Self {
+            inner: BlsDoryFoldArtifactWriter::create(scratch_directory, spec)?,
+            root_lineage,
+            parent_digest,
+            round_index,
+            active_rows,
+            written_rows: 0,
+        })
+    }
+
+    fn write_row(&mut self, row: &[BlsDoryFr]) -> Result<(), BlsDoryFoldArtifactError> {
+        if row.len() != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+            || self.written_rows >= self.active_rows
+        {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        self.inner.write_scalars(row)?;
+        self.written_rows += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<BlsDoryBlake3ExecutionRoundArtifact, BlsDoryFoldArtifactError> {
+        if self.written_rows != self.active_rows {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        Ok(BlsDoryBlake3ExecutionRoundArtifact {
+            inner: self.inner.finish()?,
+            root_lineage: self.root_lineage,
+            parent_digest: self.parent_digest,
+            round_index: self.round_index,
+            active_rows: self.active_rows,
+        })
+    }
+}
+
+/// Authenticated packed row-major state for one completed execution fold.
+#[cfg_attr(not(test), allow(dead_code))]
+struct BlsDoryBlake3ExecutionRoundArtifact {
+    inner: BlsDoryFoldArtifact,
+    root_lineage: [u8; 32],
+    parent_digest: [u8; 32],
+    round_index: usize,
+    active_rows: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BlsDoryBlake3ExecutionRoundArtifact {
+    fn digest(&self) -> [u8; 32] {
+        self.inner.digest()
+    }
+
+    fn validate_shape(&self) -> Result<(), BlsDoryFoldArtifactError> {
+        if self.root_lineage == [0; 32]
+            || self.active_rows == 0
+            || !self.active_rows.is_power_of_two()
+        {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        let generation = u32::try_from(self.round_index)
+            .ok()
+            .and_then(|round| round.checked_add(1))
+            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
+        let spec = self.inner.spec();
+        let context_digest = bls_dory_blake3_execution_round_context(self.root_lineage);
+        let explicit_scalar_count = self
+            .active_rows
+            .checked_mul(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS as u64)
+            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
+        let scalar_count = self
+            .active_rows
+            .checked_mul(BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE)
+            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
+        if context_digest == [0; 32]
+            || self.parent_digest == [0; 32]
+            || (self.round_index == 0 && self.parent_digest != self.root_lineage)
+            || spec.context_digest != context_digest
+            || spec.table_index != BLS_DORY_BLAKE3_EXECUTION_ROUND_TABLE_INDEX
+            || spec.generation != generation
+            || spec.scalar_count != scalar_count
+            || spec.explicit_scalar_count != explicit_scalar_count
+            || spec.parent_digest != self.parent_digest
+        {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        Ok(())
+    }
+
+    /// Visit adjacent rows in canonical order while retaining only two rows.
+    ///
+    /// Visitor effects are provisional. A corrupt body or footer can be found
+    /// after earlier callbacks, so callers must discard all accumulated state
+    /// unless this method returns `Ok(())`.
+    fn for_each_row_pair(
+        &self,
+        mut visitor: impl FnMut(
+            &BlsDoryBlake3ExecutionRoundRow,
+            &BlsDoryBlake3ExecutionRoundRow,
+        ) -> Result<(), BlsDoryFoldArtifactError>,
+    ) -> Result<(), BlsDoryFoldArtifactError> {
+        self.validate_shape()?;
+        if self.active_rows < 2 {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        let mut rows = [
+            [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS],
+            [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS],
+        ];
+        let mut row_index = 0u64;
+        let mut column = 0usize;
+        self.inner.for_each_scalar(|scalar| {
+            let pair_row = usize::try_from(row_index & 1)
+                .map_err(|_| BlsDoryFoldArtifactError::InvalidArtifact)?;
+            rows[pair_row][column] = scalar;
+            column += 1;
+            if column == BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS {
+                row_index += 1;
+                column = 0;
+                if pair_row == 1 {
+                    visitor(&rows[0], &rows[1])?;
+                }
+            }
+            Ok(())
+        })?;
+        if column != 0 || row_index != self.active_rows {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        Ok(())
+    }
+
+    /// Return the sole terminal row only after the entire artifact authenticates.
+    fn terminal_row(&self) -> Result<BlsDoryBlake3ExecutionRoundRow, BlsDoryFoldArtifactError> {
+        self.validate_shape()?;
+        if self.active_rows != 1 {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        let mut row = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+        let mut column = 0usize;
+        self.inner.for_each_scalar(|scalar| {
+            if column >= row.len() {
+                return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+            }
+            row[column] = scalar;
+            column += 1;
+            Ok(())
+        })?;
+        if column != row.len() {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
+        Ok(row)
+    }
+
+    #[cfg(test)]
+    fn spec(&self) -> BlsDoryFoldArtifactSpec {
+        self.inner.spec()
+    }
+
+    #[cfg(test)]
+    fn path(&self) -> &std::path::Path {
+        self.inner.path()
+    }
+}
+
+fn bls_dory_blake3_execution_round_context(root_lineage: [u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(BLS_DORY_BLAKE3_EXECUTION_ROUND_CONTEXT_DOMAIN);
+    hasher.update(&root_lineage);
+    hasher.update(&BLS_DORY_BLAKE3_EXECUTION_ROUND_TABLE_INDEX.to_le_bytes());
+    hasher.update(&(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS as u64).to_le_bytes());
+    hasher.update(&BLS_DORY_BLAKE3_EXECUTION_ROUND_ROW_STRIDE.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+#[path = "dory_bls12_381_blake3_execution_round_tests.rs"]
+mod execution_round_artifact_tests;
+
 /// Main words, the native accumulator, and post-challenge inverses require
 /// three adjacency openings. Preprocessing is not part of adjacency.
 pub const BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS: usize = 3;

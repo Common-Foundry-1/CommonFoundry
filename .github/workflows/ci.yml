@@ -27,6 +27,7 @@ jobs:
           toolchain: 1.88.0
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check -p cmfd-consensus --all-targets --features whir-prototype --locked
+      - run: cargo check -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype --locked
       - run: cargo check -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
       - run: cargo check -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked
 
@@ -55,10 +56,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features whir-prototype --locked -- -D warnings
+      - run: cargo clippy -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features gpu-proof-prover --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked --no-deps -- -D warnings
       - run: cargo test --workspace --all-targets --locked
+      - run: cargo test -p cmfd-consensus --lib --no-default-features --features dory-bls12-381-prototype --locked dory_v3_
       - run: cargo test -p cmfd-consensus --all-targets --features whir-prototype --locked
       - run: cargo test -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
       - run: cargo test -p cmfd-consensus --lib --features production-whir-candidate,gpu-proof-prover --locked production_candidate

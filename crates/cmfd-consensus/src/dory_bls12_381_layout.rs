@@ -35,10 +35,6 @@ use crate::{
         regenerate_bls_dory_compact_row_source_with_scratch, verify_bls_dory_openings,
     },
     dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
-    dory_bls12_381_execution_artifact::{
-        BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
-        BlsDoryExecutionAccumulatorColumn,
-    },
     dory_bls12_381_fold_artifact::BlsDoryFoldArtifactSpec,
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_OPENING_CLAIMS, BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
@@ -47,18 +43,16 @@ use crate::{
         projected_production_range_logup_proof_bytes, prove_bls_dory_range_logup,
         prove_bls_dory_range_logup_at_variables, prove_bls_dory_range_logup_deferred_at_variables,
         prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch,
-        prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch,
         prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
         verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
         verify_bls_dory_range_logup_deferred_at_variables,
     },
     dory_bls12_381_matrix::{
-        BlsDoryExecutionArtifactMatrixInput, BlsDoryMatrixError, BlsDoryMatrixProof,
-        PreparedBlsDoryMatrixProof, projected_production_matrix_opening_bytes,
-        projected_production_matrix_proof_bytes, prove_bls_dory_matrix_deferred_at_variables,
+        BlsDoryMatrixError, BlsDoryMatrixProof, PreparedBlsDoryMatrixProof,
+        projected_production_matrix_opening_bytes, projected_production_matrix_proof_bytes,
+        prove_bls_dory_matrix_deferred_at_variables,
         prove_bls_dory_matrix_deferred_at_variables_with_scratch,
         prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch,
-        prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch,
         verify_bls_dory_matrix_deferred_at_variables,
     },
     dory_bls12_381_prototype::{
@@ -66,26 +60,25 @@ use crate::{
     },
     dory_bls12_381_streaming::BlsDoryRowSource,
     dory_bls12_381_transition::{
-        BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryExecutionAccumulatorTransition,
-        BlsDoryTransitionError, BlsDoryTransitionProof, BlsDoryTransitionWitnessRowSource,
-        PRODUCTION_TRANSITION_WORD_WIDTH_CODES, PreparedBlsDoryTransitionProof,
-        TRANSITION_SIGNED_WORD_SELECTORS, derive_transition_regular_row_from_mask,
+        BLS_DORY_TRANSITION_OPENING_CLAIMS, BlsDoryTransitionError, BlsDoryTransitionProof,
+        BlsDoryTransitionWitnessRowSource, PRODUCTION_TRANSITION_WORD_WIDTH_CODES,
+        PreparedBlsDoryTransitionProof, TRANSITION_SIGNED_WORD_SELECTORS,
         projected_production_transition_opening_bytes, projected_production_transition_proof_bytes,
         prove_bls_dory_transition, prove_bls_dory_transition_at_variables,
         prove_bls_dory_transition_deferred_at_variables,
-        prove_bls_dory_transition_deferred_at_variables_with_scratch,
-        prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch,
-        regenerate_bls_dory_transition_compact_source_from_execution_artifact_with_scratch,
-        verify_bls_dory_transition, verify_bls_dory_transition_at_variables,
-        verify_bls_dory_transition_deferred_at_variables,
+        prove_bls_dory_transition_deferred_at_variables_with_scratch, verify_bls_dory_transition,
+        verify_bls_dory_transition_at_variables, verify_bls_dory_transition_deferred_at_variables,
     },
     dory_bls12_381_wiring::{
         BlsDoryWiringError, BlsDoryWiringProof, PreparedBlsDoryWiringProof,
         projected_production_wiring_opening_bytes, projected_production_wiring_proof_bytes,
         prove_bls_dory_wiring_deferred_at_variables,
         prove_bls_dory_wiring_deferred_at_variables_with_scratch,
-        prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch,
         verify_bls_dory_wiring_deferred_at_variables,
+    },
+    model_bank::{
+        StagedModelFieldLayoutSink, VerifiedModelBankLayoutReceipt,
+        verify_model_bank_into_staged_field_layout_sink,
     },
     sumcheck::GOLDILOCKS_MODULUS,
     verify_model_bank_into_staged_field_sink,
@@ -107,6 +100,21 @@ use crate::{
         BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, BLS_DORY_BLAKE3_PROJECTION_VERSION,
         BlsDoryBlake3OpeningStatement,
     },
+    dory_bls12_381_execution_artifact::{
+        BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
+        BlsDoryExecutionAccumulatorColumn,
+    },
+    dory_bls12_381_logup::prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch,
+    dory_bls12_381_matrix::{
+        BlsDoryExecutionArtifactMatrixInput,
+        prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execution_artifact_and_scratch,
+    },
+    dory_bls12_381_transition::{
+        BlsDoryExecutionAccumulatorTransition, derive_transition_regular_row_from_mask,
+        prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch,
+        regenerate_bls_dory_transition_compact_source_from_execution_artifact_with_scratch,
+    },
+    dory_bls12_381_wiring::prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch,
 };
 
 #[cfg(all(test, feature = "whir-prototype"))]
@@ -362,6 +370,54 @@ pub fn derive_bls_dory_fixed_model_identity_from_verified_bank<R: Read>(
     let sink = BlsDoryFixedModelSink::new(trusted_model, padded_variables, setup)
         .map_err(ModelBankFieldStreamError::Sink)?;
     verify_model_bank_into_staged_field_sink(reader, expected_manifest, trusted_model, sink)
+}
+
+/// Commitments rederived from one completely authenticated model-bank reader.
+///
+/// This crate-private value deliberately carries no legacy `ModelPcsIdentity`:
+/// Record V2 compares each ordered commitment against the independently pinned
+/// Dory V3 identity before publishing an authenticated capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlsDoryDerivedModelCommitments {
+    pub(crate) base_input: BlsDoryGt,
+    pub(crate) weight_banks: Vec<BlsDoryGt>,
+}
+
+/// Authenticate one canonical model bank and transactionally rederive the
+/// ordered Dory commitments for an explicitly supplied role layout.
+///
+/// Geometry and setup checks run before the reader is touched. Chunks remain
+/// provisional inside the sink, and no commitment is returned unless the same
+/// reader authenticates the complete header, payload, roots, length, and EOF.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn derive_bls_dory_model_commitments_from_verified_layout<R: Read>(
+    reader: R,
+    expected_manifest: &ModelBankManifest,
+    batch: u32,
+    dimension: u32,
+    layers_per_bank: u32,
+    weight_bank_count: u32,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryDerivedModelCommitments, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>>
+{
+    let sink = BlsDoryModelLayoutSink::new(
+        expected_manifest,
+        batch,
+        dimension,
+        layers_per_bank,
+        weight_bank_count,
+        padded_variables,
+        setup,
+    )
+    .map_err(ModelBankFieldStreamError::Sink)?;
+    verify_model_bank_into_staged_field_layout_sink(
+        reader,
+        expected_manifest,
+        layers_per_bank,
+        weight_bank_count,
+        sink,
+    )
 }
 
 /// Authenticated fixed-model commitments plus reusable coefficient artifacts.
@@ -727,6 +783,171 @@ impl StreamedDoryRole {
                     .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
         }
         Ok(self.commitment)
+    }
+}
+
+struct BlsDoryModelLayoutSink<'a> {
+    expected_manifest: ModelBankManifest,
+    layers_per_bank: u32,
+    weight_bank_count: u32,
+    setup: &'a DeterministicBlsDorySetup,
+    columns: usize,
+    rows: usize,
+    roles: Vec<StreamedDoryRole>,
+    next_role: usize,
+}
+
+impl<'a> BlsDoryModelLayoutSink<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        expected_manifest: &ModelBankManifest,
+        batch: u32,
+        dimension: u32,
+        layers_per_bank: u32,
+        weight_bank_count: u32,
+        padded_variables: usize,
+        setup: &'a DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryFixedModelStreamError> {
+        setup
+            .validate()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        expected_manifest
+            .digest()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        if batch == 0
+            || dimension == 0
+            || layers_per_bank == 0
+            || weight_bank_count == 0
+            || !batch.is_power_of_two()
+            || !dimension.is_power_of_two()
+            || !layers_per_bank.is_power_of_two()
+            || padded_variables == 0
+            || padded_variables > setup.max_log_n()
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+        let expected_layers = layers_per_bank
+            .checked_mul(weight_bank_count)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if expected_manifest.batch != batch
+            || expected_manifest.dimension != dimension
+            || expected_manifest.layers != expected_layers
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidIdentity);
+        }
+
+        let padded_elements = 1_u64
+            .checked_shl(padded_variables as u32)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let nu = padded_variables / 2;
+        let sigma = padded_variables - nu;
+        let rows = 1_usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let columns = 1_usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let base_elements = u64::from(batch)
+            .checked_mul(u64::from(dimension))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let weight_elements = u64::from(layers_per_bank)
+            .checked_mul(u64::from(dimension))
+            .and_then(|value| value.checked_mul(u64::from(dimension)))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if !base_elements.is_power_of_two()
+            || !weight_elements.is_power_of_two()
+            || base_elements > padded_elements
+            || weight_elements > padded_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+
+        let role_capacity = usize::try_from(weight_bank_count)
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let mut roles = Vec::with_capacity(role_capacity);
+        roles.push(StreamedDoryRole::new(
+            ModelPcsRole::BaseInput,
+            base_elements,
+        ));
+        for index in 0..weight_bank_count {
+            roles.push(StreamedDoryRole::new(
+                ModelPcsRole::WeightBank { index },
+                weight_elements,
+            ));
+        }
+
+        Ok(Self {
+            expected_manifest: *expected_manifest,
+            layers_per_bank,
+            weight_bank_count,
+            setup,
+            columns,
+            rows,
+            roles,
+            next_role: 0,
+        })
+    }
+}
+
+impl StagedModelFieldLayoutSink for BlsDoryModelLayoutSink<'_> {
+    type Error = BlsDoryFixedModelStreamError;
+    type Output = BlsDoryDerivedModelCommitments;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        let role = self
+            .roles
+            .get_mut(self.next_role)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_len = u64::try_from(chunk.elements.len())
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_end = chunk
+            .role_offset
+            .checked_add(chunk_len)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        if chunk.elements.is_empty()
+            || chunk.role != role.role
+            || chunk.role_elements != role.expected_elements
+            || chunk.role_offset != role.next_offset
+            || chunk_end > role.expected_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidChunk);
+        }
+        role.write(chunk.elements, self.columns, self.rows, self.setup)?;
+        role.next_offset = chunk_end;
+        if chunk_end == role.expected_elements {
+            self.next_role += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_verified(
+        self,
+        receipt: VerifiedModelBankLayoutReceipt,
+    ) -> Result<Self::Output, Self::Error> {
+        if self.next_role != self.roles.len()
+            || receipt.manifest() != &self.expected_manifest
+            || receipt.layout().layers_per_bank() != self.layers_per_bank
+            || receipt.layout().weight_bank_count() != self.weight_bank_count
+        {
+            return Err(BlsDoryFixedModelStreamError::ReceiptMismatch);
+        }
+        let mut commitments = self
+            .roles
+            .into_iter()
+            .map(|role| role.finish(self.rows, self.setup));
+        let base_input = commitments
+            .next()
+            .ok_or(BlsDoryFixedModelStreamError::InvalidIdentity)??;
+        let weight_banks = commitments.collect::<Result<Vec<_>, _>>()?;
+        if u32::try_from(weight_banks.len()).ok() != Some(self.weight_bank_count) {
+            return Err(BlsDoryFixedModelStreamError::InvalidIdentity);
+        }
+        Ok(BlsDoryDerivedModelCommitments {
+            base_input,
+            weight_banks,
+        })
     }
 }
 
@@ -1555,6 +1776,7 @@ pub(crate) fn prepare_bls_dory_shared_layout_with_precommitted_weights_at_variab
 /// Read the final bank's final activation directly from the authenticated
 /// execution trace. Only one authentication chunk is buffered in addition to
 /// the returned canonical byte string.
+#[cfg(any(test, feature = "whir-prototype"))]
 pub(crate) fn extract_bls_dory_final_activation_from_execution_artifact(
     statement: StructuredTransitionStatement,
     mask_polynomial: &StructuredMaskPolynomial,
@@ -1659,6 +1881,7 @@ pub(crate) fn extract_bls_dory_final_activation_from_execution_artifact(
 /// Prepare the complete shared layout directly from one authenticated
 /// execution trace. The returned state owns every coefficient capability it
 /// needs for aggregation and therefore does not retain a borrow of `artifact`.
+#[cfg(any(test, feature = "whir-prototype"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch(
     binding: &[u8],
@@ -1859,6 +2082,7 @@ pub(crate) fn prepare_bls_dory_shared_layout_from_execution_artifact_with_scratc
     )
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 #[allow(clippy::too_many_arguments)]
 fn validate_execution_artifact_shared_layout(
     binding: &[u8],
@@ -1979,6 +2203,7 @@ fn validate_execution_artifact_shared_layout(
         .map_err(|_| BlsDorySharedLayoutError::ExecutionArtifact)
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 const fn execution_artifact_transition(index: usize) -> BlsDoryExecutionAccumulatorTransition {
     if index == 0 {
         BlsDoryExecutionAccumulatorTransition::Initialization
@@ -4408,7 +4633,9 @@ pub fn require_bls_dory_shared_layout_production_ready() -> Result<(), BlsDorySh
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    #[cfg(feature = "whir-prototype")]
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::{
@@ -4475,12 +4702,14 @@ mod tests {
             .sum()
     }
 
+    #[cfg(feature = "whir-prototype")]
     struct ScratchPeakObserver {
         stop: std::sync::Arc<AtomicBool>,
         peak: std::sync::Arc<AtomicU64>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
+    #[cfg(feature = "whir-prototype")]
     impl ScratchPeakObserver {
         fn start(path: std::path::PathBuf) -> Self {
             let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -4508,6 +4737,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whir-prototype")]
     impl Drop for ScratchPeakObserver {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);

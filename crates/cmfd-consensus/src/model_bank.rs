@@ -113,6 +113,45 @@ impl VerifiedModelBankReceipt {
     }
 }
 
+/// Crate-internal capability proving that one reader authenticated the complete
+/// model bank using the requested fixed-role layer partition.
+///
+/// The fields are deliberately private. A staged sink receives this receipt
+/// only after the trusted header, canonical payload, raw root, indexed layer
+/// roots, exact payload length, and EOF have all been verified.
+#[derive(Debug)]
+pub(crate) struct VerifiedModelBankLayoutReceipt {
+    manifest: ModelBankManifest,
+    layout: ModelPcsRoleLayout,
+}
+
+impl VerifiedModelBankLayoutReceipt {
+    pub(crate) const fn manifest(&self) -> &ModelBankManifest {
+        &self.manifest
+    }
+
+    pub(crate) const fn layout(&self) -> ModelPcsRoleLayout {
+        self.layout
+    }
+}
+
+/// Crate-internal transactional sink for a caller-supplied model-bank layout.
+///
+/// This is the layout-only streaming seam used by additive commitment
+/// backends. `write_chunk` must stage provisional state and publication must
+/// occur only from `finish_verified`.
+pub(crate) trait StagedModelFieldLayoutSink: Sized {
+    type Error: std::error::Error + 'static;
+    type Output;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error>;
+
+    fn finish_verified(
+        self,
+        receipt: VerifiedModelBankLayoutReceipt,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
 /// Transactional consumer for canonical model-field chunks.
 ///
 /// `write_chunk` must only stage provisional state. The sink is owned by the
@@ -549,18 +588,74 @@ pub fn verify_model_bank_into_staged_field_sink<R, S>(
     reader: R,
     expected: &ModelBankManifest,
     trusted_identity: &ModelPcsIdentity,
-    mut sink: S,
+    sink: S,
 ) -> Result<S::Output, ModelBankFieldStreamError<S::Error>>
 where
     R: Read,
     S: StagedModelFieldSink,
 {
     expected.verify_pcs_identity(trusted_identity)?;
-    let layout = ModelPcsRoleLayout {
-        layers_per_bank: trusted_identity.layers_per_bank,
-        weight_bank_count: u32::try_from(trusted_identity.weight_bank_commitments.len())
-            .map_err(|_| ModelBankError::InvalidPcsBankCount)?,
-    };
+    let weight_bank_count = u32::try_from(trusted_identity.weight_bank_commitments.len())
+        .map_err(|_| ModelBankError::InvalidPcsBankCount)?;
+
+    verify_model_bank_into_staged_field_layout_sink(
+        reader,
+        expected,
+        trusted_identity.layers_per_bank,
+        weight_bank_count,
+        LegacyStagedModelFieldSinkAdapter {
+            sink,
+            identity: trusted_identity.clone(),
+        },
+    )
+}
+
+struct LegacyStagedModelFieldSinkAdapter<S> {
+    sink: S,
+    identity: ModelPcsIdentity,
+}
+
+impl<S> StagedModelFieldLayoutSink for LegacyStagedModelFieldSinkAdapter<S>
+where
+    S: StagedModelFieldSink,
+{
+    type Error = S::Error;
+    type Output = S::Output;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        self.sink.write_chunk(chunk)
+    }
+
+    fn finish_verified(
+        self,
+        receipt: VerifiedModelBankLayoutReceipt,
+    ) -> Result<Self::Output, Self::Error> {
+        self.sink.finish_verified(VerifiedModelBankReceipt {
+            manifest: *receipt.manifest(),
+            layout: receipt.layout(),
+            identity: self.identity,
+        })
+    }
+}
+
+/// Authenticates and field-encodes one model bank using an exact caller-owned
+/// layer partition, without depending on a particular commitment backend.
+///
+/// Partition validation happens before the reader is touched. All emitted
+/// chunks remain provisional until the same reader has authenticated the
+/// header, payload, raw root, indexed layer roots, exact length, and EOF.
+pub(crate) fn verify_model_bank_into_staged_field_layout_sink<R, S>(
+    reader: R,
+    expected: &ModelBankManifest,
+    layers_per_bank: u32,
+    weight_bank_count: u32,
+    mut sink: S,
+) -> Result<S::Output, ModelBankFieldStreamError<S::Error>>
+where
+    R: Read,
+    S: StagedModelFieldLayoutSink,
+{
+    let layout = validate_model_bank_role_layout(expected, layers_per_bank, weight_bank_count)?;
     let bank_elements = u64::from(layout.layers_per_bank)
         .checked_mul(expected.bytes_per_layer)
         .ok_or(ModelBankError::SizeOverflow)?;
@@ -623,12 +718,32 @@ where
         Err(ModelBankConsumerError::Consumer(error)) => return Err(error),
     }
 
-    sink.finish_verified(VerifiedModelBankReceipt {
+    sink.finish_verified(VerifiedModelBankLayoutReceipt {
         manifest: *expected,
         layout,
-        identity: trusted_identity.clone(),
     })
     .map_err(ModelBankFieldStreamError::Sink)
+}
+
+fn validate_model_bank_role_layout(
+    expected: &ModelBankManifest,
+    layers_per_bank: u32,
+    weight_bank_count: u32,
+) -> Result<ModelPcsRoleLayout, ModelBankError> {
+    expected.validate_shape()?;
+    if layers_per_bank == 0 || weight_bank_count == 0 {
+        return Err(ModelBankError::LayerShape);
+    }
+    let partitioned_layers = layers_per_bank
+        .checked_mul(weight_bank_count)
+        .ok_or(ModelBankError::SizeOverflow)?;
+    if partitioned_layers != expected.layers {
+        return Err(ModelBankError::LayerShape);
+    }
+    Ok(ModelPcsRoleLayout {
+        layers_per_bank,
+        weight_bank_count,
+    })
 }
 
 fn compare_manifests(
@@ -958,6 +1073,7 @@ mod tests {
         receipt_manifest: Option<ModelBankManifest>,
         receipt_layout: Option<ModelPcsRoleLayout>,
         receipt_identity: Option<ModelPcsIdentity>,
+        eof_seen_at_finish: Option<bool>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1032,6 +1148,55 @@ mod tests {
             state.receipt_manifest = Some(*receipt.manifest());
             state.receipt_layout = Some(receipt.layout());
             state.receipt_identity = Some(receipt.identity().clone());
+            Ok(())
+        }
+    }
+
+    struct LayoutRecordingSink {
+        state: Rc<RefCell<RecordingSinkState>>,
+        eof_seen: Option<Rc<Cell<bool>>>,
+    }
+
+    impl LayoutRecordingSink {
+        fn new(state: Rc<RefCell<RecordingSinkState>>) -> Self {
+            Self {
+                state,
+                eof_seen: None,
+            }
+        }
+
+        fn requiring_eof(state: Rc<RefCell<RecordingSinkState>>, eof_seen: Rc<Cell<bool>>) -> Self {
+            Self {
+                state,
+                eof_seen: Some(eof_seen),
+            }
+        }
+    }
+
+    impl StagedModelFieldLayoutSink for LayoutRecordingSink {
+        type Error = RecordingSinkError;
+        type Output = ();
+
+        fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+            self.state.borrow_mut().chunks.push(RecordedFieldChunk {
+                role: chunk.role,
+                role_offset: chunk.role_offset,
+                role_elements: chunk.role_elements,
+                elements: chunk.elements.to_vec(),
+            });
+            Ok(())
+        }
+
+        fn finish_verified(
+            self,
+            receipt: VerifiedModelBankLayoutReceipt,
+        ) -> Result<Self::Output, Self::Error> {
+            let mut state = self.state.borrow_mut();
+            state.finish_attempts += 1;
+            state.published = true;
+            state.receipt_manifest = Some(*receipt.manifest());
+            state.receipt_layout = Some(receipt.layout());
+            state.eof_seen_at_finish = self.eof_seen.map(|seen| seen.get());
             Ok(())
         }
     }
@@ -1375,6 +1540,208 @@ mod tests {
                 .map(|value| GOLDILOCKS_MODULUS - (125 - value))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn layout_field_stream_matches_legacy_role_order_and_encoding() {
+        let (built, identity) = staged_fixture();
+        let legacy_state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        verify_model_bank_into_staged_field_sink(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            &identity,
+            RecordingSink::new(Rc::clone(&legacy_state)),
+        )
+        .unwrap();
+
+        let layout_state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        verify_model_bank_into_staged_field_layout_sink(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            identity.layers_per_bank,
+            u32::try_from(identity.weight_bank_commitments.len()).unwrap(),
+            LayoutRecordingSink::new(Rc::clone(&layout_state)),
+        )
+        .unwrap();
+
+        let legacy_state = legacy_state.borrow();
+        let layout_state = layout_state.borrow();
+        assert_eq!(
+            layout_state.chunks.as_slice(),
+            legacy_state.chunks.as_slice()
+        );
+        assert!(layout_state.published);
+        assert_eq!(layout_state.finish_attempts, 1);
+        assert_eq!(layout_state.receipt_manifest, Some(built.manifest));
+        assert_eq!(layout_state.receipt_layout, legacy_state.receipt_layout);
+        assert_eq!(layout_state.receipt_identity, None);
+    }
+
+    #[test]
+    fn layout_field_stream_rejects_alternate_partition_before_reader_access() {
+        struct PanicReader;
+
+        impl Read for PanicReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                panic!("invalid layout partition must reject before reading")
+            }
+        }
+
+        let (built, _) = staged_fixture();
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_layout_sink(
+                PanicReader,
+                &built.manifest,
+                3,
+                2,
+                LayoutRecordingSink::new(Rc::clone(&state)),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::LayerShape
+            ))
+        ));
+        assert!(state.borrow().chunks.is_empty());
+        assert_eq!(state.borrow().finish_attempts, 0);
+        assert!(!state.borrow().published);
+    }
+
+    #[test]
+    fn layout_field_stream_publishes_only_after_roots_and_eof() {
+        struct EofTrackingReader {
+            cursor: Cursor<Vec<u8>>,
+            eof_seen: Rc<Cell<bool>>,
+        }
+
+        impl Read for EofTrackingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.cursor.read(buffer)?;
+                if read == 0 {
+                    self.eof_seen.set(true);
+                }
+                Ok(read)
+            }
+        }
+
+        fn tracked_reader(bytes: Vec<u8>) -> (EofTrackingReader, Rc<Cell<bool>>) {
+            let eof_seen = Rc::new(Cell::new(false));
+            (
+                EofTrackingReader {
+                    cursor: Cursor::new(bytes),
+                    eof_seen: Rc::clone(&eof_seen),
+                },
+                eof_seen,
+            )
+        }
+
+        let (built, identity) = staged_fixture();
+        let bank_count = u32::try_from(identity.weight_bank_commitments.len()).unwrap();
+
+        let (reader, eof_seen) = tracked_reader(built.bytes.clone());
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        verify_model_bank_into_staged_field_layout_sink(
+            reader,
+            &built.manifest,
+            identity.layers_per_bank,
+            bank_count,
+            LayoutRecordingSink::requiring_eof(Rc::clone(&state), Rc::clone(&eof_seen)),
+        )
+        .unwrap();
+        assert!(eof_seen.get());
+        assert!(state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 1);
+        assert_eq!(state.borrow().eof_seen_at_finish, Some(true));
+
+        let mut wrong_payload = built.bytes.clone();
+        wrong_payload[MODEL_BANK_HEADER_BYTES] ^= 1;
+        let (reader, eof_seen) = tracked_reader(wrong_payload);
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_layout_sink(
+                reader,
+                &built.manifest,
+                identity.layers_per_bank,
+                bank_count,
+                LayoutRecordingSink::requiring_eof(Rc::clone(&state), Rc::clone(&eof_seen),),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::RawRootMismatch
+            ))
+        ));
+        assert!(!eof_seen.get());
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+
+        let mut wrong_layer_manifest = built.manifest;
+        wrong_layer_manifest.layer_roots_aggregate[0] ^= 1;
+        let mut wrong_layer_header = built.bytes.clone();
+        wrong_layer_header[..MODEL_BANK_HEADER_BYTES]
+            .copy_from_slice(&encode_header(&wrong_layer_manifest));
+        let (reader, eof_seen) = tracked_reader(wrong_layer_header);
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_layout_sink(
+                reader,
+                &wrong_layer_manifest,
+                identity.layers_per_bank,
+                bank_count,
+                LayoutRecordingSink::requiring_eof(Rc::clone(&state), Rc::clone(&eof_seen),),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::LayerRootsAggregateMismatch
+            ))
+        ));
+        assert!(!eof_seen.get());
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+
+        let mut trailing = built.bytes.clone();
+        trailing.push(0);
+        let (reader, eof_seen) = tracked_reader(trailing);
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+        assert!(matches!(
+            verify_model_bank_into_staged_field_layout_sink(
+                reader,
+                &built.manifest,
+                identity.layers_per_bank,
+                bank_count,
+                LayoutRecordingSink::requiring_eof(Rc::clone(&state), Rc::clone(&eof_seen),),
+            ),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::TrailingBytes
+            ))
+        ));
+        assert!(!eof_seen.get());
+        assert!(!state.borrow().published);
+        assert_eq!(state.borrow().finish_attempts, 0);
+    }
+
+    #[test]
+    fn legacy_staged_field_stream_remains_receipt_compatible() {
+        let (built, identity) = staged_fixture();
+        let state = Rc::new(RefCell::new(RecordingSinkState::default()));
+
+        verify_model_bank_into_staged_field_sink(
+            Cursor::new(&built.bytes),
+            &built.manifest,
+            &identity,
+            RecordingSink::new(Rc::clone(&state)),
+        )
+        .unwrap();
+
+        let state = state.borrow();
+        assert_eq!(MODEL_BANK_HEADER_BYTES, 184);
+        assert_eq!(state.receipt_manifest, Some(built.manifest));
+        assert_eq!(state.receipt_identity.as_ref(), Some(&identity));
+        assert_eq!(
+            state.receipt_layout,
+            Some(ModelPcsRoleLayout {
+                layers_per_bank: identity.layers_per_bank,
+                weight_bank_count: u32::try_from(identity.weight_bank_commitments.len()).unwrap(),
+            })
+        );
+        assert!(state.published);
+        assert_eq!(state.finish_attempts, 1);
     }
 
     #[test]

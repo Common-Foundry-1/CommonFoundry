@@ -9,6 +9,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+#[cfg(any(test, feature = "whir-prototype"))]
 use std::sync::{Arc, Mutex};
 
 use dory_pcs::primitives::{
@@ -27,18 +28,11 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
         BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        BlsDoryReleasedCompactSource, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_existing_compact_artifact,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_compact_row_source_with_scratch,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
-        prove_bls_dory_deferred_opening_sets, source_artifact_spec, verify_bls_dory_openings,
+        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
-    dory_bls12_381_compact_artifact::{
-        BlsDoryCompactArtifact, BlsDoryCompactArtifactSpec, BlsDoryGroupedCompactArtifactWriter,
-    },
-    dory_bls12_381_execution_artifact::{
-        BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
-        BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorColumn,
-    },
+    dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
     dory_bls12_381_fold_artifact::{
         BlsDoryFoldArtifact, BlsDoryFoldArtifactError, BlsDoryFoldArtifactSpec,
         BlsDoryFoldArtifactWriter,
@@ -49,6 +43,21 @@ use crate::{
     dory_bls12_381_streaming::BlsDoryRowSource,
     structured_transition::{
         structured_transition_range_specs, validate_streaming_witness, validate_witness,
+    },
+};
+
+#[cfg(any(test, feature = "whir-prototype"))]
+use crate::{
+    dory_bls12_381_aggregate::{
+        BlsDoryReleasedCompactSource, commit_bls_dory_existing_compact_artifact,
+        source_artifact_spec,
+    },
+    dory_bls12_381_compact_artifact::{
+        BlsDoryCompactArtifact, BlsDoryGroupedCompactArtifactWriter,
+    },
+    dory_bls12_381_execution_artifact::{
+        BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
+        BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorColumn,
     },
 };
 
@@ -93,6 +102,7 @@ const NEGATIVE: usize = 9;
 const ACTIVATION: usize = STRUCTURED_TRANSITION_ACTIVATION_ORACLE;
 const SHIFTED_ACCUMULATOR: usize = 11;
 const TRANSITION_FOLD_SLOTS: usize = 16;
+#[cfg(any(test, feature = "whir-prototype"))]
 const TRANSITION_GROUPED_COMPACT_CHUNK_CELLS: usize = 1 << 17;
 pub(crate) const TRANSITION_SIGNED_WORD_SELECTORS: u64 =
     (1u64 << ACCUMULATOR) | (1u64 << ACTIVATION);
@@ -490,6 +500,7 @@ pub(crate) fn prove_bls_dory_transition_deferred_at_variables_with_scratch(
     )
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_bls_dory_transition_deferred_from_execution_artifact_with_scratch(
     binding: &[u8],
@@ -563,6 +574,7 @@ pub(crate) fn prove_bls_dory_transition_deferred_from_execution_artifact_with_sc
     )
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn regenerate_bls_dory_transition_compact_source_from_execution_artifact_with_scratch(
     statement: StructuredTransitionStatement,
@@ -618,11 +630,13 @@ pub(crate) fn regenerate_bls_dory_transition_compact_source_from_execution_artif
     Ok(grouped.artifact)
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 struct BuiltGroupedTransitionArtifact {
     artifact: Arc<BlsDoryCompactArtifact>,
     derived_cells: usize,
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 fn build_grouped_transition_compact_artifact_with_scratch(
     source: &mut BlsDoryTransitionWitnessRowSource<'_>,
     packed_nu: usize,
@@ -640,6 +654,7 @@ fn build_grouped_transition_compact_artifact_with_scratch(
     )
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 fn build_grouped_transition_compact_artifact_with_chunk_cells(
     source: &mut BlsDoryTransitionWitnessRowSource<'_>,
     packed_nu: usize,
@@ -1585,13 +1600,14 @@ pub(crate) fn derive_transition_regular_row_from_mask(
     })
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum BlsDoryExecutionAccumulatorTransition {
     Initialization,
     Bank(usize),
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 struct BlsDoryExecutionAccumulatorReader<'a> {
     artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
     context: BlsDoryExecutionAccumulatorArtifactContext,
@@ -1604,6 +1620,7 @@ struct BlsDoryExecutionAccumulatorReader<'a> {
     cache: Vec<i32>,
 }
 
+#[cfg(any(test, feature = "whir-prototype"))]
 impl<'a> BlsDoryExecutionAccumulatorReader<'a> {
     fn new(
         statement: StructuredTransitionStatement,
@@ -1704,6 +1721,7 @@ enum TransitionWitnessBacking<'a> {
         mask_polynomial: &'a StructuredMaskPolynomial,
         accumulators: &'a [i64],
     },
+    #[cfg(any(test, feature = "whir-prototype"))]
     ExecutionArtifact {
         mask_polynomial: &'a StructuredMaskPolynomial,
         reader: Box<Mutex<BlsDoryExecutionAccumulatorReader<'a>>>,
@@ -1761,6 +1779,7 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         )
     }
 
+    #[cfg(any(test, feature = "whir-prototype"))]
     pub(crate) fn new_from_execution_artifact(
         statement: StructuredTransitionStatement,
         mask_polynomial: &'a StructuredMaskPolynomial,
@@ -1870,6 +1889,7 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         self.explicit_scalars
     }
 
+    #[cfg(any(test, feature = "whir-prototype"))]
     fn execution_derived_regular_row(
         &mut self,
         index: usize,
@@ -1955,6 +1975,7 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
                 derive_transition_regular_row_from_mask(self.statement, index, accumulator, mask)?
                     .word(oracle)
             }
+            #[cfg(any(test, feature = "whir-prototype"))]
             TransitionWitnessBacking::ExecutionArtifact {
                 mask_polynomial,
                 reader,
@@ -2010,6 +2031,7 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
                     mask,
                 )?)
             }
+            #[cfg(any(test, feature = "whir-prototype"))]
             TransitionWitnessBacking::ExecutionArtifact {
                 mask_polynomial,
                 reader,
@@ -2263,6 +2285,7 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
         if output.len() != self.columns || end > self.literal_scalar_count() {
             return Err(BlsDoryTransitionError::InvalidDimensions);
         }
+        #[cfg(any(test, feature = "whir-prototype"))]
         if let TransitionWitnessBacking::ExecutionArtifact {
             mask_polynomial,
             reader,
@@ -2308,6 +2331,7 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
         if output.len() != self.columns || start < self.literal_scalar_count() {
             return Err(BlsDoryTransitionError::InvalidDimensions);
         }
+        #[cfg(any(test, feature = "whir-prototype"))]
         if let TransitionWitnessBacking::ExecutionArtifact {
             mask_polynomial,
             reader,

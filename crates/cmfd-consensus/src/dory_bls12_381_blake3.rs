@@ -211,8 +211,10 @@ const BLS_DORY_BLAKE3_EXECUTION_AUXILIARY_TABLES: usize = 1 + 3 + 8;
 const BLS_DORY_BLAKE3_ADJACENCY_AUXILIARY_TABLES: usize = 3;
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_CONTEXT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundContext/v1";
+#[cfg(feature = "whir-prototype")]
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_ROOT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundRoot/v1";
+#[cfg(feature = "whir-prototype")]
 const BLS_DORY_BLAKE3_ADJACENCY_ROUND_ROOT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3AdjacencyRoundRoot/v1";
 

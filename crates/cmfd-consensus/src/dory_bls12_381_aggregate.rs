@@ -2229,6 +2229,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
 /// second coefficient file. The artifact's source context binds its setup and
 /// matrix layout; its complete live file is authenticated while coefficients
 /// are decoded into bounded row chunks.
+#[cfg(any(test, feature = "whir-prototype"))]
 pub(crate) fn commit_bls_dory_existing_compact_artifact(
     artifact: Arc<BlsDoryCompactArtifact>,
     nu: usize,

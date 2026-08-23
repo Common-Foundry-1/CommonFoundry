@@ -606,7 +606,7 @@ impl DoryV3ModelIdentityV1 {
 
     /// Require the generic model-bank PCS fields to carry this exact Dory suite
     /// and commitment root, in addition to matching the model bytes and shape.
-    fn verify_manifest(
+    pub(crate) fn verify_manifest(
         &self,
         manifest: &ModelBankManifest,
     ) -> Result<(), DoryV3ModelIdentityError> {

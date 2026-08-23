@@ -7,8 +7,8 @@
 //!
 //! The component parameter digests use explicit labelled descriptors. Values
 //! with implemented owners are consumed directly or checked by the owner-map
-//! test. Values that describe future V3 transcripts, layout V5, binding V2, or
-//! Record V2 remain explicit activation blockers until those owners exist.
+//! test. Values that describe future V3 transcripts, layout V5, or binding V2
+//! remain explicit activation blockers until those owners exist.
 
 use std::{fmt, sync::LazyLock};
 
@@ -116,7 +116,7 @@ pub const DORY_V3_SUITE_ACTIVATION_READY: bool = false;
 pub const DORY_V3_SUITE_ACTIVATION_BLOCKERS: &[&str] = &[
     "dedicated V3 challenge, mask, output, and work transcripts are not wired",
     "shared layout V5 and fixed-model binding V2 are not implemented",
-    "algebraic binding V2 and model commitment record V2 are not implemented",
+    "algebraic binding V2 is not implemented",
     "the canonical production model bank ceremony has not been independently reproduced and its V2 record pinned",
     "the unchanged production n=33 proof has not passed the benchmark and review gates",
 ];

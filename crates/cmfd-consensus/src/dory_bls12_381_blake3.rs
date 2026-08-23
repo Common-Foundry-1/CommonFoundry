@@ -206,6 +206,8 @@ const BLS_DORY_BLAKE3_EXECUTION_ROUND_CONTEXT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundContext/v1";
 const BLS_DORY_BLAKE3_EXECUTION_ROUND_ROOT_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/BlsDoryBlake3ExecutionRoundRoot/v1";
+const BLS_DORY_BLAKE3_ADJACENCY_ROUND_ROOT_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/BlsDoryBlake3AdjacencyRoundRoot/v1";
 
 const _: () = {
     assert!(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS == 746);
@@ -475,6 +477,16 @@ fn bls_dory_blake3_execution_round_context(root_lineage: [u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 #[path = "dory_bls12_381_blake3_execution_round_tests.rs"]
 mod execution_round_artifact_tests;
+
+#[cfg(feature = "whir-prototype")]
+#[path = "dory_bls12_381_blake3_adjacency_round.rs"]
+mod adjacency_round_artifact;
+#[cfg(feature = "whir-prototype")]
+use adjacency_round_artifact::{
+    BlsDoryBlake3AdjacencyRoundArtifact, BlsDoryBlake3AdjacencyRoundArtifactWriter,
+    BlsDoryBlake3AdjacencyRoundParent, BlsDoryBlake3AdjacencyRoundRow,
+    fold_native_blake3_adjacency_artifact,
+};
 
 /// Main words, the native accumulator, and post-challenge inverses require
 /// three adjacency openings. Preprocessing is not part of adjacency.
@@ -1097,6 +1109,62 @@ impl PreparedBlsDoryBlake3Sources {
         )?;
         emit(final_row, &terminal)?;
         Ok(())
+    }
+
+    /// Stream the 580 adjacency terminals in canonical dense-table order:
+    /// main local, main next, inverse local, then inverse next.
+    ///
+    /// Both inverse tables authenticate and snapshot before the execution-row
+    /// stream can invoke the first external callback. Callback effects remain
+    /// provisional until the complete execution stream returns `Ok(())`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn for_each_authenticated_adjacency_row(
+        &mut self,
+        maximum_block_rows: usize,
+        mut emit: impl FnMut(
+            usize,
+            &[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS],
+        ) -> Result<(), BlsDoryAggregateError>,
+    ) -> Result<(), BlsDoryAggregateError> {
+        let trace_rows = self.binding.trace_rows;
+        let inverse_scalars = trace_rows
+            .checked_mul(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        if maximum_block_rows == 0
+            || !trace_rows.is_power_of_two()
+            || self.sources.inverse.explicit_coefficient_count() != inverse_scalars
+        {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+
+        let mut inverse_local = Vec::new();
+        inverse_local
+            .try_reserve_exact(trace_rows)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        inverse_local.resize(trace_rows, BlsDoryFr::zero());
+        let mut inverse_next = Vec::new();
+        inverse_next
+            .try_reserve_exact(trace_rows)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        inverse_next.resize(trace_rows, BlsDoryFr::zero());
+        self.sources
+            .inverse
+            .for_each_explicit_coefficient(|index, coefficient| {
+                if index < trace_rows {
+                    inverse_local[index] = coefficient;
+                } else {
+                    inverse_next[index - trace_rows] = coefficient;
+                }
+            })?;
+
+        let mut terminal = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS];
+        self.for_each_authenticated_execution_row(maximum_block_rows, |row, execution| {
+            terminal[..2 * BLS_DORY_BLAKE3_MAIN_WIDTH]
+                .copy_from_slice(&execution[..2 * BLS_DORY_BLAKE3_MAIN_WIDTH]);
+            terminal[2 * BLS_DORY_BLAKE3_MAIN_WIDTH] = inverse_local[row];
+            terminal[2 * BLS_DORY_BLAKE3_MAIN_WIDTH + 1] = inverse_next[row];
+            emit(row, &terminal)
+        })
     }
 
     fn into_committed_sources(
@@ -4243,6 +4311,414 @@ fn native_blake3_row_index_evaluation(point: &[BlsDoryFr]) -> Option<BlsDoryFr> 
                 value + BlsDoryFr::from_u64(1_u64 << variable) * *coordinate
             }),
     )
+}
+
+#[cfg(feature = "whir-prototype")]
+struct BlsDoryBlake3AdjacencyAuxiliaryTables {
+    equality: Vec<BlsDoryFr>,
+    row_index: Vec<BlsDoryFr>,
+    first: Vec<BlsDoryFr>,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryBlake3AdjacencyAuxiliaryTables {
+    fn new(trace_rows: usize, equality_point: &[BlsDoryFr]) -> Result<Self, BlsDoryAggregateError> {
+        if !trace_rows.is_power_of_two() || equality_point.len() != trace_rows.ilog2() as usize {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        let mut equality = allocate_native_blake3_auxiliary_table(trace_rows, BlsDoryFr::zero())?;
+        equality[0] = BlsDoryFr::from_u64(1);
+        let mut active = 1usize;
+        for coordinate in equality_point {
+            for index in (0..active).rev() {
+                let value = equality[index];
+                equality[index] = value * (BlsDoryFr::from_u64(1) - *coordinate);
+                equality[index + active] = value * *coordinate;
+            }
+            active = active
+                .checked_mul(2)
+                .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        }
+        if active != trace_rows {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+
+        let mut row_index = allocate_native_blake3_auxiliary_table(trace_rows, BlsDoryFr::zero())?;
+        for (row, value) in row_index.iter_mut().enumerate() {
+            let row = u64::try_from(row).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+            *value = BlsDoryFr::from_u64(row);
+        }
+        let mut first = allocate_native_blake3_auxiliary_table(trace_rows, BlsDoryFr::zero())?;
+        first[0] = BlsDoryFr::from_u64(1);
+        Ok(Self {
+            equality,
+            row_index,
+            first,
+        })
+    }
+
+    fn active_rows(&self) -> Result<usize, BlsDoryAggregateError> {
+        let rows = self.equality.len();
+        if rows == 0 || self.row_index.len() != rows || self.first.len() != rows {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        Ok(rows)
+    }
+
+    fn fold(&mut self, challenge: BlsDoryFr) -> Result<(), BlsDoryAggregateError> {
+        let rows = self.active_rows()?;
+        if rows < 2 || rows & 1 != 0 {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        fold_native_blake3_auxiliary_table(&mut self.equality, challenge);
+        fold_native_blake3_auxiliary_table(&mut self.row_index, challenge);
+        fold_native_blake3_auxiliary_table(&mut self.first, challenge);
+        Ok(())
+    }
+
+    fn terminal(&self) -> Result<(BlsDoryFr, BlsDoryFr, BlsDoryFr), BlsDoryAggregateError> {
+        if self.active_rows()? != 1 {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        Ok((self.equality[0], self.row_index[0], self.first[0]))
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn for_each_authenticated_adjacency_root_pair(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    maximum_block_rows: usize,
+    mut visitor: impl FnMut(
+        usize,
+        &[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS],
+        &[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS],
+    ) -> Result<(), BlsDoryAggregateError>,
+) -> Result<(), BlsDoryAggregateError> {
+    let trace_rows = prepared.binding.trace_rows;
+    if trace_rows < 2 || !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let mut lower = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS];
+    let mut visited = 0usize;
+    let mut pair_index = 0usize;
+    prepared.for_each_authenticated_adjacency_row(maximum_block_rows, |row, terminal| {
+        if row != visited {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        if row & 1 == 0 {
+            lower.copy_from_slice(terminal);
+        } else {
+            visitor(pair_index, &lower, terminal)?;
+            pair_index += 1;
+        }
+        visited += 1;
+        Ok(())
+    })?;
+    if visited != trace_rows || pair_index != trace_rows / 2 {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_accumulate_adjacency_pair(
+    pair_index: usize,
+    lower: &[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS],
+    upper: &[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS],
+    auxiliary: &BlsDoryBlake3AdjacencyAuxiliaryTables,
+    relation: BlsDoryBlake3AdjacencyRelation,
+    evaluations: &mut [BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1],
+) -> Result<(), BlsDoryAggregateError> {
+    let offset = pair_index
+        .checked_mul(2)
+        .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+    let rows = auxiliary.active_rows()?;
+    if offset + 1 >= rows {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    let mut terminal = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS];
+    for (sample_index, evaluation) in evaluations.iter_mut().enumerate() {
+        let sample = BlsDoryFr::from_u64(sample_index as u64);
+        for column in 0..BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS {
+            terminal[column] = lower[column] + sample * (upper[column] - lower[column]);
+        }
+        let interpolate =
+            |table: &[BlsDoryFr]| table[offset] + sample * (table[offset + 1] - table[offset]);
+        *evaluation = *evaluation
+            + native_blake3_adjacency_relation_value(
+                &terminal,
+                interpolate(&auxiliary.row_index),
+                interpolate(&auxiliary.first),
+                interpolate(&auxiliary.equality),
+                relation,
+            )
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn evaluate_native_blake3_adjacency_root_round(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    maximum_block_rows: usize,
+    auxiliary: &BlsDoryBlake3AdjacencyAuxiliaryTables,
+    relation: BlsDoryBlake3AdjacencyRelation,
+) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
+    let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1];
+    for_each_authenticated_adjacency_root_pair(
+        prepared,
+        maximum_block_rows,
+        |pair_index, lower, upper| {
+            native_blake3_accumulate_adjacency_pair(
+                pair_index,
+                lower,
+                upper,
+                auxiliary,
+                relation,
+                &mut evaluations,
+            )
+        },
+    )?;
+    Ok(evaluations)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn for_each_authenticated_adjacency_round_pair(
+    artifact: &BlsDoryBlake3AdjacencyRoundArtifact,
+    mut visitor: impl FnMut(
+        usize,
+        &BlsDoryBlake3AdjacencyRoundRow,
+        &BlsDoryBlake3AdjacencyRoundRow,
+    ) -> Result<(), BlsDoryAggregateError>,
+) -> Result<(), BlsDoryAggregateError> {
+    let mut pair_index = 0usize;
+    let mut visitor_error = None;
+    let traversal = artifact.for_each_row_pair(|lower, upper| {
+        match visitor(pair_index, lower, upper) {
+            Ok(()) => pair_index += 1,
+            Err(error) => {
+                visitor_error = Some(error);
+                return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+            }
+        }
+        Ok(())
+    });
+    if let Some(error) = visitor_error {
+        return Err(error);
+    }
+    traversal.map_err(native_blake3_fold_artifact_error)?;
+    let expected_pairs = usize::try_from(artifact.active_rows() / 2)
+        .map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    if pair_index != expected_pairs {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn evaluate_native_blake3_adjacency_artifact_round(
+    artifact: &BlsDoryBlake3AdjacencyRoundArtifact,
+    auxiliary: &BlsDoryBlake3AdjacencyAuxiliaryTables,
+    relation: BlsDoryBlake3AdjacencyRelation,
+) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
+    let artifact_rows = usize::try_from(artifact.active_rows())
+        .map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    if artifact_rows != auxiliary.active_rows()? {
+        return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+    }
+    let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1];
+    for_each_authenticated_adjacency_round_pair(artifact, |pair_index, lower, upper| {
+        native_blake3_accumulate_adjacency_pair(
+            pair_index,
+            lower,
+            upper,
+            auxiliary,
+            relation,
+            &mut evaluations,
+        )
+    })?;
+    Ok(evaluations)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn fold_native_blake3_adjacency_root(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    maximum_block_rows: usize,
+    scratch_directory: &std::path::Path,
+    root_lineage: [u8; 32],
+    challenge: BlsDoryFr,
+) -> Result<BlsDoryBlake3AdjacencyRoundArtifact, BlsDoryAggregateError> {
+    let active_rows = prepared.binding.trace_rows / 2;
+    let active_rows =
+        u64::try_from(active_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    let mut writer = BlsDoryBlake3AdjacencyRoundArtifactWriter::create(
+        scratch_directory,
+        active_rows,
+        0,
+        BlsDoryBlake3AdjacencyRoundParent::Root(root_lineage),
+    )
+    .map_err(native_blake3_fold_artifact_error)?;
+    let mut folded = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS];
+    for_each_authenticated_adjacency_root_pair(
+        prepared,
+        maximum_block_rows,
+        |_pair_index, lower, upper| {
+            for column in 0..BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS {
+                folded[column] = lower[column] + challenge * (upper[column] - lower[column]);
+            }
+            writer
+                .write_row(&folded)
+                .map_err(native_blake3_fold_artifact_error)
+        },
+    )?;
+    writer.finish().map_err(native_blake3_fold_artifact_error)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_adjacency_round_root_lineage(
+    transcript_digest: [u8; 32],
+    trace_rows: usize,
+) -> Result<[u8; 32], BlsDoryAggregateError> {
+    if transcript_digest == [0; 32] || !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let trace_rows =
+        u64::try_from(trace_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
+    let mut hasher = blake3::Hasher::new_derive_key(BLS_DORY_BLAKE3_ADJACENCY_ROUND_ROOT_DOMAIN);
+    hasher.update(&transcript_digest);
+    hasher.update(&trace_rows.to_le_bytes());
+    hasher.update(&(BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS as u64).to_le_bytes());
+    let digest = *hasher.finalize().as_bytes();
+    if digest == [0; 32] {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    Ok(digest)
+}
+
+/// Produce the native row-adjacency sumcheck without materializing its
+/// 580-column terminal matrix. The authenticated streamed root and every
+/// subsequent round artifact are each read twice: once to evaluate the round
+/// polynomial and once to transactionally write the challenge-folded child.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn prove_native_blake3_adjacency_sumcheck_out_of_core(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+) -> Result<BlsDoryBlake3AdjacencySumcheckProof, BlsDoryAggregateError> {
+    if maximum_block_rows == 0 || !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let air = NarrowBlake3Air::new(&native_blake3_statement_from_bridge(bridge))
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let trace_rows = air.trace_rows();
+    if trace_rows != prepared.binding.trace_rows || !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let variables = trace_rows.ilog2() as usize;
+    let trace_rows_field = BlsDoryFr::from_u64(
+        u64::try_from(trace_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+    );
+    let commitments = prepared.commitments();
+    let adjacency_sources = commitments.adjacency_sources();
+    let mut transcript =
+        native_blake3_adjacency_transcript(bridge, trace_rows, &adjacency_sources)?;
+    let compression = transcript.challenge_scalar(b"row-compression");
+    let alpha = transcript.challenge_scalar(b"lookup-alpha");
+    transcript.append_bytes(b"inverse-source-count", &1_u64.to_le_bytes());
+    append_native_blake3_source_descriptor(
+        &mut transcript,
+        BlsDoryBlake3SourceRole::Inverse,
+        BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES,
+        commitments.commitment(BlsDoryBlake3SourceRole::Inverse),
+    );
+    let local_mixing = [
+        transcript.challenge_scalar(b"local-mixing"),
+        transcript.challenge_scalar(b"local-mixing"),
+    ];
+    let rational_mixing = transcript.challenge_scalar(b"rational-mixing");
+    let equality_point = native_blake3_cell_point(&mut transcript, variables);
+    let root_lineage = native_blake3_adjacency_round_root_lineage(transcript.digest(), trace_rows)?;
+    let relation = BlsDoryBlake3AdjacencyRelation {
+        trace_rows: trace_rows_field,
+        compression,
+        alpha,
+        local_mixing,
+        rational_mixing,
+    };
+    let mut auxiliary = BlsDoryBlake3AdjacencyAuxiliaryTables::new(trace_rows, &equality_point)?;
+    let mut rounds = Vec::new();
+    rounds
+        .try_reserve_exact(variables)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    let mut claim = BlsDoryFr::zero();
+    let mut current_artifact = None;
+
+    for round_index in 0..variables {
+        let evaluations = if let Some(parent) = current_artifact.as_ref() {
+            evaluate_native_blake3_adjacency_artifact_round(parent, &auxiliary, relation)?
+        } else {
+            evaluate_native_blake3_adjacency_root_round(
+                prepared,
+                maximum_block_rows,
+                &auxiliary,
+                relation,
+            )?
+        };
+        if evaluations[0] + evaluations[1] != claim {
+            return Err(BlsDoryAggregateError::SumcheckFailed);
+        }
+        native_blake3_absorb_sumcheck_round(&mut transcript, round_index, &evaluations);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = native_blake3_evaluate_samples(
+            &evaluations,
+            BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1,
+            challenge,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+
+        let child = if let Some(parent) = current_artifact.as_ref() {
+            fold_native_blake3_adjacency_artifact(parent, scratch_directory, challenge)
+                .map_err(native_blake3_fold_artifact_error)?
+        } else {
+            fold_native_blake3_adjacency_root(
+                prepared,
+                maximum_block_rows,
+                scratch_directory,
+                root_lineage,
+                challenge,
+            )?
+        };
+        auxiliary.fold(challenge)?;
+        current_artifact = Some(child);
+        rounds.push(evaluations.to_vec());
+    }
+
+    let terminal = current_artifact
+        .as_ref()
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?
+        .terminal_row()
+        .map_err(native_blake3_fold_artifact_error)?;
+    let (equality, row_index, first) = auxiliary.terminal()?;
+    let expected =
+        native_blake3_adjacency_relation_value(&terminal, row_index, first, equality, relation)
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    if claim != expected {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    native_blake3_absorb_terminal(&mut transcript, &terminal);
+    let proof = BlsDoryBlake3AdjacencySumcheckProof {
+        rounds,
+        terminal_evaluations: terminal.to_vec(),
+        transcript_digest: transcript.digest(),
+    };
+    let verified =
+        verify_native_blake3_adjacency_sumcheck(&proof, trace_rows, bridge, &commitments)?;
+    if verified.point.len() != variables || verified.transcript_digest != proof.transcript_digest {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    Ok(proof)
 }
 
 #[cfg(feature = "whir-prototype")]
@@ -11561,6 +12037,212 @@ mod tests {
         assert_eq!(std::fs::read_dir(&round_scratch.0).unwrap().count(), 0);
         drop(prepared);
         assert_eq!(std::fs::read_dir(&source_scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn prepared_adjacency_rows_match_dense_order_across_blocks_and_wrap() {
+        let fixture = dense_blake3_fixture();
+        assert_eq!(fixture.air.trace_rows(), 1 << 8);
+        let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+        let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+        let source_scratch = Blake3ScratchDirectory::create();
+        let mut prepared = prepare_native_blake3_sources_at_layout(
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &source_scratch.0,
+        )
+        .unwrap();
+        let commitments = prepared.commitments();
+        let source_tables = dense_adjacency_source_tables(&fixture.tables);
+        let mut transcript = native_blake3_adjacency_transcript(
+            &fixture.bridge,
+            fixture.air.trace_rows(),
+            &commitments.adjacency_sources(),
+        )
+        .unwrap();
+        let compression = transcript.challenge_scalar(b"row-compression");
+        let alpha = transcript.challenge_scalar(b"lookup-alpha");
+        let inverse_tables =
+            dense_adjacency_inverse_tables(&source_tables, compression, alpha).unwrap();
+        let mut seen = Vec::new();
+
+        prepared
+            .for_each_authenticated_adjacency_row(31, |row, terminal| {
+                for column in 0..2 * BLS_DORY_BLAKE3_MAIN_WIDTH {
+                    assert_eq!(terminal[column], source_tables[column][row]);
+                }
+                assert_eq!(
+                    terminal[2 * BLS_DORY_BLAKE3_MAIN_WIDTH],
+                    inverse_tables[0][row]
+                );
+                assert_eq!(
+                    terminal[2 * BLS_DORY_BLAKE3_MAIN_WIDTH + 1],
+                    inverse_tables[1][row]
+                );
+                seen.push(row);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(seen, (0..fixture.air.trace_rows()).collect::<Vec<_>>());
+        for boundary in [30, 31, 61, 62, fixture.air.trace_rows() - 1] {
+            assert_eq!(seen[boundary], boundary);
+        }
+        let final_row = fixture.air.trace_rows() - 1;
+        for column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
+            assert_eq!(
+                source_tables[BLS_DORY_BLAKE3_MAIN_WIDTH + column][final_row],
+                source_tables[column][0]
+            );
+        }
+
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&source_scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn out_of_core_adjacency_sumcheck_matches_dense_v2_at_256_rows() {
+        let fixture = dense_blake3_fixture();
+        assert_eq!(fixture.air.trace_rows(), 1 << 8);
+        let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+        let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+        let source_scratch = Blake3ScratchDirectory::create();
+        let round_scratch = Blake3ScratchDirectory::create();
+        let mut prepared = prepare_native_blake3_sources_at_layout(
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &source_scratch.0,
+        )
+        .unwrap();
+        let commitments = prepared.commitments();
+        let inverse_commitments = [*commitments.commitment(BlsDoryBlake3SourceRole::Inverse)];
+        let dense = prove_dense_adjacency_sumcheck_with_transcript(
+            dense_adjacency_source_tables(&fixture.tables),
+            &inverse_commitments,
+            native_blake3_adjacency_transcript(
+                &fixture.bridge,
+                fixture.air.trace_rows(),
+                &commitments.adjacency_sources(),
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+        let expected = BlsDoryBlake3AdjacencySumcheckProof {
+            rounds: dense.rounds,
+            terminal_evaluations: dense.terminal_evaluations,
+            transcript_digest: dense.transcript_digest,
+        };
+
+        let first = prove_native_blake3_adjacency_sumcheck_out_of_core(
+            &mut prepared,
+            &fixture.bridge,
+            &round_scratch.0,
+            31,
+        )
+        .unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(std::fs::read_dir(&round_scratch.0).unwrap().count(), 0);
+        let second = prove_native_blake3_adjacency_sumcheck_out_of_core(
+            &mut prepared,
+            &fixture.bridge,
+            &round_scratch.0,
+            17,
+        )
+        .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_dir(&round_scratch.0).unwrap().count(), 0);
+
+        let encode = |proof: &BlsDoryBlake3AdjacencySumcheckProof| {
+            encode_native_blake3_component(
+                BLS_DORY_BLAKE3_ADJACENCY_PROOF_MAGIC,
+                &inverse_commitments,
+                &proof.rounds,
+                BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1,
+                &proof.terminal_evaluations,
+                BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS,
+                proof.transcript_digest,
+                fixture.air.trace_rows().ilog2() as usize,
+            )
+            .unwrap()
+        };
+        let first_encoded = encode(&first);
+        assert_eq!(first_encoded, encode(&expected));
+        assert_eq!(first_encoded, encode(&second));
+        let decoded = decode_native_blake3_component(
+            &first_encoded,
+            BLS_DORY_BLAKE3_ADJACENCY_PROOF_MAGIC,
+            inverse_commitments.len(),
+            fixture.air.trace_rows().ilog2() as usize,
+            BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1,
+            BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS,
+        )
+        .unwrap();
+        assert_eq!(decoded.commitments, inverse_commitments);
+        assert_eq!(decoded.rounds, first.rounds);
+        assert_eq!(decoded.terminal_evaluations, first.terminal_evaluations);
+        assert_eq!(decoded.transcript_digest, first.transcript_digest);
+        let verified = verify_native_blake3_adjacency_sumcheck(
+            &first,
+            fixture.air.trace_rows(),
+            &fixture.bridge,
+            &commitments,
+        )
+        .unwrap();
+        assert_eq!(verified.point.len(), 8);
+        assert_eq!(verified.transcript_digest, first.transcript_digest);
+
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&source_scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn out_of_core_adjacency_sumcheck_rejects_corrupt_sources_without_scratch_leaks() {
+        for corrupt_inverse in [false, true] {
+            let fixture = dense_blake3_fixture();
+            let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+            let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+            let source_scratch = Blake3ScratchDirectory::create();
+            let round_scratch = Blake3ScratchDirectory::create();
+            let mut prepared = prepare_native_blake3_sources_at_layout(
+                &fixture.witness,
+                &fixture.bridge,
+                layout,
+                &setup,
+                &source_scratch.0,
+            )
+            .unwrap();
+            let path = if corrupt_inverse {
+                prepared
+                    .sources
+                    .inverse
+                    .coefficient_artifact_path()
+                    .unwrap()
+                    .to_path_buf()
+            } else {
+                prepared.main_transpose.path().to_path_buf()
+            };
+            flip_file_byte(&path, 100).unwrap();
+            assert!(matches!(
+                prove_native_blake3_adjacency_sumcheck_out_of_core(
+                    &mut prepared,
+                    &fixture.bridge,
+                    &round_scratch.0,
+                    31,
+                ),
+                Err(BlsDoryAggregateError::ProverStorage)
+            ));
+            assert_eq!(std::fs::read_dir(&round_scratch.0).unwrap().count(), 0);
+            drop(prepared);
+            assert_eq!(std::fs::read_dir(&source_scratch.0).unwrap().count(), 0);
+        }
     }
 
     #[test]

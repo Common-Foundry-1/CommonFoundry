@@ -774,7 +774,9 @@ mod tests {
         BlsDoryTransposeError, BlsDoryWordTransposeArtifact, BlsDoryWordTransposeWriter,
     };
     #[cfg(feature = "whir-prototype")]
-    use crate::structured_blake3_narrow::{generate_main_trace, public_values};
+    use crate::structured_blake3_narrow::{
+        for_each_main_trace_row, generate_main_trace, public_values,
+    };
     #[cfg(feature = "whir-prototype")]
     use crate::structured_blake3_tree::build_tree_witness;
     #[cfg(feature = "whir-prototype")]
@@ -908,6 +910,8 @@ mod tests {
     struct DenseBlake3Fixture {
         air: NarrowBlake3Air,
         tables: Vec<Vec<BlsDoryFr>>,
+        statement: StructuredBlake3Statement,
+        witness: crate::structured_blake3_tree::Blake3TreeWitness,
         public: Vec<BlsDoryFr>,
         constraints: Vec<BlsDoryBlake3ConstraintExpr>,
         bridge: BlsDoryOutputBridgeStatement,
@@ -1841,15 +1845,17 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
-    struct TransposedSignedWordRowSource<'a> {
+    struct TransposedLocalNextSignedWordRowSource<'a> {
         artifact: &'a mut BlsDoryWordTransposeArtifact,
         selector_slots: usize,
         dictionary: [BlsDoryFr; 1],
     }
 
     #[cfg(feature = "whir-prototype")]
-    impl<'a> TransposedSignedWordRowSource<'a> {
+    impl<'a> TransposedLocalNextSignedWordRowSource<'a> {
         fn new(artifact: &'a mut BlsDoryWordTransposeArtifact, selector_slots: usize) -> Self {
+            assert!(selector_slots.is_power_of_two());
+            assert!(artifact.columns().saturating_mul(2) <= selector_slots);
             Self {
                 artifact,
                 selector_slots,
@@ -1859,7 +1865,7 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
-    impl BlsDoryCompactRowSource for TransposedSignedWordRowSource<'_> {
+    impl BlsDoryCompactRowSource for TransposedLocalNextSignedWordRowSource<'_> {
         type Error = BlsDoryTransposeError;
 
         fn rows(&self) -> usize {
@@ -1871,7 +1877,10 @@ mod tests {
         }
 
         fn explicit_scalar_count(&self) -> usize {
-            self.artifact.columns().saturating_mul(self.artifact.rows())
+            self.artifact
+                .columns()
+                .saturating_mul(2)
+                .saturating_mul(self.artifact.rows())
         }
 
         fn word_scalar_count(&self) -> usize {
@@ -1895,10 +1904,17 @@ mod tests {
             row_index: usize,
             output: &mut [u64],
         ) -> Result<usize, Self::Error> {
-            if row_index >= self.artifact.columns() {
+            let local_columns = self.artifact.columns();
+            if row_index >= local_columns.saturating_mul(2) || local_columns == 0 {
                 return Err(BlsDoryTransposeError::InvalidShape);
             }
-            self.artifact.read_column(row_index, output)
+            let read = self
+                .artifact
+                .read_column(row_index % local_columns, output)?;
+            if row_index >= local_columns {
+                output.rotate_left(1);
+            }
+            Ok(read)
         }
 
         fn read_code_row(
@@ -2795,9 +2811,12 @@ mod tests {
         let preprocessed_rows = (0..air.trace_rows())
             .map(|row| bls_values(unsafe { preprocessed.row_unchecked(row) }))
             .collect::<Vec<_>>();
+        let public = bls_values(public_values(&statement).unwrap());
         DenseBlake3Fixture {
             tables: dense_execution_tables(&native_rows, &preprocessed_rows),
-            public: bls_values(public_values(&statement).unwrap()),
+            statement,
+            witness,
+            public,
             constraints: bls_dory_native_blake3_constraint_ir(activation.len()).unwrap(),
             bridge,
             air,
@@ -3525,105 +3544,121 @@ mod tests {
         const SELECTOR_VARIABLES: usize = 8;
         const TRACE_ROWS: usize = 1 << TRACE_VARIABLES;
         const SELECTOR_SLOTS: usize = 1 << SELECTOR_VARIABLES;
-        let signed_tables = (0..137)
-            .map(|selector| {
-                (0..TRACE_ROWS)
-                    .map(|row| {
-                        let magnitude = ((selector * TRACE_ROWS + row + 1) % 1_000_003) as i64;
-                        if (selector + row).is_multiple_of(3) {
-                            -magnitude
-                        } else {
-                            magnitude
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
+        const TABLES_PER_DIRECTION: usize = BLS_DORY_BLAKE3_MAIN_WIDTH - 1;
+        const MAX_BATCH_TABLES: usize = SELECTOR_SLOTS / 2;
+        let fixture = dense_blake3_fixture();
+        assert_eq!(fixture.air.trace_rows(), TRACE_ROWS);
+        let ordinary_native_columns = (0..BLS_DORY_BLAKE3_MAIN_WIDTH)
+            .filter(|column| *column != TEST_EVALUATION_ACCUMULATOR_START)
             .collect::<Vec<_>>();
-        let field_tables = signed_tables
-            .iter()
-            .map(|table| {
-                table
-                    .iter()
-                    .copied()
-                    .map(BlsDoryFr::from_i64)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
-        let scratch = Blake3ScratchDirectory::create();
-        let materialized = commit_bls_dory_polynomial(
-            dense_pack_adjacency_tables(&field_tables, TRACE_ROWS, SELECTOR_SLOTS).unwrap(),
-            SELECTOR_VARIABLES,
-            TRACE_VARIABLES,
-            &setup,
+        assert_eq!(ordinary_native_columns.len(), TABLES_PER_DIRECTION);
+        let next_start = BLS_DORY_BLAKE3_MAIN_WIDTH;
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(
+            TRACE_VARIABLES + SELECTOR_VARIABLES,
         )
         .unwrap();
-        let mut transpose_writer =
-            BlsDoryWordTransposeWriter::create(&scratch.0, TRACE_ROWS, signed_tables.len(), 17)
-                .unwrap();
-        for row in 0..TRACE_ROWS {
-            let values = signed_tables
-                .iter()
-                .map(|table| u64::from_le_bytes(table[row].to_le_bytes()))
-                .collect::<Vec<_>>();
-            transpose_writer.write_row(&values).unwrap();
-        }
-        let mut transpose = transpose_writer.finish().unwrap();
-        transpose.authenticate().unwrap();
-        let compact = {
-            let mut source = TransposedSignedWordRowSource::new(&mut transpose, SELECTOR_SLOTS);
-            commit_bls_dory_compact_row_source_with_scratch(
-                &mut source,
-                SELECTOR_VARIABLES,
-                TRACE_VARIABLES,
-                &setup,
-                &scratch.0,
-            )
-            .unwrap()
-        };
-        drop(transpose);
-        assert_eq!(compact.commitment(), materialized.commitment());
-        let artifact_path = std::fs::read_dir(&scratch.0)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let compact_bytes = std::fs::metadata(artifact_path).unwrap().len();
-        let literal_bytes = (signed_tables.len() * TRACE_ROWS * 32) as u64;
-        assert!(compact_bytes * 3 < literal_bytes);
-
+        let scratch = Blake3ScratchDirectory::create();
         let points = vec![
-            (0..16)
+            (0..(TRACE_VARIABLES + SELECTOR_VARIABLES))
                 .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 5) * 13))
                 .collect::<Vec<_>>(),
-            (0..16)
+            (0..(TRACE_VARIABLES + SELECTOR_VARIABLES))
                 .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 7) * 17))
                 .collect::<Vec<_>>(),
         ];
-        let ordinary = prove_bls_dory_same_commitment_openings(
-            b"blake3-compact-source-equivalence",
-            &materialized,
-            &points,
-            &setup,
-        )
-        .unwrap();
-        let artifact_backed = prove_bls_dory_same_commitment_openings(
-            b"blake3-compact-source-equivalence",
-            &compact,
-            &points,
-            &setup,
-        )
-        .unwrap();
-        assert_eq!(artifact_backed, ordinary);
-        verify_bls_dory_openings(
-            b"blake3-compact-source-equivalence",
-            &artifact_backed.0,
-            &artifact_backed.1,
-            &setup,
-        )
-        .unwrap();
-        drop(compact);
+        let mut covered_tables = 0;
+        for batch_start in (0..TABLES_PER_DIRECTION).step_by(MAX_BATCH_TABLES) {
+            let batch_end = batch_start
+                .saturating_add(MAX_BATCH_TABLES)
+                .min(TABLES_PER_DIRECTION);
+            let batch_columns = &ordinary_native_columns[batch_start..batch_end];
+            let field_tables = batch_columns
+                .iter()
+                .map(|column| fixture.tables[*column].clone())
+                .chain(
+                    batch_columns
+                        .iter()
+                        .map(|column| fixture.tables[next_start + *column].clone()),
+                )
+                .collect::<Vec<_>>();
+            let materialized = commit_bls_dory_polynomial(
+                dense_pack_adjacency_tables(&field_tables, TRACE_ROWS, SELECTOR_SLOTS).unwrap(),
+                SELECTOR_VARIABLES,
+                TRACE_VARIABLES,
+                &setup,
+            )
+            .unwrap();
+            let mut transpose_writer =
+                BlsDoryWordTransposeWriter::create(&scratch.0, TRACE_ROWS, batch_columns.len(), 17)
+                    .unwrap();
+            for_each_main_trace_row(
+                &fixture.air,
+                &fixture.statement,
+                &fixture.witness,
+                |row_index, row| {
+                    let centered = row
+                        .iter()
+                        .enumerate()
+                        .filter(|(column, _)| {
+                            !(TEST_EVALUATION_ACCUMULATOR_START..TEST_STACK_START).contains(column)
+                        })
+                        .map(|(_, value)| centered_goldilocks(*value))
+                        .collect::<Vec<_>>();
+                    assert_eq!(centered.len(), TABLES_PER_DIRECTION);
+                    let batch = &centered[batch_start..batch_end];
+                    for (column, value) in batch.iter().copied().enumerate() {
+                        assert_eq!(field_tables[column][row_index], BlsDoryFr::from_i64(value));
+                    }
+                    let values = batch
+                        .iter()
+                        .map(|value| u64::from_le_bytes(value.to_le_bytes()))
+                        .collect::<Vec<_>>();
+                    transpose_writer.write_row(&values)
+                },
+            )
+            .unwrap();
+            let mut transpose = transpose_writer.finish().unwrap();
+            transpose.authenticate().unwrap();
+            let compact = {
+                let mut source =
+                    TransposedLocalNextSignedWordRowSource::new(&mut transpose, SELECTOR_SLOTS);
+                commit_bls_dory_compact_row_source_with_scratch(
+                    &mut source,
+                    SELECTOR_VARIABLES,
+                    TRACE_VARIABLES,
+                    &setup,
+                    &scratch.0,
+                )
+                .unwrap()
+            };
+            drop(transpose);
+            assert_eq!(compact.commitment(), materialized.commitment());
+            let artifact_path = std::fs::read_dir(&scratch.0)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let compact_bytes = std::fs::metadata(artifact_path).unwrap().len();
+            let literal_bytes = (field_tables.len() * TRACE_ROWS * 32) as u64;
+            assert!(compact_bytes * 3 < literal_bytes);
+
+            let mut binding = b"blake3-compact-source-equivalence".to_vec();
+            binding.extend_from_slice(&(batch_start as u64).to_le_bytes());
+            let ordinary =
+                prove_bls_dory_same_commitment_openings(&binding, &materialized, &points, &setup)
+                    .unwrap();
+            let artifact_backed =
+                prove_bls_dory_same_commitment_openings(&binding, &compact, &points, &setup)
+                    .unwrap();
+            assert_eq!(artifact_backed, ordinary);
+            verify_bls_dory_openings(&binding, &artifact_backed.0, &artifact_backed.1, &setup)
+                .unwrap();
+            covered_tables += batch_columns.len();
+            drop(compact);
+            assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        }
+        assert_eq!(covered_tables, TABLES_PER_DIRECTION);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

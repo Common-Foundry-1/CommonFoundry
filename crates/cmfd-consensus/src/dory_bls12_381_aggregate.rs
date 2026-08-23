@@ -433,6 +433,18 @@ impl BlsDoryDeferredOpeningSet {
 }
 
 impl BlsDoryCommittedPolynomial {
+    /// Borrow the authenticated compact coefficient source committed by this
+    /// polynomial. Mapped, released, and materialized storage cannot stand in
+    /// for the exact transition artifact consumed by compact-native provers.
+    pub(crate) fn compact_coefficient_artifact(
+        &self,
+    ) -> Result<&BlsDoryCompactArtifact, BlsDoryAggregateError> {
+        let BlsDoryCoefficientStorage::CompactArtifact(artifact) = &self.coefficients else {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        };
+        Ok(artifact)
+    }
+
     #[cfg(feature = "whir-prototype")]
     pub(crate) fn compact_artifact_audit_metadata(
         &self,

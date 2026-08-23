@@ -42,6 +42,7 @@ use crate::{
     dory_bls12_381_aggregate::BlsDoryAggregateError,
     dory_bls12_381_blake3::{
         PreparedBlsDoryNativeBlake3Opening, prepare_production_native_blake3_opening,
+        projected_bls_dory_blake3_production_resources,
     },
     dory_bls12_381_execution_artifact::{
         BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
@@ -54,8 +55,13 @@ use crate::{
         prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch,
         prepare_bls_dory_shared_layout_verifier_state,
         prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch,
+        projected_shared_production_scratch_bytes,
         prove_prepared_bls_dory_shared_layout_with_composition,
         verify_prepared_bls_dory_shared_layout_with_native_proof,
+    },
+    dory_bls12_381_logup::{
+        projected_production_range_logup_early_lineage_peak_bytes,
+        projected_production_transition_range_source_bytes,
     },
     dory_bls12_381_output_bridge::{BlsDoryOutputBridgeError, BlsDoryOutputBridgeStatement},
     forgematrix_v2::output_digest,
@@ -86,6 +92,18 @@ struct ValidatedBlsDoryV3CandidateStatement {
     shape: StructuredForgeMatrixResearchShape,
     transition_statements: Vec<StructuredTransitionStatement>,
     masks: Vec<StructuredMaskPolynomial>,
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlsDoryV3CandidateScratchProjection {
+    conservative_future_retained_source_bytes: u64,
+    shared_construction_peak_bytes: u64,
+    shared_aggregate_peak_bytes: u64,
+    native_execution_peak_bytes: u64,
+    native_adjacency_peak_bytes: u64,
+    native_aggregate_peak_bytes: u64,
+    required_free_bytes: u64,
 }
 
 /// Opaque evidence that one exact candidate passed only the Dory algebraic checks.
@@ -211,6 +229,15 @@ pub enum BlsDoryV3CandidateError {
     #[cfg(feature = "whir-prototype")]
     #[error("candidate prover configuration is not valid for the production shape")]
     ProverConfiguration,
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate scratch-space projection is invalid")]
+    ScratchProjection,
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate scratch-space query failed: {0}")]
+    ScratchSpaceQuery(#[source] std::io::Error),
+    #[cfg(feature = "whir-prototype")]
+    #[error("insufficient candidate scratch space: need {required} bytes, have {available} bytes")]
+    InsufficientScratch { required: u64, available: u64 },
     #[cfg(feature = "whir-prototype")]
     #[error("candidate final activation is outside the canonical centered-byte range")]
     FinalActivation,
@@ -374,6 +401,8 @@ impl BlsDoryV3AlgebraicVerifier {
             return Err(BlsDoryV3CandidateError::HighHash);
         }
 
+        preflight_candidate_scratch(scratch_directory)?;
+
         let proof = ForgeMatrixV3CandidateProof {
             algorithm_version: FORGEMATRIX_V2_ALGORITHM_VERSION,
             proof_version: FORGEMATRIX_V2_PROOF_VERSION,
@@ -494,6 +523,8 @@ impl BlsDoryV3AlgebraicVerifier {
         if work_digest > block.target {
             return Err(BlsDoryV3CandidateError::HighHash);
         }
+
+        preflight_candidate_scratch(scratch_directory)?;
 
         let proof = ForgeMatrixV3CandidateProof {
             algorithm_version: FORGEMATRIX_V2_ALGORITHM_VERSION,
@@ -955,6 +986,104 @@ fn production_masks(
     Ok(masks)
 }
 
+#[cfg(feature = "whir-prototype")]
+fn checked_candidate_scratch_sum(values: &[u64]) -> Result<u64, BlsDoryV3CandidateError> {
+    values.iter().try_fold(0_u64, |sum, value| {
+        sum.checked_add(*value)
+            .ok_or(BlsDoryV3CandidateError::ScratchProjection)
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn projected_candidate_scratch_space()
+-> Result<BlsDoryV3CandidateScratchProjection, BlsDoryV3CandidateError> {
+    let shared = projected_shared_production_scratch_bytes()
+        .map_err(|_| BlsDoryV3CandidateError::ScratchProjection)?;
+    let transition_source_bytes = projected_production_transition_range_source_bytes()
+        .map_err(|_| BlsDoryV3CandidateError::ScratchProjection)?;
+    let logup_lineage_peak_bytes = projected_production_range_logup_early_lineage_peak_bytes()
+        .map_err(|_| BlsDoryV3CandidateError::ScratchProjection)?;
+    let native = projected_bls_dory_blake3_production_resources()
+        .map_err(|_| BlsDoryV3CandidateError::ScratchProjection)?;
+
+    // The fixed-base artifact belongs to `prepared_model` and already exists
+    // when the candidate preflight measures free space, so exclude it. The
+    // shared projection does not expose the three prepared weight artifacts
+    // separately; leaving them in this value deliberately overstates future
+    // scratch allocation rather than risking an undercount.
+    let conservative_future_retained_source_bytes = shared
+        .retained_source_bytes
+        .checked_sub(shared.fixed_base_source_bytes)
+        .ok_or(BlsDoryV3CandidateError::ScratchProjection)?;
+    let shared_construction_peak_bytes = checked_candidate_scratch_sum(&[
+        shared.matrix_source_bytes,
+        shared.multiplicity_source_bytes,
+        transition_source_bytes,
+        logup_lineage_peak_bytes,
+    ])?;
+    let shared_aggregate_peak_bytes = shared
+        .aggregate_peak_bytes
+        .checked_sub(shared.fixed_base_source_bytes)
+        .ok_or(BlsDoryV3CandidateError::ScratchProjection)?;
+
+    // The prepared shared state remains live through both native sumchecks.
+    // Their standalone projections therefore need the retained shared sources
+    // added explicitly before comparing phase peaks.
+    let native_execution_peak_bytes = conservative_future_retained_source_bytes
+        .checked_add(native.execution_stage_projected_peak_scratch_bytes)
+        .ok_or(BlsDoryV3CandidateError::ScratchProjection)?;
+    let native_adjacency_peak_bytes = conservative_future_retained_source_bytes
+        .checked_add(native.adjacency_stage_projected_peak_scratch_bytes)
+        .ok_or(BlsDoryV3CandidateError::ScratchProjection)?;
+    let native_aggregate_peak_bytes = native
+        .aggregate_with_transpose_coexistence_bytes
+        .checked_sub(shared.fixed_base_source_bytes)
+        .ok_or(BlsDoryV3CandidateError::ScratchProjection)?;
+    let required_free_bytes = [
+        shared_construction_peak_bytes,
+        shared_aggregate_peak_bytes,
+        native_execution_peak_bytes,
+        native_adjacency_peak_bytes,
+        native_aggregate_peak_bytes,
+        native.provisional_scratch_gate_bytes,
+    ]
+    .into_iter()
+    .max()
+    .ok_or(BlsDoryV3CandidateError::ScratchProjection)?;
+
+    Ok(BlsDoryV3CandidateScratchProjection {
+        conservative_future_retained_source_bytes,
+        shared_construction_peak_bytes,
+        shared_aggregate_peak_bytes,
+        native_execution_peak_bytes,
+        native_adjacency_peak_bytes,
+        native_aggregate_peak_bytes,
+        required_free_bytes,
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn preflight_candidate_scratch(scratch_directory: &Path) -> Result<(), BlsDoryV3CandidateError> {
+    let projection = projected_candidate_scratch_space()?;
+    let available = fs2::available_space(scratch_directory)
+        .map_err(BlsDoryV3CandidateError::ScratchSpaceQuery)?;
+    ensure_candidate_scratch_available(projection.required_free_bytes, available)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn ensure_candidate_scratch_available(
+    required: u64,
+    available: u64,
+) -> Result<(), BlsDoryV3CandidateError> {
+    if available < required {
+        return Err(BlsDoryV3CandidateError::InsufficientScratch {
+            required,
+            available,
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn verify_algebraic_payload(
@@ -1129,6 +1258,56 @@ mod tests {
             record_digest,
             setup,
         }
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn production_candidate_scratch_projection_covers_every_live_phase() {
+        let projection = projected_candidate_scratch_space().unwrap();
+
+        assert_eq!(
+            projection.conservative_future_retained_source_bytes,
+            25_887_962_384
+        );
+        assert_eq!(projection.shared_construction_peak_bytes, 39_868_223_240);
+        assert_eq!(projection.shared_aggregate_peak_bytes, 29_185_638_896);
+        assert_eq!(projection.native_execution_peak_bytes, 52_899_281_168);
+        assert_eq!(projection.native_adjacency_peak_bytes, 48_721_754_384);
+        assert_eq!(projection.native_aggregate_peak_bytes, 38_407_962_284);
+        assert_eq!(projection.required_free_bytes, 53_687_091_200);
+        assert!(
+            [
+                projection.shared_construction_peak_bytes,
+                projection.shared_aggregate_peak_bytes,
+                projection.native_execution_peak_bytes,
+                projection.native_adjacency_peak_bytes,
+                projection.native_aggregate_peak_bytes,
+            ]
+            .into_iter()
+            .all(|phase| projection.required_free_bytes >= phase)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn candidate_scratch_boundary_and_projection_overflow_fail_closed() {
+        let required = projected_candidate_scratch_space()
+            .unwrap()
+            .required_free_bytes;
+
+        ensure_candidate_scratch_available(required, required).unwrap();
+        ensure_candidate_scratch_available(required, u64::MAX).unwrap();
+        assert!(matches!(
+            ensure_candidate_scratch_available(required, required - 1),
+            Err(BlsDoryV3CandidateError::InsufficientScratch {
+                required: observed_required,
+                available
+            }) if observed_required == required && available == required - 1
+        ));
+        assert!(matches!(
+            checked_candidate_scratch_sum(&[u64::MAX, 1]),
+            Err(BlsDoryV3CandidateError::ScratchProjection)
+        ));
     }
 
     #[test]

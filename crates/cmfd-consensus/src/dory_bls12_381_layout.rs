@@ -46,6 +46,7 @@ use crate::{
         projected_production_range_logup_opening_bytes,
         projected_production_range_logup_proof_bytes, prove_bls_dory_range_logup,
         prove_bls_dory_range_logup_at_variables, prove_bls_dory_range_logup_deferred_at_variables,
+        prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch,
         prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch,
         prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
         verify_bls_dory_range_logup, verify_bls_dory_range_logup_at_variables,
@@ -1722,14 +1723,6 @@ pub(crate) fn prepare_bls_dory_shared_layout_from_execution_artifact_with_scratc
         matrices.push(matrix);
     }
 
-    let nu = padded_variables / 2;
-    let sigma = padded_variables - nu;
-    let rows = 1usize
-        .checked_shl(u32::try_from(nu).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?)
-        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
-    let columns = 1usize
-        .checked_shl(u32::try_from(sigma).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?)
-        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
     let mut transitions = Vec::with_capacity(transition_statements.len());
     let mut released_transition_sources = Vec::with_capacity(transition_statements.len());
     for (index, (statement, mask_polynomial)) in transition_statements
@@ -1754,16 +1747,42 @@ pub(crate) fn prepare_bls_dory_shared_layout_from_execution_artifact_with_scratc
             .openings
             .polynomial(0)
             .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
-        let source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
-            *statement,
-            mask_polynomial,
-            artifact,
-            expected_context,
-            transition,
-            rows,
-            columns,
-        )?;
-        let mut range =
+        let mut range = if statement
+            .elements()
+            .map_err(BlsDoryTransitionError::Structured)?
+            >= BLS_DORY_RANGE_LOGUP_TABLE_VALUES
+        {
+            prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch(
+                &component_binding,
+                *statement,
+                committed_transition,
+                padded_variables,
+                setup,
+                scratch_directory,
+            )?
+        } else {
+            let nu = padded_variables / 2;
+            let sigma = padded_variables - nu;
+            let rows = 1usize
+                .checked_shl(
+                    u32::try_from(nu).map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
+                )
+                .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+            let columns = 1usize
+                .checked_shl(
+                    u32::try_from(sigma)
+                        .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
+                )
+                .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+            let source = BlsDoryTransitionWitnessRowSource::new_from_execution_artifact(
+                *statement,
+                mask_polynomial,
+                artifact,
+                expected_context,
+                transition,
+                rows,
+                columns,
+            )?;
             prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch(
                 &component_binding,
                 *statement,
@@ -1772,8 +1791,8 @@ pub(crate) fn prepare_bls_dory_shared_layout_from_execution_artifact_with_scratc
                 padded_variables,
                 setup,
                 scratch_directory,
-            )?;
-        drop(source);
+            )?
+        };
         if arithmetic.proof.oracle_commitment != range.proof.transition_commitment {
             return Err(BlsDorySharedLayoutError::TransitionRangeCommitment);
         }
@@ -2121,7 +2140,21 @@ fn prepare_bls_dory_shared_layout_at_variables_with_optional_scratch(
                 .openings
                 .polynomial(0)
                 .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
-            let range =
+            let range = if input
+                .statement
+                .elements()
+                .map_err(BlsDoryTransitionError::Structured)?
+                >= BLS_DORY_RANGE_LOGUP_TABLE_VALUES
+            {
+                prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch(
+                    &component_binding,
+                    input.statement,
+                    transition,
+                    padded_variables,
+                    setup,
+                    scratch_directory,
+                )?
+            } else {
                 prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch(
                     &component_binding,
                     input.statement,
@@ -2130,7 +2163,8 @@ fn prepare_bls_dory_shared_layout_at_variables_with_optional_scratch(
                     padded_variables,
                     setup,
                     scratch_directory,
-                )?;
+                )?
+            };
             (arithmetic, range)
         } else {
             (

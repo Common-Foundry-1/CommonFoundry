@@ -60,6 +60,7 @@ dory-bls12-381-prototype = [
     "dep:ark-bls12-381",
     "dep:ark-ec",
     "dep:ark-ff",
+    "dep:fs2",
     "dep:rand_core",
     "dep:rayon",
     "dep:same-file",

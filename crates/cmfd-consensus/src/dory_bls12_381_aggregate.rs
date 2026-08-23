@@ -70,6 +70,8 @@ const WIRE_HEADER_BYTES: usize = 18;
 const MAX_PUBLIC_BINDING_BYTES: usize = 4_096;
 const ROW_COMMIT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 const AGGREGATE_SOURCE_FOLD_GENERATIONS: usize = 8;
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_AUTHENTICATED_COEFFICIENT_RANGE_SCALARS: usize = 1 << 20;
 
 pub(crate) fn bounded_signed_dictionary(maximum: u8) -> Option<Vec<BlsDoryFr>> {
     if maximum == 0 || maximum > 127 {
@@ -712,6 +714,99 @@ impl BlsDoryCommittedPolynomial {
         Ok(())
     }
 
+    /// Stream one contiguous logical coefficient range in canonical row-major
+    /// order. Scratch artifacts are completely authenticated before the first
+    /// coefficient is exposed; only the requested stored subrange is retained
+    /// during that pass, never the complete polynomial. An omitted artifact
+    /// suffix is emitted as the zero range committed by the artifact
+    /// specification; released compact storage remains unavailable until the
+    /// caller explicitly restores the authenticated regenerated source. A
+    /// request is capped at one production trace table (2^20 scalars) so this
+    /// authentication buffer remains bounded.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn for_each_authenticated_coefficient_range(
+        &self,
+        start: usize,
+        count: usize,
+        mut visitor: impl FnMut(usize, BlsDoryFr) -> Result<(), BlsDoryAggregateError>,
+    ) -> Result<(), BlsDoryAggregateError> {
+        let end = start
+            .checked_add(count)
+            .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+        if count > MAX_AUTHENTICATED_COEFFICIENT_RANGE_SCALARS || end > self.coefficient_count() {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let explicit_count = self.explicit_coefficient_count();
+        let explicit_start = start.min(explicit_count);
+        let explicit_end = end.min(explicit_count);
+        let stored_count = explicit_end - explicit_start;
+
+        match &self.coefficients {
+            BlsDoryCoefficientStorage::Materialized(polynomial) => {
+                for (offset, coefficient) in polynomial.coefficients()[start..end]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    visitor(start + offset, coefficient)?;
+                }
+                return Ok(());
+            }
+            BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => {
+                stream_authenticated_artifact_range(
+                    explicit_start,
+                    stored_count,
+                    explicit_count,
+                    &mut visitor,
+                    || BlsDoryFoldArtifactError::InvalidArtifact,
+                    |range_visitor| artifact.for_each_scalar(range_visitor),
+                )?;
+            }
+            #[cfg(test)]
+            BlsDoryCoefficientStorage::IndexedArtifact(artifact) => {
+                use crate::dory_bls12_381_index_artifact::BlsDoryIndexArtifactError;
+
+                stream_authenticated_artifact_range(
+                    explicit_start,
+                    stored_count,
+                    explicit_count,
+                    &mut visitor,
+                    || BlsDoryIndexArtifactError::InvalidArtifact,
+                    |range_visitor| artifact.for_each_scalar(range_visitor),
+                )?;
+            }
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
+                stream_authenticated_artifact_range(
+                    explicit_start,
+                    stored_count,
+                    explicit_count,
+                    &mut visitor,
+                    || BlsDoryCompactArtifactError::InvalidArtifact,
+                    |range_visitor| artifact.for_each_scalar(range_visitor),
+                )?;
+            }
+            BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => {
+                stream_authenticated_artifact_range(
+                    explicit_start,
+                    stored_count,
+                    explicit_count,
+                    &mut visitor,
+                    || BlsDoryCompactArtifactError::InvalidArtifact,
+                    |range_visitor| artifact.for_each_scalar(range_visitor),
+                )?;
+            }
+            BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
+                return Err(BlsDoryAggregateError::ProverStorage);
+            }
+        }
+
+        for index in explicit_end.max(start)..end {
+            visitor(index, BlsDoryFr::zero())?;
+        }
+        Ok(())
+    }
+
     fn evaluate(&self, point: &[BlsDoryFr]) -> Result<BlsDoryFr, BlsDoryAggregateError> {
         if point.len() != self.variables() {
             return Err(BlsDoryAggregateError::InvalidDimension);
@@ -956,6 +1051,47 @@ impl BlsDoryCommittedPolynomial {
     pub(crate) fn row_commitments(&self) -> &[BlsDoryG1] {
         &self.row_commitments
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn stream_authenticated_artifact_range<E>(
+    start: usize,
+    count: usize,
+    explicit_count: usize,
+    visitor: &mut impl FnMut(usize, BlsDoryFr) -> Result<(), BlsDoryAggregateError>,
+    abort_error: impl Fn() -> E,
+    stream: impl FnOnce(&mut dyn FnMut(BlsDoryFr) -> Result<(), E>) -> Result<(), E>,
+) -> Result<(), BlsDoryAggregateError> {
+    let expected_end = start
+        .checked_add(count)
+        .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+    let mut source_index = 0usize;
+    let mut authenticated_range = Vec::new();
+    authenticated_range
+        .try_reserve_exact(count)
+        .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    let result = stream(&mut |coefficient| {
+        let index = source_index;
+        let Some(incremented) = source_index.checked_add(1) else {
+            return Err(abort_error());
+        };
+        source_index = incremented;
+        if (start..expected_end).contains(&index) {
+            authenticated_range.push(coefficient);
+        }
+        Ok(())
+    });
+    result.map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    if source_index != explicit_count || authenticated_range.len() != count {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    for (offset, coefficient) in authenticated_range.into_iter().enumerate() {
+        let index = start
+            .checked_add(offset)
+            .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+        visitor(index, coefficient)?;
+    }
+    Ok(())
 }
 
 /// Transactional builder for one authenticated coefficient artifact and its
@@ -5037,6 +5173,43 @@ mod tests {
         }
     }
 
+    fn collect_authenticated_range(
+        polynomial: &BlsDoryCommittedPolynomial,
+        start: usize,
+        count: usize,
+    ) -> Result<Vec<(usize, BlsDoryFr)>, BlsDoryAggregateError> {
+        let mut values = Vec::with_capacity(count);
+        polynomial.for_each_authenticated_coefficient_range(
+            start,
+            count,
+            |index, coefficient| {
+                values.push((index, coefficient));
+                Ok(())
+            },
+        )?;
+        Ok(values)
+    }
+
+    fn assert_authenticated_range(
+        polynomial: &BlsDoryCommittedPolynomial,
+        expected: &[BlsDoryFr],
+        start: usize,
+        count: usize,
+    ) {
+        let actual = collect_authenticated_range(polynomial, start, count).unwrap();
+        assert_eq!(
+            actual.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (start..start + count).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual
+                .into_iter()
+                .map(|(_, coefficient)| coefficient)
+                .collect::<Vec<_>>(),
+            expected[start..start + count]
+        );
+    }
+
     #[test]
     fn bounded_signed_dictionary_has_canonical_codes_and_rejects_out_of_range_values() {
         let dictionary = bounded_signed_dictionary(125).unwrap();
@@ -5439,6 +5612,184 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_ranges_preserve_dense_fold_compact_and_mapped_order() {
+        let variables = 6;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let total = 1usize << variables;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+
+        let mut fold_source = fixture_row_source(variables);
+        fold_source.explicit_coefficients -= 2 * fold_source.columns;
+        let fold_explicit = fold_source.explicit_coefficients;
+        let mut fold_expected = fold_source.coefficients[..fold_explicit].to_vec();
+        fold_expected.resize(total, BlsDoryFr::zero());
+        let dense = commit_bls_dory_polynomial(fold_expected.clone(), nu, sigma, &setup).unwrap();
+        let fold = commit_bls_dory_row_source_with_scratch(
+            &mut fold_source,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let fold_start = fold_explicit - 3;
+        assert_authenticated_range(&dense, &fold_expected, fold_start, 9);
+        assert_authenticated_range(&fold, &fold_expected, fold_start, 9);
+
+        let mut compact_source = fixture_compact_row_source(variables);
+        let compact_explicit = compact_source.explicit_coefficients;
+        let word_count = compact_source.word_coefficients;
+        let compact = commit_bls_dory_compact_row_source_with_scratch(
+            &mut compact_source,
+            nu,
+            sigma,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let mapped_dictionary = (0..16)
+            .map(|digit| BlsDoryFr::from_u64(digit + 101))
+            .collect::<Vec<_>>();
+        let mapped = commit_bls_dory_mapped_compact_polynomial(
+            &compact,
+            word_count,
+            mapped_dictionary.clone(),
+            &setup,
+        )
+        .unwrap();
+        let compact_expected = (0..total)
+            .map(|index| {
+                if index < word_count {
+                    BlsDoryFr::from_u64(index as u64 + 17)
+                } else if index < compact_explicit {
+                    BlsDoryFr::from_u64((index % 16) as u64)
+                } else {
+                    BlsDoryFr::zero()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mapped_expected = (0..total)
+            .map(|index| {
+                if index < word_count || index >= compact_explicit {
+                    BlsDoryFr::zero()
+                } else {
+                    mapped_dictionary[index % mapped_dictionary.len()]
+                }
+            })
+            .collect::<Vec<_>>();
+        for (start, count) in [
+            (word_count - 2, 8),
+            (compact_explicit - 2, total - compact_explicit + 2),
+        ] {
+            assert_authenticated_range(&compact, &compact_expected, start, count);
+            assert_authenticated_range(&mapped, &mapped_expected, start, count);
+        }
+
+        drop(fold);
+        drop(mapped);
+        drop(compact);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn authenticated_ranges_propagate_callback_errors_and_reject_invalid_bounds() {
+        let variables = 6;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let mut source = fixture_row_source(variables);
+        let polynomial = commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            variables / 2,
+            variables - variables / 2,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let total = 1usize << variables;
+
+        let mut exposed = 0usize;
+        assert_eq!(
+            polynomial.for_each_authenticated_coefficient_range(4, 12, |_index, _coefficient| {
+                exposed += 1;
+                if exposed == 3 {
+                    Err(BlsDoryAggregateError::SumcheckFailed)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(BlsDoryAggregateError::SumcheckFailed)
+        );
+        assert_eq!(exposed, 3);
+
+        for (start, count) in [
+            (total, 1),
+            (usize::MAX, 2),
+            (0, MAX_AUTHENTICATED_COEFFICIENT_RANGE_SCALARS + 1),
+        ] {
+            let mut called = false;
+            assert_eq!(
+                polynomial.for_each_authenticated_coefficient_range(
+                    start,
+                    count,
+                    |_index, _coefficient| {
+                        called = true;
+                        Ok(())
+                    },
+                ),
+                Err(BlsDoryAggregateError::InvalidCoefficientCount)
+            );
+            assert!(!called);
+        }
+        assert!(
+            collect_authenticated_range(&polynomial, total, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn corrupted_artifact_range_fails_before_exposing_a_coefficient_and_cleans_up() {
+        let variables = 6;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let mut source = fixture_row_source(variables);
+        let polynomial = commit_bls_dory_row_source_with_scratch(
+            &mut source,
+            variables / 2,
+            variables - variables / 2,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let path = polynomial
+            .coefficient_artifact_path()
+            .unwrap()
+            .to_path_buf();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len() - 1;
+        let replacement = std::fs::read(&path).unwrap()[usize::try_from(offset).unwrap()] ^ 1;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[replacement]).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let mut exposed = 0usize;
+        assert_eq!(
+            polynomial.for_each_authenticated_coefficient_range(3, 7, |_index, _coefficient| {
+                exposed += 1;
+                Ok(())
+            }),
+            Err(BlsDoryAggregateError::ProverStorage)
+        );
+        assert_eq!(exposed, 0);
+        drop(polynomial);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
     fn compact_source_release_regenerates_exact_bytes_and_rejects_substitution() {
         let variables = 6;
         let nu = variables / 2;
@@ -5480,10 +5831,31 @@ mod tests {
             &setup,
         )
         .unwrap();
+        let original_prefixes = [0, 1].map(|index| {
+            collect_authenticated_range(openings.polynomial(index).unwrap(), 5, 11).unwrap()
+        });
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
 
         let identity = openings.release_compact_source().unwrap().unwrap();
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        for index in [0, 1] {
+            let mut exposed = 0usize;
+            assert_eq!(
+                openings
+                    .polynomial(index)
+                    .unwrap()
+                    .for_each_authenticated_coefficient_range(
+                        5,
+                        11,
+                        |_coefficient_index, _coefficient| {
+                            exposed += 1;
+                            Ok(())
+                        },
+                    ),
+                Err(BlsDoryAggregateError::ProverStorage)
+            );
+            assert_eq!(exposed, 0);
+        }
         assert_eq!(
             openings
                 .polynomial(0)
@@ -5517,6 +5889,7 @@ mod tests {
             &scratch.0,
         )
         .unwrap();
+        let regenerated_path = regenerated.path().to_path_buf();
         openings.restore_compact_source(&regenerated).unwrap();
         assert_eq!(
             openings.restore_compact_source(&regenerated),
@@ -5530,8 +5903,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored, original);
+        for (index, expected) in original_prefixes.iter().enumerate() {
+            assert_eq!(
+                collect_authenticated_range(openings.polynomial(index).unwrap(), 5, 11).unwrap(),
+                *expected
+            );
+        }
         drop(regenerated);
+        assert!(regenerated_path.exists());
         drop(openings);
+        assert!(!regenerated_path.exists());
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

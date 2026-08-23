@@ -205,7 +205,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "bounded row streams now transpose every ordinary main and preprocessing column, derive next rows without duplicate scratch, preserve exact commitment and opening bytes, reject non-Boolean codes, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact; signed-word and preprocessing streams have materialized commitment/opening equivalence for bounded shared-layout reblocking analogs and pin the exact n=33 topology, while a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches; production-owned native-accumulator/inverse source construction, canonical four-source/six-claim composition, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "bounded row streams now transpose every ordinary main and preprocessing column, derive next rows without duplicate scratch, preserve exact commitment and opening bytes, reject non-Boolean codes, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact; signed-word and preprocessing streams have materialized commitment/opening equivalence for bounded shared-layout reblocking analogs and pin the exact n=33 topology, a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches, and a bounded four-source/six-claim test demonstrates canonical statement rejection of freshly reproved wrong routes and nonzero lift coordinates; production-owned source construction and source-role/point/evaluation binding, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -2016,6 +2016,36 @@ mod tests {
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&byte)?;
         file.flush()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn validate_blake3_opening_statement(
+        claims: &[BlsDoryOpeningClaim],
+        source_commitments: &[BlsDoryGt],
+        expected_points: &[Vec<BlsDoryFr>],
+        expected_evaluations: &[BlsDoryFr],
+    ) -> Result<(), BlsDoryAggregateError> {
+        if claims.len() != BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()
+            || source_commitments.len() != BLS_DORY_BLAKE3_SOURCE_COMMITMENTS
+            || expected_points.len() != claims.len()
+            || expected_evaluations.len() != claims.len()
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        if claims
+            .iter()
+            .zip(BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES)
+            .zip(expected_points)
+            .zip(expected_evaluations)
+            .any(|(((claim, source), point), evaluation)| {
+                claim.commitment != source_commitments[source]
+                    || claim.point != *point
+                    || claim.evaluation != *evaluation
+            })
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        Ok(())
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -4819,6 +4849,212 @@ mod tests {
         let mut with_late_zero = values;
         with_late_zero[BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS + 1] = BlsDoryFr::zero();
         assert_eq!(batch_invert_nonzero(&mut with_late_zero), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "bounded four-source Dory aggregate; run explicitly in --release"]
+    fn four_source_six_claim_aggregate_uses_canonical_blake3_routing() {
+        const SOURCE_VARIABLES: usize = 10;
+        let layout = BlsDoryAggregateLayout::new(5, 7).unwrap();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(14).unwrap();
+        let polynomials = (0..BLS_DORY_BLAKE3_SOURCE_COMMITMENTS)
+            .map(|source| {
+                let mut coefficients = (0..1 << SOURCE_VARIABLES)
+                    .map(|index| {
+                        BlsDoryFr::from_u64(
+                            (source as u64 + 1) * 1_000_003 + (index as u64 + 17) * 97,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                coefficients.resize(1 << layout.variables(), BlsDoryFr::zero());
+                commit_bls_dory_polynomial(coefficients, layout.nu(), layout.sigma(), &setup)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let commitments = polynomials
+            .iter()
+            .map(BlsDoryCommittedPolynomial::commitment)
+            .collect::<Vec<_>>();
+        for (index, commitment) in commitments.iter().enumerate() {
+            assert!(
+                commitments
+                    .iter()
+                    .skip(index + 1)
+                    .all(|other| other != commitment)
+            );
+        }
+
+        let points = (0..BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len())
+            .map(|claim| {
+                let mut point = (0..SOURCE_VARIABLES)
+                    .map(|coordinate| {
+                        BlsDoryFr::from_u64(
+                            (claim as u64 + 3) * 101 + (coordinate as u64 + 5) * 103,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                point.resize(layout.variables(), BlsDoryFr::zero());
+                point
+            })
+            .collect::<Vec<_>>();
+        let expected_points = points.clone();
+        let opening_set = BlsDoryDeferredOpeningSet::new(
+            polynomials,
+            BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.to_vec(),
+            points,
+        )
+        .unwrap();
+        assert!(opening_set.claims().iter().all(|claim| {
+            claim.point[SOURCE_VARIABLES..]
+                .iter()
+                .all(|coordinate| *coordinate == BlsDoryFr::zero())
+        }));
+        assert_ne!(opening_set.claims()[0].point, opening_set.claims()[3].point);
+        assert_ne!(opening_set.claims()[1].point, opening_set.claims()[4].point);
+        for (claim, source) in opening_set
+            .claims()
+            .iter()
+            .zip(BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES)
+        {
+            assert_eq!(claim.commitment, commitments[source]);
+        }
+        assert_eq!(
+            opening_set.claims()[0].commitment,
+            opening_set.claims()[3].commitment
+        );
+        assert_eq!(
+            opening_set.claims()[1].commitment,
+            opening_set.claims()[4].commitment
+        );
+        assert_ne!(
+            opening_set.claims()[2].commitment,
+            opening_set.claims()[5].commitment
+        );
+
+        let public_binding = b"blake3-four-source-six-claim-aggregate-v1";
+        let (claims, proof) =
+            prove_bls_dory_deferred_opening_sets(public_binding, layout, &[&opening_set], &setup)
+                .unwrap();
+        let expected_evaluations = opening_set
+            .claims()
+            .iter()
+            .map(|claim| claim.evaluation)
+            .collect::<Vec<_>>();
+        assert_eq!(claims, opening_set.claims());
+        validate_blake3_opening_statement(
+            &claims,
+            &commitments,
+            &expected_points,
+            &expected_evaluations,
+        )
+        .unwrap();
+        verify_bls_dory_openings(public_binding, layout, &claims, &proof, &setup).unwrap();
+
+        let wrong_routing_set = BlsDoryDeferredOpeningSet::new(
+            (0..BLS_DORY_BLAKE3_SOURCE_COMMITMENTS)
+                .map(|source| opening_set.polynomial(source).unwrap().clone())
+                .collect(),
+            [0, 1, 2, 2, 1, 3].to_vec(),
+            opening_set
+                .claims()
+                .iter()
+                .map(|claim| claim.point.clone())
+                .collect(),
+        )
+        .unwrap();
+        let (wrong_routing_claims, wrong_routing_proof) = prove_bls_dory_deferred_opening_sets(
+            public_binding,
+            layout,
+            &[&wrong_routing_set],
+            &setup,
+        )
+        .unwrap();
+        verify_bls_dory_openings(
+            public_binding,
+            layout,
+            &wrong_routing_claims,
+            &wrong_routing_proof,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_blake3_opening_statement(
+                &wrong_routing_claims,
+                &commitments,
+                &expected_points,
+                &expected_evaluations,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+
+        let mut noncanonical_lift_points = expected_points.clone();
+        noncanonical_lift_points[0][SOURCE_VARIABLES] = BlsDoryFr::from_u64(1);
+        let noncanonical_lift_set = BlsDoryDeferredOpeningSet::new(
+            (0..BLS_DORY_BLAKE3_SOURCE_COMMITMENTS)
+                .map(|source| opening_set.polynomial(source).unwrap().clone())
+                .collect(),
+            BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.to_vec(),
+            noncanonical_lift_points,
+        )
+        .unwrap();
+        let (noncanonical_lift_claims, noncanonical_lift_proof) =
+            prove_bls_dory_deferred_opening_sets(
+                public_binding,
+                layout,
+                &[&noncanonical_lift_set],
+                &setup,
+            )
+            .unwrap();
+        verify_bls_dory_openings(
+            public_binding,
+            layout,
+            &noncanonical_lift_claims,
+            &noncanonical_lift_proof,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_blake3_opening_statement(
+                &noncanonical_lift_claims,
+                &commitments,
+                &expected_points,
+                &expected_evaluations,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+
+        assert!(
+            verify_bls_dory_openings(b"wrong-binding", layout, &claims, &proof, &setup).is_err()
+        );
+        let mut wrong_point = claims.clone();
+        wrong_point[0].point[SOURCE_VARIABLES] = BlsDoryFr::from_u64(1);
+        assert!(
+            verify_bls_dory_openings(public_binding, layout, &wrong_point, &proof, &setup).is_err()
+        );
+        let mut wrong_evaluation = claims.clone();
+        wrong_evaluation[1].evaluation = wrong_evaluation[1].evaluation + BlsDoryFr::from_u64(1);
+        assert!(
+            verify_bls_dory_openings(public_binding, layout, &wrong_evaluation, &proof, &setup,)
+                .is_err()
+        );
+        let mut wrong_commitment = claims.clone();
+        wrong_commitment[2].commitment = commitments[3];
+        assert!(
+            verify_bls_dory_openings(public_binding, layout, &wrong_commitment, &proof, &setup,)
+                .is_err()
+        );
+        let mut reordered = claims.clone();
+        reordered.swap(0, 1);
+        assert!(
+            verify_bls_dory_openings(public_binding, layout, &reordered, &proof, &setup).is_err()
+        );
+        let wrong_layout = BlsDoryAggregateLayout::new(6, 6).unwrap();
+        assert!(
+            verify_bls_dory_openings(public_binding, wrong_layout, &claims, &proof, &setup)
+                .is_err()
+        );
+        assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
     }
 
     #[test]

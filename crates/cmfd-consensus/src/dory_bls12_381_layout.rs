@@ -2916,6 +2916,284 @@ fn replace_projected_fold(
     Ok(())
 }
 
+/// One additional physical coefficient source appended after the shared
+/// layout's canonical source order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlsDoryAdditionalFoldSourceProjection {
+    pub explicit_scalars: u64,
+    /// The source remains a challenge-bound compact view through generation
+    /// eight and materializes its first scalar artifact at generation nine.
+    pub compress_first_eight_generations: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectedSharedFoldLifecycle {
+    first_generation_fold_bytes: u64,
+    second_generation_fold_bytes: u64,
+    fifth_generation_fold_bytes: u64,
+    eighth_generation_fold_bytes: u64,
+    source_materialization_fold_bytes: u64,
+    final_generation_fold_bytes: u64,
+    aggregate_fold_peak_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlsDoryComposedProductionScratchProjection {
+    pub retained_source_bytes: u64,
+    pub first_generation_fold_bytes: u64,
+    pub second_generation_fold_bytes: u64,
+    pub fifth_generation_fold_bytes: u64,
+    pub eighth_generation_fold_bytes: u64,
+    pub source_materialization_fold_bytes: u64,
+    pub final_generation_fold_bytes: u64,
+    pub aggregate_fold_peak_bytes: u64,
+    pub aggregate_peak_bytes: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn projected_shared_fold_lifecycle(
+    padded_variables: usize,
+    logical_scalars: u64,
+    banks: u64,
+    transition_count: u64,
+    initialization_cells: u64,
+    bank_cells: u64,
+    weight_cells: u64,
+    wiring_scalars: u64,
+    additional_sources: &[BlsDoryAdditionalFoldSourceProjection],
+) -> Result<ProjectedSharedFoldLifecycle, BlsDorySharedLayoutError> {
+    if padded_variables <= BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS as usize
+        || additional_sources
+            .iter()
+            .any(|source| source.explicit_scalars == 0 || source.explicit_scalars > logical_scalars)
+    {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    let mut transition_cells = Vec::with_capacity(transition_count as usize);
+    transition_cells.push(initialization_cells);
+    transition_cells.extend(std::iter::repeat_n(bank_cells, banks as usize));
+    let multiplicity_first_fold_bytes = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+        1,
+    )?
+    .checked_mul(transition_count)
+    .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let fixed_base_first_fold_bytes =
+        projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, 1)?;
+    let mut current_fold_bytes = multiplicity_first_fold_bytes
+        .checked_add(fixed_base_first_fold_bytes)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let mut aggregate_fold_peak_bytes = current_fold_bytes;
+    for source in additional_sources {
+        if !source.compress_first_eight_generations {
+            add_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                projected_shared_scalar_fold_bytes(logical_scalars, source.explicit_scalars, 1)?,
+            )?;
+        }
+    }
+    let first_generation_fold_bytes = current_fold_bytes;
+    let mut second_generation_fold_bytes = 0;
+    let mut fifth_generation_fold_bytes = 0;
+    let mut eighth_generation_fold_bytes = 0;
+
+    for generation in 2..=BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS {
+        for _ in 0..transition_count {
+            replace_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                projected_shared_scalar_fold_bytes(
+                    logical_scalars,
+                    BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+                    generation - 1,
+                )?,
+                projected_shared_scalar_fold_bytes(
+                    logical_scalars,
+                    BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+                    generation,
+                )?,
+            )?;
+        }
+        replace_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            projected_shared_scalar_fold_bytes(
+                logical_scalars,
+                initialization_cells,
+                generation - 1,
+            )?,
+            projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, generation)?,
+        )?;
+        for source in additional_sources {
+            if !source.compress_first_eight_generations {
+                replace_projected_fold(
+                    &mut current_fold_bytes,
+                    &mut aggregate_fold_peak_bytes,
+                    projected_shared_scalar_fold_bytes(
+                        logical_scalars,
+                        source.explicit_scalars,
+                        generation - 1,
+                    )?,
+                    projected_shared_scalar_fold_bytes(
+                        logical_scalars,
+                        source.explicit_scalars,
+                        generation,
+                    )?,
+                )?;
+            }
+        }
+        match generation {
+            2 => second_generation_fold_bytes = current_fold_bytes,
+            5 => fifth_generation_fold_bytes = current_fold_bytes,
+            BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS => {
+                eighth_generation_fold_bytes = current_fold_bytes;
+            }
+            _ => {}
+        }
+    }
+
+    let materialization_generation = BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS + 1;
+    let mut ordinary_folds = Vec::new();
+    for _ in 0..banks {
+        for explicit in [bank_cells, weight_cells, bank_cells] {
+            let child = projected_shared_scalar_fold_bytes(
+                logical_scalars,
+                explicit,
+                materialization_generation,
+            )?;
+            add_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                child,
+            )?;
+            ordinary_folds.push((explicit, child));
+        }
+    }
+    for cells in &transition_cells {
+        let transition_explicit = cells
+            .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+        let transition_child = projected_shared_scalar_fold_bytes(
+            logical_scalars,
+            transition_explicit,
+            materialization_generation,
+        )?;
+        add_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            transition_child,
+        )?;
+        ordinary_folds.push((transition_explicit, transition_child));
+
+        let multiplicity_parent = projected_shared_scalar_fold_bytes(
+            logical_scalars,
+            BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+            BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS,
+        )?;
+        let multiplicity_child = projected_shared_scalar_fold_bytes(
+            logical_scalars,
+            BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
+            materialization_generation,
+        )?;
+        replace_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            multiplicity_parent,
+            multiplicity_child,
+        )?;
+        ordinary_folds.push((BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64, multiplicity_child));
+
+        let mapped_child = transition_child;
+        add_projected_fold(
+            &mut current_fold_bytes,
+            &mut aggregate_fold_peak_bytes,
+            mapped_child,
+        )?;
+        ordinary_folds.push((transition_explicit, mapped_child));
+    }
+    let wiring_child = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        wiring_scalars,
+        materialization_generation,
+    )?;
+    add_projected_fold(
+        &mut current_fold_bytes,
+        &mut aggregate_fold_peak_bytes,
+        wiring_child,
+    )?;
+    ordinary_folds.push((wiring_scalars, wiring_child));
+    let fixed_parent = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        initialization_cells,
+        BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS,
+    )?;
+    let fixed_child = projected_shared_scalar_fold_bytes(
+        logical_scalars,
+        initialization_cells,
+        materialization_generation,
+    )?;
+    replace_projected_fold(
+        &mut current_fold_bytes,
+        &mut aggregate_fold_peak_bytes,
+        fixed_parent,
+        fixed_child,
+    )?;
+    ordinary_folds.push((initialization_cells, fixed_child));
+
+    for source in additional_sources {
+        let child = projected_shared_scalar_fold_bytes(
+            logical_scalars,
+            source.explicit_scalars,
+            materialization_generation,
+        )?;
+        if source.compress_first_eight_generations {
+            add_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                child,
+            )?;
+        } else {
+            replace_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                projected_shared_scalar_fold_bytes(
+                    logical_scalars,
+                    source.explicit_scalars,
+                    BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS,
+                )?,
+                child,
+            )?;
+        }
+        ordinary_folds.push((source.explicit_scalars, child));
+    }
+    let source_materialization_fold_bytes = current_fold_bytes;
+
+    for generation in materialization_generation + 1..=padded_variables as u32 {
+        for (explicit, parent) in &mut ordinary_folds {
+            let child = projected_shared_scalar_fold_bytes(logical_scalars, *explicit, generation)?;
+            replace_projected_fold(
+                &mut current_fold_bytes,
+                &mut aggregate_fold_peak_bytes,
+                *parent,
+                child,
+            )?;
+            *parent = child;
+        }
+    }
+
+    Ok(ProjectedSharedFoldLifecycle {
+        first_generation_fold_bytes,
+        second_generation_fold_bytes,
+        fifth_generation_fold_bytes,
+        eighth_generation_fold_bytes,
+        source_materialization_fold_bytes,
+        final_generation_fold_bytes: current_fold_bytes,
+        aggregate_fold_peak_bytes,
+    })
+}
+
 fn projected_shared_scratch_bytes_for_shape(
     padded_variables: usize,
     banks: u64,
@@ -3008,9 +3286,6 @@ fn projected_shared_scratch_bytes_for_shape(
         fixed_base_source_bytes,
     ])?;
 
-    let mut transition_cells = Vec::with_capacity(transition_count as usize);
-    transition_cells.push(initialization_cells);
-    transition_cells.extend(std::iter::repeat_n(bank_cells, banks as usize));
     let matrix_first_fold_bytes = 0;
     let transition_first_fold_bytes = 0;
     let multiplicity_first_fold_bytes = projected_shared_scalar_fold_bytes(
@@ -3023,150 +3298,21 @@ fn projected_shared_scratch_bytes_for_shape(
     let wiring_first_fold_bytes = 0;
     let fixed_base_first_fold_bytes =
         projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, 1)?;
-    let first_generation_fold_bytes = checked_projection_sum(&[
-        matrix_first_fold_bytes,
-        transition_first_fold_bytes,
-        multiplicity_first_fold_bytes,
-        wiring_first_fold_bytes,
-        fixed_base_first_fold_bytes,
-    ])?;
-    let mut current_fold_bytes = first_generation_fold_bytes;
-    let mut aggregate_fold_peak_bytes = current_fold_bytes;
-    let mut fifth_generation_fold_bytes = 0;
-
-    for generation in 2..=BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS {
-        for _ in 0..transition_count {
-            replace_projected_fold(
-                &mut current_fold_bytes,
-                &mut aggregate_fold_peak_bytes,
-                projected_shared_scalar_fold_bytes(
-                    logical_scalars,
-                    BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
-                    generation - 1,
-                )?,
-                projected_shared_scalar_fold_bytes(
-                    logical_scalars,
-                    BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
-                    generation,
-                )?,
-            )?;
-        }
-        replace_projected_fold(
-            &mut current_fold_bytes,
-            &mut aggregate_fold_peak_bytes,
-            projected_shared_scalar_fold_bytes(
-                logical_scalars,
-                initialization_cells,
-                generation - 1,
-            )?,
-            projected_shared_scalar_fold_bytes(logical_scalars, initialization_cells, generation)?,
-        )?;
-        if generation == 5 {
-            fifth_generation_fold_bytes = current_fold_bytes;
-        }
-    }
-
-    let materialization_generation = BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS + 1;
-    let mut ordinary_folds = Vec::new();
-    for _ in 0..banks {
-        for explicit in [bank_cells, weight_cells, bank_cells] {
-            let child = projected_shared_scalar_fold_bytes(
-                logical_scalars,
-                explicit,
-                materialization_generation,
-            )?;
-            add_projected_fold(
-                &mut current_fold_bytes,
-                &mut aggregate_fold_peak_bytes,
-                child,
-            )?;
-            ordinary_folds.push((explicit, child));
-        }
-    }
-    for cells in &transition_cells {
-        let transition_explicit = cells
-            .checked_mul(STRUCTURED_TRANSITION_ORACLES as u64)
-            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
-        let transition_child = projected_shared_scalar_fold_bytes(
-            logical_scalars,
-            transition_explicit,
-            materialization_generation,
-        )?;
-        add_projected_fold(
-            &mut current_fold_bytes,
-            &mut aggregate_fold_peak_bytes,
-            transition_child,
-        )?;
-        ordinary_folds.push((transition_explicit, transition_child));
-
-        let multiplicity_parent = projected_shared_scalar_fold_bytes(
-            logical_scalars,
-            BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
-            BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS,
-        )?;
-        let multiplicity_child = projected_shared_scalar_fold_bytes(
-            logical_scalars,
-            BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64,
-            materialization_generation,
-        )?;
-        replace_projected_fold(
-            &mut current_fold_bytes,
-            &mut aggregate_fold_peak_bytes,
-            multiplicity_parent,
-            multiplicity_child,
-        )?;
-        ordinary_folds.push((BLS_DORY_RANGE_LOGUP_TABLE_VALUES as u64, multiplicity_child));
-
-        let mapped_child = transition_child;
-        add_projected_fold(
-            &mut current_fold_bytes,
-            &mut aggregate_fold_peak_bytes,
-            mapped_child,
-        )?;
-        ordinary_folds.push((transition_explicit, mapped_child));
-    }
-    let wiring_child = projected_shared_scalar_fold_bytes(
+    let lifecycle = projected_shared_fold_lifecycle(
+        padded_variables,
         logical_scalars,
+        banks,
+        transition_count,
+        initialization_cells,
+        bank_cells,
+        weight_cells,
         wiring_scalars,
-        materialization_generation,
+        &[],
     )?;
-    add_projected_fold(
-        &mut current_fold_bytes,
-        &mut aggregate_fold_peak_bytes,
-        wiring_child,
-    )?;
-    ordinary_folds.push((wiring_scalars, wiring_child));
-    let fixed_parent = projected_shared_scalar_fold_bytes(
-        logical_scalars,
-        initialization_cells,
-        BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS,
-    )?;
-    let fixed_child = projected_shared_scalar_fold_bytes(
-        logical_scalars,
-        initialization_cells,
-        materialization_generation,
-    )?;
-    replace_projected_fold(
-        &mut current_fold_bytes,
-        &mut aggregate_fold_peak_bytes,
-        fixed_parent,
-        fixed_child,
-    )?;
-    ordinary_folds.push((initialization_cells, fixed_child));
-    let source_materialization_fold_bytes = current_fold_bytes;
-
-    for generation in materialization_generation + 1..=padded_variables as u32 {
-        for (explicit, parent) in &mut ordinary_folds {
-            let child = projected_shared_scalar_fold_bytes(logical_scalars, *explicit, generation)?;
-            replace_projected_fold(
-                &mut current_fold_bytes,
-                &mut aggregate_fold_peak_bytes,
-                *parent,
-                child,
-            )?;
-            *parent = child;
-        }
-    }
+    let first_generation_fold_bytes = lifecycle.first_generation_fold_bytes;
+    let fifth_generation_fold_bytes = lifecycle.fifth_generation_fold_bytes;
+    let source_materialization_fold_bytes = lifecycle.source_materialization_fold_bytes;
+    let aggregate_fold_peak_bytes = lifecycle.aggregate_fold_peak_bytes;
     let aggregate_peak_bytes = retained_source_bytes
         .checked_add(aggregate_fold_peak_bytes)
         .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
@@ -3207,6 +3353,73 @@ pub fn projected_shared_production_scratch_bytes()
         125,
         125,
     )
+}
+
+/// Extend the canonical production fold lifecycle with physical sources that
+/// are appended after the shared layout's existing source order.
+pub(crate) fn projected_shared_production_scratch_with_additional_sources(
+    additional_retained_source_bytes: u64,
+    additional_sources: &[BlsDoryAdditionalFoldSourceProjection],
+) -> Result<BlsDoryComposedProductionScratchProjection, BlsDorySharedLayoutError> {
+    let logical_scalars = 1u64
+        .checked_shl(BLS_DORY_SHARED_PRODUCTION_VARIABLES as u32)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let banks = u64::from(PRODUCTION_V2_BANKS);
+    let batch = u64::from(PRODUCTION_V2_BATCH);
+    let dimension = u64::from(PRODUCTION_V2_DIMENSION);
+    let layers_per_bank = u64::from(PRODUCTION_V2_LAYERS_PER_BANK);
+    let transition_count = banks
+        .checked_add(1)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let initialization_cells = batch
+        .checked_mul(dimension)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let bank_cells = layers_per_bank
+        .checked_mul(batch)
+        .and_then(|value| value.checked_mul(dimension))
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let weight_cells = layers_per_bank
+        .checked_mul(dimension)
+        .and_then(|value| value.checked_mul(dimension))
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let wiring_scalars = bank_cells
+        .checked_mul(
+            banks
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?,
+        )
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let lifecycle = projected_shared_fold_lifecycle(
+        BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+        logical_scalars,
+        banks,
+        transition_count,
+        initialization_cells,
+        bank_cells,
+        weight_cells,
+        wiring_scalars,
+        additional_sources,
+    )?;
+    let retained_source_bytes = projected_shared_production_scratch_bytes()?
+        .retained_source_bytes
+        .checked_add(additional_retained_source_bytes)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+    let aggregate_peak_bytes = retained_source_bytes
+        .checked_add(lifecycle.aggregate_fold_peak_bytes)
+        .ok_or(BlsDorySharedLayoutError::InvalidProofShape)?;
+
+    Ok(BlsDoryComposedProductionScratchProjection {
+        retained_source_bytes,
+        first_generation_fold_bytes: lifecycle.first_generation_fold_bytes,
+        second_generation_fold_bytes: lifecycle.second_generation_fold_bytes,
+        fifth_generation_fold_bytes: lifecycle.fifth_generation_fold_bytes,
+        eighth_generation_fold_bytes: lifecycle.eighth_generation_fold_bytes,
+        source_materialization_fold_bytes: lifecycle.source_materialization_fold_bytes,
+        final_generation_fold_bytes: lifecycle.final_generation_fold_bytes,
+        aggregate_fold_peak_bytes: lifecycle.aggregate_fold_peak_bytes,
+        aggregate_peak_bytes,
+    })
 }
 
 /// Project one Dory opening aggregate at the canonical production geometry.

@@ -32,7 +32,7 @@ use crate::{
     GOLDILOCKS_MODULUS, StructuredBlake3Statement,
     dory_bls12_381_aggregate::{
         BlsDoryAggregateLayout, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
-        BlsDoryCompactRowSource,
+        BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
     },
     dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
     dory_bls12_381_prototype::DeterministicBlsDorySetup,
@@ -190,6 +190,13 @@ impl BlsDoryBlake3SourceRole {
     }
 }
 
+/// Canonical physical-source order used only at the aggregate boundary.
+pub const BLS_DORY_BLAKE3_SOURCE_ROLES: [BlsDoryBlake3SourceRole; 4] = [
+    BlsDoryBlake3SourceRole::Main,
+    BlsDoryBlake3SourceRole::Accumulator,
+    BlsDoryBlake3SourceRole::Preprocessing,
+    BlsDoryBlake3SourceRole::Inverse,
+];
 /// Canonical source role selected by each execution then adjacency claim.
 pub const BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES: [BlsDoryBlake3SourceRole; 6] = [
     BlsDoryBlake3SourceRole::Main,
@@ -233,6 +240,96 @@ impl BlsDoryBlake3SourceCommitments {
             BlsDoryBlake3SourceRole::Preprocessing => &self.preprocessing,
             BlsDoryBlake3SourceRole::Inverse => &self.inverse,
         }
+    }
+}
+
+/// Prover-owned BLAKE3 sources kept in semantic rather than positional form.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct BlsDoryBlake3CommittedSources {
+    main: BlsDoryCommittedPolynomial,
+    accumulator: BlsDoryCommittedPolynomial,
+    preprocessing: BlsDoryCommittedPolynomial,
+    inverse: BlsDoryCommittedPolynomial,
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl BlsDoryBlake3CommittedSources {
+    fn source(&self, role: BlsDoryBlake3SourceRole) -> &BlsDoryCommittedPolynomial {
+        match role {
+            BlsDoryBlake3SourceRole::Main => &self.main,
+            BlsDoryBlake3SourceRole::Accumulator => &self.accumulator,
+            BlsDoryBlake3SourceRole::Preprocessing => &self.preprocessing,
+            BlsDoryBlake3SourceRole::Inverse => &self.inverse,
+        }
+    }
+
+    fn commitments(&self) -> BlsDoryBlake3SourceCommitments {
+        BlsDoryBlake3SourceCommitments {
+            main: self.main.commitment(),
+            accumulator: self.accumulator.commitment(),
+            preprocessing: self.preprocessing.commitment(),
+            inverse: self.inverse.commitment(),
+        }
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    fn into_canonical_deferred_openings(
+        self,
+        points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+    ) -> Result<BlsDoryDeferredOpeningSet, BlsDoryAggregateError> {
+        Self::validate_lifted_points(
+            &points,
+            BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES,
+            BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+        )?;
+        self.into_deferred_openings(points)
+    }
+
+    #[cfg(test)]
+    fn into_canonical_deferred_openings_at_variables(
+        self,
+        points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+        source_variables: usize,
+        shared_variables: usize,
+    ) -> Result<BlsDoryDeferredOpeningSet, BlsDoryAggregateError> {
+        Self::validate_lifted_points(&points, source_variables, shared_variables)?;
+        self.into_deferred_openings(points)
+    }
+
+    fn validate_lifted_points(
+        points: &[Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+        source_variables: usize,
+        shared_variables: usize,
+    ) -> Result<(), BlsDoryAggregateError> {
+        if source_variables > shared_variables
+            || points.iter().any(|point| {
+                point.len() != shared_variables
+                    || point[source_variables..]
+                        .iter()
+                        .any(|coordinate| *coordinate != BlsDoryFr::zero())
+            })
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        Ok(())
+    }
+
+    fn into_deferred_openings(
+        self,
+        points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+    ) -> Result<BlsDoryDeferredOpeningSet, BlsDoryAggregateError> {
+        BlsDoryDeferredOpeningSet::new(
+            vec![
+                self.main,
+                self.accumulator,
+                self.preprocessing,
+                self.inverse,
+            ],
+            BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.to_vec(),
+            points.into_iter().collect(),
+        )
     }
 }
 
@@ -5584,24 +5681,24 @@ mod tests {
         const SOURCE_VARIABLES: usize = 10;
         let layout = BlsDoryAggregateLayout::new(5, 7).unwrap();
         let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(14).unwrap();
-        let polynomials = (0..BLS_DORY_BLAKE3_SOURCE_COMMITMENTS)
-            .map(|source| {
-                let mut coefficients = (0..1 << SOURCE_VARIABLES)
-                    .map(|index| {
-                        BlsDoryFr::from_u64(
-                            (source as u64 + 1) * 1_000_003 + (index as u64 + 17) * 97,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                coefficients.resize(1 << layout.variables(), BlsDoryFr::zero());
-                commit_bls_dory_polynomial(coefficients, layout.nu(), layout.sigma(), &setup)
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let commitments = polynomials
-            .iter()
-            .map(BlsDoryCommittedPolynomial::commitment)
-            .collect::<Vec<_>>();
+        let [main, accumulator, preprocessing, inverse] = std::array::from_fn(|source| {
+            let mut coefficients = (0..1 << SOURCE_VARIABLES)
+                .map(|index| {
+                    BlsDoryFr::from_u64((source as u64 + 1) * 1_000_003 + (index as u64 + 17) * 97)
+                })
+                .collect::<Vec<_>>();
+            coefficients.resize(1 << layout.variables(), BlsDoryFr::zero());
+            commit_bls_dory_polynomial(coefficients, layout.nu(), layout.sigma(), &setup).unwrap()
+        });
+        let committed_sources = BlsDoryBlake3CommittedSources {
+            main,
+            accumulator,
+            preprocessing,
+            inverse,
+        };
+        let source_commitments = committed_sources.commitments();
+        let commitments =
+            BLS_DORY_BLAKE3_SOURCE_ROLES.map(|role| committed_sources.source(role).commitment());
         for (index, commitment) in commitments.iter().enumerate() {
             assert!(
                 commitments
@@ -5625,12 +5722,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let expected_points = points.clone();
-        let opening_set = BlsDoryDeferredOpeningSet::new(
-            polynomials,
-            BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.to_vec(),
-            points,
-        )
-        .unwrap();
+        let opening_set = committed_sources
+            .into_canonical_deferred_openings_at_variables(
+                points.try_into().unwrap(),
+                SOURCE_VARIABLES,
+                layout.variables(),
+            )
+            .unwrap();
         assert!(opening_set.claims().iter().all(|claim| {
             claim.point[SOURCE_VARIABLES..]
                 .iter()
@@ -5667,12 +5765,6 @@ mod tests {
             .iter()
             .map(|claim| claim.evaluation)
             .collect::<Vec<_>>();
-        let source_commitments = BlsDoryBlake3SourceCommitments {
-            main: commitments[0],
-            accumulator: commitments[1],
-            preprocessing: commitments[2],
-            inverse: commitments[3],
-        };
         let opening_replay = blake3_opening_replay(&expected_points, &expected_evaluations);
         let opening_statement = BlsDoryBlake3OpeningStatement::from_verified_replay_at_variables(
             source_commitments.clone(),

@@ -697,11 +697,13 @@ and 18 samples per round, yields the expected 746 terminal evaluations, and
 rejects modified round messages and terminal values. The fixture commits packed
 terminal tables before the sumcheck and derives random selector points only
 after its transcript and terminal vector are fixed. Because the bounded Dory
-setup supports at most 16 variables, three commitments cover the 746 tables and
-one three-claim aggregate authenticates their selector evaluations; changing
-the opening proof is rejected. Production geometry instead needs one
-30-variable packed commitment and one opening claim. Selector batching adds at
-most degree-10 error over the BLS12-381 scalar field at that geometry, before
+setup supports at most 16 variables, four commitments cover the 746 tables and
+one four-claim aggregate authenticates their selector evaluations: three
+commitments contain main terminals and a fourth contains preprocessing
+terminals. Changing the opening proof is rejected. The projected production
+layout places those groups in separate 1,024-slot halves of one 31-variable
+commitment and uses one opening claim. Selector batching adds at most degree-11
+error over the BLS12-381 scalar field at that geometry, before
 the complete union bound. The production out-of-core commitment/opening path is
 not implemented or measured, so this is not yet an admissible proof.
 
@@ -720,9 +722,22 @@ rejected. A 16-row fixture preserves the full 289-column width and packs the 578
 source tables into one 16-variable Dory commitment and both inverses into a
 second. Two transcript-random selector claims authenticate all 580 terminal
 evaluations; source-commitment, terminal, and opening-proof mutations fail. At
-production geometry, each commitment has 20 row variables plus 10 selector
-variables. Its out-of-core implementation, complete Fiat-Shamir union bound,
+production geometry, adjacency reuses the 31-variable execution source with its
+half selector fixed and randomizes the remaining 10 selector variables; the
+post-challenge inverse is a second 31-variable commitment. Its out-of-core
+implementation, complete Fiat-Shamir union bound,
 and independent review remain open.
+
+The composed 256-row fixture now proves that execution and adjacency refer to
+one source identity. Four bounded execution commitments separate three main
+groups from one preprocessing group. Adjacency reopens the exact same three main
+commitments at its own sumcheck point and adds one inverse commitment. A single
+eight-claim Dory aggregate verified in 193.89 seconds in an unoptimized debug
+run. Replacing a shared source commitment, an adjacency terminal, the inverse
+commitment, or the aggregate proof is rejected. Production projects the four
+bounded source groups into one 31-variable commitment whose two 1,024-slot
+halves separate main and preprocessing tables. The unified out-of-core prover
+and a measured production run remain open.
 
 The verified model-bank reader can now transactionally publish reusable BLS coefficient artifacts as well as the fixed identity. It builds the base input and every ordered weight bank while checking the canonical byte roots and EOF, returns nothing on failure, and cleans provisional files. Its writer reassembles arbitrary authenticated input chunks into canonical rows, commits complete rows in deterministic parallel batches behind a bounded 256 MiB window, and preserves canonical artifact and target-group accumulation order. Three n=19 release A/B repeats measured 814--826 ms for the former serial writer and 377--391 ms for the parallel writer; their 822 and 385 ms medians give a 53.2% reduction while producing the identical artifact digest, row commitments, tier-two commitment, opening claims, and proof bytes. Matrix proving consumes the authenticated weight artifact sequentially, reuses it in the shared aggregate opening, and rejects a commitment from the wrong pinned bank before proving. Bounded fixtures match materialized proof bytes exactly. This removes the roughly 16 GiB in-memory `i64` slice for an n=31 weight bank. It also replaces the former 32-byte-per-weight scalar artifact: the first Dory row is stored as canonical signed words and each remaining model weight in the consensus range `[-125, 125]` is one authenticated byte selecting the fixed dictionary `0, -1..-125, 1..125`. Every read reauthenticates the dictionary, codes, dimensions, source digest, and EOF before expansion.
 

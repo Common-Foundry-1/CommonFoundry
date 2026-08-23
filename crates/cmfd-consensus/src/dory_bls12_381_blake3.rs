@@ -48,6 +48,12 @@ pub const BLS_DORY_BLAKE3_TRACE_VARIABLES: usize = 20;
 pub const BLS_DORY_BLAKE3_MAIN_WIDTH: usize = 289;
 /// The deterministic BLAKE3 schedule retains the existing fixed preprocessing width.
 pub const BLS_DORY_BLAKE3_PREPROCESSED_WIDTH: usize = 84;
+/// Eleven selector variables separate main and preprocessing tables into 1,024-slot halves.
+pub const BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES: usize = 11;
+/// Adjacency fixes the source half selector and randomizes the remaining ten variables.
+pub const BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES: usize = 10;
+/// Twenty trace variables plus eleven source selectors define the shared commitment.
+pub const BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES: usize = 31;
 /// The translated execution constraints have degree at most sixteen.
 pub const BLS_DORY_BLAKE3_EXECUTION_CONSTRAINT_DEGREE: usize = 16;
 /// The native relation keeps 1,296 BLAKE3 constraints and replaces nine
@@ -117,8 +123,8 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "the bounded fixture Dory-authenticates all 746 execution terminal evaluations by random-selector batching, but the production out-of-core commitment and opening path is not implemented or measured",
-    "the bounded row-indexed LogUp adjacency fixture Dory-authenticates the pre-challenge source and post-challenge inverse commitments plus all 580 terminal evaluations, but the production out-of-core path, complete Fiat-Shamir soundness bound, and independent review remain open",
+    "the bounded composed fixture makes execution and adjacency reuse the exact same Dory-authenticated main commitments, but the unified 31-variable production source/inverse commitment and out-of-core opening path are not implemented or measured",
+    "the execution, row-compression, lookup, sumcheck, and selector-batching errors do not yet have one complete independently reviewed Fiat-Shamir union bound",
     "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
@@ -533,8 +539,9 @@ mod tests {
     use crate::dory_bls12_381_aggregate::MAX_BLS_DORY_AGGREGATE_CLAIMS;
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        commit_bls_dory_polynomial, prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
+        BlsDoryOpeningClaim, commit_bls_dory_polynomial, prove_bls_dory_deferred_opening_sets,
+        verify_bls_dory_openings,
     };
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_prototype::{BlsDoryGt, DeterministicBlsDorySetup};
@@ -626,6 +633,25 @@ mod tests {
         sumcheck: DenseAdjacencySumcheckProof,
         opening_batches: Vec<DenseAdjacencyOpeningBatch>,
         opening_proof: Vec<u8>,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[derive(Clone)]
+    struct DenseAuthenticatedBlake3Proof {
+        execution_sumcheck: DenseExecutionSumcheckProof,
+        adjacency_sumcheck: DenseAdjacencySumcheckProof,
+        execution_batches: Vec<DenseExecutionOpeningBatch>,
+        inverse_commitment: BlsDoryGt,
+        opening_proof: Vec<u8>,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    struct DenseBlake3Fixture {
+        air: NarrowBlake3Air,
+        tables: Vec<Vec<BlsDoryFr>>,
+        public: Vec<BlsDoryFr>,
+        constraints: Vec<BlsDoryBlake3ConstraintExpr>,
+        bridge: BlsDoryOutputBridgeStatement,
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -1786,6 +1812,42 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
+    fn commit_dense_execution_batches(
+        tables: &[Vec<BlsDoryFr>],
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<
+        (
+            Vec<BlsDoryCommittedPolynomial>,
+            Vec<DenseExecutionOpeningBatch>,
+        ),
+        BlsDoryAggregateError,
+    > {
+        const ROWS: usize = 1 << 8;
+        const PACKED_SLOTS: usize = 1 << 8;
+        if tables.len() != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+            || tables.iter().any(|table| table.len() != ROWS)
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let mut committed_batches = Vec::new();
+        let mut opening_batches = Vec::new();
+        let main_terminals = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+        for group in [&tables[..main_terminals], &tables[main_terminals..]] {
+            for batch in group.chunks(PACKED_SLOTS) {
+                let packed = dense_pack_adjacency_tables(batch, ROWS, PACKED_SLOTS)
+                    .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+                let committed = commit_bls_dory_polynomial(packed, 8, 8, setup)?;
+                opening_batches.push(DenseExecutionOpeningBatch {
+                    commitment: committed.commitment(),
+                    terminal_count: batch.len(),
+                });
+                committed_batches.push(committed);
+            }
+        }
+        Ok((committed_batches, opening_batches))
+    }
+
+    #[cfg(feature = "whir-prototype")]
     fn prove_dense_authenticated_execution(
         tables: Vec<Vec<BlsDoryFr>>,
         air: &NarrowBlake3Air,
@@ -1794,30 +1856,7 @@ mod tests {
         bridge: &BlsDoryOutputBridgeStatement,
         setup: &DeterministicBlsDorySetup,
     ) -> Result<DenseAuthenticatedExecutionProof, BlsDoryAggregateError> {
-        const PACKED_SLOTS: usize = 1 << 8;
-        if tables.len() != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
-            || tables.iter().any(|table| table.len() != PACKED_SLOTS)
-        {
-            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
-        }
-        let mut committed_batches = Vec::new();
-        let mut opening_batches = Vec::new();
-        for batch in tables.chunks(PACKED_SLOTS) {
-            let mut packed = Vec::with_capacity(PACKED_SLOTS * PACKED_SLOTS);
-            for slot in 0..PACKED_SLOTS {
-                if let Some(table) = batch.get(slot) {
-                    packed.extend_from_slice(table);
-                } else {
-                    packed.resize(packed.len() + PACKED_SLOTS, BlsDoryFr::zero());
-                }
-            }
-            let committed = commit_bls_dory_polynomial(packed, 8, 8, setup)?;
-            opening_batches.push(DenseExecutionOpeningBatch {
-                commitment: committed.commitment(),
-                terminal_count: batch.len(),
-            });
-            committed_batches.push(committed);
-        }
+        let (committed_batches, opening_batches) = commit_dense_execution_batches(&tables, setup)?;
         let commitments = opening_batches
             .iter()
             .map(|batch| batch.commitment)
@@ -1872,10 +1911,8 @@ mod tests {
         bridge: &BlsDoryOutputBridgeStatement,
         setup: &DeterministicBlsDorySetup,
     ) -> bool {
-        const PACKED_SLOTS: usize = 1 << 8;
-        let expected_batches =
-            BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS.div_ceil(PACKED_SLOTS);
-        if proof.opening_batches.len() != expected_batches || proof.opening_proof.is_empty() {
+        let expected_counts = [256, 256, 66, 168];
+        if proof.opening_batches.len() != expected_counts.len() || proof.opening_proof.is_empty() {
             return false;
         }
         let commitments = proof
@@ -1901,16 +1938,14 @@ mod tests {
         let (selector_points, opening_binding) =
             dense_opening_selector_points(proof.sumcheck.transcript_digest, &proof.opening_batches);
         let mut terminal_start = 0usize;
-        let mut claims = Vec::with_capacity(expected_batches);
-        for ((batch_index, batch), selector) in proof
+        let mut claims = Vec::with_capacity(expected_counts.len());
+        for (((batch, selector), expected_count), batch_index) in proof
             .opening_batches
             .iter()
-            .enumerate()
             .zip(&selector_points)
+            .zip(expected_counts)
+            .zip(0..)
         {
-            let expected_count = (BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
-                - batch_index * PACKED_SLOTS)
-                .min(PACKED_SLOTS);
             if batch.terminal_count != expected_count {
                 return false;
             }
@@ -1924,8 +1959,392 @@ mod tests {
                 ),
             });
             terminal_start = terminal_end;
+            if batch_index + 1 == expected_counts.len()
+                && terminal_start != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+            {
+                return false;
+            }
         }
         verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup).is_ok()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_composed_adjacency_batches(
+        execution_batches: &[DenseExecutionOpeningBatch],
+        inverse_commitment: BlsDoryGt,
+    ) -> Option<Vec<DenseAdjacencyOpeningBatch>> {
+        let source_counts = [256, 256, 66];
+        if execution_batches.len() != 4
+            || execution_batches
+                .iter()
+                .zip([256, 256, 66, 168])
+                .any(|(batch, count)| batch.terminal_count != count)
+        {
+            return None;
+        }
+        let mut terminal_start = 0usize;
+        let mut batches = execution_batches[..3]
+            .iter()
+            .zip(source_counts)
+            .map(|(batch, count)| {
+                let opening = DenseAdjacencyOpeningBatch {
+                    commitment: batch.commitment,
+                    terminal_start,
+                    terminal_count: count,
+                    selector_variables: 8,
+                };
+                terminal_start += count;
+                opening
+            })
+            .collect::<Vec<_>>();
+        batches.push(DenseAdjacencyOpeningBatch {
+            commitment: inverse_commitment,
+            terminal_start,
+            terminal_count: 2,
+            selector_variables: 8,
+        });
+        Some(batches)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_composed_opening_binding(
+        bridge: &BlsDoryOutputBridgeStatement,
+        execution_digest: [u8; 32],
+        adjacency_digest: [u8; 32],
+        execution_selector_binding: [u8; 32],
+        adjacency_selector_binding: [u8; 32],
+        execution_batches: &[DenseExecutionOpeningBatch],
+        inverse_commitment: BlsDoryGt,
+    ) -> [u8; 32] {
+        let mut transcript = BlsDoryTranscript::new(b"blake3-native-composed-dory-opening");
+        transcript.append_bytes(b"dory-binding", &bridge.transcript_binding());
+        transcript.append_bytes(b"execution-sumcheck", &execution_digest);
+        transcript.append_bytes(b"adjacency-sumcheck", &adjacency_digest);
+        transcript.append_bytes(b"execution-selectors", &execution_selector_binding);
+        transcript.append_bytes(b"adjacency-selectors", &adjacency_selector_binding);
+        transcript.append_bytes(
+            b"execution-batch-count",
+            &(execution_batches.len() as u64).to_le_bytes(),
+        );
+        for batch in execution_batches {
+            transcript.append_bytes(
+                b"execution-terminal-count",
+                &(batch.terminal_count as u64).to_le_bytes(),
+            );
+            transcript.append_group(b"execution-commitment", &batch.commitment);
+        }
+        transcript.append_group(b"adjacency-inverse-commitment", &inverse_commitment);
+        transcript.digest()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn prove_dense_authenticated_blake3(
+        tables: Vec<Vec<BlsDoryFr>>,
+        air: &NarrowBlake3Air,
+        public: &[BlsDoryFr],
+        constraints: &[BlsDoryBlake3ConstraintExpr],
+        bridge: &BlsDoryOutputBridgeStatement,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<DenseAuthenticatedBlake3Proof, BlsDoryAggregateError> {
+        const ROWS: usize = 1 << 8;
+        const SLOTS: usize = 1 << 8;
+        let adjacency_tables = dense_adjacency_source_tables(&tables);
+        let (mut committed_batches, execution_batches) =
+            commit_dense_execution_batches(&tables, setup)?;
+        let execution_commitments = execution_batches
+            .iter()
+            .map(|batch| batch.commitment)
+            .collect::<Vec<_>>();
+        let execution_sumcheck = prove_dense_execution_sumcheck(
+            tables,
+            air,
+            public,
+            constraints,
+            bridge,
+            &execution_commitments,
+        );
+
+        let source_commitments = execution_commitments[..3].to_vec();
+        let mut challenge_transcript =
+            dense_adjacency_transcript(bridge, ROWS, &source_commitments);
+        let compression = challenge_transcript.challenge_scalar(b"row-compression");
+        let alpha = challenge_transcript.challenge_scalar(b"lookup-alpha");
+        let inverse_tables = dense_adjacency_inverse_tables(&adjacency_tables, compression, alpha)
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+        let inverse = commit_bls_dory_polynomial(
+            dense_pack_adjacency_tables(&inverse_tables, ROWS, SLOTS)
+                .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?,
+            8,
+            8,
+            setup,
+        )?;
+        let inverse_commitment = inverse.commitment();
+        let inverse_commitments = [inverse_commitment];
+        let adjacency_sumcheck = prove_dense_adjacency_sumcheck(
+            adjacency_tables,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+
+        let execution_point =
+            dense_replay_sumcheck_point(&execution_sumcheck, bridge, &execution_commitments)
+                .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+        let adjacency_point = dense_replay_adjacency_point(
+            &adjacency_sumcheck,
+            ROWS,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+        let adjacency_batches =
+            dense_composed_adjacency_batches(&execution_batches, inverse_commitment)
+                .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+        let (execution_selectors, execution_selector_binding) =
+            dense_opening_selector_points(execution_sumcheck.transcript_digest, &execution_batches);
+        let (adjacency_selectors, adjacency_selector_binding) =
+            dense_adjacency_opening_selector_points(
+                adjacency_sumcheck.transcript_digest,
+                &adjacency_batches,
+            );
+        let mut points = execution_selectors
+            .iter()
+            .map(|selector| dense_opening_point(&execution_point, selector))
+            .collect::<Vec<_>>();
+        points.extend(
+            adjacency_selectors
+                .iter()
+                .map(|selector| dense_opening_point(&adjacency_point, selector)),
+        );
+        committed_batches.push(inverse);
+        let mut polynomial_indices = (0..execution_batches.len()).collect::<Vec<_>>();
+        polynomial_indices.extend([0, 1, 2, 4]);
+        let openings =
+            BlsDoryDeferredOpeningSet::new(committed_batches, polynomial_indices, points)?;
+        let mut opening_index = 0usize;
+        let mut terminal_start = 0usize;
+        for (batch, selector) in execution_batches.iter().zip(&execution_selectors) {
+            let terminal_end = terminal_start + batch.terminal_count;
+            let expected = dense_terminal_selector_evaluation(
+                &execution_sumcheck.terminal_evaluations[terminal_start..terminal_end],
+                selector,
+            );
+            if openings.claims()[opening_index].evaluation != expected {
+                return Err(BlsDoryAggregateError::InvalidProofShape);
+            }
+            terminal_start = terminal_end;
+            opening_index += 1;
+        }
+        for (batch, selector) in adjacency_batches.iter().zip(&adjacency_selectors) {
+            let terminal_end = batch.terminal_start + batch.terminal_count;
+            let expected = dense_terminal_selector_evaluation(
+                &adjacency_sumcheck.terminal_evaluations[batch.terminal_start..terminal_end],
+                selector,
+            );
+            if openings.claims()[opening_index].evaluation != expected {
+                return Err(BlsDoryAggregateError::InvalidProofShape);
+            }
+            opening_index += 1;
+        }
+        let opening_binding = dense_composed_opening_binding(
+            bridge,
+            execution_sumcheck.transcript_digest,
+            adjacency_sumcheck.transcript_digest,
+            execution_selector_binding,
+            adjacency_selector_binding,
+            &execution_batches,
+            inverse_commitment,
+        );
+        let (_, opening_proof) =
+            prove_bls_dory_deferred_opening_sets(&opening_binding, &[&openings], setup)?;
+        Ok(DenseAuthenticatedBlake3Proof {
+            execution_sumcheck,
+            adjacency_sumcheck,
+            execution_batches,
+            inverse_commitment,
+            opening_proof,
+        })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn verify_dense_authenticated_blake3(
+        proof: &DenseAuthenticatedBlake3Proof,
+        air: &NarrowBlake3Air,
+        public: &[BlsDoryFr],
+        constraints: &[BlsDoryBlake3ConstraintExpr],
+        bridge: &BlsDoryOutputBridgeStatement,
+        setup: &DeterministicBlsDorySetup,
+    ) -> bool {
+        const ROWS: usize = 1 << 8;
+        if proof.opening_proof.is_empty()
+            || proof.execution_batches.len() != 4
+            || proof
+                .execution_batches
+                .iter()
+                .zip([256, 256, 66, 168])
+                .any(|(batch, count)| batch.terminal_count != count)
+        {
+            return false;
+        }
+        let execution_commitments = proof
+            .execution_batches
+            .iter()
+            .map(|batch| batch.commitment)
+            .collect::<Vec<_>>();
+        let source_commitments = execution_commitments[..3].to_vec();
+        let inverse_commitments = [proof.inverse_commitment];
+        if !verify_dense_execution_sumcheck(
+            &proof.execution_sumcheck,
+            air,
+            public,
+            constraints,
+            bridge,
+            &execution_commitments,
+        ) || !verify_dense_adjacency_sumcheck(
+            &proof.adjacency_sumcheck,
+            ROWS,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        ) {
+            return false;
+        }
+        let Some(execution_point) =
+            dense_replay_sumcheck_point(&proof.execution_sumcheck, bridge, &execution_commitments)
+        else {
+            return false;
+        };
+        let Some(adjacency_point) = dense_replay_adjacency_point(
+            &proof.adjacency_sumcheck,
+            ROWS,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        ) else {
+            return false;
+        };
+        let Some(adjacency_batches) =
+            dense_composed_adjacency_batches(&proof.execution_batches, proof.inverse_commitment)
+        else {
+            return false;
+        };
+        let (execution_selectors, execution_selector_binding) = dense_opening_selector_points(
+            proof.execution_sumcheck.transcript_digest,
+            &proof.execution_batches,
+        );
+        let (adjacency_selectors, adjacency_selector_binding) =
+            dense_adjacency_opening_selector_points(
+                proof.adjacency_sumcheck.transcript_digest,
+                &adjacency_batches,
+            );
+        let mut claims = Vec::with_capacity(8);
+        let mut terminal_start = 0usize;
+        for (batch, selector) in proof.execution_batches.iter().zip(&execution_selectors) {
+            let terminal_end = terminal_start + batch.terminal_count;
+            claims.push(BlsDoryOpeningClaim {
+                commitment: batch.commitment,
+                point: dense_opening_point(&execution_point, selector),
+                evaluation: dense_terminal_selector_evaluation(
+                    &proof.execution_sumcheck.terminal_evaluations[terminal_start..terminal_end],
+                    selector,
+                ),
+            });
+            terminal_start = terminal_end;
+        }
+        for (batch, selector) in adjacency_batches.iter().zip(&adjacency_selectors) {
+            let terminal_end = batch.terminal_start + batch.terminal_count;
+            claims.push(BlsDoryOpeningClaim {
+                commitment: batch.commitment,
+                point: dense_opening_point(&adjacency_point, selector),
+                evaluation: dense_terminal_selector_evaluation(
+                    &proof.adjacency_sumcheck.terminal_evaluations
+                        [batch.terminal_start..terminal_end],
+                    selector,
+                ),
+            });
+        }
+        let opening_binding = dense_composed_opening_binding(
+            bridge,
+            proof.execution_sumcheck.transcript_digest,
+            proof.adjacency_sumcheck.transcript_digest,
+            execution_selector_binding,
+            adjacency_selector_binding,
+            &proof.execution_batches,
+            proof.inverse_commitment,
+        );
+        verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup).is_ok()
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_blake3_fixture() -> DenseBlake3Fixture {
+        let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
+        let challenge_digest = [0x42; 32];
+        let witness = build_tree_witness(OUTPUT_CONTEXT, challenge_digest, &activation).unwrap();
+        let point = (0..activation.len().ilog2())
+            .map(|index| ExtensionElement {
+                limbs: [
+                    u64::from(index) + 2,
+                    u64::from(index) + 3,
+                    u64::from(index) + 4,
+                ],
+            })
+            .collect::<Vec<_>>();
+        let native_point = point
+            .iter()
+            .copied()
+            .map(ExtensionElement::to_field)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let signed_activation = activation
+            .iter()
+            .map(|value| {
+                crate::structured_sumcheck::ExtensionField::from_signed(i64::from(*value) - 125)
+            })
+            .collect::<Vec<_>>();
+        let statement = StructuredBlake3Statement {
+            challenge_digest,
+            final_activation_len: activation.len(),
+            final_activation_digest: witness.digest,
+            final_activation_point: point,
+            final_activation_evaluation: ExtensionElement::from_field(
+                crate::structured_sumcheck::evaluate_mle(&signed_activation, &native_point),
+            ),
+        };
+        let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            challenge_digest,
+            witness.digest,
+            &activation,
+            [0x51; 32],
+            [2_u64, 3, 5, 7, 11]
+                .into_iter()
+                .map(BlsDoryFr::from_u64)
+                .collect(),
+        )
+        .unwrap();
+        let air = NarrowBlake3Air::new(&statement).unwrap();
+        let main = generate_main_trace(&air, &statement, &witness);
+        let old_main_rows = (0..air.trace_rows())
+            .map(|row| bls_values(unsafe { main.row_unchecked(row) }))
+            .collect::<Vec<_>>();
+        let accumulators = native_accumulator_trace(&air, &old_main_rows, &bridge);
+        let native_rows = old_main_rows
+            .iter()
+            .zip(&accumulators)
+            .map(|(row, accumulator)| native_main_row(row, *accumulator))
+            .collect::<Vec<_>>();
+        let preprocessed = air.preprocessed_trace().unwrap();
+        let preprocessed_rows = (0..air.trace_rows())
+            .map(|row| bls_values(unsafe { preprocessed.row_unchecked(row) }))
+            .collect::<Vec<_>>();
+        DenseBlake3Fixture {
+            tables: dense_execution_tables(&native_rows, &preprocessed_rows),
+            public: bls_values(public_values(&statement).unwrap()),
+            constraints: bls_dory_native_blake3_constraint_ir(activation.len()).unwrap(),
+            bridge,
+            air,
+        }
     }
 
     #[test]
@@ -1935,6 +2354,9 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS, 746);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS, 1);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS, 1_299);
+        assert_eq!(BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES, 11);
+        assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES, 10);
+        assert_eq!(BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES, 31);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS, 580);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS, 2);
         assert_eq!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, 131);
@@ -2490,7 +2912,7 @@ mod tests {
             &setup,
         )
         .unwrap();
-        assert_eq!(authenticated.opening_batches.len(), 3);
+        assert_eq!(authenticated.opening_batches.len(), 4);
         assert_eq!(
             authenticated
                 .opening_batches
@@ -2516,6 +2938,84 @@ mod tests {
             &public,
             &constraints,
             &bridge,
+            &setup,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "five shared Dory commitments are intentionally expensive in debug builds"]
+    fn native_execution_and_adjacency_share_authenticated_source_commitments() {
+        let fixture = dense_blake3_fixture();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
+        let authenticated = prove_dense_authenticated_blake3(
+            fixture.tables,
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(authenticated.execution_batches.len(), 4);
+        assert_eq!(authenticated.execution_sumcheck.rounds.len(), 8);
+        assert_eq!(authenticated.adjacency_sumcheck.rounds.len(), 8);
+        assert!(verify_dense_authenticated_blake3(
+            &authenticated,
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
+            &setup,
+        ));
+
+        let mut changed_shared_source = authenticated.clone();
+        changed_shared_source.execution_batches[0].commitment =
+            changed_shared_source.execution_batches[1].commitment;
+        assert!(!verify_dense_authenticated_blake3(
+            &changed_shared_source,
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
+            &setup,
+        ));
+
+        let mut changed_adjacency_terminal = authenticated.clone();
+        changed_adjacency_terminal
+            .adjacency_sumcheck
+            .terminal_evaluations[0] = changed_adjacency_terminal
+            .adjacency_sumcheck
+            .terminal_evaluations[0]
+            + BlsDoryFr::from_u64(1);
+        assert!(!verify_dense_authenticated_blake3(
+            &changed_adjacency_terminal,
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
+            &setup,
+        ));
+
+        let mut changed_inverse = authenticated.clone();
+        changed_inverse.inverse_commitment = changed_inverse.execution_batches[0].commitment;
+        assert!(!verify_dense_authenticated_blake3(
+            &changed_inverse,
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
+            &setup,
+        ));
+
+        let mut changed_opening = authenticated;
+        changed_opening.opening_proof[0] ^= 1;
+        assert!(!verify_dense_authenticated_blake3(
+            &changed_opening,
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
             &setup,
         ));
     }

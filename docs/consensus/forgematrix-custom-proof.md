@@ -1059,11 +1059,13 @@ rounds with 18 evaluations per round, exposes all 746 local/next terminal
 evaluations, and rejects round-message and terminal-value substitutions. A
 transcript-random selector batches those values into packed Dory openings after
 the commitments, sumcheck transcript, and terminal vector are fixed. The
-bounded setup uses three 16-variable commitments and authenticates all values
-with one three-claim Dory proof; changing that proof is rejected. Production
-geometry needs one 30-variable packed commitment and one opening claim, but its
-out-of-core construction is not implemented or measured. Selector batching
-adds at most degree-10 error over the BLS12-381 scalar field at production
+bounded setup uses four 16-variable commitments and authenticates all values
+with one four-claim Dory proof: three commitments contain main terminals and a
+fourth contains preprocessing terminals. Changing that proof is rejected. The
+projected production layout places those groups in separate 1,024-slot halves
+of one 31-variable packed commitment and uses one execution opening claim, but
+its out-of-core construction is not implemented or measured. Selector batching
+adds at most degree-11 error over the BLS12-381 scalar field at production
 geometry, before the complete union bound. This checkpoint remains
 non-admissible.
 
@@ -1082,10 +1084,22 @@ rejected. A 16-row fixture retains all 289 main columns, packs its 578 source
 tables into one 16-variable Dory commitment, and packs both inverse tables into
 a second. Two transcript-random selector openings authenticate all 580 terminal
 evaluations; source-commitment, terminal, and opening-proof mutations fail.
-Production geometry uses 20 row variables plus 10 selector variables for each
-of the same two commitments. The out-of-core path and the complete
+Production reuses the 31-variable execution source commitment with its half
+selector fixed and randomizes the remaining 10 selector variables; one separate
+31-variable commitment holds the inverse tables. The out-of-core path and the complete
 row-compression and lookup-challenge soundness bound remain to be implemented
 and reviewed.
+
+The composed 256-row fixture passes the first end-to-end source-identity gate.
+Execution uses four bounded commitments: three main groups and one preprocessing
+group. Adjacency reuses the exact three main commitments at its independent
+sumcheck point and adds only the inverse commitment. One eight-claim Dory
+aggregate authenticates all of those openings and verified in 193.89 seconds in
+an unoptimized debug run. Shared-source substitution, adjacency-terminal
+substitution, inverse-commitment substitution, and opening-proof mutation are
+all rejected. At production geometry the four bounded source groups project to
+one 31-variable source commitment with main and preprocessing tables in separate
+halves. That unification and its out-of-core prover are not implemented.
 
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate

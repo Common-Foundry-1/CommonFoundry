@@ -297,10 +297,12 @@ Fiat-Shamir and verifies the 256-row fixture in eight degree-17 rounds with 18
 samples per round. It exposes the expected 746 terminal evaluations and rejects
 round-message and terminal-evaluation mutations. A transcript-derived random
 selector batches those values into packed Dory openings. The bounded fixture
-uses three commitments only because the prototype is capped at 16 variables;
-all 746 values authenticate in one three-claim Dory proof, and an opening-proof
-mutation fails. Production geometry uses one 30-variable packed commitment and
-one opening claim, but its out-of-core prover is not implemented or measured.
+uses four commitments only because the prototype is capped at 16 variables:
+three hold the 578 main terminals and one holds the 168 preprocessing terminals.
+All 746 values authenticate in one four-claim Dory proof, and an opening-proof
+mutation fails. The projected production layout places main and preprocessing
+tables in separate 1,024-slot halves of one 31-variable commitment and uses one
+opening claim, but its out-of-core prover is not implemented or measured.
 
 The companion bounded adjacency fixture commits its local/next source before
 compressing each complete main row, then commits its two inverse tables after
@@ -314,8 +316,19 @@ or terminal values. A 16-row, full-289-column Dory fixture packs the 578 source
 tables into one commitment and the two inverse tables into a second commitment.
 Two selector-batched opening claims authenticate all 580 terminals; source-
 commitment, terminal, and opening-proof mutations fail. Production geometry
-uses the same two commitments at 30 variables. Its out-of-core path and complete
+reuses the 31-variable execution source commitment with its half selector fixed,
+plus one 31-variable inverse commitment. Its out-of-core path and complete
 soundness bound remain open.
+
+The composed 256-row fixture now reuses the exact same three bounded main
+commitments in both sumchecks. Its single Dory aggregate has eight openings:
+four for execution, three for adjacency at its independent sumcheck point, and
+one for the inverse commitment. It verified in 193.89 seconds in an unoptimized
+debug run. Replacing a shared source commitment, an adjacency terminal, the
+inverse commitment, or the aggregate proof is rejected. The production layout
+compresses the four bounded execution groups into the one 31-variable source
+commitment described above; this remains a projection until the out-of-core
+path is implemented.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

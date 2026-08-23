@@ -343,18 +343,20 @@ Its 289-column honest trace reaches the Dory-authenticated raw-byte evaluation,
 and accumulator, hashed-byte, point, and claimed-evaluation mutations fail. The
 bounded execution fixture commits the terminal tables before the sumcheck,
 derives selector points only after the sumcheck transcript and terminal values
-are fixed, and authenticates all 746 values in one three-claim Dory aggregate.
-Three commitments are needed only because the test setup is capped at 16
-variables; production geometry needs one 30-variable packed commitment and one
-opening claim. The production out-of-core execution prover, adjacency argument
+are fixed, and authenticates all 746 values in one four-claim Dory aggregate.
+Four commitments are needed only because the test setup is capped at 16
+variables: three hold main terminals and one holds preprocessing terminals. The
+projected production layout separates those groups into two 1,024-slot halves
+of one 31-variable commitment and needs one execution opening claim. The
+production out-of-core execution prover, adjacency argument
 and complete union bound, complete proof, independent review, and audit remain
 required.
 
 The bounded dense execution sumcheck now mixes all 1,299 native constraints and
 verifies the 256-row fixture in eight degree-17 rounds, with 18 samples per
 round. It produces 746 terminal evaluations and rejects altered round messages,
-terminal values, and the selector-batched Dory opening proof. The batching step
-adds at most degree-10 error over the BLS12-381 scalar field at production
+terminal values, and the selector-batched Dory opening proof. The unified source
+batching step adds at most degree-11 error over the BLS12-381 scalar field at production
 geometry, before the still-missing complete union bound. The production
 out-of-core commitment/opening path is not implemented or measured, so this
 fixture does not authorize V3.
@@ -371,10 +373,21 @@ values are rejected. A 16-row fixture retains the full 289-column row width and
 packs the 578 source tables into one 16-variable commitment and the two inverse
 tables into a second. Two selector-batched Dory claims authenticate all 580
 terminals; changing the source commitment, a terminal, or the opening proof is
-rejected. Production uses the same two-commitment chronology with 20 row and 10
-selector variables. Its out-of-core implementation, the complete
+rejected. Production reuses the 31-variable execution source commitment with
+its half selector fixed and randomizes the remaining 10 selector variables; a
+second 31-variable commitment holds the post-challenge inverse tables. Its
+out-of-core implementation, the complete
 row-compression and lookup-challenge union bound, and independent review remain
 open.
+
+The 256-row composed fixture reuses the exact same three bounded main
+commitments in execution and adjacency. One aggregate authenticates four
+execution openings, three adjacency openings of those same commitments at the
+adjacency sumcheck point, and one inverse opening. An unoptimized debug run
+verified in 193.89 seconds. Substituting a shared commitment, adjacency
+terminal, inverse commitment, or aggregate proof fails. This closes the
+independent-trace substitution in the bounded fixture; the unified production
+commitment path and its measurements remain activation gates.
 
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its

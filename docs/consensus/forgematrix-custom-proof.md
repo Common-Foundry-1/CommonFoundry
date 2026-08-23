@@ -1377,13 +1377,19 @@ The feature-gated BLS/Dory candidate now has a narrower, explicitly
 non-consensus verifier boundary. It validates an authenticated model-commitment
 record at the exact n=33 production geometry, recomputes the block challenge
 and work digest, enforces the target, derives each transition bank's masks from
-its global layer offset, canonically decodes the shared Dory payload, and runs
-the real algebraic verifier. Its result type cannot be converted into the
-chain-admission capability. This is intentional: the current Dory layout and
-Goldilocks BLAKE3 STARK do not yet prove that they authenticate the same final
-activation table. Until that same-table link is implemented and reviewed, a
-successful algebraic preverification is not a valid V3 block proof and V3
-remains unselectable by `PowParameters`.
+its global layer offset, and verifies the canonical shared-Dory plus native
+BLAKE3 envelope through one exact 128-plus-6 opening aggregate. The materialized
+research constructor derives the final activation only from the last wiring
+output, rejects noncanonical centered bytes and losing work before expensive
+proving, constructs the pending-output bridge, composes both proof halves, and
+self-verifies the unchanged envelope before returning it. This closes the
+implemented same-table binding path without creating a chain-admission
+capability. V3 remains unselectable by `PowParameters`: the runtime cannot yet
+stream an authenticated production execution witness into this constructor,
+the final model record is not pinned, and no unchanged exact n=33 candidate has
+completed twice with proof size, proving and verification time, peak memory,
+peak scratch, and cleanup recorded. Independent review and external audit also
+remain mandatory.
 
 The component proof constructors receive the fixed or trace commitment aliases
 before any component transcript samples challenges, and

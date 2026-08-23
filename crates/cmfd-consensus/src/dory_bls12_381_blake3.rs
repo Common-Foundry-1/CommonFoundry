@@ -123,6 +123,8 @@ pub const BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES: usize =
     2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES;
 /// Two post-challenge LogUp inverse tables require canonical full-field scalars.
 pub const BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES: usize = 2;
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
 
 #[cfg(feature = "whir-prototype")]
 const _: () = {
@@ -1948,7 +1950,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and loads an opaque preprocessing pin from the byte-identical two-run ceremony record; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; the version-2 top-level candidate envelope routes its shared frame and native frame through that atomic composer and rejects the legacy separate bridge; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical envelope routing and tamper rejection, and leaves zero retained scratch; the authenticated out-of-core execution and adjacency sumchecks match their dense v2 proofs byte for byte, reject corrupt sources, and clean every round artifact, but the composed production witness adapter and exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and loads an opaque preprocessing pin from the byte-identical two-run ceremony record; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded canonical native wire now carries only the four named commitments and two fixed-shape sumchecks, and the layout composer accepts only the opaque replay statement before authenticating the exact 128-plus-6 partition; the version-2 top-level candidate envelope routes its shared frame and native frame through that atomic composer and rejects the legacy separate bridge; a bounded release-only 21-variable regression composes the authentic topology in one consuming 134-claim aggregate, verifies canonical envelope routing and tamper rejection, and leaves zero retained scratch; the authenticated out-of-core execution and adjacency sumchecks match their dense v2 proofs byte for byte, reject corrupt sources, and clean every round artifact; a fail-closed materialized production candidate constructor derives every public field, rejects losing work before proving, composes the exact shared and native openings, and self-verifies the canonical envelope, but the authenticated streaming execution-witness provider, final pinned model artifact, and unchanged exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the public shared aggregate parser intentionally remains capped at 128; only the version-2 top-level candidate route reaches the specialized exact-134 verifier after deriving the native six-claim suffix from opaque replay, so unrelated callers cannot widen the aggregate boundary",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; authenticated execution rounds require an 18,773,704,968-byte maximum parent/child overlap and a 27,011,318,784-byte complete stage, while adjacency rounds require 14,596,178,184 bytes of parent/child overlap and a 22,833,792,000-byte complete stage; known execution and adjacency root-stream vector payloads are 859,844,224 and 624,963,200 bytes respectively, excluding allocator, stack, authentication, setup, Rayon, and I/O overhead; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below provisional 50 GiB scratch and 4 GiB memory floors; it is not yet wired to a production run, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -6033,6 +6035,69 @@ fn finalize_native_blake3_opening(
         opening_set,
         encoded_native_proof,
     })
+}
+
+/// Build the exact production-geometry native opening witness for the
+/// non-consensus V3 research candidate. This does not change either production
+/// readiness flag or create a chain-admission capability.
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn prepare_production_native_blake3_opening(
+    final_activation: &[u8],
+    bridge: &BlsDoryOutputBridgeStatement,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    if final_activation.len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES
+        || bridge.final_activation_len() != final_activation.len()
+        || setup.max_log_n() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
+        || maximum_block_rows == 0
+        || !scratch_directory.is_absolute()
+        || !scratch_directory.is_dir()
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    bridge
+        .validate_activation(final_activation)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let witness = crate::structured_blake3_tree::build_tree_witness(
+        BLS_DORY_BLAKE3_OUTPUT_CONTEXT,
+        bridge.challenge_digest(),
+        final_activation,
+    )
+    .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let layout = BlsDoryAggregateLayout::new(
+        BLS_DORY_BLAKE3_SHARED_DORY_NU,
+        BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
+    )?;
+    let verifier_context = BlsDoryBlake3VerifierContext::new(layout, setup)?;
+    let preprocessing_pin = native_blake3_production_preprocessing_pin(&verifier_context)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let prepared = prepare_native_blake3_sources_at_layout(
+        &witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+    )?;
+    let proven = prove_prepared_native_blake3_sources(
+        prepared,
+        bridge,
+        scratch_directory,
+        maximum_block_rows,
+    )?;
+    if proven.geometry != BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    finalize_native_blake3_opening(
+        proven,
+        bridge,
+        BlsDoryBlake3ReplayVerifier {
+            context: &verifier_context,
+            preprocessing_pin: &preprocessing_pin,
+            geometry: BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+        },
+    )
 }
 
 #[cfg(feature = "whir-prototype")]

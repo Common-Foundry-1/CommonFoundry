@@ -1024,13 +1024,15 @@ therefore a measured rejection rather than the missing size optimization.
 The next bounded design eliminates that FRI frame. The narrow BLAKE3 execution
 becomes a BLS/Dory sumcheck with 289 BLS-native main columns, where the
 evaluation accumulator is one scalar rather than three Goldilocks limbs. It
-opens 746 local/next main and preprocessing claims; authenticating only one
-preprocessing evaluation would leave the shifted next row unbound. A separate
-row-indexed LogUp
-permutation opens 580 more claims and binds every committed next row to the
+exposes 746 local/next main and preprocessing terminal evaluations;
+authenticating only one preprocessing evaluation would leave the shifted next
+row unbound. A separate row-indexed LogUp permutation is projected to expose
+580 more terminal evaluations and binds every committed next row to the
 following local row; omitting that argument would let a prover choose unrelated
-rows. Together with the current 128 claims, the design requires 1,454 claims
-under a future bounded 2,048-claim parser. Conservative wire accounting gives
+rows. Transcript-random selector batching reduces each terminal vector to one
+Dory opening claim. Together with the current 128 claims, the design therefore
+requires 130 claims under a proposed future bounded 256-claim parser.
+Conservative wire accounting gives
 36,020 bytes for execution and 21,748 bytes for adjacency, projecting the full
 V3 payload at 191,185 bytes with 70,762 bytes of headroom. The current parser
 remains capped at 128. These values are an executable layout projection, not a
@@ -1046,15 +1048,22 @@ equations are removed, 1,296 translated equations remain, and three BLS-scalar
 accumulator equations produce a 1,299-constraint, 289-column trace. The honest
 trace reaches the Dory-authenticated raw-byte evaluation, while accumulator,
 hashed-byte, Dory-point, and final-evaluation mutations fail. It is not yet
-wired into Dory opening proofs; adjacency soundness, a complete n=33
-run, independent review, and audit also remain.
+wired into a production out-of-core prover; adjacency soundness, a complete
+n=33 run, independent review, and audit also remain.
 
 The first dense execution sumcheck now combines all 1,299 native constraints
 with a Fiat-Shamir challenge. The 256-row fixture verifies in eight degree-17
 rounds with 18 evaluations per round, exposes all 746 local/next terminal
-evaluations, and rejects round-message and terminal-value substitutions. The
-terminal evaluations still lack Dory opening proofs. This checkpoint establishes
-the algebraic reduction only and remains non-admissible.
+evaluations, and rejects round-message and terminal-value substitutions. A
+transcript-random selector batches those values into packed Dory openings after
+the commitments, sumcheck transcript, and terminal vector are fixed. The
+bounded setup uses three 16-variable commitments and authenticates all values
+with one three-claim Dory proof; changing that proof is rejected. Production
+geometry needs one 30-variable packed commitment and one opening claim, but its
+out-of-core construction is not implemented or measured. Selector batching
+adds at most degree-10 error over the BLS12-381 scalar field at production
+geometry, before the complete union bound. This checkpoint remains
+non-admissible.
 
 The deterministic setup now admits the required n=33 square-root generator
 geometry separately from the n=16 materialized-polynomial cap. The aggregate

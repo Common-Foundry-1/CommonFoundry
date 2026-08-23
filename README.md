@@ -270,11 +270,14 @@ and audits remain activation gates.
 The next fail-closed design removes the separate FRI bridge instead of tuning
 it. It projects the exact BLAKE3 execution as a BLS/Dory sumcheck plus a
 row-indexed LogUp adjacency argument, so prover-supplied local and next rows
-cannot be unrelated. Conservative accounting adds 746 execution claims and 580
-adjacency claims to the existing 128, projects 36,020- and 21,748-byte component
-frames, and places the complete V3 payload at 191,185 bytes with 70,762 bytes of
-headroom. This is a budget, not an implemented proof: the active parser remains
-capped at 128 claims. A test-only canonical translator now regenerates all 1,305
+cannot be unrelated. The two sumchecks expose 746 execution and 580 adjacency
+terminal evaluations, but transcript-random selector batching reduces each
+terminal vector to one Dory opening claim. Composed with the existing 128
+claims, the future aggregate needs 130 claims under a proposed 256-claim bound;
+the active parser remains capped at 128. Conservative accounting projects
+36,020- and 21,748-byte component frames and places the complete V3 payload at
+191,185 bytes with 70,762 bytes of headroom. This remains a budget, not an
+activated proof. A test-only canonical translator now regenerates all 1,305
 existing BLAKE3 AIR equations as centered integer expressions and evaluates
 them over BLS12-381. A nonconstant 32-byte activation at a nonzero point
 satisfies every translated equation across all 256 rows; changing either one
@@ -284,15 +287,18 @@ three-limb evaluation equations, retains 1,296 translated BLAKE3 equations, and
 adds three native accumulator equations. The resulting 1,299-constraint trace
 has the projected 289 main columns and reaches the Dory-authenticated raw-byte
 evaluation; accumulator, hashed-byte, Dory-point, and final-evaluation
-mutations are rejected. The Dory-authenticated execution sumcheck, adjacency argument,
-soundness analysis, end-to-end verification, and audit remain incomplete.
+mutations are rejected. The production out-of-core execution prover, adjacency
+argument, soundness analysis, end-to-end verification, and audit remain incomplete.
 
 A bounded dense execution sumcheck now mixes all 1,299 native constraints under
 Fiat-Shamir and verifies the 256-row fixture in eight degree-17 rounds with 18
 samples per round. It exposes the expected 746 terminal evaluations and rejects
-round-message and terminal-evaluation mutations. Those evaluations are not yet
-authenticated by Dory opening proofs, so this remains an algebraic checkpoint,
-not an admissible V3 proof.
+round-message and terminal-evaluation mutations. A transcript-derived random
+selector batches those values into packed Dory openings. The bounded fixture
+uses three commitments only because the prototype is capped at 16 variables;
+all 746 values authenticate in one three-claim Dory proof, and an opening-proof
+mutation fails. Production geometry uses one 30-variable packed commitment and
+one opening claim, but its out-of-core prover is not implemented or measured.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

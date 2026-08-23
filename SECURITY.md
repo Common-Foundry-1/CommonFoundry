@@ -320,12 +320,14 @@ it totals 288,033 bytes, still 26,086 bytes over the structured-proof cap. FRI
 transport geometry therefore does not close the activation gap.
 
 The replacement direction is now bounded without widening any active parser.
-A BLS-native execution sumcheck would open 746 local/next main and preprocessing
-claims; both preprocessing evaluations are required to authenticate a shifted
-next row. A separate row-indexed LogUp permutation would open 580 claims and is
-mandatory
-to prevent independently chosen next rows. Composed with the existing 128
-claims, the design requires a future bounded maximum of at least 1,454 claims.
+A BLS-native execution sumcheck exposes 746 local/next main and preprocessing
+terminal evaluations; both preprocessing evaluations are required to
+authenticate a shifted next row. A separate row-indexed LogUp permutation is
+projected to expose 580 terminal evaluations and is mandatory to prevent
+independently chosen next rows. Transcript-random selector batching reduces
+each terminal vector to one Dory opening claim. Composed with the existing 128
+claims, the design therefore requires 130 claims under a proposed future
+256-claim maximum.
 Its conservative component projections are 36,020 and 21,748 bytes, placing the
 complete V3 payload at 191,185 bytes with 70,762 bytes below the exact V3
 allowance of 261,947 bytes. The current aggregate limit remains 128. No
@@ -338,14 +340,23 @@ test-only native relation also replaces the nine three-limb evaluation
 equations with three BLS-scalar equations while retaining 1,296 other equations.
 Its 289-column honest trace reaches the Dory-authenticated raw-byte evaluation,
 and accumulator, hashed-byte, point, and claimed-evaluation mutations fail. The
-Dory execution sumcheck, adjacency argument and union bound, complete proof,
-independent review, and audit remain required.
+bounded execution fixture commits the terminal tables before the sumcheck,
+derives selector points only after the sumcheck transcript and terminal values
+are fixed, and authenticates all 746 values in one three-claim Dory aggregate.
+Three commitments are needed only because the test setup is capped at 16
+variables; production geometry needs one 30-variable packed commitment and one
+opening claim. The production out-of-core execution prover, adjacency argument
+and complete union bound, complete proof, independent review, and audit remain
+required.
 
 The bounded dense execution sumcheck now mixes all 1,299 native constraints and
 verifies the 256-row fixture in eight degree-17 rounds, with 18 samples per
-round. It produces 746 terminal evaluations and rejects altered round messages
-and terminal values. The terminal evaluations are not yet authenticated by Dory
-openings; accepting this algebraic transcript as V3 would therefore be unsound.
+round. It produces 746 terminal evaluations and rejects altered round messages,
+terminal values, and the selector-batched Dory opening proof. The batching step
+adds at most degree-10 error over the BLS12-381 scalar field at production
+geometry, before the still-missing complete union bound. The production
+out-of-core commitment/opening path is not implemented or measured, so this
+fixture does not authorize V3.
 
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its

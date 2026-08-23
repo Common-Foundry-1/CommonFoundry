@@ -10,6 +10,8 @@ pub mod dory_bls12_381_candidate;
 pub mod dory_bls12_381_compact_artifact;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_execution_artifact;
+#[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+mod dory_bls12_381_execution_provider;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_bls12_381_fold_artifact;
 #[cfg(all(feature = "dory-bls12-381-prototype", test))]
@@ -80,6 +82,10 @@ pub use chain::{
 pub use difficulty::{
     DGW_WINDOW, DifficultyError, HeaderWork, TARGET_SPACING_SECONDS, add_chain_work, block_work,
     chain_work_bytes, next_work_target,
+};
+#[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+pub use dory_bls12_381_execution_provider::{
+    BlsDoryWinningNonceClaim, BlsDoryWinningNonceReplayError, VerifiedBlsDoryWinningNonceExecution,
 };
 pub use economics::{
     Allocation, BLOCKS_PER_365_DAY_YEAR, COIN, CoinbaseClaim, DEFAULT_MONETARY_POLICY,

@@ -889,7 +889,7 @@ fn bls_scalar_from_model_field(value: u64) -> Result<BlsDoryFr, BlsDoryFixedMode
     signed_model_value(value).map(BlsDoryFr::from_i64)
 }
 
-fn signed_model_value(value: u64) -> Result<i64, BlsDoryFixedModelStreamError> {
+pub(crate) fn signed_model_value(value: u64) -> Result<i64, BlsDoryFixedModelStreamError> {
     if value <= 125 {
         return i64::try_from(value).map_err(|_| BlsDoryFixedModelStreamError::InvalidFieldValue);
     }

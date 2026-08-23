@@ -7,9 +7,9 @@
 //! n=33 run has not completed, and the required review and audit gates remain
 //! open.
 
-#[cfg(feature = "whir-prototype")]
-use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "whir-prototype")]
+use std::{io::Read, path::Path, sync::atomic::AtomicBool};
 
 use thiserror::Error;
 
@@ -47,6 +47,11 @@ use crate::{
     dory_bls12_381_execution_artifact::{
         BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
         BlsDoryExecutionAccumulatorArtifactError,
+    },
+    dory_bls12_381_execution_provider::{
+        BlsDoryWinningNonceClaim, BlsDoryWinningNonceReplayError,
+        VerifiedBlsDoryWinningNonceExecution,
+        replay_winning_nonce_from_verified_bank as replay_verified_winning_nonce,
     },
     dory_bls12_381_layout::{
         BlsDoryPrecommittedMatrixProverInput, BlsDoryPreparedFixedModel,
@@ -244,6 +249,9 @@ pub enum BlsDoryV3CandidateError {
     #[cfg(feature = "whir-prototype")]
     #[error("candidate execution-accumulator artifact context is invalid: {0}")]
     ExecutionArtifact(#[from] BlsDoryExecutionAccumulatorArtifactError),
+    #[cfg(feature = "whir-prototype")]
+    #[error("verified winning-nonce execution does not match this candidate statement")]
+    VerifiedExecution,
 }
 
 impl BlsDoryV3CandidatePayload {
@@ -356,6 +364,72 @@ impl BlsDoryV3AlgebraicVerifier {
             self.setup.identity(),
             challenge,
         )?)
+    }
+
+    /// Recompute an accelerator-proposed winning nonce on the CPU while the
+    /// canonical model bank is authenticated on the same reader. GPU output is
+    /// only a cheap candidate hint; the returned execution capability exists
+    /// only after every accumulator, final activation, and public digest has
+    /// been reconstructed from the verifier's pinned model.
+    #[cfg(feature = "whir-prototype")]
+    pub fn replay_winning_nonce_from_verified_bank<R: Read>(
+        &self,
+        block: &BlockChallenge,
+        claim: BlsDoryWinningNonceClaim,
+        model_bank: R,
+        scratch_directory: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<VerifiedBlsDoryWinningNonceExecution, BlsDoryWinningNonceReplayError> {
+        if block.network_id != self.network_id {
+            return Err(BlsDoryWinningNonceReplayError::WrongNetwork);
+        }
+        let context = self
+            .execution_artifact_context(block, claim.nonce)
+            .map_err(|_| BlsDoryWinningNonceReplayError::CandidateContext)?;
+        replay_verified_winning_nonce(
+            context,
+            &self.manifest,
+            &self.trusted_model,
+            block.target,
+            claim,
+            model_bank,
+            scratch_directory,
+            cancel,
+        )
+    }
+
+    /// Consume one CPU-replayed execution capability and construct the exact
+    /// production candidate it authenticates. A capability cannot be reused
+    /// for a different block, nonce, verifier, model, or setup because the
+    /// execution artifact context is checked before proving and then consumed.
+    #[cfg(feature = "whir-prototype")]
+    pub fn prove_candidate_from_verified_execution(
+        &self,
+        block: &BlockChallenge,
+        prepared_model: &BlsDoryPreparedFixedModel,
+        execution: VerifiedBlsDoryWinningNonceExecution,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+    ) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+        let (nonce, final_activation_digest, work_digest, artifact) = execution.into_parts();
+        let expected_context = self.execution_artifact_context(block, nonce)?;
+        if artifact.context() != expected_context {
+            return Err(BlsDoryV3CandidateError::VerifiedExecution);
+        }
+        let proof = self.prove_candidate_from_execution_artifact(
+            block,
+            nonce,
+            prepared_model,
+            artifact,
+            scratch_directory,
+            maximum_native_block_rows,
+        )?;
+        if proof.final_activation_digest != final_activation_digest
+            || proof.work_digest != work_digest
+        {
+            return Err(BlsDoryV3CandidateError::VerifiedExecution);
+        }
+        Ok(proof)
     }
 
     /// Construct and self-verify one exact production-shaped research
@@ -476,7 +550,7 @@ impl BlsDoryV3AlgebraicVerifier {
     /// identity, public statement, mask, or dense witness table.
     #[cfg(feature = "whir-prototype")]
     #[allow(clippy::too_many_arguments)]
-    pub fn prove_candidate_from_execution_artifact(
+    pub(crate) fn prove_candidate_from_execution_artifact(
         &self,
         block: &BlockChallenge,
         nonce: u64,

@@ -12,7 +12,7 @@
 //! one prover-supplied table would not prove that adjacent rows are related.
 
 use dory_pcs::primitives::arithmetic::Field as DoryField;
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 use dory_pcs::primitives::transcript::Transcript;
 #[cfg(all(test, feature = "whir-prototype"))]
 use p3_air::symbolic::{
@@ -22,7 +22,7 @@ use p3_air::symbolic::{
 use p3_field::PrimeField64;
 use thiserror::Error;
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 use crate::dory_bls12_381_prototype::BlsDoryTranscript;
 use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt};
 #[cfg(all(test, feature = "whir-prototype"))]
@@ -33,14 +33,18 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateLayout, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
         BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
+        commit_bls_dory_compact_row_source_with_scratch,
     },
     dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
     dory_bls12_381_prototype::DeterministicBlsDorySetup,
-    dory_bls12_381_transpose::{BlsDoryTransposeError, BlsDoryWordTransposeArtifact},
+    dory_bls12_381_transpose::{
+        BlsDoryTransposeError, BlsDoryWordTransposeArtifact, BlsDoryWordTransposeWriter,
+    },
     structured_blake3_narrow::{
         F as Goldilocks, NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START, NARROW_BLAKE3_MAIN_WIDTH,
         NARROW_BLAKE3_ORIGINAL_NIBBLES_START, NARROW_BLAKE3_PREPROCESSED_WIDTH,
         NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS, NARROW_BLAKE3_STACK_START, NarrowBlake3Air,
+        for_each_main_trace_row, for_each_preprocessed_trace_row,
     },
 };
 use crate::{
@@ -243,6 +247,59 @@ impl BlsDoryBlake3SourceCommitments {
     }
 }
 
+/// Named commitments absorbed before deriving the adjacency challenges.
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlsDoryBlake3AdjacencySourceCommitments {
+    main: BlsDoryGt,
+    accumulator: BlsDoryGt,
+    preprocessing: BlsDoryGt,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryBlake3AdjacencySourceCommitments {
+    fn ordered(self) -> [BlsDoryGt; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS] {
+        [self.main, self.accumulator, self.preprocessing]
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn derive_native_blake3_adjacency_challenges(
+    bridge: &BlsDoryOutputBridgeStatement,
+    trace_rows: usize,
+    commitments: BlsDoryBlake3AdjacencySourceCommitments,
+) -> Result<(BlsDoryFr, BlsDoryFr), BlsDoryAggregateError> {
+    if !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let ordered = commitments.ordered();
+    let mut transcript = BlsDoryTranscript::new(b"blake3-native-row-adjacency-sumcheck");
+    transcript.append_bytes(b"protocol-version", &1_u16.to_le_bytes());
+    transcript.append_bytes(b"challenge-digest", &bridge.challenge_digest());
+    transcript.append_bytes(
+        b"activation-length",
+        &(bridge.final_activation_len() as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(b"activation-digest", &bridge.final_activation_digest());
+    transcript.append_bytes(b"dory-binding", &bridge.transcript_binding());
+    transcript.append_bytes(b"trace-rows", &(trace_rows as u64).to_le_bytes());
+    transcript.append_bytes(
+        b"main-width",
+        &(BLS_DORY_BLAKE3_MAIN_WIDTH as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(
+        b"source-commitment-count",
+        &(ordered.len() as u64).to_le_bytes(),
+    );
+    for commitment in &ordered {
+        transcript.append_group(b"packed-adjacency-source-commitment", commitment);
+    }
+    Ok((
+        transcript.challenge_scalar(b"row-compression"),
+        transcript.challenge_scalar(b"lookup-alpha"),
+    ))
+}
+
 /// Prover-owned BLAKE3 sources kept in semantic rather than positional form.
 #[cfg(feature = "whir-prototype")]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -272,6 +329,44 @@ impl BlsDoryBlake3CommittedSources {
             preprocessing: self.preprocessing.commitment(),
             inverse: self.inverse.commitment(),
         }
+    }
+
+    fn validate_layout(
+        &self,
+        trace_rows: usize,
+        layout: BlsDoryAggregateLayout,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<(), BlsDoryAggregateError> {
+        let expected = [
+            trace_rows
+                .checked_mul(BLS_DORY_BLAKE3_SIGNED_WORD_TABLES)
+                .ok_or(BlsDoryAggregateError::InvalidDimension)?,
+            trace_rows
+                .checked_mul(BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES)
+                .ok_or(BlsDoryAggregateError::InvalidDimension)?,
+            trace_rows
+                .checked_mul(
+                    BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+                        + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES,
+                )
+                .ok_or(BlsDoryAggregateError::InvalidDimension)?,
+            trace_rows
+                .checked_mul(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)
+                .ok_or(BlsDoryAggregateError::InvalidDimension)?,
+        ];
+        if !trace_rows.is_power_of_two()
+            || BLS_DORY_BLAKE3_SOURCE_ROLES
+                .into_iter()
+                .zip(expected)
+                .any(|(role, expected)| {
+                    let source = self.source(role);
+                    !source.matches_layout(layout, setup)
+                        || source.explicit_coefficient_count() != expected
+                })
+        {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        Ok(())
     }
 
     #[cfg_attr(test, allow(dead_code))]
@@ -932,7 +1027,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; production-owned accumulator and bounded-batch adjacency-inverse constructors preserve exact dense commitment/opening bytes and reject mismatched statements, terminal evaluations, zero denominators, corrupt sources, and setup mismatches; production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; a named four-source bundle, verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -1685,6 +1780,279 @@ fn commit_native_adjacency_inverse_source(
     )?;
     writer.write_scalars(&keys)?;
     writer.finish()
+}
+
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_TRANSPOSE_CHUNK_ROWS: usize = 1 << 14;
+
+#[cfg(feature = "whir-prototype")]
+fn blake3_transpose_error(error: BlsDoryTransposeError) -> BlsDoryAggregateError {
+    match error {
+        BlsDoryTransposeError::InvalidShape | BlsDoryTransposeError::Incomplete => {
+            BlsDoryAggregateError::InvalidProofShape
+        }
+        BlsDoryTransposeError::Authentication | BlsDoryTransposeError::Io(_) => {
+            BlsDoryAggregateError::ProverStorage
+        }
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn validate_native_blake3_source_layout(
+    trace_rows: usize,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryAggregateError> {
+    let physical_rows = 1usize
+        .checked_shl(layout.nu() as u32)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let physical_columns = 1usize
+        .checked_shl(layout.sigma() as u32)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let capacity = physical_rows
+        .checked_mul(physical_columns)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let main_scalars = trace_rows
+        .checked_mul(BLS_DORY_BLAKE3_SIGNED_WORD_TABLES)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let accumulator_scalars = trace_rows
+        .checked_mul(BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let preprocessed_word_scalars = trace_rows
+        .checked_mul(BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let preprocessed_scalars = trace_rows
+        .checked_mul(
+            BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES,
+        )
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let inverse_scalars = trace_rows
+        .checked_mul(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    setup
+        .validate()
+        .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
+    if !trace_rows.is_power_of_two()
+        || setup.max_log_n() < layout.variables()
+        || setup.prover().g1_vec.len() < physical_columns
+        || setup.prover().g2_vec.len() < physical_rows
+        || [
+            main_scalars,
+            accumulator_scalars,
+            preprocessed_scalars,
+            inverse_scalars,
+        ]
+        .into_iter()
+        .any(|scalars| scalars > capacity)
+        || !main_scalars.is_multiple_of(physical_columns)
+        || !preprocessed_word_scalars.is_multiple_of(physical_columns)
+    {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn create_native_main_transpose(
+    air: &NarrowBlake3Air,
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
+    let mut writer = BlsDoryWordTransposeWriter::create(
+        scratch_directory,
+        air.trace_rows(),
+        BLS_DORY_BLAKE3_MAIN_WIDTH - 1,
+        BLS_DORY_BLAKE3_TRANSPOSE_CHUNK_ROWS.min(air.trace_rows()),
+    )
+    .map_err(blake3_transpose_error)?;
+    let mut emitted = 0usize;
+    let mut words = Vec::with_capacity(BLS_DORY_BLAKE3_MAIN_WIDTH - 1);
+    for_each_main_trace_row(air, statement, witness, |row_index, row| {
+        if row_index != emitted || row.len() != NARROW_BLAKE3_MAIN_WIDTH {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        words.clear();
+        words.extend(
+            row.iter()
+                .enumerate()
+                .filter(|(column, _)| {
+                    !(NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START..NARROW_BLAKE3_STACK_START)
+                        .contains(column)
+                })
+                .map(|(_, value)| u64::from_le_bytes(centered_goldilocks(*value).to_le_bytes())),
+        );
+        if words.len() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1 {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        writer.write_row(&words)?;
+        emitted += 1;
+        Ok(())
+    })
+    .map_err(blake3_transpose_error)?;
+    if emitted != air.trace_rows() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    writer.finish().map_err(blake3_transpose_error)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn create_native_preprocessed_transpose(
+    air: &NarrowBlake3Air,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
+    let mut writer = BlsDoryWordTransposeWriter::create(
+        scratch_directory,
+        air.trace_rows(),
+        BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+        BLS_DORY_BLAKE3_TRANSPOSE_CHUNK_ROWS.min(air.trace_rows()),
+    )
+    .map_err(blake3_transpose_error)?;
+    let mut emitted = 0usize;
+    let mut words = Vec::with_capacity(BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
+    for_each_preprocessed_trace_row(air, witness, |row_index, row| {
+        if row_index != emitted || row.len() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        words.clear();
+        words.extend(row.iter().map(|value| value.as_canonical_u64()));
+        writer.write_row(&words)?;
+        emitted += 1;
+        Ok(())
+    })
+    .map_err(blake3_transpose_error)?;
+    if emitted != air.trace_rows() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    writer.finish().map_err(blake3_transpose_error)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn commit_native_blake3_sources_at_layout(
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
+    if bridge.challenge_digest() != statement.challenge_digest
+        || bridge.final_activation_digest() != statement.final_activation_digest
+        || bridge.final_activation_len() != statement.final_activation_len
+        || witness.digest != statement.final_activation_digest
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let air =
+        NarrowBlake3Air::new(statement).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    validate_native_blake3_source_layout(air.trace_rows(), layout, setup)?;
+
+    let mut preprocessed_transpose =
+        create_native_preprocessed_transpose(&air, witness, scratch_directory)?;
+    let preprocessing = {
+        let mut source =
+            TransposedPreprocessedRowSource::new_for_layout(&mut preprocessed_transpose, layout)
+                .map_err(blake3_transpose_error)?;
+        commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            layout.nu(),
+            layout.sigma(),
+            setup,
+            scratch_directory,
+        )?
+    };
+    drop(preprocessed_transpose);
+
+    let mut main_transpose =
+        create_native_main_transpose(&air, statement, witness, scratch_directory)?;
+    let main = {
+        let mut source =
+            TransposedLocalNextSignedWordRowSource::new_for_layout(&mut main_transpose, layout)
+                .map_err(blake3_transpose_error)?;
+        commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            layout.nu(),
+            layout.sigma(),
+            setup,
+            scratch_directory,
+        )?
+    };
+    let accumulator = commit_native_accumulator_source(
+        statement,
+        witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+    )?;
+    let (compression, alpha) = derive_native_blake3_adjacency_challenges(
+        bridge,
+        air.trace_rows(),
+        BlsDoryBlake3AdjacencySourceCommitments {
+            main: main.commitment(),
+            accumulator: accumulator.commitment(),
+            preprocessing: preprocessing.commitment(),
+        },
+    )?;
+    let inverse = commit_native_adjacency_inverse_source(
+        &mut main_transpose,
+        &accumulator,
+        compression,
+        alpha,
+        layout,
+        setup,
+        scratch_directory,
+    )?;
+    drop(main_transpose);
+
+    let sources = BlsDoryBlake3CommittedSources {
+        main,
+        accumulator,
+        preprocessing,
+        inverse,
+    };
+    sources.validate_layout(air.trace_rows(), layout, setup)?;
+    Ok(sources)
+}
+
+/// Build the four production sources at the immutable shared 33-variable
+/// layout. This remains private until the six-claim verifier replay is wired.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+fn commit_native_blake3_sources(
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
+    if statement.final_activation_len != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES
+        || setup.max_log_n() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
+        || !scratch_directory.is_absolute()
+        || !scratch_directory.is_dir()
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    if NarrowBlake3Air::new(statement)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?
+        .trace_rows()
+        != BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let layout = BlsDoryAggregateLayout::new(
+        BLS_DORY_SHARED_PRODUCTION_VARIABLES / 2,
+        BLS_DORY_SHARED_PRODUCTION_VARIABLES - BLS_DORY_SHARED_PRODUCTION_VARIABLES / 2,
+    )?;
+    commit_native_blake3_sources_at_layout(
+        statement,
+        witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+    )
 }
 
 /// Exact projection values exposed to tests and activation tooling.
@@ -5672,6 +6040,134 @@ mod tests {
         let mut with_late_zero = values;
         with_late_zero[BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS + 1] = BlsDoryFr::zero();
         assert_eq!(batch_invert_nonzero(&mut with_late_zero), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn named_adjacency_challenges_match_the_canonical_transcript_order() {
+        let fixture = dense_blake3_fixture();
+        let layout = BlsDoryAggregateLayout::new(1, 1).unwrap();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(2).unwrap();
+        let commitments: [BlsDoryGt; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS] =
+            std::array::from_fn(|source| {
+                commit_bls_dory_polynomial(
+                    (0..4)
+                        .map(|index| {
+                            BlsDoryFr::from_u64((source as u64 + 3) * 101 + index as u64 * 7)
+                        })
+                        .collect(),
+                    layout.nu(),
+                    layout.sigma(),
+                    &setup,
+                )
+                .unwrap()
+                .commitment()
+            });
+        let named = BlsDoryBlake3AdjacencySourceCommitments {
+            main: commitments[0],
+            accumulator: commitments[1],
+            preprocessing: commitments[2],
+        };
+        let derived = derive_native_blake3_adjacency_challenges(
+            &fixture.bridge,
+            fixture.air.trace_rows(),
+            named.clone(),
+        )
+        .unwrap();
+        let mut reference =
+            dense_adjacency_transcript(&fixture.bridge, fixture.air.trace_rows(), &commitments);
+        assert_eq!(
+            derived,
+            (
+                reference.challenge_scalar(b"row-compression"),
+                reference.challenge_scalar(b"lookup-alpha"),
+            )
+        );
+
+        let swapped = derive_native_blake3_adjacency_challenges(
+            &fixture.bridge,
+            fixture.air.trace_rows(),
+            BlsDoryBlake3AdjacencySourceCommitments {
+                main: named.accumulator,
+                accumulator: named.main,
+                preprocessing: named.preprocessing,
+            },
+        )
+        .unwrap();
+        assert_ne!(swapped, derived);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "full four-source construction; run explicitly in --release"]
+    fn native_blake3_source_bundle_constructs_named_authenticated_sources() {
+        let fixture = dense_blake3_fixture();
+        let layout = BlsDoryAggregateLayout::new(9, 9).unwrap();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(18).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+        assert!(matches!(
+            commit_native_blake3_sources(
+                &fixture.statement,
+                &fixture.witness,
+                &fixture.bridge,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let undersized_setup =
+            crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(2).unwrap();
+        assert!(matches!(
+            commit_native_blake3_sources_at_layout(
+                &fixture.statement,
+                &fixture.witness,
+                &fixture.bridge,
+                layout,
+                &undersized_setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryAggregateError::InvalidDimension)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let sources = commit_native_blake3_sources_at_layout(
+            &fixture.statement,
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        sources
+            .validate_layout(fixture.air.trace_rows(), layout, &setup)
+            .unwrap();
+        let expected = [
+            fixture.air.trace_rows() * BLS_DORY_BLAKE3_SIGNED_WORD_TABLES,
+            fixture.air.trace_rows() * BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES,
+            fixture.air.trace_rows()
+                * (BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+                    + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES),
+            fixture.air.trace_rows() * BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES,
+        ];
+        let commitments = BLS_DORY_BLAKE3_SOURCE_ROLES.map(|role| {
+            let source = sources.source(role);
+            assert_eq!(source.explicit_coefficient_count(), expected[role.index()]);
+            assert!(source.matches_layout(layout, &setup));
+            source.commitment()
+        });
+        for (index, commitment) in commitments.iter().enumerate() {
+            assert!(
+                commitments
+                    .iter()
+                    .skip(index + 1)
+                    .all(|other| other != commitment)
+            );
+        }
+        drop(sources);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     #[test]

@@ -1363,11 +1363,7 @@ impl BaseAir<F> for NarrowBlake3Air {
                 "verifier must not materialize the preprocessed trace"
             );
         });
-        Some(generate_preprocessed(
-            self.activation_len,
-            self.trace_rows,
-            &self.schedule,
-        ))
+        Some(generate_preprocessed(self, &self.schedule))
     }
 
     fn preprocessed_width(&self) -> usize {
@@ -2064,15 +2060,28 @@ fn activation_group_index(
     Some(evaluation_offset - activation_start)
 }
 
-fn generate_preprocessed(
-    activation_len: usize,
-    rows: usize,
+fn generate_preprocessed(air: &NarrowBlake3Air, witness: &Blake3TreeWitness) -> RowMajorMatrix<F> {
+    let mut values = Vec::with_capacity(air.trace_rows * PREP_WIDTH);
+    for_each_preprocessed_trace_row(air, witness, |row_index, row| {
+        debug_assert_eq!(values.len(), row_index * PREP_WIDTH);
+        values.extend_from_slice(row);
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .expect("infallible in-memory preprocessing sink");
+    RowMajorMatrix::new(values, PREP_WIDTH)
+}
+
+/// Generates one deterministic preprocessing row at a time without retaining
+/// the full matrix.
+pub(crate) fn for_each_preprocessed_trace_row<E>(
+    air: &NarrowBlake3Air,
     witness: &Blake3TreeWitness,
-) -> RowMajorMatrix<F> {
-    let mut values = F::zero_vec(rows * PREP_WIDTH);
-    for row_index in 0..rows {
-        let prep: &mut PrepCols<F> =
-            values[row_index * PREP_WIDTH..(row_index + 1) * PREP_WIDTH].borrow_mut();
+    mut emit: impl FnMut(usize, &[F]) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut row_values = F::zero_vec(PREP_WIDTH);
+    for row_index in 0..air.trace_rows {
+        row_values.fill(F::ZERO);
+        let prep: &mut PrepCols<F> = row_values.as_mut_slice().borrow_mut();
         let step = row_index % ROWS_PER_COMPRESSION;
         if step < G_STEPS_PER_COMPRESSION {
             let round = step / G_STEPS_PER_ROUND;
@@ -2095,6 +2104,7 @@ fn generate_preprocessed(
         }
         let operation_index = row_index / ROWS_PER_COMPRESSION;
         let Some(operation) = witness.operations.get(operation_index) else {
+            emit(row_index, &row_values)?;
             continue;
         };
         prep.is_active_operation = F::ONE;
@@ -2141,8 +2151,8 @@ fn generate_preprocessed(
                 .message_offset
                 .expect("chunk compression has a message offset")
                 + step * 8;
-            if (40..40 + activation_len).contains(&message_offset)
-                && message_offset + 8 <= 40 + activation_len
+            if (40..40 + air.activation_len).contains(&message_offset)
+                && message_offset + 8 <= 40 + air.activation_len
             {
                 let activation_index = message_offset - 40;
                 prep.activation_active = F::ONE;
@@ -2155,8 +2165,9 @@ fn generate_preprocessed(
                 }
             }
         }
+        emit(row_index, &row_values)?;
     }
-    RowMajorMatrix::new(values, PREP_WIDTH)
+    Ok(())
 }
 
 pub(crate) fn generate_main_trace(
@@ -3626,6 +3637,42 @@ mod tests {
         assert_eq!(stopped, Err("stop"));
         assert_eq!(emitted, 17);
         assert!(air.trace_rows > emitted);
+    }
+
+    #[test]
+    fn preprocessing_rows_stream_exact_matrix_and_stop_early() {
+        let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let air = NarrowBlake3Air::new(&statement).unwrap();
+        let witness =
+            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+        let materialized = generate_preprocessed(&air, &witness);
+        let mut streamed = Vec::with_capacity(materialized.values.len());
+        for_each_preprocessed_trace_row(
+            &air,
+            &witness,
+            |row_index, row| -> Result<(), std::convert::Infallible> {
+                assert_eq!(streamed.len(), row_index * PREP_WIDTH);
+                assert_eq!(row.len(), PREP_WIDTH);
+                streamed.extend_from_slice(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed, materialized.values);
+
+        let mut emitted = 0_usize;
+        let stopped = for_each_preprocessed_trace_row(
+            &air,
+            &witness,
+            |row_index, _| -> Result<(), &'static str> {
+                assert_eq!(row_index, emitted);
+                emitted += 1;
+                if emitted == 17 { Err("stop") } else { Ok(()) }
+            },
+        );
+        assert_eq!(stopped, Err("stop"));
+        assert_eq!(emitted, 17);
     }
 
     #[test]

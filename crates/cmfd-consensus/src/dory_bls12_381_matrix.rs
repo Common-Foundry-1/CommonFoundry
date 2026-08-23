@@ -21,9 +21,9 @@ use thiserror::Error;
 use crate::{
     StructuredMatrixStatement, StructuredSumcheckError,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCompactRowSource,
-        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        bounded_signed_code, bounded_signed_dictionary,
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
+        BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        MAX_BLS_DORY_AGGREGATE_BYTES, bounded_signed_code, bounded_signed_dictionary,
         commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
         commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
@@ -353,8 +353,16 @@ pub fn prove_bls_dory_matrix_at_variables(
         setup,
     )?;
     let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
-    let (claims, opening_proof) =
-        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        padded_variables / 2,
+        padded_variables - padded_variables / 2,
+    )?;
+    let (claims, opening_proof) = prove_bls_dory_deferred_opening_sets(
+        &opening_binding,
+        aggregate_layout,
+        &[&prepared.openings],
+        setup,
+    )?;
     if claims != prepared.openings.claims() {
         return Err(BlsDoryMatrixError::Opening);
     }
@@ -555,6 +563,7 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
     }
     let nu = padded_variables / 2;
     let sigma = padded_variables - nu;
+    let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma)?;
     let activation_polynomial = commit_bounded_signed_table(
         activations,
         statement.max_abs_activation,
@@ -575,7 +584,7 @@ fn prove_bls_dory_matrix_deferred_at_variables_with_optional_scratch(
             scratch_directory,
         )?,
         MatrixWeightProverSource::Precommitted(weight) => {
-            if scratch_directory.is_none() || weight.variables() != padded_variables {
+            if scratch_directory.is_none() || !weight.matches_layout(aggregate_layout, setup) {
                 return Err(BlsDoryMatrixError::InvalidDimensions);
             }
             weight.clone()
@@ -786,7 +795,17 @@ pub fn verify_bls_dory_matrix_at_variables(
         setup,
     )?;
     let binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&binding, &claims, &proof.opening_proof, setup)?;
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        padded_variables / 2,
+        padded_variables - padded_variables / 2,
+    )?;
+    verify_bls_dory_openings(
+        &binding,
+        aggregate_layout,
+        &claims,
+        &proof.opening_proof,
+        setup,
+    )?;
     Ok(())
 }
 
@@ -1652,11 +1671,17 @@ mod tests {
         assert_eq!(ordinary.openings.claims(), dense.openings.claims());
         let aggregate_binding =
             opening_binding(b"precommitted-weight", &ordinary.proof.transcript_digest);
-        let dense_opening =
-            prove_bls_dory_deferred_opening_sets(&aggregate_binding, &[&dense.openings], &setup)
-                .unwrap();
+        let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma).unwrap();
+        let dense_opening = prove_bls_dory_deferred_opening_sets(
+            &aggregate_binding,
+            aggregate_layout,
+            &[&dense.openings],
+            &setup,
+        )
+        .unwrap();
         let compact_opening = prove_bls_dory_deferred_opening_sets_with_scratch(
             &aggregate_binding,
+            aggregate_layout,
             &[&ordinary.openings],
             &setup,
             &scratch.0,

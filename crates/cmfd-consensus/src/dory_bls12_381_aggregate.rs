@@ -112,6 +112,35 @@ pub struct BlsDoryOpeningClaim {
     pub evaluation: BlsDoryFr,
 }
 
+/// Exact matrix partition required by one aggregate opening statement.
+///
+/// The total variable count alone is insufficient because Dory assigns the
+/// two partitions different algebraic roles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlsDoryAggregateLayout {
+    nu: usize,
+    sigma: usize,
+}
+
+impl BlsDoryAggregateLayout {
+    pub fn new(nu: usize, sigma: usize) -> Result<Self, BlsDoryAggregateError> {
+        validate_layout(nu, sigma)?;
+        Ok(Self { nu, sigma })
+    }
+
+    pub fn nu(self) -> usize {
+        self.nu
+    }
+
+    pub fn sigma(self) -> usize {
+        self.sigma
+    }
+
+    pub fn variables(self) -> usize {
+        self.nu + self.sigma
+    }
+}
+
 /// A committed evaluation table retained only by the aggregate prover.
 #[derive(Clone)]
 pub struct BlsDoryCommittedPolynomial {
@@ -244,12 +273,12 @@ impl BlsDoryDeferredOpeningSet {
         if polynomials.is_empty() {
             return Err(BlsDoryAggregateError::InvalidClaimCount);
         }
-        let variables = polynomials[0].variables();
+        let (nu, sigma) = (polynomials[0].nu, polynomials[0].sigma);
         if polynomials
             .iter()
-            .any(|polynomial| polynomial.variables() != variables)
+            .any(|polynomial| polynomial.nu != nu || polynomial.sigma != sigma)
         {
-            return Err(BlsDoryAggregateError::InvalidDimension);
+            return Err(BlsDoryAggregateError::MixedStatement);
         }
         Ok(Self {
             polynomials,
@@ -273,7 +302,14 @@ impl BlsDoryDeferredOpeningSet {
         {
             return Err(BlsDoryAggregateError::InvalidClaimCount);
         }
-        let variables = polynomials[0].variables();
+        let (nu, sigma) = (polynomials[0].nu, polynomials[0].sigma);
+        if polynomials
+            .iter()
+            .any(|polynomial| polynomial.nu != nu || polynomial.sigma != sigma)
+        {
+            return Err(BlsDoryAggregateError::MixedStatement);
+        }
+        let variables = nu + sigma;
         if points.iter().any(|point| point.len() != variables) {
             return Err(BlsDoryAggregateError::InvalidDimension);
         }
@@ -525,10 +561,12 @@ impl BlsDoryCommittedPolynomial {
 
     pub(crate) fn matches_layout(
         &self,
-        variables: usize,
+        layout: BlsDoryAggregateLayout,
         setup: &DeterministicBlsDorySetup,
     ) -> bool {
-        self.variables() == variables && self.setup_identity == setup.identity()
+        self.nu == layout.nu
+            && self.sigma == layout.sigma
+            && self.setup_identity == setup.identity()
     }
 
     pub(crate) fn shares_coefficient_source(&self, other: &Self) -> bool {
@@ -2315,12 +2353,20 @@ fn source_artifact_spec(
 /// Reduce distinct-point claims to one random point and prove one combined opening.
 pub fn prove_bls_dory_openings(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     polynomials: &[BlsDoryCommittedPolynomial],
     points: &[Vec<BlsDoryFr>],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     let polynomial_refs = polynomials.iter().collect::<Vec<_>>();
-    prove_bls_dory_opening_refs_with_scratch(public_binding, &polynomial_refs, points, setup, None)
+    prove_bls_dory_opening_refs_with_scratch(
+        public_binding,
+        layout,
+        &polynomial_refs,
+        points,
+        setup,
+        None,
+    )
 }
 
 /// Prove the same aggregate while keeping every post-challenge polynomial fold
@@ -2330,6 +2376,7 @@ pub fn prove_bls_dory_openings(
 /// Any scratch failure aborts without retrying through the in-memory path.
 pub fn prove_bls_dory_openings_with_scratch(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     polynomials: &[BlsDoryCommittedPolynomial],
     points: &[Vec<BlsDoryFr>],
     setup: &DeterministicBlsDorySetup,
@@ -2338,6 +2385,7 @@ pub fn prove_bls_dory_openings_with_scratch(
     let polynomial_refs = polynomials.iter().collect::<Vec<_>>();
     prove_bls_dory_opening_refs_with_scratch(
         public_binding,
+        layout,
         &polynomial_refs,
         points,
         setup,
@@ -2348,12 +2396,20 @@ pub fn prove_bls_dory_openings_with_scratch(
 /// Prove many points of one commitment without cloning its coefficient table.
 pub fn prove_bls_dory_same_commitment_openings(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     polynomial: &BlsDoryCommittedPolynomial,
     points: &[Vec<BlsDoryFr>],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     let polynomial_refs = vec![polynomial; points.len()];
-    prove_bls_dory_opening_refs_with_scratch(public_binding, &polynomial_refs, points, setup, None)
+    prove_bls_dory_opening_refs_with_scratch(
+        public_binding,
+        layout,
+        &polynomial_refs,
+        points,
+        setup,
+        None,
+    )
 }
 
 struct PreparedBlsDoryOpeningProof {
@@ -2370,6 +2426,7 @@ struct PreparedBlsDoryOpeningProof {
 
 fn prove_bls_dory_opening_refs_with_scratch(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     polynomials: &[&BlsDoryCommittedPolynomial],
     points: &[Vec<BlsDoryFr>],
     setup: &DeterministicBlsDorySetup,
@@ -2377,6 +2434,7 @@ fn prove_bls_dory_opening_refs_with_scratch(
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     let prepared = prepare_bls_dory_opening_refs(
         public_binding,
+        layout,
         polynomials,
         points,
         setup,
@@ -2387,6 +2445,7 @@ fn prove_bls_dory_opening_refs_with_scratch(
 
 fn prepare_bls_dory_opening_refs(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     polynomials: &[&BlsDoryCommittedPolynomial],
     points: &[Vec<BlsDoryFr>],
     setup: &DeterministicBlsDorySetup,
@@ -2399,12 +2458,9 @@ fn prepare_bls_dory_opening_refs(
     if polynomials.len() != points.len() {
         return Err(BlsDoryAggregateError::InvalidClaimCount);
     }
-    let first = polynomials
-        .first()
-        .ok_or(BlsDoryAggregateError::InvalidClaimCount)?;
-    let (nu, sigma) = (first.nu, first.sigma);
-    validate_layout(nu, sigma)?;
-    if setup.max_log_n() < nu + sigma
+    let (nu, sigma) = (layout.nu, layout.sigma);
+    let variables = layout.variables();
+    if setup.max_log_n() < variables
         || polynomials.iter().any(|polynomial| {
             polynomial.nu != nu
                 || polynomial.sigma != sigma
@@ -2413,7 +2469,6 @@ fn prepare_bls_dory_opening_refs(
     {
         return Err(BlsDoryAggregateError::MixedStatement);
     }
-    let variables = nu + sigma;
     if points.iter().any(|point| point.len() != variables) {
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
@@ -2521,21 +2576,30 @@ fn finish_prepared_bls_dory_opening(
 /// Dory payload.
 pub(crate) fn prove_bls_dory_deferred_opening_sets(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     sets: &[&BlsDoryDeferredOpeningSet],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
-    prove_bls_dory_deferred_opening_sets_with_optional_scratch(public_binding, sets, setup, None)
+    prove_bls_dory_deferred_opening_sets_with_optional_scratch(
+        public_binding,
+        layout,
+        sets,
+        setup,
+        None,
+    )
 }
 
 #[cfg(test)]
 pub(crate) fn prove_bls_dory_deferred_opening_sets_with_scratch(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     sets: &[&BlsDoryDeferredOpeningSet],
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     prove_bls_dory_deferred_opening_sets_with_optional_scratch(
         public_binding,
+        layout,
         sets,
         setup,
         Some(scratch_directory),
@@ -2544,11 +2608,13 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_with_scratch(
 
 pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     sets: Vec<BlsDoryDeferredOpeningSet>,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
         public_binding,
+        layout,
         sets,
         setup,
         None,
@@ -2557,12 +2623,14 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming(
 
 pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     sets: Vec<BlsDoryDeferredOpeningSet>,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
         public_binding,
+        layout,
         sets,
         setup,
         Some(scratch_directory),
@@ -2571,6 +2639,7 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
 
 fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     sets: Vec<BlsDoryDeferredOpeningSet>,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
@@ -2628,6 +2697,7 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
         .collect::<Result<Vec<_>, _>>()?;
     let prepared = prepare_bls_dory_opening_refs(
         public_binding,
+        layout,
         &polynomial_refs,
         &points,
         setup,
@@ -2643,6 +2713,7 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
 
 fn prove_bls_dory_deferred_opening_sets_with_optional_scratch(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     sets: &[&BlsDoryDeferredOpeningSet],
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
@@ -2667,6 +2738,7 @@ fn prove_bls_dory_deferred_opening_sets_with_optional_scratch(
     }
     let (claims, proof) = prove_bls_dory_opening_refs_with_scratch(
         public_binding,
+        layout,
         &polynomials,
         &points,
         setup,
@@ -2681,6 +2753,7 @@ fn prove_bls_dory_deferred_opening_sets_with_optional_scratch(
 /// Verify the bounded aggregate after absorbing every public claim.
 pub fn verify_bls_dory_openings(
     public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
     claims: &[BlsDoryOpeningClaim],
     proof: &[u8],
     setup: &DeterministicBlsDorySetup,
@@ -2689,11 +2762,11 @@ pub fn verify_bls_dory_openings(
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
     validate_public_inputs(public_binding, claims.len())?;
-    let parsed = decode_aggregate_proof(proof, claims.len())?;
-    if setup.max_log_n() < parsed.variables
+    let parsed = decode_aggregate_proof(proof, claims.len(), layout)?;
+    if setup.max_log_n() < layout.variables()
         || claims
             .iter()
-            .any(|claim| claim.point.len() != parsed.variables)
+            .any(|claim| claim.point.len() != layout.variables())
     {
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
@@ -4231,7 +4304,6 @@ fn combine_polynomials_for_opening(
 type BlsDoryProof = DoryProof<BlsDoryG1, BlsDoryG2, BlsDoryGt>;
 
 struct ParsedAggregateProof {
-    variables: usize,
     nu: usize,
     sigma: usize,
     sumcheck_rounds: Vec<[BlsDoryFr; 3]>,
@@ -4278,6 +4350,7 @@ fn encode_aggregate_proof(
 fn decode_aggregate_proof(
     encoded: &[u8],
     expected_claims: usize,
+    expected_layout: BlsDoryAggregateLayout,
 ) -> Result<ParsedAggregateProof, BlsDoryAggregateError> {
     if encoded.len() < WIRE_HEADER_BYTES || encoded.len() > MAX_BLS_DORY_AGGREGATE_BYTES {
         return Err(BlsDoryAggregateError::InvalidProofShape);
@@ -4296,6 +4369,12 @@ fn decode_aggregate_proof(
     validate_layout(nu, sigma)?;
     if variables != nu + sigma || encoded.len() != aggregate_wire_bytes(variables, sigma) {
         return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    if variables != expected_layout.variables()
+        || nu != expected_layout.nu
+        || sigma != expected_layout.sigma
+    {
+        return Err(BlsDoryAggregateError::MixedStatement);
     }
 
     let mut reader = Cursor::new(&encoded[WIRE_HEADER_BYTES..]);
@@ -4318,7 +4397,6 @@ fn decode_aggregate_proof(
         return Err(BlsDoryAggregateError::InvalidEncoding);
     }
     Ok(ParsedAggregateProof {
-        variables,
         nu,
         sigma,
         sumcheck_rounds,
@@ -4633,6 +4711,7 @@ mod tests {
 
     struct Fixture {
         setup: DeterministicBlsDorySetup,
+        layout: BlsDoryAggregateLayout,
         polynomials: Vec<BlsDoryCommittedPolynomial>,
         points: Vec<Vec<BlsDoryFr>>,
     }
@@ -4869,21 +4948,28 @@ mod tests {
             .collect();
         Fixture {
             setup,
+            layout: BlsDoryAggregateLayout::new(nu, sigma).unwrap(),
             polynomials,
             points,
         }
+    }
+
+    fn test_layout(variables: usize) -> BlsDoryAggregateLayout {
+        BlsDoryAggregateLayout::new(variables / 2, variables - variables / 2).unwrap()
     }
 
     #[test]
     fn distinct_points_reduce_to_one_real_bls_opening() {
         let Fixture {
             setup,
+            layout,
             polynomials,
             points,
         } = fixture(8, 3);
         let (claims, proof) =
-            prove_bls_dory_openings(b"block-binding", &polynomials, &points, &setup).unwrap();
-        verify_bls_dory_openings(b"block-binding", &claims, &proof, &setup).unwrap();
+            prove_bls_dory_openings(b"block-binding", layout, &polynomials, &points, &setup)
+                .unwrap();
+        verify_bls_dory_openings(b"block-binding", layout, &claims, &proof, &setup).unwrap();
         assert_eq!(
             blake3::hash(&proof).to_hex().as_str(),
             "6aa99fd095e70180b6b2fdd94dc96fc420f99eb529ec03ad5dfa978731d9cfac"
@@ -4897,6 +4983,7 @@ mod tests {
     fn repeated_claims_share_one_folded_polynomial_table() {
         let Fixture {
             setup,
+            layout,
             polynomials,
             points,
         } = fixture(6, 3);
@@ -4927,27 +5014,43 @@ mod tests {
         assert_eq!(sumcheck.peak_additional_coefficients, 1 << 5);
         let (public_claims, proof) = prove_bls_dory_opening_refs_with_scratch(
             b"deduplicated-folds",
+            layout,
             &polynomial_refs,
             &points,
             &setup,
             None,
         )
         .unwrap();
-        verify_bls_dory_openings(b"deduplicated-folds", &public_claims, &proof, &setup).unwrap();
+        verify_bls_dory_openings(
+            b"deduplicated-folds",
+            layout,
+            &public_claims,
+            &proof,
+            &setup,
+        )
+        .unwrap();
     }
 
     #[test]
     fn authenticated_scratch_preserves_exact_proof_bytes_and_cleans_artifacts() {
         let Fixture {
             setup,
+            layout,
             polynomials,
             points,
         } = fixture(6, 3);
         let scratch = ScratchDirectory::create();
-        let ordinary =
-            prove_bls_dory_openings(b"scratch-equivalence", &polynomials, &points, &setup).unwrap();
+        let ordinary = prove_bls_dory_openings(
+            b"scratch-equivalence",
+            layout,
+            &polynomials,
+            &points,
+            &setup,
+        )
+        .unwrap();
         let artifact_backed = prove_bls_dory_openings_with_scratch(
             b"scratch-equivalence",
+            layout,
             &polynomials,
             &points,
             &setup,
@@ -4958,6 +5061,7 @@ mod tests {
         assert_eq!(artifact_backed, ordinary);
         verify_bls_dory_openings(
             b"scratch-equivalence",
+            layout,
             &artifact_backed.0,
             &artifact_backed.1,
             &setup,
@@ -4967,6 +5071,7 @@ mod tests {
         assert_eq!(
             prove_bls_dory_openings_with_scratch(
                 b"scratch-equivalence",
+                layout,
                 &polynomials,
                 &points,
                 &setup,
@@ -5013,6 +5118,7 @@ mod tests {
         ];
         let ordinary = prove_bls_dory_same_commitment_openings(
             b"row-source-equivalence",
+            test_layout(variables),
             &materialized,
             &points,
             &setup,
@@ -5021,6 +5127,7 @@ mod tests {
         let artifact_refs = vec![&artifact_backed; points.len()];
         let streamed = prove_bls_dory_opening_refs_with_scratch(
             b"row-source-equivalence",
+            test_layout(variables),
             &artifact_refs,
             &points,
             &setup,
@@ -5028,8 +5135,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(streamed, ordinary);
-        verify_bls_dory_openings(b"row-source-equivalence", &streamed.0, &streamed.1, &setup)
-            .unwrap();
+        verify_bls_dory_openings(
+            b"row-source-equivalence",
+            test_layout(variables),
+            &streamed.0,
+            &streamed.1,
+            &setup,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
 
         let clone = artifact_backed.clone();
@@ -5055,6 +5168,7 @@ mod tests {
         assert_eq!(sumcheck.unique_polynomial_tables, 1);
         let cloned = prove_bls_dory_opening_refs_with_scratch(
             b"row-source-equivalence",
+            test_layout(variables),
             &cloned_refs,
             &points,
             &setup,
@@ -5108,8 +5222,13 @@ mod tests {
         ];
         let mut openings =
             BlsDoryDeferredOpeningSet::new(vec![compact, mapped], vec![0, 1], points).unwrap();
-        let original =
-            prove_bls_dory_deferred_opening_sets(b"compact-release", &[&openings], &setup).unwrap();
+        let original = prove_bls_dory_deferred_opening_sets(
+            b"compact-release",
+            test_layout(variables),
+            &[&openings],
+            &setup,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
 
         let identity = openings.release_compact_source().unwrap().unwrap();
@@ -5152,8 +5271,13 @@ mod tests {
             openings.restore_compact_source(&regenerated),
             Err(BlsDoryAggregateError::ProverStorage)
         );
-        let restored =
-            prove_bls_dory_deferred_opening_sets(b"compact-release", &[&openings], &setup).unwrap();
+        let restored = prove_bls_dory_deferred_opening_sets(
+            b"compact-release",
+            test_layout(variables),
+            &[&openings],
+            &setup,
+        )
+        .unwrap();
         assert_eq!(restored, original);
         drop(regenerated);
         drop(openings);
@@ -5196,6 +5320,7 @@ mod tests {
         let polynomial_refs = vec![&compact, &mapped];
         let ordinary = prove_bls_dory_opening_refs_with_scratch(
             b"paired-compact-folds",
+            test_layout(variables),
             &polynomial_refs,
             &points,
             &setup,
@@ -5227,6 +5352,7 @@ mod tests {
 
         let compressed = prove_bls_dory_opening_refs_with_scratch(
             b"paired-compact-folds",
+            test_layout(variables),
             &polynomial_refs,
             &points,
             &setup,
@@ -5236,6 +5362,7 @@ mod tests {
         assert_eq!(compressed, ordinary);
         verify_bls_dory_openings(
             b"paired-compact-folds",
+            test_layout(variables),
             &compressed.0,
             &compressed.1,
             &setup,
@@ -5272,6 +5399,7 @@ mod tests {
             .collect::<Vec<_>>();
         let dense_result = prove_bls_dory_opening_refs_with_scratch(
             b"word-compact-folds",
+            test_layout(variables),
             &[&dense],
             std::slice::from_ref(&point),
             &setup,
@@ -5280,6 +5408,7 @@ mod tests {
         .unwrap();
         let compact_result = prove_bls_dory_opening_refs_with_scratch(
             b"word-compact-folds",
+            test_layout(variables),
             &[&compact],
             &[point],
             &setup,
@@ -5337,6 +5466,7 @@ mod tests {
             .collect::<Vec<_>>();
         let dense_result = prove_bls_dory_opening_refs_with_scratch(
             b"wide-signed-word-compact-folds",
+            test_layout(variables),
             &[&dense],
             std::slice::from_ref(&point),
             &setup,
@@ -5345,6 +5475,7 @@ mod tests {
         .unwrap();
         let compact_result = prove_bls_dory_opening_refs_with_scratch(
             b"wide-signed-word-compact-folds",
+            test_layout(variables),
             &[&compact],
             &[point],
             &setup,
@@ -5354,6 +5485,7 @@ mod tests {
         assert_eq!(compact_result, dense_result);
         verify_bls_dory_openings(
             b"wide-signed-word-compact-folds",
+            test_layout(variables),
             &compact_result.0,
             &compact_result.1,
             &setup,
@@ -5513,6 +5645,7 @@ mod tests {
         let streamed_refs = vec![&streamed, &streamed];
         let chunked_proof = prove_bls_dory_opening_refs_with_scratch(
             b"chunked-writer-equivalence",
+            test_layout(variables),
             &chunked_refs,
             &points,
             &setup,
@@ -5521,6 +5654,7 @@ mod tests {
         .unwrap();
         let streamed_proof = prove_bls_dory_opening_refs_with_scratch(
             b"chunked-writer-equivalence",
+            test_layout(variables),
             &streamed_refs,
             &points,
             &setup,
@@ -5554,6 +5688,7 @@ mod tests {
         ];
         let ordinary = prove_bls_dory_same_commitment_openings(
             b"prepared-source-release",
+            test_layout(variables),
             &materialized,
             &points,
             &setup,
@@ -5562,6 +5697,7 @@ mod tests {
         let artifact_refs = vec![&artifact; points.len()];
         let prepared = prepare_bls_dory_opening_refs(
             b"prepared-source-release",
+            test_layout(variables),
             &artifact_refs,
             &points,
             &setup,
@@ -5669,6 +5805,7 @@ mod tests {
         ];
         let ordinary = prove_bls_dory_same_commitment_openings(
             b"implicit-zero-tail",
+            test_layout(variables),
             &materialized,
             &points,
             &setup,
@@ -5677,6 +5814,7 @@ mod tests {
         let sparse_refs = vec![&sparse; points.len()];
         let sparse_proof = prove_bls_dory_opening_refs_with_scratch(
             b"implicit-zero-tail",
+            test_layout(variables),
             &sparse_refs,
             &points,
             &setup,
@@ -5686,6 +5824,7 @@ mod tests {
         assert_eq!(sparse_proof, ordinary);
         verify_bls_dory_openings(
             b"implicit-zero-tail",
+            test_layout(variables),
             &sparse_proof.0,
             &sparse_proof.1,
             &setup,
@@ -5701,6 +5840,67 @@ mod tests {
         assert_eq!(
             validate_layout(8, MAX_BLS_DORY_SETUP_VARIABLES - 7),
             Err(BlsDoryAggregateError::InvalidDimension)
+        );
+    }
+
+    #[test]
+    fn exact_layout_rejects_same_total_partition_substitution() {
+        let setup = deterministic_bls_dory_setup(8).unwrap();
+        let expected_layout = BlsDoryAggregateLayout::new(3, 3).unwrap();
+        let wrong_layout = BlsDoryAggregateLayout::new(2, 4).unwrap();
+        let coefficients = (0..64)
+            .map(|index| BlsDoryFr::from_u64(index + 1))
+            .collect::<Vec<_>>();
+        let expected = commit_bls_dory_polynomial(coefficients.clone(), 3, 3, &setup).unwrap();
+        let wrong = commit_bls_dory_polynomial(coefficients, 2, 4, &setup).unwrap();
+        let point = (0..6)
+            .map(|index| BlsDoryFr::from_u64(index + 7))
+            .collect::<Vec<_>>();
+
+        assert!(expected.matches_layout(expected_layout, &setup));
+        assert!(!wrong.matches_layout(expected_layout, &setup));
+        assert!(matches!(
+            BlsDoryDeferredOpeningSet::unopened(vec![expected.clone(), wrong.clone()]),
+            Err(BlsDoryAggregateError::MixedStatement)
+        ));
+        assert!(matches!(
+            BlsDoryDeferredOpeningSet::new(
+                vec![expected, wrong.clone()],
+                vec![0],
+                vec![point.clone()],
+            ),
+            Err(BlsDoryAggregateError::MixedStatement)
+        ));
+        assert!(matches!(
+            prove_bls_dory_openings(
+                b"same-total-layout",
+                expected_layout,
+                std::slice::from_ref(&wrong),
+                std::slice::from_ref(&point),
+                &setup,
+            ),
+            Err(BlsDoryAggregateError::MixedStatement)
+        ));
+
+        let (claims, proof) = prove_bls_dory_openings(
+            b"same-total-layout",
+            wrong_layout,
+            std::slice::from_ref(&wrong),
+            std::slice::from_ref(&point),
+            &setup,
+        )
+        .unwrap();
+        verify_bls_dory_openings(b"same-total-layout", wrong_layout, &claims, &proof, &setup)
+            .unwrap();
+        assert_eq!(
+            verify_bls_dory_openings(
+                b"same-total-layout",
+                expected_layout,
+                &claims,
+                &proof,
+                &setup,
+            ),
+            Err(BlsDoryAggregateError::MixedStatement)
         );
     }
 
@@ -5782,6 +5982,7 @@ mod tests {
         assert_eq!(
             prove_bls_dory_openings(
                 b"corrupt-row-source",
+                test_layout(variables),
                 std::slice::from_ref(&committed),
                 &[point],
                 &setup,
@@ -5797,32 +5998,37 @@ mod tests {
     fn statement_order_setup_and_proof_mutations_are_rejected() {
         let Fixture {
             setup,
+            layout,
             polynomials,
             points,
         } = fixture(6, 3);
         let (claims, proof) =
-            prove_bls_dory_openings(b"binding-a", &polynomials, &points, &setup).unwrap();
+            prove_bls_dory_openings(b"binding-a", layout, &polynomials, &points, &setup).unwrap();
 
-        assert!(verify_bls_dory_openings(b"binding-b", &claims, &proof, &setup).is_err());
+        assert!(verify_bls_dory_openings(b"binding-b", layout, &claims, &proof, &setup).is_err());
 
         let mut changed = claims.clone();
         changed[0].evaluation = changed[0].evaluation + BlsDoryFr::one();
-        assert!(verify_bls_dory_openings(b"binding-a", &changed, &proof, &setup).is_err());
+        assert!(verify_bls_dory_openings(b"binding-a", layout, &changed, &proof, &setup).is_err());
 
         let mut changed = claims.clone();
         changed[1].point[0] = changed[1].point[0] + BlsDoryFr::one();
-        assert!(verify_bls_dory_openings(b"binding-a", &changed, &proof, &setup).is_err());
+        assert!(verify_bls_dory_openings(b"binding-a", layout, &changed, &proof, &setup).is_err());
 
         let mut changed = claims.clone();
         changed[2].commitment = changed[2].commitment.scale(&BlsDoryFr::from_u64(2));
-        assert!(verify_bls_dory_openings(b"binding-a", &changed, &proof, &setup).is_err());
+        assert!(verify_bls_dory_openings(b"binding-a", layout, &changed, &proof, &setup).is_err());
 
         let mut reordered = claims.clone();
         reordered.swap(0, 1);
-        assert!(verify_bls_dory_openings(b"binding-a", &reordered, &proof, &setup).is_err());
+        assert!(
+            verify_bls_dory_openings(b"binding-a", layout, &reordered, &proof, &setup).is_err()
+        );
 
         let other_setup = deterministic_bls_dory_setup(8).unwrap();
-        assert!(verify_bls_dory_openings(b"binding-a", &claims, &proof, &other_setup).is_err());
+        assert!(
+            verify_bls_dory_openings(b"binding-a", layout, &claims, &proof, &other_setup).is_err()
+        );
 
         let foreign = commit_bls_dory_polynomial(
             polynomials[0].materialized_coefficients().unwrap().to_vec(),
@@ -5834,31 +6040,35 @@ mod tests {
         let mut mixed = polynomials.clone();
         mixed[0] = foreign;
         assert_eq!(
-            prove_bls_dory_openings(b"binding-a", &mixed, &points, &setup),
+            prove_bls_dory_openings(b"binding-a", layout, &mixed, &points, &setup),
             Err(BlsDoryAggregateError::MixedStatement)
         );
 
         let mut changed_sumcheck = proof.clone();
         changed_sumcheck[WIRE_HEADER_BYTES] ^= 1;
         assert!(
-            verify_bls_dory_openings(b"binding-a", &claims, &changed_sumcheck, &setup).is_err()
+            verify_bls_dory_openings(b"binding-a", layout, &claims, &changed_sumcheck, &setup,)
+                .is_err()
         );
 
         let mut changed_dory = proof.clone();
         let dory_offset = WIRE_HEADER_BYTES + 6 * 3 * scalar_bytes();
         changed_dory[dory_offset] ^= 1;
-        assert!(verify_bls_dory_openings(b"binding-a", &claims, &changed_dory, &setup).is_err());
+        assert!(
+            verify_bls_dory_openings(b"binding-a", layout, &claims, &changed_dory, &setup).is_err()
+        );
     }
 
     #[test]
     fn parser_preflights_shape_and_rejects_trailing_bytes() {
         let Fixture {
             setup,
+            layout,
             polynomials,
             points,
         } = fixture(6, 2);
         let (claims, proof) =
-            prove_bls_dory_openings(b"parser", &polynomials, &points, &setup).unwrap();
+            prove_bls_dory_openings(b"parser", layout, &polynomials, &points, &setup).unwrap();
         let dory_offset = WIRE_HEADER_BYTES + 6 * 3 * scalar_bytes();
         let vmv = 2 * gt_bytes() + g1_bytes();
 
@@ -5866,14 +6076,14 @@ mod tests {
         changed_round_count[dory_offset + vmv..dory_offset + vmv + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
-            verify_bls_dory_openings(b"parser", &claims, &changed_round_count, &setup),
+            verify_bls_dory_openings(b"parser", layout, &claims, &changed_round_count, &setup,),
             Err(BlsDoryAggregateError::InvalidProofShape)
         );
 
         let mut trailing = proof.clone();
         trailing.push(0);
         assert_eq!(
-            verify_bls_dory_openings(b"parser", &claims, &trailing, &setup),
+            verify_bls_dory_openings(b"parser", layout, &claims, &trailing, &setup),
             Err(BlsDoryAggregateError::InvalidProofShape)
         );
     }

@@ -20,12 +20,12 @@ use thiserror::Error;
 use crate::{
     StructuredWiringError, StructuredWiringStatement,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES, bounded_signed_code,
-        bounded_signed_dictionary, commit_bls_dory_compact_row_source_with_scratch,
-        commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
-        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets,
-        verify_bls_dory_openings,
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCompactRowSource,
+        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        bounded_signed_code, bounded_signed_dictionary,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
+        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
     },
     dory_bls12_381_prototype::{
         BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
@@ -304,8 +304,16 @@ pub fn prove_bls_dory_wiring_at_variables(
         setup,
     )?;
     let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
-    let (claims, opening_proof) =
-        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        packed_variables / 2,
+        packed_variables - packed_variables / 2,
+    )?;
+    let (claims, opening_proof) = prove_bls_dory_deferred_opening_sets(
+        &opening_binding,
+        aggregate_layout,
+        &[&prepared.openings],
+        setup,
+    )?;
     if claims != prepared.openings.claims() {
         return Err(BlsDoryWiringError::Opening);
     }
@@ -513,7 +521,17 @@ pub fn verify_bls_dory_wiring_at_variables(
         setup,
     )?;
     let binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&binding, &claims, &proof.opening_proof, setup)?;
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        packed_variables / 2,
+        packed_variables - packed_variables / 2,
+    )?;
+    verify_bls_dory_openings(
+        &binding,
+        aggregate_layout,
+        &claims,
+        &proof.opening_proof,
+        setup,
+    )?;
     Ok(())
 }
 
@@ -1503,11 +1521,18 @@ mod tests {
         assert_eq!(scratch.openings.claims(), dense.openings.claims());
         let aggregate_binding =
             opening_binding(b"signed-word-wiring", &scratch.proof.transcript_digest);
-        let dense_opening =
-            prove_bls_dory_deferred_opening_sets(&aggregate_binding, &[&dense.openings], &setup)
-                .unwrap();
+        let aggregate_layout =
+            BlsDoryAggregateLayout::new(variables / 2, variables - variables / 2).unwrap();
+        let dense_opening = prove_bls_dory_deferred_opening_sets(
+            &aggregate_binding,
+            aggregate_layout,
+            &[&dense.openings],
+            &setup,
+        )
+        .unwrap();
         let scratch_opening = prove_bls_dory_deferred_opening_sets_with_scratch(
             &aggregate_binding,
+            aggregate_layout,
             &[&scratch.openings],
             &setup,
             &scratch_directory.0,

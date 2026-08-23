@@ -761,8 +761,8 @@ mod tests {
     use crate::dory_bls12_381_aggregate::MAX_BLS_DORY_AGGREGATE_CLAIMS;
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCompactRowSource,
-        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
+        BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
         commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
         commit_bls_dory_row_source_with_scratch, prove_bls_dory_deferred_opening_sets,
         prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
@@ -791,6 +791,11 @@ mod tests {
         io::{Seek, SeekFrom, Write},
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_aggregate_layout() -> BlsDoryAggregateLayout {
+        BlsDoryAggregateLayout::new(8, 8).unwrap()
+    }
 
     #[cfg(feature = "whir-prototype")]
     const OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
@@ -2238,8 +2243,12 @@ mod tests {
                 return Err(BlsDoryAggregateError::InvalidProofShape);
             }
         }
-        let (_, opening_proof) =
-            prove_bls_dory_deferred_opening_sets(&opening_binding, &[&openings], setup)?;
+        let (_, opening_proof) = prove_bls_dory_deferred_opening_sets(
+            &opening_binding,
+            dense_aggregate_layout(),
+            &[&openings],
+            setup,
+        )?;
         Ok(DenseAuthenticatedAdjacencyProof {
             sumcheck,
             opening_batches,
@@ -2313,7 +2322,14 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup).is_ok()
+        verify_bls_dory_openings(
+            &opening_binding,
+            dense_aggregate_layout(),
+            &claims,
+            &proof.opening_proof,
+            setup,
+        )
+        .is_ok()
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -2487,8 +2503,12 @@ mod tests {
             }
             terminal_start = terminal_end;
         }
-        let (_, opening_proof) =
-            prove_bls_dory_deferred_opening_sets(&opening_binding, &[&openings], setup)?;
+        let (_, opening_proof) = prove_bls_dory_deferred_opening_sets(
+            &opening_binding,
+            dense_aggregate_layout(),
+            &[&openings],
+            setup,
+        )?;
         Ok(DenseAuthenticatedExecutionProof {
             sumcheck,
             opening_batches,
@@ -2559,7 +2579,14 @@ mod tests {
                 return false;
             }
         }
-        verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup).is_ok()
+        verify_bls_dory_openings(
+            &opening_binding,
+            dense_aggregate_layout(),
+            &claims,
+            &proof.opening_proof,
+            setup,
+        )
+        .is_ok()
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -2751,8 +2778,12 @@ mod tests {
             &execution_batches,
             inverse_commitment,
         );
-        let (_, opening_proof) =
-            prove_bls_dory_deferred_opening_sets(&opening_binding, &[&openings], setup)?;
+        let (_, opening_proof) = prove_bls_dory_deferred_opening_sets(
+            &opening_binding,
+            dense_aggregate_layout(),
+            &[&openings],
+            setup,
+        )?;
         Ok(DenseAuthenticatedBlake3Proof {
             execution_sumcheck,
             adjacency_sumcheck,
@@ -2868,7 +2899,14 @@ mod tests {
             &proof.execution_batches,
             proof.inverse_commitment,
         );
-        verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup).is_ok()
+        verify_bls_dory_openings(
+            &opening_binding,
+            dense_aggregate_layout(),
+            &claims,
+            &proof.opening_proof,
+            setup,
+        )
+        .is_ok()
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -3609,6 +3647,7 @@ mod tests {
         ];
         let ordinary = prove_bls_dory_same_commitment_openings(
             b"blake3-row-source-equivalence",
+            dense_aggregate_layout(),
             &materialized,
             &points,
             &setup,
@@ -3616,6 +3655,7 @@ mod tests {
         .unwrap();
         let artifact_backed = prove_bls_dory_same_commitment_openings(
             b"blake3-row-source-equivalence",
+            dense_aggregate_layout(),
             &streamed,
             &points,
             &setup,
@@ -3624,6 +3664,7 @@ mod tests {
         assert_eq!(artifact_backed, ordinary);
         verify_bls_dory_openings(
             b"blake3-row-source-equivalence",
+            dense_aggregate_layout(),
             &artifact_backed.0,
             &artifact_backed.1,
             &setup,
@@ -3647,6 +3688,7 @@ mod tests {
         assert_eq!(
             prove_bls_dory_same_commitment_openings(
                 b"blake3-row-source-corruption",
+                dense_aggregate_layout(),
                 &streamed,
                 &points,
                 &setup,
@@ -3766,15 +3808,31 @@ mod tests {
 
             let mut binding = b"blake3-compact-source-equivalence".to_vec();
             binding.extend_from_slice(&(batch_start as u64).to_le_bytes());
-            let ordinary =
-                prove_bls_dory_same_commitment_openings(&binding, &materialized, &points, &setup)
-                    .unwrap();
-            let artifact_backed =
-                prove_bls_dory_same_commitment_openings(&binding, &compact, &points, &setup)
-                    .unwrap();
+            let ordinary = prove_bls_dory_same_commitment_openings(
+                &binding,
+                dense_aggregate_layout(),
+                &materialized,
+                &points,
+                &setup,
+            )
+            .unwrap();
+            let artifact_backed = prove_bls_dory_same_commitment_openings(
+                &binding,
+                dense_aggregate_layout(),
+                &compact,
+                &points,
+                &setup,
+            )
+            .unwrap();
             assert_eq!(artifact_backed, ordinary);
-            verify_bls_dory_openings(&binding, &artifact_backed.0, &artifact_backed.1, &setup)
-                .unwrap();
+            verify_bls_dory_openings(
+                &binding,
+                dense_aggregate_layout(),
+                &artifact_backed.0,
+                &artifact_backed.1,
+                &setup,
+            )
+            .unwrap();
             covered_tables += batch_columns.len();
             drop(compact);
             assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
@@ -3942,6 +4000,7 @@ mod tests {
         ];
         let ordinary = prove_bls_dory_same_commitment_openings(
             b"blake3-preprocessed-source-equivalence",
+            dense_aggregate_layout(),
             &materialized,
             &points,
             &setup,
@@ -3949,6 +4008,7 @@ mod tests {
         .unwrap();
         let artifact_backed = prove_bls_dory_same_commitment_openings(
             b"blake3-preprocessed-source-equivalence",
+            dense_aggregate_layout(),
             &compact,
             &points,
             &setup,
@@ -3957,6 +4017,7 @@ mod tests {
         assert_eq!(artifact_backed, ordinary);
         verify_bls_dory_openings(
             b"blake3-preprocessed-source-equivalence",
+            dense_aggregate_layout(),
             &artifact_backed.0,
             &artifact_backed.1,
             &setup,
@@ -4037,6 +4098,7 @@ mod tests {
         ];
         let ordinary = prove_bls_dory_same_commitment_openings(
             b"blake3-code-source-equivalence",
+            dense_aggregate_layout(),
             &materialized,
             &points,
             &setup,
@@ -4044,6 +4106,7 @@ mod tests {
         .unwrap();
         let artifact_backed = prove_bls_dory_same_commitment_openings(
             b"blake3-code-source-equivalence",
+            dense_aggregate_layout(),
             &compact,
             &points,
             &setup,
@@ -4052,6 +4115,7 @@ mod tests {
         assert_eq!(artifact_backed, ordinary);
         verify_bls_dory_openings(
             b"blake3-code-source-equivalence",
+            dense_aggregate_layout(),
             &artifact_backed.0,
             &artifact_backed.1,
             &setup,

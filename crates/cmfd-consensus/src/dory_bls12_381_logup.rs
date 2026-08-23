@@ -26,8 +26,8 @@ use crate::{
     STRUCTURED_TRANSITION_ORACLES, STRUCTURED_TRANSITION_REGULAR_ORACLES,
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
+        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
         commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_mapped_compact_polynomial,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
@@ -715,8 +715,14 @@ fn prove_from_oracles(
     let mut prepared =
         prove_from_oracles_deferred(binding, statement, oracles, packed_variables, setup)?;
     let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
-    let (claims, opening_proof) =
-        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    let (nu, sigma) = dory_layout(packed_variables);
+    let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma)?;
+    let (claims, opening_proof) = prove_bls_dory_deferred_opening_sets(
+        &opening_binding,
+        aggregate_layout,
+        &[&prepared.openings],
+        setup,
+    )?;
     if claims != prepared.openings.claims() {
         return Err(BlsDoryRangeLogUpError::Opening);
     }
@@ -784,6 +790,7 @@ fn prove_from_source_deferred(
         .checked_shl(packed_variables as u32)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
     let (nu, sigma) = dory_layout(packed_variables);
+    let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma)?;
     let rows = 1usize
         .checked_shl(nu as u32)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
@@ -804,7 +811,7 @@ fn prove_from_source_deferred(
         let explicit_scalars = elements
             .checked_mul(STRUCTURED_TRANSITION_ORACLES)
             .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-        if !transition.matches_layout(packed_variables, setup)
+        if !transition.matches_layout(aggregate_layout, setup)
             || transition.explicit_coefficient_count() != explicit_scalars
         {
             return Err(BlsDoryRangeLogUpError::InvalidDimensions);
@@ -1197,7 +1204,15 @@ pub fn verify_bls_dory_range_logup_at_variables(
         setup,
     )?;
     let opening_binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
+    let (nu, sigma) = dory_layout(packed_variables);
+    let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma)?;
+    verify_bls_dory_openings(
+        &opening_binding,
+        aggregate_layout,
+        &claims,
+        &proof.opening_proof,
+        setup,
+    )?;
     Ok(())
 }
 
@@ -4791,9 +4806,12 @@ mod tests {
         );
         let expected_claims = prepared.openings.claims().to_vec();
         let mut proof = prepared.proof;
+        let (nu, sigma) = dory_layout(packed_variables);
+        let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma).unwrap();
         let (claims, opening_proof) =
             crate::dory_bls12_381_aggregate::prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
                 &opening_binding,
+                aggregate_layout,
                 vec![prepared.openings],
                 &setup,
                 &scratch_directory,

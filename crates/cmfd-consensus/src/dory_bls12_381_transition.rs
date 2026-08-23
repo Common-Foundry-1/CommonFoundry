@@ -24,8 +24,8 @@ use crate::{
     StructuredTransitionError, StructuredTransitionStatement, StructuredTransitionWitness,
     V2_TRANSITION_MODULUS,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCompactRowSource,
+        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
         commit_bls_dory_compact_row_source_with_scratch,
         commit_bls_dory_padded_prefix_with_optional_scratch, projected_bls_dory_aggregate_bytes,
         prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
@@ -404,8 +404,16 @@ pub fn prove_bls_dory_transition_at_variables(
         setup,
     )?;
     let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
-    let (claims, opening_proof) =
-        prove_bls_dory_deferred_opening_sets(&opening_binding, &[&prepared.openings], setup)?;
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        packed_variables / 2,
+        packed_variables - packed_variables / 2,
+    )?;
+    let (claims, opening_proof) = prove_bls_dory_deferred_opening_sets(
+        &opening_binding,
+        aggregate_layout,
+        &[&prepared.openings],
+        setup,
+    )?;
     if claims != prepared.openings.claims() {
         return Err(BlsDoryTransitionError::Opening);
     }
@@ -678,7 +686,17 @@ pub fn verify_bls_dory_transition_at_variables(
         setup,
     )?;
     let opening_binding = opening_binding(binding, &proof.transcript_digest);
-    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        packed_variables / 2,
+        packed_variables - packed_variables / 2,
+    )?;
+    verify_bls_dory_openings(
+        &opening_binding,
+        aggregate_layout,
+        &claims,
+        &proof.opening_proof,
+        setup,
+    )?;
     Ok(())
 }
 

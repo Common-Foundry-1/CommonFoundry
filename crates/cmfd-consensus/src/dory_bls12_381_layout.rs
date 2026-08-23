@@ -26,10 +26,11 @@ use crate::{
     StructuredMatrixStatement, StructuredTransitionStatement, StructuredTransitionWitness,
     StructuredWiringStatement, VerifiedModelBankReceipt,
     dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
-        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
-        commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
-        projected_bls_dory_aggregate_bytes, prove_bls_dory_deferred_opening_sets_consuming,
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
+        BlsDoryCommittedPolynomialWriter, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
+        MAX_BLS_DORY_AGGREGATE_BYTES, commit_bls_dory_polynomial,
+        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets_consuming,
         prove_bls_dory_deferred_opening_sets_consuming_with_scratch,
         regenerate_bls_dory_compact_row_source_with_scratch, verify_bls_dory_openings,
     },
@@ -1645,6 +1646,10 @@ fn prove_prepared_shared_layout(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
 ) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        padded_variables / 2,
+        padded_variables - padded_variables / 2,
+    )?;
     let matrix_proofs = matrices
         .iter()
         .map(|prepared| &prepared.proof)
@@ -1723,12 +1728,18 @@ fn prove_prepared_shared_layout(
     let (claims, opening_proof) = if let Some(scratch_directory) = scratch_directory {
         prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
             &opening_binding,
+            aggregate_layout,
             opening_sets,
             setup,
             scratch_directory,
         )?
     } else {
-        prove_bls_dory_deferred_opening_sets_consuming(&opening_binding, opening_sets, setup)?
+        prove_bls_dory_deferred_opening_sets_consuming(
+            &opening_binding,
+            aggregate_layout,
+            opening_sets,
+            setup,
+        )?
     };
     if claims != expected_claims {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
@@ -1792,6 +1803,10 @@ pub fn verify_bls_dory_shared_layout_with_final_output_at_variables(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<VerifiedBlsDoryFinalOutputOpening, BlsDorySharedLayoutError> {
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        padded_variables / 2,
+        padded_variables - padded_variables / 2,
+    )?;
     validate_shared_proof_shape(binding, proof, padded_variables)?;
     if proof.matrices.len() != matrix_statements.len()
         || proof.transitions.len() != transition_statements.len()
@@ -1917,7 +1932,13 @@ pub fn verify_bls_dory_shared_layout_with_final_output_at_variables(
     }
     claims.extend(wiring_claims);
     claims.extend(fixed_base_claims);
-    verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup)?;
+    verify_bls_dory_openings(
+        &opening_binding,
+        aggregate_layout,
+        &claims,
+        &proof.opening_proof,
+        setup,
+    )?;
     Ok(VerifiedBlsDoryFinalOutputOpening {
         cell_point: final_output_points.cell_point,
         signed_evaluation: proof.final_output_evaluation,

@@ -11,8 +11,9 @@
 //! The adjacency argument is required. Merely placing local and next values in
 //! one prover-supplied table would not prove that adjacent rows are related.
 
+use dory_pcs::primitives::arithmetic::Field as DoryField;
 #[cfg(all(test, feature = "whir-prototype"))]
-use dory_pcs::primitives::{arithmetic::Field as DoryField, transcript::Transcript};
+use dory_pcs::primitives::transcript::Transcript;
 #[cfg(all(test, feature = "whir-prototype"))]
 use p3_air::symbolic::{
     AirLayout, BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression, get_symbolic_constraints,
@@ -22,7 +23,8 @@ use p3_field::PrimeField64;
 use thiserror::Error;
 
 #[cfg(all(test, feature = "whir-prototype"))]
-use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryTranscript};
+use crate::dory_bls12_381_prototype::BlsDoryTranscript;
+use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt};
 #[cfg(all(test, feature = "whir-prototype"))]
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredBlake3Statement,
@@ -34,6 +36,7 @@ use crate::{
     },
 };
 use crate::{
+    dory_bls12_381_aggregate::{BlsDoryAggregateError, BlsDoryOpeningClaim},
     dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
     dory_bls12_381_fold_artifact::BlsDoryFoldArtifactSpec,
     dory_bls12_381_layout::{
@@ -144,14 +147,196 @@ pub const BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS: usize = 3;
 /// Physical source commitments in canonical order: main words, accumulator,
 /// preprocessing, and post-challenge adjacency inverses.
 pub const BLS_DORY_BLAKE3_SOURCE_COMMITMENTS: usize = 4;
+/// Semantic identity of each physical BLAKE3 coefficient source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum BlsDoryBlake3SourceRole {
+    Main = 0,
+    Accumulator = 1,
+    Preprocessing = 2,
+    Inverse = 3,
+}
+
+impl BlsDoryBlake3SourceRole {
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Canonical source role selected by each execution then adjacency claim.
+pub const BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES: [BlsDoryBlake3SourceRole; 6] = [
+    BlsDoryBlake3SourceRole::Main,
+    BlsDoryBlake3SourceRole::Accumulator,
+    BlsDoryBlake3SourceRole::Preprocessing,
+    BlsDoryBlake3SourceRole::Main,
+    BlsDoryBlake3SourceRole::Accumulator,
+    BlsDoryBlake3SourceRole::Inverse,
+];
 /// Canonical source selected by each execution then adjacency opening claim.
-pub const BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES: [usize; 6] = [0, 1, 2, 0, 1, 3];
+pub const BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES: [usize; 6] = [
+    BlsDoryBlake3SourceRole::Main.index(),
+    BlsDoryBlake3SourceRole::Accumulator.index(),
+    BlsDoryBlake3SourceRole::Preprocessing.index(),
+    BlsDoryBlake3SourceRole::Main.index(),
+    BlsDoryBlake3SourceRole::Accumulator.index(),
+    BlsDoryBlake3SourceRole::Inverse.index(),
+];
 /// Complete Dory opening-claim count after composition with the shared proof.
 pub const BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS: usize = BLS_DORY_SHARED_PRODUCTION_CLAIMS
     + BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS
     + BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS;
 /// Proposed future parser bound. The active aggregate parser remains at 128 claims.
 pub const BLS_DORY_BLAKE3_PROPOSED_MAX_OPENING_CLAIMS: usize = 256;
+
+/// Named commitments for the four physical BLAKE3 coefficient sources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BlsDoryBlake3SourceCommitments {
+    main: BlsDoryGt,
+    accumulator: BlsDoryGt,
+    preprocessing: BlsDoryGt,
+    inverse: BlsDoryGt,
+}
+
+impl BlsDoryBlake3SourceCommitments {
+    fn commitment(&self, role: BlsDoryBlake3SourceRole) -> &BlsDoryGt {
+        match role {
+            BlsDoryBlake3SourceRole::Main => &self.main,
+            BlsDoryBlake3SourceRole::Accumulator => &self.accumulator,
+            BlsDoryBlake3SourceRole::Preprocessing => &self.preprocessing,
+            BlsDoryBlake3SourceRole::Inverse => &self.inverse,
+        }
+    }
+}
+
+/// Six points and evaluations emitted by successful verifier transcript replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BlsDoryBlake3OpeningReplay {
+    execution_points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS],
+    execution_evaluations: [BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS],
+    adjacency_points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS],
+    adjacency_evaluations: [BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS],
+}
+
+/// Internal binding of replayed claims to named source commitments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BlsDoryBlake3OpeningStatement {
+    source_commitments: BlsDoryBlake3SourceCommitments,
+    points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+    evaluations: [BlsDoryFr; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BlsDoryBlake3OpeningStatement {
+    pub(crate) fn from_verified_replay(
+        source_commitments: BlsDoryBlake3SourceCommitments,
+        replay: BlsDoryBlake3OpeningReplay,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        let (points, evaluations) = Self::replay_parts(replay);
+        if points.iter().any(|point| {
+            point.len() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
+                || point[BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES..]
+                    .iter()
+                    .any(|coordinate| *coordinate != BlsDoryFr::zero())
+        }) {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        Ok(Self {
+            source_commitments,
+            points,
+            evaluations,
+        })
+    }
+
+    #[cfg(all(test, feature = "whir-prototype"))]
+    fn from_verified_replay_at_variables(
+        source_commitments: BlsDoryBlake3SourceCommitments,
+        replay: BlsDoryBlake3OpeningReplay,
+        source_variables: usize,
+        shared_variables: usize,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        let (points, evaluations) = Self::replay_parts(replay);
+        if source_variables > shared_variables
+            || points.iter().any(|point| {
+                point.len() != shared_variables
+                    || point[source_variables..]
+                        .iter()
+                        .any(|coordinate| *coordinate != BlsDoryFr::zero())
+            })
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        Ok(Self {
+            source_commitments,
+            points,
+            evaluations,
+        })
+    }
+
+    fn replay_parts(
+        replay: BlsDoryBlake3OpeningReplay,
+    ) -> (
+        [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+        [BlsDoryFr; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+    ) {
+        let [execution_point_0, execution_point_1, execution_point_2] = replay.execution_points;
+        let [adjacency_point_0, adjacency_point_1, adjacency_point_2] = replay.adjacency_points;
+        let points = [
+            execution_point_0,
+            execution_point_1,
+            execution_point_2,
+            adjacency_point_0,
+            adjacency_point_1,
+            adjacency_point_2,
+        ];
+        let [
+            execution_evaluation_0,
+            execution_evaluation_1,
+            execution_evaluation_2,
+        ] = replay.execution_evaluations;
+        let [
+            adjacency_evaluation_0,
+            adjacency_evaluation_1,
+            adjacency_evaluation_2,
+        ] = replay.adjacency_evaluations;
+        (
+            points,
+            [
+                execution_evaluation_0,
+                execution_evaluation_1,
+                execution_evaluation_2,
+                adjacency_evaluation_0,
+                adjacency_evaluation_1,
+                adjacency_evaluation_2,
+            ],
+        )
+    }
+
+    /// Bind each claim to its semantic source role, exact lifted point, and
+    /// transcript-replayed terminal evaluation.
+    pub(crate) fn validate_claims(
+        &self,
+        claims: &[BlsDoryOpeningClaim],
+    ) -> Result<(), BlsDoryAggregateError> {
+        if claims.len() != BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES.len()
+            || claims
+                .iter()
+                .zip(BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES)
+                .zip(&self.points)
+                .zip(&self.evaluations)
+                .any(|(((claim, role), point), evaluation)| {
+                    claim.commitment != *self.source_commitments.commitment(role)
+                        || claim.point != *point
+                        || claim.evaluation != *evaluation
+                })
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        Ok(())
+    }
+}
 
 const SCALAR_BYTES: usize = 32;
 const GT_BYTES: usize = 576;
@@ -213,7 +398,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "bounded row streams now transpose every ordinary main and preprocessing column, derive next rows without duplicate scratch, preserve exact commitment and opening bytes, reject non-Boolean codes, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact; signed-word and preprocessing streams have materialized commitment/opening equivalence for bounded shared-layout reblocking analogs and pin the exact n=33 topology, a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches, and a bounded four-source/six-claim test demonstrates canonical statement rejection of freshly reproved wrong routes and nonzero lift coordinates; production-owned source construction and source-role/point/evaluation binding, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "bounded row streams now transpose every ordinary main and preprocessing column, derive next rows without duplicate scratch, preserve exact commitment and opening bytes, reject non-Boolean codes, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact; signed-word and preprocessing streams have materialized commitment/opening equivalence for bounded shared-layout reblocking analogs and pin the exact n=33 topology, a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches, and production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; production-owned source construction, verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -1064,15 +1249,14 @@ mod tests {
     use crate::dory_bls12_381_aggregate::MAX_BLS_DORY_AGGREGATE_CLAIMS;
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_aggregate::{
-        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
-        BlsDoryCommittedPolynomialWriter, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
-        BlsDoryOpeningClaim, commit_bls_dory_compact_row_source_with_scratch,
-        commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
-        prove_bls_dory_deferred_opening_sets, prove_bls_dory_same_commitment_openings,
-        verify_bls_dory_openings,
+        BlsDoryAggregateLayout, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
+        BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
+        commit_bls_dory_row_source_with_scratch, prove_bls_dory_deferred_opening_sets,
+        prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
     };
     #[cfg(feature = "whir-prototype")]
-    use crate::dory_bls12_381_prototype::{BlsDoryGt, DeterministicBlsDorySetup};
+    use crate::dory_bls12_381_prototype::DeterministicBlsDorySetup;
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_streaming::BlsDoryRowSource;
     #[cfg(feature = "whir-prototype")]
@@ -1086,6 +1270,7 @@ mod tests {
     };
     #[cfg(feature = "whir-prototype")]
     use crate::structured_blake3_tree::build_tree_witness;
+    use dory_pcs::primitives::arithmetic::Group as DoryGroup;
     #[cfg(feature = "whir-prototype")]
     use p3_air::BaseAir;
     #[cfg(feature = "whir-prototype")]
@@ -1106,6 +1291,94 @@ mod tests {
 
     #[cfg(feature = "whir-prototype")]
     static BLAKE3_SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn canonical_opening_binding_rejects_semantic_mismatches() {
+        let main = BlsDoryGt::random();
+        let preprocessing = loop {
+            let candidate = BlsDoryGt::random();
+            if candidate != main {
+                break candidate;
+            }
+        };
+        let source_commitments = BlsDoryBlake3SourceCommitments {
+            main,
+            accumulator: BlsDoryGt::random(),
+            preprocessing,
+            inverse: BlsDoryGt::random(),
+        };
+
+        let points = (0..BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES.len())
+            .map(|claim| {
+                let mut point = vec![BlsDoryFr::zero(); BLS_DORY_SHARED_PRODUCTION_VARIABLES];
+                point[0] = BlsDoryFr::from_u64(claim as u64 + 1);
+                point
+            })
+            .collect::<Vec<_>>();
+        let evaluations = (0..BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES.len())
+            .map(|claim| BlsDoryFr::from_u64(claim as u64 + 11))
+            .collect::<Vec<_>>();
+        let statement = BlsDoryBlake3OpeningStatement::from_verified_replay(
+            source_commitments.clone(),
+            blake3_opening_replay(&points, &evaluations),
+        )
+        .unwrap();
+        let claims = BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES
+            .iter()
+            .enumerate()
+            .map(|(index, role)| BlsDoryOpeningClaim {
+                commitment: *source_commitments.commitment(*role),
+                point: points[index].clone(),
+                evaluation: evaluations[index],
+            })
+            .collect::<Vec<_>>();
+        statement.validate_claims(&claims).unwrap();
+
+        let mut wrong_count = claims.clone();
+        wrong_count.pop();
+        assert_eq!(
+            statement.validate_claims(&wrong_count),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let mut wrong_role = claims.clone();
+        wrong_role[0].commitment = source_commitments.preprocessing;
+        assert_eq!(
+            statement.validate_claims(&wrong_role),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let mut wrong_point = claims.clone();
+        wrong_point[0].point[0] = wrong_point[0].point[0] + BlsDoryFr::from_u64(1);
+        assert_eq!(
+            statement.validate_claims(&wrong_point),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let mut wrong_evaluation = claims;
+        wrong_evaluation[0].evaluation = wrong_evaluation[0].evaluation + BlsDoryFr::from_u64(1);
+        assert_eq!(
+            statement.validate_claims(&wrong_evaluation),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+
+        let mut noncanonical_points = points.clone();
+        noncanonical_points[0][BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES] =
+            BlsDoryFr::from_u64(1);
+        assert_eq!(
+            BlsDoryBlake3OpeningStatement::from_verified_replay(
+                source_commitments.clone(),
+                blake3_opening_replay(&noncanonical_points, &evaluations),
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let mut short_points = points;
+        short_points[0].pop();
+        assert_eq!(
+            BlsDoryBlake3OpeningStatement::from_verified_replay(
+                source_commitments,
+                blake3_opening_replay(&short_points, &evaluations),
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+    }
 
     #[cfg(feature = "whir-prototype")]
     struct Blake3ScratchDirectory(std::path::PathBuf);
@@ -2270,34 +2543,21 @@ mod tests {
         file.flush()
     }
 
-    #[cfg(feature = "whir-prototype")]
-    fn validate_blake3_opening_statement(
-        claims: &[BlsDoryOpeningClaim],
-        source_commitments: &[BlsDoryGt],
-        expected_points: &[Vec<BlsDoryFr>],
-        expected_evaluations: &[BlsDoryFr],
-    ) -> Result<(), BlsDoryAggregateError> {
-        if claims.len() != BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()
-            || source_commitments.len() != BLS_DORY_BLAKE3_SOURCE_COMMITMENTS
-            || expected_points.len() != claims.len()
-            || expected_evaluations.len() != claims.len()
-        {
-            return Err(BlsDoryAggregateError::InvalidProofShape);
+    fn blake3_opening_replay(
+        points: &[Vec<BlsDoryFr>],
+        evaluations: &[BlsDoryFr],
+    ) -> BlsDoryBlake3OpeningReplay {
+        assert_eq!(points.len(), BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES.len());
+        assert_eq!(
+            evaluations.len(),
+            BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES.len()
+        );
+        BlsDoryBlake3OpeningReplay {
+            execution_points: [points[0].clone(), points[1].clone(), points[2].clone()],
+            execution_evaluations: [evaluations[0], evaluations[1], evaluations[2]],
+            adjacency_points: [points[3].clone(), points[4].clone(), points[5].clone()],
+            adjacency_evaluations: [evaluations[3], evaluations[4], evaluations[5]],
         }
-        if claims
-            .iter()
-            .zip(BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES)
-            .zip(expected_points)
-            .zip(expected_evaluations)
-            .any(|(((claim, source), point), evaluation)| {
-                claim.commitment != source_commitments[source]
-                    || claim.point != *point
-                    || claim.evaluation != *evaluation
-            })
-        {
-            return Err(BlsDoryAggregateError::InvalidProofShape);
-        }
-        Ok(())
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -5265,14 +5525,22 @@ mod tests {
             .iter()
             .map(|claim| claim.evaluation)
             .collect::<Vec<_>>();
-        assert_eq!(claims, opening_set.claims());
-        validate_blake3_opening_statement(
-            &claims,
-            &commitments,
-            &expected_points,
-            &expected_evaluations,
+        let source_commitments = BlsDoryBlake3SourceCommitments {
+            main: commitments[0],
+            accumulator: commitments[1],
+            preprocessing: commitments[2],
+            inverse: commitments[3],
+        };
+        let opening_replay = blake3_opening_replay(&expected_points, &expected_evaluations);
+        let opening_statement = BlsDoryBlake3OpeningStatement::from_verified_replay_at_variables(
+            source_commitments.clone(),
+            opening_replay,
+            SOURCE_VARIABLES,
+            layout.variables(),
         )
         .unwrap();
+        assert_eq!(claims, opening_set.claims());
+        opening_statement.validate_claims(&claims).unwrap();
         verify_bls_dory_openings(public_binding, layout, &claims, &proof, &setup).unwrap();
 
         let wrong_routing_set = BlsDoryDeferredOpeningSet::new(
@@ -5303,17 +5571,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_blake3_opening_statement(
-                &wrong_routing_claims,
-                &commitments,
-                &expected_points,
-                &expected_evaluations,
-            ),
+            opening_statement.validate_claims(&wrong_routing_claims),
             Err(BlsDoryAggregateError::InvalidProofShape)
         );
 
         let mut noncanonical_lift_points = expected_points.clone();
         noncanonical_lift_points[0][SOURCE_VARIABLES] = BlsDoryFr::from_u64(1);
+        let noncanonical_lift_replay =
+            blake3_opening_replay(&noncanonical_lift_points, &expected_evaluations);
+        assert_eq!(
+            BlsDoryBlake3OpeningStatement::from_verified_replay_at_variables(
+                source_commitments,
+                noncanonical_lift_replay,
+                SOURCE_VARIABLES,
+                layout.variables(),
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
         let noncanonical_lift_set = BlsDoryDeferredOpeningSet::new(
             (0..BLS_DORY_BLAKE3_SOURCE_COMMITMENTS)
                 .map(|source| opening_set.polynomial(source).unwrap().clone())
@@ -5339,12 +5613,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_blake3_opening_statement(
-                &noncanonical_lift_claims,
-                &commitments,
-                &expected_points,
-                &expected_evaluations,
-            ),
+            opening_statement.validate_claims(&noncanonical_lift_claims),
             Err(BlsDoryAggregateError::InvalidProofShape)
         );
 

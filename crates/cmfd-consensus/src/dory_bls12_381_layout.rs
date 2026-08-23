@@ -76,6 +76,7 @@ use crate::{
         prove_bls_dory_wiring_deferred_at_variables_with_scratch,
         verify_bls_dory_wiring_deferred_at_variables,
     },
+    dory_v3_model::DoryV3ModelIdentityV1,
     dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     dory_v3_suite::{
         DORY_V3_FIXED_MODEL_BINDING_DOMAIN, DORY_V3_FIXED_MODEL_BINDING_VERSION,
@@ -640,6 +641,62 @@ pub struct BlsDoryPreparedFixedModel {
     weight_banks: Vec<BlsDoryCommittedPolynomial>,
 }
 
+/// Bank-authenticated Dory V3 fixed-model commitments plus reusable
+/// coefficient artifacts.
+///
+/// The exact Record V2 and model-identity bindings remain private. Callers can
+/// only test them against another non-serializable bank-authenticated record,
+/// so serialized audit records cannot substitute for the reader-authenticated
+/// capability used to prepare these polynomials.
+#[derive(Debug)]
+pub struct BlsDoryPreparedFixedModelV5 {
+    record_digest: Digest32,
+    model_identity_digest: Digest32,
+    model_identity: DoryV3ModelIdentityV1,
+    #[allow(dead_code, reason = "consumed by the in-module V5 prover integration")]
+    base_input: BlsDoryCommittedPolynomial,
+    #[allow(dead_code, reason = "consumed by the in-module V5 prover integration")]
+    weight_banks: Vec<BlsDoryCommittedPolynomial>,
+}
+
+impl BlsDoryPreparedFixedModelV5 {
+    #[must_use]
+    pub const fn record_digest(&self) -> Digest32 {
+        self.record_digest
+    }
+
+    #[must_use]
+    pub const fn model_identity_digest(&self) -> Digest32 {
+        self.model_identity_digest
+    }
+
+    /// Return true only when this prepared model belongs to the exact same
+    /// bank-authenticated Record V2 and immutable Dory V3 model identity.
+    #[must_use]
+    pub fn is_bound_to_bank_authenticated_record(
+        &self,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    ) -> bool {
+        let record = authenticated.record();
+        self.is_bound_to_record_parts(
+            record.record_digest(),
+            record.model_identity_digest(),
+            record.model_identity(),
+        )
+    }
+
+    fn is_bound_to_record_parts(
+        &self,
+        record_digest: Digest32,
+        model_identity_digest: Digest32,
+        model_identity: &DoryV3ModelIdentityV1,
+    ) -> bool {
+        self.record_digest == record_digest
+            && self.model_identity_digest == model_identity_digest
+            && &self.model_identity == model_identity
+    }
+}
+
 impl BlsDoryPreparedFixedModel {
     #[must_use]
     pub const fn identity(&self) -> &BlsDoryFixedModelIdentity {
@@ -678,6 +735,46 @@ pub fn prepare_bls_dory_fixed_model_from_verified_bank_with_scratch<R: Read>(
     verify_model_bank_into_staged_field_sink(reader, expected_manifest, trusted_model, sink)
 }
 
+/// Reauthenticate one production Dory V3 model-bank reader and
+/// transactionally publish the exact reusable coefficient artifacts bound to
+/// its non-serializable Record V2 capability.
+///
+/// The staged polynomials remain private to the verifier until the bank header,
+/// payload roots, exact length, and EOF have authenticated. The publication
+/// step then compares the base commitment and every ordered weight-bank
+/// commitment individually against the immutable Dory V3 model identity.
+pub fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch<R: Read>(
+    reader: R,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>> {
+    let record = authenticated.record();
+    record.validate_production(setup).map_err(|_| {
+        ModelBankFieldStreamError::Sink(BlsDoryFixedModelStreamError::InvalidIdentity)
+    })?;
+    let identity = record.model_identity();
+    let weight_bank_count = identity.weight_bank_count().map_err(|_| {
+        ModelBankFieldStreamError::Sink(BlsDoryFixedModelStreamError::InvalidIdentity)
+    })?;
+    let sink = BlsDoryPreparedFixedModelV5Sink::new(
+        record.manifest(),
+        identity,
+        record.record_digest(),
+        record.model_identity_digest(),
+        setup,
+        scratch_directory,
+    )
+    .map_err(ModelBankFieldStreamError::Sink)?;
+    verify_model_bank_into_staged_field_layout_sink(
+        reader,
+        record.manifest(),
+        identity.layers_per_bank(),
+        weight_bank_count,
+        sink,
+    )
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BlsDoryFixedModelStreamError {
     #[error("the streamed fixed-model setup or padded geometry is invalid")]
@@ -690,6 +787,8 @@ pub enum BlsDoryFixedModelStreamError {
     ReceiptMismatch,
     #[error("the authenticated fixed-model commitments do not form a valid identity")]
     InvalidIdentity,
+    #[error("the authenticated fixed-model commitment does not match Dory V3 role {role}")]
+    DoryV3CommitmentMismatch { role: u32 },
     #[error("authenticated fixed-model prover storage failed")]
     ProverStorage,
 }
@@ -908,6 +1007,242 @@ impl StagedModelFieldSink for BlsDoryPreparedFixedModelSink<'_> {
             .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
         Ok(BlsDoryPreparedFixedModel {
             identity,
+            base_input,
+            weight_banks,
+        })
+    }
+}
+
+struct BlsDoryPreparedFixedModelV5Sink<'a> {
+    expected_manifest: ModelBankManifest,
+    record_digest: Digest32,
+    model_identity_digest: Digest32,
+    model_identity: DoryV3ModelIdentityV1,
+    roles: Vec<PreparedDoryRole<'a>>,
+    next_role: usize,
+}
+
+impl<'a> BlsDoryPreparedFixedModelV5Sink<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        expected_manifest: &ModelBankManifest,
+        model_identity: &DoryV3ModelIdentityV1,
+        record_digest: Digest32,
+        model_identity_digest: Digest32,
+        setup: &'a DeterministicBlsDorySetup,
+        scratch_directory: &Path,
+    ) -> Result<Self, BlsDoryFixedModelStreamError> {
+        model_identity
+            .validate()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        model_identity
+            .verify_manifest(expected_manifest)
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        if model_identity_digest.into_bytes()
+            != model_identity
+                .digest()
+                .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidIdentity);
+        }
+        setup
+            .validate()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let padded_variables = usize::try_from(model_identity.padded_variables())
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if padded_variables == 0
+            || padded_variables != setup.max_log_n()
+            || model_identity.setup_identity() != setup.identity()
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+        let padded_elements = 1_u64
+            .checked_shl(model_identity.padded_variables())
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let base_elements = u64::from(model_identity.batch())
+            .checked_mul(u64::from(model_identity.dimension()))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let weight_elements = u64::from(model_identity.layers_per_bank())
+            .checked_mul(u64::from(model_identity.dimension()))
+            .and_then(|value| value.checked_mul(u64::from(model_identity.dimension())))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        if !base_elements.is_power_of_two()
+            || !weight_elements.is_power_of_two()
+            || base_elements > padded_elements
+            || weight_elements > padded_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidGeometry);
+        }
+
+        let weight_bank_count = model_identity
+            .weight_bank_count()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let role_capacity = usize::try_from(weight_bank_count)
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or(BlsDoryFixedModelStreamError::InvalidGeometry)?;
+        let mut role_specs = Vec::with_capacity(role_capacity);
+        role_specs.push((ModelPcsRole::BaseInput, base_elements));
+        for index in 0..weight_bank_count {
+            role_specs.push((ModelPcsRole::WeightBank { index }, weight_elements));
+        }
+        let nu = padded_variables / 2;
+        let sigma = padded_variables - nu;
+        let roles = role_specs
+            .into_iter()
+            .map(|(role, expected_elements)| {
+                let explicit_count = usize::try_from(expected_elements)
+                    .map_err(|_| BlsDoryFixedModelStreamError::InvalidGeometry)?;
+                let writer = match role {
+                    ModelPcsRole::BaseInput => PreparedDoryWriter::Scalar(
+                        BlsDoryCommittedPolynomialWriter::create(
+                            scratch_directory,
+                            explicit_count,
+                            nu,
+                            sigma,
+                            setup,
+                        )
+                        .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?,
+                    ),
+                    ModelPcsRole::WeightBank { .. } => PreparedDoryWriter::SignedByte(
+                        BlsDoryCommittedPolynomialWriter::create_signed_byte(
+                            scratch_directory,
+                            explicit_count,
+                            nu,
+                            sigma,
+                            125,
+                            setup,
+                        )
+                        .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?,
+                    ),
+                };
+                Ok(PreparedDoryRole {
+                    role,
+                    expected_elements,
+                    next_offset: 0,
+                    writer,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            expected_manifest: *expected_manifest,
+            record_digest,
+            model_identity_digest,
+            model_identity: model_identity.clone(),
+            roles,
+            next_role: 0,
+        })
+    }
+}
+
+impl StagedModelFieldLayoutSink for BlsDoryPreparedFixedModelV5Sink<'_> {
+    type Error = BlsDoryFixedModelStreamError;
+    type Output = BlsDoryPreparedFixedModelV5;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        let role = self
+            .roles
+            .get_mut(self.next_role)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_len = u64::try_from(chunk.elements.len())
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidChunk)?;
+        let chunk_end = chunk
+            .role_offset
+            .checked_add(chunk_len)
+            .ok_or(BlsDoryFixedModelStreamError::InvalidChunk)?;
+        if chunk.elements.is_empty()
+            || chunk.role != role.role
+            || chunk.role_elements != role.expected_elements
+            || chunk.role_offset != role.next_offset
+            || chunk_end > role.expected_elements
+        {
+            return Err(BlsDoryFixedModelStreamError::InvalidChunk);
+        }
+        match &mut role.writer {
+            PreparedDoryWriter::Scalar(writer) => {
+                let scalars = chunk
+                    .elements
+                    .iter()
+                    .copied()
+                    .map(bls_scalar_from_model_field)
+                    .collect::<Result<Vec<_>, _>>()?;
+                writer
+                    .write_scalars(&scalars)
+                    .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+            }
+            PreparedDoryWriter::SignedByte(writer) => {
+                let values = chunk
+                    .elements
+                    .iter()
+                    .copied()
+                    .map(signed_model_value)
+                    .collect::<Result<Vec<_>, _>>()?;
+                writer
+                    .write_signed_values(&values)
+                    .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)?;
+            }
+        }
+        role.next_offset = chunk_end;
+        if chunk_end == role.expected_elements {
+            self.next_role += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_verified(
+        self,
+        receipt: VerifiedModelBankLayoutReceipt,
+    ) -> Result<Self::Output, Self::Error> {
+        let expected_weight_count = self
+            .model_identity
+            .weight_bank_count()
+            .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        if self.next_role != self.roles.len()
+            || receipt.manifest() != &self.expected_manifest
+            || receipt.layout().layers_per_bank() != self.model_identity.layers_per_bank()
+            || receipt.layout().weight_bank_count() != expected_weight_count
+            || self
+                .roles
+                .iter()
+                .any(|role| role.next_offset != role.expected_elements)
+        {
+            return Err(BlsDoryFixedModelStreamError::ReceiptMismatch);
+        }
+
+        let mut polynomials = self.roles.into_iter().map(|role| {
+            match role.writer {
+                PreparedDoryWriter::Scalar(writer) | PreparedDoryWriter::SignedByte(writer) => {
+                    writer.finish()
+                }
+            }
+            .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)
+        });
+        let base_input = polynomials
+            .next()
+            .ok_or(BlsDoryFixedModelStreamError::InvalidIdentity)??;
+        let weight_banks = polynomials.collect::<Result<Vec<_>, _>>()?;
+        if base_input.commitment() != self.model_identity.base_input_commitment() {
+            return Err(BlsDoryFixedModelStreamError::DoryV3CommitmentMismatch { role: 0 });
+        }
+        let expected_weights = self.model_identity.weight_bank_commitments();
+        if weight_banks.len() != expected_weights.len() {
+            return Err(BlsDoryFixedModelStreamError::InvalidIdentity);
+        }
+        for (index, (actual, expected)) in
+            weight_banks.iter().zip(expected_weights.iter()).enumerate()
+        {
+            if actual.commitment() != *expected {
+                let role = u32::try_from(index + 1)
+                    .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
+                return Err(BlsDoryFixedModelStreamError::DoryV3CommitmentMismatch { role });
+            }
+        }
+
+        Ok(BlsDoryPreparedFixedModelV5 {
+            record_digest: self.record_digest,
+            model_identity_digest: self.model_identity_digest,
+            model_identity: self.model_identity,
             base_input,
             weight_banks,
         })
@@ -4848,6 +5183,9 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{fs::File, io};
+
+    use serde_json::json;
 
     use super::*;
     use crate::{
@@ -4870,6 +5208,12 @@ mod tests {
             BlsDoryWiringProof, prove_bls_dory_wiring_at_variables,
             verify_bls_dory_wiring_at_variables,
         },
+        dory_v3_model::CanonicalBlsDoryGtHex,
+        dory_v3_model_record::{
+            DoryV3ModelCommitmentRecordV2,
+            derive_bank_authenticated_dory_v3_model_commitment_record_v2,
+        },
+        dory_v3_suite::DORY_V3_MODEL_IDENTITY_VERSION,
         model_bank::{MODEL_BANK_HEADER_BYTES, ModelBankError},
     };
     #[cfg(feature = "whir-prototype")]
@@ -4883,6 +5227,32 @@ mod tests {
     const OUTPUT_MODULUS: u64 = 251;
     const OUTPUT_CENTER: i64 = 125;
     static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    struct FailAfterReader {
+        inner: Cursor<Vec<u8>>,
+        fail_after: u64,
+    }
+
+    impl FailAfterReader {
+        fn new(bytes: Vec<u8>, fail_after: usize) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                fail_after: u64::try_from(fail_after).unwrap(),
+            }
+        }
+    }
+
+    impl Read for FailAfterReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let position = self.inner.position();
+            if position >= self.fail_after {
+                return Err(io::Error::other("injected model-bank read failure"));
+            }
+            let remaining = usize::try_from(self.fail_after - position).unwrap();
+            let take = buffer.len().min(remaining);
+            self.inner.read(&mut buffer[..take])
+        }
+    }
 
     struct ScratchDirectory(std::path::PathBuf);
 
@@ -5021,6 +5391,351 @@ mod tests {
             })
             .collect::<Vec<_>>();
         (built, identity, base_values, weight_banks)
+    }
+
+    struct PreparedV5Fixture {
+        built: BuiltModelBankFixture,
+        identity: DoryV3ModelIdentityV1,
+        setup: DeterministicBlsDorySetup,
+        record_digest: Digest32,
+        base_commitment: BlsDoryGt,
+        weight_commitments: Vec<BlsDoryGt>,
+    }
+
+    fn prepared_v5_commit_bytes(bytes: &[u8], setup: &DeterministicBlsDorySetup) -> BlsDoryGt {
+        const VARIABLES: usize = 4;
+        let mut coefficients = bytes
+            .iter()
+            .map(|value| BlsDoryFr::from_i64(i64::from(*value) - 125))
+            .collect::<Vec<_>>();
+        coefficients.resize(1 << VARIABLES, BlsDoryFr::zero());
+        commit_bls_dory_polynomial(
+            coefficients,
+            VARIABLES / 2,
+            VARIABLES - VARIABLES / 2,
+            setup,
+        )
+        .unwrap()
+        .commitment()
+    }
+
+    fn prepared_v5_identity(
+        manifest: &ModelBankManifest,
+        setup: &DeterministicBlsDorySetup,
+        base_commitment: BlsDoryGt,
+        weight_commitments: &[BlsDoryGt],
+    ) -> DoryV3ModelIdentityV1 {
+        let suite_parameter_digest = [0x51; 32];
+        let encode = |commitment| {
+            CanonicalBlsDoryGtHex::from_commitment(commitment)
+                .unwrap()
+                .to_hex()
+                .unwrap()
+        };
+        serde_json::from_value(json!({
+            "identity_version": DORY_V3_MODEL_IDENTITY_VERSION,
+            "model_version": 2,
+            "batch": 2,
+            "dimension": 2,
+            "layers_per_bank": 2,
+            "model_byte_root": manifest.raw_blake3_root,
+            "layer_roots_aggregate": manifest.layer_roots_aggregate,
+            "suite_parameter_digest": suite_parameter_digest,
+            "setup_identity": setup.identity(),
+            "padded_variables": 4,
+            "base_input_commitment": encode(base_commitment),
+            "weight_bank_commitments": weight_commitments
+                .iter()
+                .copied()
+                .map(encode)
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    fn prepared_v5_fixture(wrong_role: Option<u32>) -> PreparedV5Fixture {
+        let setup = deterministic_bls_dory_setup(4).unwrap();
+        let base = [0, 125, 250, 126];
+        let layers = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+        ];
+        let layer_slices = layers
+            .iter()
+            .map(|layer| layer.as_slice())
+            .collect::<Vec<_>>();
+        let base_commitment = prepared_v5_commit_bytes(&base, &setup);
+        let weight_commitments = layers
+            .chunks_exact(2)
+            .map(|bank| {
+                let bytes = bank
+                    .iter()
+                    .flat_map(|layer| layer.iter().copied())
+                    .collect::<Vec<_>>();
+                prepared_v5_commit_bytes(&bytes, &setup)
+            })
+            .collect::<Vec<_>>();
+        let mut expected_base = base_commitment;
+        let mut expected_weights = weight_commitments.clone();
+        if let Some(role) = wrong_role {
+            if role == 0 {
+                let mut changed = base;
+                changed[0] = 1;
+                expected_base = prepared_v5_commit_bytes(&changed, &setup);
+            } else {
+                let bank = usize::try_from(role - 1).unwrap();
+                let mut changed = layers[bank * 2..bank * 2 + 2]
+                    .iter()
+                    .flat_map(|layer| layer.iter().copied())
+                    .collect::<Vec<_>>();
+                changed[0] += 1;
+                expected_weights[bank] = prepared_v5_commit_bytes(&changed, &setup);
+            }
+        }
+        let provisional = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: [0x51; 32],
+            pcs_commitment_root: [0x52; 32],
+        })
+        .unwrap();
+        let identity = prepared_v5_identity(
+            &provisional.manifest,
+            &setup,
+            expected_base,
+            &expected_weights,
+        );
+        let built = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &base,
+            layers: &layer_slices,
+            pcs_parameter_digest: identity.suite_parameter_digest(),
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        })
+        .unwrap();
+        identity.verify_manifest(&built.manifest).unwrap();
+        PreparedV5Fixture {
+            built,
+            identity,
+            setup,
+            record_digest: Digest32::new([0x91; 32]),
+            base_commitment,
+            weight_commitments,
+        }
+    }
+
+    fn prepare_v5_fixture_reader<R: Read>(
+        fixture: &PreparedV5Fixture,
+        reader: R,
+        scratch_directory: &Path,
+    ) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>>
+    {
+        let model_identity_digest = Digest32::new(fixture.identity.digest().unwrap());
+        let sink = BlsDoryPreparedFixedModelV5Sink::new(
+            &fixture.built.manifest,
+            &fixture.identity,
+            fixture.record_digest,
+            model_identity_digest,
+            &fixture.setup,
+            scratch_directory,
+        )
+        .map_err(ModelBankFieldStreamError::Sink)?;
+        verify_model_bank_into_staged_field_layout_sink(
+            reader,
+            &fixture.built.manifest,
+            fixture.identity.layers_per_bank(),
+            fixture.identity.weight_bank_count().unwrap(),
+            sink,
+        )
+    }
+
+    #[test]
+    fn v5_prepared_model_publishes_only_exact_ordered_record_bound_polynomials() {
+        let fixture = prepared_v5_fixture(None);
+        let scratch = ScratchDirectory::create();
+        let prepared =
+            prepare_v5_fixture_reader(&fixture, Cursor::new(&fixture.built.bytes), &scratch.0)
+                .unwrap();
+        let identity_digest = Digest32::new(fixture.identity.digest().unwrap());
+        assert_eq!(prepared.record_digest(), fixture.record_digest);
+        assert_eq!(prepared.model_identity_digest(), identity_digest);
+        assert_eq!(prepared.base_input.commitment(), fixture.base_commitment);
+        assert_eq!(
+            prepared
+                .weight_banks
+                .iter()
+                .map(BlsDoryCommittedPolynomial::commitment)
+                .collect::<Vec<_>>(),
+            fixture.weight_commitments
+        );
+        assert!(prepared.is_bound_to_record_parts(
+            fixture.record_digest,
+            identity_digest,
+            &fixture.identity
+        ));
+        assert!(!prepared.is_bound_to_record_parts(
+            Digest32::new([0x92; 32]),
+            identity_digest,
+            &fixture.identity
+        ));
+        let other = prepared_v5_fixture(Some(0));
+        assert!(!prepared.is_bound_to_record_parts(
+            fixture.record_digest,
+            Digest32::new(other.identity.digest().unwrap()),
+            &other.identity
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 3);
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn v5_prepared_model_compares_every_ordered_commitment_and_cleans_failure_scratch() {
+        for role in 0..=2 {
+            let fixture = prepared_v5_fixture(Some(role));
+            let scratch = ScratchDirectory::create();
+            assert!(matches!(
+                prepare_v5_fixture_reader(
+                    &fixture,
+                    Cursor::new(&fixture.built.bytes),
+                    &scratch.0,
+                ),
+                Err(ModelBankFieldStreamError::Sink(
+                    BlsDoryFixedModelStreamError::DoryV3CommitmentMismatch {
+                        role: actual_role
+                    }
+                )) if actual_role == role
+            ));
+            assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn v5_prepared_model_requires_authenticated_eof_and_cleans_failure_scratch() {
+        let fixture = prepared_v5_fixture(None);
+        let scratch = ScratchDirectory::create();
+        let mut corrupted = fixture.built.bytes.clone();
+        corrupted[MODEL_BANK_HEADER_BYTES] ^= 1;
+        assert!(matches!(
+            prepare_v5_fixture_reader(&fixture, Cursor::new(corrupted), &scratch.0),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::RawRootMismatch
+            ))
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let mut trailing = fixture.built.bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            prepare_v5_fixture_reader(&fixture, Cursor::new(trailing), &scratch.0),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::TrailingBytes
+            ))
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn v5_prepared_model_cleans_scratch_after_midstream_read_failure_and_truncation() {
+        let fixture = prepared_v5_fixture(None);
+        let scratch = ScratchDirectory::create();
+        let fail_after = MODEL_BANK_HEADER_BYTES
+            + usize::try_from(fixture.built.manifest.base_input_bytes).unwrap()
+            + usize::try_from(fixture.built.manifest.bytes_per_layer).unwrap()
+            + 2;
+
+        // The complete base and first layer have already reached the staged
+        // sink when the second layer's read fails at this exact boundary.
+        let failing = FailAfterReader::new(fixture.built.bytes.clone(), fail_after);
+        assert!(matches!(
+            prepare_v5_fixture_reader(&fixture, failing, &scratch.0),
+            Err(ModelBankFieldStreamError::ModelBank(ModelBankError::Io(error)))
+                if error.kind() == io::ErrorKind::Other
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let truncated = fixture.built.bytes[..fail_after].to_vec();
+        assert!(matches!(
+            prepare_v5_fixture_reader(&fixture, Cursor::new(truncated), &scratch.0),
+            Err(ModelBankFieldStreamError::ModelBank(
+                ModelBankError::Truncated
+            ))
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn v5_public_prepare_signature_requires_bank_authenticated_record_v2() {
+        type PublicPrepare = fn(
+            Cursor<Vec<u8>>,
+            &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            &DeterministicBlsDorySetup,
+            &Path,
+        ) -> Result<
+            BlsDoryPreparedFixedModelV5,
+            ModelBankFieldStreamError<BlsDoryFixedModelStreamError>,
+        >;
+        let entry: PublicPrepare =
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch::<
+                Cursor<Vec<u8>>,
+            >;
+        let _ = entry;
+    }
+
+    /// Unchanged-production gate for the canonical approximately 6-GiB bank.
+    /// This intentionally performs the real bank-authentication pass before
+    /// exercising the public preparation entry point; it has no fixture or
+    /// serialized-record shortcut.
+    #[test]
+    #[ignore = "requires canonical 6-GiB model bank and pinned Record V2 ceremony artifacts"]
+    fn v5_public_prepare_unchanged_production_six_gib_gate() {
+        let bank_path = std::env::var("CMFD_DORY_V3_PRODUCTION_MODEL_BANK")
+            .expect("set CMFD_DORY_V3_PRODUCTION_MODEL_BANK");
+        let record_path = std::env::var("CMFD_DORY_V3_PRODUCTION_RECORD_V2")
+            .expect("set CMFD_DORY_V3_PRODUCTION_RECORD_V2");
+        let encoded_record = std::fs::read(record_path).unwrap();
+        let pinned_record: DoryV3ModelCommitmentRecordV2 =
+            serde_json::from_slice(&encoded_record).unwrap();
+        let setup = deterministic_bls_dory_setup(BLS_DORY_SHARED_PRODUCTION_VARIABLES).unwrap();
+        let structurally_validated = pinned_record
+            .model_identity()
+            .validate_production_structure(pinned_record.manifest(), &setup)
+            .unwrap();
+        let expected_file_bytes = u64::try_from(MODEL_BANK_HEADER_BYTES)
+            .unwrap()
+            .checked_add(pinned_record.manifest().payload_bytes)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&bank_path).unwrap().len(),
+            expected_file_bytes
+        );
+
+        let authenticated = derive_bank_authenticated_dory_v3_model_commitment_record_v2(
+            File::open(&bank_path).unwrap(),
+            &structurally_validated,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(authenticated.record(), &pinned_record);
+
+        let scratch = ScratchDirectory::create();
+        let prepared = prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch(
+            File::open(bank_path).unwrap(),
+            &authenticated,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        assert!(prepared.is_bound_to_bank_authenticated_record(&authenticated));
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     #[test]

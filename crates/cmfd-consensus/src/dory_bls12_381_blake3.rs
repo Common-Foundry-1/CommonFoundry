@@ -62,6 +62,7 @@ use crate::{
         F as Goldilocks, NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START, NARROW_BLAKE3_MAIN_WIDTH,
         NARROW_BLAKE3_ORIGINAL_NIBBLES_START, NARROW_BLAKE3_PREPROCESSED_WIDTH,
         NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS, NARROW_BLAKE3_STACK_START, NarrowBlake3Air,
+        NarrowBlake3OutputProfile, build_tree_witness_for_output_profile,
         for_each_canonical_preprocessed_trace_row, for_each_main_trace_row, public_values,
     },
 };
@@ -123,9 +124,6 @@ pub const BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES: usize =
     2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES;
 /// Two post-challenge LogUp inverse tables require canonical full-field scalars.
 pub const BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES: usize = 2;
-#[cfg(feature = "whir-prototype")]
-const BLS_DORY_BLAKE3_OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
-
 #[cfg(feature = "whir-prototype")]
 const _: () = {
     assert!(NARROW_BLAKE3_STACK_START > NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START);
@@ -722,6 +720,7 @@ struct ProvenBlsDoryNativeBlake3Sources {
     sources: BlsDoryBlake3CommittedSources,
     proof: BlsDoryNativeBlake3Proof,
     geometry: BlsDoryBlake3ReplayGeometry,
+    output_profile: NarrowBlake3OutputProfile,
 }
 
 /// Native proof bytes plus the exact verifier-derived six-opening witness used
@@ -740,6 +739,7 @@ struct PreparedBlsDoryBlake3SourceBinding {
     trace_rows: usize,
     layout: BlsDoryAggregateLayout,
     setup_identity: [u8; 32],
+    output_profile: NarrowBlake3OutputProfile,
     main_transpose_digest: [u8; 32],
     preprocessing_transpose_digest: [u8; 32],
     source_commitments: BlsDoryBlake3SourceCommitments,
@@ -874,10 +874,31 @@ impl PreparedBlsDoryBlake3Sources {
         layout: BlsDoryAggregateLayout,
         setup: &DeterministicBlsDorySetup,
     ) -> Result<Self, BlsDoryAggregateError> {
+        Self::new_with_output_profile(
+            sources,
+            main_transpose,
+            preprocessing_transpose,
+            trace_rows,
+            layout,
+            setup,
+            NarrowBlake3OutputProfile::ForgeMatrixV2,
+        )
+    }
+
+    fn new_with_output_profile(
+        sources: BlsDoryBlake3CommittedSources,
+        main_transpose: BlsDoryWordTransposeArtifact,
+        preprocessing_transpose: BlsDoryWordTransposeArtifact,
+        trace_rows: usize,
+        layout: BlsDoryAggregateLayout,
+        setup: &DeterministicBlsDorySetup,
+        output_profile: NarrowBlake3OutputProfile,
+    ) -> Result<Self, BlsDoryAggregateError> {
         let binding = PreparedBlsDoryBlake3SourceBinding {
             trace_rows,
             layout,
             setup_identity: setup.identity(),
+            output_profile,
             main_transpose_digest: main_transpose.digest(),
             preprocessing_transpose_digest: preprocessing_transpose.digest(),
             source_commitments: sources.commitments(),
@@ -2574,8 +2595,20 @@ impl BlsDoryBlake3ConstraintExpr {
 
 /// Generate the exact existing narrow-BLAKE3 equations as a field-independent IR.
 #[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn bls_dory_blake3_constraint_ir(
     activation_len: usize,
+) -> Result<Vec<BlsDoryBlake3ConstraintExpr>, NarrowBlake3Error> {
+    bls_dory_blake3_constraint_ir_with_output_profile(
+        activation_len,
+        NarrowBlake3OutputProfile::ForgeMatrixV2,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn bls_dory_blake3_constraint_ir_with_output_profile(
+    activation_len: usize,
+    output_profile: NarrowBlake3OutputProfile,
 ) -> Result<Vec<BlsDoryBlake3ConstraintExpr>, NarrowBlake3Error> {
     if activation_len < 32 || !activation_len.is_power_of_two() {
         return Err(NarrowBlake3Error::UnsupportedShape);
@@ -2588,7 +2621,7 @@ pub(crate) fn bls_dory_blake3_constraint_ir(
         final_activation_point: vec![ExtensionElement { limbs: [0; 3] }; point_variables],
         final_activation_evaluation: ExtensionElement { limbs: [0; 3] },
     };
-    let air = NarrowBlake3Air::new(&statement)?;
+    let air = NarrowBlake3Air::new_with_output_profile(&statement, output_profile)?;
     let layout = AirLayout::from_air(&air);
     get_symbolic_constraints::<Goldilocks, _>(&air, layout)
         .iter()
@@ -2757,10 +2790,22 @@ fn uses_removed_native_input(expression: &BlsDoryBlake3ConstraintExpr) -> bool {
 }
 
 #[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn bls_dory_native_blake3_constraint_ir(
     activation_len: usize,
 ) -> Result<Vec<BlsDoryBlake3ConstraintExpr>, NarrowBlake3Error> {
-    bls_dory_blake3_constraint_ir(activation_len)?
+    bls_dory_native_blake3_constraint_ir_with_output_profile(
+        activation_len,
+        NarrowBlake3OutputProfile::ForgeMatrixV2,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn bls_dory_native_blake3_constraint_ir_with_output_profile(
+    activation_len: usize,
+    output_profile: NarrowBlake3OutputProfile,
+) -> Result<Vec<BlsDoryBlake3ConstraintExpr>, NarrowBlake3Error> {
+    bls_dory_blake3_constraint_ir_with_output_profile(activation_len, output_profile)?
         .iter()
         .filter(|constraint| !uses_old_evaluation_constraint(constraint))
         .map(remap_native_main_constraint)
@@ -3227,13 +3272,23 @@ struct BlsDoryBlake3VerifierContext {
     layout: BlsDoryAggregateLayout,
     setup_identity: [u8; 32],
     setup_max_log_n: usize,
+    output_profile: NarrowBlake3OutputProfile,
 }
 
 #[cfg(feature = "whir-prototype")]
 impl BlsDoryBlake3VerifierContext {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(
         layout: BlsDoryAggregateLayout,
         setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        Self::new_with_output_profile(layout, setup, NarrowBlake3OutputProfile::ForgeMatrixV2)
+    }
+
+    fn new_with_output_profile(
+        layout: BlsDoryAggregateLayout,
+        setup: &DeterministicBlsDorySetup,
+        output_profile: NarrowBlake3OutputProfile,
     ) -> Result<Self, BlsDoryAggregateError> {
         setup
             .validate()
@@ -3245,6 +3300,7 @@ impl BlsDoryBlake3VerifierContext {
             layout,
             setup_identity: setup.identity(),
             setup_max_log_n: setup.max_log_n(),
+            output_profile,
         })
     }
 
@@ -3253,6 +3309,21 @@ impl BlsDoryBlake3VerifierContext {
         layout: BlsDoryAggregateLayout,
         setup_identity: [u8; 32],
         setup_max_log_n: usize,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        Self::for_test_metadata_with_output_profile(
+            layout,
+            setup_identity,
+            setup_max_log_n,
+            NarrowBlake3OutputProfile::ForgeMatrixV2,
+        )
+    }
+
+    #[cfg(test)]
+    fn for_test_metadata_with_output_profile(
+        layout: BlsDoryAggregateLayout,
+        setup_identity: [u8; 32],
+        setup_max_log_n: usize,
+        output_profile: NarrowBlake3OutputProfile,
     ) -> Result<Self, BlsDoryAggregateError> {
         if setup_identity == [0u8; 32]
             || setup_max_log_n == 0
@@ -3264,6 +3335,7 @@ impl BlsDoryBlake3VerifierContext {
             layout,
             setup_identity,
             setup_max_log_n,
+            output_profile,
         })
     }
 
@@ -4097,16 +4169,22 @@ fn prove_native_blake3_execution_sumcheck_out_of_core(
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     let native_statement = native_blake3_statement_from_bridge(bridge);
-    let air = NarrowBlake3Air::new(&native_statement)
-        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let air = NarrowBlake3Air::new_with_output_profile(
+        &native_statement,
+        prepared.binding.output_profile,
+    )
+    .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     let trace_rows = air.trace_rows();
     if trace_rows != prepared.binding.trace_rows || !trace_rows.is_power_of_two() {
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
     let variables = trace_rows.ilog2() as usize;
     let public = native_blake3_public_values(bridge)?;
-    let constraints = bls_dory_native_blake3_constraint_ir(bridge.final_activation_len())
-        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let constraints = bls_dory_native_blake3_constraint_ir_with_output_profile(
+        bridge.final_activation_len(),
+        prepared.binding.output_profile,
+    )
+    .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     if constraints.len() + 3 != BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
@@ -4642,8 +4720,11 @@ fn prove_native_blake3_adjacency_sumcheck_out_of_core(
     if maximum_block_rows == 0 || !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    let air = NarrowBlake3Air::new(&native_blake3_statement_from_bridge(bridge))
-        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let air = NarrowBlake3Air::new_with_output_profile(
+        &native_blake3_statement_from_bridge(bridge),
+        prepared.binding.output_profile,
+    )
+    .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     let trace_rows = air.trace_rows();
     if trace_rows != prepared.binding.trace_rows || !trace_rows.is_power_of_two() {
         return Err(BlsDoryAggregateError::InvalidDimension);
@@ -4964,6 +5045,19 @@ fn native_blake3_opening_binding(
         b"shared-variables",
         &(geometry.shared_variables as u64).to_le_bytes(),
     );
+    // Preserve the frozen V2 transcript byte-for-byte. Dory V3 is an explicit
+    // closed profile and binds both its numeric selector and derive-key domain
+    // into the verifier-owned opening statement.
+    if verifier_context.output_profile == NarrowBlake3OutputProfile::DoryV3 {
+        transcript.append_bytes(
+            b"output-profile",
+            &verifier_context.output_profile.verifier_tag().to_le_bytes(),
+        );
+        transcript.append_bytes(
+            b"output-domain",
+            verifier_context.output_profile.domain().as_bytes(),
+        );
+    }
     transcript.append_bytes(
         b"dory-nu",
         &(verifier_context.layout.nu() as u64).to_le_bytes(),
@@ -5144,8 +5238,11 @@ fn verify_native_blake3_opening_replay_at_geometry(
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     let native_statement = native_blake3_statement_from_bridge(bridge);
-    let air = NarrowBlake3Air::new(&native_statement)
-        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let air = NarrowBlake3Air::new_with_output_profile(
+        &native_statement,
+        verifier.context.output_profile,
+    )
+    .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     if !air.trace_rows().is_power_of_two()
         || air.trace_rows().ilog2() as usize != geometry.trace_variables
     {
@@ -5160,8 +5257,11 @@ fn verify_native_blake3_opening_replay_at_geometry(
         commitments,
     )?;
     let public = native_blake3_public_values(bridge)?;
-    let constraints = bls_dory_native_blake3_constraint_ir(bridge.final_activation_len())
-        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let constraints = bls_dory_native_blake3_constraint_ir_with_output_profile(
+        bridge.final_activation_len(),
+        verifier.context.output_profile,
+    )
+    .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     let execution_replay = verify_native_blake3_execution_sumcheck(
         execution,
         &air,
@@ -5235,8 +5335,7 @@ fn verify_native_blake3_opening_replay_at_geometry(
     })
 }
 
-/// Verify both native BLAKE3 sumchecks and bind their six verifier-derived
-/// openings at the immutable production geometry.
+/// Verify the current V4 candidate's V2-domain native BLAKE3 opening.
 #[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
 pub(crate) fn verify_native_blake3_opening_statement(
@@ -5244,15 +5343,49 @@ pub(crate) fn verify_native_blake3_opening_statement(
     proof: &BlsDoryNativeBlake3Proof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
+    verify_native_blake3_opening_statement_with_output_profile(
+        bridge,
+        proof,
+        setup,
+        NarrowBlake3OutputProfile::ForgeMatrixV2,
+    )
+}
+
+/// Verify the upcoming V5 candidate's Dory-V3-domain native BLAKE3 opening.
+/// This is deliberately separate from the V2 wrapper; neither path detects or
+/// falls back to the other profile.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+pub(crate) fn verify_dory_v3_native_blake3_opening_statement(
+    bridge: &BlsDoryOutputBridgeStatement,
+    proof: &BlsDoryNativeBlake3Proof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
+    verify_native_blake3_opening_statement_with_output_profile(
+        bridge,
+        proof,
+        setup,
+        NarrowBlake3OutputProfile::DoryV3,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn verify_native_blake3_opening_statement_with_output_profile(
+    bridge: &BlsDoryOutputBridgeStatement,
+    proof: &BlsDoryNativeBlake3Proof,
+    setup: &DeterministicBlsDorySetup,
+    output_profile: NarrowBlake3OutputProfile,
+) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
     if bridge.final_activation_len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    let verifier_context = BlsDoryBlake3VerifierContext::new(
+    let verifier_context = BlsDoryBlake3VerifierContext::new_with_output_profile(
         BlsDoryAggregateLayout::new(
             BLS_DORY_BLAKE3_SHARED_DORY_NU,
             BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
         )?,
         setup,
+        output_profile,
     )?;
     let preprocessing_pin = native_blake3_production_preprocessing_pin(&verifier_context)
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
@@ -5270,7 +5403,7 @@ pub(crate) fn verify_native_blake3_opening_statement(
     BlsDoryBlake3OpeningStatement::from_verified_replay(proof.source_commitments.clone(), replay)
 }
 
-/// Decode the canonical production native proof before verifier-owned replay.
+/// Decode and verify the current V4 candidate's V2-domain native proof.
 #[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
 pub(crate) fn verify_encoded_native_blake3_opening_statement(
@@ -5280,6 +5413,18 @@ pub(crate) fn verify_encoded_native_blake3_opening_statement(
 ) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
     let proof = BlsDoryNativeBlake3Proof::decode(encoded)?;
     verify_native_blake3_opening_statement(bridge, &proof, setup)
+}
+
+/// Decode and verify the upcoming V5 candidate's Dory-V3-domain native proof.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+pub(crate) fn verify_encoded_dory_v3_native_blake3_opening_statement(
+    bridge: &BlsDoryOutputBridgeStatement,
+    encoded: &[u8],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
+    let proof = BlsDoryNativeBlake3Proof::decode(encoded)?;
+    verify_dory_v3_native_blake3_opening_statement(bridge, &proof, setup)
 }
 
 /// Exercise the same opaque wire-to-replay boundary at a bounded test
@@ -5449,11 +5594,30 @@ fn commit_native_accumulator_source(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    commit_native_accumulator_source_with_output_profile(
+        witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+        NarrowBlake3OutputProfile::ForgeMatrixV2,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn commit_native_accumulator_source_with_output_profile(
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    output_profile: NarrowBlake3OutputProfile,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
     if witness.digest != bridge.final_activation_digest() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     let native_statement = native_blake3_statement_from_bridge(bridge);
-    let air = NarrowBlake3Air::new(&native_statement)
+    let air = NarrowBlake3Air::new_with_output_profile(&native_statement, output_profile)
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     if !air.trace_rows().is_power_of_two() {
         return Err(BlsDoryAggregateError::InvalidDimension);
@@ -5849,11 +6013,30 @@ fn prepare_native_blake3_sources_at_layout(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
 ) -> Result<PreparedBlsDoryBlake3Sources, BlsDoryAggregateError> {
+    prepare_native_blake3_sources_at_layout_with_output_profile(
+        witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+        NarrowBlake3OutputProfile::ForgeMatrixV2,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn prepare_native_blake3_sources_at_layout_with_output_profile(
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    output_profile: NarrowBlake3OutputProfile,
+) -> Result<PreparedBlsDoryBlake3Sources, BlsDoryAggregateError> {
     if witness.digest != bridge.final_activation_digest() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     let native_statement = native_blake3_statement_from_bridge(bridge);
-    let air = NarrowBlake3Air::new(&native_statement)
+    let air = NarrowBlake3Air::new_with_output_profile(&native_statement, output_profile)
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     validate_native_blake3_source_layout(air.trace_rows(), layout, setup)?;
 
@@ -5885,8 +6068,14 @@ fn prepare_native_blake3_sources_at_layout(
             scratch_directory,
         )?
     };
-    let accumulator =
-        commit_native_accumulator_source(witness, bridge, layout, setup, scratch_directory)?;
+    let accumulator = commit_native_accumulator_source_with_output_profile(
+        witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+        output_profile,
+    )?;
     let (compression, alpha) = derive_native_blake3_adjacency_challenges(
         bridge,
         air.trace_rows(),
@@ -5912,13 +6101,14 @@ fn prepare_native_blake3_sources_at_layout(
         preprocessing,
         inverse,
     };
-    PreparedBlsDoryBlake3Sources::new(
+    PreparedBlsDoryBlake3Sources::new_with_output_profile(
         sources,
         main_transpose,
         preprocessed_transpose,
         air.trace_rows(),
         layout,
         setup,
+        output_profile,
     )
 }
 
@@ -5965,6 +6155,7 @@ fn prove_prepared_native_blake3_sources(
         scratch_directory,
         maximum_block_rows,
     )?;
+    let output_profile = prepared.binding.output_profile;
     let sources = prepared.into_committed_sources()?;
     if sources.commitments() != source_commitments {
         return Err(BlsDoryAggregateError::InvalidProofShape);
@@ -5977,6 +6168,7 @@ fn prove_prepared_native_blake3_sources(
             adjacency,
         },
         geometry,
+        output_profile,
     })
 }
 
@@ -5993,8 +6185,12 @@ fn finalize_native_blake3_opening(
         sources,
         proof,
         geometry,
+        output_profile,
     } = proven;
-    if verifier.geometry != geometry || sources.commitments() != proof.source_commitments {
+    if verifier.geometry != geometry
+        || verifier.context.output_profile != output_profile
+        || sources.commitments() != proof.source_commitments
+    {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
 
@@ -6041,9 +6237,7 @@ fn finalize_native_blake3_opening(
     })
 }
 
-/// Build the exact production-geometry native opening witness for the
-/// non-consensus V3 research candidate. This does not change either production
-/// readiness flag or create a chain-admission capability.
+/// Build the current V4 candidate's V2-domain production native opening.
 #[cfg(feature = "whir-prototype")]
 pub(crate) fn prepare_production_native_blake3_opening(
     final_activation: &[u8],
@@ -6051,6 +6245,46 @@ pub(crate) fn prepare_production_native_blake3_opening(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
+) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    prepare_production_native_blake3_opening_with_output_profile(
+        final_activation,
+        bridge,
+        setup,
+        scratch_directory,
+        maximum_block_rows,
+        NarrowBlake3OutputProfile::ForgeMatrixV2,
+    )
+}
+
+/// Build the upcoming V5 candidate's Dory-V3-domain production native opening.
+/// This research wrapper remains non-consensus and does not change readiness.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+pub(crate) fn prepare_production_dory_v3_native_blake3_opening(
+    final_activation: &[u8],
+    bridge: &BlsDoryOutputBridgeStatement,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    prepare_production_native_blake3_opening_with_output_profile(
+        final_activation,
+        bridge,
+        setup,
+        scratch_directory,
+        maximum_block_rows,
+        NarrowBlake3OutputProfile::DoryV3,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn prepare_production_native_blake3_opening_with_output_profile(
+    final_activation: &[u8],
+    bridge: &BlsDoryOutputBridgeStatement,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+    output_profile: NarrowBlake3OutputProfile,
 ) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
     if final_activation.len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES
         || bridge.final_activation_len() != final_activation.len()
@@ -6064,8 +6298,8 @@ pub(crate) fn prepare_production_native_blake3_opening(
     bridge
         .validate_activation(final_activation)
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
-    let witness = crate::structured_blake3_tree::build_tree_witness(
-        BLS_DORY_BLAKE3_OUTPUT_CONTEXT,
+    let witness = build_tree_witness_for_output_profile(
+        output_profile,
         bridge.challenge_digest(),
         final_activation,
     )
@@ -6074,15 +6308,17 @@ pub(crate) fn prepare_production_native_blake3_opening(
         BLS_DORY_BLAKE3_SHARED_DORY_NU,
         BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
     )?;
-    let verifier_context = BlsDoryBlake3VerifierContext::new(layout, setup)?;
+    let verifier_context =
+        BlsDoryBlake3VerifierContext::new_with_output_profile(layout, setup, output_profile)?;
     let preprocessing_pin = native_blake3_production_preprocessing_pin(&verifier_context)
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
-    let prepared = prepare_native_blake3_sources_at_layout(
+    let prepared = prepare_native_blake3_sources_at_layout_with_output_profile(
         &witness,
         bridge,
         layout,
         setup,
         scratch_directory,
+        output_profile,
     )?;
     let proven = prove_prepared_native_blake3_sources(
         prepared,
@@ -6692,7 +6928,7 @@ mod tests {
         public_values,
     };
     #[cfg(feature = "whir-prototype")]
-    use crate::structured_blake3_tree::build_tree_witness;
+    use crate::structured_blake3_tree::build_forgematrix_v2_tree_witness;
     use dory_pcs::primitives::arithmetic::Group as DoryGroup;
     #[cfg(feature = "whir-prototype")]
     use p3_air::BaseAir;
@@ -6708,9 +6944,6 @@ mod tests {
     fn dense_aggregate_layout() -> BlsDoryAggregateLayout {
         BlsDoryAggregateLayout::new(8, 8).unwrap()
     }
-
-    #[cfg(feature = "whir-prototype")]
-    const OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
 
     #[cfg(feature = "whir-prototype")]
     static BLAKE3_SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -6842,6 +7075,224 @@ mod tests {
         assert_ne!(pin.commitment, BlsDoryGt::identity());
         assert_eq!(pin.verifier_context, context);
         assert_eq!(pin.geometry, BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY);
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn dory_v3_output_profile_is_bound_to_the_verifier_context_and_opening() {
+        let v2_context = pinned_production_preprocessing_context();
+        let v3_context = BlsDoryBlake3VerifierContext::for_test_metadata_with_output_profile(
+            v2_context.layout,
+            v2_context.setup_identity,
+            v2_context.setup_max_log_n,
+            NarrowBlake3OutputProfile::DoryV3,
+        )
+        .unwrap();
+        assert_ne!(v2_context, v3_context);
+        assert_eq!(
+            v3_context.output_profile.domain(),
+            crate::dory_v3_suite::DORY_V3_OUTPUT_DOMAIN
+        );
+
+        // The fixed schedule is topology-only, so both closed profiles use the
+        // same authenticated preprocessing commitment. The opaque pin still
+        // carries the selected verifier profile and rejects substitution.
+        let v2_pin = native_blake3_production_preprocessing_pin(&v2_context).unwrap();
+        let v3_pin = native_blake3_production_preprocessing_pin(&v3_context).unwrap();
+        assert_eq!(v2_pin.commitment, v3_pin.commitment);
+        assert_ne!(v2_pin.verifier_context, v3_pin.verifier_context);
+
+        let activation = vec![0_u8; BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES];
+        let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            [0x11; 32],
+            [0x22; 32],
+            &activation,
+            [0x33; 32],
+            vec![BlsDoryFr::zero(); BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES.ilog2() as usize],
+        )
+        .unwrap();
+        let commitments = BlsDoryBlake3SourceCommitments {
+            main: v3_pin.commitment,
+            accumulator: v3_pin.commitment,
+            preprocessing: v3_pin.commitment,
+            inverse: v3_pin.commitment,
+        };
+        v3_pin
+            .validate(
+                &bridge,
+                BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+                BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+                &v3_context,
+                &commitments,
+            )
+            .unwrap();
+        assert_eq!(
+            v3_pin.validate(
+                &bridge,
+                BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS,
+                BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+                &v2_context,
+                &commitments,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+
+        let digests = BlsDoryBlake3OpeningTranscriptDigests {
+            execution_sumcheck: [0x44; 32],
+            adjacency_sumcheck: [0x55; 32],
+            execution_selectors: [0x66; 32],
+            adjacency_selectors: [0x77; 32],
+        };
+        let v2_binding = native_blake3_opening_binding(
+            &bridge,
+            digests,
+            BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+            &v2_context,
+            &commitments,
+        );
+        let v3_binding = native_blake3_opening_binding(
+            &bridge,
+            digests,
+            BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+            &v3_context,
+            &commitments,
+        );
+        assert_ne!(v2_binding, v3_binding);
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn bounded_native_replay_rejects_v2_v3_wrapper_profile_substitution() {
+        let v2_fixture =
+            dense_blake3_fixture_with_output_profile(NarrowBlake3OutputProfile::ForgeMatrixV2);
+        let v3_fixture =
+            dense_blake3_fixture_with_output_profile(NarrowBlake3OutputProfile::DoryV3);
+        assert_eq!(v2_fixture.activation, v3_fixture.activation);
+        assert_eq!(
+            v2_fixture.bridge.challenge_digest(),
+            v3_fixture.bridge.challenge_digest()
+        );
+        assert_ne!(
+            v2_fixture.bridge.final_activation_digest(),
+            v3_fixture.bridge.final_activation_digest()
+        );
+
+        let commitments = BlsDoryBlake3SourceCommitments {
+            main: BlsDoryGt::random(),
+            accumulator: BlsDoryGt::random(),
+            preprocessing: BlsDoryGt::random(),
+            inverse: BlsDoryGt::random(),
+        };
+        let (v2_execution, v2_adjacency) = named_replay_sumcheck_proofs(&v2_fixture, &commitments);
+        let (v3_execution, v3_adjacency) = named_replay_sumcheck_proofs(&v3_fixture, &commitments);
+        let trace_variables = v2_fixture.air.trace_rows().ilog2() as usize;
+        assert_eq!(
+            v3_fixture.air.trace_rows().ilog2() as usize,
+            trace_variables
+        );
+        let geometry = BlsDoryBlake3ReplayGeometry {
+            trace_variables,
+            source_variables: trace_variables + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES,
+            shared_variables: trace_variables + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES + 2,
+        };
+        let layout = BlsDoryAggregateLayout::new(10, 11).unwrap();
+        let v2_context = BlsDoryBlake3VerifierContext::for_test_metadata_with_output_profile(
+            layout,
+            [0x81; 32],
+            21,
+            NarrowBlake3OutputProfile::ForgeMatrixV2,
+        )
+        .unwrap();
+        let v3_context = BlsDoryBlake3VerifierContext::for_test_metadata_with_output_profile(
+            layout,
+            [0x81; 32],
+            21,
+            NarrowBlake3OutputProfile::DoryV3,
+        )
+        .unwrap();
+        let v2_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &v2_fixture.bridge,
+            v2_fixture.air.trace_rows(),
+            geometry,
+            &v2_context,
+            &commitments,
+        );
+        let v3_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &v3_fixture.bridge,
+            v3_fixture.air.trace_rows(),
+            geometry,
+            &v3_context,
+            &commitments,
+        );
+
+        verify_native_blake3_opening_replay_at_geometry(
+            &v2_fixture.bridge,
+            &commitments,
+            BlsDoryBlake3ReplayVerifier {
+                context: &v2_context,
+                preprocessing_pin: &v2_pin,
+                geometry,
+            },
+            &v2_execution,
+            &v2_adjacency,
+        )
+        .unwrap();
+        verify_native_blake3_opening_replay_at_geometry(
+            &v3_fixture.bridge,
+            &commitments,
+            BlsDoryBlake3ReplayVerifier {
+                context: &v3_context,
+                preprocessing_pin: &v3_pin,
+                geometry,
+            },
+            &v3_execution,
+            &v3_adjacency,
+        )
+        .unwrap();
+
+        let v3_bridge_v2_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &v3_fixture.bridge,
+            v3_fixture.air.trace_rows(),
+            geometry,
+            &v2_context,
+            &commitments,
+        );
+        assert!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &v3_fixture.bridge,
+                &commitments,
+                BlsDoryBlake3ReplayVerifier {
+                    context: &v2_context,
+                    preprocessing_pin: &v3_bridge_v2_pin,
+                    geometry,
+                },
+                &v3_execution,
+                &v3_adjacency,
+            )
+            .is_err()
+        );
+
+        let v2_bridge_v3_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &v2_fixture.bridge,
+            v2_fixture.air.trace_rows(),
+            geometry,
+            &v3_context,
+            &commitments,
+        );
+        assert!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &v2_fixture.bridge,
+                &commitments,
+                BlsDoryBlake3ReplayVerifier {
+                    context: &v3_context,
+                    preprocessing_pin: &v2_bridge_v3_pin,
+                    geometry,
+                },
+                &v2_execution,
+                &v2_adjacency,
+            )
+            .is_err()
+        );
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -7604,6 +8055,7 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     struct DenseBlake3Fixture {
         activation: Vec<u8>,
+        output_profile: NarrowBlake3OutputProfile,
         air: NarrowBlake3Air,
         tables: Vec<Vec<BlsDoryFr>>,
         statement: StructuredBlake3Statement,
@@ -9557,9 +10009,18 @@ mod tests {
 
     #[cfg(feature = "whir-prototype")]
     fn dense_blake3_fixture() -> DenseBlake3Fixture {
+        dense_blake3_fixture_with_output_profile(NarrowBlake3OutputProfile::ForgeMatrixV2)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_blake3_fixture_with_output_profile(
+        output_profile: NarrowBlake3OutputProfile,
+    ) -> DenseBlake3Fixture {
         let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
         let challenge_digest = [0x42; 32];
-        let witness = build_tree_witness(OUTPUT_CONTEXT, challenge_digest, &activation).unwrap();
+        let witness =
+            build_tree_witness_for_output_profile(output_profile, challenge_digest, &activation)
+                .unwrap();
         let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
             challenge_digest,
             witness.digest,
@@ -9571,7 +10032,12 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        dense_blake3_fixture_for_activation_and_bridge(&activation, bridge).unwrap()
+        dense_blake3_fixture_for_activation_and_bridge_with_output_profile(
+            &activation,
+            bridge,
+            output_profile,
+        )
+        .unwrap()
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -9579,11 +10045,28 @@ mod tests {
         activation: &[u8],
         bridge: BlsDoryOutputBridgeStatement,
     ) -> Result<DenseBlake3Fixture, BlsDoryAggregateError> {
+        dense_blake3_fixture_for_activation_and_bridge_with_output_profile(
+            activation,
+            bridge,
+            NarrowBlake3OutputProfile::ForgeMatrixV2,
+        )
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_blake3_fixture_for_activation_and_bridge_with_output_profile(
+        activation: &[u8],
+        bridge: BlsDoryOutputBridgeStatement,
+        output_profile: NarrowBlake3OutputProfile,
+    ) -> Result<DenseBlake3Fixture, BlsDoryAggregateError> {
         bridge
             .validate_activation(activation)
             .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
-        let witness = build_tree_witness(OUTPUT_CONTEXT, bridge.challenge_digest(), activation)
-            .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+        let witness = build_tree_witness_for_output_profile(
+            output_profile,
+            bridge.challenge_digest(),
+            activation,
+        )
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
         if bridge.final_activation_len() != activation.len()
             || bridge.final_activation_digest() != witness.digest
         {
@@ -9619,7 +10102,7 @@ mod tests {
                 crate::structured_sumcheck::evaluate_mle(&signed_activation, &native_point),
             ),
         };
-        let air = NarrowBlake3Air::new(&statement)
+        let air = NarrowBlake3Air::new_with_output_profile(&statement, output_profile)
             .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
         let main = generate_main_trace(&air, &statement, &witness);
         let old_main_rows = (0..air.trace_rows())
@@ -9642,12 +10125,16 @@ mod tests {
         );
         Ok(DenseBlake3Fixture {
             activation: activation.to_vec(),
+            output_profile,
             tables: dense_execution_tables(&native_rows, &preprocessed_rows),
             statement,
             witness,
             public,
-            constraints: bls_dory_native_blake3_constraint_ir(activation.len())
-                .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?,
+            constraints: bls_dory_native_blake3_constraint_ir_with_output_profile(
+                activation.len(),
+                output_profile,
+            )
+            .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?,
             bridge,
             air,
         })
@@ -9676,12 +10163,15 @@ mod tests {
         BlsDoryAggregateError,
     > {
         let native_statement = native_blake3_statement_from_bridge(&fixture.bridge);
-        let native_air = NarrowBlake3Air::new(&native_statement)
-            .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
-        let native_public = native_blake3_public_values(&fixture.bridge)?;
-        let native_constraints =
-            bls_dory_native_blake3_constraint_ir(fixture.bridge.final_activation_len())
+        let native_air =
+            NarrowBlake3Air::new_with_output_profile(&native_statement, fixture.output_profile)
                 .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+        let native_public = native_blake3_public_values(&fixture.bridge)?;
+        let native_constraints = bls_dory_native_blake3_constraint_ir_with_output_profile(
+            fixture.bridge.final_activation_len(),
+            fixture.output_profile,
+        )
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
         let execution = prove_dense_execution_sumcheck_with_transcript(
             fixture.tables.clone(),
             &native_air,
@@ -9862,7 +10352,7 @@ mod tests {
     fn dense_fixture_accepts_caller_activation_and_bridge() {
         let activation = (0_u8..32).map(|index| 32 + index).collect::<Vec<_>>();
         let challenge_digest = [0x77; 32];
-        let witness = build_tree_witness(OUTPUT_CONTEXT, challenge_digest, &activation).unwrap();
+        let witness = build_forgematrix_v2_tree_witness(challenge_digest, &activation).unwrap();
         let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
             challenge_digest,
             witness.digest,
@@ -10725,10 +11215,27 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whir-prototype")]
+    fn dory_v3_native_constraints_select_the_frozen_output_domain() {
+        let v2 = bls_dory_native_blake3_constraint_ir_with_output_profile(
+            32,
+            NarrowBlake3OutputProfile::ForgeMatrixV2,
+        )
+        .unwrap();
+        let v3 = bls_dory_native_blake3_constraint_ir_with_output_profile(
+            32,
+            NarrowBlake3OutputProfile::DoryV3,
+        )
+        .unwrap();
+        assert_eq!(v2.len(), v3.len());
+        assert_ne!(v2, v3);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
     fn honest_narrow_blake3_trace_satisfies_translated_bls_constraints() {
         let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
         let challenge_digest = [0x42; 32];
-        let witness = build_tree_witness(OUTPUT_CONTEXT, challenge_digest, &activation).unwrap();
+        let witness = build_forgematrix_v2_tree_witness(challenge_digest, &activation).unwrap();
         let point = (0..activation.len().ilog2())
             .map(|index| ExtensionElement {
                 limbs: [
@@ -10848,7 +11355,7 @@ mod tests {
     fn native_bls_accumulator_replaces_three_goldilocks_limbs() {
         let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
         let challenge_digest = [0x42; 32];
-        let witness = build_tree_witness(OUTPUT_CONTEXT, challenge_digest, &activation).unwrap();
+        let witness = build_forgematrix_v2_tree_witness(challenge_digest, &activation).unwrap();
         let goldilocks_point = (0..activation.len().ilog2())
             .map(|index| ExtensionElement {
                 limbs: [
@@ -13528,7 +14035,7 @@ mod tests {
     fn native_execution_sumcheck_terminal_values_are_dory_authenticated() {
         let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
         let challenge_digest = [0x42; 32];
-        let witness = build_tree_witness(OUTPUT_CONTEXT, challenge_digest, &activation).unwrap();
+        let witness = build_forgematrix_v2_tree_witness(challenge_digest, &activation).unwrap();
         let point = (0..activation.len().ilog2())
             .map(|index| ExtensionElement {
                 limbs: [

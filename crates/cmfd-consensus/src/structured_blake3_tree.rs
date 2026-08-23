@@ -75,7 +75,26 @@ struct Node {
     chunks: usize,
 }
 
-pub(crate) fn build_tree_witness(
+pub(crate) fn build_forgematrix_v2_tree_witness(
+    challenge: [u8; 32],
+    activation: &[u8],
+) -> Result<Blake3TreeWitness, Blake3TreeError> {
+    build_tree_witness(crate::forgematrix_v2::OUTPUT_DOMAIN, challenge, activation)
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub(crate) fn build_dory_v3_tree_witness(
+    challenge: [u8; 32],
+    activation: &[u8],
+) -> Result<Blake3TreeWitness, Blake3TreeError> {
+    build_tree_witness(
+        crate::dory_v3_suite::DORY_V3_OUTPUT_DOMAIN,
+        challenge,
+        activation,
+    )
+}
+
+fn build_tree_witness(
     output_context: &str,
     challenge: [u8; 32],
     activation: &[u8],
@@ -186,7 +205,9 @@ pub(crate) fn build_tree_witness(
         output_words(&operations.last().expect("tree has a root operation").output)
     };
 
-    let expected = crate::forgematrix_v2::output_digest(challenge, activation);
+    let mut expected = blake3::Hasher::new_derive_key(output_context);
+    expected.update(&message);
+    let expected = *expected.finalize().as_bytes();
     if digest != expected {
         return Err(Blake3TreeError::DigestMismatch);
     }
@@ -380,15 +401,13 @@ fn output_words(output: &[u32; 16]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    const OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
-
     #[test]
     fn schedule_matches_upstream_across_chunk_boundaries() {
         for length in [1, 8, 64, 512, 1024, 2048, 4096] {
             let activation = (0..length)
                 .map(|index| (index % 251) as u8)
                 .collect::<Vec<_>>();
-            let witness = build_tree_witness(OUTPUT_CONTEXT, [0x42; 32], &activation).unwrap();
+            let witness = build_forgematrix_v2_tree_witness([0x42; 32], &activation).unwrap();
             assert_eq!(
                 witness.digest,
                 crate::forgematrix_v2::output_digest([0x42; 32], &activation)
@@ -410,7 +429,7 @@ mod tests {
         let activation = (0..(1 << 19))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let witness = build_tree_witness(OUTPUT_CONTEXT, [0x24; 32], &activation).unwrap();
+        let witness = build_forgematrix_v2_tree_witness([0x24; 32], &activation).unwrap();
         assert_eq!(witness.message_len, 524_328);
         assert_eq!(witness.chunk_count, 513);
         assert_eq!(witness.operations.len(), 8_705);
@@ -442,11 +461,11 @@ mod tests {
     #[test]
     fn invalid_activation_is_rejected() {
         assert_eq!(
-            build_tree_witness(OUTPUT_CONTEXT, [0; 32], &[]),
+            build_forgematrix_v2_tree_witness([0; 32], &[]),
             Err(Blake3TreeError::InvalidActivationLength)
         );
         assert_eq!(
-            build_tree_witness(OUTPUT_CONTEXT, [0; 32], &[251]),
+            build_forgematrix_v2_tree_witness([0; 32], &[251]),
             Err(Blake3TreeError::ActivationEncoding)
         );
     }

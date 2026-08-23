@@ -851,7 +851,7 @@ fn lookup_batch_inputs(
 ) -> (NarrowBlake3XorLookupAir, RowMajorMatrix<F>, Vec<F>) {
     let air = NarrowBlake3XorLookupAir::new(statement).expect("fixture shape is supported");
     validate_opening(statement, activation).expect("fixture activation matches its statement");
-    let witness = build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, activation)
+    let witness = build_forgematrix_v2_tree_witness(statement.challenge_digest, activation)
         .expect("fixture tree witness builds");
     assert_eq!(witness.digest, statement.final_activation_digest);
     let trace = generate_xor_lookup_trace(&air, statement, &witness);
@@ -1158,7 +1158,7 @@ fn projected_trace_matches_native_blake3_and_lookup_histograms() {
         let statement = fixture_statement(&activation);
         let air = NarrowBlake3XorLookupAir::new(&statement).unwrap();
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation).unwrap();
         let trace = generate_xor_lookup_trace(&air, &statement, &witness);
         assert_eq!(trace.width(), LOOKUP_MAIN_WIDTH);
         assert_eq!(trace.height(), air.inner.trace_rows);
@@ -1303,7 +1303,7 @@ fn lookup_trace_stream_matches_collected_trace_and_stops_on_sink_error() {
     let statement = fixture_statement(&activation);
     let air = NarrowBlake3XorLookupAir::new(&statement).unwrap();
     let witness =
-        build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+        build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation).unwrap();
     let collected = generate_xor_lookup_trace(&air, &statement, &witness);
     let mut streamed = Vec::new();
     for_each_xor_lookup_trace_row(&air, &statement, &witness, |row_index, row| {
@@ -1661,7 +1661,7 @@ fn legacy_vs_xor_lookup_batch_release_benchmark() {
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let statement = fixture_statement(&activation);
-    let witness = build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation)
+    let witness = build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation)
         .expect("benchmark tree witness builds");
     let public = public_values(&statement).expect("benchmark public values are canonical");
     let config = build_config();

@@ -193,7 +193,7 @@ fn prove_bls_dory_narrow_blake3_with_config(
         .map_err(|_| NarrowBlake3Error::Opening)?;
     let air = BlsDoryNarrowBlake3Air::new(statement)?;
     let pinned_key = pinned_preprocessed_verifier_key(&air.base)?;
-    let witness = build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest(), activation)?;
+    let witness = build_forgematrix_v2_tree_witness(statement.challenge_digest(), activation)?;
     if witness.digest != statement.final_activation_digest() {
         return Err(NarrowBlake3Error::Tree(Blake3TreeError::DigestMismatch));
     }
@@ -612,7 +612,7 @@ mod tests {
         let statement = statement(&activation, point(6));
         let air = BlsDoryNarrowBlake3Air::new(&statement).unwrap();
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest(), &activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest(), &activation).unwrap();
         let trace = generate_bridge_trace(&air, &statement, &witness).unwrap();
         let final_row = trace.row_slice(trace.height() - 1).unwrap();
         let final_cols: &BridgeCols<F> = final_row.as_ref().borrow();
@@ -630,7 +630,7 @@ mod tests {
         let statement = statement(&activation, point(6));
         let air = BlsDoryNarrowBlake3Air::new(&statement).unwrap();
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest(), &activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest(), &activation).unwrap();
         let trace = generate_bridge_trace(&air, &statement, &witness).unwrap();
         p3_air::check_constraints(&air, &trace, &bridge_public_values(&statement));
     }

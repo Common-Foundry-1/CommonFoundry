@@ -64,9 +64,13 @@ use crate::{
         pinned_preprocessed_key,
     },
     structured_blake3_tree::{
-        Blake3TreeError, Blake3TreeWitness, CompressionKind, CompressionOp, build_tree_witness,
+        Blake3TreeError, Blake3TreeWitness, CompressionKind, CompressionOp,
+        build_forgematrix_v2_tree_witness,
     },
 };
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+use crate::structured_blake3_tree::build_dory_v3_tree_witness;
 
 #[cfg(all(test, feature = "dory-bls12-381-prototype"))]
 pub(crate) mod bls_bridge;
@@ -76,7 +80,53 @@ type NarrowDftBackend = cmfd_proof_accel::ProofDft;
 #[cfg(not(feature = "gpu-proof-prover"))]
 type NarrowDftBackend = Radix2DitParallel<F>;
 
-const OUTPUT_CONTEXT: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
+/// Closed output-domain selection for the narrow BLAKE3 relation.
+///
+/// Existing constructors remain pinned to ForgeMatrix V2. The Dory V3
+/// variant is only available with the Dory prototype feature, so callers
+/// cannot inject an arbitrary derive-key context into either the witness or
+/// verifier-owned AIR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NarrowBlake3OutputProfile {
+    ForgeMatrixV2,
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3,
+}
+
+impl NarrowBlake3OutputProfile {
+    pub(crate) const fn domain(self) -> &'static str {
+        match self {
+            Self::ForgeMatrixV2 => crate::forgematrix_v2::OUTPUT_DOMAIN,
+            #[cfg(feature = "dory-bls12-381-prototype")]
+            Self::DoryV3 => crate::dory_v3_suite::DORY_V3_OUTPUT_DOMAIN,
+        }
+    }
+
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    pub(crate) const fn verifier_tag(self) -> u16 {
+        match self {
+            Self::ForgeMatrixV2 => 2,
+            #[cfg(feature = "dory-bls12-381-prototype")]
+            Self::DoryV3 => 3,
+        }
+    }
+}
+
+/// Construct the exact tree witness selected by a closed output profile.
+pub(crate) fn build_tree_witness_for_output_profile(
+    output_profile: NarrowBlake3OutputProfile,
+    challenge: [u8; 32],
+    activation: &[u8],
+) -> Result<Blake3TreeWitness, NarrowBlake3Error> {
+    Ok(match output_profile {
+        NarrowBlake3OutputProfile::ForgeMatrixV2 => {
+            build_forgematrix_v2_tree_witness(challenge, activation)?
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        NarrowBlake3OutputProfile::DoryV3 => build_dory_v3_tree_witness(challenge, activation)?,
+    })
+}
+
 const MAX_POINT_VARIABLES: usize = 19;
 const MAX_STACK_DEPTH: usize = 10;
 const G_STEPS_PER_ROUND: usize = 16;
@@ -1272,6 +1322,7 @@ pub(crate) struct NarrowBlake3Air {
     point: Vec<crate::structured_sumcheck::ExtensionField>,
     trace_rows: usize,
     schedule: Arc<Blake3TreeWitness>,
+    output_profile: NarrowBlake3OutputProfile,
 }
 
 impl NarrowBlake3Air {
@@ -1279,9 +1330,29 @@ impl NarrowBlake3Air {
         Self::new_with_min_rows(statement, ROWS_PER_COMPRESSION)
     }
 
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    pub(crate) fn new_with_output_profile(
+        statement: &StructuredBlake3Statement,
+        output_profile: NarrowBlake3OutputProfile,
+    ) -> Result<Self, NarrowBlake3Error> {
+        Self::new_with_min_rows_and_output_profile(statement, ROWS_PER_COMPRESSION, output_profile)
+    }
+
     pub(crate) fn new_with_min_rows(
         statement: &StructuredBlake3Statement,
         min_rows: usize,
+    ) -> Result<Self, NarrowBlake3Error> {
+        Self::new_with_min_rows_and_output_profile(
+            statement,
+            min_rows,
+            NarrowBlake3OutputProfile::ForgeMatrixV2,
+        )
+    }
+
+    pub(crate) fn new_with_min_rows_and_output_profile(
+        statement: &StructuredBlake3Statement,
+        min_rows: usize,
+        output_profile: NarrowBlake3OutputProfile,
     ) -> Result<Self, NarrowBlake3Error> {
         if statement.final_activation_len < 32
             || !statement.final_activation_len.is_power_of_two()
@@ -1293,7 +1364,7 @@ impl NarrowBlake3Air {
         }
         validate_field_elements(statement)?;
         let dummy = vec![0_u8; statement.final_activation_len];
-        let schedule = build_tree_witness(OUTPUT_CONTEXT, [0; 32], &dummy)?;
+        let schedule = build_tree_witness_for_output_profile(output_profile, [0; 32], &dummy)?;
         let operation_count = operation_count(statement.final_activation_len)?;
         debug_assert_eq!(schedule.operations.len(), operation_count);
         let active_rows = operation_count
@@ -1318,7 +1389,12 @@ impl NarrowBlake3Air {
                 .collect(),
             trace_rows,
             schedule: Arc::new(schedule),
+            output_profile,
         })
+    }
+
+    pub(crate) const fn output_profile(&self) -> NarrowBlake3OutputProfile {
+        self.output_profile
     }
 
     #[cfg(feature = "dory-bls12-381-prototype")]
@@ -1475,7 +1551,7 @@ impl<AB: AirBuilder<F = F>> Air<AB> for NarrowBlake3Air {
 
         constrain_bits(builder, &local);
         constrain_round(builder, &local, &next, &prep);
-        constrain_initial_state(builder, &local, &prep);
+        constrain_initial_state_with_output_profile(builder, &local, &prep, self.output_profile);
         constrain_message(builder, &local, &next, &prep);
         constrain_digest(builder, &local, &prep, self.point_variables);
         constrain_evaluation(builder, &local, &next, self.point_variables);
@@ -1537,7 +1613,11 @@ fn prove_narrow_blake3_with_backends(
         return Err(NarrowBlake3Error::UnsupportedShape);
     }
     validate_opening(statement, activation)?;
-    let witness = build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, activation)?;
+    let witness = build_tree_witness_for_output_profile(
+        air.output_profile(),
+        statement.challenge_digest,
+        activation,
+    )?;
     if witness.digest != statement.final_activation_digest {
         return Err(NarrowBlake3Error::Tree(Blake3TreeError::DigestMismatch));
     }
@@ -1822,10 +1902,25 @@ fn constrain_xor_rotate<AB: AirBuilder>(
     builder.assert_zero(active * (packed - pack_expr_bits::<AB>(&bits)));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn constrain_initial_state<AB: AirBuilder>(
     builder: &mut AB,
     local: &MainCols<AB::Var>,
     prep: &PrepCols<AB::Var>,
+) {
+    constrain_initial_state_with_output_profile(
+        builder,
+        local,
+        prep,
+        NarrowBlake3OutputProfile::ForgeMatrixV2,
+    );
+}
+
+fn constrain_initial_state_with_output_profile<AB: AirBuilder>(
+    builder: &mut AB,
+    local: &MainCols<AB::Var>,
+    prep: &PrepCols<AB::Var>,
+    output_profile: NarrowBlake3OutputProfile,
 ) {
     let is_new = prep.is_first_step;
     let state = &local.state;
@@ -1851,7 +1946,7 @@ fn constrain_initial_state<AB: AirBuilder>(
     for word in local.output_words {
         builder.when(is_new).assert_zero(word);
     }
-    let context_key = blake3::hazmat::hash_derive_key_context(OUTPUT_CONTEXT);
+    let context_key = blake3::hazmat::hash_derive_key_context(output_profile.domain());
     for index in 0..8 {
         let word = u32::from_le_bytes(
             context_key[index * 4..(index + 1) * 4]
@@ -3088,7 +3183,7 @@ mod tests {
         let air = NarrowBlake3Air::new(statement).unwrap();
         validate_opening(statement, activation).unwrap();
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest, activation).unwrap();
         assert_eq!(witness.digest, statement.final_activation_digest);
         let trace = generate_main_trace(&air, statement, &witness);
         let public = public_values(statement).unwrap();
@@ -3336,6 +3431,94 @@ mod tests {
                 .flatten()
                 .all(|word| word < GOLDILOCKS_MODULUS)
         );
+    }
+
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    #[test]
+    fn dory_v3_output_profile_keeps_the_v2_preprocessing_rows_and_root() {
+        let activation = (0_u8..32).collect::<Vec<_>>();
+        let v2_statement = statement(&activation);
+        let v2_witness = build_tree_witness_for_output_profile(
+            NarrowBlake3OutputProfile::ForgeMatrixV2,
+            v2_statement.challenge_digest,
+            &activation,
+        )
+        .unwrap();
+        let v3_witness = build_tree_witness_for_output_profile(
+            NarrowBlake3OutputProfile::DoryV3,
+            v2_statement.challenge_digest,
+            &activation,
+        )
+        .unwrap();
+        assert_ne!(v2_witness.digest, v3_witness.digest);
+        assert_eq!(v2_witness.message_len, v3_witness.message_len);
+        assert_eq!(v2_witness.chunk_count, v3_witness.chunk_count);
+        assert_eq!(v2_witness.operations.len(), v3_witness.operations.len());
+
+        let mut v3_statement = v2_statement.clone();
+        v3_statement.final_activation_digest = v3_witness.digest;
+        assert_eq!(
+            prove_narrow_blake3(&v3_statement, &activation),
+            Err(NarrowBlake3Error::Tree(Blake3TreeError::DigestMismatch))
+        );
+        let v2_air = NarrowBlake3Air::new(&v2_statement).unwrap();
+        let v3_air = NarrowBlake3Air::new_with_output_profile(
+            &v3_statement,
+            NarrowBlake3OutputProfile::DoryV3,
+        )
+        .unwrap();
+        assert_eq!(
+            v2_air.output_profile(),
+            NarrowBlake3OutputProfile::ForgeMatrixV2
+        );
+        assert_eq!(v3_air.output_profile(), NarrowBlake3OutputProfile::DoryV3);
+        assert_ne!(
+            v2_air.output_profile().domain(),
+            v3_air.output_profile().domain()
+        );
+        assert_eq!(v2_air.trace_rows, v3_air.trace_rows);
+        assert_eq!(
+            generate_preprocessed(&v2_air),
+            generate_preprocessed(&v3_air)
+        );
+
+        // Also cover a real two-chunk tree with a parent compression, where
+        // the selected output domain changes child CVs and the parent block.
+        let tree_activation = (0..1_024)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let tree_v2_statement = statement(&tree_activation);
+        let tree_v3_witness = build_tree_witness_for_output_profile(
+            NarrowBlake3OutputProfile::DoryV3,
+            tree_v2_statement.challenge_digest,
+            &tree_activation,
+        )
+        .unwrap();
+        assert!(
+            tree_v3_witness
+                .operations
+                .iter()
+                .any(|operation| operation.kind == CompressionKind::Parent)
+        );
+        let mut tree_v3_statement = tree_v2_statement.clone();
+        tree_v3_statement.final_activation_digest = tree_v3_witness.digest;
+        let tree_v2_air = NarrowBlake3Air::new(&tree_v2_statement).unwrap();
+        let tree_v3_air = NarrowBlake3Air::new_with_output_profile(
+            &tree_v3_statement,
+            NarrowBlake3OutputProfile::DoryV3,
+        )
+        .unwrap();
+        assert_eq!(
+            generate_preprocessed(&tree_v2_air),
+            generate_preprocessed(&tree_v3_air)
+        );
+
+        let config = build_config();
+        let v2_root = preprocessed_root_and_drop(&config, &v2_air);
+        let v3_root = preprocessed_root_and_drop(&config, &v3_air);
+        let pinned = pinned_preprocessed_key(activation.len(), v2_air.trace_rows).unwrap();
+        assert_eq!(v2_root, pinned.root);
+        assert_eq!(v3_root, pinned.root);
     }
 
     #[test]
@@ -3621,7 +3804,7 @@ mod tests {
         let air = NarrowBlake3Air::new(&statement).unwrap();
         assert_eq!(air.trace_rows, 256);
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation).unwrap();
         let trace = generate_main_trace(&air, &statement, &witness);
         p3_air::check_constraints(&air, &trace, &public_values(&statement).unwrap());
     }
@@ -3634,7 +3817,7 @@ mod tests {
         let statement = statement(&activation);
         let air = NarrowBlake3Air::new(&statement).unwrap();
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation).unwrap();
         let mut emitted = 0_usize;
         let stopped = for_each_main_trace_row(
             &air,
@@ -3692,8 +3875,8 @@ mod tests {
             .collect::<Vec<_>>();
         let statement = statement(&activation);
         let witnesses = [
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap(),
-            build_tree_witness(OUTPUT_CONTEXT, [0xa5; 32], &alternate_activation).unwrap(),
+            build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation).unwrap(),
+            build_forgematrix_v2_tree_witness([0xa5; 32], &alternate_activation).unwrap(),
         ];
 
         for min_rows in [ROWS_PER_COMPRESSION, 1 << 9] {
@@ -4080,7 +4263,7 @@ mod tests {
         let statement = statement(&activation);
         let air = NarrowBlake3Air::new(&statement).unwrap();
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation).unwrap();
         assert!(witness.operations.iter().any(|operation| {
             operation.stack_read_left.is_some() && operation.stack_read_right.is_some()
         }));
@@ -4154,7 +4337,7 @@ mod tests {
         let air = NarrowBlake3Air::new_with_min_rows(&statement, 32_768).unwrap();
         let witness_started = Instant::now();
         let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
+            build_forgematrix_v2_tree_witness(statement.challenge_digest, &activation).unwrap();
         let witness_elapsed = witness_started.elapsed();
         let trace_started = Instant::now();
         let trace = generate_main_trace(&air, &statement, &witness);

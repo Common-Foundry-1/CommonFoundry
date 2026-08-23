@@ -708,6 +708,47 @@ fn native_accumulator_trace(
         .collect()
 }
 
+#[cfg(all(test, feature = "whir-prototype"))]
+fn for_each_native_accumulator_pair<E>(
+    air: &NarrowBlake3Air,
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    mut emit: impl FnMut(usize, BlsDoryFr, BlsDoryFr) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut accumulator = BlsDoryFr::zero();
+    crate::structured_blake3_narrow::for_each_main_trace_row(
+        air,
+        statement,
+        witness,
+        |row_index, row| {
+            let current = accumulator;
+            let coefficients = native_byte_coefficients(
+                air.activation_group_index_at_row(row_index),
+                bridge.cell_point(),
+            );
+            let contribution = (0..8).fold(BlsDoryFr::zero(), |sum, byte| {
+                let low = BlsDoryFr::from_i64(centered_goldilocks(
+                    row[TEST_ORIGINAL_NIBBLES_START + 2 * byte],
+                ));
+                let high = BlsDoryFr::from_i64(centered_goldilocks(
+                    row[TEST_ORIGINAL_NIBBLES_START + 2 * byte + 1],
+                ));
+                sum + (low + BlsDoryFr::from_u64(16) * high) * coefficients[byte]
+            });
+            let after = current + contribution;
+            let next = if row_index + 1 == air.trace_rows() {
+                BlsDoryFr::zero()
+            } else {
+                after
+            };
+            emit(row_index, current, next)?;
+            accumulator = after;
+            Ok(())
+        },
+    )
+}
+
 /// Exact projection values exposed to tests and activation tooling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlsDoryBlake3Projection {
@@ -762,10 +803,11 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_aggregate::{
         BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCommittedPolynomial,
-        BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim,
-        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
-        commit_bls_dory_row_source_with_scratch, prove_bls_dory_deferred_opening_sets,
-        prove_bls_dory_same_commitment_openings, verify_bls_dory_openings,
+        BlsDoryCommittedPolynomialWriter, BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
+        BlsDoryOpeningClaim, commit_bls_dory_compact_row_source_with_scratch,
+        commit_bls_dory_polynomial, commit_bls_dory_row_source_with_scratch,
+        prove_bls_dory_deferred_opening_sets, prove_bls_dory_same_commitment_openings,
+        verify_bls_dory_openings,
     };
     #[cfg(feature = "whir-prototype")]
     use crate::dory_bls12_381_prototype::{BlsDoryGt, DeterministicBlsDorySetup};
@@ -3838,6 +3880,124 @@ mod tests {
             assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
         }
         assert_eq!(covered_tables, TABLES_PER_DIRECTION);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn native_accumulator_stream_matches_materialized_local_and_next() {
+        let fixture = dense_blake3_fixture();
+        let local_table = TEST_EVALUATION_ACCUMULATOR_START;
+        let next_table = BLS_DORY_BLAKE3_MAIN_WIDTH + local_table;
+        let mut visited = 0usize;
+        for_each_native_accumulator_pair(
+            &fixture.air,
+            &fixture.statement,
+            &fixture.witness,
+            &fixture.bridge,
+            |row_index, local, next| {
+                assert_eq!(local, fixture.tables[local_table][row_index]);
+                assert_eq!(next, fixture.tables[next_table][row_index]);
+                visited += 1;
+                Ok::<_, std::convert::Infallible>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, fixture.air.trace_rows());
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "the exact 16-variable scalar Dory comparison is intentionally expensive"]
+    fn native_accumulator_scalar_stream_preserves_commitment_and_opening_bytes() {
+        const TRACE_ROWS: usize = 1 << 8;
+        const STREAM_CHUNK: usize = 29;
+        let fixture = dense_blake3_fixture();
+        assert_eq!(fixture.air.trace_rows(), TRACE_ROWS);
+        let local_table = TEST_EVALUATION_ACCUMULATOR_START;
+        let next_table = BLS_DORY_BLAKE3_MAIN_WIDTH + local_table;
+        let field_tables = vec![
+            fixture.tables[local_table].clone(),
+            fixture.tables[next_table].clone(),
+        ];
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
+        let layout = dense_aggregate_layout();
+        let scratch = Blake3ScratchDirectory::create();
+        let materialized = commit_bls_dory_polynomial(
+            dense_pack_adjacency_tables(&field_tables, TRACE_ROWS, 1 << 8).unwrap(),
+            layout.nu(),
+            layout.sigma(),
+            &setup,
+        )
+        .unwrap();
+        let mut writer = BlsDoryCommittedPolynomialWriter::create(
+            &scratch.0,
+            2 * TRACE_ROWS,
+            layout.nu(),
+            layout.sigma(),
+            &setup,
+        )
+        .unwrap();
+        for use_next in [false, true] {
+            let mut scalars = Vec::with_capacity(STREAM_CHUNK);
+            for_each_native_accumulator_pair(
+                &fixture.air,
+                &fixture.statement,
+                &fixture.witness,
+                &fixture.bridge,
+                |row_index, local, next| {
+                    let scalar = if use_next { next } else { local };
+                    assert_eq!(scalar, field_tables[usize::from(use_next)][row_index]);
+                    scalars.push(scalar);
+                    if scalars.len() == STREAM_CHUNK {
+                        writer.write_scalars(&scalars)?;
+                        scalars.clear();
+                    }
+                    Ok::<_, BlsDoryAggregateError>(())
+                },
+            )
+            .unwrap();
+            if !scalars.is_empty() {
+                writer.write_scalars(&scalars).unwrap();
+            }
+        }
+        let streamed = writer.finish().unwrap();
+        assert_eq!(streamed.commitment(), materialized.commitment());
+
+        let points = vec![
+            (0..16)
+                .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 23) * 37))
+                .collect::<Vec<_>>(),
+            (0..16)
+                .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 29) * 41))
+                .collect::<Vec<_>>(),
+        ];
+        let ordinary = prove_bls_dory_same_commitment_openings(
+            b"blake3-native-accumulator-source-equivalence",
+            layout,
+            &materialized,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        let artifact_backed = prove_bls_dory_same_commitment_openings(
+            b"blake3-native-accumulator-source-equivalence",
+            layout,
+            &streamed,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(artifact_backed, ordinary);
+        verify_bls_dory_openings(
+            b"blake3-native-accumulator-source-equivalence",
+            layout,
+            &artifact_backed.0,
+            &artifact_backed.1,
+            &setup,
+        )
+        .unwrap();
+        drop(streamed);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

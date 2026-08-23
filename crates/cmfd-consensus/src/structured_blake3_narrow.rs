@@ -1363,7 +1363,7 @@ impl BaseAir<F> for NarrowBlake3Air {
                 "verifier must not materialize the preprocessed trace"
             );
         });
-        Some(generate_preprocessed(self, &self.schedule))
+        Some(generate_preprocessed(self))
     }
 
     fn preprocessed_width(&self) -> usize {
@@ -2060,15 +2060,24 @@ fn activation_group_index(
     Some(evaluation_offset - activation_start)
 }
 
-fn generate_preprocessed(air: &NarrowBlake3Air, witness: &Blake3TreeWitness) -> RowMajorMatrix<F> {
+fn generate_preprocessed(air: &NarrowBlake3Air) -> RowMajorMatrix<F> {
     let mut values = Vec::with_capacity(air.trace_rows * PREP_WIDTH);
-    for_each_preprocessed_trace_row(air, witness, |row_index, row| {
+    for_each_canonical_preprocessed_trace_row(air, |row_index, row| {
         debug_assert_eq!(values.len(), row_index * PREP_WIDTH);
         values.extend_from_slice(row);
         Ok::<_, std::convert::Infallible>(())
     })
     .expect("infallible in-memory preprocessing sink");
     RowMajorMatrix::new(values, PREP_WIDTH)
+}
+
+/// Streams the canonical preprocessing profile owned by the AIR without
+/// accepting any prover witness.
+pub(crate) fn for_each_canonical_preprocessed_trace_row<E>(
+    air: &NarrowBlake3Air,
+    emit: impl FnMut(usize, &[F]) -> Result<(), E>,
+) -> Result<(), E> {
+    for_each_preprocessed_trace_row(air, &air.schedule, emit)
 }
 
 /// Generates one deterministic preprocessing row at a time without retaining
@@ -3640,17 +3649,14 @@ mod tests {
     }
 
     #[test]
-    fn preprocessing_rows_stream_exact_matrix_and_stop_early() {
+    fn canonical_preprocessing_rows_stream_exact_matrix_and_stop_early() {
         let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         let statement = statement(&activation);
         let air = NarrowBlake3Air::new(&statement).unwrap();
-        let witness =
-            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap();
-        let materialized = generate_preprocessed(&air, &witness);
+        let materialized = generate_preprocessed(&air);
         let mut streamed = Vec::with_capacity(materialized.values.len());
-        for_each_preprocessed_trace_row(
+        for_each_canonical_preprocessed_trace_row(
             &air,
-            &witness,
             |row_index, row| -> Result<(), std::convert::Infallible> {
                 assert_eq!(streamed.len(), row_index * PREP_WIDTH);
                 assert_eq!(row.len(), PREP_WIDTH);
@@ -3662,9 +3668,8 @@ mod tests {
         assert_eq!(streamed, materialized.values);
 
         let mut emitted = 0_usize;
-        let stopped = for_each_preprocessed_trace_row(
+        let stopped = for_each_canonical_preprocessed_trace_row(
             &air,
-            &witness,
             |row_index, _| -> Result<(), &'static str> {
                 assert_eq!(row_index, emitted);
                 emitted += 1;
@@ -3673,6 +3678,47 @@ mod tests {
         );
         assert_eq!(stopped, Err("stop"));
         assert_eq!(emitted, 17);
+    }
+
+    #[test]
+    fn canonical_preprocessing_rows_match_witness_schedules_across_bounded_profiles() {
+        let activation = (0..64).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let alternate_activation = (0..64)
+            .map(|index| (250 - index % 251) as u8)
+            .collect::<Vec<_>>();
+        let statement = statement(&activation);
+        let witnesses = [
+            build_tree_witness(OUTPUT_CONTEXT, statement.challenge_digest, &activation).unwrap(),
+            build_tree_witness(OUTPUT_CONTEXT, [0xa5; 32], &alternate_activation).unwrap(),
+        ];
+
+        for min_rows in [ROWS_PER_COMPRESSION, 1 << 9] {
+            let air = NarrowBlake3Air::new_with_min_rows(&statement, min_rows).unwrap();
+            let mut canonical = Vec::with_capacity(air.trace_rows * PREP_WIDTH);
+            for_each_canonical_preprocessed_trace_row(
+                &air,
+                |_, row| -> Result<(), std::convert::Infallible> {
+                    canonical.extend_from_slice(row);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(canonical, generate_preprocessed(&air).values);
+
+            for witness in &witnesses {
+                let mut supplied = Vec::with_capacity(canonical.len());
+                for_each_preprocessed_trace_row(
+                    &air,
+                    witness,
+                    |_, row| -> Result<(), std::convert::Infallible> {
+                        supplied.extend_from_slice(row);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(supplied, canonical);
+            }
+        }
     }
 
     #[test]

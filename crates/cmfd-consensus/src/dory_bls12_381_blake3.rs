@@ -1,8 +1,9 @@
 //! Fail-closed production projection for proving BLAKE3 inside the BLS/Dory aggregate.
 //!
-//! This module does not implement or activate a proof. It pins the conservative
-//! wire and opening-claim budget for replacing the separate Goldilocks FRI
-//! bridge with two BLS12-381 scalar-field arguments:
+//! This module implements production-owned sources and verifier transcript
+//! replay, but does not activate a complete proof. It pins the conservative wire
+//! and opening-claim budget for replacing the separate Goldilocks FRI bridge
+//! with two BLS12-381 scalar-field arguments:
 //!
 //! 1. an execution sumcheck over the complete narrow BLAKE3 trace; and
 //! 2. a row-indexed LogUp permutation that binds every committed `next` row to
@@ -14,7 +15,7 @@
 use dory_pcs::primitives::arithmetic::Field as DoryField;
 #[cfg(feature = "whir-prototype")]
 use dory_pcs::primitives::transcript::Transcript;
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 use p3_air::symbolic::{
     AirLayout, BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression, get_symbolic_constraints,
 };
@@ -25,7 +26,7 @@ use thiserror::Error;
 #[cfg(feature = "whir-prototype")]
 use crate::dory_bls12_381_prototype::BlsDoryTranscript;
 use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt};
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 use crate::{ExtensionElement, structured_blake3_narrow::NarrowBlake3Error};
 #[cfg(feature = "whir-prototype")]
 use crate::{
@@ -44,7 +45,7 @@ use crate::{
         F as Goldilocks, NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START, NARROW_BLAKE3_MAIN_WIDTH,
         NARROW_BLAKE3_ORIGINAL_NIBBLES_START, NARROW_BLAKE3_PREPROCESSED_WIDTH,
         NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS, NARROW_BLAKE3_STACK_START, NarrowBlake3Air,
-        for_each_main_trace_row, for_each_preprocessed_trace_row,
+        for_each_canonical_preprocessed_trace_row, for_each_main_trace_row, public_values,
     },
 };
 use crate::{
@@ -175,6 +176,25 @@ pub const BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS: usize =
 /// Main words, the native accumulator, and post-challenge inverses require
 /// three adjacency openings. Preprocessing is not part of adjacency.
 pub const BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS: usize = 3;
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_EXECUTION_SOURCE_TERMINALS: [usize; 3] = [
+    BLS_DORY_BLAKE3_SIGNED_WORD_TABLES,
+    BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES,
+    BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES,
+];
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_ADJACENCY_SOURCE_TERMINALS: [usize; 3] = [
+    BLS_DORY_BLAKE3_SIGNED_WORD_TABLES,
+    BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES,
+    BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES,
+];
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_SOURCE_TERMINALS: [usize; 4] = [
+    BLS_DORY_BLAKE3_SIGNED_WORD_TABLES,
+    BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES,
+    BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES,
+    BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES,
+];
 /// Physical source commitments in canonical order: main words, accumulator,
 /// preprocessing, and post-challenge adjacency inverses.
 pub const BLS_DORY_BLAKE3_SOURCE_COMMITMENTS: usize = 4;
@@ -245,6 +265,15 @@ impl BlsDoryBlake3SourceCommitments {
             BlsDoryBlake3SourceRole::Inverse => &self.inverse,
         }
     }
+
+    #[cfg(feature = "whir-prototype")]
+    fn adjacency_sources(&self) -> BlsDoryBlake3AdjacencySourceCommitments {
+        BlsDoryBlake3AdjacencySourceCommitments {
+            main: self.main,
+            accumulator: self.accumulator,
+            preprocessing: self.preprocessing,
+        }
+    }
 }
 
 /// Named commitments absorbed before deriving the adjacency challenges.
@@ -258,23 +287,38 @@ struct BlsDoryBlake3AdjacencySourceCommitments {
 
 #[cfg(feature = "whir-prototype")]
 impl BlsDoryBlake3AdjacencySourceCommitments {
-    fn ordered(self) -> [BlsDoryGt; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS] {
+    fn ordered(&self) -> [BlsDoryGt; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS] {
         [self.main, self.accumulator, self.preprocessing]
     }
 }
 
 #[cfg(feature = "whir-prototype")]
-fn derive_native_blake3_adjacency_challenges(
+fn append_native_blake3_source_descriptor(
+    transcript: &mut BlsDoryTranscript,
+    role: BlsDoryBlake3SourceRole,
+    terminal_count: usize,
+    commitment: &BlsDoryGt,
+) {
+    transcript.append_bytes(b"source-role", &[role as u8]);
+    transcript.append_bytes(
+        b"source-terminal-count",
+        &(terminal_count as u64).to_le_bytes(),
+    );
+    transcript.append_group(b"source-commitment", commitment);
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_adjacency_transcript(
     bridge: &BlsDoryOutputBridgeStatement,
     trace_rows: usize,
-    commitments: BlsDoryBlake3AdjacencySourceCommitments,
-) -> Result<(BlsDoryFr, BlsDoryFr), BlsDoryAggregateError> {
+    commitments: &BlsDoryBlake3AdjacencySourceCommitments,
+) -> Result<BlsDoryTranscript, BlsDoryAggregateError> {
     if !trace_rows.is_power_of_two() {
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
     let ordered = commitments.ordered();
-    let mut transcript = BlsDoryTranscript::new(b"blake3-native-row-adjacency-sumcheck");
-    transcript.append_bytes(b"protocol-version", &1_u16.to_le_bytes());
+    let mut transcript = BlsDoryTranscript::new(b"blake3-native-row-adjacency-sumcheck-v2");
+    transcript.append_bytes(b"protocol-version", &2_u16.to_le_bytes());
     transcript.append_bytes(b"challenge-digest", &bridge.challenge_digest());
     transcript.append_bytes(
         b"activation-length",
@@ -288,12 +332,30 @@ fn derive_native_blake3_adjacency_challenges(
         &(BLS_DORY_BLAKE3_MAIN_WIDTH as u64).to_le_bytes(),
     );
     transcript.append_bytes(
-        b"source-commitment-count",
-        &(ordered.len() as u64).to_le_bytes(),
+        b"source-count",
+        &(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS as u64).to_le_bytes(),
     );
-    for commitment in &ordered {
-        transcript.append_group(b"packed-adjacency-source-commitment", commitment);
+    for ((role, terminal_count), commitment) in [
+        BlsDoryBlake3SourceRole::Main,
+        BlsDoryBlake3SourceRole::Accumulator,
+        BlsDoryBlake3SourceRole::Preprocessing,
+    ]
+    .into_iter()
+    .zip(BLS_DORY_BLAKE3_EXECUTION_SOURCE_TERMINALS)
+    .zip(&ordered)
+    {
+        append_native_blake3_source_descriptor(&mut transcript, role, terminal_count, commitment);
     }
+    Ok(transcript)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn derive_native_blake3_adjacency_challenges(
+    bridge: &BlsDoryOutputBridgeStatement,
+    trace_rows: usize,
+    commitments: BlsDoryBlake3AdjacencySourceCommitments,
+) -> Result<(BlsDoryFr, BlsDoryFr), BlsDoryAggregateError> {
+    let mut transcript = native_blake3_adjacency_transcript(bridge, trace_rows, &commitments)?;
     Ok((
         transcript.challenge_scalar(b"row-compression"),
         transcript.challenge_scalar(b"lookup-alpha"),
@@ -436,6 +498,7 @@ pub(crate) struct BlsDoryBlake3OpeningReplay {
     execution_evaluations: [BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS],
     adjacency_points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS],
     adjacency_evaluations: [BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS],
+    opening_binding: [u8; 32],
 }
 
 /// Internal binding of replayed claims to named source commitments.
@@ -445,6 +508,7 @@ pub(crate) struct BlsDoryBlake3OpeningStatement {
     source_commitments: BlsDoryBlake3SourceCommitments,
     points: [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
     evaluations: [BlsDoryFr; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+    opening_binding: [u8; 32],
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -453,45 +517,64 @@ impl BlsDoryBlake3OpeningStatement {
         source_commitments: BlsDoryBlake3SourceCommitments,
         replay: BlsDoryBlake3OpeningReplay,
     ) -> Result<Self, BlsDoryAggregateError> {
-        let (points, evaluations) = Self::replay_parts(replay);
-        if points.iter().any(|point| {
-            point.len() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
-                || point[BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES..]
-                    .iter()
-                    .any(|coordinate| *coordinate != BlsDoryFr::zero())
-        }) {
-            return Err(BlsDoryAggregateError::InvalidProofShape);
-        }
+        Self::from_verified_replay_with_geometry(
+            source_commitments,
+            replay,
+            BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+        )
+    }
+
+    #[cfg(all(test, feature = "whir-prototype"))]
+    fn from_verified_replay_at_geometry(
+        source_commitments: BlsDoryBlake3SourceCommitments,
+        replay: BlsDoryBlake3OpeningReplay,
+        geometry: BlsDoryBlake3ReplayGeometry,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        Self::from_verified_replay_with_geometry(source_commitments, replay, geometry)
+    }
+
+    fn from_verified_replay_with_geometry(
+        source_commitments: BlsDoryBlake3SourceCommitments,
+        replay: BlsDoryBlake3OpeningReplay,
+        geometry: BlsDoryBlake3ReplayGeometry,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        let (points, evaluations, opening_binding) = Self::replay_parts(replay);
+        Self::validate_replay_shape(&points, geometry)?;
         Ok(Self {
             source_commitments,
             points,
             evaluations,
+            opening_binding,
         })
     }
 
-    #[cfg(all(test, feature = "whir-prototype"))]
-    fn from_verified_replay_at_variables(
-        source_commitments: BlsDoryBlake3SourceCommitments,
-        replay: BlsDoryBlake3OpeningReplay,
-        source_variables: usize,
-        shared_variables: usize,
-    ) -> Result<Self, BlsDoryAggregateError> {
-        let (points, evaluations) = Self::replay_parts(replay);
-        if source_variables > shared_variables
+    fn validate_replay_shape(
+        points: &[Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+        geometry: BlsDoryBlake3ReplayGeometry,
+    ) -> Result<(), BlsDoryAggregateError> {
+        if geometry.trace_variables >= geometry.source_variables
+            || geometry.source_variables > geometry.shared_variables
             || points.iter().any(|point| {
-                point.len() != shared_variables
-                    || point[source_variables..]
+                point.len() != geometry.shared_variables
+                    || point[geometry.source_variables..]
                         .iter()
                         .any(|coordinate| *coordinate != BlsDoryFr::zero())
             })
         {
             return Err(BlsDoryAggregateError::InvalidProofShape);
         }
-        Ok(Self {
-            source_commitments,
-            points,
-            evaluations,
-        })
+        let adjacency_fixed_selector = geometry.source_variables - 1;
+        if points[1][..geometry.trace_variables] != points[0][..geometry.trace_variables]
+            || points[2][..geometry.trace_variables] != points[0][..geometry.trace_variables]
+            || points[4][..geometry.trace_variables] != points[3][..geometry.trace_variables]
+            || points[5][..geometry.trace_variables] != points[3][..geometry.trace_variables]
+            || points[3..]
+                .iter()
+                .any(|point| point[adjacency_fixed_selector] != BlsDoryFr::zero())
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        Ok(())
     }
 
     fn replay_parts(
@@ -499,7 +582,9 @@ impl BlsDoryBlake3OpeningStatement {
     ) -> (
         [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
         [BlsDoryFr; BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len()],
+        [u8; 32],
     ) {
+        let opening_binding = replay.opening_binding;
         let [execution_point_0, execution_point_1, execution_point_2] = replay.execution_points;
         let [adjacency_point_0, adjacency_point_1, adjacency_point_2] = replay.adjacency_points;
         let points = [
@@ -530,7 +615,13 @@ impl BlsDoryBlake3OpeningStatement {
                 adjacency_evaluation_1,
                 adjacency_evaluation_2,
             ],
+            opening_binding,
         )
+    }
+
+    /// Canonical verifier-owned binding for the six replayed opening claims.
+    pub(crate) fn opening_binding(&self) -> [u8; 32] {
+        self.opening_binding
     }
 
     /// Bind each claim to its semantic source role, exact lifted point, and
@@ -1027,7 +1118,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin in bounded tests; the real production preprocessing-pin registry, a six-claim proof and verification against the named source bundle in one end-to-end path, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -1160,7 +1251,7 @@ const fn blake3_ceil_log2(value: u64) -> u32 {
 }
 
 /// Field-independent variable reference emitted by the existing BLAKE3 AIR.
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlsDoryBlake3Variable {
     Main { offset: u8, index: u16 },
@@ -1170,7 +1261,7 @@ pub(crate) enum BlsDoryBlake3Variable {
 }
 
 /// Canonical integer expression translated from one Goldilocks AIR constraint.
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BlsDoryBlake3ConstraintExpr {
     Variable(BlsDoryBlake3Variable),
@@ -1184,7 +1275,7 @@ pub(crate) enum BlsDoryBlake3ConstraintExpr {
     Mul(Box<Self>, Box<Self>),
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 pub(crate) struct BlsDoryBlake3Evaluation<'a> {
     pub main_local: &'a [BlsDoryFr],
     pub main_next: &'a [BlsDoryFr],
@@ -1197,7 +1288,7 @@ pub(crate) struct BlsDoryBlake3Evaluation<'a> {
     pub transition: BlsDoryFr,
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 impl BlsDoryBlake3ConstraintExpr {
     pub(crate) fn evaluate(&self, values: &BlsDoryBlake3Evaluation<'_>) -> BlsDoryFr {
         match self {
@@ -1234,7 +1325,7 @@ impl BlsDoryBlake3ConstraintExpr {
 }
 
 /// Generate the exact existing narrow-BLAKE3 equations as a field-independent IR.
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 pub(crate) fn bls_dory_blake3_constraint_ir(
     activation_len: usize,
 ) -> Result<Vec<BlsDoryBlake3ConstraintExpr>, NarrowBlake3Error> {
@@ -1257,7 +1348,7 @@ pub(crate) fn bls_dory_blake3_constraint_ir(
         .collect()
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn translate_constraint(
     expression: &SymbolicExpression<Goldilocks>,
 ) -> Result<BlsDoryBlake3ConstraintExpr, NarrowBlake3Error> {
@@ -1319,7 +1410,7 @@ fn centered_goldilocks(value: Goldilocks) -> i64 {
     }
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn uses_old_evaluation_constraint(expression: &BlsDoryBlake3ConstraintExpr) -> bool {
     match expression {
         BlsDoryBlake3ConstraintExpr::Variable(BlsDoryBlake3Variable::Main { index, .. }) => {
@@ -1340,7 +1431,7 @@ fn uses_old_evaluation_constraint(expression: &BlsDoryBlake3ConstraintExpr) -> b
     }
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn remap_native_main_constraint(
     expression: &BlsDoryBlake3ConstraintExpr,
 ) -> Result<BlsDoryBlake3ConstraintExpr, NarrowBlake3Error> {
@@ -1417,7 +1508,7 @@ fn uses_removed_native_input(expression: &BlsDoryBlake3ConstraintExpr) -> bool {
     }
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn bls_dory_native_blake3_constraint_ir(
     activation_len: usize,
 ) -> Result<Vec<BlsDoryBlake3ConstraintExpr>, NarrowBlake3Error> {
@@ -1472,7 +1563,7 @@ fn native_byte_coefficients(
     })
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn native_activation_contribution_from_coefficients(
     main_local: &[BlsDoryFr],
     coefficients: &[BlsDoryFr; 8],
@@ -1485,7 +1576,7 @@ fn native_activation_contribution_from_coefficients(
     })
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 struct BlsDoryNativeEvaluationRow<'a> {
     main_local: &'a [BlsDoryFr],
     main_next: &'a [BlsDoryFr],
@@ -1505,7 +1596,7 @@ fn native_evaluation_residuals(
     native_evaluation_residuals_from_coefficients(row, &coefficients, raw_evaluation)
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn native_evaluation_residuals_from_coefficients(
     row: &BlsDoryNativeEvaluationRow<'_>,
     coefficients: &[BlsDoryFr; 8],
@@ -1520,6 +1611,1105 @@ fn native_evaluation_residuals_from_coefficients(
         row.transition * (next - current - contribution),
         row.last_row * (current - raw_evaluation),
     ]
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlsDoryBlake3ExecutionSumcheckProof {
+    rounds: Vec<Vec<BlsDoryFr>>,
+    terminal_evaluations: Vec<BlsDoryFr>,
+    transcript_digest: [u8; 32],
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlsDoryBlake3AdjacencySumcheckProof {
+    rounds: Vec<Vec<BlsDoryFr>>,
+    terminal_evaluations: Vec<BlsDoryFr>,
+    transcript_digest: [u8; 32],
+}
+
+#[cfg(feature = "whir-prototype")]
+struct VerifiedBlsDoryBlake3Sumcheck {
+    point: Vec<BlsDoryFr>,
+    transcript_digest: [u8; 32],
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Copy)]
+struct BlsDoryBlake3OpeningTranscriptDigests {
+    execution_sumcheck: [u8; 32],
+    adjacency_sumcheck: [u8; 32],
+    execution_selectors: [u8; 32],
+    adjacency_selectors: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlsDoryBlake3ReplayGeometry {
+    trace_variables: usize,
+    source_variables: usize,
+    shared_variables: usize,
+}
+
+const BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY: BlsDoryBlake3ReplayGeometry =
+    BlsDoryBlake3ReplayGeometry {
+        trace_variables: BLS_DORY_BLAKE3_TRACE_VARIABLES,
+        source_variables: BLS_DORY_BLAKE3_SOURCE_COMMITMENT_VARIABLES,
+        shared_variables: BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+    };
+
+/// Validated Dory verifier identity used by the BLAKE3 replay boundary.
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlsDoryBlake3VerifierContext {
+    layout: BlsDoryAggregateLayout,
+    setup_identity: [u8; 32],
+    setup_max_log_n: usize,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryBlake3VerifierContext {
+    fn new(
+        layout: BlsDoryAggregateLayout,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        setup
+            .validate()
+            .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+        if layout.variables() > setup.max_log_n() {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        Ok(Self {
+            layout,
+            setup_identity: setup.identity(),
+            setup_max_log_n: setup.max_log_n(),
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test_metadata(
+        layout: BlsDoryAggregateLayout,
+        setup_identity: [u8; 32],
+        setup_max_log_n: usize,
+    ) -> Result<Self, BlsDoryAggregateError> {
+        if setup_identity == [0u8; 32]
+            || setup_max_log_n == 0
+            || layout.variables() > setup_max_log_n
+        {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        Ok(Self {
+            layout,
+            setup_identity,
+            setup_max_log_n,
+        })
+    }
+
+    fn validate_geometry(
+        &self,
+        geometry: BlsDoryBlake3ReplayGeometry,
+    ) -> Result<(), BlsDoryAggregateError> {
+        if self.layout.variables() != geometry.shared_variables
+            || self.layout.variables() > self.setup_max_log_n
+        {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        Ok(())
+    }
+}
+
+/// Opaque verifier authority for the deterministic preprocessing polynomial.
+///
+/// Production construction remains unavailable until consensus pins a registry
+/// entry for the exact commitment and geometry below.
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlsDoryBlake3TrustedPreprocessingPin {
+    projection_version: u16,
+    activation_len: usize,
+    activation_point_variables: usize,
+    trace_rows: usize,
+    geometry: BlsDoryBlake3ReplayGeometry,
+    verifier_context: BlsDoryBlake3VerifierContext,
+    source_role: BlsDoryBlake3SourceRole,
+    terminal_count: usize,
+    commitment: BlsDoryGt,
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Copy)]
+struct BlsDoryBlake3ReplayVerifier<'a> {
+    context: &'a BlsDoryBlake3VerifierContext,
+    preprocessing_pin: &'a BlsDoryBlake3TrustedPreprocessingPin,
+    geometry: BlsDoryBlake3ReplayGeometry,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryBlake3TrustedPreprocessingPin {
+    #[cfg(test)]
+    fn for_test_sources(
+        statement: &StructuredBlake3Statement,
+        trace_rows: usize,
+        geometry: BlsDoryBlake3ReplayGeometry,
+        verifier_context: &BlsDoryBlake3VerifierContext,
+        commitments: &BlsDoryBlake3SourceCommitments,
+    ) -> Self {
+        Self {
+            projection_version: BLS_DORY_BLAKE3_PROJECTION_VERSION,
+            activation_len: statement.final_activation_len,
+            activation_point_variables: statement.final_activation_point.len(),
+            trace_rows,
+            geometry,
+            verifier_context: verifier_context.clone(),
+            source_role: BlsDoryBlake3SourceRole::Preprocessing,
+            terminal_count: BLS_DORY_BLAKE3_SOURCE_TERMINALS
+                [BlsDoryBlake3SourceRole::Preprocessing.index()],
+            commitment: *commitments.commitment(BlsDoryBlake3SourceRole::Preprocessing),
+        }
+    }
+
+    fn validate(
+        &self,
+        statement: &StructuredBlake3Statement,
+        trace_rows: usize,
+        geometry: BlsDoryBlake3ReplayGeometry,
+        verifier_context: &BlsDoryBlake3VerifierContext,
+        commitments: &BlsDoryBlake3SourceCommitments,
+    ) -> Result<(), BlsDoryAggregateError> {
+        if self.projection_version != BLS_DORY_BLAKE3_PROJECTION_VERSION
+            || self.activation_len != statement.final_activation_len
+            || self.activation_point_variables != statement.final_activation_point.len()
+            || self.trace_rows != trace_rows
+            || self.geometry != geometry
+            || self.verifier_context != *verifier_context
+            || self.source_role != BlsDoryBlake3SourceRole::Preprocessing
+            || self.terminal_count
+                != BLS_DORY_BLAKE3_SOURCE_TERMINALS[BlsDoryBlake3SourceRole::Preprocessing.index()]
+            || self.commitment != *commitments.commitment(BlsDoryBlake3SourceRole::Preprocessing)
+        {
+            return Err(BlsDoryAggregateError::InvalidProofShape);
+        }
+        Ok(())
+    }
+}
+
+/// No production pin is registered yet, so the production wrapper fails closed.
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_production_preprocessing_pin() -> Option<BlsDoryBlake3TrustedPreprocessingPin> {
+    None
+}
+
+#[cfg(feature = "whir-prototype")]
+struct BlsDoryBlake3ExecutionRelation<'a> {
+    public: &'a [BlsDoryFr],
+    constraints: &'a [BlsDoryBlake3ConstraintExpr],
+    mixing_powers: &'a [BlsDoryFr],
+    raw_evaluation: BlsDoryFr,
+}
+
+#[cfg(feature = "whir-prototype")]
+#[derive(Clone, Copy)]
+struct BlsDoryBlake3AdjacencyRelation {
+    trace_rows: BlsDoryFr,
+    compression: BlsDoryFr,
+    alpha: BlsDoryFr,
+    local_mixing: [BlsDoryFr; 2],
+    rational_mixing: BlsDoryFr,
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_public_values(
+    statement: &StructuredBlake3Statement,
+) -> Result<Vec<BlsDoryFr>, BlsDoryAggregateError> {
+    public_values(statement)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| BlsDoryFr::from_i64(centered_goldilocks(value)))
+                .collect()
+        })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_execution_transcript(
+    bridge: &BlsDoryOutputBridgeStatement,
+    commitments: &BlsDoryBlake3SourceCommitments,
+) -> BlsDoryTranscript {
+    let mut transcript = BlsDoryTranscript::new(b"blake3-native-execution-sumcheck-v2");
+    transcript.append_bytes(b"protocol-version", &2_u16.to_le_bytes());
+    transcript.append_bytes(b"challenge-digest", &bridge.challenge_digest());
+    transcript.append_bytes(
+        b"activation-length",
+        &(bridge.final_activation_len() as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(b"activation-digest", &bridge.final_activation_digest());
+    transcript.append_bytes(b"dory-binding", &bridge.transcript_binding());
+    transcript.append_bytes(
+        b"point-count",
+        &(bridge.cell_point().len() as u64).to_le_bytes(),
+    );
+    for coordinate in bridge.cell_point() {
+        transcript.append_field(b"dory-point", coordinate);
+    }
+    transcript.append_field(b"raw-evaluation", &bridge.raw_byte_evaluation());
+    transcript.append_bytes(
+        b"source-count",
+        &(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS as u64).to_le_bytes(),
+    );
+    for (role, terminal_count) in [
+        BlsDoryBlake3SourceRole::Main,
+        BlsDoryBlake3SourceRole::Accumulator,
+        BlsDoryBlake3SourceRole::Preprocessing,
+    ]
+    .into_iter()
+    .zip(BLS_DORY_BLAKE3_EXECUTION_SOURCE_TERMINALS)
+    {
+        append_native_blake3_source_descriptor(
+            &mut transcript,
+            role,
+            terminal_count,
+            commitments.commitment(role),
+        );
+    }
+    transcript
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_constraint_powers(transcript: &mut BlsDoryTranscript) -> Vec<BlsDoryFr> {
+    let mixing = transcript.challenge_scalar(b"constraint-mixing");
+    let mut powers = Vec::with_capacity(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS);
+    let mut power = BlsDoryFr::from_u64(1);
+    for _ in 0..BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS {
+        powers.push(power);
+        power = power * mixing;
+    }
+    powers
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_cell_point(
+    transcript: &mut BlsDoryTranscript,
+    variables: usize,
+) -> Vec<BlsDoryFr> {
+    (0..variables)
+        .map(|index| {
+            transcript.append_bytes(b"cell-index", &(index as u64).to_le_bytes());
+            transcript.challenge_scalar(b"cell-point")
+        })
+        .collect()
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_absorb_sumcheck_round(
+    transcript: &mut BlsDoryTranscript,
+    round_index: usize,
+    evaluations: &[BlsDoryFr],
+) {
+    transcript.append_bytes(b"round-index", &(round_index as u64).to_le_bytes());
+    transcript.append_bytes(b"round-count", &(evaluations.len() as u64).to_le_bytes());
+    for evaluation in evaluations {
+        transcript.append_field(b"round-evaluation", evaluation);
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_absorb_terminal(transcript: &mut BlsDoryTranscript, terminal: &[BlsDoryFr]) {
+    transcript.append_bytes(b"terminal-count", &(terminal.len() as u64).to_le_bytes());
+    for evaluation in terminal {
+        transcript.append_field(b"terminal-evaluation", evaluation);
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_evaluate_samples(
+    values: &[BlsDoryFr],
+    expected_samples: usize,
+    point: BlsDoryFr,
+) -> Option<BlsDoryFr> {
+    if values.len() != expected_samples {
+        return None;
+    }
+    values
+        .iter()
+        .copied()
+        .enumerate()
+        .try_fold(BlsDoryFr::zero(), |result, (index, value)| {
+            let mut numerator = BlsDoryFr::from_u64(1);
+            let mut denominator = BlsDoryFr::from_u64(1);
+            for other in 0..values.len() {
+                if other != index {
+                    numerator = numerator * (point - BlsDoryFr::from_u64(other as u64));
+                    denominator = denominator * BlsDoryFr::from_i64(index as i64 - other as i64);
+                }
+            }
+            Some(result + value * numerator * denominator.inv()?)
+        })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_boolean_equality(index: usize, point: &[BlsDoryFr]) -> BlsDoryFr {
+    point
+        .iter()
+        .enumerate()
+        .fold(BlsDoryFr::from_u64(1), |weight, (variable, coordinate)| {
+            if (index >> variable) & 1 == 1 {
+                weight * *coordinate
+            } else {
+                weight * (BlsDoryFr::from_u64(1) - *coordinate)
+            }
+        })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_equality_evaluation(left: &[BlsDoryFr], right: &[BlsDoryFr]) -> Option<BlsDoryFr> {
+    if left.len() != right.len() {
+        return None;
+    }
+    Some(
+        left.iter()
+            .zip(right)
+            .fold(BlsDoryFr::from_u64(1), |product, (left, right)| {
+                product
+                    * ((BlsDoryFr::from_u64(1) - *left) * (BlsDoryFr::from_u64(1) - *right)
+                        + *left * *right)
+            }),
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_coefficient_terminal(
+    air: &NarrowBlake3Air,
+    dory_point: &[BlsDoryFr],
+    sumcheck_point: &[BlsDoryFr],
+) -> [BlsDoryFr; 8] {
+    let mut terminal = [BlsDoryFr::zero(); 8];
+    for row in 0..air.trace_rows() {
+        let equality = native_blake3_boolean_equality(row, sumcheck_point);
+        let coefficients =
+            native_byte_coefficients(air.activation_group_index_at_row(row), dory_point);
+        for byte in 0..8 {
+            terminal[byte] = terminal[byte] + equality * coefficients[byte];
+        }
+    }
+    terminal
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_execution_relation_value(
+    terminal: &[BlsDoryFr],
+    selectors: [BlsDoryFr; 3],
+    coefficients: &[BlsDoryFr; 8],
+    relation: &BlsDoryBlake3ExecutionRelation<'_>,
+) -> Result<BlsDoryFr, BlsDoryAggregateError> {
+    if terminal.len() != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+        || relation.constraints.len() + 3 != BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS
+        || relation.mixing_powers.len() != BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let main_next_start = BLS_DORY_BLAKE3_MAIN_WIDTH;
+    let preprocessed_local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+    let preprocessed_next_start = preprocessed_local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
+    let values = BlsDoryBlake3Evaluation {
+        main_local: &terminal[..main_next_start],
+        main_next: &terminal[main_next_start..preprocessed_local_start],
+        preprocessed_local: &terminal[preprocessed_local_start..preprocessed_next_start],
+        preprocessed_next: &terminal[preprocessed_next_start..],
+        public: relation.public,
+        periodic: &[],
+        first_row: selectors[0],
+        last_row: selectors[1],
+        transition: selectors[2],
+    };
+    let mut mixed = relation
+        .constraints
+        .iter()
+        .zip(relation.mixing_powers)
+        .fold(BlsDoryFr::zero(), |sum, (constraint, coefficient)| {
+            sum + constraint.evaluate(&values) * *coefficient
+        });
+    let native = native_evaluation_residuals_from_coefficients(
+        &BlsDoryNativeEvaluationRow {
+            main_local: values.main_local,
+            main_next: values.main_next,
+            first_row: values.first_row,
+            last_row: values.last_row,
+            transition: values.transition,
+        },
+        coefficients,
+        relation.raw_evaluation,
+    );
+    for (residual, coefficient) in native
+        .into_iter()
+        .zip(&relation.mixing_powers[relation.constraints.len()..])
+    {
+        mixed = mixed + residual * *coefficient;
+    }
+    Ok(mixed)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn verify_native_blake3_execution_sumcheck(
+    proof: &BlsDoryBlake3ExecutionSumcheckProof,
+    air: &NarrowBlake3Air,
+    public: &[BlsDoryFr],
+    constraints: &[BlsDoryBlake3ConstraintExpr],
+    bridge: &BlsDoryOutputBridgeStatement,
+    commitments: &BlsDoryBlake3SourceCommitments,
+) -> Result<VerifiedBlsDoryBlake3Sumcheck, BlsDoryAggregateError> {
+    let trace_rows = air.trace_rows();
+    if !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let variables = trace_rows.ilog2() as usize;
+    if proof.rounds.len() != variables
+        || proof.terminal_evaluations.len() != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+        || proof
+            .rounds
+            .iter()
+            .any(|round| round.len() != BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1)
+        || constraints.len() + 3 != BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let mut transcript = native_blake3_execution_transcript(bridge, commitments);
+    let mixing_powers = native_blake3_constraint_powers(&mut transcript);
+    let cell_point = native_blake3_cell_point(&mut transcript, variables);
+    let relation = BlsDoryBlake3ExecutionRelation {
+        public,
+        constraints,
+        mixing_powers: &mixing_powers,
+        raw_evaluation: bridge.raw_byte_evaluation(),
+    };
+    let mut claim = BlsDoryFr::zero();
+    let mut point = Vec::with_capacity(variables);
+    for (round_index, round) in proof.rounds.iter().enumerate() {
+        if round[0] + round[1] != claim {
+            return Err(BlsDoryAggregateError::SumcheckFailed);
+        }
+        native_blake3_absorb_sumcheck_round(&mut transcript, round_index, round);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = native_blake3_evaluate_samples(
+            round,
+            BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1,
+            challenge,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+        point.push(challenge);
+    }
+    let first = point
+        .iter()
+        .fold(BlsDoryFr::from_u64(1), |value, coordinate| {
+            value * (BlsDoryFr::from_u64(1) - *coordinate)
+        });
+    let last = point
+        .iter()
+        .fold(BlsDoryFr::from_u64(1), |value, coordinate| {
+            value * *coordinate
+        });
+    let selectors = [first, last, BlsDoryFr::from_u64(1) - last];
+    let coefficients = native_blake3_coefficient_terminal(air, bridge.cell_point(), &point);
+    let expected = native_blake3_equality_evaluation(&cell_point, &point)
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?
+        * native_blake3_execution_relation_value(
+            &proof.terminal_evaluations,
+            selectors,
+            &coefficients,
+            &relation,
+        )?;
+    if claim != expected {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    native_blake3_absorb_terminal(&mut transcript, &proof.terminal_evaluations);
+    let transcript_digest = transcript.digest();
+    if transcript_digest != proof.transcript_digest {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    Ok(VerifiedBlsDoryBlake3Sumcheck {
+        point,
+        transcript_digest,
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_adjacency_key(
+    values: impl IntoIterator<Item = BlsDoryFr>,
+    row_label: BlsDoryFr,
+    compression: BlsDoryFr,
+) -> BlsDoryFr {
+    values
+        .into_iter()
+        .fold(row_label, |key, value| key * compression + value)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_adjacency_relation_value(
+    terminal: &[BlsDoryFr],
+    row_index: BlsDoryFr,
+    first_row: BlsDoryFr,
+    equality: BlsDoryFr,
+    relation: BlsDoryBlake3AdjacencyRelation,
+) -> Option<BlsDoryFr> {
+    if terminal.len() != BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS {
+        return None;
+    }
+    let next_start = BLS_DORY_BLAKE3_MAIN_WIDTH;
+    let inverse_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+    let local_key = native_blake3_adjacency_key(
+        terminal[..next_start].iter().copied(),
+        row_index - BlsDoryFr::from_u64(1) + relation.trace_rows * first_row,
+        relation.compression,
+    );
+    let next_key = native_blake3_adjacency_key(
+        terminal[next_start..inverse_start].iter().copied(),
+        row_index,
+        relation.compression,
+    );
+    let local_inverse = terminal[inverse_start];
+    let next_inverse = terminal[inverse_start + 1];
+    let local_constraint = local_inverse * (relation.alpha - local_key) - BlsDoryFr::from_u64(1);
+    let next_constraint = next_inverse * (relation.alpha - next_key) - BlsDoryFr::from_u64(1);
+    Some(
+        equality
+            * (relation.local_mixing[0] * local_constraint
+                + relation.local_mixing[1] * next_constraint)
+            + relation.rational_mixing * (next_inverse - local_inverse),
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_row_index_evaluation(point: &[BlsDoryFr]) -> Option<BlsDoryFr> {
+    if point.len() >= u64::BITS as usize {
+        return None;
+    }
+    Some(
+        point
+            .iter()
+            .enumerate()
+            .fold(BlsDoryFr::zero(), |value, (variable, coordinate)| {
+                value + BlsDoryFr::from_u64(1_u64 << variable) * *coordinate
+            }),
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn verify_native_blake3_adjacency_sumcheck(
+    proof: &BlsDoryBlake3AdjacencySumcheckProof,
+    trace_rows: usize,
+    bridge: &BlsDoryOutputBridgeStatement,
+    commitments: &BlsDoryBlake3SourceCommitments,
+) -> Result<VerifiedBlsDoryBlake3Sumcheck, BlsDoryAggregateError> {
+    if !trace_rows.is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let variables = trace_rows.ilog2() as usize;
+    if proof.rounds.len() != variables
+        || proof.terminal_evaluations.len() != BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS
+        || proof
+            .rounds
+            .iter()
+            .any(|round| round.len() != BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1)
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let adjacency_sources = commitments.adjacency_sources();
+    let mut transcript =
+        native_blake3_adjacency_transcript(bridge, trace_rows, &adjacency_sources)?;
+    let compression = transcript.challenge_scalar(b"row-compression");
+    let alpha = transcript.challenge_scalar(b"lookup-alpha");
+    transcript.append_bytes(b"inverse-source-count", &1_u64.to_le_bytes());
+    append_native_blake3_source_descriptor(
+        &mut transcript,
+        BlsDoryBlake3SourceRole::Inverse,
+        BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES,
+        commitments.commitment(BlsDoryBlake3SourceRole::Inverse),
+    );
+    let local_mixing = [
+        transcript.challenge_scalar(b"local-mixing"),
+        transcript.challenge_scalar(b"local-mixing"),
+    ];
+    let rational_mixing = transcript.challenge_scalar(b"rational-mixing");
+    let equality_point = native_blake3_cell_point(&mut transcript, variables);
+    let relation = BlsDoryBlake3AdjacencyRelation {
+        trace_rows: BlsDoryFr::from_u64(trace_rows as u64),
+        compression,
+        alpha,
+        local_mixing,
+        rational_mixing,
+    };
+    let mut claim = BlsDoryFr::zero();
+    let mut point = Vec::with_capacity(variables);
+    for (round_index, round) in proof.rounds.iter().enumerate() {
+        if round[0] + round[1] != claim {
+            return Err(BlsDoryAggregateError::SumcheckFailed);
+        }
+        native_blake3_absorb_sumcheck_round(&mut transcript, round_index, round);
+        let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+        claim = native_blake3_evaluate_samples(
+            round,
+            BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1,
+            challenge,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+        point.push(challenge);
+    }
+    let first = point
+        .iter()
+        .fold(BlsDoryFr::from_u64(1), |value, coordinate| {
+            value * (BlsDoryFr::from_u64(1) - *coordinate)
+        });
+    let expected = native_blake3_adjacency_relation_value(
+        &proof.terminal_evaluations,
+        native_blake3_row_index_evaluation(&point)
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?,
+        first,
+        native_blake3_equality_evaluation(&equality_point, &point)
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?,
+        relation,
+    )
+    .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    if claim != expected {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    native_blake3_absorb_terminal(&mut transcript, &proof.terminal_evaluations);
+    let transcript_digest = transcript.digest();
+    if transcript_digest != proof.transcript_digest {
+        return Err(BlsDoryAggregateError::SumcheckFailed);
+    }
+    Ok(VerifiedBlsDoryBlake3Sumcheck {
+        point,
+        transcript_digest,
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_execution_selector_points(
+    sumcheck_digest: [u8; 32],
+    commitments: &BlsDoryBlake3SourceCommitments,
+) -> (
+    [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS],
+    [u8; 32],
+) {
+    let roles = [
+        BlsDoryBlake3SourceRole::Main,
+        BlsDoryBlake3SourceRole::Accumulator,
+        BlsDoryBlake3SourceRole::Preprocessing,
+    ];
+    let mut transcript = BlsDoryTranscript::new(b"blake3-native-execution-opening-selectors-v2");
+    transcript.append_bytes(b"protocol-version", &2_u16.to_le_bytes());
+    transcript.append_bytes(b"sumcheck-digest", &sumcheck_digest);
+    transcript.append_bytes(
+        b"source-count",
+        &(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS as u64).to_le_bytes(),
+    );
+    let points = std::array::from_fn(|source| {
+        transcript.append_bytes(b"source-index", &(source as u64).to_le_bytes());
+        append_native_blake3_source_descriptor(
+            &mut transcript,
+            roles[source],
+            BLS_DORY_BLAKE3_EXECUTION_SOURCE_TERMINALS[source],
+            commitments.commitment(roles[source]),
+        );
+        (0..BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES)
+            .map(|selector| {
+                transcript.append_bytes(b"selector-index", &(selector as u64).to_le_bytes());
+                transcript.challenge_scalar(b"opening-selector")
+            })
+            .collect()
+    });
+    (points, transcript.digest())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_adjacency_selector_points(
+    sumcheck_digest: [u8; 32],
+    commitments: &BlsDoryBlake3SourceCommitments,
+) -> (
+    [Vec<BlsDoryFr>; BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS],
+    [u8; 32],
+) {
+    let roles = [
+        BlsDoryBlake3SourceRole::Main,
+        BlsDoryBlake3SourceRole::Accumulator,
+        BlsDoryBlake3SourceRole::Inverse,
+    ];
+    let mut transcript = BlsDoryTranscript::new(b"blake3-native-adjacency-opening-selectors-v2");
+    transcript.append_bytes(b"protocol-version", &2_u16.to_le_bytes());
+    transcript.append_bytes(b"sumcheck-digest", &sumcheck_digest);
+    transcript.append_bytes(
+        b"source-count",
+        &(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS as u64).to_le_bytes(),
+    );
+    let points = std::array::from_fn(|source| {
+        transcript.append_bytes(b"source-index", &(source as u64).to_le_bytes());
+        append_native_blake3_source_descriptor(
+            &mut transcript,
+            roles[source],
+            BLS_DORY_BLAKE3_ADJACENCY_SOURCE_TERMINALS[source],
+            commitments.commitment(roles[source]),
+        );
+        (0..BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES)
+            .map(|selector| {
+                transcript.append_bytes(b"selector-index", &(selector as u64).to_le_bytes());
+                transcript.challenge_scalar(b"opening-selector")
+            })
+            .collect()
+    });
+    (points, transcript.digest())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_opening_binding(
+    bridge: &BlsDoryOutputBridgeStatement,
+    digests: BlsDoryBlake3OpeningTranscriptDigests,
+    geometry: BlsDoryBlake3ReplayGeometry,
+    verifier_context: &BlsDoryBlake3VerifierContext,
+    commitments: &BlsDoryBlake3SourceCommitments,
+) -> [u8; 32] {
+    let mut transcript = BlsDoryTranscript::new(b"blake3-native-six-opening-binding-v2");
+    transcript.append_bytes(b"protocol-version", &2_u16.to_le_bytes());
+    transcript.append_bytes(
+        b"projection-version",
+        &BLS_DORY_BLAKE3_PROJECTION_VERSION.to_le_bytes(),
+    );
+    transcript.append_bytes(b"challenge-digest", &bridge.challenge_digest());
+    transcript.append_bytes(
+        b"activation-length",
+        &(bridge.final_activation_len() as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(b"activation-digest", &bridge.final_activation_digest());
+    transcript.append_bytes(b"dory-binding", &bridge.transcript_binding());
+    transcript.append_bytes(
+        b"point-count",
+        &(bridge.cell_point().len() as u64).to_le_bytes(),
+    );
+    for coordinate in bridge.cell_point() {
+        transcript.append_field(b"dory-point", coordinate);
+    }
+    transcript.append_field(b"raw-evaluation", &bridge.raw_byte_evaluation());
+    transcript.append_bytes(b"execution-sumcheck-digest", &digests.execution_sumcheck);
+    transcript.append_bytes(b"adjacency-sumcheck-digest", &digests.adjacency_sumcheck);
+    transcript.append_bytes(b"execution-selector-digest", &digests.execution_selectors);
+    transcript.append_bytes(b"adjacency-selector-digest", &digests.adjacency_selectors);
+    transcript.append_bytes(
+        b"trace-variables",
+        &(geometry.trace_variables as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(
+        b"source-variables",
+        &(geometry.source_variables as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(
+        b"shared-variables",
+        &(geometry.shared_variables as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(
+        b"dory-nu",
+        &(verifier_context.layout.nu() as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(
+        b"dory-sigma",
+        &(verifier_context.layout.sigma() as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(b"setup-identity", &verifier_context.setup_identity);
+    transcript.append_bytes(
+        b"setup-max-log-n",
+        &(verifier_context.setup_max_log_n as u64).to_le_bytes(),
+    );
+    transcript.append_bytes(
+        b"source-count",
+        &(BLS_DORY_BLAKE3_SOURCE_ROLES.len() as u64).to_le_bytes(),
+    );
+    for (role, terminal_count) in BLS_DORY_BLAKE3_SOURCE_ROLES
+        .into_iter()
+        .zip(BLS_DORY_BLAKE3_SOURCE_TERMINALS)
+    {
+        append_native_blake3_source_descriptor(
+            &mut transcript,
+            role,
+            terminal_count,
+            commitments.commitment(role),
+        );
+    }
+    transcript.digest()
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_main_physical_terminal_index(physical_slot: usize) -> Option<usize> {
+    let ordinary_width = BLS_DORY_BLAKE3_MAIN_WIDTH.checked_sub(1)?;
+    if physical_slot >= 2 * ordinary_width
+        || NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START >= BLS_DORY_BLAKE3_MAIN_WIDTH
+    {
+        return None;
+    }
+    let direction = physical_slot / ordinary_width;
+    let ordinary_column = physical_slot % ordinary_width;
+    let logical_column = ordinary_column
+        + usize::from(ordinary_column >= NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START);
+    direction
+        .checked_mul(BLS_DORY_BLAKE3_MAIN_WIDTH)?
+        .checked_add(logical_column)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_terminal_selector_evaluation(
+    terminal: &[BlsDoryFr],
+    selector_point: &[BlsDoryFr],
+) -> Option<BlsDoryFr> {
+    let capacity = 1usize.checked_shl(selector_point.len() as u32)?;
+    if terminal.is_empty() || terminal.len() > capacity {
+        return None;
+    }
+    let mut layer = terminal.to_vec();
+    layer.resize(capacity, BlsDoryFr::zero());
+    for coordinate in selector_point {
+        for index in 0..layer.len() / 2 {
+            let low = layer[2 * index];
+            let high = layer[2 * index + 1];
+            layer[index] = low + *coordinate * (high - low);
+        }
+        layer.truncate(layer.len() / 2);
+    }
+    (layer.len() == 1).then_some(layer[0])
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_main_terminal_values(terminal: &[BlsDoryFr]) -> Option<Vec<BlsDoryFr>> {
+    if terminal.len() < 2 * BLS_DORY_BLAKE3_MAIN_WIDTH {
+        return None;
+    }
+    (0..BLS_DORY_BLAKE3_SIGNED_WORD_TABLES)
+        .map(|physical_slot| {
+            native_main_physical_terminal_index(physical_slot)
+                .and_then(|logical| terminal.get(logical).copied())
+        })
+        .collect()
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_accumulator_terminal_values(terminal: &[BlsDoryFr]) -> Option<Vec<BlsDoryFr>> {
+    let accumulator = NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START;
+    Some(vec![
+        *terminal.get(accumulator)?,
+        *terminal.get(BLS_DORY_BLAKE3_MAIN_WIDTH + accumulator)?,
+    ])
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_execution_evaluations(
+    terminal: &[BlsDoryFr],
+    selectors: &[Vec<BlsDoryFr>; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS],
+) -> Option<[BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS]> {
+    if terminal.len() != BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS
+        || selectors
+            .iter()
+            .any(|selector| selector.len() != BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES)
+    {
+        return None;
+    }
+    let main = native_blake3_main_terminal_values(terminal)?;
+    let accumulator = native_blake3_accumulator_terminal_values(terminal)?;
+    let preprocessed_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+    let preprocessing = (0..BLS_DORY_BLAKE3_EXECUTION_SOURCE_TERMINALS[2])
+        .map(|physical_slot| {
+            preprocessed_physical_terminal_index(physical_slot)
+                .and_then(|logical| terminal.get(preprocessed_start + logical).copied())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some([
+        native_blake3_terminal_selector_evaluation(&main, &selectors[0])?,
+        native_blake3_terminal_selector_evaluation(&accumulator, &selectors[1])?,
+        native_blake3_terminal_selector_evaluation(&preprocessing, &selectors[2])?,
+    ])
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_adjacency_evaluations(
+    terminal: &[BlsDoryFr],
+    selectors: &[Vec<BlsDoryFr>; BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS],
+) -> Option<[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS]> {
+    if terminal.len() != BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS
+        || selectors
+            .iter()
+            .any(|selector| selector.len() != BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES)
+    {
+        return None;
+    }
+    let main = native_blake3_main_terminal_values(terminal)?;
+    let accumulator = native_blake3_accumulator_terminal_values(terminal)?;
+    let inverse_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
+    let inverse = terminal.get(inverse_start..inverse_start + 2)?;
+    Some([
+        native_blake3_terminal_selector_evaluation(&main, &selectors[0])?,
+        native_blake3_terminal_selector_evaluation(&accumulator, &selectors[1])?,
+        native_blake3_terminal_selector_evaluation(inverse, &selectors[2])?,
+    ])
+}
+
+#[cfg(feature = "whir-prototype")]
+fn native_blake3_lifted_opening_point(
+    sumcheck_point: &[BlsDoryFr],
+    selector_point: &[BlsDoryFr],
+    source_variables: usize,
+    shared_variables: usize,
+) -> Option<Vec<BlsDoryFr>> {
+    if sumcheck_point.len() + selector_point.len() != source_variables
+        || source_variables > shared_variables
+    {
+        return None;
+    }
+    let mut point = Vec::with_capacity(shared_variables);
+    point.extend_from_slice(sumcheck_point);
+    point.extend_from_slice(selector_point);
+    point.resize(shared_variables, BlsDoryFr::zero());
+    Some(point)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn verify_native_blake3_opening_replay_at_geometry(
+    statement: &StructuredBlake3Statement,
+    bridge: &BlsDoryOutputBridgeStatement,
+    commitments: &BlsDoryBlake3SourceCommitments,
+    verifier: BlsDoryBlake3ReplayVerifier<'_>,
+    execution: &BlsDoryBlake3ExecutionSumcheckProof,
+    adjacency: &BlsDoryBlake3AdjacencySumcheckProof,
+) -> Result<BlsDoryBlake3OpeningReplay, BlsDoryAggregateError> {
+    let geometry = verifier.geometry;
+    if bridge.challenge_digest() != statement.challenge_digest
+        || bridge.final_activation_digest() != statement.final_activation_digest
+        || bridge.final_activation_len() != statement.final_activation_len
+        || !statement.final_activation_len.is_power_of_two()
+        || bridge.cell_point().len() != statement.final_activation_len.ilog2() as usize
+        || geometry.source_variables
+            != geometry.trace_variables + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES
+        || geometry.shared_variables != geometry.source_variables + 2
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let air =
+        NarrowBlake3Air::new(statement).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    if !air.trace_rows().is_power_of_two()
+        || air.trace_rows().ilog2() as usize != geometry.trace_variables
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    verifier.context.validate_geometry(geometry)?;
+    verifier.preprocessing_pin.validate(
+        statement,
+        air.trace_rows(),
+        geometry,
+        verifier.context,
+        commitments,
+    )?;
+    let public = native_blake3_public_values(statement)?;
+    let constraints = bls_dory_native_blake3_constraint_ir(statement.final_activation_len)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let execution_replay = verify_native_blake3_execution_sumcheck(
+        execution,
+        &air,
+        &public,
+        &constraints,
+        bridge,
+        commitments,
+    )?;
+    let adjacency_replay =
+        verify_native_blake3_adjacency_sumcheck(adjacency, air.trace_rows(), bridge, commitments)?;
+    let (execution_selectors, execution_selector_digest) =
+        native_blake3_execution_selector_points(execution_replay.transcript_digest, commitments);
+    let (adjacency_selectors, adjacency_selector_digest) =
+        native_blake3_adjacency_selector_points(adjacency_replay.transcript_digest, commitments);
+    let execution_evaluations =
+        native_blake3_execution_evaluations(&execution.terminal_evaluations, &execution_selectors)
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let adjacency_evaluations =
+        native_blake3_adjacency_evaluations(&adjacency.terminal_evaluations, &adjacency_selectors)
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+
+    let execution_points = execution_selectors
+        .iter()
+        .map(|selector| {
+            native_blake3_lifted_opening_point(
+                &execution_replay.point,
+                selector,
+                geometry.source_variables,
+                geometry.shared_variables,
+            )
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let adjacency_points = adjacency_selectors
+        .iter()
+        .map(|selector| {
+            let mut full_selector = selector.clone();
+            full_selector.push(BlsDoryFr::zero());
+            native_blake3_lifted_opening_point(
+                &adjacency_replay.point,
+                &full_selector,
+                geometry.source_variables,
+                geometry.shared_variables,
+            )
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let opening_binding = native_blake3_opening_binding(
+        bridge,
+        BlsDoryBlake3OpeningTranscriptDigests {
+            execution_sumcheck: execution_replay.transcript_digest,
+            adjacency_sumcheck: adjacency_replay.transcript_digest,
+            execution_selectors: execution_selector_digest,
+            adjacency_selectors: adjacency_selector_digest,
+        },
+        geometry,
+        verifier.context,
+        commitments,
+    );
+
+    Ok(BlsDoryBlake3OpeningReplay {
+        execution_points,
+        execution_evaluations,
+        adjacency_points,
+        adjacency_evaluations,
+        opening_binding,
+    })
+}
+
+/// Verify both native BLAKE3 sumchecks and bind their six verifier-derived
+/// openings at the immutable production geometry.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+fn verify_native_blake3_opening_statement(
+    statement: &StructuredBlake3Statement,
+    bridge: &BlsDoryOutputBridgeStatement,
+    commitments: BlsDoryBlake3SourceCommitments,
+    execution: &BlsDoryBlake3ExecutionSumcheckProof,
+    adjacency: &BlsDoryBlake3AdjacencySumcheckProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
+    if statement.final_activation_len != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let verifier_context =
+        BlsDoryBlake3VerifierContext::new(BlsDoryAggregateLayout::new(16, 17)?, setup)?;
+    let preprocessing_pin = native_blake3_production_preprocessing_pin()
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    let replay = verify_native_blake3_opening_replay_at_geometry(
+        statement,
+        bridge,
+        &commitments,
+        BlsDoryBlake3ReplayVerifier {
+            context: &verifier_context,
+            preprocessing_pin: &preprocessing_pin,
+            geometry: BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
+        },
+        execution,
+        adjacency,
+    )?;
+    BlsDoryBlake3OpeningStatement::from_verified_replay(commitments, replay)
 }
 
 #[cfg(all(test, feature = "whir-prototype"))]
@@ -1899,7 +3089,6 @@ fn create_native_main_transpose(
 #[cfg(feature = "whir-prototype")]
 fn create_native_preprocessed_transpose(
     air: &NarrowBlake3Air,
-    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
     scratch_directory: &std::path::Path,
 ) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
     let mut writer = BlsDoryWordTransposeWriter::create(
@@ -1911,7 +3100,7 @@ fn create_native_preprocessed_transpose(
     .map_err(blake3_transpose_error)?;
     let mut emitted = 0usize;
     let mut words = Vec::with_capacity(BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
-    for_each_preprocessed_trace_row(air, witness, |row_index, row| {
+    for_each_canonical_preprocessed_trace_row(air, |row_index, row| {
         if row_index != emitted || row.len() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
             return Err(BlsDoryTransposeError::InvalidShape);
         }
@@ -1948,8 +3137,7 @@ fn commit_native_blake3_sources_at_layout(
         NarrowBlake3Air::new(statement).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     validate_native_blake3_source_layout(air.trace_rows(), layout, setup)?;
 
-    let mut preprocessed_transpose =
-        create_native_preprocessed_transpose(&air, witness, scratch_directory)?;
+    let mut preprocessed_transpose = create_native_preprocessed_transpose(&air, scratch_directory)?;
     let preprocessing = {
         let mut source =
             TransposedPreprocessedRowSource::new_for_layout(&mut preprocessed_transpose, layout)
@@ -2410,10 +3598,29 @@ mod tests {
             inverse: BlsDoryGt::random(),
         };
 
+        let execution_trace = (0..BLS_DORY_BLAKE3_TRACE_VARIABLES)
+            .map(|coordinate| BlsDoryFr::from_u64(coordinate as u64 + 101))
+            .collect::<Vec<_>>();
+        let adjacency_trace = (0..BLS_DORY_BLAKE3_TRACE_VARIABLES)
+            .map(|coordinate| BlsDoryFr::from_u64(coordinate as u64 + 211))
+            .collect::<Vec<_>>();
         let points = (0..BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES.len())
             .map(|claim| {
                 let mut point = vec![BlsDoryFr::zero(); BLS_DORY_SHARED_PRODUCTION_VARIABLES];
-                point[0] = BlsDoryFr::from_u64(claim as u64 + 1);
+                let trace = if claim < BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS {
+                    &execution_trace
+                } else {
+                    &adjacency_trace
+                };
+                point[..BLS_DORY_BLAKE3_TRACE_VARIABLES].copy_from_slice(trace);
+                for selector in 0..BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES {
+                    point[BLS_DORY_BLAKE3_TRACE_VARIABLES + selector] =
+                        BlsDoryFr::from_u64((claim as u64 + 1) * 31 + selector as u64 + 1);
+                }
+                if claim >= BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS {
+                    point[BLS_DORY_BLAKE3_TRACE_VARIABLES
+                        + BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES] = BlsDoryFr::zero();
+                }
                 point
             })
             .collect::<Vec<_>>();
@@ -2468,6 +3675,27 @@ mod tests {
             BlsDoryBlake3OpeningStatement::from_verified_replay(
                 source_commitments.clone(),
                 blake3_opening_replay(&noncanonical_points, &evaluations),
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let mut mismatched_execution_prefix = points.clone();
+        mismatched_execution_prefix[1][0] =
+            mismatched_execution_prefix[1][0] + BlsDoryFr::from_u64(1);
+        assert_eq!(
+            BlsDoryBlake3OpeningStatement::from_verified_replay(
+                source_commitments.clone(),
+                blake3_opening_replay(&mismatched_execution_prefix, &evaluations),
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let mut nonzero_adjacency_half = points.clone();
+        nonzero_adjacency_half[3]
+            [BLS_DORY_BLAKE3_TRACE_VARIABLES + BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES] =
+            BlsDoryFr::from_u64(1);
+        assert_eq!(
+            BlsDoryBlake3OpeningStatement::from_verified_replay(
+                source_commitments.clone(),
+                blake3_opening_replay(&nonzero_adjacency_half, &evaluations),
             ),
             Err(BlsDoryAggregateError::InvalidProofShape)
         );
@@ -2887,12 +4115,32 @@ mod tests {
 
     #[cfg(feature = "whir-prototype")]
     fn prove_dense_execution_sumcheck(
-        mut tables: Vec<Vec<BlsDoryFr>>,
+        tables: Vec<Vec<BlsDoryFr>>,
         air: &NarrowBlake3Air,
         public: &[BlsDoryFr],
         constraints: &[BlsDoryBlake3ConstraintExpr],
         bridge: &BlsDoryOutputBridgeStatement,
         commitments: &[BlsDoryGt],
+    ) -> DenseExecutionSumcheckProof {
+        let transcript = dense_execution_transcript(bridge, commitments);
+        prove_dense_execution_sumcheck_with_transcript(
+            tables,
+            air,
+            public,
+            constraints,
+            bridge,
+            transcript,
+        )
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn prove_dense_execution_sumcheck_with_transcript(
+        mut tables: Vec<Vec<BlsDoryFr>>,
+        air: &NarrowBlake3Air,
+        public: &[BlsDoryFr],
+        constraints: &[BlsDoryBlake3ConstraintExpr],
+        bridge: &BlsDoryOutputBridgeStatement,
+        mut transcript: BlsDoryTranscript,
     ) -> DenseExecutionSumcheckProof {
         assert_eq!(tables.len(), BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS);
         let rows = tables[0].len();
@@ -2900,7 +4148,6 @@ mod tests {
         assert!(tables.iter().all(|table| table.len() == rows));
         assert_eq!(constraints.len() + 3, BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS);
         let variables = rows.ilog2() as usize;
-        let mut transcript = dense_execution_transcript(bridge, commitments);
         let mixing_powers = dense_constraint_powers(&mut transcript);
         let cell_point = dense_cell_point(&mut transcript, variables);
         let relation = DenseExecutionRelation {
@@ -3227,10 +4474,27 @@ mod tests {
 
     #[cfg(feature = "whir-prototype")]
     fn prove_dense_adjacency_sumcheck(
-        mut source_tables: Vec<Vec<BlsDoryFr>>,
+        source_tables: Vec<Vec<BlsDoryFr>>,
         bridge: &BlsDoryOutputBridgeStatement,
         source_commitments: &[BlsDoryGt],
         inverse_commitments: &[BlsDoryGt],
+    ) -> Option<DenseAdjacencySumcheckProof> {
+        let rows = source_tables.first()?.len();
+        let transcript = dense_adjacency_transcript(bridge, rows, source_commitments);
+        prove_dense_adjacency_sumcheck_with_transcript(
+            source_tables,
+            inverse_commitments,
+            transcript,
+            false,
+        )
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn prove_dense_adjacency_sumcheck_with_transcript(
+        mut source_tables: Vec<Vec<BlsDoryFr>>,
+        inverse_commitments: &[BlsDoryGt],
+        mut transcript: BlsDoryTranscript,
+        named_inverse: bool,
     ) -> Option<DenseAdjacencySumcheckProof> {
         let rows = source_tables.first()?.len();
         if source_tables.len() != 2 * BLS_DORY_BLAKE3_MAIN_WIDTH
@@ -3240,17 +4504,29 @@ mod tests {
             return None;
         }
         let variables = rows.ilog2() as usize;
-        let mut transcript = dense_adjacency_transcript(bridge, rows, source_commitments);
         let compression = transcript.challenge_scalar(b"row-compression");
         let alpha = transcript.challenge_scalar(b"lookup-alpha");
         let inverses = dense_adjacency_inverse_tables(&source_tables, compression, alpha)?;
         source_tables.extend(inverses);
-        transcript.append_bytes(
-            b"inverse-commitment-count",
-            &(inverse_commitments.len() as u64).to_le_bytes(),
-        );
-        for commitment in inverse_commitments {
-            transcript.append_group(b"packed-adjacency-inverse-commitment", commitment);
+        if named_inverse {
+            let [inverse_commitment] = inverse_commitments else {
+                return None;
+            };
+            transcript.append_bytes(b"inverse-source-count", &1_u64.to_le_bytes());
+            append_native_blake3_source_descriptor(
+                &mut transcript,
+                BlsDoryBlake3SourceRole::Inverse,
+                BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES,
+                inverse_commitment,
+            );
+        } else {
+            transcript.append_bytes(
+                b"inverse-commitment-count",
+                &(inverse_commitments.len() as u64).to_le_bytes(),
+            );
+            for commitment in inverse_commitments {
+                transcript.append_group(b"packed-adjacency-inverse-commitment", commitment);
+            }
         }
         let local_mixing = [
             transcript.challenge_scalar(b"local-mixing"),
@@ -3562,6 +4838,7 @@ mod tests {
             execution_evaluations: [evaluations[0], evaluations[1], evaluations[2]],
             adjacency_points: [points[3].clone(), points[4].clone(), points[5].clone()],
             adjacency_evaluations: [evaluations[3], evaluations[4], evaluations[5]],
+            opening_binding: [0u8; 32],
         }
     }
 
@@ -4570,6 +5847,430 @@ mod tests {
             bridge,
             air,
         }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn named_replay_sumcheck_proofs(
+        fixture: &DenseBlake3Fixture,
+        commitments: &BlsDoryBlake3SourceCommitments,
+    ) -> (
+        BlsDoryBlake3ExecutionSumcheckProof,
+        BlsDoryBlake3AdjacencySumcheckProof,
+    ) {
+        let execution = prove_dense_execution_sumcheck_with_transcript(
+            fixture.tables.clone(),
+            &fixture.air,
+            &fixture.public,
+            &fixture.constraints,
+            &fixture.bridge,
+            native_blake3_execution_transcript(&fixture.bridge, commitments),
+        );
+        let adjacency_sources = commitments.adjacency_sources();
+        let adjacency = prove_dense_adjacency_sumcheck_with_transcript(
+            dense_adjacency_source_tables(&fixture.tables),
+            &[*commitments.commitment(BlsDoryBlake3SourceRole::Inverse)],
+            native_blake3_adjacency_transcript(
+                &fixture.bridge,
+                fixture.air.trace_rows(),
+                &adjacency_sources,
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+        (
+            BlsDoryBlake3ExecutionSumcheckProof {
+                rounds: execution.rounds,
+                terminal_evaluations: execution.terminal_evaluations,
+                transcript_digest: execution.transcript_digest,
+            },
+            BlsDoryBlake3AdjacencySumcheckProof {
+                rounds: adjacency.rounds,
+                terminal_evaluations: adjacency.terminal_evaluations,
+                transcript_digest: adjacency.transcript_digest,
+            },
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn verifier_context_validates_and_captures_small_real_setup() {
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(6).unwrap();
+        let layout = BlsDoryAggregateLayout::new(3, 3).unwrap();
+        let context = BlsDoryBlake3VerifierContext::new(layout, &setup).unwrap();
+        assert_eq!(context.layout, layout);
+        assert_eq!(context.setup_identity, setup.identity());
+        assert_eq!(context.setup_max_log_n, setup.max_log_n());
+        assert_eq!(
+            BlsDoryBlake3VerifierContext::new(BlsDoryAggregateLayout::new(3, 4).unwrap(), &setup,),
+            Err(BlsDoryAggregateError::InvalidDimension)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn verifier_owned_replay_derives_six_fixed_named_claims() {
+        let fixture = dense_blake3_fixture();
+        let commitments = BlsDoryBlake3SourceCommitments {
+            main: BlsDoryGt::random(),
+            accumulator: BlsDoryGt::random(),
+            preprocessing: BlsDoryGt::random(),
+            inverse: BlsDoryGt::random(),
+        };
+        let (execution, adjacency) = named_replay_sumcheck_proofs(&fixture, &commitments);
+        let trace_variables = fixture.air.trace_rows().ilog2() as usize;
+        let source_variables = trace_variables + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES;
+        let shared_variables = source_variables + 2;
+        let geometry = BlsDoryBlake3ReplayGeometry {
+            trace_variables,
+            source_variables,
+            shared_variables,
+        };
+        let verifier_context = BlsDoryBlake3VerifierContext::for_test_metadata(
+            BlsDoryAggregateLayout::new(10, 11).unwrap(),
+            [0x61; 32],
+            21,
+        )
+        .unwrap();
+        let preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.statement,
+            fixture.air.trace_rows(),
+            geometry,
+            &verifier_context,
+            &commitments,
+        );
+        let replay_verifier = BlsDoryBlake3ReplayVerifier {
+            context: &verifier_context,
+            preprocessing_pin: &preprocessing_pin,
+            geometry,
+        };
+        let replay = verify_native_blake3_opening_replay_at_geometry(
+            &fixture.statement,
+            &fixture.bridge,
+            &commitments,
+            replay_verifier,
+            &execution,
+            &adjacency,
+        )
+        .unwrap();
+
+        assert!(
+            replay
+                .execution_points
+                .iter()
+                .chain(&replay.adjacency_points)
+                .all(|point| {
+                    point.len() == shared_variables
+                        && point[source_variables..]
+                            .iter()
+                            .all(|coordinate| *coordinate == BlsDoryFr::zero())
+                })
+        );
+        assert!(
+            replay
+                .execution_points
+                .iter()
+                .all(|point| point[..trace_variables]
+                    == replay.execution_points[0][..trace_variables])
+        );
+        assert!(
+            replay
+                .adjacency_points
+                .iter()
+                .all(|point| point[..trace_variables]
+                    == replay.adjacency_points[0][..trace_variables]
+                    && point[trace_variables + BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES]
+                        == BlsDoryFr::zero())
+        );
+        assert_ne!(replay.execution_points[0], replay.adjacency_points[0]);
+
+        let statement = BlsDoryBlake3OpeningStatement::from_verified_replay_at_geometry(
+            commitments.clone(),
+            replay.clone(),
+            geometry,
+        )
+        .unwrap();
+        assert_eq!(statement.opening_binding(), replay.opening_binding);
+        let points = [
+            replay.execution_points[0].clone(),
+            replay.execution_points[1].clone(),
+            replay.execution_points[2].clone(),
+            replay.adjacency_points[0].clone(),
+            replay.adjacency_points[1].clone(),
+            replay.adjacency_points[2].clone(),
+        ];
+        let evaluations = [
+            replay.execution_evaluations[0],
+            replay.execution_evaluations[1],
+            replay.execution_evaluations[2],
+            replay.adjacency_evaluations[0],
+            replay.adjacency_evaluations[1],
+            replay.adjacency_evaluations[2],
+        ];
+        let claims = BLS_DORY_BLAKE3_OPENING_SOURCE_ROLES
+            .iter()
+            .enumerate()
+            .map(|(index, role)| BlsDoryOpeningClaim {
+                commitment: *commitments.commitment(*role),
+                point: points[index].clone(),
+                evaluation: evaluations[index],
+            })
+            .collect::<Vec<_>>();
+        statement.validate_claims(&claims).unwrap();
+
+        let mut wrong_execution_round = execution.clone();
+        wrong_execution_round.rounds[0][0] =
+            wrong_execution_round.rounds[0][0] + BlsDoryFr::from_u64(1);
+        assert_eq!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                replay_verifier,
+                &wrong_execution_round,
+                &adjacency,
+            ),
+            Err(BlsDoryAggregateError::SumcheckFailed)
+        );
+
+        let mut wrong_execution_terminal = execution.clone();
+        wrong_execution_terminal.terminal_evaluations[0] =
+            wrong_execution_terminal.terminal_evaluations[0] + BlsDoryFr::from_u64(1);
+        assert!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                replay_verifier,
+                &wrong_execution_terminal,
+                &adjacency,
+            )
+            .is_err()
+        );
+
+        let mut wrong_adjacency_digest = adjacency.clone();
+        wrong_adjacency_digest.transcript_digest[0] ^= 1;
+        assert_eq!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                replay_verifier,
+                &execution,
+                &wrong_adjacency_digest,
+            ),
+            Err(BlsDoryAggregateError::SumcheckFailed)
+        );
+
+        let swapped = BlsDoryBlake3SourceCommitments {
+            main: commitments.accumulator,
+            accumulator: commitments.main,
+            preprocessing: commitments.preprocessing,
+            inverse: commitments.inverse,
+        };
+        assert!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &swapped,
+                replay_verifier,
+                &execution,
+                &adjacency,
+            )
+            .is_err()
+        );
+
+        let wrong_preprocessing = loop {
+            let candidate = BlsDoryGt::random();
+            if candidate != commitments.preprocessing {
+                break candidate;
+            }
+        };
+        let wrong_pin_sources = BlsDoryBlake3SourceCommitments {
+            preprocessing: wrong_preprocessing,
+            ..commitments.clone()
+        };
+        let wrong_commitment_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.statement,
+            fixture.air.trace_rows(),
+            geometry,
+            &verifier_context,
+            &wrong_pin_sources,
+        );
+        assert_eq!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                BlsDoryBlake3ReplayVerifier {
+                    context: &verifier_context,
+                    preprocessing_pin: &wrong_commitment_pin,
+                    geometry,
+                },
+                &execution,
+                &adjacency,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let wrong_pin_geometry = BlsDoryBlake3ReplayGeometry {
+            shared_variables: geometry.shared_variables + 1,
+            ..geometry
+        };
+        let wrong_shape_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.statement,
+            fixture.air.trace_rows(),
+            wrong_pin_geometry,
+            &verifier_context,
+            &commitments,
+        );
+        assert_eq!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                BlsDoryBlake3ReplayVerifier {
+                    context: &verifier_context,
+                    preprocessing_pin: &wrong_shape_pin,
+                    geometry,
+                },
+                &execution,
+                &adjacency,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let wrong_layout_context = BlsDoryBlake3VerifierContext::for_test_metadata(
+            BlsDoryAggregateLayout::new(9, 12).unwrap(),
+            verifier_context.setup_identity,
+            verifier_context.setup_max_log_n,
+        )
+        .unwrap();
+        let wrong_layout_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.statement,
+            fixture.air.trace_rows(),
+            geometry,
+            &wrong_layout_context,
+            &commitments,
+        );
+        assert_eq!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                BlsDoryBlake3ReplayVerifier {
+                    context: &verifier_context,
+                    preprocessing_pin: &wrong_layout_pin,
+                    geometry,
+                },
+                &execution,
+                &adjacency,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+        let mut wrong_setup_context = verifier_context.clone();
+        wrong_setup_context.setup_identity[0] ^= 1;
+        let wrong_setup_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.statement,
+            fixture.air.trace_rows(),
+            geometry,
+            &wrong_setup_context,
+            &commitments,
+        );
+        assert_eq!(
+            verify_native_blake3_opening_replay_at_geometry(
+                &fixture.statement,
+                &fixture.bridge,
+                &commitments,
+                BlsDoryBlake3ReplayVerifier {
+                    context: &verifier_context,
+                    preprocessing_pin: &wrong_setup_pin,
+                    geometry,
+                },
+                &execution,
+                &adjacency,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+
+        let mut nonzero_fixed_selector = replay.clone();
+        nonzero_fixed_selector.adjacency_points[0]
+            [trace_variables + BLS_DORY_BLAKE3_ADJACENCY_SELECTOR_VARIABLES] =
+            BlsDoryFr::from_u64(1);
+        assert_eq!(
+            BlsDoryBlake3OpeningStatement::from_verified_replay_at_geometry(
+                commitments.clone(),
+                nonzero_fixed_selector,
+                geometry,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+
+        let (execution_selectors, execution_selector_digest) =
+            native_blake3_execution_selector_points(execution.transcript_digest, &commitments);
+        let (_, adjacency_selector_digest) =
+            native_blake3_adjacency_selector_points(adjacency.transcript_digest, &commitments);
+        assert_eq!(
+            replay.opening_binding,
+            native_blake3_opening_binding(
+                &fixture.bridge,
+                BlsDoryBlake3OpeningTranscriptDigests {
+                    execution_sumcheck: execution.transcript_digest,
+                    adjacency_sumcheck: adjacency.transcript_digest,
+                    execution_selectors: execution_selector_digest,
+                    adjacency_selectors: adjacency_selector_digest,
+                },
+                geometry,
+                &verifier_context,
+                &commitments,
+            )
+        );
+        let mut changed_sumcheck_digest = execution.transcript_digest;
+        changed_sumcheck_digest[0] ^= 1;
+        let (changed_selectors, changed_selector_digest) =
+            native_blake3_execution_selector_points(changed_sumcheck_digest, &commitments);
+        assert_ne!(changed_selectors, execution_selectors);
+        assert_ne!(changed_selector_digest, execution_selector_digest);
+        assert_ne!(
+            native_blake3_opening_binding(
+                &fixture.bridge,
+                BlsDoryBlake3OpeningTranscriptDigests {
+                    execution_sumcheck: changed_sumcheck_digest,
+                    adjacency_sumcheck: adjacency.transcript_digest,
+                    execution_selectors: changed_selector_digest,
+                    adjacency_selectors: adjacency_selector_digest,
+                },
+                geometry,
+                &verifier_context,
+                &commitments,
+            ),
+            replay.opening_binding
+        );
+        let changed_commitments = BlsDoryBlake3SourceCommitments {
+            main: BlsDoryGt::random(),
+            ..commitments.clone()
+        };
+        let (_, changed_execution_selector_digest) = native_blake3_execution_selector_points(
+            execution.transcript_digest,
+            &changed_commitments,
+        );
+        let (_, changed_adjacency_selector_digest) = native_blake3_adjacency_selector_points(
+            adjacency.transcript_digest,
+            &changed_commitments,
+        );
+        assert_ne!(
+            native_blake3_opening_binding(
+                &fixture.bridge,
+                BlsDoryBlake3OpeningTranscriptDigests {
+                    execution_sumcheck: execution.transcript_digest,
+                    adjacency_sumcheck: adjacency.transcript_digest,
+                    execution_selectors: changed_execution_selector_digest,
+                    adjacency_selectors: changed_adjacency_selector_digest,
+                },
+                geometry,
+                &verifier_context,
+                &changed_commitments,
+            ),
+            replay.opening_binding
+        );
     }
 
     #[test]
@@ -6074,8 +7775,46 @@ mod tests {
             named.clone(),
         )
         .unwrap();
-        let mut reference =
-            dense_adjacency_transcript(&fixture.bridge, fixture.air.trace_rows(), &commitments);
+        let mut reference = BlsDoryTranscript::new(b"blake3-native-row-adjacency-sumcheck-v2");
+        reference.append_bytes(b"protocol-version", &2_u16.to_le_bytes());
+        reference.append_bytes(b"challenge-digest", &fixture.bridge.challenge_digest());
+        reference.append_bytes(
+            b"activation-length",
+            &(fixture.bridge.final_activation_len() as u64).to_le_bytes(),
+        );
+        reference.append_bytes(
+            b"activation-digest",
+            &fixture.bridge.final_activation_digest(),
+        );
+        reference.append_bytes(b"dory-binding", &fixture.bridge.transcript_binding());
+        reference.append_bytes(
+            b"trace-rows",
+            &(fixture.air.trace_rows() as u64).to_le_bytes(),
+        );
+        reference.append_bytes(
+            b"main-width",
+            &(BLS_DORY_BLAKE3_MAIN_WIDTH as u64).to_le_bytes(),
+        );
+        reference.append_bytes(
+            b"source-count",
+            &(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS as u64).to_le_bytes(),
+        );
+        for ((role, terminal_count), commitment) in [
+            BlsDoryBlake3SourceRole::Main,
+            BlsDoryBlake3SourceRole::Accumulator,
+            BlsDoryBlake3SourceRole::Preprocessing,
+        ]
+        .into_iter()
+        .zip(BLS_DORY_BLAKE3_EXECUTION_SOURCE_TERMINALS)
+        .zip(&commitments)
+        {
+            append_native_blake3_source_descriptor(
+                &mut reference,
+                role,
+                terminal_count,
+                commitment,
+            );
+        }
         assert_eq!(
             derived,
             (
@@ -6175,7 +7914,13 @@ mod tests {
     #[ignore = "bounded four-source Dory aggregate; run explicitly in --release"]
     fn four_source_six_claim_aggregate_uses_canonical_blake3_routing() {
         const SOURCE_VARIABLES: usize = 10;
+        const TRACE_VARIABLES: usize = 4;
         let layout = BlsDoryAggregateLayout::new(5, 7).unwrap();
+        let replay_geometry = BlsDoryBlake3ReplayGeometry {
+            trace_variables: TRACE_VARIABLES,
+            source_variables: SOURCE_VARIABLES,
+            shared_variables: layout.variables(),
+        };
         let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(14).unwrap();
         let [main, accumulator, preprocessing, inverse] = std::array::from_fn(|source| {
             let mut coefficients = (0..1 << SOURCE_VARIABLES)
@@ -6204,15 +7949,34 @@ mod tests {
             );
         }
 
+        let execution_trace = (0..TRACE_VARIABLES)
+            .map(|coordinate| BlsDoryFr::from_u64(coordinate as u64 + 71))
+            .collect::<Vec<_>>();
+        let adjacency_trace = (0..TRACE_VARIABLES)
+            .map(|coordinate| BlsDoryFr::from_u64(coordinate as u64 + 173))
+            .collect::<Vec<_>>();
         let points = (0..BLS_DORY_BLAKE3_OPENING_SOURCE_INDICES.len())
             .map(|claim| {
-                let mut point = (0..SOURCE_VARIABLES)
-                    .map(|coordinate| {
-                        BlsDoryFr::from_u64(
-                            (claim as u64 + 3) * 101 + (coordinate as u64 + 5) * 103,
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let mut point = vec![BlsDoryFr::zero(); SOURCE_VARIABLES];
+                let trace = if claim < BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS {
+                    &execution_trace
+                } else {
+                    &adjacency_trace
+                };
+                point[..TRACE_VARIABLES].copy_from_slice(trace);
+                for (coordinate, value) in point
+                    .iter_mut()
+                    .enumerate()
+                    .take(SOURCE_VARIABLES)
+                    .skip(TRACE_VARIABLES)
+                {
+                    *value = BlsDoryFr::from_u64(
+                        (claim as u64 + 3) * 101 + (coordinate as u64 + 5) * 103,
+                    );
+                }
+                if claim >= BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS {
+                    point[SOURCE_VARIABLES - 1] = BlsDoryFr::zero();
+                }
                 point.resize(layout.variables(), BlsDoryFr::zero());
                 point
             })
@@ -6262,11 +8026,10 @@ mod tests {
             .map(|claim| claim.evaluation)
             .collect::<Vec<_>>();
         let opening_replay = blake3_opening_replay(&expected_points, &expected_evaluations);
-        let opening_statement = BlsDoryBlake3OpeningStatement::from_verified_replay_at_variables(
+        let opening_statement = BlsDoryBlake3OpeningStatement::from_verified_replay_at_geometry(
             source_commitments.clone(),
             opening_replay,
-            SOURCE_VARIABLES,
-            layout.variables(),
+            replay_geometry,
         )
         .unwrap();
         assert_eq!(claims, opening_set.claims());
@@ -6310,11 +8073,10 @@ mod tests {
         let noncanonical_lift_replay =
             blake3_opening_replay(&noncanonical_lift_points, &expected_evaluations);
         assert_eq!(
-            BlsDoryBlake3OpeningStatement::from_verified_replay_at_variables(
+            BlsDoryBlake3OpeningStatement::from_verified_replay_at_geometry(
                 source_commitments,
                 noncanonical_lift_replay,
-                SOURCE_VARIABLES,
-                layout.variables(),
+                replay_geometry,
             ),
             Err(BlsDoryAggregateError::InvalidProofShape)
         );

@@ -383,11 +383,14 @@ open.
 The 256-row composed fixture reuses the exact same three bounded main
 commitments in execution and adjacency. One aggregate authenticates four
 execution openings, three adjacency openings of those same commitments at the
-adjacency sumcheck point, and one inverse opening. An unoptimized debug run
-verified in 193.89 seconds. Substituting a shared commitment, adjacency
+adjacency sumcheck point, and one inverse opening. Three optimized repeats
+proved in 8.298--8.621 seconds with an 8.476-second median, verified in
+0.759--0.773 seconds with a 0.762-second median, and retained an identical
+34,015-byte opening. Substituting a shared commitment, adjacency
 terminal, inverse commitment, or aggregate proof fails. This closes the
 independent-trace substitution in the bounded fixture; the unified production
-commitment path and its measurements remain activation gates.
+commitment path, peak memory, and complete production measurements remain
+activation gates.
 
 The composed algebraic soundness report now includes constraint mixing,
 execution and adjacency equality points, both sumchecks, row compression, the

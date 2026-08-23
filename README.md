@@ -323,12 +323,15 @@ soundness bound remain open.
 The composed 256-row fixture now reuses the exact same three bounded main
 commitments in both sumchecks. Its single Dory aggregate has eight openings:
 four for execution, three for adjacency at its independent sumcheck point, and
-one for the inverse commitment. It verified in 193.89 seconds in an unoptimized
-debug run. Replacing a shared source commitment, an adjacency terminal, the
+one for the inverse commitment. Three optimized repeats proved in
+8.298--8.621 seconds (8.476-second median), verified in 0.759--0.773 seconds
+(0.762-second median), and produced the same 34,015-byte aggregate opening.
+Replacing a shared source commitment, an adjacency terminal, the
 inverse commitment, or the aggregate proof is rejected. The production layout
 compresses the four bounded execution groups into the one 31-variable source
 commitment described above; this remains a projection until the out-of-core
-path is implemented.
+path is implemented. These are 256-row, 16-variable fixture measurements, not
+production extrapolations.
 
 An executable production-geometry union bound now itemizes every added
 algebraic reduction. The largest terms are 303,038,464 for row compression and

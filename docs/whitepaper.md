@@ -732,12 +732,15 @@ The composed 256-row fixture now proves that execution and adjacency refer to
 one source identity. Four bounded execution commitments separate three main
 groups from one preprocessing group. Adjacency reopens the exact same three main
 commitments at its own sumcheck point and adds one inverse commitment. A single
-eight-claim Dory aggregate verified in 193.89 seconds in an unoptimized debug
-run. Replacing a shared source commitment, an adjacency terminal, the inverse
+eight-claim Dory aggregate produced the same 34,015-byte opening in three
+optimized repeats. Proving took 8.298--8.621 seconds with an 8.476-second median;
+verification took 0.759--0.773 seconds with a 0.762-second median. Replacing a
+shared source commitment, an adjacency terminal, the inverse
 commitment, or the aggregate proof is rejected. Production projects the four
 bounded source groups into one 31-variable commitment whose two 1,024-slot
 halves separate main and preprocessing tables. The unified out-of-core prover
-and a measured production run remain open.
+and a measured production run remain open; the reported timings cover only the
+256-row, 16-variable fixture and do not measure peak memory.
 
 The production-geometry algebraic union bound is now executable. Execution
 accounts for constraint mixing, the local equality point, twenty degree-17

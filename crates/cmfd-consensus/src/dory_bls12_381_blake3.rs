@@ -3122,6 +3122,7 @@ mod tests {
     fn native_execution_and_adjacency_share_authenticated_source_commitments() {
         let fixture = dense_blake3_fixture();
         let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
+        let proving_started = std::time::Instant::now();
         let authenticated = prove_dense_authenticated_blake3(
             fixture.tables,
             &fixture.air,
@@ -3131,17 +3132,27 @@ mod tests {
             &setup,
         )
         .unwrap();
+        let proving_elapsed = proving_started.elapsed();
         assert_eq!(authenticated.execution_batches.len(), 4);
         assert_eq!(authenticated.execution_sumcheck.rounds.len(), 8);
         assert_eq!(authenticated.adjacency_sumcheck.rounds.len(), 8);
-        assert!(verify_dense_authenticated_blake3(
+        let verification_started = std::time::Instant::now();
+        let verified = verify_dense_authenticated_blake3(
             &authenticated,
             &fixture.air,
             &fixture.public,
             &fixture.constraints,
             &fixture.bridge,
             &setup,
-        ));
+        );
+        let verification_elapsed = verification_started.elapsed();
+        eprintln!(
+            "composed BLAKE3 fixture: prove_ms={} verify_ms={} opening_bytes={}",
+            proving_elapsed.as_millis(),
+            verification_elapsed.as_millis(),
+            authenticated.opening_proof.len(),
+        );
+        assert!(verified);
 
         let mut changed_shared_source = authenticated.clone();
         changed_shared_source.execution_batches[0].commitment =

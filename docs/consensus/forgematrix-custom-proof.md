@@ -1094,12 +1094,16 @@ The composed 256-row fixture passes the first end-to-end source-identity gate.
 Execution uses four bounded commitments: three main groups and one preprocessing
 group. Adjacency reuses the exact three main commitments at its independent
 sumcheck point and adds only the inverse commitment. One eight-claim Dory
-aggregate authenticates all of those openings and verified in 193.89 seconds in
-an unoptimized debug run. Shared-source substitution, adjacency-terminal
+aggregate authenticates all of those openings. Three optimized repeats proved
+in 8.298--8.621 seconds (8.476-second median), verified in 0.759--0.773 seconds
+(0.762-second median), and emitted the same 34,015-byte aggregate opening.
+Shared-source substitution, adjacency-terminal
 substitution, inverse-commitment substitution, and opening-proof mutation are
 all rejected. At production geometry the four bounded source groups project to
 one 31-variable source commitment with main and preprocessing tables in separate
-halves. That unification and its out-of-core prover are not implemented.
+halves. These measurements cover the 256-row, 16-variable fixture only. That
+unification, its out-of-core prover, and peak-memory measurement are not
+implemented.
 
 The executable production-geometry algebraic report now closes the accounting
 list, though not its review gate. Execution contributes constraint-mixing,

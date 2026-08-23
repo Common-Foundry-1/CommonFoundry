@@ -50,6 +50,8 @@ pub const BLS_DORY_AGGREGATE_VERSION: u16 = 1;
 pub const BLS_DORY_AGGREGATE_SUMCHECK_DEGREE: usize = 2;
 /// Maximum number of claims admitted by the research verifier.
 pub const MAX_BLS_DORY_AGGREGATE_CLAIMS: usize = 128;
+#[cfg(test)]
+const TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS: usize = 134;
 /// Same proof-payload ceiling enforced by the production candidate frame.
 pub const MAX_BLS_DORY_AGGREGATE_BYTES: usize = 262_128;
 /// This aggregate remains unavailable to consensus activation.
@@ -2412,6 +2414,27 @@ pub fn prove_bls_dory_same_commitment_openings(
     )
 }
 
+#[cfg(test)]
+fn prove_bls_dory_same_commitment_openings_with_test_claim_limit(
+    public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
+    polynomial: &BlsDoryCommittedPolynomial,
+    points: &[Vec<BlsDoryFr>],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let polynomial_refs = vec![polynomial; points.len()];
+    let prepared = prepare_bls_dory_opening_refs_with_claim_limit(
+        public_binding,
+        layout,
+        &polynomial_refs,
+        points,
+        setup,
+        None,
+        TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS,
+    )?;
+    finish_prepared_bls_dory_opening(prepared, setup)
+}
+
 struct PreparedBlsDoryOpeningProof {
     claims: Vec<BlsDoryOpeningClaim>,
     transcript: BlsDoryTranscript,
@@ -2451,10 +2474,30 @@ fn prepare_bls_dory_opening_refs(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
 ) -> Result<PreparedBlsDoryOpeningProof, BlsDoryAggregateError> {
+    prepare_bls_dory_opening_refs_with_claim_limit(
+        public_binding,
+        layout,
+        polynomials,
+        points,
+        setup,
+        scratch_directory,
+        MAX_BLS_DORY_AGGREGATE_CLAIMS,
+    )
+}
+
+fn prepare_bls_dory_opening_refs_with_claim_limit(
+    public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
+    polynomials: &[&BlsDoryCommittedPolynomial],
+    points: &[Vec<BlsDoryFr>],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+    maximum_claims: usize,
+) -> Result<PreparedBlsDoryOpeningProof, BlsDoryAggregateError> {
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
-    validate_public_inputs(public_binding, polynomials.len())?;
+    validate_public_inputs_with_claim_limit(public_binding, polynomials.len(), maximum_claims)?;
     if polynomials.len() != points.len() {
         return Err(BlsDoryAggregateError::InvalidClaimCount);
     }
@@ -2618,6 +2661,7 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming(
         sets,
         setup,
         None,
+        MAX_BLS_DORY_AGGREGATE_CLAIMS,
     )
 }
 
@@ -2634,6 +2678,25 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
         sets,
         setup,
         Some(scratch_directory),
+        MAX_BLS_DORY_AGGREGATE_CLAIMS,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_with_test_claim_limit(
+    public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
+    sets: Vec<BlsDoryDeferredOpeningSet>,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
+        public_binding,
+        layout,
+        sets,
+        setup,
+        Some(scratch_directory),
+        TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS,
     )
 }
 
@@ -2643,6 +2706,7 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
     sets: Vec<BlsDoryDeferredOpeningSet>,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
+    maximum_claims: usize,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
     if sets.is_empty() {
         return Err(BlsDoryAggregateError::InvalidClaimCount);
@@ -2695,13 +2759,14 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
                 .ok_or(BlsDoryAggregateError::InvalidClaimCount)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let prepared = prepare_bls_dory_opening_refs(
+    let prepared = prepare_bls_dory_opening_refs_with_claim_limit(
         public_binding,
         layout,
         &polynomial_refs,
         &points,
         setup,
         scratch_directory,
+        maximum_claims,
     )?;
     if prepared.claims != expected_claims {
         return Err(BlsDoryAggregateError::InvalidProofShape);
@@ -2758,10 +2823,46 @@ pub fn verify_bls_dory_openings(
     proof: &[u8],
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(), BlsDoryAggregateError> {
+    verify_bls_dory_openings_with_claim_limit(
+        public_binding,
+        layout,
+        claims,
+        proof,
+        setup,
+        MAX_BLS_DORY_AGGREGATE_CLAIMS,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn verify_bls_dory_openings_with_test_claim_limit(
+    public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
+    claims: &[BlsDoryOpeningClaim],
+    proof: &[u8],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryAggregateError> {
+    verify_bls_dory_openings_with_claim_limit(
+        public_binding,
+        layout,
+        claims,
+        proof,
+        setup,
+        TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS,
+    )
+}
+
+fn verify_bls_dory_openings_with_claim_limit(
+    public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
+    claims: &[BlsDoryOpeningClaim],
+    proof: &[u8],
+    setup: &DeterministicBlsDorySetup,
+    maximum_claims: usize,
+) -> Result<(), BlsDoryAggregateError> {
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
-    validate_public_inputs(public_binding, claims.len())?;
+    validate_public_inputs_with_claim_limit(public_binding, claims.len(), maximum_claims)?;
     let parsed = decode_aggregate_proof(proof, claims.len(), layout)?;
     if setup.max_log_n() < layout.variables()
         || claims
@@ -2822,14 +2923,15 @@ fn validate_layout(nu: usize, sigma: usize) -> Result<(), BlsDoryAggregateError>
     Ok(())
 }
 
-fn validate_public_inputs(
+fn validate_public_inputs_with_claim_limit(
     public_binding: &[u8],
     claims: usize,
+    maximum_claims: usize,
 ) -> Result<(), BlsDoryAggregateError> {
     if public_binding.len() > MAX_PUBLIC_BINDING_BYTES {
         return Err(BlsDoryAggregateError::PublicBindingTooLarge);
     }
-    if claims == 0 || claims > MAX_BLS_DORY_AGGREGATE_CLAIMS {
+    if claims == 0 || claims > maximum_claims {
         return Err(BlsDoryAggregateError::InvalidClaimCount);
     }
     Ok(())
@@ -4977,6 +5079,108 @@ mod tests {
         assert_eq!(proof.len(), aggregate_wire_bytes(8, 4));
         assert_eq!(proof.len(), 17_695);
         assert!(proof.len() < MAX_BLS_DORY_AGGREGATE_BYTES);
+    }
+
+    #[test]
+    fn test_claim_limit_accepts_134_without_widening_the_public_boundary() {
+        let variables = 4;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let layout = test_layout(variables);
+        let polynomial = commit_bls_dory_polynomial(
+            (0..1usize << variables)
+                .map(|index| BlsDoryFr::from_u64(index as u64 + 1))
+                .collect(),
+            layout.nu,
+            layout.sigma,
+            &setup,
+        )
+        .unwrap();
+        let points = (0..TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS)
+            .map(|claim| {
+                (0..variables)
+                    .map(|coordinate| {
+                        BlsDoryFr::from_u64((claim as u64 + 2) * (coordinate as u64 + 3) + 5)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(MAX_BLS_DORY_AGGREGATE_CLAIMS, 128);
+        assert_eq!(TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS, 134);
+        assert_eq!(
+            prove_bls_dory_same_commitment_openings(
+                b"test-claim-limit",
+                layout,
+                &polynomial,
+                &points,
+                &setup,
+            ),
+            Err(BlsDoryAggregateError::InvalidClaimCount)
+        );
+
+        let (claims, proof) = prove_bls_dory_same_commitment_openings_with_test_claim_limit(
+            b"test-claim-limit",
+            layout,
+            &polynomial,
+            &points,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(claims.len(), TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS);
+        assert_eq!(
+            read_u16(&proof, 10).unwrap() as usize,
+            TEST_MAX_BLS_DORY_AGGREGATE_CLAIMS
+        );
+        verify_bls_dory_openings_with_test_claim_limit(
+            b"test-claim-limit",
+            layout,
+            &claims,
+            &proof,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_bls_dory_openings(b"test-claim-limit", layout, &claims, &proof, &setup,),
+            Err(BlsDoryAggregateError::InvalidClaimCount)
+        );
+
+        let mut changed_count = proof.clone();
+        changed_count[10..12].copy_from_slice(&133u16.to_le_bytes());
+        assert_eq!(
+            verify_bls_dory_openings_with_test_claim_limit(
+                b"test-claim-limit",
+                layout,
+                &claims,
+                &changed_count,
+                &setup,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        );
+
+        let mut too_many_points = points;
+        too_many_points.push(vec![BlsDoryFr::from_u64(1); variables]);
+        assert_eq!(
+            prove_bls_dory_same_commitment_openings_with_test_claim_limit(
+                b"test-claim-limit",
+                layout,
+                &polynomial,
+                &too_many_points,
+                &setup,
+            ),
+            Err(BlsDoryAggregateError::InvalidClaimCount)
+        );
+        let mut too_many_claims = claims;
+        too_many_claims.push(too_many_claims[0].clone());
+        assert_eq!(
+            verify_bls_dory_openings_with_test_claim_limit(
+                b"test-claim-limit",
+                layout,
+                &too_many_claims,
+                &proof,
+                &setup,
+            ),
+            Err(BlsDoryAggregateError::InvalidClaimCount)
+        );
     }
 
     #[test]

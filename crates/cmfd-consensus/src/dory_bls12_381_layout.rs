@@ -79,6 +79,18 @@ use crate::{
     verify_model_bank_into_staged_field_sink,
 };
 
+#[cfg(test)]
+use crate::{
+    dory_bls12_381_aggregate::{
+        BLS_DORY_AGGREGATE_VERSION,
+        prove_bls_dory_deferred_opening_sets_consuming_with_test_claim_limit,
+        verify_bls_dory_openings_with_test_claim_limit,
+    },
+    dory_bls12_381_blake3::{
+        BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, BLS_DORY_BLAKE3_PROJECTION_VERSION,
+    },
+};
+
 pub const BLS_DORY_SHARED_LAYOUT_VERSION: u16 = 4;
 pub const BLS_DORY_FIXED_MODEL_IDENTITY_VERSION: u16 = 1;
 pub const BLS_DORY_FINAL_OUTPUT_BRIDGE_VERSION: u16 = 1;
@@ -91,6 +103,11 @@ pub const MAX_BLS_DORY_SHARED_LAYOUT_PROOF_BYTES: usize = 262_128;
 pub const BLS_DORY_SHARED_INITIALIZATION_LINKS: usize = 2;
 pub const BLS_DORY_SHARED_LINKS_PER_BANK: usize = 3;
 const BLS_DORY_SHARED_SOURCE_FOLD_GENERATIONS: u32 = 8;
+
+#[cfg(test)]
+const BLS_DORY_SHARED_NATIVE_COMPOSITION_VERSION: u16 = 1;
+#[cfg(test)]
+const BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS: usize = 6;
 
 /// Maximum variable count across production matrix, transition, and wiring tables.
 pub const BLS_DORY_SHARED_PRODUCTION_VARIABLES: usize = 33;
@@ -131,6 +148,16 @@ pub const BLS_DORY_SHARED_FINAL_OUTPUT_BRIDGE_CLAIMS: usize = 2;
 pub const BLS_DORY_SHARED_PRODUCTION_CLAIMS: usize = BLS_DORY_SHARED_COMPRESSED_CHECKPOINT_CLAIMS
     + BLS_DORY_SHARED_PRODUCTION_EQUALITY_CLAIMS
     + BLS_DORY_SHARED_FINAL_OUTPUT_BRIDGE_CLAIMS;
+#[cfg(test)]
+const _: () = {
+    assert!(BLS_DORY_SHARED_PRODUCTION_CLAIMS == 128);
+    assert!(BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS == 6);
+    assert!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS == 134);
+    assert!(
+        BLS_DORY_SHARED_PRODUCTION_CLAIMS + BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS
+            == BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS
+    );
+};
 /// Shared transport is not yet accepted by consensus.
 pub const BLS_DORY_SHARED_LAYOUT_PRODUCTION_READY: bool = false;
 /// Remaining gates on the shared scalar layout.
@@ -994,6 +1021,84 @@ impl VerifiedBlsDoryFinalOutputOpening {
     }
 }
 
+/// Final-output data derived from authenticated component transcripts but not
+/// yet authorized by their aggregate opening proof.
+pub(crate) struct PendingBlsDoryFinalOutputOpening {
+    cell_point: Vec<BlsDoryFr>,
+    signed_evaluation: BlsDoryFr,
+    transcript_binding: [u8; 32],
+}
+
+#[allow(dead_code)]
+impl PendingBlsDoryFinalOutputOpening {
+    fn into_verified(self) -> VerifiedBlsDoryFinalOutputOpening {
+        VerifiedBlsDoryFinalOutputOpening {
+            cell_point: self.cell_point,
+            signed_evaluation: self.signed_evaluation,
+            transcript_binding: self.transcript_binding,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell_point(&self) -> &[BlsDoryFr] {
+        &self.cell_point
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn signed_evaluation(&self) -> BlsDoryFr {
+        self.signed_evaluation
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn transcript_binding(&self) -> [u8; 32] {
+        self.transcript_binding
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct PreparedBlsDorySharedLayoutProverState {
+    aggregate_layout: BlsDoryAggregateLayout,
+    shared_opening_binding: [u8; 32],
+    opening_sets: Vec<BlsDoryDeferredOpeningSet>,
+    expected_claims: Vec<BlsDoryOpeningClaim>,
+    proof: BlsDorySharedLayoutProof,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pending_final_output: PendingBlsDoryFinalOutputOpening,
+}
+
+#[allow(dead_code)]
+impl PreparedBlsDorySharedLayoutProverState {
+    #[cfg(test)]
+    pub(crate) fn pending_final_output(&self) -> &PendingBlsDoryFinalOutputOpening {
+        &self.pending_final_output
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn shared_opening_binding(&self) -> [u8; 32] {
+        self.shared_opening_binding
+    }
+}
+
+pub(crate) struct PreparedBlsDorySharedLayoutVerifierState {
+    aggregate_layout: BlsDoryAggregateLayout,
+    shared_opening_binding: [u8; 32],
+    claims: Vec<BlsDoryOpeningClaim>,
+    pending_final_output: PendingBlsDoryFinalOutputOpening,
+}
+
+#[allow(dead_code)]
+impl PreparedBlsDorySharedLayoutVerifierState {
+    #[cfg(test)]
+    pub(crate) fn pending_final_output(&self) -> &PendingBlsDoryFinalOutputOpening {
+        &self.pending_final_output
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn shared_opening_binding(&self) -> [u8; 32] {
+        self.shared_opening_binding
+    }
+}
+
 impl BlsDorySharedLayoutProof {
     /// Encode the component algebraic messages and their single shared opening
     /// payload with exact length-delimited canonical framing.
@@ -1337,6 +1442,50 @@ pub fn prove_bls_dory_shared_layout_at_variables_with_scratch(
     )
 }
 
+/// Test-only split phase used to attach the native BLAKE3 suffix before the
+/// one aggregate opening proof is produced.
+#[cfg(test)]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_bls_dory_shared_layout_at_variables_with_scratch_for_test(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_inputs: &[BlsDoryMatrixProverInput<'_>],
+    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
+    wiring_statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDorySharedLayoutProverState, BlsDorySharedLayoutError> {
+    let matrix_inputs = matrix_inputs
+        .iter()
+        .map(|input| SharedMatrixProverInput {
+            statement: input.statement,
+            activations: input.activations,
+            weight: SharedMatrixWeight::Signed(input.weights),
+            accumulators: input.accumulators,
+        })
+        .collect::<Vec<_>>();
+    prepare_bls_dory_shared_layout_at_variables_with_optional_scratch(
+        binding,
+        trusted_model,
+        fixed_model,
+        &matrix_inputs,
+        transition_inputs,
+        wiring_statement,
+        initial,
+        inputs,
+        outputs,
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
 /// Prove the shared layout while reusing weight polynomials prepared by an
 /// authenticated fixed-model stream. No materialized weight slice is accepted
 /// on this path, and every supplied commitment must match the pinned identity.
@@ -1395,6 +1544,38 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
 ) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let prepared = prepare_bls_dory_shared_layout_at_variables_with_optional_scratch(
+        binding,
+        trusted_model,
+        fixed_model,
+        matrix_inputs,
+        transition_inputs,
+        wiring_statement,
+        initial,
+        inputs,
+        outputs,
+        padded_variables,
+        setup,
+        scratch_directory,
+    )?;
+    finish_prepared_shared_layout(prepared, setup, scratch_directory)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_bls_dory_shared_layout_at_variables_with_optional_scratch(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_inputs: &[SharedMatrixProverInput<'_>],
+    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
+    wiring_statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDorySharedLayoutProverState, BlsDorySharedLayoutError> {
     if binding.len() > MAX_SHARED_LAYOUT_BINDING_BYTES
         || !(1..=MAX_BLS_DORY_SHARED_MATRIX_PROOFS).contains(&matrix_inputs.len())
         || !(1..=MAX_BLS_DORY_SHARED_TRANSITION_PROOFS).contains(&transition_inputs.len())
@@ -1612,7 +1793,7 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
             range.openings.restore_compact_source(&restored)?;
         }
     }
-    prove_prepared_shared_layout(
+    prepare_prepared_shared_layout(
         &component_binding,
         matrices,
         transitions,
@@ -1624,12 +1805,11 @@ fn prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
         wiring_statement,
         padded_variables,
         setup,
-        scratch_directory,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prove_prepared_shared_layout(
+fn prepare_prepared_shared_layout(
     binding: &[u8],
     mut matrices: Vec<PreparedBlsDoryMatrixProof>,
     mut transitions: Vec<(
@@ -1644,8 +1824,7 @@ fn prove_prepared_shared_layout(
     wiring_statement: StructuredWiringStatement,
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
-    scratch_directory: Option<&Path>,
-) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+) -> Result<PreparedBlsDorySharedLayoutProverState, BlsDorySharedLayoutError> {
     let aggregate_layout = BlsDoryAggregateLayout::new(
         padded_variables / 2,
         padded_variables - padded_variables / 2,
@@ -1725,9 +1904,46 @@ fn prove_prepared_shared_layout(
     opening_sets.push(wiring_openings);
     expected_claims.extend_from_slice(fixed_base.claims());
     opening_sets.push(fixed_base);
+    Ok(PreparedBlsDorySharedLayoutProverState {
+        aggregate_layout,
+        shared_opening_binding: opening_binding,
+        opening_sets,
+        expected_claims,
+        proof: BlsDorySharedLayoutProof {
+            protocol_version: BLS_DORY_SHARED_LAYOUT_VERSION,
+            padded_variables: u16::try_from(padded_variables)
+                .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
+            matrices: matrix_proofs,
+            transitions: transition_proofs,
+            wiring: wiring_proof,
+            link_evaluations,
+            final_output_evaluation,
+            opening_proof: Vec::new(),
+        },
+        pending_final_output: PendingBlsDoryFinalOutputOpening {
+            cell_point: final_output_points.cell_point,
+            signed_evaluation: final_output_evaluation,
+            transcript_binding: final_output_points.transcript_binding,
+        },
+    })
+}
+
+fn finish_prepared_shared_layout(
+    prepared: PreparedBlsDorySharedLayoutProverState,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let PreparedBlsDorySharedLayoutProverState {
+        aggregate_layout,
+        shared_opening_binding,
+        opening_sets,
+        expected_claims,
+        mut proof,
+        pending_final_output: _,
+    } = prepared;
     let (claims, opening_proof) = if let Some(scratch_directory) = scratch_directory {
         prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
-            &opening_binding,
+            &shared_opening_binding,
             aggregate_layout,
             opening_sets,
             setup,
@@ -1735,7 +1951,7 @@ fn prove_prepared_shared_layout(
         )?
     } else {
         prove_bls_dory_deferred_opening_sets_consuming(
-            &opening_binding,
+            &shared_opening_binding,
             aggregate_layout,
             opening_sets,
             setup,
@@ -1744,17 +1960,59 @@ fn prove_prepared_shared_layout(
     if claims != expected_claims {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
     }
-    Ok(BlsDorySharedLayoutProof {
-        protocol_version: BLS_DORY_SHARED_LAYOUT_VERSION,
-        padded_variables: u16::try_from(padded_variables)
-            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
-        matrices: matrix_proofs,
-        transitions: transition_proofs,
-        wiring: wiring_proof,
-        link_evaluations,
-        final_output_evaluation,
-        opening_proof,
-    })
+    proof.opening_proof = opening_proof;
+    Ok(proof)
+}
+
+/// Append exactly the six native BLAKE3 claims after the canonical shared
+/// prefix and authenticate all 134 claims with one test-only aggregate.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn prove_prepared_bls_dory_shared_layout_with_test_composition(
+    prepared: PreparedBlsDorySharedLayoutProverState,
+    native_openings: BlsDoryDeferredOpeningSet,
+    native_opening_binding: [u8; 32],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BlsDorySharedLayoutProof, BlsDorySharedLayoutError> {
+    let PreparedBlsDorySharedLayoutProverState {
+        aggregate_layout,
+        shared_opening_binding,
+        mut opening_sets,
+        mut expected_claims,
+        mut proof,
+        pending_final_output: _,
+    } = prepared;
+    if expected_claims.len() != BLS_DORY_SHARED_PRODUCTION_CLAIMS
+        || native_openings.claims().len() != BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS
+        || native_opening_binding == [0; 32]
+    {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    expected_claims.extend_from_slice(native_openings.claims());
+    opening_sets.push(native_openings);
+    if expected_claims.len() != BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    let aggregate_binding = shared_native_composed_opening_binding(
+        shared_opening_binding,
+        native_opening_binding,
+        aggregate_layout,
+        setup,
+    );
+    let (claims, opening_proof) =
+        prove_bls_dory_deferred_opening_sets_consuming_with_test_claim_limit(
+            &aggregate_binding,
+            aggregate_layout,
+            opening_sets,
+            setup,
+            scratch_directory,
+        )?;
+    if claims != expected_claims {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    proof.opening_proof = opening_proof;
+    Ok(proof)
 }
 
 /// Verify every component transcript, then authenticate their ordered opening
@@ -1803,6 +2061,47 @@ pub fn verify_bls_dory_shared_layout_with_final_output_at_variables(
     padded_variables: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<VerifiedBlsDoryFinalOutputOpening, BlsDorySharedLayoutError> {
+    let prepared = prepare_bls_dory_shared_layout_verifier_state(
+        binding,
+        trusted_model,
+        fixed_model,
+        matrix_statements,
+        transition_statements,
+        mask_polynomials,
+        wiring_statement,
+        proof,
+        padded_variables,
+        setup,
+    )?;
+    let PreparedBlsDorySharedLayoutVerifierState {
+        aggregate_layout,
+        shared_opening_binding,
+        claims,
+        pending_final_output,
+    } = prepared;
+    verify_bls_dory_openings(
+        &shared_opening_binding,
+        aggregate_layout,
+        &claims,
+        &proof.opening_proof,
+        setup,
+    )?;
+    Ok(pending_final_output.into_verified())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_bls_dory_shared_layout_verifier_state(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_statements: &[StructuredMatrixStatement],
+    transition_statements: &[StructuredTransitionStatement],
+    mask_polynomials: &[&StructuredMaskPolynomial],
+    wiring_statement: StructuredWiringStatement,
+    proof: &BlsDorySharedLayoutProof,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDorySharedLayoutVerifierState, BlsDorySharedLayoutError> {
     let aggregate_layout = BlsDoryAggregateLayout::new(
         padded_variables / 2,
         padded_variables - padded_variables / 2,
@@ -1932,18 +2231,91 @@ pub fn verify_bls_dory_shared_layout_with_final_output_at_variables(
     }
     claims.extend(wiring_claims);
     claims.extend(fixed_base_claims);
-    verify_bls_dory_openings(
-        &opening_binding,
+    Ok(PreparedBlsDorySharedLayoutVerifierState {
+        aggregate_layout,
+        shared_opening_binding: opening_binding,
+        claims,
+        pending_final_output: PendingBlsDoryFinalOutputOpening {
+            cell_point: final_output_points.cell_point,
+            signed_evaluation: proof.final_output_evaluation,
+            transcript_binding: final_output_points.transcript_binding,
+        },
+    })
+}
+
+/// Test-only split verifier phase. It validates every shared component and
+/// reconstructs the canonical 128-claim prefix without accepting it yet.
+#[cfg(test)]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_bls_dory_shared_layout_verifier_state_for_test(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_statements: &[StructuredMatrixStatement],
+    transition_statements: &[StructuredTransitionStatement],
+    mask_polynomials: &[&StructuredMaskPolynomial],
+    wiring_statement: StructuredWiringStatement,
+    proof: &BlsDorySharedLayoutProof,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDorySharedLayoutVerifierState, BlsDorySharedLayoutError> {
+    prepare_bls_dory_shared_layout_verifier_state(
+        binding,
+        trusted_model,
+        fixed_model,
+        matrix_statements,
+        transition_statements,
+        mask_polynomials,
+        wiring_statement,
+        proof,
+        padded_variables,
+        setup,
+    )
+}
+
+/// Append exactly the six verifier-reconstructed native BLAKE3 claims after
+/// the canonical shared prefix. The pending final-output opening is promoted
+/// only after the one 134-claim aggregate verifies.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn verify_prepared_bls_dory_shared_layout_with_test_composition(
+    prepared: PreparedBlsDorySharedLayoutVerifierState,
+    native_claims: &[BlsDoryOpeningClaim],
+    native_opening_binding: [u8; 32],
+    opening_proof: &[u8],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<VerifiedBlsDoryFinalOutputOpening, BlsDorySharedLayoutError> {
+    let PreparedBlsDorySharedLayoutVerifierState {
+        aggregate_layout,
+        shared_opening_binding,
+        mut claims,
+        pending_final_output,
+    } = prepared;
+    if claims.len() != BLS_DORY_SHARED_PRODUCTION_CLAIMS
+        || native_claims.len() != BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS
+        || native_opening_binding == [0; 32]
+    {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    claims.extend_from_slice(native_claims);
+    if claims.len() != BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    let aggregate_binding = shared_native_composed_opening_binding(
+        shared_opening_binding,
+        native_opening_binding,
+        aggregate_layout,
+        setup,
+    );
+    verify_bls_dory_openings_with_test_claim_limit(
+        &aggregate_binding,
         aggregate_layout,
         &claims,
-        &proof.opening_proof,
+        opening_proof,
         setup,
     )?;
-    Ok(VerifiedBlsDoryFinalOutputOpening {
-        cell_point: final_output_points.cell_point,
-        signed_evaluation: proof.final_output_evaluation,
-        transcript_binding: final_output_points.transcript_binding,
-    })
+    Ok(pending_final_output.into_verified())
 }
 
 fn validate_shared_proof_shape(
@@ -2140,6 +2512,35 @@ fn shared_opening_binding(
     }
     hasher.update(&wiring.transcript_digest);
     Ok(*hasher.finalize().as_bytes())
+}
+
+#[cfg(test)]
+fn shared_native_composed_opening_binding(
+    shared_opening_binding: [u8; 32],
+    native_opening_binding: [u8; 32],
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(
+        "CommonFoundry/ForgeMatrix/BlsDorySharedNativeAggregateBinding/v1",
+    );
+    hasher.update(&BLS_DORY_SHARED_NATIVE_COMPOSITION_VERSION.to_le_bytes());
+    hasher.update(&BLS_DORY_AGGREGATE_VERSION.to_le_bytes());
+    hasher.update(&BLS_DORY_SHARED_LAYOUT_VERSION.to_le_bytes());
+    hasher.update(&BLS_DORY_BLAKE3_PROJECTION_VERSION.to_le_bytes());
+    hasher.update(&setup.identity());
+    hasher.update(&(setup.max_log_n() as u64).to_le_bytes());
+    hasher.update(&(layout.nu() as u64).to_le_bytes());
+    hasher.update(&(layout.sigma() as u64).to_le_bytes());
+    hasher.update(&(layout.variables() as u64).to_le_bytes());
+    hasher.update(&(BLS_DORY_SHARED_PRODUCTION_CLAIMS as u64).to_le_bytes());
+    hasher.update(&(BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS as u64).to_le_bytes());
+    hasher.update(&(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS as u64).to_le_bytes());
+    hasher.update(b"shared-prefix");
+    hasher.update(&shared_opening_binding);
+    hasher.update(b"native-suffix");
+    hasher.update(&native_opening_binding);
+    *hasher.finalize().as_bytes()
 }
 
 #[derive(Clone, Copy)]
@@ -3474,7 +3875,7 @@ pub fn require_bls_dory_shared_layout_production_ready() -> Result<(), BlsDorySh
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::*;
     use crate::{
@@ -3497,6 +3898,11 @@ mod tests {
             verify_bls_dory_wiring_at_variables,
         },
         model_bank::{MODEL_BANK_HEADER_BYTES, ModelBankError},
+    };
+    #[cfg(feature = "whir-prototype")]
+    use crate::{
+        dory_bls12_381_blake3::prepare_native_blake3_test_opening_at_layout,
+        dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
     };
 
     const FIXTURE_VARIABLES: usize = 10;
@@ -3532,6 +3938,48 @@ mod tests {
             .filter_map(|entry| entry.metadata().ok())
             .map(|metadata| metadata.len())
             .sum()
+    }
+
+    struct ScratchPeakObserver {
+        stop: std::sync::Arc<AtomicBool>,
+        peak: std::sync::Arc<AtomicU64>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ScratchPeakObserver {
+        fn start(path: std::path::PathBuf) -> Self {
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let peak = std::sync::Arc::new(AtomicU64::new(0));
+            let observer_stop = std::sync::Arc::clone(&stop);
+            let observer_peak = std::sync::Arc::clone(&peak);
+            let handle = std::thread::spawn(move || {
+                while !observer_stop.load(Ordering::Relaxed) {
+                    observer_peak.fetch_max(observed_directory_bytes(&path), Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                observer_peak.fetch_max(observed_directory_bytes(&path), Ordering::Relaxed);
+            });
+            Self {
+                stop,
+                peak,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> u64 {
+            self.stop.store(true, Ordering::Relaxed);
+            self.handle.take().unwrap().join().unwrap();
+            self.peak.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for ScratchPeakObserver {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     fn authenticated_fixed_model_fixture() -> (
@@ -5482,6 +5930,354 @@ mod tests {
         assert_eq!(
             require_bls_dory_shared_layout_production_ready(),
             Err(BlsDorySharedLayoutError::NotProductionReady)
+        );
+    }
+
+    #[test]
+    fn shared_native_composition_binding_is_ordered_and_context_bound() {
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let layout = BlsDoryAggregateLayout::new(3, 3).unwrap();
+        let shared = [0x11; 32];
+        let native = [0x22; 32];
+        let binding = shared_native_composed_opening_binding(shared, native, layout, &setup);
+
+        assert_ne!(binding, [0; 32]);
+        assert_eq!(
+            binding,
+            shared_native_composed_opening_binding(shared, native, layout, &setup)
+        );
+        assert_ne!(
+            binding,
+            shared_native_composed_opening_binding(native, shared, layout, &setup)
+        );
+        assert_ne!(
+            binding,
+            shared_native_composed_opening_binding(
+                shared,
+                native,
+                BlsDoryAggregateLayout::new(2, 4).unwrap(),
+                &setup,
+            )
+        );
+
+        let other_setup = deterministic_bls_dory_setup(7).unwrap();
+        assert_ne!(
+            binding,
+            shared_native_composed_opening_binding(shared, native, layout, &other_setup)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "real 21-variable shared/native aggregate; run explicitly in --release"]
+    fn shared_native_aggregate_authenticates_exact_128_plus_6_claims_end_to_end() {
+        const PADDED_VARIABLES: usize = 21;
+        const FINAL_ACTIVATION_BYTES: usize = 32;
+
+        let total_started = std::time::Instant::now();
+        let fixture_started = std::time::Instant::now();
+        let fixture = linked_fixture_shape(3, 128, 16, 2);
+        let fixture_millis = fixture_started.elapsed().as_millis();
+        let matrix_statements = vec![fixture.matrix_statement; fixture.matrices.len()];
+        let transition_statements = fixture
+            .transitions
+            .iter()
+            .map(|transition| transition.statement)
+            .collect::<Vec<_>>();
+        let masks = fixture
+            .transitions
+            .iter()
+            .map(|transition| &transition.mask)
+            .collect::<Vec<_>>();
+        let matrix_inputs = fixture
+            .matrices
+            .iter()
+            .map(|matrix| BlsDoryMatrixProverInput {
+                statement: fixture.matrix_statement,
+                activations: &matrix.activations,
+                weights: &matrix.weights,
+                accumulators: &matrix.accumulators,
+            })
+            .collect::<Vec<_>>();
+        let transition_inputs = fixture
+            .transitions
+            .iter()
+            .map(|transition| BlsDoryTransitionProverInput {
+                statement: transition.statement,
+                mask_polynomial: &transition.mask,
+                witness: &transition.witness,
+            })
+            .collect::<Vec<_>>();
+
+        let setup_started = std::time::Instant::now();
+        let setup = deterministic_bls_dory_setup(PADDED_VARIABLES).unwrap();
+        let setup_millis = setup_started.elapsed().as_millis();
+        let layout = BlsDoryAggregateLayout::new(10, 11).unwrap();
+        let (model, fixed_model) =
+            fixed_model_fixture_at_variables(&fixture, &setup, PADDED_VARIABLES);
+        let scratch = ScratchDirectory::create();
+        let observer = ScratchPeakObserver::start(scratch.0.clone());
+
+        let shared_started = std::time::Instant::now();
+        let shared = prepare_bls_dory_shared_layout_at_variables_with_scratch_for_test(
+            b"shared-native-134",
+            &model,
+            &fixed_model,
+            &matrix_inputs,
+            &transition_inputs,
+            fixture.wiring_statement,
+            &fixture.initial,
+            &fixture.inputs,
+            &fixture.outputs,
+            PADDED_VARIABLES,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let shared_millis = shared_started.elapsed().as_millis();
+        assert_eq!(
+            shared.expected_claims.len(),
+            BLS_DORY_SHARED_PRODUCTION_CLAIMS
+        );
+
+        let pending_cell_point = shared.pending_final_output().cell_point().to_vec();
+        let pending_signed_evaluation = shared.pending_final_output().signed_evaluation();
+        let pending_transcript_binding = shared.pending_final_output().transcript_binding();
+        let shared_boundary_claim = shared.expected_claims.last().unwrap().clone();
+        let final_signed = &fixture.outputs[fixture.outputs.len() - FINAL_ACTIVATION_BYTES..];
+        let final_activation = final_signed
+            .iter()
+            .map(|value| u8::try_from(value + 125).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(final_activation.len(), FINAL_ACTIVATION_BYTES);
+        let challenge_digest = *blake3::hash(b"CommonFoundry/shared-native-134/e2e").as_bytes();
+        let activation_digest =
+            crate::forgematrix_v2::output_digest(challenge_digest, &final_activation);
+        let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            challenge_digest,
+            activation_digest,
+            &final_activation,
+            pending_transcript_binding,
+            pending_cell_point.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            bridge.raw_byte_evaluation(),
+            pending_signed_evaluation + BlsDoryFr::from_u64(125)
+        );
+
+        let native = prepare_native_blake3_test_opening_at_layout(
+            &final_activation,
+            &bridge,
+            layout,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let native_telemetry = native.telemetry;
+        let native_binding = native.opening_statement.opening_binding();
+        let native_claims = native.opening_set.claims().to_vec();
+        native
+            .opening_statement
+            .validate_claims(&native_claims)
+            .unwrap();
+        assert_eq!(
+            native_claims.len(),
+            BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS
+        );
+
+        let aggregate_started = std::time::Instant::now();
+        let proof = prove_prepared_bls_dory_shared_layout_with_test_composition(
+            shared,
+            native.opening_set,
+            native_binding,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
+        let aggregate_millis = aggregate_started.elapsed().as_millis();
+        let peak_scratch_bytes = observer.finish();
+        assert_eq!(proof.opening_proof.len(), 46_159);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        assert_eq!(observed_directory_bytes(&scratch.0), 0);
+
+        let encoded = proof
+            .encode(
+                &matrix_statements,
+                &transition_statements,
+                fixture.wiring_statement,
+            )
+            .unwrap();
+        let decoded = BlsDorySharedLayoutProof::decode_with_variables(
+            &encoded,
+            &matrix_statements,
+            &transition_statements,
+            fixture.wiring_statement,
+            PADDED_VARIABLES,
+        )
+        .unwrap();
+        assert_eq!(decoded, proof);
+        let proof = decoded;
+
+        assert!(
+            verify_bls_dory_shared_layout_with_final_output_at_variables(
+                b"shared-native-134",
+                &model,
+                &fixed_model,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                &proof,
+                PADDED_VARIABLES,
+                &setup,
+            )
+            .is_err()
+        );
+        native
+            .opening_statement
+            .validate_claims(&native_claims)
+            .unwrap();
+
+        let prepare_verifier = |candidate: &BlsDorySharedLayoutProof| {
+            prepare_bls_dory_shared_layout_verifier_state_for_test(
+                b"shared-native-134",
+                &model,
+                &fixed_model,
+                &matrix_statements,
+                &transition_statements,
+                &masks,
+                fixture.wiring_statement,
+                candidate,
+                PADDED_VARIABLES,
+                &setup,
+            )
+        };
+        let verifier_started = std::time::Instant::now();
+        let verifier = prepare_verifier(&proof).unwrap();
+        assert_eq!(verifier.claims.len(), BLS_DORY_SHARED_PRODUCTION_CLAIMS);
+        let verified = verify_prepared_bls_dory_shared_layout_with_test_composition(
+            verifier,
+            &native_claims,
+            native_binding,
+            &proof.opening_proof,
+            &setup,
+        )
+        .unwrap();
+        let verifier_millis = verifier_started.elapsed().as_millis();
+        assert_eq!(verified.cell_point(), pending_cell_point);
+        assert_eq!(verified.signed_evaluation(), pending_signed_evaluation);
+        assert_eq!(verified.transcript_binding(), pending_transcript_binding);
+
+        let mut wrong_native_binding = native_binding;
+        wrong_native_binding[0] ^= 1;
+        assert!(
+            verify_prepared_bls_dory_shared_layout_with_test_composition(
+                prepare_verifier(&proof).unwrap(),
+                &native_claims,
+                wrong_native_binding,
+                &proof.opening_proof,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut wrong_route = native_claims.clone();
+        wrong_route[0].commitment = wrong_route[2].commitment;
+        assert!(
+            native
+                .opening_statement
+                .validate_claims(&wrong_route)
+                .is_err()
+        );
+        assert!(
+            verify_prepared_bls_dory_shared_layout_with_test_composition(
+                prepare_verifier(&proof).unwrap(),
+                &wrong_route,
+                native_binding,
+                &proof.opening_proof,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut wrong_evaluation = native_claims.clone();
+        wrong_evaluation[0].evaluation = wrong_evaluation[0].evaluation + BlsDoryFr::one();
+        assert!(
+            native
+                .opening_statement
+                .validate_claims(&wrong_evaluation)
+                .is_err()
+        );
+        assert!(
+            verify_prepared_bls_dory_shared_layout_with_test_composition(
+                prepare_verifier(&proof).unwrap(),
+                &wrong_evaluation,
+                native_binding,
+                &proof.opening_proof,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut shared_as_native = native_claims.clone();
+        shared_as_native[0] = shared_boundary_claim;
+        assert!(
+            native
+                .opening_statement
+                .validate_claims(&shared_as_native)
+                .is_err()
+        );
+        assert!(
+            verify_prepared_bls_dory_shared_layout_with_test_composition(
+                prepare_verifier(&proof).unwrap(),
+                &shared_as_native,
+                native_binding,
+                &proof.opening_proof,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed_final_evaluation = proof.clone();
+        changed_final_evaluation.final_output_evaluation =
+            changed_final_evaluation.final_output_evaluation + BlsDoryFr::one();
+        assert!(
+            verify_prepared_bls_dory_shared_layout_with_test_composition(
+                prepare_verifier(&changed_final_evaluation).unwrap(),
+                &native_claims,
+                native_binding,
+                &changed_final_evaluation.opening_proof,
+                &setup,
+            )
+            .is_err()
+        );
+
+        let mut changed_opening_proof = proof.opening_proof.clone();
+        let changed_index = changed_opening_proof.len() / 2;
+        changed_opening_proof[changed_index] ^= 1;
+        assert!(
+            verify_prepared_bls_dory_shared_layout_with_test_composition(
+                prepare_verifier(&proof).unwrap(),
+                &native_claims,
+                native_binding,
+                &changed_opening_proof,
+                &setup,
+            )
+            .is_err()
+        );
+
+        eprintln!(
+            "CMFD_SHARED_NATIVE_E2E {{\"fixture_ms\":{fixture_millis},\"setup_ms\":{setup_millis},\"shared_prepare_ms\":{shared_millis},\"native_fixture_ms\":{},\"native_source_ms\":{},\"native_sumcheck_ms\":{},\"native_replay_ms\":{},\"aggregate_ms\":{aggregate_millis},\"verify_ms\":{verifier_millis},\"total_ms\":{},\"claims\":134,\"opening_proof_bytes\":{},\"outer_proof_bytes\":{},\"peak_scratch_bytes\":{peak_scratch_bytes},\"scratch_entries\":{},\"scratch_bytes\":{}}}",
+            native_telemetry.fixture_millis,
+            native_telemetry.source_millis,
+            native_telemetry.sumcheck_millis,
+            native_telemetry.replay_millis,
+            total_started.elapsed().as_millis(),
+            proof.opening_proof.len(),
+            encoded.len(),
+            std::fs::read_dir(&scratch.0).unwrap().count(),
+            observed_directory_bytes(&scratch.0),
         );
     }
 }

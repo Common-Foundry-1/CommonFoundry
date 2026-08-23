@@ -1319,12 +1319,10 @@ impl NarrowBlake3Air {
         })
     }
 
-    #[cfg(test)]
     pub(crate) const fn trace_rows(&self) -> usize {
         self.trace_rows
     }
 
-    #[cfg(test)]
     pub(crate) fn activation_group_index_at_row(&self, row_index: usize) -> Option<usize> {
         let operation_index = row_index / ROWS_PER_COMPRESSION;
         let step = row_index % ROWS_PER_COMPRESSION;

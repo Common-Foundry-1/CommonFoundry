@@ -18,7 +18,7 @@ use dory_pcs::primitives::transcript::Transcript;
 use p3_air::symbolic::{
     AirLayout, BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression, get_symbolic_constraints,
 };
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 use p3_field::PrimeField64;
 use thiserror::Error;
 
@@ -26,10 +26,22 @@ use thiserror::Error;
 use crate::dory_bls12_381_prototype::BlsDoryTranscript;
 use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt};
 #[cfg(all(test, feature = "whir-prototype"))]
+use crate::{ExtensionElement, structured_blake3_narrow::NarrowBlake3Error};
+#[cfg(feature = "whir-prototype")]
 use crate::{
-    ExtensionElement, GOLDILOCKS_MODULUS, StructuredBlake3Statement,
+    GOLDILOCKS_MODULUS, StructuredBlake3Statement,
+    dory_bls12_381_aggregate::{
+        BlsDoryAggregateLayout, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
+        BlsDoryCompactRowSource,
+    },
     dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
-    structured_blake3_narrow::{F as Goldilocks, NarrowBlake3Air, NarrowBlake3Error},
+    dory_bls12_381_prototype::DeterministicBlsDorySetup,
+    dory_bls12_381_transpose::{BlsDoryTransposeError, BlsDoryWordTransposeArtifact},
+    structured_blake3_narrow::{
+        F as Goldilocks, NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START, NARROW_BLAKE3_MAIN_WIDTH,
+        NARROW_BLAKE3_ORIGINAL_NIBBLES_START, NARROW_BLAKE3_PREPROCESSED_WIDTH,
+        NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS, NARROW_BLAKE3_STACK_START, NarrowBlake3Air,
+    },
 };
 use crate::{
     dory_bls12_381_aggregate::{BlsDoryAggregateError, BlsDoryOpeningClaim},
@@ -45,16 +57,6 @@ use crate::{
     },
     dory_bls12_381_transpose::projected_bls_dory_transpose_artifact_bytes,
     wire::MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
-};
-#[cfg(feature = "whir-prototype")]
-use crate::{
-    dory_bls12_381_aggregate::{BlsDoryAggregateLayout, BlsDoryCompactRowSource},
-    dory_bls12_381_transpose::{BlsDoryTransposeError, BlsDoryWordTransposeArtifact},
-    structured_blake3_narrow::{
-        NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START, NARROW_BLAKE3_MAIN_WIDTH,
-        NARROW_BLAKE3_ORIGINAL_NIBBLES_START, NARROW_BLAKE3_PREPROCESSED_WIDTH,
-        NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS, NARROW_BLAKE3_STACK_START,
-    },
 };
 
 /// Version of this projection only; no wire proof uses it.
@@ -1114,7 +1116,7 @@ fn translate_constraint(
     })
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn centered_goldilocks(value: Goldilocks) -> i64 {
     let canonical = value.as_canonical_u64();
     if canonical <= GOLDILOCKS_MODULUS / 2 {
@@ -1255,7 +1257,7 @@ fn native_activation_contribution(
     native_activation_contribution_from_coefficients(main_local, &coefficients)
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn native_byte_coefficients(
     activation_group: Option<usize>,
     point: &[BlsDoryFr],
@@ -1351,7 +1353,7 @@ fn native_accumulator_trace(
         .collect()
 }
 
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 fn for_each_native_accumulator_pair<E>(
     air: &NarrowBlake3Air,
     statement: &StructuredBlake3Statement,
@@ -1390,6 +1392,87 @@ fn for_each_native_accumulator_pair<E>(
             Ok(())
         },
     )
+}
+
+#[cfg(feature = "whir-prototype")]
+const BLS_DORY_BLAKE3_ACCUMULATOR_WRITE_CHUNK_SCALARS: usize = 1 << 15;
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_native_accumulator_pass(
+    writer: &mut BlsDoryCommittedPolynomialWriter<'_>,
+    air: &NarrowBlake3Air,
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    write_next: bool,
+) -> Result<(), BlsDoryAggregateError> {
+    let mut scalars = Vec::with_capacity(BLS_DORY_BLAKE3_ACCUMULATOR_WRITE_CHUNK_SCALARS);
+    let mut emitted = 0usize;
+    let mut last = None;
+    for_each_native_accumulator_pair(air, statement, witness, bridge, |row_index, local, next| {
+        if row_index != emitted {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        scalars.push(if write_next { next } else { local });
+        if scalars.len() == BLS_DORY_BLAKE3_ACCUMULATOR_WRITE_CHUNK_SCALARS {
+            writer.write_scalars(&scalars)?;
+            scalars.clear();
+        }
+        emitted += 1;
+        last = Some((local, next));
+        Ok(())
+    })?;
+    if !scalars.is_empty() {
+        writer.write_scalars(&scalars)?;
+    }
+    if emitted != air.trace_rows()
+        || last != Some((bridge.raw_byte_evaluation(), BlsDoryFr::zero()))
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+/// Commit the local and cyclic-next native evaluation accumulators without
+/// retaining either full scalar table in memory. The canonical main trace is
+/// regenerated once per table so the artifact remains in table-major order.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn commit_native_accumulator_source(
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    if bridge.challenge_digest() != statement.challenge_digest
+        || bridge.final_activation_digest() != statement.final_activation_digest
+        || bridge.final_activation_len() != statement.final_activation_len
+        || witness.digest != statement.final_activation_digest
+    {
+        return Err(BlsDoryAggregateError::InvalidProofShape);
+    }
+    let air =
+        NarrowBlake3Air::new(statement).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    if !air.trace_rows().is_power_of_two() {
+        return Err(BlsDoryAggregateError::InvalidDimension);
+    }
+    let explicit_scalars = air
+        .trace_rows()
+        .checked_mul(BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES)
+        .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+    let mut writer = BlsDoryCommittedPolynomialWriter::create(
+        scratch_directory,
+        explicit_scalars,
+        layout.nu(),
+        layout.sigma(),
+        setup,
+    )?;
+    write_native_accumulator_pass(&mut writer, &air, statement, witness, bridge, false)?;
+    write_native_accumulator_pass(&mut writer, &air, statement, witness, bridge, true)?;
+    writer.finish()
 }
 
 /// Exact projection values exposed to tests and activation tooling.
@@ -5367,10 +5450,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whir-prototype")]
-    #[ignore = "the exact 16-variable scalar Dory comparison is intentionally expensive"]
-    fn native_accumulator_scalar_stream_preserves_commitment_and_opening_bytes() {
+    fn native_accumulator_source_builder_preserves_commitment_and_opening_bytes() {
         const TRACE_ROWS: usize = 1 << 8;
-        const STREAM_CHUNK: usize = 29;
         let fixture = dense_blake3_fixture();
         assert_eq!(fixture.air.trace_rows(), TRACE_ROWS);
         let local_table = NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START;
@@ -5379,55 +5460,70 @@ mod tests {
             fixture.tables[local_table].clone(),
             fixture.tables[next_table].clone(),
         ];
-        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
-        let layout = dense_aggregate_layout();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(9).unwrap();
+        let layout = BlsDoryAggregateLayout::new(4, 5).unwrap();
         let scratch = Blake3ScratchDirectory::create();
         let materialized = commit_bls_dory_polynomial(
-            dense_pack_adjacency_tables(&field_tables, TRACE_ROWS, 1 << 8).unwrap(),
+            dense_pack_adjacency_tables(&field_tables, TRACE_ROWS, 2).unwrap(),
             layout.nu(),
             layout.sigma(),
             &setup,
         )
         .unwrap();
-        let mut writer = BlsDoryCommittedPolynomialWriter::create(
-            &scratch.0,
-            2 * TRACE_ROWS,
-            layout.nu(),
-            layout.sigma(),
-            &setup,
-        )
-        .unwrap();
-        for use_next in [false, true] {
-            let mut scalars = Vec::with_capacity(STREAM_CHUNK);
-            for_each_native_accumulator_pair(
-                &fixture.air,
-                &fixture.statement,
+        let mut wrong_statement = fixture.statement.clone();
+        wrong_statement.challenge_digest[0] ^= 1;
+        assert!(matches!(
+            commit_native_accumulator_source(
+                &wrong_statement,
                 &fixture.witness,
                 &fixture.bridge,
-                |row_index, local, next| {
-                    let scalar = if use_next { next } else { local };
-                    assert_eq!(scalar, field_tables[usize::from(use_next)][row_index]);
-                    scalars.push(scalar);
-                    if scalars.len() == STREAM_CHUNK {
-                        writer.write_scalars(&scalars)?;
-                        scalars.clear();
-                    }
-                    Ok::<_, BlsDoryAggregateError>(())
-                },
-            )
-            .unwrap();
-            if !scalars.is_empty() {
-                writer.write_scalars(&scalars).unwrap();
-            }
-        }
-        let streamed = writer.finish().unwrap();
+                layout,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let mut wrong_activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
+        wrong_activation[0] ^= 1;
+        let wrong_bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            fixture.statement.challenge_digest,
+            fixture.statement.final_activation_digest,
+            &wrong_activation,
+            fixture.bridge.transcript_binding(),
+            fixture.bridge.cell_point().to_vec(),
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_native_accumulator_source(
+                &fixture.statement,
+                &fixture.witness,
+                &wrong_bridge,
+                layout,
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+
+        let streamed = commit_native_accumulator_source(
+            &fixture.statement,
+            &fixture.witness,
+            &fixture.bridge,
+            layout,
+            &setup,
+            &scratch.0,
+        )
+        .unwrap();
         assert_eq!(streamed.commitment(), materialized.commitment());
 
         let points = vec![
-            (0..16)
+            (0..layout.variables())
                 .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 23) * 37))
                 .collect::<Vec<_>>(),
-            (0..16)
+            (0..layout.variables())
                 .map(|coordinate| BlsDoryFr::from_u64((coordinate as u64 + 29) * 41))
                 .collect::<Vec<_>>(),
         ];

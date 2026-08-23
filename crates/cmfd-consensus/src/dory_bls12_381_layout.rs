@@ -1450,50 +1450,6 @@ pub fn prove_bls_dory_shared_layout_at_variables_with_scratch(
     )
 }
 
-/// Test-only split phase used to attach the native BLAKE3 suffix before the
-/// one aggregate opening proof is produced.
-#[cfg(test)]
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_bls_dory_shared_layout_at_variables_with_scratch_for_test(
-    binding: &[u8],
-    trusted_model: &ModelPcsIdentity,
-    fixed_model: &BlsDoryFixedModelIdentity,
-    matrix_inputs: &[BlsDoryMatrixProverInput<'_>],
-    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
-    wiring_statement: StructuredWiringStatement,
-    initial: &[i64],
-    inputs: &[i64],
-    outputs: &[i64],
-    padded_variables: usize,
-    setup: &DeterministicBlsDorySetup,
-    scratch_directory: &Path,
-) -> Result<PreparedBlsDorySharedLayoutProverState, BlsDorySharedLayoutError> {
-    let matrix_inputs = matrix_inputs
-        .iter()
-        .map(|input| SharedMatrixProverInput {
-            statement: input.statement,
-            activations: input.activations,
-            weight: SharedMatrixWeight::Signed(input.weights),
-            accumulators: input.accumulators,
-        })
-        .collect::<Vec<_>>();
-    prepare_bls_dory_shared_layout_at_variables_with_optional_scratch(
-        binding,
-        trusted_model,
-        fixed_model,
-        &matrix_inputs,
-        transition_inputs,
-        wiring_statement,
-        initial,
-        inputs,
-        outputs,
-        padded_variables,
-        setup,
-        Some(scratch_directory),
-    )
-}
-
 /// Prove the shared layout while reusing weight polynomials prepared by an
 /// authenticated fixed-model stream. No materialized weight slice is accepted
 /// on this path, and every supplied commitment must match the pinned identity.
@@ -1522,6 +1478,51 @@ pub fn prove_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_
         })
         .collect::<Vec<_>>();
     prove_bls_dory_shared_layout_at_variables_with_optional_scratch(
+        binding,
+        trusted_model,
+        fixed_model,
+        &matrix_inputs,
+        transition_inputs,
+        wiring_statement,
+        initial,
+        inputs,
+        outputs,
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+/// Prepare the authenticated precommitted-weight shared layout without
+/// producing its aggregate opening. The returned state is consumed by the
+/// exact 128+6 native BLAKE3 composer.
+#[cfg(any(test, feature = "whir-prototype"))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+    binding: &[u8],
+    trusted_model: &ModelPcsIdentity,
+    fixed_model: &BlsDoryFixedModelIdentity,
+    matrix_inputs: &[BlsDoryPrecommittedMatrixProverInput<'_>],
+    transition_inputs: &[BlsDoryTransitionProverInput<'_>],
+    wiring_statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDorySharedLayoutProverState, BlsDorySharedLayoutError> {
+    let matrix_inputs = matrix_inputs
+        .iter()
+        .map(|input| SharedMatrixProverInput {
+            statement: input.statement,
+            activations: input.activations,
+            weight: SharedMatrixWeight::Precommitted(input.weight),
+            accumulators: input.accumulators,
+        })
+        .collect::<Vec<_>>();
+    prepare_bls_dory_shared_layout_at_variables_with_optional_scratch(
         binding,
         trusted_model,
         fixed_model,
@@ -5020,6 +5021,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(precommitted_proof, proof);
+        let prepared_precommitted =
+            prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+                b"shared-opening",
+                &model,
+                &fixed_model,
+                &precommitted_inputs,
+                &transition_inputs,
+                fixture.wiring_statement,
+                &fixture.initial,
+                &fixture.inputs,
+                &fixture.outputs,
+                FIXTURE_VARIABLES,
+                &setup,
+                &scratch.0,
+            )
+            .unwrap();
+        assert!(prepared_precommitted.proof.opening_proof.is_empty());
+        assert_eq!(
+            prepared_precommitted
+                .pending_final_output()
+                .signed_evaluation(),
+            proof.final_output_evaluation
+        );
+        let split_precommitted_proof =
+            finish_prepared_shared_layout(prepared_precommitted, &setup, Some(&scratch.0)).unwrap();
+        assert_eq!(split_precommitted_proof, proof);
         drop(precommitted_inputs);
         let mut wrong_values = fixture.matrices[0].weights.clone();
         wrong_values[0] += 1;
@@ -5045,7 +5072,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(matches!(
-            prove_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+            prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
                 b"shared-opening",
                 &model,
                 &fixed_model,
@@ -6058,16 +6085,6 @@ mod tests {
             .iter()
             .map(|transition| &transition.mask)
             .collect::<Vec<_>>();
-        let matrix_inputs = fixture
-            .matrices
-            .iter()
-            .map(|matrix| BlsDoryMatrixProverInput {
-                statement: fixture.matrix_statement,
-                activations: &matrix.activations,
-                weights: &matrix.weights,
-                accumulators: &matrix.accumulators,
-            })
-            .collect::<Vec<_>>();
         let transition_inputs = fixture
             .transitions
             .iter()
@@ -6086,23 +6103,50 @@ mod tests {
             fixed_model_fixture_at_variables(&fixture, &setup, PADDED_VARIABLES);
         let scratch = ScratchDirectory::create();
         let observer = ScratchPeakObserver::start(scratch.0.clone());
+        let precommitted_weights = fixture
+            .matrices
+            .iter()
+            .map(|matrix| {
+                commit_fixed_table_with_optional_scratch(
+                    &matrix.weights,
+                    PADDED_VARIABLES,
+                    &setup,
+                    Some(&scratch.0),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let precommitted_inputs = fixture
+            .matrices
+            .iter()
+            .zip(&precommitted_weights)
+            .map(|(matrix, weight)| BlsDoryPrecommittedMatrixProverInput {
+                statement: fixture.matrix_statement,
+                activations: &matrix.activations,
+                weight,
+                accumulators: &matrix.accumulators,
+            })
+            .collect::<Vec<_>>();
 
         let shared_started = std::time::Instant::now();
-        let shared = prepare_bls_dory_shared_layout_at_variables_with_scratch_for_test(
-            b"shared-native-134",
-            &model,
-            &fixed_model,
-            &matrix_inputs,
-            &transition_inputs,
-            fixture.wiring_statement,
-            &fixture.initial,
-            &fixture.inputs,
-            &fixture.outputs,
-            PADDED_VARIABLES,
-            &setup,
-            &scratch.0,
-        )
-        .unwrap();
+        let shared =
+            prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch(
+                b"shared-native-134",
+                &model,
+                &fixed_model,
+                &precommitted_inputs,
+                &transition_inputs,
+                fixture.wiring_statement,
+                &fixture.initial,
+                &fixture.inputs,
+                &fixture.outputs,
+                PADDED_VARIABLES,
+                &setup,
+                &scratch.0,
+            )
+            .unwrap();
+        drop(precommitted_inputs);
+        drop(precommitted_weights);
         let shared_millis = shared_started.elapsed().as_millis();
         assert_eq!(
             shared.expected_claims.len(),

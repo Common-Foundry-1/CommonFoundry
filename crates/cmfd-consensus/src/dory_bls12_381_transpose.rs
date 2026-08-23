@@ -201,8 +201,31 @@ impl BlsDoryWordTransposeArtifact {
         if column >= self.columns || output.len() != self.rows {
             return Err(BlsDoryTransposeError::InvalidShape);
         }
+        self.read_column_segment(column, 0, output)
+    }
+
+    /// Read one bounded contiguous segment from an authenticated column.
+    ///
+    /// Production Dory layouts split each million-row logical trace table into
+    /// smaller physical rows. Segment reads avoid allocating the complete
+    /// logical column merely to expose one physical row.
+    pub fn read_column_segment(
+        &mut self,
+        column: usize,
+        start_row: usize,
+        output: &mut [u64],
+    ) -> Result<usize, BlsDoryTransposeError> {
+        if column >= self.columns
+            || output.is_empty()
+            || start_row
+                .checked_add(output.len())
+                .is_none_or(|end| end > self.rows)
+        {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
         let word_index = column
             .checked_mul(self.rows)
+            .and_then(|index| index.checked_add(start_row))
             .ok_or(BlsDoryTransposeError::InvalidShape)?;
         let offset = HEADER_BYTES
             .checked_add(
@@ -381,11 +404,34 @@ mod tests {
         for column in 0..columns {
             let mut output = vec![0; rows];
             assert_eq!(artifact.read_column(column, &mut output).unwrap(), rows);
-            assert_eq!(
-                output,
-                matrix.iter().map(|row| row[column]).collect::<Vec<_>>()
-            );
+            let expected = matrix.iter().map(|row| row[column]).collect::<Vec<_>>();
+            assert_eq!(output, expected);
+
+            let mut segmented = Vec::with_capacity(rows);
+            for (start, len) in [(0, 3), (3, 3), (6, 2)] {
+                let mut segment = vec![0; len];
+                assert_eq!(
+                    artifact
+                        .read_column_segment(column, start, &mut segment)
+                        .unwrap(),
+                    len
+                );
+                segmented.extend_from_slice(&segment);
+            }
+            assert_eq!(segmented, expected);
         }
+        assert!(matches!(
+            artifact.read_column_segment(columns, 0, &mut [0]),
+            Err(BlsDoryTransposeError::InvalidShape)
+        ));
+        assert!(matches!(
+            artifact.read_column_segment(0, rows, &mut [0]),
+            Err(BlsDoryTransposeError::InvalidShape)
+        ));
+        assert!(matches!(
+            artifact.read_column_segment(0, 0, &mut []),
+            Err(BlsDoryTransposeError::InvalidShape)
+        ));
         let path = artifact.path().to_path_buf();
         drop(artifact);
         assert!(!path.exists());

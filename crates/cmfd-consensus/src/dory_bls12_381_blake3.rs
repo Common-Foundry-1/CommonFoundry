@@ -66,8 +66,8 @@ pub const BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS: usize = 1;
 /// Local/next and inverse terminal evaluations exposed by the adjacency sumcheck.
 pub const BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS: usize =
     2 * BLS_DORY_BLAKE3_MAIN_WIDTH + 2;
-/// One transcript-random selector batches every adjacency terminal evaluation.
-pub const BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS: usize = 1;
+/// Separate source and post-challenge inverse commitments require two openings.
+pub const BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS: usize = 2;
 /// Complete Dory opening-claim count after composition with the shared proof.
 pub const BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS: usize = BLS_DORY_SHARED_PRODUCTION_CLAIMS
     + BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS
@@ -118,7 +118,7 @@ pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
     "the bounded fixture Dory-authenticates all 746 execution terminal evaluations by random-selector batching, but the production out-of-core commitment and opening path is not implemented or measured",
-    "the bounded row-indexed LogUp adjacency sumcheck verifies fixed row-substitution, reordering, duplication, and wrap-boundary tests, but its sources and 580 terminal evaluations are not yet Dory-authenticated, so adaptive proving and the complete Fiat-Shamir soundness bound remain open",
+    "the bounded row-indexed LogUp adjacency fixture Dory-authenticates the pre-challenge source and post-challenge inverse commitments plus all 580 terminal evaluations, but the production out-of-core path, complete Fiat-Shamir soundness bound, and independent review remain open",
     "the shared aggregate parser still intentionally caps claim count at 128 and must not be widened before the new components verify end to end",
     "the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
 ];
@@ -612,6 +612,23 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
+    #[derive(Clone)]
+    struct DenseAdjacencyOpeningBatch {
+        commitment: BlsDoryGt,
+        terminal_start: usize,
+        terminal_count: usize,
+        selector_variables: usize,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[derive(Clone)]
+    struct DenseAuthenticatedAdjacencyProof {
+        sumcheck: DenseAdjacencySumcheckProof,
+        opening_batches: Vec<DenseAdjacencyOpeningBatch>,
+        opening_proof: Vec<u8>,
+    }
+
+    #[cfg(feature = "whir-prototype")]
     struct DenseExecutionRelation<'a> {
         public: &'a [BlsDoryFr],
         constraints: &'a [BlsDoryBlake3ConstraintExpr],
@@ -1065,8 +1082,33 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
+    fn synthetic_dense_adjacency_tables(rows: usize) -> Vec<Vec<BlsDoryFr>> {
+        assert!(rows.is_power_of_two());
+        let local = (0..BLS_DORY_BLAKE3_MAIN_WIDTH)
+            .map(|column| {
+                (0..rows)
+                    .map(|row| {
+                        BlsDoryFr::from_u64(
+                            1 + row as u64 * BLS_DORY_BLAKE3_MAIN_WIDTH as u64 + column as u64,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut tables = Vec::with_capacity(2 * BLS_DORY_BLAKE3_MAIN_WIDTH);
+        tables.extend(local.iter().cloned());
+        tables.extend(
+            local
+                .iter()
+                .map(|table| table[1..].iter().chain(&table[..1]).copied().collect()),
+        );
+        tables
+    }
+
+    #[cfg(feature = "whir-prototype")]
     fn dense_adjacency_transcript(
         bridge: &BlsDoryOutputBridgeStatement,
+        trace_rows: usize,
         source_commitments: &[BlsDoryGt],
     ) -> BlsDoryTranscript {
         let mut transcript = BlsDoryTranscript::new(b"blake3-native-row-adjacency-sumcheck");
@@ -1078,6 +1120,11 @@ mod tests {
         );
         transcript.append_bytes(b"activation-digest", &bridge.final_activation_digest());
         transcript.append_bytes(b"dory-binding", &bridge.transcript_binding());
+        transcript.append_bytes(b"trace-rows", &(trace_rows as u64).to_le_bytes());
+        transcript.append_bytes(
+            b"main-width",
+            &(BLS_DORY_BLAKE3_MAIN_WIDTH as u64).to_le_bytes(),
+        );
         transcript.append_bytes(
             b"source-commitment-count",
             &(source_commitments.len() as u64).to_le_bytes(),
@@ -1215,7 +1262,7 @@ mod tests {
             return None;
         }
         let variables = rows.ilog2() as usize;
-        let mut transcript = dense_adjacency_transcript(bridge, source_commitments);
+        let mut transcript = dense_adjacency_transcript(bridge, rows, source_commitments);
         let compression = transcript.challenge_scalar(b"row-compression");
         let alpha = transcript.challenge_scalar(b"lookup-alpha");
         let inverses = dense_adjacency_inverse_tables(&source_tables, compression, alpha)?;
@@ -1325,7 +1372,7 @@ mod tests {
             return false;
         }
         let variables = trace_rows.ilog2() as usize;
-        let mut transcript = dense_adjacency_transcript(bridge, source_commitments);
+        let mut transcript = dense_adjacency_transcript(bridge, trace_rows, source_commitments);
         let compression = transcript.challenge_scalar(b"row-compression");
         let alpha = transcript.challenge_scalar(b"lookup-alpha");
         transcript.append_bytes(
@@ -1376,6 +1423,277 @@ mod tests {
         }
         dense_absorb_terminal(&mut transcript, &proof.terminal_evaluations);
         transcript.digest() == proof.transcript_digest
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_replay_adjacency_point(
+        proof: &DenseAdjacencySumcheckProof,
+        trace_rows: usize,
+        bridge: &BlsDoryOutputBridgeStatement,
+        source_commitments: &[BlsDoryGt],
+        inverse_commitments: &[BlsDoryGt],
+    ) -> Option<Vec<BlsDoryFr>> {
+        if !trace_rows.is_power_of_two()
+            || proof.rounds.len() != trace_rows.ilog2() as usize
+            || proof
+                .rounds
+                .iter()
+                .any(|round| round.len() != DENSE_ADJACENCY_SUMCHECK_DEGREE + 1)
+        {
+            return None;
+        }
+        let mut transcript = dense_adjacency_transcript(bridge, trace_rows, source_commitments);
+        transcript.challenge_scalar(b"row-compression");
+        transcript.challenge_scalar(b"lookup-alpha");
+        transcript.append_bytes(
+            b"inverse-commitment-count",
+            &(inverse_commitments.len() as u64).to_le_bytes(),
+        );
+        for commitment in inverse_commitments {
+            transcript.append_group(b"packed-adjacency-inverse-commitment", commitment);
+        }
+        transcript.challenge_scalar(b"local-mixing");
+        transcript.challenge_scalar(b"local-mixing");
+        transcript.challenge_scalar(b"rational-mixing");
+        dense_cell_point(&mut transcript, proof.rounds.len());
+        let mut claim = BlsDoryFr::zero();
+        let mut point = Vec::with_capacity(proof.rounds.len());
+        for (round_index, round) in proof.rounds.iter().enumerate() {
+            if round[0] + round[1] != claim {
+                return None;
+            }
+            dense_absorb_round(&mut transcript, round_index, round);
+            let challenge = transcript.challenge_scalar(b"sumcheck-challenge");
+            claim = dense_evaluate_adjacency_samples(round, challenge);
+            point.push(challenge);
+        }
+        Some(point)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_pack_adjacency_tables(
+        tables: &[Vec<BlsDoryFr>],
+        rows: usize,
+        slots: usize,
+    ) -> Option<Vec<BlsDoryFr>> {
+        if tables.is_empty()
+            || tables.len() > slots
+            || tables.iter().any(|table| table.len() != rows)
+        {
+            return None;
+        }
+        let mut packed = Vec::with_capacity(rows.checked_mul(slots)?);
+        for slot in 0..slots {
+            if let Some(table) = tables.get(slot) {
+                packed.extend_from_slice(table);
+            } else {
+                packed.resize(packed.len().checked_add(rows)?, BlsDoryFr::zero());
+            }
+        }
+        Some(packed)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dense_adjacency_opening_selector_points(
+        sumcheck_digest: [u8; 32],
+        batches: &[DenseAdjacencyOpeningBatch],
+    ) -> (Vec<Vec<BlsDoryFr>>, [u8; 32]) {
+        let mut transcript = BlsDoryTranscript::new(b"blake3-native-adjacency-opening-selectors");
+        transcript.append_bytes(b"sumcheck-digest", &sumcheck_digest);
+        transcript.append_bytes(b"batch-count", &(batches.len() as u64).to_le_bytes());
+        let points = batches
+            .iter()
+            .enumerate()
+            .map(|(batch_index, batch)| {
+                transcript.append_bytes(b"batch-index", &(batch_index as u64).to_le_bytes());
+                transcript.append_bytes(
+                    b"terminal-start",
+                    &(batch.terminal_start as u64).to_le_bytes(),
+                );
+                transcript.append_bytes(
+                    b"terminal-count",
+                    &(batch.terminal_count as u64).to_le_bytes(),
+                );
+                transcript.append_bytes(
+                    b"selector-variables",
+                    &(batch.selector_variables as u64).to_le_bytes(),
+                );
+                transcript.append_group(b"packed-adjacency-commitment", &batch.commitment);
+                (0..batch.selector_variables)
+                    .map(|selector| {
+                        transcript
+                            .append_bytes(b"selector-index", &(selector as u64).to_le_bytes());
+                        transcript.challenge_scalar(b"opening-selector")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        (points, transcript.digest())
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn prove_dense_authenticated_adjacency(
+        source_tables: Vec<Vec<BlsDoryFr>>,
+        bridge: &BlsDoryOutputBridgeStatement,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<DenseAuthenticatedAdjacencyProof, BlsDoryAggregateError> {
+        const ROWS: usize = 1 << 4;
+        const SELECTOR_VARIABLES: usize = 12;
+        const SLOTS: usize = 1 << SELECTOR_VARIABLES;
+        if source_tables.len() != 2 * BLS_DORY_BLAKE3_MAIN_WIDTH
+            || source_tables.iter().any(|table| table.len() != ROWS)
+        {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let source = commit_bls_dory_polynomial(
+            dense_pack_adjacency_tables(&source_tables, ROWS, SLOTS)
+                .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?,
+            8,
+            8,
+            setup,
+        )?;
+        let source_commitments = [source.commitment()];
+        let mut challenge_transcript =
+            dense_adjacency_transcript(bridge, ROWS, &source_commitments);
+        let compression = challenge_transcript.challenge_scalar(b"row-compression");
+        let alpha = challenge_transcript.challenge_scalar(b"lookup-alpha");
+        let inverse_tables = dense_adjacency_inverse_tables(&source_tables, compression, alpha)
+            .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+        let inverse = commit_bls_dory_polynomial(
+            dense_pack_adjacency_tables(&inverse_tables, ROWS, SLOTS)
+                .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?,
+            8,
+            8,
+            setup,
+        )?;
+        let inverse_commitments = [inverse.commitment()];
+        let sumcheck = prove_dense_adjacency_sumcheck(
+            source_tables,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+        let sumcheck_point = dense_replay_adjacency_point(
+            &sumcheck,
+            ROWS,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        )
+        .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
+        let opening_batches = vec![
+            DenseAdjacencyOpeningBatch {
+                commitment: source_commitments[0],
+                terminal_start: 0,
+                terminal_count: 2 * BLS_DORY_BLAKE3_MAIN_WIDTH,
+                selector_variables: SELECTOR_VARIABLES,
+            },
+            DenseAdjacencyOpeningBatch {
+                commitment: inverse_commitments[0],
+                terminal_start: 2 * BLS_DORY_BLAKE3_MAIN_WIDTH,
+                terminal_count: 2,
+                selector_variables: SELECTOR_VARIABLES,
+            },
+        ];
+        let (selector_points, opening_binding) =
+            dense_adjacency_opening_selector_points(sumcheck.transcript_digest, &opening_batches);
+        let points = selector_points
+            .iter()
+            .map(|selector| dense_opening_point(&sumcheck_point, selector))
+            .collect::<Vec<_>>();
+        let openings = BlsDoryDeferredOpeningSet::new(vec![source, inverse], vec![0, 1], points)?;
+        for ((claim, selector), batch) in openings
+            .claims()
+            .iter()
+            .zip(&selector_points)
+            .zip(&opening_batches)
+        {
+            let terminal_end = batch.terminal_start + batch.terminal_count;
+            let expected = dense_terminal_selector_evaluation(
+                &sumcheck.terminal_evaluations[batch.terminal_start..terminal_end],
+                selector,
+            );
+            if claim.evaluation != expected {
+                return Err(BlsDoryAggregateError::InvalidProofShape);
+            }
+        }
+        let (_, opening_proof) =
+            prove_bls_dory_deferred_opening_sets(&opening_binding, &[&openings], setup)?;
+        Ok(DenseAuthenticatedAdjacencyProof {
+            sumcheck,
+            opening_batches,
+            opening_proof,
+        })
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn verify_dense_authenticated_adjacency(
+        proof: &DenseAuthenticatedAdjacencyProof,
+        bridge: &BlsDoryOutputBridgeStatement,
+        setup: &DeterministicBlsDorySetup,
+    ) -> bool {
+        const ROWS: usize = 1 << 4;
+        const SELECTOR_VARIABLES: usize = 12;
+        let expected = [
+            (0, 2 * BLS_DORY_BLAKE3_MAIN_WIDTH),
+            (2 * BLS_DORY_BLAKE3_MAIN_WIDTH, 2),
+        ];
+        if proof.opening_batches.len() != expected.len()
+            || proof.opening_proof.is_empty()
+            || proof
+                .opening_batches
+                .iter()
+                .zip(expected)
+                .any(|(batch, (start, count))| {
+                    batch.terminal_start != start
+                        || batch.terminal_count != count
+                        || batch.selector_variables != SELECTOR_VARIABLES
+                })
+        {
+            return false;
+        }
+        let source_commitments = [proof.opening_batches[0].commitment];
+        let inverse_commitments = [proof.opening_batches[1].commitment];
+        if !verify_dense_adjacency_sumcheck(
+            &proof.sumcheck,
+            ROWS,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        ) {
+            return false;
+        }
+        let Some(sumcheck_point) = dense_replay_adjacency_point(
+            &proof.sumcheck,
+            ROWS,
+            bridge,
+            &source_commitments,
+            &inverse_commitments,
+        ) else {
+            return false;
+        };
+        let (selector_points, opening_binding) = dense_adjacency_opening_selector_points(
+            proof.sumcheck.transcript_digest,
+            &proof.opening_batches,
+        );
+        let claims = proof
+            .opening_batches
+            .iter()
+            .zip(&selector_points)
+            .map(|(batch, selector)| {
+                let terminal_end = batch.terminal_start + batch.terminal_count;
+                BlsDoryOpeningClaim {
+                    commitment: batch.commitment,
+                    point: dense_opening_point(&sumcheck_point, selector),
+                    evaluation: dense_terminal_selector_evaluation(
+                        &proof.sumcheck.terminal_evaluations[batch.terminal_start..terminal_end],
+                        selector,
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        verify_bls_dory_openings(&opening_binding, &claims, &proof.opening_proof, setup).is_ok()
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -1618,8 +1936,8 @@ mod tests {
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_OPENING_CLAIMS, 1);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_CONSTRAINTS, 1_299);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS, 580);
-        assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS, 1);
-        assert_eq!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, 130);
+        assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_OPENING_CLAIMS, 2);
+        assert_eq!(BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, 131);
         assert_eq!(BLS_DORY_BLAKE3_EXECUTION_PROOF_BYTES, 36_020);
         assert_eq!(BLS_DORY_BLAKE3_ADJACENCY_PROOF_BYTES, 21_748);
         assert_eq!(
@@ -2197,6 +2515,68 @@ mod tests {
             &air,
             &public,
             &constraints,
+            &bridge,
+            &setup,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    #[ignore = "two packed Dory commitments are intentionally expensive in debug builds"]
+    fn native_adjacency_sumcheck_sources_and_terminals_are_dory_authenticated() {
+        let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
+        let bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            [0x42; 32],
+            [0x43; 32],
+            &activation,
+            [0x51; 32],
+            [2_u64, 3, 5, 7, 11]
+                .into_iter()
+                .map(BlsDoryFr::from_u64)
+                .collect(),
+        )
+        .unwrap();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(16).unwrap();
+        let authenticated = prove_dense_authenticated_adjacency(
+            synthetic_dense_adjacency_tables(16),
+            &bridge,
+            &setup,
+        )
+        .unwrap();
+        assert_eq!(authenticated.sumcheck.rounds.len(), 4);
+        assert_eq!(
+            authenticated.sumcheck.terminal_evaluations.len(),
+            BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS
+        );
+        assert_eq!(authenticated.opening_batches.len(), 2);
+        assert!(verify_dense_authenticated_adjacency(
+            &authenticated,
+            &bridge,
+            &setup,
+        ));
+
+        let mut changed_source_commitment = authenticated.clone();
+        changed_source_commitment.opening_batches[0].commitment =
+            changed_source_commitment.opening_batches[1].commitment;
+        assert!(!verify_dense_authenticated_adjacency(
+            &changed_source_commitment,
+            &bridge,
+            &setup,
+        ));
+
+        let mut changed_terminal = authenticated.clone();
+        changed_terminal.sumcheck.terminal_evaluations[0] =
+            changed_terminal.sumcheck.terminal_evaluations[0] + BlsDoryFr::from_u64(1);
+        assert!(!verify_dense_authenticated_adjacency(
+            &changed_terminal,
+            &bridge,
+            &setup,
+        ));
+
+        let mut changed_opening = authenticated;
+        changed_opening.opening_proof[0] ^= 1;
+        assert!(!verify_dense_authenticated_adjacency(
+            &changed_opening,
             &bridge,
             &setup,
         ));

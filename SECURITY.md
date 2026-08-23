@@ -324,10 +324,11 @@ A BLS-native execution sumcheck exposes 746 local/next main and preprocessing
 terminal evaluations; both preprocessing evaluations are required to
 authenticate a shifted next row. A separate row-indexed LogUp permutation is
 projected to expose 580 terminal evaluations and is mandatory to prevent
-independently chosen next rows. Transcript-random selector batching reduces
-each terminal vector to one Dory opening claim. Composed with the existing 128
-claims, the design therefore requires 130 claims under a proposed future
-256-claim maximum.
+independently chosen next rows. Transcript-random selector batching reduces the
+execution vector to one Dory opening claim. Adjacency requires two claims
+because its source is committed before the lookup challenge and its inverse is
+committed afterward. Composed with the existing 128 claims, the design therefore
+requires 131 claims under a proposed future 256-claim maximum.
 Its conservative component projections are 36,020 and 21,748 bytes, placing the
 complete V3 payload at 191,185 bytes with 70,762 bytes below the exact V3
 allowance of 261,947 bytes. The current aggregate limit remains 128. No
@@ -358,19 +359,22 @@ geometry, before the still-missing complete union bound. The production
 out-of-core commitment/opening path is not implemented or measured, so this
 fixture does not authorize V3.
 
-The bounded algebraic row-adjacency checkpoint now places the compression
-challenge after a reserved source-commitment transcript section and compares
-the cyclic indexed multisets
+The bounded row-adjacency checkpoint commits the local/next source before the
+compression and lookup challenges, commits the two inverse tables afterward,
+and compares the cyclic indexed multisets
 `(r, next[r])` and `((r - 1) mod N, local[r])`. Two inverse tables prove the
 LogUp denominator relations under an equality-weighted local check, and their
 global rational sum binds the permutation. The 256-row fixture verifies in
 eight degree-three rounds with four samples per round. Changed cells, row
 reordering, duplication, wrap-boundary changes, and altered round or terminal
-values are rejected. The current fixture supplies no Dory source commitments,
-and its 580 terminal evaluations are not authenticated by Dory openings; it
-therefore does not yet exclude an adaptive prover. The row-compression and
-lookup-challenge errors also need the complete Fiat-Shamir union bound and
-independent review.
+values are rejected. A 16-row fixture retains the full 289-column row width and
+packs the 578 source tables into one 16-variable commitment and the two inverse
+tables into a second. Two selector-batched Dory claims authenticate all 580
+terminals; changing the source commitment, a terminal, or the opening proof is
+rejected. Production uses the same two-commitment chronology with 20 row and 10
+selector variables. Its out-of-core implementation, the complete
+row-compression and lookup-challenge union bound, and independent review remain
+open.
 
 The separate `production-whir-candidate` parser profile admits exact n=19/n=31
 configuration geometry but intentionally rejects n=31 at the byte gate: its

@@ -271,9 +271,11 @@ The next fail-closed design removes the separate FRI bridge instead of tuning
 it. It projects the exact BLAKE3 execution as a BLS/Dory sumcheck plus a
 row-indexed LogUp adjacency argument, so prover-supplied local and next rows
 cannot be unrelated. The two sumchecks expose 746 execution and 580 adjacency
-terminal evaluations, but transcript-random selector batching reduces each
-terminal vector to one Dory opening claim. Composed with the existing 128
-claims, the future aggregate needs 130 claims under a proposed 256-claim bound;
+terminal evaluations. Transcript-random selector batching reduces execution to
+one Dory opening claim. Adjacency requires two because its source must be
+committed before the lookup challenge and its inverse must be committed after
+it. Composed with the existing 128 claims, the future aggregate needs 131
+claims under a proposed 256-claim bound;
 the active parser remains capped at 128. Conservative accounting projects
 36,020- and 21,748-byte component frames and places the complete V3 payload at
 191,185 bytes with 70,762 bytes of headroom. This remains a budget, not an
@@ -300,18 +302,20 @@ all 746 values authenticate in one three-claim Dory proof, and an opening-proof
 mutation fails. Production geometry uses one 30-variable packed commitment and
 one opening claim, but its out-of-core prover is not implemented or measured.
 
-The companion bounded algebraic adjacency fixture reserves transcript placement
-for source commitments before compressing each complete main row, then proves
-equality of the cyclic row-indexed multisets `(r, next[r])` and
-`((r - 1) mod N, local[r])`. Two inverse tables
+The companion bounded adjacency fixture commits its local/next source before
+compressing each complete main row, then commits its two inverse tables after
+the lookup challenge and proves equality of the cyclic row-indexed multisets
+`(r, next[r])` and `((r - 1) mod N, local[r])`. The inverse tables
 enforce the LogUp denominators locally, while their global sum binds the
 permutation. The 256-row fixture verifies in eight degree-three rounds with four
 samples per round and exposes 580 terminal evaluations. It rejects a changed
 cell, reordered or duplicated rows, a changed wrap boundary, and altered round
-or terminal values. This checkpoint is exercised without Dory source
-commitments: its 580 adjacency terminals are not yet authenticated, so an
-adaptive prover is not yet excluded. The production out-of-core path and
-complete soundness bound remain open.
+or terminal values. A 16-row, full-289-column Dory fixture packs the 578 source
+tables into one commitment and the two inverse tables into a second commitment.
+Two selector-batched opening claims authenticate all 580 terminals; source-
+commitment, terminal, and opening-proof mutations fail. Production geometry
+uses the same two commitments at 30 variables. Its out-of-core path and complete
+soundness bound remain open.
 
 The complete tiny structured fixture now combines its arithmetic arguments, a
 split WHIR opening proof, and the exact one-block BLAKE3 argument below the

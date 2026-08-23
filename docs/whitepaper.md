@@ -666,9 +666,11 @@ row adjacency with a row-indexed LogUp permutation. Conservative accounting
 exposes 746 execution and 580 adjacency terminal evaluations. The execution
 count includes both local and shifted-next evaluations of all 84 preprocessing
 columns; omitting the second value would leave next-row preprocessing
-unauthenticated. Transcript-random selector batching reduces each terminal
-vector to one Dory opening claim, so the future composed aggregate has 130
-claims under a proposed 256-claim bound rather than 1,454 separate claims. The
+unauthenticated. Transcript-random selector batching reduces execution to one
+Dory opening claim. Adjacency needs two claims because the source must be fixed
+before the lookup challenge and its inverse can only be committed afterward.
+The future composed aggregate therefore has 131 claims under a proposed
+256-claim bound rather than 1,454 separate claims. The
 projected component frames are 36,020 and 21,748 bytes,
 producing a complete 191,185-byte V3 payload with 70,762 bytes of room under the
 exact 261,947-byte allowance.
@@ -703,10 +705,10 @@ most degree-10 error over the BLS12-381 scalar field at that geometry, before
 the complete union bound. The production out-of-core commitment/opening path is
 not implemented or measured, so this is not yet an admissible proof.
 
-A companion bounded algebraic LogUp sumcheck now specifies how to bind the
-prover-supplied local and next main rows. Its transcript reserves source
-commitments before one challenge compresses each 289-scalar row. The argument
-compares the cyclic row-indexed multisets
+A companion bounded LogUp sumcheck now binds the prover-supplied local and next
+main rows. It commits their source before one challenge compresses each
+289-scalar row, then commits the two inverse tables after the lookup challenge.
+The argument compares the cyclic row-indexed multisets
 `(r, next[r])` and `((r - 1) mod N, local[r])`; including the row label prevents
 ordinary multiset equality from concealing reordering and also binds the final
 wrap to the first row. Two inverse tables enforce their denominator identities
@@ -714,10 +716,13 @@ locally, and equality of the inverse sums enforces the permutation globally.
 The 256-row fixture verifies in eight degree-three rounds with four samples per
 round and exposes 580 terminal evaluations. Cell substitution, reordering,
 duplication, wrap-boundary changes, and round or terminal mutations are
-rejected. The current fixture supplies no Dory source commitment, so these
-mutation tests do not yet exclude an adaptive prover. Dory authentication of
-the sources and terminals, the production out-of-core path, a complete
-Fiat-Shamir union bound, and independent review remain open.
+rejected. A 16-row fixture preserves the full 289-column width and packs the 578
+source tables into one 16-variable Dory commitment and both inverses into a
+second. Two transcript-random selector claims authenticate all 580 terminal
+evaluations; source-commitment, terminal, and opening-proof mutations fail. At
+production geometry, each commitment has 20 row variables plus 10 selector
+variables. Its out-of-core implementation, complete Fiat-Shamir union bound,
+and independent review remain open.
 
 The verified model-bank reader can now transactionally publish reusable BLS coefficient artifacts as well as the fixed identity. It builds the base input and every ordered weight bank while checking the canonical byte roots and EOF, returns nothing on failure, and cleans provisional files. Its writer reassembles arbitrary authenticated input chunks into canonical rows, commits complete rows in deterministic parallel batches behind a bounded 256 MiB window, and preserves canonical artifact and target-group accumulation order. Three n=19 release A/B repeats measured 814--826 ms for the former serial writer and 377--391 ms for the parallel writer; their 822 and 385 ms medians give a 53.2% reduction while producing the identical artifact digest, row commitments, tier-two commitment, opening claims, and proof bytes. Matrix proving consumes the authenticated weight artifact sequentially, reuses it in the shared aggregate opening, and rejects a commitment from the wrong pinned bank before proving. Bounded fixtures match materialized proof bytes exactly. This removes the roughly 16 GiB in-memory `i64` slice for an n=31 weight bank. It also replaces the former 32-byte-per-weight scalar artifact: the first Dory row is stored as canonical signed words and each remaining model weight in the consensus range `[-125, 125]` is one authenticated byte selecting the fixed dictionary `0, -1..-125, 1..125`. Every read reauthenticates the dictionary, codes, dimensions, source digest, and EOF before expansion.
 

@@ -1118,7 +1118,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; a bounded release-only 21-variable regression now commits the actual four named sources, replays the six claims, proves and verifies them through the consuming scratch lifecycle, and rejects wrong preprocessing pins plus binding, route, point, evaluation, and proof tampering; the native boundary must still normalize away the unused legacy Goldilocks point and evaluation fields before activation; the real production preprocessing-pin registry, composition with the shared 128 claims, a complete production out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; a production-owned named bundle constructs main, accumulator, preprocessing, and bounded-batch adjacency-inverse sources, derives LogUp challenges from the bridge and the three named pre-inverse commitments, preserves exact dense commitment/opening bytes, and rejects mismatched statements, terminal evaluations, zero denominators, corrupt sources, setup mismatches, and source-role swaps; verifier-owned v2 execution and adjacency replay verifies the complete terminal relations, derives the fixed named six points and evaluations, fixes the adjacency half selector and lift coordinates to zero, binds the exact Dory layout and setup identity, and requires an opaque verifier-supplied preprocessing pin; native source construction and replay derive one normalized statement solely from the bridge, fixing the unused legacy Goldilocks point and evaluation to zero so callers cannot supply a parallel opening; a bounded release-only 21-variable regression now commits the actual four named sources, replays the six claims, proves and verifies them through the consuming scratch lifecycle, and rejects wrong preprocessing pins plus binding, route, point, evaluation, and proof tampering; the real production preprocessing-pin registry, composition with the shared 128 claims, a complete production out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -1727,7 +1727,7 @@ impl BlsDoryBlake3VerifierContext {
 struct BlsDoryBlake3TrustedPreprocessingPin {
     projection_version: u16,
     activation_len: usize,
-    activation_point_variables: usize,
+    cell_point_variables: usize,
     trace_rows: usize,
     geometry: BlsDoryBlake3ReplayGeometry,
     verifier_context: BlsDoryBlake3VerifierContext,
@@ -1748,7 +1748,7 @@ struct BlsDoryBlake3ReplayVerifier<'a> {
 impl BlsDoryBlake3TrustedPreprocessingPin {
     #[cfg(test)]
     fn for_test_sources(
-        statement: &StructuredBlake3Statement,
+        bridge: &BlsDoryOutputBridgeStatement,
         trace_rows: usize,
         geometry: BlsDoryBlake3ReplayGeometry,
         verifier_context: &BlsDoryBlake3VerifierContext,
@@ -1756,8 +1756,8 @@ impl BlsDoryBlake3TrustedPreprocessingPin {
     ) -> Self {
         Self {
             projection_version: BLS_DORY_BLAKE3_PROJECTION_VERSION,
-            activation_len: statement.final_activation_len,
-            activation_point_variables: statement.final_activation_point.len(),
+            activation_len: bridge.final_activation_len(),
+            cell_point_variables: bridge.cell_point().len(),
             trace_rows,
             geometry,
             verifier_context: verifier_context.clone(),
@@ -1770,15 +1770,15 @@ impl BlsDoryBlake3TrustedPreprocessingPin {
 
     fn validate(
         &self,
-        statement: &StructuredBlake3Statement,
+        bridge: &BlsDoryOutputBridgeStatement,
         trace_rows: usize,
         geometry: BlsDoryBlake3ReplayGeometry,
         verifier_context: &BlsDoryBlake3VerifierContext,
         commitments: &BlsDoryBlake3SourceCommitments,
     ) -> Result<(), BlsDoryAggregateError> {
         if self.projection_version != BLS_DORY_BLAKE3_PROJECTION_VERSION
-            || self.activation_len != statement.final_activation_len
-            || self.activation_point_variables != statement.final_activation_point.len()
+            || self.activation_len != bridge.final_activation_len()
+            || self.cell_point_variables != bridge.cell_point().len()
             || self.trace_rows != trace_rows
             || self.geometry != geometry
             || self.verifier_context != *verifier_context
@@ -1818,10 +1818,26 @@ struct BlsDoryBlake3AdjacencyRelation {
 }
 
 #[cfg(feature = "whir-prototype")]
+// This is only a shape adapter for the legacy narrow AIR. The zero Goldilocks
+// point and evaluation are intentional placeholders: the authenticated BLS
+// point and evaluation remain exclusively in the bridge/native accumulator.
+fn native_blake3_statement_from_bridge(
+    bridge: &BlsDoryOutputBridgeStatement,
+) -> StructuredBlake3Statement {
+    StructuredBlake3Statement {
+        challenge_digest: bridge.challenge_digest(),
+        final_activation_len: bridge.final_activation_len(),
+        final_activation_digest: bridge.final_activation_digest(),
+        final_activation_point: vec![ExtensionElement { limbs: [0; 3] }; bridge.cell_point().len()],
+        final_activation_evaluation: ExtensionElement { limbs: [0; 3] },
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
 fn native_blake3_public_values(
-    statement: &StructuredBlake3Statement,
+    bridge: &BlsDoryOutputBridgeStatement,
 ) -> Result<Vec<BlsDoryFr>, BlsDoryAggregateError> {
-    public_values(statement)
+    public_values(&native_blake3_statement_from_bridge(bridge))
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)
         .map(|values| {
             values
@@ -2568,7 +2584,6 @@ fn native_blake3_lifted_opening_point(
 
 #[cfg(feature = "whir-prototype")]
 fn verify_native_blake3_opening_replay_at_geometry(
-    statement: &StructuredBlake3Statement,
     bridge: &BlsDoryOutputBridgeStatement,
     commitments: &BlsDoryBlake3SourceCommitments,
     verifier: BlsDoryBlake3ReplayVerifier<'_>,
@@ -2576,19 +2591,17 @@ fn verify_native_blake3_opening_replay_at_geometry(
     adjacency: &BlsDoryBlake3AdjacencySumcheckProof,
 ) -> Result<BlsDoryBlake3OpeningReplay, BlsDoryAggregateError> {
     let geometry = verifier.geometry;
-    if bridge.challenge_digest() != statement.challenge_digest
-        || bridge.final_activation_digest() != statement.final_activation_digest
-        || bridge.final_activation_len() != statement.final_activation_len
-        || !statement.final_activation_len.is_power_of_two()
-        || bridge.cell_point().len() != statement.final_activation_len.ilog2() as usize
+    if !bridge.final_activation_len().is_power_of_two()
+        || bridge.cell_point().len() != bridge.final_activation_len().ilog2() as usize
         || geometry.source_variables
             != geometry.trace_variables + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES
         || geometry.shared_variables != geometry.source_variables + 2
     {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    let air =
-        NarrowBlake3Air::new(statement).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let native_statement = native_blake3_statement_from_bridge(bridge);
+    let air = NarrowBlake3Air::new(&native_statement)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     if !air.trace_rows().is_power_of_two()
         || air.trace_rows().ilog2() as usize != geometry.trace_variables
     {
@@ -2596,14 +2609,14 @@ fn verify_native_blake3_opening_replay_at_geometry(
     }
     verifier.context.validate_geometry(geometry)?;
     verifier.preprocessing_pin.validate(
-        statement,
+        bridge,
         air.trace_rows(),
         geometry,
         verifier.context,
         commitments,
     )?;
-    let public = native_blake3_public_values(statement)?;
-    let constraints = bls_dory_native_blake3_constraint_ir(statement.final_activation_len)
+    let public = native_blake3_public_values(bridge)?;
+    let constraints = bls_dory_native_blake3_constraint_ir(bridge.final_activation_len())
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     let execution_replay = verify_native_blake3_execution_sumcheck(
         execution,
@@ -2683,14 +2696,13 @@ fn verify_native_blake3_opening_replay_at_geometry(
 #[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
 fn verify_native_blake3_opening_statement(
-    statement: &StructuredBlake3Statement,
     bridge: &BlsDoryOutputBridgeStatement,
     commitments: BlsDoryBlake3SourceCommitments,
     execution: &BlsDoryBlake3ExecutionSumcheckProof,
     adjacency: &BlsDoryBlake3AdjacencySumcheckProof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryBlake3OpeningStatement, BlsDoryAggregateError> {
-    if statement.final_activation_len != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES {
+    if bridge.final_activation_len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     let verifier_context =
@@ -2698,7 +2710,6 @@ fn verify_native_blake3_opening_statement(
     let preprocessing_pin = native_blake3_production_preprocessing_pin()
         .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
     let replay = verify_native_blake3_opening_replay_at_geometry(
-        statement,
         bridge,
         &commitments,
         BlsDoryBlake3ReplayVerifier {
@@ -2822,22 +2833,18 @@ fn write_native_accumulator_pass(
 #[cfg(feature = "whir-prototype")]
 #[cfg_attr(not(test), allow(dead_code))]
 fn commit_native_accumulator_source(
-    statement: &StructuredBlake3Statement,
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
     bridge: &BlsDoryOutputBridgeStatement,
     layout: BlsDoryAggregateLayout,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
-    if bridge.challenge_digest() != statement.challenge_digest
-        || bridge.final_activation_digest() != statement.final_activation_digest
-        || bridge.final_activation_len() != statement.final_activation_len
-        || witness.digest != statement.final_activation_digest
-    {
+    if witness.digest != bridge.final_activation_digest() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    let air =
-        NarrowBlake3Air::new(statement).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let native_statement = native_blake3_statement_from_bridge(bridge);
+    let air = NarrowBlake3Air::new(&native_statement)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     if !air.trace_rows().is_power_of_two() {
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
@@ -2852,8 +2859,8 @@ fn commit_native_accumulator_source(
         layout.sigma(),
         setup,
     )?;
-    write_native_accumulator_pass(&mut writer, &air, statement, witness, bridge, false)?;
-    write_native_accumulator_pass(&mut writer, &air, statement, witness, bridge, true)?;
+    write_native_accumulator_pass(&mut writer, &air, &native_statement, witness, bridge, false)?;
+    write_native_accumulator_pass(&mut writer, &air, &native_statement, witness, bridge, true)?;
     writer.finish()
 }
 
@@ -3119,22 +3126,18 @@ fn create_native_preprocessed_transpose(
 
 #[cfg(feature = "whir-prototype")]
 fn commit_native_blake3_sources_at_layout(
-    statement: &StructuredBlake3Statement,
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
     bridge: &BlsDoryOutputBridgeStatement,
     layout: BlsDoryAggregateLayout,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
 ) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
-    if bridge.challenge_digest() != statement.challenge_digest
-        || bridge.final_activation_digest() != statement.final_activation_digest
-        || bridge.final_activation_len() != statement.final_activation_len
-        || witness.digest != statement.final_activation_digest
-    {
+    if witness.digest != bridge.final_activation_digest() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    let air =
-        NarrowBlake3Air::new(statement).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    let native_statement = native_blake3_statement_from_bridge(bridge);
+    let air = NarrowBlake3Air::new(&native_statement)
+        .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     validate_native_blake3_source_layout(air.trace_rows(), layout, setup)?;
 
     let mut preprocessed_transpose = create_native_preprocessed_transpose(&air, scratch_directory)?;
@@ -3153,7 +3156,7 @@ fn commit_native_blake3_sources_at_layout(
     drop(preprocessed_transpose);
 
     let mut main_transpose =
-        create_native_main_transpose(&air, statement, witness, scratch_directory)?;
+        create_native_main_transpose(&air, &native_statement, witness, scratch_directory)?;
     let main = {
         let mut source =
             TransposedLocalNextSignedWordRowSource::new_for_layout(&mut main_transpose, layout)
@@ -3166,14 +3169,8 @@ fn commit_native_blake3_sources_at_layout(
             scratch_directory,
         )?
     };
-    let accumulator = commit_native_accumulator_source(
-        statement,
-        witness,
-        bridge,
-        layout,
-        setup,
-        scratch_directory,
-    )?;
+    let accumulator =
+        commit_native_accumulator_source(witness, bridge, layout, setup, scratch_directory)?;
     let (compression, alpha) = derive_native_blake3_adjacency_challenges(
         bridge,
         air.trace_rows(),
@@ -3209,20 +3206,19 @@ fn commit_native_blake3_sources_at_layout(
 #[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
 fn commit_native_blake3_sources(
-    statement: &StructuredBlake3Statement,
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
     bridge: &BlsDoryOutputBridgeStatement,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
 ) -> Result<BlsDoryBlake3CommittedSources, BlsDoryAggregateError> {
-    if statement.final_activation_len != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES
+    if bridge.final_activation_len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES
         || setup.max_log_n() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
         || !scratch_directory.is_absolute()
         || !scratch_directory.is_dir()
     {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    if NarrowBlake3Air::new(statement)
+    if NarrowBlake3Air::new(&native_blake3_statement_from_bridge(bridge))
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?
         .trace_rows()
         != BLS_DORY_BLAKE3_PRODUCTION_TRACE_ROWS
@@ -3233,14 +3229,7 @@ fn commit_native_blake3_sources(
         BLS_DORY_SHARED_PRODUCTION_VARIABLES / 2,
         BLS_DORY_SHARED_PRODUCTION_VARIABLES - BLS_DORY_SHARED_PRODUCTION_VARIABLES / 2,
     )?;
-    commit_native_blake3_sources_at_layout(
-        statement,
-        witness,
-        bridge,
-        layout,
-        setup,
-        scratch_directory,
-    )
+    commit_native_blake3_sources_at_layout(witness, bridge, layout, setup, scratch_directory)
 }
 
 /// Exact projection values exposed to tests and activation tooling.
@@ -5858,11 +5847,16 @@ mod tests {
         BlsDoryBlake3ExecutionSumcheckProof,
         BlsDoryBlake3AdjacencySumcheckProof,
     ) {
+        let native_statement = native_blake3_statement_from_bridge(&fixture.bridge);
+        let native_air = NarrowBlake3Air::new(&native_statement).unwrap();
+        let native_public = native_blake3_public_values(&fixture.bridge).unwrap();
+        let native_constraints =
+            bls_dory_native_blake3_constraint_ir(fixture.bridge.final_activation_len()).unwrap();
         let execution = prove_dense_execution_sumcheck_with_transcript(
             fixture.tables.clone(),
-            &fixture.air,
-            &fixture.public,
-            &fixture.constraints,
+            &native_air,
+            &native_public,
+            &native_constraints,
             &fixture.bridge,
             native_blake3_execution_transcript(&fixture.bridge, commitments),
         );
@@ -5872,7 +5866,7 @@ mod tests {
             &[*commitments.commitment(BlsDoryBlake3SourceRole::Inverse)],
             native_blake3_adjacency_transcript(
                 &fixture.bridge,
-                fixture.air.trace_rows(),
+                native_air.trace_rows(),
                 &adjacency_sources,
             )
             .unwrap(),
@@ -5910,6 +5904,122 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whir-prototype")]
+    fn native_bridge_normalization_excludes_legacy_point_and_evaluation() {
+        let mut fixture = dense_blake3_fixture();
+        let canonical = native_blake3_statement_from_bridge(&fixture.bridge);
+        assert_eq!(
+            canonical.challenge_digest,
+            fixture.bridge.challenge_digest()
+        );
+        assert_eq!(
+            canonical.final_activation_digest,
+            fixture.bridge.final_activation_digest()
+        );
+        assert_eq!(
+            canonical.final_activation_len,
+            fixture.bridge.final_activation_len()
+        );
+        assert_eq!(
+            canonical.final_activation_point.len(),
+            fixture.bridge.cell_point().len()
+        );
+        assert!(
+            canonical
+                .final_activation_point
+                .iter()
+                .all(|coordinate| coordinate.limbs == [0; 3])
+        );
+        assert_eq!(canonical.final_activation_evaluation.limbs, [0; 3]);
+
+        fixture.statement.final_activation_point[0] = ExtensionElement { limbs: [1, 0, 0] };
+        fixture.statement.final_activation_evaluation = ExtensionElement { limbs: [7, 0, 0] };
+        fixture.public = bls_values(public_values(&fixture.statement).unwrap());
+        assert_ne!(
+            fixture.statement.final_activation_point,
+            canonical.final_activation_point
+        );
+        assert_ne!(
+            fixture.statement.final_activation_evaluation,
+            canonical.final_activation_evaluation
+        );
+        assert_eq!(
+            native_blake3_statement_from_bridge(&fixture.bridge),
+            canonical
+        );
+        assert_ne!(
+            fixture.public,
+            native_blake3_public_values(&fixture.bridge).unwrap()
+        );
+
+        let commitments = BlsDoryBlake3SourceCommitments {
+            main: BlsDoryGt::random(),
+            accumulator: BlsDoryGt::random(),
+            preprocessing: BlsDoryGt::random(),
+            inverse: BlsDoryGt::random(),
+        };
+        let (execution, adjacency) = named_replay_sumcheck_proofs(&fixture, &commitments);
+        let geometry = BlsDoryBlake3ReplayGeometry {
+            trace_variables: fixture.air.trace_rows().ilog2() as usize,
+            source_variables: fixture.air.trace_rows().ilog2() as usize
+                + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES,
+            shared_variables: fixture.air.trace_rows().ilog2() as usize
+                + BLS_DORY_BLAKE3_SOURCE_SELECTOR_VARIABLES
+                + 2,
+        };
+        let verifier_context = BlsDoryBlake3VerifierContext::for_test_metadata(
+            BlsDoryAggregateLayout::new(10, 11).unwrap(),
+            [0x71; 32],
+            21,
+        )
+        .unwrap();
+        let preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
+            &fixture.bridge,
+            fixture.air.trace_rows(),
+            geometry,
+            &verifier_context,
+            &commitments,
+        );
+        verify_native_blake3_opening_replay_at_geometry(
+            &fixture.bridge,
+            &commitments,
+            BlsDoryBlake3ReplayVerifier {
+                context: &verifier_context,
+                preprocessing_pin: &preprocessing_pin,
+                geometry,
+            },
+            &execution,
+            &adjacency,
+        )
+        .unwrap();
+
+        let activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
+        let mut wrong_digest = fixture.bridge.final_activation_digest();
+        wrong_digest[0] ^= 1;
+        let wrong_bridge = BlsDoryOutputBridgeStatement::from_test_parts(
+            fixture.bridge.challenge_digest(),
+            wrong_digest,
+            &activation,
+            fixture.bridge.transcript_binding(),
+            fixture.bridge.cell_point().to_vec(),
+        )
+        .unwrap();
+        let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(6).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+        assert!(matches!(
+            commit_native_blake3_sources_at_layout(
+                &fixture.witness,
+                &wrong_bridge,
+                BlsDoryAggregateLayout::new(3, 3).unwrap(),
+                &setup,
+                &scratch.0,
+            ),
+            Err(BlsDoryAggregateError::InvalidProofShape)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
     fn verifier_owned_replay_derives_six_fixed_named_claims() {
         let fixture = dense_blake3_fixture();
         let commitments = BlsDoryBlake3SourceCommitments {
@@ -5934,7 +6044,7 @@ mod tests {
         )
         .unwrap();
         let preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
-            &fixture.statement,
+            &fixture.bridge,
             fixture.air.trace_rows(),
             geometry,
             &verifier_context,
@@ -5946,7 +6056,6 @@ mod tests {
             geometry,
         };
         let replay = verify_native_blake3_opening_replay_at_geometry(
-            &fixture.statement,
             &fixture.bridge,
             &commitments,
             replay_verifier,
@@ -6024,7 +6133,6 @@ mod tests {
             wrong_execution_round.rounds[0][0] + BlsDoryFr::from_u64(1);
         assert_eq!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 replay_verifier,
@@ -6039,7 +6147,6 @@ mod tests {
             wrong_execution_terminal.terminal_evaluations[0] + BlsDoryFr::from_u64(1);
         assert!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 replay_verifier,
@@ -6053,7 +6160,6 @@ mod tests {
         wrong_adjacency_digest.transcript_digest[0] ^= 1;
         assert_eq!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 replay_verifier,
@@ -6071,7 +6177,6 @@ mod tests {
         };
         assert!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &swapped,
                 replay_verifier,
@@ -6092,7 +6197,7 @@ mod tests {
             ..commitments.clone()
         };
         let wrong_commitment_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
-            &fixture.statement,
+            &fixture.bridge,
             fixture.air.trace_rows(),
             geometry,
             &verifier_context,
@@ -6100,7 +6205,6 @@ mod tests {
         );
         assert_eq!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 BlsDoryBlake3ReplayVerifier {
@@ -6118,7 +6222,7 @@ mod tests {
             ..geometry
         };
         let wrong_shape_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
-            &fixture.statement,
+            &fixture.bridge,
             fixture.air.trace_rows(),
             wrong_pin_geometry,
             &verifier_context,
@@ -6126,7 +6230,6 @@ mod tests {
         );
         assert_eq!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 BlsDoryBlake3ReplayVerifier {
@@ -6146,7 +6249,7 @@ mod tests {
         )
         .unwrap();
         let wrong_layout_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
-            &fixture.statement,
+            &fixture.bridge,
             fixture.air.trace_rows(),
             geometry,
             &wrong_layout_context,
@@ -6154,7 +6257,6 @@ mod tests {
         );
         assert_eq!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 BlsDoryBlake3ReplayVerifier {
@@ -6170,7 +6272,7 @@ mod tests {
         let mut wrong_setup_context = verifier_context.clone();
         wrong_setup_context.setup_identity[0] ^= 1;
         let wrong_setup_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
-            &fixture.statement,
+            &fixture.bridge,
             fixture.air.trace_rows(),
             geometry,
             &wrong_setup_context,
@@ -6178,7 +6280,6 @@ mod tests {
         );
         assert_eq!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 BlsDoryBlake3ReplayVerifier {
@@ -7161,7 +7262,9 @@ mod tests {
         const TABLES_PER_DIRECTION: usize = BLS_DORY_BLAKE3_MAIN_WIDTH - 1;
         const MAX_BATCH_TABLES: usize = SELECTOR_SLOTS / 2;
         let fixture = dense_blake3_fixture();
-        assert_eq!(fixture.air.trace_rows(), TRACE_ROWS);
+        let native_statement = native_blake3_statement_from_bridge(&fixture.bridge);
+        let native_air = NarrowBlake3Air::new(&native_statement).unwrap();
+        assert_eq!(native_air.trace_rows(), TRACE_ROWS);
         let ordinary_native_columns = (0..BLS_DORY_BLAKE3_MAIN_WIDTH)
             .filter(|column| *column != NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START)
             .collect::<Vec<_>>();
@@ -7206,8 +7309,8 @@ mod tests {
                 BlsDoryWordTransposeWriter::create(&scratch.0, TRACE_ROWS, batch_columns.len(), 17)
                     .unwrap();
             for_each_main_trace_row(
-                &fixture.air,
-                &fixture.statement,
+                &native_air,
+                &native_statement,
                 &fixture.witness,
                 |row_index, row| {
                     let centered = row
@@ -7597,12 +7700,14 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     fn native_accumulator_stream_matches_materialized_local_and_next() {
         let fixture = dense_blake3_fixture();
+        let native_statement = native_blake3_statement_from_bridge(&fixture.bridge);
+        let native_air = NarrowBlake3Air::new(&native_statement).unwrap();
         let local_table = NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START;
         let next_table = BLS_DORY_BLAKE3_MAIN_WIDTH + local_table;
         let mut visited = 0usize;
         for_each_native_accumulator_pair(
-            &fixture.air,
-            &fixture.statement,
+            &native_air,
+            &native_statement,
             &fixture.witness,
             &fixture.bridge,
             |row_index, local, next| {
@@ -7638,26 +7743,11 @@ mod tests {
             &setup,
         )
         .unwrap();
-        let mut wrong_statement = fixture.statement.clone();
-        wrong_statement.challenge_digest[0] ^= 1;
-        assert!(matches!(
-            commit_native_accumulator_source(
-                &wrong_statement,
-                &fixture.witness,
-                &fixture.bridge,
-                layout,
-                &setup,
-                &scratch.0,
-            ),
-            Err(BlsDoryAggregateError::InvalidProofShape)
-        ));
-        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
-
         let mut wrong_activation = (0_u8..32).map(|index| 100 + index).collect::<Vec<_>>();
         wrong_activation[0] ^= 1;
         let wrong_bridge = BlsDoryOutputBridgeStatement::from_test_parts(
-            fixture.statement.challenge_digest,
-            fixture.statement.final_activation_digest,
+            fixture.bridge.challenge_digest(),
+            fixture.bridge.final_activation_digest(),
             &wrong_activation,
             fixture.bridge.transcript_binding(),
             fixture.bridge.cell_point().to_vec(),
@@ -7665,7 +7755,6 @@ mod tests {
         .unwrap();
         assert!(matches!(
             commit_native_accumulator_source(
-                &fixture.statement,
                 &fixture.witness,
                 &wrong_bridge,
                 layout,
@@ -7677,7 +7766,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
 
         let streamed = commit_native_accumulator_source(
-            &fixture.statement,
             &fixture.witness,
             &fixture.bridge,
             layout,
@@ -7846,13 +7934,7 @@ mod tests {
         let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(18).unwrap();
         let scratch = Blake3ScratchDirectory::create();
         assert!(matches!(
-            commit_native_blake3_sources(
-                &fixture.statement,
-                &fixture.witness,
-                &fixture.bridge,
-                &setup,
-                &scratch.0,
-            ),
+            commit_native_blake3_sources(&fixture.witness, &fixture.bridge, &setup, &scratch.0,),
             Err(BlsDoryAggregateError::InvalidProofShape)
         ));
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
@@ -7861,7 +7943,6 @@ mod tests {
             crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(2).unwrap();
         assert!(matches!(
             commit_native_blake3_sources_at_layout(
-                &fixture.statement,
                 &fixture.witness,
                 &fixture.bridge,
                 layout,
@@ -7873,7 +7954,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
 
         let sources = commit_native_blake3_sources_at_layout(
-            &fixture.statement,
             &fixture.witness,
             &fixture.bridge,
             layout,
@@ -7915,7 +7995,10 @@ mod tests {
     #[ignore = "real 21-variable four-source replay and Dory opening; run explicitly in --release"]
     fn native_six_claim_replay_authenticates_named_sources_end_to_end() {
         let total_started = std::time::Instant::now();
-        let fixture = dense_blake3_fixture();
+        let mut fixture = dense_blake3_fixture();
+        fixture.statement.final_activation_point[0] = ExtensionElement { limbs: [1, 0, 0] };
+        fixture.statement.final_activation_evaluation = ExtensionElement { limbs: [7, 0, 0] };
+        fixture.public = bls_values(public_values(&fixture.statement).unwrap());
         assert_eq!(fixture.air.trace_rows(), 1 << 8);
         let geometry = BlsDoryBlake3ReplayGeometry {
             trace_variables: 8,
@@ -7932,7 +8015,6 @@ mod tests {
         let scratch = Blake3ScratchDirectory::create();
         let source_started = std::time::Instant::now();
         let sources = commit_native_blake3_sources_at_layout(
-            &fixture.statement,
             &fixture.witness,
             &fixture.bridge,
             layout,
@@ -7947,7 +8029,7 @@ mod tests {
         let commitments = sources.commitments();
 
         let preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
-            &fixture.statement,
+            &fixture.bridge,
             fixture.air.trace_rows(),
             geometry,
             &verifier_context,
@@ -7961,7 +8043,7 @@ mod tests {
             ..commitments.clone()
         };
         let wrong_preprocessing_pin = BlsDoryBlake3TrustedPreprocessingPin::for_test_sources(
-            &fixture.statement,
+            &fixture.bridge,
             fixture.air.trace_rows(),
             geometry,
             &verifier_context,
@@ -7969,7 +8051,6 @@ mod tests {
         );
         assert_eq!(
             verify_native_blake3_opening_replay_at_geometry(
-                &fixture.statement,
                 &fixture.bridge,
                 &commitments,
                 BlsDoryBlake3ReplayVerifier {
@@ -7983,7 +8064,6 @@ mod tests {
             Err(BlsDoryAggregateError::InvalidProofShape)
         );
         let replay = verify_native_blake3_opening_replay_at_geometry(
-            &fixture.statement,
             &fixture.bridge,
             &commitments,
             BlsDoryBlake3ReplayVerifier {

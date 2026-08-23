@@ -361,6 +361,7 @@ fn failed_parent_authentication_removes_unfinished_child() {
 }
 
 #[test]
+#[cfg(feature = "whir-prototype")]
 fn transactional_artifact_fold_rejects_corrupt_parent_and_removes_child() {
     let directory = TestDirectory::create();
     let parent = root_artifact(&directory, [0x91; 32], &[row(0), row(1_000)]);

@@ -29,11 +29,7 @@ use crate::dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt};
 use crate::{
     ExtensionElement, GOLDILOCKS_MODULUS, StructuredBlake3Statement,
     dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
-    structured_blake3_narrow::{
-        F as Goldilocks, NarrowBlake3Air, NarrowBlake3Error, TEST_EVALUATION_ACCUMULATOR_START,
-        TEST_MAIN_WIDTH, TEST_ORIGINAL_NIBBLES_START, TEST_PREPROCESSED_WORD_COLUMNS,
-        TEST_STACK_START,
-    },
+    structured_blake3_narrow::{F as Goldilocks, NarrowBlake3Air, NarrowBlake3Error},
 };
 use crate::{
     dory_bls12_381_aggregate::{BlsDoryAggregateError, BlsDoryOpeningClaim},
@@ -49,6 +45,16 @@ use crate::{
     },
     dory_bls12_381_transpose::projected_bls_dory_transpose_artifact_bytes,
     wire::MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
+};
+#[cfg(feature = "whir-prototype")]
+use crate::{
+    dory_bls12_381_aggregate::{BlsDoryAggregateLayout, BlsDoryCompactRowSource},
+    dory_bls12_381_transpose::{BlsDoryTransposeError, BlsDoryWordTransposeArtifact},
+    structured_blake3_narrow::{
+        NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START, NARROW_BLAKE3_MAIN_WIDTH,
+        NARROW_BLAKE3_ORIGINAL_NIBBLES_START, NARROW_BLAKE3_PREPROCESSED_WIDTH,
+        NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS, NARROW_BLAKE3_STACK_START,
+    },
 };
 
 /// Version of this projection only; no wire proof uses it.
@@ -84,6 +90,25 @@ pub const BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES: usize =
     2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES;
 /// Two post-challenge LogUp inverse tables require canonical full-field scalars.
 pub const BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES: usize = 2;
+
+#[cfg(feature = "whir-prototype")]
+const _: () = {
+    assert!(NARROW_BLAKE3_STACK_START > NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START);
+    assert!(
+        BLS_DORY_BLAKE3_MAIN_WIDTH
+            == NARROW_BLAKE3_MAIN_WIDTH
+                - (NARROW_BLAKE3_STACK_START - NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START)
+                + 1
+    );
+    assert!(BLS_DORY_BLAKE3_PREPROCESSED_WIDTH == NARROW_BLAKE3_PREPROCESSED_WIDTH);
+    assert!(
+        NARROW_BLAKE3_ORIGINAL_NIBBLES_START + 16 <= NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START
+    );
+    assert!(
+        BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+            == 2 * NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.len()
+    );
+};
 
 const BLS_DORY_SCALAR_BYTES: u64 = 32;
 const BLS_DORY_SIGNED_WORD_BYTES: u64 = 8;
@@ -338,6 +363,416 @@ impl BlsDoryBlake3OpeningStatement {
     }
 }
 
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_transposed_shifted_segment(
+    artifact: &mut BlsDoryWordTransposeArtifact,
+    column: usize,
+    direction: usize,
+    start_row: usize,
+    output: &mut [u64],
+) -> Result<usize, BlsDoryTransposeError> {
+    if output.is_empty() || start_row >= artifact.rows() || direction > 1 {
+        return Err(BlsDoryTransposeError::InvalidShape);
+    }
+    if direction == 0 {
+        return artifact.read_column_segment(column, start_row, output);
+    }
+    let shifted_start = (start_row + 1) % artifact.rows();
+    let first_len = output.len().min(artifact.rows() - shifted_start);
+    artifact.read_column_segment(column, shifted_start, &mut output[..first_len])?;
+    if first_len < output.len() {
+        artifact.read_column_segment(column, 0, &mut output[first_len..])?;
+    }
+    Ok(output.len())
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_lifted_transposed_row(
+    artifact: &mut BlsDoryWordTransposeArtifact,
+    physical_rows: usize,
+    physical_columns: usize,
+    logical_tables: usize,
+    row_index: usize,
+    output: &mut [u64],
+    mut logical_role: impl FnMut(usize) -> Option<(usize, usize)>,
+) -> Result<usize, BlsDoryTransposeError> {
+    if row_index >= physical_rows
+        || output.len() != physical_columns
+        || logical_tables == 0
+        || physical_columns == 0
+    {
+        return Err(BlsDoryTransposeError::InvalidShape);
+    }
+    let logical_values = logical_tables
+        .checked_mul(artifact.rows())
+        .ok_or(BlsDoryTransposeError::InvalidShape)?;
+    let flat_start = row_index
+        .checked_mul(physical_columns)
+        .ok_or(BlsDoryTransposeError::InvalidShape)?;
+    if flat_start >= logical_values {
+        return Err(BlsDoryTransposeError::InvalidShape);
+    }
+    let flat_end = flat_start
+        .checked_add(physical_columns)
+        .ok_or(BlsDoryTransposeError::InvalidShape)?
+        .min(logical_values);
+    output.fill(0);
+    let mut flat = flat_start;
+    let mut written = 0usize;
+    while flat < flat_end {
+        let logical_table = flat / artifact.rows();
+        let table_offset = flat % artifact.rows();
+        let take = (artifact.rows() - table_offset).min(flat_end - flat);
+        let (direction, column) =
+            logical_role(logical_table).ok_or(BlsDoryTransposeError::InvalidShape)?;
+        read_transposed_shifted_segment(
+            artifact,
+            column,
+            direction,
+            table_offset,
+            &mut output[written..written + take],
+        )?;
+        flat += take;
+        written += take;
+    }
+    Ok(output.len())
+}
+
+/// Compact Dory source for local and cyclic-next signed BLAKE3 main columns.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct TransposedLocalNextSignedWordRowSource<'a> {
+    artifact: &'a mut BlsDoryWordTransposeArtifact,
+    physical_rows: usize,
+    physical_columns: usize,
+    dictionary: [BlsDoryFr; 1],
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a> TransposedLocalNextSignedWordRowSource<'a> {
+    #[cfg(test)]
+    fn new(artifact: &'a mut BlsDoryWordTransposeArtifact, selector_slots: usize) -> Self {
+        let trace_rows = artifact.rows();
+        Self::new_with_geometry(artifact, selector_slots, trace_rows).expect("valid source shape")
+    }
+
+    fn new_for_layout(
+        artifact: &'a mut BlsDoryWordTransposeArtifact,
+        layout: BlsDoryAggregateLayout,
+    ) -> Result<Self, BlsDoryTransposeError> {
+        let physical_rows = 1usize
+            .checked_shl(layout.nu() as u32)
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        let physical_columns = 1usize
+            .checked_shl(layout.sigma() as u32)
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        Self::new_with_geometry(artifact, physical_rows, physical_columns)
+    }
+
+    fn new_with_geometry(
+        artifact: &'a mut BlsDoryWordTransposeArtifact,
+        physical_rows: usize,
+        physical_columns: usize,
+    ) -> Result<Self, BlsDoryTransposeError> {
+        let explicit = artifact
+            .columns()
+            .checked_mul(2)
+            .and_then(|tables| tables.checked_mul(artifact.rows()))
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        let capacity = physical_rows
+            .checked_mul(physical_columns)
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        if !physical_rows.is_power_of_two()
+            || !physical_columns.is_power_of_two()
+            || explicit == 0
+            || explicit > capacity
+            || !explicit.is_multiple_of(physical_columns)
+        {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        Ok(Self {
+            artifact,
+            physical_rows,
+            physical_columns,
+            dictionary: [BlsDoryFr::zero()],
+        })
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryCompactRowSource for TransposedLocalNextSignedWordRowSource<'_> {
+    type Error = BlsDoryTransposeError;
+
+    fn rows(&self) -> usize {
+        self.physical_rows
+    }
+
+    fn columns(&self) -> usize {
+        self.physical_columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.artifact
+            .columns()
+            .saturating_mul(2)
+            .saturating_mul(self.artifact.rows())
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.explicit_scalar_count()
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.artifact.rows()
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        let word_selectors = self.word_scalar_count() / self.word_group_len();
+        if word_selectors >= u64::BITS as usize {
+            u64::MAX
+        } else {
+            (1u64 << word_selectors) - 1
+        }
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        let local_columns = self.artifact.columns();
+        read_lifted_transposed_row(
+            self.artifact,
+            self.physical_rows,
+            self.physical_columns,
+            2 * local_columns,
+            row_index,
+            output,
+            |logical_table| {
+                (logical_table < 2 * local_columns).then_some((
+                    usize::from(logical_table >= local_columns),
+                    logical_table % local_columns,
+                ))
+            },
+        )
+    }
+
+    fn read_code_row(
+        &mut self,
+        _row_index: usize,
+        _output: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        Err(BlsDoryTransposeError::InvalidShape)
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn preprocessed_physical_role(physical_slot: usize) -> Option<(usize, usize)> {
+    let word_columns = NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.len();
+    let boolean_columns = BLS_DORY_BLAKE3_PREPROCESSED_WIDTH.checked_sub(word_columns)?;
+    if physical_slot < word_columns {
+        return Some((0, NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS[physical_slot]));
+    }
+    if physical_slot < 2 * word_columns {
+        return Some((
+            1,
+            NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS[physical_slot - word_columns],
+        ));
+    }
+    let code_slot = physical_slot.checked_sub(2 * word_columns)?;
+    if code_slot >= 2 * boolean_columns {
+        return None;
+    }
+    let direction = code_slot / boolean_columns;
+    let boolean_index = code_slot % boolean_columns;
+    let column = (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
+        .filter(|column| !NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(column))
+        .nth(boolean_index)?;
+    Some((direction, column))
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn preprocessed_physical_terminal_index(physical_slot: usize) -> Option<usize> {
+    let (direction, column) = preprocessed_physical_role(physical_slot)?;
+    direction
+        .checked_mul(BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)?
+        .checked_add(column)
+}
+
+/// Compact Dory source for reordered BLAKE3 preprocessing words and Boolean codes.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct TransposedPreprocessedRowSource<'a> {
+    artifact: &'a mut BlsDoryWordTransposeArtifact,
+    physical_rows: usize,
+    physical_columns: usize,
+    code_scratch: Vec<u64>,
+    dictionary: [BlsDoryFr; 2],
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a> TransposedPreprocessedRowSource<'a> {
+    #[cfg(test)]
+    fn new(artifact: &'a mut BlsDoryWordTransposeArtifact, selector_slots: usize) -> Self {
+        let trace_rows = artifact.rows();
+        Self::new_with_geometry(artifact, selector_slots, trace_rows).expect("valid source shape")
+    }
+
+    fn new_for_layout(
+        artifact: &'a mut BlsDoryWordTransposeArtifact,
+        layout: BlsDoryAggregateLayout,
+    ) -> Result<Self, BlsDoryTransposeError> {
+        let physical_rows = 1usize
+            .checked_shl(layout.nu() as u32)
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        let physical_columns = 1usize
+            .checked_shl(layout.sigma() as u32)
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        Self::new_with_geometry(artifact, physical_rows, physical_columns)
+    }
+
+    fn new_with_geometry(
+        artifact: &'a mut BlsDoryWordTransposeArtifact,
+        physical_rows: usize,
+        physical_columns: usize,
+    ) -> Result<Self, BlsDoryTransposeError> {
+        let expected_code_tables = 2usize
+            .checked_mul(
+                BLS_DORY_BLAKE3_PREPROCESSED_WIDTH
+                    .checked_sub(NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.len())
+                    .ok_or(BlsDoryTransposeError::InvalidShape)?,
+            )
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        if artifact.columns() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH
+            || expected_code_tables != BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES
+        {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        let explicit = (BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+            + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES)
+            .checked_mul(artifact.rows())
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        let word_scalars = BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
+            .checked_mul(artifact.rows())
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        let capacity = physical_rows
+            .checked_mul(physical_columns)
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        if !physical_rows.is_power_of_two()
+            || !physical_columns.is_power_of_two()
+            || explicit > capacity
+            || !word_scalars.is_multiple_of(physical_columns)
+        {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        Ok(Self {
+            code_scratch: vec![0; physical_columns],
+            artifact,
+            physical_rows,
+            physical_columns,
+            dictionary: [BlsDoryFr::zero(), BlsDoryFr::from_u64(1)],
+        })
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryCompactRowSource for TransposedPreprocessedRowSource<'_> {
+    type Error = BlsDoryTransposeError;
+
+    fn rows(&self) -> usize {
+        self.physical_rows
+    }
+
+    fn columns(&self) -> usize {
+        self.physical_columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        (BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES)
+            .saturating_mul(self.artifact.rows())
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES.saturating_mul(self.artifact.rows())
+    }
+
+    fn code_bits(&self) -> u8 {
+        4
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.artifact.rows()
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        0
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        if row_index
+            .checked_mul(self.physical_columns)
+            .is_none_or(|start| start >= self.word_scalar_count())
+        {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        read_lifted_transposed_row(
+            self.artifact,
+            self.physical_rows,
+            self.physical_columns,
+            2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+            row_index,
+            output,
+            preprocessed_physical_role,
+        )
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let row_start = row_index
+            .checked_mul(self.physical_columns)
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        if row_start < self.word_scalar_count()
+            || row_start >= self.explicit_scalar_count()
+            || output.len() != self.physical_columns
+        {
+            return Err(BlsDoryTransposeError::InvalidShape);
+        }
+        let read = read_lifted_transposed_row(
+            self.artifact,
+            self.physical_rows,
+            self.physical_columns,
+            2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
+            row_index,
+            &mut self.code_scratch,
+            preprocessed_physical_role,
+        )?;
+        for (code, value) in output.iter_mut().zip(&self.code_scratch) {
+            *code = u8::try_from(*value)
+                .ok()
+                .filter(|code| *code <= 1)
+                .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        }
+        Ok(read)
+    }
+}
+
 const SCALAR_BYTES: usize = 32;
 const GT_BYTES: usize = 576;
 const COMPONENT_HEADER_BYTES: usize = 20;
@@ -398,7 +833,7 @@ const _: () = {
 pub const BLS_DORY_BLAKE3_PRODUCTION_READY: bool = false;
 /// Gates that must remain closed before this design can replace the FRI bridge.
 pub const BLS_DORY_BLAKE3_PRODUCTION_BLOCKERS: [&str; 4] = [
-    "bounded row streams now transpose every ordinary main and preprocessing column, derive next rows without duplicate scratch, preserve exact commitment and opening bytes, reject non-Boolean codes, and project the production source payload from 23.375 GiB literal to 4.765625 GiB compact; signed-word and preprocessing streams have materialized commitment/opening equivalence for bounded shared-layout reblocking analogs and pin the exact n=33 topology, a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches, and production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; production-owned source construction, verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
+    "production-owned main and preprocessing row-source primitives now transpose every ordinary column, derive cyclic next rows without duplicate scratch, reject malformed shapes and non-Boolean codes, and are pinned to the narrow-trace schema by compile-time assertions; bounded tests preserve exact commitment and opening bytes for shared-layout reblocking analogs, while a bounded-memory adjacency-inverse prototype matches dense commitments/opening bytes and rejects zero denominators, corrupt sources, and setup mismatches, and production-owned role/lift binding rejects freshly reproved wrong routes and nonzero lift coordinates in the bounded four-source/six-claim test; production-owned accumulator and inverse construction, a named four-source bundle, verifier transcript derivation of the six points and evaluations, composition with the shared 128 claims, a complete out-of-core opening, and the exact n=33 run are still not implemented or measured",
     "the executable union bound covers execution, row compression, lookup, sumchecks, and selector batching at a 219-bit algebraic floor, but it is not independently reviewed and does not replace Dory knowledge-soundness or Fiat-Shamir analysis",
     "the shared aggregate parser still intentionally caps claim count at 128 while the audited split-source topology requires 134 total claims, and must not be widened before the new components verify end to end",
     "a nonallocating fail-closed budget checker accounts for 5,117,051,496 bytes of framed BLAKE3 sources and 3,120,562,320 bytes of source-construction transposes; the canonical four-source fold lifecycle projects a 35,304,177,312-byte aggregate-stage peak, or 38,424,739,632 bytes if both transposes remain live, and the checker rejects caller-supplied measurements below a provisional 50 GiB scratch floor; it is not yet wired to a production run, peak memory still has only a provisional 4 GiB floor, and the complete n=33 proof size, proving time, verification time, peak memory, and peak scratch have not been measured or audited",
@@ -694,7 +1129,8 @@ fn centered_goldilocks(value: Goldilocks) -> i64 {
 fn uses_old_evaluation_constraint(expression: &BlsDoryBlake3ConstraintExpr) -> bool {
     match expression {
         BlsDoryBlake3ConstraintExpr::Variable(BlsDoryBlake3Variable::Main { index, .. }) => {
-            (TEST_EVALUATION_ACCUMULATOR_START..TEST_STACK_START).contains(&usize::from(*index))
+            (NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START..NARROW_BLAKE3_STACK_START)
+                .contains(&usize::from(*index))
         }
         BlsDoryBlake3ConstraintExpr::Add(left, right)
         | BlsDoryBlake3ConstraintExpr::Sub(left, right)
@@ -719,11 +1155,16 @@ fn remap_native_main_constraint(
             let variable = match *variable {
                 BlsDoryBlake3Variable::Main { offset, index } => {
                     let index = usize::from(index);
-                    if (TEST_EVALUATION_ACCUMULATOR_START..TEST_STACK_START).contains(&index) {
+                    if (NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START..NARROW_BLAKE3_STACK_START)
+                        .contains(&index)
+                    {
                         return Err(NarrowBlake3Error::Encoding);
                     }
-                    let native_index = if index >= TEST_STACK_START {
-                        index - (TEST_STACK_START - TEST_EVALUATION_ACCUMULATOR_START - 1)
+                    let native_index = if index >= NARROW_BLAKE3_STACK_START {
+                        index
+                            - (NARROW_BLAKE3_STACK_START
+                                - NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START
+                                - 1)
                     } else {
                         index
                     };
@@ -795,11 +1236,11 @@ fn bls_dory_native_blake3_constraint_ir(
 
 #[cfg(all(test, feature = "whir-prototype"))]
 fn native_main_row(old_row: &[BlsDoryFr], accumulator: BlsDoryFr) -> Vec<BlsDoryFr> {
-    assert_eq!(old_row.len(), TEST_MAIN_WIDTH);
+    assert_eq!(old_row.len(), NARROW_BLAKE3_MAIN_WIDTH);
     let mut row = Vec::with_capacity(BLS_DORY_BLAKE3_MAIN_WIDTH);
-    row.extend_from_slice(&old_row[..TEST_EVALUATION_ACCUMULATOR_START]);
+    row.extend_from_slice(&old_row[..NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START]);
     row.push(accumulator);
-    row.extend_from_slice(&old_row[TEST_STACK_START..]);
+    row.extend_from_slice(&old_row[NARROW_BLAKE3_STACK_START..]);
     assert_eq!(row.len(), BLS_DORY_BLAKE3_MAIN_WIDTH);
     row
 }
@@ -843,8 +1284,8 @@ fn native_activation_contribution_from_coefficients(
     coefficients: &[BlsDoryFr; 8],
 ) -> BlsDoryFr {
     (0..8).fold(BlsDoryFr::zero(), |sum, byte| {
-        let low = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte];
-        let high = main_local[TEST_ORIGINAL_NIBBLES_START + 2 * byte + 1];
+        let low = main_local[NARROW_BLAKE3_ORIGINAL_NIBBLES_START + 2 * byte];
+        let high = main_local[NARROW_BLAKE3_ORIGINAL_NIBBLES_START + 2 * byte + 1];
         let value = low + BlsDoryFr::from_u64(16) * high;
         sum + value * coefficients[byte]
     })
@@ -876,8 +1317,8 @@ fn native_evaluation_residuals_from_coefficients(
     coefficients: &[BlsDoryFr; 8],
     raw_evaluation: BlsDoryFr,
 ) -> [BlsDoryFr; 3] {
-    let current = row.main_local[TEST_EVALUATION_ACCUMULATOR_START];
-    let next = row.main_next[TEST_EVALUATION_ACCUMULATOR_START];
+    let current = row.main_local[NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START];
+    let next = row.main_next[NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START];
     let contribution =
         native_activation_contribution_from_coefficients(row.main_local, coefficients);
     [
@@ -931,10 +1372,10 @@ fn for_each_native_accumulator_pair<E>(
             );
             let contribution = (0..8).fold(BlsDoryFr::zero(), |sum, byte| {
                 let low = BlsDoryFr::from_i64(centered_goldilocks(
-                    row[TEST_ORIGINAL_NIBBLES_START + 2 * byte],
+                    row[NARROW_BLAKE3_ORIGINAL_NIBBLES_START + 2 * byte],
                 ));
                 let high = BlsDoryFr::from_i64(centered_goldilocks(
-                    row[TEST_ORIGINAL_NIBBLES_START + 2 * byte + 1],
+                    row[NARROW_BLAKE3_ORIGINAL_NIBBLES_START + 2 * byte + 1],
                 ));
                 sum + (low + BlsDoryFr::from_u64(16) * high) * coefficients[byte]
             });
@@ -2432,81 +2873,6 @@ mod tests {
     }
 
     #[cfg(feature = "whir-prototype")]
-    fn read_transposed_shifted_segment(
-        artifact: &mut BlsDoryWordTransposeArtifact,
-        column: usize,
-        direction: usize,
-        start_row: usize,
-        output: &mut [u64],
-    ) -> Result<usize, BlsDoryTransposeError> {
-        if output.is_empty() || start_row >= artifact.rows() || direction > 1 {
-            return Err(BlsDoryTransposeError::InvalidShape);
-        }
-        if direction == 0 {
-            return artifact.read_column_segment(column, start_row, output);
-        }
-        let shifted_start = (start_row + 1) % artifact.rows();
-        let first_len = output.len().min(artifact.rows() - shifted_start);
-        artifact.read_column_segment(column, shifted_start, &mut output[..first_len])?;
-        if first_len < output.len() {
-            artifact.read_column_segment(column, 0, &mut output[first_len..])?;
-        }
-        Ok(output.len())
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    fn read_lifted_transposed_row(
-        artifact: &mut BlsDoryWordTransposeArtifact,
-        physical_rows: usize,
-        physical_columns: usize,
-        logical_tables: usize,
-        row_index: usize,
-        output: &mut [u64],
-        mut logical_role: impl FnMut(usize) -> Option<(usize, usize)>,
-    ) -> Result<usize, BlsDoryTransposeError> {
-        if row_index >= physical_rows
-            || output.len() != physical_columns
-            || logical_tables == 0
-            || physical_columns == 0
-        {
-            return Err(BlsDoryTransposeError::InvalidShape);
-        }
-        let logical_values = logical_tables
-            .checked_mul(artifact.rows())
-            .ok_or(BlsDoryTransposeError::InvalidShape)?;
-        let flat_start = row_index
-            .checked_mul(physical_columns)
-            .ok_or(BlsDoryTransposeError::InvalidShape)?;
-        if flat_start >= logical_values {
-            return Err(BlsDoryTransposeError::InvalidShape);
-        }
-        let flat_end = flat_start
-            .checked_add(physical_columns)
-            .ok_or(BlsDoryTransposeError::InvalidShape)?
-            .min(logical_values);
-        output.fill(0);
-        let mut flat = flat_start;
-        let mut written = 0usize;
-        while flat < flat_end {
-            let logical_table = flat / artifact.rows();
-            let table_offset = flat % artifact.rows();
-            let take = (artifact.rows() - table_offset).min(flat_end - flat);
-            let (direction, column) =
-                logical_role(logical_table).ok_or(BlsDoryTransposeError::InvalidShape)?;
-            read_transposed_shifted_segment(
-                artifact,
-                column,
-                direction,
-                table_offset,
-                &mut output[written..written + take],
-            )?;
-            flat += take;
-            written += take;
-        }
-        Ok(output.len())
-    }
-
-    #[cfg(feature = "whir-prototype")]
     const BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS: usize = 1 << 15;
 
     #[cfg(feature = "whir-prototype")]
@@ -2608,7 +2974,7 @@ mod tests {
         let mut words = vec![0u64; trace_rows];
         let mut artifact_column = 0usize;
         for native_column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
-            if native_column == TEST_EVALUATION_ACCUMULATOR_START {
+            if native_column == NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START {
                 accumulator.for_each_explicit_coefficient(|index, value| {
                     keys[index] = keys[index] * compression + value;
                 })?;
@@ -2648,328 +3014,6 @@ mod tests {
         )?;
         writer.write_scalars(&keys)?;
         writer.finish()
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    struct TransposedLocalNextSignedWordRowSource<'a> {
-        artifact: &'a mut BlsDoryWordTransposeArtifact,
-        physical_rows: usize,
-        physical_columns: usize,
-        dictionary: [BlsDoryFr; 1],
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    impl<'a> TransposedLocalNextSignedWordRowSource<'a> {
-        fn new(artifact: &'a mut BlsDoryWordTransposeArtifact, selector_slots: usize) -> Self {
-            let trace_rows = artifact.rows();
-            Self::new_with_geometry(artifact, selector_slots, trace_rows)
-                .expect("valid source shape")
-        }
-
-        fn new_for_layout(
-            artifact: &'a mut BlsDoryWordTransposeArtifact,
-            layout: BlsDoryAggregateLayout,
-        ) -> Result<Self, BlsDoryTransposeError> {
-            let physical_rows = 1usize
-                .checked_shl(layout.nu() as u32)
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            let physical_columns = 1usize
-                .checked_shl(layout.sigma() as u32)
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            Self::new_with_geometry(artifact, physical_rows, physical_columns)
-        }
-
-        fn new_with_geometry(
-            artifact: &'a mut BlsDoryWordTransposeArtifact,
-            physical_rows: usize,
-            physical_columns: usize,
-        ) -> Result<Self, BlsDoryTransposeError> {
-            let explicit = artifact
-                .columns()
-                .checked_mul(2)
-                .and_then(|tables| tables.checked_mul(artifact.rows()))
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            let capacity = physical_rows
-                .checked_mul(physical_columns)
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            if !physical_rows.is_power_of_two()
-                || !physical_columns.is_power_of_two()
-                || explicit == 0
-                || explicit > capacity
-                || !explicit.is_multiple_of(physical_columns)
-            {
-                return Err(BlsDoryTransposeError::InvalidShape);
-            }
-            Ok(Self {
-                artifact,
-                physical_rows,
-                physical_columns,
-                dictionary: [BlsDoryFr::zero()],
-            })
-        }
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    impl BlsDoryCompactRowSource for TransposedLocalNextSignedWordRowSource<'_> {
-        type Error = BlsDoryTransposeError;
-
-        fn rows(&self) -> usize {
-            self.physical_rows
-        }
-
-        fn columns(&self) -> usize {
-            self.physical_columns
-        }
-
-        fn explicit_scalar_count(&self) -> usize {
-            self.artifact
-                .columns()
-                .saturating_mul(2)
-                .saturating_mul(self.artifact.rows())
-        }
-
-        fn word_scalar_count(&self) -> usize {
-            self.explicit_scalar_count()
-        }
-
-        fn word_group_len(&self) -> usize {
-            self.artifact.rows()
-        }
-
-        fn signed_word_selectors(&self) -> u64 {
-            let word_selectors = self.word_scalar_count() / self.word_group_len();
-            if word_selectors >= u64::BITS as usize {
-                u64::MAX
-            } else {
-                (1u64 << word_selectors) - 1
-            }
-        }
-
-        fn dictionary(&self) -> &[BlsDoryFr] {
-            &self.dictionary
-        }
-
-        fn read_word_row(
-            &mut self,
-            row_index: usize,
-            output: &mut [u64],
-        ) -> Result<usize, Self::Error> {
-            let local_columns = self.artifact.columns();
-            read_lifted_transposed_row(
-                self.artifact,
-                self.physical_rows,
-                self.physical_columns,
-                2 * local_columns,
-                row_index,
-                output,
-                |logical_table| {
-                    (logical_table < 2 * local_columns).then_some((
-                        usize::from(logical_table >= local_columns),
-                        logical_table % local_columns,
-                    ))
-                },
-            )
-        }
-
-        fn read_code_row(
-            &mut self,
-            _row_index: usize,
-            _output: &mut [u8],
-        ) -> Result<usize, Self::Error> {
-            Err(BlsDoryTransposeError::InvalidShape)
-        }
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    fn preprocessed_physical_role(physical_slot: usize) -> Option<(usize, usize)> {
-        let word_columns = TEST_PREPROCESSED_WORD_COLUMNS.len();
-        let boolean_columns = BLS_DORY_BLAKE3_PREPROCESSED_WIDTH.checked_sub(word_columns)?;
-        if physical_slot < word_columns {
-            return Some((0, TEST_PREPROCESSED_WORD_COLUMNS[physical_slot]));
-        }
-        if physical_slot < 2 * word_columns {
-            return Some((
-                1,
-                TEST_PREPROCESSED_WORD_COLUMNS[physical_slot - word_columns],
-            ));
-        }
-        let code_slot = physical_slot.checked_sub(2 * word_columns)?;
-        if code_slot >= 2 * boolean_columns {
-            return None;
-        }
-        let direction = code_slot / boolean_columns;
-        let boolean_index = code_slot % boolean_columns;
-        let column = (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
-            .filter(|column| !TEST_PREPROCESSED_WORD_COLUMNS.contains(column))
-            .nth(boolean_index)?;
-        Some((direction, column))
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    fn preprocessed_physical_terminal_index(physical_slot: usize) -> Option<usize> {
-        let (direction, column) = preprocessed_physical_role(physical_slot)?;
-        direction
-            .checked_mul(BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)?
-            .checked_add(column)
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    struct TransposedPreprocessedRowSource<'a> {
-        artifact: &'a mut BlsDoryWordTransposeArtifact,
-        physical_rows: usize,
-        physical_columns: usize,
-        code_scratch: Vec<u64>,
-        dictionary: [BlsDoryFr; 2],
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    impl<'a> TransposedPreprocessedRowSource<'a> {
-        fn new(artifact: &'a mut BlsDoryWordTransposeArtifact, selector_slots: usize) -> Self {
-            let trace_rows = artifact.rows();
-            Self::new_with_geometry(artifact, selector_slots, trace_rows)
-                .expect("valid source shape")
-        }
-
-        fn new_for_layout(
-            artifact: &'a mut BlsDoryWordTransposeArtifact,
-            layout: BlsDoryAggregateLayout,
-        ) -> Result<Self, BlsDoryTransposeError> {
-            let physical_rows = 1usize
-                .checked_shl(layout.nu() as u32)
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            let physical_columns = 1usize
-                .checked_shl(layout.sigma() as u32)
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            Self::new_with_geometry(artifact, physical_rows, physical_columns)
-        }
-
-        fn new_with_geometry(
-            artifact: &'a mut BlsDoryWordTransposeArtifact,
-            physical_rows: usize,
-            physical_columns: usize,
-        ) -> Result<Self, BlsDoryTransposeError> {
-            assert_eq!(artifact.columns(), BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
-            assert_eq!(
-                2 * (BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - TEST_PREPROCESSED_WORD_COLUMNS.len()),
-                BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES
-            );
-            let explicit = (BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
-                + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES)
-                .checked_mul(artifact.rows())
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            let word_scalars = BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES
-                .checked_mul(artifact.rows())
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            let capacity = physical_rows
-                .checked_mul(physical_columns)
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            if !physical_rows.is_power_of_two()
-                || !physical_columns.is_power_of_two()
-                || explicit > capacity
-                || !word_scalars.is_multiple_of(physical_columns)
-            {
-                return Err(BlsDoryTransposeError::InvalidShape);
-            }
-            Ok(Self {
-                code_scratch: vec![0; physical_columns],
-                artifact,
-                physical_rows,
-                physical_columns,
-                dictionary: [BlsDoryFr::zero(), BlsDoryFr::from_u64(1)],
-            })
-        }
-    }
-
-    #[cfg(feature = "whir-prototype")]
-    impl BlsDoryCompactRowSource for TransposedPreprocessedRowSource<'_> {
-        type Error = BlsDoryTransposeError;
-
-        fn rows(&self) -> usize {
-            self.physical_rows
-        }
-
-        fn columns(&self) -> usize {
-            self.physical_columns
-        }
-
-        fn explicit_scalar_count(&self) -> usize {
-            (BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES + BLS_DORY_BLAKE3_PREPROCESSED_CODE_TABLES)
-                .saturating_mul(self.artifact.rows())
-        }
-
-        fn word_scalar_count(&self) -> usize {
-            BLS_DORY_BLAKE3_PREPROCESSED_WORD_TABLES.saturating_mul(self.artifact.rows())
-        }
-
-        fn code_bits(&self) -> u8 {
-            4
-        }
-
-        fn word_group_len(&self) -> usize {
-            self.artifact.rows()
-        }
-
-        fn signed_word_selectors(&self) -> u64 {
-            0
-        }
-
-        fn dictionary(&self) -> &[BlsDoryFr] {
-            &self.dictionary
-        }
-
-        fn read_word_row(
-            &mut self,
-            row_index: usize,
-            output: &mut [u64],
-        ) -> Result<usize, Self::Error> {
-            if row_index
-                .checked_mul(self.physical_columns)
-                .is_none_or(|start| start >= self.word_scalar_count())
-            {
-                return Err(BlsDoryTransposeError::InvalidShape);
-            }
-            read_lifted_transposed_row(
-                self.artifact,
-                self.physical_rows,
-                self.physical_columns,
-                2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
-                row_index,
-                output,
-                preprocessed_physical_role,
-            )
-        }
-
-        fn read_code_row(
-            &mut self,
-            row_index: usize,
-            output: &mut [u8],
-        ) -> Result<usize, Self::Error> {
-            let row_start = row_index
-                .checked_mul(self.physical_columns)
-                .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            if row_start < self.word_scalar_count()
-                || row_start >= self.explicit_scalar_count()
-                || output.len() != self.physical_columns
-            {
-                return Err(BlsDoryTransposeError::InvalidShape);
-            }
-            let read = read_lifted_transposed_row(
-                self.artifact,
-                self.physical_rows,
-                self.physical_columns,
-                2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH,
-                row_index,
-                &mut self.code_scratch,
-                preprocessed_physical_role,
-            )?;
-            for (code, value) in output.iter_mut().zip(&self.code_scratch) {
-                *code = u8::try_from(*value)
-                    .ok()
-                    .filter(|code| *code <= 1)
-                    .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            }
-            Ok(read)
-        }
     }
 
     #[cfg(feature = "whir-prototype")]
@@ -4144,7 +4188,7 @@ mod tests {
         let zero = BlsDoryFr::zero();
         let one = BlsDoryFr::from_u64(1);
         for column in 0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
-            if TEST_PREPROCESSED_WORD_COLUMNS.contains(&column) {
+            if NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(&column) {
                 continue;
             }
             for table in [
@@ -4159,7 +4203,7 @@ mod tests {
     #[test]
     #[cfg(feature = "whir-prototype")]
     fn preprocessing_physical_mapping_is_bijective_and_complete() {
-        let word_columns = TEST_PREPROCESSED_WORD_COLUMNS.len();
+        let word_columns = NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.len();
         let boolean_columns = BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - word_columns;
         let physical_tables = 2 * BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
         let mut logical_indices = Vec::with_capacity(physical_tables);
@@ -4169,16 +4213,16 @@ mod tests {
             assert!(direction <= 1);
             if physical_slot < word_columns {
                 assert_eq!(direction, 0);
-                assert!(TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+                assert!(NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(&column));
             } else if physical_slot < 2 * word_columns {
                 assert_eq!(direction, 1);
-                assert!(TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+                assert!(NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(&column));
             } else if physical_slot < 2 * word_columns + boolean_columns {
                 assert_eq!(direction, 0);
-                assert!(!TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+                assert!(!NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(&column));
             } else {
                 assert_eq!(direction, 1);
-                assert!(!TEST_PREPROCESSED_WORD_COLUMNS.contains(&column));
+                assert!(!NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(&column));
             }
 
             let logical = preprocessed_physical_terminal_index(physical_slot).unwrap();
@@ -4444,7 +4488,7 @@ mod tests {
             .map(|row| bls_values(unsafe { main.row_unchecked(row) }))
             .collect::<Vec<_>>();
         let accumulators = native_accumulator_trace(&air, &old_main_rows, &bridge);
-        assert_eq!(TEST_MAIN_WIDTH, 291);
+        assert_eq!(NARROW_BLAKE3_MAIN_WIDTH, 291);
         assert_eq!(BLS_DORY_BLAKE3_MAIN_WIDTH, 289);
         assert_eq!(accumulators.last(), Some(&bridge.raw_byte_evaluation()));
 
@@ -4513,7 +4557,7 @@ mod tests {
         }
 
         let mut changed_first = native_rows[0].clone();
-        changed_first[TEST_EVALUATION_ACCUMULATOR_START] = BlsDoryFr::from_u64(1);
+        changed_first[NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START] = BlsDoryFr::from_u64(1);
         assert_ne!(
             native_evaluation_residuals(
                 &BlsDoryNativeEvaluationRow {
@@ -4534,8 +4578,8 @@ mod tests {
             .find(|row| air.activation_group_index_at_row(*row).is_some())
             .unwrap();
         let mut changed_byte = native_rows[activation_row].clone();
-        changed_byte[TEST_ORIGINAL_NIBBLES_START] =
-            changed_byte[TEST_ORIGINAL_NIBBLES_START] + BlsDoryFr::from_u64(1);
+        changed_byte[NARROW_BLAKE3_ORIGINAL_NIBBLES_START] =
+            changed_byte[NARROW_BLAKE3_ORIGINAL_NIBBLES_START] + BlsDoryFr::from_u64(1);
         assert_ne!(
             native_evaluation_residuals(
                 &BlsDoryNativeEvaluationRow {
@@ -4868,7 +4912,7 @@ mod tests {
         let fixture = dense_blake3_fixture();
         assert_eq!(fixture.air.trace_rows(), TRACE_ROWS);
         let ordinary_native_columns = (0..BLS_DORY_BLAKE3_MAIN_WIDTH)
-            .filter(|column| *column != TEST_EVALUATION_ACCUMULATOR_START)
+            .filter(|column| *column != NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START)
             .collect::<Vec<_>>();
         assert_eq!(ordinary_native_columns.len(), TABLES_PER_DIRECTION);
         let next_start = BLS_DORY_BLAKE3_MAIN_WIDTH;
@@ -4919,7 +4963,8 @@ mod tests {
                         .iter()
                         .enumerate()
                         .filter(|(column, _)| {
-                            !(TEST_EVALUATION_ACCUMULATOR_START..TEST_STACK_START).contains(column)
+                            !(NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START..NARROW_BLAKE3_STACK_START)
+                                .contains(column)
                         })
                         .map(|(_, value)| centered_goldilocks(*value))
                         .collect::<Vec<_>>();
@@ -5210,7 +5255,7 @@ mod tests {
         for row in 0..TRACE_ROWS {
             let values = (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
                 .map(|column| {
-                    if TEST_PREPROCESSED_WORD_COLUMNS.contains(&column) {
+                    if NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(&column) {
                         (row * 1_009 + column * 97 + 11) as u64
                     } else {
                         ((row + column) & 1) as u64
@@ -5301,7 +5346,7 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     fn native_accumulator_stream_matches_materialized_local_and_next() {
         let fixture = dense_blake3_fixture();
-        let local_table = TEST_EVALUATION_ACCUMULATOR_START;
+        let local_table = NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START;
         let next_table = BLS_DORY_BLAKE3_MAIN_WIDTH + local_table;
         let mut visited = 0usize;
         for_each_native_accumulator_pair(
@@ -5328,7 +5373,7 @@ mod tests {
         const STREAM_CHUNK: usize = 29;
         let fixture = dense_blake3_fixture();
         assert_eq!(fixture.air.trace_rows(), TRACE_ROWS);
-        let local_table = TEST_EVALUATION_ACCUMULATOR_START;
+        let local_table = NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START;
         let next_table = BLS_DORY_BLAKE3_MAIN_WIDTH + local_table;
         let field_tables = vec![
             fixture.tables[local_table].clone(),
@@ -5658,7 +5703,7 @@ mod tests {
         let setup = crate::dory_bls12_381_prototype::deterministic_bls_dory_setup(6).unwrap();
         let scratch = Blake3ScratchDirectory::create();
         let ordinary_columns = (0..BLS_DORY_BLAKE3_MAIN_WIDTH)
-            .filter(|column| *column != TEST_EVALUATION_ACCUMULATOR_START)
+            .filter(|column| *column != NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START)
             .collect::<Vec<_>>();
         assert_eq!(ordinary_columns.len(), BLS_DORY_BLAKE3_MAIN_WIDTH - 1);
 
@@ -5671,7 +5716,7 @@ mod tests {
         for row in 0..TRACE_ROWS {
             let mut words = Vec::with_capacity(ordinary_columns.len());
             for (native_column, table) in local_tables.iter_mut().enumerate() {
-                if native_column == TEST_EVALUATION_ACCUMULATOR_START {
+                if native_column == NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START {
                     table.push(BlsDoryFr::from_u64((row as u64 + 3) * (row as u64 + 11)));
                 } else {
                     let value = ((row * 19 + native_column * 37) % 201) as i64 - 100;
@@ -5706,10 +5751,10 @@ mod tests {
         )
         .unwrap();
         accumulator_writer
-            .write_scalars(&local_tables[TEST_EVALUATION_ACCUMULATOR_START])
+            .write_scalars(&local_tables[NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START])
             .unwrap();
         accumulator_writer
-            .write_scalars(&next_tables[TEST_EVALUATION_ACCUMULATOR_START])
+            .write_scalars(&next_tables[NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START])
             .unwrap();
         let accumulator = accumulator_writer.finish().unwrap();
 
@@ -5862,8 +5907,31 @@ mod tests {
         const SELECTOR_SLOTS: usize = 1 << 8;
         let scratch = Blake3ScratchDirectory::create();
         let boolean_column = (0..BLS_DORY_BLAKE3_PREPROCESSED_WIDTH)
-            .find(|column| !TEST_PREPROCESSED_WORD_COLUMNS.contains(column))
+            .find(|column| !NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS.contains(column))
             .unwrap();
+
+        let mut wrong_width_writer = BlsDoryWordTransposeWriter::create(
+            &scratch.0,
+            TRACE_ROWS,
+            BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - 1,
+            3,
+        )
+        .unwrap();
+        let wrong_width_row = vec![0; BLS_DORY_BLAKE3_PREPROCESSED_WIDTH - 1];
+        for _ in 0..TRACE_ROWS {
+            wrong_width_writer.write_row(&wrong_width_row).unwrap();
+        }
+        let mut wrong_width_artifact = wrong_width_writer.finish().unwrap();
+        assert!(matches!(
+            TransposedPreprocessedRowSource::new_with_geometry(
+                &mut wrong_width_artifact,
+                SELECTOR_SLOTS,
+                TRACE_ROWS,
+            ),
+            Err(BlsDoryTransposeError::InvalidShape)
+        ));
+        drop(wrong_width_artifact);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
 
         let mut writer = BlsDoryWordTransposeWriter::create(
             &scratch.0,
@@ -6240,7 +6308,7 @@ mod tests {
         let mut altered_tables = tables;
         let local_start = 2 * BLS_DORY_BLAKE3_MAIN_WIDTH;
         let next_start = local_start + BLS_DORY_BLAKE3_PREPROCESSED_WIDTH;
-        let counter_low = TEST_PREPROCESSED_WORD_COLUMNS[0];
+        let counter_low = NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS[0];
         let delta = BlsDoryFr::from_u64(1);
         altered_tables[local_start + counter_low][1] =
             altered_tables[local_start + counter_low][1] + delta;

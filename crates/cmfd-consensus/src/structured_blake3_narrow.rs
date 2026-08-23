@@ -1184,16 +1184,16 @@ struct MainCols<T> {
 }
 
 const MAIN_WIDTH: usize = size_of::<MainCols<u8>>();
-#[cfg(test)]
-pub(crate) const TEST_MAIN_WIDTH: usize = MAIN_WIDTH;
-#[cfg(test)]
-pub(crate) const TEST_ORIGINAL_NIBBLES_START: usize =
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NARROW_BLAKE3_MAIN_WIDTH: usize = MAIN_WIDTH;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NARROW_BLAKE3_ORIGINAL_NIBBLES_START: usize =
     std::mem::offset_of!(MainCols<u8>, original_nibbles);
-#[cfg(test)]
-pub(crate) const TEST_EVALUATION_ACCUMULATOR_START: usize =
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START: usize =
     std::mem::offset_of!(MainCols<u8>, evaluation_accumulator);
-#[cfg(test)]
-pub(crate) const TEST_STACK_START: usize = std::mem::offset_of!(MainCols<u8>, stack);
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NARROW_BLAKE3_STACK_START: usize = std::mem::offset_of!(MainCols<u8>, stack);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1225,8 +1225,10 @@ struct PrepCols<T> {
 }
 
 const PREP_WIDTH: usize = size_of::<PrepCols<u8>>();
-#[cfg(test)]
-pub(crate) const TEST_PREPROCESSED_WORD_COLUMNS: [usize; 4] = [
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NARROW_BLAKE3_PREPROCESSED_WIDTH: usize = PREP_WIDTH;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NARROW_BLAKE3_PREPROCESSED_WORD_COLUMNS: [usize; 4] = [
     std::mem::offset_of!(PrepCols<u8>, counter_low),
     std::mem::offset_of!(PrepCols<u8>, counter_high),
     std::mem::offset_of!(PrepCols<u8>, block_len),

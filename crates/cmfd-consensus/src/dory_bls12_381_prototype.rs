@@ -835,7 +835,7 @@ fn setup_identity(
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn absorb_groups<G: Group>(
+fn absorb_groups<G: Group + Sync>(
     hasher: &mut blake3::Hasher,
     label: &[u8],
     groups: &[G],
@@ -846,8 +846,35 @@ fn absorb_groups<G: Group>(
         b"group-vector-length",
         &(groups.len() as u64).to_le_bytes(),
     );
-    for group in groups {
-        absorb_group(hasher, b"group-vector-element", group)?;
+    let Some(first) = groups.first() else {
+        return Ok(());
+    };
+    let element_bytes = first.compressed_size();
+    let total_bytes = groups
+        .len()
+        .checked_mul(element_bytes)
+        .ok_or(BlsDoryPrototypeError::InvalidSize)?;
+    if element_bytes == 0 {
+        return Err(BlsDoryPrototypeError::InvalidSize);
+    }
+    let mut encoded = vec![0_u8; total_bytes];
+    groups
+        .par_iter()
+        .zip(encoded.par_chunks_exact_mut(element_bytes))
+        .try_for_each(|(group, output)| {
+            let mut writer = std::io::Cursor::new(output);
+            group
+                .serialize_compressed(&mut writer)
+                .map_err(|error| BlsDoryPrototypeError::Serialization(error.to_string()))?;
+            if writer.position() != element_bytes as u64 {
+                return Err(BlsDoryPrototypeError::Serialization(
+                    "group encoding has an unexpected length".to_owned(),
+                ));
+            }
+            Ok(())
+        })?;
+    for group in encoded.chunks_exact(element_bytes) {
+        absorb_bytes(hasher, b"group-vector-element", group);
     }
     Ok(())
 }

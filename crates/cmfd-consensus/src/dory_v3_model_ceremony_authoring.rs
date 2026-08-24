@@ -42,8 +42,9 @@ use crate::{
         RevealSetBody, RosterMember, SignedCeremonyRecord, SignerClass, VerifiedCeremonyTranscript,
         ceremony_attestation_signature_message, ceremony_record_content_digest,
         ceremony_record_signature_message, ceremony_signed_record_digest, decode_ceremony_record,
-        encode_and_verify_reveal_set_prefix, encode_ceremony_record,
-        encode_detached_transcript_attestation, parse_and_verify_ceremony_transcript,
+        encode_and_verify_ceremony_transcript, encode_and_verify_reveal_set_prefix,
+        encode_ceremony_record, encode_detached_transcript_attestation,
+        parse_and_verify_ceremony_transcript, parse_and_verify_completed_ceremony_transcript,
         parse_and_verify_reveal_set_prefix, verify_detached_transcript_attestation,
     },
     dory_v3_model_final_candidate_validation::{
@@ -351,6 +352,19 @@ pub struct ProductionDoryV3CeremonyPrefixStageReport {
     publication_pending: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionDoryV3CompletedTranscriptStageReport {
+    output: PathBuf,
+    reveal_set_prefix_file: FileIdentity,
+    final_receipt_record_file: FileIdentity,
+    transcript_file: FileIdentity,
+    ceremony_id: [u8; 32],
+    transcript_derive_key_digest: [u8; 32],
+    record_count: u16,
+    durability: ProductionDoryV3CeremonyRecordStageDurability,
+    publication_pending: bool,
+}
+
 /// Public signing request reconstructed from one exact, terminal transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedProductionDoryV3CeremonyAttestation {
@@ -456,6 +470,44 @@ impl ProductionDoryV3CeremonyAttestationStageReport {
 impl ProductionDoryV3CeremonyPrefixStageReport {
     pub fn output(&self) -> &Path {
         &self.output
+    }
+
+    pub const fn transcript_file(&self) -> &FileIdentity {
+        &self.transcript_file
+    }
+
+    pub const fn ceremony_id(&self) -> [u8; 32] {
+        self.ceremony_id
+    }
+
+    pub const fn transcript_derive_key_digest(&self) -> [u8; 32] {
+        self.transcript_derive_key_digest
+    }
+
+    pub const fn record_count(&self) -> u16 {
+        self.record_count
+    }
+
+    pub const fn durability(&self) -> ProductionDoryV3CeremonyRecordStageDurability {
+        self.durability
+    }
+
+    pub const fn publication_pending(&self) -> bool {
+        self.publication_pending
+    }
+}
+
+impl ProductionDoryV3CompletedTranscriptStageReport {
+    pub fn output(&self) -> &Path {
+        &self.output
+    }
+
+    pub const fn reveal_set_prefix_file(&self) -> &FileIdentity {
+        &self.reveal_set_prefix_file
+    }
+
+    pub const fn final_receipt_record_file(&self) -> &FileIdentity {
+        &self.final_receipt_record_file
     }
 
     pub const fn transcript_file(&self) -> &FileIdentity {
@@ -791,6 +843,140 @@ pub fn stage_production_dory_v3_ceremony_reveal_set_prefix(
         output: output_path.to_path_buf(),
         transcript_file,
         ceremony_id: expected_ceremony_id,
+        transcript_derive_key_digest,
+        record_count,
+        durability,
+        publication_pending: true,
+    })
+}
+
+/// Authenticate one exact staged type-5 prefix and one exact signed type-6
+/// record, rebuild the canonical completed transcript, and create-new stage it.
+/// Both input handles remain retained until the reopened output is verified,
+/// both inputs are authenticated one final time, the parent is synchronized,
+/// and the output is confirmed. Publication remains a separate append-only
+/// bulletin operation.
+pub fn stage_production_dory_v3_completed_ceremony_transcript(
+    reveal_set_prefix_path: &Path,
+    final_receipt_record_path: &Path,
+    expected_ceremony_id: [u8; 32],
+    output_path: &Path,
+) -> Result<ProductionDoryV3CompletedTranscriptStageReport, ProductionDoryV3CeremonyAuthoringError>
+{
+    stage_production_dory_v3_completed_ceremony_transcript_with_final_reauthentication_hook(
+        reveal_set_prefix_path,
+        final_receipt_record_path,
+        expected_ceremony_id,
+        output_path,
+        || Ok(()),
+    )
+}
+
+fn stage_production_dory_v3_completed_ceremony_transcript_with_final_reauthentication_hook(
+    reveal_set_prefix_path: &Path,
+    final_receipt_record_path: &Path,
+    expected_ceremony_id: [u8; 32],
+    output_path: &Path,
+    before_final_reauthentication: impl FnOnce() -> Result<(), ProductionDoryV3CeremonyAuthoringError>,
+) -> Result<ProductionDoryV3CompletedTranscriptStageReport, ProductionDoryV3CeremonyAuthoringError>
+{
+    if reveal_set_prefix_path == final_receipt_record_path {
+        return Err(ProductionDoryV3CeremonyAuthoringError::DuplicateInput(
+            final_receipt_record_path.to_path_buf(),
+        ));
+    }
+
+    let mut prefix = RetainedAuthenticatedSmallFile::open(
+        reveal_set_prefix_path,
+        MAX_CEREMONY_TRANSCRIPT_BYTES,
+    )?;
+    let mut final_receipt = RetainedAuthenticatedSmallFile::open(
+        final_receipt_record_path,
+        MAX_SIGNED_CEREMONY_RECORD_BYTES,
+    )?;
+    if prefix.input.identity() == final_receipt.input.identity() {
+        return Err(ProductionDoryV3CeremonyAuthoringError::DuplicateInput(
+            final_receipt_record_path.to_path_buf(),
+        ));
+    }
+
+    let verified_prefix = parse_and_verify_reveal_set_prefix(&prefix.bytes, expected_ceremony_id)?;
+    let final_receipt_record = decode_ceremony_record(&final_receipt.bytes)?;
+    if encode_ceremony_record(&final_receipt_record)? != final_receipt.bytes {
+        return Err(
+            ProductionDoryV3CeremonyAuthoringError::InvalidPriorSequence(
+                "noncanonical final receipt record encoding",
+            ),
+        );
+    }
+    if !matches!(
+        &final_receipt_record.body,
+        CeremonyRecordBody::FinalReceipt(_)
+    ) {
+        return Err(ProductionDoryV3CeremonyAuthoringError::WrongNextRecord);
+    }
+    let genesis = verified_prefix
+        .records()
+        .first()
+        .and_then(|record| match &record.body {
+            CeremonyRecordBody::Genesis(genesis) => Some(genesis.as_ref()),
+            _ => None,
+        })
+        .ok_or(
+            ProductionDoryV3CeremonyAuthoringError::InvalidPriorSequence("missing Genesis roster"),
+        )?;
+    let required_signers = required_signers_for_body(&final_receipt_record.body, Some(genesis))?;
+    verify_signatures_against(&final_receipt_record, &required_signers)?;
+
+    let mut records = verified_prefix.records().to_vec();
+    records.push(final_receipt_record);
+    let encoded = encode_and_verify_ceremony_transcript(&records)?;
+    let completed = parse_and_verify_completed_ceremony_transcript(&encoded, expected_ceremony_id)?;
+    if completed.records() != records {
+        return Err(ProductionDoryV3CeremonyAuthoringError::StagedOutputChanged);
+    }
+
+    let reveal_set_prefix_file = prefix.file_identity.clone();
+    let final_receipt_record_file = final_receipt.file_identity.clone();
+    let transcript_file = file_identity_for_bytes(&encoded);
+    let transcript_derive_key_digest = completed.transcript_derive_key_digest();
+    let record_count = u16::try_from(completed.records().len())
+        .map_err(|_| CeremonyTranscriptError::Limit("transcript record count"))?;
+
+    let output_parent = TrustedCeremonyParent::for_artifact(output_path)?;
+    let mut output = PendingOutput::create(&output_parent, output_path)?;
+    let completion = (|| {
+        output.write_all(&encoded)?;
+        output.sync_file()?;
+        let reopened = output.reopen_exact(&output_parent, &encoded)?;
+        let reparsed =
+            parse_and_verify_completed_ceremony_transcript(&reopened, expected_ceremony_id)?;
+        if reparsed != completed
+            || encode_and_verify_ceremony_transcript(reparsed.records())? != reopened
+            || file_identity_for_bytes(&reopened) != transcript_file
+        {
+            return Err(ProductionDoryV3CeremonyAuthoringError::StagedOutputChanged);
+        }
+        before_final_reauthentication()?;
+        prefix.reauthenticate_exact()?;
+        final_receipt.reauthenticate_exact()?;
+        let durability = map_durability(output.sync_parent(&output_parent)?);
+        Ok(durability)
+    })();
+    let confirmed = finish_pending_output(output, &output_parent, completion);
+
+    // Keep both authenticated inputs and their trusted parent handles alive
+    // through `PendingOutput::confirm`, including its final identity checks.
+    drop(final_receipt);
+    drop(prefix);
+    let durability = confirmed?;
+
+    Ok(ProductionDoryV3CompletedTranscriptStageReport {
+        output: output_path.to_path_buf(),
+        reveal_set_prefix_file,
+        final_receipt_record_file,
+        transcript_file,
+        ceremony_id: completed.ceremony_id(),
         transcript_derive_key_digest,
         record_count,
         durability,
@@ -1671,6 +1857,70 @@ fn verify_signatures_against(
     Ok(())
 }
 
+/// One bounded input whose authenticated file and parent handles remain live
+/// until the caller explicitly finishes confirming its output.
+struct RetainedAuthenticatedSmallFile {
+    path: PathBuf,
+    maximum_bytes: usize,
+    parent: TrustedCeremonyParent,
+    input: AuthenticatedInput,
+    bytes: Vec<u8>,
+    file_identity: FileIdentity,
+}
+
+impl RetainedAuthenticatedSmallFile {
+    fn open(
+        path: &Path,
+        maximum_bytes: usize,
+    ) -> Result<Self, ProductionDoryV3CeremonyAuthoringError> {
+        let parent = TrustedCeremonyParent::for_artifact(path)?;
+        let mut input = AuthenticatedInput::open(&parent, path, None)?;
+        let first = input.read_bounded(maximum_bytes)?;
+        if first.len() > maximum_bytes {
+            return Err(ProductionDoryV3CeremonyAuthoringError::InputTooLarge(
+                path.to_path_buf(),
+            ));
+        }
+        input.recheck(&parent, Some(first.len() as u64))?;
+        let second = input.read_bounded(maximum_bytes)?;
+        input.recheck(&parent, Some(first.len() as u64))?;
+        if first != second {
+            return Err(ProductionDoryV3CeremonyAuthoringError::InputChanged(
+                path.to_path_buf(),
+            ));
+        }
+        let file_identity = file_identity_for_bytes(&first);
+        Ok(Self {
+            path: path.to_path_buf(),
+            maximum_bytes,
+            parent,
+            input,
+            bytes: first,
+            file_identity,
+        })
+    }
+
+    fn reauthenticate_exact(&mut self) -> Result<(), ProductionDoryV3CeremonyAuthoringError> {
+        self.input
+            .recheck(&self.parent, Some(self.bytes.len() as u64))?;
+        let first = self.input.read_bounded(self.maximum_bytes)?;
+        self.input
+            .recheck(&self.parent, Some(self.bytes.len() as u64))?;
+        let second = self.input.read_bounded(self.maximum_bytes)?;
+        self.input
+            .recheck(&self.parent, Some(self.bytes.len() as u64))?;
+        if first != self.bytes
+            || second != self.bytes
+            || file_identity_for_bytes(&first) != self.file_identity
+        {
+            return Err(ProductionDoryV3CeremonyAuthoringError::InputChanged(
+                self.path.clone(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn authenticate_small_file(
     path: &Path,
     maximum_bytes: usize,
@@ -1866,10 +2116,7 @@ mod tests {
         },
         dory_v3_model::{CanonicalBlsDoryGtHex, ordered_dory_v3_model_commitment_root},
         dory_v3_model_ceremony_fs::prepare_test_parent,
-        dory_v3_model_ceremony_transcript::{
-            AbortBody, PRODUCTION_BANK_BYTES, ReproducerReceipt,
-            encode_and_verify_ceremony_transcript,
-        },
+        dory_v3_model_ceremony_transcript::{AbortBody, PRODUCTION_BANK_BYTES, ReproducerReceipt},
         dory_v3_model_reproduction::PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES,
         dory_v3_suite::{
             DORY_V3_MODEL_IDENTITY_DOMAIN, DORY_V3_MODEL_IDENTITY_VERSION,
@@ -2326,6 +2573,31 @@ mod tests {
         path
     }
 
+    fn persist_completed_transcript_inputs(
+        directory: &TestDirectory,
+        fixture: &TerminalTranscriptFixture,
+    ) -> (PathBuf, Vec<u8>, PathBuf, Vec<u8>) {
+        let completed =
+            parse_and_verify_completed_ceremony_transcript(&fixture.bytes, fixture.ceremony_id)
+                .unwrap();
+        let prefix_bytes = encode_and_verify_reveal_set_prefix(
+            &completed.records()[..completed.records().len() - 1],
+            fixture.ceremony_id,
+        )
+        .unwrap();
+        let final_receipt_bytes =
+            encode_ceremony_record(completed.records().last().unwrap()).unwrap();
+        let prefix_path = write_test_input(directory, "reveal-set-prefix.cmfdct01", &prefix_bytes);
+        let final_receipt_path =
+            write_test_input(directory, "final-receipt.cmfdcr01", &final_receipt_bytes);
+        (
+            prefix_path,
+            prefix_bytes,
+            final_receipt_path,
+            final_receipt_bytes,
+        )
+    }
+
     fn genesis_plan_bytes(
         directory: &TestDirectory,
         operators: &[SigningKey],
@@ -2754,6 +3026,419 @@ mod tests {
             ),
             Err(ProductionDoryV3CeremonyAuthoringError::CeremonyIdAnchorMismatch)
         ));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn completed_transcript_stage_rebuilds_n3_r2_and_is_create_new() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        assert_eq!(fixture.operators.len(), 3);
+        assert_eq!(fixture.reproducers.len(), 2);
+        let (prefix_path, prefix_bytes, final_receipt_path, final_receipt_bytes) =
+            persist_completed_transcript_inputs(&directory, &fixture);
+        let output = directory.0.join("completed-transcript.cmfdct01");
+
+        let report = stage_production_dory_v3_completed_ceremony_transcript(
+            &prefix_path,
+            &final_receipt_path,
+            fixture.ceremony_id,
+            &output,
+        )
+        .unwrap();
+        let reopened = fs::read(&output).unwrap();
+        let completed =
+            parse_and_verify_completed_ceremony_transcript(&reopened, fixture.ceremony_id).unwrap();
+
+        assert_eq!(reopened, fixture.bytes);
+        assert_eq!(completed.operators().len(), 3);
+        assert_eq!(completed.reproducers().len(), 2);
+        assert_eq!(report.output(), output);
+        assert_eq!(
+            report.reveal_set_prefix_file(),
+            &file_identity_for_bytes(&prefix_bytes)
+        );
+        assert_eq!(
+            report.final_receipt_record_file(),
+            &file_identity_for_bytes(&final_receipt_bytes)
+        );
+        assert_eq!(
+            report.transcript_file(),
+            &file_identity_for_bytes(&reopened)
+        );
+        assert_eq!(report.ceremony_id(), fixture.ceremony_id);
+        assert_eq!(report.record_count(), 10);
+        assert_eq!(
+            report.transcript_derive_key_digest(),
+            completed.transcript_derive_key_digest()
+        );
+        assert!(report.publication_pending());
+
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &final_receipt_path,
+                fixture.ceremony_id,
+                &output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Filesystem(message))
+                if message.contains("refusing to overwrite existing output")
+        ));
+        assert_eq!(fs::read(output).unwrap(), reopened);
+    }
+
+    #[test]
+    fn completed_transcript_stage_rejects_wrong_anchor_type_trailing_and_duplicate_inputs() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let (prefix_path, prefix_bytes, final_receipt_path, final_receipt_bytes) =
+            persist_completed_transcript_inputs(&directory, &fixture);
+
+        let mut wrong_anchor = fixture.ceremony_id;
+        wrong_anchor[0] ^= 1;
+        let wrong_anchor_output = directory.0.join("wrong-anchor-completed.cmfdct01");
+        assert!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &final_receipt_path,
+                wrong_anchor,
+                &wrong_anchor_output
+            )
+            .is_err()
+        );
+        assert!(!wrong_anchor_output.exists());
+
+        let prefix =
+            parse_and_verify_reveal_set_prefix(&prefix_bytes, fixture.ceremony_id).unwrap();
+        let wrong_type_bytes = encode_ceremony_record(prefix.records().last().unwrap()).unwrap();
+        let wrong_type_path =
+            write_test_input(&directory, "wrong-type.cmfdcr01", &wrong_type_bytes);
+        let wrong_type_output = directory.0.join("wrong-type-completed.cmfdct01");
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &wrong_type_path,
+                fixture.ceremony_id,
+                &wrong_type_output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::WrongNextRecord)
+        ));
+        assert!(!wrong_type_output.exists());
+
+        let mut trailing_bytes = final_receipt_bytes;
+        trailing_bytes.push(0);
+        let trailing_path =
+            write_test_input(&directory, "trailing-final.cmfdcr01", &trailing_bytes);
+        let trailing_output = directory.0.join("trailing-completed.cmfdct01");
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &trailing_path,
+                fixture.ceremony_id,
+                &trailing_output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Transcript(_))
+        ));
+        assert!(!trailing_output.exists());
+
+        let duplicate_output = directory.0.join("duplicate-completed.cmfdct01");
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &prefix_path,
+                fixture.ceremony_id,
+                &duplicate_output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::DuplicateInput(path))
+                if path == prefix_path
+        ));
+        assert!(!duplicate_output.exists());
+    }
+
+    #[test]
+    fn completed_transcript_stage_rejects_same_ceremony_cross_fork_receipt() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let completed =
+            parse_and_verify_completed_ceremony_transcript(&fixture.bytes, fixture.ceremony_id)
+                .unwrap();
+        let mut fork_records = completed.records()[..completed.records().len() - 1].to_vec();
+        let operator_signers: Vec<_> = fixture
+            .operators
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (SignerClass::Operator, index as u16, key))
+            .collect();
+
+        let CeremonyRecordBody::ContributionCommitment(commitment) = &mut fork_records[1].body
+        else {
+            panic!("fixture record 1 must be type 2");
+        };
+        commitment.generation_finished_unix_seconds += 1;
+        fork_records[1] = sign_test_record(
+            fork_records[1].body.clone(),
+            &[(SignerClass::Operator, 0, &fixture.operators[0])],
+        );
+        let fork_commitment_digest = ceremony_signed_record_digest(&fork_records[1]).unwrap();
+
+        let CeremonyRecordBody::CommitmentSet(commitment_set) = &mut fork_records[4].body else {
+            panic!("fixture record 4 must be type 3");
+        };
+        commitment_set.commitments[0].signed_record_digest = fork_commitment_digest;
+        fork_records[4] = sign_test_record(fork_records[4].body.clone(), &operator_signers);
+        let fork_commitment_set_digest = ceremony_signed_record_digest(&fork_records[4]).unwrap();
+
+        let CeremonyRecordBody::ContributionReveal(reveal) = &mut fork_records[5].body else {
+            panic!("fixture record 5 must be type 4");
+        };
+        reveal.contribution_commitment_signed_record_digest = fork_commitment_digest;
+        fork_records[5] = sign_test_record(
+            fork_records[5].body.clone(),
+            &[(SignerClass::Operator, 0, &fixture.operators[0])],
+        );
+        let fork_reveal_digest = ceremony_signed_record_digest(&fork_records[5]).unwrap();
+
+        let CeremonyRecordBody::RevealSet(reveal_set) = &mut fork_records[8].body else {
+            panic!("fixture record 8 must be type 5");
+        };
+        reveal_set.commitment_set_signed_record_digest = fork_commitment_set_digest;
+        reveal_set.reveals[0].signed_record_digest = fork_reveal_digest;
+        fork_records[8] = sign_test_record(fork_records[8].body.clone(), &operator_signers);
+
+        let fork_prefix_bytes =
+            encode_and_verify_reveal_set_prefix(&fork_records, fixture.ceremony_id).unwrap();
+        let fork_prefix_path =
+            write_test_input(&directory, "fork-prefix.cmfdct01", &fork_prefix_bytes);
+        let original_final_receipt =
+            encode_ceremony_record(completed.records().last().unwrap()).unwrap();
+        let final_receipt_path = write_test_input(
+            &directory,
+            "other-fork-final-receipt.cmfdcr01",
+            &original_final_receipt,
+        );
+        let output = directory.0.join("cross-fork-completed.cmfdct01");
+
+        assert!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &fork_prefix_path,
+                &final_receipt_path,
+                fixture.ceremony_id,
+                &output
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn completed_transcript_stage_rejects_missing_bad_and_swapped_type_six_signatures() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let (prefix_path, _, _, final_receipt_bytes) =
+            persist_completed_transcript_inputs(&directory, &fixture);
+        let final_receipt = decode_ceremony_record(&final_receipt_bytes).unwrap();
+
+        let mut missing = final_receipt.clone();
+        missing.signatures.pop();
+        let missing_path = write_test_input(
+            &directory,
+            "missing-signature.cmfdcr01",
+            &encode_ceremony_record(&missing).unwrap(),
+        );
+        let missing_output = directory.0.join("missing-signature.cmfdct01");
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &missing_path,
+                fixture.ceremony_id,
+                &missing_output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+        assert!(!missing_output.exists());
+
+        let mut bad = final_receipt.clone();
+        bad.signatures[0].signature[0] ^= 1;
+        let bad_path = write_test_input(
+            &directory,
+            "bad-signature.cmfdcr01",
+            &encode_ceremony_record(&bad).unwrap(),
+        );
+        let bad_output = directory.0.join("bad-signature.cmfdct01");
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &bad_path,
+                fixture.ceremony_id,
+                &bad_output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Transcript(
+                CeremonyTranscriptError::MalformedSignature
+                    | CeremonyTranscriptError::InvalidSignature
+            ))
+        ));
+        assert!(!bad_output.exists());
+
+        let mut swapped = final_receipt;
+        let first_signature = swapped.signatures[0].signature;
+        swapped.signatures[0].signature = swapped.signatures[1].signature;
+        swapped.signatures[1].signature = first_signature;
+        let swapped_path = write_test_input(
+            &directory,
+            "swapped-signatures.cmfdcr01",
+            &encode_ceremony_record(&swapped).unwrap(),
+        );
+        let swapped_output = directory.0.join("swapped-signatures.cmfdct01");
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &prefix_path,
+                &swapped_path,
+                fixture.ceremony_id,
+                &swapped_output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Transcript(
+                CeremonyTranscriptError::InvalidSignature
+            ))
+        ));
+        assert!(!swapped_output.exists());
+    }
+
+    #[test]
+    fn completed_transcript_stage_rejects_terminal_transcript_as_prefix() {
+        let directory = TestDirectory::new();
+        let completed_fixture = completed_transcript_fixture();
+        let completed_path = write_test_input(
+            &directory,
+            "already-completed.cmfdct01",
+            &completed_fixture.bytes,
+        );
+        let completed = parse_and_verify_completed_ceremony_transcript(
+            &completed_fixture.bytes,
+            completed_fixture.ceremony_id,
+        )
+        .unwrap();
+        let final_receipt_bytes =
+            encode_ceremony_record(completed.records().last().unwrap()).unwrap();
+        let final_receipt_path = write_test_input(
+            &directory,
+            "terminal-prefix-final.cmfdcr01",
+            &final_receipt_bytes,
+        );
+        let completed_output = directory.0.join("completed-as-prefix-output.cmfdct01");
+        assert!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &completed_path,
+                &final_receipt_path,
+                completed_fixture.ceremony_id,
+                &completed_output
+            )
+            .is_err()
+        );
+        assert!(!completed_output.exists());
+
+        let aborted_fixture = aborted_transcript_fixture(12);
+        let aborted_path = write_test_input(
+            &directory,
+            "aborted-as-prefix.cmfdct01",
+            &aborted_fixture.bytes,
+        );
+        let aborted_output = directory.0.join("aborted-as-prefix-output.cmfdct01");
+        assert!(
+            stage_production_dory_v3_completed_ceremony_transcript(
+                &aborted_path,
+                &final_receipt_path,
+                aborted_fixture.ceremony_id,
+                &aborted_output
+            )
+            .is_err()
+        );
+        assert!(!aborted_output.exists());
+    }
+
+    #[test]
+    fn completed_transcript_stage_cleans_output_on_final_reauthentication_failure() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let (prefix_path, _, final_receipt_path, _) =
+            persist_completed_transcript_inputs(&directory, &fixture);
+        let output = directory.0.join("failed-final-reauth-completed.cmfdct01");
+        let expected_failure_path = prefix_path.clone();
+
+        assert!(matches!(
+            stage_production_dory_v3_completed_ceremony_transcript_with_final_reauthentication_hook(
+                &prefix_path,
+                &final_receipt_path,
+                fixture.ceremony_id,
+                &output,
+                || Err(ProductionDoryV3CeremonyAuthoringError::InputChanged(
+                    expected_failure_path
+                ))
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::InputChanged(path))
+                if path == prefix_path
+        ));
+        assert!(!output.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn completed_transcript_stage_retains_windows_input_share_denials_until_confirmation() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let (prefix_path, _, final_receipt_path, _) =
+            persist_completed_transcript_inputs(&directory, &fixture);
+        let output = directory.0.join("windows-retained-inputs.cmfdct01");
+        let prefix_for_write = prefix_path.clone();
+        let receipt_for_delete = final_receipt_path.clone();
+        let mut write_denied = false;
+        let mut delete_denied = false;
+
+        let report =
+            stage_production_dory_v3_completed_ceremony_transcript_with_final_reauthentication_hook(
+                &prefix_path,
+                &final_receipt_path,
+                fixture.ceremony_id,
+                &output,
+                || {
+                    write_denied = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&prefix_for_write)
+                        .is_err();
+                    delete_denied = fs::remove_file(&receipt_for_delete).is_err();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(write_denied);
+        assert!(delete_denied);
+        assert!(report.publication_pending());
+        assert!(output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_transcript_stage_rejects_replaced_input_before_confirmation() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let (prefix_path, _, final_receipt_path, _) =
+            persist_completed_transcript_inputs(&directory, &fixture);
+        let output = directory.0.join("replaced-input-completed.cmfdct01");
+        let replacement_path = prefix_path.clone();
+        let retained_path = directory.0.join("retained-old-prefix.cmfdct01");
+
+        let result =
+            stage_production_dory_v3_completed_ceremony_transcript_with_final_reauthentication_hook(
+                &prefix_path,
+                &final_receipt_path,
+                fixture.ceremony_id,
+                &output,
+                || {
+                    fs::rename(&replacement_path, &retained_path).unwrap();
+                    fs::write(&replacement_path, b"replacement").unwrap();
+                    Ok(())
+                },
+            );
+        assert!(result.is_err());
         assert!(!output.exists());
     }
 

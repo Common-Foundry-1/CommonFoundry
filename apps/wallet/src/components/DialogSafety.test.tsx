@@ -84,6 +84,7 @@ describe("wallet dialog safety", () => {
     await screen.findByText("125.00");
 
     await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Send CMFD" })).toHaveFocus());
     const amount = screen.getByRole("textbox", { name: "Amount" });
     await user.click(amount);
     expect(amount).toHaveFocus();

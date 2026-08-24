@@ -1,6 +1,6 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NodeStatus } from "../types";
 import { NetworkView } from "./NetworkView";
 
@@ -33,6 +33,8 @@ const status: NodeStatus = {
   public_peer_mode: true,
   peers: [],
 };
+
+afterEach(() => cleanup());
 
 describe("NetworkView", () => {
   const bootstrap = "107.214.187.2:18444";

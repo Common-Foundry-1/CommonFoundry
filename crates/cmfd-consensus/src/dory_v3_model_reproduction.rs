@@ -262,6 +262,30 @@ impl ProductionDoryV3ModelReproductionReport {
         self.target_id
     }
 
+    pub(crate) const fn genesis_signed_record_digest(&self) -> [u8; 32] {
+        self.genesis_signed_record_digest
+    }
+
+    pub(crate) fn reveal_set_prefix_identity(&self) -> FileIdentity {
+        FileIdentity {
+            bytes: self.reveal_set_prefix_bytes,
+            blake3: self.reveal_set_prefix_blake3,
+            sha256: self.reveal_set_prefix_sha256,
+        }
+    }
+
+    pub(crate) const fn reveal_set_prefix_derive_key_digest(&self) -> [u8; 32] {
+        self.reveal_set_prefix_derive_key_digest
+    }
+
+    pub(crate) const fn commitment_set_signed_record_digest(&self) -> [u8; 32] {
+        self.commitment_set_signed_record_digest
+    }
+
+    pub(crate) const fn reveal_set_signed_record_digest(&self) -> [u8; 32] {
+        self.reveal_set_signed_record_digest
+    }
+
     #[must_use]
     pub fn canonical_bytes(&self) -> [u8; PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES] {
         encode_report(self)

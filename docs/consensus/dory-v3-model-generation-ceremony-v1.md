@@ -782,6 +782,123 @@ or publish anything. No type-6 wire change is needed: the existing
 `ReproducerReceipt.reproduction_report` `FileIdentity` transitively binds these
 4,283 bytes, including the opaque combiner-report identity.
 
+### `CMFDIL01` independent-lineage approval V1
+
+An `implementation_kind = 1` value inside `CMFDRP01` is a reproducer claim; it
+is not authority that an implementation has an independent code lineage. V1
+therefore requires the report's `implementation_lineage_report` `FileIdentity`
+to name one exact `CMFDIL01` artifact. The lineage artifact contains no
+reproduction-report identity or hash, so this binding introduces no hash or
+signature cycle. The CMFDRP file identity points to CMFDIL, never the reverse.
+
+CMFDIL is an accountable signed human approval, not a cryptographic proof of
+independent authorship. It records exactly which frozen-roster people approved
+specific source, build, binary, review, conformance, host, extraction, command,
+type-5, and candidate identities. A dishonest or careless roster can still
+approve a false lineage statement. Signers must inspect the named evidence and
+are accountable for that inspection; the signatures cannot prove how code was
+written or that two source trees lack a concealed common origin.
+
+All integers are little-endian and every `FileIdentity` is
+`bytes_u64le || blake3[32] || sha256[32]` (72 bytes). The fixed prefix is exactly
+1,284 bytes. Each following `RecordSignature` is exactly
+`signer_class_u8 || signer_index_u16le || bip340_signature[64]` (67 bytes).
+There is no padding and no trailing data. The V1 prefix field order is:
+
+```text
+field                                             bytes   end offset
+magic = ASCII "CMFDIL01"                            8            8
+version_u16le = 1                                     2           10
+declared_total_bytes_u32le                            4           14
+ceremony_id[32]                                      32           46
+genesis_signed_record_digest[32]                    32           78
+commitment_set_signed_record_digest[32]             32          110
+reveal_set_signed_record_digest[32]                 32          142
+reveal_set_prefix: FileIdentity                     72          214
+reveal_set_prefix_derive_key_digest[32]             32          246
+reproducer_index_u16le                                2          248
+reproducer_public_key[32]                           32          280
+target_id_u16le                                       2          282
+raw_payload: FileIdentity                           72          354
+roots_file: FileIdentity                            72          426
+base_input_blake3_root[32]                          32          458
+layer_roots_aggregate[32]                           32          490
+combiner_source_bundle: FileIdentity                72          562
+combiner_build_provenance: FileIdentity             72          634
+combiner_binary: FileIdentity                       72          706
+roots_calculator_source_bundle: FileIdentity        72          778
+roots_calculator_build_provenance: FileIdentity     72          850
+roots_calculator_binary: FileIdentity               72          922
+independent_lineage_review_report: FileIdentity     72          994
+conformance_test_report: FileIdentity               72         1066
+host_environment_report: FileIdentity               72         1138
+source_extraction_report: FileIdentity              72         1210
+command_log: FileIdentity                           72         1282
+signer_count_u16le                                    2         1284
+```
+
+The artifact then contains exactly `signer_count` signatures. A valid artifact
+requires `signer_count = N + R` and every genesis-roster operator followed by
+every genesis-roster reproducer in exact index order. The minimum `N=3, R=2`
+artifact is 1,619 bytes. The maximum `N=16, R=16` artifact is exactly:
+
+```text
+1284 + 67 * 32 = 3428 bytes
+```
+
+The content digest deliberately excludes only the final signer-count field and
+the signatures. `bytes[0..1282]` uses half-open indexing:
+
+```text
+content_digest = BLAKE3-DK(
+    "CMFD/FORGEMATRIX/V3/MODEL-REPRODUCTION/INDEPENDENT-LINEAGE-ATTESTATION/V1",
+    bytes[0..1282])
+
+signature_message = BLAKE3-DK(
+    "CMFD/FORGEMATRIX/V3/MODEL-REPRODUCTION/INDEPENDENT-LINEAGE-ATTESTATION/SIGNATURE/V1",
+    version_u16le || declared_total_bytes_u32le ||
+    content_digest || signer_count_u16le)
+```
+
+Every roster member signs the 32-byte `signature_message` with the same
+canonical BIP340 rules used by ceremony records. The declared total must equal
+both the actual EOF and `1284 + 67 * signer_count`. Reserved signer classes,
+wrong order, missing or extra signers, malformed signatures, and any signature
+failure invalidate the artifact.
+
+The verifier requires the independently anchored, exact reveal-set-closed
+type-5 capability used to context-verify the CMFDRP report. It binds the
+ceremony and three signed-record digests, exact type-5 prefix length and
+ordinary BLAKE3/SHA-256 identity, its domain-separated transcript digest, the
+subject reproducer and key, target, raw payload, roots file, base and layer
+roots, combiner binary, and the three CMFDRP audit identities for host,
+extraction, and commands. The complete CMFDIL ordinary BLAKE3/SHA-256 file
+identity must equal CMFDRP's `implementation_lineage_report`. The CMFDRP kind
+must be `Independent`; a reference report cannot acquire independent authority
+by attaching this file. A completed type-6 transcript is not accepted in place
+of the exact type-5 capability.
+
+All CMFDIL file identities must be nonzero. Both independent source-bundle
+identities are rejected if they equal the genesis reference source bundle. The
+combiner and roots-calculator binary identities are rejected if either digest
+reuses any genesis-pinned reference binary or the pinned structural analyzer.
+These checks exclude obvious reuse; they do not establish source independence.
+That conclusion remains the signed reviewers' responsibility.
+
+The production validator accepts paths, not caller-supplied bytes. It opens the
+CMFDIL artifact and all eleven post-root evidence files before parsing any of
+them. All twelve paths must be pairwise-distinct normalized absolute direct
+children of trusted private local directories, and their retained filesystem
+identities must also be pairwise distinct. Each of the eleven evidence files
+is read through its retained handle to the exact signed byte count and EOF and
+must match both signed hashes. The validator repeats those complete evidence
+reads, then rereads, reparses, rehashes, and identity-checks CMFDIL last. The
+returned `VerifiedIndependentLineage` is opaque, non-cloneable, and
+non-serializable and retains every file and parent handle. Raw-payload and
+roots-file semantic authentication remains the separate final-candidate
+validator's responsibility; CMFDIL binds their identities but does not open
+those two large candidate artifacts.
+
 ### Type 7: abort body
 
 ```text

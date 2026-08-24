@@ -49,6 +49,8 @@ mod dory_scratch_telemetry;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_bank_bootstrap;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_ceremony;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_record;

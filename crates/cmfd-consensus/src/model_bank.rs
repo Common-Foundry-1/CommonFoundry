@@ -919,13 +919,13 @@ fn validate_values(bytes: &[u8], start_offset: u64) -> Result<(), ModelBankError
     Ok(())
 }
 
-fn start_layer_aggregate(layers: u32) -> Hasher {
+pub(crate) fn start_layer_aggregate(layers: u32) -> Hasher {
     let mut hasher = Hasher::new_derive_key(LAYER_ROOTS_DOMAIN);
     hasher.update(&layers.to_le_bytes());
     hasher
 }
 
-fn add_layer_root(aggregate: &mut Hasher, index: u32, root: blake3::Hash) {
+pub(crate) fn add_layer_root(aggregate: &mut Hasher, index: u32, root: blake3::Hash) {
     aggregate.update(&index.to_le_bytes());
     aggregate.update(root.as_bytes());
 }
@@ -979,6 +979,16 @@ fn encode_header(manifest: &ModelBankManifest) -> [u8; MODEL_BANK_HEADER_BYTES] 
     put(&mut header, &mut offset, &manifest.pcs_commitment_root);
     debug_assert_eq!(offset, MODEL_BANK_HEADER_BYTES);
     header
+}
+
+/// Encode the exact canonical header after a production ceremony has derived
+/// every manifest field. Kept crate-private so general callers cannot bypass
+/// the read-only production model-bank boundary.
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub(crate) fn encode_model_bank_header(
+    manifest: &ModelBankManifest,
+) -> [u8; MODEL_BANK_HEADER_BYTES] {
+    encode_header(manifest)
 }
 
 fn put<const N: usize>(target: &mut [u8], offset: &mut usize, bytes: &[u8; N]) {

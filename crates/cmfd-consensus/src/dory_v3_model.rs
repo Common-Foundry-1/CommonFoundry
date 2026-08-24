@@ -554,33 +554,14 @@ impl DoryV3ModelIdentityV1 {
     /// every ordered canonical weight-bank commitment.
     pub fn commitment_root(&self) -> Result<[u8; 32], DoryV3ModelIdentityError> {
         self.validate()?;
-        let role_count = self
-            .weight_bank_count()?
-            .checked_add(1)
-            .and_then(|count| u16::try_from(count).ok())
-            .ok_or(DoryV3ModelIdentityError::InvalidBankCount)?;
-        let commitment_bytes = DORY_V3_GT_CANONICAL_BYTES;
-        let mut hasher = Hasher::new_derive_key(DORY_V3_MODEL_COMMITMENT_ROOT_DOMAIN);
-        hasher.update(&self.identity_version.to_le_bytes());
-        hasher.update(&self.suite_parameter_digest);
-        hasher.update(&self.setup_identity);
-        hasher.update(&self.padded_variables.to_le_bytes());
-        hasher.update(&role_count.to_le_bytes());
-        hasher.update(&BASE_INPUT_ROLE.to_le_bytes());
-        hasher.update(&commitment_bytes.to_le_bytes());
-        hasher.update(&self.base_input_commitment.canonical_bytes()?);
-        for (index, commitment) in self.weight_bank_commitments.iter().enumerate() {
-            let role =
-                u16::try_from(index + 1).map_err(|_| DoryV3ModelIdentityError::InvalidBankCount)?;
-            hasher.update(&role.to_le_bytes());
-            hasher.update(&commitment_bytes.to_le_bytes());
-            hasher.update(&commitment.canonical_bytes()?);
-        }
-        let root = *hasher.finalize().as_bytes();
-        if root == [0; 32] {
-            return Err(DoryV3ModelIdentityError::UnspecifiedCommitmentRoot);
-        }
-        Ok(root)
+        ordered_dory_v3_model_commitment_root(
+            self.identity_version,
+            self.suite_parameter_digest,
+            self.setup_identity,
+            self.padded_variables,
+            &self.base_input_commitment,
+            &self.weight_bank_commitments,
+        )
     }
 
     /// Canonical digest of every model, setup, geometry, suite, and commitment
@@ -635,6 +616,49 @@ impl DoryV3ModelIdentityV1 {
         }
         Ok(())
     }
+}
+
+/// Derive the consensus commitment root directly from freshly computed,
+/// ordered commitments before a production model-bank header exists.
+///
+/// This is crate-private bootstrap plumbing, not a caller-supplied commitment
+/// path. The resulting root is checked again through `DoryV3ModelIdentityV1`
+/// before a production bootstrap can publish anything.
+pub(crate) fn ordered_dory_v3_model_commitment_root(
+    identity_version: u16,
+    suite_parameter_digest: [u8; 32],
+    setup_identity: [u8; 32],
+    padded_variables: u32,
+    base_input_commitment: &CanonicalBlsDoryGtHex,
+    weight_bank_commitments: &[CanonicalBlsDoryGtHex],
+) -> Result<[u8; 32], DoryV3ModelIdentityError> {
+    let role_count = u32::try_from(weight_bank_commitments.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| u16::try_from(count).ok())
+        .ok_or(DoryV3ModelIdentityError::InvalidBankCount)?;
+    let commitment_bytes = DORY_V3_GT_CANONICAL_BYTES;
+    let mut hasher = Hasher::new_derive_key(DORY_V3_MODEL_COMMITMENT_ROOT_DOMAIN);
+    hasher.update(&identity_version.to_le_bytes());
+    hasher.update(&suite_parameter_digest);
+    hasher.update(&setup_identity);
+    hasher.update(&padded_variables.to_le_bytes());
+    hasher.update(&role_count.to_le_bytes());
+    hasher.update(&BASE_INPUT_ROLE.to_le_bytes());
+    hasher.update(&commitment_bytes.to_le_bytes());
+    hasher.update(&base_input_commitment.canonical_bytes()?);
+    for (index, commitment) in weight_bank_commitments.iter().enumerate() {
+        let role =
+            u16::try_from(index + 1).map_err(|_| DoryV3ModelIdentityError::InvalidBankCount)?;
+        hasher.update(&role.to_le_bytes());
+        hasher.update(&commitment_bytes.to_le_bytes());
+        hasher.update(&commitment.canonical_bytes()?);
+    }
+    let root = *hasher.finalize().as_bytes();
+    if root == [0; 32] {
+        return Err(DoryV3ModelIdentityError::UnspecifiedCommitmentRoot);
+    }
+    Ok(root)
 }
 
 #[derive(Serialize)]

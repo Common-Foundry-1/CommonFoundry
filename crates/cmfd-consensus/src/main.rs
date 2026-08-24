@@ -16,6 +16,7 @@ use cmfd_consensus::{
     ModelBankManifest, ModelPcsIdentity,
     dory_bls12_381_model_commitment::derive_bls_dory_model_commitment_record,
     dory_bls12_381_prototype::deterministic_bls_dory_setup,
+    dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
     dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
 };
 
@@ -82,6 +83,19 @@ enum Command {
         /// New JSON record path; omit for stdout. Existing files are never overwritten.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
+    },
+    /// Build the canonical production V2 model bank from a pre-generated raw payload.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelBankBootstrap {
+        /// Exact raw payload: base input followed by 384 layers; every byte must be 0..=250.
+        #[arg(long)]
+        payload: std::path::PathBuf,
+        /// New canonical 184-byte-header V2 bank. Existing paths are never overwritten.
+        #[arg(long)]
+        bank_output: std::path::PathBuf,
+        /// New strict manifest JSON. Existing paths are never overwritten.
+        #[arg(long)]
+        manifest_output: std::path::PathBuf,
     },
     /// Run the two-pass production Dory V3 Model Record V2 ceremony.
     #[cfg(feature = "dory-bls12-381-prototype")]
@@ -241,6 +255,20 @@ fn main() -> Result<()> {
             } else {
                 print!("{}", String::from_utf8(encoded)?);
             }
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelBankBootstrap {
+            payload,
+            bank_output,
+            manifest_output,
+        } => {
+            let report = run_production_dory_v3_model_bank_bootstrap(
+                &payload,
+                &bank_output,
+                &manifest_output,
+            )
+            .context("production Dory V3 model-bank bootstrap failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(feature = "dory-bls12-381-prototype")]
         Command::DoryV3ModelRecordCeremony {

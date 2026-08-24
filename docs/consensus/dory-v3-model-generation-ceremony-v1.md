@@ -782,12 +782,17 @@ retained lineage evidence immediately before expensive payload validation and
 again in the final guard before the bank-last check; aggregate rechecks preserve
 the same bank-last ordering. This checkpoint still does not author type 6.
 
-The keyless authoring API derives ceremony, source, closure, ordered-input,
-combined-output, and frozen-suite fields from verified capabilities, then
-canonicalizes, reparses, and context-verifies its own output. It does not sign
-or publish anything. No type-6 wire change is needed: the existing
-`ReproducerReceipt.reproduction_report` `FileIdentity` transitively binds these
-4,283 bytes, including the opaque combiner-report identity.
+The keyless type-6 preparation API consumes the exact anchored type-5 prefix
+and the non-cloneable retained final-candidate capability. It derives the whole
+receipt internally, exposes only public signing material, and retains both
+capabilities across external signature collection. Staging requires the exact
+ordered `N + R` operator-then-reproducer BIP340 signatures, rederives the body
+before accepting them, create-new writes and canonically reopens the record,
+then rederives the body again with the bank checked last before confirming the
+output. It does not sign, publish, or activate anything. No type-6 wire change
+is needed: the existing `ReproducerReceipt.reproduction_report`
+`FileIdentity` transitively binds these 4,283 bytes, including the opaque
+combiner-report identity.
 
 ### `CMFDIL01` independent-lineage approval V1
 
@@ -1315,9 +1320,9 @@ The feature-gated detached-attestation commands accept only an exact,
 terminal transcript: either a completed transcript ending at the signed type-6
 receipt or an aborted transcript ending at the signed type-7 record and EOF.
 The type-5-terminal reveal-set prefix above is deliberately ineligible. A
-successful ceremony therefore cannot use this flow until the separate type-6
-record-authoring and final-transcript-staging tooling exists and has assembled
-the completed transcript.
+successful ceremony can now prepare and stage the separate signed type-6
+record, but cannot use this flow until final-transcript-staging tooling has
+assembled and reauthenticated the completed transcript.
 
 Both commands require `--expected-ceremony-id`. Obtain this 32-byte anchor
 independently from the authenticated, signed, published, and mirrored type-1
@@ -1907,10 +1912,11 @@ It then rederives Record V2 twice through the same retained bank handle. Each
 complete pass independently counts and computes BLAKE3 and SHA-256 over the
 exact 6,442,975,416 bytes and exact EOF. Inter-pass and final identity rechecks,
 a final reread and reparse of both small files, and a bank-last recheck are
-required before the non-cloneable, non-serializable capability is returned. No
-CLI or type-6 authoring path consumes this capability yet. The private-workspace
-rule still excludes same-user concurrent writers; in particular, a retained
-read handle on Unix is not an exclusive content lock.
+required before the non-cloneable, non-serializable capability is returned. It
+is consumed only by the capability-bound type-6 preparation and staging API;
+there is no type-6 operator CLI yet. The private-workspace rule still excludes
+same-user concurrent writers; in particular, a retained read handle on Unix is
+not an exclusive content lock.
 
 The bank contains the 184-byte header followed by the payload, for exactly
 6,442,975,416 bytes and exact EOF. The bootstrap publishes bank and manifest as
@@ -2103,6 +2109,14 @@ Already implemented in this repository:
   exact type-5/sealed-combiner contextual verification, immutable artifact and
   final-candidate projections, and bounded known-answer, capability-boundary,
   mutation, context, completed, and aborted tests;
+- the exact-roster retained final-candidate validator plus capability-only
+  type-6 preparation and create-new signed-record staging. Every receipt field
+  is projected internally, same-ceremony alternate type-5 forks are rejected,
+  full-roster signatures are exact and ordered, and retained artifacts are
+  rechecked with the bank last before and after canonical output reopen. A
+  dedicated parser separately requires an exact ceremony-ID-anchored Completed
+  transcript; final completed-transcript staging and a type-6 CLI remain
+  separate unfinished work;
 - the exact `CMFDMR01` roots and `CMFDSR01` structural-report codecs,
   create-new generators, full-payload validators, and operator commands, backed
   by a shared trusted-filesystem boundary that retains and rechecks parent and
@@ -2126,13 +2140,8 @@ Not implemented or not completed by this document:
 - public append-only bulletin submission, independently mirrored expected
   ceremony-ID tooling, receipt/equivocation handling, and independent external
   review of the transcript and detached-attestation implementation;
-- type-6 receipt authoring and final completed-transcript staging, without
-  which a successful ceremony cannot reach detached attestation;
-- completion of the retained-handle final-candidate validator around the new
-  bank/manifest/Record V2 capability: it must still independently open and
-  reauthenticate the exact roots, structure, and report files before type-6
-  authoring; `CMFDRP01` alone records their claims but does not authenticate
-  those external bytes;
+- final completed-transcript staging and type-6 operator CLI integration,
+  without which a successful ceremony cannot yet reach detached attestation;
 - independent security review and an operator-scale rehearsal of the keyless
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
@@ -2149,11 +2158,11 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice completes the retained-handle
-final-candidate validator around the bank-chain capability, followed by type-6
-receipt authoring and final completed-transcript staging, plus validation and an
-operator-scale rehearsal of the keyless record and detached-attestation
-authoring paths. That is followed by public
+The next minimal implementation slice adds final completed-transcript staging
+from the exact retained type-5 prefix plus the staged signed type-6 record,
+followed by type-6 CLI integration, validation, and an operator-scale rehearsal
+of the keyless record and detached-attestation authoring paths. That is followed
+by public
 append-only transcript publication with independent mirror receipts and
 production-scale roots, structure, combiner, request, and proof qualification.
 The transcript, generator, combiner, and new report tools still require

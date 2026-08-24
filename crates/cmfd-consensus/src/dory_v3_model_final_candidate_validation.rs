@@ -22,7 +22,8 @@ use crate::{
     },
     dory_v3_model_ceremony_fs::{AuthenticatedInput, CeremonyFsError, TrustedCeremonyParent},
     dory_v3_model_ceremony_transcript::{
-        CeremonyTranscriptError, FileIdentity, PRODUCTION_BANK_BYTES, VerifiedCeremonyTranscript,
+        CeremonyTranscriptError, FileIdentity, FinalReceiptBody, PRODUCTION_BANK_BYTES,
+        ReproducerReceipt, VerifiedCeremonyTranscript,
     },
     dory_v3_model_combiner::{
         ProductionDoryV3ModelCombinerError, ValidatedProductionDoryV3ModelCombinedPayload,
@@ -121,6 +122,18 @@ impl ValidatedProductionDoryV3ModelFinalCandidate {
     ) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
         self.inner.recheck_retained_files()
     }
+
+    /// Derive the complete type-6 body from the retained, context-verified
+    /// reproducer reports after binding them to this exact signed type-5
+    /// prefix. The final filesystem guard rechecks the bank last.
+    pub(crate) fn derive_final_receipt_body(
+        &mut self,
+        transcript: &VerifiedCeremonyTranscript,
+    ) -> Result<FinalReceiptBody, ProductionDoryV3ModelFinalCandidateValidationError> {
+        let body = self.inner.derive_final_receipt_body(transcript)?;
+        self.recheck_retained_files()?;
+        Ok(body)
+    }
 }
 
 /// Fail-closed errors from exact-roster final-candidate validation.
@@ -168,6 +181,8 @@ pub enum ProductionDoryV3ModelFinalCandidateValidationError {
     },
     #[error("invalid reveal-set-closed transcript while verifying reproducer lineages: {0}")]
     LineageTranscript(#[source] CeremonyTranscriptError),
+    #[error("invalid reveal-set-closed transcript while deriving the final receipt: {0}")]
+    FinalReceiptTranscript(#[source] CeremonyTranscriptError),
     #[error("fresh combined-payload validation failed: {0}")]
     Combined(#[source] ProductionDoryV3ModelCombinerError),
     #[error("production roots validation failed: {0}")]
@@ -886,6 +901,116 @@ struct ValidatedFinalCandidateCore<R> {
     reports: Vec<ContextVerifiedProductionDoryV3ModelReproductionReport>,
     retained: RetainedCandidateArtifacts,
     heavy: R,
+}
+
+impl<R> ValidatedFinalCandidateCore<R> {
+    fn derive_final_receipt_body(
+        &self,
+        transcript: &VerifiedCeremonyTranscript,
+    ) -> Result<FinalReceiptBody, ProductionDoryV3ModelFinalCandidateValidationError> {
+        let bindings = transcript
+            .require_combiner_bindings()
+            .map_err(ProductionDoryV3ModelFinalCandidateValidationError::FinalReceiptTranscript)?;
+        require_exact_reproducer_count(transcript.reproducers().len(), self.reports.len())?;
+        if self.ceremony_id != transcript.ceremony_id() {
+            return Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::CrossBinding(
+                    "final receipt ceremony",
+                ),
+            );
+        }
+
+        let expected_prefix = FileIdentity {
+            bytes: transcript.transcript_bytes(),
+            blake3: transcript.transcript_blake3(),
+            sha256: transcript.transcript_sha256(),
+        };
+        for (position, verified) in self.reports.iter().enumerate() {
+            let report = verified.report();
+            if usize::from(report.reproducer_index()) != position
+                || report.reproducer_public_key() != transcript.reproducers()[position]
+            {
+                return Err(
+                    ProductionDoryV3ModelFinalCandidateValidationError::CrossBinding(
+                        "final receipt reproducer roster",
+                    ),
+                );
+            }
+            if report.ceremony_id() != transcript.ceremony_id()
+                || report.reveal_set_prefix_identity() != expected_prefix
+                || report.reveal_set_prefix_derive_key_digest()
+                    != transcript.transcript_derive_key_digest()
+                || report.commitment_set_signed_record_digest()
+                    != bindings.commitment_set_signed_record_digest()
+                || report.reveal_set_signed_record_digest()
+                    != bindings.reveal_set_signed_record_digest()
+            {
+                return Err(
+                    ProductionDoryV3ModelFinalCandidateValidationError::CrossBinding(
+                        "type-5 prefix or closure",
+                    ),
+                );
+            }
+        }
+        self.lineages
+            .validate(transcript.ceremony_id(), &self.reports)?;
+
+        let first = self
+            .reports
+            .first()
+            .ok_or(ProductionDoryV3ModelFinalCandidateValidationError::CandidateMismatch)?;
+        let report = first.report();
+        let candidate = first.final_candidate();
+        let reproducers = self
+            .reports
+            .iter()
+            .map(|verified| {
+                let report = verified.report();
+                let artifacts = verified.artifacts();
+                ReproducerReceipt {
+                    index: report.reproducer_index(),
+                    combiner_binary_blake3: artifacts.combiner_binary.blake3,
+                    combiner_binary_sha256: artifacts.combiner_binary.sha256,
+                    bootstrap_report: artifacts.bootstrap_report.clone(),
+                    record_ceremony_report: artifacts.record_ceremony_report.clone(),
+                    reproduction_report: report.content_identity(),
+                }
+            })
+            .collect();
+        Ok(FinalReceiptBody {
+            ceremony_id: report.ceremony_id(),
+            commitment_set_signed_record_digest: report.commitment_set_signed_record_digest(),
+            reveal_set_signed_record_digest: report.reveal_set_signed_record_digest(),
+            payload_bytes: candidate.raw_payload.bytes,
+            raw_payload_blake3: candidate.raw_payload.blake3,
+            raw_payload_sha256: candidate.raw_payload.sha256,
+            base_input_blake3_root: candidate.base_input_blake3_root,
+            layer_roots_aggregate: candidate.layer_roots_aggregate,
+            roots_file: candidate.roots_file.clone(),
+            structural_report: candidate.structural_report.clone(),
+            bank_bytes: candidate.bank_file.bytes,
+            bank_file_blake3: candidate.bank_file.blake3,
+            bank_file_sha256: candidate.bank_file.sha256,
+            manifest_file: candidate.manifest_file.clone(),
+            manifest_digest: candidate.manifest_digest,
+            production_suite_digest: candidate.production_suite_digest,
+            pcs_parameter_digest: candidate.pcs_parameter_digest,
+            base_commitment: *candidate.base_commitment,
+            weight_bank_0_commitment: *candidate.weight_bank_0_commitment,
+            weight_bank_1_commitment: *candidate.weight_bank_1_commitment,
+            weight_bank_2_commitment: *candidate.weight_bank_2_commitment,
+            pcs_commitment_root: candidate.pcs_commitment_root,
+            model_identity_digest: candidate.model_identity_digest,
+            setup_identity: candidate.setup_identity,
+            padded_variables: candidate.padded_variables,
+            record_v2_file: candidate.record_v2_file.clone(),
+            record_v2_digest: candidate.record_v2_digest,
+            // Type-6 publication is frozen to the first reproducer in the
+            // exact signed roster.
+            publisher_reproducer_index: 0,
+            reproducers,
+        })
+    }
 }
 
 impl ValidatedFinalCandidateCore<ProductionHeavyRetention> {
@@ -1712,16 +1837,18 @@ mod tests {
         },
         dory_v3_model_ceremony_fs::prepare_test_parent,
         dory_v3_model_ceremony_transcript::{
-            CEREMONY_PROTOCOL_VERSION, CeremonyRecordBody, CommitmentSetBody,
-            ContributionCommitmentBody, ContributionRevealBody, GenesisBody, IndexedRecordDigest,
-            PRODUCTION_BANK_FORMAT_VERSION, PRODUCTION_BANK_HEADER_BYTES, PRODUCTION_BANKS,
-            PRODUCTION_BASE_INPUT_BYTES, PRODUCTION_BATCH, PRODUCTION_BYTES_PER_LAYER,
-            PRODUCTION_DIMENSION, PRODUCTION_LAYERS, PRODUCTION_LAYERS_PER_BANK,
-            PRODUCTION_MAX_MODEL_BYTE, PRODUCTION_MODEL_VERSION, PRODUCTION_PADDED_VARIABLES,
-            PRODUCTION_PAYLOAD_BYTES, RecordSignature, ReferenceBinary, RevealSetBody,
-            RosterMember, SignedCeremonyRecord, SignerClass, ceremony_record_content_digest,
-            ceremony_record_signature_message, ceremony_signed_record_digest,
-            encode_and_verify_reveal_set_prefix, parse_and_verify_reveal_set_prefix,
+            AbortBody, CEREMONY_PROTOCOL_VERSION, CeremonyRecordBody, CeremonyTranscriptStatus,
+            CommitmentSetBody, ContributionCommitmentBody, ContributionRevealBody, GenesisBody,
+            IndexedRecordDigest, PRODUCTION_BANK_FORMAT_VERSION, PRODUCTION_BANK_HEADER_BYTES,
+            PRODUCTION_BANKS, PRODUCTION_BASE_INPUT_BYTES, PRODUCTION_BATCH,
+            PRODUCTION_BYTES_PER_LAYER, PRODUCTION_DIMENSION, PRODUCTION_LAYERS,
+            PRODUCTION_LAYERS_PER_BANK, PRODUCTION_MAX_MODEL_BYTE, PRODUCTION_MODEL_VERSION,
+            PRODUCTION_PADDED_VARIABLES, PRODUCTION_PAYLOAD_BYTES, RecordSignature,
+            ReferenceBinary, RevealSetBody, RosterMember, SignedCeremonyRecord, SignerClass,
+            ceremony_record_content_digest, ceremony_record_signature_message,
+            ceremony_signed_record_digest, encode_and_verify_ceremony_transcript,
+            encode_and_verify_reveal_set_prefix, parse_and_verify_ceremony_transcript,
+            parse_and_verify_reveal_set_prefix,
         },
         dory_v3_model_combiner::{
             ProductionDoryV3ModelCombinedPayloadValidationReport,
@@ -2045,6 +2172,27 @@ mod tests {
         VerifiedCeremonyTranscript,
         ProductionDoryV3ModelCombinedPayloadValidationReport,
     ) {
+        bounded_transcript_and_combined_with_closure_seed(
+            source_bundle,
+            source_bundle_policy,
+            reference_combiner,
+            contribution_paths,
+            raw_payload_path,
+            0,
+        )
+    }
+
+    fn bounded_transcript_and_combined_with_closure_seed(
+        source_bundle: FileIdentity,
+        source_bundle_policy: FileIdentity,
+        reference_combiner: &FileIdentity,
+        contribution_paths: &[PathBuf],
+        raw_payload_path: &Path,
+        closure_seed: u8,
+    ) -> (
+        VerifiedCeremonyTranscript,
+        ProductionDoryV3ModelCombinedPayloadValidationReport,
+    ) {
         let operators = signing_keys(3, 1);
         let reproducers = signing_keys(2, 20);
         let operator_signers: Vec<_> = operators
@@ -2116,8 +2264,10 @@ mod tests {
                 operator_index: index as u16,
                 operator_public_key: key.verifying_key().to_bytes().into(),
                 contribution_bytes: PRODUCTION_PAYLOAD_BYTES,
-                contribution_blake3: [60 + index as u8; 32],
-                contribution_sha256: [70 + index as u8; 32],
+                contribution_blake3: [60_u8.wrapping_add(index as u8).wrapping_add(closure_seed);
+                    32],
+                contribution_sha256: [70_u8.wrapping_add(index as u8).wrapping_add(closure_seed);
+                    32],
                 source_bytes_consumed: PRODUCTION_PAYLOAD_BYTES + 5,
                 rejected_source_bytes: 5,
                 generation_finished_unix_seconds: 100 + index as u64,
@@ -2586,6 +2736,41 @@ mod tests {
         }
     }
 
+    fn completed_transcript_from_prefix(
+        prefix: &VerifiedCeremonyTranscript,
+        body: FinalReceiptBody,
+    ) -> VerifiedCeremonyTranscript {
+        let operators = signing_keys(3, 1);
+        let reproducers = signing_keys(2, 20);
+        let mut records = prefix.records().to_vec();
+        records.push(sign_record(
+            CeremonyRecordBody::FinalReceipt(Box::new(body)),
+            &all_signers(&operators, &reproducers),
+        ));
+        let bytes = encode_and_verify_ceremony_transcript(&records).unwrap();
+        parse_and_verify_ceremony_transcript(&bytes).unwrap()
+    }
+
+    fn aborted_transcript_from_prefix(
+        prefix: &VerifiedCeremonyTranscript,
+    ) -> VerifiedCeremonyTranscript {
+        let operators = signing_keys(3, 1);
+        let previous = ceremony_signed_record_digest(prefix.records().last().unwrap()).unwrap();
+        let mut records = prefix.records().to_vec();
+        records.push(sign_record(
+            CeremonyRecordBody::Abort(AbortBody {
+                ceremony_id: prefix.ceremony_id(),
+                last_valid_signed_record_digest: previous,
+                phase: 6,
+                reason_code: 12,
+                evidence_file: file(123, 211),
+            }),
+            &[(SignerClass::Operator, 0, &operators[0])],
+        ));
+        let bytes = encode_and_verify_ceremony_transcript(&records).unwrap();
+        parse_and_verify_ceremony_transcript(&bytes).unwrap()
+    }
+
     #[test]
     fn bounded_backend_exercises_exact_roster_final_candidate_orchestration() {
         let mut fixture = bounded_final_candidate_fixture();
@@ -2595,6 +2780,158 @@ mod tests {
         assert_eq!(validated.reports.len(), 2);
         assert_eq!(fixture.backend.combined_calls, 1);
         assert_eq!(fixture.backend.heavy_calls, 1);
+    }
+
+    #[test]
+    fn final_receipt_projection_derives_every_field_from_retained_reports() {
+        let mut fixture = bounded_final_candidate_fixture();
+        let transcript = fixture.transcript.clone();
+        let validated = fixture.validate().unwrap();
+        let body = validated.derive_final_receipt_body(&transcript).unwrap();
+        let first = &validated.reports[0];
+        let report = first.report();
+        let candidate = first.final_candidate();
+
+        assert_eq!(body.ceremony_id, report.ceremony_id());
+        assert_eq!(
+            body.commitment_set_signed_record_digest,
+            report.commitment_set_signed_record_digest()
+        );
+        assert_eq!(
+            body.reveal_set_signed_record_digest,
+            report.reveal_set_signed_record_digest()
+        );
+        assert_eq!(body.payload_bytes, candidate.raw_payload.bytes);
+        assert_eq!(body.raw_payload_blake3, candidate.raw_payload.blake3);
+        assert_eq!(body.raw_payload_sha256, candidate.raw_payload.sha256);
+        assert_eq!(
+            body.base_input_blake3_root,
+            candidate.base_input_blake3_root
+        );
+        assert_eq!(body.layer_roots_aggregate, candidate.layer_roots_aggregate);
+        assert_eq!(body.roots_file, *candidate.roots_file);
+        assert_eq!(body.structural_report, *candidate.structural_report);
+        assert_eq!(body.bank_bytes, candidate.bank_file.bytes);
+        assert_eq!(body.bank_file_blake3, candidate.bank_file.blake3);
+        assert_eq!(body.bank_file_sha256, candidate.bank_file.sha256);
+        assert_eq!(body.manifest_file, *candidate.manifest_file);
+        assert_eq!(body.manifest_digest, candidate.manifest_digest);
+        assert_eq!(
+            body.production_suite_digest,
+            candidate.production_suite_digest
+        );
+        assert_eq!(body.pcs_parameter_digest, candidate.pcs_parameter_digest);
+        assert_eq!(body.base_commitment, *candidate.base_commitment);
+        assert_eq!(
+            body.weight_bank_0_commitment,
+            *candidate.weight_bank_0_commitment
+        );
+        assert_eq!(
+            body.weight_bank_1_commitment,
+            *candidate.weight_bank_1_commitment
+        );
+        assert_eq!(
+            body.weight_bank_2_commitment,
+            *candidate.weight_bank_2_commitment
+        );
+        assert_eq!(body.pcs_commitment_root, candidate.pcs_commitment_root);
+        assert_eq!(body.model_identity_digest, candidate.model_identity_digest);
+        assert_eq!(body.setup_identity, candidate.setup_identity);
+        assert_eq!(body.padded_variables, candidate.padded_variables);
+        assert_eq!(body.record_v2_file, *candidate.record_v2_file);
+        assert_eq!(body.record_v2_digest, candidate.record_v2_digest);
+        assert_eq!(body.publisher_reproducer_index, 0);
+        assert_eq!(body.reproducers.len(), validated.reports.len());
+        for (receipt, verified) in body.reproducers.iter().zip(&validated.reports) {
+            let report = verified.report();
+            let artifacts = verified.artifacts();
+            assert_eq!(receipt.index, report.reproducer_index());
+            assert_eq!(
+                receipt.combiner_binary_blake3,
+                artifacts.combiner_binary.blake3
+            );
+            assert_eq!(
+                receipt.combiner_binary_sha256,
+                artifacts.combiner_binary.sha256
+            );
+            assert_eq!(receipt.bootstrap_report, *artifacts.bootstrap_report);
+            assert_eq!(
+                receipt.record_ceremony_report,
+                *artifacts.record_ceremony_report
+            );
+            assert_eq!(receipt.reproduction_report, report.content_identity());
+            assert_eq!(
+                receipt.reproduction_report.bytes,
+                PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES as u64
+            );
+        }
+        ceremony_record_content_digest(&CeremonyRecordBody::FinalReceipt(Box::new(body))).unwrap();
+    }
+
+    #[test]
+    fn final_receipt_projection_rejects_same_ceremony_alternate_type5_fork() {
+        let mut fixture = bounded_final_candidate_fixture();
+        let (source_bundle, source_bundle_policy, reference_combiner) =
+            match &fixture.transcript.records()[0].body {
+                CeremonyRecordBody::Genesis(genesis) => (
+                    genesis.source_bundle.clone(),
+                    genesis.source_bundle_policy.clone(),
+                    FileIdentity {
+                        bytes: 1,
+                        blake3: genesis.reference_binaries[0].binary_blake3,
+                        sha256: genesis.reference_binaries[0].binary_sha256,
+                    },
+                ),
+                _ => unreachable!(),
+            };
+        let (alternate, _) = bounded_transcript_and_combined_with_closure_seed(
+            source_bundle,
+            source_bundle_policy,
+            &reference_combiner,
+            &fixture.contribution_paths,
+            &fixture.shared_paths[2],
+            1,
+        );
+        assert_eq!(alternate.ceremony_id(), fixture.transcript.ceremony_id());
+        assert_ne!(
+            alternate.transcript_derive_key_digest(),
+            fixture.transcript.transcript_derive_key_digest()
+        );
+
+        let validated = fixture.validate().unwrap();
+        assert!(matches!(
+            validated.derive_final_receipt_body(&alternate),
+            Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::CrossBinding(
+                    "type-5 prefix or closure"
+                )
+            )
+        ));
+    }
+
+    #[test]
+    fn completed_and_aborted_transcripts_cannot_authorize_final_receipt_projection() {
+        let mut fixture = bounded_final_candidate_fixture();
+        let prefix = fixture.transcript.clone();
+        let validated = fixture.validate().unwrap();
+        let body = validated.derive_final_receipt_body(&prefix).unwrap();
+        let completed = completed_transcript_from_prefix(&prefix, body);
+        let aborted = aborted_transcript_from_prefix(&prefix);
+        assert_eq!(completed.status(), CeremonyTranscriptStatus::Completed);
+        assert_eq!(aborted.status(), CeremonyTranscriptStatus::Aborted);
+
+        for transcript in [&completed, &aborted] {
+            assert!(matches!(
+                validated.derive_final_receipt_body(transcript),
+                Err(
+                    ProductionDoryV3ModelFinalCandidateValidationError::FinalReceiptTranscript(
+                        CeremonyTranscriptError::Invalid(
+                            "combiner bindings require an anchored reveal-set-closed prefix"
+                        )
+                    )
+                )
+            ));
+        }
     }
 
     #[cfg(unix)]

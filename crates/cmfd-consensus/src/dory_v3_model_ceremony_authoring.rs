@@ -32,8 +32,8 @@ use crate::{
     dory_v3_model_ceremony_transcript::{
         CEREMONY_PROTOCOL_VERSION, CeremonyRecordBody, CeremonyTranscriptError,
         CeremonyTranscriptStatus, CommitmentSetBody, ContributionCommitmentBody,
-        ContributionRevealBody, DetachedTranscriptAttestation, FileIdentity, GenesisBody,
-        IndexedRecordDigest, MAX_CEREMONY_OPERATORS, MAX_CEREMONY_RECORD_BODY_BYTES,
+        ContributionRevealBody, DetachedTranscriptAttestation, FileIdentity, FinalReceiptBody,
+        GenesisBody, IndexedRecordDigest, MAX_CEREMONY_OPERATORS, MAX_CEREMONY_RECORD_BODY_BYTES,
         MAX_CEREMONY_SIGNERS, MAX_CEREMONY_TRANSCRIPT_BYTES, PRODUCTION_BANK_FORMAT_VERSION,
         PRODUCTION_BANK_HEADER_BYTES, PRODUCTION_BANKS, PRODUCTION_BASE_INPUT_BYTES,
         PRODUCTION_BATCH, PRODUCTION_BYTES_PER_LAYER, PRODUCTION_DIMENSION, PRODUCTION_LAYERS,
@@ -45,6 +45,10 @@ use crate::{
         encode_and_verify_reveal_set_prefix, encode_ceremony_record,
         encode_detached_transcript_attestation, parse_and_verify_ceremony_transcript,
         parse_and_verify_reveal_set_prefix, verify_detached_transcript_attestation,
+    },
+    dory_v3_model_final_candidate_validation::{
+        ProductionDoryV3ModelFinalCandidateValidationError,
+        ValidatedProductionDoryV3ModelFinalCandidate,
     },
     dory_v3_suite::{DORY_V3_SETUP_IDENTITY, production_dory_v3_suite_digest},
 };
@@ -245,6 +249,97 @@ pub struct ProductionDoryV3CeremonyRecordStageReport {
     publication_pending: bool,
 }
 
+/// Opaque keyless signing request derived only from an anchored type-5 prefix
+/// and a retained, exact-roster final-candidate capability.
+///
+/// The capability deliberately owns both inputs across external signature
+/// collection. It is non-cloneable and non-serializable, and staging consumes
+/// it so retained artifact guards remain live through the final output check.
+#[must_use]
+pub struct PreparedProductionDoryV3FinalReceipt {
+    transcript: VerifiedCeremonyTranscript,
+    candidate: ValidatedProductionDoryV3ModelFinalCandidate,
+    body: FinalReceiptBody,
+    record_content_digest: [u8; 32],
+    signature_message: [u8; 32],
+    required_signers: Vec<RequiredCeremonySigner>,
+}
+
+impl PreparedProductionDoryV3FinalReceipt {
+    pub const fn body(&self) -> &FinalReceiptBody {
+        &self.body
+    }
+
+    pub const fn ceremony_id(&self) -> [u8; 32] {
+        self.transcript.ceremony_id()
+    }
+
+    pub const fn record_content_digest(&self) -> [u8; 32] {
+        self.record_content_digest
+    }
+
+    pub const fn signature_message(&self) -> [u8; 32] {
+        self.signature_message
+    }
+
+    pub fn required_signers(&self) -> &[RequiredCeremonySigner] {
+        &self.required_signers
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionDoryV3FinalReceiptStageReport {
+    output: PathBuf,
+    record_file: FileIdentity,
+    record_content_digest: [u8; 32],
+    signed_record_digest: [u8; 32],
+    signature_message: [u8; 32],
+    signer_count: u16,
+    durability: ProductionDoryV3CeremonyRecordStageDurability,
+    publication_pending: bool,
+}
+
+struct StagedFinalReceiptRecord {
+    record_file: FileIdentity,
+    signed_record_digest: [u8; 32],
+    signer_count: u16,
+    durability: ProductionDoryV3CeremonyRecordStageDurability,
+}
+
+impl ProductionDoryV3FinalReceiptStageReport {
+    pub fn output(&self) -> &Path {
+        &self.output
+    }
+
+    pub const fn record_file(&self) -> &FileIdentity {
+        &self.record_file
+    }
+
+    pub const fn record_content_digest(&self) -> [u8; 32] {
+        self.record_content_digest
+    }
+
+    pub const fn signed_record_digest(&self) -> [u8; 32] {
+        self.signed_record_digest
+    }
+
+    pub const fn signature_message(&self) -> [u8; 32] {
+        self.signature_message
+    }
+
+    pub const fn signer_count(&self) -> u16 {
+        self.signer_count
+    }
+
+    pub const fn durability(&self) -> ProductionDoryV3CeremonyRecordStageDurability {
+        self.durability
+    }
+
+    pub const fn publication_pending(&self) -> bool {
+        self.publication_pending
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionDoryV3CeremonyPrefixStageReport {
     output: PathBuf,
@@ -438,6 +533,8 @@ pub enum ProductionDoryV3CeremonyAuthoringError {
     PlanJson(#[from] serde_json::Error),
     #[error("ceremony transcript codec or signature verification failed: {0}")]
     Transcript(#[from] CeremonyTranscriptError),
+    #[error("production Dory V3 final-candidate validation failed: {0}")]
+    FinalCandidate(#[from] ProductionDoryV3ModelFinalCandidateValidationError),
     #[error("failed to read trusted input {path}: {source}")]
     ReadInput {
         path: PathBuf,
@@ -474,6 +571,8 @@ pub enum ProductionDoryV3CeremonyAuthoringError {
     SignerPolicy,
     #[error("reopened staged output differs from the prepared canonical bytes")]
     StagedOutputChanged,
+    #[error("retained final-candidate projection differs from the prepared type-6 body")]
+    FinalCandidateProjectionChanged,
     #[error("failed to clean an unconfirmed output; original: {original}; cleanup: {cleanup}")]
     OutputCleanup { original: String, cleanup: String },
 }
@@ -538,6 +637,117 @@ pub fn stage_production_dory_v3_ceremony_record(
         signer_count,
         durability,
         publication_pending: true,
+    })
+}
+
+/// Consume an anchored type-5 prefix and one exact-roster retained candidate,
+/// then derive the complete canonical type-6 body and public signing request.
+/// No caller supplies receipt hashes, file identities, or signer slots.
+pub fn prepare_production_dory_v3_final_receipt(
+    transcript: VerifiedCeremonyTranscript,
+    mut candidate: ValidatedProductionDoryV3ModelFinalCandidate,
+) -> Result<PreparedProductionDoryV3FinalReceipt, ProductionDoryV3CeremonyAuthoringError> {
+    let body = candidate.derive_final_receipt_body(&transcript)?;
+    let record_body = CeremonyRecordBody::FinalReceipt(Box::new(body.clone()));
+    let genesis = transcript
+        .records()
+        .first()
+        .and_then(|record| match &record.body {
+            CeremonyRecordBody::Genesis(genesis) => Some(genesis.as_ref()),
+            _ => None,
+        })
+        .ok_or(
+            ProductionDoryV3CeremonyAuthoringError::InvalidPriorSequence("missing Genesis roster"),
+        )?;
+    let required_signers = required_signers_for_body(&record_body, Some(genesis))?;
+    let record_content_digest = ceremony_record_content_digest(&record_body)?;
+    let signature_message = ceremony_record_signature_message(&record_body)?;
+
+    Ok(PreparedProductionDoryV3FinalReceipt {
+        transcript,
+        candidate,
+        body,
+        record_content_digest,
+        signature_message,
+        required_signers,
+    })
+}
+
+/// Verify the exact externally supplied full-roster signatures and create-new
+/// stage the canonical type-6 record. The retained final candidate is checked
+/// once before signing material is accepted and again after the output is
+/// reopened; its bank guard remains the last retained-artifact check.
+pub fn stage_production_dory_v3_final_receipt(
+    mut prepared: PreparedProductionDoryV3FinalReceipt,
+    signatures: Vec<RecordSignature>,
+    output_path: &Path,
+) -> Result<ProductionDoryV3FinalReceiptStageReport, ProductionDoryV3CeremonyAuthoringError> {
+    let refreshed = prepared
+        .candidate
+        .derive_final_receipt_body(&prepared.transcript)?;
+    if refreshed != prepared.body {
+        return Err(ProductionDoryV3CeremonyAuthoringError::FinalCandidateProjectionChanged);
+    }
+
+    let staged = persist_production_dory_v3_final_receipt(
+        &prepared.body,
+        &prepared.required_signers,
+        signatures,
+        output_path,
+        || {
+            prepared
+                .candidate
+                .derive_final_receipt_body(&prepared.transcript)
+                .map_err(Into::into)
+        },
+    )?;
+
+    Ok(ProductionDoryV3FinalReceiptStageReport {
+        output: output_path.to_path_buf(),
+        record_file: staged.record_file,
+        record_content_digest: prepared.record_content_digest,
+        signed_record_digest: staged.signed_record_digest,
+        signature_message: prepared.signature_message,
+        signer_count: staged.signer_count,
+        durability: staged.durability,
+        publication_pending: true,
+    })
+}
+
+fn persist_production_dory_v3_final_receipt(
+    body: &FinalReceiptBody,
+    required_signers: &[RequiredCeremonySigner],
+    signatures: Vec<RecordSignature>,
+    output_path: &Path,
+    final_guard: impl FnOnce() -> Result<FinalReceiptBody, ProductionDoryV3CeremonyAuthoringError>,
+) -> Result<StagedFinalReceiptRecord, ProductionDoryV3CeremonyAuthoringError> {
+    let record = SignedCeremonyRecord {
+        body: CeremonyRecordBody::FinalReceipt(Box::new(body.clone())),
+        signatures,
+    };
+    verify_signatures_against(&record, required_signers)?;
+
+    let encoded = encode_ceremony_record(&record)?;
+    let record_file = file_identity_for_bytes(&encoded);
+    let signed_record_digest = ceremony_signed_record_digest(&record)?;
+    let signer_count = u16::try_from(record.signatures.len())
+        .map_err(|_| CeremonyTranscriptError::Limit("signature count"))?;
+    let expected = record.clone();
+    let durability = persist_record(output_path, &encoded, |reopened| {
+        let decoded = decode_ceremony_record(reopened)?;
+        if decoded != expected || encode_ceremony_record(&decoded)? != reopened {
+            return Err(ProductionDoryV3CeremonyAuthoringError::StagedOutputChanged);
+        }
+        if final_guard()? != *body {
+            return Err(ProductionDoryV3CeremonyAuthoringError::FinalCandidateProjectionChanged);
+        }
+        Ok(())
+    })?;
+    Ok(StagedFinalReceiptRecord {
+        record_file,
+        signed_record_digest,
+        signer_count,
+        durability,
     })
 }
 
@@ -1391,7 +1601,8 @@ fn required_signers_for_body(
             Ok(vec![operator_signer(genesis, value.operator_index)?])
         }
         CeremonyRecordBody::RevealSet(_) => Ok(operators()),
-        CeremonyRecordBody::FinalReceipt(_) | CeremonyRecordBody::Abort(_) => {
+        CeremonyRecordBody::FinalReceipt(_) => Ok(all()),
+        CeremonyRecordBody::Abort(_) => {
             Err(ProductionDoryV3CeremonyAuthoringError::WrongNextRecord)
         }
     }
@@ -1656,7 +1867,7 @@ mod tests {
         dory_v3_model::{CanonicalBlsDoryGtHex, ordered_dory_v3_model_commitment_root},
         dory_v3_model_ceremony_fs::prepare_test_parent,
         dory_v3_model_ceremony_transcript::{
-            AbortBody, FinalReceiptBody, PRODUCTION_BANK_BYTES, ReproducerReceipt,
+            AbortBody, PRODUCTION_BANK_BYTES, ReproducerReceipt,
             encode_and_verify_ceremony_transcript,
         },
         dory_v3_model_reproduction::PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES,
@@ -2394,6 +2605,96 @@ mod tests {
                 CeremonyTranscriptError::InvalidSignature
             ))
         ));
+    }
+
+    #[test]
+    fn type_six_signer_policy_requires_exact_full_roster_order() {
+        let fixture = completed_transcript_fixture();
+        let transcript = parse_and_verify_ceremony_transcript(&fixture.bytes).unwrap();
+        let final_record = transcript.records().last().unwrap();
+        let genesis = match &transcript.records()[0].body {
+            CeremonyRecordBody::Genesis(genesis) => genesis.as_ref(),
+            _ => unreachable!(),
+        };
+        let required = required_signers_for_body(&final_record.body, Some(genesis)).unwrap();
+        assert_eq!(
+            required.len(),
+            fixture.operators.len() + fixture.reproducers.len()
+        );
+        assert_eq!(required[0].signer_class(), SignerClass::Operator);
+        assert_eq!(required[2].signer_index(), 2);
+        assert_eq!(required[3].signer_class(), SignerClass::Reproducer);
+        assert_eq!(required[4].signer_index(), 1);
+        verify_signatures_against(final_record, &required).unwrap();
+
+        let mut reordered = final_record.clone();
+        reordered.signatures.swap(0, 1);
+        assert!(matches!(
+            verify_signatures_against(&reordered, &required),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+    }
+
+    #[test]
+    fn type_six_stage_reopens_create_new_output_and_runs_final_guard() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let transcript = parse_and_verify_ceremony_transcript(&fixture.bytes).unwrap();
+        let final_record = transcript.records().last().unwrap().clone();
+        let body = match &final_record.body {
+            CeremonyRecordBody::FinalReceipt(body) => body.as_ref().clone(),
+            _ => unreachable!(),
+        };
+        let genesis = match &transcript.records()[0].body {
+            CeremonyRecordBody::Genesis(genesis) => genesis.as_ref(),
+            _ => unreachable!(),
+        };
+        let required = required_signers_for_body(&final_record.body, Some(genesis)).unwrap();
+        let output = directory.0.join("final-receipt.cmfdcr01");
+        let mut guard_calls = 0;
+        let staged = persist_production_dory_v3_final_receipt(
+            &body,
+            &required,
+            final_record.signatures.clone(),
+            &output,
+            || {
+                guard_calls += 1;
+                Ok(body.clone())
+            },
+        )
+        .unwrap();
+        let reopened = fs::read(&output).unwrap();
+        assert_eq!(decode_ceremony_record(&reopened).unwrap(), final_record);
+        assert_eq!(encode_ceremony_record(&final_record).unwrap(), reopened);
+        assert_eq!(staged.record_file, file_identity_for_bytes(&reopened));
+        assert_eq!(guard_calls, 1);
+
+        assert!(matches!(
+            persist_production_dory_v3_final_receipt(
+                &body,
+                &required,
+                final_record.signatures.clone(),
+                &output,
+                || Ok(body.clone())
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Filesystem(message))
+                if message.contains("refusing to overwrite existing output")
+        ));
+
+        let rejected_output = directory.0.join("rejected-final-receipt.cmfdcr01");
+        let mut changed = body.clone();
+        changed.raw_payload_blake3[0] ^= 1;
+        assert!(matches!(
+            persist_production_dory_v3_final_receipt(
+                &body,
+                &required,
+                final_record.signatures,
+                &rejected_output,
+                || Ok(changed)
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::FinalCandidateProjectionChanged)
+        ));
+        assert!(!rejected_output.exists());
     }
 
     #[test]

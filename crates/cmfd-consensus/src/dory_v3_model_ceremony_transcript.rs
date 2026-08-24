@@ -1954,6 +1954,31 @@ pub fn parse_and_verify_ceremony_transcript(
     parse_and_verify_ceremony_transcript_with_terminal(bytes, RequiredTerminal::CompletedOrAborted)
 }
 
+/// Parse and verify a completed ceremony transcript against an independently
+/// authenticated ceremony identifier.
+///
+/// This is the anchored acceptance path for a type-6 final receipt. It retains
+/// all canonical decoding, signature, reference, and sequence validation from
+/// [`parse_and_verify_ceremony_transcript`], then excludes valid-but-aborted
+/// transcripts and transcripts for a different ceremony.
+pub fn parse_and_verify_completed_ceremony_transcript(
+    bytes: &[u8],
+    expected_ceremony_id: [u8; 32],
+) -> Result<VerifiedCeremonyTranscript, CeremonyTranscriptError> {
+    let transcript = parse_and_verify_ceremony_transcript(bytes)?;
+    if transcript.status != CeremonyTranscriptStatus::Completed {
+        return Err(CeremonyTranscriptError::Invalid(
+            "completed ceremony transcript required",
+        ));
+    }
+    if transcript.ceremony_id != expected_ceremony_id {
+        return Err(CeremonyTranscriptError::Invalid(
+            "completed transcript ceremony id does not match trusted anchor",
+        ));
+    }
+    Ok(transcript)
+}
+
 /// Verify the exact signed prefix ending immediately after the type-5
 /// reveal-set closure, before combination or any type-6 final receipt.
 ///
@@ -2556,6 +2581,44 @@ mod tests {
             verify_detached_transcript_attestation(&encoded, &transcript).unwrap(),
             attestation
         );
+    }
+
+    #[test]
+    fn completed_transcript_parser_requires_exact_trusted_anchor() {
+        let (bytes, _, _) = completed_fixture();
+        let generic = parse_and_verify_ceremony_transcript(&bytes).unwrap();
+        let anchored =
+            parse_and_verify_completed_ceremony_transcript(&bytes, generic.ceremony_id()).unwrap();
+        assert_eq!(anchored, generic);
+
+        let mut wrong_anchor = generic.ceremony_id();
+        wrong_anchor[0] ^= 1;
+        assert!(matches!(
+            parse_and_verify_completed_ceremony_transcript(&bytes, wrong_anchor),
+            Err(CeremonyTranscriptError::Invalid(
+                "completed transcript ceremony id does not match trusted anchor"
+            ))
+        ));
+
+        let mut noncanonical = bytes;
+        noncanonical.push(0);
+        assert!(
+            parse_and_verify_completed_ceremony_transcript(&noncanonical, generic.ceremony_id())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn completed_transcript_parser_rejects_valid_aborted_transcript() {
+        let (bytes, _, _) = aborted_fixture();
+        let generic = parse_and_verify_ceremony_transcript(&bytes).unwrap();
+        assert_eq!(generic.status(), CeremonyTranscriptStatus::Aborted);
+        assert!(matches!(
+            parse_and_verify_completed_ceremony_transcript(&bytes, generic.ceremony_id()),
+            Err(CeremonyTranscriptError::Invalid(
+                "completed ceremony transcript required"
+            ))
+        ));
     }
 
     #[test]

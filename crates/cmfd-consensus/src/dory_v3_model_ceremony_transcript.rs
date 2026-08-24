@@ -3034,6 +3034,18 @@ mod tests {
                 }
             )
         ));
+        assert!(matches!(
+            crate::dory_v3_model_combiner::validate_existing_production_dory_v3_model_combined_payload(
+                &completed,
+                &[],
+                std::path::Path::new("unused-completed-validator-output")
+            ),
+            Err(
+                crate::dory_v3_model_combiner::ProductionDoryV3ModelCombinerError::TranscriptAuthority {
+                    ..
+                }
+            )
+        ));
 
         let mut abort_after_closure = completed.records()[..9].to_vec();
         let abort = sign_record(
@@ -3059,6 +3071,18 @@ mod tests {
                 &aborted,
                 &[],
                 std::path::Path::new("unused-aborted-combiner-output")
+            ),
+            Err(
+                crate::dory_v3_model_combiner::ProductionDoryV3ModelCombinerError::TranscriptAuthority {
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            crate::dory_v3_model_combiner::validate_existing_production_dory_v3_model_combined_payload(
+                &aborted,
+                &[],
+                std::path::Path::new("unused-aborted-validator-output")
             ),
             Err(
                 crate::dory_v3_model_combiner::ProductionDoryV3ModelCombinerError::TranscriptAuthority {

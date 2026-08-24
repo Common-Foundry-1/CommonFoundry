@@ -1,17 +1,18 @@
 //! Identity-bound streaming combiner for production Dory V3 model contributions.
 //!
-//! The public entry point accepts only an independently ceremony-ID-anchored,
-//! exact type-5-terminal transcript capability, its ordered contribution paths,
-//! and one create-new output path. It authenticates every full-length input
-//! against the signed type-2/type-4 claim before, during, and after the combine
-//! pass, computes the canonical bytewise sum modulo 251 from retained file
-//! handles, and authenticates the reopened output again before success. The JSON
-//! report is operational output, not a signed ceremony artifact and not a
+//! Both public entry points accept only an independently ceremony-ID-anchored,
+//! exact type-5-terminal transcript capability and its ordered contribution
+//! paths. The combiner writes one create-new output; the existing-payload
+//! validator is read-only and byte-compares a retained payload handle against
+//! the same canonical modulo-251 stream. Both authenticate every full-length
+//! input against its signed type-2/type-4 claim before, during, and after the
+//! stream, then authenticate the output again before success. Their JSON
+//! reports are operational output, not signed ceremony artifacts and not a
 //! substitute for the ceremony transcript.
 //!
 //! The ceremony's filesystem boundary remains mandatory: run in a local,
 //! operator-owned directory that no untrusted account can write. On Windows,
-//! the production entry point enforces a fixed local volume and a simple parent
+//! the production entry points enforce a fixed local volume and a simple parent
 //! DACL owned by the current user with every allow ACE limited to that user,
 //! LocalSystem, or Administrators. The create-new output therefore inherits no
 //! untrusted read grant before its protected final DACL is applied. Retained
@@ -88,6 +89,30 @@ pub struct ProductionDoryV3ModelCombinerReport {
     pub bytes_processed: u64,
     pub elapsed_micros: u64,
     pub durability: ProductionDoryV3ModelCombinerDurability,
+}
+
+/// Audit-only report for read-only validation of an already-existing combined
+/// production payload.
+///
+/// Every content identity in this report was reproduced from retained handles
+/// while the exact signed contribution claims remained authenticated. The
+/// report is operational output, not a signed ceremony artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProductionDoryV3ModelCombinedPayloadValidationReport {
+    pub ceremony_id: Digest32,
+    pub reveal_set_prefix_bytes: u64,
+    pub reveal_set_prefix_derive_key_digest: Digest32,
+    pub reveal_set_prefix_blake3: Digest32,
+    pub reveal_set_prefix_sha256: Digest32,
+    pub commitment_set_signed_record_digest: Digest32,
+    pub reveal_set_signed_record_digest: Digest32,
+    pub ordered_inputs: Vec<ProductionDoryV3ModelCombinerInputReport>,
+    pub output: PathBuf,
+    pub output_bytes: u64,
+    pub output_blake3: Digest32,
+    pub output_sha256: Digest32,
+    pub bytes_processed: u64,
+    pub elapsed_micros: u64,
 }
 
 /// Fail-closed errors from the production streaming modular combiner.
@@ -255,8 +280,18 @@ pub enum ProductionDoryV3ModelCombinerError {
     OutputLength { expected: u64, actual: u64 },
     #[error("output byte {value} at offset {offset} exceeds 250")]
     OutputByteOutOfRange { offset: u64, value: u8 },
-    #[error("the reopened output differs from the stream that was written")]
+    #[error("the combined payload differs between authenticated passes")]
     OutputDigestMismatch,
+    #[error(
+        "combined payload byte mismatch at offset {offset}: expected {expected}, observed {actual}"
+    )]
+    OutputCombinationMismatch {
+        offset: u64,
+        expected: u8,
+        actual: u8,
+    },
+    #[error("combined payload aliases ordered contribution {index}: {path}")]
+    OutputAliasesInput { index: usize, path: PathBuf },
     #[error("failed to synchronize output parent {path}: {source}")]
     SyncParent {
         path: PathBuf,
@@ -450,6 +485,11 @@ struct AuthenticatedInput {
     claim: ContributionClaim,
 }
 
+struct AuthenticatedExistingOutput {
+    path: PathBuf,
+    retained: SameFileHandle,
+}
+
 trait CombinerIo {
     fn write_output(
         &mut self,
@@ -490,6 +530,16 @@ impl CombinerIo for SystemCombinerIo {
     }
 }
 
+trait CombinedPayloadValidatorIo {
+    fn after_artifacts_authenticated(&mut self, _inputs: &[PathBuf], _output: &Path) {}
+
+    fn before_final_authentication(&mut self, _inputs: &[PathBuf], _output: &Path) {}
+}
+
+struct SystemCombinedPayloadValidatorIo;
+
+impl CombinedPayloadValidatorIo for SystemCombinedPayloadValidatorIo {}
+
 /// Combine the ordered full-length production contributions bytewise modulo
 /// 251 under an independently ceremony-ID-anchored exact type-5 prefix.
 ///
@@ -513,6 +563,115 @@ pub fn combine_production_dory_v3_model_contributions(
         geometry,
         &mut SystemCombinerIo,
     )
+}
+
+/// Validate an already-existing full-length production combined payload
+/// without creating, overwriting, truncating, or otherwise writing any
+/// ceremony artifact.
+///
+/// `transcript` must be the opaque capability returned by
+/// [`crate::dory_v3_model_ceremony_transcript::parse_and_verify_reveal_set_prefix`]
+/// for an independently authenticated ceremony ID. The contribution paths
+/// must be in the exact signed operator order. The payload is streamed against
+/// a fresh bytewise modulo-251 recomputation, and all input and output paths
+/// are identity-checked around retained-handle authentication passes.
+pub fn validate_existing_production_dory_v3_model_combined_payload(
+    transcript: &VerifiedCeremonyTranscript,
+    ordered_contribution_paths: &[PathBuf],
+    existing_payload_path: &Path,
+) -> Result<ProductionDoryV3ModelCombinedPayloadValidationReport, ProductionDoryV3ModelCombinerError>
+{
+    let geometry = CombineGeometry::production()?;
+    let authority = CombinerAuthority::from_verified_transcript(transcript, geometry)?;
+    authority.validate_path_count(ordered_contribution_paths)?;
+    preflight_combiner_paths(ordered_contribution_paths, existing_payload_path)?;
+    validate_existing_with_io(
+        &authority,
+        ordered_contribution_paths,
+        existing_payload_path,
+        geometry,
+        &mut SystemCombinedPayloadValidatorIo,
+    )
+}
+
+fn validate_existing_with_io<I: CombinedPayloadValidatorIo>(
+    authority: &CombinerAuthority,
+    ordered_contribution_paths: &[PathBuf],
+    existing_payload_path: &Path,
+    geometry: CombineGeometry,
+    io: &mut I,
+) -> Result<ProductionDoryV3ModelCombinedPayloadValidationReport, ProductionDoryV3ModelCombinerError>
+{
+    geometry.validate()?;
+    authority.validate(geometry)?;
+    authority.validate_path_count(ordered_contribution_paths)?;
+
+    let started = Instant::now();
+    let mut inputs = Vec::with_capacity(ordered_contribution_paths.len());
+    for (index, (path, claim)) in ordered_contribution_paths
+        .iter()
+        .zip(&authority.contributions)
+        .enumerate()
+    {
+        let input = authenticate_input_read_locked(index, path, *claim, geometry)?;
+        if let Some(first) = inputs
+            .iter()
+            .find(|first: &&AuthenticatedInput| first.retained == input.retained)
+        {
+            return Err(ProductionDoryV3ModelCombinerError::DuplicateInput {
+                first_index: first.index,
+                second_index: index,
+                second_path: path.clone(),
+            });
+        }
+        inputs.push(input);
+    }
+
+    let output = authenticate_existing_output(existing_payload_path, geometry)?;
+    if let Some(input) = inputs
+        .iter()
+        .find(|input| input.retained == output.retained)
+    {
+        return Err(ProductionDoryV3ModelCombinerError::OutputAliasesInput {
+            index: input.index,
+            path: existing_payload_path.to_path_buf(),
+        });
+    }
+
+    io.after_artifacts_authenticated(ordered_contribution_paths, existing_payload_path);
+    let validated = validate_combined_streams(&inputs, &output, geometry)?;
+
+    io.before_final_authentication(ordered_contribution_paths, existing_payload_path);
+    for input in &inputs {
+        reauthenticate_input(input, geometry)?;
+    }
+    // Keep output authentication last so an output mutation during the long
+    // final input passes cannot produce a successful stale report.
+    let final_output = reauthenticate_existing_output(&output, geometry)?;
+    if final_output != validated.output {
+        return Err(ProductionDoryV3ModelCombinerError::OutputDigestMismatch);
+    }
+
+    Ok(ProductionDoryV3ModelCombinedPayloadValidationReport {
+        ceremony_id: Digest32::new(authority.ceremony_id),
+        reveal_set_prefix_bytes: authority.reveal_set_prefix_bytes,
+        reveal_set_prefix_derive_key_digest: Digest32::new(
+            authority.reveal_set_prefix_derive_key_digest,
+        ),
+        reveal_set_prefix_blake3: Digest32::new(authority.reveal_set_prefix_blake3),
+        reveal_set_prefix_sha256: Digest32::new(authority.reveal_set_prefix_sha256),
+        commitment_set_signed_record_digest: Digest32::new(
+            authority.commitment_set_signed_record_digest,
+        ),
+        reveal_set_signed_record_digest: Digest32::new(authority.reveal_set_signed_record_digest),
+        ordered_inputs: input_reports(&inputs),
+        output: existing_payload_path.to_path_buf(),
+        output_bytes: final_output.bytes,
+        output_blake3: Digest32::new(final_output.blake3),
+        output_sha256: Digest32::new(final_output.sha256),
+        bytes_processed: validated.bytes_processed,
+        elapsed_micros: elapsed_micros(started.elapsed()),
+    })
 }
 
 fn combine_with_io<I: CombinerIo>(
@@ -590,23 +749,7 @@ fn combine_with_io<I: CombinerIo>(
             return Err(ProductionDoryV3ModelCombinerError::OutputDigestMismatch);
         }
         let durability = sync_output_parent(output_path)?;
-        let ordered_inputs = inputs
-            .iter()
-            .map(|input| ProductionDoryV3ModelCombinerInputReport {
-                path: input.path.clone(),
-                operator_index: input.claim.operator_index,
-                operator_public_key: Digest32::new(input.claim.operator_public_key),
-                contribution_bytes: input.claim.file.bytes,
-                contribution_blake3: Digest32::new(input.claim.file.blake3),
-                contribution_sha256: Digest32::new(input.claim.file.sha256),
-                contribution_commitment_signed_record_digest: Digest32::new(
-                    input.claim.contribution_commitment_signed_record_digest,
-                ),
-                contribution_reveal_signed_record_digest: Digest32::new(
-                    input.claim.contribution_reveal_signed_record_digest,
-                ),
-            })
-            .collect();
+        let ordered_inputs = input_reports(&inputs);
         Ok(ProductionDoryV3ModelCombinerReport {
             ceremony_id: Digest32::new(authority.ceremony_id),
             reveal_set_prefix_bytes: authority.reveal_set_prefix_bytes,
@@ -634,6 +777,26 @@ fn combine_with_io<I: CombinerIo>(
     finish_or_cleanup_output(&mut published, completion)
 }
 
+fn input_reports(inputs: &[AuthenticatedInput]) -> Vec<ProductionDoryV3ModelCombinerInputReport> {
+    inputs
+        .iter()
+        .map(|input| ProductionDoryV3ModelCombinerInputReport {
+            path: input.path.clone(),
+            operator_index: input.claim.operator_index,
+            operator_public_key: Digest32::new(input.claim.operator_public_key),
+            contribution_bytes: input.claim.file.bytes,
+            contribution_blake3: Digest32::new(input.claim.file.blake3),
+            contribution_sha256: Digest32::new(input.claim.file.sha256),
+            contribution_commitment_signed_record_digest: Digest32::new(
+                input.claim.contribution_commitment_signed_record_digest,
+            ),
+            contribution_reveal_signed_record_digest: Digest32::new(
+                input.claim.contribution_reveal_signed_record_digest,
+            ),
+        })
+        .collect()
+}
+
 struct CombinedStream {
     output: FileDigest,
     bytes_processed: u64,
@@ -646,6 +809,37 @@ fn combine_streams<I: CombinerIo>(
     geometry: CombineGeometry,
     io: &mut I,
 ) -> Result<CombinedStream, ProductionDoryV3ModelCombinerError> {
+    let mut output_blake3 = blake3::Hasher::new();
+    let mut output_sha256 = Sha256::new();
+    let bytes_processed = stream_combined_chunks(inputs, geometry, "combine pass", |_, bytes| {
+        io.write_output(output_path, output_file, bytes)
+            .map_err(|source| ProductionDoryV3ModelCombinerError::WriteOutput {
+                path: output_path.to_path_buf(),
+                source,
+            })?;
+        output_blake3.update(bytes);
+        output_sha256.update(bytes);
+        Ok(())
+    })?;
+    Ok(CombinedStream {
+        output: FileDigest {
+            bytes: bytes_processed,
+            blake3: *output_blake3.finalize().as_bytes(),
+            sha256: finalize_sha256(output_sha256),
+        },
+        bytes_processed,
+    })
+}
+
+fn stream_combined_chunks<F>(
+    inputs: &[AuthenticatedInput],
+    geometry: CombineGeometry,
+    claim_pass: &'static str,
+    mut consume: F,
+) -> Result<u64, ProductionDoryV3ModelCombinerError>
+where
+    F: FnMut(u64, &[u8]) -> Result<(), ProductionDoryV3ModelCombinerError>,
+{
     let mut readers = Vec::with_capacity(inputs.len());
     for input in inputs {
         readers.push(clone_input_reader(input)?);
@@ -657,8 +851,6 @@ fn combine_streams<I: CombinerIo>(
     let mut input_buffer = vec![0_u8; geometry.chunk_bytes];
     let mut accumulator = vec![0_u32; geometry.chunk_bytes];
     let mut output_buffer = vec![0_u8; geometry.chunk_bytes];
-    let mut output_blake3 = blake3::Hasher::new();
-    let mut output_sha256 = Sha256::new();
     let mut offset = 0_u64;
 
     while offset < geometry.contribution_bytes {
@@ -688,13 +880,7 @@ fn combine_streams<I: CombinerIo>(
             *target = u8::try_from(*sum % 251)
                 .map_err(|_| ProductionDoryV3ModelCombinerError::AccumulatorOverflow)?;
         }
-        io.write_output(output_path, output_file, &output_buffer[..chunk_len])
-            .map_err(|source| ProductionDoryV3ModelCombinerError::WriteOutput {
-                path: output_path.to_path_buf(),
-                source,
-            })?;
-        output_blake3.update(&output_buffer[..chunk_len]);
-        output_sha256.update(&output_buffer[..chunk_len]);
+        consume(offset, &output_buffer[..chunk_len])?;
         offset = offset
             .checked_add(
                 u64::try_from(chunk_len)
@@ -714,16 +900,65 @@ fn combine_streams<I: CombinerIo>(
             blake3: *input_blake3[input_index].finalize().as_bytes(),
             sha256: finalize_sha256(input_sha256[input_index].clone()),
         };
-        require_claim_match(input, observed, "combine pass")?;
+        require_claim_match(input, observed, claim_pass)?;
     }
+    Ok(offset)
+}
 
+fn validate_combined_streams(
+    inputs: &[AuthenticatedInput],
+    output: &AuthenticatedExistingOutput,
+    geometry: CombineGeometry,
+) -> Result<CombinedStream, ProductionDoryV3ModelCombinerError> {
+    let mut output_reader = clone_existing_output_reader(output)?;
+    let mut output_blake3 = blake3::Hasher::new();
+    let mut output_sha256 = Sha256::new();
+    let mut observed = vec![0_u8; geometry.chunk_bytes];
+    let bytes_processed = stream_combined_chunks(
+        inputs,
+        geometry,
+        "combination validation pass",
+        |offset, expected| {
+            let observed = &mut observed[..expected.len()];
+            read_exact_output_chunk(&mut output_reader, &output.path, observed, offset)?;
+            validate_output_range(observed, offset)?;
+            if let Some((position, (expected, actual))) = expected
+                .iter()
+                .copied()
+                .zip(observed.iter().copied())
+                .enumerate()
+                .find(|(_, (expected, actual))| expected != actual)
+            {
+                let position = u64::try_from(position)
+                    .map_err(|_| ProductionDoryV3ModelCombinerError::CountOverflow)?;
+                return Err(
+                    ProductionDoryV3ModelCombinerError::OutputCombinationMismatch {
+                        offset: offset
+                            .checked_add(position)
+                            .ok_or(ProductionDoryV3ModelCombinerError::CountOverflow)?,
+                        expected,
+                        actual,
+                    },
+                );
+            }
+            output_blake3.update(observed);
+            output_sha256.update(observed);
+            Ok(())
+        },
+    )?;
+    require_output_eof(
+        &mut output_reader,
+        &output.path,
+        geometry.contribution_bytes,
+    )?;
+    ensure_output_path_identity(&output.path, &output.retained)?;
     Ok(CombinedStream {
         output: FileDigest {
-            bytes: offset,
+            bytes: bytes_processed,
             blake3: *output_blake3.finalize().as_bytes(),
             sha256: finalize_sha256(output_sha256),
         },
-        bytes_processed: offset,
+        bytes_processed,
     })
 }
 
@@ -733,13 +968,35 @@ fn authenticate_input(
     claim: ContributionClaim,
     geometry: CombineGeometry,
 ) -> Result<AuthenticatedInput, ProductionDoryV3ModelCombinerError> {
+    authenticate_input_with_open(index, path, claim, geometry, false)
+}
+
+fn authenticate_input_read_locked(
+    index: usize,
+    path: &Path,
+    claim: ContributionClaim,
+    geometry: CombineGeometry,
+) -> Result<AuthenticatedInput, ProductionDoryV3ModelCombinerError> {
+    authenticate_input_with_open(index, path, claim, geometry, true)
+}
+
+fn authenticate_input_with_open(
+    index: usize,
+    path: &Path,
+    claim: ContributionClaim,
+    geometry: CombineGeometry,
+    read_locked: bool,
+) -> Result<AuthenticatedInput, ProductionDoryV3ModelCombinerError> {
     validate_input_path_type(index, path)?;
-    let file = OpenOptions::new().read(true).open(path).map_err(|source| {
-        ProductionDoryV3ModelCombinerError::OpenInput {
-            index,
-            path: path.to_path_buf(),
-            source,
-        }
+    let file = if read_locked {
+        open_read_locked_no_follow(path)
+    } else {
+        OpenOptions::new().read(true).open(path)
+    }
+    .map_err(|source| ProductionDoryV3ModelCombinerError::OpenInput {
+        index,
+        path: path.to_path_buf(),
+        source,
     })?;
     let metadata =
         file.metadata()
@@ -777,6 +1034,89 @@ fn reauthenticate_input(
     let observed = scan_input(input.index, &input.path, &input.retained, geometry)?;
     require_claim_match(input, observed, "final retained-handle authentication")?;
     ensure_input_path_identity(input.index, &input.path, &input.retained)
+}
+
+fn authenticate_existing_output(
+    path: &Path,
+    geometry: CombineGeometry,
+) -> Result<AuthenticatedExistingOutput, ProductionDoryV3ModelCombinerError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        ProductionDoryV3ModelCombinerError::InspectOutput {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    if metadata_is_reparse_point(&metadata) {
+        return Err(ProductionDoryV3ModelCombinerError::OutputReparsePoint(
+            path.to_path_buf(),
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(ProductionDoryV3ModelCombinerError::OutputNotRegular(
+            path.to_path_buf(),
+        ));
+    }
+    let file = open_read_locked_no_follow(path).map_err(|source| {
+        ProductionDoryV3ModelCombinerError::ReadOutput {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let metadata =
+        file.metadata()
+            .map_err(|source| ProductionDoryV3ModelCombinerError::InspectOutput {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    validate_existing_output_metadata(path, &file, &metadata, geometry)?;
+    let retained = SameFileHandle::from_file(file).map_err(|source| {
+        ProductionDoryV3ModelCombinerError::InspectOutput {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    ensure_output_path_identity(path, &retained)?;
+    Ok(AuthenticatedExistingOutput {
+        path: path.to_path_buf(),
+        retained,
+    })
+}
+
+fn reauthenticate_existing_output(
+    output: &AuthenticatedExistingOutput,
+    geometry: CombineGeometry,
+) -> Result<FileDigest, ProductionDoryV3ModelCombinerError> {
+    ensure_output_path_identity(&output.path, &output.retained)?;
+    let digest = scan_existing_output(output, geometry)?;
+    ensure_output_path_identity(&output.path, &output.retained)?;
+    Ok(digest)
+}
+
+fn scan_existing_output(
+    output: &AuthenticatedExistingOutput,
+    geometry: CombineGeometry,
+) -> Result<FileDigest, ProductionDoryV3ModelCombinerError> {
+    let mut reader = clone_existing_output_reader(output)?;
+    scan_output_reader(&mut reader, &output.path, geometry)
+}
+
+fn clone_existing_output_reader(
+    output: &AuthenticatedExistingOutput,
+) -> Result<File, ProductionDoryV3ModelCombinerError> {
+    ensure_output_path_identity(&output.path, &output.retained)?;
+    let mut reader = output.retained.as_file().try_clone().map_err(|source| {
+        ProductionDoryV3ModelCombinerError::ReadOutput {
+            path: output.path.clone(),
+            source,
+        }
+    })?;
+    reader.seek(SeekFrom::Start(0)).map_err(|source| {
+        ProductionDoryV3ModelCombinerError::ReadOutput {
+            path: output.path.clone(),
+            source,
+        }
+    })?;
+    Ok(reader)
 }
 
 fn require_claim_match(
@@ -993,10 +1333,18 @@ fn verify_output(
     geometry: CombineGeometry,
 ) -> Result<FileDigest, ProductionDoryV3ModelCombinerError> {
     let mut reader = output.reopen_reader()?;
+    scan_output_reader(&mut reader, &output.path, geometry)
+}
+
+fn scan_output_reader(
+    reader: &mut File,
+    path: &Path,
+    geometry: CombineGeometry,
+) -> Result<FileDigest, ProductionDoryV3ModelCombinerError> {
     let initial_length = reader
         .metadata()
         .map_err(|source| ProductionDoryV3ModelCombinerError::ReadOutput {
-            path: output.path.clone(),
+            path: path.to_path_buf(),
             source,
         })?
         .len();
@@ -1014,22 +1362,8 @@ fn verify_output(
         let remaining = geometry.contribution_bytes - offset;
         let chunk_len = usize::try_from(remaining.min(geometry.chunk_bytes as u64))
             .map_err(|_| ProductionDoryV3ModelCombinerError::CountOverflow)?;
-        read_exact_output_chunk(&mut reader, &output.path, &mut buffer[..chunk_len], offset)?;
-        if let Some((position, value)) = buffer[..chunk_len]
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, value)| *value > MAX_MODEL_BYTE)
-        {
-            let position = u64::try_from(position)
-                .map_err(|_| ProductionDoryV3ModelCombinerError::CountOverflow)?;
-            return Err(ProductionDoryV3ModelCombinerError::OutputByteOutOfRange {
-                offset: offset
-                    .checked_add(position)
-                    .ok_or(ProductionDoryV3ModelCombinerError::CountOverflow)?,
-                value,
-            });
-        }
+        read_exact_output_chunk(reader, path, &mut buffer[..chunk_len], offset)?;
+        validate_output_range(&buffer[..chunk_len], offset)?;
         blake3.update(&buffer[..chunk_len]);
         sha256.update(&buffer[..chunk_len]);
         offset = offset
@@ -1039,37 +1373,65 @@ fn verify_output(
             )
             .ok_or(ProductionDoryV3ModelCombinerError::CountOverflow)?;
     }
-    let mut trailing = [0_u8; 1];
-    if reader.read(&mut trailing).map_err(|source| {
-        ProductionDoryV3ModelCombinerError::ReadOutput {
-            path: output.path.clone(),
-            source,
-        }
-    })? != 0
-    {
-        return Err(ProductionDoryV3ModelCombinerError::OutputLength {
-            expected: geometry.contribution_bytes,
-            actual: geometry.contribution_bytes.saturating_add(1),
-        });
-    }
-    let final_length = reader
-        .metadata()
-        .map_err(|source| ProductionDoryV3ModelCombinerError::ReadOutput {
-            path: output.path.clone(),
-            source,
-        })?
-        .len();
-    if final_length != geometry.contribution_bytes {
-        return Err(ProductionDoryV3ModelCombinerError::OutputLength {
-            expected: geometry.contribution_bytes,
-            actual: final_length,
-        });
-    }
+    require_output_eof(reader, path, geometry.contribution_bytes)?;
     Ok(FileDigest {
         bytes: offset,
         blake3: *blake3.finalize().as_bytes(),
         sha256: finalize_sha256(sha256),
     })
+}
+
+fn validate_output_range(
+    bytes: &[u8],
+    offset: u64,
+) -> Result<(), ProductionDoryV3ModelCombinerError> {
+    if let Some((position, value)) = bytes
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value > MAX_MODEL_BYTE)
+    {
+        let position = u64::try_from(position)
+            .map_err(|_| ProductionDoryV3ModelCombinerError::CountOverflow)?;
+        return Err(ProductionDoryV3ModelCombinerError::OutputByteOutOfRange {
+            offset: offset
+                .checked_add(position)
+                .ok_or(ProductionDoryV3ModelCombinerError::CountOverflow)?,
+            value,
+        });
+    }
+    Ok(())
+}
+
+fn require_output_eof(
+    reader: &mut File,
+    path: &Path,
+    expected: u64,
+) -> Result<(), ProductionDoryV3ModelCombinerError> {
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing).map_err(|source| {
+        ProductionDoryV3ModelCombinerError::ReadOutput {
+            path: path.to_path_buf(),
+            source,
+        }
+    })? != 0
+    {
+        return Err(ProductionDoryV3ModelCombinerError::OutputLength {
+            expected,
+            actual: expected.saturating_add(1),
+        });
+    }
+    let actual = reader
+        .metadata()
+        .map_err(|source| ProductionDoryV3ModelCombinerError::ReadOutput {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if actual != expected {
+        return Err(ProductionDoryV3ModelCombinerError::OutputLength { expected, actual });
+    }
+    Ok(())
 }
 
 fn read_exact_output_chunk(
@@ -1102,6 +1464,27 @@ fn read_exact_output_chunk(
         target = &mut target[read..];
     }
     Ok(())
+}
+
+fn open_read_locked_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
 }
 
 fn create_private_output(
@@ -1809,6 +2192,32 @@ fn validate_output_single_link(
     Ok(())
 }
 
+fn validate_existing_output_metadata(
+    path: &Path,
+    file: &File,
+    metadata: &Metadata,
+    geometry: CombineGeometry,
+) -> Result<(), ProductionDoryV3ModelCombinerError> {
+    if metadata_is_reparse_point(metadata) {
+        return Err(ProductionDoryV3ModelCombinerError::OutputReparsePoint(
+            path.to_path_buf(),
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(ProductionDoryV3ModelCombinerError::OutputNotRegular(
+            path.to_path_buf(),
+        ));
+    }
+    validate_output_single_link(path, file, metadata)?;
+    if metadata.len() != geometry.contribution_bytes {
+        return Err(ProductionDoryV3ModelCombinerError::OutputLength {
+            expected: geometry.contribution_bytes,
+            actual: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
 fn regular_output_path_identity(
     path: &Path,
 ) -> Result<SameFileHandle, ProductionDoryV3ModelCombinerError> {
@@ -2286,12 +2695,43 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestValidatorIo {
+        after_auth: Option<StageHook>,
+        before_final: Option<StageHook>,
+    }
+
+    impl CombinedPayloadValidatorIo for TestValidatorIo {
+        fn after_artifacts_authenticated(&mut self, inputs: &[PathBuf], output: &Path) {
+            if let Some(hook) = &mut self.after_auth {
+                hook(inputs, output);
+            }
+        }
+
+        fn before_final_authentication(&mut self, inputs: &[PathBuf], output: &Path) {
+            if let Some(hook) = &mut self.before_final {
+                hook(inputs, output);
+            }
+        }
+    }
+
     fn combine_tiny(
         inputs: &[PathBuf],
         output: &Path,
         io: &mut TestIo,
     ) -> Result<ProductionDoryV3ModelCombinerReport, ProductionDoryV3ModelCombinerError> {
         combine_with_io(&tiny_authority(inputs), inputs, output, tiny_geometry(), io)
+    }
+
+    fn validate_tiny(
+        inputs: &[PathBuf],
+        output: &Path,
+        io: &mut TestValidatorIo,
+    ) -> Result<
+        ProductionDoryV3ModelCombinedPayloadValidationReport,
+        ProductionDoryV3ModelCombinerError,
+    > {
+        validate_existing_with_io(&tiny_authority(inputs), inputs, output, tiny_geometry(), io)
     }
 
     #[test]
@@ -2492,6 +2932,156 @@ mod tests {
     }
 
     #[test]
+    fn existing_payload_validator_recomputes_report_and_never_mutates_artifacts() {
+        let inputs = create_inputs(
+            "validate-kat",
+            &[
+                &[0, 1, 2, 249, 250, 250],
+                &[250, 250, 249, 2, 1, 250],
+                &[1, 2, 3, 4, 5, 250],
+            ],
+        );
+        let output = temp_path("validate-kat-output");
+        let expected = [0, 2, 3, 4, 5, 248];
+        fs::write(&output, expected).unwrap();
+        let before_inputs = inputs
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let before_output = fs::read(&output).unwrap();
+
+        let report = validate_tiny(&inputs, &output, &mut TestValidatorIo::default()).unwrap();
+
+        assert_eq!(report.ceremony_id, Digest32::new([0x11; 32]));
+        assert_eq!(report.reveal_set_prefix_bytes, 1234);
+        assert_eq!(report.ordered_inputs.len(), 3);
+        assert_eq!(report.output, output);
+        assert_eq!(report.output_bytes, 6);
+        assert_eq!(report.bytes_processed, 6);
+        assert_eq!(
+            hex::encode(report.output_blake3.into_bytes()),
+            "d256495d06d49773ec8aac338050786bddf071fec661f07d766bfd2c7b23979f"
+        );
+        assert_eq!(
+            hex::encode(report.output_sha256.into_bytes()),
+            "6b675b3bf6561e7e5bbc47b1ac9eb32d956fe1c45dea926dd62ea6ab1f75673a"
+        );
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|path| fs::read(path).unwrap())
+                .collect::<Vec<_>>(),
+            before_inputs
+        );
+        assert_eq!(fs::read(&output).unwrap(), before_output);
+        remove_paths(inputs.into_iter().chain([output]));
+    }
+
+    #[test]
+    fn existing_payload_validator_rejects_mismatch_without_mutation() {
+        let inputs = create_inputs(
+            "validate-mismatch",
+            &[&[1, 2, 3, 4, 5, 6], &[6, 5, 4, 3, 2, 1], &[1; 6]],
+        );
+        let output = temp_path("validate-mismatch-output");
+        let wrong = [9_u8; 6];
+        fs::write(&output, wrong).unwrap();
+
+        assert!(matches!(
+            validate_tiny(&inputs, &output, &mut TestValidatorIo::default()),
+            Err(ProductionDoryV3ModelCombinerError::OutputCombinationMismatch { offset: 0, .. })
+        ));
+        assert_eq!(fs::read(&output).unwrap(), wrong);
+        remove_paths(inputs.into_iter().chain([output]));
+    }
+
+    #[test]
+    fn existing_payload_validator_rejects_short_trailing_and_out_of_range_outputs() {
+        for (label, output_bytes, expected) in [
+            ("short", vec![6_u8; 5], "length"),
+            ("trailing", vec![6_u8; 7], "length"),
+            ("range", vec![251_u8; 6], "range"),
+        ] {
+            let inputs = create_inputs(
+                &format!("validate-output-{label}"),
+                &[&[1; 6], &[2; 6], &[3; 6]],
+            );
+            let output = temp_path(&format!("validate-output-{label}"));
+            fs::write(&output, &output_bytes).unwrap();
+            let error =
+                validate_tiny(&inputs, &output, &mut TestValidatorIo::default()).unwrap_err();
+            match expected {
+                "length" => assert!(matches!(
+                    error,
+                    ProductionDoryV3ModelCombinerError::OutputLength { .. }
+                )),
+                "range" => assert!(matches!(
+                    error,
+                    ProductionDoryV3ModelCombinerError::OutputByteOutOfRange { .. }
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read(&output).unwrap(), output_bytes);
+            remove_paths(inputs.into_iter().chain([output]));
+        }
+    }
+
+    #[test]
+    fn existing_payload_validator_rejects_wrong_count_order_and_claim() {
+        let inputs = create_inputs("validate-bindings", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output = temp_path("validate-bindings-output");
+        fs::write(&output, [6_u8; 6]).unwrap();
+        let authority = tiny_authority(&inputs);
+
+        assert!(matches!(
+            validate_existing_with_io(
+                &authority,
+                &inputs[..2],
+                &output,
+                tiny_geometry(),
+                &mut TestValidatorIo::default()
+            ),
+            Err(
+                ProductionDoryV3ModelCombinerError::TranscriptContributionCount {
+                    expected: 3,
+                    actual: 2
+                }
+            )
+        ));
+
+        let mut wrong_order = authority.clone();
+        wrong_order.contributions.swap(0, 1);
+        assert!(matches!(
+            validate_existing_with_io(
+                &wrong_order,
+                &inputs,
+                &output,
+                tiny_geometry(),
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::TranscriptContributionOrder { position: 0 })
+        ));
+
+        let mut swapped_paths = inputs.clone();
+        swapped_paths.swap(0, 1);
+        assert!(matches!(
+            validate_existing_with_io(
+                &authority,
+                &swapped_paths,
+                &output,
+                tiny_geometry(),
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::InputClaimMismatch {
+                index: 0,
+                pass: "initial authentication",
+                ..
+            })
+        ));
+        remove_paths(inputs.into_iter().chain([output]));
+    }
+
+    #[test]
     fn maximum_sixteen_input_sum_uses_checked_u32_before_reduction() {
         let input_bytes = [250_u8; 6];
         let values = (0..16).map(|_| input_bytes.as_slice()).collect::<Vec<_>>();
@@ -2542,6 +3132,132 @@ mod tests {
             })
         ));
         remove_paths(inputs.into_iter().chain([alias]));
+    }
+
+    #[test]
+    fn existing_payload_validator_rejects_duplicate_hardlink_and_output_aliases() {
+        let mut duplicated = create_inputs("validate-duplicate", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let displaced_duplicate_path = duplicated[2].clone();
+        duplicated[2] = duplicated[0].clone();
+        let duplicate_output = temp_path("validate-duplicate-output");
+        fs::write(&duplicate_output, [6_u8; 6]).unwrap();
+        assert!(matches!(
+            validate_tiny(
+                &duplicated,
+                &duplicate_output,
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::DuplicateInput {
+                first_index: 0,
+                second_index: 2,
+                ..
+            })
+        ));
+        let duplicate_cleanup = vec![
+            duplicated[0].clone(),
+            duplicated[1].clone(),
+            displaced_duplicate_path,
+            duplicate_output,
+        ];
+        remove_paths(duplicate_cleanup);
+
+        let hardlinked = create_inputs("validate-hardlink", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let alias = temp_path("validate-hardlink-alias");
+        fs::hard_link(&hardlinked[0], &alias).unwrap();
+        let mut aliased_paths = hardlinked.clone();
+        aliased_paths[2] = alias.clone();
+        let hardlink_output = temp_path("validate-hardlink-output");
+        fs::write(&hardlink_output, [6_u8; 6]).unwrap();
+        assert!(matches!(
+            validate_tiny(
+                &aliased_paths,
+                &hardlink_output,
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::InputHardLinks {
+                index: 0,
+                links: 2,
+                ..
+            })
+        ));
+        remove_paths(hardlinked.into_iter().chain([alias, hardlink_output]));
+
+        let output_alias_inputs =
+            create_inputs("validate-output-alias", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output_alias = output_alias_inputs[0].clone();
+        assert!(matches!(
+            validate_tiny(
+                &output_alias_inputs,
+                &output_alias,
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::OutputAliasesInput { index: 0, .. })
+        ));
+        remove_paths(output_alias_inputs);
+
+        let output_hardlink_inputs =
+            create_inputs("validate-output-hardlink", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output_hardlink = temp_path("validate-output-hardlink-output");
+        let output_hardlink_alias = temp_path("validate-output-hardlink-alias");
+        fs::write(&output_hardlink, [6_u8; 6]).unwrap();
+        fs::hard_link(&output_hardlink, &output_hardlink_alias).unwrap();
+        assert!(matches!(
+            validate_tiny(
+                &output_hardlink_inputs,
+                &output_hardlink,
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::OutputHardLinks { links: 2, .. })
+        ));
+        remove_paths(
+            output_hardlink_inputs
+                .into_iter()
+                .chain([output_hardlink, output_hardlink_alias]),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_payload_validator_rejects_input_and_output_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let inputs = create_inputs("validate-symlink", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let authority = tiny_authority(&inputs);
+        let input_alias = temp_path("validate-input-symlink");
+        symlink(&inputs[0], &input_alias).unwrap();
+        let mut aliased_inputs = inputs.clone();
+        aliased_inputs[0] = input_alias.clone();
+        let output = temp_path("validate-symlink-output");
+        fs::write(&output, [6_u8; 6]).unwrap();
+        assert!(matches!(
+            validate_existing_with_io(
+                &authority,
+                &aliased_inputs,
+                &output,
+                tiny_geometry(),
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::InputNotRegular { index: 0, .. })
+        ));
+
+        let output_alias = temp_path("validate-output-symlink");
+        symlink(&output, &output_alias).unwrap();
+        assert!(matches!(
+            validate_existing_with_io(
+                &authority,
+                &inputs,
+                &output_alias,
+                tiny_geometry(),
+                &mut TestValidatorIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::OutputNotRegular(ref path))
+                if path == &output_alias
+        ));
+        remove_paths(
+            inputs
+                .into_iter()
+                .chain([input_alias, output_alias, output]),
+        );
     }
 
     #[test]
@@ -2680,6 +3396,112 @@ mod tests {
         assert_eq!(fs::read(&inputs[0]).unwrap(), [7_u8; 6]);
         assert!(!output.exists());
         remove_paths(inputs.into_iter().chain([displaced]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_payload_validator_detects_input_replacement() {
+        let inputs = create_inputs("validate-input-replace", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output = temp_path("validate-input-replace-output");
+        fs::write(&output, [6_u8; 6]).unwrap();
+        let displaced = temp_path("validate-input-replace-displaced");
+        let displaced_for_hook = displaced.clone();
+        let mut io = TestValidatorIo {
+            after_auth: Some(Box::new(move |paths, _| {
+                fs::rename(&paths[0], &displaced_for_hook).unwrap();
+                fs::write(&paths[0], [7_u8; 6]).unwrap();
+            })),
+            ..TestValidatorIo::default()
+        };
+        assert!(matches!(
+            validate_tiny(&inputs, &output, &mut io),
+            Err(ProductionDoryV3ModelCombinerError::InputIdentityMismatch { index: 0, .. })
+        ));
+        assert_eq!(fs::read(&inputs[0]).unwrap(), [7_u8; 6]);
+        assert_eq!(fs::read(&output).unwrap(), [6_u8; 6]);
+        remove_paths(inputs.into_iter().chain([output, displaced]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_payload_validator_detects_output_replacement() {
+        let inputs = create_inputs("validate-output-replace", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output = temp_path("validate-output-replace-output");
+        fs::write(&output, [6_u8; 6]).unwrap();
+        let displaced = temp_path("validate-output-replace-displaced");
+        let displaced_for_hook = displaced.clone();
+        let mut io = TestValidatorIo {
+            after_auth: Some(Box::new(move |_, output| {
+                fs::rename(output, &displaced_for_hook).unwrap();
+                fs::write(output, [6_u8; 6]).unwrap();
+            })),
+            ..TestValidatorIo::default()
+        };
+        assert!(matches!(
+            validate_tiny(&inputs, &output, &mut io),
+            Err(ProductionDoryV3ModelCombinerError::OutputIdentityMismatch(ref path))
+                if path == &output
+        ));
+        assert_eq!(fs::read(&output).unwrap(), [6_u8; 6]);
+        remove_paths(inputs.into_iter().chain([output, displaced]));
+    }
+
+    #[test]
+    fn existing_payload_validator_rechecks_output_after_final_input_passes() {
+        let inputs = create_inputs("validate-final-output-tamper", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output = temp_path("validate-final-output-tamper-output");
+        fs::write(&output, [6_u8; 6]).unwrap();
+        let mutation_was_blocked = Arc::new(Mutex::new(false));
+        let mutation_was_blocked_for_hook = Arc::clone(&mutation_was_blocked);
+        let mut io = TestValidatorIo {
+            before_final: Some(Box::new(move |_, output| {
+                *mutation_was_blocked_for_hook.lock().unwrap() =
+                    fs::write(output, [9_u8; 6]).is_err();
+            })),
+            ..TestValidatorIo::default()
+        };
+        let result = validate_tiny(&inputs, &output, &mut io);
+        if *mutation_was_blocked.lock().unwrap() {
+            assert!(result.is_ok());
+            assert_eq!(fs::read(&output).unwrap(), [6_u8; 6]);
+        } else {
+            assert!(matches!(
+                result,
+                Err(ProductionDoryV3ModelCombinerError::OutputDigestMismatch)
+            ));
+            assert_eq!(fs::read(&output).unwrap(), [9_u8; 6]);
+        }
+        remove_paths(inputs.into_iter().chain([output]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_payload_validator_read_locks_prevent_path_replacement() {
+        let inputs = create_inputs("validate-windows-lock", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output = temp_path("validate-windows-lock-output");
+        fs::write(&output, [6_u8; 6]).unwrap();
+        let displaced_input = temp_path("validate-windows-lock-input-displaced");
+        let displaced_output = temp_path("validate-windows-lock-output-displaced");
+        let displaced_input_for_hook = displaced_input.clone();
+        let displaced_output_for_hook = displaced_output.clone();
+        let replacement_results = Arc::new(Mutex::new((false, false)));
+        let replacement_results_for_hook = Arc::clone(&replacement_results);
+        let mut io = TestValidatorIo {
+            after_auth: Some(Box::new(move |paths, output| {
+                let input_blocked = fs::rename(&paths[0], &displaced_input_for_hook).is_err();
+                let output_blocked = fs::rename(output, &displaced_output_for_hook).is_err();
+                *replacement_results_for_hook.lock().unwrap() = (input_blocked, output_blocked);
+            })),
+            ..TestValidatorIo::default()
+        };
+        validate_tiny(&inputs, &output, &mut io).unwrap();
+        assert_eq!(*replacement_results.lock().unwrap(), (true, true));
+        assert_eq!(fs::read(&output).unwrap(), [6_u8; 6]);
+        remove_paths(
+            inputs
+                .into_iter()
+                .chain([output, displaced_input, displaced_output]),
+        );
     }
 
     #[test]

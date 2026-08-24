@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
 use cmfd_consensus::dory_bls12_381_blake3::derive_bls_dory_blake3_preprocessing_record;
+#[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+use cmfd_consensus::dory_v3_qualification::{
+    ProductionDoryV3QualificationRequest, run_production_dory_v3_qualification,
+};
 use cmfd_consensus::forgematrix::CANDIDATE_16GB_PROFILE;
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
@@ -101,6 +105,31 @@ enum Command {
         /// New JSON record path; omit for stdout. Existing files are never overwritten.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
+    },
+    /// Run one unchanged n=33 Dory V3 production qualification.
+    #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+    DoryV3Qualify {
+        /// Canonical production model bank.
+        #[arg(long)]
+        bank: std::path::PathBuf,
+        /// Canonical production Record V2 JSON.
+        #[arg(long)]
+        record: std::path::PathBuf,
+        /// Strict qualification request JSON containing the block and winning claim.
+        #[arg(long)]
+        request: std::path::PathBuf,
+        /// New absolute runner-owned scratch directory.
+        #[arg(long)]
+        scratch: std::path::PathBuf,
+        /// New canonical proof-wire output path.
+        #[arg(long)]
+        proof_output: std::path::PathBuf,
+        /// New report written last as the completion marker; publication is not crash-atomic.
+        #[arg(long)]
+        report_output: std::path::PathBuf,
+        /// Maximum native BLAKE3 rows materialized in one block.
+        #[arg(long)]
+        maximum_native_block_rows: usize,
     },
 }
 
@@ -275,6 +304,40 @@ fn main() -> Result<()> {
             } else {
                 print!("{}", String::from_utf8(encoded)?);
             }
+        }
+        #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+        Command::DoryV3Qualify {
+            bank,
+            record,
+            request,
+            scratch,
+            proof_output,
+            report_output,
+            maximum_native_block_rows,
+        } => {
+            let request_reader = std::fs::File::open(&request)
+                .with_context(|| format!("failed to open {}", request.display()))?;
+            let qualification_request: ProductionDoryV3QualificationRequest =
+                serde_json::from_reader(request_reader)
+                    .with_context(|| format!("failed to parse {}", request.display()))?;
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal_cancel = std::sync::Arc::clone(&cancel);
+            ctrlc::set_handler(move || {
+                signal_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .context("failed to install qualification Ctrl-C handler")?;
+            let report = run_production_dory_v3_qualification(
+                &bank,
+                &record,
+                &qualification_request,
+                &scratch,
+                &proof_output,
+                &report_output,
+                maximum_native_block_rows,
+                cancel.as_ref(),
+            )
+            .context("production Dory V3 qualification failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())

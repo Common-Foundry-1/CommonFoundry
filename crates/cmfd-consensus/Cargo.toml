@@ -16,6 +16,7 @@ blake3.workspace = true
 clap.workspace = true
 cmfd-marketplace = { path = "../cmfd-marketplace" }
 cmfd-proof-accel = { path = "../cmfd-proof-accel", optional = true }
+ctrlc.workspace = true
 dory-pcs = { version = "=0.4.2", default-features = false, features = ["arkworks"], optional = true }
 # Remainder's arkworks graph accepts 4.3, while 4.4 requires Rust 1.89.
 enum-ordinalize = { version = "=4.3.0", optional = true }

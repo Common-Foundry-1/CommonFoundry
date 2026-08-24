@@ -884,6 +884,7 @@ dependencies = [
  "clap",
  "cmfd-marketplace",
  "cmfd-proof-accel",
+ "ctrlc",
  "dory-pcs",
  "enum-ordinalize",
  "flate2",

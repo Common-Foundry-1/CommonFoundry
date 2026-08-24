@@ -52,6 +52,35 @@ install -m 0644 "$PROJECT_ROOT/docs/standalone-miner.md" "$TEMP_STAGE/standalone
 install -m 0644 "$PROJECT_ROOT/LICENSE" "$TEMP_STAGE/LICENSE"
 
 tar -C "$PACKAGE_TEMP_ROOT" -czf "$TEMP_ARCHIVE" "$PACKAGE_NAME"
+
+VERIFY_ROOT="$PACKAGE_TEMP_ROOT/verify"
+mkdir -p "$VERIFY_ROOT"
+tar -C "$VERIFY_ROOT" -xzf "$TEMP_ARCHIVE"
+
+require_mode() {
+  local expected="$1"
+  local path="$2"
+  local actual
+  actual="$(stat -c '%a' "$path")"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Unexpected archive mode $actual for $path; expected $expected." >&2
+    exit 1
+  fi
+}
+
+VERIFY_STAGE="$VERIFY_ROOT/$PACKAGE_NAME"
+require_mode 755 "$VERIFY_STAGE"
+require_mode 755 "$VERIFY_STAGE/cmfd-miner"
+require_mode 755 "$VERIFY_STAGE/cmfd-forgematrix-v2-miner.so"
+require_mode 755 "$VERIFY_STAGE/start-miner.sh"
+require_mode 644 "$VERIFY_STAGE/README.txt"
+require_mode 644 "$VERIFY_STAGE/standalone-miner.md"
+require_mode 644 "$VERIFY_STAGE/LICENSE"
+if [[ -f "$OPENCL_LIBRARY" ]]; then
+  require_mode 755 "$VERIFY_STAGE/cmfd-forgematrix-v2-opencl.so"
+  require_mode 644 "$VERIFY_STAGE/opencl-miner.md"
+fi
+
 cp -a "$TEMP_STAGE" "$STAGE"
 cp "$TEMP_ARCHIVE" "$ARCHIVE"
 BYTES="$(stat -c '%s' "$ARCHIVE")"

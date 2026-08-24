@@ -220,6 +220,25 @@ impl BlsDorySharedLayoutV5Context {
         })
     }
 
+    #[cfg(all(test, feature = "whir-prototype"))]
+    pub(crate) fn from_bank_authenticated_record_for_test(
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDorySharedLayoutError> {
+        let record = authenticated.record();
+        if record.setup_identity().into_bytes() != setup.identity()
+            || usize::try_from(record.padded_variables()).ok() != Some(setup.max_log_n())
+        {
+            return Err(BlsDorySharedLayoutError::V3Context);
+        }
+        Ok(Self {
+            suite_digest: record.suite_digest(),
+            model_identity_digest: record.model_identity_digest(),
+            setup_identity: record.setup_identity(),
+            padded_variables: record.padded_variables(),
+        })
+    }
+
     pub const fn suite_digest(self) -> Digest32 {
         self.suite_digest
     }
@@ -760,6 +779,45 @@ pub fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scrat
     record.validate_production(setup).map_err(|_| {
         ModelBankFieldStreamError::Sink(BlsDoryFixedModelStreamError::InvalidIdentity)
     })?;
+    let identity = record.model_identity();
+    let weight_bank_count = identity.weight_bank_count().map_err(|_| {
+        ModelBankFieldStreamError::Sink(BlsDoryFixedModelStreamError::InvalidIdentity)
+    })?;
+    let sink = BlsDoryPreparedFixedModelV5Sink::new(
+        record.manifest(),
+        identity,
+        record.record_digest(),
+        record.model_identity_digest(),
+        setup,
+        scratch_directory,
+    )
+    .map_err(ModelBankFieldStreamError::Sink)?;
+    verify_model_bank_into_staged_field_layout_sink(
+        reader,
+        record.manifest(),
+        identity.layers_per_bank(),
+        weight_bank_count,
+        sink,
+    )
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+pub(crate) fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch<
+    R: Read,
+>(
+    reader: R,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>> {
+    let record = authenticated.record();
+    if record.setup_identity().into_bytes() != setup.identity()
+        || usize::try_from(record.padded_variables()).ok() != Some(setup.max_log_n())
+    {
+        return Err(ModelBankFieldStreamError::Sink(
+            BlsDoryFixedModelStreamError::InvalidIdentity,
+        ));
+    }
     let identity = record.model_identity();
     let weight_bank_count = identity.weight_bank_count().map_err(|_| {
         ModelBankFieldStreamError::Sink(BlsDoryFixedModelStreamError::InvalidIdentity)
@@ -1925,6 +1983,16 @@ impl PreparedBlsDorySharedLayoutV5ProverState {
     pub(crate) const fn pending_final_output(&self) -> &PendingBlsDoryFinalOutputOpening {
         &self.pending_final_output
     }
+
+    #[cfg(test)]
+    pub(crate) const fn proof_for_test(&self) -> &BlsDorySharedLayoutProof {
+        &self.proof
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expected_claim_count_for_test(&self) -> usize {
+        self.expected_claims.len()
+    }
 }
 
 /// Bank-authenticated Layout V5 verifier state after every component
@@ -2407,13 +2475,43 @@ fn validate_layout_v5_record_context_binding(
 ) -> Result<usize, BlsDorySharedLayoutError> {
     let expected_context =
         BlsDorySharedLayoutV5Context::from_bank_authenticated_record(authenticated, setup)?;
+    if context != expected_context {
+        return Err(BlsDorySharedLayoutError::V3Context);
+    }
+    validate_layout_v5_record_context_authority(
+        binding,
+        authenticated,
+        context,
+        component_binding,
+        setup,
+    )?;
+    validate_layout_v5_codec_context(&context)
+}
+
+fn validate_layout_v5_record_context_authority(
+    binding: &[u8],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    context: BlsDorySharedLayoutV5Context,
+    component_binding: BlsDoryFixedModelBindingV2,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<usize, BlsDorySharedLayoutError> {
+    let record = authenticated.record();
+    let expected_context = BlsDorySharedLayoutV5Context {
+        suite_digest: record.suite_digest(),
+        model_identity_digest: record.model_identity_digest(),
+        setup_identity: record.setup_identity(),
+        padded_variables: record.padded_variables(),
+    };
+    let padded_variables = usize::try_from(context.padded_variables)
+        .map_err(|_| BlsDorySharedLayoutError::V3Context)?;
     if context != expected_context
         || component_binding != context.fixed_model_binding(binding)?
         || context.setup_identity != Digest32::new(setup.identity())
+        || padded_variables != setup.max_log_n()
     {
         return Err(BlsDorySharedLayoutError::V3Context);
     }
-    validate_layout_v5_codec_context(&context)
+    Ok(padded_variables)
 }
 
 #[allow(
@@ -2785,6 +2883,329 @@ pub(crate) fn prepare_bls_dory_shared_layout_with_precommitted_weights_at_variab
         padded_variables,
         setup,
         Some(scratch_directory),
+    )
+}
+
+/// Closed authority for preparing one exact Layout V5 from a verified V3
+/// execution. Fixed polynomials, statements, and the typed component binding
+/// cannot be replaced after this preflight succeeds.
+#[cfg(feature = "whir-prototype")]
+pub(crate) struct ValidatedBlsDorySharedLayoutV5ExecutionPreparation<'a> {
+    context: BlsDorySharedLayoutV5Context,
+    component_binding: BlsDoryFixedModelBindingV2,
+    prepared_model: &'a BlsDoryPreparedFixedModelV5,
+    matrix_statements: [StructuredMatrixStatement; MAX_BLS_DORY_SHARED_MATRIX_PROOFS],
+    transition_statements: [StructuredTransitionStatement; MAX_BLS_DORY_SHARED_TRANSITION_PROOFS],
+    wiring_statement: StructuredWiringStatement,
+    padded_variables: usize,
+    #[cfg(test)]
+    production: bool,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl<'a> ValidatedBlsDorySharedLayoutV5ExecutionPreparation<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new_production(
+        binding: &[u8],
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        prepared_model: &'a BlsDoryPreparedFixedModelV5,
+        context: BlsDorySharedLayoutV5Context,
+        component_binding: BlsDoryFixedModelBindingV2,
+        matrix_statements: [StructuredMatrixStatement; MAX_BLS_DORY_SHARED_MATRIX_PROOFS],
+        transition_statements: [StructuredTransitionStatement;
+            MAX_BLS_DORY_SHARED_TRANSITION_PROOFS],
+        wiring_statement: StructuredWiringStatement,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDorySharedLayoutError> {
+        let padded_variables = validate_layout_v5_record_context_authority(
+            binding,
+            authenticated,
+            context,
+            component_binding,
+            setup,
+        )?;
+        if !prepared_model.is_bound_to_bank_authenticated_record(authenticated) {
+            return Err(BlsDorySharedLayoutError::V3Context);
+        }
+        authenticated
+            .record()
+            .validate_production(setup)
+            .map_err(|_| BlsDorySharedLayoutError::V3Context)?;
+        if validate_layout_v5_codec_context(&context)? != padded_variables {
+            return Err(BlsDorySharedLayoutError::V3Context);
+        }
+        validate_layout_v5_production_statements(
+            &matrix_statements,
+            &transition_statements,
+            wiring_statement,
+        )?;
+        let aggregate_layout = BlsDoryAggregateLayout::new(
+            padded_variables / 2,
+            padded_variables - padded_variables / 2,
+        )?;
+        validate_layout_v5_prepared_model_commitments(
+            prepared_model,
+            authenticated.record().model_identity(),
+            &matrix_statements,
+            &transition_statements,
+            aggregate_layout,
+            setup,
+        )?;
+        Ok(Self {
+            context,
+            component_binding,
+            prepared_model,
+            matrix_statements,
+            transition_statements,
+            wiring_statement,
+            padded_variables,
+            #[cfg(test)]
+            production: true,
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_for_test(
+        binding: &[u8],
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        prepared_model: &'a BlsDoryPreparedFixedModelV5,
+        context: BlsDorySharedLayoutV5Context,
+        component_binding: BlsDoryFixedModelBindingV2,
+        matrix_statements: [StructuredMatrixStatement; MAX_BLS_DORY_SHARED_MATRIX_PROOFS],
+        transition_statements: [StructuredTransitionStatement;
+            MAX_BLS_DORY_SHARED_TRANSITION_PROOFS],
+        wiring_statement: StructuredWiringStatement,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<Self, BlsDorySharedLayoutError> {
+        let padded_variables = validate_layout_v5_record_context_authority(
+            binding,
+            authenticated,
+            context,
+            component_binding,
+            setup,
+        )?;
+        if !prepared_model.is_bound_to_bank_authenticated_record(authenticated) {
+            return Err(BlsDorySharedLayoutError::V3Context);
+        }
+        validate_shared_link_topology(
+            &matrix_statements,
+            &transition_statements,
+            wiring_statement,
+        )?;
+        let aggregate_layout = BlsDoryAggregateLayout::new(
+            padded_variables / 2,
+            padded_variables - padded_variables / 2,
+        )?;
+        validate_layout_v5_prepared_model_commitments(
+            prepared_model,
+            authenticated.record().model_identity(),
+            &matrix_statements,
+            &transition_statements,
+            aggregate_layout,
+            setup,
+        )?;
+        Ok(Self {
+            context,
+            component_binding,
+            prepared_model,
+            matrix_statements,
+            transition_statements,
+            wiring_statement,
+            padded_variables,
+            production: false,
+        })
+    }
+
+    pub(crate) const fn component_binding(&self) -> BlsDoryFixedModelBindingV2 {
+        self.component_binding
+    }
+
+    pub(crate) const fn padded_variables(&self) -> usize {
+        self.padded_variables
+    }
+
+    pub(crate) const fn matrix_count(&self) -> usize {
+        self.matrix_statements.len()
+    }
+
+    pub(crate) const fn transition_count(&self) -> usize {
+        self.transition_statements.len()
+    }
+
+    pub(crate) const fn execution_geometry(&self) -> (usize, usize, usize, usize) {
+        (
+            self.wiring_statement.rows,
+            self.wiring_statement.cols,
+            self.wiring_statement.banks,
+            self.wiring_statement.layers_per_bank,
+        )
+    }
+
+    pub(crate) fn matrix_weight(
+        &self,
+        bank: usize,
+    ) -> Result<&BlsDoryCommittedPolynomial, BlsDorySharedLayoutError> {
+        self.prepared_model
+            .weight_banks
+            .get(bank)
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)
+    }
+
+    pub(crate) fn transition_statement(
+        &self,
+        index: usize,
+    ) -> Result<StructuredTransitionStatement, BlsDorySharedLayoutError> {
+        self.transition_statements
+            .get(index)
+            .copied()
+            .ok_or(BlsDorySharedLayoutError::InvalidProofShape)
+    }
+
+    pub(crate) fn into_prepared(
+        self,
+        matrices: Vec<PreparedBlsDoryMatrixProof>,
+        transitions: Vec<(
+            PreparedBlsDoryTransitionProof,
+            PreparedBlsDoryRangeLogUpProof,
+        )>,
+        wiring: PreparedBlsDoryWiringProof,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<PreparedBlsDorySharedLayoutV5ProverState, BlsDorySharedLayoutError> {
+        let fixed_base = self.prepared_model.base_input.clone();
+        #[cfg(test)]
+        if !self.production {
+            return prepare_prepared_shared_layout_v5_validated(
+                self.context,
+                self.component_binding,
+                matrices,
+                transitions,
+                wiring,
+                fixed_base,
+                &self.matrix_statements,
+                &self.transition_statements,
+                self.wiring_statement,
+                self.padded_variables,
+            );
+        }
+        prepare_prepared_shared_layout_v5(
+            self.context,
+            self.component_binding,
+            matrices,
+            transitions,
+            wiring,
+            fixed_base,
+            &self.matrix_statements,
+            &self.transition_statements,
+            self.wiring_statement,
+            self.padded_variables,
+            setup,
+        )
+    }
+}
+
+/// Authenticate every fixed Layout V5 authority before a verified execution
+/// artifact or proof scratch is touched.
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn preflight_bls_dory_shared_layout_v5_execution_preparation<'a>(
+    binding: &[u8],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    prepared_model: &'a BlsDoryPreparedFixedModelV5,
+    context: BlsDorySharedLayoutV5Context,
+    component_binding: BlsDoryFixedModelBindingV2,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<ValidatedBlsDorySharedLayoutV5ExecutionPreparation<'a>, BlsDorySharedLayoutError> {
+    let production = StructuredForgeMatrixResearchShape::production_candidate();
+    let transition_statements = [
+        production.initialization_statement,
+        production.transition_statements[0],
+        production.transition_statements[1],
+        production.transition_statements[2],
+    ];
+    ValidatedBlsDorySharedLayoutV5ExecutionPreparation::new_production(
+        binding,
+        authenticated,
+        prepared_model,
+        context,
+        component_binding,
+        production.matrix_statements,
+        transition_statements,
+        production.wiring_statement,
+        setup,
+    )
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn preflight_bls_dory_shared_layout_v5_execution_preparation_for_test<'a>(
+    binding: &[u8],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    prepared_model: &'a BlsDoryPreparedFixedModelV5,
+    context: BlsDorySharedLayoutV5Context,
+    component_binding: BlsDoryFixedModelBindingV2,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<ValidatedBlsDorySharedLayoutV5ExecutionPreparation<'a>, BlsDorySharedLayoutError> {
+    let identity = authenticated.record().model_identity();
+    let banks = usize::try_from(
+        identity
+            .weight_bank_count()
+            .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?,
+    )
+    .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+    let layers = usize::try_from(identity.layers_per_bank())
+        .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+    let rows = usize::try_from(identity.batch())
+        .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+    let columns = usize::try_from(identity.dimension())
+        .map_err(|_| BlsDorySharedLayoutError::InvalidProofShape)?;
+    if banks != MAX_BLS_DORY_SHARED_MATRIX_PROOFS {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    let matrix = StructuredMatrixStatement {
+        layers,
+        rows,
+        inner: columns,
+        cols: columns,
+        max_abs_activation: 125,
+        max_abs_weight: 125,
+        max_abs_accumulator: 64_000_000,
+    };
+    let transition = StructuredTransitionStatement {
+        layers,
+        rows,
+        cols: columns,
+        max_abs_accumulator: 64_000_000,
+        max_mask: 5_000,
+    };
+    let transition_statements = [
+        StructuredTransitionStatement {
+            layers: 1,
+            rows,
+            cols: columns,
+            max_abs_accumulator: 125,
+            max_mask: 5_000,
+        },
+        transition,
+        transition,
+        transition,
+    ];
+    ValidatedBlsDorySharedLayoutV5ExecutionPreparation::new_for_test(
+        binding,
+        authenticated,
+        prepared_model,
+        context,
+        component_binding,
+        [matrix; MAX_BLS_DORY_SHARED_MATRIX_PROOFS],
+        transition_statements,
+        StructuredWiringStatement {
+            banks,
+            layers_per_bank: layers,
+            rows,
+            cols: columns,
+            max_abs_activation: 125,
+        },
+        setup,
     )
 }
 
@@ -3865,12 +4286,12 @@ fn prepare_prepared_shared_layout(
 fn prepare_prepared_shared_layout_v5(
     context: BlsDorySharedLayoutV5Context,
     component_binding: BlsDoryFixedModelBindingV2,
-    mut matrices: Vec<PreparedBlsDoryMatrixProof>,
-    mut transitions: Vec<(
+    matrices: Vec<PreparedBlsDoryMatrixProof>,
+    transitions: Vec<(
         PreparedBlsDoryTransitionProof,
         PreparedBlsDoryRangeLogUpProof,
     )>,
-    mut wiring: PreparedBlsDoryWiringProof,
+    wiring: PreparedBlsDoryWiringProof,
     fixed_base: BlsDoryCommittedPolynomial,
     matrix_statements: &[StructuredMatrixStatement],
     transition_statements: &[StructuredTransitionStatement],
@@ -3888,6 +4309,40 @@ fn prepare_prepared_shared_layout_v5(
         transition_statements,
         wiring_statement,
     )?;
+    let prepared = prepare_prepared_shared_layout_v5_validated(
+        context,
+        component_binding,
+        matrices,
+        transitions,
+        wiring,
+        fixed_base,
+        matrix_statements,
+        transition_statements,
+        wiring_statement,
+        padded_variables,
+    )?;
+    if prepared.expected_claims.len() != BLS_DORY_SHARED_PRODUCTION_CLAIMS {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    Ok(prepared)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_prepared_shared_layout_v5_validated(
+    context: BlsDorySharedLayoutV5Context,
+    component_binding: BlsDoryFixedModelBindingV2,
+    mut matrices: Vec<PreparedBlsDoryMatrixProof>,
+    mut transitions: Vec<(
+        PreparedBlsDoryTransitionProof,
+        PreparedBlsDoryRangeLogUpProof,
+    )>,
+    mut wiring: PreparedBlsDoryWiringProof,
+    fixed_base: BlsDoryCommittedPolynomial,
+    matrix_statements: &[StructuredMatrixStatement],
+    transition_statements: &[StructuredTransitionStatement],
+    wiring_statement: StructuredWiringStatement,
+    padded_variables: usize,
+) -> Result<PreparedBlsDorySharedLayoutV5ProverState, BlsDorySharedLayoutError> {
     let aggregate_layout = BlsDoryAggregateLayout::new(
         padded_variables / 2,
         padded_variables - padded_variables / 2,
@@ -3966,9 +4421,6 @@ fn prepare_prepared_shared_layout_v5(
     opening_sets.push(wiring_openings);
     expected_claims.extend_from_slice(fixed_base.claims());
     opening_sets.push(fixed_base);
-    if expected_claims.len() != BLS_DORY_SHARED_PRODUCTION_CLAIMS {
-        return Err(BlsDorySharedLayoutError::OpeningClaims);
-    }
     Ok(PreparedBlsDorySharedLayoutV5ProverState {
         context,
         aggregate_layout,

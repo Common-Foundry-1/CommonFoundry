@@ -17,16 +17,33 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockChallenge,
+    BlockChallenge, ForgeMatrixV3CandidateProof,
     dory_bls12_381_execution_artifact::{
         BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
         BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorArtifactError,
         BlsDoryExecutionAccumulatorArtifactWriter, BlsDoryExecutionAccumulatorColumn,
     },
-    dory_bls12_381_layout::signed_model_value,
+    dory_bls12_381_layout::{
+        BlsDoryPreparedFixedModelV5, BlsDorySharedLayoutError, BlsDorySharedLayoutV5Context,
+        PreparedBlsDorySharedLayoutV5ProverState,
+        ValidatedBlsDorySharedLayoutV5ExecutionPreparation,
+        preflight_bls_dory_shared_layout_v5_execution_preparation, signed_model_value,
+    },
+    dory_bls12_381_logup::{
+        BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
+        prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch,
+    },
+    dory_bls12_381_matrix::prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch,
     dory_bls12_381_prototype::DeterministicBlsDorySetup,
-    dory_bls12_381_transition::{BlsDoryTransitionError, derive_transition_regular_row_from_mask},
+    dory_bls12_381_transition::{
+        BlsDoryTransitionError, derive_transition_regular_row_from_mask,
+        prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch,
+        prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch,
+        regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch,
+    },
+    dory_bls12_381_wiring::prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch,
     dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    dory_v3_suite::{DORY_V3_ALGORITHM_VERSION, DORY_V3_PROOF_VERSION},
     dory_v3_transcript::{DoryV3ChallengeContext, DoryV3TranscriptContext, DoryV3TranscriptError},
     forgematrix_v2::{V2_MODEL_VALUE_CENTER, output_digest, work_digest_from_roots},
     model_bank::{
@@ -287,6 +304,16 @@ impl VerifiedBlsDoryV3FinalActivation {
     const fn work_digest(&self) -> [u8; 32] {
         self.work_digest
     }
+}
+
+/// Atomic output of one authenticated V3 replay and its matching Layout V5
+/// preparation. The two capabilities cannot be split or substituted by a
+/// caller; a future native-composition checkpoint will consume this value.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct PreparedBlsDoryV3LayoutV5Execution {
+    prepared: PreparedBlsDorySharedLayoutV5ProverState,
+    final_activation: VerifiedBlsDoryV3FinalActivation,
 }
 
 /// Opaque, authority-checked access to one verified V3 execution artifact.
@@ -576,6 +603,279 @@ pub(crate) enum BlsDoryV3WinningNonceReplayError {
     Mask(#[from] StructuredTransitionError),
     #[error("Dory V3 transition replay failed: {0}")]
     Transition(#[from] BlsDoryTransitionError),
+}
+
+#[derive(Debug, Error)]
+#[allow(dead_code)]
+pub(crate) enum BlsDoryV3LayoutV5PreparationError {
+    #[error("verified Dory V3 execution failed authentication: {0}")]
+    Replay(#[from] BlsDoryV3WinningNonceReplayError),
+    #[error("Dory V3 Layout V5 preparation failed: {0}")]
+    Layout(#[from] BlsDorySharedLayoutError),
+}
+
+fn algebraic_binding_for_verified_dory_v3_execution(
+    execution: &VerifiedBlsDoryV3WinningNonceExecution,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<[u8; 32], BlsDoryV3WinningNonceReplayError> {
+    let transcript = BlsDoryV3ExecutionAccumulatorArtifactContext::validate_authority(
+        execution.context.challenge,
+        authenticated,
+        setup,
+    )?;
+    let challenge = transcript.challenge_context(block, execution.nonce)?;
+    if challenge != execution.context.challenge {
+        return Err(BlsDoryV3WinningNonceReplayError::Context);
+    }
+    if execution
+        .context
+        .work_digest(execution.final_activation_digest)
+        != execution.work_digest
+    {
+        return Err(BlsDoryV3WinningNonceReplayError::WorkDigest);
+    }
+    let public_fields = ForgeMatrixV3CandidateProof {
+        algorithm_version: DORY_V3_ALGORITHM_VERSION,
+        proof_version: DORY_V3_PROOF_VERSION,
+        nonce: execution.nonce,
+        model_manifest_digest: transcript.manifest_digest().into_bytes(),
+        challenge_digest: challenge.digest(),
+        final_activation_digest: execution.final_activation_digest,
+        work_digest: execution.work_digest,
+        structured_proof: Vec::new(),
+    };
+    Ok(transcript.algebraic_binding(block, &public_fields)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch(
+    mut execution: VerifiedBlsDoryV3WinningNonceExecution,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    preparation: ValidatedBlsDorySharedLayoutV5ExecutionPreparation<'_>,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5PreparationError> {
+    if !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
+        return Err(BlsDoryV3WinningNonceReplayError::ScratchDirectory.into());
+    }
+    let component_binding = preparation.component_binding();
+    let padded_variables = preparation.padded_variables();
+    let (final_activation, matrices, transitions, wiring) = {
+        let mut reader = execution.authenticated_artifact_reader(authenticated, setup)?;
+        let expected_geometry = preparation.execution_geometry();
+        let actual_geometry = (
+            reader.canonical_rows(),
+            reader.canonical_columns(),
+            reader.banks(),
+            reader.layers_per_bank(),
+        );
+        if actual_geometry != expected_geometry {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape.into());
+        }
+
+        // Authenticate the final-output bytes and both retained digests before
+        // any matrix, transition, range, or wiring proof work begins.
+        let final_activation = reader.reconstruct_verified_final_activation()?;
+
+        let mut matrices = Vec::with_capacity(preparation.matrix_count());
+        for bank in 0..preparation.matrix_count() {
+            let weight = preparation.matrix_weight(bank)?;
+            let matrix =
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+                component_binding.as_bytes(),
+                weight,
+                &mut reader,
+                bank,
+                padded_variables,
+                setup,
+                scratch_directory,
+            )
+            .map_err(BlsDorySharedLayoutError::from)?;
+            if matrix.proof.weight_commitment != weight.commitment() {
+                return Err(BlsDorySharedLayoutError::FixedModelCommitment.into());
+            }
+            matrices.push(matrix);
+        }
+
+        let mut transitions = Vec::with_capacity(preparation.transition_count());
+        let mut released_transition_sources = Vec::with_capacity(preparation.transition_count());
+        for transition_index in 0..preparation.transition_count() {
+            let statement = preparation.transition_statement(transition_index)?;
+            let mut arithmetic =
+                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+                    component_binding.as_bytes(),
+                    &mut reader,
+                    transition_index,
+                    padded_variables,
+                    setup,
+                    scratch_directory,
+                )
+                .map_err(BlsDorySharedLayoutError::from)?;
+            let committed_transition = arithmetic
+                .openings
+                .polynomial(0)
+                .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+            let transition_elements = statement
+                .elements()
+                .map_err(BlsDoryTransitionError::from)
+                .map_err(BlsDorySharedLayoutError::from)?;
+            let mut range = if transition_elements >= BLS_DORY_RANGE_LOGUP_TABLE_VALUES {
+                prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch(
+                component_binding.as_bytes(),
+                statement,
+                committed_transition,
+                padded_variables,
+                setup,
+                scratch_directory,
+            )
+            .map_err(BlsDorySharedLayoutError::from)?
+            } else {
+                prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch(
+                    component_binding.as_bytes(),
+                    &mut reader,
+                    transition_index,
+                    committed_transition,
+                    padded_variables,
+                    setup,
+                    scratch_directory,
+                )
+                .map_err(BlsDorySharedLayoutError::from)?
+            };
+            if arithmetic.proof.oracle_commitment != range.proof.transition_commitment {
+                return Err(BlsDorySharedLayoutError::TransitionRangeCommitment.into());
+            }
+            let arithmetic_source = arithmetic
+                .openings
+                .release_compact_source()
+                .map_err(BlsDorySharedLayoutError::from)?
+                .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+            let range_source = range
+                .openings
+                .release_compact_source()
+                .map_err(BlsDorySharedLayoutError::from)?
+                .ok_or(BlsDorySharedLayoutError::OpeningClaims)?;
+            if arithmetic_source != range_source {
+                return Err(BlsDorySharedLayoutError::OpeningClaims.into());
+            }
+            transitions.push((arithmetic, range));
+            released_transition_sources.push(arithmetic_source);
+        }
+
+        let wiring = prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
+            component_binding.as_bytes(),
+            &mut reader,
+            padded_variables,
+            setup,
+            scratch_directory,
+        )
+        .map_err(BlsDorySharedLayoutError::from)?;
+
+        for (transition_index, ((arithmetic, range), expected_source)) in transitions
+            .iter_mut()
+            .zip(&released_transition_sources)
+            .enumerate()
+        {
+            let restored =
+            regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch(
+                &mut reader,
+                transition_index,
+                padded_variables,
+                expected_source,
+                setup,
+                scratch_directory,
+            )
+            .map_err(BlsDorySharedLayoutError::from)?;
+            arithmetic
+                .openings
+                .restore_compact_source(&restored)
+                .map_err(BlsDorySharedLayoutError::from)?;
+            range
+                .openings
+                .restore_compact_source(&restored)
+                .map_err(BlsDorySharedLayoutError::from)?;
+        }
+
+        (final_activation, matrices, transitions, wiring)
+    };
+    drop(execution);
+    let prepared = preparation.into_prepared(matrices, transitions, wiring, setup)?;
+    Ok(PreparedBlsDoryV3LayoutV5Execution {
+        prepared,
+        final_activation,
+    })
+}
+
+/// Consume one verified V3 execution and prepare its exact bank-authenticated
+/// Layout V5 state. The algebraic binding is derived internally from the
+/// retained execution fields and block; callers cannot inject raw transcript
+/// bytes, statements, masks, or artifact context.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch(
+    execution: VerifiedBlsDoryV3WinningNonceExecution,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    prepared_model: &BlsDoryPreparedFixedModelV5,
+    block: &BlockChallenge,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5PreparationError> {
+    let binding =
+        algebraic_binding_for_verified_dory_v3_execution(&execution, authenticated, block, setup)?;
+    let context =
+        BlsDorySharedLayoutV5Context::from_bank_authenticated_record(authenticated, setup)?;
+    let component_binding = context.fixed_model_binding(&binding)?;
+    let preparation = preflight_bls_dory_shared_layout_v5_execution_preparation(
+        &binding,
+        authenticated,
+        prepared_model,
+        context,
+        component_binding,
+        setup,
+    )?;
+    prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch(
+        execution,
+        authenticated,
+        preparation,
+        setup,
+        scratch_directory,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_for_test_with_scratch(
+    execution: VerifiedBlsDoryV3WinningNonceExecution,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    prepared_model: &BlsDoryPreparedFixedModelV5,
+    block: &BlockChallenge,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5PreparationError> {
+    use crate::dory_bls12_381_layout::preflight_bls_dory_shared_layout_v5_execution_preparation_for_test;
+
+    let binding =
+        algebraic_binding_for_verified_dory_v3_execution(&execution, authenticated, block, setup)?;
+    let context = BlsDorySharedLayoutV5Context::from_bank_authenticated_record_for_test(
+        authenticated,
+        setup,
+    )?;
+    let component_binding = context.fixed_model_binding(&binding)?;
+    let preparation = preflight_bls_dory_shared_layout_v5_execution_preparation_for_test(
+        &binding,
+        authenticated,
+        prepared_model,
+        context,
+        component_binding,
+        setup,
+    )?;
+    prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch(
+        execution,
+        authenticated,
+        preparation,
+        setup,
+        scratch_directory,
+    )
 }
 
 /// Dormant Dory V3 CPU replay. No candidate or consensus path calls this entry.
@@ -1893,6 +2193,7 @@ mod tests {
         StructuredMatrixStatement, StructuredSumcheckError, StructuredTransitionWitness,
         StructuredWiringStatement,
         dory_bls12_381_aggregate::commit_bls_dory_padded_prefix_with_optional_scratch,
+        dory_bls12_381_layout::prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch,
         dory_bls12_381_logup::{
             BlsDoryRangeLogUpError,
             prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
@@ -2541,12 +2842,23 @@ mod tests {
     const DORY_V3_TRANSITION_TEST_VARIABLES: usize = 10;
     #[cfg(feature = "whir-prototype")]
     const DORY_V3_WIRING_TEST_VARIABLES: usize = 6;
+    #[cfg(feature = "whir-prototype")]
+    const DORY_V3_LAYOUT_V5_TEST_VARIABLES: usize = 10;
     const DORY_V3_TEST_BASE: [u8; 4] = [125, 126, 124, 127];
     const DORY_V3_TEST_LAYERS: [[u8; 4]; 4] = [
         [126, 125, 124, 127],
         [124, 126, 125, 123],
         [127, 124, 126, 125],
         [125, 123, 127, 124],
+    ];
+    #[cfg(feature = "whir-prototype")]
+    const DORY_V3_LAYOUT_V5_TEST_LAYERS: [[u8; 4]; 6] = [
+        [126, 125, 124, 127],
+        [124, 126, 125, 123],
+        [127, 124, 126, 125],
+        [125, 123, 127, 124],
+        [123, 127, 125, 126],
+        [126, 124, 123, 127],
     ];
     #[cfg(feature = "whir-prototype")]
     type DoryV3MaterializedMatrixBanks = ([Vec<i64>; 2], [Vec<i64>; 2], [Vec<i64>; 2]);
@@ -2750,9 +3062,34 @@ mod tests {
         tweak: u8,
         padded_variables: usize,
     ) -> DoryV3ReplayFixture {
+        dory_v3_replay_fixture_with_layers_at_variables(
+            tweak,
+            padded_variables,
+            &DORY_V3_TEST_LAYERS,
+        )
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    fn dory_v3_layout_v5_replay_fixture(tweak: u8) -> DoryV3ReplayFixture {
+        dory_v3_replay_fixture_with_layers_at_variables(
+            tweak,
+            DORY_V3_LAYOUT_V5_TEST_VARIABLES,
+            &DORY_V3_LAYOUT_V5_TEST_LAYERS,
+        )
+    }
+
+    fn dory_v3_replay_fixture_with_layers_at_variables(
+        tweak: u8,
+        padded_variables: usize,
+        layer_bytes: &[[u8; 4]],
+    ) -> DoryV3ReplayFixture {
         let mut base = DORY_V3_TEST_BASE.to_vec();
         base[3] += tweak;
-        let layers = DORY_V3_TEST_LAYERS.map(Vec::from).to_vec();
+        let layers = layer_bytes
+            .iter()
+            .copied()
+            .map(Vec::from)
+            .collect::<Vec<_>>();
         let layer_slices = layers.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let suite = DORY_V3_PRODUCTION_SUITE_DIGEST.into_bytes();
         let provisional = build_small_model_bank(SmallModelBankFixture {
@@ -3968,6 +4305,205 @@ mod tests {
 
         drop(execution);
         assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_layout_v5_preparation_is_atomic_and_exact_for_bounded_execution() {
+        let fixture = dory_v3_layout_v5_replay_fixture(0);
+        let fixed_scratch = ScratchDirectory::create();
+        let prepared_model =
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch(
+                Cursor::new(&fixture.bank.bytes),
+                &fixture.authenticated,
+                &fixture.setup,
+                fixed_scratch.path(),
+            )
+            .unwrap();
+        assert_eq!(fixed_scratch.entry_count(), 4);
+
+        let execution_scratch = ScratchDirectory::create();
+        let proof_scratch = ScratchDirectory::create();
+        let execution = replay_dory_v3(&fixture, &execution_scratch);
+        let atomic =
+            prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_for_test_with_scratch(
+                execution,
+                &fixture.authenticated,
+                &prepared_model,
+                &fixture.block,
+                &fixture.setup,
+                proof_scratch.path(),
+            )
+            .unwrap();
+        assert_eq!(execution_scratch.entry_count(), 0);
+
+        assert_eq!(atomic.final_activation.nonce(), fixture.claim.nonce);
+        assert_eq!(
+            atomic.final_activation.as_bytes(),
+            fixture.final_activation.as_slice()
+        );
+        assert_eq!(
+            atomic.final_activation.final_activation_digest(),
+            fixture.claim.final_activation_digest
+        );
+        assert_eq!(
+            atomic.final_activation.work_digest(),
+            fixture.claim.work_digest
+        );
+        let proof = atomic.prepared.proof_for_test();
+        assert_eq!(proof.protocol_version, 5);
+        assert_eq!(
+            usize::from(proof.padded_variables),
+            DORY_V3_LAYOUT_V5_TEST_VARIABLES
+        );
+        assert_eq!(proof.matrices.len(), 3);
+        assert_eq!(proof.transitions.len(), 4);
+        assert!(proof.opening_proof.is_empty());
+        assert_eq!(atomic.prepared.expected_claim_count_for_test(), 110);
+        assert_eq!(
+            atomic.prepared.shared_opening_binding().into_bytes(),
+            [
+                0xeb, 0x33, 0x89, 0x7d, 0xbe, 0xe1, 0x45, 0x83, 0x2c, 0xba, 0xaf, 0x2e, 0x3c, 0x4c,
+                0x75, 0xac, 0xb5, 0x39, 0xa7, 0xbc, 0xac, 0x18, 0xc1, 0x75, 0x50, 0xa6, 0xce, 0xa6,
+                0xc3, 0xbe, 0x01, 0x09,
+            ]
+        );
+        assert!(proof_scratch.entry_count() > 0);
+
+        drop(prepared_model);
+        assert!(fixed_scratch.entry_count() > 0);
+        drop(atomic);
+        assert_eq!(fixed_scratch.entry_count(), 0);
+        assert_eq!(execution_scratch.entry_count(), 0);
+        assert_eq!(proof_scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_layout_v5_preparation_rejects_cross_execution_substitution_before_proving() {
+        let fixture = dory_v3_layout_v5_replay_fixture(0);
+        let other = dory_v3_layout_v5_replay_fixture(1);
+        let fixed_scratch = ScratchDirectory::create();
+        let prepared_model =
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch(
+                Cursor::new(&other.bank.bytes),
+                &other.authenticated,
+                &other.setup,
+                fixed_scratch.path(),
+            )
+            .unwrap();
+        let execution_scratch = ScratchDirectory::create();
+        let proof_scratch = ScratchDirectory::create();
+        let execution = replay_dory_v3(&fixture, &execution_scratch);
+
+        assert!(matches!(
+            prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_for_test_with_scratch(
+                execution,
+                &other.authenticated,
+                &prepared_model,
+                &other.block,
+                &other.setup,
+                proof_scratch.path(),
+            ),
+            Err(BlsDoryV3LayoutV5PreparationError::Replay(
+                BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                    BlsDoryExecutionAccumulatorArtifactError::WrongContext
+                )
+            ))
+        ));
+        assert_eq!(execution_scratch.entry_count(), 0);
+        assert_eq!(proof_scratch.entry_count(), 0);
+        assert_eq!(fixed_scratch.entry_count(), 4);
+
+        let execution = replay_dory_v3(&fixture, &execution_scratch);
+        assert!(matches!(
+            prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_for_test_with_scratch(
+                execution,
+                &fixture.authenticated,
+                &prepared_model,
+                &fixture.block,
+                &fixture.setup,
+                proof_scratch.path(),
+            ),
+            Err(BlsDoryV3LayoutV5PreparationError::Layout(
+                BlsDorySharedLayoutError::V3Context
+            ))
+        ));
+        assert_eq!(execution_scratch.entry_count(), 0);
+        assert_eq!(proof_scratch.entry_count(), 0);
+        drop(prepared_model);
+        assert_eq!(fixed_scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_layout_v5_preparation_rejects_invalid_proof_scratch_before_reading_execution() {
+        let fixture = dory_v3_layout_v5_replay_fixture(0);
+        let fixed_scratch = ScratchDirectory::create();
+        let prepared_model =
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch(
+                Cursor::new(&fixture.bank.bytes),
+                &fixture.authenticated,
+                &fixture.setup,
+                fixed_scratch.path(),
+            )
+            .unwrap();
+        let execution_scratch = ScratchDirectory::create();
+        let execution = replay_dory_v3(&fixture, &execution_scratch);
+
+        assert!(matches!(
+            prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_for_test_with_scratch(
+                execution,
+                &fixture.authenticated,
+                &prepared_model,
+                &fixture.block,
+                &fixture.setup,
+                Path::new("relative-proof-scratch"),
+            ),
+            Err(BlsDoryV3LayoutV5PreparationError::Replay(
+                BlsDoryV3WinningNonceReplayError::ScratchDirectory
+            ))
+        ));
+        assert_eq!(execution_scratch.entry_count(), 0);
+        assert_eq!(fixed_scratch.entry_count(), 4);
+
+        drop(prepared_model);
+        assert_eq!(fixed_scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_layout_v5_preparation_rejects_block_substitution_before_proving() {
+        let fixture = dory_v3_layout_v5_replay_fixture(0);
+        let fixed_scratch = ScratchDirectory::create();
+        let prepared_model =
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch(
+                Cursor::new(&fixture.bank.bytes),
+                &fixture.authenticated,
+                &fixture.setup,
+                fixed_scratch.path(),
+            )
+            .unwrap();
+        let execution_scratch = ScratchDirectory::create();
+        let proof_scratch = ScratchDirectory::create();
+        let execution = replay_dory_v3(&fixture, &execution_scratch);
+        let mut substituted_block = fixture.block;
+        substituted_block.timestamp += 1;
+
+        assert!(matches!(
+            prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_for_test_with_scratch(
+                execution,
+                &fixture.authenticated,
+                &prepared_model,
+                &substituted_block,
+                &fixture.setup,
+                proof_scratch.path(),
+            ),
+            Err(BlsDoryV3LayoutV5PreparationError::Replay(
+                BlsDoryV3WinningNonceReplayError::Context
+            ))
+        ));
+        assert_eq!(execution_scratch.entry_count(), 0);
+        assert_eq!(proof_scratch.entry_count(), 0);
+
+        drop(prepared_model);
+        assert_eq!(fixed_scratch.entry_count(), 0);
     }
 
     #[test]

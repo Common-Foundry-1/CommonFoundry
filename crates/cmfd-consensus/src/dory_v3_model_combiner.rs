@@ -1,11 +1,13 @@
 //! Identity-bound streaming combiner for production Dory V3 model contributions.
 //!
-//! The public entry point accepts only the ordered contribution paths and one
-//! create-new output path. It authenticates every full-length input before the
-//! combine pass, computes the canonical bytewise sum modulo 251 from retained
-//! file handles, and authenticates all inputs and the reopened output again
-//! before success. The JSON report is operational output, not a signed ceremony
-//! artifact and not a substitute for the ceremony transcript.
+//! The public entry point accepts only an independently ceremony-ID-anchored,
+//! exact type-5-terminal transcript capability, its ordered contribution paths,
+//! and one create-new output path. It authenticates every full-length input
+//! against the signed type-2/type-4 claim before, during, and after the combine
+//! pass, computes the canonical bytewise sum modulo 251 from retained file
+//! handles, and authenticates the reopened output again before success. The JSON
+//! report is operational output, not a signed ceremony artifact and not a
+//! substitute for the ceremony transcript.
 //!
 //! The ceremony's filesystem boundary remains mandatory: run in a local,
 //! operator-owned directory that no untrusted account can write. On Windows,
@@ -32,6 +34,7 @@ use thiserror::Error;
 
 use crate::{
     MAX_MODEL_BYTE,
+    dory_v3_model_ceremony_transcript::{CeremonyTranscriptError, VerifiedCeremonyTranscript},
     dory_v3_suite::{DORY_V3_BATCH, DORY_V3_DIMENSION, DORY_V3_LAYERS, Digest32},
 };
 
@@ -44,9 +47,13 @@ const COMBINE_CHUNK_BYTES: usize = 1_048_576;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProductionDoryV3ModelCombinerInputReport {
     pub path: PathBuf,
+    pub operator_index: u16,
+    pub operator_public_key: Digest32,
     pub contribution_bytes: u64,
     pub contribution_blake3: Digest32,
     pub contribution_sha256: Digest32,
+    pub contribution_commitment_signed_record_digest: Digest32,
+    pub contribution_reveal_signed_record_digest: Digest32,
 }
 
 /// What the platform could durably synchronize for the create-new output.
@@ -66,6 +73,13 @@ pub enum ProductionDoryV3ModelCombinerDurability {
 /// Audit-only report emitted after all retained identities and bytes reproduce.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProductionDoryV3ModelCombinerReport {
+    pub ceremony_id: Digest32,
+    pub reveal_set_prefix_bytes: u64,
+    pub reveal_set_prefix_derive_key_digest: Digest32,
+    pub reveal_set_prefix_blake3: Digest32,
+    pub reveal_set_prefix_sha256: Digest32,
+    pub commitment_set_signed_record_digest: Digest32,
+    pub reveal_set_signed_record_digest: Digest32,
     pub ordered_inputs: Vec<ProductionDoryV3ModelCombinerInputReport>,
     pub output: PathBuf,
     pub output_bytes: u64,
@@ -79,8 +93,27 @@ pub struct ProductionDoryV3ModelCombinerReport {
 /// Fail-closed errors from the production streaming modular combiner.
 #[derive(Debug, Error)]
 pub enum ProductionDoryV3ModelCombinerError {
+    #[error(
+        "the transcript is not an independently anchored reveal-set-closed combine authority: {source}"
+    )]
+    TranscriptAuthority {
+        #[source]
+        source: CeremonyTranscriptError,
+    },
     #[error("expected 3 through 16 ordered contribution files, received {actual}")]
     ContributionCount { actual: usize },
+    #[error("the anchored transcript requires {expected} ordered contributions, observed {actual}")]
+    TranscriptContributionCount { expected: usize, actual: usize },
+    #[error("anchored transcript contribution binding {position} is not in exact operator order")]
+    TranscriptContributionOrder { position: usize },
+    #[error(
+        "anchored transcript contribution {index} length is not the frozen production length: expected {expected}, observed {actual}"
+    )]
+    TranscriptContributionLength {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
     #[error("the compiled production contribution geometry overflowed")]
     GeometryOverflow,
     #[error("the compiled contribution geometry is not the frozen production geometry")]
@@ -162,8 +195,14 @@ pub enum ProductionDoryV3ModelCombinerError {
         offset: u64,
         value: u8,
     },
-    #[error("contribution {index} changed after initial authentication: {path}")]
-    InputDigestMismatch { index: usize, path: PathBuf },
+    #[error(
+        "contribution {index} does not match its signed type-2/type-4 claim during {pass}: {path}"
+    )]
+    InputClaimMismatch {
+        index: usize,
+        path: PathBuf,
+        pass: &'static str,
+    },
     #[error("the checked u32 combination accumulator overflowed")]
     AccumulatorOverflow,
     #[error("combiner byte accounting overflowed")]
@@ -283,11 +322,132 @@ struct FileDigest {
     sha256: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContributionClaim {
+    operator_index: u16,
+    operator_public_key: [u8; 32],
+    file: FileDigest,
+    contribution_commitment_signed_record_digest: [u8; 32],
+    contribution_reveal_signed_record_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CombinerAuthority {
+    ceremony_id: [u8; 32],
+    reveal_set_prefix_bytes: u64,
+    reveal_set_prefix_derive_key_digest: [u8; 32],
+    reveal_set_prefix_blake3: [u8; 32],
+    reveal_set_prefix_sha256: [u8; 32],
+    commitment_set_signed_record_digest: [u8; 32],
+    reveal_set_signed_record_digest: [u8; 32],
+    ordered_operator_keys: Vec<[u8; 32]>,
+    contributions: Vec<ContributionClaim>,
+}
+
+impl CombinerAuthority {
+    fn from_verified_transcript(
+        transcript: &VerifiedCeremonyTranscript,
+        geometry: CombineGeometry,
+    ) -> Result<Self, ProductionDoryV3ModelCombinerError> {
+        let bindings = transcript
+            .require_combiner_bindings()
+            .map_err(|source| ProductionDoryV3ModelCombinerError::TranscriptAuthority { source })?;
+        let contributions = bindings
+            .contributions()
+            .iter()
+            .map(|binding| ContributionClaim {
+                operator_index: binding.operator_index(),
+                operator_public_key: binding.operator_public_key(),
+                file: FileDigest {
+                    bytes: binding.contribution_bytes(),
+                    blake3: binding.contribution_blake3(),
+                    sha256: binding.contribution_sha256(),
+                },
+                contribution_commitment_signed_record_digest: binding
+                    .contribution_commitment_signed_record_digest(),
+                contribution_reveal_signed_record_digest: binding
+                    .contribution_reveal_signed_record_digest(),
+            })
+            .collect();
+        let authority = Self {
+            ceremony_id: bindings.ceremony_id(),
+            reveal_set_prefix_bytes: transcript.transcript_bytes(),
+            reveal_set_prefix_derive_key_digest: transcript.transcript_derive_key_digest(),
+            reveal_set_prefix_blake3: transcript.transcript_blake3(),
+            reveal_set_prefix_sha256: transcript.transcript_sha256(),
+            commitment_set_signed_record_digest: bindings.commitment_set_signed_record_digest(),
+            reveal_set_signed_record_digest: bindings.reveal_set_signed_record_digest(),
+            ordered_operator_keys: transcript.operators().to_vec(),
+            contributions,
+        };
+        authority.validate(geometry)?;
+        Ok(authority)
+    }
+
+    fn validate(
+        &self,
+        geometry: CombineGeometry,
+    ) -> Result<(), ProductionDoryV3ModelCombinerError> {
+        if !(MIN_CONTRIBUTIONS..=MAX_CONTRIBUTIONS).contains(&self.contributions.len()) {
+            return Err(ProductionDoryV3ModelCombinerError::ContributionCount {
+                actual: self.contributions.len(),
+            });
+        }
+        if self.contributions.len() != self.ordered_operator_keys.len() {
+            return Err(
+                ProductionDoryV3ModelCombinerError::TranscriptContributionCount {
+                    expected: self.ordered_operator_keys.len(),
+                    actual: self.contributions.len(),
+                },
+            );
+        }
+        for (position, (claim, operator_key)) in self
+            .contributions
+            .iter()
+            .zip(&self.ordered_operator_keys)
+            .enumerate()
+        {
+            if usize::from(claim.operator_index) != position
+                || claim.operator_public_key != *operator_key
+            {
+                return Err(
+                    ProductionDoryV3ModelCombinerError::TranscriptContributionOrder { position },
+                );
+            }
+            if claim.file.bytes != geometry.contribution_bytes {
+                return Err(
+                    ProductionDoryV3ModelCombinerError::TranscriptContributionLength {
+                        index: position,
+                        expected: geometry.contribution_bytes,
+                        actual: claim.file.bytes,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_path_count(
+        &self,
+        ordered_contribution_paths: &[PathBuf],
+    ) -> Result<(), ProductionDoryV3ModelCombinerError> {
+        if ordered_contribution_paths.len() != self.contributions.len() {
+            return Err(
+                ProductionDoryV3ModelCombinerError::TranscriptContributionCount {
+                    expected: self.contributions.len(),
+                    actual: ordered_contribution_paths.len(),
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
 struct AuthenticatedInput {
     index: usize,
     path: PathBuf,
     retained: SameFileHandle,
-    initial: FileDigest,
+    claim: ContributionClaim,
 }
 
 trait CombinerIo {
@@ -331,44 +491,50 @@ impl CombinerIo for SystemCombinerIo {
 }
 
 /// Combine the ordered full-length production contributions bytewise modulo
-/// 251. The order is preserved in the report; the API accepts no caller-owned
-/// geometry, seed, digest, root, operator index, or model identity.
+/// 251 under an independently ceremony-ID-anchored exact type-5 prefix.
+///
+/// `transcript` must come from
+/// [`crate::dory_v3_model_ceremony_transcript::parse_and_verify_reveal_set_prefix`].
+/// Generic completed/aborted transcript inspection results cannot authorize
+/// combination. The paths must match the signed operator order exactly.
 pub fn combine_production_dory_v3_model_contributions(
+    transcript: &VerifiedCeremonyTranscript,
     ordered_contribution_paths: &[PathBuf],
     output_path: &Path,
 ) -> Result<ProductionDoryV3ModelCombinerReport, ProductionDoryV3ModelCombinerError> {
-    if !(MIN_CONTRIBUTIONS..=MAX_CONTRIBUTIONS).contains(&ordered_contribution_paths.len()) {
-        return Err(ProductionDoryV3ModelCombinerError::ContributionCount {
-            actual: ordered_contribution_paths.len(),
-        });
-    }
+    let geometry = CombineGeometry::production()?;
+    let authority = CombinerAuthority::from_verified_transcript(transcript, geometry)?;
+    authority.validate_path_count(ordered_contribution_paths)?;
     preflight_combiner_paths(ordered_contribution_paths, output_path)?;
     combine_with_io(
+        &authority,
         ordered_contribution_paths,
         output_path,
-        CombineGeometry::production()?,
+        geometry,
         &mut SystemCombinerIo,
     )
 }
 
 fn combine_with_io<I: CombinerIo>(
+    authority: &CombinerAuthority,
     ordered_contribution_paths: &[PathBuf],
     output_path: &Path,
     geometry: CombineGeometry,
     io: &mut I,
 ) -> Result<ProductionDoryV3ModelCombinerReport, ProductionDoryV3ModelCombinerError> {
     geometry.validate()?;
-    if !(MIN_CONTRIBUTIONS..=MAX_CONTRIBUTIONS).contains(&ordered_contribution_paths.len()) {
-        return Err(ProductionDoryV3ModelCombinerError::ContributionCount {
-            actual: ordered_contribution_paths.len(),
-        });
-    }
+    authority.validate(geometry)?;
+    authority.validate_path_count(ordered_contribution_paths)?;
     reject_existing_output(output_path)?;
 
     let started = Instant::now();
     let mut inputs = Vec::with_capacity(ordered_contribution_paths.len());
-    for (index, path) in ordered_contribution_paths.iter().enumerate() {
-        let input = authenticate_input(index, path, geometry)?;
+    for (index, (path, claim)) in ordered_contribution_paths
+        .iter()
+        .zip(&authority.contributions)
+        .enumerate()
+    {
+        let input = authenticate_input(index, path, *claim, geometry)?;
         if let Some(first) = inputs
             .iter()
             .find(|first: &&AuthenticatedInput| first.retained == input.retained)
@@ -428,12 +594,33 @@ fn combine_with_io<I: CombinerIo>(
             .iter()
             .map(|input| ProductionDoryV3ModelCombinerInputReport {
                 path: input.path.clone(),
-                contribution_bytes: input.initial.bytes,
-                contribution_blake3: Digest32::new(input.initial.blake3),
-                contribution_sha256: Digest32::new(input.initial.sha256),
+                operator_index: input.claim.operator_index,
+                operator_public_key: Digest32::new(input.claim.operator_public_key),
+                contribution_bytes: input.claim.file.bytes,
+                contribution_blake3: Digest32::new(input.claim.file.blake3),
+                contribution_sha256: Digest32::new(input.claim.file.sha256),
+                contribution_commitment_signed_record_digest: Digest32::new(
+                    input.claim.contribution_commitment_signed_record_digest,
+                ),
+                contribution_reveal_signed_record_digest: Digest32::new(
+                    input.claim.contribution_reveal_signed_record_digest,
+                ),
             })
             .collect();
         Ok(ProductionDoryV3ModelCombinerReport {
+            ceremony_id: Digest32::new(authority.ceremony_id),
+            reveal_set_prefix_bytes: authority.reveal_set_prefix_bytes,
+            reveal_set_prefix_derive_key_digest: Digest32::new(
+                authority.reveal_set_prefix_derive_key_digest,
+            ),
+            reveal_set_prefix_blake3: Digest32::new(authority.reveal_set_prefix_blake3),
+            reveal_set_prefix_sha256: Digest32::new(authority.reveal_set_prefix_sha256),
+            commitment_set_signed_record_digest: Digest32::new(
+                authority.commitment_set_signed_record_digest,
+            ),
+            reveal_set_signed_record_digest: Digest32::new(
+                authority.reveal_set_signed_record_digest,
+            ),
             ordered_inputs,
             output: output_path.to_path_buf(),
             output_bytes: verified_output.bytes,
@@ -527,12 +714,7 @@ fn combine_streams<I: CombinerIo>(
             blake3: *input_blake3[input_index].finalize().as_bytes(),
             sha256: finalize_sha256(input_sha256[input_index].clone()),
         };
-        if observed != input.initial {
-            return Err(ProductionDoryV3ModelCombinerError::InputDigestMismatch {
-                index: input.index,
-                path: input.path.clone(),
-            });
-        }
+        require_claim_match(input, observed, "combine pass")?;
     }
 
     Ok(CombinedStream {
@@ -548,6 +730,7 @@ fn combine_streams<I: CombinerIo>(
 fn authenticate_input(
     index: usize,
     path: &Path,
+    claim: ContributionClaim,
     geometry: CombineGeometry,
 ) -> Result<AuthenticatedInput, ProductionDoryV3ModelCombinerError> {
     validate_input_path_type(index, path)?;
@@ -574,14 +757,16 @@ fn authenticate_input(
         }
     })?;
     ensure_input_path_identity(index, path, &retained)?;
-    let initial = scan_input(index, path, &retained, geometry)?;
-    ensure_input_path_identity(index, path, &retained)?;
-    Ok(AuthenticatedInput {
+    let observed = scan_input(index, path, &retained, geometry)?;
+    let input = AuthenticatedInput {
         index,
         path: path.to_path_buf(),
         retained,
-        initial,
-    })
+        claim,
+    };
+    require_claim_match(&input, observed, "initial authentication")?;
+    ensure_input_path_identity(index, path, &input.retained)?;
+    Ok(input)
 }
 
 fn reauthenticate_input(
@@ -590,13 +775,23 @@ fn reauthenticate_input(
 ) -> Result<(), ProductionDoryV3ModelCombinerError> {
     ensure_input_path_identity(input.index, &input.path, &input.retained)?;
     let observed = scan_input(input.index, &input.path, &input.retained, geometry)?;
-    if observed != input.initial {
-        return Err(ProductionDoryV3ModelCombinerError::InputDigestMismatch {
+    require_claim_match(input, observed, "final retained-handle authentication")?;
+    ensure_input_path_identity(input.index, &input.path, &input.retained)
+}
+
+fn require_claim_match(
+    input: &AuthenticatedInput,
+    observed: FileDigest,
+    pass: &'static str,
+) -> Result<(), ProductionDoryV3ModelCombinerError> {
+    if observed != input.claim.file {
+        return Err(ProductionDoryV3ModelCombinerError::InputClaimMismatch {
             index: input.index,
             path: input.path.clone(),
+            pass,
         });
     }
-    ensure_input_path_identity(input.index, &input.path, &input.retained)
+    Ok(())
 }
 
 fn scan_input(
@@ -1969,6 +2164,60 @@ mod tests {
             .collect()
     }
 
+    fn tiny_authority(inputs: &[PathBuf]) -> CombinerAuthority {
+        let claims = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let bytes = fs::read(path).unwrap();
+                let mut sha256 = Sha256::new();
+                sha256.update(&bytes);
+                let operator_public_key = [u8::try_from(index + 1).unwrap(); 32];
+                ContributionClaim {
+                    operator_index: u16::try_from(index).unwrap(),
+                    operator_public_key,
+                    file: FileDigest {
+                        bytes: tiny_geometry().contribution_bytes,
+                        blake3: *blake3::hash(&bytes).as_bytes(),
+                        sha256: finalize_sha256(sha256),
+                    },
+                    contribution_commitment_signed_record_digest: [u8::try_from(0x40 + index)
+                        .unwrap();
+                        32],
+                    contribution_reveal_signed_record_digest: [u8::try_from(0x60 + index).unwrap();
+                        32],
+                }
+            })
+            .collect::<Vec<_>>();
+        CombinerAuthority {
+            ceremony_id: [0x11; 32],
+            reveal_set_prefix_bytes: 1234,
+            reveal_set_prefix_derive_key_digest: [0x12; 32],
+            reveal_set_prefix_blake3: [0x13; 32],
+            reveal_set_prefix_sha256: [0x14; 32],
+            commitment_set_signed_record_digest: [0x15; 32],
+            reveal_set_signed_record_digest: [0x16; 32],
+            ordered_operator_keys: claims
+                .iter()
+                .map(|claim| claim.operator_public_key)
+                .collect(),
+            contributions: claims,
+        }
+    }
+
+    fn tiny_authority_with_count(count: usize) -> CombinerAuthority {
+        let inputs = (0..count)
+            .map(|index| {
+                let path = temp_path(&format!("authority-{count}-{index}"));
+                fs::write(&path, [u8::try_from(index).unwrap(); 6]).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let authority = tiny_authority(&inputs);
+        remove_paths(inputs);
+        authority
+    }
+
     fn remove_paths(paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
             if path.is_dir() {
@@ -2042,7 +2291,7 @@ mod tests {
         output: &Path,
         io: &mut TestIo,
     ) -> Result<ProductionDoryV3ModelCombinerReport, ProductionDoryV3ModelCombinerError> {
-        combine_with_io(inputs, output, tiny_geometry(), io)
+        combine_with_io(&tiny_authority(inputs), inputs, output, tiny_geometry(), io)
     }
 
     #[test]
@@ -2053,14 +2302,130 @@ mod tests {
 
         let output = temp_path("count-output");
         for count in [0, 1, 2, 17] {
+            let authority = tiny_authority_with_count(count);
             let inputs = (0..count)
                 .map(|index| PathBuf::from(format!("unused-{index}")))
                 .collect::<Vec<_>>();
             assert!(matches!(
-                combine_with_io(&inputs, &output, tiny_geometry(), &mut TestIo::default()),
+                combine_with_io(
+                    &authority,
+                    &inputs,
+                    &output,
+                    tiny_geometry(),
+                    &mut TestIo::default()
+                ),
                 Err(ProductionDoryV3ModelCombinerError::ContributionCount { actual }) if actual == count
             ));
         }
+    }
+
+    #[test]
+    fn transcript_binding_count_order_length_and_hashes_fail_closed() {
+        let inputs = create_inputs("binding-negative", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let output = temp_path("binding-negative-output");
+        let authority = tiny_authority(&inputs);
+
+        assert!(matches!(
+            combine_with_io(
+                &authority,
+                &inputs[..2],
+                &output,
+                tiny_geometry(),
+                &mut TestIo::default()
+            ),
+            Err(
+                ProductionDoryV3ModelCombinerError::TranscriptContributionCount {
+                    expected: 3,
+                    actual: 2
+                }
+            )
+        ));
+
+        let mut wrong_order = authority.clone();
+        wrong_order.contributions.swap(0, 1);
+        assert!(matches!(
+            combine_with_io(
+                &wrong_order,
+                &inputs,
+                &output,
+                tiny_geometry(),
+                &mut TestIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::TranscriptContributionOrder { position: 0 })
+        ));
+
+        let mut swapped_paths = inputs.clone();
+        swapped_paths.swap(0, 1);
+        assert!(matches!(
+            combine_with_io(
+                &authority,
+                &swapped_paths,
+                &output,
+                tiny_geometry(),
+                &mut TestIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::InputClaimMismatch {
+                index: 0,
+                pass: "initial authentication",
+                ..
+            })
+        ));
+        assert!(!output.exists());
+
+        let mut wrong_length = authority.clone();
+        wrong_length.contributions[0].file.bytes += 1;
+        assert!(matches!(
+            combine_with_io(
+                &wrong_length,
+                &inputs,
+                &output,
+                tiny_geometry(),
+                &mut TestIo::default()
+            ),
+            Err(
+                ProductionDoryV3ModelCombinerError::TranscriptContributionLength {
+                    index: 0,
+                    expected: 6,
+                    actual: 7
+                }
+            )
+        ));
+
+        for (label, mutate) in [
+            (
+                "blake3",
+                (|claim: &mut ContributionClaim| claim.file.blake3[0] ^= 1)
+                    as fn(&mut ContributionClaim),
+            ),
+            (
+                "sha256",
+                (|claim: &mut ContributionClaim| claim.file.sha256[0] ^= 1)
+                    as fn(&mut ContributionClaim),
+            ),
+        ] {
+            let mut wrong_hash = authority.clone();
+            mutate(&mut wrong_hash.contributions[0]);
+            assert!(
+                matches!(
+                    combine_with_io(
+                        &wrong_hash,
+                        &inputs,
+                        &output,
+                        tiny_geometry(),
+                        &mut TestIo::default()
+                    ),
+                    Err(ProductionDoryV3ModelCombinerError::InputClaimMismatch {
+                        index: 0,
+                        pass: "initial authentication",
+                        ..
+                    })
+                ),
+                "{label}"
+            );
+            assert!(!output.exists());
+        }
+
+        remove_paths(inputs);
     }
 
     #[test]
@@ -2086,6 +2451,35 @@ mod tests {
             inputs.iter().collect::<Vec<_>>()
         );
         assert_eq!(report.bytes_processed, 6);
+        assert_eq!(report.ceremony_id, Digest32::new([0x11; 32]));
+        assert_eq!(report.reveal_set_prefix_bytes, 1234);
+        assert_eq!(
+            report.reveal_set_prefix_derive_key_digest,
+            Digest32::new([0x12; 32])
+        );
+        assert_eq!(report.reveal_set_prefix_blake3, Digest32::new([0x13; 32]));
+        assert_eq!(report.reveal_set_prefix_sha256, Digest32::new([0x14; 32]));
+        assert_eq!(
+            report.commitment_set_signed_record_digest,
+            Digest32::new([0x15; 32])
+        );
+        assert_eq!(
+            report.reveal_set_signed_record_digest,
+            Digest32::new([0x16; 32])
+        );
+        assert_eq!(report.ordered_inputs[0].operator_index, 0);
+        assert_eq!(
+            report.ordered_inputs[0].operator_public_key,
+            Digest32::new([1; 32])
+        );
+        assert_eq!(
+            report.ordered_inputs[0].contribution_commitment_signed_record_digest,
+            Digest32::new([0x40; 32])
+        );
+        assert_eq!(
+            report.ordered_inputs[0].contribution_reveal_signed_record_digest,
+            Digest32::new([0x60; 32])
+        );
         assert_eq!(
             hex::encode(report.output_blake3.into_bytes()),
             "d256495d06d49773ec8aac338050786bddf071fec661f07d766bfd2c7b23979f"
@@ -2183,6 +2577,30 @@ mod tests {
     }
 
     #[test]
+    fn same_length_tamper_before_initial_authentication_is_rejected() {
+        let inputs = create_inputs("initial-tamper", &[&[1; 6], &[2; 6], &[3; 6]]);
+        let authority = tiny_authority(&inputs);
+        fs::write(&inputs[0], [9_u8; 6]).unwrap();
+        let output = temp_path("initial-tamper-output");
+        assert!(matches!(
+            combine_with_io(
+                &authority,
+                &inputs,
+                &output,
+                tiny_geometry(),
+                &mut TestIo::default()
+            ),
+            Err(ProductionDoryV3ModelCombinerError::InputClaimMismatch {
+                index: 0,
+                pass: "initial authentication",
+                ..
+            })
+        ));
+        assert!(!output.exists());
+        remove_paths(inputs);
+    }
+
+    #[test]
     fn same_length_tamper_between_authentication_and_combine_is_rejected() {
         let inputs = create_inputs("tamper", &[&[1; 6], &[2; 6], &[3; 6]]);
         let output = temp_path("tamper-output");
@@ -2194,7 +2612,11 @@ mod tests {
         };
         assert!(matches!(
             combine_tiny(&inputs, &output, &mut io),
-            Err(ProductionDoryV3ModelCombinerError::InputDigestMismatch { index: 1, .. })
+            Err(ProductionDoryV3ModelCombinerError::InputClaimMismatch {
+                index: 1,
+                pass: "combine pass",
+                ..
+            })
         ));
         assert!(!output.exists());
         remove_paths(inputs);
@@ -2212,7 +2634,11 @@ mod tests {
         };
         assert!(matches!(
             combine_tiny(&inputs, &output, &mut io),
-            Err(ProductionDoryV3ModelCombinerError::InputDigestMismatch { index: 2, .. })
+            Err(ProductionDoryV3ModelCombinerError::InputClaimMismatch {
+                index: 2,
+                pass: "final retained-handle authentication",
+                ..
+            })
         ));
         assert!(!output.exists());
         remove_paths(inputs);

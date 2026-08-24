@@ -18,9 +18,14 @@ use cmfd_consensus::{
     dory_bls12_381_prototype::deterministic_bls_dory_setup,
     dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
     dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
+    dory_v3_model_ceremony_transcript::{
+        MAX_CEREMONY_TRANSCRIPT_BYTES, parse_and_verify_reveal_set_prefix,
+    },
     dory_v3_model_combiner::combine_production_dory_v3_model_contributions,
     dory_v3_model_contribution::generate_production_dory_v3_model_contribution,
 };
+#[cfg(feature = "dory-bls12-381-prototype")]
+use std::io::Read as _;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -123,6 +128,12 @@ enum Command {
     /// Combine ordered production ceremony contributions bytewise modulo 251.
     #[cfg(feature = "dory-bls12-381-prototype")]
     DoryV3ModelCombine {
+        /// Exact signed transcript prefix ending at type 5 and EOF (at most 1 MiB).
+        #[arg(long)]
+        reveal_set_prefix: std::path::PathBuf,
+        /// Independently authenticated ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
         /// Ordered local contribution paths in operator-owned parents, repeated in operator-index order (3 through 16).
         #[arg(long = "contribution", required = true)]
         contributions: Vec<std::path::PathBuf>,
@@ -165,6 +176,44 @@ enum Command {
         #[arg(long)]
         maximum_native_block_rows: usize,
     },
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn parse_lower_hex_32(encoded: &str) -> std::result::Result<[u8; 32], String> {
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err("expected exactly 64 lowercase hexadecimal characters".to_owned());
+    }
+    let decoded = hex::decode(encoded)
+        .map_err(|_| "expected exactly 64 lowercase hexadecimal characters".to_owned())?;
+    decoded
+        .try_into()
+        .map_err(|_| "expected exactly 32 decoded bytes".to_owned())
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn read_reveal_set_prefix(path: &std::path::Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open reveal-set prefix {}", path.display()))?;
+    let limit = u64::try_from(MAX_CEREMONY_TRANSCRIPT_BYTES)
+        .expect("the 1 MiB transcript cap fits u64")
+        + 1;
+    let mut reader = file.take(limit);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read reveal-set prefix {}", path.display()))?;
+    if bytes.len() > MAX_CEREMONY_TRANSCRIPT_BYTES {
+        anyhow::bail!(
+            "reveal-set prefix {} exceeds the {}-byte protocol cap",
+            path.display(),
+            MAX_CEREMONY_TRANSCRIPT_BYTES
+        );
+    }
+    Ok(bytes)
 }
 
 fn sample_block(network_id: [u8; 32], target: [u8; 32]) -> BlockChallenge {
@@ -313,11 +362,26 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "dory-bls12-381-prototype")]
         Command::DoryV3ModelCombine {
+            reveal_set_prefix,
+            expected_ceremony_id,
             contributions,
             output,
         } => {
-            let report = combine_production_dory_v3_model_contributions(&contributions, &output)
-                .context("production Dory V3 contribution combination failed")?;
+            let prefix_bytes = read_reveal_set_prefix(&reveal_set_prefix)?;
+            let transcript =
+                parse_and_verify_reveal_set_prefix(&prefix_bytes, expected_ceremony_id)
+                    .with_context(|| {
+                        format!(
+                            "failed to verify anchored reveal-set prefix {}",
+                            reveal_set_prefix.display()
+                        )
+                    })?;
+            let report = combine_production_dory_v3_model_contributions(
+                &transcript,
+                &contributions,
+                &output,
+            )
+            .context("production Dory V3 contribution combination failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]

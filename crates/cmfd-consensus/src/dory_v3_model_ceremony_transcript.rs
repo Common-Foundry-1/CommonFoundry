@@ -327,8 +327,8 @@ pub(crate) struct VerifiedCombinerContributionBinding {
     contribution_reveal_signed_record_digest: [u8; 32],
 }
 
-// These accessors are the dormant handoff to the separately integrated
-// production combiner. Protocol tests exercise them before that consumer lands.
+// These crate-private accessors are the capability handoff to the production
+// combiner; no public caller can construct or mutate the signed bindings.
 #[cfg_attr(not(test), allow(dead_code))]
 impl VerifiedCombinerContributionBinding {
     pub(crate) const fn operator_index(&self) -> u16 {
@@ -2933,6 +2933,18 @@ mod tests {
         }
         assert!(completed.combiner_bindings.is_none());
         assert!(completed.require_combiner_bindings().is_err());
+        assert!(matches!(
+            crate::dory_v3_model_combiner::combine_production_dory_v3_model_contributions(
+                &completed,
+                &[],
+                std::path::Path::new("unused-completed-combiner-output")
+            ),
+            Err(
+                crate::dory_v3_model_combiner::ProductionDoryV3ModelCombinerError::TranscriptAuthority {
+                    ..
+                }
+            )
+        ));
 
         let mut abort_after_closure = completed.records()[..9].to_vec();
         let abort = sign_record(
@@ -2953,6 +2965,18 @@ mod tests {
         let aborted = parse_and_verify_ceremony_transcript(&aborted_bytes).unwrap();
         assert_eq!(aborted.status(), CeremonyTranscriptStatus::Aborted);
         assert!(aborted.require_combiner_bindings().is_err());
+        assert!(matches!(
+            crate::dory_v3_model_combiner::combine_production_dory_v3_model_contributions(
+                &aborted,
+                &[],
+                std::path::Path::new("unused-aborted-combiner-output")
+            ),
+            Err(
+                crate::dory_v3_model_combiner::ProductionDoryV3ModelCombinerError::TranscriptAuthority {
+                    ..
+                }
+            )
+        ));
         assert!(parse_and_verify_reveal_set_prefix(&aborted_bytes, aborted.ceremony_id()).is_err());
 
         let mut attestation = DetachedTranscriptAttestation {

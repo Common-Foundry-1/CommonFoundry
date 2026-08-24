@@ -749,7 +749,31 @@ The production combiner accepts only an exact transcript prefix ending at the
 fully signed type-5 record. It also requires the expected `ceremony_id` obtained
 independently from the authenticated, mirrored genesis; deriving that expected
 identifier from the prefix under validation would remove the organizer-intent
-trust anchor and is forbidden.
+trust anchor and is forbidden. The command requires both that prefix file and
+the explicit 32-byte expected identifier, reads the prefix through exact EOF
+under the 1 MiB protocol cap, and has no path-only production entry point.
+Completed and aborted transcript inspection results cannot authorize
+combination.
+
+The feature-gated reference invocation is:
+
+```text
+cmfd-consensus dory-v3-model-combine \
+  --reveal-set-prefix ./REVEAL-SET-CLOSED.cmfd \
+  --expected-ceremony-id <64-lowercase-hex-characters> \
+  --contribution ./operator-0.bin \
+  --contribution ./operator-1.bin \
+  --contribution ./operator-2.bin \
+  [--contribution ./operator-N.bin ...] \
+  --output ./MODEL-PAYLOAD.bin
+```
+
+Each repeated contribution path is positionally checked against the matching
+signed operator-index claim. Swapping paths whose signed length or digest
+claims differ is a verification failure, even though addition modulo 251 is
+mathematically commutative. If two operators sign byte-identical contribution
+claims, their payloads are content-equivalent and local paths cannot provide
+additional cryptographic attribution.
 
 For every payload offset `j` satisfying `0 <= j < 6,442,975,232`:
 
@@ -884,7 +908,8 @@ repository. That is a pre-ceremony blocker.
 
 ## Model-bank bootstrap and Record V2
 
-The existing Rust tooling begins only after a combined raw payload exists.
+The model-bank bootstrap and Record V2 tooling begin only after the bound
+combiner has produced a combined raw payload.
 Genesis pins one or both target-specific distributed reference executables.
 The executable used for the canonical published artifacts must match its
 target's genesis hashes. Independently built executables are recorded in
@@ -1115,7 +1140,10 @@ Already implemented in this repository:
   BLAKE3 and SHA-256 before removing the temporary artifact;
 - the feature-gated exact binary transcript encoder/parser, BIP340 signature
   verifier, detached-attestation verifier, and independently anchored exact
-  type-5-prefix capability used to authorize the future combiner;
+  type-5-prefix capability;
+- the feature-gated, identity-safe streaming modular combiner bound exclusively
+  to that anchored type-5-prefix capability, with three-pass signed-claim
+  authentication and ceremony-bound operational reporting;
 - the fail-closed `dory-v3-model-bank-bootstrap` command; and
 - the two-pass `dory-v3-model-record-ceremony` command.
 
@@ -1126,7 +1154,8 @@ Not implemented or not completed by this document:
 - append-only transcript publication and independently mirrored expected
   ceremony-ID tooling, plus independent external review of the transcript
   implementation;
-- the identity-bound streaming modular combiner;
+- independent external review and a production-scale qualification of the
+  reference combiner;
 - the exact roots-file and structural-report generators and validators;
 - an independently authored reproduction implementation;
 - operator/reproducer rosters, public identity documents, bulletin mirrors,
@@ -1136,12 +1165,12 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is to bind the identity-safe streaming
-combiner to the anchored type-5 transcript capability, then implement the
-frozen reports and append-only publication path. Those components and the
-generator still require independent external review before generating real
-contributions. A successful run of the current bootstrap or one local
-generator qualification is not a completed ceremony.
+The next minimal implementation slice is the exact roots-file and structural-
+report generators and validators, followed by append-only transcript
+publication. The transcript, generator, and combiner still require independent
+external review, and the combiner requires a production-scale qualification,
+before generating real contributions. A successful run of the current
+bootstrap or one local generator qualification is not a completed ceremony.
 
 ## Operator completion checklist
 

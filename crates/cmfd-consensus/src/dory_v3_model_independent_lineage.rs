@@ -7,7 +7,7 @@
 
 use std::{
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use k256::schnorr::{Signature, VerifyingKey};
@@ -15,7 +15,10 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    dory_v3_model_ceremony_fs::{AuthenticatedInput, CeremonyFsError, TrustedCeremonyParent},
+    dory_v3_model_ceremony_fs::{
+        AuthenticatedInput, CeremonyFsError, FileIdentity as CeremonyFilesystemIdentity,
+        TrustedCeremonyParent,
+    },
     dory_v3_model_ceremony_transcript::{
         CeremonyRecordBody, CeremonyTranscriptError, FileIdentity, GenesisBody,
         MAX_CEREMONY_SIGNERS, RecordSignature, SignerClass, VerifiedCeremonyTranscript,
@@ -339,6 +342,20 @@ impl VerifiedIndependentLineage {
         }
         self.lineage_input
             .reauthenticate_content("independent-lineage artifact")
+    }
+
+    pub(crate) fn retained_filesystem_entries(&self) -> Vec<(PathBuf, CeremonyFilesystemIdentity)> {
+        let mut entries = Vec::with_capacity(1 + self.evidence_inputs.len());
+        entries.extend(
+            self.evidence_inputs
+                .iter()
+                .map(|input| (input.input.path().to_path_buf(), input.input.identity())),
+        );
+        entries.push((
+            self.lineage_input.input.path().to_path_buf(),
+            self.lineage_input.input.identity(),
+        ));
+        entries
     }
 }
 

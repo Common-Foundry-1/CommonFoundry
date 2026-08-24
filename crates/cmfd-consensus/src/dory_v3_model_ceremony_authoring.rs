@@ -625,6 +625,8 @@ pub enum ProductionDoryV3CeremonyAuthoringError {
     StagedOutputChanged,
     #[error("retained final-candidate projection differs from the prepared type-6 body")]
     FinalCandidateProjectionChanged,
+    #[error("an external retained-input guard failed before final-candidate reauthentication: {0}")]
+    RetainedInputGuard(String),
     #[error("failed to clean an unconfirmed output; original: {original}; cleanup: {cleanup}")]
     OutputCleanup { original: String, cleanup: String },
 }
@@ -730,10 +732,25 @@ pub fn prepare_production_dory_v3_final_receipt(
 /// once before signing material is accepted and again after the output is
 /// reopened; its bank guard remains the last retained-artifact check.
 pub fn stage_production_dory_v3_final_receipt(
-    mut prepared: PreparedProductionDoryV3FinalReceipt,
+    prepared: PreparedProductionDoryV3FinalReceipt,
     signatures: Vec<RecordSignature>,
     output_path: &Path,
 ) -> Result<ProductionDoryV3FinalReceiptStageReport, ProductionDoryV3CeremonyAuthoringError> {
+    stage_production_dory_v3_final_receipt_with_retained_input_guard(
+        prepared,
+        signatures,
+        output_path,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn stage_production_dory_v3_final_receipt_with_retained_input_guard(
+    mut prepared: PreparedProductionDoryV3FinalReceipt,
+    signatures: Vec<RecordSignature>,
+    output_path: &Path,
+    mut retained_input_guard: impl FnMut() -> Result<(), ProductionDoryV3CeremonyAuthoringError>,
+) -> Result<ProductionDoryV3FinalReceiptStageReport, ProductionDoryV3CeremonyAuthoringError> {
+    retained_input_guard()?;
     let refreshed = prepared
         .candidate
         .derive_final_receipt_body(&prepared.transcript)?;
@@ -746,6 +763,7 @@ pub fn stage_production_dory_v3_final_receipt(
         &prepared.required_signers,
         signatures,
         output_path,
+        retained_input_guard,
         || {
             prepared
                 .candidate
@@ -771,6 +789,7 @@ fn persist_production_dory_v3_final_receipt(
     required_signers: &[RequiredCeremonySigner],
     signatures: Vec<RecordSignature>,
     output_path: &Path,
+    retained_input_guard: impl FnOnce() -> Result<(), ProductionDoryV3CeremonyAuthoringError>,
     final_guard: impl FnOnce() -> Result<FinalReceiptBody, ProductionDoryV3CeremonyAuthoringError>,
 ) -> Result<StagedFinalReceiptRecord, ProductionDoryV3CeremonyAuthoringError> {
     let record = SignedCeremonyRecord {
@@ -790,6 +809,7 @@ fn persist_production_dory_v3_final_receipt(
         if decoded != expected || encode_ceremony_record(&decoded)? != reopened {
             return Err(ProductionDoryV3CeremonyAuthoringError::StagedOutputChanged);
         }
+        retained_input_guard()?;
         if final_guard()? != *body {
             return Err(ProductionDoryV3CeremonyAuthoringError::FinalCandidateProjectionChanged);
         }
@@ -2101,6 +2121,7 @@ fn map_durability(outcome: ParentSyncOutcome) -> ProductionDoryV3CeremonyRecordS
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         fs,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -2924,12 +2945,18 @@ mod tests {
         let required = required_signers_for_body(&final_record.body, Some(genesis)).unwrap();
         let output = directory.0.join("final-receipt.cmfdcr01");
         let mut guard_calls = 0;
+        let guard_order = RefCell::new(Vec::new());
         let staged = persist_production_dory_v3_final_receipt(
             &body,
             &required,
             final_record.signatures.clone(),
             &output,
             || {
+                guard_order.borrow_mut().push("retained inputs");
+                Ok(())
+            },
+            || {
+                guard_order.borrow_mut().push("final candidate");
                 guard_calls += 1;
                 Ok(body.clone())
             },
@@ -2940,6 +2967,10 @@ mod tests {
         assert_eq!(encode_ceremony_record(&final_record).unwrap(), reopened);
         assert_eq!(staged.record_file, file_identity_for_bytes(&reopened));
         assert_eq!(guard_calls, 1);
+        assert_eq!(
+            guard_order.into_inner(),
+            ["retained inputs", "final candidate"]
+        );
 
         assert!(matches!(
             persist_production_dory_v3_final_receipt(
@@ -2947,11 +2978,31 @@ mod tests {
                 &required,
                 final_record.signatures.clone(),
                 &output,
+                || Ok(()),
                 || Ok(body.clone())
             ),
             Err(ProductionDoryV3CeremonyAuthoringError::Filesystem(message))
                 if message.contains("refusing to overwrite existing output")
         ));
+
+        let retained_rejected_output = directory.0.join("retained-rejected-final-receipt.cmfdcr01");
+        assert!(matches!(
+            persist_production_dory_v3_final_receipt(
+                &body,
+                &required,
+                final_record.signatures.clone(),
+                &retained_rejected_output,
+                || {
+                    Err(ProductionDoryV3CeremonyAuthoringError::RetainedInputGuard(
+                        "changed plan".to_owned(),
+                    ))
+                },
+                || Ok(body.clone())
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::RetainedInputGuard(message))
+                if message == "changed plan"
+        ));
+        assert!(!retained_rejected_output.exists());
 
         let rejected_output = directory.0.join("rejected-final-receipt.cmfdcr01");
         let mut changed = body.clone();
@@ -2962,6 +3013,7 @@ mod tests {
                 &required,
                 final_record.signatures,
                 &rejected_output,
+                || Ok(()),
                 || Ok(changed)
             ),
             Err(ProductionDoryV3CeremonyAuthoringError::FinalCandidateProjectionChanged)

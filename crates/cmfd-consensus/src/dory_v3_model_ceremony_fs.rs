@@ -243,6 +243,10 @@ impl AuthenticatedInput {
         self.identity
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn read_bounded(
         &mut self,
         maximum_bytes: usize,

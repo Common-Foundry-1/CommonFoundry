@@ -7,7 +7,7 @@
 
 use std::{
     io::{self, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -24,7 +24,10 @@ use crate::{
         ProductionDoryV3ModelRecordV2CeremonyError,
         preflight_production_dory_v3_model_bank_manifest,
     },
-    dory_v3_model_ceremony_fs::{AuthenticatedInput, CeremonyFsError, TrustedCeremonyParent},
+    dory_v3_model_ceremony_fs::{
+        AuthenticatedInput, CeremonyFsError, FileIdentity as CeremonyFilesystemIdentity,
+        TrustedCeremonyParent,
+    },
     dory_v3_model_ceremony_transcript::{FileIdentity, PRODUCTION_BANK_BYTES},
     dory_v3_model_record::{
         BankAuthenticatedDoryV3ModelCommitmentRecordV2, DoryV3ModelCommitmentRecordError,
@@ -61,6 +64,20 @@ pub struct ValidatedProductionDoryV3ModelBankRecordChain {
 }
 
 impl ValidatedProductionDoryV3ModelBankRecordChain {
+    pub(crate) fn retained_filesystem_entries(&self) -> [(PathBuf, CeremonyFilesystemIdentity); 3] {
+        [
+            (self.bank.path().to_path_buf(), self.bank.identity()),
+            (
+                self.manifest_input.path().to_path_buf(),
+                self.manifest_input.identity(),
+            ),
+            (
+                self.record_v2_input.path().to_path_buf(),
+                self.record_v2_input.identity(),
+            ),
+        ]
+    }
+
     pub(crate) fn retained_bank_filesystem_identity(
         &self,
     ) -> crate::dory_v3_model_ceremony_fs::FileIdentity {
@@ -947,6 +964,14 @@ mod tests {
         assert!(
             record_bytes.starts_with(b"{\n  \"record_version\": 2,\n"),
             "Record V2 serde pretty-JSON prefix changed"
+        );
+        assert_eq!(
+            validated.retained_filesystem_entries(),
+            [
+                (bank_path.clone(), validated.bank.identity()),
+                (manifest_path.clone(), validated.manifest_input.identity()),
+                (record_path.clone(), validated.record_v2_input.identity()),
+            ]
         );
         validated.recheck_retained_files().unwrap();
         let _ = validated.pass_one_elapsed_micros();

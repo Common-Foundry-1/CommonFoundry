@@ -33,6 +33,10 @@ use cmfd_consensus::{
     },
     dory_v3_model_combiner::combine_production_dory_v3_model_contributions,
     dory_v3_model_contribution::generate_production_dory_v3_model_contribution,
+    dory_v3_model_final_receipt_orchestration::{
+        prepare_production_dory_v3_final_receipt_from_orchestration_plan,
+        stage_production_dory_v3_final_receipt_from_orchestration_plan,
+    },
     dory_v3_model_roots::{
         ProductionDoryV3ModelRoots, generate_production_dory_v3_model_roots_file,
         validate_production_dory_v3_model_roots_files,
@@ -220,6 +224,35 @@ enum Command {
         #[arg(long, value_parser = parse_external_signature)]
         reproducer_signature: Vec<ExternalRecordSignature>,
         /// New absolute path for the exact signed record; existing paths are never overwritten.
+        #[arg(long, value_parser = parse_absolute_path)]
+        record_output: std::path::PathBuf,
+    },
+    /// Revalidate the complete type-6 candidate and emit its public signing request.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyFinalReceiptPrepare {
+        /// Existing absolute path to the strict final-receipt orchestration plan.
+        #[arg(long, value_parser = parse_absolute_path)]
+        plan: std::path::PathBuf,
+        /// Independently authenticated ceremony ID.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+    },
+    /// Freshly revalidate, verify external signatures, and create-new stage the type-6 record.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyFinalReceiptStage {
+        /// Existing absolute path to the strict final-receipt orchestration plan.
+        #[arg(long, value_parser = parse_absolute_path)]
+        plan: std::path::PathBuf,
+        /// Independently authenticated ceremony ID.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// External operator signature as INDEX:128-lowercase-hex. Repeat for every operator.
+        #[arg(long, required = true, value_parser = parse_external_signature)]
+        operator_signature: Vec<ExternalRecordSignature>,
+        /// External reproducer signature as INDEX:128-lowercase-hex. Repeat for every reproducer.
+        #[arg(long, required = true, value_parser = parse_external_signature)]
+        reproducer_signature: Vec<ExternalRecordSignature>,
+        /// New absolute path for the exact signed type-6 record; existing paths are never overwritten.
         #[arg(long, value_parser = parse_absolute_path)]
         record_output: std::path::PathBuf,
     },
@@ -608,6 +641,12 @@ fn parse_absolute_path(encoded: &str) -> std::result::Result<std::path::PathBuf,
 }
 
 #[cfg(feature = "dory-bls12-381-prototype")]
+fn escaped_path_for_line_output(path: &std::path::Path) -> String {
+    serde_json::to_string(path.to_string_lossy().as_ref())
+        .expect("path display strings always serialize as JSON")
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
 fn print_model_roots(roots: &ProductionDoryV3ModelRoots) {
     println!("ceremony_id {}", roots.ceremony_id());
     println!("payload_bytes {}", roots.payload_bytes());
@@ -937,6 +976,144 @@ fn run_cli() -> Result<()> {
                 "mirror_publication_pending {}",
                 report.publication_pending()
             );
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyFinalReceiptPrepare {
+            plan,
+            expected_ceremony_id,
+        } => {
+            let prepared = prepare_production_dory_v3_final_receipt_from_orchestration_plan(
+                &plan,
+                expected_ceremony_id,
+            )
+            .context("failed to prepare the keyless Dory V3 final receipt")?;
+            let plan_file = prepared.plan_file();
+            let reveal_set_prefix_file = prepared.reveal_set_prefix_file();
+            println!("outcome final_receipt_prepared");
+            println!(
+                "plan {}",
+                escaped_path_for_line_output(prepared.plan_path())
+            );
+            println!("plan_bytes {}", plan_file.bytes);
+            println!("plan_blake3 {}", hex::encode(plan_file.blake3));
+            println!("plan_sha256 {}", hex::encode(plan_file.sha256));
+            println!(
+                "reveal_set_prefix {}",
+                escaped_path_for_line_output(prepared.reveal_set_prefix_path())
+            );
+            println!("reveal_set_prefix_bytes {}", reveal_set_prefix_file.bytes);
+            println!(
+                "reveal_set_prefix_blake3 {}",
+                hex::encode(reveal_set_prefix_file.blake3)
+            );
+            println!(
+                "reveal_set_prefix_sha256 {}",
+                hex::encode(reveal_set_prefix_file.sha256)
+            );
+            println!("ceremony_id {}", hex::encode(prepared.ceremony_id()));
+            println!(
+                "transcript_derive_key_digest {}",
+                hex::encode(prepared.transcript_derive_key_digest())
+            );
+            println!("record_type 6");
+            println!(
+                "record_content_digest {}",
+                hex::encode(prepared.record_content_digest())
+            );
+            println!(
+                "signature_message {}",
+                hex::encode(prepared.signature_message())
+            );
+            for signer in prepared.required_signers() {
+                let class = match signer.signer_class() {
+                    SignerClass::Operator => "operator",
+                    SignerClass::Reproducer => "reproducer",
+                };
+                println!(
+                    "required_signer {class}:{}:{}",
+                    signer.signer_index(),
+                    hex::encode(signer.public_key())
+                );
+            }
+            println!("signature_algorithm bip340_raw_32_byte_message");
+            println!("private_key_handling external_only");
+            println!("validation_scope full_type6_candidate_and_lineage_validation");
+            println!("staging_requires_fresh_validation true");
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyFinalReceiptStage {
+            plan,
+            expected_ceremony_id,
+            operator_signature,
+            reproducer_signature,
+            record_output,
+        } => {
+            let mut signatures: Vec<_> = operator_signature
+                .into_iter()
+                .map(|signature| signature.into_record_signature(SignerClass::Operator))
+                .collect();
+            signatures.extend(
+                reproducer_signature
+                    .into_iter()
+                    .map(|signature| signature.into_record_signature(SignerClass::Reproducer)),
+            );
+            signatures.sort_by_key(|signature| (signature.signer_class, signature.signer_index));
+            let report = stage_production_dory_v3_final_receipt_from_orchestration_plan(
+                &plan,
+                expected_ceremony_id,
+                signatures,
+                &record_output,
+            )
+            .context("failed to verify and stage the keyless Dory V3 final receipt")?;
+            let plan_file = report.plan_file();
+            let reveal_set_prefix_file = report.reveal_set_prefix_file();
+            let record_file = report.record_file();
+            println!("outcome final_receipt_staged");
+            println!("plan {}", escaped_path_for_line_output(report.plan_path()));
+            println!("plan_bytes {}", plan_file.bytes);
+            println!("plan_blake3 {}", hex::encode(plan_file.blake3));
+            println!("plan_sha256 {}", hex::encode(plan_file.sha256));
+            println!(
+                "reveal_set_prefix {}",
+                escaped_path_for_line_output(report.reveal_set_prefix_path())
+            );
+            println!("reveal_set_prefix_bytes {}", reveal_set_prefix_file.bytes);
+            println!(
+                "reveal_set_prefix_blake3 {}",
+                hex::encode(reveal_set_prefix_file.blake3)
+            );
+            println!(
+                "reveal_set_prefix_sha256 {}",
+                hex::encode(reveal_set_prefix_file.sha256)
+            );
+            println!(
+                "signed_record {}",
+                escaped_path_for_line_output(report.output())
+            );
+            println!("record_type 6");
+            println!("record_bytes {}", record_file.bytes);
+            println!("record_blake3 {}", hex::encode(record_file.blake3));
+            println!("record_sha256 {}", hex::encode(record_file.sha256));
+            println!("ceremony_id {}", hex::encode(report.ceremony_id()));
+            println!(
+                "record_content_digest {}",
+                hex::encode(report.record_content_digest())
+            );
+            println!(
+                "signed_record_digest {}",
+                hex::encode(report.signed_record_digest())
+            );
+            println!(
+                "signature_message {}",
+                hex::encode(report.signature_message())
+            );
+            println!("signer_count {}", report.signer_count());
+            println!("durability {:?}", report.durability());
+            println!(
+                "mirror_publication_pending {}",
+                report.publication_pending()
+            );
+            println!("validation_scope fresh_full_type6_candidate_and_lineage_validation");
         }
         #[cfg(feature = "dory-bls12-381-prototype")]
         Command::DoryV3ModelCeremonyPrefixStage {
@@ -1643,6 +1820,18 @@ mod tests {
     use clap::CommandFactory as _;
 
     #[test]
+    fn line_output_paths_are_json_escaped_and_round_trip() {
+        let path = std::path::PathBuf::from("ceremony\ninjected status");
+        let escaped = escaped_path_for_line_output(&path);
+
+        assert!(!escaped.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<String>(&escaped).unwrap(),
+            path.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
     fn external_signature_parser_accepts_only_canonical_bip340_tuples() {
         let signature_hex = "ab".repeat(64);
         let parsed = parse_external_signature(&format!("17:{signature_hex}")).unwrap();
@@ -1678,6 +1867,167 @@ mod tests {
                 "accepted noncanonical external signature tuple: {encoded}"
             );
         }
+    }
+
+    #[test]
+    fn final_receipt_prepare_cli_routes_and_exposes_only_public_inputs() {
+        let directory = std::env::current_dir().unwrap();
+        let plan = directory.join("final-receipt-plan.json");
+        let ceremony_id = "ab".repeat(32);
+        let valid_args = || {
+            vec![
+                "cmfd-consensus".into(),
+                "dory-v3-model-ceremony-final-receipt-prepare".into(),
+                "--plan".into(),
+                plan.clone().into_os_string(),
+                "--expected-ceremony-id".into(),
+                ceremony_id.clone().into(),
+            ]
+        };
+
+        let parsed = Cli::try_parse_from(valid_args()).unwrap();
+        match parsed.command {
+            Command::DoryV3ModelCeremonyFinalReceiptPrepare {
+                plan: parsed_plan,
+                expected_ceremony_id,
+            } => {
+                assert_eq!(parsed_plan, plan);
+                assert_eq!(expected_ceremony_id, [0xab; 32]);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("dory-v3-model-ceremony-final-receipt-prepare")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for required in ["--plan", "--expected-ceremony-id"] {
+            assert!(help.contains(required), "missing help option {required}");
+        }
+        for forbidden in [
+            "--private-key",
+            "--seed",
+            "--mnemonic",
+            "--signature-message",
+            "--prepared",
+            "--request",
+        ] {
+            assert!(!help.contains(forbidden), "unsafe help option {forbidden}");
+        }
+
+        let mut missing_anchor = valid_args();
+        missing_anchor.truncate(missing_anchor.len() - 2);
+        assert!(Cli::try_parse_from(missing_anchor).is_err());
+
+        let mut relative_plan = valid_args();
+        relative_plan[3] = "relative-plan.json".into();
+        assert!(Cli::try_parse_from(relative_plan).is_err());
+
+        let mut uppercase_id = valid_args();
+        uppercase_id[5] = "AB".repeat(32).into();
+        assert!(Cli::try_parse_from(uppercase_id).is_err());
+
+        let mut private_key = valid_args();
+        private_key.extend(["--private-key".into(), "00".into()]);
+        assert!(Cli::try_parse_from(private_key).is_err());
+    }
+
+    #[test]
+    fn final_receipt_stage_cli_routes_and_requires_both_signature_classes() {
+        let directory = std::env::current_dir().unwrap();
+        let plan = directory.join("final-receipt-plan.json");
+        let record_output = directory.join("009-type-6-final-receipt.cmfd");
+        let ceremony_id = "ab".repeat(32);
+        let operator_signature = format!("0:{}", "11".repeat(64));
+        let reproducer_signature = format!("0:{}", "22".repeat(64));
+        let valid_args = || {
+            vec![
+                "cmfd-consensus".into(),
+                "dory-v3-model-ceremony-final-receipt-stage".into(),
+                "--plan".into(),
+                plan.clone().into_os_string(),
+                "--expected-ceremony-id".into(),
+                ceremony_id.clone().into(),
+                "--operator-signature".into(),
+                operator_signature.clone().into(),
+                "--reproducer-signature".into(),
+                reproducer_signature.clone().into(),
+                "--record-output".into(),
+                record_output.clone().into_os_string(),
+            ]
+        };
+
+        let parsed = Cli::try_parse_from(valid_args()).unwrap();
+        match parsed.command {
+            Command::DoryV3ModelCeremonyFinalReceiptStage {
+                plan: parsed_plan,
+                expected_ceremony_id,
+                operator_signature: operators,
+                reproducer_signature: reproducers,
+                record_output: parsed_output,
+            } => {
+                assert_eq!(parsed_plan, plan);
+                assert_eq!(expected_ceremony_id, [0xab; 32]);
+                assert_eq!(operators.len(), 1);
+                assert_eq!(operators[0].signer_index, 0);
+                assert_eq!(operators[0].signature, [0x11; 64]);
+                assert_eq!(reproducers.len(), 1);
+                assert_eq!(reproducers[0].signer_index, 0);
+                assert_eq!(reproducers[0].signature, [0x22; 64]);
+                assert_eq!(parsed_output, record_output);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("dory-v3-model-ceremony-final-receipt-stage")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for required in [
+            "--plan",
+            "--expected-ceremony-id",
+            "--operator-signature",
+            "--reproducer-signature",
+            "--record-output",
+        ] {
+            assert!(help.contains(required), "missing help option {required}");
+        }
+        for forbidden in [
+            "--private-key",
+            "--seed",
+            "--mnemonic",
+            "--signature-message",
+            "--prepared",
+            "--request",
+        ] {
+            assert!(!help.contains(forbidden), "unsafe help option {forbidden}");
+        }
+
+        let without_operator: Vec<_> = valid_args()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, argument)| (!matches!(index, 6 | 7)).then_some(argument))
+            .collect();
+        assert!(Cli::try_parse_from(without_operator).is_err());
+
+        let without_reproducer: Vec<_> = valid_args()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, argument)| (!matches!(index, 8 | 9)).then_some(argument))
+            .collect();
+        assert!(Cli::try_parse_from(without_reproducer).is_err());
+
+        let mut relative_output = valid_args();
+        relative_output[11] = "type-6.cmfd".into();
+        assert!(Cli::try_parse_from(relative_output).is_err());
+
+        let mut malformed_signature = valid_args();
+        malformed_signature[7] = format!("0:{}", "AA".repeat(64)).into();
+        assert!(Cli::try_parse_from(malformed_signature).is_err());
     }
 
     #[test]

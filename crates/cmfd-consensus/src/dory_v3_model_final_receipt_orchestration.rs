@@ -1,8 +1,11 @@
-//! Retained path-plan loading for production Dory V3 final-receipt orchestration.
+//! Retained plan-to-Type-6 orchestration for production Dory V3 final receipts.
 //!
-//! This first boundary authenticates only the strict JSON plan and its exact,
-//! independently anchored reveal-set-closed prefix. Paths declared by the plan
-//! are routing inputs for later validators, never content or candidate authority.
+//! The loader boundary authenticates only the strict JSON plan and its exact,
+//! independently anchored reveal-set-closed prefix; plan path claims never
+//! become content or candidate authority. The higher-level prepare and stage
+//! APIs then route those paths through the existing combined-payload, CMFDRP,
+//! CMFDIL, final-candidate, and keyless Type-6 validators while retaining every
+//! resulting capability through the final create-new output guard.
 
 use std::path::{Path, PathBuf};
 
@@ -11,14 +14,59 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    dory_v3_model_ceremony_fs::{AuthenticatedInput, CeremonyFsError, TrustedCeremonyParent},
+    dory_v3_model_ceremony_authoring::{
+        PreparedProductionDoryV3FinalReceipt, ProductionDoryV3CeremonyAuthoringError,
+        ProductionDoryV3CeremonyRecordStageDurability, ProductionDoryV3FinalReceiptStageReport,
+        RequiredCeremonySigner, prepare_production_dory_v3_final_receipt,
+        stage_production_dory_v3_final_receipt_with_retained_input_guard,
+    },
+    dory_v3_model_ceremony_fs::{
+        AuthenticatedInput, CeremonyFsError, FileIdentity as CeremonyFilesystemIdentity,
+        TrustedCeremonyParent,
+    },
     dory_v3_model_ceremony_transcript::{
-        CeremonyTranscriptError, FileIdentity, MAX_CEREMONY_TRANSCRIPT_BYTES,
+        CeremonyTranscriptError, FileIdentity, MAX_CEREMONY_TRANSCRIPT_BYTES, RecordSignature,
         VerifiedCeremonyTranscript, parse_and_verify_reveal_set_prefix,
+    },
+    dory_v3_model_combiner::{
+        ProductionDoryV3ModelCombinerError,
+        validate_existing_production_dory_v3_model_combined_payload,
+    },
+    dory_v3_model_final_candidate_validation::{
+        ProductionDoryV3ModelFinalCandidatePaths,
+        ProductionDoryV3ModelFinalCandidateValidationError,
+        ProductionDoryV3ModelReproducerCandidatePaths,
+        ValidatedProductionDoryV3ModelFinalCandidate, VerifiedProductionDoryV3ReproducerLineages,
+        validate_existing_production_dory_v3_model_final_candidate,
+    },
+    dory_v3_model_independent_lineage::{
+        ProductionDoryV3IndependentLineageError, ProductionDoryV3IndependentLineageEvidencePaths,
+        validate_existing_production_dory_v3_independent_lineage,
+    },
+    dory_v3_model_reproduction::{
+        PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES,
+        ProductionDoryV3ModelReproductionReportError,
+        ProductionDoryV3ReproductionImplementationKind,
+        verify_production_dory_v3_model_reproduction_report,
     },
 };
 
 pub const PRODUCTION_DORY_V3_FINAL_RECEIPT_PLAN_MAX_BYTES: usize = 256 * 1024;
+
+// Every authenticated artifact retains both its file and trusted-parent
+// handles. The fixed set is plan + prefix + eight shared candidate artifacts
+// + the bank chain's three independently retained artifacts. Contributions,
+// reproducer bundles, and Independent lineages add the remaining terms.
+const FIXED_RETAINED_HANDLES: usize = 2 * (2 + 8 + 3);
+const RETAINED_HANDLES_PER_CONTRIBUTION: usize = 2;
+const RETAINED_HANDLES_PER_REPRODUCER: usize = 2 * 9;
+const RETAINED_HANDLES_PER_INDEPENDENT_LINEAGE: usize = 2 * 12;
+// Leave room for the process runtime and the create-new/reopen staging path.
+const OPEN_FILE_DESCRIPTOR_RESERVE: usize = 64;
+// Production operators use one explicit, reviewable floor. This also covers
+// transient combiner handles and process descriptors that are not part of the
+// retained-capability count above.
+const MINIMUM_OPEN_FILE_DESCRIPTOR_SOFT_LIMIT: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "plan_type", content = "artifacts", deny_unknown_fields)]
@@ -93,6 +141,120 @@ pub struct RetainedProductionDoryV3FinalReceiptOrchestrationInputs {
     _artifacts: ProductionDoryV3FinalReceiptArtifactsV1,
 }
 
+/// Opaque keyless Type-6 signing request whose strict plan, anchored type-5
+/// prefix, final candidate, and Independent lineage evidence all remain live.
+///
+/// This capability is deliberately non-cloneable and non-serializable. It
+/// exposes only public signing material and can be consumed only by the
+/// guarded Type-6 staging entry point below.
+#[must_use]
+pub struct PreparedProductionDoryV3FinalReceiptOrchestration {
+    inputs: RetainedProductionDoryV3FinalReceiptOrchestrationInputs,
+    prepared: PreparedProductionDoryV3FinalReceipt,
+}
+
+impl PreparedProductionDoryV3FinalReceiptOrchestration {
+    pub fn plan_path(&self) -> &Path {
+        self.inputs.plan_path()
+    }
+
+    pub const fn plan_file(&self) -> &FileIdentity {
+        self.inputs.plan_file()
+    }
+
+    pub fn reveal_set_prefix_path(&self) -> &Path {
+        self.inputs.reveal_set_prefix_path()
+    }
+
+    pub const fn reveal_set_prefix_file(&self) -> &FileIdentity {
+        self.inputs.reveal_set_prefix_file()
+    }
+
+    pub const fn ceremony_id(&self) -> [u8; 32] {
+        self.prepared.ceremony_id()
+    }
+
+    pub const fn transcript_derive_key_digest(&self) -> [u8; 32] {
+        self.inputs.transcript.transcript_derive_key_digest()
+    }
+
+    pub const fn record_content_digest(&self) -> [u8; 32] {
+        self.prepared.record_content_digest()
+    }
+
+    pub const fn signature_message(&self) -> [u8; 32] {
+        self.prepared.signature_message()
+    }
+
+    pub fn required_signers(&self) -> &[RequiredCeremonySigner] {
+        self.prepared.required_signers()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionDoryV3FinalReceiptOrchestrationStageReport {
+    plan_path: PathBuf,
+    plan_file: FileIdentity,
+    reveal_set_prefix_path: PathBuf,
+    reveal_set_prefix_file: FileIdentity,
+    ceremony_id: [u8; 32],
+    staged: ProductionDoryV3FinalReceiptStageReport,
+}
+
+impl ProductionDoryV3FinalReceiptOrchestrationStageReport {
+    pub fn plan_path(&self) -> &Path {
+        &self.plan_path
+    }
+
+    pub const fn plan_file(&self) -> &FileIdentity {
+        &self.plan_file
+    }
+
+    pub fn reveal_set_prefix_path(&self) -> &Path {
+        &self.reveal_set_prefix_path
+    }
+
+    pub const fn reveal_set_prefix_file(&self) -> &FileIdentity {
+        &self.reveal_set_prefix_file
+    }
+
+    pub const fn ceremony_id(&self) -> [u8; 32] {
+        self.ceremony_id
+    }
+
+    pub fn output(&self) -> &Path {
+        self.staged.output()
+    }
+
+    pub const fn record_file(&self) -> &FileIdentity {
+        self.staged.record_file()
+    }
+
+    pub const fn record_content_digest(&self) -> [u8; 32] {
+        self.staged.record_content_digest()
+    }
+
+    pub const fn signed_record_digest(&self) -> [u8; 32] {
+        self.staged.signed_record_digest()
+    }
+
+    pub const fn signature_message(&self) -> [u8; 32] {
+        self.staged.signature_message()
+    }
+
+    pub const fn signer_count(&self) -> u16 {
+        self.staged.signer_count()
+    }
+
+    pub const fn durability(&self) -> ProductionDoryV3CeremonyRecordStageDurability {
+        self.staged.durability()
+    }
+
+    pub const fn publication_pending(&self) -> bool {
+        self.staged.publication_pending()
+    }
+}
+
 impl RetainedProductionDoryV3FinalReceiptOrchestrationInputs {
     pub fn plan_path(&self) -> &Path {
         &self.plan.path
@@ -158,6 +320,54 @@ pub enum ProductionDoryV3FinalReceiptOrchestrationError {
         "expected between one and {maximum} ordered independent-evidence bundles, observed {actual}"
     )]
     IndependentEvidenceCount { maximum: usize, actual: usize },
+    #[error("declared artifacts for {first} and {second} resolve to the same retained file")]
+    AliasedArtifacts { first: String, second: String },
+    #[error("no validated retained capability covers declared artifact {0}")]
+    MissingRetainedArtifact(String),
+    #[error("validated capabilities disagree on the retained filesystem identity for {0}")]
+    RetainedArtifactIdentityMismatch(String),
+    #[error("a validated capability retained an artifact absent from the strict plan: {0}")]
+    UnexpectedRetainedArtifact(PathBuf),
+    #[error(
+        "reproduction report {index} has {actual} bytes; expected exactly {expected} canonical bytes"
+    )]
+    ReproductionReportLength {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("reproduction report {index} changed between authenticated reads")]
+    ReproductionReportChanged { index: usize },
+    #[error("reproduction report {index} failed context verification: {source}")]
+    ReproductionReport {
+        index: usize,
+        #[source]
+        source: ProductionDoryV3ModelReproductionReportError,
+    },
+    #[error("reproduction report at ordered position {position} declares index {actual}")]
+    ReproducerOrder { position: usize, actual: u16 },
+    #[error(
+        "verified reports require exactly {expected} Independent evidence bundles, observed {actual}"
+    )]
+    ExactIndependentEvidenceCount { expected: usize, actual: usize },
+    #[error("Independent lineage validation failed for reproducer {index}: {source}")]
+    IndependentLineage {
+        index: usize,
+        #[source]
+        source: ProductionDoryV3IndependentLineageError,
+    },
+    #[error("fresh combined-payload validation failed: {0}")]
+    Combined(#[source] ProductionDoryV3ModelCombinerError),
+    #[error("exact-roster final-candidate validation failed: {0}")]
+    FinalCandidate(#[from] ProductionDoryV3ModelFinalCandidateValidationError),
+    #[error("keyless Type-6 preparation or staging failed: {0}")]
+    Authoring(#[from] ProductionDoryV3CeremonyAuthoringError),
+    #[error("failed to inspect the process open-file descriptor limit: {0}")]
+    OpenFileDescriptorLimit(#[source] std::io::Error),
+    #[error(
+        "production Type-6 orchestration requires an open-file descriptor soft limit of at least {required}, observed {actual}"
+    )]
+    InsufficientOpenFileDescriptorLimit { required: usize, actual: u64 },
 }
 
 impl From<CeremonyFsError> for ProductionDoryV3FinalReceiptOrchestrationError {
@@ -260,6 +470,332 @@ fn load_production_dory_v3_final_receipt_orchestration_plan_with_final_reauthent
     })
 }
 
+/// Authenticate every path named by a strict plan, validate the complete
+/// A-through-G semantic chain, and return only public Type-6 signing material
+/// plus the retained capabilities needed for guarded staging.
+pub fn prepare_production_dory_v3_final_receipt_from_orchestration_plan(
+    plan_path: &Path,
+    expected_ceremony_id: [u8; 32],
+) -> Result<
+    PreparedProductionDoryV3FinalReceiptOrchestration,
+    ProductionDoryV3FinalReceiptOrchestrationError,
+> {
+    let inputs =
+        load_production_dory_v3_final_receipt_orchestration_plan(plan_path, expected_ceremony_id)?;
+    prepare_loaded_production_dory_v3_final_receipt_orchestration(inputs)
+}
+
+fn prepare_loaded_production_dory_v3_final_receipt_orchestration(
+    mut inputs: RetainedProductionDoryV3FinalReceiptOrchestrationInputs,
+) -> Result<
+    PreparedProductionDoryV3FinalReceiptOrchestration,
+    ProductionDoryV3FinalReceiptOrchestrationError,
+> {
+    let artifacts = &inputs._artifacts;
+    let transcript = &inputs.transcript;
+    preflight_open_file_descriptor_capacity(
+        transcript.operators().len(),
+        transcript.reproducers().len(),
+        artifacts.ordered_independent_evidence.len(),
+    )?;
+
+    // A-B: the exact contribution roster freshly reconstructs and validates
+    // the shared raw payload against the independently anchored Type-5 prefix.
+    let combined = validate_existing_production_dory_v3_model_combined_payload(
+        transcript,
+        &artifacts.ordered_contributions,
+        &artifacts.shared_candidate.raw_payload,
+    )
+    .map_err(ProductionDoryV3FinalReceiptOrchestrationError::Combined)?;
+
+    // C: each fixed-width canonical CMFDRP is read twice through its retained
+    // handle and context-verified in frozen roster order.
+    let mut reports = Vec::with_capacity(artifacts.ordered_reproducers.len());
+    for (index, reproducer) in artifacts.ordered_reproducers.iter().enumerate() {
+        let bytes = read_authenticated_reproduction_report(&reproducer.reproduction_report, index)?;
+        let report =
+            verify_production_dory_v3_model_reproduction_report(&bytes, transcript, &combined)
+                .map_err(|source| {
+                    ProductionDoryV3FinalReceiptOrchestrationError::ReproductionReport {
+                        index,
+                        source,
+                    }
+                })?;
+        reports.push(report);
+    }
+
+    // D-E: dense evidence is consumed only for the filtered Independent
+    // report order. Exact count is checked before opening any CMFDIL evidence.
+    let descriptors: Vec<_> = reports
+        .iter()
+        .map(|report| {
+            (
+                report.report().reproducer_index(),
+                report.report().implementation_kind(),
+            )
+        })
+        .collect();
+    let independent_positions = require_ordered_reports_and_independent_evidence(
+        &descriptors,
+        artifacts.ordered_independent_evidence.len(),
+    )?;
+    let mut independent_lineages = Vec::with_capacity(independent_positions.len());
+    for (independent, index) in artifacts
+        .ordered_independent_evidence
+        .iter()
+        .zip(independent_positions)
+    {
+        let report = &reports[index];
+        let reproducer = &artifacts.ordered_reproducers[index];
+        let paths = independent_lineage_evidence_paths(reproducer, independent);
+        independent_lineages.push(
+            validate_existing_production_dory_v3_independent_lineage(
+                &reproducer.implementation_lineage_report,
+                paths,
+                transcript,
+                report,
+            )
+            .map_err(|source| {
+                ProductionDoryV3FinalReceiptOrchestrationError::IndependentLineage { index, source }
+            })?,
+        );
+    }
+    let lineages = VerifiedProductionDoryV3ReproducerLineages::verify_exact_ordered(
+        transcript,
+        &reports,
+        independent_lineages,
+    )?;
+
+    // F: repeat fresh combined/report validation inside the existing retained
+    // exact-candidate validator, including roots, structure, bank and Record V2.
+    let shared = ProductionDoryV3ModelFinalCandidatePaths {
+        source_bundle: &artifacts.shared_candidate.source_bundle,
+        source_bundle_policy: &artifacts.shared_candidate.source_bundle_policy,
+        raw_payload: &artifacts.shared_candidate.raw_payload,
+        roots_file: &artifacts.shared_candidate.roots_file,
+        structural_report: &artifacts.shared_candidate.structural_report,
+        bank_file: &artifacts.shared_candidate.bank_file,
+        manifest_file: &artifacts.shared_candidate.manifest_file,
+        record_v2_file: &artifacts.shared_candidate.record_v2_file,
+    };
+    let reproducer_paths: Vec<_> = artifacts
+        .ordered_reproducers
+        .iter()
+        .map(|reproducer| ProductionDoryV3ModelReproducerCandidatePaths {
+            reproduction_report: &reproducer.reproduction_report,
+            combiner_binary: &reproducer.combiner_binary,
+            combiner_report: &reproducer.combiner_report,
+            bootstrap_report: &reproducer.bootstrap_report,
+            record_ceremony_report: &reproducer.record_ceremony_report,
+            host_environment_report: &reproducer.host_environment_report,
+            source_extraction_report: &reproducer.source_extraction_report,
+            command_log: &reproducer.command_log,
+            implementation_lineage_report: &reproducer.implementation_lineage_report,
+        })
+        .collect();
+    let candidate = validate_existing_production_dory_v3_model_final_candidate(
+        transcript,
+        lineages,
+        &artifacts.ordered_contributions,
+        shared,
+        &reproducer_paths,
+    )?;
+
+    // G: compare filesystem identities across the already-retained plan,
+    // prefix, candidate, and CMFDIL capabilities. Same-path overlap between
+    // validators is coalesced; different declared paths may never hardlink.
+    validate_global_retained_artifact_identities(&inputs, &candidate)?;
+    let authoring_transcript = inputs.transcript.clone();
+    inputs.reauthenticate_retained_inputs()?;
+    let prepared = prepare_production_dory_v3_final_receipt(authoring_transcript, candidate)?;
+    Ok(PreparedProductionDoryV3FinalReceiptOrchestration { inputs, prepared })
+}
+
+fn retained_handle_count(
+    operator_count: usize,
+    reproducer_count: usize,
+    independent_count: usize,
+) -> usize {
+    FIXED_RETAINED_HANDLES
+        + RETAINED_HANDLES_PER_CONTRIBUTION * operator_count
+        + RETAINED_HANDLES_PER_REPRODUCER * reproducer_count
+        + RETAINED_HANDLES_PER_INDEPENDENT_LINEAGE * independent_count
+}
+
+fn required_open_file_descriptor_soft_limit(
+    operator_count: usize,
+    reproducer_count: usize,
+    independent_count: usize,
+) -> usize {
+    (retained_handle_count(operator_count, reproducer_count, independent_count)
+        + OPEN_FILE_DESCRIPTOR_RESERVE)
+        .max(MINIMUM_OPEN_FILE_DESCRIPTOR_SOFT_LIMIT)
+}
+
+#[cfg(unix)]
+fn preflight_open_file_descriptor_capacity(
+    operator_count: usize,
+    reproducer_count: usize,
+    independent_count: usize,
+) -> Result<(), ProductionDoryV3FinalReceiptOrchestrationError> {
+    let required = required_open_file_descriptor_soft_limit(
+        operator_count,
+        reproducer_count,
+        independent_count,
+    );
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `limit` points to writable storage for one `rlimit`, and the
+    // result is read only after `getrlimit` reports success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(
+            ProductionDoryV3FinalReceiptOrchestrationError::OpenFileDescriptorLimit(
+                std::io::Error::last_os_error(),
+            ),
+        );
+    }
+    // SAFETY: the successful call above initialized the complete value.
+    let limit = unsafe { limit.assume_init() };
+    let actual = (limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur as u64);
+    require_open_file_descriptor_soft_limit(required, actual)
+}
+
+#[cfg(not(unix))]
+fn preflight_open_file_descriptor_capacity(
+    operator_count: usize,
+    reproducer_count: usize,
+    independent_count: usize,
+) -> Result<(), ProductionDoryV3FinalReceiptOrchestrationError> {
+    // Windows kernel handles do not have an RLIMIT_NOFILE-style process soft
+    // limit. Still compute the documented bound, while every retained open
+    // remains fail-closed through ceremony_fs.
+    let required = required_open_file_descriptor_soft_limit(
+        operator_count,
+        reproducer_count,
+        independent_count,
+    );
+    require_open_file_descriptor_soft_limit(required, None)
+}
+
+fn require_open_file_descriptor_soft_limit(
+    required: usize,
+    actual: Option<u64>,
+) -> Result<(), ProductionDoryV3FinalReceiptOrchestrationError> {
+    match actual {
+        Some(actual) if actual < required as u64 => Err(
+            ProductionDoryV3FinalReceiptOrchestrationError::InsufficientOpenFileDescriptorLimit {
+                required,
+                actual,
+            },
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Consume one live plan-to-Type-6 capability, verify external full-roster
+/// signatures, and create-new stage the canonical Type-6 record. The plan and
+/// Type-5 prefix are reauthenticated immediately before both candidate guards,
+/// including the final bank-last guard after the output is reopened.
+pub fn stage_production_dory_v3_final_receipt_orchestration(
+    prepared: PreparedProductionDoryV3FinalReceiptOrchestration,
+    signatures: Vec<RecordSignature>,
+    output_path: &Path,
+) -> Result<
+    ProductionDoryV3FinalReceiptOrchestrationStageReport,
+    ProductionDoryV3FinalReceiptOrchestrationError,
+> {
+    let PreparedProductionDoryV3FinalReceiptOrchestration {
+        mut inputs,
+        prepared,
+    } = prepared;
+    let plan_path = inputs.plan_path().to_path_buf();
+    let plan_file = inputs.plan_file().clone();
+    let reveal_set_prefix_path = inputs.reveal_set_prefix_path().to_path_buf();
+    let reveal_set_prefix_file = inputs.reveal_set_prefix_file().clone();
+    let ceremony_id = inputs.ceremony_id();
+    let staged = stage_production_dory_v3_final_receipt_with_retained_input_guard(
+        prepared,
+        signatures,
+        output_path,
+        || {
+            inputs.reauthenticate_retained_inputs().map_err(|error| {
+                ProductionDoryV3CeremonyAuthoringError::RetainedInputGuard(error.to_string())
+            })
+        },
+    )?;
+    Ok(ProductionDoryV3FinalReceiptOrchestrationStageReport {
+        plan_path,
+        plan_file,
+        reveal_set_prefix_path,
+        reveal_set_prefix_file,
+        ceremony_id,
+        staged,
+    })
+}
+
+pub fn stage_production_dory_v3_final_receipt_from_orchestration_plan(
+    plan_path: &Path,
+    expected_ceremony_id: [u8; 32],
+    signatures: Vec<RecordSignature>,
+    output_path: &Path,
+) -> Result<
+    ProductionDoryV3FinalReceiptOrchestrationStageReport,
+    ProductionDoryV3FinalReceiptOrchestrationError,
+> {
+    let prepared = prepare_production_dory_v3_final_receipt_from_orchestration_plan(
+        plan_path,
+        expected_ceremony_id,
+    )?;
+    stage_production_dory_v3_final_receipt_orchestration(prepared, signatures, output_path)
+}
+
+fn require_ordered_reports_and_independent_evidence(
+    reports: &[(u16, ProductionDoryV3ReproductionImplementationKind)],
+    evidence_count: usize,
+) -> Result<Vec<usize>, ProductionDoryV3FinalReceiptOrchestrationError> {
+    let mut independent = Vec::new();
+    for (position, (actual, kind)) in reports.iter().copied().enumerate() {
+        if usize::from(actual) != position {
+            return Err(
+                ProductionDoryV3FinalReceiptOrchestrationError::ReproducerOrder {
+                    position,
+                    actual,
+                },
+            );
+        }
+        if kind == ProductionDoryV3ReproductionImplementationKind::Independent {
+            independent.push(position);
+        }
+    }
+    if evidence_count != independent.len() {
+        return Err(
+            ProductionDoryV3FinalReceiptOrchestrationError::ExactIndependentEvidenceCount {
+                expected: independent.len(),
+                actual: evidence_count,
+            },
+        );
+    }
+    Ok(independent)
+}
+
+fn independent_lineage_evidence_paths<'a>(
+    reproducer: &'a ReproducerCandidatePaths,
+    independent: &'a IndependentEvidencePaths,
+) -> ProductionDoryV3IndependentLineageEvidencePaths<'a> {
+    ProductionDoryV3IndependentLineageEvidencePaths {
+        combiner_source_bundle: &independent.combiner_source_bundle,
+        combiner_build_provenance: &independent.combiner_build_provenance,
+        combiner_binary: &reproducer.combiner_binary,
+        roots_calculator_source_bundle: &independent.roots_calculator_source_bundle,
+        roots_calculator_build_provenance: &independent.roots_calculator_build_provenance,
+        roots_calculator_binary: &independent.roots_calculator_binary,
+        independent_lineage_review_report: &independent.independent_lineage_review_report,
+        conformance_test_report: &independent.conformance_test_report,
+        host_environment_report: &reproducer.host_environment_report,
+        source_extraction_report: &reproducer.source_extraction_report,
+        command_log: &reproducer.command_log,
+    }
+}
+
 fn validate_declared_paths(
     plan_path: &Path,
     artifacts: &ProductionDoryV3FinalReceiptArtifactsV1,
@@ -267,23 +803,7 @@ fn validate_declared_paths(
     // This routing layer deliberately requires every declared pathname to be
     // textually distinct. Later semantic validators additionally open the real
     // files and reject filesystem-identity aliases within their authority sets.
-    let mut paths = vec![
-        ("plan".to_owned(), plan_path),
-        (
-            "reveal_set_prefix".to_owned(),
-            artifacts.reveal_set_prefix.as_path(),
-        ),
-    ];
-    for (index, path) in artifacts.ordered_contributions.iter().enumerate() {
-        paths.push((format!("ordered_contributions[{index}]"), path));
-    }
-    push_shared_candidate_paths(&mut paths, &artifacts.shared_candidate);
-    for (index, reproducer) in artifacts.ordered_reproducers.iter().enumerate() {
-        push_reproducer_paths(&mut paths, index, reproducer);
-    }
-    for (index, evidence) in artifacts.ordered_independent_evidence.iter().enumerate() {
-        push_independent_evidence_paths(&mut paths, index, evidence);
-    }
+    let paths = declared_paths(plan_path, artifacts);
 
     for first in 0..paths.len() {
         for second in first + 1..paths.len() {
@@ -301,6 +821,30 @@ fn validate_declared_paths(
         drop(TrustedCeremonyParent::for_artifact(path)?);
     }
     Ok(())
+}
+
+fn declared_paths<'a>(
+    plan_path: &'a Path,
+    artifacts: &'a ProductionDoryV3FinalReceiptArtifactsV1,
+) -> Vec<(String, &'a Path)> {
+    let mut paths = vec![
+        ("plan".to_owned(), plan_path),
+        (
+            "reveal_set_prefix".to_owned(),
+            artifacts.reveal_set_prefix.as_path(),
+        ),
+    ];
+    for (index, path) in artifacts.ordered_contributions.iter().enumerate() {
+        paths.push((format!("ordered_contributions[{index}]"), path));
+    }
+    push_shared_candidate_paths(&mut paths, &artifacts.shared_candidate);
+    for (index, reproducer) in artifacts.ordered_reproducers.iter().enumerate() {
+        push_reproducer_paths(&mut paths, index, reproducer);
+    }
+    for (index, evidence) in artifacts.ordered_independent_evidence.iter().enumerate() {
+        push_independent_evidence_paths(&mut paths, index, evidence);
+    }
+    paths
 }
 
 fn push_shared_candidate_paths<'a>(
@@ -425,6 +969,107 @@ fn push_independent_evidence_paths<'a>(
             evidence.conformance_test_report.as_path(),
         ),
     ]);
+}
+
+fn read_authenticated_reproduction_report(
+    path: &Path,
+    index: usize,
+) -> Result<Vec<u8>, ProductionDoryV3FinalReceiptOrchestrationError> {
+    let parent = TrustedCeremonyParent::for_artifact(path)?;
+    let expected = PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES;
+    let mut input = AuthenticatedInput::open(&parent, path, Some(expected as u64))?;
+    let first = input.read_bounded(expected)?;
+    if first.len() != expected {
+        return Err(
+            ProductionDoryV3FinalReceiptOrchestrationError::ReproductionReportLength {
+                index,
+                expected,
+                actual: first.len(),
+            },
+        );
+    }
+    input.recheck(&parent, Some(expected as u64))?;
+    let second = input.read_bounded(expected)?;
+    input.recheck(&parent, Some(expected as u64))?;
+    if second != first {
+        return Err(
+            ProductionDoryV3FinalReceiptOrchestrationError::ReproductionReportChanged { index },
+        );
+    }
+    Ok(first)
+}
+
+fn validate_global_retained_artifact_identities(
+    inputs: &RetainedProductionDoryV3FinalReceiptOrchestrationInputs,
+    candidate: &ValidatedProductionDoryV3ModelFinalCandidate,
+) -> Result<(), ProductionDoryV3FinalReceiptOrchestrationError> {
+    let mut retained = candidate.retained_filesystem_entries();
+    retained.push((
+        inputs.plan_path().to_path_buf(),
+        inputs.plan.input.identity(),
+    ));
+    retained.push((
+        inputs.reveal_set_prefix_path().to_path_buf(),
+        inputs.reveal_set_prefix.input.identity(),
+    ));
+
+    let declared = declared_paths(inputs.plan_path(), &inputs._artifacts);
+    validate_global_retained_artifact_identity_entries(&declared, &retained)
+}
+
+fn validate_global_retained_artifact_identity_entries(
+    declared: &[(String, &Path)],
+    retained: &[(PathBuf, CeremonyFilesystemIdentity)],
+) -> Result<(), ProductionDoryV3FinalReceiptOrchestrationError> {
+    for (path, _) in retained {
+        if !declared
+            .iter()
+            .any(|(_, declared_path)| *declared_path == path)
+        {
+            return Err(
+                ProductionDoryV3FinalReceiptOrchestrationError::UnexpectedRetainedArtifact(
+                    path.clone(),
+                ),
+            );
+        }
+    }
+
+    let mut unique: Vec<(String, &Path, CeremonyFilesystemIdentity)> =
+        Vec::with_capacity(declared.len());
+    for (role, path) in declared {
+        let mut matches = retained
+            .iter()
+            .filter(|(retained_path, _)| retained_path == path);
+        let Some((_, identity)) = matches.next() else {
+            return Err(
+                ProductionDoryV3FinalReceiptOrchestrationError::MissingRetainedArtifact(
+                    role.clone(),
+                ),
+            );
+        };
+        if matches.any(|(_, observed)| observed != identity) {
+            return Err(
+                ProductionDoryV3FinalReceiptOrchestrationError::RetainedArtifactIdentityMismatch(
+                    role.clone(),
+                ),
+            );
+        }
+        unique.push((role.clone(), *path, *identity));
+    }
+
+    for second in 0..unique.len() {
+        for first in 0..second {
+            if unique[first].2 == unique[second].2 {
+                return Err(
+                    ProductionDoryV3FinalReceiptOrchestrationError::AliasedArtifacts {
+                        first: unique[first].0.clone(),
+                        second: unique[second].0.clone(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 struct RetainedAuthenticatedSmallFile {
@@ -850,6 +1495,13 @@ mod tests {
         path
     }
 
+    fn filesystem_identity(path: &Path) -> CeremonyFilesystemIdentity {
+        let parent = TrustedCeremonyParent::for_artifact(path).unwrap();
+        AuthenticatedInput::open(&parent, path, None)
+            .unwrap()
+            .identity()
+    }
+
     #[test]
     fn canonical_paths_only_plan_loads_and_retains_exact_inputs() {
         let directory = TestDirectory::new();
@@ -882,6 +1534,247 @@ mod tests {
         assert_eq!(loaded.operator_count(), 3);
         assert_eq!(loaded.reproducer_count(), 2);
         loaded.reauthenticate_retained_inputs().unwrap();
+    }
+
+    #[test]
+    fn report_order_and_dense_independent_evidence_are_fail_closed() {
+        use ProductionDoryV3ReproductionImplementationKind::{Independent, Reference};
+
+        let honest = [
+            (0, Reference),
+            (1, Independent),
+            (2, Reference),
+            (3, Independent),
+        ];
+        assert_eq!(
+            require_ordered_reports_and_independent_evidence(&honest, 2).unwrap(),
+            [1, 3]
+        );
+
+        let swapped = [(1, Independent), (0, Reference)];
+        assert!(matches!(
+            require_ordered_reports_and_independent_evidence(&swapped, 1),
+            Err(
+                ProductionDoryV3FinalReceiptOrchestrationError::ReproducerOrder {
+                    position: 0,
+                    actual: 1
+                }
+            )
+        ));
+        for actual in [1, 3] {
+            assert!(matches!(
+                require_ordered_reports_and_independent_evidence(&honest, actual),
+                Err(ProductionDoryV3FinalReceiptOrchestrationError::
+                    ExactIndependentEvidenceCount {
+                        expected: 2,
+                        actual: observed
+                    }) if observed == actual
+            ));
+        }
+    }
+
+    #[test]
+    fn retained_handle_budget_is_bounded_before_heavy_validation() {
+        assert_eq!(retained_handle_count(3, 2, 1), 92);
+        assert_eq!(required_open_file_descriptor_soft_limit(3, 2, 1), 1024);
+        assert_eq!(retained_handle_count(16, 16, 16), 730);
+        assert_eq!(required_open_file_descriptor_soft_limit(16, 16, 16), 1024);
+        assert!(matches!(
+            require_open_file_descriptor_soft_limit(1024, Some(1023)),
+            Err(ProductionDoryV3FinalReceiptOrchestrationError::
+                InsufficientOpenFileDescriptorLimit {
+                    required: 1024,
+                    actual: 1023
+                })
+        ));
+        require_open_file_descriptor_soft_limit(1024, Some(1024)).unwrap();
+        require_open_file_descriptor_soft_limit(1024, None).unwrap();
+        preflight_open_file_descriptor_capacity(3, 2, 1).unwrap();
+    }
+
+    #[test]
+    fn independent_lineage_path_mapping_uses_only_the_verified_dense_slot() {
+        let directory = TestDirectory::new();
+        let reproducer = ReproducerCandidatePaths {
+            reproduction_report: directory.path("report"),
+            combiner_binary: directory.path("combiner-binary"),
+            combiner_report: directory.path("combiner-report"),
+            bootstrap_report: directory.path("bootstrap-report"),
+            record_ceremony_report: directory.path("record-report"),
+            host_environment_report: directory.path("host"),
+            source_extraction_report: directory.path("extraction"),
+            command_log: directory.path("command"),
+            implementation_lineage_report: directory.path("lineage"),
+        };
+        let independent = IndependentEvidencePaths {
+            combiner_source_bundle: directory.path("combiner-source"),
+            combiner_build_provenance: directory.path("combiner-build"),
+            roots_calculator_source_bundle: directory.path("roots-source"),
+            roots_calculator_build_provenance: directory.path("roots-build"),
+            roots_calculator_binary: directory.path("roots-binary"),
+            independent_lineage_review_report: directory.path("review"),
+            conformance_test_report: directory.path("conformance"),
+        };
+        let mapped = independent_lineage_evidence_paths(&reproducer, &independent);
+        assert_eq!(
+            mapped.combiner_source_bundle,
+            independent.combiner_source_bundle
+        );
+        assert_eq!(
+            mapped.combiner_build_provenance,
+            independent.combiner_build_provenance
+        );
+        assert_eq!(mapped.combiner_binary, reproducer.combiner_binary);
+        assert_eq!(
+            mapped.roots_calculator_source_bundle,
+            independent.roots_calculator_source_bundle
+        );
+        assert_eq!(
+            mapped.roots_calculator_build_provenance,
+            independent.roots_calculator_build_provenance
+        );
+        assert_eq!(
+            mapped.roots_calculator_binary,
+            independent.roots_calculator_binary
+        );
+        assert_eq!(
+            mapped.independent_lineage_review_report,
+            independent.independent_lineage_review_report
+        );
+        assert_eq!(
+            mapped.conformance_test_report,
+            independent.conformance_test_report
+        );
+        assert_eq!(
+            mapped.host_environment_report,
+            reproducer.host_environment_report
+        );
+        assert_eq!(
+            mapped.source_extraction_report,
+            reproducer.source_extraction_report
+        );
+        assert_eq!(mapped.command_log, reproducer.command_log);
+    }
+
+    #[test]
+    fn global_retained_identity_registry_coalesces_overlap_and_rejects_aliases() {
+        let directory = TestDirectory::new();
+        let first = directory.path("first");
+        let second = directory.path("second");
+        let third = directory.path("third");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::write(&third, b"third").unwrap();
+        let first_identity = filesystem_identity(&first);
+        let second_identity = filesystem_identity(&second);
+        let third_identity = filesystem_identity(&third);
+        let declared = vec![
+            ("first".to_owned(), first.as_path()),
+            ("second".to_owned(), second.as_path()),
+        ];
+
+        validate_global_retained_artifact_identity_entries(
+            &declared,
+            &[
+                (first.clone(), first_identity),
+                (second.clone(), second_identity),
+                (second.clone(), second_identity),
+            ],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            validate_global_retained_artifact_identity_entries(
+                &declared,
+                &[(first.clone(), first_identity), (second.clone(), first_identity)]
+            ),
+            Err(ProductionDoryV3FinalReceiptOrchestrationError::AliasedArtifacts {
+                first: first_role,
+                second: second_role
+            }) if first_role == "first" && second_role == "second"
+        ));
+        assert!(matches!(
+            validate_global_retained_artifact_identity_entries(
+                &declared,
+                &[
+                    (first.clone(), first_identity),
+                    (second.clone(), second_identity),
+                    (second.clone(), third_identity),
+                ]
+            ),
+            Err(ProductionDoryV3FinalReceiptOrchestrationError::
+                RetainedArtifactIdentityMismatch(role)) if role == "second"
+        ));
+        assert!(matches!(
+            validate_global_retained_artifact_identity_entries(
+                &declared,
+                &[(first.clone(), first_identity)]
+            ),
+            Err(ProductionDoryV3FinalReceiptOrchestrationError::MissingRetainedArtifact(role))
+                if role == "second"
+        ));
+        assert!(matches!(
+            validate_global_retained_artifact_identity_entries(
+                &declared,
+                &[
+                    (first.clone(), first_identity),
+                    (second.clone(), second_identity),
+                    (third.clone(), third_identity),
+                ]
+            ),
+            Err(ProductionDoryV3FinalReceiptOrchestrationError::UnexpectedRetainedArtifact(path))
+                if path == third
+        ));
+    }
+
+    #[test]
+    fn bank_chain_duplicate_manifest_and_record_identities_must_match() {
+        let directory = TestDirectory::new();
+        let manifest = directory.path("manifest.json");
+        let record_v2 = directory.path("record-v2.json");
+        let replacement = directory.path("replacement");
+        fs::write(&manifest, b"manifest").unwrap();
+        fs::write(&record_v2, b"record-v2").unwrap();
+        fs::write(&replacement, b"replacement").unwrap();
+        let manifest_identity = filesystem_identity(&manifest);
+        let record_v2_identity = filesystem_identity(&record_v2);
+        let replacement_identity = filesystem_identity(&replacement);
+        let declared = vec![
+            (
+                "shared_candidate.manifest_file".to_owned(),
+                manifest.as_path(),
+            ),
+            (
+                "shared_candidate.record_v2_file".to_owned(),
+                record_v2.as_path(),
+            ),
+        ];
+
+        for (path, second, expected_role) in [
+            (
+                manifest.clone(),
+                replacement_identity,
+                "shared_candidate.manifest_file",
+            ),
+            (
+                record_v2.clone(),
+                replacement_identity,
+                "shared_candidate.record_v2_file",
+            ),
+        ] {
+            assert!(matches!(
+                validate_global_retained_artifact_identity_entries(
+                    &declared,
+                    &[
+                        (manifest.clone(), manifest_identity),
+                        (record_v2.clone(), record_v2_identity),
+                        (path, second),
+                    ]
+                ),
+                Err(ProductionDoryV3FinalReceiptOrchestrationError::
+                    RetainedArtifactIdentityMismatch(role)) if role == expected_role
+            ));
+        }
     }
 
     #[test]

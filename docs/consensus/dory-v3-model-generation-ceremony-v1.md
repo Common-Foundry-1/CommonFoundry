@@ -1329,11 +1329,147 @@ each mirrored copy, check for equivocation, and retain those receipts before
 advancing the ceremony. None of these authoring commands uploads, mirrors,
 declares publication complete, or activates production consensus.
 
+### Prepare and stage the type-6 final receipt
+
+Type 6 uses a separate strict paths-only orchestration plan. The plan is
+routing input, not candidate authority: every named artifact is opened and
+authenticated by the corresponding retained validator before a receipt can be
+prepared. The exact V1 JSON shape is:
+
+```json
+{
+  "plan_type": "production_dory_v3_final_receipt_v1",
+  "artifacts": {
+    "reveal_set_prefix": "/srv/cmfd/ceremony/records/REVEAL-SET-CLOSED.cmfd",
+    "ordered_contributions": [
+      "/srv/cmfd/ceremony/contributions/operator-0.bin",
+      "/srv/cmfd/ceremony/contributions/operator-1.bin",
+      "/srv/cmfd/ceremony/contributions/operator-2.bin"
+    ],
+    "shared_candidate": {
+      "source_bundle": "/srv/cmfd/ceremony/candidate/source-bundle.tar",
+      "source_bundle_policy": "/srv/cmfd/ceremony/candidate/source-bundle-policy.json",
+      "raw_payload": "/srv/cmfd/ceremony/candidate/raw-payload.bin",
+      "roots_file": "/srv/cmfd/ceremony/candidate/roots.cmfdmr01",
+      "structural_report": "/srv/cmfd/ceremony/candidate/structure.cmfdsr01",
+      "bank_file": "/srv/cmfd/ceremony/candidate/model-bank.bin",
+      "manifest_file": "/srv/cmfd/ceremony/candidate/manifest.json",
+      "record_v2_file": "/srv/cmfd/ceremony/candidate/record-v2.json"
+    },
+    "ordered_reproducers": [
+      {
+        "reproduction_report": "/srv/cmfd/ceremony/reproducer-0/reproduction.cmfdrp01",
+        "combiner_binary": "/srv/cmfd/ceremony/reproducer-0/combiner.bin",
+        "combiner_report": "/srv/cmfd/ceremony/reproducer-0/combiner-report.json",
+        "bootstrap_report": "/srv/cmfd/ceremony/reproducer-0/bootstrap-report.json",
+        "record_ceremony_report": "/srv/cmfd/ceremony/reproducer-0/record-ceremony-report.json",
+        "host_environment_report": "/srv/cmfd/ceremony/reproducer-0/host-environment.json",
+        "source_extraction_report": "/srv/cmfd/ceremony/reproducer-0/source-extraction.json",
+        "command_log": "/srv/cmfd/ceremony/reproducer-0/commands.log",
+        "implementation_lineage_report": "/srv/cmfd/ceremony/reproducer-0/lineage.cmfdil01"
+      },
+      {
+        "reproduction_report": "/srv/cmfd/ceremony/reproducer-1/reproduction.cmfdrp01",
+        "combiner_binary": "/srv/cmfd/ceremony/reproducer-1/combiner.bin",
+        "combiner_report": "/srv/cmfd/ceremony/reproducer-1/combiner-report.json",
+        "bootstrap_report": "/srv/cmfd/ceremony/reproducer-1/bootstrap-report.json",
+        "record_ceremony_report": "/srv/cmfd/ceremony/reproducer-1/record-ceremony-report.json",
+        "host_environment_report": "/srv/cmfd/ceremony/reproducer-1/host-environment.json",
+        "source_extraction_report": "/srv/cmfd/ceremony/reproducer-1/source-extraction.json",
+        "command_log": "/srv/cmfd/ceremony/reproducer-1/commands.log",
+        "implementation_lineage_report": "/srv/cmfd/ceremony/reproducer-1/lineage.cmfdil01"
+      }
+    ],
+    "ordered_independent_evidence": [
+      {
+        "combiner_source_bundle": "/srv/cmfd/ceremony/independent-0/combiner-source.tar",
+        "combiner_build_provenance": "/srv/cmfd/ceremony/independent-0/combiner-build.json",
+        "roots_calculator_source_bundle": "/srv/cmfd/ceremony/independent-0/roots-source.tar",
+        "roots_calculator_build_provenance": "/srv/cmfd/ceremony/independent-0/roots-build.json",
+        "roots_calculator_binary": "/srv/cmfd/ceremony/independent-0/roots-calculator.bin",
+        "independent_lineage_review_report": "/srv/cmfd/ceremony/independent-0/lineage-review.json",
+        "conformance_test_report": "/srv/cmfd/ceremony/independent-0/conformance.json"
+      }
+    ]
+  }
+}
+```
+
+All paths must be absolute, normalized, pairwise distinct direct children of
+trusted private local directories. `ordered_contributions` is exact operator
+order and `ordered_reproducers` is exact reproducer-roster order.
+`ordered_independent_evidence` is the filtered order of those reproduction
+reports whose implementation kind is `Independent`; it contains exactly one
+entry for each such report and at least one entry. Its matching reproducer
+bundle supplies the lineage artifact, combiner binary, host report, source
+extraction report, and command log required by the complete CMFDIL evidence
+set. Unknown or missing JSON fields fail closed.
+
+On Unix, each preparation or staging process must start with a soft
+`RLIMIT_NOFILE` of at least 1024. The command checks this before heavy
+validation; the maximum retained capability set uses 730 handles and the
+remaining capacity covers transient validation and process descriptors.
+Windows has no equivalent per-process soft limit, and every individual open
+still fails closed.
+
+Prepare the public signing request with:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-final-receipt-prepare \
+  --plan /srv/cmfd/ceremony/plans/type-6-final-receipt.json \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS
+```
+
+This command verifies the independently anchored type-5 prefix, freshly
+validates the combined payload and every ordered reproduction report, verifies
+and retains the exact Independent CMFDIL subset, validates all shared and
+reproducer artifacts, and derives every type-6 field internally. It prints the
+plan and prefix identities, ceremony ID, record type, content digest, raw
+32-byte `signature_message`, exact ordered signer slots, signature algorithm,
+and `private_key_handling external_only`. It does not write a record, accept a
+prepared request as authority, or expose a secret-key option.
+Path values in this line-oriented output are JSON string literals so control
+characters cannot create forged status lines; consumers must JSON-decode the
+value after the field name.
+
+Every operator and reproducer independently runs preparation and compares the
+result. Each then produces one canonical BIP340 signature over the exact raw
+32-byte `signature_message`; the signer must not hash it again. For the minimum
+three-operator, two-reproducer roster, stage the record with:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-final-receipt-stage \
+  --plan /srv/cmfd/ceremony/plans/type-6-final-receipt.json \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --operator-signature 0:128_LOWERCASE_HEX \
+  --operator-signature 1:128_LOWERCASE_HEX \
+  --operator-signature 2:128_LOWERCASE_HEX \
+  --reproducer-signature 0:128_LOWERCASE_HEX \
+  --reproducer-signature 1:128_LOWERCASE_HEX \
+  --record-output /srv/cmfd/ceremony/records/009-type-6-final-receipt.cmfd
+```
+
+Preparation and staging are separate processes, while the validated candidate
+capability is deliberately non-cloneable and non-serializable. Staging
+therefore repeats the complete plan, transcript, lineage, combined-payload,
+and final-candidate validation instead of trusting or deserializing the earlier
+prepare output. It reconstructs the signing message, requires exactly every
+operator followed by every reproducer signature, and consumes the new opaque
+capability immediately. A missing, duplicate, extra, wrong-class, wrong-index,
+malformed, or invalid signature fails closed.
+
+The output must be a new absolute path. Staging writes and synchronizes the
+canonical record, reopens and verifies it, then reauthenticates the retained
+plan and type-5 prefix before the candidate's final bank-last guard. A failed
+guard removes the unconfirmed output. Successful output reports the signed
+record's ordinary BLAKE3 and SHA-256, content and signed-record digests, signer
+count, durability, and `mirror_publication_pending true`. Neither command
+publishes, mirrors, or activates the ceremony.
+
 ### Stage the completed transcript
 
-After separately preparing, signing, and authenticating the canonical type-6
-final-receipt record through the library API, create the exact Completed
-transcript with:
+After separately preparing, signing, staging, and authenticating the canonical
+type-6 final-receipt record, create the exact Completed transcript with:
 
 ```text
 cmfd-consensus dory-v3-model-ceremony-completed-transcript-stage \
@@ -1351,11 +1487,11 @@ then create-new writes and reopens the Completed transcript. Its report includes
 both input content identities, the output identity, protocol status, ceremony
 ID, derive-key digest, record count, durability, and publication-pending state.
 
-This command does not prepare or sign type 6 and does not validate the external
+This command does not prepare or sign type 6 and does not freshly validate the external
 candidate, `CMFDRP01`, or `CMFDIL01` artifact set named by its receipt. The
-capability-bound type-6 preparation and staging APIs remain library-only. It
-also does not publish, mirror, attest, or activate the transcript and accepts no
-private-key or signing options.
+separate final-receipt commands perform that validation. It also does not
+publish, mirror, attest, or activate the transcript and accepts no private-key
+or signing options.
 
 ### Prepare and stage the detached transcript attestation
 
@@ -1955,10 +2091,11 @@ complete pass independently counts and computes BLAKE3 and SHA-256 over the
 exact 6,442,975,416 bytes and exact EOF. Inter-pass and final identity rechecks,
 a final reread and reparse of both small files, and a bank-last recheck are
 required before the non-cloneable, non-serializable capability is returned. It
-is consumed only by the capability-bound type-6 preparation and staging API;
-there is no type-6 operator CLI yet. The private-workspace rule still excludes
-same-user concurrent writers; in particular, a retained read handle on Unix is
-not an exclusive content lock.
+is consumed only by the capability-bound type-6 preparation and staging API.
+The operator commands reconstruct that capability independently during both
+prepare and stage; they never serialize it. The private-workspace rule still
+excludes same-user concurrent writers; in particular, a retained read handle
+on Unix is not an exclusive content lock.
 
 The bank contains the 184-byte header followed by the payload, for exactly
 6,442,975,416 bytes and exact EOF. The bootstrap publishes bank and manifest as
@@ -2152,10 +2289,12 @@ Already implemented in this repository:
   final-candidate projections, and bounded known-answer, capability-boundary,
   mutation, context, completed, and aborted tests;
 - the exact-roster retained final-candidate validator plus capability-only
-  type-6 preparation and create-new signed-record staging. Every receipt field
-  is projected internally, same-ceremony alternate type-5 forks are rejected,
-  full-roster signatures are exact and ordered, and retained artifacts are
-  rechecked with the bank last before and after canonical output reopen. A
+  type-6 preparation and create-new signed-record staging, exposed through
+  keyless operator prepare/stage commands that independently revalidate the
+  strict paths-only plan. Every receipt field is projected internally,
+  same-ceremony alternate type-5 forks are rejected, full-roster signatures
+  are exact and ordered, and retained artifacts are rechecked with the bank
+  last before and after canonical output reopen. A
   dedicated parser requires an exact ceremony-ID-anchored Completed transcript.
   Completed-transcript library and operator staging retain and reauthenticate
   the exact type-5 prefix and signed type-6 record, verify the exact full-roster
@@ -2185,8 +2324,8 @@ Not implemented or not completed by this document:
 - public append-only bulletin submission, independently mirrored expected
   ceremony-ID tooling, receipt/equivocation handling, and independent external
   review of the transcript and detached-attestation implementation;
-- type-6 operator CLI integration plus an operator-scale rehearsal of the
-  existing type-6 and completed-transcript APIs;
+- cross-platform and operator-scale rehearsal of the type-6 and
+  completed-transcript commands;
 - independent security review and an operator-scale rehearsal of the keyless
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
@@ -2203,12 +2342,12 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice adds type-6 CLI integration around the
-existing capability-bound library APIs, cross-platform validation, and an
-operator-scale rehearsal of the keyless record, completed-transcript, and
-detached-attestation authoring paths. That is followed by public
-append-only transcript publication with independent mirror receipts and
-production-scale roots, structure, combiner, request, and proof qualification.
+The next minimal implementation slice performs cross-platform validation and
+an operator-scale rehearsal of the keyless type-6 record,
+completed-transcript, and detached-attestation authoring paths. That is
+followed by public append-only transcript publication with independent mirror
+receipts and production-scale roots, structure, combiner, request, and proof
+qualification.
 The transcript, generator, combiner, and new report tools still require
 independent external review before generating real contributions. A successful
 run of the current bootstrap or one local generator qualification is not a

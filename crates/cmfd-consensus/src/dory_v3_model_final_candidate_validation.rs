@@ -20,7 +20,10 @@ use crate::{
         ValidatedProductionDoryV3ModelBankRecordChain,
         validate_existing_production_dory_v3_model_bank_record_chain,
     },
-    dory_v3_model_ceremony_fs::{AuthenticatedInput, CeremonyFsError, TrustedCeremonyParent},
+    dory_v3_model_ceremony_fs::{
+        AuthenticatedInput, CeremonyFsError, FileIdentity as CeremonyFilesystemIdentity,
+        TrustedCeremonyParent,
+    },
     dory_v3_model_ceremony_transcript::{
         CeremonyTranscriptError, FileIdentity, FinalReceiptBody, PRODUCTION_BANK_BYTES,
         ReproducerReceipt, VerifiedCeremonyTranscript,
@@ -133,6 +136,15 @@ impl ValidatedProductionDoryV3ModelFinalCandidate {
         let body = self.inner.derive_final_receipt_body(transcript)?;
         self.recheck_retained_files()?;
         Ok(body)
+    }
+
+    pub(crate) fn retained_filesystem_entries(&self) -> Vec<(PathBuf, CeremonyFilesystemIdentity)> {
+        let mut entries = self.inner.retained.filesystem_entries();
+        entries.extend(self.inner.heavy.bank_chain.retained_filesystem_entries());
+        for independent in &self.inner.lineages.independent {
+            entries.extend(independent.lineage.retained_filesystem_entries());
+        }
+        entries
     }
 }
 
@@ -249,6 +261,10 @@ impl RetainedArtifact {
             expected_bytes,
             expected_identity: None,
         })
+    }
+
+    fn filesystem_entry(&self) -> (PathBuf, CeremonyFilesystemIdentity) {
+        (self.input.path().to_path_buf(), self.input.identity())
     }
 
     fn read_exact(
@@ -636,6 +652,41 @@ impl RetainedCandidateArtifacts {
             observe(&reproducer.implementation_lineage_report)?;
         }
         Ok(())
+    }
+
+    fn filesystem_entries(&self) -> Vec<(PathBuf, CeremonyFilesystemIdentity)> {
+        let mut entries = Vec::with_capacity(
+            8 + self.contributions.len() + self.reproducers.len().saturating_mul(9),
+        );
+        entries.extend([
+            self.shared.source_bundle.filesystem_entry(),
+            self.shared.source_bundle_policy.filesystem_entry(),
+            self.shared.raw_payload.filesystem_entry(),
+            self.shared.roots_file.filesystem_entry(),
+            self.shared.structural_report.filesystem_entry(),
+            self.shared.bank_file.filesystem_entry(),
+            self.shared.manifest_file.filesystem_entry(),
+            self.shared.record_v2_file.filesystem_entry(),
+        ]);
+        entries.extend(
+            self.contributions
+                .iter()
+                .map(RetainedArtifact::filesystem_entry),
+        );
+        for reproducer in &self.reproducers {
+            entries.extend([
+                reproducer.reproduction_report.filesystem_entry(),
+                reproducer.combiner_binary.filesystem_entry(),
+                reproducer.combiner_report.filesystem_entry(),
+                reproducer.bootstrap_report.filesystem_entry(),
+                reproducer.record_ceremony_report.filesystem_entry(),
+                reproducer.host_environment_report.filesystem_entry(),
+                reproducer.source_extraction_report.filesystem_entry(),
+                reproducer.command_log.filesystem_entry(),
+                reproducer.implementation_lineage_report.filesystem_entry(),
+            ]);
+        }
+        entries
     }
 
     fn recheck_except_bank(

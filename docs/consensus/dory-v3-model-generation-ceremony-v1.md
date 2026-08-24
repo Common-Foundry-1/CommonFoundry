@@ -282,6 +282,18 @@ A completed transcript therefore has exactly `2 * N + 4` records. An aborted
 transcript begins with the fully signed genesis, contains a valid prefix of the
 remaining sequence, then exactly one abort record, type 7, and EOF.
 
+The production combiner consumes an intermediate reveal-set-closed prefix with
+the same header and record framing, containing exactly the first `2 * N + 3`
+records through the fully signed type-5 closure and EOF. This prefix is neither
+a completed nor an aborted transcript and is not eligible for the detached
+transcript attestation. Its verifier requires a separately trusted expected
+`ceremony_id` in addition to validating every included record and closure.
+Only that anchored, exact type-5-terminal prefix may yield combiner bindings.
+The generic completed/aborted transcript parser is an inspection API without an
+external ceremony-identifier trust anchor and must not mint or expose a combine
+capability. Any future need to combine from a completed transcript requires a
+separate parser that takes and validates the independently trusted identifier.
+
 After assembly, exact transcript bytes are closed by this detached binary
 attestation:
 
@@ -645,6 +657,13 @@ identity/replacement event,
 11 I/O or resource failure, and 12 other fail-closed error. Reason 12 requires
 public evidence explaining the error.
 
+`phase` is signature-bound, operator-asserted incident metadata. It identifies
+the operation in which the failure occurred, which need not have produced a
+valid record in the retained transcript prefix. A missing first commitment may,
+for example, produce a phase-2 abort immediately after genesis. Transcript
+verification enforces the frozen `1..=8` registry but does not infer or prove a
+phase from the valid prefix.
+
 An abort record has one or more valid signatures from the frozen rosters,
 ordered by class and index. A participant's refusal to sign an abort cannot
 make a failed ceremony valid; the available signed evidence and mirrored
@@ -726,6 +745,11 @@ After the reveal-set closure, each reproducer independently opens the exact `N`
 contribution files in operator-index order and verifies both committed file
 hashes, exact length, byte range, and EOF. It retains those authenticated file
 handles or an equivalent immutable, identity-bound snapshot for combination.
+The production combiner accepts only an exact transcript prefix ending at the
+fully signed type-5 record. It also requires the expected `ceremony_id` obtained
+independently from the authenticated, mirrored genesis; deriving that expected
+identifier from the prefix under validation would remove the organizer-intent
+trust anchor and is forbidden.
 
 For every payload offset `j` satisfying `0 <= j < 6,442,975,232`:
 

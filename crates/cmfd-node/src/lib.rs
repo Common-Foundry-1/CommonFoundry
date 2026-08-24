@@ -4224,6 +4224,14 @@ mod tests {
     }
 
     #[test]
+    fn devnet_fingerprint_remains_compatible_with_v10_and_v11() {
+        assert_eq!(
+            hex::encode(devnet_params().unwrap().fingerprint().unwrap()),
+            "7ae1b8fadadc6e9316e480968fe2647b3a627df33a1a1c7f7c6c53433a4ff778"
+        );
+    }
+
+    #[test]
     fn preverified_submission_consumes_only_exact_process_local_proof_evidence() {
         let path = test_dir("preverified-submission");
         clean_test_dir(&path);

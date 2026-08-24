@@ -58,6 +58,8 @@ The Windows ZIP includes:
 
 - `cmfd-miner.exe`
 - `cmfd-forgematrix-v2-miner.dll`
+- `cmfd-forgematrix-v2-miner.dll.build-receipt`
+- `cmfd-forgematrix-v2-opencl.dll` and its `.build-receipt` (unless omitted)
 - `LIST-GPUS.bat`
 - `START-MINER.bat`
 
@@ -68,6 +70,11 @@ supported card automatically. Copy the 64-character address from the wallet's
 **Receive** page into `PAYOUT_ADDRESS` before starting. The connected node owns
 the chain and creates each payout-bound template. `WORKERS_PER_GPU=0` is the
 recommended automatic high-throughput setting.
+
+Release packaging requires the exact candidate commit as an external input and
+rejects native libraries whose adjacent build receipt does not match it. The
+receipt prevents accidental input mixing but does not authenticate the builder;
+see [Release identity guards](release-integrity.md).
 
 ## Direct commands
 

@@ -61,6 +61,15 @@ use crate::{
     },
 };
 
+#[cfg(feature = "whir-prototype")]
+use crate::{
+    dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader,
+    dory_bls12_381_logup::{
+        BLS_DORY_RANGE_LOGUP_TABLE_VALUES, BlsDoryRangeLogUpError, PreparedBlsDoryRangeLogUpProof,
+        prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch,
+    },
+};
+
 /// Version of the arithmetic-only scalar-field transition transcript.
 pub const BLS_DORY_TRANSITION_VERSION: u16 = 2;
 /// Seven bits address 128 slots, covering all 110 transition oracles.
@@ -630,6 +639,247 @@ pub(crate) fn regenerate_bls_dory_transition_compact_source_from_execution_artif
     Ok(grouped.artifact)
 }
 
+#[cfg(feature = "whir-prototype")]
+struct DoryV3ExecutionTransitionDescriptor {
+    statement: StructuredTransitionStatement,
+    mask_polynomial: StructuredMaskPolynomial,
+    transition: BlsDoryExecutionAccumulatorTransition,
+}
+
+#[cfg(feature = "whir-prototype")]
+fn dory_v3_execution_transition_descriptor(
+    reader: &BlsDoryV3ExecutionArtifactReader<'_>,
+    transition_index: usize,
+) -> Result<DoryV3ExecutionTransitionDescriptor, BlsDoryTransitionError> {
+    let rows = reader.canonical_rows();
+    let cols = reader.canonical_columns();
+    rows.checked_mul(cols)
+        .filter(|cells| *cells == reader.cells_per_column())
+        .ok_or(BlsDoryTransitionError::ExecutionArtifact)?;
+    let (statement, mask_polynomial, transition) = if transition_index == 0 {
+        (
+            StructuredTransitionStatement {
+                layers: 1,
+                rows,
+                cols,
+                max_abs_accumulator: 125,
+                max_mask: 5_000,
+            },
+            reader
+                .v3_initialization_mask()
+                .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?,
+            BlsDoryExecutionAccumulatorTransition::Initialization,
+        )
+    } else {
+        let bank = transition_index
+            .checked_sub(1)
+            .filter(|bank| *bank < reader.banks())
+            .ok_or(BlsDoryTransitionError::ExecutionArtifact)?;
+        (
+            StructuredTransitionStatement {
+                layers: reader.layers_per_bank(),
+                rows,
+                cols,
+                max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+                max_mask: 5_000,
+            },
+            reader
+                .v3_bank_mask(bank)
+                .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?,
+            BlsDoryExecutionAccumulatorTransition::Bank(bank),
+        )
+    };
+    statement.validate_verifier_shape()?;
+    mask_polynomial.validate(statement)?;
+    Ok(DoryV3ExecutionTransitionDescriptor {
+        statement,
+        mask_polynomial,
+        transition,
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn preflight_dory_v3_transition_dimensions(
+    statement: StructuredTransitionStatement,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(usize, usize, usize, usize), BlsDoryTransitionError> {
+    validate_target_variables(minimum_packed_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryTransitionError::InvalidDimensions);
+    }
+    let packed_nu = packed_variables / 2;
+    let packed_sigma = packed_variables - packed_nu;
+    let packed_rows = 1usize
+        .checked_shl(packed_nu as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let packed_columns = 1usize
+        .checked_shl(packed_sigma as u32)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    Ok((packed_nu, packed_sigma, packed_rows, packed_columns))
+}
+
+/// Prove one V3 transition directly from the authority-checked execution reader.
+///
+/// Index zero selects initialization and indices `1..=banks` select the exact
+/// authenticated bank. Statements, V3 masks, and artifact roles are derived
+/// internally; no raw context, artifact, challenge, or caller mask enters.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+    binding: &[u8],
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    transition_index: usize,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    reader
+        .validate_setup(setup)
+        .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+    if binding.len() > MAX_TRANSITION_BINDING_BYTES {
+        return Err(BlsDoryTransitionError::PublicBindingTooLarge);
+    }
+    let descriptor = dory_v3_execution_transition_descriptor(reader, transition_index)?;
+    let (packed_nu, packed_sigma, packed_rows, packed_columns) =
+        preflight_dory_v3_transition_dimensions(descriptor.statement, packed_variables, setup)?;
+    let cell_variables = descriptor.statement.elements()?.ilog2() as usize;
+    let mask_polynomial = descriptor.mask_polynomial.clone();
+    let mut source = BlsDoryTransitionWitnessRowSource::new_from_dory_v3_execution_reader(
+        descriptor,
+        reader,
+        packed_rows,
+        packed_columns,
+    )?;
+    let grouped = build_grouped_transition_compact_artifact_with_scratch(
+        &mut source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+    )?;
+    if grouped.derived_cells != source.statement.elements()? {
+        return Err(transition_storage_error());
+    }
+    let statement = source.statement;
+    let committed = commit_bls_dory_existing_compact_artifact(
+        grouped.artifact,
+        packed_nu,
+        packed_sigma,
+        setup,
+    )?;
+    prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch(
+        binding,
+        statement,
+        &mask_polynomial,
+        source,
+        packed_variables,
+        cell_variables,
+        committed,
+        setup,
+        scratch_directory,
+    )
+}
+
+/// Rebuild a released V3 transition source from the same opaque execution
+/// capability. The expected source is authenticated only after the reader has
+/// been dropped, preserving the compact-artifact lifecycle.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch(
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    transition_index: usize,
+    packed_variables: usize,
+    expected: &BlsDoryReleasedCompactSource,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<Arc<BlsDoryCompactArtifact>, BlsDoryTransitionError> {
+    reader
+        .validate_setup(setup)
+        .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+    let descriptor = dory_v3_execution_transition_descriptor(reader, transition_index)?;
+    let (packed_nu, packed_sigma, packed_rows, packed_columns) =
+        preflight_dory_v3_transition_dimensions(descriptor.statement, packed_variables, setup)?;
+    let mut source = BlsDoryTransitionWitnessRowSource::new_from_dory_v3_execution_reader(
+        descriptor,
+        reader,
+        packed_rows,
+        packed_columns,
+    )?;
+    let grouped = build_grouped_transition_compact_artifact_with_scratch(
+        &mut source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+    )?;
+    if grouped.derived_cells != source.statement.elements()? {
+        return Err(transition_storage_error());
+    }
+    drop(source);
+    expected.validate_artifact(grouped.artifact.as_ref())?;
+    Ok(grouped.artifact)
+}
+
+/// Bounded small-table LogUp path for a V3 transition reader.
+///
+/// Production-sized transitions use their already committed compact source.
+/// This entry exists only for tables below the compact LogUp threshold and
+/// never crosses through the legacy V2 artifact row-source constructor.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch(
+    binding: &[u8],
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    transition_index: usize,
+    transition: &BlsDoryCommittedPolynomial,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    reader
+        .validate_setup(setup)
+        .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+    if binding.len() > MAX_TRANSITION_BINDING_BYTES {
+        return Err(BlsDoryRangeLogUpError::PublicBindingTooLarge);
+    }
+    let descriptor = dory_v3_execution_transition_descriptor(reader, transition_index)?;
+    let (_, _, packed_rows, packed_columns) =
+        preflight_dory_v3_transition_dimensions(descriptor.statement, packed_variables, setup)?;
+    let elements = descriptor.statement.elements()?;
+    if elements >= BLS_DORY_RANGE_LOGUP_TABLE_VALUES {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        packed_variables / 2,
+        packed_variables - packed_variables / 2,
+    )?;
+    let explicit_scalars = elements
+        .checked_mul(STRUCTURED_TRANSITION_ORACLES)
+        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+    if !transition.matches_layout(aggregate_layout, setup)
+        || transition.explicit_coefficient_count() != explicit_scalars
+    {
+        return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+    }
+    let statement = descriptor.statement;
+    let source = BlsDoryTransitionWitnessRowSource::new_from_dory_v3_execution_reader(
+        descriptor,
+        reader,
+        packed_rows,
+        packed_columns,
+    )?;
+    prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch(
+        binding,
+        statement,
+        &source,
+        transition,
+        packed_variables,
+        setup,
+        scratch_directory,
+    )
+}
+
 #[cfg(any(test, feature = "whir-prototype"))]
 struct BuiltGroupedTransitionArtifact {
     artifact: Arc<BlsDoryCompactArtifact>,
@@ -673,26 +923,33 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
         .checked_mul(packed_columns)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
     let elements = source.elements;
-    let word_scalar_count = elements
+    let regular_scalar_count = elements
         .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let word_scalar_count = source.literal_scalar_count();
     let explicit_scalar_count = elements
         .checked_mul(STRUCTURED_TRANSITION_ORACLES)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-    let code_selectors = STRUCTURED_TRANSITION_ORACLES
+    let word_selectors = word_scalar_count
+        .checked_div(elements)
+        .filter(|selectors| selectors.checked_mul(elements) == Some(word_scalar_count))
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let word_range_selectors = word_selectors
         .checked_sub(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+        .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+    let code_selectors = STRUCTURED_TRANSITION_ORACLES
+        .checked_sub(word_selectors)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
     if source.rows != packed_rows
         || source.columns != packed_columns
         || source.explicit_scalars != explicit_scalar_count
-        || source.literal_scalar_count() != word_scalar_count
-        || source.range_oracles.len() != code_selectors
+        || word_scalar_count < regular_scalar_count
+        || source.range_oracles.len()
+            != STRUCTURED_TRANSITION_ORACLES - STRUCTURED_TRANSITION_REGULAR_ORACLES
+        || word_range_selectors > source.range_oracles.len()
         || source.range_dictionary.len() != 16
         || explicit_scalar_count > coefficient_count
-        || !matches!(
-            &source.backing,
-            TransitionWitnessBacking::ExecutionArtifact { .. }
-        )
+        || !source.is_execution_artifact_backed()
     {
         return Err(BlsDoryTransitionError::InvalidDimensions);
     }
@@ -728,7 +985,7 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
         return Err(BlsDoryTransitionError::InvalidDimensions);
     }
     let maximum_word_scalars = chunk_cells
-        .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+        .checked_mul(word_selectors)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
     let maximum_codes = chunk_cells
         .checked_mul(code_selectors)
@@ -747,7 +1004,7 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
         let cell_count = (elements - cell_start).min(chunk_cells);
         selector_words.resize(
             cell_count
-                .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+                .checked_mul(word_selectors)
                 .ok_or(BlsDoryTransitionError::InvalidDimensions)?,
             0,
         );
@@ -779,9 +1036,16 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
                 } else {
                     value
                 };
-                selector_codes[selector * cell_count + local_cell] =
-                    u8::try_from((bounded >> (descriptor.digit * 4)) & 0xf)
-                        .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+                let digit = u8::try_from((bounded >> (descriptor.digit * 4)) & 0xf)
+                    .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+                if selector < word_range_selectors {
+                    selector_words[(STRUCTURED_TRANSITION_REGULAR_ORACLES + selector)
+                        * cell_count
+                        + local_cell] = u64::from(digit);
+                } else {
+                    selector_codes[(selector - word_range_selectors) * cell_count + local_cell] =
+                        digit;
+                }
             }
             derived_cells = derived_cells
                 .checked_add(1)
@@ -1715,6 +1979,128 @@ impl<'a> BlsDoryExecutionAccumulatorReader<'a> {
     }
 }
 
+#[cfg(feature = "whir-prototype")]
+trait DoryV3TransitionAccumulatorReader: Send {
+    fn accumulator(&mut self, index: usize) -> Result<i64, BlsDoryTransitionError>;
+}
+
+#[cfg(feature = "whir-prototype")]
+struct BlsDoryV3ExecutionAccumulatorReader<'a, 'r> {
+    reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+    transition: BlsDoryExecutionAccumulatorTransition,
+    cells_per_layer: usize,
+    elements: usize,
+    cached_column: Option<BlsDoryExecutionAccumulatorColumn>,
+    cached_start: usize,
+    cached_len: usize,
+    cache: Vec<i32>,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl<'a, 'r> BlsDoryV3ExecutionAccumulatorReader<'a, 'r> {
+    fn new(
+        statement: StructuredTransitionStatement,
+        reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+        transition: BlsDoryExecutionAccumulatorTransition,
+    ) -> Result<Self, BlsDoryTransitionError> {
+        statement.validate_verifier_shape()?;
+        let cells_per_layer = statement
+            .rows
+            .checked_mul(statement.cols)
+            .filter(|cells| *cells == reader.cells_per_column())
+            .ok_or(BlsDoryTransitionError::ExecutionArtifact)?;
+        if statement.rows != reader.canonical_rows()
+            || statement.cols != reader.canonical_columns()
+            || statement.max_abs_accumulator > u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS)
+        {
+            return Err(BlsDoryTransitionError::ExecutionArtifact);
+        }
+        match transition {
+            BlsDoryExecutionAccumulatorTransition::Initialization if statement.layers == 1 => {}
+            BlsDoryExecutionAccumulatorTransition::Bank(bank)
+                if bank < reader.banks() && statement.layers == reader.layers_per_bank() => {}
+            BlsDoryExecutionAccumulatorTransition::Initialization
+            | BlsDoryExecutionAccumulatorTransition::Bank(_) => {
+                return Err(BlsDoryTransitionError::ExecutionArtifact);
+            }
+        }
+        let mut cache = Vec::new();
+        cache
+            .try_reserve_exact(reader.authentication_chunk_cells())
+            .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+        cache.resize(reader.authentication_chunk_cells(), 0);
+        Ok(Self {
+            reader,
+            transition,
+            cells_per_layer,
+            elements: statement.elements()?,
+            cached_column: None,
+            cached_start: 0,
+            cached_len: 0,
+            cache,
+        })
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl DoryV3TransitionAccumulatorReader for BlsDoryV3ExecutionAccumulatorReader<'_, '_> {
+    fn accumulator(&mut self, index: usize) -> Result<i64, BlsDoryTransitionError> {
+        if index >= self.elements {
+            return Err(BlsDoryTransitionError::InvalidDimensions);
+        }
+        let layer = index / self.cells_per_layer;
+        let cell = index % self.cells_per_layer;
+        let column = match self.transition {
+            BlsDoryExecutionAccumulatorTransition::Initialization => {
+                BlsDoryExecutionAccumulatorColumn::Initialization
+            }
+            BlsDoryExecutionAccumulatorTransition::Bank(bank) => {
+                BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer }
+            }
+        };
+        let chunk_cells = self.reader.authentication_chunk_cells();
+        let chunk_start = cell / chunk_cells * chunk_cells;
+        let chunk_len = self
+            .cells_per_layer
+            .checked_sub(chunk_start)
+            .map(|remaining| remaining.min(chunk_cells))
+            .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
+        if self.cached_column != Some(column)
+            || self.cached_start != chunk_start
+            || self.cached_len != chunk_len
+        {
+            self.cached_column = None;
+            self.cached_start = 0;
+            self.cached_len = 0;
+            let read = match column {
+                BlsDoryExecutionAccumulatorColumn::Initialization => self
+                    .reader
+                    .read_initialization_segment(chunk_start, &mut self.cache[..chunk_len]),
+                BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer } => {
+                    self.reader.read_bank_layer_segment(
+                        bank,
+                        layer,
+                        chunk_start,
+                        &mut self.cache[..chunk_len],
+                    )
+                }
+            }
+            .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+            if read != chunk_len {
+                return Err(BlsDoryTransitionError::ExecutionArtifact);
+            }
+            self.cached_column = Some(column);
+            self.cached_start = chunk_start;
+            self.cached_len = chunk_len;
+        }
+        self.cache
+            .get(cell - chunk_start)
+            .copied()
+            .map(i64::from)
+            .ok_or(BlsDoryTransitionError::ExecutionArtifact)
+    }
+}
+
 enum TransitionWitnessBacking<'a> {
     Materialized(&'a StructuredTransitionWitness),
     Derived {
@@ -1725,6 +2111,11 @@ enum TransitionWitnessBacking<'a> {
     ExecutionArtifact {
         mask_polynomial: &'a StructuredMaskPolynomial,
         reader: Box<Mutex<BlsDoryExecutionAccumulatorReader<'a>>>,
+    },
+    #[cfg(feature = "whir-prototype")]
+    DoryV3ExecutionArtifact {
+        mask_polynomial: StructuredMaskPolynomial,
+        reader: Box<Mutex<dyn DoryV3TransitionAccumulatorReader + 'a>>,
     },
 }
 
@@ -1835,6 +2226,34 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         )
     }
 
+    #[cfg(feature = "whir-prototype")]
+    fn new_from_dory_v3_execution_reader<'r>(
+        descriptor: DoryV3ExecutionTransitionDescriptor,
+        reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryTransitionError>
+    where
+        'r: 'a,
+    {
+        descriptor.statement.validate_verifier_shape()?;
+        descriptor.mask_polynomial.validate(descriptor.statement)?;
+        let reader = BlsDoryV3ExecutionAccumulatorReader::new(
+            descriptor.statement,
+            reader,
+            descriptor.transition,
+        )?;
+        Self::from_backing(
+            descriptor.statement,
+            TransitionWitnessBacking::DoryV3ExecutionArtifact {
+                mask_polynomial: descriptor.mask_polynomial,
+                reader: Box::new(Mutex::new(reader)),
+            },
+            rows,
+            columns,
+        )
+    }
+
     fn from_backing(
         statement: StructuredTransitionStatement,
         backing: TransitionWitnessBacking<'a>,
@@ -1890,6 +2309,17 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
     }
 
     #[cfg(any(test, feature = "whir-prototype"))]
+    fn is_execution_artifact_backed(&self) -> bool {
+        match &self.backing {
+            TransitionWitnessBacking::ExecutionArtifact { .. } => true,
+            #[cfg(feature = "whir-prototype")]
+            TransitionWitnessBacking::DoryV3ExecutionArtifact { .. } => true,
+            TransitionWitnessBacking::Materialized(_)
+            | TransitionWitnessBacking::Derived { .. } => false,
+        }
+    }
+
+    #[cfg(any(test, feature = "whir-prototype"))]
     fn execution_derived_regular_row(
         &mut self,
         index: usize,
@@ -1897,18 +2327,37 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
         if index >= self.elements {
             return Err(BlsDoryTransitionError::InvalidDimensions);
         }
-        let TransitionWitnessBacking::ExecutionArtifact {
-            mask_polynomial,
-            reader,
-        } = &mut self.backing
-        else {
-            return Err(BlsDoryTransitionError::InvalidProofShape);
+        let (accumulator, mask) = match &mut self.backing {
+            TransitionWitnessBacking::ExecutionArtifact {
+                mask_polynomial,
+                reader,
+            } => {
+                let accumulator = reader
+                    .get_mut()
+                    .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
+                    .accumulator(index)?;
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                (accumulator, mask)
+            }
+            #[cfg(feature = "whir-prototype")]
+            TransitionWitnessBacking::DoryV3ExecutionArtifact {
+                mask_polynomial,
+                reader,
+            } => {
+                let accumulator = reader
+                    .get_mut()
+                    .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
+                    .accumulator(index)?;
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                (accumulator, mask)
+            }
+            TransitionWitnessBacking::Materialized(_)
+            | TransitionWitnessBacking::Derived { .. } => {
+                return Err(BlsDoryTransitionError::InvalidProofShape);
+            }
         };
-        let accumulator = reader
-            .get_mut()
-            .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
-            .accumulator(index)?;
-        let mask = mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
         derive_transition_regular_row_from_mask(self.statement, index, accumulator, mask)
     }
 
@@ -1989,6 +2438,20 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
                 derive_transition_regular_row_from_mask(self.statement, index, accumulator, mask)?
                     .word(oracle)
             }
+            #[cfg(feature = "whir-prototype")]
+            TransitionWitnessBacking::DoryV3ExecutionArtifact {
+                mask_polynomial,
+                reader,
+            } => {
+                let accumulator = reader
+                    .lock()
+                    .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
+                    .accumulator(index)?;
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                derive_transition_regular_row_from_mask(self.statement, index, accumulator, mask)?
+                    .word(oracle)
+            }
         }
     }
 
@@ -2033,6 +2496,24 @@ impl<'a> BlsDoryTransitionWitnessRowSource<'a> {
             }
             #[cfg(any(test, feature = "whir-prototype"))]
             TransitionWitnessBacking::ExecutionArtifact {
+                mask_polynomial,
+                reader,
+            } => {
+                let accumulator = reader
+                    .lock()
+                    .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?
+                    .accumulator(index)?;
+                let mask =
+                    mask_polynomial.value_at_boolean_index_prevalidated(self.statement, index)?;
+                Some(derive_transition_regular_row_from_mask(
+                    self.statement,
+                    index,
+                    accumulator,
+                    mask,
+                )?)
+            }
+            #[cfg(feature = "whir-prototype")]
+            TransitionWitnessBacking::DoryV3ExecutionArtifact {
                 mask_polynomial,
                 reader,
             } => {
@@ -2311,6 +2792,32 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
             }
             return Ok(output.len());
         }
+        #[cfg(feature = "whir-prototype")]
+        if let TransitionWitnessBacking::DoryV3ExecutionArtifact {
+            mask_polynomial,
+            reader,
+        } = &mut self.backing
+        {
+            let statement = self.statement;
+            let elements = self.elements;
+            let reader = reader
+                .get_mut()
+                .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+            for (column, word) in output.iter_mut().enumerate() {
+                let packed_index = start + column;
+                let oracle = packed_index / elements;
+                let index = packed_index % elements;
+                if oracle >= STRUCTURED_TRANSITION_REGULAR_ORACLES {
+                    return Err(BlsDoryTransitionError::InvalidProofShape);
+                }
+                let accumulator = reader.accumulator(index)?;
+                let mask = mask_polynomial.value_at_boolean_index_prevalidated(statement, index)?;
+                *word =
+                    derive_transition_regular_row_from_mask(statement, index, accumulator, mask)?
+                        .word(oracle)?;
+            }
+            return Ok(output.len());
+        }
         for (column, word) in output.iter_mut().enumerate() {
             let packed_index = start + column;
             let oracle = packed_index / self.elements;
@@ -2333,6 +2840,52 @@ impl BlsDoryCompactRowSource for BlsDoryTransitionWitnessRowSource<'_> {
         }
         #[cfg(any(test, feature = "whir-prototype"))]
         if let TransitionWitnessBacking::ExecutionArtifact {
+            mask_polynomial,
+            reader,
+        } = &mut self.backing
+        {
+            let statement = self.statement;
+            let elements = self.elements;
+            let range_oracles = &self.range_oracles;
+            let reader = reader
+                .get_mut()
+                .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
+            for (column, code) in output.iter_mut().enumerate() {
+                let packed_index = start + column;
+                if packed_index >= self.explicit_scalars {
+                    *code = 0;
+                    continue;
+                }
+                let oracle = packed_index / elements;
+                let index = packed_index % elements;
+                let descriptor = range_oracles
+                    .get(
+                        oracle
+                            .checked_sub(STRUCTURED_TRANSITION_REGULAR_ORACLES)
+                            .ok_or(BlsDoryTransitionError::InvalidProofShape)?,
+                    )
+                    .copied()
+                    .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+                let accumulator = reader.accumulator(index)?;
+                let mask = mask_polynomial.value_at_boolean_index_prevalidated(statement, index)?;
+                let value =
+                    derive_transition_regular_row_from_mask(statement, index, accumulator, mask)?
+                        .word(descriptor.source_oracle)?;
+                let bounded = if descriptor.slack {
+                    descriptor
+                        .maximum
+                        .checked_sub(value)
+                        .ok_or(BlsDoryTransitionError::InvalidDimensions)?
+                } else {
+                    value
+                };
+                *code = u8::try_from((bounded >> (descriptor.digit * 4)) & 0xf)
+                    .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?;
+            }
+            return Ok(output.len());
+        }
+        #[cfg(feature = "whir-prototype")]
+        if let TransitionWitnessBacking::DoryV3ExecutionArtifact {
             mask_polynomial,
             reader,
         } = &mut self.backing

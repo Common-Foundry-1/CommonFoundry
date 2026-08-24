@@ -1745,17 +1745,9 @@ mod tests {
     use super::*;
     use crate::{
         BlockChallenge, ForgeMatrixV2Descriptor, ForgeMatrixV2Reference,
-        ForgeMatrixV2ReferenceProof, SmallModelBankFixture, StructuredMatrixStatement,
-        StructuredSumcheckError,
-        dory_bls12_381_aggregate::{
-            commit_bls_dory_padded_prefix_with_optional_scratch, commit_bls_dory_polynomial,
-        },
+        ForgeMatrixV2ReferenceProof, SmallModelBankFixture,
+        dory_bls12_381_aggregate::commit_bls_dory_polynomial,
         dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorColumn,
-        dory_bls12_381_matrix::{
-            BlsDoryMatrixError,
-            prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch,
-            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch,
-        },
         dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt, deterministic_bls_dory_setup},
         dory_v3_model::{CanonicalBlsDoryGtHex, DoryV3ModelIdentityV1},
         dory_v3_model_record::{
@@ -1764,6 +1756,27 @@ mod tests {
         },
         dory_v3_suite::{DORY_V3_MODEL_IDENTITY_VERSION, DORY_V3_PRODUCTION_SUITE_DIGEST},
         model_bank::{BuiltModelBankFixture, build_small_model_bank},
+    };
+
+    #[cfg(feature = "whir-prototype")]
+    use crate::{
+        StructuredMatrixStatement, StructuredSumcheckError, StructuredTransitionWitness,
+        dory_bls12_381_aggregate::commit_bls_dory_padded_prefix_with_optional_scratch,
+        dory_bls12_381_logup::{
+            BlsDoryRangeLogUpError,
+            prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
+        },
+        dory_bls12_381_matrix::{
+            BlsDoryMatrixError,
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch,
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch,
+        },
+        dory_bls12_381_transition::{
+            prove_bls_dory_transition_deferred_at_variables_with_scratch,
+            prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch,
+            prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch,
+            regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch,
+        },
     };
 
     static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -2315,6 +2328,8 @@ mod tests {
     }
 
     const DORY_V3_TEST_VARIABLES: usize = 3;
+    #[cfg(feature = "whir-prototype")]
+    const DORY_V3_TRANSITION_TEST_VARIABLES: usize = 10;
     const DORY_V3_TEST_BASE: [u8; 4] = [125, 126, 124, 127];
     const DORY_V3_TEST_LAYERS: [[u8; 4]; 4] = [
         [126, 125, 124, 127],
@@ -2322,6 +2337,7 @@ mod tests {
         [127, 124, 126, 125],
         [125, 123, 127, 124],
     ];
+    #[cfg(feature = "whir-prototype")]
     type DoryV3MaterializedMatrixBanks = ([Vec<i64>; 2], [Vec<i64>; 2], [Vec<i64>; 2]);
 
     struct DoryV3ReplayFixture {
@@ -2336,27 +2352,32 @@ mod tests {
         expected_accumulators: Vec<Vec<i32>>,
     }
 
-    fn commit_dory_v3_test_bytes(bytes: &[u8], setup: &DeterministicBlsDorySetup) -> BlsDoryGt {
+    fn commit_dory_v3_test_bytes_at_variables(
+        bytes: &[u8],
+        setup: &DeterministicBlsDorySetup,
+        padded_variables: usize,
+    ) -> BlsDoryGt {
         let mut coefficients = bytes
             .iter()
             .map(|value| BlsDoryFr::from_i64(i64::from(*value) - 125))
             .collect::<Vec<_>>();
-        coefficients.resize(1 << DORY_V3_TEST_VARIABLES, BlsDoryFr::from_i64(0));
+        coefficients.resize(1 << padded_variables, BlsDoryFr::from_i64(0));
         commit_bls_dory_polynomial(
             coefficients,
-            DORY_V3_TEST_VARIABLES / 2,
-            DORY_V3_TEST_VARIABLES - DORY_V3_TEST_VARIABLES / 2,
+            padded_variables / 2,
+            padded_variables - padded_variables / 2,
             setup,
         )
         .unwrap()
         .commitment()
     }
 
-    fn dory_v3_test_identity(
+    fn dory_v3_test_identity_at_variables(
         manifest: &ModelBankManifest,
         setup: &DeterministicBlsDorySetup,
         base: &[u8],
         layers: &[Vec<u8>],
+        padded_variables: usize,
     ) -> DoryV3ModelIdentityV1 {
         let encoded = |commitment| {
             CanonicalBlsDoryGtHex::from_commitment(commitment)
@@ -2368,7 +2389,11 @@ mod tests {
             .chunks_exact(2)
             .map(|bank| {
                 let bytes = bank.iter().flatten().copied().collect::<Vec<_>>();
-                encoded(commit_dory_v3_test_bytes(&bytes, setup))
+                encoded(commit_dory_v3_test_bytes_at_variables(
+                    &bytes,
+                    setup,
+                    padded_variables,
+                ))
             })
             .collect::<Vec<_>>();
         serde_json::from_value(json!({
@@ -2381,8 +2406,12 @@ mod tests {
             "layer_roots_aggregate": manifest.layer_roots_aggregate,
             "suite_parameter_digest": DORY_V3_PRODUCTION_SUITE_DIGEST.into_bytes(),
             "setup_identity": setup.identity(),
-            "padded_variables": DORY_V3_TEST_VARIABLES,
-            "base_input_commitment": encoded(commit_dory_v3_test_bytes(base, setup)),
+            "padded_variables": padded_variables,
+            "base_input_commitment": encoded(commit_dory_v3_test_bytes_at_variables(
+                base,
+                setup,
+                padded_variables,
+            )),
             "weight_bank_commitments": weight_bank_commitments,
         }))
         .unwrap()
@@ -2503,6 +2532,13 @@ mod tests {
     }
 
     fn dory_v3_replay_fixture(tweak: u8) -> DoryV3ReplayFixture {
+        dory_v3_replay_fixture_at_variables(tweak, DORY_V3_TEST_VARIABLES)
+    }
+
+    fn dory_v3_replay_fixture_at_variables(
+        tweak: u8,
+        padded_variables: usize,
+    ) -> DoryV3ReplayFixture {
         let mut base = DORY_V3_TEST_BASE.to_vec();
         base[3] += tweak;
         let layers = DORY_V3_TEST_LAYERS.map(Vec::from).to_vec();
@@ -2518,8 +2554,14 @@ mod tests {
             pcs_commitment_root: [0x52; 32],
         })
         .unwrap();
-        let setup = deterministic_bls_dory_setup(DORY_V3_TEST_VARIABLES).unwrap();
-        let identity = dory_v3_test_identity(&provisional.manifest, &setup, &base, &layers);
+        let setup = deterministic_bls_dory_setup(padded_variables).unwrap();
+        let identity = dory_v3_test_identity_at_variables(
+            &provisional.manifest,
+            &setup,
+            &base,
+            &layers,
+            padded_variables,
+        );
         let bank = build_small_model_bank(SmallModelBankFixture {
             model_version: 2,
             dimension: 2,
@@ -2575,6 +2617,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "whir-prototype")]
     fn dory_v3_matrix_statement_for_test() -> StructuredMatrixStatement {
         StructuredMatrixStatement {
             layers: 2,
@@ -2587,6 +2630,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whir-prototype")]
     fn dory_v3_transition_activations_for_test(
         statement: StructuredTransitionStatement,
         mask: &StructuredMaskPolynomial,
@@ -2610,6 +2654,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "whir-prototype")]
     fn materialized_dory_v3_matrix_banks(
         fixture: &DoryV3ReplayFixture,
     ) -> DoryV3MaterializedMatrixBanks {
@@ -2676,6 +2721,98 @@ mod tests {
         (activations, weights, accumulators)
     }
 
+    #[cfg(feature = "whir-prototype")]
+    fn materialized_dory_v3_transition(
+        fixture: &DoryV3ReplayFixture,
+        transition_index: usize,
+    ) -> (
+        StructuredTransitionStatement,
+        StructuredMaskPolynomial,
+        StructuredTransitionWitness,
+    ) {
+        let challenge = fixture
+            .transcript
+            .challenge_context(&fixture.block, fixture.claim.nonce)
+            .unwrap();
+        let (statement, mask, accumulators) = if transition_index == 0 {
+            (
+                StructuredTransitionStatement {
+                    layers: 1,
+                    rows: 2,
+                    cols: 2,
+                    max_abs_accumulator: 125,
+                    max_mask: MAX_TRANSITION_MASK,
+                },
+                StructuredMaskPolynomial::from_dory_v3_virtual_challenge(&challenge.digest(), 2, 2)
+                    .unwrap(),
+                fixture
+                    .base
+                    .iter()
+                    .map(|value| i64::from(*value) - 125)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            let bank = transition_index - 1;
+            (
+                StructuredTransitionStatement {
+                    layers: 2,
+                    rows: 2,
+                    cols: 2,
+                    max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+                    max_mask: MAX_TRANSITION_MASK,
+                },
+                StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+                    &challenge.digest(),
+                    u32::try_from(bank * 2).unwrap(),
+                    2,
+                    2,
+                    2,
+                )
+                .unwrap(),
+                fixture.expected_accumulators[bank * 2..bank * 2 + 2]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .map(i64::from)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut witness = StructuredTransitionWitness {
+            accumulators: Vec::new(),
+            masks: Vec::new(),
+            encoded: Vec::new(),
+            square_quotients: Vec::new(),
+            square_remainders: Vec::new(),
+            cube_quotients: Vec::new(),
+            cube_remainders: Vec::new(),
+            output_quotients: Vec::new(),
+            output_remainders: Vec::new(),
+            negative: Vec::new(),
+            activations: Vec::new(),
+        };
+        for (index, accumulator) in accumulators.into_iter().enumerate() {
+            let mask_value = mask
+                .value_at_boolean_index_prevalidated(statement, index)
+                .unwrap();
+            let row =
+                derive_transition_regular_row_from_mask(statement, index, accumulator, mask_value)
+                    .unwrap();
+            witness.accumulators.push(row.accumulator);
+            witness.masks.push(row.mask);
+            witness.encoded.push(row.encoded);
+            witness.square_quotients.push(row.square_quotient);
+            witness.square_remainders.push(row.square_remainder);
+            witness.cube_quotients.push(row.cube_quotient);
+            witness.cube_remainders.push(row.cube_remainder);
+            witness.output_quotients.push(row.output_quotient);
+            witness.output_remainders.push(row.output_remainder);
+            witness.negative.push(row.negative);
+            witness.activations.push(row.activation);
+        }
+        (statement, mask, witness)
+    }
+
+    #[cfg(feature = "whir-prototype")]
     #[test]
     fn dory_v3_streamed_matrix_banks_match_independent_materialized_proofs() {
         let fixture = dory_v3_replay_fixture(0);
@@ -2873,6 +3010,268 @@ mod tests {
         drop((short_weight, wrong_setup_weight, correct_weight));
         drop(execution);
         assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn dory_v3_streamed_transitions_match_materialized_proofs_and_regeneration() {
+        let fixture = dory_v3_replay_fixture_at_variables(0, DORY_V3_TRANSITION_TEST_VARIABLES);
+        let replay_scratch = ScratchDirectory::create();
+        let materialized_scratch = ScratchDirectory::create();
+        let streamed_scratch = ScratchDirectory::create();
+        let materialized_logup_scratch = ScratchDirectory::create();
+        let streamed_logup_scratch = ScratchDirectory::create();
+        let preflight_scratch = ScratchDirectory::create();
+        let mismatch_scratch = ScratchDirectory::create();
+        let unavailable_scratch = preflight_scratch.path().join("not-created");
+        let mut execution = replay_dory_v3(&fixture, &replay_scratch);
+        let mut materialized_transitions = Vec::new();
+
+        for transition_index in 0..=2 {
+            let (statement, mask, witness) =
+                materialized_dory_v3_transition(&fixture, transition_index);
+            let binding = format!("dory-v3-streamed-transition-{transition_index}");
+            let materialized = prove_bls_dory_transition_deferred_at_variables_with_scratch(
+                binding.as_bytes(),
+                statement,
+                &mask,
+                &witness,
+                DORY_V3_TRANSITION_TEST_VARIABLES,
+                &fixture.setup,
+                materialized_scratch.path(),
+            )
+            .unwrap();
+            let mut streamed = {
+                let mut reader = execution
+                    .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                    .unwrap();
+                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+                    binding.as_bytes(),
+                    &mut reader,
+                    transition_index,
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &fixture.setup,
+                    streamed_scratch.path(),
+                )
+                .unwrap()
+            };
+
+            assert_eq!(streamed.proof, materialized.proof);
+            assert_eq!(
+                streamed.proof.encode_deferred(statement).unwrap(),
+                materialized.proof.encode_deferred(statement).unwrap()
+            );
+            assert_eq!(
+                streamed.proof.transcript_digest,
+                materialized.proof.transcript_digest
+            );
+            assert_eq!(
+                streamed.proof.oracle_commitment,
+                materialized.proof.oracle_commitment
+            );
+            assert_eq!(streamed.openings.claims(), materialized.openings.claims());
+            assert_eq!(
+                streamed.openings.polynomial(0).unwrap().row_commitments(),
+                materialized
+                    .openings
+                    .polynomial(0)
+                    .unwrap()
+                    .row_commitments()
+            );
+            let streamed_path = streamed
+                .openings
+                .polynomial(0)
+                .unwrap()
+                .coefficient_artifact_path()
+                .unwrap()
+                .to_path_buf();
+            let materialized_path = materialized
+                .openings
+                .polynomial(0)
+                .unwrap()
+                .coefficient_artifact_path()
+                .unwrap()
+                .to_path_buf();
+            let streamed_bytes = fs::read(&streamed_path).unwrap();
+            assert_eq!(streamed_bytes, fs::read(&materialized_path).unwrap());
+
+            let materialized_range =
+                prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch(
+                    binding.as_bytes(),
+                    statement,
+                    &witness,
+                    materialized.openings.polynomial(0).unwrap(),
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &fixture.setup,
+                    materialized_logup_scratch.path(),
+                )
+                .unwrap();
+            let streamed_range = {
+                let mut reader = execution
+                    .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                    .unwrap();
+                prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch(
+                    binding.as_bytes(),
+                    &mut reader,
+                    transition_index,
+                    streamed.openings.polynomial(0).unwrap(),
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &fixture.setup,
+                    streamed_logup_scratch.path(),
+                )
+                .unwrap()
+            };
+            assert_eq!(streamed_range.proof, materialized_range.proof);
+            assert_eq!(
+                streamed_range.proof.encode_deferred(statement).unwrap(),
+                materialized_range.proof.encode_deferred(statement).unwrap()
+            );
+            assert_eq!(
+                streamed_range.proof.transcript_digest,
+                materialized_range.proof.transcript_digest
+            );
+            assert_eq!(
+                streamed_range.proof.transition_commitment,
+                materialized_range.proof.transition_commitment
+            );
+            assert_eq!(
+                streamed_range.openings.claims(),
+                materialized_range.openings.claims()
+            );
+            drop((streamed_range, materialized_range));
+
+            let released = streamed.openings.release_compact_source().unwrap().unwrap();
+            assert!(!streamed_path.exists());
+            let regenerated = {
+                let mut reader = execution
+                    .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                    .unwrap();
+                regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch(
+                    &mut reader,
+                    transition_index,
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &released,
+                    &fixture.setup,
+                    streamed_scratch.path(),
+                )
+                .unwrap()
+            };
+            assert_eq!(fs::read(regenerated.path()).unwrap(), streamed_bytes);
+            streamed
+                .openings
+                .restore_compact_source(&regenerated)
+                .unwrap();
+            drop((regenerated, streamed));
+            materialized_transitions.push(materialized);
+        }
+
+        let substituted_setup =
+            deterministic_bls_dory_setup(DORY_V3_TRANSITION_TEST_VARIABLES + 1).unwrap();
+        {
+            let mut reader = execution
+                .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                .unwrap();
+            assert!(matches!(
+                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+                    b"wrong-index",
+                    &mut reader,
+                    3,
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryTransitionError::ExecutionArtifact)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+                    b"wrong-setup",
+                    &mut reader,
+                    0,
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &substituted_setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryTransitionError::ExecutionArtifact)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+                    &[0; 4_097],
+                    &mut reader,
+                    0,
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryTransitionError::PublicBindingTooLarge)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+                    b"packed-too-small",
+                    &mut reader,
+                    1,
+                    DORY_V3_TRANSITION_TEST_VARIABLES - 1,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryTransitionError::InvalidDimensions)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch(
+                    &[0; 4_097],
+                    &mut reader,
+                    0,
+                    materialized_transitions[0].openings.polynomial(0).unwrap(),
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryRangeLogUpError::PublicBindingTooLarge)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch(
+                    b"wrong-precommitted-transition",
+                    &mut reader,
+                    1,
+                    materialized_transitions[0].openings.polynomial(0).unwrap(),
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryRangeLogUpError::InvalidDimensions)
+            ));
+        }
+        assert_eq!(preflight_scratch.entry_count(), 0);
+
+        let released_initialization = materialized_transitions[0]
+            .openings
+            .release_compact_source()
+            .unwrap()
+            .unwrap();
+        {
+            let mut reader = execution
+                .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                .unwrap();
+            assert!(
+                regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch(
+                    &mut reader,
+                    1,
+                    DORY_V3_TRANSITION_TEST_VARIABLES,
+                    &released_initialization,
+                    &fixture.setup,
+                    mismatch_scratch.path(),
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(mismatch_scratch.entry_count(), 0);
+
+        drop((released_initialization, materialized_transitions));
+        drop(execution);
+        assert_eq!(replay_scratch.entry_count(), 0);
+        assert_eq!(materialized_scratch.entry_count(), 0);
+        assert_eq!(streamed_scratch.entry_count(), 0);
+        assert_eq!(materialized_logup_scratch.entry_count(), 0);
+        assert_eq!(streamed_logup_scratch.entry_count(), 0);
     }
 
     #[test]

@@ -754,13 +754,19 @@ mod tests {
             &fixture.setup,
         )
         .unwrap();
-        assert_eq!(typed.raw().network_identity(), block.network_id);
+        assert_eq!(typed.raw_for_test().network_identity(), block.network_id);
         assert_eq!(
-            typed.raw().model_record_identity(),
+            typed.raw_for_test().model_record_identity(),
             authenticated.record().record_digest().into_bytes()
         );
-        assert_eq!(typed.raw().setup_identity(), fixture.setup.identity());
-        assert_eq!(typed.raw().challenge_identity(), challenge.digest());
+        assert_eq!(
+            typed.raw_for_test().setup_identity(),
+            fixture.setup.identity()
+        );
+        assert_eq!(
+            typed.raw_for_test().challenge_identity(),
+            challenge.digest()
+        );
 
         let mut changed_manifest = *authenticated.record().manifest();
         changed_manifest.model_version += 1;
@@ -1190,13 +1196,16 @@ mod tests {
                 &setup,
             )
             .unwrap();
-            assert_eq!(typed.raw().network_identity(), network_id);
+            assert_eq!(typed.raw_for_test().network_identity(), network_id);
             assert_eq!(
-                typed.raw().model_record_identity(),
+                typed.raw_for_test().model_record_identity(),
                 first.record_digest().into_bytes()
             );
-            assert_eq!(typed.raw().setup_identity(), setup.identity());
-            assert_eq!(typed.raw().challenge_identity(), challenge.digest());
+            assert_eq!(typed.raw_for_test().setup_identity(), setup.identity());
+            assert_eq!(
+                typed.raw_for_test().challenge_identity(),
+                challenge.digest()
+            );
         }
     }
 }

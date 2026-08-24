@@ -145,8 +145,13 @@ impl BlsDoryV3ExecutionAccumulatorArtifactContext {
         Ok(transcript)
     }
 
-    pub(crate) const fn raw(&self) -> &BlsDoryExecutionAccumulatorArtifactContext {
+    const fn raw(&self) -> &BlsDoryExecutionAccumulatorArtifactContext {
         &self.raw
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn raw_for_test(&self) -> &BlsDoryExecutionAccumulatorArtifactContext {
+        self.raw()
     }
 
     fn output_digest(
@@ -198,6 +203,38 @@ impl VerifiedBlsDoryV3WinningNonceExecution {
         self.work_digest
     }
 
+    /// Mint the only production reader for this verified V3 execution.
+    ///
+    /// The mutable borrow keeps the context and artifact inseparable. The
+    /// complete artifact is reauthenticated before any bounded segment reader
+    /// or V3 mask derivation is published.
+    pub(crate) fn authenticated_artifact_reader<'a>(
+        &'a mut self,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<BlsDoryV3ExecutionArtifactReader<'a>, BlsDoryV3WinningNonceReplayError> {
+        BlsDoryV3ExecutionAccumulatorArtifactContext::validate_authority(
+            self.context.challenge,
+            authenticated,
+            setup,
+        )?;
+        if self.context.work_digest(self.final_activation_digest) != self.work_digest {
+            return Err(BlsDoryV3WinningNonceReplayError::WorkDigest);
+        }
+        if self.artifact.context() != *self.context.raw() {
+            return Err(BlsDoryExecutionAccumulatorArtifactError::WrongContext.into());
+        }
+        self.artifact.authenticate(self.context.raw())?;
+        Ok(BlsDoryV3ExecutionArtifactReader {
+            context: self.context,
+            nonce: self.nonce,
+            final_activation_digest: self.final_activation_digest,
+            work_digest: self.work_digest,
+            artifact: &mut self.artifact,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -214,6 +251,166 @@ impl VerifiedBlsDoryV3WinningNonceExecution {
             self.work_digest,
             self.artifact,
         )
+    }
+}
+
+/// Opaque, authority-checked access to one verified V3 execution artifact.
+///
+/// There is no raw context or artifact accessor. Every mask is derived under
+/// the V3 transcript retained by the verified execution, and every read is
+/// bounded to one canonical artifact role.
+#[allow(dead_code)]
+pub(crate) struct BlsDoryV3ExecutionArtifactReader<'a> {
+    context: BlsDoryV3ExecutionAccumulatorArtifactContext,
+    nonce: u64,
+    final_activation_digest: [u8; 32],
+    work_digest: [u8; 32],
+    artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+}
+
+#[allow(dead_code)]
+impl BlsDoryV3ExecutionArtifactReader<'_> {
+    pub(crate) const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub(crate) const fn final_activation_digest(&self) -> [u8; 32] {
+        self.final_activation_digest
+    }
+
+    pub(crate) const fn work_digest(&self) -> [u8; 32] {
+        self.work_digest
+    }
+
+    pub(crate) const fn canonical_rows(&self) -> usize {
+        self.context.raw.canonical_rows()
+    }
+
+    pub(crate) const fn canonical_columns(&self) -> usize {
+        self.context.raw.canonical_columns()
+    }
+
+    pub(crate) const fn banks(&self) -> usize {
+        self.context.raw.banks()
+    }
+
+    pub(crate) const fn layers_per_bank(&self) -> usize {
+        self.context.raw.layers_per_bank()
+    }
+
+    pub(crate) const fn cells_per_column(&self) -> usize {
+        self.context.raw.cells_per_column()
+    }
+
+    pub(crate) const fn authentication_chunk_cells(&self) -> usize {
+        self.context.raw.authentication_chunk_cells()
+    }
+
+    pub(crate) fn validate_setup(
+        &self,
+        setup: &DeterministicBlsDorySetup,
+    ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
+        if self.context.raw.setup_identity() != setup.identity() {
+            return Err(BlsDoryExecutionAccumulatorArtifactError::WrongContext.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn v3_initialization_mask(
+        &self,
+    ) -> Result<StructuredMaskPolynomial, BlsDoryV3WinningNonceReplayError> {
+        Ok(StructuredMaskPolynomial::from_dory_v3_virtual_challenge(
+            &self.context.challenge.digest(),
+            self.canonical_rows(),
+            self.canonical_columns(),
+        )?)
+    }
+
+    pub(crate) fn v3_bank_mask(
+        &self,
+        bank: usize,
+    ) -> Result<StructuredMaskPolynomial, BlsDoryV3WinningNonceReplayError> {
+        if bank >= self.banks() {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        let first_layer = bank
+            .checked_mul(self.layers_per_bank())
+            .and_then(|layer| u32::try_from(layer).ok())
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        Ok(
+            StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+                &self.context.challenge.digest(),
+                first_layer,
+                self.layers_per_bank(),
+                self.canonical_rows(),
+                self.canonical_columns(),
+            )?,
+        )
+    }
+
+    pub(crate) fn read_initialization_segment(
+        &mut self,
+        start_cell: usize,
+        output: &mut [i32],
+    ) -> Result<usize, BlsDoryV3WinningNonceReplayError> {
+        self.validate_segment(start_cell, output.len())?;
+        Ok(self.artifact.read_column_segment(
+            BlsDoryExecutionAccumulatorColumn::Initialization,
+            start_cell,
+            output,
+        )?)
+    }
+
+    pub(crate) fn read_bank_layer_segment(
+        &mut self,
+        bank: usize,
+        layer: usize,
+        start_cell: usize,
+        output: &mut [i32],
+    ) -> Result<usize, BlsDoryV3WinningNonceReplayError> {
+        if bank >= self.banks() || layer >= self.layers_per_bank() {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        self.validate_segment(start_cell, output.len())?;
+        Ok(self.artifact.read_column_segment(
+            BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
+            start_cell,
+            output,
+        )?)
+    }
+
+    pub(crate) fn verify_final_activation(
+        &self,
+        activation: &[u8],
+    ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
+        if activation.len() != self.cells_per_column() {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        let final_activation_digest = self.context.output_digest(activation)?;
+        if final_activation_digest != self.final_activation_digest {
+            return Err(BlsDoryV3WinningNonceReplayError::FinalActivationDigest);
+        }
+        if self.context.work_digest(final_activation_digest) != self.work_digest {
+            return Err(BlsDoryV3WinningNonceReplayError::WorkDigest);
+        }
+        Ok(())
+    }
+
+    fn validate_segment(
+        &self,
+        start_cell: usize,
+        output_len: usize,
+    ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
+        if output_len == 0
+            || output_len > self.authentication_chunk_cells()
+            || start_cell
+                .checked_add(output_len)
+                .filter(|end| *end <= self.cells_per_column())
+                .is_none()
+        {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        Ok(())
     }
 }
 
@@ -2126,6 +2323,7 @@ mod tests {
         block: BlockChallenge,
         claim: BlsDoryV3WinningNonceClaim,
         base: Vec<u8>,
+        final_activation: Vec<u8>,
         expected_accumulators: Vec<Vec<i32>>,
     }
 
@@ -2187,7 +2385,7 @@ mod tests {
         transcript: DoryV3TranscriptContext,
         block: &BlockChallenge,
         nonce: u64,
-    ) -> (BlsDoryV3WinningNonceClaim, Vec<Vec<i32>>) {
+    ) -> (BlsDoryV3WinningNonceClaim, Vec<u8>, Vec<Vec<i32>>) {
         let challenge = transcript.challenge_context(block, nonce).unwrap();
         let initialization_statement = StructuredTransitionStatement {
             layers: 1,
@@ -2290,6 +2488,7 @@ mod tests {
                 final_activation_digest,
                 work_digest: challenge.work_digest(final_activation_digest),
             },
+            final_activation,
             expected_accumulators,
         )
     }
@@ -2335,7 +2534,7 @@ mod tests {
             &authenticated,
         )
         .unwrap();
-        let (claim, expected_accumulators) =
+        let (claim, final_activation, expected_accumulators) =
             evaluate_dory_v3_test_reference(&base, &layers, transcript, &block, 9);
         DoryV3ReplayFixture {
             bank,
@@ -2345,6 +2544,7 @@ mod tests {
             block,
             claim,
             base,
+            final_activation,
             expected_accumulators,
         }
     }
@@ -2427,6 +2627,188 @@ mod tests {
             Err(BlsDoryExecutionAccumulatorArtifactError::WrongContext)
         ));
         drop(artifact);
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_artifact_reader_derives_exact_masks_reads_segments_and_verifies_output() {
+        let fixture = dory_v3_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let challenge = fixture
+            .transcript
+            .challenge_context(&fixture.block, fixture.claim.nonce)
+            .unwrap();
+        let mut execution = replay_dory_v3(&fixture, &scratch);
+        let mut reader = execution
+            .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+            .unwrap();
+
+        assert_eq!(reader.nonce(), fixture.claim.nonce);
+        assert_eq!(
+            reader.final_activation_digest(),
+            fixture.claim.final_activation_digest
+        );
+        assert_eq!(reader.work_digest(), fixture.claim.work_digest);
+        assert_eq!(reader.canonical_rows(), 2);
+        assert_eq!(reader.canonical_columns(), 2);
+        assert_eq!(reader.banks(), 2);
+        assert_eq!(reader.layers_per_bank(), 2);
+        assert_eq!(reader.cells_per_column(), 4);
+        assert_eq!(reader.authentication_chunk_cells(), 4);
+        reader.validate_setup(&fixture.setup).unwrap();
+
+        let initialization = reader.v3_initialization_mask().unwrap();
+        assert_eq!(
+            initialization,
+            StructuredMaskPolynomial::from_dory_v3_virtual_challenge(&challenge.digest(), 2, 2)
+                .unwrap()
+        );
+        assert_ne!(
+            initialization,
+            StructuredMaskPolynomial::from_virtual_challenge(&challenge.digest(), 2, 2).unwrap()
+        );
+        for (bank, first_layer) in [0, 2].into_iter().enumerate() {
+            let mask = reader.v3_bank_mask(bank).unwrap();
+            assert_eq!(
+                mask,
+                StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+                    &challenge.digest(),
+                    first_layer,
+                    2,
+                    2,
+                    2,
+                )
+                .unwrap()
+            );
+            assert_ne!(
+                mask,
+                StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                    &challenge.digest(),
+                    first_layer,
+                    2,
+                    2,
+                    2,
+                )
+                .unwrap()
+            );
+        }
+
+        let mut initialization_segment = [0_i32; 2];
+        assert_eq!(
+            reader
+                .read_initialization_segment(1, &mut initialization_segment)
+                .unwrap(),
+            2
+        );
+        assert_eq!(initialization_segment, [1, -1]);
+        let mut layer_segment = [0_i32; 2];
+        assert_eq!(
+            reader
+                .read_bank_layer_segment(1, 1, 1, &mut layer_segment)
+                .unwrap(),
+            2
+        );
+        assert_eq!(layer_segment, fixture.expected_accumulators[3][1..3]);
+        reader
+            .verify_final_activation(&fixture.final_activation)
+            .unwrap();
+
+        drop(execution);
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_artifact_reader_rejects_authority_output_role_and_bounds_substitution() {
+        let fixture = dory_v3_replay_fixture(0);
+        let other = dory_v3_replay_fixture(1);
+        let scratch = ScratchDirectory::create();
+
+        let mut wrong_record = replay_dory_v3(&fixture, &scratch);
+        assert!(matches!(
+            wrong_record.authenticated_artifact_reader(&other.authenticated, &other.setup),
+            Err(BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                BlsDoryExecutionAccumulatorArtifactError::WrongContext
+            ))
+        ));
+
+        let mut wrong_setup = replay_dory_v3(&fixture, &scratch);
+        let substituted_setup = deterministic_bls_dory_setup(DORY_V3_TEST_VARIABLES + 1).unwrap();
+        assert!(matches!(
+            wrong_setup.authenticated_artifact_reader(&fixture.authenticated, &substituted_setup),
+            Err(BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                BlsDoryExecutionAccumulatorArtifactError::WrongContext
+            ))
+        ));
+
+        let mut wrong_work = replay_dory_v3(&fixture, &scratch);
+        wrong_work.work_digest[0] ^= 1;
+        assert!(matches!(
+            wrong_work.authenticated_artifact_reader(&fixture.authenticated, &fixture.setup),
+            Err(BlsDoryV3WinningNonceReplayError::WorkDigest)
+        ));
+
+        let mut wrong_artifact = replay_dory_v3(&fixture, &scratch);
+        let mut substituted_artifact = replay_dory_v3(&other, &scratch);
+        std::mem::swap(
+            &mut wrong_artifact.artifact,
+            &mut substituted_artifact.artifact,
+        );
+        assert!(matches!(
+            wrong_artifact.authenticated_artifact_reader(&fixture.authenticated, &fixture.setup),
+            Err(BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                BlsDoryExecutionAccumulatorArtifactError::WrongContext
+            ))
+        ));
+
+        let mut execution = replay_dory_v3(&fixture, &scratch);
+        let mut reader = execution
+            .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+            .unwrap();
+        assert!(matches!(
+            reader.validate_setup(&substituted_setup),
+            Err(BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                BlsDoryExecutionAccumulatorArtifactError::WrongContext
+            ))
+        ));
+        assert!(matches!(
+            reader.v3_bank_mask(2),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+        assert!(matches!(
+            reader.read_bank_layer_segment(2, 0, 0, &mut [0]),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+        assert!(matches!(
+            reader.read_bank_layer_segment(0, 2, 0, &mut [0]),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+        assert!(matches!(
+            reader.read_initialization_segment(4, &mut [0]),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+        assert!(matches!(
+            reader.read_initialization_segment(0, &mut []),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+        let mut changed_activation = fixture.final_activation.clone();
+        changed_activation[0] ^= 1;
+        assert!(matches!(
+            reader.verify_final_activation(&changed_activation),
+            Err(BlsDoryV3WinningNonceReplayError::FinalActivationDigest)
+        ));
+        assert!(matches!(
+            reader.verify_final_activation(&fixture.final_activation[..3]),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+
+        drop((
+            execution,
+            wrong_record,
+            wrong_setup,
+            wrong_work,
+            wrong_artifact,
+            substituted_artifact,
+        ));
         assert_eq!(scratch.entry_count(), 0);
     }
 

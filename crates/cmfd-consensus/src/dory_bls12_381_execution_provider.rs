@@ -104,9 +104,9 @@ impl BlsDoryV3ExecutionAccumulatorArtifactContext {
         .map_err(|_| BlsDoryExecutionAccumulatorArtifactError::InvalidShape)?;
         let layers_per_bank = usize::try_from(identity.layers_per_bank())
             .map_err(|_| BlsDoryExecutionAccumulatorArtifactError::InvalidShape)?;
-        let chunk_cells = rows
-            .checked_mul(columns)
-            .ok_or(BlsDoryExecutionAccumulatorArtifactError::InvalidShape)?;
+        // Keep bounded V3 fixtures genuinely streamed: one row per chunk
+        // makes every multi-row layer cross an authentication boundary.
+        let chunk_cells = columns;
         Ok(Self {
             raw: BlsDoryExecutionAccumulatorArtifactContext::for_test(
                 [
@@ -191,15 +191,15 @@ pub(crate) struct VerifiedBlsDoryV3WinningNonceExecution {
 
 #[allow(dead_code)]
 impl VerifiedBlsDoryV3WinningNonceExecution {
-    pub(crate) const fn nonce(&self) -> u64 {
+    const fn nonce(&self) -> u64 {
         self.nonce
     }
 
-    pub(crate) const fn final_activation_digest(&self) -> [u8; 32] {
+    const fn final_activation_digest(&self) -> [u8; 32] {
         self.final_activation_digest
     }
 
-    pub(crate) const fn work_digest(&self) -> [u8; 32] {
+    const fn work_digest(&self) -> [u8; 32] {
         self.work_digest
     }
 
@@ -254,6 +254,41 @@ impl VerifiedBlsDoryV3WinningNonceExecution {
     }
 }
 
+/// Opaque authority for the canonical final activation of one verified V3
+/// execution.
+///
+/// Only an authenticated execution-artifact reader can mint this capability.
+/// The originating transcript context remains private and inseparable from the
+/// canonical bytes and the two digests checked during reconstruction.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct VerifiedBlsDoryV3FinalActivation {
+    context: BlsDoryV3ExecutionAccumulatorArtifactContext,
+    nonce: u64,
+    activation: Box<[u8]>,
+    final_activation_digest: [u8; 32],
+    work_digest: [u8; 32],
+}
+
+#[allow(dead_code)]
+impl VerifiedBlsDoryV3FinalActivation {
+    const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.activation
+    }
+
+    const fn final_activation_digest(&self) -> [u8; 32] {
+        self.final_activation_digest
+    }
+
+    const fn work_digest(&self) -> [u8; 32] {
+        self.work_digest
+    }
+}
+
 /// Opaque, authority-checked access to one verified V3 execution artifact.
 ///
 /// There is no raw context or artifact accessor. Every mask is derived under
@@ -270,15 +305,15 @@ pub(crate) struct BlsDoryV3ExecutionArtifactReader<'a> {
 
 #[allow(dead_code)]
 impl BlsDoryV3ExecutionArtifactReader<'_> {
-    pub(crate) const fn nonce(&self) -> u64 {
+    const fn nonce(&self) -> u64 {
         self.nonce
     }
 
-    pub(crate) const fn final_activation_digest(&self) -> [u8; 32] {
+    const fn final_activation_digest(&self) -> [u8; 32] {
         self.final_activation_digest
     }
 
-    pub(crate) const fn work_digest(&self) -> [u8; 32] {
+    const fn work_digest(&self) -> [u8; 32] {
         self.work_digest
     }
 
@@ -379,10 +414,99 @@ impl BlsDoryV3ExecutionArtifactReader<'_> {
         )?)
     }
 
-    pub(crate) fn verify_final_activation(
+    /// Reconstruct and authenticate the exact final activation retained by the
+    /// final bank's final accumulator column.
+    ///
+    /// The bank, layer, transition statement, and V3 mask are all derived from
+    /// the reader's private authority. A capability is returned only after
+    /// every touched artifact chunk and both claimed digests authenticate.
+    pub(crate) fn reconstruct_verified_final_activation(
+        &mut self,
+    ) -> Result<VerifiedBlsDoryV3FinalActivation, BlsDoryV3WinningNonceReplayError> {
+        let final_bank = self
+            .banks()
+            .checked_sub(1)
+            .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?;
+        let final_layer = self
+            .layers_per_bank()
+            .checked_sub(1)
+            .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?;
+        let rows = self.canonical_rows();
+        let cols = self.canonical_columns();
+        let cells = rows
+            .checked_mul(cols)
+            .filter(|cells| *cells == self.cells_per_column())
+            .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?;
+        let statement = StructuredTransitionStatement {
+            layers: self.layers_per_bank(),
+            rows,
+            cols,
+            max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+            max_mask: MAX_TRANSITION_MASK,
+        };
+        statement.validate_verifier_shape()?;
+        let mask = self.v3_bank_mask(final_bank)?;
+        mask.validate(statement)?;
+
+        let chunk_cells = self.authentication_chunk_cells();
+        let mut accumulators = zeroed_dory_v3_vector(chunk_cells)?;
+        let mut activation = reserved_dory_v3_vector(cells)?;
+        let layer_offset = final_layer
+            .checked_mul(cells)
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        let mut start = 0usize;
+        while start < cells {
+            let take = cells.saturating_sub(start).min(chunk_cells);
+            if take == 0 {
+                return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+            }
+            let read = self.read_bank_layer_segment(
+                final_bank,
+                final_layer,
+                start,
+                &mut accumulators[..take],
+            )?;
+            if read != take {
+                return Err(BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                    BlsDoryExecutionAccumulatorArtifactError::InvalidShape,
+                ));
+            }
+            for (offset, accumulator) in accumulators[..take].iter().copied().enumerate() {
+                let index = layer_offset
+                    .checked_add(start)
+                    .and_then(|index| index.checked_add(offset))
+                    .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+                let mask_value = mask.value_at_boolean_index_prevalidated(statement, index)?;
+                let transition = derive_transition_regular_row_from_mask(
+                    statement,
+                    index,
+                    i64::from(accumulator),
+                    mask_value,
+                )?;
+                activation.push(encode_dory_v3_activation(transition.activation)?);
+            }
+            start = start
+                .checked_add(take)
+                .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        }
+        if activation.len() != cells {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        let (final_activation_digest, work_digest) =
+            self.authenticate_final_activation(&activation)?;
+        Ok(VerifiedBlsDoryV3FinalActivation {
+            context: self.context,
+            nonce: self.nonce,
+            activation: activation.into_boxed_slice(),
+            final_activation_digest,
+            work_digest,
+        })
+    }
+
+    fn authenticate_final_activation(
         &self,
         activation: &[u8],
-    ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
+    ) -> Result<([u8; 32], [u8; 32]), BlsDoryV3WinningNonceReplayError> {
         if activation.len() != self.cells_per_column() {
             return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
         }
@@ -390,10 +514,11 @@ impl BlsDoryV3ExecutionArtifactReader<'_> {
         if final_activation_digest != self.final_activation_digest {
             return Err(BlsDoryV3WinningNonceReplayError::FinalActivationDigest);
         }
-        if self.context.work_digest(final_activation_digest) != self.work_digest {
+        let work_digest = self.context.work_digest(final_activation_digest);
+        if work_digest != self.work_digest {
             return Err(BlsDoryV3WinningNonceReplayError::WorkDigest);
         }
-        Ok(())
+        Ok((final_activation_digest, work_digest))
     }
 
     fn validate_segment(
@@ -1642,12 +1767,7 @@ impl StagedModelFieldLayoutSink for DoryV3WinningNonceReplaySink<'_> {
 
         let mut final_activation = reserved_dory_v3_vector(self.cells)?;
         for activation in &self.activations {
-            let encoded = i16::from(*activation)
-                .checked_add(V2_MODEL_VALUE_CENTER)
-                .and_then(|value| u8::try_from(value).ok())
-                .filter(|value| *value <= 250)
-                .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?;
-            final_activation.push(encoded);
+            final_activation.push(encode_dory_v3_activation(i64::from(*activation))?);
         }
         let final_activation_digest = self.context.output_digest(&final_activation)?;
         if final_activation_digest != self.claim.final_activation_digest {
@@ -1701,6 +1821,16 @@ fn decode_dory_v3_model_field(value: u64) -> Result<i8, BlsDoryV3WinningNonceRep
     i8::try_from(signed).map_err(|_| BlsDoryV3WinningNonceReplayError::ModelEncoding)
 }
 
+fn encode_dory_v3_activation(activation: i64) -> Result<u8, BlsDoryV3WinningNonceReplayError> {
+    let activation =
+        i8::try_from(activation).map_err(|_| BlsDoryV3WinningNonceReplayError::ModelShape)?;
+    i16::from(activation)
+        .checked_add(V2_MODEL_VALUE_CENTER)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| *value <= 250)
+        .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)
+}
+
 fn validate_dory_v3_accumulator_bound(
     accumulators: &[i64],
 ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
@@ -1732,8 +1862,8 @@ fn reserved_dory_v3_vector<T>(capacity: usize) -> Result<Vec<T>, BlsDoryV3Winnin
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
-        io::{self, Cursor, Read},
+        fs::{self, OpenOptions},
+        io::{self, Cursor, Read, Seek, SeekFrom, Write},
         path::{Path, PathBuf},
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
@@ -1812,6 +1942,79 @@ mod tests {
     impl Drop for ScratchDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn corrupt_final_accumulator_column(
+        scratch: &ScratchDirectory,
+        reader: &BlsDoryV3ExecutionArtifactReader<'_>,
+    ) {
+        let mut entries = fs::read_dir(scratch.path()).unwrap();
+        let path = entries.next().unwrap().unwrap().path();
+        assert!(entries.next().is_none());
+
+        let cells = reader.cells_per_column();
+        let chunk_cells = reader.authentication_chunk_cells();
+        let columns = reader
+            .banks()
+            .checked_mul(reader.layers_per_bank())
+            .and_then(|columns| columns.checked_add(1))
+            .unwrap();
+        let chunks_per_column = cells.div_ceil(chunk_cells);
+        let data_bytes = columns
+            .checked_mul(cells)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<i32>()))
+            .unwrap();
+        let trailing_bytes = columns
+            .checked_mul(chunks_per_column)
+            .and_then(|digests| digests.checked_add(2))
+            .and_then(|digests| digests.checked_mul(std::mem::size_of::<[u8; 32]>()))
+            .unwrap();
+        let file_bytes = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
+        let header_bytes = file_bytes
+            .checked_sub(data_bytes)
+            .and_then(|bytes| bytes.checked_sub(trailing_bytes))
+            .unwrap();
+        let final_column = columns.checked_sub(1).unwrap();
+        let byte_offset = final_column
+            .checked_mul(cells)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<i32>()))
+            .and_then(|bytes| bytes.checked_add(header_bytes))
+            .unwrap();
+        assert!(byte_offset < header_bytes + data_bytes);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(u64::try_from(byte_offset).unwrap()))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(u64::try_from(byte_offset).unwrap()))
+            .unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    fn read_artifact_column_in_authenticated_chunks(
+        artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+        column: BlsDoryExecutionAccumulatorColumn,
+        output: &mut [i32],
+    ) {
+        let chunk_cells = artifact.context().authentication_chunk_cells();
+        let mut start = 0usize;
+        while start < output.len() {
+            let end = start.saturating_add(chunk_cells).min(output.len());
+            assert_eq!(
+                artifact
+                    .read_column_segment(column, start, &mut output[start..end])
+                    .unwrap(),
+                end - start
+            );
+            start = end;
         }
     }
 
@@ -3476,6 +3679,21 @@ mod tests {
     }
 
     #[test]
+    fn dory_v3_activation_encoding_matches_execution_output_boundaries() {
+        assert_eq!(encode_dory_v3_activation(-125).unwrap(), 0);
+        assert_eq!(encode_dory_v3_activation(0).unwrap(), 125);
+        assert_eq!(encode_dory_v3_activation(125).unwrap(), 250);
+        assert!(matches!(
+            encode_dory_v3_activation(-126),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+        assert!(matches!(
+            encode_dory_v3_activation(126),
+            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
+    }
+
+    #[test]
     fn dory_v3_replay_authenticates_exact_accumulators_and_output() {
         let fixture = dory_v3_replay_fixture(0);
         let scratch = ScratchDirectory::create();
@@ -3490,13 +3708,11 @@ mod tests {
         let (context, _, _, _, mut artifact) = execution.into_parts();
         assert_eq!(artifact.context(), *context.raw());
         let mut actual = vec![0i32; 4];
-        artifact
-            .read_column_segment(
-                BlsDoryExecutionAccumulatorColumn::Initialization,
-                0,
-                &mut actual,
-            )
-            .unwrap();
+        read_artifact_column_in_authenticated_chunks(
+            &mut artifact,
+            BlsDoryExecutionAccumulatorColumn::Initialization,
+            &mut actual,
+        );
         assert_eq!(
             actual,
             fixture
@@ -3507,13 +3723,11 @@ mod tests {
         );
         for bank in 0..2 {
             for layer in 0..2 {
-                artifact
-                    .read_column_segment(
-                        BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
-                        0,
-                        &mut actual,
-                    )
-                    .unwrap();
+                read_artifact_column_in_authenticated_chunks(
+                    &mut artifact,
+                    BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
+                    &mut actual,
+                );
                 assert_eq!(actual, fixture.expected_accumulators[bank * 2 + layer]);
             }
         }
@@ -3563,7 +3777,7 @@ mod tests {
         assert_eq!(reader.banks(), 2);
         assert_eq!(reader.layers_per_bank(), 2);
         assert_eq!(reader.cells_per_column(), 4);
-        assert_eq!(reader.authentication_chunk_cells(), 4);
+        assert_eq!(reader.authentication_chunk_cells(), 2);
         reader.validate_setup(&fixture.setup).unwrap();
 
         let initialization = reader.v3_initialization_mask().unwrap();
@@ -3618,9 +3832,14 @@ mod tests {
             2
         );
         assert_eq!(layer_segment, fixture.expected_accumulators[3][1..3]);
-        reader
-            .verify_final_activation(&fixture.final_activation)
-            .unwrap();
+        let verified = reader.reconstruct_verified_final_activation().unwrap();
+        assert_eq!(verified.nonce(), fixture.claim.nonce);
+        assert_eq!(verified.as_bytes(), fixture.final_activation.as_slice());
+        assert_eq!(
+            verified.final_activation_digest(),
+            fixture.claim.final_activation_digest
+        );
+        assert_eq!(verified.work_digest(), fixture.claim.work_digest);
 
         drop(execution);
         assert_eq!(scratch.entry_count(), 0);
@@ -3699,15 +3918,16 @@ mod tests {
             reader.read_initialization_segment(0, &mut []),
             Err(BlsDoryV3WinningNonceReplayError::ModelShape)
         ));
-        let mut changed_activation = fixture.final_activation.clone();
-        changed_activation[0] ^= 1;
+        reader.final_activation_digest[0] ^= 1;
         assert!(matches!(
-            reader.verify_final_activation(&changed_activation),
+            reader.reconstruct_verified_final_activation(),
             Err(BlsDoryV3WinningNonceReplayError::FinalActivationDigest)
         ));
+        reader.final_activation_digest = fixture.claim.final_activation_digest;
+        reader.work_digest[0] ^= 1;
         assert!(matches!(
-            reader.verify_final_activation(&fixture.final_activation[..3]),
-            Err(BlsDoryV3WinningNonceReplayError::ModelShape)
+            reader.reconstruct_verified_final_activation(),
+            Err(BlsDoryV3WinningNonceReplayError::WorkDigest)
         ));
 
         drop((
@@ -3718,6 +3938,35 @@ mod tests {
             wrong_artifact,
             substituted_artifact,
         ));
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_final_activation_reconstruction_rejects_live_artifact_corruption() {
+        let fixture = dory_v3_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let mut execution = replay_dory_v3(&fixture, &scratch);
+        {
+            let mut reader = execution
+                .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                .unwrap();
+
+            corrupt_final_accumulator_column(&scratch, &reader);
+            assert!(matches!(
+                reader.reconstruct_verified_final_activation(),
+                Err(BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                    BlsDoryExecutionAccumulatorArtifactError::Authentication
+                ))
+            ));
+            assert!(matches!(
+                reader.reconstruct_verified_final_activation(),
+                Err(BlsDoryV3WinningNonceReplayError::ExecutionArtifact(
+                    BlsDoryExecutionAccumulatorArtifactError::NotAuthenticated
+                ))
+            ));
+        }
+
+        drop(execution);
         assert_eq!(scratch.entry_count(), 0);
     }
 

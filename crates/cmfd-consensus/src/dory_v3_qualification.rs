@@ -43,7 +43,7 @@ use crate::{
         seal_composed_bls_dory_v3_layout_v5_candidate,
     },
     dory_bls12_381_layout::{
-        BLS_DORY_SHARED_PRODUCTION_VARIABLES,
+        BLS_DORY_SHARED_PRODUCTION_VARIABLES, SHARED_PROOF_MAGIC,
         prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch,
     },
     dory_bls12_381_prototype::{BlsDoryPrototypeError, deterministic_bls_dory_setup},
@@ -53,13 +53,19 @@ use crate::{
         DoryV3ModelCommitmentRecordError, DoryV3ModelCommitmentRecordV2,
         derive_bank_authenticated_dory_v3_model_commitment_record_v2,
     },
-    dory_v3_suite::{DORY_V3_PADDED_VARIABLES, Digest32},
+    dory_v3_suite::{
+        DORY_V3_ALGORITHM_VERSION, DORY_V3_PADDED_VARIABLES, DORY_V3_PROOF_VERSION,
+        DORY_V3_SETUP_IDENTITY, DORY_V3_SHARED_LAYOUT_VERSION, Digest32,
+    },
     dory_v3_transcript::DoryV3TranscriptContext,
-    wire::{WireError, decode_forgematrix_proof, encode_forgematrix_proof},
+    wire::{MAX_PROOF_BYTES, WireError, decode_forgematrix_proof, encode_forgematrix_proof},
 };
 
 const QUALIFICATION_REPORT_VERSION: u16 = 2;
 const QUALIFICATION_REQUEST_GENERATION_REPORT_VERSION: u16 = 1;
+const VERIFIER_REPORT_VERSION: u16 = 1;
+const MAX_QUALIFICATION_REQUEST_JSON_BYTES: usize = 16 * 1024;
+const MAX_RECORD_V2_JSON_BYTES: usize = 64 * 1024;
 const SCRATCH_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const QUALIFICATION_REQUEST_DIGEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/QUALIFICATION-REQUEST/V1";
 
@@ -197,6 +203,35 @@ pub struct ProductionDoryV3QualificationReport {
     pub prepublication_qualification_nanoseconds: u64,
 }
 
+/// Measurements from independently loading and verifying one persisted proof.
+///
+/// This runner never proves, mines, publishes, or creates a chain-admission
+/// capability. Layout V5 decoding includes its canonical re-encoding check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProductionDoryV3VerifierReport {
+    pub report_version: u16,
+    pub network_id: Digest32,
+    pub block_height: u64,
+    pub nonce: u64,
+    pub request_digest: Digest32,
+    pub record_digest: Digest32,
+    pub model_identity_digest: Digest32,
+    pub setup_identity: Digest32,
+    pub wire_blake3_digest: Digest32,
+    pub wire_bytes: u64,
+    pub cp02_bytes: u64,
+    pub algorithm_version: u32,
+    pub proof_version: u32,
+    pub shared_layout_version: u16,
+    pub parse_and_canonicalization_nanoseconds: u64,
+    pub record_and_bank_authentication_nanoseconds: u64,
+    pub verification_nanoseconds: u64,
+    pub total_nanoseconds: u64,
+    pub whole_process_peak_rss_bytes: u64,
+    pub whole_process_peak_rss_scope: &'static str,
+    pub verifier_only: bool,
+}
+
 /// Fail-closed errors from the production qualification orchestrator.
 #[derive(Debug, Error)]
 pub enum ProductionDoryV3QualificationError {
@@ -258,6 +293,18 @@ pub enum ProductionDoryV3QualificationError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to read input {path}: {source}")]
+    ReadInput {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("persisted proof wire exceeds the {max}-byte limit")]
+    ProofWireTooLarge { max: usize },
+    #[error("qualification request JSON exceeds the {max}-byte limit")]
+    QualificationRequestJsonTooLarge { max: usize },
+    #[error("Record V2 JSON exceeds the {max}-byte limit")]
+    RecordV2JsonTooLarge { max: usize },
     #[error("qualification JSON encoding or decoding failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("deterministic n=33 setup failed: {0}")]
@@ -281,6 +328,12 @@ pub enum ProductionDoryV3QualificationError {
     NonCanonicalCp02,
     #[error("the canonical proof wire did not round-trip byte-identically")]
     NonCanonicalWire,
+    #[error("the persisted proof wire does not contain a V3 candidate")]
+    ExpectedV3Candidate,
+    #[error("the persisted candidate is not a Layout V5 proof")]
+    ExpectedLayoutV5,
+    #[error("the persisted candidate does not match the qualification request: {0}")]
+    ProofRequestMismatch(&'static str),
     #[error("qualification duration overflowed its u64 nanosecond field")]
     DurationOverflow,
     #[error("qualification size overflowed its u64 byte field")]
@@ -782,6 +835,84 @@ pub fn run_production_dory_v3_qualification(
     Ok(report)
 }
 
+/// Independently load and verify one persisted production Dory V3 Layout V5 proof.
+///
+/// The proof wire and its nested CP02 envelope are decoded and canonically
+/// re-encoded before the production Record V2 and bank are authenticated. The
+/// existing Layout V5 verifier then performs the context-bound inner decode,
+/// canonical re-encoding, and cryptographic verification. This function has no
+/// proving, publication, or consensus-activation side effects.
+pub fn run_production_dory_v3_verifier(
+    bank_path: &Path,
+    record_path: &Path,
+    request_path: &Path,
+    proof_path: &Path,
+) -> Result<ProductionDoryV3VerifierReport, ProductionDoryV3QualificationError> {
+    let verifier_started = Instant::now();
+
+    let parse_started = Instant::now();
+    let request = load_bounded_qualification_request(request_path)?;
+    let wire = read_bounded_proof_wire(proof_path)?;
+    let (candidate, _payload) = decode_canonical_v3_layout_v5_wire(&wire, &request)?;
+    let parse_and_canonicalization_nanoseconds = elapsed_nanoseconds(parse_started)?;
+
+    let authentication_started = Instant::now();
+    let audit_record = load_bounded_record_v2(record_path)?;
+    validate_verifier_record_static_identity(&audit_record)?;
+    let setup = deterministic_bls_dory_setup(DORY_V3_PADDED_VARIABLES as usize)?;
+    setup.validate()?;
+    audit_record.validate_production(&setup)?;
+    let structural = audit_record
+        .model_identity()
+        .validate_production_structure(audit_record.manifest(), &setup)?;
+    let authenticated = derive_bank_authenticated_dory_v3_model_commitment_record_v2(
+        open_input(bank_path)?,
+        &structural,
+        &setup,
+    )?;
+    if authenticated.record() != &audit_record {
+        return Err(ProductionDoryV3QualificationError::RecordReproductionMismatch);
+    }
+    validate_verifier_candidate_binding(&candidate, &request, audit_record.manifest_digest())?;
+    let record_and_bank_authentication_nanoseconds = elapsed_nanoseconds(authentication_started)?;
+
+    let verification_started = Instant::now();
+    let _verified = verify_bls_dory_v3_layout_v5_candidate(
+        request.block.network_id,
+        &authenticated,
+        &request.block,
+        &candidate,
+        &setup,
+    )?;
+    let verification_nanoseconds = elapsed_nanoseconds(verification_started)?;
+    let whole_process_peak_rss_bytes =
+        peak_whole_process_rss_bytes().map_err(ProductionDoryV3QualificationError::MemoryQuery)?;
+
+    Ok(ProductionDoryV3VerifierReport {
+        report_version: VERIFIER_REPORT_VERSION,
+        network_id: Digest32::new(request.block.network_id),
+        block_height: request.block.height,
+        nonce: candidate.nonce,
+        request_digest: qualification_request_digest(&request),
+        record_digest: audit_record.record_digest(),
+        model_identity_digest: audit_record.model_identity_digest(),
+        setup_identity: audit_record.setup_identity(),
+        wire_blake3_digest: blake3_digest(&wire),
+        wire_bytes: byte_len(&wire)?,
+        cp02_bytes: byte_len(&candidate.structured_proof)?,
+        algorithm_version: candidate.algorithm_version,
+        proof_version: candidate.proof_version,
+        shared_layout_version: DORY_V3_SHARED_LAYOUT_VERSION,
+        parse_and_canonicalization_nanoseconds,
+        record_and_bank_authentication_nanoseconds,
+        verification_nanoseconds,
+        total_nanoseconds: elapsed_nanoseconds(verifier_started)?,
+        whole_process_peak_rss_bytes,
+        whole_process_peak_rss_scope: "OS process-lifetime high-water mark; run the verifier CLI in a fresh process for an isolated measurement",
+        verifier_only: true,
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictBlockChallenge {
@@ -1040,6 +1171,145 @@ fn qualification_request_digest(request: &ProductionDoryV3QualificationRequest) 
     hasher.update(request.final_activation_digest.as_bytes());
     hasher.update(request.work_digest.as_bytes());
     Digest32::new(*hasher.finalize().as_bytes())
+}
+
+fn load_bounded_qualification_request(
+    path: &Path,
+) -> Result<ProductionDoryV3QualificationRequest, ProductionDoryV3QualificationError> {
+    let bytes = read_input_prefix(path, MAX_QUALIFICATION_REQUEST_JSON_BYTES)?;
+    if bytes.len() > MAX_QUALIFICATION_REQUEST_JSON_BYTES {
+        return Err(
+            ProductionDoryV3QualificationError::QualificationRequestJsonTooLarge {
+                max: MAX_QUALIFICATION_REQUEST_JSON_BYTES,
+            },
+        );
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn load_bounded_record_v2(
+    path: &Path,
+) -> Result<DoryV3ModelCommitmentRecordV2, ProductionDoryV3QualificationError> {
+    let bytes = read_input_prefix(path, MAX_RECORD_V2_JSON_BYTES)?;
+    if bytes.len() > MAX_RECORD_V2_JSON_BYTES {
+        return Err(ProductionDoryV3QualificationError::RecordV2JsonTooLarge {
+            max: MAX_RECORD_V2_JSON_BYTES,
+        });
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_bounded_proof_wire(path: &Path) -> Result<Vec<u8>, ProductionDoryV3QualificationError> {
+    let bytes = read_input_prefix(path, MAX_PROOF_BYTES)?;
+    if bytes.len() > MAX_PROOF_BYTES {
+        return Err(ProductionDoryV3QualificationError::ProofWireTooLarge {
+            max: MAX_PROOF_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+fn read_input_prefix(
+    path: &Path,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, ProductionDoryV3QualificationError> {
+    let mut bytes = Vec::new();
+    open_input(path)?
+        .take((maximum_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ProductionDoryV3QualificationError::ReadInput {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(bytes)
+}
+
+fn decode_canonical_v3_layout_v5_wire(
+    wire: &[u8],
+    request: &ProductionDoryV3QualificationRequest,
+) -> Result<
+    (ForgeMatrixV3CandidateProof, BlsDoryV3CandidatePayload),
+    ProductionDoryV3QualificationError,
+> {
+    let decoded = decode_forgematrix_proof(wire, request.block.network_id)?;
+    let BlockProof::V3Candidate(candidate) = decoded else {
+        return Err(ProductionDoryV3QualificationError::ExpectedV3Candidate);
+    };
+    let reencoded = encode_forgematrix_proof(
+        &BlockProof::V3Candidate(candidate.clone()),
+        request.block.network_id,
+    )?;
+    if reencoded != wire {
+        return Err(ProductionDoryV3QualificationError::NonCanonicalWire);
+    }
+    let payload = validate_cp02(&candidate)?;
+    require_layout_v5_header(&payload.dory_proof)?;
+    validate_candidate_request_binding(&candidate, request)?;
+    Ok((*candidate, payload))
+}
+
+fn require_layout_v5_header(dory_proof: &[u8]) -> Result<(), ProductionDoryV3QualificationError> {
+    let Some(version_bytes) = dory_proof.get(8..10) else {
+        return Err(ProductionDoryV3QualificationError::ExpectedLayoutV5);
+    };
+    if dory_proof.get(..SHARED_PROOF_MAGIC.len()) != Some(SHARED_PROOF_MAGIC.as_slice())
+        || u16::from_le_bytes([version_bytes[0], version_bytes[1]]) != DORY_V3_SHARED_LAYOUT_VERSION
+    {
+        return Err(ProductionDoryV3QualificationError::ExpectedLayoutV5);
+    }
+    Ok(())
+}
+
+fn validate_candidate_request_binding(
+    candidate: &ForgeMatrixV3CandidateProof,
+    request: &ProductionDoryV3QualificationRequest,
+) -> Result<(), ProductionDoryV3QualificationError> {
+    if candidate.algorithm_version != DORY_V3_ALGORITHM_VERSION {
+        return Err(BlsDoryV3CandidateError::AlgorithmVersion.into());
+    }
+    if candidate.proof_version != DORY_V3_PROOF_VERSION {
+        return Err(BlsDoryV3CandidateError::ProofVersion.into());
+    }
+    if candidate.nonce != request.nonce {
+        return Err(ProductionDoryV3QualificationError::ProofRequestMismatch(
+            "nonce",
+        ));
+    }
+    if candidate.final_activation_digest != request.final_activation_digest.into_bytes() {
+        return Err(ProductionDoryV3QualificationError::ProofRequestMismatch(
+            "final activation digest",
+        ));
+    }
+    if candidate.work_digest != request.work_digest.into_bytes() {
+        return Err(ProductionDoryV3QualificationError::ProofRequestMismatch(
+            "work digest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_verifier_candidate_binding(
+    candidate: &ForgeMatrixV3CandidateProof,
+    request: &ProductionDoryV3QualificationRequest,
+    manifest_digest: Digest32,
+) -> Result<(), ProductionDoryV3QualificationError> {
+    validate_candidate_request_binding(candidate, request)?;
+    if candidate.model_manifest_digest != manifest_digest.into_bytes() {
+        return Err(BlsDoryV3CandidateError::ModelManifestDigest.into());
+    }
+    Ok(())
+}
+
+fn validate_verifier_record_static_identity(
+    record: &DoryV3ModelCommitmentRecordV2,
+) -> Result<(), ProductionDoryV3QualificationError> {
+    if record.padded_variables() != DORY_V3_PADDED_VARIABLES {
+        return Err(DoryV3ModelIdentityError::ProductionGeometry.into());
+    }
+    if record.setup_identity() != DORY_V3_SETUP_IDENTITY {
+        return Err(DoryV3ModelIdentityError::SetupMismatch.into());
+    }
+    Ok(())
 }
 
 fn validate_cp02(
@@ -1655,15 +1925,39 @@ fn sync_output_parent_directories(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        io::Cursor,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
+    use dory_pcs::primitives::arithmetic::Field;
     use serde_json::json;
+
+    use crate::{
+        ForgeMatrixV2CompactProof, ModelBankManifest, SmallModelBankFixture,
+        dory_bls12_381_aggregate::commit_bls_dory_polynomial,
+        dory_bls12_381_candidate::decode_dory_v3_layout_v5_candidate_payload,
+        dory_bls12_381_layout::bls_dory_shared_layout_v5_candidate_codec_fixture_for_test,
+        dory_bls12_381_prototype::{BlsDoryFr, DeterministicBlsDorySetup},
+        dory_v3_model::{CanonicalBlsDoryGtHex, DoryV3ModelIdentityV1},
+        dory_v3_model_record::derive_bank_authenticated_dory_v3_model_commitment_record_v2_for_test,
+        dory_v3_suite::DORY_V3_MODEL_IDENTITY_VERSION,
+        model_bank::build_small_model_bank,
+        structured_proof::StructuredForgeMatrixResearchShape,
+    };
 
     use super::*;
 
     static TEST_DIRECTORY_NONCE: AtomicU64 = AtomicU64::new(1);
 
     struct TestDirectory(PathBuf);
+
+    struct SmallBankFixture {
+        bytes: Vec<u8>,
+        manifest: ModelBankManifest,
+        identity: DoryV3ModelIdentityV1,
+        setup: DeterministicBlsDorySetup,
+    }
 
     impl TestDirectory {
         fn create() -> Self {
@@ -1703,6 +1997,109 @@ mod tests {
                 target: [0xff; 32],
             },
             nonce: 6,
+        }
+    }
+
+    fn verifier_candidate(
+        request: &ProductionDoryV3QualificationRequest,
+        manifest_digest: [u8; 32],
+    ) -> ForgeMatrixV3CandidateProof {
+        let mut dory_proof = SHARED_PROOF_MAGIC.to_vec();
+        dory_proof.extend_from_slice(&DORY_V3_SHARED_LAYOUT_VERSION.to_le_bytes());
+        dory_proof.extend_from_slice(&(DORY_V3_PADDED_VARIABLES as u16).to_le_bytes());
+        dory_proof.extend_from_slice(&3_u16.to_le_bytes());
+        dory_proof.extend_from_slice(&4_u16.to_le_bytes());
+        ForgeMatrixV3CandidateProof {
+            algorithm_version: DORY_V3_ALGORITHM_VERSION,
+            proof_version: DORY_V3_PROOF_VERSION,
+            nonce: request.nonce,
+            model_manifest_digest: manifest_digest,
+            challenge_digest: [9; 32],
+            final_activation_digest: request.final_activation_digest.into_bytes(),
+            work_digest: request.work_digest.into_bytes(),
+            structured_proof: BlsDoryV3CandidatePayload {
+                dory_proof,
+                native_blake3_proof: vec![4, 5, 6],
+            }
+            .encode()
+            .unwrap(),
+        }
+    }
+
+    fn small_bank_fixture() -> SmallBankFixture {
+        const VARIABLES: usize = 4;
+        const BASE: [u8; 4] = [125, 126, 124, 130];
+        const LAYER: [u8; 4] = [125, 127, 129, 131];
+        const SUITE_DIGEST: [u8; 32] = [0x51; 32];
+
+        let setup = deterministic_bls_dory_setup(VARIABLES).unwrap();
+        let commit = |bytes: &[u8]| {
+            let mut coefficients = bytes
+                .iter()
+                .map(|value| BlsDoryFr::from_i64(i64::from(*value) - 125))
+                .collect::<Vec<_>>();
+            coefficients.resize(1_usize << VARIABLES, BlsDoryFr::from_i64(0));
+            commit_bls_dory_polynomial(
+                coefficients,
+                VARIABLES / 2,
+                VARIABLES - VARIABLES / 2,
+                &setup,
+            )
+            .unwrap()
+            .commitment()
+        };
+        let base_commitment = commit(&BASE);
+        let weight_commitment = commit(&LAYER);
+        let layers = [LAYER.as_slice()];
+        let provisional = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &BASE,
+            layers: &layers,
+            pcs_parameter_digest: SUITE_DIGEST,
+            pcs_commitment_root: [0x52; 32],
+        })
+        .unwrap();
+        let identity: DoryV3ModelIdentityV1 = serde_json::from_value(json!({
+            "identity_version": DORY_V3_MODEL_IDENTITY_VERSION,
+            "model_version": 2,
+            "batch": 2,
+            "dimension": 2,
+            "layers_per_bank": 1,
+            "model_byte_root": provisional.manifest.raw_blake3_root,
+            "layer_roots_aggregate": provisional.manifest.layer_roots_aggregate,
+            "suite_parameter_digest": SUITE_DIGEST,
+            "setup_identity": setup.identity(),
+            "padded_variables": VARIABLES,
+            "base_input_commitment": CanonicalBlsDoryGtHex::from_commitment(base_commitment)
+                .unwrap()
+                .to_hex()
+                .unwrap(),
+            "weight_bank_commitments": [
+                CanonicalBlsDoryGtHex::from_commitment(weight_commitment)
+                    .unwrap()
+                    .to_hex()
+                    .unwrap()
+            ],
+        }))
+        .unwrap();
+        let built = build_small_model_bank(SmallModelBankFixture {
+            model_version: 2,
+            dimension: 2,
+            batch: 2,
+            base_input: &BASE,
+            layers: &layers,
+            pcs_parameter_digest: SUITE_DIGEST,
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        })
+        .unwrap();
+        identity.verify_manifest(&built.manifest).unwrap();
+        SmallBankFixture {
+            bytes: built.bytes,
+            manifest: built.manifest,
+            identity,
+            setup,
         }
     }
 
@@ -2027,5 +2424,257 @@ mod tests {
             validate_cp02(&wrong_magic),
             Err(ProductionDoryV3QualificationError::NonCanonicalCp02)
         ));
+    }
+
+    #[test]
+    fn verifier_wire_loader_accepts_only_canonical_v3_layout_v5() {
+        let request = request();
+        let candidate = verifier_candidate(&request, [8; 32]);
+        let wire = encode_forgematrix_proof(
+            &BlockProof::V3Candidate(Box::new(candidate.clone())),
+            request.block.network_id,
+        )
+        .unwrap();
+        let (decoded, payload) = decode_canonical_v3_layout_v5_wire(&wire, &request).unwrap();
+        assert_eq!(decoded, candidate);
+        require_layout_v5_header(&payload.dory_proof).unwrap();
+
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert!(decode_canonical_v3_layout_v5_wire(&trailing, &request).is_err());
+
+        let v2 = BlockProof::V2Reference(ForgeMatrixV2CompactProof {
+            algorithm_version: 2,
+            proof_version: 1,
+            nonce: request.nonce,
+            model_manifest_digest: [8; 32],
+            challenge_digest: [9; 32],
+            final_activation_digest: request.final_activation_digest.into_bytes(),
+            work_digest: request.work_digest.into_bytes(),
+        });
+        let v2_wire = encode_forgematrix_proof(&v2, request.block.network_id).unwrap();
+        assert!(matches!(
+            decode_canonical_v3_layout_v5_wire(&v2_wire, &request),
+            Err(ProductionDoryV3QualificationError::ExpectedV3Candidate)
+        ));
+    }
+
+    #[test]
+    fn verifier_wire_loader_rejects_layout_v4_and_wrong_bindings() {
+        let request = request();
+        let manifest_digest = Digest32::new([8; 32]);
+        let candidate = verifier_candidate(&request, manifest_digest.into_bytes());
+        validate_verifier_candidate_binding(&candidate, &request, manifest_digest).unwrap();
+
+        let mut wrong_manifest = candidate.clone();
+        wrong_manifest.model_manifest_digest[0] ^= 1;
+        assert!(matches!(
+            validate_verifier_candidate_binding(&wrong_manifest, &request, manifest_digest),
+            Err(ProductionDoryV3QualificationError::Candidate(
+                BlsDoryV3CandidateError::ModelManifestDigest
+            ))
+        ));
+
+        let mut wrong_nonce = candidate.clone();
+        wrong_nonce.nonce += 1;
+        assert!(matches!(
+            validate_candidate_request_binding(&wrong_nonce, &request),
+            Err(ProductionDoryV3QualificationError::ProofRequestMismatch(
+                "nonce"
+            ))
+        ));
+
+        let mut payload = BlsDoryV3CandidatePayload::decode(&candidate.structured_proof).unwrap();
+        payload.dory_proof[8..10].copy_from_slice(&4_u16.to_le_bytes());
+        let mut v4 = candidate;
+        v4.structured_proof = payload.encode().unwrap();
+        let v4_wire = encode_forgematrix_proof(
+            &BlockProof::V3Candidate(Box::new(v4)),
+            request.block.network_id,
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_canonical_v3_layout_v5_wire(&v4_wire, &request),
+            Err(ProductionDoryV3QualificationError::ExpectedLayoutV5)
+        ));
+    }
+
+    #[test]
+    fn verifier_proof_reader_rejects_oversize_before_decoding() {
+        let directory = TestDirectory::create();
+        let proof = directory.0.join("oversize-proof.bin");
+        fs::write(&proof, vec![0_u8; MAX_PROOF_BYTES + 1]).unwrap();
+        assert!(matches!(
+            read_bounded_proof_wire(&proof),
+            Err(ProductionDoryV3QualificationError::ProofWireTooLarge {
+                max: MAX_PROOF_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn verifier_json_loaders_reject_oversize_before_parsing() {
+        let directory = TestDirectory::create();
+        let request_path = directory.0.join("oversize-request.json");
+        fs::write(
+            &request_path,
+            vec![b' '; MAX_QUALIFICATION_REQUEST_JSON_BYTES + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            load_bounded_qualification_request(&request_path),
+            Err(
+                ProductionDoryV3QualificationError::QualificationRequestJsonTooLarge {
+                    max: MAX_QUALIFICATION_REQUEST_JSON_BYTES
+                }
+            )
+        ));
+
+        let record_path = directory.0.join("oversize-record-v2.json");
+        let oversized_record = serde_json::to_vec(&json!({
+            "model_identity": {
+                "weight_bank_commitments": ["a".repeat(MAX_RECORD_V2_JSON_BYTES)]
+            }
+        }))
+        .unwrap();
+        assert!(oversized_record.len() > MAX_RECORD_V2_JSON_BYTES);
+        fs::write(&record_path, oversized_record).unwrap();
+        assert!(matches!(
+            load_bounded_record_v2(&record_path),
+            Err(ProductionDoryV3QualificationError::RecordV2JsonTooLarge {
+                max: MAX_RECORD_V2_JSON_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_wrong_request_before_record_or_bank_authentication() {
+        let directory = TestDirectory::create();
+        let original_request = request();
+        let candidate = verifier_candidate(&original_request, [8; 32]);
+        let proof_path = directory.0.join("proof.cmfd");
+        fs::write(
+            &proof_path,
+            encode_forgematrix_proof(
+                &BlockProof::V3Candidate(Box::new(candidate)),
+                original_request.block.network_id,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut wrong_request = original_request;
+        wrong_request.nonce += 1;
+        let request_path = directory.0.join("wrong-request.json");
+        fs::write(&request_path, serde_json::to_vec(&wrong_request).unwrap()).unwrap();
+        let error = run_production_dory_v3_verifier(
+            &directory.0.join("unused-bank.cmfdmb02"),
+            &directory.0.join("unused-record-v2.json"),
+            &request_path,
+            &proof_path,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionDoryV3QualificationError::ProofRequestMismatch("nonce")
+        ));
+    }
+
+    #[test]
+    fn verifier_record_loader_rejects_wrong_document_type() {
+        let directory = TestDirectory::create();
+        let record_path = directory.0.join("wrong-record-v2.json");
+        fs::write(&record_path, serde_json::to_vec(&request()).unwrap()).unwrap();
+        assert!(matches!(
+            load_bounded_record_v2(&record_path),
+            Err(ProductionDoryV3QualificationError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_nonproduction_record_identity() {
+        let directory = TestDirectory::create();
+        let fixture = small_bank_fixture();
+        let authenticated = derive_bank_authenticated_dory_v3_model_commitment_record_v2_for_test(
+            Cursor::new(&fixture.bytes),
+            &fixture.manifest,
+            &fixture.identity,
+            &fixture.setup,
+        )
+        .unwrap();
+        let record_path = directory.0.join("wrong-production-record-v2.json");
+        fs::write(
+            &record_path,
+            serde_json::to_vec(authenticated.record()).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_bounded_record_v2(&record_path).unwrap();
+        assert!(matches!(
+            validate_verifier_record_static_identity(&loaded),
+            Err(ProductionDoryV3QualificationError::ModelIdentity(
+                DoryV3ModelIdentityError::ProductionGeometry
+            ))
+        ));
+    }
+
+    #[test]
+    fn verifier_bank_authentication_rejects_changed_bytes() {
+        let fixture = small_bank_fixture();
+        let _authenticated = derive_bank_authenticated_dory_v3_model_commitment_record_v2_for_test(
+            Cursor::new(&fixture.bytes),
+            &fixture.manifest,
+            &fixture.identity,
+            &fixture.setup,
+        )
+        .unwrap();
+
+        let mut changed_bank = fixture.bytes.clone();
+        *changed_bank.last_mut().unwrap() ^= 1;
+        assert!(
+            derive_bank_authenticated_dory_v3_model_commitment_record_v2_for_test(
+                Cursor::new(changed_bank),
+                &fixture.manifest,
+                &fixture.identity,
+                &fixture.setup,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verifier_layout_v5_decoder_rejects_mutated_inner_frame() {
+        let (context, proof) = bls_dory_shared_layout_v5_candidate_codec_fixture_for_test(0x71);
+        let shape = StructuredForgeMatrixResearchShape::production_candidate();
+        let transition_statements = [
+            shape.initialization_statement,
+            shape.transition_statements[0],
+            shape.transition_statements[1],
+            shape.transition_statements[2],
+        ];
+        let encoded = proof
+            .encode(
+                &shape.matrix_statements,
+                &transition_statements,
+                shape.wiring_statement,
+            )
+            .unwrap();
+        let payload = BlsDoryV3CandidatePayload {
+            dory_proof: encoded.clone(),
+            native_blake3_proof: vec![1],
+        }
+        .encode()
+        .unwrap();
+        let (_decoded, _decoded_payload) =
+            decode_dory_v3_layout_v5_candidate_payload(&payload, &context).unwrap();
+
+        let mut mutated = encoded;
+        mutated[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mutated_payload = BlsDoryV3CandidatePayload {
+            dory_proof: mutated,
+            native_blake3_proof: vec![1],
+        }
+        .encode()
+        .unwrap();
+        assert!(decode_dory_v3_layout_v5_candidate_payload(&mutated_payload, &context).is_err());
     }
 }

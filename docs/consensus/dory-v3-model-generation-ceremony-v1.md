@@ -2244,6 +2244,19 @@ replay. A request generated from a single qualification payload is evidence for
 the proof toolchain only. It is not a combined ceremony model or a signed
 type-5 ceremony prefix.
 
+After `dory-v3-qualify` persists the proof, run a second, fresh process with the
+feature-gated `dory-v3-verify-qualification` command and the exact same bank,
+Record V2, request, and proof paths. The verifier caps the request at 16 KiB,
+Record V2 at 64 KiB, and the proof at the consensus proof limit before decoding.
+It requires canonical V3, `CFV3CP02`, and Layout V5 encodings, reauthenticates
+the complete bank, reproduces the supplied Record V2, checks every request and
+model binding, and invokes the full Layout V5 cryptographic verifier. Its JSON
+report records the request, Record, model, setup, and proof-wire identities,
+stage timings, exact wire sizes, and the process-lifetime peak RSS. Run it in a
+fresh process so that RSS is an isolated verifier measurement. This command
+does not prove, publish, mine, create a chain-admission capability, or change an
+activation flag.
+
 At the frozen production geometry, request generation reads the
 `6,442,975,416`-byte bank twice, performs `824,633,720,832` integer
 multiply-accumulates for the selected nonce, and preflights an exact
@@ -2315,7 +2328,8 @@ Already implemented in this repository:
   validator, including two complete same-handle commitment derivations and
   dual whole-file identities; and
 - the one-nonce, exact-CPU `dory-v3-qualify-request` generator with strict
-  create-new output and an independently replaying `dory-v3-qualify` consumer.
+  create-new output, an independently replaying `dory-v3-qualify` consumer,
+  and a bounded fresh-process `dory-v3-verify-qualification` verifier.
 
 Not implemented or not completed by this document:
 
@@ -2330,6 +2344,9 @@ Not implemented or not completed by this document:
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
   reference combiner;
+- one unchanged n=33 proof accepted by `dory-v3-verify-qualification` in a
+  separate fresh process, with proof size, verification time, and peak RSS
+  retained alongside the producer report;
 - external signature collection, public append-only publication, and
   independent mirroring of a locally staged type-7 abort record;
 - a full-length qualification of the roots and structural-report tools on a

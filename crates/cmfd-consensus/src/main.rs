@@ -6,6 +6,7 @@ use cmfd_consensus::dory_bls12_381_blake3::derive_bls_dory_blake3_preprocessing_
 use cmfd_consensus::dory_v3_qualification::{
     ProductionDoryV3QualificationRequest, ProductionDoryV3QualificationSeed,
     generate_production_dory_v3_qualification_request, run_production_dory_v3_qualification,
+    run_production_dory_v3_verifier,
 };
 use cmfd_consensus::forgematrix::CANDIDATE_16GB_PROFILE;
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
@@ -581,6 +582,22 @@ enum Command {
         /// Maximum native BLAKE3 rows materialized in one block.
         #[arg(long)]
         maximum_native_block_rows: usize,
+    },
+    /// Independently verify one persisted production Dory V3 Layout V5 proof.
+    #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+    DoryV3VerifyQualification {
+        /// Existing absolute canonical production model bank.
+        #[arg(long, value_parser = parse_absolute_path)]
+        bank: std::path::PathBuf,
+        /// Existing absolute canonical production Record V2 JSON.
+        #[arg(long, value_parser = parse_absolute_path)]
+        record: std::path::PathBuf,
+        /// Existing absolute strict qualification-request JSON.
+        #[arg(long, value_parser = parse_absolute_path)]
+        request: std::path::PathBuf,
+        /// Existing absolute canonical persisted proof wire.
+        #[arg(long, value_parser = parse_absolute_path)]
+        proof: std::path::PathBuf,
     },
 }
 
@@ -1793,6 +1810,17 @@ fn run_cli() -> Result<()> {
             .context("production Dory V3 qualification failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+        Command::DoryV3VerifyQualification {
+            bank,
+            record,
+            request,
+            proof,
+        } => {
+            let report = run_production_dory_v3_verifier(&bank, &record, &request, &proof)
+                .context("production Dory V3 persisted-proof verification failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     }
     Ok(())
 }
@@ -2101,5 +2129,62 @@ mod tests {
         let mut private_key = valid_args();
         private_key.extend(["--private-key".into(), "00".into()]);
         assert!(Cli::try_parse_from(private_key).is_err());
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn dory_v3_verify_qualification_cli_requires_only_absolute_verifier_inputs() {
+        let directory = std::env::current_dir().unwrap();
+        let bank = directory.join("model.cmfdmb02");
+        let record = directory.join("record-v2.json");
+        let request = directory.join("qualification-request.json");
+        let proof = directory.join("proof.cmfd");
+        let valid_args = || {
+            vec![
+                "cmfd-consensus".into(),
+                "dory-v3-verify-qualification".into(),
+                "--bank".into(),
+                bank.clone().into_os_string(),
+                "--record".into(),
+                record.clone().into_os_string(),
+                "--request".into(),
+                request.clone().into_os_string(),
+                "--proof".into(),
+                proof.clone().into_os_string(),
+            ]
+        };
+
+        let parsed = Cli::try_parse_from(valid_args()).unwrap();
+        match parsed.command {
+            Command::DoryV3VerifyQualification {
+                bank: parsed_bank,
+                record: parsed_record,
+                request: parsed_request,
+                proof: parsed_proof,
+            } => {
+                assert_eq!(parsed_bank, bank);
+                assert_eq!(parsed_record, record);
+                assert_eq!(parsed_request, request);
+                assert_eq!(parsed_proof, proof);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("dory-v3-verify-qualification")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for required in ["--bank", "--record", "--request", "--proof"] {
+            assert!(help.contains(required), "missing help option {required}");
+        }
+        for forbidden in ["--scratch", "--proof-output", "--private-key"] {
+            assert!(!help.contains(forbidden), "unsafe help option {forbidden}");
+        }
+
+        let mut relative_proof = valid_args();
+        relative_proof[9] = "proof.cmfd".into();
+        assert!(Cli::try_parse_from(relative_proof).is_err());
     }
 }

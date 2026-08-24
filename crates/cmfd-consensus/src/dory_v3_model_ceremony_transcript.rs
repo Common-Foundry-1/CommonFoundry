@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::{
     ModelBankManifest,
     dory_v3_model::{CanonicalBlsDoryGtHex, ordered_dory_v3_model_commitment_root},
+    dory_v3_model_reproduction::PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES,
     dory_v3_suite::{
         DORY_V3_MODEL_IDENTITY_DOMAIN, DORY_V3_MODEL_IDENTITY_VERSION, DORY_V3_MODEL_RECORD_DOMAIN,
         DORY_V3_MODEL_RECORD_VERSION,
@@ -582,6 +583,16 @@ fn decode_file_identity(
     })
 }
 
+fn validate_nonzero_file_identity(
+    identity: &FileIdentity,
+    field: &'static str,
+) -> Result<(), CeremonyTranscriptError> {
+    if identity.bytes == 0 || identity.blake3 == [0; 32] || identity.sha256 == [0; 32] {
+        return Err(CeremonyTranscriptError::Invalid(field));
+    }
+    Ok(())
+}
+
 fn checked_u16(length: usize, field: &'static str) -> Result<u16, CeremonyTranscriptError> {
     u16::try_from(length).map_err(|_| CeremonyTranscriptError::Limit(field))
 }
@@ -751,10 +762,77 @@ fn validate_body(body: &CeremonyRecordBody) -> Result<(), CeremonyTranscriptErro
                     "final receipt reproducer count",
                 ));
             }
+            if value.raw_payload_blake3 == [0; 32]
+                || value.raw_payload_sha256 == [0; 32]
+                || value.base_input_blake3_root == [0; 32]
+                || value.layer_roots_aggregate == [0; 32]
+                || value.bank_file_blake3 == [0; 32]
+                || value.bank_file_sha256 == [0; 32]
+            {
+                return Err(CeremonyTranscriptError::Invalid(
+                    "zero final receipt content digest",
+                ));
+            }
+            for (identity, field) in [
+                (
+                    &value.roots_file,
+                    "invalid final receipt roots file identity",
+                ),
+                (
+                    &value.structural_report,
+                    "invalid final receipt structural report identity",
+                ),
+                (
+                    &value.manifest_file,
+                    "invalid final receipt manifest file identity",
+                ),
+                (
+                    &value.record_v2_file,
+                    "invalid final receipt Record V2 file identity",
+                ),
+            ] {
+                validate_nonzero_file_identity(identity, field)?;
+            }
+            let mut reproduction_reports = BTreeSet::new();
             for (expected, receipt) in value.reproducers.iter().enumerate() {
                 if usize::from(receipt.index) != expected {
                     return Err(CeremonyTranscriptError::Invalid(
                         "nonconsecutive final receipt reproducer",
+                    ));
+                }
+                if receipt.combiner_binary_blake3 == [0; 32]
+                    || receipt.combiner_binary_sha256 == [0; 32]
+                {
+                    return Err(CeremonyTranscriptError::Invalid(
+                        "zero final receipt combiner binary digest",
+                    ));
+                }
+                validate_nonzero_file_identity(
+                    &receipt.bootstrap_report,
+                    "invalid final receipt bootstrap report identity",
+                )?;
+                validate_nonzero_file_identity(
+                    &receipt.record_ceremony_report,
+                    "invalid final receipt Record V2 ceremony report identity",
+                )?;
+                validate_nonzero_file_identity(
+                    &receipt.reproduction_report,
+                    "invalid final receipt reproduction report identity",
+                )?;
+                if receipt.reproduction_report.bytes
+                    != PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES as u64
+                {
+                    return Err(CeremonyTranscriptError::Invalid(
+                        "final receipt reproduction report length",
+                    ));
+                }
+                if !reproduction_reports.insert((
+                    receipt.reproduction_report.bytes,
+                    receipt.reproduction_report.blake3,
+                    receipt.reproduction_report.sha256,
+                )) {
+                    return Err(CeremonyTranscriptError::Invalid(
+                        "duplicate final receipt reproduction report identity",
                     ));
                 }
             }
@@ -2138,6 +2216,13 @@ mod tests {
         }
     }
 
+    fn reproduction_file(byte: u8) -> FileIdentity {
+        FileIdentity {
+            bytes: PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES as u64,
+            ..file(byte)
+        }
+    }
+
     fn keys(count: usize, offset: u8) -> Vec<SigningKey> {
         (0..count)
             .map(|index| SigningKey::from_bytes(&[offset.wrapping_add(index as u8); 32]).unwrap())
@@ -2406,7 +2491,7 @@ mod tests {
                     combiner_binary_sha256: [112 + index as u8; 32],
                     bootstrap_report: file(114 + index as u8),
                     record_ceremony_report: file(116 + index as u8),
-                    reproduction_report: file(118 + index as u8),
+                    reproduction_report: reproduction_file(118 + index as u8),
                 })
                 .collect(),
         };
@@ -2423,6 +2508,27 @@ mod tests {
             operators,
             reproducers,
         )
+    }
+
+    fn completed_final_receipt_body() -> FinalReceiptBody {
+        let (bytes, _, _) = completed_fixture();
+        let transcript = parse_and_verify_ceremony_transcript(&bytes).unwrap();
+        let CeremonyRecordBody::FinalReceipt(body) = &transcript.records()[9].body else {
+            panic!("fixture must finish with type 6");
+        };
+        body.as_ref().clone()
+    }
+
+    fn assert_invalid_final_receipt(
+        valid: &FinalReceiptBody,
+        mutate: impl FnOnce(&mut FinalReceiptBody),
+    ) {
+        let mut body = valid.clone();
+        mutate(&mut body);
+        assert!(matches!(
+            validate_body(&CeremonyRecordBody::FinalReceipt(Box::new(body))),
+            Err(CeremonyTranscriptError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -2480,15 +2586,15 @@ mod tests {
         );
         assert_eq!(
             hex::encode(transcript.transcript_derive_key_digest()),
-            "71d07b4bd81729777ead91e9807eee8e6275d09a8ebb170345f38515f35dc8b0"
+            "e8d8d7cb2683ed59d7164e12d3483486f22a5f42cb9cd3586285f9b6d539933c"
         );
         assert_eq!(
             hex::encode(transcript.transcript_blake3()),
-            "23293f47e57372556b96456de1eb94e5d630e3defd4eb51639ec8f6d7a1ccb03"
+            "9fabf16e6840585c588d4eb00ecc4d193ead66b741f6e6beafe5d2b0c85414e9"
         );
         assert_eq!(
             hex::encode(transcript.transcript_sha256()),
-            "e4d38fb2953e7f226bcefbb52ea1be342f0768bfe19073c426e69db30b276a3d"
+            "cd920f1bb2ce16634b09a7a1fffd3cb973e4952387c9262296e38b186e07d571"
         );
 
         let mut reordered = transcript.records().to_vec();
@@ -3142,6 +3248,58 @@ mod tests {
         };
         body.weight_bank_0_commitment = body.base_commitment;
         assert!(encode_and_verify_ceremony_transcript(&duplicate).is_err());
+    }
+
+    #[test]
+    fn final_receipt_rejects_zero_content_hashes_and_file_identities() {
+        let valid = completed_final_receipt_body();
+
+        assert_invalid_final_receipt(&valid, |body| body.raw_payload_blake3 = [0; 32]);
+        assert_invalid_final_receipt(&valid, |body| body.raw_payload_sha256 = [0; 32]);
+        assert_invalid_final_receipt(&valid, |body| body.base_input_blake3_root = [0; 32]);
+        assert_invalid_final_receipt(&valid, |body| body.layer_roots_aggregate = [0; 32]);
+        assert_invalid_final_receipt(&valid, |body| body.bank_file_blake3 = [0; 32]);
+        assert_invalid_final_receipt(&valid, |body| body.bank_file_sha256 = [0; 32]);
+        assert_invalid_final_receipt(&valid, |body| body.roots_file.bytes = 0);
+        assert_invalid_final_receipt(&valid, |body| {
+            body.structural_report.blake3 = [0; 32];
+        });
+        assert_invalid_final_receipt(&valid, |body| body.manifest_file.sha256 = [0; 32]);
+        assert_invalid_final_receipt(&valid, |body| body.record_v2_file.bytes = 0);
+    }
+
+    #[test]
+    fn final_receipt_rejects_invalid_reproducer_receipt_identities() {
+        let valid = completed_final_receipt_body();
+
+        assert_invalid_final_receipt(&valid, |body| {
+            body.reproducers[0].combiner_binary_blake3 = [0; 32];
+        });
+        assert_invalid_final_receipt(&valid, |body| {
+            body.reproducers[0].combiner_binary_sha256 = [0; 32];
+        });
+        assert_invalid_final_receipt(&valid, |body| {
+            body.reproducers[0].bootstrap_report.bytes = 0;
+        });
+        assert_invalid_final_receipt(&valid, |body| {
+            body.reproducers[0].record_ceremony_report.blake3 = [0; 32];
+        });
+        assert_invalid_final_receipt(&valid, |body| {
+            body.reproducers[0].reproduction_report.sha256 = [0; 32];
+        });
+        assert_invalid_final_receipt(&valid, |body| {
+            body.reproducers[0].reproduction_report.bytes =
+                PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES as u64 - 1;
+        });
+    }
+
+    #[test]
+    fn final_receipt_rejects_duplicate_reproduction_report_identities() {
+        let valid = completed_final_receipt_body();
+        assert_invalid_final_receipt(&valid, |body| {
+            body.reproducers[1].reproduction_report =
+                body.reproducers[0].reproduction_report.clone();
+        });
     }
 
     #[test]

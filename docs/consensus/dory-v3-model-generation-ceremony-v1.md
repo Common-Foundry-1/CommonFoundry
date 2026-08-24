@@ -622,6 +622,12 @@ model identity, setup identity, and Record V2 digest must validate under the
 frozen production suite. Both `production_suite_digest` and
 `pcs_parameter_digest` must equal the pinned production suite digest.
 
+The raw-payload, base-root, layer-root, and bank-file hashes must be nonzero.
+Every final-receipt file identity must have a nonzero length and nonzero BLAKE3
+and SHA-256 digests, and each combiner-binary digest must be nonzero. Every
+`reproduction_report` identity has the exact `CMFDRP01` V1 length of 4,283
+bytes, and those identities are pairwise distinct across the `R` reproducers.
+
 Reproducer 0 is the canonical artifact publisher. Its raw payload, roots,
 structural report, bank, manifest, and Record V2 files supply the singular file
 fields above after all reproducers agree on their content. Bootstrap and Record

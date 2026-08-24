@@ -1659,6 +1659,7 @@ mod tests {
             AbortBody, FinalReceiptBody, PRODUCTION_BANK_BYTES, ReproducerReceipt,
             encode_and_verify_ceremony_transcript,
         },
+        dory_v3_model_reproduction::PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES,
         dory_v3_suite::{
             DORY_V3_MODEL_IDENTITY_DOMAIN, DORY_V3_MODEL_IDENTITY_VERSION,
             DORY_V3_MODEL_RECORD_DOMAIN, DORY_V3_MODEL_RECORD_VERSION,
@@ -1707,6 +1708,13 @@ mod tests {
             bytes: u64::from(byte) + 1,
             blake3: [byte; 32],
             sha256: [byte.wrapping_add(1); 32],
+        }
+    }
+
+    fn test_reproduction_file(byte: u8) -> FileIdentity {
+        FileIdentity {
+            bytes: PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES as u64,
+            ..test_file(byte)
         }
     }
 
@@ -2035,7 +2043,7 @@ mod tests {
                         combiner_binary_sha256: [112 + index as u8; 32],
                         bootstrap_report: test_file(114 + index as u8),
                         record_ceremony_report: test_file(116 + index as u8),
-                        reproduction_report: test_file(118 + index as u8),
+                        reproduction_report: test_reproduction_file(118 + index as u8),
                     })
                     .collect(),
             })),

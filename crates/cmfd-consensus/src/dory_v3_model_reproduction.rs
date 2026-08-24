@@ -1574,7 +1574,10 @@ mod tests {
                     combiner_binary_sha256: [121; 32],
                     bootstrap_report: file(122),
                     record_ceremony_report: file(123),
-                    reproduction_report: file(124),
+                    reproduction_report: sized_file(
+                        PRODUCTION_DORY_V3_MODEL_REPRODUCTION_REPORT_BYTES as u64,
+                        124,
+                    ),
                 },
             ],
         };

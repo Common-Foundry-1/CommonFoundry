@@ -20,6 +20,9 @@ use thiserror::Error;
 use crate::{
     PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
     PRODUCTION_V2_LAYERS_PER_BANK,
+    dory_scratch_telemetry::{
+        register_scratch_artifact_reservation, release_scratch_artifact_reservation,
+    },
 };
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSE1";
@@ -377,6 +380,11 @@ impl BlsDoryExecutionAccumulatorArtifactWriter {
             .read(true)
             .write(true)
             .open(&path)?;
+        if let Err(error) = register_scratch_artifact_reservation(&path, geometry.total_bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
         let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(IO_BUFFER_BYTES, file)),
@@ -1144,8 +1152,8 @@ fn remove_if_owned(path: &Path, file: &File) {
     let Ok(live) = Handle::from_path(path) else {
         return;
     };
-    if held == live {
-        let _ = std::fs::remove_file(path);
+    if held == live && std::fs::remove_file(path).is_ok() {
+        release_scratch_artifact_reservation(path);
     }
 }
 

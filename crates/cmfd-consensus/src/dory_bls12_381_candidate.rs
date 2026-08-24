@@ -1422,11 +1422,14 @@ fn projected_candidate_scratch_space()
 }
 
 #[cfg(feature = "whir-prototype")]
-fn preflight_candidate_scratch(scratch_directory: &Path) -> Result<(), BlsDoryV3CandidateError> {
+pub(crate) fn preflight_candidate_scratch(
+    scratch_directory: &Path,
+) -> Result<(u64, u64), BlsDoryV3CandidateError> {
     let projection = projected_candidate_scratch_space()?;
     let available = fs2::available_space(scratch_directory)
         .map_err(BlsDoryV3CandidateError::ScratchSpaceQuery)?;
-    ensure_candidate_scratch_available(projection.required_free_bytes, available)
+    ensure_candidate_scratch_available(projection.required_free_bytes, available)?;
+    Ok((projection.required_free_bytes, available))
 }
 
 #[cfg(feature = "whir-prototype")]

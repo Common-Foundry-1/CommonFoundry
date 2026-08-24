@@ -45,9 +45,43 @@ mod dory_field_portability;
 #[cfg(feature = "dory-opening-prototype")]
 pub mod dory_opening_prototype;
 #[cfg(feature = "dory-bls12-381-prototype")]
+mod dory_scratch_telemetry;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_bank_bootstrap;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_bank_record_validation;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_ceremony;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_ceremony_authoring;
+#[cfg(feature = "dory-bls12-381-prototype")]
+mod dory_v3_model_ceremony_fs;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_ceremony_transcript;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_combiner;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_contribution;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_final_candidate_validation;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_final_receipt_orchestration;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_independent_lineage;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_record;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_reproduction;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_roots;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_structure;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_structure_evidence;
+#[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+pub mod dory_v3_qualification;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_suite;
 #[cfg(feature = "dory-bls12-381-prototype")]

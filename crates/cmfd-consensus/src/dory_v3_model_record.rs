@@ -259,6 +259,18 @@ pub fn derive_bank_authenticated_dory_v3_model_commitment_record_v2<R: Read>(
     Ok(authenticated)
 }
 
+/// Authenticate a bounded fixture with the same transactional reader path but
+/// without claiming the compiled production geometry.
+#[cfg(all(test, feature = "whir-prototype"))]
+pub(crate) fn derive_bank_authenticated_dory_v3_model_commitment_record_v2_for_test<R: Read>(
+    reader: R,
+    manifest: &ModelBankManifest,
+    identity: &DoryV3ModelIdentityV1,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BankAuthenticatedDoryV3ModelCommitmentRecordV2, DoryV3ModelCommitmentRecordError> {
+    derive_bank_authenticated_record_v2(reader, manifest, identity, setup)
+}
+
 fn derive_bank_authenticated_record_v2<R: Read>(
     reader: R,
     manifest: &ModelBankManifest,
@@ -718,7 +730,7 @@ mod tests {
         ) -> Result<
             BlsDoryV3ExecutionAccumulatorArtifactContext,
             BlsDoryExecutionAccumulatorArtifactError,
-        > = BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge;
+        > = BlsDoryV3ExecutionAccumulatorArtifactContext::for_test;
         let _ = typed_constructor;
 
         let fixture = production_suite_fixture();
@@ -736,7 +748,7 @@ mod tests {
         };
         let challenge = transcript.challenge_context(&block, 26).unwrap();
 
-        let typed = BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+        let typed = BlsDoryV3ExecutionAccumulatorArtifactContext::for_test(
             challenge,
             &authenticated,
             &fixture.setup,
@@ -762,7 +774,7 @@ mod tests {
             record: changed_record,
         };
         assert!(matches!(
-            BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+            BlsDoryV3ExecutionAccumulatorArtifactContext::for_test(
                 challenge,
                 &changed_authenticated,
                 &fixture.setup,
@@ -772,7 +784,7 @@ mod tests {
 
         let wrong_setup = deterministic_bls_dory_setup(VARIABLES + 1).unwrap();
         assert!(matches!(
-            BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+            BlsDoryV3ExecutionAccumulatorArtifactContext::for_test(
                 challenge,
                 &authenticated,
                 &wrong_setup,

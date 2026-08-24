@@ -70,6 +70,26 @@ impl DoryV3ChallengeContext {
             .work_digest(self.digest, final_activation_digest)
     }
 
+    /// Exercise the identical V3 output transcript with a bounded activation
+    /// in unit tests. Production callers always use [`Self::output_digest`],
+    /// which enforces the frozen production activation length.
+    #[cfg(all(test, feature = "whir-prototype"))]
+    pub(crate) fn output_digest_for_test(
+        self,
+        activation: &[u8],
+    ) -> Result<[u8; 32], DoryV3TranscriptError> {
+        if activation.iter().any(|byte| *byte > 250) {
+            return Err(DoryV3TranscriptError::Activation);
+        }
+        let activation_len =
+            u64::try_from(activation.len()).map_err(|_| DoryV3TranscriptError::LengthOverflow)?;
+        let mut hasher = Hasher::new_derive_key(DORY_V3_OUTPUT_DOMAIN);
+        hasher.update(&self.digest);
+        hasher.update(&activation_len.to_le_bytes());
+        hasher.update(activation);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
     #[allow(dead_code)]
     pub(crate) const fn transcript_context(self) -> DoryV3TranscriptContext {
         self.transcript_context

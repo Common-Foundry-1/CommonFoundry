@@ -67,6 +67,8 @@ pub mod dory_v3_model_contribution;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_final_candidate_validation;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_final_receipt_orchestration;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_independent_lineage;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_record;

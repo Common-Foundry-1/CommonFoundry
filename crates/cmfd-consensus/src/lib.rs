@@ -65,6 +65,8 @@ pub mod dory_v3_model_contribution;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_record;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_reproduction;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_roots;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_structure;

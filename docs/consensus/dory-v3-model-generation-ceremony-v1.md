@@ -635,6 +635,128 @@ report identifies the host, source revision, binary hashes, commands, elapsed
 times, peak resources, and all independently computed results. Those reports
 are audit artifacts, not substitutes for the signed binary receipt.
 
+### `CMFDRP01` reproduction-report V1
+
+Each type-6 `reproduction_report` file identity names one exact canonical
+fixed-width report. All integers are little-endian, `FileIdentity` means
+`bytes_u64le || blake3[32] || sha256[32]` (72 bytes), and no padding or trailing
+bytes are permitted. The V1 field order and cumulative end offsets are:
+
+```text
+field                                             bytes   end offset
+magic = ASCII "CMFDRP01"                             8            8
+version_u16le = 1                                     2           10
+report_bytes_u32le = 4283                             4           14
+ceremony_id[32]                                      32           46
+genesis_signed_record_digest[32]                    32           78
+reproducer_index_u16le                                2           80
+reproducer_public_key[32]                           32          112
+implementation_kind_u8                               1          113
+target_id_u16le                                       2          115
+source_commit_sha1[20]                              20          135
+source_bundle: FileIdentity                         72          207
+source_bundle_policy: FileIdentity                  72          279
+cargo_lock_blake3[32]                               32          311
+cargo_lock_sha256[32]                               32          343
+protocol_spec_blake3[32]                            32          375
+protocol_spec_sha256[32]                            32          407
+reveal_set_prefix_bytes_u64le                         8          415
+reveal_set_prefix_derive_key_digest[32]             32          447
+reveal_set_prefix_blake3[32]                        32          479
+reveal_set_prefix_sha256[32]                        32          511
+commitment_set_signed_record_digest[32]             32          543
+reveal_set_signed_record_digest[32]                 32          575
+combiner_ordered_inputs_digest[32]                  32          607
+combiner_binary: FileIdentity                       72          679
+combiner_report: FileIdentity                       72          751
+bootstrap_report: FileIdentity                      72          823
+record_ceremony_report: FileIdentity                72          895
+host_environment_report: FileIdentity               72          967
+source_extraction_report: FileIdentity              72         1039
+command_log: FileIdentity                           72         1111
+implementation_lineage_report: FileIdentity         72         1183
+raw_payload: FileIdentity                           72         1255
+roots_file: FileIdentity                            72         1327
+structural_report: FileIdentity                     72         1399
+bank_file: FileIdentity                             72         1471
+manifest_file: FileIdentity                         72         1543
+record_v2_file: FileIdentity                        72         1615
+base_input_blake3_root[32]                          32         1647
+layer_roots_aggregate[32]                           32         1679
+production_suite_digest[32]                         32         1711
+pcs_parameter_digest[32]                            32         1743
+base_commitment[576]                               576         2319
+weight_bank_0_commitment[576]                      576         2895
+weight_bank_1_commitment[576]                      576         3471
+weight_bank_2_commitment[576]                      576         4047
+pcs_commitment_root[32]                             32         4079
+manifest_digest[32]                                 32         4111
+model_identity_digest[32]                           32         4143
+setup_identity[32]                                  32         4175
+padded_variables_u32le                               4         4179
+record_v2_digest[32]                                32         4211
+combine_bytes_processed_u64le                        8         4219
+combine_elapsed_micros_u64le                         8         4227
+roots_elapsed_micros_u64le                           8         4235
+structure_elapsed_micros_u64le                       8         4243
+bootstrap_elapsed_micros_u64le                       8         4251
+record_elapsed_micros_u64le                          8         4259
+total_elapsed_micros_u64le                           8         4267
+peak_rss_bytes_u64le                                 8         4275
+peak_disk_bytes_u64le                                8         4283
+```
+
+`implementation_kind` is 0 for the pinned reference implementation and 1 for
+an independent implementation; all other values are reserved and invalid.
+Targets remain the genesis registry values 1 and 2. The ordered-input digest is:
+
+```text
+BLAKE3-DK("CMFD/FORGEMATRIX/V3/MODEL-REPRODUCTION/COMBINER-INPUTS/V1",
+    input_count_u16le ||
+    for each exact operator-order input:
+        operator_index_u16le || operator_public_key[32] ||
+        contribution_bytes_u64le || contribution_blake3[32] ||
+        contribution_sha256[32] ||
+        contribution_commitment_signed_record_digest[32] ||
+        contribution_reveal_signed_record_digest[32])
+```
+
+There are three distinct authority levels. Syntax verification checks exact
+length, magic, version, EOF, discriminants, nonzero file identities, frozen
+production sizes and suite constants, canonical pairwise-distinct Dory
+commitments, and every locally derivable commitment, manifest, model, and
+Record V2 digest. Context verification additionally requires the opaque
+combiner bindings from an independently anchored exact type-5 prefix and one
+fresh validated-existing-payload capability. It matches the ceremony, genesis,
+source, reproducer roster position and key, exact prefix, both closure digests,
+every path-independent ordered-input claim, and the combined output length and
+dual hashes. A completed or aborted generic transcript has no such combiner
+capability and is ineligible.
+
+The report is still not a signature, transcript, or proof that every external
+file was opened. The combiner JSON is deliberately opaque: its exact
+`FileIdentity` is bound, but its JSON is neither deserialized nor trusted.
+Filesystem paths, durability labels, and timing/resource measurements are
+operational audit data, not ceremony authority. The downstream roots,
+structure, bank, manifest, Record V2, host, source-extraction, command, and
+lineage file identities remain reproducer claims until their exact retained
+files are independently authenticated. A type-6 signer must perform those
+checks separately. Context verification covers only the transcript and freshly
+validated combined-payload boundary; even its downstream final-candidate
+projection remains a claim rather than semantic authority over those unopened
+files. Artifact and final-candidate projections and same-candidate comparison
+are exposed only from the opaque context-verified wrapper, not from a
+syntax-only parsed report. This layer deliberately cannot construct a
+`ReproducerReceipt`; later type-6 preparation may do that only after every
+downstream artifact validator succeeds.
+
+The keyless authoring API derives ceremony, source, closure, ordered-input,
+combined-output, and frozen-suite fields from verified capabilities, then
+canonicalizes, reparses, and context-verifies its own output. It does not sign
+or publish anything. No type-6 wire change is needed: the existing
+`ReproducerReceipt.reproduction_report` `FileIdentity` transitively binds these
+4,283 bytes, including the opaque combiner-report identity.
+
 ### Type 7: abort body
 
 ```text
@@ -1227,6 +1349,15 @@ must consume exactly the same offset from every input, reject early EOF and
 trailing data, use a create-new output, synchronize it, reopen it, range-check
 and dual-hash through EOF, and reauthenticate the inputs after the combine pass.
 
+The read-only existing-payload validator returns a non-cloneable opaque
+capability only after that retained-handle procedure succeeds. Its contained
+operational report remains serializable for audit, but the public report value
+alone is not validation authority and cannot be supplied to reproduction
+authoring. The capability retains no file handle or lock after return; type-6
+preparation must run this validator freshly and consume that new capability in
+the same preparation flow rather than rely on an older result as ongoing path
+authority.
+
 The combined file is the raw payload supplied to the existing bootstrap. No
 participant-provided root, layer digest, PCS commitment, commitment root, model
 identity, or Record V2 value is accepted as input to that bootstrap.
@@ -1801,6 +1932,11 @@ Already implemented in this repository:
 - the feature-gated, identity-safe streaming modular combiner bound exclusively
   to that anchored type-5-prefix capability, with three-pass signed-claim
   authentication and ceremony-bound operational reporting;
+- the fixed-width `CMFDRP01` V1 reproduction-report codec, keyless
+  capability-derived authoring, strict syntax and derived-field validation,
+  exact type-5/sealed-combiner contextual verification, immutable artifact and
+  final-candidate projections, and bounded known-answer, capability-boundary,
+  mutation, context, completed, and aborted tests;
 - the exact `CMFDMR01` roots and `CMFDSR01` structural-report codecs,
   create-new generators, full-payload validators, and operator commands, backed
   by a shared trusted-filesystem boundary that retains and rechecks parent and
@@ -1823,6 +1959,10 @@ Not implemented or not completed by this document:
   review of the transcript and detached-attestation implementation;
 - type-6 receipt authoring and final completed-transcript staging, without
   which a successful ceremony cannot reach detached attestation;
+- one retained-handle final-candidate validator that independently opens and
+  reauthenticates the exact roots, structure, bank, manifest, Record V2, and
+  report files before type-6 authoring; `CMFDRP01` alone records their claims
+  but does not authenticate those external bytes;
 - independent security review and an operator-scale rehearsal of the keyless
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
@@ -1839,15 +1979,16 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is type-6 receipt authoring and final
-completed-transcript staging, plus validation and an operator-scale rehearsal
-of the keyless record and detached-attestation authoring paths. That is followed
-by public append-only transcript publication with independent mirror receipts
-and production-scale roots, structure, combiner, request, and proof
-qualification. The transcript, generator, combiner, and new report tools still
-require independent external review before generating real contributions. A
-successful run of the current bootstrap or one local generator qualification
-is not a completed ceremony.
+The next minimal implementation slice is the retained-handle final-candidate
+validator followed by type-6 receipt authoring and final completed-transcript
+staging, plus validation and an operator-scale rehearsal of the keyless record
+and detached-attestation authoring paths. That is followed by public
+append-only transcript publication with independent mirror receipts and
+production-scale roots, structure, combiner, request, and proof qualification.
+The transcript, generator, combiner, and new report tools still require
+independent external review before generating real contributions. A successful
+run of the current bootstrap or one local generator qualification is not a
+completed ceremony.
 
 ## Operator completion checklist
 

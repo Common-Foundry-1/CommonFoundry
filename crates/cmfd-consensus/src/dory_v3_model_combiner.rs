@@ -115,6 +115,33 @@ pub struct ProductionDoryV3ModelCombinedPayloadValidationReport {
     pub elapsed_micros: u64,
 }
 
+/// Opaque authority that proves the existing combined payload passed the
+/// retained-handle production validator when this value was created.
+///
+/// The contained operational report remains readable and serializable, but a
+/// report value by itself cannot recreate this capability. This value retains
+/// no file handle or lock after validation returns; type-6 preparation must run
+/// the validator freshly rather than treat an older value as ongoing pathname
+/// authority.
+#[derive(Debug)]
+pub struct ValidatedProductionDoryV3ModelCombinedPayload {
+    report: ProductionDoryV3ModelCombinedPayloadValidationReport,
+}
+
+impl ValidatedProductionDoryV3ModelCombinedPayload {
+    #[must_use]
+    pub const fn report(&self) -> &ProductionDoryV3ModelCombinedPayloadValidationReport {
+        &self.report
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_report_for_test(
+        report: ProductionDoryV3ModelCombinedPayloadValidationReport,
+    ) -> Self {
+        Self { report }
+    }
+}
+
 /// Fail-closed errors from the production streaming modular combiner.
 #[derive(Debug, Error)]
 pub enum ProductionDoryV3ModelCombinerError {
@@ -579,19 +606,19 @@ pub fn validate_existing_production_dory_v3_model_combined_payload(
     transcript: &VerifiedCeremonyTranscript,
     ordered_contribution_paths: &[PathBuf],
     existing_payload_path: &Path,
-) -> Result<ProductionDoryV3ModelCombinedPayloadValidationReport, ProductionDoryV3ModelCombinerError>
-{
+) -> Result<ValidatedProductionDoryV3ModelCombinedPayload, ProductionDoryV3ModelCombinerError> {
     let geometry = CombineGeometry::production()?;
     let authority = CombinerAuthority::from_verified_transcript(transcript, geometry)?;
     authority.validate_path_count(ordered_contribution_paths)?;
     preflight_combiner_paths(ordered_contribution_paths, existing_payload_path)?;
-    validate_existing_with_io(
+    let report = validate_existing_with_io(
         &authority,
         ordered_contribution_paths,
         existing_payload_path,
         geometry,
         &mut SystemCombinedPayloadValidatorIo,
-    )
+    )?;
+    Ok(ValidatedProductionDoryV3ModelCombinedPayload { report })
 }
 
 fn validate_existing_with_io<I: CombinedPayloadValidatorIo>(

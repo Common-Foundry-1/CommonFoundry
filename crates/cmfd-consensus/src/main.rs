@@ -23,6 +23,15 @@ use cmfd_consensus::{
     },
     dory_v3_model_combiner::combine_production_dory_v3_model_contributions,
     dory_v3_model_contribution::generate_production_dory_v3_model_contribution,
+    dory_v3_model_roots::{
+        ProductionDoryV3ModelRoots, generate_production_dory_v3_model_roots_file,
+        validate_production_dory_v3_model_roots_files,
+    },
+    dory_v3_model_structure::{
+        ProductionDoryV3ModelStructuralReport, run_production_dory_v3_model_structural_report,
+        validate_production_dory_v3_model_structural_report_files,
+    },
+    dory_v3_suite::Digest32,
 };
 #[cfg(feature = "dory-bls12-381-prototype")]
 use std::io::Read as _;
@@ -141,6 +150,64 @@ enum Command {
         #[arg(long)]
         output: std::path::PathBuf,
     },
+    /// Generate and authenticate the frozen production model-roots artifact.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelRootsGenerate {
+        /// Existing absolute path to the exact raw production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// New absolute path for the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots_output: std::path::PathBuf,
+        /// Ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+    },
+    /// Authenticate an existing production model-roots artifact against its full payload.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelRootsValidate {
+        /// Existing absolute path to the exact raw production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// Independently trusted ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+    },
+    /// Generate and authenticate the frozen production structural-report artifact.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelStructureGenerate {
+        /// Existing absolute path to the exact raw production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// New absolute path for the CMFDSR01 structural-report artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        structure_output: std::path::PathBuf,
+        /// Independently trusted ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+    },
+    /// Authenticate an existing structural report against its roots and full payload.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelStructureValidate {
+        /// Existing absolute path to the exact raw production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// Existing absolute path to the CMFDSR01 structural-report artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        structure: std::path::PathBuf,
+        /// Independently trusted ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+    },
     /// Derive the reproducible production BLAKE3 preprocessing-only BLS record.
     #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
     BlsBlake3PreprocessingCommitment {
@@ -192,6 +259,40 @@ fn parse_lower_hex_32(encoded: &str) -> std::result::Result<[u8; 32], String> {
     decoded
         .try_into()
         .map_err(|_| "expected exactly 32 decoded bytes".to_owned())
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn parse_absolute_path(encoded: &str) -> std::result::Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(encoded);
+    if !path.is_absolute() {
+        return Err("expected an absolute artifact path".to_owned());
+    }
+    Ok(path)
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn print_model_roots(roots: &ProductionDoryV3ModelRoots) {
+    println!("ceremony_id {}", roots.ceremony_id());
+    println!("payload_bytes {}", roots.payload_bytes());
+    println!("raw_blake3 {}", roots.raw_blake3());
+    println!("raw_sha256 {}", roots.raw_sha256());
+    println!("base_input_blake3_root {}", roots.base_input_blake3_root());
+    println!("layer_roots {}", roots.layer_roots().len());
+    println!("layer_roots_aggregate {}", roots.layer_roots_aggregate());
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn print_structural_report(report: &ProductionDoryV3ModelStructuralReport) {
+    println!("ceremony_id {}", report.ceremony_id());
+    println!("payload_bytes {}", report.payload_bytes());
+    println!("raw_blake3 {}", report.raw_payload_blake3());
+    println!("raw_sha256 {}", report.raw_payload_sha256());
+    println!("sections {}", report.sections().len());
+    println!("duplicate_row_pairs {}", report.duplicate_row_pairs());
+    println!("duplicate_column_pairs {}", report.duplicate_column_pairs());
+    println!("duplicate_layer_pairs {}", report.duplicate_layer_pairs());
+    println!("diagnostic_mask 0x{:08x}", report.diagnostic_mask());
+    println!("fatal_mask 0x{:08x}", report.fatal_mask());
 }
 
 #[cfg(feature = "dory-bls12-381-prototype")]
@@ -383,6 +484,85 @@ fn main() -> Result<()> {
             )
             .context("production Dory V3 contribution combination failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelRootsGenerate {
+            payload,
+            roots_output,
+            expected_ceremony_id,
+        } => {
+            let file_report = generate_production_dory_v3_model_roots_file(
+                &payload,
+                &roots_output,
+                Digest32::new(expected_ceremony_id),
+            )
+            .context("production Dory V3 model-roots generation failed")?;
+            println!("roots_generated {}", roots_output.display());
+            print_model_roots(file_report.roots());
+            println!("durability {:?}", file_report.durability());
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelRootsValidate {
+            payload,
+            roots,
+            expected_ceremony_id,
+        } => {
+            let validated = validate_production_dory_v3_model_roots_files(
+                &roots,
+                &payload,
+                Digest32::new(expected_ceremony_id),
+            )
+            .context("production Dory V3 model-roots validation failed")?;
+            println!("roots_validated {}", roots.display());
+            print_model_roots(&validated);
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelStructureGenerate {
+            payload,
+            roots,
+            structure_output,
+            expected_ceremony_id,
+        } => {
+            let validated_roots = validate_production_dory_v3_model_roots_files(
+                &roots,
+                &payload,
+                Digest32::new(expected_ceremony_id),
+            )
+            .context("production Dory V3 model-roots validation failed")?;
+            let run = run_production_dory_v3_model_structural_report(
+                &payload,
+                &validated_roots,
+                &structure_output,
+            )
+            .context("production Dory V3 structural-report generation failed")?;
+            println!("structure_generated {}", run.output.display());
+            println!("report_bytes {}", run.report_bytes);
+            println!("report_blake3 {}", run.report_blake3);
+            println!("report_sha256 {}", run.report_sha256);
+            print_structural_report(&run.report);
+            println!("durability {:?}", run.durability);
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelStructureValidate {
+            payload,
+            roots,
+            structure,
+            expected_ceremony_id,
+        } => {
+            let validated_roots = validate_production_dory_v3_model_roots_files(
+                &roots,
+                &payload,
+                Digest32::new(expected_ceremony_id),
+            )
+            .context("production Dory V3 model-roots validation failed")?;
+            let report = validate_production_dory_v3_model_structural_report_files(
+                &payload,
+                &structure,
+                &validated_roots,
+            )
+            .context("production Dory V3 structural-report validation failed")?;
+            println!("structure_validated {}", structure.display());
+            print_structural_report(&report);
         }
         #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
         Command::BlsBlake3PreprocessingCommitment { scratch, output } => {

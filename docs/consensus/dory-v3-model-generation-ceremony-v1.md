@@ -704,9 +704,10 @@ must neither stop early nor reroll a statistically unusual but valid stream.
 
 Each operator should use a separately built and reviewed generator where
 practical. The feature-gated `dory-v3-model-contribution-generate` reference
-command implements this step, but its ignored full-scale qualification and an
-actual production contribution run have not yet been executed. No current file
-should be represented as a ceremony contribution.
+command implements this step. One local full-scale qualification has exercised
+the reference generator, but a second independently operated qualification and
+an actual production contribution run have not yet been completed. No current
+file should be represented as a ceremony contribution.
 
 ## Commit, reveal, and closure sequence
 
@@ -903,8 +904,17 @@ publicly without an activated model. Any later protocol must use a new version,
 new ceremony identifier, and disclosed rationale; it must not disguise a
 post-hoc search for a preferred output.
 
-The structural analyzer named in genesis is not yet implemented in this
-repository. That is a pre-ceremony blocker.
+The feature-gated reference implementation now generates and separately
+validates both fixed-width artifacts through the
+`dory-v3-model-roots-generate`, `dory-v3-model-roots-validate`,
+`dory-v3-model-structure-generate`, and
+`dory-v3-model-structure-validate` commands. Every artifact path must be an
+absolute direct child of an operator-private local directory. The roots
+authority is created only after the complete payload has been reproduced; a
+parsed roots file alone cannot authorize a structural report. Full-length
+qualification on the eventual combined payload, an independently authored
+reproducer, and the separately dual-hashed analyzer error-evidence path remain
+pre-ceremony blockers.
 
 ## Model-bank bootstrap and Record V2
 
@@ -1144,6 +1154,10 @@ Already implemented in this repository:
 - the feature-gated, identity-safe streaming modular combiner bound exclusively
   to that anchored type-5-prefix capability, with three-pass signed-claim
   authentication and ceremony-bound operational reporting;
+- the exact `CMFDMR01` roots and `CMFDSR01` structural-report codecs,
+  create-new generators, full-payload validators, and operator commands, backed
+  by a shared trusted-filesystem boundary that retains and rechecks parent and
+  file identities;
 - the fail-closed `dory-v3-model-bank-bootstrap` command; and
 - the two-pass `dory-v3-model-record-ceremony` command.
 
@@ -1156,8 +1170,11 @@ Not implemented or not completed by this document:
   implementation;
 - independent external review and a production-scale qualification of the
   reference combiner;
-- the exact roots-file and structural-report generators and validators;
-- an independently authored reproduction implementation;
+- the exact separately dual-hashed structural-analyzer error-evidence artifact
+  and its signed, anchored type-7 abort path;
+- a full-length qualification of the roots and structural-report tools on a
+  production-geometry combined payload, plus an independently authored
+  reproduction implementation;
 - operator/reproducer rosters, public identity documents, bulletin mirrors,
   the authoritative source bundle and policy, source/binary hashes, and actual
   ceremony artifacts;
@@ -1165,12 +1182,13 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is the exact roots-file and structural-
-report generators and validators, followed by append-only transcript
-publication. The transcript, generator, and combiner still require independent
-external review, and the combiner requires a production-scale qualification,
-before generating real contributions. A successful run of the current
-bootstrap or one local generator qualification is not a completed ceremony.
+The next minimal implementation slice is the structural-analyzer error-evidence
+artifact and its anchored type-7 abort path, followed by append-only transcript
+publication and production-scale roots, structure, and combiner qualification.
+The transcript, generator, combiner, and new report tools still require
+independent external review before generating real contributions. A successful
+run of the current bootstrap or one local generator qualification is not a
+completed ceremony.
 
 ## Operator completion checklist
 

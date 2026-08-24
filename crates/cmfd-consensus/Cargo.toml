@@ -65,6 +65,7 @@ dory-bls12-381-prototype = [
     "dep:rand_core",
     "dep:rayon",
     "dep:same-file",
+    "dep:libc",
     "dep:sha2",
     "dep:windows-sys",
 ]
@@ -121,8 +122,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_WindowsProgramming",
 ], optional = true }
 
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [lib]
 name = "cmfd_consensus"

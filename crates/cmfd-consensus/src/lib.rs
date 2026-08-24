@@ -53,6 +53,8 @@ pub mod dory_v3_model_bank_bootstrap;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_ceremony;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_ceremony_authoring;
+#[cfg(feature = "dory-bls12-381-prototype")]
 mod dory_v3_model_ceremony_fs;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_ceremony_transcript;

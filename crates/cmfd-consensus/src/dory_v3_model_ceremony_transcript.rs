@@ -1843,6 +1843,21 @@ pub fn encode_and_verify_ceremony_transcript(
     encode_transcript_records(records)
 }
 
+/// Canonically encode the exact signed prefix ending at the type-5 reveal-set
+/// closure and verify it against an independently authenticated ceremony ID.
+///
+/// The resulting bytes are reparsed through
+/// [`parse_and_verify_reveal_set_prefix`], which remains the only path that
+/// constructs the opaque combiner bindings. This encoder returns bytes only.
+pub fn encode_and_verify_reveal_set_prefix(
+    records: &[SignedCeremonyRecord],
+    expected_ceremony_id: [u8; 32],
+) -> Result<Vec<u8>, CeremonyTranscriptError> {
+    let bytes = encode_transcript_records(records)?;
+    let _verified = parse_and_verify_reveal_set_prefix(&bytes, expected_ceremony_id)?;
+    Ok(bytes)
+}
+
 /// Parse the authoritative bytes, verify every signature and reference, and
 /// require a complete or explicitly aborted sequence.
 ///
@@ -2871,6 +2886,80 @@ mod tests {
         body.reveal_set_signed_record_digest[0] ^= 1;
         bad_type_6[9] = sign_record(bad_type_6[9].body.clone(), &all);
         assert!(encode_and_verify_ceremony_transcript(&bad_type_6).is_err());
+    }
+
+    #[test]
+    fn reveal_set_prefix_encoder_round_trips_exact_n3_r2_stage() {
+        let (completed_bytes, _, _) = completed_fixture();
+        let completed = parse_and_verify_ceremony_transcript(&completed_bytes).unwrap();
+        let prefix_records = &completed.records()[..9];
+        assert_eq!(completed.operators().len(), 3);
+        assert_eq!(completed.reproducers().len(), 2);
+        assert_eq!(
+            prefix_records
+                .iter()
+                .map(|record| record.body.record_type())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2, 2, 3, 4, 4, 4, 5]
+        );
+
+        let encoded =
+            encode_and_verify_reveal_set_prefix(prefix_records, completed.ceremony_id()).unwrap();
+        assert_eq!(encoded, encode_transcript_records(prefix_records).unwrap());
+        let reparsed =
+            parse_and_verify_reveal_set_prefix(&encoded, completed.ceremony_id()).unwrap();
+        assert_eq!(reparsed.status(), CeremonyTranscriptStatus::RevealSetClosed);
+        assert_eq!(reparsed.records(), prefix_records);
+    }
+
+    #[test]
+    fn reveal_set_prefix_encoder_rejects_malformed_incomplete_order_and_anchor() {
+        let (completed_bytes, operators, _) = completed_fixture();
+        let completed = parse_and_verify_ceremony_transcript(&completed_bytes).unwrap();
+        let prefix_records = completed.records()[..9].to_vec();
+        let operator_signers: Vec<_> = operators
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (SignerClass::Operator, index as u16, key))
+            .collect();
+
+        assert!(
+            encode_and_verify_reveal_set_prefix(completed.records(), completed.ceremony_id())
+                .is_err()
+        );
+
+        let mut malformed_closure = prefix_records.clone();
+        let CeremonyRecordBody::RevealSet(body) = &mut malformed_closure[8].body else {
+            panic!("fixture record 8 must be type 5");
+        };
+        body.reveals[0].signed_record_digest[0] ^= 1;
+        malformed_closure[8] = sign_record(malformed_closure[8].body.clone(), &operator_signers);
+        assert!(matches!(
+            encode_and_verify_reveal_set_prefix(&malformed_closure, completed.ceremony_id()),
+            Err(CeremonyTranscriptError::Invalid(
+                "reveal set sequence or reference"
+            ))
+        ));
+
+        assert!(
+            encode_and_verify_reveal_set_prefix(&prefix_records[..8], completed.ceremony_id())
+                .is_err()
+        );
+
+        let mut out_of_order = prefix_records.clone();
+        out_of_order.swap(1, 2);
+        assert!(
+            encode_and_verify_reveal_set_prefix(&out_of_order, completed.ceremony_id()).is_err()
+        );
+
+        let mut wrong_anchor = completed.ceremony_id();
+        wrong_anchor[0] ^= 1;
+        assert!(matches!(
+            encode_and_verify_reveal_set_prefix(&prefix_records, wrong_anchor),
+            Err(CeremonyTranscriptError::Invalid(
+                "reveal-set prefix ceremony id does not match trusted anchor"
+            ))
+        ));
     }
 
     #[test]

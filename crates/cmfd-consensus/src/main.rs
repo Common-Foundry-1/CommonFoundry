@@ -19,6 +19,10 @@ use cmfd_consensus::{
     dory_bls12_381_prototype::deterministic_bls_dory_setup,
     dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
     dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
+    dory_v3_model_ceremony_authoring::{
+        prepare_production_dory_v3_ceremony_record, stage_production_dory_v3_ceremony_record,
+        stage_production_dory_v3_ceremony_reveal_set_prefix,
+    },
     dory_v3_model_ceremony_transcript::{
         CeremonyRecordBody, MAX_CEREMONY_TRANSCRIPT_BYTES, RecordSignature, SignerClass,
         ceremony_record_content_digest, parse_and_verify_reveal_set_prefix,
@@ -162,6 +166,48 @@ enum Command {
         /// Use an operator-owned local directory; Windows requires an operator-only parent DACL.
         #[arg(long)]
         output: std::path::PathBuf,
+    },
+    /// Reconstruct one unsigned type-1-through-type-5 ceremony record for external signers.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyRecordPrepare {
+        /// Existing absolute path to the strict tagged JSON authoring plan.
+        #[arg(long, value_parser = parse_absolute_path)]
+        plan: std::path::PathBuf,
+        /// Independently authenticated ceremony ID; required for types 2-5 and forbidden for type 1.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: Option<[u8; 32]>,
+    },
+    /// Verify external signatures and create-new stage one immutable type-1-through-type-5 record.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyRecordStage {
+        /// Existing absolute path to the strict tagged JSON authoring plan.
+        #[arg(long, value_parser = parse_absolute_path)]
+        plan: std::path::PathBuf,
+        /// Independently authenticated ceremony ID; required for types 2-5 and forbidden for type 1.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: Option<[u8; 32]>,
+        /// External operator signature as INDEX:128-lowercase-hex. Repeat as required.
+        #[arg(long, required = true, value_parser = parse_external_signature)]
+        operator_signature: Vec<ExternalRecordSignature>,
+        /// External reproducer signature as INDEX:128-lowercase-hex. Repeat as required.
+        #[arg(long, value_parser = parse_external_signature)]
+        reproducer_signature: Vec<ExternalRecordSignature>,
+        /// New absolute path for the exact signed record; existing paths are never overwritten.
+        #[arg(long, value_parser = parse_absolute_path)]
+        record_output: std::path::PathBuf,
+    },
+    /// Create-new stage the canonical signed type-5-terminal transcript prefix.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyPrefixStage {
+        /// Signed record file repeated in exact type-1-through-type-5 order.
+        #[arg(long = "record", required = true, value_parser = parse_absolute_path)]
+        records: Vec<std::path::PathBuf>,
+        /// Independently authenticated ceremony ID.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// New absolute type-5-terminal transcript-prefix path.
+        #[arg(long, value_parser = parse_absolute_path)]
+        prefix_output: std::path::PathBuf,
     },
     /// Combine ordered production ceremony contributions bytewise modulo 251.
     #[cfg(feature = "dory-bls12-381-prototype")]
@@ -717,6 +763,126 @@ fn run_cli() -> Result<()> {
             let report = generate_production_dory_v3_model_contribution(&output)
                 .context("production Dory V3 model contribution generation failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyRecordPrepare {
+            plan,
+            expected_ceremony_id,
+        } => {
+            let prepared = prepare_production_dory_v3_ceremony_record(&plan, expected_ceremony_id)
+                .context("failed to prepare the keyless Dory V3 ceremony record")?;
+            let plan_file = prepared.plan_file();
+            println!("outcome record_prepared");
+            println!("plan {}", plan.display());
+            println!("plan_bytes {}", plan_file.bytes);
+            println!("plan_blake3 {}", hex::encode(plan_file.blake3));
+            println!("plan_sha256 {}", hex::encode(plan_file.sha256));
+            println!("record_type {}", prepared.body().record_type());
+            println!(
+                "record_content_digest {}",
+                hex::encode(prepared.record_content_digest())
+            );
+            println!(
+                "signature_message {}",
+                hex::encode(prepared.signature_message())
+            );
+            for signer in prepared.required_signers() {
+                let class = match signer.signer_class() {
+                    SignerClass::Operator => "operator",
+                    SignerClass::Reproducer => "reproducer",
+                };
+                println!(
+                    "required_signer {class}:{}:{}",
+                    signer.signer_index(),
+                    hex::encode(signer.public_key())
+                );
+            }
+            println!("signature_algorithm bip340_raw_32_byte_message");
+            println!("private_key_handling external_only");
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyRecordStage {
+            plan,
+            expected_ceremony_id,
+            operator_signature,
+            reproducer_signature,
+            record_output,
+        } => {
+            let mut signatures: Vec<_> = operator_signature
+                .into_iter()
+                .map(|signature| signature.into_record_signature(SignerClass::Operator))
+                .collect();
+            signatures.extend(
+                reproducer_signature
+                    .into_iter()
+                    .map(|signature| signature.into_record_signature(SignerClass::Reproducer)),
+            );
+            let report = stage_production_dory_v3_ceremony_record(
+                &plan,
+                expected_ceremony_id,
+                signatures,
+                &record_output,
+            )
+            .context("failed to verify and stage the keyless Dory V3 ceremony record")?;
+            let plan_file = report.plan_file();
+            let record_file = report.record_file();
+            println!("outcome record_staged");
+            println!("signed_record {}", report.output().display());
+            println!("record_type {}", report.record_type());
+            println!("plan_bytes {}", plan_file.bytes);
+            println!("plan_blake3 {}", hex::encode(plan_file.blake3));
+            println!("plan_sha256 {}", hex::encode(plan_file.sha256));
+            println!("record_bytes {}", record_file.bytes);
+            println!("record_blake3 {}", hex::encode(record_file.blake3));
+            println!("record_sha256 {}", hex::encode(record_file.sha256));
+            println!(
+                "record_content_digest {}",
+                hex::encode(report.record_content_digest())
+            );
+            println!(
+                "signed_record_digest {}",
+                hex::encode(report.signed_record_digest())
+            );
+            println!(
+                "signature_message {}",
+                hex::encode(report.signature_message())
+            );
+            println!("signer_count {}", report.signer_count());
+            println!("durability {:?}", report.durability());
+            println!(
+                "mirror_publication_pending {}",
+                report.publication_pending()
+            );
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyPrefixStage {
+            records,
+            expected_ceremony_id,
+            prefix_output,
+        } => {
+            let report = stage_production_dory_v3_ceremony_reveal_set_prefix(
+                &records,
+                expected_ceremony_id,
+                &prefix_output,
+            )
+            .context("failed to stage the anchored Dory V3 reveal-set prefix")?;
+            let transcript = report.transcript_file();
+            println!("outcome reveal_set_prefix_staged");
+            println!("reveal_set_prefix {}", report.output().display());
+            println!("record_count {}", report.record_count());
+            println!("ceremony_id {}", hex::encode(report.ceremony_id()));
+            println!("transcript_bytes {}", transcript.bytes);
+            println!("transcript_blake3 {}", hex::encode(transcript.blake3));
+            println!("transcript_sha256 {}", hex::encode(transcript.sha256));
+            println!(
+                "transcript_derive_key_digest {}",
+                hex::encode(report.transcript_derive_key_digest())
+            );
+            println!("durability {:?}", report.durability());
+            println!(
+                "mirror_publication_pending {}",
+                report.publication_pending()
+            );
         }
         #[cfg(feature = "dory-bls12-381-prototype")]
         Command::DoryV3ModelCombine {

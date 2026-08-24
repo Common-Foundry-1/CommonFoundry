@@ -709,6 +709,335 @@ the reference generator, but a second independently operated qualification and
 an actual production contribution run have not yet been completed. No current
 file should be represented as a ceremony contribution.
 
+## Keyless type-1-through-type-5 authoring
+
+The current source tree exposes feature-gated, keyless preparation and staging
+commands for records 1 through 5. The commands pass warning-denied Windows
+compilation and bounded Windows/Linux tests, including one signed `N = 3`,
+`R = 2` type-5-terminal prefix staged and reparsed on each platform. This does
+not constitute independent review, production-scale qualification, or a real
+ceremony. The commands do not publish records, collect mirror receipts, hold
+private keys, or change `DORY_V3_SUITE_ACTIVATION_READY` from `false`.
+
+### Strict authoring plans
+
+Every plan is an existing absolute path to at most 256 KiB of strict JSON with
+exactly this outer shape:
+
+```json
+{
+  "record_type": "type_N_name",
+  "plan": {}
+}
+```
+
+Unknown outer or inner fields, missing fields, invalid lowercase hexadecimal,
+duplicate entries in prior-record or type-5 contribution-file lists,
+noncanonical prior-record order, relative artifact paths, changed inputs, and
+trailing or malformed signed-record bytes fail closed. All paths below are
+fill-in placeholders. Plan files and every artifact named inside a plan must
+already exist at absolute paths. `--record-output` and `--prefix-output` are the
+opposite: each must name a new absolute path that does not exist. The direct
+parent of every input and output must be owned by the ceremony operator. On
+Unix its mode must be exactly `0700`; on Windows it must be on local fixed
+storage, owned by the current user, with a protected operator-only DACL that
+permits only that user, SYSTEM, and Administrators. Symlinks, reparse points,
+and hard-linked inputs fail closed, and no parent-path component may be a
+symlink or reparse point. Likewise, replace hexadecimal placeholders with exact
+lowercase values; the templates are schemas, not ready-to-sign ceremony
+fixtures. Windows JSON paths must escape each backslash, for example
+`"D:\\cmfd\\ceremony\\records\\000-type-1-genesis.cmfd"`.
+
+Type 1 fixes every trusted input, deadline, reference target, and ordered
+roster. Reference target IDs are ordered and in `1..=2`; operator indices and
+reproducer indices each begin at zero and are consecutive. The minimum roster
+shown here is three operators and two reproducers:
+
+```json
+{
+  "record_type": "type_1_genesis",
+  "plan": {
+    "commit_deadline_unix_seconds": 1789000000,
+    "reveal_deadline_unix_seconds": 1789100000,
+    "source_commit_sha1": "REPLACE_WITH_40_LOWERCASE_HEX",
+    "source_bundle": "/srv/cmfd/ceremony/source-bundle.tar",
+    "source_bundle_policy": "/srv/cmfd/ceremony/source-bundle-policy.txt",
+    "cargo_lock": "/srv/cmfd/ceremony/Cargo.lock",
+    "protocol_spec": "/srv/cmfd/ceremony/dory-v3-model-generation-ceremony-v1.md",
+    "bulletin_policy": "/srv/cmfd/ceremony/bulletin-policy.txt",
+    "reference_binaries": [
+      {
+        "target_id": 1,
+        "rustc_vv": "/srv/cmfd/ceremony/target-1-rustc-vv.txt",
+        "build_environment": "/srv/cmfd/ceremony/target-1-build-environment.txt",
+        "binary": "/srv/cmfd/ceremony/target-1/cmfd-consensus"
+      }
+    ],
+    "structural_analyzer_target_id": 1,
+    "structural_analyzer_binary": "/srv/cmfd/ceremony/target-1/cmfd-consensus",
+    "operators": [
+      {
+        "index": 0,
+        "public_key": "REPLACE_WITH_OPERATOR_0_XONLY_BIP340_KEY_64_LOWERCASE_HEX",
+        "identity_document": "/srv/cmfd/ceremony/operator-0-identity.txt"
+      },
+      {
+        "index": 1,
+        "public_key": "REPLACE_WITH_OPERATOR_1_XONLY_BIP340_KEY_64_LOWERCASE_HEX",
+        "identity_document": "/srv/cmfd/ceremony/operator-1-identity.txt"
+      },
+      {
+        "index": 2,
+        "public_key": "REPLACE_WITH_OPERATOR_2_XONLY_BIP340_KEY_64_LOWERCASE_HEX",
+        "identity_document": "/srv/cmfd/ceremony/operator-2-identity.txt"
+      }
+    ],
+    "reproducers": [
+      {
+        "index": 0,
+        "public_key": "REPLACE_WITH_REPRODUCER_0_XONLY_BIP340_KEY_64_LOWERCASE_HEX",
+        "identity_document": "/srv/cmfd/ceremony/reproducer-0-identity.txt"
+      },
+      {
+        "index": 1,
+        "public_key": "REPLACE_WITH_REPRODUCER_1_XONLY_BIP340_KEY_64_LOWERCASE_HEX",
+        "identity_document": "/srv/cmfd/ceremony/reproducer-1-identity.txt"
+      }
+    ]
+  }
+}
+```
+
+Type 2 describes the next operator commitment. `prior_records` is the exact
+immutable prefix: signed type 1 followed by every earlier type-2 record in
+operator-index order. `source_bytes_consumed` must equal
+`6,442,975,232 + rejected_source_bytes`; the generator binary must match the
+selected reference target from type 1.
+
+```json
+{
+  "record_type": "type_2_contribution_commitment",
+  "plan": {
+    "prior_records": [
+      "/srv/cmfd/ceremony/records/000-type-1-genesis.cmfd"
+    ],
+    "operator_index": 0,
+    "contribution_file": "/srv/cmfd/ceremony/private/operator-0.bin",
+    "source_bytes_consumed": 6571306075,
+    "rejected_source_bytes": 128330843,
+    "generation_finished_unix_seconds": 1788900000,
+    "generator_target_id": 1,
+    "generator_binary": "/srv/cmfd/ceremony/target-1/cmfd-consensus",
+    "entropy_attestation": "/srv/cmfd/ceremony/operator-0-entropy-attestation.txt"
+  }
+}
+```
+
+Type 3 has no caller-supplied commitment list. Its exact list is reconstructed
+from signed type-2 records. `prior_records` contains type 1 and all `N` type-2
+records in canonical order:
+
+```json
+{
+  "record_type": "type_3_commitment_set",
+  "plan": {
+    "prior_records": [
+      "/srv/cmfd/ceremony/records/000-type-1-genesis.cmfd",
+      "/srv/cmfd/ceremony/records/001-type-2-operator-0.cmfd",
+      "/srv/cmfd/ceremony/records/002-type-2-operator-1.cmfd",
+      "/srv/cmfd/ceremony/records/003-type-2-operator-2.cmfd"
+    ]
+  }
+}
+```
+
+Type 4 describes the next operator reveal. Its immutable prefix ends at type 3
+for operator 0 and then includes every earlier type-4 record for later
+operators. The contribution is fully length-, range-, BLAKE3-, and SHA-256-
+checked against that operator's signed type-2 commitment.
+
+```json
+{
+  "record_type": "type_4_contribution_reveal",
+  "plan": {
+    "prior_records": [
+      "/srv/cmfd/ceremony/records/000-type-1-genesis.cmfd",
+      "/srv/cmfd/ceremony/records/001-type-2-operator-0.cmfd",
+      "/srv/cmfd/ceremony/records/002-type-2-operator-1.cmfd",
+      "/srv/cmfd/ceremony/records/003-type-2-operator-2.cmfd",
+      "/srv/cmfd/ceremony/records/004-type-3-commitment-set.cmfd"
+    ],
+    "operator_index": 0,
+    "contribution_file": "/srv/cmfd/ceremony/reveals/operator-0.bin",
+    "reveal_finished_unix_seconds": 1789050000
+  }
+}
+```
+
+Type 5 reconstructs its reveal list from the full signed prefix. In addition,
+`contribution_files` names every revealed 6,442,975,232-byte contribution in
+operator-index order:
+
+```json
+{
+  "record_type": "type_5_reveal_set",
+  "plan": {
+    "prior_records": [
+      "/srv/cmfd/ceremony/records/000-type-1-genesis.cmfd",
+      "/srv/cmfd/ceremony/records/001-type-2-operator-0.cmfd",
+      "/srv/cmfd/ceremony/records/002-type-2-operator-1.cmfd",
+      "/srv/cmfd/ceremony/records/003-type-2-operator-2.cmfd",
+      "/srv/cmfd/ceremony/records/004-type-3-commitment-set.cmfd",
+      "/srv/cmfd/ceremony/records/005-type-4-operator-0.cmfd",
+      "/srv/cmfd/ceremony/records/006-type-4-operator-1.cmfd",
+      "/srv/cmfd/ceremony/records/007-type-4-operator-2.cmfd"
+    ],
+    "contribution_files": [
+      "/srv/cmfd/ceremony/reveals/operator-0.bin",
+      "/srv/cmfd/ceremony/reveals/operator-1.bin",
+      "/srv/cmfd/ceremony/reveals/operator-2.bin"
+    ]
+  }
+}
+```
+
+Type-5 preparation does not trust the earlier type-4 summaries alone. It opens
+every contribution under the trusted-filesystem boundary, scans the entire
+file twice, enforces exact length, byte range, EOF, BLAKE3, and SHA-256, and
+matches those results to the corresponding signed type-2 commitment. Staging
+repeats preparation, so it repeats those full contribution scans before it
+accepts signatures. Operators must provision time and I/O for both passes in
+both operations; bypassing them does not produce a valid staged type-5 record.
+
+### Independent ceremony-ID rule
+
+For type 1, `--expected-ceremony-id` is forbidden on both preparation and
+staging. The canonical type-1 `record_content_digest` becomes the ceremony ID.
+For every type 2, 3, 4, and 5 operation, `--expected-ceremony-id` is mandatory
+and must be obtained independently from the authenticated, signed, published,
+and mirrored type-1 record. It must not be copied from the plan, a prior-record
+prefix currently being validated, or organizer-supplied command output without
+independent mirror authentication. A mismatch fails closed.
+
+### Prepare, sign externally, and stage
+
+Preparation authenticates the plan and every named input, reconstructs the one
+canonical body, and prints the plan's dual hashes, `record_content_digest`, the
+raw 32-byte `signature_message`, and every exact `required_signer` slot. Type 1
+omits the ceremony-ID option:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-record-prepare \
+  --plan /srv/cmfd/ceremony/plans/type-1.json
+```
+
+Types 2 through 5 require the independently authenticated anchor:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-record-prepare \
+  --plan /srv/cmfd/ceremony/plans/type-N.json \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS
+```
+
+Every required signer independently reproduces those values, then uses an
+external signer or HSM to produce a canonical BIP340 signature over the exact
+32-byte message. The signer must sign the raw message; it must not hash the
+message again. The ceremony tool has no private-key, seed, key-generation, or
+signing option. Never place private keys in a plan, command line, working
+directory, log, record file, or bulletin submission.
+
+Staging repeats the complete preparation pass and accepts public signatures
+only as `INDEX:128-lowercase-hex`. The exact signer policy is:
+
+| Record | Required external signatures |
+|---|---|
+| Type 1 | every operator and every reproducer |
+| Type 2 | the named operator only |
+| Type 3 | every operator |
+| Type 4 | the named operator only |
+| Type 5 | every operator |
+
+For the minimum three-operator, two-reproducer example, type 1 is staged as:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-record-stage \
+  --plan /srv/cmfd/ceremony/plans/type-1.json \
+  --operator-signature 0:128_LOWERCASE_HEX \
+  --operator-signature 1:128_LOWERCASE_HEX \
+  --operator-signature 2:128_LOWERCASE_HEX \
+  --reproducer-signature 0:128_LOWERCASE_HEX \
+  --reproducer-signature 1:128_LOWERCASE_HEX \
+  --record-output /srv/cmfd/ceremony/records/000-type-1-genesis.cmfd
+```
+
+Types 2 and 4 use their one named operator signature. Types 3 and 5 repeat an
+operator signature for every operator. All post-genesis stages include the
+independent anchor, for example:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-record-stage \
+  --plan /srv/cmfd/ceremony/plans/type-2-operator-0.json \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --operator-signature 0:128_LOWERCASE_HEX \
+  --record-output /srv/cmfd/ceremony/records/001-type-2-operator-0.cmfd
+
+cmfd-consensus dory-v3-model-ceremony-record-stage \
+  --plan /srv/cmfd/ceremony/plans/type-3.json \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --operator-signature 0:128_LOWERCASE_HEX \
+  --operator-signature 1:128_LOWERCASE_HEX \
+  --operator-signature 2:128_LOWERCASE_HEX \
+  --record-output /srv/cmfd/ceremony/records/004-type-3-commitment-set.cmfd
+```
+
+The type-4 and type-5 invocations have the same shapes as type 2 and type 3,
+respectively, with their own plan and output paths. A missing, duplicate,
+extra, wrong-class, wrong-index, malformed, or invalid signature fails closed.
+
+The output path must be a new absolute path in a participant-controlled parent;
+an existing path is never overwritten. Staging synchronizes the exact binary
+record, reopens it, decodes it, verifies it equals the prepared record, and
+reports its ordinary BLAKE3 and SHA-256 plus its signed-record digest. Treat the
+record as immutable after staging. Every later plan must name those exact files
+in canonical sequence; editing, replacing, reordering, or re-encoding one is a
+fatal verification failure.
+
+### Stage the type-5-terminal prefix
+
+After the signed type-5 record has been independently authenticated, stage the
+canonical reveal-set-closed prefix. Supply one `--record` for every immutable
+record in exact type-1-through-type-5 order. For `N = 3`:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-prefix-stage \
+  --record /srv/cmfd/ceremony/records/000-type-1-genesis.cmfd \
+  --record /srv/cmfd/ceremony/records/001-type-2-operator-0.cmfd \
+  --record /srv/cmfd/ceremony/records/002-type-2-operator-1.cmfd \
+  --record /srv/cmfd/ceremony/records/003-type-2-operator-2.cmfd \
+  --record /srv/cmfd/ceremony/records/004-type-3-commitment-set.cmfd \
+  --record /srv/cmfd/ceremony/records/005-type-4-operator-0.cmfd \
+  --record /srv/cmfd/ceremony/records/006-type-4-operator-1.cmfd \
+  --record /srv/cmfd/ceremony/records/007-type-4-operator-2.cmfd \
+  --record /srv/cmfd/ceremony/records/008-type-5-reveal-set.cmfd \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --prefix-output /srv/cmfd/ceremony/records/REVEAL-SET-CLOSED.cmfd
+```
+
+The command verifies all signatures and sequence links, requires the exact
+`2 * N + 3` record prefix ending at type 5 and EOF, create-new persists it, and
+reopens and revalidates the bytes. This is the only staged prefix eligible for
+the independently anchored combiner path.
+
+Every successful record or prefix stage reports
+`mirror_publication_pending true`. That is not a warning that the file is
+partially written; it means local durable staging is complete but protocol
+publication is not. The responsible operator must publish the exact staged
+bytes and dual hashes to the append-only bulletin, obtain observable receipts
+from at least two independently controlled mirrors, download and reauthenticate
+each mirrored copy, check for equivocation, and retain those receipts before
+advancing the ceremony. None of these authoring commands uploads, mirrors,
+declares publication complete, or activates production consensus.
+
 ## Commit, reveal, and closure sequence
 
 All publications use an append-only public bulletin with at least two
@@ -1350,6 +1679,11 @@ Already implemented in this repository:
 - the feature-gated exact binary transcript encoder/parser, BIP340 signature
   verifier, detached-attestation verifier, and independently anchored exact
   type-5-prefix capability;
+- feature-gated keyless type-1-through-type-5 plan preparation,
+  external BIP340 signature verification, create-new immutable signed-record
+  staging, and type-5-terminal prefix staging, with bounded Windows/Linux
+  `N = 3`, `R = 2` tests; this does not assert independent review or
+  production qualification of those commands;
 - the feature-gated, identity-safe streaming modular combiner bound exclusively
   to that anchored type-5-prefix capability, with three-pass signed-claim
   authentication and ceremony-bound operational reporting;
@@ -1374,6 +1708,8 @@ Not implemented or not completed by this document:
   ceremony-ID tooling, receipt/equivocation handling, detached transcript
   attestation, and independent external review of the transcript
   implementation;
+- independent security review and an operator-scale rehearsal of the keyless
+  type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
   reference combiner;
 - external signature collection, public append-only publication, and
@@ -1388,10 +1724,10 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is keyless type-1-through-type-5 record
-preparation and external-signature assembly, followed by public append-only
-transcript publication with independent mirror receipts and production-scale
-roots, structure, combiner, request, and proof qualification.
+The next minimal implementation slice is detached-attestation authoring and an
+operator-scale rehearsal of the keyless authoring paths, followed by public
+append-only transcript publication with independent mirror receipts and
+production-scale roots, structure, combiner, request, and proof qualification.
 The transcript, generator, combiner, and new report tools still require
 independent external review before generating real contributions. A successful
 run of the current bootstrap or one local generator qualification is not a

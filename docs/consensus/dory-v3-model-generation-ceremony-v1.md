@@ -1109,16 +1109,23 @@ Already implemented in this repository:
 - derivation of the four ordered production commitments, commitment root,
   model identity, and canonical Record V2 digest;
 - the feature-gated, fail-closed full-length OS-CSPRNG rejection-sampling
-  contribution generator, not yet executed at production length;
+  contribution generator, including one successful local production-length
+  qualification on 2026-08-24 that generated and twice reread all
+  `6,442,975,232` bytes, range-checked every byte, and independently matched
+  BLAKE3 and SHA-256 before removing the temporary artifact;
+- the feature-gated exact binary transcript encoder/parser, BIP340 signature
+  verifier, detached-attestation verifier, and independently anchored exact
+  type-5-prefix capability used to authorize the future combiner;
 - the fail-closed `dory-v3-model-bank-bootstrap` command; and
 - the two-pass `dory-v3-model-record-ceremony` command.
 
 Not implemented or not completed by this document:
 
-- full-scale execution and independent external review of the contribution
-  generator;
-- the exact binary record/transcript encoder, parser, signature verifier, and
-  append-only publication tooling;
+- independent external review and a second independently operated full-scale
+  qualification of the contribution generator;
+- append-only transcript publication and independently mirrored expected
+  ceremony-ID tooling, plus independent external review of the transcript
+  implementation;
 - the identity-bound streaming modular combiner;
 - the exact roots-file and structural-report generators and validators;
 - an independently authored reproduction implementation;
@@ -1129,11 +1136,12 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is a fixture-tested ceremony toolset for
-the exact binary formats, BIP340 record verification, identity-bound streaming
-combiner, and frozen reports, plus full-scale qualification and review of the
-create-new generator. It must be reviewed before generating real contributions.
-A successful run of the current bootstrap alone is not a completed ceremony.
+The next minimal implementation slice is to bind the identity-safe streaming
+combiner to the anchored type-5 transcript capability, then implement the
+frozen reports and append-only publication path. Those components and the
+generator still require independent external review before generating real
+contributions. A successful run of the current bootstrap or one local
+generator qualification is not a completed ceremony.
 
 ## Operator completion checklist
 

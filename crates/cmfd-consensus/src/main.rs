@@ -24,6 +24,7 @@ use cmfd_consensus::{
         prepare_production_dory_v3_ceremony_record, stage_production_dory_v3_ceremony_attestation,
         stage_production_dory_v3_ceremony_record,
         stage_production_dory_v3_ceremony_reveal_set_prefix,
+        stage_production_dory_v3_completed_ceremony_transcript,
     },
     dory_v3_model_ceremony_transcript::{
         CeremonyRecordBody, CeremonyTranscriptStatus, MAX_CEREMONY_TRANSCRIPT_BYTES,
@@ -234,6 +235,22 @@ enum Command {
         /// New absolute type-5-terminal transcript-prefix path.
         #[arg(long, value_parser = parse_absolute_path)]
         prefix_output: std::path::PathBuf,
+    },
+    /// Authenticate a type-5 prefix and signed type-6 record, then create-new stage the Completed transcript.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyCompletedTranscriptStage {
+        /// Existing absolute path to the exact canonical reveal-set-closed transcript prefix.
+        #[arg(long, value_parser = parse_absolute_path)]
+        reveal_set_prefix: std::path::PathBuf,
+        /// Existing absolute path to the exact canonical signed type-6 final-receipt record.
+        #[arg(long, value_parser = parse_absolute_path)]
+        final_receipt_record: std::path::PathBuf,
+        /// Independently authenticated ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// New absolute path for the canonical Completed transcript; existing paths are never overwritten.
+        #[arg(long, value_parser = parse_absolute_path)]
+        transcript_output: std::path::PathBuf,
     },
     /// Reconstruct a detached terminal-transcript attestation request for external signers.
     #[cfg(feature = "dory-bls12-381-prototype")]
@@ -952,6 +969,71 @@ fn run_cli() -> Result<()> {
             );
         }
         #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyCompletedTranscriptStage {
+            reveal_set_prefix,
+            final_receipt_record,
+            expected_ceremony_id,
+            transcript_output,
+        } => {
+            let report = stage_production_dory_v3_completed_ceremony_transcript(
+                &reveal_set_prefix,
+                &final_receipt_record,
+                expected_ceremony_id,
+                &transcript_output,
+            )
+            .context("failed to stage the anchored Dory V3 completed transcript")?;
+            let reveal_set_prefix_file = report.reveal_set_prefix_file();
+            let final_receipt_record_file = report.final_receipt_record_file();
+            let transcript_file = report.transcript_file();
+            println!("outcome completed_transcript_staged");
+            println!("reveal_set_prefix {}", reveal_set_prefix.display());
+            println!("reveal_set_prefix_bytes {}", reveal_set_prefix_file.bytes);
+            println!(
+                "reveal_set_prefix_blake3 {}",
+                hex::encode(reveal_set_prefix_file.blake3)
+            );
+            println!(
+                "reveal_set_prefix_sha256 {}",
+                hex::encode(reveal_set_prefix_file.sha256)
+            );
+            println!("final_receipt_record {}", final_receipt_record.display());
+            println!(
+                "final_receipt_record_bytes {}",
+                final_receipt_record_file.bytes
+            );
+            println!(
+                "final_receipt_record_blake3 {}",
+                hex::encode(final_receipt_record_file.blake3)
+            );
+            println!(
+                "final_receipt_record_sha256 {}",
+                hex::encode(final_receipt_record_file.sha256)
+            );
+            println!("completed_transcript {}", report.output().display());
+            println!("completed_transcript_bytes {}", transcript_file.bytes);
+            println!(
+                "completed_transcript_blake3 {}",
+                hex::encode(transcript_file.blake3)
+            );
+            println!(
+                "completed_transcript_sha256 {}",
+                hex::encode(transcript_file.sha256)
+            );
+            println!("protocol_status completed");
+            println!("validation_scope signed_wire_and_retained_inputs_only");
+            println!("ceremony_id {}", hex::encode(report.ceremony_id()));
+            println!(
+                "transcript_derive_key_digest {}",
+                hex::encode(report.transcript_derive_key_digest())
+            );
+            println!("record_count {}", report.record_count());
+            println!("durability {:?}", report.durability());
+            println!(
+                "mirror_publication_pending {}",
+                report.publication_pending()
+            );
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
         Command::DoryV3ModelCeremonyAttestationPrepare {
             transcript,
             expected_ceremony_id,
@@ -1558,6 +1640,7 @@ fn main() -> Result<()> {
 #[cfg(all(test, feature = "dory-bls12-381-prototype"))]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
 
     #[test]
     fn external_signature_parser_accepts_only_canonical_bip340_tuples() {
@@ -1595,5 +1678,78 @@ mod tests {
                 "accepted noncanonical external signature tuple: {encoded}"
             );
         }
+    }
+
+    #[test]
+    fn completed_transcript_stage_cli_routes_and_rejects_unsafe_inputs() {
+        let directory = std::env::current_dir().unwrap();
+        let reveal_set_prefix = directory.join("REVEAL-SET-CLOSED.cmfd");
+        let final_receipt_record = directory.join("009-type-6-final-receipt.cmfd");
+        let transcript_output = directory.join("COMPLETED.cmfd");
+        let ceremony_id = "ab".repeat(32);
+        let valid_args = || {
+            vec![
+                "cmfd-consensus".into(),
+                "dory-v3-model-ceremony-completed-transcript-stage".into(),
+                "--reveal-set-prefix".into(),
+                reveal_set_prefix.clone().into_os_string(),
+                "--final-receipt-record".into(),
+                final_receipt_record.clone().into_os_string(),
+                "--expected-ceremony-id".into(),
+                ceremony_id.clone().into(),
+                "--transcript-output".into(),
+                transcript_output.clone().into_os_string(),
+            ]
+        };
+
+        let parsed = Cli::try_parse_from(valid_args()).unwrap();
+        match parsed.command {
+            Command::DoryV3ModelCeremonyCompletedTranscriptStage {
+                reveal_set_prefix: parsed_prefix,
+                final_receipt_record: parsed_receipt,
+                expected_ceremony_id,
+                transcript_output: parsed_output,
+            } => {
+                assert_eq!(parsed_prefix, reveal_set_prefix);
+                assert_eq!(parsed_receipt, final_receipt_record);
+                assert_eq!(expected_ceremony_id, [0xab; 32]);
+                assert_eq!(parsed_output, transcript_output);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("dory-v3-model-ceremony-completed-transcript-stage")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for required in [
+            "--reveal-set-prefix",
+            "--final-receipt-record",
+            "--expected-ceremony-id",
+            "--transcript-output",
+        ] {
+            assert!(help.contains(required), "missing help option {required}");
+        }
+        for forbidden in ["--private-key", "--seed", "--mnemonic"] {
+            assert!(!help.contains(forbidden), "unsafe help option {forbidden}");
+        }
+
+        let mut missing_output = valid_args();
+        missing_output.truncate(missing_output.len() - 2);
+        assert!(Cli::try_parse_from(missing_output).is_err());
+
+        let mut relative_path = valid_args();
+        relative_path[3] = "relative-prefix.cmfd".into();
+        assert!(Cli::try_parse_from(relative_path).is_err());
+
+        let mut uppercase_id = valid_args();
+        uppercase_id[7] = "AB".repeat(32).into();
+        assert!(Cli::try_parse_from(uppercase_id).is_err());
+
+        let mut private_key = valid_args();
+        private_key.extend(["--private-key".into(), "00".into()]);
+        assert!(Cli::try_parse_from(private_key).is_err());
     }
 }

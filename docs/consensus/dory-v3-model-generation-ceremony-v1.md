@@ -794,10 +794,10 @@ is needed: the existing `ReproducerReceipt.reproduction_report`
 `FileIdentity` transitively binds these 4,283 bytes, including the opaque
 combiner-report identity.
 
-The library-only completed-transcript staging API accepts one exact retained
-type-5 prefix, one canonical signed type-6 record, and an independently
-obtained expected ceremony ID. It verifies the exact type-5 sequence and
-anchor, the type-6 sequence link, and the ordered full-roster `N + R`
+The completed-transcript staging API and operator command accept one exact
+retained type-5 prefix, one canonical signed type-6 record, and an independently
+obtained expected ceremony ID. It verifies the exact type-5 sequence and anchor,
+the type-6 sequence link, and the ordered full-roster `N + R`
 signatures, rebuilds and anchored-parses the canonical Completed transcript,
 then create-new writes and canonically reopens it. Both input files and their
 trusted parent handles remain retained through the output checks; both inputs
@@ -806,8 +806,8 @@ the file is confirmed. The report exposes the two input content identities,
 the completed-transcript identity and derive-key digest, durability, and
 publication-pending state. This stage authenticates the signed wire record and
 the retained inputs only. It does not freshly accept external candidate,
-`CMFDRP01`, or `CMFDIL01` artifacts, sign, provide an operator CLI, publish or
-mirror, or activate production consensus.
+`CMFDRP01`, or `CMFDIL01` artifacts, sign, publish or mirror, or activate
+production consensus.
 
 ### `CMFDIL01` independent-lineage approval V1
 
@@ -1329,16 +1329,42 @@ each mirrored copy, check for equivocation, and retain those receipts before
 advancing the ceremony. None of these authoring commands uploads, mirrors,
 declares publication complete, or activates production consensus.
 
+### Stage the completed transcript
+
+After separately preparing, signing, and authenticating the canonical type-6
+final-receipt record through the library API, create the exact Completed
+transcript with:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-completed-transcript-stage \
+  --reveal-set-prefix /srv/cmfd/ceremony/records/REVEAL-SET-CLOSED.cmfd \
+  --final-receipt-record /srv/cmfd/ceremony/records/009-type-6-final-receipt.cmfd \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --transcript-output /srv/cmfd/ceremony/records/COMPLETED.cmfd
+```
+
+Every path is required and absolute. The two inputs must already exist; the
+output must be absent and is never overwritten. The command retains and
+reauthenticates both inputs, verifies the independently supplied ceremony ID,
+the complete canonical sequence, and all ordered type-6 roster signatures,
+then create-new writes and reopens the Completed transcript. Its report includes
+both input content identities, the output identity, protocol status, ceremony
+ID, derive-key digest, record count, durability, and publication-pending state.
+
+This command does not prepare or sign type 6 and does not validate the external
+candidate, `CMFDRP01`, or `CMFDIL01` artifact set named by its receipt. The
+capability-bound type-6 preparation and staging APIs remain library-only. It
+also does not publish, mirror, attest, or activate the transcript and accepts no
+private-key or signing options.
+
 ### Prepare and stage the detached transcript attestation
 
 The feature-gated detached-attestation commands accept only an exact,
 terminal transcript: either a completed transcript ending at the signed type-6
 receipt or an aborted transcript ending at the signed type-7 record and EOF.
-The type-5-terminal reveal-set prefix above is deliberately ineligible. The
-library API can now assemble and reauthenticate `COMPLETED.cmfd` from the exact
-prefix and signed type-6 record, but no operator CLI exists for either type-6
-or completed-transcript staging. Detached attestation begins only after
-equivalent library orchestration has produced the exact completed file.
+The type-5-terminal reveal-set prefix above is deliberately ineligible.
+Detached attestation begins only after the completed-transcript staging command
+or equivalent library orchestration has produced the exact completed file.
 
 Both commands require `--expected-ceremony-id`. Obtain this 32-byte anchor
 independently from the authenticated, signed, published, and mirrored type-1
@@ -2116,7 +2142,7 @@ Already implemented in this repository:
   trusted-filesystem reauthentication, with 14 bounded authoring tests passing
   on each Windows and Ubuntu 22.04 plus warning-denied Clippy and both new CLI
   help paths; this is not independent review or production qualification, and
-  it neither authors type 6 nor stages a final completed transcript;
+  it does not author type 6;
 - the feature-gated, identity-safe streaming modular combiner bound exclusively
   to that anchored type-5-prefix capability, with three-pass signed-claim
   authentication and ceremony-bound operational reporting;
@@ -2131,11 +2157,11 @@ Already implemented in this repository:
   full-roster signatures are exact and ordered, and retained artifacts are
   rechecked with the bank last before and after canonical output reopen. A
   dedicated parser requires an exact ceremony-ID-anchored Completed transcript.
-  Library-only completed-transcript staging retains and reauthenticates the
-  exact type-5 prefix and signed type-6 record, verifies the exact full-roster
-  sequence, and create-new reopens the canonical result before confirmation;
+  Completed-transcript library and operator staging retain and reauthenticate
+  the exact type-5 prefix and signed type-6 record, verify the exact full-roster
+  sequence, and create-new reopen the canonical result before confirmation;
   it does not freshly accept the external candidate artifacts, sign, publish,
-  mirror, activate, or provide an operator CLI;
+  mirror, or activate;
 - the exact `CMFDMR01` roots and `CMFDSR01` structural-report codecs,
   create-new generators, full-payload validators, and operator commands, backed
   by a shared trusted-filesystem boundary that retains and rechecks parent and
@@ -2159,8 +2185,8 @@ Not implemented or not completed by this document:
 - public append-only bulletin submission, independently mirrored expected
   ceremony-ID tooling, receipt/equivocation handling, and independent external
   review of the transcript and detached-attestation implementation;
-- type-6 and completed-transcript operator CLI integration plus an
-  operator-scale rehearsal of the existing library APIs;
+- type-6 operator CLI integration plus an operator-scale rehearsal of the
+  existing type-6 and completed-transcript APIs;
 - independent security review and an operator-scale rehearsal of the keyless
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
@@ -2177,10 +2203,10 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice adds type-6 and completed-transcript CLI
-integration around the existing library APIs, cross-platform validation, and
-an operator-scale rehearsal of the keyless record and detached-attestation
-authoring paths. That is followed by public
+The next minimal implementation slice adds type-6 CLI integration around the
+existing capability-bound library APIs, cross-platform validation, and an
+operator-scale rehearsal of the keyless record, completed-transcript, and
+detached-attestation authoring paths. That is followed by public
 append-only transcript publication with independent mirror receipts and
 production-scale roots, structure, combiner, request, and proof qualification.
 The transcript, generator, combiner, and new report tools still require

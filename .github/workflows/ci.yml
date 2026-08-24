@@ -90,6 +90,8 @@ jobs:
         run: cargo test --locked -p cmfd-consensus --lib --features whir-prototype canonical_binary
       - name: Reject malformed WHIR proof bytes
         run: cargo test --locked -p cmfd-consensus --lib --features whir-prototype native_codec
+      - name: Exercise Dory Type-6 CLI
+        run: cargo test --locked -p cmfd-consensus --bin cmfd-consensus --no-default-features --features dory-bls12-381-prototype
 
   wallet:
     runs-on: ubuntu-latest

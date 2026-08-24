@@ -36,6 +36,7 @@ use crate::{
     },
     dory_bls12_381_execution_provider::{
         BlsDoryV3WinningNonceClaim, BlsDoryV3WinningNonceReplayError,
+        derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record,
         finish_prepared_bls_dory_v3_layout_v5_execution_with_composition,
         prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch,
         replay_dory_v3_winning_nonce_from_bank_authenticated_record,
@@ -58,6 +59,7 @@ use crate::{
 };
 
 const QUALIFICATION_REPORT_VERSION: u16 = 2;
+const QUALIFICATION_REQUEST_GENERATION_REPORT_VERSION: u16 = 1;
 const SCRATCH_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const QUALIFICATION_REQUEST_DIGEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/QUALIFICATION-REQUEST/V1";
 
@@ -78,6 +80,45 @@ pub struct ProductionDoryV3QualificationRequest {
     pub nonce: u64,
     pub final_activation_digest: Digest32,
     pub work_digest: Digest32,
+}
+
+/// Exact caller-selected block and nonce for one production-faithful request evaluation.
+///
+/// The final-activation and work digests are deliberately absent. They are
+/// derived by a complete authenticated CPU execution and cannot be supplied by
+/// the caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionDoryV3QualificationSeed {
+    #[serde(deserialize_with = "deserialize_strict_block_challenge")]
+    pub block: BlockChallenge,
+    pub nonce: u64,
+}
+
+/// Measurements and identities retained after one request is derived and published.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProductionDoryV3QualificationRequestGenerationReport {
+    pub report_version: u16,
+    pub network_id: Digest32,
+    pub block_height: u64,
+    pub nonce: u64,
+    pub request_digest: Digest32,
+    pub record_digest: Digest32,
+    pub model_identity_digest: Digest32,
+    pub setup_identity: Digest32,
+    pub final_activation_digest: Digest32,
+    pub work_digest: Digest32,
+    pub request_bytes: u64,
+    pub setup_nanoseconds: u64,
+    pub record_load_and_validation_nanoseconds: u64,
+    pub bank_reauthentication_nanoseconds: u64,
+    pub nonce_evaluation_nanoseconds: u64,
+    pub scratch_cleanup_nanoseconds: u64,
+    pub request_publication_nanoseconds: u64,
+    pub total_nanoseconds: u64,
+    pub request_output_is_completion_marker: bool,
+    pub publication_crash_atomic: bool,
+    pub parent_directory_sync_performed: bool,
 }
 
 /// Exact measurements retained after one successful qualification run.
@@ -288,6 +329,136 @@ pub enum ProductionDoryV3QualificationError {
     },
     #[error("output path was replaced while qualification was publishing it: {0}")]
     OutputReplaced(PathBuf),
+}
+
+/// Derive one qualification request by executing the exact authenticated
+/// production model for the caller-selected nonce.
+///
+/// This is deliberately a one-nonce evaluator, not a CPU miner. A useful
+/// qualification seed uses the maximum target. The independent qualification
+/// runner still reauthenticates the bank and replays the emitted claim before
+/// constructing any proof.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_production_dory_v3_qualification_request(
+    bank_path: &Path,
+    record_path: &Path,
+    seed: &ProductionDoryV3QualificationSeed,
+    scratch_path: &Path,
+    request_output: &Path,
+    cancel: &AtomicBool,
+) -> Result<ProductionDoryV3QualificationRequestGenerationReport, ProductionDoryV3QualificationError>
+{
+    let generation_started = Instant::now();
+    check_cancel(cancel)?;
+    let paths = QualificationRequestPaths::preflight(scratch_path, request_output)?;
+    let mut scratch = OwnedScratchDirectory::create(paths.scratch.clone())?;
+
+    let setup_started = Instant::now();
+    let setup = deterministic_bls_dory_setup(DORY_V3_PADDED_VARIABLES as usize)?;
+    setup.validate()?;
+    let setup_nanoseconds = elapsed_nanoseconds(setup_started)?;
+    check_cancel(cancel)?;
+
+    let record_started = Instant::now();
+    let record_reader = open_input(record_path)?;
+    let audit_record: DoryV3ModelCommitmentRecordV2 = serde_json::from_reader(record_reader)?;
+    audit_record.validate_production(&setup)?;
+    let structural = audit_record
+        .model_identity()
+        .validate_production_structure(audit_record.manifest(), &setup)?;
+    let record_load_and_validation_nanoseconds = elapsed_nanoseconds(record_started)?;
+    check_cancel(cancel)?;
+
+    let bank_reauthentication_started = Instant::now();
+    let authenticated = derive_bank_authenticated_dory_v3_model_commitment_record_v2(
+        open_input(bank_path)?,
+        &structural,
+        &setup,
+    )?;
+    if authenticated.record() != &audit_record {
+        return Err(ProductionDoryV3QualificationError::RecordReproductionMismatch);
+    }
+    let bank_reauthentication_nanoseconds = elapsed_nanoseconds(bank_reauthentication_started)?;
+    check_cancel(cancel)?;
+
+    let evaluation_started = Instant::now();
+    let transcript = DoryV3TranscriptContext::from_bank_authenticated_record(
+        seed.block.network_id,
+        &authenticated,
+    )
+    .map_err(|error| pipeline_error("transcript construction", error))?;
+    let claim = derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record(
+        &authenticated,
+        transcript,
+        &seed.block,
+        seed.nonce,
+        &setup,
+        open_input(bank_path)?,
+        scratch.path(),
+        cancel,
+    )
+    .map_err(|error| match error {
+        BlsDoryV3WinningNonceReplayError::Cancelled => {
+            ProductionDoryV3QualificationError::Cancelled
+        }
+        error => pipeline_error("winning-claim CPU evaluation", error),
+    })?;
+    let nonce_evaluation_nanoseconds = elapsed_nanoseconds(evaluation_started)?;
+    check_cancel(cancel)?;
+
+    let scratch_cleanup_started = Instant::now();
+    let (retained_scratch_entries, retained_scratch_logical_bytes) = scratch.measure_retained()?;
+    if retained_scratch_entries != 0 || retained_scratch_logical_bytes != 0 {
+        return Err(ProductionDoryV3QualificationError::RetainedScratch {
+            entries: retained_scratch_entries,
+            logical_bytes: retained_scratch_logical_bytes,
+        });
+    }
+    scratch.remove_empty()?;
+    let scratch_cleanup_nanoseconds = elapsed_nanoseconds(scratch_cleanup_started)?;
+    check_cancel(cancel)?;
+
+    let request = ProductionDoryV3QualificationRequest {
+        block: seed.block,
+        nonce: claim.nonce,
+        final_activation_digest: Digest32::new(claim.final_activation_digest),
+        work_digest: Digest32::new(claim.work_digest),
+    };
+    let mut request_bytes = serde_json::to_vec_pretty(&request)?;
+    request_bytes.push(b'\n');
+    if serde_json::from_slice::<ProductionDoryV3QualificationRequest>(&request_bytes)? != request {
+        return Err(ProductionDoryV3QualificationError::Configuration(
+            "qualification request did not round-trip canonically",
+        ));
+    }
+
+    let publication_started = Instant::now();
+    write_verified_output(&paths.request_output, &request_bytes)?;
+    let request_publication_nanoseconds = elapsed_nanoseconds(publication_started)?;
+
+    Ok(ProductionDoryV3QualificationRequestGenerationReport {
+        report_version: QUALIFICATION_REQUEST_GENERATION_REPORT_VERSION,
+        network_id: Digest32::new(request.block.network_id),
+        block_height: request.block.height,
+        nonce: request.nonce,
+        request_digest: qualification_request_digest(&request),
+        record_digest: audit_record.record_digest(),
+        model_identity_digest: audit_record.model_identity_digest(),
+        setup_identity: audit_record.setup_identity(),
+        final_activation_digest: request.final_activation_digest,
+        work_digest: request.work_digest,
+        request_bytes: byte_len(&request_bytes)?,
+        setup_nanoseconds,
+        record_load_and_validation_nanoseconds,
+        bank_reauthentication_nanoseconds,
+        nonce_evaluation_nanoseconds,
+        scratch_cleanup_nanoseconds,
+        request_publication_nanoseconds,
+        total_nanoseconds: elapsed_nanoseconds(generation_started)?,
+        request_output_is_completion_marker: true,
+        publication_crash_atomic: false,
+        parent_directory_sync_performed: cfg!(unix),
+    })
 }
 
 /// Run one exact n=33, 134-claim qualification and publish only fully checked outputs.
@@ -641,6 +812,42 @@ struct QualificationPaths {
     scratch: PathBuf,
     proof_output: PathBuf,
     report_output: PathBuf,
+}
+
+struct QualificationRequestPaths {
+    scratch: PathBuf,
+    request_output: PathBuf,
+}
+
+impl QualificationRequestPaths {
+    fn preflight(
+        scratch: &Path,
+        request_output: &Path,
+    ) -> Result<Self, ProductionDoryV3QualificationError> {
+        if !scratch.is_absolute() || !request_output.is_absolute() {
+            return Err(ProductionDoryV3QualificationError::Configuration(
+                "request scratch and output paths must be absolute",
+            ));
+        }
+        if request_output.starts_with(scratch) {
+            return Err(ProductionDoryV3QualificationError::Configuration(
+                "request output must not be inside runner-owned scratch",
+            ));
+        }
+        let scratch = resolve_new_path(scratch)?;
+        let request_output = resolve_new_path(request_output)?;
+        if request_output.starts_with(&scratch) {
+            return Err(ProductionDoryV3QualificationError::Configuration(
+                "request output must not be inside runner-owned scratch",
+            ));
+        }
+        ensure_path_absent(&scratch)?;
+        ensure_path_absent(&request_output)?;
+        Ok(Self {
+            scratch,
+            request_output,
+        })
+    }
 }
 
 impl QualificationPaths {
@@ -1381,6 +1588,22 @@ fn write_verified_outputs(
     Ok(())
 }
 
+fn write_verified_output(
+    output_path: &Path,
+    output_bytes: &[u8],
+) -> Result<(), ProductionDoryV3QualificationError> {
+    let mut outputs = UnconfirmedOutputs::new();
+    outputs.write_and_verify(output_path, output_bytes)?;
+    let parent = output_path
+        .parent()
+        .ok_or(ProductionDoryV3QualificationError::Configuration(
+            "request output must have a parent directory",
+        ))?;
+    sync_output_parent_directory(parent)?;
+    outputs.confirm();
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_output_parent_directories(
     proof_path: &Path,
@@ -1415,6 +1638,11 @@ fn sync_output_parent_directory(path: &Path) -> Result<(), ProductionDoryV3Quali
                 source,
             },
         )
+}
+
+#[cfg(not(unix))]
+fn sync_output_parent_directory(_path: &Path) -> Result<(), ProductionDoryV3QualificationError> {
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -1457,6 +1685,15 @@ mod tests {
 
     fn request() -> ProductionDoryV3QualificationRequest {
         ProductionDoryV3QualificationRequest {
+            block: seed().block,
+            nonce: 6,
+            final_activation_digest: Digest32::new([7; 32]),
+            work_digest: Digest32::new([8; 32]),
+        }
+    }
+
+    fn seed() -> ProductionDoryV3QualificationSeed {
+        ProductionDoryV3QualificationSeed {
             block: BlockChallenge {
                 network_id: [1; 32],
                 previous_block: [2; 32],
@@ -1466,9 +1703,30 @@ mod tests {
                 target: [0xff; 32],
             },
             nonce: 6,
-            final_activation_digest: Digest32::new([7; 32]),
-            work_digest: Digest32::new([8; 32]),
         }
+    }
+
+    #[test]
+    fn qualification_seed_json_is_strict_and_has_no_claim_fields() {
+        let encoded = serde_json::to_value(seed()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ProductionDoryV3QualificationSeed>(encoded.clone()).unwrap(),
+            seed()
+        );
+        assert!(encoded.get("final_activation_digest").is_none());
+        assert!(encoded.get("work_digest").is_none());
+
+        let mut unknown_outer = encoded.clone();
+        unknown_outer["work_digest"] = json!("00".repeat(32));
+        assert!(
+            serde_json::from_value::<ProductionDoryV3QualificationSeed>(unknown_outer).is_err()
+        );
+
+        let mut unknown_block = encoded;
+        unknown_block["block"]["algorithm_version"] = json!(3);
+        assert!(
+            serde_json::from_value::<ProductionDoryV3QualificationSeed>(unknown_block).is_err()
+        );
     }
 
     #[test]
@@ -1533,6 +1791,35 @@ mod tests {
     }
 
     #[test]
+    fn qualification_request_paths_require_new_absolute_separate_locations() {
+        let directory = TestDirectory::create();
+        let scratch = directory.0.join("request-scratch");
+        let output = directory.0.join("request.json");
+        let paths = QualificationRequestPaths::preflight(&scratch, &output).unwrap();
+        assert_eq!(paths.scratch, scratch);
+        assert_eq!(paths.request_output, output);
+
+        assert!(matches!(
+            QualificationRequestPaths::preflight(Path::new("relative"), &output),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        assert!(matches!(
+            QualificationRequestPaths::preflight(&scratch, Path::new("relative.json")),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        assert!(matches!(
+            QualificationRequestPaths::preflight(&scratch, &scratch.join("request.json")),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+
+        fs::write(&output, b"existing").unwrap();
+        assert!(matches!(
+            QualificationRequestPaths::preflight(&scratch, &output),
+            Err(ProductionDoryV3QualificationError::PathExists(path)) if path == output
+        ));
+    }
+
+    #[test]
     fn qualification_resource_floors_reject_one_byte_short() {
         ensure_scratch_floor(10, 10).unwrap();
         assert!(matches!(
@@ -1564,6 +1851,22 @@ mod tests {
             Path::new("report"),
             1,
             &cancel,
+        );
+        assert!(matches!(
+            result,
+            Err(ProductionDoryV3QualificationError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn request_generation_honors_prestart_cancellation_before_path_io() {
+        let result = generate_production_dory_v3_qualification_request(
+            Path::new("missing-bank"),
+            Path::new("missing-record"),
+            &seed(),
+            Path::new("relative-scratch"),
+            Path::new("relative-request"),
+            &AtomicBool::new(true),
         );
         assert!(matches!(
             result,
@@ -1607,6 +1910,14 @@ mod tests {
             Err(ProductionDoryV3QualificationError::CreateOutput { .. })
         ));
         assert!(!unconfirmed_proof.exists());
+
+        let request = directory.0.join("request.json");
+        write_verified_output(&request, b"request\n").unwrap();
+        assert_eq!(fs::read(&request).unwrap(), b"request\n");
+        assert!(matches!(
+            write_verified_output(&request, b"replacement\n"),
+            Err(ProductionDoryV3QualificationError::CreateOutput { .. })
+        ));
     }
 
     #[test]

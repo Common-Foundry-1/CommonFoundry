@@ -1305,6 +1305,34 @@ for a clean abort. A GPU is not required merely to validate or relay ordinary
 node transactions; this ceremony is a separate one-time production-artifact
 operation.
 
+### Non-ceremony proof-qualification request
+
+The feature-gated `dory-v3-qualify-request` command evaluates exactly one
+caller-selected nonce against an authenticated production bank. Its strict seed
+JSON contains only a complete block challenge and `nonce`; it cannot contain a
+claimed final-activation digest or work digest. The command validates the
+production Record V2, reauthenticates the complete bank, executes all 384 model
+layers with the consensus-owned CPU path, derives both digests, enforces the
+block target, removes its authenticated execution scratch, and only then
+creates, syncs, reopens, and byte-checks the request output.
+
+This command is a one-nonce evaluator, not a CPU mining loop. For an unchanged
+pipeline qualification, use a fixed nonce such as `0` and a target containing
+32 bytes of `255`; every computed digest then meets the target. A real mining
+target needs a separate batched accelerator search, whose result must still be
+replayed by the CPU verifier. The subsequent `dory-v3-qualify` command performs
+its own Record V2 validation, bank authentication, and full winning-claim CPU
+replay. A request generated from a single qualification payload is evidence for
+the proof toolchain only. It is not a combined ceremony model or a signed
+type-5 ceremony prefix.
+
+At the frozen production geometry, request generation reads the
+`6,442,975,416`-byte bank twice, performs `824,633,720,832` integer
+multiply-accumulates for the selected nonce, and preflights an exact
+`807,453,072`-byte authenticated execution artifact. Runtime, peak RSS, and
+filesystem behavior must be measured on the qualification host rather than
+inferred from these operation and byte counts.
+
 ## Implementation inventory and remaining gates
 
 Already implemented in this repository:
@@ -1333,8 +1361,10 @@ Already implemented in this repository:
   persistence, independently anchored type-5 generation authority, prepared
   unsigned type-7 abort, external-signature verifier, create-new signed-record
   and successor-transcript staging, and signed type-7 evidence verifier;
-- the fail-closed `dory-v3-model-bank-bootstrap` command; and
-- the two-pass `dory-v3-model-record-ceremony` command.
+- the fail-closed `dory-v3-model-bank-bootstrap` command;
+- the two-pass `dory-v3-model-record-ceremony` command; and
+- the one-nonce, exact-CPU `dory-v3-qualify-request` generator with strict
+  create-new output and an independently replaying `dory-v3-qualify` consumer.
 
 Not implemented or not completed by this document:
 
@@ -1358,10 +1388,10 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is public append-only transcript
-publication with independent mirror receipts, followed by production-scale
-roots, structure, and combiner qualification and qualification-request
-generation.
+The next minimal implementation slice is keyless type-1-through-type-5 record
+preparation and external-signature assembly, followed by public append-only
+transcript publication with independent mirror receipts and production-scale
+roots, structure, combiner, request, and proof qualification.
 The transcript, generator, combiner, and new report tools still require
 independent external review before generating real contributions. A successful
 run of the current bootstrap or one local generator qualification is not a

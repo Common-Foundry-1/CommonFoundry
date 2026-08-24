@@ -206,6 +206,43 @@ pub(crate) struct BlsDoryV3WinningNonceClaim {
     pub(crate) work_digest: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlsDoryV3WinningNonceExpectation {
+    Derive { nonce: u64 },
+    Verify(BlsDoryV3WinningNonceClaim),
+}
+
+impl BlsDoryV3WinningNonceExpectation {
+    const fn nonce(self) -> u64 {
+        match self {
+            Self::Derive { nonce } => nonce,
+            Self::Verify(claim) => claim.nonce,
+        }
+    }
+
+    fn resolve(
+        self,
+        final_activation_digest: [u8; 32],
+        work_digest: [u8; 32],
+    ) -> Result<BlsDoryV3WinningNonceClaim, BlsDoryV3WinningNonceReplayError> {
+        let derived = BlsDoryV3WinningNonceClaim {
+            nonce: self.nonce(),
+            final_activation_digest,
+            work_digest,
+        };
+        let Self::Verify(expected) = self else {
+            return Ok(derived);
+        };
+        if derived.final_activation_digest != expected.final_activation_digest {
+            return Err(BlsDoryV3WinningNonceReplayError::FinalActivationDigest);
+        }
+        if derived.work_digest != expected.work_digest {
+            return Err(BlsDoryV3WinningNonceReplayError::WorkDigest);
+        }
+        Ok(derived)
+    }
+}
+
 /// Opaque capability published only after a complete authenticated V3 replay.
 #[allow(dead_code)]
 pub(crate) struct VerifiedBlsDoryV3WinningNonceExecution {
@@ -1079,6 +1116,42 @@ fn prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_for_test_wi
     )
 }
 
+/// Derive one Dory V3 claim by executing one caller-selected nonce against the
+/// authenticated production bank.
+///
+/// This is a one-nonce evaluator, not a mining loop. The exact replay sink
+/// derives both digests, the target is checked only after that complete
+/// execution, and the provisional execution artifact is dropped before the
+/// claim is returned.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record<R: Read>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    transcript: DoryV3TranscriptContext,
+    block: &BlockChallenge,
+    nonce: u64,
+    setup: &DeterministicBlsDorySetup,
+    model_bank: R,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryV3WinningNonceClaim, BlsDoryV3WinningNonceReplayError> {
+    let challenge =
+        validate_dory_v3_derivation_context(authenticated, transcript, block, nonce, cancel)?;
+    let context = BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+        challenge,
+        authenticated,
+        setup,
+    )?;
+    derive_dory_v3_winning_nonce_claim_with_context(
+        authenticated,
+        context,
+        block,
+        nonce,
+        model_bank,
+        scratch_directory,
+        cancel,
+    )
+}
+
 /// Dormant Dory V3 CPU replay. No candidate or consensus path calls this entry.
 ///
 /// The claimed work and target are checked before the model-bank reader is
@@ -1101,10 +1174,10 @@ pub(crate) fn replay_dory_v3_winning_nonce_from_bank_authenticated_record<R: Rea
         authenticated,
         setup,
     )?;
-    replay_dory_v3_with_context(
+    execute_dory_v3_with_context(
         authenticated,
         context,
-        claim,
+        BlsDoryV3WinningNonceExpectation::Verify(claim),
         model_bank,
         scratch_directory,
         cancel,
@@ -1126,14 +1199,60 @@ fn replay_dory_v3_winning_nonce_from_bank_authenticated_record_for_test<R: Read>
     let challenge = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
     let context =
         BlsDoryV3ExecutionAccumulatorArtifactContext::for_test(challenge, authenticated, setup)?;
-    replay_dory_v3_with_context(
+    execute_dory_v3_with_context(
         authenticated,
         context,
-        claim,
+        BlsDoryV3WinningNonceExpectation::Verify(claim),
         model_bank,
         scratch_directory,
         cancel,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record_for_test<R: Read>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    transcript: DoryV3TranscriptContext,
+    block: &BlockChallenge,
+    nonce: u64,
+    setup: &DeterministicBlsDorySetup,
+    model_bank: R,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryV3WinningNonceClaim, BlsDoryV3WinningNonceReplayError> {
+    let challenge =
+        validate_dory_v3_derivation_context(authenticated, transcript, block, nonce, cancel)?;
+    let context =
+        BlsDoryV3ExecutionAccumulatorArtifactContext::for_test(challenge, authenticated, setup)?;
+    derive_dory_v3_winning_nonce_claim_with_context(
+        authenticated,
+        context,
+        block,
+        nonce,
+        model_bank,
+        scratch_directory,
+        cancel,
+    )
+}
+
+fn validate_dory_v3_derivation_context(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    transcript: DoryV3TranscriptContext,
+    block: &BlockChallenge,
+    nonce: u64,
+    cancel: &AtomicBool,
+) -> Result<DoryV3ChallengeContext, BlsDoryV3WinningNonceReplayError> {
+    let challenge = transcript.challenge_context(block, nonce)?;
+    let expected_transcript =
+        DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
+    if transcript != expected_transcript {
+        return Err(BlsDoryV3WinningNonceReplayError::Context);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BlsDoryV3WinningNonceReplayError::Cancelled);
+    }
+    Ok(challenge)
 }
 
 fn validate_dory_v3_replay_claim(
@@ -1161,10 +1280,39 @@ fn validate_dory_v3_replay_claim(
     Ok(challenge)
 }
 
-fn replay_dory_v3_with_context<R: Read>(
+fn derive_dory_v3_winning_nonce_claim_with_context<R: Read>(
     authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     context: BlsDoryV3ExecutionAccumulatorArtifactContext,
-    claim: BlsDoryV3WinningNonceClaim,
+    block: &BlockChallenge,
+    nonce: u64,
+    model_bank: R,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryV3WinningNonceClaim, BlsDoryV3WinningNonceReplayError> {
+    let execution = execute_dory_v3_with_context(
+        authenticated,
+        context,
+        BlsDoryV3WinningNonceExpectation::Derive { nonce },
+        model_bank,
+        scratch_directory,
+        cancel,
+    )?;
+    let claim = BlsDoryV3WinningNonceClaim {
+        nonce: execution.nonce(),
+        final_activation_digest: execution.final_activation_digest(),
+        work_digest: execution.work_digest(),
+    };
+    drop(execution);
+    if claim.work_digest > block.target {
+        return Err(BlsDoryV3WinningNonceReplayError::HighHash);
+    }
+    Ok(claim)
+}
+
+fn execute_dory_v3_with_context<R: Read>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    context: BlsDoryV3ExecutionAccumulatorArtifactContext,
+    expectation: BlsDoryV3WinningNonceExpectation,
     model_bank: R,
     scratch_directory: &Path,
     cancel: &AtomicBool,
@@ -1179,7 +1327,7 @@ fn replay_dory_v3_with_context<R: Read>(
     let sink = DoryV3WinningNonceReplaySink::new(
         context,
         *record.manifest(),
-        claim,
+        expectation,
         scratch_directory,
         cancel,
     )?;
@@ -1886,7 +2034,7 @@ fn reserved_vector<T>(capacity: usize) -> Result<Vec<T>, BlsDoryWinningNonceRepl
 struct DoryV3WinningNonceReplaySink<'a> {
     context: BlsDoryV3ExecutionAccumulatorArtifactContext,
     expected_manifest: ModelBankManifest,
-    claim: BlsDoryV3WinningNonceClaim,
+    expectation: BlsDoryV3WinningNonceExpectation,
     cancel: &'a AtomicBool,
     writer: Option<BlsDoryExecutionAccumulatorArtifactWriter>,
     initialization_statement: StructuredTransitionStatement,
@@ -1911,7 +2059,7 @@ impl<'a> DoryV3WinningNonceReplaySink<'a> {
     fn new(
         context: BlsDoryV3ExecutionAccumulatorArtifactContext,
         expected_manifest: ModelBankManifest,
-        claim: BlsDoryV3WinningNonceClaim,
+        expectation: BlsDoryV3WinningNonceExpectation,
         scratch_directory: &Path,
         cancel: &'a AtomicBool,
     ) -> Result<Self, BlsDoryV3WinningNonceReplayError> {
@@ -1971,7 +2119,7 @@ impl<'a> DoryV3WinningNonceReplaySink<'a> {
         Ok(Self {
             context,
             expected_manifest,
-            claim,
+            expectation,
             cancel,
             writer: Some(BlsDoryExecutionAccumulatorArtifactWriter::create_new(
                 scratch_directory,
@@ -2271,13 +2419,10 @@ impl StagedModelFieldLayoutSink for DoryV3WinningNonceReplaySink<'_> {
             final_activation.push(encode_dory_v3_activation(i64::from(*activation))?);
         }
         let final_activation_digest = self.context.output_digest(&final_activation)?;
-        if final_activation_digest != self.claim.final_activation_digest {
-            return Err(BlsDoryV3WinningNonceReplayError::FinalActivationDigest);
-        }
         let work_digest = self.context.work_digest(final_activation_digest);
-        if work_digest != self.claim.work_digest {
-            return Err(BlsDoryV3WinningNonceReplayError::WorkDigest);
-        }
+        let claim = self
+            .expectation
+            .resolve(final_activation_digest, work_digest)?;
 
         let writer = self
             .writer
@@ -2286,7 +2431,7 @@ impl StagedModelFieldLayoutSink for DoryV3WinningNonceReplaySink<'_> {
         finish_verified_dory_v3_execution(
             writer,
             self.context,
-            self.claim,
+            claim,
             final_activation_digest,
             work_digest,
             self.cancel,
@@ -5060,6 +5205,120 @@ mod tests {
     }
 
     #[test]
+    fn dory_v3_derived_claim_matches_reference_and_replay_and_cleans_artifact() {
+        let fixture = dory_v3_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let claim = derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record_for_test(
+            &fixture.authenticated,
+            fixture.transcript,
+            &fixture.block,
+            fixture.claim.nonce,
+            &fixture.setup,
+            Cursor::new(&fixture.bank.bytes),
+            scratch.path(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(claim, fixture.claim);
+        assert_eq!(scratch.entry_count(), 0);
+
+        let execution = replay_dory_v3_winning_nonce_from_bank_authenticated_record_for_test(
+            &fixture.authenticated,
+            fixture.transcript,
+            &fixture.block,
+            claim,
+            &fixture.setup,
+            Cursor::new(&fixture.bank.bytes),
+            scratch.path(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(execution.nonce(), claim.nonce);
+        assert_eq!(
+            execution.final_activation_digest(),
+            claim.final_activation_digest
+        );
+        assert_eq!(execution.work_digest(), claim.work_digest);
+        drop(execution);
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_derivation_checks_target_after_exact_execution_and_cleans_artifact() {
+        let fixture = dory_v3_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let mut high_block = fixture.block;
+        high_block.target = [0; 32];
+        let layers = DORY_V3_TEST_LAYERS
+            .into_iter()
+            .map(Vec::from)
+            .collect::<Vec<_>>();
+        let (expected, _, _) = evaluate_dory_v3_test_reference(
+            &fixture.base,
+            &layers,
+            fixture.transcript,
+            &high_block,
+            fixture.claim.nonce,
+        );
+        assert_ne!(expected.work_digest, high_block.target);
+
+        let error = derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record_for_test(
+            &fixture.authenticated,
+            fixture.transcript,
+            &high_block,
+            fixture.claim.nonce,
+            &fixture.setup,
+            Cursor::new(&fixture.bank.bytes),
+            scratch.path(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BlsDoryV3WinningNonceReplayError::HighHash));
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_derivation_context_and_cancellation_precede_model_reads() {
+        let fixture = dory_v3_replay_fixture(0);
+        let other = dory_v3_replay_fixture(1);
+        let scratch = ScratchDirectory::create();
+
+        let context_error =
+            derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record_for_test(
+                &other.authenticated,
+                fixture.transcript,
+                &fixture.block,
+                fixture.claim.nonce,
+                &other.setup,
+                PanicReader,
+                scratch.path(),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            context_error,
+            BlsDoryV3WinningNonceReplayError::Context
+        ));
+
+        let cancelled = derive_dory_v3_winning_nonce_claim_from_bank_authenticated_record_for_test(
+            &fixture.authenticated,
+            fixture.transcript,
+            &fixture.block,
+            fixture.claim.nonce,
+            &fixture.setup,
+            PanicReader,
+            scratch.path(),
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cancelled,
+            BlsDoryV3WinningNonceReplayError::Cancelled
+        ));
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
     fn dory_v3_replay_uses_exact_v3_virtual_and_global_bank_offsets() {
         let fixture = dory_v3_replay_fixture(0);
         let scratch = ScratchDirectory::create();
@@ -5077,7 +5336,7 @@ mod tests {
         let sink = DoryV3WinningNonceReplaySink::new(
             context,
             fixture.bank.manifest,
-            fixture.claim,
+            BlsDoryV3WinningNonceExpectation::Verify(fixture.claim),
             scratch.path(),
             &cancel,
         )

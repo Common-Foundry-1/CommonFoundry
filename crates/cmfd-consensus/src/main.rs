@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use cmfd_consensus::dory_bls12_381_blake3::derive_bls_dory_blake3_preprocessing_record;
 #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
 use cmfd_consensus::dory_v3_qualification::{
-    ProductionDoryV3QualificationRequest, run_production_dory_v3_qualification,
+    ProductionDoryV3QualificationRequest, ProductionDoryV3QualificationSeed,
+    generate_production_dory_v3_qualification_request, run_production_dory_v3_qualification,
 };
 use cmfd_consensus::forgematrix::CANDIDATE_16GB_PROFILE;
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
@@ -373,6 +374,25 @@ enum Command {
         /// New JSON record path; omit for stdout. Existing files are never overwritten.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
+    },
+    /// Execute one nonce and create a strict production Dory V3 qualification request.
+    #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+    DoryV3QualifyRequest {
+        /// Existing absolute canonical production model bank.
+        #[arg(long, value_parser = parse_absolute_path)]
+        bank: std::path::PathBuf,
+        /// Existing absolute canonical production Record V2 JSON.
+        #[arg(long, value_parser = parse_absolute_path)]
+        record: std::path::PathBuf,
+        /// Existing absolute strict JSON containing only the block and selected nonce.
+        #[arg(long, value_parser = parse_absolute_path)]
+        seed: std::path::PathBuf,
+        /// New absolute runner-owned scratch directory.
+        #[arg(long, value_parser = parse_absolute_path)]
+        scratch: std::path::PathBuf,
+        /// New absolute strict qualification-request JSON output.
+        #[arg(long, value_parser = parse_absolute_path)]
+        request_output: std::path::PathBuf,
     },
     /// Run one unchanged n=33 Dory V3 production qualification.
     #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
@@ -1092,6 +1112,36 @@ fn run_cli() -> Result<()> {
             } else {
                 print!("{}", String::from_utf8(encoded)?);
             }
+        }
+        #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+        Command::DoryV3QualifyRequest {
+            bank,
+            record,
+            seed,
+            scratch,
+            request_output,
+        } => {
+            let seed_reader = std::fs::File::open(&seed)
+                .with_context(|| format!("failed to open {}", seed.display()))?;
+            let qualification_seed: ProductionDoryV3QualificationSeed =
+                serde_json::from_reader(seed_reader)
+                    .with_context(|| format!("failed to parse {}", seed.display()))?;
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal_cancel = std::sync::Arc::clone(&cancel);
+            ctrlc::set_handler(move || {
+                signal_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .context("failed to install qualification-request Ctrl-C handler")?;
+            let report = generate_production_dory_v3_qualification_request(
+                &bank,
+                &record,
+                &qualification_seed,
+                &scratch,
+                &request_output,
+                cancel.as_ref(),
+            )
+            .context("production Dory V3 qualification-request generation failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
         Command::DoryV3Qualify {

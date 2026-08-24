@@ -733,6 +733,45 @@ pub(crate) struct PreparedBlsDoryNativeBlake3Opening {
     pub(crate) encoded_native_proof: Vec<u8>,
 }
 
+/// Dory-V3-domain native proof and its exact six deferred openings.
+///
+/// This capability is intentionally distinct from the V2 candidate's native
+/// opening. Its fields are private, it is not cloneable, and the only consuming
+/// operation appends the authenticated opening set to a Layout V5 aggregate.
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PreparedBlsDoryV3NativeBlake3Opening {
+    opening_statement: BlsDoryBlake3OpeningStatement,
+    opening_set: BlsDoryDeferredOpeningSet,
+    encoded_native_proof: Vec<u8>,
+}
+
+#[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl PreparedBlsDoryV3NativeBlake3Opening {
+    pub(crate) fn opening_binding(&self) -> [u8; 32] {
+        self.opening_statement.opening_binding()
+    }
+
+    pub(crate) fn opening_claim_count(&self) -> usize {
+        self.opening_set.claims().len()
+    }
+
+    /// Consume the typed V3 capability directly into the caller's Layout V5
+    /// aggregate. No raw opening-set or proof-parts accessor is exposed.
+    pub(crate) fn append_to_layout_v5(
+        self,
+        opening_sets: &mut Vec<BlsDoryDeferredOpeningSet>,
+        expected_claims: &mut Vec<BlsDoryOpeningClaim>,
+    ) -> Result<Vec<u8>, BlsDoryAggregateError> {
+        self.opening_statement
+            .validate_claims(self.opening_set.claims())?;
+        expected_claims.extend_from_slice(self.opening_set.claims());
+        opening_sets.push(self.opening_set);
+        Ok(self.encoded_native_proof)
+    }
+}
+
 #[cfg(feature = "whir-prototype")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreparedBlsDoryBlake3SourceBinding {
@@ -6266,15 +6305,20 @@ pub(crate) fn prepare_production_dory_v3_native_blake3_opening(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
-) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
-    prepare_production_native_blake3_opening_with_output_profile(
+) -> Result<PreparedBlsDoryV3NativeBlake3Opening, BlsDoryAggregateError> {
+    let prepared = prepare_production_native_blake3_opening_with_output_profile(
         final_activation,
         bridge,
         setup,
         scratch_directory,
         maximum_block_rows,
         NarrowBlake3OutputProfile::DoryV3,
-    )
+    )?;
+    Ok(PreparedBlsDoryV3NativeBlake3Opening {
+        opening_statement: prepared.opening_statement,
+        opening_set: prepared.opening_set,
+        encoded_native_proof: prepared.encoded_native_proof,
+    })
 }
 
 #[cfg(feature = "whir-prototype")]

@@ -97,7 +97,7 @@ use crate::{
 #[cfg(feature = "whir-prototype")]
 use crate::{
     dory_bls12_381_blake3::{
-        PreparedBlsDoryNativeBlake3Opening, prepare_production_dory_v3_native_blake3_opening,
+        PreparedBlsDoryV3NativeBlake3Opening,
         verify_encoded_dory_v3_native_blake3_opening_statement,
         verify_encoded_native_blake3_opening_statement,
     },
@@ -2022,28 +2022,25 @@ impl PreparedBlsDorySharedLayoutV5VerifierState {
 /// Opaque six-opening capability produced by the native BLAKE3 prover for
 /// Layout V5 composition. Its private fields prevent callers from supplying an
 /// arbitrary untyped deferred-opening set to the public composer.
+#[cfg(feature = "whir-prototype")]
 #[must_use]
 #[allow(dead_code)]
 struct BlsDorySharedLayoutV5NativeProverOpenings {
-    openings: BlsDoryDeferredOpeningSet,
-    opening_binding: [u8; 32],
+    native: PreparedBlsDoryV3NativeBlake3Opening,
 }
 
+#[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
 impl BlsDorySharedLayoutV5NativeProverOpenings {
-    fn from_deferred(
-        openings: BlsDoryDeferredOpeningSet,
-        opening_binding: [u8; 32],
+    fn from_dory_v3(
+        native: PreparedBlsDoryV3NativeBlake3Opening,
     ) -> Result<Self, BlsDorySharedLayoutError> {
-        if openings.claims().len() != BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS
-            || opening_binding == [0; 32]
+        if native.opening_claim_count() != BLS_DORY_SHARED_NATIVE_COMPOSITION_CLAIMS
+            || native.opening_binding() == [0; 32]
         {
             return Err(BlsDorySharedLayoutError::OpeningClaims);
         }
-        Ok(Self {
-            openings,
-            opening_binding,
-        })
+        Ok(Self { native })
     }
 }
 
@@ -2601,6 +2598,35 @@ fn validate_shared_component_shape_v5(
         || proof.link_evaluations.len() != BLS_DORY_SHARED_PRODUCTION_EQUALITY_LINKS
         || proof.opening_proof.is_empty()
         || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
+        || proof.matrices.iter().any(|matrix| {
+            usize::from(matrix.padded_variables) != padded_variables
+                || !matrix.opening_proof.is_empty()
+        })
+        || proof.transitions.iter().any(|transition| {
+            usize::from(transition.arithmetic.packed_variables) != padded_variables
+                || usize::from(transition.range.packed_variables) != padded_variables
+                || !transition.arithmetic.opening_proof.is_empty()
+                || !transition.range.opening_proof.is_empty()
+        })
+        || usize::from(proof.wiring.packed_variables) != padded_variables
+        || !proof.wiring.opening_proof.is_empty()
+    {
+        return Err(BlsDorySharedLayoutError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn validate_prepared_shared_component_shape_v5(
+    proof: &BlsDorySharedLayoutProof,
+    padded_variables: usize,
+) -> Result<(), BlsDorySharedLayoutError> {
+    if proof.protocol_version != DORY_V3_SHARED_LAYOUT_VERSION
+        || usize::from(proof.padded_variables) != padded_variables
+        || proof.matrices.len() != MAX_BLS_DORY_SHARED_MATRIX_PROOFS
+        || proof.transitions.len() != MAX_BLS_DORY_SHARED_TRANSITION_PROOFS
+        || proof.link_evaluations.len() != BLS_DORY_SHARED_PRODUCTION_EQUALITY_LINKS
+        || !proof.opening_proof.is_empty()
         || proof.matrices.iter().any(|matrix| {
             usize::from(matrix.padded_variables) != padded_variables
                 || !matrix.opening_proof.is_empty()
@@ -4526,72 +4552,72 @@ fn finish_prepared_bls_dory_shared_layout_v5_algebraic_only_for_test(
     Ok(BlsDorySharedLayoutV5Proof { context, proof })
 }
 
-/// Produce the Dory-V3-domain native BLAKE3 argument, then append its exact six
-/// openings after the canonical 128-claim Layout V5 prefix.
+/// Cheaply validate the exact production Layout V5 state before any native
+/// BLAKE3 source or proof work begins.
 #[cfg(feature = "whir-prototype")]
-#[allow(clippy::too_many_arguments)]
-pub fn prove_prepared_bls_dory_shared_layout_v5_with_composition(
-    prepared: PreparedBlsDorySharedLayoutV5ProverState,
-    challenge_digest: [u8; 32],
-    final_activation_digest: [u8; 32],
-    final_activation: &[u8],
+pub(crate) fn preflight_prepared_bls_dory_shared_layout_v5_composition(
+    prepared: &PreparedBlsDorySharedLayoutV5ProverState,
     setup: &DeterministicBlsDorySetup,
-    scratch_directory: &Path,
-    maximum_native_block_rows: usize,
-) -> Result<(BlsDorySharedLayoutV5Proof, Vec<u8>), BlsDorySharedLayoutError> {
+) -> Result<(), BlsDorySharedLayoutError> {
     let padded_variables = validate_layout_v5_codec_context(&prepared.context)?;
+    let expected_layout = BlsDoryAggregateLayout::new(
+        padded_variables / 2,
+        padded_variables - padded_variables / 2,
+    )?;
     if prepared.context.setup_identity != Digest32::new(setup.identity())
-        || prepared.aggregate_layout
-            != BlsDoryAggregateLayout::new(
-                padded_variables / 2,
-                padded_variables - padded_variables / 2,
-            )?
+        || prepared.aggregate_layout != expected_layout
     {
         return Err(BlsDorySharedLayoutError::V3Context);
     }
-    let bridge = BlsDoryOutputBridgeStatement::from_pending_dory(
-        challenge_digest,
-        final_activation_digest,
-        final_activation.len(),
-        prepared.pending_final_output(),
-    )?;
-    bridge.validate_activation(final_activation)?;
-    let PreparedBlsDoryNativeBlake3Opening {
-        opening_statement,
-        opening_set,
-        encoded_native_proof,
-    } = prepare_production_dory_v3_native_blake3_opening(
-        final_activation,
-        &bridge,
-        setup,
-        scratch_directory,
-        maximum_native_block_rows,
-    )?;
-    let native = BlsDorySharedLayoutV5NativeProverOpenings::from_deferred(
-        opening_set,
-        opening_statement.opening_binding(),
-    )?;
-    let proof = prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
+    validate_prepared_shared_component_shape_v5(&prepared.proof, padded_variables)?;
+    let opening_claim_count = prepared
+        .opening_sets
+        .iter()
+        .try_fold(0_usize, |total, set| total.checked_add(set.claims().len()));
+    if prepared.shared_opening_binding.as_bytes() == &[0; 32]
+        || prepared.pending_final_output.transcript_binding() == [0; 32]
+        || prepared.expected_claims.len() != BLS_DORY_SHARED_PRODUCTION_CLAIMS
+        || opening_claim_count != Some(BLS_DORY_SHARED_PRODUCTION_CLAIMS)
+        || !prepared
+            .opening_sets
+            .iter()
+            .flat_map(BlsDoryDeferredOpeningSet::claims)
+            .eq(prepared.expected_claims.iter())
+    {
+        return Err(BlsDorySharedLayoutError::OpeningClaims);
+    }
+    Ok(())
+}
+
+/// Consume one typed Dory-V3 native opening into the exact 128+6 Layout V5
+/// aggregate. Only the provider-owned atomic execution path calls this seam.
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening(
+    prepared: PreparedBlsDorySharedLayoutV5ProverState,
+    native: PreparedBlsDoryV3NativeBlake3Opening,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<(BlsDorySharedLayoutV5Proof, Vec<u8>), BlsDorySharedLayoutError> {
+    preflight_prepared_bls_dory_shared_layout_v5_composition(&prepared, setup)?;
+    let native = BlsDorySharedLayoutV5NativeProverOpenings::from_dory_v3(native)?;
+    prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
         prepared,
         native,
         setup,
         scratch_directory,
-    )?;
-    Ok((proof, encoded_native_proof))
+    )
 }
 
-#[cfg(any(test, feature = "whir-prototype"))]
+#[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
 fn prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
     prepared: PreparedBlsDorySharedLayoutV5ProverState,
     native: BlsDorySharedLayoutV5NativeProverOpenings,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
-) -> Result<BlsDorySharedLayoutV5Proof, BlsDorySharedLayoutError> {
-    let BlsDorySharedLayoutV5NativeProverOpenings {
-        openings: native_openings,
-        opening_binding: native_opening_binding,
-    } = native;
+) -> Result<(BlsDorySharedLayoutV5Proof, Vec<u8>), BlsDorySharedLayoutError> {
+    let native_opening_binding = native.native.opening_binding();
+    let native_claim_count = native.native.opening_claim_count();
     let PreparedBlsDorySharedLayoutV5ProverState {
         context,
         aggregate_layout,
@@ -4611,17 +4637,15 @@ fn prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
     {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
     }
-    validate_layout_v5_composition_claim_counts(
-        expected_claims.len(),
-        native_openings.claims().len(),
-    )?;
+    validate_layout_v5_composition_claim_counts(expected_claims.len(), native_claim_count)?;
     let aggregate_binding = context.native_composition_binding(
         shared_opening_binding,
         native_opening_binding,
         aggregate_layout,
     )?;
-    expected_claims.extend_from_slice(native_openings.claims());
-    opening_sets.push(native_openings);
+    let encoded_native_proof = native
+        .native
+        .append_to_layout_v5(&mut opening_sets, &mut expected_claims)?;
     if expected_claims.len() != BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
     }
@@ -4637,7 +4661,10 @@ fn prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
     }
     proof.opening_proof = opening_proof;
     validate_shared_component_shape_v5(&proof, padded_variables)?;
-    Ok(BlsDorySharedLayoutV5Proof { context, proof })
+    Ok((
+        BlsDorySharedLayoutV5Proof { context, proof },
+        encoded_native_proof,
+    ))
 }
 
 /// Append exactly the six native BLAKE3 claims after the canonical shared

@@ -684,8 +684,10 @@ is an acceptance condition. Rejection sampling is variable length. A generator
 must neither stop early nor reroll a statistically unusual but valid stream.
 
 Each operator should use a separately built and reviewed generator where
-practical. Generator tooling does not yet exist in this repository; no current
-command should be represented as having performed this step.
+practical. The feature-gated `dory-v3-model-contribution-generate` reference
+command implements this step, but its ignored full-scale qualification and an
+actual production contribution run have not yet been executed. No current file
+should be represented as a ceremony contribution.
 
 ## Commit, reveal, and closure sequence
 
@@ -1082,12 +1084,15 @@ Already implemented in this repository:
 - deterministic transparent Dory `n = 33` setup derivation;
 - derivation of the four ordered production commitments, commitment root,
   model identity, and canonical Record V2 digest;
+- the feature-gated, fail-closed full-length OS-CSPRNG rejection-sampling
+  contribution generator, not yet executed at production length;
 - the fail-closed `dory-v3-model-bank-bootstrap` command; and
 - the two-pass `dory-v3-model-record-ceremony` command.
 
 Not implemented or not completed by this document:
 
-- the reviewed full-length CSPRNG rejection-sampling generator;
+- full-scale execution and independent external review of the contribution
+  generator;
 - the exact binary record/transcript encoder, parser, signature verifier, and
   append-only publication tooling;
 - the identity-bound streaming modular combiner;
@@ -1101,10 +1106,10 @@ Not implemented or not completed by this document:
   and the remaining activation gates in `SECURITY.md`.
 
 The next minimal implementation slice is a fixture-tested ceremony toolset for
-the exact binary formats, BIP340 record verification, create-new full-length
-generator, identity-bound streaming combiner, and frozen reports. It must be
-reviewed before generating real contributions. A successful run of the current
-bootstrap alone is not a completed ceremony.
+the exact binary formats, BIP340 record verification, identity-bound streaming
+combiner, and frozen reports, plus full-scale qualification and review of the
+create-new generator. It must be reviewed before generating real contributions.
+A successful run of the current bootstrap alone is not a completed ceremony.
 
 ## Operator completion checklist
 

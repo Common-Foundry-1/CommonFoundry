@@ -66,6 +66,7 @@ dory-bls12-381-prototype = [
     "dep:rayon",
     "dep:same-file",
     "dep:sha2",
+    "dep:windows-sys",
 ]
 dory-opening-prototype = ["dep:ark-serialize", "dep:dory-pcs"]
 gpu-proof-prover = ["whir-prototype", "dep:cmfd-proof-accel", "dep:fs2"]
@@ -108,6 +109,12 @@ whir-prototype = [
     "dep:p3-whir",
     "p3-whir/parallel",
 ]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optional = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [lib]
 name = "cmfd_consensus"

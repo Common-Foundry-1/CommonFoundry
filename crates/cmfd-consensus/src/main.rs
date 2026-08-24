@@ -18,6 +18,7 @@ use cmfd_consensus::{
     dory_bls12_381_prototype::deterministic_bls_dory_setup,
     dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
     dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
+    dory_v3_model_contribution::generate_production_dory_v3_model_contribution,
 };
 
 #[derive(Debug, Parser)]
@@ -107,6 +108,14 @@ enum Command {
         #[arg(long)]
         manifest: std::path::PathBuf,
         /// New canonical Record V2 JSON path. Existing files are never overwritten.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Generate one full-length production ceremony contribution from the operating-system CSPRNG.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelContributionGenerate {
+        /// New 6,442,975,232-byte contribution path. Existing paths are never overwritten.
+        /// Use an operator-owned local directory; Windows requires an operator-only parent DACL.
         #[arg(long)]
         output: std::path::PathBuf,
     },
@@ -283,6 +292,12 @@ fn main() -> Result<()> {
             let report =
                 run_production_dory_v3_model_record_v2_ceremony(&bank, &trusted_manifest, &output)
                     .context("production Dory V3 Model Record V2 ceremony failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelContributionGenerate { output } => {
+            let report = generate_production_dory_v3_model_contribution(&output)
+                .context("production Dory V3 model contribution generation failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]

@@ -2,8 +2,10 @@
 //!
 //! The analyzer deliberately rereads the raw payload independently of the
 //! roots-file producer. It retains at most one weight layer and small indexes,
-//! emits only the fixed CMFDSR01 codec, and accepts only opaque roots authority
-//! minted by repeated full-payload verification.
+//! emits only the fixed CMFDSR01 codec, and its public entry points accept only
+//! opaque roots authority minted by repeated full-payload verification. The
+//! ceremony evidence path separately admits syntax-validated roots claims so
+//! the analyzer itself can record a payload/root mismatch before aborting.
 
 use std::{
     collections::BTreeMap,
@@ -20,7 +22,7 @@ use crate::{
         AuthenticatedInput, CeremonyFsError, ParentSyncOutcome, PendingOutput,
         TrustedCeremonyParent,
     },
-    dory_v3_model_roots::ProductionDoryV3ModelRoots,
+    dory_v3_model_roots::{ProductionDoryV3ModelRoots, ProductionDoryV3ModelRootsClaims},
     dory_v3_suite::{DORY_V3_BATCH, DORY_V3_DIMENSION, DORY_V3_LAYERS, Digest32},
     model_bank::{add_layer_root, start_layer_aggregate},
 };
@@ -46,6 +48,89 @@ const FATAL_ROOT: u32 = 1 << 1;
 const FATAL_ALLOWED_MASK: u32 = FATAL_HISTOGRAM | FATAL_ROOT;
 const COLUMN_TRANSPOSE_BLOCK: usize = 64;
 const COMPARE_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructuralAnalyzerPayloadPrefix {
+    bytes: u64,
+    blake3: Digest32,
+    sha256: Digest32,
+}
+
+impl StructuralAnalyzerPayloadPrefix {
+    pub(crate) const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(crate) const fn blake3(&self) -> Digest32 {
+        self.blake3
+    }
+
+    pub(crate) const fn sha256(&self) -> Digest32 {
+        self.sha256
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StructuralAnalyzerProgress {
+    scan_index: u8,
+    bytes: u64,
+    blake3: blake3::Hasher,
+    sha256: Sha256,
+}
+
+impl StructuralAnalyzerProgress {
+    pub(crate) fn new() -> Self {
+        Self {
+            scan_index: 0,
+            bytes: 0,
+            blake3: blake3::Hasher::new(),
+            sha256: Sha256::new(),
+        }
+    }
+
+    fn reset_all(&mut self) {
+        *self = Self::new();
+    }
+
+    fn begin_scan(&mut self) -> Result<(), ProductionDoryV3ModelStructureError> {
+        self.scan_index = self
+            .scan_index
+            .checked_add(1)
+            .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?;
+        self.bytes = 0;
+        self.blake3 = blake3::Hasher::new();
+        self.sha256 = Sha256::new();
+        Ok(())
+    }
+
+    pub(crate) const fn scan_index(&self) -> u8 {
+        self.scan_index
+    }
+
+    fn record_successful_read(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), ProductionDoryV3ModelStructureError> {
+        self.bytes = self
+            .bytes
+            .checked_add(
+                u64::try_from(bytes.len())
+                    .map_err(|_| ProductionDoryV3ModelStructureError::CounterOverflow)?,
+            )
+            .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?;
+        self.blake3.update(bytes);
+        self.sha256.update(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self) -> StructuralAnalyzerPayloadPrefix {
+        StructuralAnalyzerPayloadPrefix {
+            bytes: self.bytes,
+            blake3: Digest32::new(*self.blake3.clone().finalize().as_bytes()),
+            sha256: Digest32::new(finalize_sha256(self.sha256.clone())),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -437,6 +522,28 @@ impl ExpectedRoots {
             layer_aggregate: roots.layer_roots_aggregate(),
         })
     }
+
+    fn from_claims(
+        roots: &ProductionDoryV3ModelRootsClaims,
+        geometry: StructuralGeometry,
+    ) -> Result<Self, ProductionDoryV3ModelStructureError> {
+        let expected_layers = usize::try_from(geometry.layers)
+            .map_err(|_| ProductionDoryV3ModelStructureError::GeometryOverflow)?;
+        if roots.payload_bytes() != geometry.payload_bytes()?
+            || roots.layer_roots().len() != expected_layers
+        {
+            return Err(ProductionDoryV3ModelStructureError::RootsGeometryMismatch);
+        }
+        Ok(Self {
+            ceremony_id: roots.ceremony_id(),
+            payload_bytes: roots.payload_bytes(),
+            raw_blake3: roots.raw_blake3(),
+            raw_sha256: roots.raw_sha256(),
+            base_root: roots.base_input_blake3_root(),
+            layer_roots: roots.layer_roots().to_vec(),
+            layer_aggregate: roots.layer_roots_aggregate(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -454,6 +561,24 @@ pub fn analyze_production_dory_v3_model_structure<R: Read + Seek>(
     let geometry = StructuralGeometry::production()?;
     let expected = ExpectedRoots::from_production(roots, geometry)?;
     analyze_with_geometry(reader, geometry, &expected)
+}
+
+pub(crate) fn run_production_dory_v3_model_structural_report_observed_from_claims(
+    payload_path: &Path,
+    roots: &ProductionDoryV3ModelRootsClaims,
+    output_path: &Path,
+    progress: &mut StructuralAnalyzerProgress,
+) -> Result<ProductionDoryV3ModelStructuralReportRun, ProductionDoryV3ModelStructureError> {
+    let geometry = StructuralGeometry::production()?;
+    let expected = ExpectedRoots::from_claims(roots, geometry)?;
+    run_with_geometry_observed(
+        payload_path,
+        output_path,
+        geometry,
+        &expected,
+        true,
+        progress,
+    )
 }
 
 /// Parse the fixed report, independently rescan the complete payload, and
@@ -609,6 +734,17 @@ fn analyze_with_geometry<R: Read + Seek>(
     geometry: StructuralGeometry,
     expected: &ExpectedRoots,
 ) -> Result<ProductionDoryV3ModelStructuralReport, ProductionDoryV3ModelStructureError> {
+    let mut progress = StructuralAnalyzerProgress::new();
+    analyze_with_geometry_observed(reader, geometry, expected, &mut progress)
+}
+
+fn analyze_with_geometry_observed<R: Read + Seek>(
+    reader: &mut R,
+    geometry: StructuralGeometry,
+    expected: &ExpectedRoots,
+    progress: &mut StructuralAnalyzerProgress,
+) -> Result<ProductionDoryV3ModelStructuralReport, ProductionDoryV3ModelStructureError> {
+    progress.begin_scan()?;
     if expected.payload_bytes != geometry.payload_bytes()?
         || expected.layer_roots.len()
             != usize::try_from(geometry.layers)
@@ -627,8 +763,6 @@ fn analyze_with_geometry<R: Read + Seek>(
     let mut section_buffer = Vec::with_capacity(section_capacity);
     let mut compare_buffer = vec![0_u8; COMPARE_BUFFER_BYTES];
     let mut sections = Vec::with_capacity(section_count);
-    let mut raw_blake3 = blake3::Hasher::new();
-    let mut raw_sha256 = Sha256::new();
     let mut payload_offset = 0_u64;
     let mut duplicate_row_pairs = 0_u64;
     let mut duplicate_column_pairs = 0_u64;
@@ -644,8 +778,7 @@ fn analyze_with_geometry<R: Read + Seek>(
         DoryV3ModelStructuralSectionKind::Base,
         BASE_SECTION_INDEX,
         &mut payload_offset,
-        &mut raw_blake3,
-        &mut raw_sha256,
+        progress,
     )?;
     duplicate_row_pairs = checked_add(duplicate_row_pairs, base.duplicate_rows)?;
     duplicate_column_pairs = checked_add(duplicate_column_pairs, base.duplicate_columns)?;
@@ -662,8 +795,7 @@ fn analyze_with_geometry<R: Read + Seek>(
             DoryV3ModelStructuralSectionKind::WeightLayer,
             layer_index,
             &mut payload_offset,
-            &mut raw_blake3,
-            &mut raw_sha256,
+            progress,
         )?;
         duplicate_row_pairs = checked_add(duplicate_row_pairs, analyzed.duplicate_rows)?;
         duplicate_column_pairs = checked_add(duplicate_column_pairs, analyzed.duplicate_columns)?;
@@ -706,7 +838,8 @@ fn analyze_with_geometry<R: Read + Seek>(
     let mut trailing = [0_u8; 1];
     match reader.read(&mut trailing) {
         Ok(0) => {}
-        Ok(_) => {
+        Ok(count) => {
+            progress.record_successful_read(&trailing[..count])?;
             return Err(ProductionDoryV3ModelStructureError::TrailingBytes(
                 payload_offset,
             ));
@@ -714,8 +847,12 @@ fn analyze_with_geometry<R: Read + Seek>(
         Err(source) => return Err(ProductionDoryV3ModelStructureError::ReadPayload(source)),
     }
 
-    let raw_payload_blake3 = Digest32::new(*raw_blake3.finalize().as_bytes());
-    let raw_payload_sha256 = Digest32::new(finalize_sha256(raw_sha256));
+    let accepted_prefix = progress.snapshot();
+    if accepted_prefix.bytes() != payload_offset {
+        return Err(ProductionDoryV3ModelStructureError::CounterOverflow);
+    }
+    let raw_payload_blake3 = accepted_prefix.blake3();
+    let raw_payload_sha256 = accepted_prefix.sha256();
     let diagnostic_mask = diagnostic_mask(
         &sections,
         duplicate_row_pairs,
@@ -768,8 +905,7 @@ fn read_and_analyze_section<R: Read>(
     kind: DoryV3ModelStructuralSectionKind,
     index: u32,
     payload_offset: &mut u64,
-    raw_blake3: &mut blake3::Hasher,
-    raw_sha256: &mut Sha256,
+    progress: &mut StructuralAnalyzerProgress,
 ) -> Result<AnalyzedSection, ProductionDoryV3ModelStructureError> {
     let section_len = usize::try_from(section_bytes)
         .map_err(|_| ProductionDoryV3ModelStructureError::GeometryOverflow)?;
@@ -788,6 +924,29 @@ fn read_and_analyze_section<R: Read>(
                 });
             }
             Ok(count) => {
+                let end = read
+                    .checked_add(count)
+                    .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?;
+                let observed = &buffer[read..end];
+                progress.record_successful_read(observed)?;
+                if let Some((relative, value)) = observed
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, value)| *value > MAX_MODEL_BYTE)
+                {
+                    let accepted_before_section = u64::try_from(read)
+                        .map_err(|_| ProductionDoryV3ModelStructureError::GeometryOverflow)?;
+                    let relative = u64::try_from(relative)
+                        .map_err(|_| ProductionDoryV3ModelStructureError::GeometryOverflow)?;
+                    return Err(ProductionDoryV3ModelStructureError::OutOfRange {
+                        offset: section_start
+                            .checked_add(accepted_before_section)
+                            .and_then(|offset| offset.checked_add(relative))
+                            .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?,
+                        value,
+                    });
+                }
                 read = read
                     .checked_add(count)
                     .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?;
@@ -798,25 +957,13 @@ fn read_and_analyze_section<R: Read>(
     }
 
     let mut histogram = [0_u64; HISTOGRAM_BINS];
-    for (relative, value) in buffer.iter().copied().enumerate() {
-        if value > MAX_MODEL_BYTE {
-            let relative = u64::try_from(relative)
-                .map_err(|_| ProductionDoryV3ModelStructureError::GeometryOverflow)?;
-            return Err(ProductionDoryV3ModelStructureError::OutOfRange {
-                offset: section_start
-                    .checked_add(relative)
-                    .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?,
-                value,
-            });
-        }
+    for value in buffer.iter().copied() {
         let slot = &mut histogram[usize::from(value)];
         *slot = slot
             .checked_add(1)
             .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?;
     }
 
-    raw_blake3.update(buffer);
-    raw_sha256.update(buffer.as_slice());
     *payload_offset = payload_offset
         .checked_add(section_bytes)
         .ok_or(ProductionDoryV3ModelStructureError::CounterOverflow)?;
@@ -1376,6 +1523,26 @@ fn run_with_geometry(
     expected: &ExpectedRoots,
     require_production_size: bool,
 ) -> Result<ProductionDoryV3ModelStructuralReportRun, ProductionDoryV3ModelStructureError> {
+    let mut progress = StructuralAnalyzerProgress::new();
+    run_with_geometry_observed(
+        payload_path,
+        output_path,
+        geometry,
+        expected,
+        require_production_size,
+        &mut progress,
+    )
+}
+
+fn run_with_geometry_observed(
+    payload_path: &Path,
+    output_path: &Path,
+    geometry: StructuralGeometry,
+    expected: &ExpectedRoots,
+    require_production_size: bool,
+    progress: &mut StructuralAnalyzerProgress,
+) -> Result<ProductionDoryV3ModelStructuralReportRun, ProductionDoryV3ModelStructureError> {
+    progress.reset_all();
     let payload_bytes = geometry.payload_bytes()?;
     let payload_parent =
         TrustedCeremonyParent::for_artifact(payload_path).map_err(map_structure_payload_fs)?;
@@ -1392,8 +1559,10 @@ fn run_with_geometry(
         .map_err(map_structure_payload_fs)?;
 
     let analysis = (|| {
-        let report = analyze_with_geometry(payload.file_mut(), geometry, expected)?;
-        let final_reproduction = analyze_with_geometry(payload.file_mut(), geometry, expected)?;
+        let report =
+            analyze_with_geometry_observed(payload.file_mut(), geometry, expected, progress)?;
+        let final_reproduction =
+            analyze_with_geometry_observed(payload.file_mut(), geometry, expected, progress)?;
         if final_reproduction != report
             || final_reproduction.canonical_bytes() != report.canonical_bytes()
         {
@@ -2003,6 +2172,108 @@ mod tests {
             Err(ProductionDoryV3ModelStructureError::FatalAnalysis(mask))
                 if mask == FATAL_ROOT
         ));
+    }
+
+    #[test]
+    fn failure_progress_dual_hashes_every_successful_contiguous_read() {
+        let geometry = small_geometry();
+        let payload = small_payload();
+        let expected = expected_roots(geometry, &payload);
+
+        let mut progress = StructuralAnalyzerProgress::new();
+        analyze_with_geometry_observed(
+            &mut Cursor::new(&payload),
+            geometry,
+            &expected,
+            &mut progress,
+        )
+        .unwrap();
+        let complete = progress.snapshot();
+        assert_eq!(progress.scan_index(), 1);
+        assert_eq!(complete.bytes(), u64::try_from(payload.len()).unwrap());
+        assert_eq!(
+            complete.blake3(),
+            Digest32::new(*blake3::hash(&payload).as_bytes())
+        );
+        assert_eq!(
+            complete.sha256(),
+            Digest32::new(finalize_sha256(Sha256::new_with_prefix(&payload)))
+        );
+
+        let mut out_of_range = payload.clone();
+        out_of_range[4] = 251;
+        let mut progress = StructuralAnalyzerProgress::new();
+        assert!(matches!(
+            analyze_with_geometry_observed(
+                &mut Cursor::new(&out_of_range),
+                geometry,
+                &expected,
+                &mut progress,
+            ),
+            Err(ProductionDoryV3ModelStructureError::OutOfRange {
+                offset: 4,
+                value: 251
+            })
+        ));
+        let prefix = progress.snapshot();
+        assert_eq!(progress.scan_index(), 1);
+        let observed = &out_of_range[..geometry.base_bytes().unwrap() as usize];
+        assert_eq!(prefix.bytes(), u64::try_from(observed.len()).unwrap());
+        assert_eq!(
+            prefix.blake3(),
+            Digest32::new(*blake3::hash(observed).as_bytes())
+        );
+        assert_eq!(
+            prefix.sha256(),
+            Digest32::new(finalize_sha256(Sha256::new_with_prefix(observed)))
+        );
+
+        let mut progress = StructuralAnalyzerProgress::new();
+        let short = &payload[..payload.len() - 1];
+        assert!(matches!(
+            analyze_with_geometry_observed(
+                &mut Cursor::new(short),
+                geometry,
+                &expected,
+                &mut progress,
+            ),
+            Err(ProductionDoryV3ModelStructureError::EarlyEof { .. })
+        ));
+        let prefix = progress.snapshot();
+        assert_eq!(progress.scan_index(), 1);
+        assert_eq!(prefix.bytes(), u64::try_from(short.len()).unwrap());
+        assert_eq!(
+            prefix.blake3(),
+            Digest32::new(*blake3::hash(short).as_bytes())
+        );
+        assert_eq!(
+            prefix.sha256(),
+            Digest32::new(finalize_sha256(Sha256::new_with_prefix(short)))
+        );
+
+        let mut trailing = payload.clone();
+        trailing.push(7);
+        let mut progress = StructuralAnalyzerProgress::new();
+        assert!(matches!(
+            analyze_with_geometry_observed(
+                &mut Cursor::new(&trailing),
+                geometry,
+                &expected,
+                &mut progress,
+            ),
+            Err(ProductionDoryV3ModelStructureError::TrailingBytes(_))
+        ));
+        let prefix = progress.snapshot();
+        assert_eq!(progress.scan_index(), 1);
+        assert_eq!(prefix.bytes(), u64::try_from(trailing.len()).unwrap());
+        assert_eq!(
+            prefix.blake3(),
+            Digest32::new(*blake3::hash(&trailing).as_bytes())
+        );
+        assert_eq!(
+            prefix.sha256(),
+            Digest32::new(finalize_sha256(Sha256::new_with_prefix(&trailing)))
+        );
     }
 
     struct MutatingCursor {

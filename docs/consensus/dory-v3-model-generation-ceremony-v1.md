@@ -878,6 +878,121 @@ emits a separately dual-hashed error-evidence file, and the ceremony publishes
 an abort. It must not pad missing sections, emit partial section records, or
 encode a sentinel as though the fixed report were complete.
 
+The canonical analyzer error-evidence file is 384 through 448 bytes:
+
+```text
+magic[8] = ASCII "CMFDSE01"
+version_u16 = 1
+ceremony_id[32]
+last_valid_signed_record_digest[32]
+analyzer_target_id_u16
+analyzer_binary_blake3[32]
+analyzer_binary_sha256[32]
+roots_file_bytes_u64
+roots_file_blake3[32]
+roots_file_sha256[32]
+expected_payload_bytes_u64 = 6442975232
+opened_payload_bytes_u64
+payload_prefix_bytes_u64
+payload_prefix_blake3[32]
+payload_prefix_sha256[32]
+subject_file_bytes_u64             # zero for report generation
+subject_file_blake3[32]            # zero when subject bytes are zero
+subject_file_sha256[32]            # zero when subject bytes are zero
+operation_u16                      # 1=generate report, 2=validate report
+stage_u16                          # 1=input authentication, 2=first analysis,
+                                   # 3=second analysis, 4=report encoding,
+                                   # 5=report persistence, 6=final recheck
+failure_class_u16
+failure_code_u16
+detail_bytes_u16                   # 0..=64
+reserved_u16 = 0
+detail[detail_bytes]               # printable ASCII
+EOF
+```
+
+File identities are `u64` length followed by ordinary BLAKE3 and SHA-256. The
+failure code fixes its permitted class, stage, and deterministic length/prefix
+relationships; a parser rejects inconsistent combinations. During a failing
+analyzer pass, `payload_prefix` commits to every successful forward payload read
+before the failure, including a successfully read forbidden or trailing byte.
+It is therefore a successfully read prefix, not a claim that every committed
+byte passed semantic validation. It excludes later seek-back reads used only to
+confirm suspected duplicate rows, columns, or layers. An empty prefix uses the
+canonical hashes of the empty byte string.
+
+The anchored generator accepts only an exact, signature-verified transcript
+prefix ending at type 5 and EOF, an independently supplied ceremony ID, and an
+independently supplied digest of that signed type-5 record. The running
+executable must match both analyzer-binary hashes pinned in genesis. It
+authenticates the exact canonical roots artifact and its ceremony ID, then lets
+the analyzer's two complete passes independently compare the payload with every
+claimed root before it can succeed. This ordering is required so a forbidden
+byte or payload/root mismatch can produce evidence instead of failing before
+the observed analyzer runs. The command reserves distinct create-new report and
+evidence paths. On a mapped failure, it
+synchronizes, reopens, parses, dual-hashes, and confirms the exact `CMFDSE01`
+file before returning an unsigned type-7 body and the existing transcript
+signature message. It never signs, appends, or publishes a record. External
+operator or HSM tooling must sign the returned message under the frozen roster
+policy.
+
+Hashing the running executable file (`/proc/self/exe` on Linux and the path
+returned by `current_exe` on other supported hosts) detects accidental binary
+drift on a trusted host; it is not remote attestation and does not prove the
+in-memory image against a malicious process running as the ceremony account.
+The operator-private host and account boundary remains mandatory.
+
+The abort verifier accepts only an exact signed transcript ending at type 7 and
+EOF, with type 5 immediately before it. It independently checks both anchors,
+authenticates the exact roots and external evidence artifacts, and requires the
+type-7 phase, reason, length, BLAKE3, and SHA-256 to match the evidence. For a
+reproducible retained failed payload, it also rechecks the stable file identity
+and length and streams the recorded prefix twice, requiring both prefix hashes
+to match; a forbidden-byte claim additionally requires such a byte in that
+prefix. A mismatch in a deterministic subject claim fails closed. A transient
+I/O, resource, permission, or identity claim whose recorded observation is no
+longer reproducible verifies only as `attestation_only`, never as a retained
+payload observation.
+
+The inherited type-7 policy requires one or more valid signatures from either
+frozen roster; it is evidence of at least one roster member's attestation, not a
+threshold or full-committee vote. A pre-read, transient I/O, resource, or
+identity failure may have no reproducible subject prefix and remains a signed
+attestation. Deterministic subject claims gain the independent length/prefix
+binding above, but external reproduction is still required to establish the
+full semantic cause. Stable short or long files are reported as a generic file
+length mismatch because the trusted file opener rejects their metadata before
+analysis; the more specific early-EOF and trailing-byte codes describe changes
+or unusual read behavior observed after opening.
+
+The reference CLI exposes these two operations as:
+
+```text
+cmfd-consensus dory-v3-model-structure-generate-anchored \
+  --reveal-set-prefix ABSOLUTE-TYPE5-PREFIX \
+  --expected-ceremony-id LOWERCASE-64-HEX \
+  --expected-last-valid-signed-record-digest LOWERCASE-64-HEX \
+  --payload ABSOLUTE-PAYLOAD --roots ABSOLUTE-ROOTS \
+  --structure-output NEW-ABSOLUTE-REPORT \
+  --error-evidence-output NEW-ABSOLUTE-EVIDENCE
+
+cmfd-consensus dory-v3-model-structure-abort-verify \
+  --aborted-transcript ABSOLUTE-TYPE7-TRANSCRIPT \
+  --expected-ceremony-id LOWERCASE-64-HEX \
+  --expected-last-valid-signed-record-digest LOWERCASE-64-HEX \
+  --payload ABSOLUTE-PAYLOAD --roots ABSOLUTE-ROOTS \
+  --error-evidence ABSOLUTE-EVIDENCE
+```
+
+An evidence-producing analyzer run exits unsuccessfully after printing
+`outcome abort_evidence_prepared`; this is intentional so automation cannot
+mistake a preserved incident for a completed structural report. Successful
+abort verification also prints either
+`subject_binding retained_payload_observation_verified` or
+`subject_binding attestation_only`, so machine consumers do not confuse a
+signed incident with an independently bound retained length and read prefix.
+
 The `diagnostic_mask` bits are: bit 0 at least one constant row/column, bit 1 at
 least one duplicate row/column pair, bit 2 at least one duplicate layer pair,
 and bits 3..=31 reserved and required to be zero. It must agree exactly with the
@@ -913,8 +1028,7 @@ absolute direct child of an operator-private local directory. The roots
 authority is created only after the complete payload has been reproduced; a
 parsed roots file alone cannot authorize a structural report. Full-length
 qualification on the eventual combined payload, an independently authored
-reproducer, and the separately dual-hashed analyzer error-evidence path remain
-pre-ceremony blockers.
+reproducer, and independent external review remain pre-ceremony blockers.
 
 ## Model-bank bootstrap and Record V2
 
@@ -1158,6 +1272,9 @@ Already implemented in this repository:
   create-new generators, full-payload validators, and operator commands, backed
   by a shared trusted-filesystem boundary that retains and rechecks parent and
   file identities;
+- the exact `CMFDSE01` structural-analyzer error-evidence codec, create-new
+  persistence, independently anchored type-5 generation authority, prepared
+  unsigned type-7 abort, and signed type-7 evidence verifier;
 - the fail-closed `dory-v3-model-bank-bootstrap` command; and
 - the two-pass `dory-v3-model-record-ceremony` command.
 
@@ -1170,8 +1287,8 @@ Not implemented or not completed by this document:
   implementation;
 - independent external review and a production-scale qualification of the
   reference combiner;
-- the exact separately dual-hashed structural-analyzer error-evidence artifact
-  and its signed, anchored type-7 abort path;
+- external signing, append-only publication, and independent mirroring of a
+  prepared type-7 abort record;
 - a full-length qualification of the roots and structural-report tools on a
   production-geometry combined payload, plus an independently authored
   reproduction implementation;
@@ -1182,9 +1299,8 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is the structural-analyzer error-evidence
-artifact and its anchored type-7 abort path, followed by append-only transcript
-publication and production-scale roots, structure, and combiner qualification.
+The next minimal implementation slice is append-only transcript publication and
+production-scale roots, structure, and combiner qualification.
 The transcript, generator, combiner, and new report tools still require
 independent external review before generating real contributions. A successful
 run of the current bootstrap or one local generator qualification is not a

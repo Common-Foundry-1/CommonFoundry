@@ -19,7 +19,8 @@ use cmfd_consensus::{
     dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
     dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
     dory_v3_model_ceremony_transcript::{
-        MAX_CEREMONY_TRANSCRIPT_BYTES, parse_and_verify_reveal_set_prefix,
+        CeremonyRecordBody, MAX_CEREMONY_TRANSCRIPT_BYTES, ceremony_record_content_digest,
+        parse_and_verify_reveal_set_prefix,
     },
     dory_v3_model_combiner::combine_production_dory_v3_model_contributions,
     dory_v3_model_contribution::generate_production_dory_v3_model_contribution,
@@ -30,6 +31,12 @@ use cmfd_consensus::{
     dory_v3_model_structure::{
         ProductionDoryV3ModelStructuralReport, run_production_dory_v3_model_structural_report,
         validate_production_dory_v3_model_structural_report_files,
+    },
+    dory_v3_model_structure_evidence::{
+        AuthenticatedProductionDoryV3StructuralErrorEvidence,
+        ProductionDoryV3StructuralAbortSubjectBinding, ProductionDoryV3StructuralAnalyzerOutcome,
+        run_anchored_production_dory_v3_model_structural_report,
+        verify_anchored_production_dory_v3_structural_abort,
     },
     dory_v3_suite::Digest32,
 };
@@ -208,6 +215,53 @@ enum Command {
         #[arg(long, value_parser = parse_lower_hex_32)]
         expected_ceremony_id: [u8; 32],
     },
+    /// Run the structural analyzer under the exact signed type-5 ceremony authority.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelStructureGenerateAnchored {
+        /// Exact signed transcript prefix ending at type 5 and EOF (at most 1 MiB).
+        #[arg(long, value_parser = parse_absolute_path)]
+        reveal_set_prefix: std::path::PathBuf,
+        /// Independently authenticated ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// Independently authenticated digest of the final signed type-5 record.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_last_valid_signed_record_digest: [u8; 32],
+        /// Existing absolute path to the exact raw production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// New absolute path for the CMFDSR01 structural-report artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        structure_output: std::path::PathBuf,
+        /// New absolute path reserved for CMFDSE01 evidence if analysis fails closed.
+        #[arg(long, value_parser = parse_absolute_path)]
+        error_evidence_output: std::path::PathBuf,
+    },
+    /// Verify a signed type-7 analyzer abort and its exact external CMFDSE01 evidence.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelStructureAbortVerify {
+        /// Exact signed transcript ending at type 7 and EOF (at most 1 MiB).
+        #[arg(long, value_parser = parse_absolute_path)]
+        aborted_transcript: std::path::PathBuf,
+        /// Independently authenticated ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// Independently authenticated digest of the penultimate signed type-5 record.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_last_valid_signed_record_digest: [u8; 32],
+        /// Existing absolute path to the exact raw production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// Existing absolute path to the CMFDSE01 evidence artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        error_evidence: std::path::PathBuf,
+    },
     /// Derive the reproducible production BLAKE3 preprocessing-only BLS record.
     #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
     BlsBlake3PreprocessingCommitment {
@@ -296,9 +350,9 @@ fn print_structural_report(report: &ProductionDoryV3ModelStructuralReport) {
 }
 
 #[cfg(feature = "dory-bls12-381-prototype")]
-fn read_reveal_set_prefix(path: &std::path::Path) -> Result<Vec<u8>> {
+fn read_ceremony_transcript(path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
     let file = std::fs::File::open(path)
-        .with_context(|| format!("failed to open reveal-set prefix {}", path.display()))?;
+        .with_context(|| format!("failed to open {description} {}", path.display()))?;
     let limit = u64::try_from(MAX_CEREMONY_TRANSCRIPT_BYTES)
         .expect("the 1 MiB transcript cap fits u64")
         + 1;
@@ -306,15 +360,53 @@ fn read_reveal_set_prefix(path: &std::path::Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read reveal-set prefix {}", path.display()))?;
+        .with_context(|| format!("failed to read {description} {}", path.display()))?;
     if bytes.len() > MAX_CEREMONY_TRANSCRIPT_BYTES {
         anyhow::bail!(
-            "reveal-set prefix {} exceeds the {}-byte protocol cap",
+            "{description} {} exceeds the {}-byte protocol cap",
             path.display(),
             MAX_CEREMONY_TRANSCRIPT_BYTES
         );
     }
     Ok(bytes)
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn print_structural_error_evidence(
+    evidence: &AuthenticatedProductionDoryV3StructuralErrorEvidence,
+) {
+    let claims = evidence.claims();
+    let identity = evidence.file_identity();
+    println!("evidence_bytes {}", identity.bytes);
+    println!("evidence_blake3 {}", hex::encode(identity.blake3));
+    println!("evidence_sha256 {}", hex::encode(identity.sha256));
+    println!("ceremony_id {}", hex::encode(claims.ceremony_id()));
+    println!(
+        "last_valid_signed_record_digest {}",
+        hex::encode(claims.last_valid_signed_record_digest())
+    );
+    println!("analyzer_target_id {}", claims.analyzer_target_id());
+    println!("analyzer_blake3 {}", hex::encode(claims.analyzer_blake3()));
+    println!("analyzer_sha256 {}", hex::encode(claims.analyzer_sha256()));
+    println!("roots_bytes {}", claims.roots_file().bytes);
+    println!("roots_blake3 {}", hex::encode(claims.roots_file().blake3));
+    println!("roots_sha256 {}", hex::encode(claims.roots_file().sha256));
+    println!("expected_payload_bytes {}", claims.expected_payload_bytes());
+    println!("opened_payload_bytes {}", claims.opened_payload_bytes());
+    println!("payload_prefix_bytes {}", claims.payload_prefix_bytes());
+    println!(
+        "payload_prefix_blake3 {}",
+        hex::encode(claims.payload_prefix_blake3())
+    );
+    println!(
+        "payload_prefix_sha256 {}",
+        hex::encode(claims.payload_prefix_sha256())
+    );
+    println!("failure_operation {}", claims.operation() as u16);
+    println!("failure_stage {}", claims.stage() as u16);
+    println!("failure_class {}", claims.failure_class() as u16);
+    println!("failure_code {}", claims.failure_code() as u16);
+    println!("failure_detail {}", claims.detail());
 }
 
 fn sample_block(network_id: [u8; 32], target: [u8; 32]) -> BlockChallenge {
@@ -468,7 +560,7 @@ fn main() -> Result<()> {
             contributions,
             output,
         } => {
-            let prefix_bytes = read_reveal_set_prefix(&reveal_set_prefix)?;
+            let prefix_bytes = read_ceremony_transcript(&reveal_set_prefix, "reveal-set prefix")?;
             let transcript =
                 parse_and_verify_reveal_set_prefix(&prefix_bytes, expected_ceremony_id)
                     .with_context(|| {
@@ -563,6 +655,104 @@ fn main() -> Result<()> {
             .context("production Dory V3 structural-report validation failed")?;
             println!("structure_validated {}", structure.display());
             print_structural_report(&report);
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelStructureGenerateAnchored {
+            reveal_set_prefix,
+            expected_ceremony_id,
+            expected_last_valid_signed_record_digest,
+            payload,
+            roots,
+            structure_output,
+            error_evidence_output,
+        } => {
+            let prefix = read_ceremony_transcript(&reveal_set_prefix, "reveal-set prefix")?;
+            match run_anchored_production_dory_v3_model_structural_report(
+                &prefix,
+                expected_ceremony_id,
+                expected_last_valid_signed_record_digest,
+                &payload,
+                &roots,
+                &structure_output,
+                &error_evidence_output,
+            )
+            .context("anchored production Dory V3 structural analysis failed")?
+            {
+                ProductionDoryV3StructuralAnalyzerOutcome::Report(run) => {
+                    println!("outcome completed");
+                    println!("structure_generated {}", run.output.display());
+                    println!("report_bytes {}", run.report_bytes);
+                    println!("report_blake3 {}", run.report_blake3);
+                    println!("report_sha256 {}", run.report_sha256);
+                    print_structural_report(&run.report);
+                    println!("durability {:?}", run.durability);
+                }
+                ProductionDoryV3StructuralAnalyzerOutcome::AbortEvidence(report) => {
+                    println!("outcome abort_evidence_prepared");
+                    println!("error_evidence {}", report.output().display());
+                    print_structural_error_evidence(report.evidence());
+                    let abort = report.prepared_abort();
+                    let body = abort.body();
+                    let content_digest =
+                        ceremony_record_content_digest(&CeremonyRecordBody::Abort(body.clone()))?;
+                    println!("abort_record_type 7");
+                    println!("abort_ceremony_id {}", hex::encode(body.ceremony_id));
+                    println!(
+                        "abort_last_valid_signed_record_digest {}",
+                        hex::encode(body.last_valid_signed_record_digest)
+                    );
+                    println!("abort_phase {}", body.phase);
+                    println!("abort_reason_code {}", body.reason_code);
+                    println!(
+                        "abort_record_content_digest {}",
+                        hex::encode(content_digest)
+                    );
+                    println!(
+                        "abort_signature_message {}",
+                        hex::encode(abort.signature_message())
+                    );
+                    println!("signature_policy one-or-more-frozen-roster-members");
+                    println!("durability {:?}", report.durability());
+                    anyhow::bail!(
+                        "structural analysis failed closed; durable evidence and an unsigned type-7 abort were prepared"
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelStructureAbortVerify {
+            aborted_transcript,
+            expected_ceremony_id,
+            expected_last_valid_signed_record_digest,
+            payload,
+            roots,
+            error_evidence,
+        } => {
+            let transcript = read_ceremony_transcript(&aborted_transcript, "aborted transcript")?;
+            let verified = verify_anchored_production_dory_v3_structural_abort(
+                &transcript,
+                expected_ceremony_id,
+                expected_last_valid_signed_record_digest,
+                &payload,
+                &roots,
+                &error_evidence,
+            )
+            .context("signed production Dory V3 structural abort verification failed")?;
+            println!("outcome abort_verified");
+            println!("transcript {}", aborted_transcript.display());
+            println!("error_evidence {}", error_evidence.display());
+            println!(
+                "subject_binding {}",
+                match verified.subject_binding() {
+                    ProductionDoryV3StructuralAbortSubjectBinding::AttestationOnly => {
+                        "attestation_only"
+                    }
+                    ProductionDoryV3StructuralAbortSubjectBinding::RetainedPayloadObservationVerified => {
+                        "retained_payload_observation_verified"
+                    }
+                }
+            );
+            print_structural_error_evidence(verified.evidence());
         }
         #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
         Command::BlsBlake3PreprocessingCommitment { scratch, output } => {

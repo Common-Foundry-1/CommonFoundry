@@ -66,6 +66,8 @@ pub mod dory_v3_model_record;
 pub mod dory_v3_model_roots;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_structure;
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_structure_evidence;
 #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
 pub mod dory_v3_qualification;
 #[cfg(feature = "dory-bls12-381-prototype")]

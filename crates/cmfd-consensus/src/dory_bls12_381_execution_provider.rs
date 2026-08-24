@@ -1745,9 +1745,17 @@ mod tests {
     use super::*;
     use crate::{
         BlockChallenge, ForgeMatrixV2Descriptor, ForgeMatrixV2Reference,
-        ForgeMatrixV2ReferenceProof, SmallModelBankFixture,
-        dory_bls12_381_aggregate::commit_bls_dory_polynomial,
+        ForgeMatrixV2ReferenceProof, SmallModelBankFixture, StructuredMatrixStatement,
+        StructuredSumcheckError,
+        dory_bls12_381_aggregate::{
+            commit_bls_dory_padded_prefix_with_optional_scratch, commit_bls_dory_polynomial,
+        },
         dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorColumn,
+        dory_bls12_381_matrix::{
+            BlsDoryMatrixError,
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch,
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch,
+        },
         dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt, deterministic_bls_dory_setup},
         dory_v3_model::{CanonicalBlsDoryGtHex, DoryV3ModelIdentityV1},
         dory_v3_model_record::{
@@ -2314,6 +2322,7 @@ mod tests {
         [127, 124, 126, 125],
         [125, 123, 127, 124],
     ];
+    type DoryV3MaterializedMatrixBanks = ([Vec<i64>; 2], [Vec<i64>; 2], [Vec<i64>; 2]);
 
     struct DoryV3ReplayFixture {
         bank: BuiltModelBankFixture,
@@ -2564,6 +2573,306 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap()
+    }
+
+    fn dory_v3_matrix_statement_for_test() -> StructuredMatrixStatement {
+        StructuredMatrixStatement {
+            layers: 2,
+            rows: 2,
+            inner: 2,
+            cols: 2,
+            max_abs_activation: 125,
+            max_abs_weight: 125,
+            max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+        }
+    }
+
+    fn dory_v3_transition_activations_for_test(
+        statement: StructuredTransitionStatement,
+        mask: &StructuredMaskPolynomial,
+        layer: usize,
+        accumulators: &[i64],
+    ) -> Vec<i64> {
+        let cells = statement.rows * statement.cols;
+        accumulators
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(cell, accumulator)| {
+                let index = layer * cells + cell;
+                let mask_value = mask
+                    .value_at_boolean_index_prevalidated(statement, index)
+                    .unwrap();
+                derive_transition_regular_row_from_mask(statement, index, accumulator, mask_value)
+                    .unwrap()
+                    .activation
+            })
+            .collect()
+    }
+
+    fn materialized_dory_v3_matrix_banks(
+        fixture: &DoryV3ReplayFixture,
+    ) -> DoryV3MaterializedMatrixBanks {
+        let challenge = fixture
+            .transcript
+            .challenge_context(&fixture.block, fixture.claim.nonce)
+            .unwrap();
+        let initialization_statement = StructuredTransitionStatement {
+            layers: 1,
+            rows: 2,
+            cols: 2,
+            max_abs_accumulator: 125,
+            max_mask: MAX_TRANSITION_MASK,
+        };
+        let transition_statement = StructuredTransitionStatement {
+            layers: 2,
+            rows: 2,
+            cols: 2,
+            max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+            max_mask: MAX_TRANSITION_MASK,
+        };
+        let initialization_mask =
+            StructuredMaskPolynomial::from_dory_v3_virtual_challenge(&challenge.digest(), 2, 2)
+                .unwrap();
+        let mut activation = dory_v3_transition_activations_for_test(
+            initialization_statement,
+            &initialization_mask,
+            0,
+            &fixture
+                .base
+                .iter()
+                .map(|value| i64::from(*value) - 125)
+                .collect::<Vec<_>>(),
+        );
+        let mut activations = std::array::from_fn(|_| Vec::new());
+        let mut weights = std::array::from_fn(|_| Vec::new());
+        let mut accumulators = std::array::from_fn(|_| Vec::new());
+        for (global_layer, layer_weights) in DORY_V3_TEST_LAYERS.iter().enumerate() {
+            let bank = global_layer / 2;
+            let layer = global_layer % 2;
+            activations[bank].extend_from_slice(&activation);
+            weights[bank].extend(layer_weights.iter().map(|weight| i64::from(*weight) - 125));
+            let layer_accumulators = fixture.expected_accumulators[global_layer]
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            accumulators[bank].extend_from_slice(&layer_accumulators);
+            let mask = StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+                &challenge.digest(),
+                u32::try_from(bank * 2).unwrap(),
+                2,
+                2,
+                2,
+            )
+            .unwrap();
+            activation = dory_v3_transition_activations_for_test(
+                transition_statement,
+                &mask,
+                layer,
+                &layer_accumulators,
+            );
+        }
+        (activations, weights, accumulators)
+    }
+
+    #[test]
+    fn dory_v3_streamed_matrix_banks_match_independent_materialized_proofs() {
+        let fixture = dory_v3_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let statement = dory_v3_matrix_statement_for_test();
+        let (activations, weights, accumulators) = materialized_dory_v3_matrix_banks(&fixture);
+        let mut execution = replay_dory_v3(&fixture, &scratch);
+
+        for bank in 0..2 {
+            let binding = format!("dory-v3-streamed-matrix-bank-{bank}");
+            let weight = commit_bls_dory_polynomial(
+                weights[bank]
+                    .iter()
+                    .copied()
+                    .map(BlsDoryFr::from_i64)
+                    .collect(),
+                1,
+                2,
+                &fixture.setup,
+            )
+            .unwrap();
+            let materialized = prove_bls_dory_matrix_deferred_with_precommitted_weight_and_scratch(
+                binding.as_bytes(),
+                statement,
+                &activations[bank],
+                &weight,
+                &accumulators[bank],
+                DORY_V3_TEST_VARIABLES,
+                &fixture.setup,
+                scratch.path(),
+            )
+            .unwrap();
+            let streamed = {
+                let mut reader = execution
+                    .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                    .unwrap();
+                prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+                    binding.as_bytes(),
+                    &weight,
+                    &mut reader,
+                    bank,
+                    DORY_V3_TEST_VARIABLES,
+                    &fixture.setup,
+                    scratch.path(),
+                )
+                .unwrap()
+            };
+
+            assert_eq!(streamed.proof, materialized.proof);
+            assert_eq!(
+                streamed.proof.encode_deferred(statement).unwrap(),
+                materialized.proof.encode_deferred(statement).unwrap()
+            );
+            assert_eq!(
+                streamed.proof.transcript_digest,
+                materialized.proof.transcript_digest
+            );
+            assert_eq!(
+                streamed.proof.activation_commitment,
+                materialized.proof.activation_commitment
+            );
+            assert_eq!(
+                streamed.proof.weight_commitment,
+                materialized.proof.weight_commitment
+            );
+            assert_eq!(
+                streamed.proof.accumulator_commitment,
+                materialized.proof.accumulator_commitment
+            );
+            assert_eq!(streamed.openings.claims(), materialized.openings.claims());
+            drop((streamed, materialized, weight));
+        }
+
+        let challenge = fixture
+            .transcript
+            .challenge_context(&fixture.block, fixture.claim.nonce)
+            .unwrap();
+        let v3_virtual =
+            StructuredMaskPolynomial::from_dory_v3_virtual_challenge(&challenge.digest(), 2, 2)
+                .unwrap();
+        let v2_virtual =
+            StructuredMaskPolynomial::from_virtual_challenge(&challenge.digest(), 2, 2).unwrap();
+        let v3_later = StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+            &challenge.digest(),
+            2,
+            2,
+            2,
+            2,
+        )
+        .unwrap();
+        let v2_later = StructuredMaskPolynomial::from_challenge_at_layer_offset(
+            &challenge.digest(),
+            2,
+            2,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_ne!(v3_virtual, v2_virtual);
+        assert_ne!(v3_later, v2_later);
+
+        let correct_weight = commit_bls_dory_polynomial(
+            weights[0]
+                .iter()
+                .copied()
+                .map(BlsDoryFr::from_i64)
+                .collect(),
+            1,
+            2,
+            &fixture.setup,
+        )
+        .unwrap();
+        let short_weight = commit_bls_dory_padded_prefix_with_optional_scratch(
+            &weights[0][..4]
+                .iter()
+                .copied()
+                .map(BlsDoryFr::from_i64)
+                .collect::<Vec<_>>(),
+            1,
+            2,
+            &fixture.setup,
+            Some(scratch.path()),
+        )
+        .unwrap();
+        let substituted_setup = deterministic_bls_dory_setup(DORY_V3_TEST_VARIABLES + 1).unwrap();
+        let wrong_setup_weight = commit_bls_dory_polynomial(
+            weights[0]
+                .iter()
+                .copied()
+                .map(BlsDoryFr::from_i64)
+                .collect(),
+            1,
+            2,
+            &substituted_setup,
+        )
+        .unwrap();
+        let preflight_scratch = ScratchDirectory::create();
+        let unavailable_scratch = preflight_scratch.path().join("not-created");
+        {
+            let mut reader = execution
+                .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                .unwrap();
+            assert!(matches!(
+                prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+                    b"wrong-bank",
+                    &correct_weight,
+                    &mut reader,
+                    2,
+                    DORY_V3_TEST_VARIABLES,
+                    &fixture.setup,
+                    scratch.path(),
+                ),
+                Err(BlsDoryMatrixError::ExecutionArtifact)
+            ));
+            assert!(matches!(
+                prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+                    b"wrong-setup",
+                    &correct_weight,
+                    &mut reader,
+                    0,
+                    DORY_V3_TEST_VARIABLES,
+                    &substituted_setup,
+                    scratch.path(),
+                ),
+                Err(BlsDoryMatrixError::ExecutionArtifact)
+            ));
+            assert!(matches!(
+                prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+                    b"wrong-weight-length",
+                    &short_weight,
+                    &mut reader,
+                    0,
+                    DORY_V3_TEST_VARIABLES,
+                    &fixture.setup,
+                    scratch.path(),
+                ),
+                Err(BlsDoryMatrixError::Structured(
+                    StructuredSumcheckError::InvalidLength
+                ))
+            ));
+            assert!(matches!(
+                prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+                    b"wrong-weight-setup",
+                    &wrong_setup_weight,
+                    &mut reader,
+                    0,
+                    DORY_V3_TEST_VARIABLES,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryMatrixError::InvalidDimensions)
+            ));
+        }
+        assert_eq!(preflight_scratch.entry_count(), 0);
+        drop((short_weight, wrong_setup_weight, correct_weight));
+        drop(execution);
+        assert_eq!(scratch.entry_count(), 0);
     }
 
     #[test]

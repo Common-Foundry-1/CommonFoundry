@@ -41,6 +41,12 @@ use crate::{
     structured_sumcheck::{validate_streaming_tables, validate_tables},
 };
 
+#[cfg(feature = "whir-prototype")]
+use crate::{
+    dory_bls12_381_execution_artifact::BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS,
+    dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader,
+};
+
 #[cfg(test)]
 use crate::dory_bls12_381_aggregate::prove_bls_dory_deferred_opening_sets_with_scratch;
 
@@ -493,6 +499,79 @@ pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_from_execu
         setup,
         Some(scratch_directory),
     )
+}
+
+/// Prove one V3 matrix bank from an authority-checked execution reader.
+///
+/// The caller selects only the authenticated bank. Geometry, transition
+/// statements, and challenge masks are derived inside this closed V3 path;
+/// there is no raw artifact/context or caller-selected mask ingress.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+    binding: &[u8],
+    weight: &BlsDoryCommittedPolynomial,
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    bank: usize,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    reader
+        .validate_setup(setup)
+        .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+    let statement = dory_v3_matrix_statement(reader, bank)?;
+    if binding.len() > MAX_MATRIX_BINDING_BYTES {
+        return Err(BlsDoryMatrixError::PublicBindingTooLarge);
+    }
+    validate_target_variables(matrix_variables(statement)?, padded_variables)?;
+    if padded_variables > setup.max_log_n() {
+        return Err(BlsDoryMatrixError::InvalidDimensions);
+    }
+    validate_precommitted_matrix_weight(statement, weight)?;
+    let nu = padded_variables / 2;
+    let sigma = padded_variables - nu;
+    let aggregate_layout = BlsDoryAggregateLayout::new(nu, sigma)?;
+    if !weight.matches_layout(aggregate_layout, setup) {
+        return Err(BlsDoryMatrixError::InvalidDimensions);
+    }
+    let mut tables = DoryV3ExecutionArtifactMatrixTables::new(reader, bank, statement)?;
+    prove_bls_dory_matrix_deferred_from_table_source(
+        binding,
+        statement,
+        &mut tables,
+        MatrixWeightProverSource::Precommitted(weight),
+        padded_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn dory_v3_matrix_statement(
+    reader: &BlsDoryV3ExecutionArtifactReader<'_>,
+    bank: usize,
+) -> Result<StructuredMatrixStatement, BlsDoryMatrixError> {
+    if bank >= reader.banks() {
+        return Err(BlsDoryMatrixError::ExecutionArtifact);
+    }
+    let rows = reader.canonical_rows();
+    let columns = reader.canonical_columns();
+    rows.checked_mul(columns)
+        .filter(|cells| *cells == reader.cells_per_column())
+        .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+    let statement = StructuredMatrixStatement {
+        layers: reader.layers_per_bank(),
+        rows,
+        inner: columns,
+        cols: columns,
+        max_abs_activation: 125,
+        max_abs_weight: 125,
+        max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+    };
+    statement.validate_verifier_shape()?;
+    Ok(statement)
 }
 
 fn validate_precommitted_matrix_weight(
@@ -1746,6 +1825,546 @@ fn map_execution_artifact_commit_error(error: BlsDoryAggregateError) -> BlsDoryM
 }
 
 impl MatrixTableProverSource for ExecutionArtifactMatrixTables<'_, '_> {
+    fn commit_activation(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+        let scratch_directory = scratch_directory.ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        let padded_len = 1usize
+            .checked_shl(padded_variables as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let activation_len = statement.table_lengths()?[0];
+        if activation_len == 0 || !activation_len.is_power_of_two() || activation_len > padded_len {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let code_maximum = u8::try_from(statement.max_abs_activation)
+            .ok()
+            .filter(|maximum| *maximum <= 127);
+        let mut source = self.row_source(
+            ExecutionArtifactMatrixTable::Activation,
+            rows,
+            columns,
+            code_maximum,
+        )?;
+        if source.code_maximum.is_some() && activation_len.is_multiple_of(columns) {
+            return commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )
+            .map_err(map_execution_artifact_commit_error);
+        }
+        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)
+            .map_err(map_execution_artifact_commit_error)
+    }
+
+    fn commit_accumulator(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        padded_variables: usize,
+        nu: usize,
+        sigma: usize,
+        setup: &DeterministicBlsDorySetup,
+        scratch_directory: Option<&Path>,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryMatrixError> {
+        let scratch_directory = scratch_directory.ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        let padded_len = 1usize
+            .checked_shl(padded_variables as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let accumulator_len = statement.table_lengths()?[2];
+        if accumulator_len == 0
+            || !accumulator_len.is_power_of_two()
+            || accumulator_len > padded_len
+        {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut source = self.row_source(
+            ExecutionArtifactMatrixTable::Accumulator,
+            rows,
+            columns,
+            None,
+        )?;
+        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)
+            .map_err(map_execution_artifact_commit_error)
+    }
+
+    fn evaluate_accumulator(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        layer_weights: &[BlsDoryFr],
+        row_weights: &[BlsDoryFr],
+        column_weights: &[BlsDoryFr],
+    ) -> Result<BlsDoryFr, BlsDoryMatrixError> {
+        if layer_weights.len() != statement.layers
+            || row_weights.len() != statement.rows
+            || column_weights.len() != statement.cols
+        {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let mut values = vec![0; statement.cols];
+        let mut evaluation = BlsDoryFr::zero();
+        for (layer, layer_weight) in layer_weights.iter().copied().enumerate() {
+            for (row, row_weight) in row_weights.iter().copied().enumerate() {
+                let start = (layer * statement.rows + row) * statement.cols;
+                self.read_values(
+                    ExecutionArtifactMatrixTable::Accumulator,
+                    start,
+                    &mut values,
+                )?;
+                for (value, column_weight) in values.iter().zip(column_weights) {
+                    evaluation = evaluation
+                        + BlsDoryFr::from_i64(*value) * *column_weight * row_weight * layer_weight;
+                }
+            }
+        }
+        Ok(evaluation)
+    }
+
+    fn activation_partials(
+        &mut self,
+        statement: StructuredMatrixStatement,
+        row_weights: &[BlsDoryFr],
+    ) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {
+        if row_weights.len() != statement.rows {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let partial_len = statement
+            .layers
+            .checked_mul(statement.inner)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut partials = vec![BlsDoryFr::zero(); partial_len];
+        let mut values = vec![0; statement.inner];
+        for layer in 0..statement.layers {
+            for (row, row_weight) in row_weights.iter().copied().enumerate() {
+                let start = (layer * statement.rows + row) * statement.inner;
+                self.read_values(ExecutionArtifactMatrixTable::Activation, start, &mut values)?;
+                for (common, value) in values.iter().copied().enumerate() {
+                    partials[layer * statement.inner + common] = partials
+                        [layer * statement.inner + common]
+                        + BlsDoryFr::from_i64(value) * row_weight;
+                }
+            }
+        }
+        Ok(partials)
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+struct DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
+    reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+    bank: usize,
+    prior_statement: StructuredTransitionStatement,
+    prior_mask: StructuredMaskPolynomial,
+    current_statement: StructuredTransitionStatement,
+    current_mask: StructuredMaskPolynomial,
+    statement: StructuredMatrixStatement,
+    cells_per_layer: usize,
+    cached_column: Option<BlsDoryExecutionAccumulatorColumn>,
+    cached_start: usize,
+    cached_len: usize,
+    io: Vec<i32>,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
+    fn new(
+        reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+        bank: usize,
+        statement: StructuredMatrixStatement,
+    ) -> Result<Self, BlsDoryMatrixError> {
+        let rows = reader.canonical_rows();
+        let columns = reader.canonical_columns();
+        let layers = reader.layers_per_bank();
+        let cells_per_layer = rows
+            .checked_mul(columns)
+            .filter(|cells| *cells == reader.cells_per_column())
+            .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        let current_statement = StructuredTransitionStatement {
+            layers,
+            rows,
+            cols: columns,
+            max_abs_accumulator: statement.max_abs_accumulator,
+            max_mask: 5_000,
+        };
+        let current_mask = reader
+            .v3_bank_mask(bank)
+            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        let (prior_statement, prior_mask) = if bank == 0 {
+            (
+                StructuredTransitionStatement {
+                    layers: 1,
+                    rows,
+                    cols: columns,
+                    max_abs_accumulator: 125,
+                    max_mask: 5_000,
+                },
+                reader
+                    .v3_initialization_mask()
+                    .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?,
+            )
+        } else {
+            (
+                current_statement,
+                reader
+                    .v3_bank_mask(bank - 1)
+                    .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?,
+            )
+        };
+        prior_mask
+            .validate(prior_statement)
+            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        current_mask
+            .validate(current_statement)
+            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        Ok(Self {
+            io: vec![0; reader.authentication_chunk_cells()],
+            reader,
+            bank,
+            prior_statement,
+            prior_mask,
+            current_statement,
+            current_mask,
+            statement,
+            cells_per_layer,
+            cached_column: None,
+            cached_start: 0,
+            cached_len: 0,
+        })
+    }
+
+    fn ensure_cached_chunk(
+        &mut self,
+        column: BlsDoryExecutionAccumulatorColumn,
+        cell: usize,
+    ) -> Result<(), BlsDoryMatrixError> {
+        if cell >= self.cells_per_layer {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let chunk_cells = self.reader.authentication_chunk_cells();
+        let chunk_start = cell / chunk_cells * chunk_cells;
+        let chunk_len = (self.cells_per_layer - chunk_start).min(chunk_cells);
+        if self.cached_column == Some(column)
+            && self.cached_start == chunk_start
+            && self.cached_len == chunk_len
+        {
+            return Ok(());
+        }
+        self.cached_column = None;
+        self.cached_start = 0;
+        self.cached_len = 0;
+        match column {
+            BlsDoryExecutionAccumulatorColumn::Initialization => self
+                .reader
+                .read_initialization_segment(chunk_start, &mut self.io[..chunk_len]),
+            BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer } => self
+                .reader
+                .read_bank_layer_segment(bank, layer, chunk_start, &mut self.io[..chunk_len]),
+        }
+        .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+        self.cached_column = Some(column);
+        self.cached_start = chunk_start;
+        self.cached_len = chunk_len;
+        Ok(())
+    }
+
+    fn table_len(&self, table: ExecutionArtifactMatrixTable) -> Result<usize, BlsDoryMatrixError> {
+        let lengths = self.statement.table_lengths()?;
+        Ok(match table {
+            ExecutionArtifactMatrixTable::Activation => lengths[0],
+            ExecutionArtifactMatrixTable::Accumulator => lengths[2],
+        })
+    }
+
+    fn read_values(
+        &mut self,
+        table: ExecutionArtifactMatrixTable,
+        start: usize,
+        output: &mut [i64],
+    ) -> Result<(), BlsDoryMatrixError> {
+        let table_len = self.table_len(table)?;
+        let end = start
+            .checked_add(output.len())
+            .filter(|end| *end <= table_len)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let mut cursor = start;
+        let mut written = 0usize;
+        while cursor < end {
+            let matrix_layer = cursor / self.cells_per_layer;
+            let cell = cursor % self.cells_per_layer;
+            let column = match table {
+                ExecutionArtifactMatrixTable::Accumulator => {
+                    BlsDoryExecutionAccumulatorColumn::BankLayer {
+                        bank: self.bank,
+                        layer: matrix_layer,
+                    }
+                }
+                ExecutionArtifactMatrixTable::Activation if matrix_layer == 0 => {
+                    if self.bank == 0 {
+                        BlsDoryExecutionAccumulatorColumn::Initialization
+                    } else {
+                        BlsDoryExecutionAccumulatorColumn::BankLayer {
+                            bank: self.bank - 1,
+                            layer: self.reader.layers_per_bank() - 1,
+                        }
+                    }
+                }
+                ExecutionArtifactMatrixTable::Activation => {
+                    BlsDoryExecutionAccumulatorColumn::BankLayer {
+                        bank: self.bank,
+                        layer: matrix_layer - 1,
+                    }
+                }
+            };
+            self.ensure_cached_chunk(column, cell)?;
+            let cache_offset = cell
+                .checked_sub(self.cached_start)
+                .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+            let take = (end - cursor)
+                .min(self.cells_per_layer - cell)
+                .min(self.cached_len - cache_offset);
+            let cached = &self.io[cache_offset..cache_offset + take];
+            match table {
+                ExecutionArtifactMatrixTable::Accumulator => {
+                    for (destination, value) in
+                        output[written..written + take].iter_mut().zip(cached)
+                    {
+                        let value = i64::from(*value);
+                        if value.unsigned_abs() > self.statement.max_abs_accumulator {
+                            return Err(BlsDoryMatrixError::Structured(
+                                StructuredSumcheckError::ValueOutOfRange,
+                            ));
+                        }
+                        *destination = value;
+                    }
+                }
+                ExecutionArtifactMatrixTable::Activation => {
+                    let (transition_statement, mask, transition_layer) = if matrix_layer == 0 {
+                        (
+                            self.prior_statement,
+                            &self.prior_mask,
+                            self.prior_statement.layers - 1,
+                        )
+                    } else {
+                        (self.current_statement, &self.current_mask, matrix_layer - 1)
+                    };
+                    let transition_start = transition_layer
+                        .checked_mul(self.cells_per_layer)
+                        .and_then(|start| start.checked_add(cell))
+                        .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+                    for (offset, (destination, accumulator)) in output[written..written + take]
+                        .iter_mut()
+                        .zip(cached)
+                        .enumerate()
+                    {
+                        let index = transition_start
+                            .checked_add(offset)
+                            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+                        let mask_value = mask
+                            .value_at_boolean_index_prevalidated(transition_statement, index)
+                            .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
+                        let activation = derive_transition_regular_row_from_mask(
+                            transition_statement,
+                            index,
+                            i64::from(*accumulator),
+                            mask_value,
+                        )
+                        .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?
+                        .activation;
+                        if activation.unsigned_abs() > self.statement.max_abs_activation {
+                            return Err(BlsDoryMatrixError::Structured(
+                                StructuredSumcheckError::ValueOutOfRange,
+                            ));
+                        }
+                        *destination = activation;
+                    }
+                }
+            }
+            cursor += take;
+            written += take;
+        }
+        Ok(())
+    }
+
+    fn row_source<'s>(
+        &'s mut self,
+        table: ExecutionArtifactMatrixTable,
+        rows: usize,
+        columns: usize,
+        code_maximum: Option<u8>,
+    ) -> Result<DoryV3ExecutionArtifactMatrixRowSource<'s, 'a, 'r>, BlsDoryMatrixError> {
+        let explicit_scalars = self.table_len(table)?;
+        let dictionary = code_maximum
+            .and_then(bounded_signed_dictionary)
+            .filter(|_| explicit_scalars > columns)
+            .unwrap_or_else(|| vec![BlsDoryFr::zero()]);
+        let use_codes = dictionary.len() > 1;
+        Ok(DoryV3ExecutionArtifactMatrixRowSource {
+            tables: self,
+            table,
+            rows,
+            columns,
+            explicit_scalars,
+            word_scalar_count: if use_codes { columns } else { explicit_scalars },
+            word_group_len: if use_codes { columns } else { explicit_scalars },
+            dictionary,
+            code_maximum: use_codes.then_some(code_maximum).flatten(),
+            values: vec![0; columns],
+        })
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+struct DoryV3ExecutionArtifactMatrixRowSource<'s, 'a, 'r> {
+    tables: &'s mut DoryV3ExecutionArtifactMatrixTables<'a, 'r>,
+    table: ExecutionArtifactMatrixTable,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+    word_scalar_count: usize,
+    word_group_len: usize,
+    dictionary: Vec<BlsDoryFr>,
+    code_maximum: Option<u8>,
+    values: Vec<i64>,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+    fn load_row(&mut self, row_index: usize) -> Result<(), BlsDoryMatrixError> {
+        if row_index >= self.rows || self.values.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        self.values.fill(0);
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let count = self
+            .explicit_scalars
+            .saturating_sub(start)
+            .min(self.columns);
+        if count > 0 {
+            self.tables
+                .read_values(self.table, start, &mut self.values[..count])?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+    type Error = BlsDoryMatrixError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        if output.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        self.load_row(row_index)?;
+        for (scalar, value) in output.iter_mut().zip(&self.values) {
+            *scalar = BlsDoryFr::from_i64(*value);
+        }
+        Ok(output.len())
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryCompactRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+    type Error = BlsDoryMatrixError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.word_scalar_count
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.word_group_len
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        1
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        if output.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        self.load_row(row_index)?;
+        for (word, value) in output.iter_mut().zip(&self.values) {
+            *word = u64::from_le_bytes(value.to_le_bytes());
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        if output.len() != self.columns {
+            return Err(BlsDoryMatrixError::InvalidDimensions);
+        }
+        let maximum = self
+            .code_maximum
+            .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        self.load_row(row_index)?;
+        for (code, value) in output.iter_mut().zip(&self.values) {
+            *code = bounded_signed_code(*value, maximum)
+                .ok_or(BlsDoryMatrixError::ExecutionArtifact)?;
+        }
+        Ok(output.len())
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl MatrixTableProverSource for DoryV3ExecutionArtifactMatrixTables<'_, '_> {
     fn commit_activation(
         &mut self,
         statement: StructuredMatrixStatement,

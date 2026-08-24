@@ -31,19 +31,29 @@ if [[ -e "$STAGE" || -e "$ARCHIVE" ]]; then
   exit 1
 fi
 
-mkdir -p "$STAGE"
-install -m 0755 "$TARGET_DIRECTORY/release/cmfd-miner" "$STAGE/cmfd-miner"
-install -m 0755 "$CUDA_LIBRARY" "$STAGE/cmfd-forgematrix-v2-miner.so"
-if [[ -f "$OPENCL_LIBRARY" ]]; then
-  install -m 0755 "$OPENCL_LIBRARY" "$STAGE/cmfd-forgematrix-v2-opencl.so"
-  install -m 0644 "$PROJECT_ROOT/docs/opencl-miner.md" "$STAGE/opencl-miner.md"
-fi
-install -m 0755 "$PROJECT_ROOT/packaging/standalone-miner/linux/start-miner.sh" "$STAGE/start-miner.sh"
-install -m 0644 "$PROJECT_ROOT/packaging/standalone-miner/linux/README.txt" "$STAGE/README.txt"
-install -m 0644 "$PROJECT_ROOT/docs/standalone-miner.md" "$STAGE/standalone-miner.md"
-install -m 0644 "$PROJECT_ROOT/LICENSE" "$STAGE/LICENSE"
+# Stage the archive under the native Linux temporary filesystem. WSL-mounted
+# Windows filesystems can otherwise collapse every staged mode to 0777 before
+# tar records it.
+PACKAGE_TEMP_ROOT="$(mktemp -d /tmp/cmfd-miner-package.XXXXXX)"
+trap 'rm -rf -- "$PACKAGE_TEMP_ROOT"' EXIT
+TEMP_STAGE="$PACKAGE_TEMP_ROOT/$PACKAGE_NAME"
+TEMP_ARCHIVE="$PACKAGE_TEMP_ROOT/$PACKAGE_NAME.tar.gz"
 
-tar -C "$OUTPUT_DIRECTORY" -czf "$ARCHIVE" "$PACKAGE_NAME"
+mkdir -p "$TEMP_STAGE"
+install -m 0755 "$TARGET_DIRECTORY/release/cmfd-miner" "$TEMP_STAGE/cmfd-miner"
+install -m 0755 "$CUDA_LIBRARY" "$TEMP_STAGE/cmfd-forgematrix-v2-miner.so"
+if [[ -f "$OPENCL_LIBRARY" ]]; then
+  install -m 0755 "$OPENCL_LIBRARY" "$TEMP_STAGE/cmfd-forgematrix-v2-opencl.so"
+  install -m 0644 "$PROJECT_ROOT/docs/opencl-miner.md" "$TEMP_STAGE/opencl-miner.md"
+fi
+install -m 0755 "$PROJECT_ROOT/packaging/standalone-miner/linux/start-miner.sh" "$TEMP_STAGE/start-miner.sh"
+install -m 0644 "$PROJECT_ROOT/packaging/standalone-miner/linux/README.txt" "$TEMP_STAGE/README.txt"
+install -m 0644 "$PROJECT_ROOT/docs/standalone-miner.md" "$TEMP_STAGE/standalone-miner.md"
+install -m 0644 "$PROJECT_ROOT/LICENSE" "$TEMP_STAGE/LICENSE"
+
+tar -C "$PACKAGE_TEMP_ROOT" -czf "$TEMP_ARCHIVE" "$PACKAGE_NAME"
+cp -a "$TEMP_STAGE" "$STAGE"
+cp "$TEMP_ARCHIVE" "$ARCHIVE"
 BYTES="$(stat -c '%s' "$ARCHIVE")"
 SHA256="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
 

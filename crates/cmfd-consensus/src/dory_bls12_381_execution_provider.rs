@@ -1761,6 +1761,7 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use crate::{
         StructuredMatrixStatement, StructuredSumcheckError, StructuredTransitionWitness,
+        StructuredWiringStatement,
         dory_bls12_381_aggregate::commit_bls_dory_padded_prefix_with_optional_scratch,
         dory_bls12_381_logup::{
             BlsDoryRangeLogUpError,
@@ -1776,6 +1777,11 @@ mod tests {
             prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch,
             prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch,
             regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch,
+        },
+        dory_bls12_381_wiring::{
+            BlsDoryWiringError,
+            prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch,
+            prove_bls_dory_wiring_deferred_at_variables_with_scratch,
         },
     };
 
@@ -2330,6 +2336,8 @@ mod tests {
     const DORY_V3_TEST_VARIABLES: usize = 3;
     #[cfg(feature = "whir-prototype")]
     const DORY_V3_TRANSITION_TEST_VARIABLES: usize = 10;
+    #[cfg(feature = "whir-prototype")]
+    const DORY_V3_WIRING_TEST_VARIABLES: usize = 6;
     const DORY_V3_TEST_BASE: [u8; 4] = [125, 126, 124, 127];
     const DORY_V3_TEST_LAYERS: [[u8; 4]; 4] = [
         [126, 125, 124, 127],
@@ -3272,6 +3280,199 @@ mod tests {
         assert_eq!(streamed_scratch.entry_count(), 0);
         assert_eq!(materialized_logup_scratch.entry_count(), 0);
         assert_eq!(streamed_logup_scratch.entry_count(), 0);
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn dory_v3_streamed_wiring_matches_materialized_all_links_and_preflights() {
+        let fixture = dory_v3_replay_fixture_at_variables(0, DORY_V3_WIRING_TEST_VARIABLES);
+        let replay_scratch = ScratchDirectory::create();
+        let materialized_scratch = ScratchDirectory::create();
+        let streamed_scratch = ScratchDirectory::create();
+        let preflight_scratch = ScratchDirectory::create();
+        let unavailable_scratch = preflight_scratch.path().join("not-created");
+        let statement = StructuredWiringStatement {
+            banks: 2,
+            layers_per_bank: 2,
+            rows: 2,
+            cols: 2,
+            max_abs_activation: 125,
+        };
+        let cells = statement.rows * statement.cols;
+        let bank_elements = statement.layers_per_bank * cells;
+        let (_, _, initialization) = materialized_dory_v3_transition(&fixture, 0);
+        let (_, _, first_bank) = materialized_dory_v3_transition(&fixture, 1);
+        let (_, _, second_bank) = materialized_dory_v3_transition(&fixture, 2);
+        let initial = initialization.activations;
+        let mut outputs = first_bank.activations;
+        outputs.extend_from_slice(&second_bank.activations);
+        let mut inputs = Vec::with_capacity(outputs.len());
+        let mut predecessor = initial.clone();
+        for output in outputs.chunks_exact(cells) {
+            inputs.extend_from_slice(&predecessor);
+            predecessor.clear();
+            predecessor.extend_from_slice(output);
+        }
+        assert_eq!(&inputs[..cells], initial.as_slice());
+        assert_eq!(
+            &inputs[bank_elements..bank_elements + cells],
+            &outputs[bank_elements - cells..bank_elements]
+        );
+
+        let binding = b"dory-v3-streamed-wiring";
+        let materialized = prove_bls_dory_wiring_deferred_at_variables_with_scratch(
+            binding,
+            statement,
+            &initial,
+            &inputs,
+            &outputs,
+            DORY_V3_WIRING_TEST_VARIABLES,
+            &fixture.setup,
+            materialized_scratch.path(),
+        )
+        .unwrap();
+        let mut execution = replay_dory_v3(&fixture, &replay_scratch);
+        let streamed = {
+            let challenge = fixture
+                .transcript
+                .challenge_context(&fixture.block, fixture.claim.nonce)
+                .unwrap();
+            let mut reader = execution
+                .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                .unwrap();
+            assert_ne!(
+                reader.v3_initialization_mask().unwrap(),
+                StructuredMaskPolynomial::from_virtual_challenge(&challenge.digest(), 2, 2)
+                    .unwrap()
+            );
+            for (bank, first_layer) in [0, 2].into_iter().enumerate() {
+                assert_ne!(
+                    reader.v3_bank_mask(bank).unwrap(),
+                    StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                        &challenge.digest(),
+                        first_layer,
+                        2,
+                        2,
+                        2,
+                    )
+                    .unwrap()
+                );
+            }
+            prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
+                binding,
+                &mut reader,
+                DORY_V3_WIRING_TEST_VARIABLES,
+                &fixture.setup,
+                streamed_scratch.path(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(streamed.proof, materialized.proof);
+        assert_eq!(streamed.openings.claims(), materialized.openings.claims());
+        assert_eq!(
+            streamed.proof.encode_deferred(statement).unwrap(),
+            materialized.proof.encode_deferred(statement).unwrap()
+        );
+        assert_eq!(
+            streamed.openings.polynomial(0).unwrap().row_commitments(),
+            materialized
+                .openings
+                .polynomial(0)
+                .unwrap()
+                .row_commitments()
+        );
+        let streamed_compact = streamed
+            .openings
+            .polynomial(0)
+            .unwrap()
+            .compact_coefficient_artifact()
+            .unwrap();
+        let materialized_compact = materialized
+            .openings
+            .polynomial(0)
+            .unwrap()
+            .compact_coefficient_artifact()
+            .unwrap();
+        assert_eq!(streamed_compact.spec().word_scalar_count, 8);
+        assert_eq!(streamed_compact.spec().explicit_scalar_count, 40);
+        assert_eq!(streamed_compact.dictionary().len(), 251);
+        assert_eq!(streamed_compact.spec(), materialized_compact.spec());
+        assert_eq!(
+            streamed_compact.dictionary(),
+            materialized_compact.dictionary()
+        );
+        let streamed_path = streamed
+            .openings
+            .polynomial(0)
+            .unwrap()
+            .coefficient_artifact_path()
+            .unwrap();
+        let materialized_path = materialized
+            .openings
+            .polynomial(0)
+            .unwrap()
+            .coefficient_artifact_path()
+            .unwrap();
+        assert_eq!(
+            fs::read(streamed_path).unwrap(),
+            fs::read(materialized_path).unwrap()
+        );
+
+        let substituted_setup =
+            deterministic_bls_dory_setup(DORY_V3_WIRING_TEST_VARIABLES + 1).unwrap();
+        {
+            let mut reader = execution
+                .authenticated_artifact_reader(&fixture.authenticated, &fixture.setup)
+                .unwrap();
+            assert!(matches!(
+                prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
+                    b"wrong-setup",
+                    &mut reader,
+                    DORY_V3_WIRING_TEST_VARIABLES,
+                    &substituted_setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryWiringError::ExecutionArtifact)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
+                    &[0; 4_097],
+                    &mut reader,
+                    DORY_V3_WIRING_TEST_VARIABLES,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryWiringError::PublicBindingTooLarge)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
+                    b"packed-too-small",
+                    &mut reader,
+                    5,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryWiringError::InvalidDimensions)
+            ));
+            assert!(matches!(
+                prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
+                    b"packed-too-large",
+                    &mut reader,
+                    DORY_V3_WIRING_TEST_VARIABLES + 1,
+                    &fixture.setup,
+                    &unavailable_scratch,
+                ),
+                Err(BlsDoryWiringError::InvalidDimensions)
+            ));
+        }
+        assert_eq!(preflight_scratch.entry_count(), 0);
+
+        drop((streamed, materialized));
+        drop(execution);
+        assert_eq!(replay_scratch.entry_count(), 0);
+        assert_eq!(materialized_scratch.entry_count(), 0);
+        assert_eq!(streamed_scratch.entry_count(), 0);
     }
 
     #[test]

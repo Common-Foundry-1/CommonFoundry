@@ -1,13 +1,29 @@
+#[cfg(any(
+    all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"),
+    test
+))]
 use blake3::Hasher;
 
+#[cfg(any(
+    all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"),
+    test
+))]
 const PINNED_PREPROCESSED_REGISTRY_DOMAIN: &str = "CMFD/FORGEMATRIX/BLAKE3-PREPROCESSED-KEYS/V1";
 
 pub const STRUCTURED_BLAKE3_VERSION: u32 = 4;
 pub(crate) const STRUCTURED_BLAKE3_PROOF_MAGIC: &[u8; 8] = b"CMFDB3S4";
 pub(crate) const NARROW_BLAKE3_PROOF_VERSION: u32 = 4;
 pub(crate) const NARROW_BLAKE3_PROOF_MAGIC: &[u8; 8] = b"CMFDB3N4";
+#[cfg(any(
+    all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"),
+    test
+))]
 pub(crate) const PINNED_PREPROCESSED_REGISTRY_VERSION: u32 = 1;
 pub(crate) const PINNED_PREPROCESSED_WIDTH: usize = 84;
+#[cfg(any(
+    all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"),
+    test
+))]
 pub(crate) const PINNED_PREPROCESSED_LOG_BLOWUP: usize = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,10 +196,18 @@ pub(crate) fn pinned_preprocessed_key(
     })
 }
 
+#[cfg(any(
+    all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"),
+    test
+))]
 pub(crate) fn pinned_preprocessed_registry_digest() -> [u8; 32] {
     registry_digest(&PINNED_PREPROCESSED_KEYS)
 }
 
+#[cfg(any(
+    all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"),
+    test
+))]
 fn registry_digest(keys: &[PinnedPreprocessedKey]) -> [u8; 32] {
     let mut hasher = Hasher::new_derive_key(PINNED_PREPROCESSED_REGISTRY_DOMAIN);
     hasher.update(&STRUCTURED_BLAKE3_VERSION.to_le_bytes());

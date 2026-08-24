@@ -66,6 +66,7 @@ mod production_range_lookup_prototype;
 pub mod remainder_proof;
 #[cfg(feature = "whir-prototype")]
 pub mod structured_blake3;
+#[cfg(any(feature = "whir-prototype", test))]
 mod structured_blake3_identity;
 #[cfg(feature = "whir-prototype")]
 mod structured_blake3_narrow;

@@ -2231,6 +2231,21 @@ impl BlsDorySharedLayoutProof {
 }
 
 impl BlsDorySharedLayoutV5Proof {
+    /// Require this proof to carry the exact authenticated Layout V5 context
+    /// selected by its Record V2 authority. This is intentionally narrower
+    /// than exposing the embedded context to candidate callers.
+    #[cfg(feature = "whir-prototype")]
+    pub(crate) fn validate_context(
+        &self,
+        expected: &BlsDorySharedLayoutV5Context,
+    ) -> Result<(), BlsDorySharedLayoutError> {
+        validate_layout_v5_codec_context(expected)?;
+        if self.context != *expected {
+            return Err(BlsDorySharedLayoutError::V3Context);
+        }
+        Ok(())
+    }
+
     /// Encode the exact production Layout V5 component order canonically.
     pub fn encode(
         &self,
@@ -6900,6 +6915,13 @@ pub fn require_bls_dory_shared_layout_production_ready() -> Result<(), BlsDorySh
     Err(BlsDorySharedLayoutError::NotProductionReady)
 }
 
+#[cfg(all(test, feature = "whir-prototype"))]
+pub(crate) fn bls_dory_shared_layout_v5_candidate_codec_fixture_for_test(
+    model_identity_byte: u8,
+) -> (BlsDorySharedLayoutV5Context, BlsDorySharedLayoutV5Proof) {
+    tests::layout_v5_candidate_codec_components(model_identity_byte)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "whir-prototype")]
@@ -6941,7 +6963,9 @@ mod tests {
     #[cfg(feature = "whir-prototype")]
     use crate::{
         dory_bls12_381_blake3::prepare_native_blake3_test_opening_at_layout,
-        dory_bls12_381_candidate::BlsDoryV3CandidatePayload,
+        dory_bls12_381_candidate::{
+            BlsDoryV3CandidatePayload, decode_dory_v3_layout_v5_candidate_payload,
+        },
         dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
     };
 
@@ -9883,6 +9907,20 @@ mod tests {
     }
 
     fn layout_v5_codec_fixture() -> LayoutV5CodecFixture {
+        layout_v5_codec_fixture_with_model_identity(0x71)
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    pub(super) fn layout_v5_candidate_codec_components(
+        model_identity_byte: u8,
+    ) -> (BlsDorySharedLayoutV5Context, BlsDorySharedLayoutV5Proof) {
+        let fixture = layout_v5_codec_fixture_with_model_identity(model_identity_byte);
+        (fixture.context, fixture.proof)
+    }
+
+    fn layout_v5_codec_fixture_with_model_identity(
+        model_identity_byte: u8,
+    ) -> LayoutV5CodecFixture {
         let production = StructuredForgeMatrixResearchShape::production_candidate();
         let matrix_statements = production.matrix_statements.to_vec();
         let mut transition_statements = Vec::with_capacity(MAX_BLS_DORY_SHARED_TRANSITION_PROOFS);
@@ -9966,7 +10004,7 @@ mod tests {
         };
         let context = BlsDorySharedLayoutV5Context {
             suite_digest: *DORY_V3_PRODUCTION_SUITE_DIGEST,
-            model_identity_digest: Digest32::new([0x71; 32]),
+            model_identity_digest: Digest32::new([model_identity_byte; 32]),
             setup_identity: DORY_V3_SETUP_IDENTITY,
             padded_variables: DORY_V3_PADDED_VARIABLES,
         };
@@ -10056,6 +10094,60 @@ mod tests {
                 fixture.wiring_statement,
             )
             .is_err()
+        );
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn layout_v5_candidate_cp02_round_trips_and_never_falls_back_to_v4() {
+        let fixture = layout_v5_codec_fixture();
+        let encoded_v5 = fixture
+            .proof
+            .encode(
+                &fixture.matrix_statements,
+                &fixture.transition_statements,
+                fixture.wiring_statement,
+            )
+            .unwrap();
+        let encoded_candidate = BlsDoryV3CandidatePayload {
+            dory_proof: encoded_v5.clone(),
+            native_blake3_proof: vec![0xa6; 17],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(&encoded_candidate[..8], b"CFV3CP02");
+        let (decoded_proof, decoded_candidate) =
+            decode_dory_v3_layout_v5_candidate_payload(&encoded_candidate, &fixture.context)
+                .unwrap();
+        assert_eq!(decoded_candidate.dory_proof, encoded_v5);
+        assert_eq!(decoded_candidate.native_blake3_proof, vec![0xa6; 17]);
+        assert_eq!(decoded_candidate.encode().unwrap(), encoded_candidate);
+        assert_eq!(decoded_proof, fixture.proof);
+
+        let mut trailing_candidate = encoded_candidate;
+        trailing_candidate.push(0);
+        assert!(
+            decode_dory_v3_layout_v5_candidate_payload(&trailing_candidate, &fixture.context)
+                .is_err()
+        );
+
+        let mut v4 = fixture.proof.proof.clone();
+        v4.protocol_version = BLS_DORY_SHARED_LAYOUT_VERSION;
+        let encoded_v4 = v4
+            .encode(
+                &fixture.matrix_statements,
+                &fixture.transition_statements,
+                fixture.wiring_statement,
+            )
+            .unwrap();
+        let v4_candidate = BlsDoryV3CandidatePayload {
+            dory_proof: encoded_v4,
+            native_blake3_proof: vec![0xa6; 17],
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            decode_dory_v3_layout_v5_candidate_payload(&v4_candidate, &fixture.context).is_err()
         );
     }
 

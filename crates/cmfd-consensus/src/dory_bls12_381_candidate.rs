@@ -41,8 +41,8 @@ use crate::{
     StructuredTransitionWitness,
     dory_bls12_381_aggregate::BlsDoryAggregateError,
     dory_bls12_381_blake3::{
-        PreparedBlsDoryNativeBlake3Opening, prepare_production_native_blake3_opening,
-        projected_bls_dory_blake3_production_resources,
+        BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES, PreparedBlsDoryNativeBlake3Opening,
+        prepare_production_native_blake3_opening, projected_bls_dory_blake3_production_resources,
     },
     dory_bls12_381_execution_artifact::{
         BlsDoryExecutionAccumulatorArtifact, BlsDoryExecutionAccumulatorArtifactContext,
@@ -55,13 +55,16 @@ use crate::{
     },
     dory_bls12_381_layout::{
         BlsDoryPrecommittedMatrixProverInput, BlsDoryPreparedFixedModel,
-        BlsDoryTransitionProverInput, PreparedBlsDorySharedLayoutProverState,
+        BlsDorySharedLayoutV5Context, BlsDorySharedLayoutV5Proof, BlsDoryTransitionProverInput,
+        PreparedBlsDorySharedLayoutProverState,
         extract_bls_dory_final_activation_from_execution_artifact,
         prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch,
+        prepare_bls_dory_shared_layout_v5_verifier_state,
         prepare_bls_dory_shared_layout_verifier_state,
         prepare_bls_dory_shared_layout_with_precommitted_weights_at_variables_with_scratch,
         projected_shared_production_scratch_bytes,
         prove_prepared_bls_dory_shared_layout_with_composition,
+        verify_prepared_bls_dory_shared_layout_v5_with_native_proof,
         verify_prepared_bls_dory_shared_layout_with_native_proof,
     },
     dory_bls12_381_logup::{
@@ -69,6 +72,11 @@ use crate::{
         projected_production_transition_range_source_bytes,
     },
     dory_bls12_381_output_bridge::{BlsDoryOutputBridgeError, BlsDoryOutputBridgeStatement},
+    dory_v3_model_record::{
+        BankAuthenticatedDoryV3ModelCommitmentRecordV2, DoryV3ModelCommitmentRecordError,
+    },
+    dory_v3_suite::{DORY_V3_ALGORITHM_VERSION, DORY_V3_PROOF_VERSION},
+    dory_v3_transcript::{DoryV3TranscriptContext, DoryV3TranscriptError},
     forgematrix_v2::output_digest,
 };
 
@@ -96,6 +104,15 @@ pub struct BlsDoryV3AlgebraicVerifier {
 
 struct ValidatedBlsDoryV3CandidateStatement {
     binding: [u8; 32],
+    shape: StructuredForgeMatrixResearchShape,
+    transition_statements: Vec<StructuredTransitionStatement>,
+    masks: Vec<StructuredMaskPolynomial>,
+}
+
+#[cfg(feature = "whir-prototype")]
+struct ValidatedBlsDoryV3LayoutV5CandidateStatement {
+    binding: [u8; 32],
+    challenge_digest: [u8; 32],
     shape: StructuredForgeMatrixResearchShape,
     transition_statements: Vec<StructuredTransitionStatement>,
     masks: Vec<StructuredMaskPolynomial>,
@@ -162,6 +179,19 @@ pub struct BlsDoryV3CandidateWitness<'a> {
 pub struct VerifiedBlsDoryV3Candidate {
     algebraic: VerifiedBlsDoryV3AlgebraicCandidate,
     native_blake3_proof_digest: [u8; 32],
+}
+
+/// Opaque evidence that the Record-V2-owned Layout V5 and Dory-V3 native
+/// frames verified together. This dormant capability is deliberately distinct
+/// from the legacy V4 candidate capability and cannot authorize consensus.
+#[cfg(feature = "whir-prototype")]
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct VerifiedBlsDoryV3LayoutV5Candidate {
+    binding: [u8; 32],
+    dory_proof_digest: [u8; 32],
+    native_blake3_proof_digest: [u8; 32],
+    final_output: VerifiedBlsDoryFinalOutputOpening,
 }
 
 impl VerifiedBlsDoryV3Candidate {
@@ -254,6 +284,12 @@ pub enum BlsDoryV3CandidateError {
     #[cfg(feature = "whir-prototype")]
     #[error("verified winning-nonce execution does not match this candidate statement")]
     VerifiedExecution,
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate Record V2 authority is invalid: {0}")]
+    DoryV3Record(#[from] DoryV3ModelCommitmentRecordError),
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate Dory V3 transcript is invalid: {0}")]
+    DoryV3Transcript(#[from] DoryV3TranscriptError),
 }
 
 impl BlsDoryV3CandidatePayload {
@@ -890,6 +926,253 @@ impl BlsDoryV3AlgebraicVerifier {
             native_blake3_proof_digest: *hasher.finalize().as_bytes(),
         })
     }
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn validate_dory_v3_layout_v5_candidate_statement(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<ValidatedBlsDoryV3LayoutV5CandidateStatement, BlsDoryV3CandidateError> {
+    validate_dory_v3_layout_v5_candidate_public_envelope(network_id, block, proof)?;
+    validate_dory_v3_layout_v5_record_setup_binding(authenticated, setup)?;
+    authenticated.record().validate_production(setup)?;
+    validate_dory_v3_layout_v5_candidate_statement_after_authority(
+        network_id,
+        authenticated,
+        block,
+        proof,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn validate_dory_v3_layout_v5_candidate_public_envelope(
+    network_id: [u8; 32],
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+) -> Result<(), BlsDoryV3CandidateError> {
+    if network_id == [0; 32] {
+        return Err(BlsDoryV3CandidateError::NetworkIdentity);
+    }
+    if block.network_id != network_id {
+        return Err(BlsDoryV3CandidateError::WrongNetwork);
+    }
+    if proof.algorithm_version != DORY_V3_ALGORITHM_VERSION {
+        return Err(BlsDoryV3CandidateError::AlgorithmVersion);
+    }
+    if proof.proof_version != DORY_V3_PROOF_VERSION {
+        return Err(BlsDoryV3CandidateError::ProofVersion);
+    }
+    if proof.structured_proof.is_empty()
+        || proof.structured_proof.len() > MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES
+    {
+        return Err(BlsDoryV3CandidateError::ProofSize);
+    }
+    Ok(())
+}
+
+/// Cheap identity comparison shared by the dormant seal and verify routes.
+/// Exact production geometry remains enforced separately by
+/// `validate_production`; this helper exists so a substituted setup is rejected
+/// before any proof parsing or verification work.
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn validate_dory_v3_layout_v5_record_setup_binding(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryV3CandidateError> {
+    let record = authenticated.record();
+    if record.setup_identity().into_bytes() != setup.identity()
+        || usize::try_from(record.padded_variables()).ok() != Some(setup.max_log_n())
+    {
+        return Err(DoryV3ModelCommitmentRecordError::SetupIdentityMismatch.into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whir-prototype")]
+fn validate_dory_v3_layout_v5_candidate_statement_after_authority(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+) -> Result<ValidatedBlsDoryV3LayoutV5CandidateStatement, BlsDoryV3CandidateError> {
+    let transcript =
+        DoryV3TranscriptContext::from_bank_authenticated_record(network_id, authenticated)?;
+    if proof.model_manifest_digest != transcript.manifest_digest().into_bytes() {
+        return Err(BlsDoryV3CandidateError::ModelManifestDigest);
+    }
+    let challenge = transcript.challenge_context(block, proof.nonce)?;
+    if proof.challenge_digest != challenge.digest() {
+        return Err(BlsDoryV3CandidateError::ChallengeDigest);
+    }
+    if proof.work_digest
+        != transcript.work_digest(proof.challenge_digest, proof.final_activation_digest)
+    {
+        return Err(BlsDoryV3CandidateError::WorkDigest);
+    }
+    if proof.work_digest > block.target {
+        return Err(BlsDoryV3CandidateError::HighHash);
+    }
+
+    let shape = StructuredForgeMatrixResearchShape::production_candidate();
+    shape
+        .validate_verifier_shape()
+        .map_err(|_| BlsDoryV3CandidateError::ProductionGeometry)?;
+    let mut transition_statements = Vec::with_capacity(PRODUCTION_V2_BANKS as usize + 1);
+    transition_statements.push(shape.initialization_statement);
+    transition_statements.extend_from_slice(&shape.transition_statements);
+    let masks = production_dory_v3_masks(proof.challenge_digest, &shape)?;
+    Ok(ValidatedBlsDoryV3LayoutV5CandidateStatement {
+        binding: transcript.algebraic_binding(block, proof)?,
+        challenge_digest: challenge.digest(),
+        shape,
+        transition_statements,
+        masks,
+    })
+}
+
+#[cfg(all(test, feature = "whir-prototype"))]
+pub(crate) fn validate_dory_v3_layout_v5_candidate_statement_for_test(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryV3CandidateError> {
+    validate_dory_v3_layout_v5_candidate_public_envelope(network_id, block, proof)?;
+    authenticated.record().validate()?;
+    validate_dory_v3_layout_v5_record_setup_binding(authenticated, setup)?;
+    validate_dory_v3_layout_v5_candidate_statement_after_authority(
+        network_id,
+        authenticated,
+        block,
+        proof,
+    )?;
+    Ok(())
+}
+
+/// Decode the existing CP02 envelope and its V5 Dory frame with the exact
+/// production topology. There is deliberately no V4 retry on any failure.
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn decode_dory_v3_layout_v5_candidate_payload(
+    encoded: &[u8],
+    context: &BlsDorySharedLayoutV5Context,
+) -> Result<(BlsDorySharedLayoutV5Proof, BlsDoryV3CandidatePayload), BlsDoryV3CandidateError> {
+    let payload = BlsDoryV3CandidatePayload::decode(encoded)?;
+    let shape = StructuredForgeMatrixResearchShape::production_candidate();
+    let transition_statements = [
+        shape.initialization_statement,
+        shape.transition_statements[0],
+        shape.transition_statements[1],
+        shape.transition_statements[2],
+    ];
+    let shared_proof = BlsDorySharedLayoutV5Proof::decode_with_context(
+        &payload.dory_proof,
+        context,
+        &shape.matrix_statements,
+        &transition_statements,
+        shape.wiring_statement,
+    )?;
+    Ok((shared_proof, payload))
+}
+
+/// Verify only the dormant Record-V2/Layout-V5 research candidate route.
+/// Failure to parse or verify V5 is terminal; the legacy V4 route is never
+/// retried or reinterpreted.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+pub(crate) fn verify_bls_dory_v3_layout_v5_candidate(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<VerifiedBlsDoryV3LayoutV5Candidate, BlsDoryV3CandidateError> {
+    let validated = validate_dory_v3_layout_v5_candidate_statement(
+        network_id,
+        authenticated,
+        block,
+        proof,
+        setup,
+    )?;
+    let context =
+        BlsDorySharedLayoutV5Context::from_bank_authenticated_record(authenticated, setup)?;
+    let (shared_proof, payload) =
+        decode_dory_v3_layout_v5_candidate_payload(&proof.structured_proof, &context)?;
+    let component_binding = context.fixed_model_binding(&validated.binding)?;
+    let mask_refs = validated.masks.iter().collect::<Vec<_>>();
+    let prepared = prepare_bls_dory_shared_layout_v5_verifier_state(
+        &validated.binding,
+        authenticated,
+        context,
+        component_binding,
+        &validated.shape.matrix_statements,
+        &validated.transition_statements,
+        &mask_refs,
+        validated.shape.wiring_statement,
+        &shared_proof,
+        setup,
+    )?;
+    let final_output = verify_prepared_bls_dory_shared_layout_v5_with_native_proof(
+        prepared,
+        validated.challenge_digest,
+        proof.final_activation_digest,
+        BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES,
+        &payload.native_blake3_proof,
+        setup,
+    )?;
+
+    let mut dory_hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/V3/LayoutV5DoryProof/v1");
+    dory_hasher.update(&validated.binding);
+    dory_hasher.update(&(payload.dory_proof.len() as u64).to_le_bytes());
+    dory_hasher.update(&payload.dory_proof);
+    let mut native_hasher =
+        blake3::Hasher::new_derive_key("CommonFoundry/ForgeMatrix/V3/LayoutV5NativeBlake3Proof/v1");
+    native_hasher.update(&validated.binding);
+    native_hasher.update(&(payload.native_blake3_proof.len() as u64).to_le_bytes());
+    native_hasher.update(&payload.native_blake3_proof);
+    Ok(VerifiedBlsDoryV3LayoutV5Candidate {
+        binding: validated.binding,
+        dory_proof_digest: *dory_hasher.finalize().as_bytes(),
+        native_blake3_proof_digest: *native_hasher.finalize().as_bytes(),
+        final_output,
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn production_dory_v3_masks(
+    challenge_digest: [u8; 32],
+    shape: &StructuredForgeMatrixResearchShape,
+) -> Result<Vec<StructuredMaskPolynomial>, BlsDoryV3CandidateError> {
+    let mut masks = Vec::with_capacity(shape.transition_statements.len() + 1);
+    masks.push(StructuredMaskPolynomial::from_dory_v3_virtual_challenge(
+        &challenge_digest,
+        shape.initialization_statement.rows,
+        shape.initialization_statement.cols,
+    )?);
+    let mut first_layer = 0_u32;
+    for statement in &shape.transition_statements {
+        masks.push(
+            StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+                &challenge_digest,
+                first_layer,
+                statement.layers,
+                statement.rows,
+                statement.cols,
+            )?,
+        );
+        first_layer = first_layer
+            .checked_add(
+                u32::try_from(statement.layers)
+                    .map_err(|_| BlsDoryV3CandidateError::ProductionGeometry)?,
+            )
+            .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?;
+    }
+    Ok(masks)
 }
 
 fn verified_algebraic_candidate(
@@ -1608,6 +1891,72 @@ mod tests {
             over.encode(),
             Err(BlsDoryV3CandidateError::ProofSize)
         ));
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn layout_v5_candidate_masks_use_only_v3_domains_and_global_bank_offsets() {
+        let challenge = [0x6d; 32];
+        let shape = StructuredForgeMatrixResearchShape::production_candidate();
+        let masks = production_dory_v3_masks(challenge, &shape).unwrap();
+        assert_eq!(masks.len(), PRODUCTION_V2_BANKS as usize + 1);
+        assert_eq!(
+            masks[0],
+            StructuredMaskPolynomial::from_dory_v3_virtual_challenge(
+                &challenge,
+                shape.initialization_statement.rows,
+                shape.initialization_statement.cols,
+            )
+            .unwrap()
+        );
+        for (bank, statement) in shape.transition_statements.iter().enumerate() {
+            let first_layer = u32::try_from(bank)
+                .unwrap()
+                .checked_mul(PRODUCTION_V2_LAYERS_PER_BANK)
+                .unwrap();
+            assert_eq!(
+                masks[bank + 1],
+                StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+                    &challenge,
+                    first_layer,
+                    statement.layers,
+                    statement.rows,
+                    statement.cols,
+                )
+                .unwrap()
+            );
+        }
+        assert_ne!(
+            masks[0],
+            StructuredMaskPolynomial::from_virtual_challenge(
+                &challenge,
+                shape.initialization_statement.rows,
+                shape.initialization_statement.cols,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            masks[1],
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                &challenge,
+                0,
+                shape.transition_statements[0].layers,
+                shape.transition_statements[0].rows,
+                shape.transition_statements[0].cols,
+            )
+            .unwrap()
+        );
+
+        type VerifyEntry =
+            fn(
+                [u8; 32],
+                &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+                &BlockChallenge,
+                &ForgeMatrixV3CandidateProof,
+                &DeterministicBlsDorySetup,
+            ) -> Result<VerifiedBlsDoryV3LayoutV5Candidate, BlsDoryV3CandidateError>;
+        let verify: VerifyEntry = verify_bls_dory_v3_layout_v5_candidate;
+        let _ = verify;
     }
 
     #[cfg(feature = "whir-prototype")]

@@ -23,8 +23,11 @@ use crate::{
     },
     dory_v3_model_ceremony_transcript::{
         AbortBody, CeremonyRecordBody, CeremonyTranscriptError, CeremonyTranscriptStatus,
-        FileIdentity as TranscriptFileIdentity, GenesisBody, VerifiedCeremonyTranscript,
-        ceremony_record_signature_message, ceremony_signed_record_digest,
+        FileIdentity as TranscriptFileIdentity, GenesisBody, MAX_CEREMONY_RECORD_BODY_BYTES,
+        MAX_CEREMONY_SIGNERS, RecordSignature, SignedCeremonyRecord, VerifiedCeremonyTranscript,
+        ceremony_record_content_digest, ceremony_record_signature_message,
+        ceremony_signed_record_digest, decode_ceremony_record,
+        encode_and_verify_ceremony_transcript, encode_ceremony_record,
         parse_and_verify_ceremony_transcript, parse_and_verify_reveal_set_prefix,
     },
     dory_v3_model_roots::{
@@ -591,6 +594,123 @@ pub struct VerifiedProductionDoryV3StructuralAnalyzerAbort {
     subject_binding: ProductionDoryV3StructuralAbortSubjectBinding,
 }
 
+/// Durability reached by one create-new signed-abort staging step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProductionDoryV3StructuralAbortStageDurability {
+    FileAndParentDirectorySynced,
+    FileSyncedParentDirectorySyncAccessDeniedOnWindows,
+    FileSyncedParentDirectorySyncUnsupportedOnWindows,
+    FileSyncedParentDirectorySyncUnsupportedOnPlatform,
+}
+
+/// Exact signed type-7 record staged for append-only bulletin publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionDoryV3StructuralAbortRecordStageReport {
+    output: PathBuf,
+    record_file: TranscriptFileIdentity,
+    record_content_digest: [u8; 32],
+    signed_record_digest: [u8; 32],
+    signature_message: [u8; 32],
+    signer_count: u16,
+    subject_binding: ProductionDoryV3StructuralAbortSubjectBinding,
+    durability: ProductionDoryV3StructuralAbortStageDurability,
+}
+
+impl ProductionDoryV3StructuralAbortRecordStageReport {
+    pub fn output(&self) -> &Path {
+        &self.output
+    }
+
+    pub const fn record_file(&self) -> &TranscriptFileIdentity {
+        &self.record_file
+    }
+
+    pub const fn signature_message(&self) -> [u8; 32] {
+        self.signature_message
+    }
+
+    pub const fn record_content_digest(&self) -> [u8; 32] {
+        self.record_content_digest
+    }
+
+    pub const fn signed_record_digest(&self) -> [u8; 32] {
+        self.signed_record_digest
+    }
+
+    pub const fn signer_count(&self) -> u16 {
+        self.signer_count
+    }
+
+    pub const fn subject_binding(&self) -> ProductionDoryV3StructuralAbortSubjectBinding {
+        self.subject_binding
+    }
+
+    pub const fn durability(&self) -> ProductionDoryV3StructuralAbortStageDurability {
+        self.durability
+    }
+}
+
+/// Reconstructed unsigned type-7 request authenticated from the exact type-5
+/// prefix, roots, error evidence, and retained payload observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepreparedProductionDoryV3StructuralAnalyzerAbort {
+    prepared_abort: PreparedProductionDoryV3StructuralAnalyzerAbort,
+    evidence: AuthenticatedProductionDoryV3StructuralErrorEvidence,
+    subject_binding: ProductionDoryV3StructuralAbortSubjectBinding,
+}
+
+impl RepreparedProductionDoryV3StructuralAnalyzerAbort {
+    pub const fn prepared_abort(&self) -> &PreparedProductionDoryV3StructuralAnalyzerAbort {
+        &self.prepared_abort
+    }
+
+    pub const fn evidence(&self) -> &AuthenticatedProductionDoryV3StructuralErrorEvidence {
+        &self.evidence
+    }
+
+    pub const fn subject_binding(&self) -> ProductionDoryV3StructuralAbortSubjectBinding {
+        self.subject_binding
+    }
+}
+
+/// Exact terminal aborted-transcript snapshot staged after its signed type-7
+/// record. The original type-5 prefix remains untouched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionDoryV3StructuralAbortTranscriptStageReport {
+    output: PathBuf,
+    transcript_file: TranscriptFileIdentity,
+    transcript_derive_key_digest: [u8; 32],
+    record_file: TranscriptFileIdentity,
+    subject_binding: ProductionDoryV3StructuralAbortSubjectBinding,
+    durability: ProductionDoryV3StructuralAbortStageDurability,
+}
+
+impl ProductionDoryV3StructuralAbortTranscriptStageReport {
+    pub fn output(&self) -> &Path {
+        &self.output
+    }
+
+    pub const fn transcript_file(&self) -> &TranscriptFileIdentity {
+        &self.transcript_file
+    }
+
+    pub const fn transcript_derive_key_digest(&self) -> [u8; 32] {
+        self.transcript_derive_key_digest
+    }
+
+    pub const fn record_file(&self) -> &TranscriptFileIdentity {
+        &self.record_file
+    }
+
+    pub const fn subject_binding(&self) -> ProductionDoryV3StructuralAbortSubjectBinding {
+        self.subject_binding
+    }
+
+    pub const fn durability(&self) -> ProductionDoryV3StructuralAbortStageDurability {
+        self.durability
+    }
+}
+
 impl VerifiedProductionDoryV3StructuralAnalyzerAbort {
     pub const fn evidence(&self) -> &AuthenticatedProductionDoryV3StructuralErrorEvidence {
         &self.evidence
@@ -692,9 +812,13 @@ pub enum ProductionDoryV3StructuralEvidenceError {
     #[error("trusted ceremony filesystem operation failed: {0}")]
     Filesystem(String),
     #[error(
-        "unconfirmed CMFDSE01 output could not be removed; original failure: {original}; cleanup failure: {cleanup}"
+        "unconfirmed ceremony output could not be removed; original failure: {original}; cleanup failure: {cleanup}"
     )]
     OutputCleanup { original: String, cleanup: String },
+    #[error("signed structural-abort record is not a terminal type-7 record")]
+    NotStructuralAbortRecord,
+    #[error("staged structural-abort artifact changed during authentication")]
+    StagedArtifactChanged,
 }
 
 struct Type5AnalyzerAuthority {
@@ -842,6 +966,331 @@ pub fn verify_anchored_production_dory_v3_structural_abort(
         evidence,
         subject_binding,
     })
+}
+
+/// Reconstruct the exact unsigned type-7 body and BIP340 raw-signing message
+/// from authenticated ceremony artifacts. This read-only step is suitable for
+/// exporting the 32-byte message to an external signer or HSM.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_anchored_production_dory_v3_structural_abort_from_files(
+    reveal_set_prefix: &[u8],
+    expected_ceremony_id: [u8; 32],
+    expected_last_signed_record_digest: [u8; 32],
+    payload_path: &Path,
+    roots_path: &Path,
+    evidence_path: &Path,
+) -> Result<
+    RepreparedProductionDoryV3StructuralAnalyzerAbort,
+    ProductionDoryV3StructuralEvidenceError,
+> {
+    let prepared = reprepare_structural_abort(
+        reveal_set_prefix,
+        expected_ceremony_id,
+        expected_last_signed_record_digest,
+        payload_path,
+        roots_path,
+        evidence_path,
+    )?;
+    Ok(RepreparedProductionDoryV3StructuralAnalyzerAbort {
+        prepared_abort: prepared.prepared_abort,
+        evidence: prepared.evidence,
+        subject_binding: prepared.subject_binding,
+    })
+}
+
+/// Verify externally produced roster signatures and stage the exact signed
+/// type-7 record as one create-new file. This never reads or stores a private
+/// signing key and never modifies the type-5 prefix.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_anchored_production_dory_v3_structural_abort_record(
+    reveal_set_prefix: &[u8],
+    expected_ceremony_id: [u8; 32],
+    expected_last_signed_record_digest: [u8; 32],
+    payload_path: &Path,
+    roots_path: &Path,
+    evidence_path: &Path,
+    signatures: Vec<RecordSignature>,
+    output_path: &Path,
+) -> Result<ProductionDoryV3StructuralAbortRecordStageReport, ProductionDoryV3StructuralEvidenceError>
+{
+    let prepared = prepare_signed_structural_abort(
+        reveal_set_prefix,
+        expected_ceremony_id,
+        expected_last_signed_record_digest,
+        payload_path,
+        roots_path,
+        evidence_path,
+        signatures,
+    )?;
+    let signature_message = ceremony_record_signature_message(&prepared.record.body)?;
+    let record_content_digest = ceremony_record_content_digest(&prepared.record.body)?;
+    let signed_record_digest = ceremony_signed_record_digest(&prepared.record)?;
+    let signer_count = u16::try_from(prepared.record.signatures.len())
+        .map_err(|_| CeremonyTranscriptError::Limit("abort signature count"))?;
+    let record_bytes = encode_ceremony_record(&prepared.record)?;
+    let expected_record = prepared.record.clone();
+    let (_, record_file, durability) =
+        persist_staged_abort_bytes(output_path, &record_bytes, |reopened| {
+            let record = decode_ceremony_record(reopened)?;
+            if record != expected_record || !matches!(record.body, CeremonyRecordBody::Abort(_)) {
+                return Err(ProductionDoryV3StructuralEvidenceError::StagedArtifactChanged);
+            }
+            Ok(())
+        })?;
+    Ok(ProductionDoryV3StructuralAbortRecordStageReport {
+        output: output_path.to_path_buf(),
+        record_file,
+        record_content_digest,
+        signed_record_digest,
+        signature_message,
+        signer_count,
+        subject_binding: prepared.subject_binding,
+        durability,
+    })
+}
+
+/// Consume one immutable staged type-7 record and stage the exact terminal
+/// aborted-transcript snapshot as a second create-new file. The canonical
+/// transcript header is rebuilt; the input type-5 prefix is never overwritten
+/// or byte-appended in place.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_anchored_production_dory_v3_structural_abort_transcript(
+    reveal_set_prefix: &[u8],
+    expected_ceremony_id: [u8; 32],
+    expected_last_signed_record_digest: [u8; 32],
+    payload_path: &Path,
+    roots_path: &Path,
+    evidence_path: &Path,
+    signed_abort_record_path: &Path,
+    output_path: &Path,
+) -> Result<
+    ProductionDoryV3StructuralAbortTranscriptStageReport,
+    ProductionDoryV3StructuralEvidenceError,
+> {
+    let (staged_record, record_file) = authenticate_signed_abort_record(signed_abort_record_path)?;
+    let prepared = prepare_signed_structural_abort(
+        reveal_set_prefix,
+        expected_ceremony_id,
+        expected_last_signed_record_digest,
+        payload_path,
+        roots_path,
+        evidence_path,
+        staged_record.signatures.clone(),
+    )?;
+    if prepared.record != staged_record {
+        return Err(ProductionDoryV3StructuralEvidenceError::StagedArtifactChanged);
+    }
+    let staged_record_bytes = encode_ceremony_record(&staged_record)?;
+    let expected_evidence = prepared.evidence.clone();
+    let expected_subject_binding = prepared.subject_binding;
+    let transcript_bytes = prepared.transcript_bytes;
+    verify_abort_successor_snapshot(reveal_set_prefix, &staged_record_bytes, &transcript_bytes)?;
+    let ((verified, transcript_derive_key_digest), transcript_file, durability) =
+        persist_staged_abort_bytes(output_path, &transcript_bytes, |reopened| {
+            verify_abort_successor_snapshot(reveal_set_prefix, &staged_record_bytes, reopened)?;
+            let verified = verify_anchored_production_dory_v3_structural_abort(
+                reopened,
+                expected_ceremony_id,
+                expected_last_signed_record_digest,
+                payload_path,
+                roots_path,
+                evidence_path,
+            )?;
+            if verified.evidence() != &expected_evidence
+                || verified.subject_binding() != expected_subject_binding
+            {
+                return Err(ProductionDoryV3StructuralEvidenceError::StagedArtifactChanged);
+            }
+            let parsed = parse_and_verify_ceremony_transcript(reopened)?;
+            if parsed.status() != CeremonyTranscriptStatus::Aborted {
+                return Err(ProductionDoryV3StructuralEvidenceError::StagedArtifactChanged);
+            }
+            let (final_record, final_record_file) =
+                authenticate_signed_abort_record(signed_abort_record_path)?;
+            if final_record != staged_record || final_record_file != record_file {
+                return Err(ProductionDoryV3StructuralEvidenceError::StagedArtifactChanged);
+            }
+            Ok((verified, parsed.transcript_derive_key_digest()))
+        })?;
+    Ok(ProductionDoryV3StructuralAbortTranscriptStageReport {
+        output: output_path.to_path_buf(),
+        transcript_file,
+        transcript_derive_key_digest,
+        record_file,
+        subject_binding: verified.subject_binding(),
+        durability,
+    })
+}
+
+struct PreparedSignedStructuralAbort {
+    record: SignedCeremonyRecord,
+    transcript_bytes: Vec<u8>,
+    evidence: AuthenticatedProductionDoryV3StructuralErrorEvidence,
+    subject_binding: ProductionDoryV3StructuralAbortSubjectBinding,
+}
+
+struct RepreparedStructuralAbort {
+    prefix: VerifiedCeremonyTranscript,
+    prepared_abort: PreparedProductionDoryV3StructuralAnalyzerAbort,
+    evidence: AuthenticatedProductionDoryV3StructuralErrorEvidence,
+    subject_binding: ProductionDoryV3StructuralAbortSubjectBinding,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_signed_structural_abort(
+    reveal_set_prefix: &[u8],
+    expected_ceremony_id: [u8; 32],
+    expected_last_signed_record_digest: [u8; 32],
+    payload_path: &Path,
+    roots_path: &Path,
+    evidence_path: &Path,
+    mut signatures: Vec<RecordSignature>,
+) -> Result<PreparedSignedStructuralAbort, ProductionDoryV3StructuralEvidenceError> {
+    let prepared = reprepare_structural_abort(
+        reveal_set_prefix,
+        expected_ceremony_id,
+        expected_last_signed_record_digest,
+        payload_path,
+        roots_path,
+        evidence_path,
+    )?;
+    signatures.sort_by_key(|signature| (signature.signer_class, signature.signer_index));
+    let record = SignedCeremonyRecord {
+        body: CeremonyRecordBody::Abort(prepared.prepared_abort.body.clone()),
+        signatures,
+    };
+    let mut records = prepared.prefix.records().to_vec();
+    records.push(record.clone());
+    let transcript_bytes = encode_and_verify_ceremony_transcript(&records)?;
+    Ok(PreparedSignedStructuralAbort {
+        record,
+        transcript_bytes,
+        evidence: prepared.evidence,
+        subject_binding: prepared.subject_binding,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reprepare_structural_abort(
+    reveal_set_prefix: &[u8],
+    expected_ceremony_id: [u8; 32],
+    expected_last_signed_record_digest: [u8; 32],
+    payload_path: &Path,
+    roots_path: &Path,
+    evidence_path: &Path,
+) -> Result<RepreparedStructuralAbort, ProductionDoryV3StructuralEvidenceError> {
+    let prefix = parse_and_verify_reveal_set_prefix(reveal_set_prefix, expected_ceremony_id)?;
+    let authority = require_type5_analyzer_authority(&prefix, expected_last_signed_record_digest)?;
+    let (_, roots) = authenticate_roots_artifact(roots_path, expected_ceremony_id)?;
+    let (claims, evidence_file) = authenticate_evidence_file(evidence_path)?;
+    verify_claims_against_authority(&claims, &authority, &roots)?;
+    let subject_binding = authenticate_failed_payload(payload_path, &claims)?;
+    let body = AbortBody {
+        ceremony_id: authority.ceremony_id,
+        last_valid_signed_record_digest: authority.last_valid_signed_record_digest,
+        phase: STRUCTURAL_ANALYZER_ABORT_PHASE,
+        reason_code: claims.abort_reason_code(),
+        evidence_file: evidence_file.clone(),
+    };
+    let signature_message =
+        ceremony_record_signature_message(&CeremonyRecordBody::Abort(body.clone()))?;
+    Ok(RepreparedStructuralAbort {
+        prefix,
+        prepared_abort: PreparedProductionDoryV3StructuralAnalyzerAbort {
+            body,
+            signature_message,
+        },
+        evidence: AuthenticatedProductionDoryV3StructuralErrorEvidence {
+            claims,
+            file_identity: evidence_file,
+        },
+        subject_binding,
+    })
+}
+
+const MAX_SIGNED_CEREMONY_RECORD_BYTES: usize =
+    2 + 2 + 4 + MAX_CEREMONY_RECORD_BODY_BYTES + 2 + MAX_CEREMONY_SIGNERS * (1 + 2 + 64);
+
+fn authenticate_signed_abort_record(
+    path: &Path,
+) -> Result<(SignedCeremonyRecord, TranscriptFileIdentity), ProductionDoryV3StructuralEvidenceError>
+{
+    let parent = TrustedCeremonyParent::for_artifact(path).map_err(map_fs)?;
+    let mut input = AuthenticatedInput::open(&parent, path, None).map_err(map_fs)?;
+    let initial = input
+        .read_bounded(MAX_SIGNED_CEREMONY_RECORD_BYTES)
+        .map_err(map_fs)?;
+    let exact_len = u64::try_from(initial.len())
+        .map_err(|_| CeremonyTranscriptError::Limit("signed abort record bytes"))?;
+    input.recheck(&parent, Some(exact_len)).map_err(map_fs)?;
+    let record = decode_ceremony_record(&initial)?;
+    if !matches!(record.body, CeremonyRecordBody::Abort(_)) {
+        return Err(ProductionDoryV3StructuralEvidenceError::NotStructuralAbortRecord);
+    }
+    let file_identity = content_identity(&initial)?;
+    let final_bytes = input
+        .read_bounded(MAX_SIGNED_CEREMONY_RECORD_BYTES)
+        .map_err(map_fs)?;
+    input.recheck(&parent, Some(exact_len)).map_err(map_fs)?;
+    parent.recheck().map_err(map_fs)?;
+    if final_bytes != initial
+        || decode_ceremony_record(&final_bytes)? != record
+        || content_identity(&final_bytes)? != file_identity
+    {
+        return Err(ProductionDoryV3StructuralEvidenceError::StagedArtifactChanged);
+    }
+    Ok((record, file_identity))
+}
+
+fn verify_abort_successor_snapshot(
+    reveal_set_prefix: &[u8],
+    staged_record: &[u8],
+    successor: &[u8],
+) -> Result<(), ProductionDoryV3StructuralEvidenceError> {
+    let header_bytes =
+        usize::from(crate::dory_v3_model_ceremony_transcript::CEREMONY_TRANSCRIPT_HEADER_BYTES);
+    let unchanged_header_bytes = 12;
+    let expected_successor_bytes = reveal_set_prefix
+        .len()
+        .checked_add(staged_record.len())
+        .ok_or(CeremonyTranscriptError::Limit("aborted transcript bytes"))?;
+    if reveal_set_prefix.len() < header_bytes
+        || successor.len() != expected_successor_bytes
+        || successor.get(..unchanged_header_bytes)
+            != reveal_set_prefix.get(..unchanged_header_bytes)
+        || successor.get(header_bytes..reveal_set_prefix.len())
+            != reveal_set_prefix.get(header_bytes..)
+        || successor.get(reveal_set_prefix.len()..) != Some(staged_record)
+    {
+        return Err(ProductionDoryV3StructuralEvidenceError::StagedArtifactChanged);
+    }
+    Ok(())
+}
+
+fn persist_staged_abort_bytes<T>(
+    output_path: &Path,
+    bytes: &[u8],
+    validate: impl FnOnce(&[u8]) -> Result<T, ProductionDoryV3StructuralEvidenceError>,
+) -> Result<
+    (
+        T,
+        TranscriptFileIdentity,
+        ProductionDoryV3StructuralAbortStageDurability,
+    ),
+    ProductionDoryV3StructuralEvidenceError,
+> {
+    let parent = TrustedCeremonyParent::for_artifact(output_path).map_err(map_fs)?;
+    let mut output = PendingOutput::create(&parent, output_path).map_err(map_fs)?;
+    let completion = (|| {
+        output.write_all(bytes).map_err(map_fs)?;
+        output.sync_file().map_err(map_fs)?;
+        let reopened = output.reopen_exact(&parent, bytes).map_err(map_fs)?;
+        let value = validate(&reopened)?;
+        let file_identity = content_identity(&reopened)?;
+        let durability = map_abort_stage_durability(output.sync_parent(&parent).map_err(map_fs)?);
+        Ok((value, file_identity, durability))
+    })();
+    finish_pending_output(output, &parent, completion)
 }
 
 fn authenticate_roots_artifact(
@@ -1903,6 +2352,28 @@ fn map_durability(outcome: ParentSyncOutcome) -> ProductionDoryV3StructuralError
     }
 }
 
+fn map_abort_stage_durability(
+    outcome: ParentSyncOutcome,
+) -> ProductionDoryV3StructuralAbortStageDurability {
+    match outcome {
+        ParentSyncOutcome::Synced => {
+            ProductionDoryV3StructuralAbortStageDurability::FileAndParentDirectorySynced
+        }
+        #[cfg(windows)]
+        ParentSyncOutcome::WindowsAccessDenied => {
+            ProductionDoryV3StructuralAbortStageDurability::FileSyncedParentDirectorySyncAccessDeniedOnWindows
+        }
+        #[cfg(windows)]
+        ParentSyncOutcome::WindowsUnsupported => {
+            ProductionDoryV3StructuralAbortStageDurability::FileSyncedParentDirectorySyncUnsupportedOnWindows
+        }
+        #[cfg(not(any(unix, windows)))]
+        ParentSyncOutcome::PlatformUnsupported => {
+            ProductionDoryV3StructuralAbortStageDurability::FileSyncedParentDirectorySyncUnsupportedOnPlatform
+        }
+    }
+}
+
 struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -2197,6 +2668,9 @@ mod tests {
         let roots = directory.join("roots.cmfdr");
         let structure = directory.join("structure.cmfdsr");
         let evidence = directory.join("failure.cmfdse");
+        let signed_abort_record = directory.join("abort-record.cmfdrec");
+        let aborted_transcript = directory.join("aborted.cmfd");
+        let rejected_record = directory.join("rejected-abort-record.cmfdrec");
         fs::write(&payload, [1_u8, 2, 3]).unwrap();
         fs::write(&roots, roots_artifact(ceremony_id)).unwrap();
 
@@ -2219,11 +2693,211 @@ mod tests {
             report.evidence().claims().failure_code(),
             ProductionDoryV3StructuralEvidenceFailureCode::PayloadLengthMismatch
         );
-        records.push(sign_record(
+        let reprepared = prepare_anchored_production_dory_v3_structural_abort_from_files(
+            &prefix_bytes,
+            ceremony_id,
+            last,
+            &payload,
+            &roots,
+            &evidence,
+        )
+        .unwrap();
+        assert_eq!(reprepared.prepared_abort(), report.prepared_abort());
+        assert_eq!(reprepared.evidence(), report.evidence());
+        assert_eq!(
+            reprepared.subject_binding(),
+            ProductionDoryV3StructuralAbortSubjectBinding::RetainedPayloadObservationVerified
+        );
+        let signed_abort = sign_record(
             CeremonyRecordBody::Abort(report.prepared_abort().body().clone()),
-            &[(SignerClass::Operator, 0, &operators[0])],
-        ));
+            &[
+                (SignerClass::Operator, 0, &operators[0]),
+                (SignerClass::Operator, 1, &operators[1]),
+            ],
+        );
+        let mut bad_signatures = signed_abort.signatures.clone();
+        bad_signatures[0].signature[0] ^= 1;
+        assert!(
+            stage_anchored_production_dory_v3_structural_abort_record(
+                &prefix_bytes,
+                ceremony_id,
+                last,
+                &payload,
+                &roots,
+                &evidence,
+                bad_signatures,
+                &rejected_record,
+            )
+            .is_err()
+        );
+        assert!(!rejected_record.exists());
+        let mut wrong_message_body = report.prepared_abort().body().clone();
+        wrong_message_body.reason_code = wrong_message_body.reason_code.saturating_add(1);
+        let wrong_message_record = sign_record(
+            CeremonyRecordBody::Abort(wrong_message_body),
+            &[
+                (SignerClass::Operator, 0, &operators[0]),
+                (SignerClass::Operator, 1, &operators[1]),
+            ],
+        );
+        assert!(
+            stage_anchored_production_dory_v3_structural_abort_record(
+                &prefix_bytes,
+                ceremony_id,
+                last,
+                &payload,
+                &roots,
+                &evidence,
+                wrong_message_record.signatures,
+                &rejected_record,
+            )
+            .is_err()
+        );
+        assert!(!rejected_record.exists());
+        assert!(
+            stage_anchored_production_dory_v3_structural_abort_record(
+                &prefix_bytes,
+                ceremony_id,
+                last,
+                &payload,
+                &roots,
+                &evidence,
+                Vec::new(),
+                &rejected_record,
+            )
+            .is_err()
+        );
+        assert!(!rejected_record.exists());
+        assert!(
+            stage_anchored_production_dory_v3_structural_abort_record(
+                &prefix_bytes,
+                ceremony_id,
+                last,
+                &payload,
+                &roots,
+                &evidence,
+                vec![
+                    signed_abort.signatures[0].clone(),
+                    signed_abort.signatures[0].clone(),
+                ],
+                &rejected_record,
+            )
+            .is_err()
+        );
+        assert!(!rejected_record.exists());
+        let mut out_of_roster = signed_abort.signatures.clone();
+        out_of_roster[0].signer_index = u16::MAX;
+        assert!(
+            stage_anchored_production_dory_v3_structural_abort_record(
+                &prefix_bytes,
+                ceremony_id,
+                last,
+                &payload,
+                &roots,
+                &evidence,
+                out_of_roster,
+                &rejected_record,
+            )
+            .is_err()
+        );
+        assert!(!rejected_record.exists());
+
+        let mut reversed_signatures = signed_abort.signatures.clone();
+        reversed_signatures.reverse();
+        let record_report = stage_anchored_production_dory_v3_structural_abort_record(
+            &prefix_bytes,
+            ceremony_id,
+            last,
+            &payload,
+            &roots,
+            &evidence,
+            reversed_signatures,
+            &signed_abort_record,
+        )
+        .unwrap();
+        assert_eq!(record_report.output(), signed_abort_record);
+        assert_eq!(record_report.signer_count(), 2);
+        assert_eq!(
+            record_report.signature_message(),
+            report.prepared_abort().signature_message()
+        );
+        assert_eq!(
+            record_report.record_content_digest(),
+            ceremony_record_content_digest(&signed_abort.body).unwrap()
+        );
+        assert_eq!(
+            record_report.signed_record_digest(),
+            ceremony_signed_record_digest(&signed_abort).unwrap()
+        );
+        assert_eq!(
+            record_report.subject_binding(),
+            ProductionDoryV3StructuralAbortSubjectBinding::RetainedPayloadObservationVerified
+        );
+        let record_bytes = fs::read(&signed_abort_record).unwrap();
+        assert_eq!(record_bytes, encode_ceremony_record(&signed_abort).unwrap());
+        assert_eq!(
+            record_report.record_file(),
+            &content_identity_infallible(&record_bytes)
+        );
+        assert!(
+            stage_anchored_production_dory_v3_structural_abort_record(
+                &prefix_bytes,
+                ceremony_id,
+                last,
+                &payload,
+                &roots,
+                &evidence,
+                signed_abort.signatures.clone(),
+                &signed_abort_record,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&signed_abort_record).unwrap(), record_bytes);
+
+        let transcript_report = stage_anchored_production_dory_v3_structural_abort_transcript(
+            &prefix_bytes,
+            ceremony_id,
+            last,
+            &payload,
+            &roots,
+            &evidence,
+            &signed_abort_record,
+            &aborted_transcript,
+        )
+        .unwrap();
+        assert_eq!(transcript_report.output(), aborted_transcript);
+        assert_eq!(transcript_report.record_file(), record_report.record_file());
+        assert_eq!(
+            transcript_report.subject_binding(),
+            ProductionDoryV3StructuralAbortSubjectBinding::RetainedPayloadObservationVerified
+        );
+        records.push(signed_abort);
         let aborted = encode_and_verify_ceremony_transcript(&records).unwrap();
+        assert_eq!(fs::read(&aborted_transcript).unwrap(), aborted);
+        assert!(
+            stage_anchored_production_dory_v3_structural_abort_transcript(
+                &prefix_bytes,
+                ceremony_id,
+                last,
+                &payload,
+                &roots,
+                &evidence,
+                &signed_abort_record,
+                &aborted_transcript,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&aborted_transcript).unwrap(), aborted);
+        assert_eq!(
+            transcript_report.transcript_file(),
+            &content_identity_infallible(&aborted)
+        );
+        assert_eq!(
+            transcript_report.transcript_derive_key_digest(),
+            parse_and_verify_ceremony_transcript(&aborted)
+                .unwrap()
+                .transcript_derive_key_digest()
+        );
         let verified = verify_anchored_production_dory_v3_structural_abort(
             &aborted,
             ceremony_id,
@@ -2242,6 +2916,8 @@ mod tests {
         fs::remove_file(payload).unwrap();
         fs::remove_file(roots).unwrap();
         fs::remove_file(evidence).unwrap();
+        fs::remove_file(signed_abort_record).unwrap();
+        fs::remove_file(aborted_transcript).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 

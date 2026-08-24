@@ -937,6 +937,37 @@ signature message. It never signs, appends, or publishes a record. External
 operator or HSM tooling must sign the returned message under the frozen roster
 policy.
 
+Local type-7 construction is split into three keyless, resumable operations:
+
+1. `abort-prepare` reauthenticates the exact type-5 prefix, independent
+   ceremony anchors, retained payload, roots, and `CMFDSE01` evidence, then
+   prints the canonical 32-byte BIP340 raw-signing message. It accepts no key,
+   seed, or private-key file.
+2. `abort-record-stage` accepts only public `INDEX:128-lowercase-hex`
+   operator/reproducer signature tuples. It reconstructs the body rather than
+   trusting caller-supplied body fields, canonically orders the signatures,
+   verifies the frozen roster policy through the full transcript verifier, and
+   create-new persists one exact signed type-7 record.
+3. `abort-transcript-stage` consumes that immutable signed record and
+   create-new persists a complete terminal aborted-transcript snapshot. It
+   reauthenticates every external input before confirming the output.
+
+Transcript staging is not a literal append to the type-5 file. The canonical
+header's record count and total length must change, so the implementation
+creates a new snapshot, requires header bytes `0..12` and the original record
+region to remain byte-identical, and requires the terminal bytes to equal the
+staged record exactly. After a successful record-stage report, the valid record
+remains available while transcript staging is retried. An abrupt process or
+power loss can leave an unconfirmed final-named file because outputs are
+create-new; operators must authenticate and retain or quarantine that file,
+then use a fresh output path rather than overwrite it. The results
+`record_staged` and `transcript_staged` describe local durable files,
+not public publication. Bulletin submission, independent mirror receipts,
+equivocation monitoring, and the detached transcript attestation remain
+separate external steps. Because that attestation commits to the final
+signature count and transcript bytes, it requires a second signing round after
+the type-7 signer set is frozen.
+
 Hashing the running executable file (`/proc/self/exe` on Linux and the path
 returned by `current_exe` on other supported hosts) detects accidental binary
 drift on a trusted host; it is not remote attestation and does not prove the
@@ -966,7 +997,8 @@ length mismatch because the trusted file opener rejects their metadata before
 analysis; the more specific early-EOF and trailing-byte codes describe changes
 or unusual read behavior observed after opening.
 
-The reference CLI exposes these two operations as:
+The reference CLI exposes analyzer generation, keyless type-7 staging, and
+final verification as:
 
 ```text
 cmfd-consensus dory-v3-model-structure-generate-anchored \
@@ -976,6 +1008,31 @@ cmfd-consensus dory-v3-model-structure-generate-anchored \
   --payload ABSOLUTE-PAYLOAD --roots ABSOLUTE-ROOTS \
   --structure-output NEW-ABSOLUTE-REPORT \
   --error-evidence-output NEW-ABSOLUTE-EVIDENCE
+
+cmfd-consensus dory-v3-model-structure-abort-prepare \
+  --reveal-set-prefix ABSOLUTE-TYPE5-PREFIX \
+  --expected-ceremony-id LOWERCASE-64-HEX \
+  --expected-last-valid-signed-record-digest LOWERCASE-64-HEX \
+  --payload ABSOLUTE-PAYLOAD --roots ABSOLUTE-ROOTS \
+  --error-evidence ABSOLUTE-EVIDENCE
+
+cmfd-consensus dory-v3-model-structure-abort-record-stage \
+  --reveal-set-prefix ABSOLUTE-TYPE5-PREFIX \
+  --expected-ceremony-id LOWERCASE-64-HEX \
+  --expected-last-valid-signed-record-digest LOWERCASE-64-HEX \
+  --payload ABSOLUTE-PAYLOAD --roots ABSOLUTE-ROOTS \
+  --error-evidence ABSOLUTE-EVIDENCE \
+  --operator-signature INDEX:128-LOWERCASE-HEX \
+  --record-output NEW-ABSOLUTE-TYPE7-RECORD
+
+cmfd-consensus dory-v3-model-structure-abort-transcript-stage \
+  --reveal-set-prefix ABSOLUTE-TYPE5-PREFIX \
+  --expected-ceremony-id LOWERCASE-64-HEX \
+  --expected-last-valid-signed-record-digest LOWERCASE-64-HEX \
+  --payload ABSOLUTE-PAYLOAD --roots ABSOLUTE-ROOTS \
+  --error-evidence ABSOLUTE-EVIDENCE \
+  --signed-abort-record ABSOLUTE-TYPE7-RECORD \
+  --transcript-output NEW-ABSOLUTE-TYPE7-TRANSCRIPT
 
 cmfd-consensus dory-v3-model-structure-abort-verify \
   --aborted-transcript ABSOLUTE-TYPE7-TRANSCRIPT \
@@ -1274,7 +1331,8 @@ Already implemented in this repository:
   file identities;
 - the exact `CMFDSE01` structural-analyzer error-evidence codec, create-new
   persistence, independently anchored type-5 generation authority, prepared
-  unsigned type-7 abort, and signed type-7 evidence verifier;
+  unsigned type-7 abort, external-signature verifier, create-new signed-record
+  and successor-transcript staging, and signed type-7 evidence verifier;
 - the fail-closed `dory-v3-model-bank-bootstrap` command; and
 - the two-pass `dory-v3-model-record-ceremony` command.
 
@@ -1282,13 +1340,14 @@ Not implemented or not completed by this document:
 
 - independent external review and a second independently operated full-scale
   qualification of the contribution generator;
-- append-only transcript publication and independently mirrored expected
-  ceremony-ID tooling, plus independent external review of the transcript
+- public append-only bulletin submission, independently mirrored expected
+  ceremony-ID tooling, receipt/equivocation handling, detached transcript
+  attestation, and independent external review of the transcript
   implementation;
 - independent external review and a production-scale qualification of the
   reference combiner;
-- external signing, append-only publication, and independent mirroring of a
-  prepared type-7 abort record;
+- external signature collection, public append-only publication, and
+  independent mirroring of a locally staged type-7 abort record;
 - a full-length qualification of the roots and structural-report tools on a
   production-geometry combined payload, plus an independently authored
   reproduction implementation;
@@ -1299,8 +1358,10 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is append-only transcript publication and
-production-scale roots, structure, and combiner qualification.
+The next minimal implementation slice is public append-only transcript
+publication with independent mirror receipts, followed by production-scale
+roots, structure, and combiner qualification and qualification-request
+generation.
 The transcript, generator, combiner, and new report tools still require
 independent external review before generating real contributions. A successful
 run of the current bootstrap or one local generator qualification is not a

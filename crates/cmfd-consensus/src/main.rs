@@ -19,8 +19,8 @@ use cmfd_consensus::{
     dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
     dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
     dory_v3_model_ceremony_transcript::{
-        CeremonyRecordBody, MAX_CEREMONY_TRANSCRIPT_BYTES, ceremony_record_content_digest,
-        parse_and_verify_reveal_set_prefix,
+        CeremonyRecordBody, MAX_CEREMONY_TRANSCRIPT_BYTES, RecordSignature, SignerClass,
+        ceremony_record_content_digest, parse_and_verify_reveal_set_prefix,
     },
     dory_v3_model_combiner::combine_production_dory_v3_model_contributions,
     dory_v3_model_contribution::generate_production_dory_v3_model_contribution,
@@ -35,7 +35,10 @@ use cmfd_consensus::{
     dory_v3_model_structure_evidence::{
         AuthenticatedProductionDoryV3StructuralErrorEvidence,
         ProductionDoryV3StructuralAbortSubjectBinding, ProductionDoryV3StructuralAnalyzerOutcome,
+        prepare_anchored_production_dory_v3_structural_abort_from_files,
         run_anchored_production_dory_v3_model_structural_report,
+        stage_anchored_production_dory_v3_structural_abort_record,
+        stage_anchored_production_dory_v3_structural_abort_transcript,
         verify_anchored_production_dory_v3_structural_abort,
     },
     dory_v3_suite::Digest32,
@@ -52,6 +55,24 @@ use std::io::Read as _;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalRecordSignature {
+    signer_index: u16,
+    signature: [u8; 64],
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+impl ExternalRecordSignature {
+    fn into_record_signature(self, signer_class: SignerClass) -> RecordSignature {
+        RecordSignature {
+            signer_class,
+            signer_index: self.signer_index,
+            signature: self.signature,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -262,6 +283,87 @@ enum Command {
         #[arg(long, value_parser = parse_absolute_path)]
         error_evidence: std::path::PathBuf,
     },
+    /// Reconstruct the unsigned type-7 request for an external signer or HSM.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelStructureAbortPrepare {
+        /// Exact signed transcript prefix ending at type 5 and EOF (at most 1 MiB).
+        #[arg(long, value_parser = parse_absolute_path)]
+        reveal_set_prefix: std::path::PathBuf,
+        /// Independently authenticated ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// Independently authenticated digest of the final signed type-5 record.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_last_valid_signed_record_digest: [u8; 32],
+        /// Existing absolute path to the retained failed production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// Existing absolute path to the CMFDSE01 evidence artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        error_evidence: std::path::PathBuf,
+    },
+    /// Verify external BIP340 signatures and stage one exact signed type-7 record.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelStructureAbortRecordStage {
+        /// Exact signed transcript prefix ending at type 5 and EOF (at most 1 MiB).
+        #[arg(long, value_parser = parse_absolute_path)]
+        reveal_set_prefix: std::path::PathBuf,
+        /// Independently authenticated ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// Independently authenticated digest of the final signed type-5 record.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_last_valid_signed_record_digest: [u8; 32],
+        /// Existing absolute path to the retained failed production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// Existing absolute path to the CMFDSE01 evidence artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        error_evidence: std::path::PathBuf,
+        /// External operator signature as INDEX:128-lowercase-hex. Repeat as needed.
+        #[arg(long, value_parser = parse_external_signature)]
+        operator_signature: Vec<ExternalRecordSignature>,
+        /// External reproducer signature as INDEX:128-lowercase-hex. Repeat as needed.
+        #[arg(long, value_parser = parse_external_signature)]
+        reproducer_signature: Vec<ExternalRecordSignature>,
+        /// New absolute path for the exact signed type-7 record.
+        #[arg(long, value_parser = parse_absolute_path)]
+        record_output: std::path::PathBuf,
+    },
+    /// Stage a new terminal transcript snapshot from an immutable signed type-7 record.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelStructureAbortTranscriptStage {
+        /// Exact signed transcript prefix ending at type 5 and EOF (at most 1 MiB).
+        #[arg(long, value_parser = parse_absolute_path)]
+        reveal_set_prefix: std::path::PathBuf,
+        /// Independently authenticated ceremony ID as exactly 64 lowercase hexadecimal characters.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// Independently authenticated digest of the final signed type-5 record.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_last_valid_signed_record_digest: [u8; 32],
+        /// Existing absolute path to the retained failed production payload.
+        #[arg(long, value_parser = parse_absolute_path)]
+        payload: std::path::PathBuf,
+        /// Existing absolute path to the CMFDMR01 roots artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        roots: std::path::PathBuf,
+        /// Existing absolute path to the CMFDSE01 evidence artifact.
+        #[arg(long, value_parser = parse_absolute_path)]
+        error_evidence: std::path::PathBuf,
+        /// Existing absolute path to the staged exact signed type-7 record.
+        #[arg(long, value_parser = parse_absolute_path)]
+        signed_abort_record: std::path::PathBuf,
+        /// New absolute path for the complete aborted-transcript snapshot.
+        #[arg(long, value_parser = parse_absolute_path)]
+        transcript_output: std::path::PathBuf,
+    },
     /// Derive the reproducible production BLAKE3 preprocessing-only BLS record.
     #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
     BlsBlake3PreprocessingCommitment {
@@ -313,6 +415,37 @@ fn parse_lower_hex_32(encoded: &str) -> std::result::Result<[u8; 32], String> {
     decoded
         .try_into()
         .map_err(|_| "expected exactly 32 decoded bytes".to_owned())
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn parse_external_signature(encoded: &str) -> std::result::Result<ExternalRecordSignature, String> {
+    let (index, signature) = encoded
+        .split_once(':')
+        .ok_or_else(|| "expected INDEX:128-lowercase-hex external BIP340 signature".to_owned())?;
+    if index.is_empty()
+        || (index.len() > 1 && index.starts_with('0'))
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("expected a canonical decimal signer index".to_owned());
+    }
+    let signer_index = index
+        .parse::<u16>()
+        .map_err(|_| "signer index must fit unsigned 16 bits".to_owned())?;
+    if signature.len() != 128
+        || !signature
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err("expected exactly 128 lowercase hexadecimal signature characters".to_owned());
+    }
+    let signature = hex::decode(signature)
+        .map_err(|_| "expected exactly 128 lowercase hexadecimal signature characters".to_owned())?
+        .try_into()
+        .map_err(|_| "expected exactly 64 decoded signature bytes".to_owned())?;
+    Ok(ExternalRecordSignature {
+        signer_index,
+        signature,
+    })
 }
 
 #[cfg(feature = "dory-bls12-381-prototype")]
@@ -409,6 +542,18 @@ fn print_structural_error_evidence(
     println!("failure_detail {}", claims.detail());
 }
 
+#[cfg(feature = "dory-bls12-381-prototype")]
+const fn structural_abort_subject_binding_label(
+    binding: ProductionDoryV3StructuralAbortSubjectBinding,
+) -> &'static str {
+    match binding {
+        ProductionDoryV3StructuralAbortSubjectBinding::AttestationOnly => "attestation_only",
+        ProductionDoryV3StructuralAbortSubjectBinding::RetainedPayloadObservationVerified => {
+            "retained_payload_observation_verified"
+        }
+    }
+}
+
 fn sample_block(network_id: [u8; 32], target: [u8; 32]) -> BlockChallenge {
     BlockChallenge {
         network_id,
@@ -420,7 +565,7 @@ fn sample_block(network_id: [u8; 32], target: [u8; 32]) -> BlockChallenge {
     }
 }
 
-fn main() -> Result<()> {
+fn run_cli() -> Result<()> {
     match Cli::parse().command {
         Command::Vector => {
             let verifier = ForgeMatrixVerifier::new(TEST_PROFILE)?;
@@ -743,16 +888,162 @@ fn main() -> Result<()> {
             println!("error_evidence {}", error_evidence.display());
             println!(
                 "subject_binding {}",
-                match verified.subject_binding() {
-                    ProductionDoryV3StructuralAbortSubjectBinding::AttestationOnly => {
-                        "attestation_only"
-                    }
-                    ProductionDoryV3StructuralAbortSubjectBinding::RetainedPayloadObservationVerified => {
-                        "retained_payload_observation_verified"
-                    }
-                }
+                structural_abort_subject_binding_label(verified.subject_binding())
             );
             print_structural_error_evidence(verified.evidence());
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelStructureAbortPrepare {
+            reveal_set_prefix,
+            expected_ceremony_id,
+            expected_last_valid_signed_record_digest,
+            payload,
+            roots,
+            error_evidence,
+        } => {
+            let prefix = read_ceremony_transcript(&reveal_set_prefix, "reveal-set prefix")?;
+            let reprepared = prepare_anchored_production_dory_v3_structural_abort_from_files(
+                &prefix,
+                expected_ceremony_id,
+                expected_last_valid_signed_record_digest,
+                &payload,
+                &roots,
+                &error_evidence,
+            )
+            .context("failed to reconstruct the anchored structural-abort signing request")?;
+            let abort = reprepared.prepared_abort();
+            let body = abort.body();
+            println!("outcome abort_prepared");
+            println!("reveal_set_prefix {}", reveal_set_prefix.display());
+            println!("error_evidence {}", error_evidence.display());
+            print_structural_error_evidence(reprepared.evidence());
+            println!("abort_record_type 7");
+            println!("abort_ceremony_id {}", hex::encode(body.ceremony_id));
+            println!(
+                "abort_last_valid_signed_record_digest {}",
+                hex::encode(body.last_valid_signed_record_digest)
+            );
+            println!("abort_phase {}", body.phase);
+            println!("abort_reason_code {}", body.reason_code);
+            println!(
+                "abort_record_content_digest {}",
+                hex::encode(ceremony_record_content_digest(&CeremonyRecordBody::Abort(
+                    body.clone()
+                ))?)
+            );
+            println!(
+                "abort_signature_message {}",
+                hex::encode(abort.signature_message())
+            );
+            println!(
+                "subject_binding {}",
+                structural_abort_subject_binding_label(reprepared.subject_binding())
+            );
+            println!("signature_algorithm bip340_raw_32_byte_message");
+            println!("private_key_handling external_only");
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelStructureAbortRecordStage {
+            reveal_set_prefix,
+            expected_ceremony_id,
+            expected_last_valid_signed_record_digest,
+            payload,
+            roots,
+            error_evidence,
+            operator_signature,
+            reproducer_signature,
+            record_output,
+        } => {
+            let prefix = read_ceremony_transcript(&reveal_set_prefix, "reveal-set prefix")?;
+            let mut signatures: Vec<_> = operator_signature
+                .into_iter()
+                .map(|signature| signature.into_record_signature(SignerClass::Operator))
+                .collect();
+            signatures.extend(
+                reproducer_signature
+                    .into_iter()
+                    .map(|signature| signature.into_record_signature(SignerClass::Reproducer)),
+            );
+            let report = stage_anchored_production_dory_v3_structural_abort_record(
+                &prefix,
+                expected_ceremony_id,
+                expected_last_valid_signed_record_digest,
+                &payload,
+                &roots,
+                &error_evidence,
+                signatures,
+                &record_output,
+            )
+            .context("failed to verify and stage the signed structural-abort record")?;
+            let identity = report.record_file();
+            println!("outcome record_staged");
+            println!("signed_abort_record {}", report.output().display());
+            println!("record_bytes {}", identity.bytes);
+            println!("record_blake3 {}", hex::encode(identity.blake3));
+            println!("record_sha256 {}", hex::encode(identity.sha256));
+            println!(
+                "record_content_digest {}",
+                hex::encode(report.record_content_digest())
+            );
+            println!(
+                "signed_record_digest {}",
+                hex::encode(report.signed_record_digest())
+            );
+            println!(
+                "abort_signature_message {}",
+                hex::encode(report.signature_message())
+            );
+            println!("signer_count {}", report.signer_count());
+            println!(
+                "subject_binding {}",
+                structural_abort_subject_binding_label(report.subject_binding())
+            );
+            println!("durability {:?}", report.durability());
+            println!("mirror_publication_pending true");
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelStructureAbortTranscriptStage {
+            reveal_set_prefix,
+            expected_ceremony_id,
+            expected_last_valid_signed_record_digest,
+            payload,
+            roots,
+            error_evidence,
+            signed_abort_record,
+            transcript_output,
+        } => {
+            let prefix = read_ceremony_transcript(&reveal_set_prefix, "reveal-set prefix")?;
+            let report = stage_anchored_production_dory_v3_structural_abort_transcript(
+                &prefix,
+                expected_ceremony_id,
+                expected_last_valid_signed_record_digest,
+                &payload,
+                &roots,
+                &error_evidence,
+                &signed_abort_record,
+                &transcript_output,
+            )
+            .context("failed to stage the terminal structural-abort transcript")?;
+            let transcript = report.transcript_file();
+            let record = report.record_file();
+            println!("outcome transcript_staged");
+            println!("aborted_transcript {}", report.output().display());
+            println!("transcript_bytes {}", transcript.bytes);
+            println!("transcript_blake3 {}", hex::encode(transcript.blake3));
+            println!("transcript_sha256 {}", hex::encode(transcript.sha256));
+            println!(
+                "transcript_derive_key_digest {}",
+                hex::encode(report.transcript_derive_key_digest())
+            );
+            println!("record_bytes {}", record.bytes);
+            println!("record_blake3 {}", hex::encode(record.blake3));
+            println!("record_sha256 {}", hex::encode(record.sha256));
+            println!(
+                "subject_binding {}",
+                structural_abort_subject_binding_label(report.subject_binding())
+            );
+            println!("durability {:?}", report.durability());
+            println!("mirror_publication_pending true");
         }
         #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
         Command::BlsBlake3PreprocessingCommitment { scratch, output } => {
@@ -838,4 +1129,64 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn main() -> Result<()> {
+    // Clap's debug command graph exceeds the Windows main thread's 1 MiB stack.
+    std::thread::Builder::new()
+        .name("cmfd-consensus-cli".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_cli)
+        .context("failed to start the Windows CLI worker")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the Windows CLI worker panicked"))?
+}
+
+#[cfg(not(windows))]
+fn main() -> Result<()> {
+    run_cli()
+}
+
+#[cfg(all(test, feature = "dory-bls12-381-prototype"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_signature_parser_accepts_only_canonical_bip340_tuples() {
+        let signature_hex = "ab".repeat(64);
+        let parsed = parse_external_signature(&format!("17:{signature_hex}")).unwrap();
+        assert_eq!(parsed.signer_index, 17);
+        assert_eq!(parsed.signature, [0xab; 64]);
+        assert_eq!(
+            parse_external_signature(&format!("0:{signature_hex}"))
+                .unwrap()
+                .signer_index,
+            0
+        );
+        assert_eq!(
+            parse_external_signature(&format!("65535:{signature_hex}"))
+                .unwrap()
+                .signer_index,
+            u16::MAX
+        );
+
+        let invalid = [
+            signature_hex.clone(),
+            format!(":{signature_hex}"),
+            format!("01:{signature_hex}"),
+            format!("+1:{signature_hex}"),
+            format!("65536:{signature_hex}"),
+            format!("1:{}", "ab".repeat(63)),
+            format!("1:{}", "ab".repeat(65)),
+            format!("1:{}", "AB".repeat(64)),
+            format!("1:{signature_hex}:00"),
+        ];
+        for encoded in invalid {
+            assert!(
+                parse_external_signature(&encoded).is_err(),
+                "accepted noncanonical external signature tuple: {encoded}"
+            );
+        }
+    }
 }

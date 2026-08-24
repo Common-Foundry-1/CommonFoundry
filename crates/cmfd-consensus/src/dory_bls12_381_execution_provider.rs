@@ -5363,22 +5363,34 @@ mod tests {
             &fixture.setup,
         )
         .unwrap();
+        let raw_context = *context.raw_for_test();
         let mut writer =
-            BlsDoryExecutionAccumulatorArtifactWriter::create_new(scratch.path(), *context.raw())
+            BlsDoryExecutionAccumulatorArtifactWriter::create_new(scratch.path(), raw_context)
                 .unwrap();
-        writer
-            .write_column_chunk(BlsDoryExecutionAccumulatorColumn::Initialization, &[0; 4])
-            .unwrap();
-        for bank in 0..2 {
-            for layer in 0..2 {
-                writer
-                    .write_column_chunk(
-                        BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
-                        &[0; 4],
-                    )
-                    .unwrap();
+        let zero_chunk = vec![0; raw_context.authentication_chunk_cells()];
+        let chunks_per_column =
+            raw_context.cells_per_column() / raw_context.authentication_chunk_cells();
+        for _ in 0..chunks_per_column {
+            writer
+                .write_column_chunk(
+                    BlsDoryExecutionAccumulatorColumn::Initialization,
+                    &zero_chunk,
+                )
+                .unwrap();
+        }
+        for bank in 0..raw_context.banks() {
+            for layer in 0..raw_context.layers_per_bank() {
+                for _ in 0..chunks_per_column {
+                    writer
+                        .write_column_chunk(
+                            BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
+                            &zero_chunk,
+                        )
+                        .unwrap();
+                }
             }
         }
+        assert_eq!(scratch.entry_count(), 1);
         let error = finish_verified_dory_v3_execution(
             writer,
             context,

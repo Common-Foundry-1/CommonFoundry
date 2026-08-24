@@ -48,7 +48,7 @@ pub struct DoryV3ModelCommitmentRecordV2 {
 }
 
 impl DoryV3ModelCommitmentRecordV2 {
-    fn new(
+    pub(crate) fn new(
         manifest: ModelBankManifest,
         model_identity: DoryV3ModelIdentityV1,
     ) -> Result<Self, DoryV3ModelCommitmentRecordError> {

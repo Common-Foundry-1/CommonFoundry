@@ -12,6 +12,7 @@ use cmfd_consensus::{
     ModelBankManifest, ModelPcsIdentity,
     dory_bls12_381_model_commitment::derive_bls_dory_model_commitment_record,
     dory_bls12_381_prototype::deterministic_bls_dory_setup,
+    dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
 };
 
 #[derive(Debug, Parser)]
@@ -77,6 +78,19 @@ enum Command {
         /// New JSON record path; omit for stdout. Existing files are never overwritten.
         #[arg(long)]
         output: Option<std::path::PathBuf>,
+    },
+    /// Run the two-pass production Dory V3 Model Record V2 ceremony.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelRecordCeremony {
+        /// Canonical production model bank to authenticate independently twice.
+        #[arg(long)]
+        bank: std::path::PathBuf,
+        /// Separately trusted canonical production model-bank manifest JSON.
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        /// New canonical Record V2 JSON path. Existing files are never overwritten.
+        #[arg(long)]
+        output: std::path::PathBuf,
     },
     /// Derive the reproducible production BLAKE3 preprocessing-only BLS record.
     #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
@@ -198,6 +212,21 @@ fn main() -> Result<()> {
             } else {
                 print!("{}", String::from_utf8(encoded)?);
             }
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelRecordCeremony {
+            bank,
+            manifest,
+            output,
+        } => {
+            let manifest_reader = std::fs::File::open(&manifest)
+                .with_context(|| format!("failed to open {}", manifest.display()))?;
+            let trusted_manifest: ModelBankManifest = serde_json::from_reader(manifest_reader)
+                .with_context(|| format!("failed to parse {}", manifest.display()))?;
+            let report =
+                run_production_dory_v3_model_record_v2_ceremony(&bank, &trusted_manifest, &output)
+                    .context("production Dory V3 Model Record V2 ceremony failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
         Command::BlsBlake3PreprocessingCommitment { scratch, output } => {

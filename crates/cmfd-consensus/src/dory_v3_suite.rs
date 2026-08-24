@@ -121,9 +121,6 @@ pub const DORY_V3_REQUIRED_INTEGRATION_ASSERTIONS: &[&str] = &[
 /// The suite is a pinned migration target, not an activation signal.
 pub const DORY_V3_SUITE_ACTIVATION_READY: bool = false;
 pub const DORY_V3_SUITE_ACTIVATION_BLOCKERS: &[&str] = &[
-    "dedicated V3 challenge, mask, output, and work transcripts are not wired",
-    "shared layout V5 and fixed-model binding V2 are not implemented",
-    "algebraic binding V2 is not implemented",
     "the canonical production model bank ceremony has not been independently reproduced and its V2 record pinned",
     "the unchanged production n=33 proof has not passed the benchmark and review gates",
 ];
@@ -1695,11 +1692,16 @@ mod tests {
             assert!(!BLS_DORY_BLAKE3_PRODUCTION_READY);
             assert!(!DORY_V3_SUITE_ACTIVATION_READY);
         }
-        assert_eq!(DORY_V3_SUITE_ACTIVATION_BLOCKERS.len(), 5);
+        assert_eq!(DORY_V3_SUITE_ACTIVATION_BLOCKERS.len(), 2);
         assert!(
             DORY_V3_SUITE_ACTIVATION_BLOCKERS
                 .iter()
                 .any(|blocker| blocker.contains("model bank ceremony"))
+        );
+        assert!(
+            DORY_V3_SUITE_ACTIVATION_BLOCKERS
+                .iter()
+                .any(|blocker| blocker.contains("n=33 proof"))
         );
     }
 

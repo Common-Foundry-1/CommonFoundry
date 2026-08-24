@@ -20,6 +20,10 @@ use crate::{
     BlockChallenge, ForgeMatrixV3CandidateProof,
     dory_bls12_381_aggregate::BlsDoryAggregateError,
     dory_bls12_381_blake3::prepare_production_dory_v3_native_blake3_opening,
+    dory_bls12_381_candidate::{
+        BlsDoryV3CandidateError, BlsDoryV3CandidatePayload,
+        validate_dory_v3_layout_v5_record_setup_binding,
+    },
     dory_bls12_381_execution_artifact::{
         BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
         BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorArtifactError,
@@ -57,6 +61,7 @@ use crate::{
         VerifiedModelBankLayoutReceipt, VerifiedModelBankReceipt,
         verify_model_bank_into_staged_field_layout_sink, verify_model_bank_into_staged_field_sink,
     },
+    structured_proof::StructuredForgeMatrixResearchShape,
     structured_transition::{
         StructuredMaskPolynomial, StructuredTransitionError, StructuredTransitionStatement,
     },
@@ -968,6 +973,73 @@ pub(crate) fn finish_prepared_bls_dory_v3_layout_v5_execution_with_composition(
         work_digest: final_activation.work_digest,
         proof,
         encoded_native_proof,
+    })
+}
+
+/// Consume one opaque composed V3/Layout V5 execution and seal its exact proof
+/// pair into the existing CP02 candidate envelope. All public fields are
+/// rederived from the same Record V2, block, and setup authority before the
+/// private proof values are released as candidate bytes.
+#[allow(dead_code)]
+pub(crate) fn seal_composed_bls_dory_v3_layout_v5_candidate(
+    execution: ComposedBlsDoryV3LayoutV5Execution,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+    validate_dory_v3_layout_v5_record_setup_binding(authenticated, setup)?;
+    authenticated.record().validate_production(setup)?;
+    let transcript =
+        DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
+    let context =
+        BlsDorySharedLayoutV5Context::from_bank_authenticated_record(authenticated, setup)?;
+    seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+        execution, transcript, block, &context,
+    )
+}
+
+fn seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+    execution: ComposedBlsDoryV3LayoutV5Execution,
+    transcript: DoryV3TranscriptContext,
+    block: &BlockChallenge,
+    expected_context: &BlsDorySharedLayoutV5Context,
+) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+    execution.proof.validate_context(expected_context)?;
+    let expected_challenge = transcript.challenge_context(block, execution.nonce)?;
+    if execution.challenge != expected_challenge {
+        return Err(BlsDoryV3CandidateError::ChallengeDigest);
+    }
+    if execution.work_digest != expected_challenge.work_digest(execution.final_activation_digest) {
+        return Err(BlsDoryV3CandidateError::WorkDigest);
+    }
+    if execution.work_digest > block.target {
+        return Err(BlsDoryV3CandidateError::HighHash);
+    }
+    let shape = StructuredForgeMatrixResearchShape::production_candidate();
+    let transition_statements = [
+        shape.initialization_statement,
+        shape.transition_statements[0],
+        shape.transition_statements[1],
+        shape.transition_statements[2],
+    ];
+    let dory_proof = execution.proof.encode(
+        &shape.matrix_statements,
+        &transition_statements,
+        shape.wiring_statement,
+    )?;
+    Ok(ForgeMatrixV3CandidateProof {
+        algorithm_version: DORY_V3_ALGORITHM_VERSION,
+        proof_version: DORY_V3_PROOF_VERSION,
+        nonce: execution.nonce,
+        model_manifest_digest: transcript.manifest_digest().into_bytes(),
+        challenge_digest: expected_challenge.digest(),
+        final_activation_digest: execution.final_activation_digest,
+        work_digest: execution.work_digest,
+        structured_proof: BlsDoryV3CandidatePayload {
+            dory_proof,
+            native_blake3_proof: execution.encoded_native_proof,
+        }
+        .encode()?,
     })
 }
 
@@ -2310,7 +2382,7 @@ mod tests {
         dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt, deterministic_bls_dory_setup},
         dory_v3_model::{CanonicalBlsDoryGtHex, DoryV3ModelIdentityV1},
         dory_v3_model_record::{
-            BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            BankAuthenticatedDoryV3ModelCommitmentRecordV2, DoryV3ModelCommitmentRecordError,
             derive_bank_authenticated_dory_v3_model_commitment_record_v2_for_test,
         },
         dory_v3_suite::{DORY_V3_MODEL_IDENTITY_VERSION, DORY_V3_PRODUCTION_SUITE_DIGEST},
@@ -2322,7 +2394,14 @@ mod tests {
         StructuredMatrixStatement, StructuredSumcheckError, StructuredTransitionWitness,
         StructuredWiringStatement,
         dory_bls12_381_aggregate::commit_bls_dory_padded_prefix_with_optional_scratch,
-        dory_bls12_381_layout::prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch,
+        dory_bls12_381_candidate::{
+            decode_dory_v3_layout_v5_candidate_payload,
+            validate_dory_v3_layout_v5_candidate_statement_for_test,
+        },
+        dory_bls12_381_layout::{
+            bls_dory_shared_layout_v5_candidate_codec_fixture_for_test,
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch,
+        },
         dory_bls12_381_logup::{
             BlsDoryRangeLogUpError,
             prove_bls_dory_range_logup_deferred_with_precommitted_transition_and_scratch,
@@ -4633,6 +4712,239 @@ mod tests {
 
         drop(prepared_model);
         assert_eq!(fixed_scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_layout_v5_candidate_public_authority_rejects_every_substitution() {
+        let fixture = dory_v3_replay_fixture(0);
+        let challenge = fixture
+            .transcript
+            .challenge_context(&fixture.block, fixture.claim.nonce)
+            .unwrap();
+        let (v5_context, v5_proof) =
+            bls_dory_shared_layout_v5_candidate_codec_fixture_for_test(0x71);
+        let composed = |challenge, work_digest, proof: BlsDorySharedLayoutV5Proof| {
+            ComposedBlsDoryV3LayoutV5Execution {
+                challenge,
+                nonce: fixture.claim.nonce,
+                final_activation_digest: fixture.claim.final_activation_digest,
+                work_digest,
+                proof,
+                encoded_native_proof: vec![0xa6, 0xa7, 0xa8],
+            }
+        };
+        let proof = seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+            composed(challenge, fixture.claim.work_digest, v5_proof.clone()),
+            fixture.transcript,
+            &fixture.block,
+            &v5_context,
+        )
+        .unwrap();
+        assert_eq!(proof.algorithm_version, DORY_V3_ALGORITHM_VERSION);
+        assert_eq!(proof.proof_version, DORY_V3_PROOF_VERSION);
+        assert_eq!(
+            proof.model_manifest_digest,
+            fixture.transcript.manifest_digest().into_bytes()
+        );
+        assert_eq!(proof.challenge_digest, challenge.digest());
+        let (decoded_v5_proof, decoded_payload) =
+            decode_dory_v3_layout_v5_candidate_payload(&proof.structured_proof, &v5_context)
+                .unwrap();
+        assert_eq!(decoded_v5_proof, v5_proof);
+        assert_eq!(decoded_payload.native_blake3_proof, vec![0xa6, 0xa7, 0xa8]);
+        assert_eq!(decoded_payload.encode().unwrap(), proof.structured_proof);
+        validate_dory_v3_layout_v5_candidate_statement_for_test(
+            fixture.block.network_id,
+            &fixture.authenticated,
+            &fixture.block,
+            &proof,
+            &fixture.setup,
+        )
+        .unwrap();
+
+        let mut wrong_network = fixture.block;
+        wrong_network.network_id[0] ^= 1;
+        assert!(matches!(
+            validate_dory_v3_layout_v5_candidate_statement_for_test(
+                fixture.block.network_id,
+                &fixture.authenticated,
+                &wrong_network,
+                &proof,
+                &fixture.setup,
+            ),
+            Err(BlsDoryV3CandidateError::WrongNetwork)
+        ));
+        let mut substituted_block = fixture.block;
+        substituted_block.timestamp += 1;
+        assert!(matches!(
+            validate_dory_v3_layout_v5_candidate_statement_for_test(
+                fixture.block.network_id,
+                &fixture.authenticated,
+                &substituted_block,
+                &proof,
+                &fixture.setup,
+            ),
+            Err(BlsDoryV3CandidateError::ChallengeDigest)
+        ));
+        let mutations: [fn(&mut ForgeMatrixV3CandidateProof); 8] = [
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.algorithm_version ^= 1,
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.proof_version ^= 1,
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.nonce ^= 1,
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.model_manifest_digest[0] ^= 1,
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.challenge_digest[0] ^= 1,
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.final_activation_digest[0] ^= 1,
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.work_digest[0] ^= 1,
+            |candidate: &mut ForgeMatrixV3CandidateProof| candidate.structured_proof.clear(),
+        ];
+        for mutate in mutations {
+            let mut substituted = proof.clone();
+            mutate(&mut substituted);
+            assert!(
+                validate_dory_v3_layout_v5_candidate_statement_for_test(
+                    fixture.block.network_id,
+                    &fixture.authenticated,
+                    &fixture.block,
+                    &substituted,
+                    &fixture.setup,
+                )
+                .is_err()
+            );
+        }
+
+        let substituted_record = dory_v3_replay_fixture(1);
+        assert!(
+            validate_dory_v3_layout_v5_candidate_statement_for_test(
+                fixture.block.network_id,
+                &substituted_record.authenticated,
+                &fixture.block,
+                &proof,
+                &fixture.setup,
+            )
+            .is_err()
+        );
+
+        let substituted_setup = deterministic_bls_dory_setup(DORY_V3_TEST_VARIABLES + 1).unwrap();
+        assert!(matches!(
+            validate_dory_v3_layout_v5_candidate_statement_for_test(
+                fixture.block.network_id,
+                &fixture.authenticated,
+                &fixture.block,
+                &proof,
+                &substituted_setup,
+            ),
+            Err(BlsDoryV3CandidateError::DoryV3Record(
+                DoryV3ModelCommitmentRecordError::SetupIdentityMismatch
+            ))
+        ));
+
+        let substituted_challenge = fixture
+            .transcript
+            .challenge_context(&fixture.block, fixture.claim.nonce + 1)
+            .unwrap();
+        assert!(matches!(
+            seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+                composed(
+                    substituted_challenge,
+                    fixture.claim.work_digest,
+                    v5_proof.clone()
+                ),
+                fixture.transcript,
+                &fixture.block,
+                &v5_context,
+            ),
+            Err(BlsDoryV3CandidateError::ChallengeDigest)
+        ));
+        let mut substituted_work = fixture.claim.work_digest;
+        substituted_work[0] ^= 1;
+        assert!(matches!(
+            seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+                composed(challenge, substituted_work, v5_proof.clone()),
+                fixture.transcript,
+                &fixture.block,
+                &v5_context,
+            ),
+            Err(BlsDoryV3CandidateError::WorkDigest)
+        ));
+        assert!(matches!(
+            seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+                composed(challenge, fixture.claim.work_digest, v5_proof.clone()),
+                fixture.transcript,
+                &substituted_block,
+                &v5_context,
+            ),
+            Err(BlsDoryV3CandidateError::ChallengeDigest)
+        ));
+
+        let (substituted_context, _) =
+            bls_dory_shared_layout_v5_candidate_codec_fixture_for_test(0x72);
+        assert!(matches!(
+            seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+                composed(challenge, fixture.claim.work_digest, v5_proof.clone()),
+                fixture.transcript,
+                &fixture.block,
+                &substituted_context,
+            ),
+            Err(BlsDoryV3CandidateError::Dory(
+                BlsDorySharedLayoutError::V3Context
+            ))
+        ));
+
+        assert!(matches!(
+            seal_composed_bls_dory_v3_layout_v5_candidate(
+                composed(challenge, fixture.claim.work_digest, v5_proof.clone()),
+                &fixture.authenticated,
+                &fixture.block,
+                &fixture.setup,
+            ),
+            Err(BlsDoryV3CandidateError::DoryV3Record(_))
+        ));
+        assert!(matches!(
+            seal_composed_bls_dory_v3_layout_v5_candidate(
+                composed(challenge, fixture.claim.work_digest, v5_proof.clone()),
+                &fixture.authenticated,
+                &fixture.block,
+                &substituted_setup,
+            ),
+            Err(BlsDoryV3CandidateError::DoryV3Record(
+                DoryV3ModelCommitmentRecordError::SetupIdentityMismatch
+            ))
+        ));
+
+        let mut low_target_block = fixture.block;
+        low_target_block.target = [0; 32];
+        let low_target_challenge = fixture
+            .transcript
+            .challenge_context(&low_target_block, fixture.claim.nonce)
+            .unwrap();
+        let low_target_work =
+            low_target_challenge.work_digest(fixture.claim.final_activation_digest);
+        assert_ne!(low_target_work, [0; 32]);
+        assert!(matches!(
+            seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
+                composed(low_target_challenge, low_target_work, v5_proof),
+                fixture.transcript,
+                &low_target_block,
+                &v5_context,
+            ),
+            Err(BlsDoryV3CandidateError::HighHash)
+        ));
+
+        let mut trailing = proof.clone();
+        trailing.structured_proof.push(0);
+        assert!(matches!(
+            decode_dory_v3_layout_v5_candidate_payload(&trailing.structured_proof, &v5_context),
+            Err(BlsDoryV3CandidateError::Payload)
+        ));
+
+        type SealEntry = fn(
+            ComposedBlsDoryV3LayoutV5Execution,
+            &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            &BlockChallenge,
+            &DeterministicBlsDorySetup,
+        )
+            -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError>;
+        let seal: SealEntry = seal_composed_bls_dory_v3_layout_v5_candidate;
+        let _ = seal;
     }
 
     #[test]

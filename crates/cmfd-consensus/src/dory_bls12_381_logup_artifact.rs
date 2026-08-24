@@ -19,7 +19,12 @@ use dory_pcs::primitives::{
 use same_file::Handle;
 use thiserror::Error;
 
-use crate::dory_bls12_381_prototype::BlsDoryFr;
+use crate::{
+    dory_bls12_381_prototype::BlsDoryFr,
+    dory_scratch_telemetry::{
+        register_scratch_artifact_reservation, release_scratch_artifact_reservation,
+    },
+};
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSL1";
 const ARTIFACT_VERSION: u16 = 1;
@@ -155,23 +160,29 @@ impl BlsDoryLogUpArtifactWriter {
             spec.generation,
             std::process::id(),
         ));
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&path)?;
         let header = spec.encode()?;
-        file.write_all(&header)?;
-        let mut hasher = blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN);
-        hasher.update(&header);
-        Ok(Self {
+        let reserved_logical_bytes = artifact_file_bytes(spec)?;
+        if let Err(error) = register_scratch_artifact_reservation(&path, reserved_logical_bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
             spec,
-            hasher,
+            hasher: blake3::Hasher::new_derive_key(ARTIFACT_HASH_DOMAIN),
             written_regular: 0,
             written_range: 0,
-        })
+        };
+        writer.file_mut()?.write_all(&header)?;
+        writer.hasher.update(&header);
+        Ok(writer)
     }
 
     pub fn write_regular_scalars(
@@ -420,8 +431,8 @@ fn remove_if_owned(path: &Path, file: &File) {
     let Ok(live) = Handle::from_path(path) else {
         return;
     };
-    if held == live {
-        let _ = std::fs::remove_file(path);
+    if held == live && std::fs::remove_file(path).is_ok() {
+        release_scratch_artifact_reservation(path);
     }
 }
 

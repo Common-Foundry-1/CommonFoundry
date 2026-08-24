@@ -46,6 +46,7 @@ use crate::{
         prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch,
     },
     dory_bls12_381_prototype::{BlsDoryPrototypeError, deterministic_bls_dory_setup},
+    dory_scratch_telemetry::ExactScratchReservationSession,
     dory_v3_model::DoryV3ModelIdentityError,
     dory_v3_model_record::{
         DoryV3ModelCommitmentRecordError, DoryV3ModelCommitmentRecordV2,
@@ -56,7 +57,7 @@ use crate::{
     wire::{WireError, decode_forgematrix_proof, encode_forgematrix_proof},
 };
 
-const QUALIFICATION_REPORT_VERSION: u16 = 1;
+const QUALIFICATION_REPORT_VERSION: u16 = 2;
 const SCRATCH_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const QUALIFICATION_REQUEST_DIGEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/QUALIFICATION-REQUEST/V1";
 
@@ -82,9 +83,12 @@ pub struct ProductionDoryV3QualificationRequest {
 /// Exact measurements retained after one successful qualification run.
 ///
 /// Artifact byte counts are exact and timings are wall-clock nanoseconds around
-/// the named stage. Peak RSS is the OS process-lifetime high-water mark. Peak
-/// scratch is only a sampled logical-byte lower bound; the report explicitly
-/// records that exact writer-level peak scratch is not instrumented.
+/// the named stage. Peak RSS is the OS process-lifetime high-water mark. The
+/// sampled scratch fields remain a whole-directory lower bound. The exact
+/// reservation fields account for declared final logical-byte reservations
+/// across the six instrumented Dory artifact writer classes used by this
+/// runner. They do not establish an exact whole-directory peak and are not
+/// physical disk allocation, filesystem metadata, or RAM measurements.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProductionDoryV3QualificationReport {
     pub report_version: u16,
@@ -122,7 +126,12 @@ pub struct ProductionDoryV3QualificationReport {
     pub sampled_peak_scratch_entries_lower_bound: u64,
     pub sampled_peak_scratch_logical_bytes_lower_bound: u64,
     pub scratch_sample_interval_milliseconds: u64,
+    pub exact_peak_instrumented_scratch_reserved_logical_bytes: u64,
+    pub exact_peak_instrumented_scratch_live_artifacts: u64,
+    pub instrumented_scratch_reservation_events: u64,
     pub exact_peak_scratch_instrumented: bool,
+    pub exact_reservation_peak_instrumented: bool,
+    pub exact_reservation_peak_scope: &'static str,
     pub retained_scratch_entries: u64,
     pub retained_scratch_logical_bytes: u64,
     pub whole_process_peak_rss_bytes: u64,
@@ -237,6 +246,8 @@ pub enum ProductionDoryV3QualificationError {
     SizeOverflow,
     #[error("scratch high-water observer thread panicked")]
     ScratchObserverPanicked,
+    #[error("exact scratch reservation instrumentation failed: {0}")]
+    ScratchInstrumentation(#[source] io::Error),
     #[error("failed to create new output {path}: {source}")]
     CreateOutput {
         path: PathBuf,
@@ -329,6 +340,8 @@ pub fn run_production_dory_v3_qualification(
     )?;
 
     let mut scratch = OwnedScratchDirectory::create(paths.scratch.clone())?;
+    let mut exact_scratch = ExactScratchReservationSession::start(scratch.path())
+        .map_err(ProductionDoryV3QualificationError::ScratchInstrumentation)?;
     let mut scratch_observer = ScratchHighWaterObserver::start(scratch.path().to_path_buf());
 
     let setup_started = Instant::now();
@@ -452,6 +465,19 @@ pub fn run_production_dory_v3_qualification(
             logical_bytes: retained_scratch_logical_bytes,
         });
     }
+    let exact_scratch_reservations = exact_scratch
+        .finish()
+        .map_err(ProductionDoryV3QualificationError::ScratchInstrumentation)?;
+    if exact_scratch_reservations.reservation_events == 0
+        || scratch_high_water.entries > exact_scratch_reservations.peak_live_artifacts
+        || scratch_high_water.logical_bytes > exact_scratch_reservations.peak_reserved_logical_bytes
+    {
+        return Err(ProductionDoryV3QualificationError::ScratchInstrumentation(
+            io::Error::other(
+                "scratch reservation instrumentation was empty or its peak was below a sampled scratch observation",
+            ),
+        ));
+    }
     scratch.remove_empty()?;
     let scratch_cleanup_nanoseconds = elapsed_nanoseconds(scratch_cleanup_started)?;
     check_cancel(cancel)?;
@@ -542,7 +568,14 @@ pub fn run_production_dory_v3_qualification(
         sampled_peak_scratch_logical_bytes_lower_bound: scratch_high_water.logical_bytes,
         scratch_sample_interval_milliseconds: u64::try_from(SCRATCH_SAMPLE_INTERVAL.as_millis())
             .map_err(|_| ProductionDoryV3QualificationError::DurationOverflow)?,
+        exact_peak_instrumented_scratch_reserved_logical_bytes: exact_scratch_reservations
+            .peak_reserved_logical_bytes,
+        exact_peak_instrumented_scratch_live_artifacts: exact_scratch_reservations
+            .peak_live_artifacts,
+        instrumented_scratch_reservation_events: exact_scratch_reservations.reservation_events,
         exact_peak_scratch_instrumented: false,
+        exact_reservation_peak_instrumented: true,
+        exact_reservation_peak_scope: "exact high-water mark of declared final logical-byte reservations for the six instrumented Dory scratch artifact writer classes used by this runner; the sampled comparison is only a consistency check and does not prove an exact whole-directory peak or exclude uninstrumented transient files; excludes filesystem allocation granularity, metadata, physical bytes, and RAM",
         retained_scratch_entries,
         retained_scratch_logical_bytes,
         whole_process_peak_rss_bytes,

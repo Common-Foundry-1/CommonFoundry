@@ -16,6 +16,10 @@ use std::{
 use same_file::Handle;
 use thiserror::Error;
 
+use crate::dory_scratch_telemetry::{
+    register_scratch_artifact_reservation, release_scratch_artifact_reservation,
+};
+
 const MAGIC: [u8; 8] = *b"CFDBLST1";
 const VERSION: u16 = 1;
 const HEADER_BYTES: u64 = 72;
@@ -101,6 +105,11 @@ impl BlsDoryWordTransposeWriter {
             .read(true)
             .write(true)
             .open(&path)?;
+        if let Err(error) = register_scratch_artifact_reservation(&path, geometry.total_bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
         let mut writer = Self {
             path: Some(path),
             file,
@@ -625,8 +634,8 @@ fn remove_if_owned(path: &Path, file: &File) {
     let Ok(live) = Handle::from_path(path) else {
         return;
     };
-    if held == live {
-        let _ = std::fs::remove_file(path);
+    if held == live && std::fs::remove_file(path).is_ok() {
+        release_scratch_artifact_reservation(path);
     }
 }
 

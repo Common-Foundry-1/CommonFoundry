@@ -17,7 +17,12 @@ use dory_pcs::primitives::{DorySerialize, arithmetic::Field};
 use same_file::Handle;
 use thiserror::Error;
 
-use crate::dory_bls12_381_prototype::BlsDoryFr;
+use crate::{
+    dory_bls12_381_prototype::BlsDoryFr,
+    dory_scratch_telemetry::{
+        register_scratch_artifact_reservation, release_scratch_artifact_reservation,
+    },
+};
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSC1";
 const ARTIFACT_VERSION: u16 = 4;
@@ -214,11 +219,17 @@ impl BlsDoryCompactArtifactWriter {
             "cmfd-dory-compact-{context}-{}-{nonce}.tmp",
             std::process::id(),
         ));
+        let reserved_logical_bytes = artifact_file_bytes(spec, dictionary.len())?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&path)?;
+        if let Err(error) = register_scratch_artifact_reservation(&path, reserved_logical_bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
         let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
@@ -491,6 +502,16 @@ impl BlsDoryGroupedCompactArtifactWriter {
             return Err(BlsDoryCompactArtifactError::InvalidSpec);
         }
 
+        let mut expected_word_hashes = Vec::new();
+        expected_word_hashes
+            .try_reserve_exact(word_selectors)
+            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+        expected_word_hashes.resize_with(word_selectors, blake3::Hasher::new);
+        let mut expected_code_hashes = Vec::new();
+        expected_code_hashes
+            .try_reserve_exact(code_selectors)
+            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
+        expected_code_hashes.resize_with(code_selectors, blake3::Hasher::new);
         let nonce = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
         let context = hex::encode(&spec.context_digest[..8]);
         let path = scratch_directory.join(format!(
@@ -502,16 +523,11 @@ impl BlsDoryGroupedCompactArtifactWriter {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let mut expected_word_hashes = Vec::new();
-        expected_word_hashes
-            .try_reserve_exact(word_selectors)
-            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
-        expected_word_hashes.resize_with(word_selectors, blake3::Hasher::new);
-        let mut expected_code_hashes = Vec::new();
-        expected_code_hashes
-            .try_reserve_exact(code_selectors)
-            .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?;
-        expected_code_hashes.resize_with(code_selectors, blake3::Hasher::new);
+        if let Err(error) = register_scratch_artifact_reservation(&path, expected_len) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
         let mut writer = Self {
             path: Some(path),
             file: Some(file),
@@ -1421,8 +1437,8 @@ fn remove_if_owned(path: &Path, file: &File) {
     let Ok(live) = Handle::from_path(path) else {
         return;
     };
-    if held == live {
-        let _ = std::fs::remove_file(path);
+    if held == live && std::fs::remove_file(path).is_ok() {
+        release_scratch_artifact_reservation(path);
     }
 }
 

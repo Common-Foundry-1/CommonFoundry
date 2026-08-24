@@ -45,6 +45,8 @@ mod dory_field_portability;
 #[cfg(feature = "dory-opening-prototype")]
 pub mod dory_opening_prototype;
 #[cfg(feature = "dory-bls12-381-prototype")]
+mod dory_scratch_telemetry;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_ceremony;

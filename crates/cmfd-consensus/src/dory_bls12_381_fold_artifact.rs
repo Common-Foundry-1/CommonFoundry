@@ -17,7 +17,12 @@ use dory_pcs::primitives::{
 use same_file::Handle;
 use thiserror::Error;
 
-use crate::dory_bls12_381_prototype::BlsDoryFr;
+use crate::{
+    dory_bls12_381_prototype::BlsDoryFr,
+    dory_scratch_telemetry::{
+        register_scratch_artifact_reservation, release_scratch_artifact_reservation,
+    },
+};
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSF2";
 const ARTIFACT_VERSION: u16 = 2;
@@ -119,11 +124,17 @@ impl BlsDoryFoldArtifactWriter {
             std::process::id(),
         ));
         let header = spec.encode()?;
+        let reserved_logical_bytes = spec.encoded_bytes()?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&path)?;
+        if let Err(error) = register_scratch_artifact_reservation(&path, reserved_logical_bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
         let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
@@ -344,8 +355,8 @@ fn remove_if_owned(path: &Path, file: &File) {
     let Ok(live) = Handle::from_path(path) else {
         return;
     };
-    if held == live {
-        let _ = std::fs::remove_file(path);
+    if held == live && std::fs::remove_file(path).is_ok() {
+        release_scratch_artifact_reservation(path);
     }
 }
 

@@ -5,6 +5,8 @@ set -euo pipefail
 # Leave GPU_INDEXES empty to use every supported GPU.
 LOCAL_PEER="127.0.0.1:18444"
 BOOTSTRAP_PEER="107.214.187.2:18444"
+# Use auto for NVIDIA, or opencl for Intel Arc.
+GPU_BACKEND="auto"
 GPU_INDEXES=""
 # PAYOUT_ADDRESS is your wallet's 64-character receive address.
 PAYOUT_ADDRESS=""
@@ -32,4 +34,5 @@ if [[ -n "$GPU_INDEXES" ]]; then
     ARGS+=(--device "$DEVICE")
   done
 fi
+export CMFD_GPU_BACKEND="$GPU_BACKEND"
 exec "$SCRIPT_DIR/cmfd-miner" "${ARGS[@]}"

@@ -35,7 +35,7 @@ This paper uses the following labels as protocol terms:
 | **Production proposal** | Specified research design that is not accepted by current consensus and must not be represented as deployed. |
 | **Activation gate** | A measurable requirement that must be met before a production profile can be enabled. |
 
-This revision describes the `v0.1.0-devnet.11` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
+This revision describes the `v0.1.0-devnet.13` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
 
 This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the unresolved work. It does not offer CMFD for sale, promise financial returns, or assert that the current network is safe for real value.
 
@@ -1374,7 +1374,7 @@ The funding output contains the exact deposit and a `channel_id` commitment. Ful
 7. Bitcoin Improvement Proposal 340, *Schnorr Signatures for secp256k1*. https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
 8. BLAKE3 team, *BLAKE3 Specification*. https://github.com/BLAKE3-team/BLAKE3-specs
 9. Srinath Setty, *Nova: Recursive Zero-Knowledge Arguments from Folding Schemes*, 2021. https://eprint.iacr.org/2021/370.pdf
-10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.11`; the annotated Git tag identifies the exact source commit.
+10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.13`; the annotated Git tag identifies the exact source commit.
 
 ## Appendix F. Non-claims
 

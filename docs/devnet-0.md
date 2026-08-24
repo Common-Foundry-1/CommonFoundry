@@ -157,8 +157,11 @@ hardware-wallet integration, or production custody; never send either real
 value.
 
 The packaged wallet can also connect its embedded node to static P2P peers.
-Private addresses work by default; numeric public peers require the explicit
-`--allow-public-peers` test-only option. See
+Open **Network -> Configured peers** to add a numeric peer IP, remove a peer, or
+restore the community bootstrap. A missing port defaults to `18444`; changes
+apply immediately and persist across wallet restarts. Command-line operators
+can still supply repeatable `--peer` values; numeric public command-line peers
+require the explicit `--allow-public-peers` option. See
 [../apps/wallet/src-tauri/README.md](../apps/wallet/src-tauri/README.md) for the
 exact Windows and Linux command-line options.
 

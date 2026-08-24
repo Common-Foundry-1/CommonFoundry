@@ -1,6 +1,8 @@
 fn main() {
     const COMMANDS: &[&str] = &[
         "get_node_status",
+        "get_peer_settings",
+        "update_peer_settings",
         "get_wallet_snapshot",
         "get_mempool_snapshot",
         "send_wallet_transaction",

@@ -11,6 +11,8 @@ describe("Tauri node transport", () => {
     await transport.getNodeStatus();
     await transport.getWalletSnapshot();
     await transport.getMempool();
+    await transport.getPeerSettings();
+    await transport.updatePeerSettings(["192.168.1.20:18444"]);
     await transport.sendWalletTransaction({ recipient: "11".repeat(32), amount: "1", fee: "0.00000001" });
     await transport.consolidateWallet({ fee: "0.00000001", max_inputs: 12 });
     await transport.mineDevnetBlock("22".repeat(32), 50);
@@ -19,6 +21,8 @@ describe("Tauri node transport", () => {
       ["get_node_status", undefined],
       ["get_wallet_snapshot", undefined],
       ["get_mempool_snapshot", undefined],
+      ["get_peer_settings", undefined],
+      ["update_peer_settings", { request: { peers: ["192.168.1.20:18444"] } }],
       ["send_wallet_transaction", { request: { recipient: "11".repeat(32), amount: "1", fee: "0.00000001" } }],
       ["consolidate_wallet", { request: { fee: "0.00000001", max_inputs: 12 } }],
       ["mine_devnet_block", { request: { miner: "22".repeat(32), attempts: 50 } }],

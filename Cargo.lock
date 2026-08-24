@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-cuda"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.13"
 dependencies = [
  "cmfd-consensus",
  "libloading 0.8.9",
@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-miner"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-node"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.13"
 dependencies = [
  "blake3",
  "clap",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-proof-accel"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.13"
 dependencies = [
  "blake3",
  "fs2",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-proof-worker"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.13"
 dependencies = [
  "blake3",
  "cmfd-consensus",
@@ -1035,13 +1035,14 @@ dependencies = [
 
 [[package]]
 name = "common-foundry-wallet"
-version = "0.1.0-devnet.11"
+version = "0.1.0-devnet.13"
 dependencies = [
  "cmfd-consensus",
  "cmfd-cuda",
  "cmfd-node",
  "hex",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",

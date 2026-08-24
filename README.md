@@ -390,11 +390,11 @@ strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
 
 The community Devnet bootstrap is currently `107.214.187.2:18444`. Testers can
-join it by starting the wallet with
-`--allow-public-peers --peer 107.214.187.2:18444`. This is a best-effort testing
-endpoint rather than automatic discovery; node RPC remains local and is not
-published. Operators can also run a private direct-IP topology as documented
-in [docs/devnet-0.md](docs/devnet-0.md).
+join it by double-clicking the wallet; it is the default outbound peer. The
+wallet's **Network -> Configured peers** panel can add or remove numeric peers
+without a restart. This is a best-effort bootstrap rather than automatic peer
+discovery; node RPC remains local and is not published. Operators can also run
+a private direct-IP topology as documented in [docs/devnet-0.md](docs/devnet-0.md).
 
 ### Local Devnet wallet
 

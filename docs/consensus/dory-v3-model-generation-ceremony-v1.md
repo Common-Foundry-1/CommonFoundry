@@ -769,11 +769,18 @@ and retained filesystem identity; even two reproducers using byte-identical
 reference binaries must provide distinct physical files. The independently
 opened bank-chain validator must retain the same bank filesystem identity as
 the final-candidate validator's pre-opened guard. The production entry point
-additionally requires an opaque CMFDIL lineage capability covering every report
+additionally requires an opaque CMFDIL lineage aggregate covering every report
 that declares itself independent and proving that at least one such
-implementation exists. No production constructor for that capability exists
-yet, so this checkpoint cannot currently feed type-6 authoring; the report's
-implementation-kind byte alone is explicitly insufficient.
+implementation exists. Its public constructor accepts the complete ordered
+reproducer-report roster plus the consumed CMFDIL capabilities in exact
+Independent-subset order. It rejects a missing, extra, reordered, wrong-roster,
+wrong-ceremony, or wrong-type-5 report/capability binding and retains both each
+exact CMFDRP content identity and the real CMFDIL capability. Reference reports
+consume no CMFDIL capability. The report's implementation-kind byte alone is
+explicitly insufficient. The final-candidate validator reauthenticates all
+retained lineage evidence immediately before expensive payload validation and
+again in the final guard before the bank-last check; aggregate rechecks preserve
+the same bank-last ordering. This checkpoint still does not author type 6.
 
 The keyless authoring API derives ceremony, source, closure, ordered-input,
 combined-output, and frozen-suite fields from verified capabilities, then

@@ -1,9 +1,9 @@
 //! Exact-roster retained validation for one production Dory V3 final candidate.
 //!
-//! This module deliberately stops before type-6 authoring. The production
-//! entry point requires an opaque independent-lineage capability for which no
-//! production constructor exists yet. A self-declared `Independent` report is
-//! therefore never sufficient to mint this aggregate or activation authority.
+//! This module deliberately stops before type-6 authoring. A self-declared
+//! `Independent` report is never sufficient to mint this aggregate or
+//! activation authority: every such report must carry its exact retained
+//! CMFDIL capability.
 
 use std::{
     io::{Read, Seek, SeekFrom},
@@ -22,11 +22,14 @@ use crate::{
     },
     dory_v3_model_ceremony_fs::{AuthenticatedInput, CeremonyFsError, TrustedCeremonyParent},
     dory_v3_model_ceremony_transcript::{
-        FileIdentity, PRODUCTION_BANK_BYTES, VerifiedCeremonyTranscript,
+        CeremonyTranscriptError, FileIdentity, PRODUCTION_BANK_BYTES, VerifiedCeremonyTranscript,
     },
     dory_v3_model_combiner::{
         ProductionDoryV3ModelCombinerError, ValidatedProductionDoryV3ModelCombinedPayload,
         validate_existing_production_dory_v3_model_combined_payload,
+    },
+    dory_v3_model_independent_lineage::{
+        ProductionDoryV3IndependentLineageError, VerifiedIndependentLineage,
     },
     dory_v3_model_reproduction::{
         ContextVerifiedProductionDoryV3ModelReproductionReport,
@@ -78,20 +81,17 @@ pub struct ProductionDoryV3ModelReproducerCandidatePaths<'a> {
     pub implementation_lineage_report: &'a Path,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedIndependentLineageBinding {
-    reproducer_index: u16,
     reproduction_report: FileIdentity,
-    implementation_lineage_report: FileIdentity,
-    combiner_binary: FileIdentity,
+    lineage: VerifiedIndependentLineage,
 }
 
-/// Opaque evidence that a future strict CMFDIL verifier authenticated every
+/// Opaque evidence that strict CMFDIL verification authenticated every
 /// independently implemented reproducer and found at least one such lineage.
 ///
-/// There is intentionally no production, public, or crate-visible constructor
-/// yet. This type only reserves the fail-closed handoff expected from that
-/// verifier; a report's self-declared implementation kind cannot construct it.
+/// Construction consumes the exact ordered Independent subset of one complete,
+/// ordered reproducer roster. The aggregate retains the real CMFDIL
+/// capabilities and exposes no per-report activation authority.
 #[must_use]
 pub struct VerifiedProductionDoryV3ReproducerLineages {
     ceremony_id: [u8; 32],
@@ -154,8 +154,20 @@ pub enum ProductionDoryV3ModelFinalCandidateValidationError {
     },
     #[error("reproduction report at ordered position {position} declares index {actual}")]
     ReproducerOrder { position: usize, actual: u16 },
-    #[error("the verified lineage capability does not cover the exact ordered independent reports")]
-    IndependentLineage,
+    #[error(
+        "the verified lineage capability does not cover the exact ordered independent reports: {0}"
+    )]
+    IndependentLineage(&'static str),
+    #[error(
+        "retained independent-lineage evidence for reproducer {reproducer_index} failed reauthentication: {source}"
+    )]
+    IndependentLineageEvidence {
+        reproducer_index: u16,
+        #[source]
+        source: ProductionDoryV3IndependentLineageError,
+    },
+    #[error("invalid reveal-set-closed transcript while verifying reproducer lineages: {0}")]
+    LineageTranscript(#[source] CeremonyTranscriptError),
     #[error("fresh combined-payload validation failed: {0}")]
     Combined(#[source] ProductionDoryV3ModelCombinerError),
     #[error("production roots validation failed: {0}")]
@@ -172,10 +184,9 @@ pub enum ProductionDoryV3ModelFinalCandidateValidationError {
 
 /// Validate every exact-roster report and all shared candidate artifacts once.
 ///
-/// This function has no usable production call path until the CMFDIL verifier
-/// supplies `lineages`. It does not author, sign, stage, or publish a type-6
-/// record. All report, source, audit, and shared artifact handles are opened
-/// before any reproduction report is parsed.
+/// This function does not author, sign, stage, or publish a type-6 record. All
+/// report, source, audit, and shared artifact handles are opened before any
+/// reproduction report is parsed.
 pub fn validate_existing_production_dory_v3_model_final_candidate(
     transcript: &VerifiedCeremonyTranscript,
     lineages: VerifiedProductionDoryV3ReproducerLineages,
@@ -870,7 +881,7 @@ impl FinalCandidateValidationBackend for ProductionValidationBackend {
 
 struct ValidatedFinalCandidateCore<R> {
     ceremony_id: [u8; 32],
-    _lineages: VerifiedProductionDoryV3ReproducerLineages,
+    lineages: VerifiedProductionDoryV3ReproducerLineages,
     _combined: ValidatedProductionDoryV3ModelCombinedPayload,
     reports: Vec<ContextVerifiedProductionDoryV3ModelReproductionReport>,
     retained: RetainedCandidateArtifacts,
@@ -882,6 +893,7 @@ impl ValidatedFinalCandidateCore<ProductionHeavyRetention> {
         &mut self,
     ) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
         self.retained.recheck_except_bank()?;
+        self.lineages.recheck_retained_files()?;
         self.heavy
             .bank_chain
             .recheck_retained_files()
@@ -892,7 +904,7 @@ impl ValidatedFinalCandidateCore<ProductionHeavyRetention> {
 
 fn validate_with_backend<B: FinalCandidateValidationBackend>(
     transcript: &VerifiedCeremonyTranscript,
-    lineages: VerifiedProductionDoryV3ReproducerLineages,
+    mut lineages: VerifiedProductionDoryV3ReproducerLineages,
     ordered_contribution_paths: &[PathBuf],
     paths: ProductionDoryV3ModelFinalCandidatePaths<'_>,
     reproducer_paths: &[ProductionDoryV3ModelReproducerCandidatePaths<'_>],
@@ -930,6 +942,9 @@ fn validate_with_backend<B: FinalCandidateValidationBackend>(
     }
     require_ordered_reproducer_indices(&parsed_indices)?;
 
+    // Reauthenticate every retained CMFDIL artifact and its eleven evidence
+    // files immediately before the first expensive payload validation.
+    lineages.recheck_retained_files()?;
     let combined =
         backend.validate_combined(transcript, ordered_contribution_paths, paths.raw_payload)?;
     require_exact_contribution_count(
@@ -1027,11 +1042,14 @@ fn validate_with_backend<B: FinalCandidateValidationBackend>(
         .bind_identity(&candidate.record_v2_file);
     retained.shared.bank_file.expected_bytes = Some(candidate.bank_file.bytes);
     retained.recheck_except_bank()?;
+    // The lineage evidence is part of the final guard and must precede the
+    // last bank-name/identity check.
+    lineages.recheck_retained_files()?;
     retained.recheck_target(GuardRecheckTarget::BankFile)?;
 
     Ok(ValidatedFinalCandidateCore {
         ceremony_id: transcript.ceremony_id(),
-        _lineages: lineages,
+        lineages,
         _combined: combined,
         reports,
         retained,
@@ -1102,43 +1120,282 @@ fn require_same_candidates(
 }
 
 impl VerifiedProductionDoryV3ReproducerLineages {
-    fn validate(
-        &self,
-        ceremony_id: [u8; 32],
+    /// Verify and retain the exact Independent subset from one complete,
+    /// ordered reproducer roster.
+    ///
+    /// `reports` must contain every context-verified CMFDRP in frozen roster
+    /// order. `independent_lineages` is consumed in the corresponding filtered
+    /// order and must contain one live CMFDIL capability for each and only each
+    /// report whose implementation kind is `Independent`.
+    pub fn verify_exact_ordered(
+        transcript: &VerifiedCeremonyTranscript,
         reports: &[ContextVerifiedProductionDoryV3ModelReproductionReport],
-    ) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
-        let expected: Vec<_> = reports
+        independent_lineages: Vec<VerifiedIndependentLineage>,
+    ) -> Result<Self, ProductionDoryV3ModelFinalCandidateValidationError> {
+        require_exact_reproducer_count(transcript.reproducers().len(), reports.len())?;
+        let bindings = transcript
+            .require_combiner_bindings()
+            .map_err(ProductionDoryV3ModelFinalCandidateValidationError::LineageTranscript)?;
+        let expected_prefix = FileIdentity {
+            bytes: transcript.transcript_bytes(),
+            blake3: transcript.transcript_blake3(),
+            sha256: transcript.transcript_sha256(),
+        };
+        for (position, report) in reports.iter().enumerate() {
+            let body = report.report();
+            let actual = body.reproducer_index();
+            if usize::from(actual) != position {
+                return Err(
+                    ProductionDoryV3ModelFinalCandidateValidationError::ReproducerOrder {
+                        position,
+                        actual,
+                    },
+                );
+            }
+            if body.ceremony_id() != transcript.ceremony_id()
+                || body.reproducer_public_key() != transcript.reproducers()[position]
+                || body.reveal_set_prefix_identity() != expected_prefix
+                || body.reveal_set_prefix_derive_key_digest()
+                    != transcript.transcript_derive_key_digest()
+                || body.commitment_set_signed_record_digest()
+                    != bindings.commitment_set_signed_record_digest()
+                || body.reveal_set_signed_record_digest()
+                    != bindings.reveal_set_signed_record_digest()
+            {
+                return Err(
+                    ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                        "CMFDRP transcript or roster binding",
+                    ),
+                );
+            }
+        }
+
+        let expected_independent = reports
             .iter()
             .filter(|report| {
                 report.report().implementation_kind()
                     == ProductionDoryV3ReproductionImplementationKind::Independent
             })
-            .map(|report| VerifiedIndependentLineageBinding {
-                reproducer_index: report.report().reproducer_index(),
+            .count();
+        if expected_independent == 0 {
+            return Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                    "no Independent report",
+                ),
+            );
+        }
+        if independent_lineages.len() != expected_independent {
+            return Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                    "Independent capability count",
+                ),
+            );
+        }
+
+        let ceremony_id = transcript.ceremony_id();
+        let mut supplied = independent_lineages.into_iter();
+        let mut independent = Vec::with_capacity(expected_independent);
+        for report in reports.iter().filter(|report| {
+            report.report().implementation_kind()
+                == ProductionDoryV3ReproductionImplementationKind::Independent
+        }) {
+            let mut lineage = supplied
+                .next()
+                .expect("the exact Independent capability count was checked");
+            validate_independent_lineage_binding(ceremony_id, report, &lineage)?;
+            validate_independent_lineage_type5_binding(
+                &lineage,
+                &expected_prefix,
+                transcript.transcript_derive_key_digest(),
+                bindings.commitment_set_signed_record_digest(),
+                bindings.reveal_set_signed_record_digest(),
+            )?;
+            lineage.recheck_retained_files().map_err(|source| {
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineageEvidence {
+                    reproducer_index: report.report().reproducer_index(),
+                    source,
+                }
+            })?;
+            independent.push(VerifiedIndependentLineageBinding {
                 reproduction_report: report.report().content_identity(),
-                implementation_lineage_report: report
-                    .artifacts()
-                    .implementation_lineage_report
-                    .clone(),
-                combiner_binary: report.artifacts().combiner_binary.clone(),
-            })
-            .collect();
-        self.validate_expected(ceremony_id, &expected)
+                lineage,
+            });
+        }
+        debug_assert!(supplied.next().is_none());
+
+        Ok(Self {
+            ceremony_id,
+            independent,
+        })
     }
 
-    fn validate_expected(
+    fn validate(
         &self,
         ceremony_id: [u8; 32],
-        expected: &[VerifiedIndependentLineageBinding],
+        reports: &[ContextVerifiedProductionDoryV3ModelReproductionReport],
     ) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
-        if self.ceremony_id != ceremony_id
-            || expected.is_empty()
-            || self.independent.as_slice() != expected
-        {
-            return Err(ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage);
+        if self.ceremony_id != ceremony_id {
+            return Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                    "ceremony id",
+                ),
+            );
+        }
+        let mut independent = self.independent.iter();
+        let mut observed = 0_usize;
+        for report in reports.iter().filter(|report| {
+            report.report().implementation_kind()
+                == ProductionDoryV3ReproductionImplementationKind::Independent
+        }) {
+            observed += 1;
+            let binding = independent.next().ok_or(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                    "missing Independent capability",
+                ),
+            )?;
+            if binding.reproduction_report != report.report().content_identity() {
+                return Err(
+                    ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                        "CMFDRP content identity",
+                    ),
+                );
+            }
+            validate_independent_lineage_binding(ceremony_id, report, &binding.lineage)?;
+        }
+        if observed == 0 || independent.next().is_some() {
+            return Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                    "Independent set or order",
+                ),
+            );
         }
         Ok(())
     }
+
+    fn recheck_retained_files(
+        &mut self,
+    ) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
+        for binding in &mut self.independent {
+            let reproducer_index = binding.lineage.reproducer_index();
+            binding.lineage.recheck_retained_files().map_err(|source| {
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineageEvidence {
+                    reproducer_index,
+                    source,
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_for_test(
+        &self,
+        ceremony_id: [u8; 32],
+        reports: &[ContextVerifiedProductionDoryV3ModelReproductionReport],
+    ) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
+        self.validate(ceremony_id, reports)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recheck_for_test(
+        &mut self,
+    ) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
+        self.recheck_retained_files()
+    }
+}
+
+fn validate_independent_lineage_binding(
+    ceremony_id: [u8; 32],
+    report: &ContextVerifiedProductionDoryV3ModelReproductionReport,
+    lineage: &VerifiedIndependentLineage,
+) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
+    let report_body = report.report();
+    let report_artifacts = report.artifacts();
+    let candidate = report.final_candidate();
+    let lineage_artifacts = lineage.artifacts();
+    if report_body.implementation_kind()
+        != ProductionDoryV3ReproductionImplementationKind::Independent
+    {
+        return Err(
+            ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                "Reference report supplied a CMFDIL capability",
+            ),
+        );
+    }
+    if report_body.ceremony_id() != ceremony_id || lineage.ceremony_id() != ceremony_id {
+        return Err(
+            ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage("ceremony id"),
+        );
+    }
+    let report_prefix = report_body.reveal_set_prefix_identity();
+    validate_independent_lineage_type5_binding(
+        lineage,
+        &report_prefix,
+        report_body.reveal_set_prefix_derive_key_digest(),
+        report_body.commitment_set_signed_record_digest(),
+        report_body.reveal_set_signed_record_digest(),
+    )?;
+    if lineage.reproducer_index() != report_body.reproducer_index()
+        || lineage.reproducer_public_key() != report_body.reproducer_public_key()
+        || lineage.target_id() != report_body.target_id()
+    {
+        return Err(
+            ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                "reproducer, key, or target",
+            ),
+        );
+    }
+    if lineage.artifact_identity() != report_artifacts.implementation_lineage_report {
+        return Err(
+            ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                "CMFDIL artifact identity",
+            ),
+        );
+    }
+    if lineage_artifacts.combiner_binary != report_artifacts.combiner_binary
+        || lineage_artifacts.raw_payload != candidate.raw_payload
+        || lineage_artifacts.roots_file != candidate.roots_file
+        || lineage.base_input_blake3_root() != candidate.base_input_blake3_root
+        || lineage.layer_roots_aggregate() != candidate.layer_roots_aggregate
+    {
+        return Err(
+            ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                "combiner or final candidate",
+            ),
+        );
+    }
+    if lineage_artifacts.host_environment_report != report_artifacts.host_environment_report
+        || lineage_artifacts.source_extraction_report != report_artifacts.source_extraction_report
+        || lineage_artifacts.command_log != report_artifacts.command_log
+    {
+        return Err(
+            ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                "host, extraction, or command audit",
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn validate_independent_lineage_type5_binding(
+    lineage: &VerifiedIndependentLineage,
+    reveal_set_prefix: &FileIdentity,
+    reveal_set_prefix_derive_key_digest: [u8; 32],
+    commitment_set_signed_record_digest: [u8; 32],
+    reveal_set_signed_record_digest: [u8; 32],
+) -> Result<(), ProductionDoryV3ModelFinalCandidateValidationError> {
+    if lineage.artifacts().reveal_set_prefix != reveal_set_prefix
+        || lineage.reveal_set_prefix_derive_key_digest() != reveal_set_prefix_derive_key_digest
+        || lineage.commitment_set_signed_record_digest() != commitment_set_signed_record_digest
+        || lineage.reveal_set_signed_record_digest() != reveal_set_signed_record_digest
+    {
+        return Err(
+            ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage(
+                "type-5 prefix or closure",
+            ),
+        );
+    }
+    Ok(())
 }
 
 fn authenticate_report_artifacts(
@@ -1470,6 +1727,10 @@ mod tests {
             ProductionDoryV3ModelCombinedPayloadValidationReport,
             ProductionDoryV3ModelCombinerInputReport,
         },
+        dory_v3_model_independent_lineage::{
+            ProductionDoryV3IndependentLineageEvidencePaths, tests::signed_artifact_for_claims,
+            validate_existing_production_dory_v3_independent_lineage,
+        },
         dory_v3_model_reproduction::{
             ProductionDoryV3ModelReproductionClaims,
             author_and_verify_production_dory_v3_model_reproduction_report,
@@ -1616,6 +1877,24 @@ mod tests {
         }
     }
 
+    fn borrowed_lineage_evidence_paths(
+        paths: &[PathBuf; 11],
+    ) -> ProductionDoryV3IndependentLineageEvidencePaths<'_> {
+        ProductionDoryV3IndependentLineageEvidencePaths {
+            combiner_source_bundle: &paths[0],
+            combiner_build_provenance: &paths[1],
+            combiner_binary: &paths[2],
+            roots_calculator_source_bundle: &paths[3],
+            roots_calculator_build_provenance: &paths[4],
+            roots_calculator_binary: &paths[5],
+            independent_lineage_review_report: &paths[6],
+            conformance_test_report: &paths[7],
+            host_environment_report: &paths[8],
+            source_extraction_report: &paths[9],
+            command_log: &paths[10],
+        }
+    }
+
     struct ReproducerArtifactIdentities {
         combiner_binary: FileIdentity,
         combiner_report: FileIdentity,
@@ -1665,6 +1944,7 @@ mod tests {
         observation: HeavyCandidateObservation,
         combined_calls: usize,
         heavy_calls: usize,
+        mutate_during_heavy: Option<(PathBuf, Vec<u8>)>,
     }
 
     impl FinalCandidateValidationBackend for BoundedBackend {
@@ -1695,10 +1975,63 @@ mod tests {
             ProductionDoryV3ModelFinalCandidateValidationError,
         > {
             self.heavy_calls += 1;
+            if let Some((path, bytes)) = self.mutate_during_heavy.take() {
+                fs::write(path, bytes).unwrap();
+            }
             Ok(HeavyValidation {
                 observation: self.observation.clone(),
                 retention: (),
             })
+        }
+    }
+
+    fn borrowed_shared_paths(paths: &[PathBuf; 8]) -> ProductionDoryV3ModelFinalCandidatePaths<'_> {
+        ProductionDoryV3ModelFinalCandidatePaths {
+            source_bundle: &paths[0],
+            source_bundle_policy: &paths[1],
+            raw_payload: &paths[2],
+            roots_file: &paths[3],
+            structural_report: &paths[4],
+            bank_file: &paths[5],
+            manifest_file: &paths[6],
+            record_v2_file: &paths[7],
+        }
+    }
+
+    struct BoundedFinalCandidateFixture {
+        _directory: TestDirectory,
+        transcript: VerifiedCeremonyTranscript,
+        lineages: Option<VerifiedProductionDoryV3ReproducerLineages>,
+        contribution_paths: Vec<PathBuf>,
+        shared_paths: [PathBuf; 8],
+        reproducer_paths: [OwnedReproducerPaths; 2],
+        #[cfg(unix)]
+        lineage_evidence_paths: [PathBuf; 11],
+        backend: BoundedBackend,
+    }
+
+    impl BoundedFinalCandidateFixture {
+        fn validate(
+            &mut self,
+        ) -> Result<
+            ValidatedFinalCandidateCore<()>,
+            ProductionDoryV3ModelFinalCandidateValidationError,
+        > {
+            let reproducer_paths: Vec<_> = self
+                .reproducer_paths
+                .iter()
+                .map(OwnedReproducerPaths::borrowed)
+                .collect();
+            validate_with_backend(
+                &self.transcript,
+                self.lineages
+                    .take()
+                    .expect("bounded fixture validates once"),
+                &self.contribution_paths,
+                borrowed_shared_paths(&self.shared_paths),
+                &reproducer_paths,
+                &mut self.backend,
+            )
         }
     }
 
@@ -2047,8 +2380,7 @@ mod tests {
         )
     }
 
-    #[test]
-    fn bounded_backend_exercises_exact_roster_final_candidate_orchestration() {
+    fn bounded_final_candidate_fixture() -> BoundedFinalCandidateFixture {
         let directory = TestDirectory::new();
         let source_bundle_path = directory.join("source-bundle.tar");
         let source_policy_path = directory.join("source-policy.txt");
@@ -2106,50 +2438,100 @@ mod tests {
             ProductionDoryV3ReproductionImplementationKind::Reference,
             ProductionDoryV3ReproductionImplementationKind::Independent,
         ];
-        let mut verified_reports = Vec::new();
-        for index in 0..2 {
-            let artifacts = reproducer_artifacts[index];
-            verified_reports.push(
+        let mut claims: Vec<_> = (0..2)
+            .map(|index| {
+                let artifacts = reproducer_artifacts[index];
+                ProductionDoryV3ModelReproductionClaims {
+                    reproducer_index: index as u16,
+                    implementation_kind: implementation_kinds[index],
+                    target_id: 1,
+                    combiner_binary: artifacts.combiner_binary.clone(),
+                    combiner_report: artifacts.combiner_report.clone(),
+                    bootstrap_report: artifacts.bootstrap_report.clone(),
+                    record_ceremony_report: artifacts.record_ceremony_report.clone(),
+                    host_environment_report: artifacts.host_environment_report.clone(),
+                    source_extraction_report: artifacts.source_extraction_report.clone(),
+                    command_log: artifacts.command_log.clone(),
+                    implementation_lineage_report: artifacts.implementation_lineage_report.clone(),
+                    roots_file: roots_file.clone(),
+                    structural_report: structural_report.clone(),
+                    bank_file: bank_file.clone(),
+                    manifest_file: manifest_file.clone(),
+                    record_v2_file: record_v2_file.clone(),
+                    base_input_blake3_root: [112; 32],
+                    layer_roots_aggregate: [113; 32],
+                    base_commitment: commitments[0],
+                    weight_bank_0_commitment: commitments[1],
+                    weight_bank_1_commitment: commitments[2],
+                    weight_bank_2_commitment: commitments[3],
+                    roots_elapsed_micros: 102,
+                    structure_elapsed_micros: 103,
+                    bootstrap_elapsed_micros: 104,
+                    record_elapsed_micros: 105,
+                    total_elapsed_micros: 1_000,
+                    peak_rss_bytes: 1_048_576,
+                    peak_disk_bytes: PRODUCTION_PAYLOAD_BYTES + PRODUCTION_BANK_BYTES,
+                }
+            })
+            .collect();
+
+        let lineage_evidence_paths = [
+            directory.join("independent-combiner-source.tar"),
+            directory.join("independent-combiner-build.txt"),
+            reproducer_one_paths.combiner_binary.clone(),
+            directory.join("independent-roots-source.tar"),
+            directory.join("independent-roots-build.txt"),
+            directory.join("independent-roots-binary"),
+            directory.join("independent-lineage-review.txt"),
+            directory.join("independent-conformance.txt"),
+            reproducer_one_paths.host_environment_report.clone(),
+            reproducer_one_paths.source_extraction_report.clone(),
+            reproducer_one_paths.command_log.clone(),
+        ];
+        let lineage_evidence = [
+            write_artifact(&lineage_evidence_paths[0], b"independent combiner source"),
+            write_artifact(&lineage_evidence_paths[1], b"independent combiner build"),
+            reproducer_one_artifacts.combiner_binary.clone(),
+            write_artifact(&lineage_evidence_paths[3], b"independent roots source"),
+            write_artifact(&lineage_evidence_paths[4], b"independent roots build"),
+            write_artifact(&lineage_evidence_paths[5], b"independent roots binary"),
+            write_artifact(&lineage_evidence_paths[6], b"independent lineage review"),
+            write_artifact(&lineage_evidence_paths[7], b"independent conformance"),
+            reproducer_one_artifacts.host_environment_report.clone(),
+            reproducer_one_artifacts.source_extraction_report.clone(),
+            reproducer_one_artifacts.command_log.clone(),
+        ];
+        let raw_payload = FileIdentity {
+            bytes: combined_report.output_bytes,
+            blake3: combined_report.output_blake3.into_bytes(),
+            sha256: combined_report.output_sha256.into_bytes(),
+        };
+        let operator_keys = signing_keys(3, 1);
+        let reproducer_keys = signing_keys(2, 20);
+        let lineage_artifact = signed_artifact_for_claims(
+            &transcript,
+            raw_payload,
+            &claims[1],
+            lineage_evidence,
+            &operator_keys,
+            &reproducer_keys,
+        );
+        claims[1].implementation_lineage_report = write_artifact(
+            &reproducer_one_paths.implementation_lineage_report,
+            &lineage_artifact,
+        );
+
+        let verified_reports: Vec<_> = claims
+            .into_iter()
+            .map(|claims| {
                 author_and_verify_production_dory_v3_model_reproduction_report(
                     &transcript,
                     &combined_for_authoring,
-                    ProductionDoryV3ModelReproductionClaims {
-                        reproducer_index: index as u16,
-                        implementation_kind: implementation_kinds[index],
-                        target_id: 1,
-                        combiner_binary: artifacts.combiner_binary.clone(),
-                        combiner_report: artifacts.combiner_report.clone(),
-                        bootstrap_report: artifacts.bootstrap_report.clone(),
-                        record_ceremony_report: artifacts.record_ceremony_report.clone(),
-                        host_environment_report: artifacts.host_environment_report.clone(),
-                        source_extraction_report: artifacts.source_extraction_report.clone(),
-                        command_log: artifacts.command_log.clone(),
-                        implementation_lineage_report: artifacts
-                            .implementation_lineage_report
-                            .clone(),
-                        roots_file: roots_file.clone(),
-                        structural_report: structural_report.clone(),
-                        bank_file: bank_file.clone(),
-                        manifest_file: manifest_file.clone(),
-                        record_v2_file: record_v2_file.clone(),
-                        base_input_blake3_root: [112; 32],
-                        layer_roots_aggregate: [113; 32],
-                        base_commitment: commitments[0],
-                        weight_bank_0_commitment: commitments[1],
-                        weight_bank_1_commitment: commitments[2],
-                        weight_bank_2_commitment: commitments[3],
-                        roots_elapsed_micros: 102,
-                        structure_elapsed_micros: 103,
-                        bootstrap_elapsed_micros: 104,
-                        record_elapsed_micros: 105,
-                        total_elapsed_micros: 1_000,
-                        peak_rss_bytes: 1_048_576,
-                        peak_disk_bytes: PRODUCTION_PAYLOAD_BYTES + PRODUCTION_BANK_BYTES,
-                    },
+                    claims,
                 )
-                .unwrap(),
-            );
-        }
+                .unwrap()
+            })
+            .collect();
         let report_paths = [
             &reproducer_zero_paths.reproduction_report,
             &reproducer_one_paths.reproduction_report,
@@ -2157,20 +2539,21 @@ mod tests {
         for (path, report) in report_paths.into_iter().zip(&verified_reports) {
             fs::write(path, report.report().canonical_bytes()).unwrap();
         }
-        let independent_report = verified_reports[1].report();
-        let lineages = VerifiedProductionDoryV3ReproducerLineages {
-            ceremony_id: transcript.ceremony_id(),
-            independent: vec![VerifiedIndependentLineageBinding {
-                reproducer_index: 1,
-                reproduction_report: independent_report.content_identity(),
-                implementation_lineage_report: reproducer_one_artifacts
-                    .implementation_lineage_report
-                    .clone(),
-                combiner_binary: reproducer_one_artifacts.combiner_binary.clone(),
-            }],
-        };
+        let independent_lineage = validate_existing_production_dory_v3_independent_lineage(
+            &reproducer_one_paths.implementation_lineage_report,
+            borrowed_lineage_evidence_paths(&lineage_evidence_paths),
+            &transcript,
+            &verified_reports[1],
+        )
+        .unwrap();
+        let lineages = VerifiedProductionDoryV3ReproducerLineages::verify_exact_ordered(
+            &transcript,
+            &verified_reports,
+            vec![independent_lineage],
+        )
+        .unwrap();
         let candidate = CandidateIdentity::from(verified_reports[0].final_candidate());
-        let mut backend = BoundedBackend {
+        let backend = BoundedBackend {
             combined: Some(
                 ValidatedProductionDoryV3ModelCombinedPayload::from_report_for_test(
                     combined_report,
@@ -2179,35 +2562,102 @@ mod tests {
             observation: bounded_production_observation(transcript.ceremony_id(), &candidate),
             combined_calls: 0,
             heavy_calls: 0,
+            mutate_during_heavy: None,
         };
-        let owned_reproducers = [reproducer_zero_paths, reproducer_one_paths];
-        let reproducer_paths: Vec<_> = owned_reproducers
-            .iter()
-            .map(OwnedReproducerPaths::borrowed)
-            .collect();
-        let shared_paths = ProductionDoryV3ModelFinalCandidatePaths {
-            source_bundle: &source_bundle_path,
-            source_bundle_policy: &source_policy_path,
-            raw_payload: &raw_payload_path,
-            roots_file: &roots_path,
-            structural_report: &structure_path,
-            bank_file: &bank_path,
-            manifest_file: &manifest_path,
-            record_v2_file: &record_path,
-        };
-        let validated = validate_with_backend(
-            &transcript,
-            lineages,
-            &contribution_paths,
-            shared_paths,
-            &reproducer_paths,
-            &mut backend,
-        )
-        .unwrap();
-        assert_eq!(validated.ceremony_id, transcript.ceremony_id());
+        BoundedFinalCandidateFixture {
+            _directory: directory,
+            transcript,
+            lineages: Some(lineages),
+            contribution_paths,
+            shared_paths: [
+                source_bundle_path,
+                source_policy_path,
+                raw_payload_path,
+                roots_path,
+                structure_path,
+                bank_path,
+                manifest_path,
+                record_path,
+            ],
+            reproducer_paths: [reproducer_zero_paths, reproducer_one_paths],
+            #[cfg(unix)]
+            lineage_evidence_paths,
+            backend,
+        }
+    }
+
+    #[test]
+    fn bounded_backend_exercises_exact_roster_final_candidate_orchestration() {
+        let mut fixture = bounded_final_candidate_fixture();
+        let ceremony_id = fixture.transcript.ceremony_id();
+        let validated = fixture.validate().unwrap();
+        assert_eq!(validated.ceremony_id, ceremony_id);
         assert_eq!(validated.reports.len(), 2);
-        assert_eq!(backend.combined_calls, 1);
-        assert_eq!(backend.heavy_calls, 1);
+        assert_eq!(fixture.backend.combined_calls, 1);
+        assert_eq!(fixture.backend.heavy_calls, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lineage_mutation_or_replacement_fails_before_expensive_validation() {
+        let mut mutated = bounded_final_candidate_fixture();
+        let evidence = mutated.lineage_evidence_paths[0].clone();
+        fs::write(&evidence, b"XXXXXXXXXXXXXXXXXXXXXXXXXXX").unwrap();
+        assert!(matches!(
+            mutated.validate(),
+            Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineageEvidence {
+                    reproducer_index: 1,
+                    source: ProductionDoryV3IndependentLineageError::EvidenceIdentity(
+                        "combiner source bundle"
+                    )
+                }
+            )
+        ));
+        assert_eq!(mutated.backend.combined_calls, 0);
+        assert_eq!(mutated.backend.heavy_calls, 0);
+
+        let mut replaced = bounded_final_candidate_fixture();
+        let lineage_path = replaced.reproducer_paths[1]
+            .implementation_lineage_report
+            .clone();
+        let artifact = fs::read(&lineage_path).unwrap();
+        fs::rename(&lineage_path, lineage_path.with_extension("old")).unwrap();
+        fs::write(&lineage_path, artifact).unwrap();
+        assert!(matches!(
+            replaced.validate(),
+            Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineageEvidence {
+                    reproducer_index: 1,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(replaced.backend.combined_calls, 0);
+        assert_eq!(replaced.backend.heavy_calls, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lineage_mutation_during_heavy_validation_fails_final_guard() {
+        let mut fixture = bounded_final_candidate_fixture();
+        fixture.backend.mutate_during_heavy = Some((
+            fixture.lineage_evidence_paths[0].clone(),
+            b"XXXXXXXXXXXXXXXXXXXXXXXXXXX".to_vec(),
+        ));
+        assert!(matches!(
+            fixture.validate(),
+            Err(
+                ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineageEvidence {
+                    reproducer_index: 1,
+                    source: ProductionDoryV3IndependentLineageError::EvidenceIdentity(
+                        "combiner source bundle"
+                    )
+                }
+            )
+        ));
+        assert_eq!(fixture.backend.combined_calls, 1);
+        assert_eq!(fixture.backend.heavy_calls, 1);
     }
 
     #[test]
@@ -2359,37 +2809,6 @@ mod tests {
                     "bank-authenticated Record V2"
                 )
             )
-        ));
-    }
-
-    #[test]
-    fn lineage_capability_requires_exact_nonempty_ordered_bindings() {
-        let binding = VerifiedIndependentLineageBinding {
-            reproducer_index: 1,
-            reproduction_report: file(4_283, 31),
-            implementation_lineage_report: file(90, 32),
-            combiner_binary: file(100, 33),
-        };
-        let capability = VerifiedProductionDoryV3ReproducerLineages {
-            ceremony_id: [34; 32],
-            independent: vec![binding.clone()],
-        };
-        capability
-            .validate_expected([34; 32], std::slice::from_ref(&binding))
-            .unwrap();
-        assert!(matches!(
-            capability.validate_expected([35; 32], std::slice::from_ref(&binding)),
-            Err(ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage)
-        ));
-        assert!(matches!(
-            capability.validate_expected([34; 32], &[]),
-            Err(ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage)
-        ));
-        let mut changed = binding;
-        changed.implementation_lineage_report.blake3[0] ^= 1;
-        assert!(matches!(
-            capability.validate_expected([34; 32], &[changed]),
-            Err(ProductionDoryV3ModelFinalCandidateValidationError::IndependentLineage)
         ));
     }
 

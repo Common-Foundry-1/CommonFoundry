@@ -27,6 +27,7 @@ use crate::{
     dory_v3_model::{DoryV3ModelIdentityError, DoryV3ModelIdentityV1},
     dory_v3_model_record::{
         DoryV3ModelCommitmentRecordError, DoryV3ModelCommitmentRecordV2,
+        canonical_dory_v3_model_record_v2_json,
         derive_bank_authenticated_dory_v3_model_commitment_record_v2,
     },
     dory_v3_suite::{
@@ -281,7 +282,8 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
     first_record
         .validate_production(&setup)
         .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Record)?;
-    let first_bytes = encode_record(&first_record)?;
+    let first_bytes = canonical_dory_v3_model_record_v2_json(&first_record)
+        .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Serialize)?;
     let pass_one_elapsed = pass_one_started.elapsed();
 
     let pass_two_started = Instant::now();
@@ -309,7 +311,8 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
     )
     .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Record)?
     .into_record();
-    let second_bytes = encode_record(&second_record)?;
+    let second_bytes = canonical_dory_v3_model_record_v2_json(&second_record)
+        .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Serialize)?;
     if second_record != first_record
         || second_record.canonical_bytes() != first_record.canonical_bytes()
         || second_record.record_digest() != first_record.record_digest()
@@ -391,15 +394,6 @@ fn open_bank(
             source,
         },
     )
-}
-
-fn encode_record(
-    record: &DoryV3ModelCommitmentRecordV2,
-) -> Result<Vec<u8>, ProductionDoryV3ModelRecordV2CeremonyError> {
-    let mut encoded = serde_json::to_vec_pretty(record)
-        .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Serialize)?;
-    encoded.push(b'\n');
-    Ok(encoded)
 }
 
 fn write_new_output(

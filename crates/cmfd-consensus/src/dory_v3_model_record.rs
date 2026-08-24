@@ -217,6 +217,16 @@ impl DoryV3ModelCommitmentRecordV2 {
     }
 }
 
+/// Encode the exact human-readable Record V2 artifact: pretty JSON followed
+/// by exactly one line feed.
+pub(crate) fn canonical_dory_v3_model_record_v2_json(
+    record: &DoryV3ModelCommitmentRecordV2,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut encoded = serde_json::to_vec_pretty(record)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
 /// Non-serializable evidence that one exact reader authenticated the model
 /// bank and reproduced every commitment in the enclosed immutable record.
 #[must_use]
@@ -261,7 +271,7 @@ pub fn derive_bank_authenticated_dory_v3_model_commitment_record_v2<R: Read>(
 
 /// Authenticate a bounded fixture with the same transactional reader path but
 /// without claiming the compiled production geometry.
-#[cfg(all(test, feature = "whir-prototype"))]
+#[cfg(test)]
 pub(crate) fn derive_bank_authenticated_dory_v3_model_commitment_record_v2_for_test<R: Read>(
     reader: R,
     manifest: &ModelBankManifest,
@@ -827,6 +837,23 @@ mod tests {
         assert_eq!(
             record.record_digest().to_hex(),
             "bbc72cbe4f1327cf365bef95a0076eeb2080cf3c32ce19914b266da92ed06126"
+        );
+    }
+
+    #[test]
+    fn record_v2_canonical_json_is_pretty_and_has_exactly_one_lf() {
+        let record = derive_fixture(&fixture()).into_record();
+        let encoded = canonical_dory_v3_model_record_v2_json(&record).unwrap();
+        assert!(encoded.ends_with(b"\n"));
+        assert!(!encoded.ends_with(b"\n\n"));
+        assert_eq!(encoded, {
+            let mut expected = serde_json::to_vec_pretty(&record).unwrap();
+            expected.push(b'\n');
+            expected
+        });
+        assert_eq!(
+            serde_json::from_slice::<DoryV3ModelCommitmentRecordV2>(&encoded).unwrap(),
+            record
         );
     }
 

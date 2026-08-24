@@ -1746,6 +1746,23 @@ The canonical digest, rather than JSON whitespace, is the Record V2 identity.
 The exact published strict JSON file is audit-only but is also dual-hashed for
 distribution and recorded in type 6.
 
+The library's existing-chain validator opens the bank, manifest, and Record V2
+before parsing any of them and retains all three no-follow file handles plus
+their trusted parent handles. It requires pairwise-distinct absolute normalized
+direct-child paths, exact canonical pretty JSON followed by one line feed,
+manifest equality across both JSON artifacts, and the pinned production setup.
+Here, canonical artifact JSON means the repository's currently frozen Rust
+`serde_json::to_vec_pretty` byte encoding plus that line feed; it is guarded by
+known-answer tests and is not yet claimed as a language-neutral JSON profile.
+It then rederives Record V2 twice through the same retained bank handle. Each
+complete pass independently counts and computes BLAKE3 and SHA-256 over the
+exact 6,442,975,416 bytes and exact EOF. Inter-pass and final identity rechecks,
+a final reread and reparse of both small files, and a bank-last recheck are
+required before the non-cloneable, non-serializable capability is returned. No
+CLI or type-6 authoring path consumes this capability yet. The private-workspace
+rule still excludes same-user concurrent writers; in particular, a retained
+read handle on Unix is not an exclusive content lock.
+
 The bank contains the 184-byte header followed by the payload, for exactly
 6,442,975,416 bytes and exact EOF. The bootstrap publishes bank and manifest as
 two files and truthfully does not claim multi-file crash atomicity. After a
@@ -1946,7 +1963,10 @@ Already implemented in this repository:
   unsigned type-7 abort, external-signature verifier, create-new signed-record
   and successor-transcript staging, and signed type-7 evidence verifier;
 - the fail-closed `dory-v3-model-bank-bootstrap` command;
-- the two-pass `dory-v3-model-record-ceremony` command; and
+- the two-pass `dory-v3-model-record-ceremony` command;
+- the retained-handle existing production bank + strict manifest + Record V2
+  validator, including two complete same-handle commitment derivations and
+  dual whole-file identities; and
 - the one-nonce, exact-CPU `dory-v3-qualify-request` generator with strict
   create-new output and an independently replaying `dory-v3-qualify` consumer.
 
@@ -1959,10 +1979,11 @@ Not implemented or not completed by this document:
   review of the transcript and detached-attestation implementation;
 - type-6 receipt authoring and final completed-transcript staging, without
   which a successful ceremony cannot reach detached attestation;
-- one retained-handle final-candidate validator that independently opens and
-  reauthenticates the exact roots, structure, bank, manifest, Record V2, and
-  report files before type-6 authoring; `CMFDRP01` alone records their claims
-  but does not authenticate those external bytes;
+- completion of the retained-handle final-candidate validator around the new
+  bank/manifest/Record V2 capability: it must still independently open and
+  reauthenticate the exact roots, structure, and report files before type-6
+  authoring; `CMFDRP01` alone records their claims but does not authenticate
+  those external bytes;
 - independent security review and an operator-scale rehearsal of the keyless
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
@@ -1979,10 +2000,11 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is the retained-handle final-candidate
-validator followed by type-6 receipt authoring and final completed-transcript
-staging, plus validation and an operator-scale rehearsal of the keyless record
-and detached-attestation authoring paths. That is followed by public
+The next minimal implementation slice completes the retained-handle
+final-candidate validator around the bank-chain capability, followed by type-6
+receipt authoring and final completed-transcript staging, plus validation and an
+operator-scale rehearsal of the keyless record and detached-attestation
+authoring paths. That is followed by public
 append-only transcript publication with independent mirror receipts and
 production-scale roots, structure, combiner, request, and proof qualification.
 The transcript, generator, combiner, and new report tools still require

@@ -42,7 +42,10 @@ use crate::{
         DORY_V3_MODEL_IDENTITY_VERSION, DORY_V3_MODEL_VERSION, DORY_V3_PADDED_VARIABLES,
         DORY_V3_PRODUCTION_SUITE_MANIFEST, Digest32,
     },
-    model_bank::{add_layer_root, encode_model_bank_header, start_layer_aggregate},
+    model_bank::{
+        add_layer_root, canonical_model_bank_manifest_json, encode_model_bank_header,
+        start_layer_aggregate,
+    },
     verify_model_bank,
 };
 
@@ -459,9 +462,8 @@ fn prepare_bootstrap(
     verify_model_bank(bank_temp.reader()?, &manifest)
         .map_err(ProductionDoryV3ModelBankBootstrapError::VerifyBank)?;
 
-    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
+    let manifest_bytes = canonical_model_bank_manifest_json(&manifest)
         .map_err(ProductionDoryV3ModelBankBootstrapError::Serialize)?;
-    manifest_bytes.push(b'\n');
     let (mut manifest_file, manifest_temp) = create_temporary_near(manifest_output, "manifest")?;
     write_all(&mut manifest_file, manifest_temp.path(), &manifest_bytes)?;
     sync_file(&manifest_file, manifest_temp.path())?;

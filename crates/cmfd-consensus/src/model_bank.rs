@@ -390,6 +390,17 @@ impl ModelBankManifest {
     }
 }
 
+/// Encode the exact human-readable manifest artifact used by the production
+/// bank bootstrap: pretty JSON followed by exactly one line feed.
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub(crate) fn canonical_model_bank_manifest_json(
+    manifest: &ModelBankManifest,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut encoded = serde_json::to_vec_pretty(manifest)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
 #[derive(Debug, Error)]
 pub enum ModelBankError {
     #[error("invalid model-bank magic")]

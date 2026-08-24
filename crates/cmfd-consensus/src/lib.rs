@@ -55,6 +55,8 @@ pub mod dory_v3_model_ceremony;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_ceremony_transcript;
 #[cfg(feature = "dory-bls12-381-prototype")]
+pub mod dory_v3_model_combiner;
+#[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_contribution;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub mod dory_v3_model_record;

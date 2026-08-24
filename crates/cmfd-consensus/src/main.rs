@@ -20,12 +20,15 @@ use cmfd_consensus::{
     dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
     dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
     dory_v3_model_ceremony_authoring::{
-        prepare_production_dory_v3_ceremony_record, stage_production_dory_v3_ceremony_record,
+        ProductionDoryV3CeremonyAttestationSigner, prepare_production_dory_v3_ceremony_attestation,
+        prepare_production_dory_v3_ceremony_record, stage_production_dory_v3_ceremony_attestation,
+        stage_production_dory_v3_ceremony_record,
         stage_production_dory_v3_ceremony_reveal_set_prefix,
     },
     dory_v3_model_ceremony_transcript::{
-        CeremonyRecordBody, MAX_CEREMONY_TRANSCRIPT_BYTES, RecordSignature, SignerClass,
-        ceremony_record_content_digest, parse_and_verify_reveal_set_prefix,
+        CeremonyRecordBody, CeremonyTranscriptStatus, MAX_CEREMONY_TRANSCRIPT_BYTES,
+        RecordSignature, SignerClass, ceremony_record_content_digest,
+        parse_and_verify_reveal_set_prefix,
     },
     dory_v3_model_combiner::combine_production_dory_v3_model_contributions,
     dory_v3_model_contribution::generate_production_dory_v3_model_contribution,
@@ -77,6 +80,29 @@ impl ExternalRecordSignature {
             signer_index: self.signer_index,
             signature: self.signature,
         }
+    }
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn attestation_signer_slots(
+    operators: Vec<u16>,
+    reproducers: Vec<u16>,
+) -> Vec<ProductionDoryV3CeremonyAttestationSigner> {
+    operators
+        .into_iter()
+        .map(|index| ProductionDoryV3CeremonyAttestationSigner::new(SignerClass::Operator, index))
+        .chain(reproducers.into_iter().map(|index| {
+            ProductionDoryV3CeremonyAttestationSigner::new(SignerClass::Reproducer, index)
+        }))
+        .collect()
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+const fn ceremony_transcript_status_name(status: CeremonyTranscriptStatus) -> &'static str {
+    match status {
+        CeremonyTranscriptStatus::RevealSetClosed => "reveal_set_closed",
+        CeremonyTranscriptStatus::Completed => "completed",
+        CeremonyTranscriptStatus::Aborted => "aborted",
     }
 }
 
@@ -208,6 +234,47 @@ enum Command {
         /// New absolute type-5-terminal transcript-prefix path.
         #[arg(long, value_parser = parse_absolute_path)]
         prefix_output: std::path::PathBuf,
+    },
+    /// Reconstruct a detached terminal-transcript attestation request for external signers.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyAttestationPrepare {
+        /// Exact completed or aborted transcript at an existing absolute path.
+        #[arg(long, value_parser = parse_absolute_path)]
+        transcript: std::path::PathBuf,
+        /// Independently authenticated ceremony ID.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// Operator slot in the explicit aborted-transcript signer subset. Input order is canonicalized; duplicates are rejected; forbidden for completed transcripts.
+        #[arg(long)]
+        aborted_operator_signer: Vec<u16>,
+        /// Reproducer slot in the explicit aborted-transcript signer subset. Input order is canonicalized; duplicates are rejected; forbidden for completed transcripts.
+        #[arg(long)]
+        aborted_reproducer_signer: Vec<u16>,
+    },
+    /// Verify external signatures and create-new stage one detached terminal-transcript attestation.
+    #[cfg(feature = "dory-bls12-381-prototype")]
+    DoryV3ModelCeremonyAttestationStage {
+        /// Exact completed or aborted transcript at an existing absolute path.
+        #[arg(long, value_parser = parse_absolute_path)]
+        transcript: std::path::PathBuf,
+        /// Independently authenticated ceremony ID.
+        #[arg(long, value_parser = parse_lower_hex_32)]
+        expected_ceremony_id: [u8; 32],
+        /// Operator slot from the exact aborted signer subset used at prepare. Input order is canonicalized; duplicates are rejected; forbidden for completed transcripts.
+        #[arg(long)]
+        aborted_operator_signer: Vec<u16>,
+        /// Reproducer slot from the exact aborted signer subset used at prepare. Input order is canonicalized; duplicates are rejected; forbidden for completed transcripts.
+        #[arg(long)]
+        aborted_reproducer_signer: Vec<u16>,
+        /// External operator signature as INDEX:128-lowercase-hex. Repeat as required.
+        #[arg(long, value_parser = parse_external_signature)]
+        operator_signature: Vec<ExternalRecordSignature>,
+        /// External reproducer signature as INDEX:128-lowercase-hex. Repeat as required.
+        #[arg(long, value_parser = parse_external_signature)]
+        reproducer_signature: Vec<ExternalRecordSignature>,
+        /// New absolute path for the exact detached attestation; existing paths are never overwritten.
+        #[arg(long, value_parser = parse_absolute_path)]
+        attestation_output: std::path::PathBuf,
     },
     /// Combine ordered production ceremony contributions bytewise modulo 251.
     #[cfg(feature = "dory-bls12-381-prototype")]
@@ -878,6 +945,130 @@ fn run_cli() -> Result<()> {
                 "transcript_derive_key_digest {}",
                 hex::encode(report.transcript_derive_key_digest())
             );
+            println!("durability {:?}", report.durability());
+            println!(
+                "mirror_publication_pending {}",
+                report.publication_pending()
+            );
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyAttestationPrepare {
+            transcript,
+            expected_ceremony_id,
+            aborted_operator_signer,
+            aborted_reproducer_signer,
+        } => {
+            let aborted_signers =
+                attestation_signer_slots(aborted_operator_signer, aborted_reproducer_signer);
+            let prepared = prepare_production_dory_v3_ceremony_attestation(
+                &transcript,
+                expected_ceremony_id,
+                &aborted_signers,
+            )
+            .context("failed to prepare the keyless Dory V3 transcript attestation")?;
+            let transcript_file = prepared.transcript_file();
+            println!("outcome attestation_prepared");
+            println!("transcript {}", prepared.transcript_path().display());
+            println!(
+                "transcript_status {}",
+                ceremony_transcript_status_name(prepared.status())
+            );
+            println!("ceremony_id {}", hex::encode(prepared.ceremony_id()));
+            println!("transcript_bytes {}", transcript_file.bytes);
+            println!("transcript_blake3 {}", hex::encode(transcript_file.blake3));
+            println!("transcript_sha256 {}", hex::encode(transcript_file.sha256));
+            println!(
+                "transcript_derive_key_digest {}",
+                hex::encode(prepared.transcript_derive_key_digest())
+            );
+            println!(
+                "signature_message {}",
+                hex::encode(prepared.signature_message())
+            );
+            for signer in prepared.required_signers() {
+                let class = match signer.signer_class() {
+                    SignerClass::Operator => "operator",
+                    SignerClass::Reproducer => "reproducer",
+                };
+                println!(
+                    "required_signer {class}:{}:{}",
+                    signer.signer_index(),
+                    hex::encode(signer.public_key())
+                );
+            }
+            println!("signature_algorithm bip340_raw_32_byte_message");
+            println!("private_key_handling external_only");
+        }
+        #[cfg(feature = "dory-bls12-381-prototype")]
+        Command::DoryV3ModelCeremonyAttestationStage {
+            transcript,
+            expected_ceremony_id,
+            aborted_operator_signer,
+            aborted_reproducer_signer,
+            operator_signature,
+            reproducer_signature,
+            attestation_output,
+        } => {
+            let aborted_signers =
+                attestation_signer_slots(aborted_operator_signer, aborted_reproducer_signer);
+            let mut signatures: Vec<_> = operator_signature
+                .into_iter()
+                .map(|signature| signature.into_record_signature(SignerClass::Operator))
+                .collect();
+            signatures.extend(
+                reproducer_signature
+                    .into_iter()
+                    .map(|signature| signature.into_record_signature(SignerClass::Reproducer)),
+            );
+            let report = stage_production_dory_v3_ceremony_attestation(
+                &transcript,
+                expected_ceremony_id,
+                &aborted_signers,
+                signatures,
+                &attestation_output,
+            )
+            .context("failed to verify and stage the keyless Dory V3 transcript attestation")?;
+            let transcript_file = report.transcript_file();
+            let attestation_file = report.attestation_file();
+            println!("outcome attestation_staged");
+            println!("attestation {}", report.output().display());
+            println!(
+                "transcript_status {}",
+                ceremony_transcript_status_name(report.status())
+            );
+            println!("ceremony_id {}", hex::encode(report.ceremony_id()));
+            println!("transcript_bytes {}", transcript_file.bytes);
+            println!("transcript_blake3 {}", hex::encode(transcript_file.blake3));
+            println!("transcript_sha256 {}", hex::encode(transcript_file.sha256));
+            println!(
+                "transcript_derive_key_digest {}",
+                hex::encode(report.transcript_derive_key_digest())
+            );
+            println!("attestation_bytes {}", attestation_file.bytes);
+            println!(
+                "attestation_blake3 {}",
+                hex::encode(attestation_file.blake3)
+            );
+            println!(
+                "attestation_sha256 {}",
+                hex::encode(attestation_file.sha256)
+            );
+            println!(
+                "signature_message {}",
+                hex::encode(report.signature_message())
+            );
+            for signer in report.staged_signers() {
+                let class = match signer.signer_class() {
+                    SignerClass::Operator => "operator",
+                    SignerClass::Reproducer => "reproducer",
+                };
+                println!(
+                    "staged_signer {class}:{}:{}",
+                    signer.signer_index(),
+                    hex::encode(signer.public_key())
+                );
+            }
+            println!("signer_count {}", report.signer_count());
             println!("durability {:?}", report.durability());
             println!(
                 "mirror_publication_pending {}",

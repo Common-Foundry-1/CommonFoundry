@@ -1038,6 +1038,113 @@ each mirrored copy, check for equivocation, and retain those receipts before
 advancing the ceremony. None of these authoring commands uploads, mirrors,
 declares publication complete, or activates production consensus.
 
+### Prepare and stage the detached transcript attestation
+
+The feature-gated detached-attestation commands accept only an exact,
+terminal transcript: either a completed transcript ending at the signed type-6
+receipt or an aborted transcript ending at the signed type-7 record and EOF.
+The type-5-terminal reveal-set prefix above is deliberately ineligible. A
+successful ceremony therefore cannot use this flow until the separate type-6
+record-authoring and final-transcript-staging tooling exists and has assembled
+the completed transcript.
+
+Both commands require `--expected-ceremony-id`. Obtain this 32-byte anchor
+independently from the authenticated, signed, published, and mirrored type-1
+record; never derive it from the transcript being attested. Preparation reads
+the transcript through the trusted-filesystem boundary, parses and verifies
+the complete record sequence and exact EOF, and then reauthenticates the same
+immutable file in a second pass. It prints the transcript file identity,
+terminal status, ceremony ID, exact transcript length, derive-key digest,
+ordinary BLAKE3, SHA-256, raw 32-byte `signature_message`, and every exact
+`required_signer` slot. Every signer must independently reproduce and compare
+those values before signing.
+
+A completed transcript automatically requires every frozen operator followed
+by every frozen reproducer: all `N + R` signatures. Supplying any
+`--aborted-operator-signer` or `--aborted-reproducer-signer` selector for a
+completed transcript is an error. Prepare it as:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-attestation-prepare \
+  --transcript /srv/cmfd/ceremony/records/COMPLETED.cmfd \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS
+```
+
+An aborted transcript requires the operator to select an explicit, nonempty
+subset of the frozen roster. Repeat either selector as needed; every selected
+slot must exist in the signed type-1 roster. Selector input order is arbitrary;
+the tool canonicalizes slots by signer class and index. Duplicate or
+out-of-roster selections fail closed. For example:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-attestation-prepare \
+  --transcript /srv/cmfd/ceremony/records/ABORTED.cmfd \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --aborted-operator-signer 0 \
+  --aborted-reproducer-signer 1
+```
+
+The attestation message commits to the signature count but not to the signer
+class/index slots themselves. Consequently, the exact aborted signer subset
+selected during preparation must be repeated unchanged at staging. The stage
+command verifies that every supplied signature exactly matches the subset
+supplied to that invocation, but the message alone cannot prove which subset
+was shown during an earlier prepare invocation. Operators must therefore retain
+and compare the printed signer list out of band. Every selected signer uses an
+external signer or HSM to sign the exact raw 32-byte message. Do not hash it
+again. These commands accept no private key, seed, key-generation, or signing
+input.
+
+Stage a completed attestation by supplying all `N + R` public signatures. For
+the minimum `N = 3`, `R = 2` roster:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-attestation-stage \
+  --transcript /srv/cmfd/ceremony/records/COMPLETED.cmfd \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --operator-signature 0:128_LOWERCASE_HEX \
+  --operator-signature 1:128_LOWERCASE_HEX \
+  --operator-signature 2:128_LOWERCASE_HEX \
+  --reproducer-signature 0:128_LOWERCASE_HEX \
+  --reproducer-signature 1:128_LOWERCASE_HEX \
+  --attestation-output /srv/cmfd/ceremony/records/COMPLETED.cmfdmta1
+```
+
+Stage an aborted attestation with the exact same nonempty selector set used at
+preparation and one external signature for each selected slot:
+
+```text
+cmfd-consensus dory-v3-model-ceremony-attestation-stage \
+  --transcript /srv/cmfd/ceremony/records/ABORTED.cmfd \
+  --expected-ceremony-id 64_LOWERCASE_HEX_FROM_INDEPENDENT_MIRRORS \
+  --aborted-operator-signer 0 \
+  --aborted-reproducer-signer 1 \
+  --operator-signature 0:128_LOWERCASE_HEX \
+  --reproducer-signature 1:128_LOWERCASE_HEX \
+  --attestation-output /srv/cmfd/ceremony/records/ABORTED.cmfdmta1
+```
+
+Staging repeats the complete two-pass transcript authentication, reconstructs
+the same identity and signing message, verifies the exact signer policy and
+every external BIP340 signature, and verifies the canonical detached
+attestation before writing. `--attestation-output` must be a new absolute path
+inside the trusted ceremony filesystem boundary; an existing path is never
+overwritten. The command synchronizes the create-new output, reopens it,
+decodes and canonically re-encodes it, re-verifies it against the transcript,
+and reauthenticates the transcript once more before reporting success. The
+report includes the immutable transcript and attestation file identities,
+attestation BLAKE3 and SHA-256, signing message, every canonical staged signer
+slot and public key, signer count, durability, and
+`mirror_publication_pending true`.
+
+Local staging is not publication. Publish the exact attestation bytes and dual
+hashes to the append-only bulletin, obtain and reauthenticate receipts from at
+least two independently controlled mirrors, and compare all observed
+attestations for equivocation. The commands neither upload artifacts nor prove
+receipt timing, mirror agreement, or absence of re-signing. They do not inspect
+external artifacts named by a type-6 receipt and do not change production
+activation.
+
 ## Commit, reveal, and closure sequence
 
 All publications use an append-only public bulletin with at least two
@@ -1684,6 +1791,13 @@ Already implemented in this repository:
   staging, and type-5-terminal prefix staging, with bounded Windows/Linux
   `N = 3`, `R = 2` tests; this does not assert independent review or
   production qualification of those commands;
+- feature-gated keyless detached-transcript-attestation preparation and
+  create-new staging, with external BIP340 signatures, independent
+  ceremony-ID anchoring, strict completed-versus-aborted signer policy, and
+  trusted-filesystem reauthentication, with 14 bounded authoring tests passing
+  on each Windows and Ubuntu 22.04 plus warning-denied Clippy and both new CLI
+  help paths; this is not independent review or production qualification, and
+  it neither authors type 6 nor stages a final completed transcript;
 - the feature-gated, identity-safe streaming modular combiner bound exclusively
   to that anchored type-5-prefix capability, with three-pass signed-claim
   authentication and ceremony-bound operational reporting;
@@ -1705,9 +1819,10 @@ Not implemented or not completed by this document:
 - independent external review and a second independently operated full-scale
   qualification of the contribution generator;
 - public append-only bulletin submission, independently mirrored expected
-  ceremony-ID tooling, receipt/equivocation handling, detached transcript
-  attestation, and independent external review of the transcript
-  implementation;
+  ceremony-ID tooling, receipt/equivocation handling, and independent external
+  review of the transcript and detached-attestation implementation;
+- type-6 receipt authoring and final completed-transcript staging, without
+  which a successful ceremony cannot reach detached attestation;
 - independent security review and an operator-scale rehearsal of the keyless
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
@@ -1724,14 +1839,15 @@ Not implemented or not completed by this document:
 - independent cryptographic review, implementation audit, structural review,
   and the remaining activation gates in `SECURITY.md`.
 
-The next minimal implementation slice is detached-attestation authoring and an
-operator-scale rehearsal of the keyless authoring paths, followed by public
-append-only transcript publication with independent mirror receipts and
-production-scale roots, structure, combiner, request, and proof qualification.
-The transcript, generator, combiner, and new report tools still require
-independent external review before generating real contributions. A successful
-run of the current bootstrap or one local generator qualification is not a
-completed ceremony.
+The next minimal implementation slice is type-6 receipt authoring and final
+completed-transcript staging, plus validation and an operator-scale rehearsal
+of the keyless record and detached-attestation authoring paths. That is followed
+by public append-only transcript publication with independent mirror receipts
+and production-scale roots, structure, combiner, request, and proof
+qualification. The transcript, generator, combiner, and new report tools still
+require independent external review before generating real contributions. A
+successful run of the current bootstrap or one local generator qualification
+is not a completed ceremony.
 
 ## Operator completion checklist
 

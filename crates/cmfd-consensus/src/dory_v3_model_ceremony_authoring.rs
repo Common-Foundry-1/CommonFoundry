@@ -1,11 +1,11 @@
-//! Keyless record authoring for production Dory V3 ceremony records 1 through 5.
+//! Keyless record and detached-attestation authoring for the production Dory V3 ceremony.
 //!
 //! A strict tagged JSON plan names trusted, immutable inputs. Preparation
 //! authenticates those inputs and every prior signed record, derives the one
 //! canonical record body, and returns only public signing material. Staging
 //! repeats preparation, accepts externally produced BIP340 signatures, enforces
-//! the frozen signer policy, and create-new persists one immutable record for
-//! later append-only bulletin publication.
+//! the frozen signer policy, and create-new persists immutable records and
+//! terminal-transcript attestations for later append-only bulletin publication.
 //!
 //! This module has no secret-key, seed, signing, transcript-publication, or
 //! activation API. A locally staged record always remains publication-pending.
@@ -30,18 +30,21 @@ use crate::{
         TrustedCeremonyParent,
     },
     dory_v3_model_ceremony_transcript::{
-        CEREMONY_PROTOCOL_VERSION, CeremonyRecordBody, CeremonyTranscriptError, CommitmentSetBody,
-        ContributionCommitmentBody, ContributionRevealBody, FileIdentity, GenesisBody,
+        CEREMONY_PROTOCOL_VERSION, CeremonyRecordBody, CeremonyTranscriptError,
+        CeremonyTranscriptStatus, CommitmentSetBody, ContributionCommitmentBody,
+        ContributionRevealBody, DetachedTranscriptAttestation, FileIdentity, GenesisBody,
         IndexedRecordDigest, MAX_CEREMONY_OPERATORS, MAX_CEREMONY_RECORD_BODY_BYTES,
-        MAX_CEREMONY_SIGNERS, PRODUCTION_BANK_FORMAT_VERSION, PRODUCTION_BANK_HEADER_BYTES,
-        PRODUCTION_BANKS, PRODUCTION_BASE_INPUT_BYTES, PRODUCTION_BATCH,
-        PRODUCTION_BYTES_PER_LAYER, PRODUCTION_DIMENSION, PRODUCTION_LAYERS,
+        MAX_CEREMONY_SIGNERS, MAX_CEREMONY_TRANSCRIPT_BYTES, PRODUCTION_BANK_FORMAT_VERSION,
+        PRODUCTION_BANK_HEADER_BYTES, PRODUCTION_BANKS, PRODUCTION_BASE_INPUT_BYTES,
+        PRODUCTION_BATCH, PRODUCTION_BYTES_PER_LAYER, PRODUCTION_DIMENSION, PRODUCTION_LAYERS,
         PRODUCTION_LAYERS_PER_BANK, PRODUCTION_MAX_MODEL_BYTE, PRODUCTION_MODEL_VERSION,
         PRODUCTION_PADDED_VARIABLES, PRODUCTION_PAYLOAD_BYTES, RecordSignature, ReferenceBinary,
-        RevealSetBody, RosterMember, SignedCeremonyRecord, SignerClass,
-        ceremony_record_content_digest, ceremony_record_signature_message,
-        ceremony_signed_record_digest, decode_ceremony_record, encode_and_verify_reveal_set_prefix,
-        encode_ceremony_record, parse_and_verify_reveal_set_prefix,
+        RevealSetBody, RosterMember, SignedCeremonyRecord, SignerClass, VerifiedCeremonyTranscript,
+        ceremony_attestation_signature_message, ceremony_record_content_digest,
+        ceremony_record_signature_message, ceremony_signed_record_digest, decode_ceremony_record,
+        encode_and_verify_reveal_set_prefix, encode_ceremony_record,
+        encode_detached_transcript_attestation, parse_and_verify_ceremony_transcript,
+        parse_and_verify_reveal_set_prefix, verify_detached_transcript_attestation,
     },
     dory_v3_suite::{DORY_V3_SETUP_IDENTITY, production_dory_v3_suite_digest},
 };
@@ -163,6 +166,31 @@ impl RequiredCeremonySigner {
     }
 }
 
+/// One canonical signer slot selected for an aborted-transcript attestation.
+/// Completed transcripts never accept caller-selected slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProductionDoryV3CeremonyAttestationSigner {
+    signer_class: SignerClass,
+    signer_index: u16,
+}
+
+impl ProductionDoryV3CeremonyAttestationSigner {
+    pub const fn new(signer_class: SignerClass, signer_index: u16) -> Self {
+        Self {
+            signer_class,
+            signer_index,
+        }
+    }
+
+    pub const fn signer_class(&self) -> SignerClass {
+        self.signer_class
+    }
+
+    pub const fn signer_index(&self) -> u16 {
+        self.signer_index
+    }
+}
+
 /// Public, keyless output of a preparation pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedProductionDoryV3CeremonyRecord {
@@ -226,6 +254,108 @@ pub struct ProductionDoryV3CeremonyPrefixStageReport {
     record_count: u16,
     durability: ProductionDoryV3CeremonyRecordStageDurability,
     publication_pending: bool,
+}
+
+/// Public signing request reconstructed from one exact, terminal transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedProductionDoryV3CeremonyAttestation {
+    transcript_path: PathBuf,
+    transcript_bytes_exact: Vec<u8>,
+    transcript_file: FileIdentity,
+    transcript: VerifiedCeremonyTranscript,
+    signature_message: [u8; 32],
+    required_signers: Vec<RequiredCeremonySigner>,
+}
+
+impl PreparedProductionDoryV3CeremonyAttestation {
+    pub fn transcript_path(&self) -> &Path {
+        &self.transcript_path
+    }
+
+    pub const fn transcript_file(&self) -> &FileIdentity {
+        &self.transcript_file
+    }
+
+    pub const fn status(&self) -> CeremonyTranscriptStatus {
+        self.transcript.status()
+    }
+
+    pub const fn ceremony_id(&self) -> [u8; 32] {
+        self.transcript.ceremony_id()
+    }
+
+    pub const fn transcript_derive_key_digest(&self) -> [u8; 32] {
+        self.transcript.transcript_derive_key_digest()
+    }
+
+    pub const fn signature_message(&self) -> [u8; 32] {
+        self.signature_message
+    }
+
+    pub fn required_signers(&self) -> &[RequiredCeremonySigner] {
+        &self.required_signers
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionDoryV3CeremonyAttestationStageReport {
+    output: PathBuf,
+    transcript_file: FileIdentity,
+    attestation_file: FileIdentity,
+    status: CeremonyTranscriptStatus,
+    ceremony_id: [u8; 32],
+    transcript_derive_key_digest: [u8; 32],
+    signature_message: [u8; 32],
+    staged_signers: Vec<RequiredCeremonySigner>,
+    signer_count: u16,
+    durability: ProductionDoryV3CeremonyRecordStageDurability,
+    publication_pending: bool,
+}
+
+impl ProductionDoryV3CeremonyAttestationStageReport {
+    pub fn output(&self) -> &Path {
+        &self.output
+    }
+
+    pub const fn transcript_file(&self) -> &FileIdentity {
+        &self.transcript_file
+    }
+
+    pub const fn attestation_file(&self) -> &FileIdentity {
+        &self.attestation_file
+    }
+
+    pub const fn status(&self) -> CeremonyTranscriptStatus {
+        self.status
+    }
+
+    pub const fn ceremony_id(&self) -> [u8; 32] {
+        self.ceremony_id
+    }
+
+    pub const fn transcript_derive_key_digest(&self) -> [u8; 32] {
+        self.transcript_derive_key_digest
+    }
+
+    pub const fn signature_message(&self) -> [u8; 32] {
+        self.signature_message
+    }
+
+    pub fn staged_signers(&self) -> &[RequiredCeremonySigner] {
+        &self.staged_signers
+    }
+
+    pub const fn signer_count(&self) -> u16 {
+        self.signer_count
+    }
+
+    pub const fn durability(&self) -> ProductionDoryV3CeremonyRecordStageDurability {
+        self.durability
+    }
+
+    pub const fn publication_pending(&self) -> bool {
+        self.publication_pending
+    }
 }
 
 impl ProductionDoryV3CeremonyPrefixStageReport {
@@ -456,6 +586,214 @@ pub fn stage_production_dory_v3_ceremony_reveal_set_prefix(
         durability,
         publication_pending: true,
     })
+}
+
+/// Authenticate one exact terminal transcript twice, require an independent
+/// ceremony-ID anchor, and return only public detached-attestation signing
+/// material. Completed transcripts always require the full frozen roster.
+/// Aborted transcripts require an explicit nonempty roster subset. Its order
+/// is canonicalized, while duplicate slots are rejected.
+pub fn prepare_production_dory_v3_ceremony_attestation(
+    transcript_path: &Path,
+    expected_ceremony_id: [u8; 32],
+    aborted_signers: &[ProductionDoryV3CeremonyAttestationSigner],
+) -> Result<PreparedProductionDoryV3CeremonyAttestation, ProductionDoryV3CeremonyAuthoringError> {
+    let (transcript_bytes_exact, transcript_file) =
+        authenticate_small_file(transcript_path, MAX_CEREMONY_TRANSCRIPT_BYTES)?;
+    let transcript = parse_and_verify_ceremony_transcript(&transcript_bytes_exact)?;
+    if transcript.ceremony_id() != expected_ceremony_id {
+        return Err(ProductionDoryV3CeremonyAuthoringError::CeremonyIdAnchorMismatch);
+    }
+    let required_signers = required_attestation_signers_for_status(
+        transcript.status(),
+        transcript.operators(),
+        transcript.reproducers(),
+        aborted_signers,
+    )?;
+    let unsigned = detached_attestation_from_transcript(
+        &transcript,
+        required_signers
+            .iter()
+            .map(|signer| RecordSignature {
+                signer_class: signer.signer_class,
+                signer_index: signer.signer_index,
+                signature: [0; 64],
+            })
+            .collect(),
+    );
+    let signature_message = ceremony_attestation_signature_message(&unsigned)?;
+    Ok(PreparedProductionDoryV3CeremonyAttestation {
+        transcript_path: transcript_path.to_path_buf(),
+        transcript_bytes_exact,
+        transcript_file,
+        transcript,
+        signature_message,
+        required_signers,
+    })
+}
+
+/// Repeat terminal-transcript preparation, verify externally produced BIP340
+/// signatures, and create-new stage one detached attestation. The exact
+/// aborted signer subset must be repeated from preparation. No secret-key,
+/// signing, seed, publication, or activation capability is present here.
+pub fn stage_production_dory_v3_ceremony_attestation(
+    transcript_path: &Path,
+    expected_ceremony_id: [u8; 32],
+    aborted_signers: &[ProductionDoryV3CeremonyAttestationSigner],
+    mut signatures: Vec<RecordSignature>,
+    output_path: &Path,
+) -> Result<ProductionDoryV3CeremonyAttestationStageReport, ProductionDoryV3CeremonyAuthoringError>
+{
+    // This gate deliberately precedes every transcript filesystem operation.
+    if signatures.is_empty() {
+        return Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy);
+    }
+    let prepared = prepare_production_dory_v3_ceremony_attestation(
+        transcript_path,
+        expected_ceremony_id,
+        aborted_signers,
+    )?;
+    signatures.sort_by_key(|signature| (signature.signer_class, signature.signer_index));
+    if signatures.len() != prepared.required_signers.len()
+        || signatures
+            .iter()
+            .zip(&prepared.required_signers)
+            .any(|(actual, expected)| {
+                actual.signer_class != expected.signer_class
+                    || actual.signer_index != expected.signer_index
+            })
+    {
+        return Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy);
+    }
+
+    let attestation = detached_attestation_from_transcript(&prepared.transcript, signatures);
+    let signature_message = ceremony_attestation_signature_message(&attestation)?;
+    if signature_message != prepared.signature_message {
+        return Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy);
+    }
+    let encoded = encode_detached_transcript_attestation(&attestation)?;
+    let verified = verify_detached_transcript_attestation(&encoded, &prepared.transcript)?;
+    if verified != attestation {
+        return Err(ProductionDoryV3CeremonyAuthoringError::StagedOutputChanged);
+    }
+    let attestation_file = file_identity_for_bytes(&encoded);
+    let expected_attestation = attestation.clone();
+    let durability = persist_record(output_path, &encoded, |reopened| {
+        let reopened_attestation =
+            verify_detached_transcript_attestation(reopened, &prepared.transcript)?;
+        if reopened_attestation != expected_attestation
+            || encode_detached_transcript_attestation(&reopened_attestation)? != reopened
+            || file_identity_for_bytes(reopened) != attestation_file
+        {
+            return Err(ProductionDoryV3CeremonyAuthoringError::StagedOutputChanged);
+        }
+
+        // Reauthenticate the immutable input only after the staged output has
+        // been reopened and verified, closing the input/output TOCTOU window.
+        let (final_transcript_bytes, final_transcript_file) =
+            authenticate_small_file(transcript_path, MAX_CEREMONY_TRANSCRIPT_BYTES)?;
+        if final_transcript_bytes != prepared.transcript_bytes_exact
+            || final_transcript_file != prepared.transcript_file
+        {
+            return Err(ProductionDoryV3CeremonyAuthoringError::InputChanged(
+                transcript_path.to_path_buf(),
+            ));
+        }
+        let final_transcript = parse_and_verify_ceremony_transcript(&final_transcript_bytes)?;
+        if final_transcript != prepared.transcript
+            || final_transcript.ceremony_id() != expected_ceremony_id
+        {
+            return Err(ProductionDoryV3CeremonyAuthoringError::InputChanged(
+                transcript_path.to_path_buf(),
+            ));
+        }
+        Ok(())
+    })?;
+    let signer_count = u16::try_from(attestation.signatures.len())
+        .map_err(|_| CeremonyTranscriptError::Limit("attestation signature count"))?;
+
+    Ok(ProductionDoryV3CeremonyAttestationStageReport {
+        output: output_path.to_path_buf(),
+        transcript_file: prepared.transcript_file,
+        attestation_file,
+        status: prepared.transcript.status(),
+        ceremony_id: prepared.transcript.ceremony_id(),
+        transcript_derive_key_digest: prepared.transcript.transcript_derive_key_digest(),
+        signature_message,
+        staged_signers: prepared.required_signers,
+        signer_count,
+        durability,
+        publication_pending: true,
+    })
+}
+
+fn detached_attestation_from_transcript(
+    transcript: &VerifiedCeremonyTranscript,
+    signatures: Vec<RecordSignature>,
+) -> DetachedTranscriptAttestation {
+    DetachedTranscriptAttestation {
+        ceremony_id: transcript.ceremony_id(),
+        transcript_bytes: transcript.transcript_bytes(),
+        transcript_derive_key_digest: transcript.transcript_derive_key_digest(),
+        transcript_blake3: transcript.transcript_blake3(),
+        transcript_sha256: transcript.transcript_sha256(),
+        signatures,
+    }
+}
+
+fn required_attestation_signers_for_status(
+    status: CeremonyTranscriptStatus,
+    operators: &[[u8; 32]],
+    reproducers: &[[u8; 32]],
+    aborted_signers: &[ProductionDoryV3CeremonyAttestationSigner],
+) -> Result<Vec<RequiredCeremonySigner>, ProductionDoryV3CeremonyAuthoringError> {
+    if status == CeremonyTranscriptStatus::Completed {
+        if !aborted_signers.is_empty() {
+            return Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy);
+        }
+        return Ok(operators
+            .iter()
+            .enumerate()
+            .map(|(index, public_key)| RequiredCeremonySigner {
+                signer_class: SignerClass::Operator,
+                signer_index: u16::try_from(index).expect("operator roster is capped at u16"),
+                public_key: *public_key,
+            })
+            .chain(reproducers.iter().enumerate().map(|(index, public_key)| {
+                RequiredCeremonySigner {
+                    signer_class: SignerClass::Reproducer,
+                    signer_index: u16::try_from(index).expect("reproducer roster is capped at u16"),
+                    public_key: *public_key,
+                }
+            }))
+            .collect());
+    }
+    if status != CeremonyTranscriptStatus::Aborted || aborted_signers.is_empty() {
+        return Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy);
+    }
+
+    let mut canonical_signers = aborted_signers.to_vec();
+    canonical_signers.sort_by_key(|signer| (signer.signer_class, signer.signer_index));
+    if canonical_signers.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy);
+    }
+
+    let mut required = Vec::with_capacity(canonical_signers.len());
+    for signer in canonical_signers {
+        let roster = match signer.signer_class {
+            SignerClass::Operator => operators,
+            SignerClass::Reproducer => reproducers,
+        };
+        let Some(public_key) = roster.get(usize::from(signer.signer_index)) else {
+            return Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy);
+        };
+        required.push(RequiredCeremonySigner {
+            signer_class: signer.signer_class,
+            signer_index: signer.signer_index,
+            public_key: *public_key,
+        });
+    }
+    Ok(required)
 }
 
 fn prepare_decoded_plan(
@@ -1306,10 +1644,26 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use dory_pcs::primitives::{DorySerialize, arithmetic::Field};
     use k256::schnorr::SigningKey;
 
     use super::*;
-    use crate::dory_v3_model_ceremony_fs::prepare_test_parent;
+    use crate::{
+        ModelBankManifest,
+        dory_bls12_381_prototype::{
+            BlsDoryFr, DeterministicBlsDorySetup, deterministic_bls_dory_setup,
+        },
+        dory_v3_model::{CanonicalBlsDoryGtHex, ordered_dory_v3_model_commitment_root},
+        dory_v3_model_ceremony_fs::prepare_test_parent,
+        dory_v3_model_ceremony_transcript::{
+            AbortBody, FinalReceiptBody, PRODUCTION_BANK_BYTES, ReproducerReceipt,
+            encode_and_verify_ceremony_transcript,
+        },
+        dory_v3_suite::{
+            DORY_V3_MODEL_IDENTITY_DOMAIN, DORY_V3_MODEL_IDENTITY_VERSION,
+            DORY_V3_MODEL_RECORD_DOMAIN, DORY_V3_MODEL_RECORD_VERSION,
+        },
+    };
 
     static TEST_DIRECTORY_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1337,6 +1691,15 @@ mod tests {
     struct TypeFiveFixture {
         records: Vec<SignedCeremonyRecord>,
         ceremony_id: [u8; 32],
+        operators: Vec<SigningKey>,
+        reproducers: Vec<SigningKey>,
+    }
+
+    struct TerminalTranscriptFixture {
+        bytes: Vec<u8>,
+        ceremony_id: [u8; 32],
+        operators: Vec<SigningKey>,
+        reproducers: Vec<SigningKey>,
     }
 
     fn test_file(byte: u8) -> FileIdentity {
@@ -1542,6 +1905,175 @@ mod tests {
         TypeFiveFixture {
             records,
             ceremony_id,
+            operators,
+            reproducers,
+        }
+    }
+
+    fn canonical_test_commitment(
+        setup: &DeterministicBlsDorySetup,
+        scalar: i64,
+        row: usize,
+    ) -> [u8; 576] {
+        let committed_row = setup
+            .commit_row_segment(0, &[BlsDoryFr::from_i64(scalar)])
+            .unwrap();
+        let commitment = setup.pair_committed_row(row, &committed_row).unwrap();
+        let mut encoded = Vec::new();
+        commitment.serialize_compressed(&mut encoded).unwrap();
+        encoded.try_into().unwrap()
+    }
+
+    fn completed_transcript_fixture() -> TerminalTranscriptFixture {
+        let mut fixture = type_five_fixture();
+        let commitment_set_signed_record_digest =
+            ceremony_signed_record_digest(&fixture.records[4]).unwrap();
+        let reveal_set_signed_record_digest =
+            ceremony_signed_record_digest(fixture.records.last().unwrap()).unwrap();
+        let setup = deterministic_bls_dory_setup(3).unwrap();
+        let base_commitment = canonical_test_commitment(&setup, 3, 0);
+        let weight_bank_0_commitment = canonical_test_commitment(&setup, 5, 1);
+        let weight_bank_1_commitment = canonical_test_commitment(&setup, 7, 2);
+        let weight_bank_2_commitment = canonical_test_commitment(&setup, 11, 3);
+        let base = CanonicalBlsDoryGtHex::from_hex(&hex::encode(base_commitment)).unwrap();
+        let weights = [
+            CanonicalBlsDoryGtHex::from_hex(&hex::encode(weight_bank_0_commitment)).unwrap(),
+            CanonicalBlsDoryGtHex::from_hex(&hex::encode(weight_bank_1_commitment)).unwrap(),
+            CanonicalBlsDoryGtHex::from_hex(&hex::encode(weight_bank_2_commitment)).unwrap(),
+        ];
+        let suite_digest = production_dory_v3_suite_digest().into_bytes();
+        let setup_identity = DORY_V3_SETUP_IDENTITY.into_bytes();
+        let commitment_root = ordered_dory_v3_model_commitment_root(
+            DORY_V3_MODEL_IDENTITY_VERSION,
+            suite_digest,
+            setup_identity,
+            PRODUCTION_PADDED_VARIABLES,
+            &base,
+            &weights,
+        )
+        .unwrap();
+        let raw_payload_blake3 = [90; 32];
+        let layer_roots_aggregate = [93; 32];
+        let manifest_digest = ModelBankManifest {
+            model_version: PRODUCTION_MODEL_VERSION,
+            dimension: PRODUCTION_DIMENSION,
+            batch: PRODUCTION_BATCH,
+            layers: PRODUCTION_LAYERS,
+            base_input_bytes: PRODUCTION_BASE_INPUT_BYTES,
+            bytes_per_layer: PRODUCTION_BYTES_PER_LAYER,
+            payload_bytes: PRODUCTION_PAYLOAD_BYTES,
+            raw_blake3_root: raw_payload_blake3,
+            layer_roots_aggregate,
+            pcs_parameter_digest: suite_digest,
+            pcs_commitment_root: commitment_root,
+        }
+        .digest()
+        .unwrap();
+
+        let mut identity = blake3::Hasher::new_derive_key(DORY_V3_MODEL_IDENTITY_DOMAIN);
+        identity.update(&DORY_V3_MODEL_IDENTITY_VERSION.to_le_bytes());
+        identity.update(&suite_digest);
+        identity.update(&PRODUCTION_MODEL_VERSION.to_le_bytes());
+        identity.update(&PRODUCTION_BATCH.to_le_bytes());
+        identity.update(&PRODUCTION_DIMENSION.to_le_bytes());
+        identity.update(&PRODUCTION_LAYERS_PER_BANK.to_le_bytes());
+        identity.update(&PRODUCTION_BANKS.to_le_bytes());
+        identity.update(&raw_payload_blake3);
+        identity.update(&layer_roots_aggregate);
+        identity.update(&setup_identity);
+        identity.update(&PRODUCTION_PADDED_VARIABLES.to_le_bytes());
+        identity.update(&commitment_root);
+        let model_identity_digest = *identity.finalize().as_bytes();
+
+        let mut canonical_record = Vec::with_capacity(166);
+        canonical_record.extend_from_slice(&DORY_V3_MODEL_RECORD_VERSION.to_le_bytes());
+        canonical_record.extend_from_slice(&suite_digest);
+        canonical_record.extend_from_slice(&manifest_digest);
+        canonical_record.extend_from_slice(&model_identity_digest);
+        canonical_record.extend_from_slice(&setup_identity);
+        canonical_record.extend_from_slice(&PRODUCTION_PADDED_VARIABLES.to_le_bytes());
+        canonical_record.extend_from_slice(&commitment_root);
+        assert_eq!(canonical_record.len(), 166);
+        let mut record = blake3::Hasher::new_derive_key(DORY_V3_MODEL_RECORD_DOMAIN);
+        record.update(&canonical_record);
+        let record_v2_digest = *record.finalize().as_bytes();
+
+        let final_receipt = sign_test_record(
+            CeremonyRecordBody::FinalReceipt(Box::new(FinalReceiptBody {
+                ceremony_id: fixture.ceremony_id,
+                commitment_set_signed_record_digest,
+                reveal_set_signed_record_digest,
+                payload_bytes: PRODUCTION_PAYLOAD_BYTES,
+                raw_payload_blake3,
+                raw_payload_sha256: [91; 32],
+                base_input_blake3_root: [92; 32],
+                layer_roots_aggregate,
+                roots_file: test_file(94),
+                structural_report: test_file(95),
+                bank_bytes: PRODUCTION_BANK_BYTES,
+                bank_file_blake3: [96; 32],
+                bank_file_sha256: [97; 32],
+                manifest_file: test_file(98),
+                manifest_digest,
+                production_suite_digest: suite_digest,
+                pcs_parameter_digest: suite_digest,
+                base_commitment,
+                weight_bank_0_commitment,
+                weight_bank_1_commitment,
+                weight_bank_2_commitment,
+                pcs_commitment_root: commitment_root,
+                model_identity_digest,
+                setup_identity,
+                padded_variables: PRODUCTION_PADDED_VARIABLES,
+                record_v2_file: test_file(102),
+                record_v2_digest,
+                publisher_reproducer_index: 0,
+                reproducers: (0..fixture.reproducers.len())
+                    .map(|index| ReproducerReceipt {
+                        index: index as u16,
+                        combiner_binary_blake3: [110 + index as u8; 32],
+                        combiner_binary_sha256: [112 + index as u8; 32],
+                        bootstrap_report: test_file(114 + index as u8),
+                        record_ceremony_report: test_file(116 + index as u8),
+                        reproduction_report: test_file(118 + index as u8),
+                    })
+                    .collect(),
+            })),
+            &all_test_signers(&fixture.operators, &fixture.reproducers),
+        );
+        fixture.records.push(final_receipt);
+        TerminalTranscriptFixture {
+            bytes: encode_and_verify_ceremony_transcript(&fixture.records).unwrap(),
+            ceremony_id: fixture.ceremony_id,
+            operators: fixture.operators,
+            reproducers: fixture.reproducers,
+        }
+    }
+
+    fn aborted_transcript_fixture(reason_code: u16) -> TerminalTranscriptFixture {
+        let operators = test_keys(3, 1);
+        let reproducers = test_keys(2, 20);
+        let genesis = sign_test_record(
+            CeremonyRecordBody::Genesis(Box::new(test_genesis(&operators, &reproducers))),
+            &all_test_signers(&operators, &reproducers),
+        );
+        let ceremony_id = ceremony_record_content_digest(&genesis.body).unwrap();
+        let last_valid_signed_record_digest = ceremony_signed_record_digest(&genesis).unwrap();
+        let abort = sign_test_record(
+            CeremonyRecordBody::Abort(AbortBody {
+                ceremony_id,
+                last_valid_signed_record_digest,
+                phase: 1,
+                reason_code,
+                evidence_file: test_file(30 + reason_code as u8),
+            }),
+            &[(SignerClass::Operator, 0, &operators[0])],
+        );
+        TerminalTranscriptFixture {
+            bytes: encode_and_verify_ceremony_transcript(&[genesis, abort]).unwrap(),
+            ceremony_id,
+            operators,
+            reproducers,
         }
     }
 
@@ -1648,6 +2180,31 @@ mod tests {
                 };
                 let public_key: [u8; 32] = key.verifying_key().to_bytes().into();
                 assert_eq!(required.public_key(), public_key);
+                let signature: Signature = key
+                    .sign_raw(&prepared.signature_message(), &[0; 32])
+                    .unwrap();
+                RecordSignature {
+                    signer_class: required.signer_class(),
+                    signer_index: required.signer_index(),
+                    signature: signature.to_bytes(),
+                }
+            })
+            .collect()
+    }
+
+    fn sign_prepared_attestation(
+        prepared: &PreparedProductionDoryV3CeremonyAttestation,
+        operators: &[SigningKey],
+        reproducers: &[SigningKey],
+    ) -> Vec<RecordSignature> {
+        prepared
+            .required_signers()
+            .iter()
+            .map(|required| {
+                let key = match required.signer_class() {
+                    SignerClass::Operator => &operators[usize::from(required.signer_index())],
+                    SignerClass::Reproducer => &reproducers[usize::from(required.signer_index())],
+                };
                 let signature: Signature = key
                     .sign_raw(&prepared.signature_message(), &[0; 32])
                     .unwrap();
@@ -1889,6 +2446,368 @@ mod tests {
             Err(ProductionDoryV3CeremonyAuthoringError::CeremonyIdAnchorMismatch)
         ));
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn attestation_signer_policy_distinguishes_completed_and_aborted_transcripts() {
+        let operators = [[1; 32], [2; 32], [3; 32]];
+        let reproducers = [[4; 32], [5; 32]];
+        let completed = required_attestation_signers_for_status(
+            CeremonyTranscriptStatus::Completed,
+            &operators,
+            &reproducers,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(completed.len(), 5);
+        assert_eq!(completed[0].signer_class(), SignerClass::Operator);
+        assert_eq!(completed[2].signer_index(), 2);
+        assert_eq!(completed[3].signer_class(), SignerClass::Reproducer);
+        assert_eq!(completed[4].signer_index(), 1);
+
+        let selected = [ProductionDoryV3CeremonyAttestationSigner::new(
+            SignerClass::Reproducer,
+            1,
+        )];
+        assert!(matches!(
+            required_attestation_signers_for_status(
+                CeremonyTranscriptStatus::Completed,
+                &operators,
+                &reproducers,
+                &selected
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+        assert!(matches!(
+            required_attestation_signers_for_status(
+                CeremonyTranscriptStatus::Aborted,
+                &operators,
+                &reproducers,
+                &[]
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+        let aborted = required_attestation_signers_for_status(
+            CeremonyTranscriptStatus::Aborted,
+            &operators,
+            &reproducers,
+            &selected,
+        )
+        .unwrap();
+        assert_eq!(aborted.len(), 1);
+        assert_eq!(aborted[0].signer_class(), SignerClass::Reproducer);
+        assert_eq!(aborted[0].signer_index(), 1);
+        assert_eq!(aborted[0].public_key(), [5; 32]);
+
+        let unordered = [
+            ProductionDoryV3CeremonyAttestationSigner::new(SignerClass::Reproducer, 1),
+            ProductionDoryV3CeremonyAttestationSigner::new(SignerClass::Operator, 2),
+        ];
+        let canonical = required_attestation_signers_for_status(
+            CeremonyTranscriptStatus::Aborted,
+            &operators,
+            &reproducers,
+            &unordered,
+        )
+        .unwrap();
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(canonical[0].signer_class(), SignerClass::Operator);
+        assert_eq!(canonical[0].signer_index(), 2);
+        assert_eq!(canonical[1].signer_class(), SignerClass::Reproducer);
+        assert_eq!(canonical[1].signer_index(), 1);
+    }
+
+    #[test]
+    fn completed_attestation_prepares_all_signers_stages_and_reopens() {
+        let directory = TestDirectory::new();
+        let fixture = completed_transcript_fixture();
+        let transcript_path = write_test_input(&directory, "completed.cmfdct01", &fixture.bytes);
+        let output = directory.0.join("completed.cmfdta01");
+        let forbidden_selector = [ProductionDoryV3CeremonyAttestationSigner::new(
+            SignerClass::Operator,
+            0,
+        )];
+        assert!(matches!(
+            prepare_production_dory_v3_ceremony_attestation(
+                &transcript_path,
+                fixture.ceremony_id,
+                &forbidden_selector
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+
+        let prepared = prepare_production_dory_v3_ceremony_attestation(
+            &transcript_path,
+            fixture.ceremony_id,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(prepared.status(), CeremonyTranscriptStatus::Completed);
+        assert_eq!(prepared.required_signers().len(), 5);
+        let signatures =
+            sign_prepared_attestation(&prepared, &fixture.operators, &fixture.reproducers);
+        let report = stage_production_dory_v3_ceremony_attestation(
+            &transcript_path,
+            fixture.ceremony_id,
+            &[],
+            signatures,
+            &output,
+        )
+        .unwrap();
+
+        let transcript = parse_and_verify_ceremony_transcript(&fixture.bytes).unwrap();
+        assert_eq!(transcript.status(), CeremonyTranscriptStatus::Completed);
+        let attestation_bytes = fs::read(&output).unwrap();
+        let attestation =
+            verify_detached_transcript_attestation(&attestation_bytes, &transcript).unwrap();
+        assert_eq!(attestation.signatures.len(), 5);
+        assert_eq!(report.status(), CeremonyTranscriptStatus::Completed);
+        assert_eq!(report.signer_count(), 5);
+        assert_eq!(report.staged_signers(), prepared.required_signers());
+        assert_eq!(
+            report.staged_signers()[0].signer_class(),
+            SignerClass::Operator
+        );
+        assert_eq!(report.staged_signers()[2].signer_index(), 2);
+        assert_eq!(
+            report.staged_signers()[3].signer_class(),
+            SignerClass::Reproducer
+        );
+        let expected_reproducer_key: [u8; 32] =
+            fixture.reproducers[1].verifying_key().to_bytes().into();
+        assert_eq!(
+            report.staged_signers()[4].public_key(),
+            expected_reproducer_key
+        );
+        assert_eq!(
+            report.attestation_file(),
+            &file_identity_for_bytes(&attestation_bytes)
+        );
+        assert!(report.publication_pending());
+    }
+
+    #[test]
+    fn aborted_attestation_prepares_and_stages_reproducer_only_with_equal_message() {
+        let directory = TestDirectory::new();
+        let fixture = aborted_transcript_fixture(12);
+        let transcript_path = write_test_input(&directory, "aborted.cmfdct01", &fixture.bytes);
+        let output = directory.0.join("aborted.cmfdta01");
+        let selected = [ProductionDoryV3CeremonyAttestationSigner::new(
+            SignerClass::Reproducer,
+            1,
+        )];
+
+        let prepared = prepare_production_dory_v3_ceremony_attestation(
+            &transcript_path,
+            fixture.ceremony_id,
+            &selected,
+        )
+        .unwrap();
+        assert_eq!(prepared.status(), CeremonyTranscriptStatus::Aborted);
+        assert_eq!(
+            prepared.transcript_file(),
+            &file_identity_for_bytes(&fixture.bytes)
+        );
+        assert_eq!(prepared.required_signers().len(), 1);
+        assert_eq!(
+            prepared.required_signers()[0].signer_class(),
+            SignerClass::Reproducer
+        );
+        let signatures =
+            sign_prepared_attestation(&prepared, &fixture.operators, &fixture.reproducers);
+        let report = stage_production_dory_v3_ceremony_attestation(
+            &transcript_path,
+            fixture.ceremony_id,
+            &selected,
+            signatures,
+            &output,
+        )
+        .unwrap();
+
+        let transcript = parse_and_verify_ceremony_transcript(&fixture.bytes).unwrap();
+        let attestation_bytes = fs::read(&output).unwrap();
+        let attestation =
+            verify_detached_transcript_attestation(&attestation_bytes, &transcript).unwrap();
+        assert_eq!(
+            ceremony_attestation_signature_message(&attestation).unwrap(),
+            prepared.signature_message()
+        );
+        assert_eq!(report.signature_message(), prepared.signature_message());
+        assert_eq!(report.transcript_file(), prepared.transcript_file());
+        assert_eq!(
+            report.attestation_file(),
+            &file_identity_for_bytes(&attestation_bytes)
+        );
+        assert_eq!(report.signer_count(), 1);
+        assert_eq!(report.staged_signers(), prepared.required_signers());
+        let expected_reproducer_key: [u8; 32] =
+            fixture.reproducers[1].verifying_key().to_bytes().into();
+        assert_eq!(
+            report.staged_signers()[0].public_key(),
+            expected_reproducer_key
+        );
+        assert!(report.publication_pending());
+
+        let original = attestation_bytes;
+        let signatures =
+            sign_prepared_attestation(&prepared, &fixture.operators, &fixture.reproducers);
+        assert!(matches!(
+            stage_production_dory_v3_ceremony_attestation(
+                &transcript_path,
+                fixture.ceremony_id,
+                &selected,
+                signatures,
+                &output
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Filesystem(message))
+                if message.contains("refusing to overwrite existing output")
+        ));
+        assert_eq!(fs::read(output).unwrap(), original);
+    }
+
+    #[test]
+    fn attestation_prepare_rejects_wrong_anchor_prefix_and_bad_aborted_subsets() {
+        let directory = TestDirectory::new();
+        let aborted = aborted_transcript_fixture(12);
+        let aborted_path = write_test_input(&directory, "aborted.cmfdct01", &aborted.bytes);
+        let selected = [ProductionDoryV3CeremonyAttestationSigner::new(
+            SignerClass::Operator,
+            0,
+        )];
+        let mut wrong_anchor = aborted.ceremony_id;
+        wrong_anchor[0] ^= 1;
+        assert!(matches!(
+            prepare_production_dory_v3_ceremony_attestation(&aborted_path, wrong_anchor, &selected),
+            Err(ProductionDoryV3CeremonyAuthoringError::CeremonyIdAnchorMismatch)
+        ));
+
+        let prefix_fixture = type_five_fixture();
+        let prefix_bytes = encode_and_verify_reveal_set_prefix(
+            &prefix_fixture.records,
+            prefix_fixture.ceremony_id,
+        )
+        .unwrap();
+        let prefix_path = write_test_input(&directory, "prefix.cmfdct01", &prefix_bytes);
+        assert!(
+            prepare_production_dory_v3_ceremony_attestation(
+                &prefix_path,
+                prefix_fixture.ceremony_id,
+                &selected
+            )
+            .is_err()
+        );
+
+        let duplicate = [selected[0], selected[0]];
+        assert!(matches!(
+            prepare_production_dory_v3_ceremony_attestation(
+                &aborted_path,
+                aborted.ceremony_id,
+                &duplicate
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+        let outside = [ProductionDoryV3CeremonyAttestationSigner::new(
+            SignerClass::Reproducer,
+            2,
+        )];
+        assert!(matches!(
+            prepare_production_dory_v3_ceremony_attestation(
+                &aborted_path,
+                aborted.ceremony_id,
+                &outside
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+    }
+
+    #[test]
+    fn attestation_stage_rejects_zero_duplicate_outside_invalid_and_stale_signatures() {
+        let directory = TestDirectory::new();
+        let fixture = aborted_transcript_fixture(12);
+        let transcript_path = write_test_input(&directory, "aborted.cmfdct01", &fixture.bytes);
+        let selected = [ProductionDoryV3CeremonyAttestationSigner::new(
+            SignerClass::Reproducer,
+            1,
+        )];
+        let prepared = prepare_production_dory_v3_ceremony_attestation(
+            &transcript_path,
+            fixture.ceremony_id,
+            &selected,
+        )
+        .unwrap();
+        let valid = sign_prepared_attestation(&prepared, &fixture.operators, &fixture.reproducers);
+
+        let missing_path = directory.0.join("missing.cmfdct01");
+        assert!(matches!(
+            stage_production_dory_v3_ceremony_attestation(
+                &missing_path,
+                fixture.ceremony_id,
+                &selected,
+                Vec::new(),
+                &directory.0.join("zero.cmfdta01")
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+
+        let duplicate = vec![valid[0].clone(), valid[0].clone()];
+        assert!(matches!(
+            stage_production_dory_v3_ceremony_attestation(
+                &transcript_path,
+                fixture.ceremony_id,
+                &selected,
+                duplicate,
+                &directory.0.join("duplicate.cmfdta01")
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+
+        let mut outside = valid.clone();
+        outside[0].signer_index = 2;
+        assert!(matches!(
+            stage_production_dory_v3_ceremony_attestation(
+                &transcript_path,
+                fixture.ceremony_id,
+                &selected,
+                outside,
+                &directory.0.join("outside.cmfdta01")
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::SignerPolicy)
+        ));
+
+        let wrong_key = SigningKey::from_bytes(&[99; 32]).unwrap();
+        let wrong_signature: Signature = wrong_key
+            .sign_raw(&prepared.signature_message(), &[0; 32])
+            .unwrap();
+        let mut invalid = valid.clone();
+        invalid[0].signature = wrong_signature.to_bytes();
+        assert!(matches!(
+            stage_production_dory_v3_ceremony_attestation(
+                &transcript_path,
+                fixture.ceremony_id,
+                &selected,
+                invalid,
+                &directory.0.join("invalid.cmfdta01")
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Transcript(
+                CeremonyTranscriptError::InvalidSignature
+            ))
+        ));
+
+        let replacement = aborted_transcript_fixture(11);
+        assert_eq!(replacement.ceremony_id, fixture.ceremony_id);
+        fs::write(&transcript_path, replacement.bytes).unwrap();
+        assert!(matches!(
+            stage_production_dory_v3_ceremony_attestation(
+                &transcript_path,
+                fixture.ceremony_id,
+                &selected,
+                valid,
+                &directory.0.join("stale.cmfdta01")
+            ),
+            Err(ProductionDoryV3CeremonyAuthoringError::Transcript(
+                CeremonyTranscriptError::InvalidSignature
+            ))
+        ));
     }
 
     #[test]

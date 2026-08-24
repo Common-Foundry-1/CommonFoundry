@@ -61,6 +61,12 @@ pub struct ValidatedProductionDoryV3ModelBankRecordChain {
 }
 
 impl ValidatedProductionDoryV3ModelBankRecordChain {
+    pub(crate) fn retained_bank_filesystem_identity(
+        &self,
+    ) -> crate::dory_v3_model_ceremony_fs::FileIdentity {
+        self.bank.identity()
+    }
+
     pub const fn authenticated_record(&self) -> &BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
         &self.authenticated_record
     }

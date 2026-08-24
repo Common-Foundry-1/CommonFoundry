@@ -756,6 +756,25 @@ syntax-only parsed report. This layer deliberately cannot construct a
 `ReproducerReceipt`; later type-6 preparation may do that only after every
 downstream artifact validator succeeds.
 
+The exact-roster final-candidate validator is the next fail-closed boundary. It
+opens every shared, report, source, and audit artifact before parsing any
+`CMFDRP01`, requires exactly one ordered report for every frozen reproducer,
+freshly validates the combined payload once, validates roots and the structural
+report through one retained raw-payload handle, repeats the structural analysis,
+and validates the bank/manifest/Record V2 chain once. It then cross-binds every
+content identity, root, commitment, manifest field, and Record V2 field before
+returning a non-cloneable, non-serializable aggregate. No per-reproducer result
+is exposed as authority. Every supplied artifact role must use a distinct path
+and retained filesystem identity; even two reproducers using byte-identical
+reference binaries must provide distinct physical files. The independently
+opened bank-chain validator must retain the same bank filesystem identity as
+the final-candidate validator's pre-opened guard. The production entry point
+additionally requires an opaque CMFDIL lineage capability covering every report
+that declares itself independent and proving that at least one such
+implementation exists. No production constructor for that capability exists
+yet, so this checkpoint cannot currently feed type-6 authoring; the report's
+implementation-kind byte alone is explicitly insufficient.
+
 The keyless authoring API derives ceremony, source, closure, ordered-input,
 combined-output, and frozen-suite fields from verified capabilities, then
 canonicalizes, reparses, and context-verifies its own output. It does not sign

@@ -48,7 +48,7 @@ fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
 #[command(
     name = "cmfd-node",
     version,
-    about = "CommonFoundry bounded multi-node Devnet-0 runtime"
+    about = "Common Foundry profile-bound node runtime"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_DATA_DIR)]
@@ -58,8 +58,7 @@ struct Cli {
     /// `<data_dir>/logs` is always captured at debug level regardless.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     verbose: u8,
-    /// Absolute path to the hash-pinned proof-verifier worker. When omitted,
-    /// Devnet retains bounded in-process verification.
+    /// Absolute path to the hash-pinned proof-verifier worker.
     #[arg(long, global = true, requires = "proof_verifier_worker_sha256")]
     proof_verifier_worker: Option<PathBuf>,
     /// Expected SHA-256 of --proof-verifier-worker as 64 hexadecimal
@@ -126,7 +125,7 @@ enum Command {
         #[arg(long)]
         allow_public_peers: bool,
     },
-    /// Mine, validate, persist, and apply one Devnet-0 block locally.
+    /// Mine, validate, persist, and apply one bounded reference block locally.
     MineOnce {
         /// 32-byte x-only Schnorr public key as 64 hex characters.
         #[arg(long)]
@@ -145,7 +144,7 @@ enum Command {
         #[arg(long)]
         private_key: PathBuf,
     },
-    /// Run the authenticated, non-Stratum Devnet-0 pool service.
+    /// Run the authenticated, non-Stratum reference pool service.
     PoolServe {
         #[arg(long, default_value_t = DEFAULT_POOL_SOCKET_ADDRESS)]
         bind: SocketAddr,
@@ -166,7 +165,7 @@ enum Command {
         /// Pool-owned 32-byte x-only Schnorr block-reward destination.
         #[arg(long)]
         miner: Option<String>,
-        /// Easier share target. Devnet chain work starts at 8 leading zero bits.
+        /// Easier reference-pool share target; chain work starts at 8 leading zero bits.
         #[arg(long, default_value_t = DEFAULT_SHARE_LEADING_ZERO_BITS)]
         share_leading_zero_bits: u16,
     },
@@ -318,6 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::MineOnce { miner, attempts } => {
+            require_bounded_reference_mining("mine-once")?;
             let mut node = open_node(
                 &cli.data_dir,
                 production_v3_artifacts.as_ref(),
@@ -334,9 +334,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "accepted": true,
                     "height": block.challenge.height,
                     "block_id": hex::encode(block.block_id()),
-                    "proof_type": "forgematrix-v2-reference",
+                    "proof_type": COMPILED_NETWORK_PROFILE.proof_name(),
                     "miner": hex::encode(miner_destination),
-                    "used_insecure_default_miner": miner.is_none(),
+                    "used_insecure_default_miner": miner.is_none() && node.wallet_is_insecure_demo(),
                     "status": node.status()?,
                 }))?
             );
@@ -363,7 +363,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "private_key": info.private_key_path,
                     "certificate_sha256": hex::encode(info.certificate_sha256),
                     "format": "DER certificate and DER PKCS#8 private key",
-                    "warning": "pin this exact SHA-256 value in every Devnet pool client"
+                    "warning": format!(
+                        "pin this exact SHA-256 value in every {} pool client",
+                        COMPILED_NETWORK_PROFILE.short_name()
+                    )
                 }))?
             );
             Ok(())
@@ -378,11 +381,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             miner,
             share_leading_zero_bits,
         } => {
+            require_bounded_reference_mining("pool-serve")?;
             let shutdown = install_shutdown_handler()?;
             if share_leading_zero_bits >= 8 {
-                return Err(
-                    "pool share-leading-zero-bits must be between 0 and 7 on Devnet-0".into(),
-                );
+                return Err(format!(
+                    "pool share-leading-zero-bits must be between 0 and 7 on {}",
+                    COMPILED_NETWORK_PROFILE.short_name()
+                )
+                .into());
             }
             let address_policy = peer_address_policy(allow_public_peers);
             let mut node_instance = open_node(
@@ -395,6 +401,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(value) => parse_miner_destination(value)?,
                 None => node_instance.wallet_destination(),
             };
+            let used_insecure_default_miner =
+                miner.is_none() && node_instance.wallet_is_insecure_demo();
             let certificate_der = std::fs::read(&certificate)?;
             let private_key_der = std::fs::read(&private_key)?;
             let pin = certificate_sha256(&certificate_der);
@@ -432,12 +440,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "pool": pool.local_addr().to_string(),
                     "p2p": p2p_address.to_string(),
                     "static_peers": peers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    "protocol": "CMFD Devnet pool v1 (not Stratum)",
+                    "protocol": format!(
+                        "CMFD {} pool v1 (not Stratum)",
+                        COMPILED_NETWORK_PROFILE.short_name()
+                    ),
                     "tls": "TLS 1.3 with an exact certificate SHA-256 pin",
                     "certificate_sha256": hex::encode(pin),
                     "share_leading_zero_bits": share_leading_zero_bits,
                     "block_reward_destination": hex::encode(miner_destination),
-                    "used_insecure_default_miner": miner.is_none(),
+                    "used_insecure_default_miner": used_insecure_default_miner,
                     "public_peer_mode": allow_public_peers,
                     "p2p_warning": peer_warning(allow_public_peers),
                     "accounting": "session-only accounting records; nonwithdrawable; not funds; not an on-chain balance or payout"
@@ -579,11 +590,34 @@ fn peer_address_policy(allow_public_peers: bool) -> PeerAddressPolicy {
     }
 }
 
-fn peer_warning(allow_public_peers: bool) -> &'static str {
-    if allow_public_peers {
-        "Public Devnet P2P enabled; node RPC remains on loopback"
+fn require_bounded_reference_mining(command: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if COMPILED_NETWORK_PROFILE
+        .proof
+        .supports_bounded_reference_mining()
+    {
+        Ok(())
     } else {
-        "Common Foundry Devnet-0 testing network"
+        Err(format!(
+            "{command} is unavailable for {} ({}); no DevnetV2 fallback is permitted",
+            COMPILED_NETWORK_PROFILE.short_name(),
+            COMPILED_NETWORK_PROFILE.proof.profile_name()
+        )
+        .into())
+    }
+}
+
+fn peer_warning(allow_public_peers: bool) -> String {
+    if allow_public_peers {
+        format!(
+            "Public {} P2P enabled; node RPC remains on loopback",
+            COMPILED_NETWORK_PROFILE.short_name()
+        )
+    } else {
+        format!(
+            "{} · {}",
+            COMPILED_NETWORK_PROFILE.name,
+            COMPILED_NETWORK_PROFILE.network_notice()
+        )
     }
 }
 

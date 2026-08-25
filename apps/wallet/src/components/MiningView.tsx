@@ -71,10 +71,14 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
   const cudaActive = metricsStatus?.engine === "cuda";
   const poolUrlIssue = poolUrlError(poolUrl);
   const workerNameIssue = workerNameError(workerName);
+  const referenceMiningAvailable = nodeStatus?.bounded_reference_mining ?? false;
+  const networkName = nodeStatus?.network_short_name ?? "Network";
+  const proofProfile = nodeStatus?.proof_profile ?? "Unknown proof profile";
   const canStartBase = !mining.loading
     && mining.status !== null
     && wallet !== null
     && nodeStatus !== null
+    && referenceMiningAvailable
     && !isActive
     && !isBusy;
   const canStartSolo = mode === "solo" && canStartBase;
@@ -182,7 +186,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
                 <dd>{integerFormatter.format(metricsStatus?.blocks_found ?? 0)}</dd>
               </div>
               <div>
-                <dt>Credited Devnet atoms</dt>
+                <dt>Credited {networkName} atoms</dt>
                 <dd>{formatAtomCount(metricsStatus?.credited_atoms)}</dd>
               </div>
             </dl>
@@ -249,7 +253,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
         <section className="mining-disclosure-card">
           <div className="section-heading">
             <div>
-              <span>Devnet engine</span>
+              <span>{proofProfile} engine</span>
               <h2>What this miner does</h2>
             </div>
           </div>
@@ -258,9 +262,11 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               <span className="mining-detail-icon"><Cpu aria-hidden="true" size={18} /></span>
               <div>
                 <strong>{cudaActive ? "CUDA INT8 matrix engine" : "CPU reference engine"}</strong>
-                <p>{cudaActive
-                  ? `Runs the Devnet ForgeMatrix-v2 matrix stage on ${metricsStatus?.device ?? "the selected NVIDIA GPU"}; Rust recomputes every candidate before submission.`
-                  : "Runs the tiny ForgeMatrix-v2 full-recompute profile for Devnet testing."}</p>
+                <p>{referenceMiningAvailable
+                  ? (cudaActive
+                    ? `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} matrix stage on ${metricsStatus?.device ?? "the selected NVIDIA GPU"}; Rust recomputes every candidate before submission.`
+                    : `Runs the ${nodeStatus?.proof_of_work ?? proofProfile} profile for ${networkName} testing.`)
+                  : "ProductionV3 is selected. This wallet will not substitute the bounded DevnetV2 reference miner."}</p>
               </div>
             </div>
             <div>
@@ -292,8 +298,15 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
         <span className="card-eyebrow">Mining control</span>
         <h2>{poolSelected ? "Pool mining" : "Solo mining"}</h2>
         <p>{poolSelected
-          ? "Submit ForgeMatrix shares to a pinned CMFD pool endpoint for Devnet session accounting."
+          ? `Submit ForgeMatrix shares to a pinned CMFD pool endpoint for ${networkName} session accounting.`
           : "Mine directly against the embedded node and send accepted block rewards to this wallet."}</p>
+
+        {!referenceMiningAvailable ? (
+          <div className="warning-inline" role="status">
+            <ShieldAlert aria-hidden="true" size={17} />
+            <span>{proofProfile} is selected. Wallet mining remains disabled until its production work protocol is available.</span>
+          </div>
+        ) : null}
 
         <div className="mining-mode-switch" role="group" aria-label="Mining mode">
           <button
@@ -419,8 +432,8 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           {buttonText}
         </button>
         <small>{poolSelected
-          ? `Devnet-0 · pool session statistics · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`
-          : `Devnet-0 · solo mining · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
+          ? `${networkName} · pool session statistics · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`
+          : `${networkName} · solo mining · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
       </aside>
     </div>
   );

@@ -66,7 +66,13 @@ const runningPoolStatus: MiningStatus = {
   current_height: 130,
 };
 const wallet = { destination: payout } as WalletSnapshot;
-const nodeStatus = { accepted_height: 128 } as NodeStatus;
+const nodeStatus = {
+  accepted_height: 128,
+  network_short_name: "Devnet-0",
+  proof_profile: "DevnetV2",
+  proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
+  bounded_reference_mining: true,
+} as NodeStatus;
 
 describe("MiningView", () => {
   beforeEach(() => {
@@ -145,7 +151,7 @@ describe("MiningView", () => {
     expect(screen.getByText("4")).toBeInTheDocument();
     expect(screen.getByText("Pool blocks")).toBeInTheDocument();
     expect(screen.getByText("2")).toBeInTheDocument();
-    expect(screen.getByText("Credited Devnet atoms")).toBeInTheDocument();
+    expect(screen.getByText("Credited Devnet-0 atoms")).toBeInTheDocument();
     expect(screen.getByText("1,234,567")).toBeInTheDocument();
     expect(screen.getByText("Connected")).toBeInTheDocument();
     expect(screen.getByText("Session attempts")).toBeInTheDocument();

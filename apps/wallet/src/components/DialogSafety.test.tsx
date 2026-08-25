@@ -8,9 +8,20 @@ const destination = "1d16453b3ab3132acb0a5bc16cc49690d819a585267a15cd5a064e2a0ad
 
 const status = {
   network: "CommonFoundry Devnet-0",
+  network_short_name: "Devnet-0",
+  network_notice: "Testing network · No monetary value",
+  network_purpose: "Community testing",
   network_id: "11".repeat(32),
   consensus_fingerprint: "22".repeat(32),
+  proof_profile: "DevnetV2",
   proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
+  rpc_port: 18443,
+  p2p_port: 18444,
+  pool_port: 18445,
+  node_data_dir_identity: "commonfoundry-devnet0",
+  wallet_data_dir_identity: "devnet-0",
+  miner_data_dir_identity: "commonfoundry-miner-devnet0",
+  bounded_reference_mining: true,
   tip: "33".repeat(32),
   cumulative_work: "0".repeat(127) + "1",
   accepted_height: 128,
@@ -20,6 +31,8 @@ const status = {
   mempool_transactions: 0,
   mempool_bytes: 0,
   storage_healthy: true,
+  public_peer_mode: false,
+  peers: [],
 };
 
 const wallet = {

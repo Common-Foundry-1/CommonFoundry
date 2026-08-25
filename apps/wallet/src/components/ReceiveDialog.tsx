@@ -90,7 +90,7 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
       >
         <div className="dialog-header">
           <div className="dialog-heading">
-            <p className="dialog-eyebrow">Devnet-0 wallet</p>
+            <p className="dialog-eyebrow">{wallet?.network ?? "Network"} wallet</p>
             <h2 className="dialog-title" id="receive-dialog-title">Receive CMFD</h2>
           </div>
           <button className="button-icon" type="button" onClick={onClose} aria-label="Close receive dialog">
@@ -99,16 +99,16 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
         </div>
 
         <p className="dialog-description" id="receive-dialog-description">
-          Mine or receive Devnet CMFD at this x-only public key.
+          Mine or receive CMFD at this compiled-network x-only public key.
         </p>
 
         {address ? (
           <>
-            <div className="dialog-qr" aria-label="QR code for the Devnet wallet address">
+            <div className="dialog-qr" aria-label="QR code for the wallet address">
               <QRCodeSVG value={address} size={216} level="M" marginSize={2} />
             </div>
-            <p className="dialog-address-label">Your Devnet-0 address</p>
-            <output className="dialog-address" aria-label="Devnet wallet address">{address}</output>
+            <p className="dialog-address-label">Your {wallet?.network ?? "network"} address</p>
+            <output className="dialog-address" aria-label="Wallet address">{address}</output>
             <button
               className="button-secondary button-copy"
               type="button"
@@ -128,7 +128,7 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
         )}
 
         <div className="warning-panel" role="note">
-          <strong className="warning-title">Devnet-0 test wallet</strong>
+          <strong className="warning-title">{wallet?.network ?? "Network"} wallet</strong>
           <span className="warning-copy">
             {wallet?.warning ?? "This test wallet is currently unavailable."}
           </span>

@@ -204,7 +204,7 @@ export function SendDialog({
       >
         <div className="dialog-header">
           <div className="dialog-heading">
-            <p className="dialog-eyebrow">Devnet-0 wallet</p>
+            <p className="dialog-eyebrow">{wallet?.network ?? "Network"} wallet</p>
             <h2 className="dialog-title" id="send-dialog-title">{title}</h2>
           </div>
           <button className="button-icon" type="button" onClick={closeIfIdle} aria-label="Close send dialog" disabled={busy}>
@@ -215,7 +215,7 @@ export function SendDialog({
         {phase === "edit" && (
           <form className="form-stack" onSubmit={reviewTransaction} noValidate>
             <p className="dialog-description" id="send-dialog-description">
-              Create a signed Devnet transaction using this node's test wallet.
+              Create a signed transaction using this node's compiled-network wallet.
             </p>
 
             <div className="form-field">
@@ -315,7 +315,7 @@ export function SendDialog({
 
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
             <p className="warning-inline" role="note">
-              {wallet?.warning ?? "Devnet-0 test wallet unavailable."}
+              {wallet?.warning ?? "Network wallet unavailable."}
             </p>
 
             <div className="dialog-actions">
@@ -352,7 +352,7 @@ export function SendDialog({
             </div>
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
             <p className="warning-inline" role="note">
-              Devnet-0 test transaction · Verify the recipient and amount before sending.
+              {wallet?.network ?? "Network"} transaction · Verify the recipient and amount before sending.
             </p>
             <div className="dialog-actions">
               <button
@@ -398,7 +398,7 @@ export function SendDialog({
                 <strong className="review-value">{formatAtoms(result.change_atoms)} CMFD</strong>
               </div>
             </div>
-            <p className="warning-inline" role="note">This Devnet transaction is not final until mined.</p>
+            <p className="warning-inline" role="note">This transaction is not final until mined.</p>
             <div className="dialog-actions dialog-actions-single">
               <button className="button-primary" type="button" onClick={onClose}>Done</button>
             </div>

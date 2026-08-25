@@ -16,7 +16,7 @@ const TITLES: Record<ViewName, { eyebrow: string; title: string }> = {
   overview: { eyebrow: "Common Foundry Wallet", title: "Overview" },
   transactions: { eyebrow: "Wallet ledger", title: "Transactions" },
   mining: { eyebrow: "ForgeMatrix reference engine", title: "Mining" },
-  network: { eyebrow: "Devnet operations", title: "Network" },
+  network: { eyebrow: "Network operations", title: "Network" },
 };
 
 export function App() {
@@ -26,7 +26,10 @@ export function App() {
   const [consolidateOpen, setConsolidateOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const data = useWalletData();
-  const heading = TITLES[view];
+  const networkShortName = data.status?.network_short_name ?? "Network";
+  const heading = view === "network"
+    ? { eyebrow: `${networkShortName} operations`, title: "Network" }
+    : TITLES[view];
 
   const openSend = useCallback(() => setSendOpen(true), []);
   const closeSend = useCallback(() => setSendOpen(false), []);
@@ -47,6 +50,8 @@ export function App() {
         onNavigate={setView}
         onSend={openSend}
         onReceive={openReceive}
+        networkName={networkShortName}
+        networkPurpose={data.status?.network_purpose ?? "Network unavailable"}
       />
 
       <main className="workspace">
@@ -58,7 +63,7 @@ export function App() {
           <div className="topbar-actions">
             <div className={`connection-pill${data.error ? " is-offline" : ""}`}>
               <span />
-              {data.error ? "Node offline" : "Devnet-0 Connected"}
+              {data.error ? "Node offline" : `${networkShortName} Connected`}
             </div>
             <button className="icon-button topbar-settings" type="button" onClick={() => setView("network")} aria-label="Open node settings">
               <Settings2 aria-hidden="true" size={18} />
@@ -68,7 +73,10 @@ export function App() {
 
         <div className="devnet-warning" role="note">
           <AlertTriangle aria-hidden="true" size={16} />
-          <span><strong>Common Foundry Devnet-0</strong> · Testing network · No monetary value</span>
+          <span>
+            <strong>{data.status?.network ?? "Common Foundry network"}</strong>
+            {` · ${data.status?.network_notice ?? "Network status unavailable"}`}
+          </span>
         </div>
 
         {data.error ? (

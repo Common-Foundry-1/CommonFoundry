@@ -1,4 +1,5 @@
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,8 +50,11 @@ impl RuntimeState {
         let allow = config.allow_public_peers;
         let peers = config.peers.len();
         eprintln!(
-            "Common Foundry Wallet node starting on {} with {} configured peer(s), allow_public_peers={allow}",
-            config.p2p_bind, peers
+            "Common Foundry Wallet ({}, {}) node starting on {} with {} configured peer(s), allow_public_peers={allow}",
+            COMPILED_NETWORK_PROFILE.short_name(),
+            COMPILED_NETWORK_PROFILE.proof.profile_name(),
+            config.p2p_bind,
+            peers
         );
         match start_embedded_node(app, config) {
             Ok(started) => Self {
@@ -132,17 +136,14 @@ fn start_embedded_node<R: Runtime>(
     app: &App<R>,
     config: NodeRuntimeConfig,
 ) -> Result<EmbeddedNode, NodeClientError> {
-    let data_dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|_| {
-            startup_error(
-                "data_directory_unavailable",
-                "The desktop wallet could not resolve its local data directory.",
-                false,
-            )
-        })?
-        .join(COMPILED_NETWORK_PROFILE.wallet_data_dir_identity);
+    let app_data_root = app.path().app_local_data_dir().map_err(|_| {
+        startup_error(
+            "data_directory_unavailable",
+            "The desktop wallet could not resolve its local data directory.",
+            false,
+        )
+    })?;
+    let data_dir = wallet_data_dir(&app_data_root, COMPILED_NETWORK_PROFILE);
     let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
     let node = Node::open(&data_dir).map_err(|error| error.client_error())?;
     let shared = Arc::new(Mutex::new(node));
@@ -150,8 +151,8 @@ fn start_embedded_node<R: Runtime>(
         startup_error(
             "p2p_bind_failed",
             format!(
-                "The embedded node could not bind Devnet P2P on {}. Stop the process using that address, then reopen Common Foundry Wallet.",
-                config.p2p_bind
+                "The embedded node could not bind {} P2P on {}. Stop the process using that address, then reopen Common Foundry Wallet.",
+                COMPILED_NETWORK_PROFILE.short_name(), config.p2p_bind
             ),
             true,
         )
@@ -159,7 +160,10 @@ fn start_embedded_node<R: Runtime>(
     let p2p_address = listener.local_addr().map_err(|_| {
         startup_error(
             "p2p_address_unavailable",
-            "The embedded node could not inspect its Devnet P2P listener address.",
+            format!(
+                "The embedded node could not inspect its {} P2P listener address.",
+                COMPILED_NETWORK_PROFILE.short_name()
+            ),
             true,
         )
     })?;
@@ -173,7 +177,10 @@ fn start_embedded_node<R: Runtime>(
     .map_err(|_| {
         startup_error(
             "p2p_start_failed",
-            "The embedded Devnet peer service could not start. Reopen the wallet and try again.",
+            format!(
+                "The embedded {} peer service could not start. Reopen the wallet and try again.",
+                COMPILED_NETWORK_PROFILE.short_name()
+            ),
             true,
         )
     })?;
@@ -199,6 +206,10 @@ fn start_embedded_node<R: Runtime>(
     })
 }
 
+fn wallet_data_dir(root: &Path, profile: cmfd_node::NetworkProfile) -> PathBuf {
+    root.join(profile.wallet_data_dir_identity)
+}
+
 pub(crate) fn parse_command() -> Result<ProcessCommand, ConfigError> {
     NodeRuntimeConfig::from_process_args()
 }
@@ -207,6 +218,7 @@ pub(crate) fn command_help_text() -> String {
     format!(
         concat!(
             "Common Foundry Wallet\n",
+            "Compiled network: {} ({})\n",
             "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v...]\n",
             "Arguments:\n",
             "  --help (-h)             Show this help\n",
@@ -217,6 +229,8 @@ pub(crate) fn command_help_text() -> String {
             "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
             "                          (the default bootstrap peer is always added if no --peer is configured)\n",
         ),
+        COMPILED_NETWORK_PROFILE.name,
+        COMPILED_NETWORK_PROFILE.proof.profile_name(),
         COMPILED_NETWORK_PROFILE.p2p_address(),
     )
 }
@@ -237,6 +251,7 @@ pub fn startup_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cmfd_node::{DEVNET_PROFILE, RCNET1_PROFILE};
 
     #[test]
     fn startup_failure_is_stable_and_shutdown_is_idempotent() {
@@ -265,5 +280,16 @@ mod tests {
         assert_eq!(error.status, 400);
         assert!(!error.retryable);
         assert!(error.message.contains("--public-peer"));
+    }
+
+    #[test]
+    fn wallet_storage_identity_is_network_specific() {
+        let root = Path::new("wallet-data-root");
+        assert_eq!(wallet_data_dir(root, DEVNET_PROFILE), root.join("devnet-0"));
+        assert_eq!(wallet_data_dir(root, RCNET1_PROFILE), root.join("rcnet-1"));
+        assert_ne!(
+            wallet_data_dir(root, DEVNET_PROFILE),
+            wallet_data_dir(root, RCNET1_PROFILE)
+        );
     }
 }

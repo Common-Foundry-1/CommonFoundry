@@ -18,9 +18,20 @@ vi.mock("../api/nodeClient", async (importOriginal) => ({
 
 const status: NodeStatus = {
   network: "CommonFoundry Devnet-0",
+  network_short_name: "Devnet-0",
+  network_notice: "Testing network · No monetary value",
+  network_purpose: "Community testing",
   network_id: "11".repeat(32),
   consensus_fingerprint: "22".repeat(32),
+  proof_profile: "DevnetV2",
   proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
+  rpc_port: 18443,
+  p2p_port: 18444,
+  pool_port: 18445,
+  node_data_dir_identity: "commonfoundry-devnet0",
+  wallet_data_dir_identity: "devnet-0",
+  miner_data_dir_identity: "commonfoundry-miner-devnet0",
+  bounded_reference_mining: true,
   tip: "33".repeat(32),
   cumulative_work: "00".repeat(64),
   accepted_height: 0,
@@ -68,9 +79,43 @@ describe("NetworkView", () => {
     );
 
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Public Devnet P2P is enabled",
+      "Public Devnet-0 P2P is enabled",
     );
     expect(screen.getByText("No peer sessions observed yet")).toBeInTheDocument();
+  });
+
+  it("presents RCNet ProductionV3 ports without exposing the Devnet forge action", () => {
+    render(
+      <NetworkView
+        status={{
+          ...status,
+          network: "CommonFoundry RCNet-1",
+          network_short_name: "RCNet-1",
+          network_notice: "Release-candidate rehearsal network · Not mainnet",
+          network_purpose: "Launch rehearsal",
+          proof_profile: "ProductionV3",
+          proof_of_work: "ForgeMatrix-v3 production Dory",
+          rpc_port: 19443,
+          p2p_port: 19444,
+          pool_port: 19445,
+          node_data_dir_identity: "commonfoundry-rcnet1",
+          wallet_data_dir_identity: "rcnet-1",
+          miner_data_dir_identity: "commonfoundry-miner-rcnet1",
+          bounded_reference_mining: false,
+          public_peer_mode: false,
+        }}
+        wallet={null}
+        mempool={null}
+        refreshing={false}
+        onRefresh={vi.fn()}
+        onNotice={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText("ProductionV3").length).toBeGreaterThan(0);
+    expect(screen.getByText("19443 RPC · 19444 P2P · 19445 pool")).toBeInTheDocument();
+    expect(screen.getByText("Production proof path selected")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Forge one block" })).not.toBeInTheDocument();
   });
 
   it("shows recent peer direction, chain state, session counts, and reachability", () => {

@@ -5,9 +5,20 @@ import { App } from "./App";
 
 const status = {
   network: "CommonFoundry Profile Test",
+  network_short_name: "Devnet-0",
+  network_notice: "Testing network · No monetary value",
+  network_purpose: "Community testing",
   network_id: "11".repeat(32),
   consensus_fingerprint: "22".repeat(32),
+  proof_profile: "DevnetV2",
   proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
+  rpc_port: 18443,
+  p2p_port: 18444,
+  pool_port: 18445,
+  node_data_dir_identity: "commonfoundry-devnet0",
+  wallet_data_dir_identity: "devnet-0",
+  miner_data_dir_identity: "commonfoundry-miner-devnet0",
+  bounded_reference_mining: true,
   tip: "33".repeat(32),
   cumulative_work: "0".repeat(127) + "1",
   accepted_height: 128,
@@ -17,6 +28,8 @@ const status = {
   mempool_transactions: 1,
   mempool_bytes: 256,
   storage_healthy: true,
+  public_peer_mode: false,
+  peers: [],
 };
 
 const wallet = {
@@ -96,7 +109,7 @@ describe("Common Foundry wallet", () => {
     render(<App />);
 
     expect(await screen.findByText("177.50")).toBeInTheDocument();
-    expect(screen.getByText("CommonFoundry Profile Test")).toBeInTheDocument();
+    expect(screen.getAllByText("CommonFoundry Profile Test").length).toBeGreaterThan(0);
     expect(screen.getByText("Block height").nextElementSibling).toHaveTextContent("128");
     expect(screen.getByText("Mined reward")).toBeInTheDocument();
     expect(screen.getByText(/Testing network/)).toBeInTheDocument();

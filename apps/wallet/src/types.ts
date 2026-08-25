@@ -23,9 +23,20 @@ export interface PeerSettings {
 
 export interface NodeStatus {
   network: string;
+  network_short_name: string;
+  network_notice: string;
+  network_purpose: string;
   network_id: string;
   consensus_fingerprint: string;
   proof_of_work: string;
+  proof_profile: string;
+  rpc_port: number;
+  p2p_port: number;
+  pool_port: number;
+  node_data_dir_identity: string;
+  wallet_data_dir_identity: string;
+  miner_data_dir_identity: string;
+  bounded_reference_mining: boolean;
   tip: string;
   cumulative_work: string;
   accepted_height: number;

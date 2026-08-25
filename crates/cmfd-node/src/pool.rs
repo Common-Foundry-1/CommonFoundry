@@ -40,8 +40,8 @@ use crate::{
 };
 
 pub const POOL_PROTOCOL_VERSION: u16 = 1;
-pub const DEFAULT_POOL_ADDRESS: &str = "127.0.0.1:18445";
-pub const DEFAULT_POOL_SOCKET_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.pool_address();
+pub const DEFAULT_POOL_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.pool_address();
+pub const DEFAULT_POOL_SOCKET_ADDRESS: SocketAddr = DEFAULT_POOL_ADDRESS;
 pub const DEFAULT_SHARE_LEADING_ZERO_BITS: u16 = 7;
 pub const DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE: u64 = 1;
 pub const POOL_MAX_FRAME_BYTES: usize = 16 * 1024;

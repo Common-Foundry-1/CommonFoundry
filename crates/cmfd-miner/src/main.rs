@@ -20,15 +20,16 @@ use cmfd_node::peer::{
     BlockSubmissionStatus, MiningTemplate, PeerAddressPolicy, PeerLimits, StaticPeerConfig,
 };
 use cmfd_node::{
-    MiningShareSearchResult, MiningWork, Node, parse_miner_destination, unix_time_seconds,
+    COMPILED_NETWORK_PROFILE, MiningShareSearchResult, MiningWork, NetworkProfile, Node,
+    parse_miner_destination, unix_time_seconds,
 };
 
 mod telemetry;
 
 use telemetry::{GpuTelemetry, query_nvidia_smi};
 
-const DEFAULT_MINER_DATA_DIR: &str = "commonfoundry-miner-devnet0";
-const DEFAULT_MINER_P2P_ADDRESS: &str = "127.0.0.1:19444";
+const DEFAULT_MINER_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.miner_data_dir_identity();
+const DEFAULT_MINER_P2P_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.miner_p2p_address();
 const DEFAULT_BATCH_SIZE: u32 = 8_192;
 const MAX_BATCH_SIZE: u32 = 65_536;
 const AUTO_WORKERS_PER_GPU: usize = 0;
@@ -57,10 +58,10 @@ enum Command {
     },
     /// Mine node-provided templates without maintaining another chain database.
     Mine {
-        /// Devnet node that provides jobs and accepts blocks. Repeat for failover.
+        /// Node that provides jobs and accepts blocks. Repeat for failover.
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
-        /// Allow numeric public peer addresses for Devnet testing.
+        /// Allow numeric public peer addresses for network testing.
         #[arg(long)]
         allow_public_peers: bool,
         /// CUDA device index. Repeat to select several; omitted means every supported GPU.
@@ -86,12 +87,12 @@ enum Command {
     FullNode {
         #[arg(long, default_value = DEFAULT_MINER_DATA_DIR)]
         data_dir: PathBuf,
-        #[arg(long, default_value = DEFAULT_MINER_P2P_ADDRESS)]
+        #[arg(long, default_value_t = DEFAULT_MINER_P2P_ADDRESS)]
         p2p_bind: SocketAddr,
-        /// Static Devnet peer. Repeat to configure more than one.
+        /// Static network peer. Repeat to configure more than one.
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
-        /// Allow numeric public peer addresses for Devnet testing.
+        /// Allow numeric public peer addresses for network testing.
         #[arg(long)]
         allow_public_peers: bool,
         /// CUDA device index. Repeat to select several; omitted means every supported GPU.
@@ -475,7 +476,20 @@ fn format_duration(duration: Duration) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
+fn ensure_profile_supports_standalone_mining(profile: NetworkProfile) -> Result<()> {
+    if profile.proof.supports_bounded_reference_mining() {
+        Ok(())
+    } else {
+        bail!(
+            "{} ({}) standalone mining is not wired to the ProductionV3 work path; no DevnetV2 fallback is permitted",
+            profile.short_name(),
+            profile.proof.profile_name()
+        )
+    }
+}
+
 fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
+    ensure_profile_supports_standalone_mining(COMPILED_NETWORK_PROFILE)?;
     validate_mining_controls(
         options.batch_size,
         options.workers_per_gpu,
@@ -496,7 +510,7 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
     };
     let limits = PeerLimits::default();
     StaticPeerConfig {
-        listen_address: DEFAULT_MINER_P2P_ADDRESS.parse()?,
+        listen_address: DEFAULT_MINER_P2P_ADDRESS,
         peers: options.peers.clone(),
         limits,
         address_policy,
@@ -514,6 +528,11 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
     println!(
         "Common Foundry thin CUDA miner v{}",
         env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "Network: {} ({})",
+        COMPILED_NETWORK_PROFILE.short_name(),
+        COMPILED_NETWORK_PROFILE.proof.profile_name()
     );
     println!(
         "{} library: {}",
@@ -829,6 +848,7 @@ fn interruptible_wait(duration: Duration, shutdown: &AtomicBool) -> bool {
 }
 
 fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
+    ensure_profile_supports_standalone_mining(COMPILED_NETWORK_PROFILE)?;
     validate_mining_controls(
         options.batch_size,
         options.workers_per_gpu,
@@ -877,6 +897,11 @@ fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
     println!(
         "Common Foundry standalone CUDA miner v{}",
         env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "Network: {} ({})",
+        COMPILED_NETWORK_PROFILE.short_name(),
+        COMPILED_NETWORK_PROFILE.proof.profile_name()
     );
     println!(
         "{} library: {}",
@@ -1629,6 +1654,30 @@ fn nonce_stride(batch_size: u32, workers: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cmfd_node::{DEVNET_PROFILE, RCNET1_PROFILE};
+
+    #[test]
+    fn full_node_defaults_follow_the_compiled_network_profile() {
+        let cli = Cli::try_parse_from(["cmfd-miner", "full-node"]).unwrap();
+        let Command::FullNode {
+            data_dir, p2p_bind, ..
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(data_dir, PathBuf::from(DEFAULT_MINER_DATA_DIR));
+        assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.miner_p2p_address());
+    }
+
+    #[test]
+    fn production_profile_never_falls_back_to_devnet_v2_mining() {
+        assert!(ensure_profile_supports_standalone_mining(DEVNET_PROFILE).is_ok());
+        let error = ensure_profile_supports_standalone_mining(RCNET1_PROFILE)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RCNet-1 (ProductionV3)"));
+        assert!(error.contains("no DevnetV2 fallback"));
+    }
 
     fn device(index: i32, major: u32, minor: u32) -> CudaDevice {
         CudaDevice {

@@ -1,0 +1,8 @@
+{
+  "productName": "Common Foundry Wallet RCNet",
+  "identifier": "org.commonfoundry.wallet.rcnet1",
+  "bundle": {
+    "shortDescription": "Common Foundry RCNet desktop wallet",
+    "longDescription": "Native desktop wallet and embedded node for the Common Foundry RCNet release-candidate rehearsal network."
+  }
+}

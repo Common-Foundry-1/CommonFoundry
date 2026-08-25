@@ -46,6 +46,72 @@ pub enum ProofProfile {
 }
 
 impl NetworkProfile {
+    pub const fn short_name(self) -> &'static str {
+        match self.proof {
+            ProofProfile::DevnetV2Reference => "Devnet-0",
+            ProofProfile::ProductionV3 => "RCNet-1",
+        }
+    }
+
+    pub const fn network_notice(self) -> &'static str {
+        match self.proof {
+            ProofProfile::DevnetV2Reference => "Testing network · No monetary value",
+            ProofProfile::ProductionV3 => "Release-candidate rehearsal network · Not mainnet",
+        }
+    }
+
+    pub const fn network_purpose(self) -> &'static str {
+        match self.proof {
+            ProofProfile::DevnetV2Reference => "Community testing",
+            ProofProfile::ProductionV3 => "Launch rehearsal",
+        }
+    }
+
+    pub const fn is_devnet(self) -> bool {
+        matches!(self.proof, ProofProfile::DevnetV2Reference)
+    }
+
+    pub const fn wallet_window_title(self) -> &'static str {
+        match self.proof {
+            ProofProfile::DevnetV2Reference => "Common Foundry Wallet — Devnet-0",
+            ProofProfile::ProductionV3 => "Common Foundry Wallet — RCNet-1",
+        }
+    }
+
+    pub const fn wallet_warning(self, legacy_shared_wallet: bool) -> &'static str {
+        match (self.proof, legacy_shared_wallet) {
+            (ProofProfile::DevnetV2Reference, true) => {
+                "Devnet-0 legacy wallet: this upgraded data directory retains its original demonstration key so existing test coins remain available."
+            }
+            (ProofProfile::DevnetV2Reference, false) => {
+                "Devnet-0 test wallet: back up wallet.key if you want to test wallet recovery."
+            }
+            (ProofProfile::ProductionV3, true) => {
+                "RCNet-1 wallet uses a known development key. Create a fresh RCNet wallet before testing."
+            }
+            (ProofProfile::ProductionV3, false) => {
+                "RCNet-1 release-candidate wallet: back up wallet.key before testing recovery. This is not mainnet."
+            }
+        }
+    }
+
+    pub const fn miner_data_dir_identity(self) -> &'static str {
+        match self.proof {
+            ProofProfile::DevnetV2Reference => "commonfoundry-miner-devnet0",
+            ProofProfile::ProductionV3 => "commonfoundry-miner-rcnet1",
+        }
+    }
+
+    /// The embedded full-node miner listens one thousand ports above the
+    /// network P2P service so it can run beside a regular node. This preserves
+    /// the existing Devnet `19444` default while keeping RCNet isolated.
+    pub const fn miner_p2p_address(self) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            self.p2p_port.saturating_add(1_000),
+        )
+    }
+
     pub const fn proof_name(self) -> &'static str {
         match self.proof {
             ProofProfile::DevnetV2Reference => "ForgeMatrix-v2 tiny full-recompute reference",
@@ -67,6 +133,19 @@ impl NetworkProfile {
 
     pub const fn bootstrap_peer(self) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(self.bootstrap_ipv4), self.p2p_port)
+    }
+}
+
+impl ProofProfile {
+    pub const fn profile_name(self) -> &'static str {
+        match self {
+            Self::DevnetV2Reference => "DevnetV2",
+            Self::ProductionV3 => "ProductionV3",
+        }
+    }
+
+    pub const fn supports_bounded_reference_mining(self) -> bool {
+        matches!(self, Self::DevnetV2Reference)
     }
 }
 
@@ -162,6 +241,31 @@ mod tests {
         );
         assert_eq!(RCNET1_PROFILE.proof, ProofProfile::ProductionV3);
         assert_eq!(DEVNET_PROFILE.proof, ProofProfile::DevnetV2Reference);
+        assert_eq!(DEVNET_PROFILE.short_name(), "Devnet-0");
+        assert_eq!(DEVNET_PROFILE.proof.profile_name(), "DevnetV2");
+        assert_eq!(RCNET1_PROFILE.short_name(), "RCNet-1");
+        assert_eq!(RCNET1_PROFILE.proof.profile_name(), "ProductionV3");
+        assert_eq!(RCNET1_PROFILE.rpc_address().to_string(), "127.0.0.1:19443");
+        assert_eq!(RCNET1_PROFILE.p2p_address().to_string(), "127.0.0.1:19444");
+        assert_eq!(RCNET1_PROFILE.pool_address().to_string(), "127.0.0.1:19445");
+        assert_eq!(
+            DEVNET_PROFILE.miner_p2p_address().to_string(),
+            "127.0.0.1:19444"
+        );
+        assert_eq!(
+            RCNET1_PROFILE.miner_p2p_address().to_string(),
+            "127.0.0.1:20444"
+        );
+        assert_ne!(
+            RCNET1_PROFILE.wallet_data_dir_identity,
+            DEVNET_PROFILE.wallet_data_dir_identity
+        );
+        assert_ne!(
+            RCNET1_PROFILE.wallet_window_title(),
+            DEVNET_PROFILE.wallet_window_title()
+        );
+        assert!(!RCNET1_PROFILE.proof.supports_bounded_reference_mining());
+        assert!(DEVNET_PROFILE.proof.supports_bounded_reference_mining());
     }
 
     #[test]

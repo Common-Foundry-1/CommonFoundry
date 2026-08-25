@@ -121,7 +121,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
             <strong>{status ? "Node connected" : "Node unavailable"}</strong>
             <span>{status
               ? (usesEmbeddedNode ? "Embedded Rust node is responding" : "Loopback RPC is responding")
-              : (usesEmbeddedNode ? "Embedded node failed to start; retry or reopen the wallet" : "Start the local Devnet node, then refresh")}</span>
+              : (usesEmbeddedNode ? "Embedded node failed to start; retry or reopen the wallet" : "Start the local network node, then refresh")}</span>
           </div>
           <span className={`service-state${status ? " is-online" : ""}`}>{status ? "Online" : "Offline"}</span>
         </div>
@@ -129,13 +129,15 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
         {status?.public_peer_mode ? (
           <div className="warning-inline" role="status">
             <ShieldAlert aria-hidden="true" size={17} />
-            <span>Public Devnet P2P is enabled. Node RPC remains local to this computer.</span>
+            <span>Public {status.network_short_name} P2P is enabled. Node RPC remains local to this computer.</span>
           </div>
         ) : null}
 
         <dl className="diagnostics-grid">
           <Diagnostic label="Network" value={status?.network ?? "—"} />
+          <Diagnostic label="Proof profile" value={status?.proof_profile ?? "—"} />
           <Diagnostic label="Proof of work" value={status?.proof_of_work ?? "—"} />
+          <Diagnostic label="Service ports" value={status ? `${status.rpc_port} RPC · ${status.p2p_port} P2P · ${status.pool_port} pool` : "—"} />
           <Diagnostic label="Block height" value={status?.accepted_height.toLocaleString() ?? "—"} />
           <Diagnostic label="Next height" value={status?.next_height.toLocaleString() ?? "—"} />
           <Diagnostic label="Chain tip" value={status ? shortenHash(status.tip, 10, 10) : "—"} mono title={status?.tip} />
@@ -260,23 +262,37 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
 
       <aside className="forge-card">
         <span className="forge-icon"><Hammer aria-hidden="true" size={23} /></span>
-        <span className="card-eyebrow">Development mining</span>
-        <h2>Forge a Devnet block</h2>
-        <p>Run one bounded mining attempt with the tiny ForgeMatrix-v2 reference profile.</p>
-        <div className="miner-destination">
-          <span>Reward destination</span>
-          <code title={wallet?.destination}>{wallet ? shortenHash(wallet.destination, 9, 9) : "Waiting for wallet"}</code>
-        </div>
-        <div className="warning-inline">
-          <ShieldAlert aria-hidden="true" size={17} />
-          <span>This reward destination belongs to your local Devnet test wallet.</span>
-        </div>
-        {error ? <p className="form-error" role="alert">{error}</p> : null}
-        <button className="button-primary wide" type="button" disabled={!wallet || mining} onClick={() => void mine()}>
-          {mining ? <RefreshCw className="spin" aria-hidden="true" size={18} /> : <Blocks aria-hidden="true" size={18} />}
-          {mining ? "Forging block…" : "Forge one block"}
-        </button>
-        <small>Fees in included transactions are burned, not paid to the miner.</small>
+        {status?.bounded_reference_mining ? (
+          <>
+            <span className="card-eyebrow">{status.proof_profile} mining</span>
+            <h2>Forge a {status.network_short_name} block</h2>
+            <p>Run one bounded mining attempt with the {status.proof_of_work} profile.</p>
+            <div className="miner-destination">
+              <span>Reward destination</span>
+              <code title={wallet?.destination}>{wallet ? shortenHash(wallet.destination, 9, 9) : "Waiting for wallet"}</code>
+            </div>
+            <div className="warning-inline">
+              <ShieldAlert aria-hidden="true" size={17} />
+              <span>This reward destination belongs to your local {status.network_short_name} wallet.</span>
+            </div>
+            {error ? <p className="form-error" role="alert">{error}</p> : null}
+            <button className="button-primary wide" type="button" disabled={!wallet || mining} onClick={() => void mine()}>
+              {mining ? <RefreshCw className="spin" aria-hidden="true" size={18} /> : <Blocks aria-hidden="true" size={18} />}
+              {mining ? "Forging block…" : "Forge one block"}
+            </button>
+            <small>Fees in included transactions are burned, not paid to the miner.</small>
+          </>
+        ) : (
+          <>
+            <span className="card-eyebrow">{status?.proof_profile ?? "Production"} mining</span>
+            <h2>Production proof path selected</h2>
+            <p>The bounded DevnetV2 forge action is disabled. This build will not substitute the Devnet proof for ProductionV3 work.</p>
+            <div className="warning-inline">
+              <ShieldAlert aria-hidden="true" size={17} />
+              <span>Use a ProductionV3-capable external miner when the production work protocol is enabled.</span>
+            </div>
+          </>
+        )}
       </aside>
     </div>
   );

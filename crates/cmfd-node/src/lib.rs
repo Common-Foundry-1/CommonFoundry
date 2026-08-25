@@ -59,8 +59,8 @@ pub use network_profile::{
 pub const DEVNET_NETWORK_ID: [u8; 32] = COMPILED_NETWORK_PROFILE.network_id;
 pub const DEVNET_GENESIS_HASH: [u8; 32] = COMPILED_NETWORK_PROFILE.virtual_genesis_hash;
 pub const DEVNET_GENESIS_TIMESTAMP: u64 = COMPILED_NETWORK_PROFILE.virtual_genesis_timestamp;
-pub const DEFAULT_RPC_ADDRESS: &str = "127.0.0.1:18443";
-pub const DEFAULT_P2P_ADDRESS: &str = "127.0.0.1:18444";
+pub const DEFAULT_RPC_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.rpc_address();
+pub const DEFAULT_P2P_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.p2p_address();
 pub const DEFAULT_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.default_data_dir_identity;
 pub const DEFAULT_MINING_ATTEMPTS: u64 = 1_000_000;
 /// Maximum work accepted by one cancellable immutable mining-job search.
@@ -96,9 +96,6 @@ const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
-const LEGACY_DEV_WALLET_WARNING: &str = "Devnet-0 legacy wallet: this upgraded data directory retains its original demonstration key so existing test coins remain available.";
-const LOCAL_DEV_WALLET_WARNING: &str =
-    "Devnet-0 test wallet: back up wallet.key if you want to test wallet recovery.";
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -500,9 +497,20 @@ impl BlockPreverifier {
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeStatus {
     pub network: &'static str,
+    pub network_short_name: &'static str,
+    pub network_notice: &'static str,
+    pub network_purpose: &'static str,
     pub network_id: String,
     pub consensus_fingerprint: String,
+    pub proof_profile: &'static str,
     pub proof_of_work: &'static str,
+    pub rpc_port: u16,
+    pub p2p_port: u16,
+    pub pool_port: u16,
+    pub node_data_dir_identity: &'static str,
+    pub wallet_data_dir_identity: &'static str,
+    pub miner_data_dir_identity: &'static str,
+    pub bounded_reference_mining: bool,
     pub tip: String,
     pub cumulative_work: String,
     pub accepted_height: u64,
@@ -1683,11 +1691,11 @@ impl Node {
     }
 
     fn wallet_warning(&self) -> &'static str {
-        if self.legacy_shared_wallet {
-            LEGACY_DEV_WALLET_WARNING
-        } else {
-            LOCAL_DEV_WALLET_WARNING
-        }
+        self.profile.wallet_warning(self.legacy_shared_wallet)
+    }
+
+    pub fn wallet_is_insecure_demo(&self) -> bool {
+        self.legacy_shared_wallet
     }
 
     pub fn status(&self) -> Result<NodeStatus, NodeError> {
@@ -1700,9 +1708,20 @@ impl Node {
         ) = self.block_preverifier.backend_status();
         Ok(NodeStatus {
             network: self.profile.name,
+            network_short_name: self.profile.short_name(),
+            network_notice: self.profile.network_notice(),
+            network_purpose: self.profile.network_purpose(),
             network_id: hex::encode(self.params.network_id),
             consensus_fingerprint: hex::encode(self.fingerprint),
+            proof_profile: self.profile.proof.profile_name(),
             proof_of_work: self.profile.proof_name(),
+            rpc_port: self.profile.rpc_port,
+            p2p_port: self.profile.p2p_port,
+            pool_port: self.profile.pool_port,
+            node_data_dir_identity: self.profile.default_data_dir_identity,
+            wallet_data_dir_identity: self.profile.wallet_data_dir_identity,
+            miner_data_dir_identity: self.profile.miner_data_dir_identity(),
+            bounded_reference_mining: self.profile.proof.supports_bounded_reference_mining(),
             tip: hex::encode(self.state.tip()),
             cumulative_work: hex::encode(chain_work_bytes(self.index.active_work)),
             accepted_height: self.state.next_height().saturating_sub(1),
@@ -1902,8 +1921,8 @@ impl Node {
 
         Ok(WalletSnapshot {
             network: self.profile.name,
-            devnet_only: true,
-            insecure_demo_wallet: true,
+            devnet_only: self.profile.is_devnet(),
+            insecure_demo_wallet: self.wallet_is_insecure_demo(),
             warning: self.wallet_warning(),
             destination: hex::encode(destination),
             accepted_height,
@@ -2030,8 +2049,8 @@ impl Node {
         let entry = self.submit_transaction(transaction)?;
         Ok(WalletSendResponse {
             network: self.profile.name,
-            devnet_only: true,
-            insecure_demo_wallet: true,
+            devnet_only: self.profile.is_devnet(),
+            insecure_demo_wallet: self.wallet_is_insecure_demo(),
             warning: self.wallet_warning(),
             txid: hex::encode(entry.txid),
             amount_atoms: amount.to_string(),
@@ -2126,8 +2145,8 @@ impl Node {
         let entry = self.submit_transaction(transaction)?;
         Ok(WalletConsolidateResponse {
             network: self.profile.name,
-            devnet_only: true,
-            insecure_demo_wallet: true,
+            devnet_only: self.profile.is_devnet(),
+            insecure_demo_wallet: self.wallet_is_insecure_demo(),
             warning: self.wallet_warning(),
             txid: hex::encode(entry.txid),
             inputs_consolidated,
@@ -2624,12 +2643,17 @@ impl Node {
         now_unix_seconds: u64,
         attempts: u64,
     ) -> Result<Block, NodeError> {
+        if !self.profile.proof.supports_bounded_reference_mining() {
+            return Err(NodeError::ProductionV3Unavailable);
+        }
         let template = self.build_template(miner_destination, now_unix_seconds)?;
         let proof = self.verifier.mine(&template.challenge, 0, attempts)?;
         if !matches!(proof, BlockProof::V2Reference(_)) {
-            return Err(NodeError::CorruptLog(
-                "Devnet-0 verifier produced a non-v2 proof".to_owned(),
-            ));
+            return Err(NodeError::CorruptLog(format!(
+                "{} verifier produced a proof outside the compiled {} profile",
+                self.profile.short_name(),
+                self.profile.proof.profile_name()
+            )));
         }
         let block = Block {
             version: BLOCK_VERSION,
@@ -4766,18 +4790,9 @@ mod tests {
             DEVNET_PROFILE.virtual_genesis_timestamp
         );
         assert_eq!(DEFAULT_DATA_DIR, DEVNET_PROFILE.default_data_dir_identity);
-        assert_eq!(
-            DEFAULT_RPC_ADDRESS.parse::<SocketAddr>().unwrap(),
-            DEVNET_PROFILE.rpc_address()
-        );
-        assert_eq!(
-            DEFAULT_P2P_ADDRESS.parse::<SocketAddr>().unwrap(),
-            DEVNET_PROFILE.p2p_address()
-        );
-        assert_eq!(
-            pool::DEFAULT_POOL_ADDRESS.parse::<SocketAddr>().unwrap(),
-            DEVNET_PROFILE.pool_address()
-        );
+        assert_eq!(DEFAULT_RPC_ADDRESS, DEVNET_PROFILE.rpc_address());
+        assert_eq!(DEFAULT_P2P_ADDRESS, DEVNET_PROFILE.p2p_address());
+        assert_eq!(pool::DEFAULT_POOL_ADDRESS, DEVNET_PROFILE.pool_address());
 
         const ALTERNATE_PROFILE: NetworkProfile = NetworkProfile {
             proof: ProofProfile::DevnetV2Reference,
@@ -5835,7 +5850,10 @@ mod tests {
         let migrated = Node::open(&path).unwrap();
         assert_eq!(migrated.wallet_destination(), default_miner_destination());
         assert!(migrated.legacy_shared_wallet);
-        assert_eq!(migrated.wallet_warning(), LEGACY_DEV_WALLET_WARNING);
+        assert_eq!(
+            migrated.wallet_warning(),
+            DEVNET_PROFILE.wallet_warning(true)
+        );
         drop(migrated);
 
         let reopened = Node::open(&path).unwrap();

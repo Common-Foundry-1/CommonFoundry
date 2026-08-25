@@ -142,6 +142,28 @@ impl MiningManager {
     }
 
     pub fn start(&self, request: MiningStartRequest) -> Result<MiningStatus, NodeClientError> {
+        let node_status = self
+            .node
+            .lock()
+            .map_err(|_| {
+                manager_error(
+                    "mining_node_unavailable",
+                    "The embedded node is unavailable.",
+                    true,
+                )
+            })?
+            .status()
+            .map_err(|error| error.client_error())?;
+        if !node_status.bounded_reference_mining {
+            return Err(manager_error(
+                "production_mining_unavailable",
+                format!(
+                    "{} is selected for {}; wallet mining will not fall back to DevnetV2.",
+                    node_status.proof_profile, node_status.network_short_name
+                ),
+                false,
+            ));
+        }
         let payout = decode_payout(&request.payout)?;
         let pool_config = match request.mode {
             MiningMode::Solo => {

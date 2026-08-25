@@ -6,6 +6,7 @@ mod runtime;
 use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
 use tauri::{Manager, RunEvent};
 
+use cmfd_node::COMPILED_NETWORK_PROFILE;
 use runtime::RuntimeState;
 
 pub fn run() -> i32 {
@@ -41,7 +42,7 @@ pub fn run() -> i32 {
         .setup(|app| {
             app.manage(RuntimeState::start(app, node_config));
 
-            let window_config = app
+            let mut window_config = app
                 .config()
                 .app
                 .windows
@@ -49,6 +50,7 @@ pub fn run() -> i32 {
                 .find(|window| window.label == "main")
                 .ok_or("the main wallet window is missing from tauri.conf.json")?
                 .clone();
+            window_config.title = COMPILED_NETWORK_PROFILE.wallet_window_title().to_owned();
             WebviewWindowBuilder::from_config(app, &window_config)?
                 .on_navigation(allow_navigation)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
@@ -100,6 +102,19 @@ fn allow_navigation(url: &tauri::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rcnet_packaging_override_has_a_distinct_application_identity() {
+        let devnet: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let rcnet: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.rcnet.conf.json")).unwrap();
+
+        assert_eq!(devnet["identifier"], "org.commonfoundry.wallet.devnet");
+        assert_eq!(rcnet["identifier"], "org.commonfoundry.wallet.rcnet1");
+        assert_ne!(devnet["identifier"], rcnet["identifier"]);
+        assert_ne!(devnet["productName"], rcnet["productName"]);
+    }
 
     #[test]
     fn navigation_is_limited_to_bundled_and_exact_development_origins() {

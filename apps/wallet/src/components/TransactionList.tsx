@@ -44,7 +44,7 @@ export function TransactionList({ entries, compact = false }: TransactionListPro
       <div className="empty-state">
         <ActivityMark />
         <strong>No wallet activity yet</strong>
-        <p>Mined rewards and Devnet payments will appear here.</p>
+        <p>Mined rewards and wallet payments will appear here.</p>
       </div>
     );
   }

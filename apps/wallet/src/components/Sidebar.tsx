@@ -16,6 +16,8 @@ interface SidebarProps {
   onNavigate: (view: ViewName) => void;
   onSend: () => void;
   onReceive: () => void;
+  networkName: string;
+  networkPurpose: string;
 }
 
 const NAV_ITEMS = [
@@ -27,7 +29,14 @@ const NAV_ITEMS = [
   { id: "network" as const, label: "Network", icon: Blocks },
 ];
 
-export function Sidebar({ active, onNavigate, onSend, onReceive }: SidebarProps) {
+export function Sidebar({
+  active,
+  onNavigate,
+  onSend,
+  onReceive,
+  networkName,
+  networkPurpose,
+}: SidebarProps) {
   const activate = (id: (typeof NAV_ITEMS)[number]["id"]) => {
     if (id === "send") onSend();
     else if (id === "receive") onReceive();
@@ -69,8 +78,8 @@ export function Sidebar({ active, onNavigate, onSend, onReceive }: SidebarProps)
       <div className="sidebar-network">
         <span className="network-dot" />
         <div>
-          <strong>Devnet-0</strong>
-          <span>Community testing</span>
+          <strong>{networkName}</strong>
+          <span>{networkPurpose}</span>
         </div>
       </div>
     </aside>

@@ -16,7 +16,7 @@
       {
         "label": "main",
         "create": false,
-        "title": "Common Foundry Wallet — Devnet-0",
+        "title": "Common Foundry Wallet",
         "width": 1360,
         "height": 860,
         "minWidth": 960,
@@ -42,8 +42,8 @@
   "bundle": {
     "active": true,
     "category": "Finance",
-    "shortDescription": "Common Foundry Devnet-0 desktop wallet",
-    "longDescription": "Native desktop wallet and embedded node for the Common Foundry Devnet-0 testing network.",
+    "shortDescription": "Common Foundry desktop wallet",
+    "longDescription": "Native desktop wallet and embedded node for the compiled Common Foundry network profile.",
     "copyright": "Copyright © 2026 Common Foundry contributors",
     "icon": [
       "icons/32x32.png",

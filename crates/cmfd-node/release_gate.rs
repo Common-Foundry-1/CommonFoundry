@@ -15,9 +15,10 @@ pub enum ConsensusProofSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProductionV3ActivationEvidence {
     pub schema: &'static str,
-    pub source_commit: &'static str,
+    pub qualification_source_commit: &'static str,
     pub qualification_manifest_sha256: &'static str,
-    pub independent_verifier_sha256: &'static str,
+    pub independent_verifier_binary_sha256: &'static str,
+    pub independent_verifier_report_sha256: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +47,9 @@ pub struct CompiledReleaseProfile {
 ///
 /// This remains intentionally blocked. A production RC build may change these
 /// values only together with the real RCNet/V3 integration and committed
-/// qualification evidence.
+/// qualification evidence. The release checkout commit is deliberately not a
+/// source constant: trusted CI supplies it to the build gate so the finalizer
+/// can compare it with the exact checkout without a self-reference.
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
     network: CompiledNetworkProfile::Devnet,
     proof: ConsensusProofSelection::DevnetV2Reference,
@@ -85,7 +88,10 @@ fn valid_file_identity_pin(pin: ProductionV3FileIdentityPin) -> bool {
     pin.bytes != 0 && pin.blake3 != [0; 32] && pin.sha256 != [0; 32]
 }
 
-pub fn validate_production_rc(profile: CompiledReleaseProfile) -> Result<(), &'static str> {
+pub fn validate_production_rc(
+    profile: CompiledReleaseProfile,
+    build_source_commit: &str,
+) -> Result<(), &'static str> {
     if profile.network != CompiledNetworkProfile::Rcnet {
         return Err("compiled network profile is not RCNet");
     }
@@ -98,16 +104,24 @@ pub fn validate_production_rc(profile: CompiledReleaseProfile) -> Result<(), &'s
     if evidence.schema != "CMFD_PRODUCTION_V3_ACTIVATION_V1" {
         return Err("ProductionV3 activation evidence schema is unsupported");
     }
-    if !is_nonzero_lower_hex(evidence.source_commit, 20)
-        && !is_nonzero_lower_hex(evidence.source_commit, 32)
+    if !is_nonzero_lower_hex(build_source_commit, 20)
+        && !is_nonzero_lower_hex(build_source_commit, 32)
     {
-        return Err("ProductionV3 activation evidence has an invalid source commit");
+        return Err("trusted production RC build source commit is invalid");
+    }
+    if !is_nonzero_lower_hex(evidence.qualification_source_commit, 20)
+        && !is_nonzero_lower_hex(evidence.qualification_source_commit, 32)
+    {
+        return Err("ProductionV3 qualification source commit is invalid");
     }
     if !is_nonzero_lower_hex(evidence.qualification_manifest_sha256, 32) {
         return Err("ProductionV3 qualification manifest digest is invalid");
     }
-    if !is_nonzero_lower_hex(evidence.independent_verifier_sha256, 32) {
-        return Err("ProductionV3 independent verifier digest is invalid");
+    if !is_nonzero_lower_hex(evidence.independent_verifier_binary_sha256, 32) {
+        return Err("ProductionV3 independent verifier binary digest is invalid");
+    }
+    if !is_nonzero_lower_hex(evidence.independent_verifier_report_sha256, 32) {
+        return Err("ProductionV3 independent verifier report digest is invalid");
     }
     let artifacts = profile
         .production_v3_artifacts
@@ -127,9 +141,10 @@ mod tests {
 
     const EVIDENCE: ProductionV3ActivationEvidence = ProductionV3ActivationEvidence {
         schema: "CMFD_PRODUCTION_V3_ACTIVATION_V1",
-        source_commit: "1111111111111111111111111111111111111111",
+        qualification_source_commit: "1111111111111111111111111111111111111111",
         qualification_manifest_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
-        independent_verifier_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+        independent_verifier_binary_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+        independent_verifier_report_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
     };
     const ARTIFACTS: ProductionV3ArtifactIdentityPins = ProductionV3ArtifactIdentityPins {
         bank: ProductionV3FileIdentityPin {
@@ -148,6 +163,7 @@ mod tests {
             sha256: [0x49; 32],
         },
     };
+    const BUILD_SOURCE_COMMIT: &str = "5555555555555555555555555555555555555555";
 
     #[test]
     fn production_rc_labels_are_distinct_from_devnet_rc_labels() {
@@ -162,7 +178,7 @@ mod tests {
     #[test]
     fn current_source_tree_fails_the_production_rc_gate() {
         assert_eq!(
-            validate_production_rc(COMPILED_RELEASE_PROFILE),
+            validate_production_rc(COMPILED_RELEASE_PROFILE, BUILD_SOURCE_COMMIT),
             Err("compiled network profile is not RCNet")
         );
     }
@@ -176,7 +192,7 @@ mod tests {
             production_v3_artifacts: Some(ARTIFACTS),
         };
         assert_eq!(
-            validate_production_rc(no_v3),
+            validate_production_rc(no_v3, BUILD_SOURCE_COMMIT),
             Err("compiled consensus proof selection is not ProductionV3")
         );
 
@@ -187,7 +203,7 @@ mod tests {
             production_v3_artifacts: Some(ARTIFACTS),
         };
         assert_eq!(
-            validate_production_rc(no_evidence),
+            validate_production_rc(no_evidence, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 activation evidence is absent")
         );
 
@@ -198,7 +214,7 @@ mod tests {
             production_v3_artifacts: None,
         };
         assert_eq!(
-            validate_production_rc(no_artifacts),
+            validate_production_rc(no_artifacts, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 artifact identity pins are absent")
         );
     }
@@ -211,6 +227,10 @@ mod tests {
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
         };
-        assert_eq!(validate_production_rc(profile), Ok(()));
+        assert_eq!(validate_production_rc(profile, BUILD_SOURCE_COMMIT), Ok(()));
+        assert_eq!(
+            validate_production_rc(profile, ""),
+            Err("trusted production RC build source commit is invalid")
+        );
     }
 }

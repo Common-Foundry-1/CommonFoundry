@@ -9,6 +9,7 @@ fn main() {
         "GITHUB_REF",
         "GITHUB_REF_NAME",
         "CARGO_FEATURE_PRODUCTION_RC",
+        "CMFD_BUILD_SOURCE_COMMIT",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
@@ -22,8 +23,14 @@ fn main() {
         || release_gate::is_production_rc_label(env!("CARGO_PKG_VERSION"));
 
     if requested {
-        match release_gate::validate_production_rc(release_gate::COMPILED_RELEASE_PROFILE) {
-            Ok(()) => {}
+        let source_commit = env::var("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default();
+        match release_gate::validate_production_rc(
+            release_gate::COMPILED_RELEASE_PROFILE,
+            &source_commit,
+        ) {
+            Ok(()) => {
+                println!("cargo:rustc-env=CMFD_BUILD_SOURCE_COMMIT={source_commit}");
+            }
             Err(error) => panic!("production RC build gate: {error}"),
         }
     }

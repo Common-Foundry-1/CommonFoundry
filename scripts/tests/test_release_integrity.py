@@ -459,13 +459,90 @@ class ProductionRcGateTests(unittest.TestCase):
         return path
 
     def valid_stage_files(self) -> dict[str, Path]:
+        verifier_binary = self.root / integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME
+        verifier_binary.write_bytes(b"independent verifier fixture")
+        verifier_report = self.write_json(
+            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+            {
+                "network_id": "72" * 32,
+                "producer_report_checked": True,
+                "qualification_journal_checked": True,
+                "report_version": 2,
+                "verifier_only": True,
+            },
+        )
+        artifact_rows = {
+            role: {
+                "bytes": 1,
+                "file_name": f"{role}.fixture",
+                "sha256": "4" * 64,
+            }
+            for role in (
+                "bank",
+                "record_v2",
+                "request",
+                "proof",
+                "producer_report",
+                "journal",
+            )
+        }
+        artifact_rows["independent_verifier_binary"] = {
+            "bytes": verifier_binary.stat().st_size,
+            "file_name": integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME,
+            "sha256": integrity._sha256_file(verifier_binary),
+        }
+        artifact_rows["verifier_report"] = {
+            "bytes": verifier_report.stat().st_size,
+            "file_name": integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+            "sha256": integrity._sha256_file(verifier_report),
+        }
+        qualification_manifest = self.write_json(
+            integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME,
+            {
+                "artifacts": artifact_rows,
+                "network_profile": "RCNet-1",
+                "proof_selection": "ProductionV3",
+                "completion_evidence": {
+                    "fresh_verifier_report": True,
+                    "producer_report": True,
+                },
+                "journal_semantics": {
+                    "completion_marker": False,
+                    "diagnostic_only": True,
+                    "resumable": False,
+                    "used_as_completion_evidence": False,
+                },
+                "qualification": {
+                    "available_scratch_bytes_before_producer": 70_866_960_384,
+                    "composed_claims": 134,
+                    "fresh_process_verifier": True,
+                    "padded_variables": 33,
+                    "producer_process_id": 101,
+                    "required_scratch_bytes": 70_866_960_384,
+                    "scratch_floor_bytes": 53_687_091_200,
+                    "scratch_margin_bytes": 17_179_869_184,
+                    "verifier_process_id": 102,
+                },
+                "schema": "CMFD_PRODUCTION_V3_QUALIFICATION_MANIFEST_V1",
+                "source_commit": "9" * 40,
+                "status": "qualification_complete_activation_disabled",
+            },
+        )
         evidence = self.write_json(
             integrity.PRODUCTION_V3_ACTIVATION_NAME,
             {
-                "independent_verifier_sha256": "3" * 64,
+                "independent_verifier_binary_sha256": integrity._sha256_file(
+                    verifier_binary
+                ),
+                "independent_verifier_report_sha256": integrity._sha256_file(
+                    verifier_report
+                ),
                 "network_profile": "RCNet-1",
                 "proof_selection": "ProductionV3",
-                "qualification_manifest_sha256": "2" * 64,
+                "qualification_manifest_sha256": integrity._sha256_file(
+                    qualification_manifest
+                ),
+                "qualification_source_commit": "9" * 40,
                 "schema": "CMFD_PRODUCTION_V3_ACTIVATION_V1",
                 "source_commit": self.commit,
             },
@@ -479,6 +556,7 @@ class ProductionRcGateTests(unittest.TestCase):
                 },
                 "proof_of_work": {
                     "activation_evidence_sha256": integrity._sha256_file(evidence),
+                    "build_source_commit": self.commit,
                     "selection": "ProductionV3",
                 },
             },
@@ -486,6 +564,9 @@ class ProductionRcGateTests(unittest.TestCase):
         return {
             integrity.PRODUCTION_RC_NETWORK_INFO_NAME: network_info,
             integrity.PRODUCTION_V3_ACTIVATION_NAME: evidence,
+            integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME: qualification_manifest,
+            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME: verifier_binary,
+            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME: verifier_report,
         }
 
     def test_production_rc_labels_exclude_devnet_candidates(self) -> None:
@@ -519,6 +600,69 @@ class ProductionRcGateTests(unittest.TestCase):
             commit=self.commit,
             stage_files=self.valid_stage_files(),
         )
+
+    def test_dynamic_release_commit_must_match_the_checkout(self) -> None:
+        stage_files = self.valid_stage_files()
+        network_path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(network_path.read_text(encoding="utf-8"))
+        network["proof_of_work"]["build_source_commit"] = "8" * 40
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(integrity.IntegrityError, "checked-out commit"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1",
+                commit=self.commit,
+                stage_files=stage_files,
+            )
+
+    def test_arbitrary_nonzero_hashes_do_not_satisfy_the_gate(self) -> None:
+        stage_files = self.valid_stage_files()
+        evidence_path = stage_files[integrity.PRODUCTION_V3_ACTIVATION_NAME]
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["qualification_manifest_sha256"] = "f" * 64
+        self.write_json(integrity.PRODUCTION_V3_ACTIVATION_NAME, evidence)
+        network_path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(network_path.read_text(encoding="utf-8"))
+        network["proof_of_work"]["activation_evidence_sha256"] = (
+            integrity._sha256_file(evidence_path)
+        )
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "qualification_manifest_sha256"
+        ):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1",
+                commit=self.commit,
+                stage_files=stage_files,
+            )
+
+    def test_tampered_verifier_binary_is_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        stage_files[
+            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME
+        ].write_bytes(b"tampered verifier")
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "independent_verifier_binary_sha256"
+        ):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1",
+                commit=self.commit,
+                stage_files=stage_files,
+            )
+
+    def test_tampered_verifier_report_is_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        report = stage_files[
+            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME
+        ]
+        report.write_bytes(report.read_bytes() + b"\n")
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "independent_verifier_report_sha256"
+        ):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1",
+                commit=self.commit,
+                stage_files=stage_files,
+            )
 
 
 class ReleaseFinalizerTests(unittest.TestCase):

@@ -32,6 +32,15 @@ FULL_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HEX256_RE = re.compile(r"[0-9a-f]{64}\Z")
 PRODUCTION_RC_NETWORK_INFO_NAME = "NETWORK-INFO.json"
 PRODUCTION_V3_ACTIVATION_NAME = "PRODUCTION-V3-ACTIVATION.json"
+PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME = (
+    "PRODUCTION-V3-QUALIFICATION-MANIFEST.json"
+)
+PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME = (
+    "PRODUCTION-V3-INDEPENDENT-VERIFIER.bin"
+)
+PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME = (
+    "PRODUCTION-V3-INDEPENDENT-VERIFIER-REPORT.json"
+)
 RECEIPT_FIELDS = (
     "SCHEMA",
     "TRUST_SCOPE",
@@ -100,11 +109,18 @@ def validate_production_rc_artifacts(
     if not is_production_rc_label(version):
         return
 
-    required = {PRODUCTION_RC_NETWORK_INFO_NAME, PRODUCTION_V3_ACTIVATION_NAME}
+    required = {
+        PRODUCTION_RC_NETWORK_INFO_NAME,
+        PRODUCTION_V3_ACTIVATION_NAME,
+        PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME,
+        PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME,
+        PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+    }
     missing = sorted(required - set(stage_files))
     if missing:
         raise IntegrityError(
-            f"production RC release gate is blocked; missing compiled activation artifacts: {missing}"
+            "production RC release gate is blocked; "
+            f"missing compiled activation artifacts: {missing}"
         )
 
     network_info, _ = _bounded_json_object(
@@ -113,6 +129,21 @@ def validate_production_rc_artifacts(
     evidence, evidence_bytes = _bounded_json_object(
         stage_files[PRODUCTION_V3_ACTIVATION_NAME], "ProductionV3 activation evidence"
     )
+    qualification_manifest, qualification_manifest_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME],
+        "ProductionV3 qualification manifest",
+    )
+    verifier_binary = _regular_file(
+        stage_files[PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME],
+        "ProductionV3 independent verifier binary",
+    )
+    verifier_report, verifier_report_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME],
+        "ProductionV3 independent verifier report",
+    )
+    qualification_manifest_sha256 = _sha256_bytes(qualification_manifest_bytes)
+    verifier_binary_sha256 = _sha256_file(verifier_binary)
+    verifier_report_sha256 = _sha256_bytes(verifier_report_bytes)
     network = network_info.get("network")
     proof = network_info.get("proof_of_work")
     if not isinstance(network, dict) or network.get("name") != "CommonFoundry RCNet-1":
@@ -121,26 +152,168 @@ def validate_production_rc_artifacts(
         raise IntegrityError("production RC compiled network ID is not RCNet-1")
     if not isinstance(proof, dict) or proof.get("selection") != "ProductionV3":
         raise IntegrityError("production RC compiled proof selection is not ProductionV3")
+    if proof.get("build_source_commit") != commit:
+        raise IntegrityError(
+            "production RC compiled build source commit does not match the checked-out commit"
+        )
     if proof.get("activation_evidence_sha256") != _sha256_bytes(evidence_bytes):
         raise IntegrityError(
             "compiled ProductionV3 selection is not bound to the staged activation evidence"
         )
 
+    qualification_source_commit = qualification_manifest.get("source_commit")
+    if (
+        not isinstance(qualification_source_commit, str)
+        or not FULL_COMMIT_RE.fullmatch(qualification_source_commit)
+        or set(qualification_source_commit) == {"0"}
+    ):
+        raise IntegrityError(
+            "ProductionV3 qualification manifest has an invalid source commit"
+        )
+
     expected_evidence = {
         "schema": "CMFD_PRODUCTION_V3_ACTIVATION_V1",
         "source_commit": commit,
+        "qualification_source_commit": qualification_source_commit,
         "network_profile": "RCNet-1",
         "proof_selection": "ProductionV3",
+        "qualification_manifest_sha256": qualification_manifest_sha256,
+        "independent_verifier_binary_sha256": verifier_binary_sha256,
+        "independent_verifier_report_sha256": verifier_report_sha256,
     }
     for field, expected in expected_evidence.items():
         if evidence.get(field) != expected:
             raise IntegrityError(
                 f"ProductionV3 activation evidence has invalid {field}"
             )
-    for field in ("qualification_manifest_sha256", "independent_verifier_sha256"):
-        value = evidence.get(field)
-        if not isinstance(value, str) or not HEX256_RE.fullmatch(value) or set(value) == {"0"}:
-            raise IntegrityError(f"ProductionV3 activation evidence has invalid {field}")
+    if qualification_manifest.get("schema") != (
+        "CMFD_PRODUCTION_V3_QUALIFICATION_MANIFEST_V1"
+    ):
+        raise IntegrityError("ProductionV3 qualification manifest schema is unsupported")
+    if qualification_manifest.get("status") != (
+        "qualification_complete_activation_disabled"
+    ):
+        raise IntegrityError("ProductionV3 qualification manifest status is invalid")
+    if (
+        qualification_manifest.get("network_profile") != "RCNet-1"
+        or qualification_manifest.get("proof_selection") != "ProductionV3"
+    ):
+        raise IntegrityError("ProductionV3 qualification manifest identity is invalid")
+
+    qualification = qualification_manifest.get("qualification")
+    if not isinstance(qualification, dict):
+        raise IntegrityError("ProductionV3 qualification manifest geometry is invalid")
+    scratch_floor = qualification.get("scratch_floor_bytes")
+    scratch_margin = qualification.get("scratch_margin_bytes")
+    required_scratch = qualification.get("required_scratch_bytes")
+    available_scratch = qualification.get("available_scratch_bytes_before_producer")
+    producer_pid = qualification.get("producer_process_id")
+    verifier_pid = qualification.get("verifier_process_id")
+    if (
+        qualification.get("padded_variables") != 33
+        or qualification.get("composed_claims") != 134
+        or qualification.get("fresh_process_verifier") is not True
+        or scratch_floor != 53_687_091_200
+        or not isinstance(scratch_margin, int)
+        or isinstance(scratch_margin, bool)
+        or scratch_margin <= 0
+        or required_scratch != scratch_floor + scratch_margin
+        or not isinstance(available_scratch, int)
+        or isinstance(available_scratch, bool)
+        or available_scratch < required_scratch
+        or not isinstance(producer_pid, int)
+        or isinstance(producer_pid, bool)
+        or producer_pid <= 0
+        or not isinstance(verifier_pid, int)
+        or isinstance(verifier_pid, bool)
+        or verifier_pid <= 0
+        or producer_pid == verifier_pid
+    ):
+        raise IntegrityError("ProductionV3 qualification manifest geometry is invalid")
+
+    if qualification_manifest.get("journal_semantics") != {
+        "diagnostic_only": True,
+        "completion_marker": False,
+        "resumable": False,
+        "used_as_completion_evidence": False,
+    } or qualification_manifest.get("completion_evidence") != {
+        "producer_report": True,
+        "fresh_verifier_report": True,
+    }:
+        raise IntegrityError("ProductionV3 qualification completion semantics are invalid")
+
+    artifacts = qualification_manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise IntegrityError("ProductionV3 qualification manifest artifacts are missing")
+    required_bound_roles = {
+        "bank",
+        "record_v2",
+        "request",
+        "proof",
+        "producer_report",
+        "journal",
+        "independent_verifier_binary",
+        "verifier_report",
+    }
+    if not required_bound_roles.issubset(artifacts):
+        raise IntegrityError(
+            "ProductionV3 qualification manifest omits required artifact bindings"
+        )
+    for role in required_bound_roles:
+        row = artifacts.get(role)
+        if not isinstance(row, dict):
+            raise IntegrityError(
+                f"ProductionV3 qualification manifest has invalid {role} binding"
+            )
+        digest = row.get("sha256")
+        size = row.get("bytes")
+        if (
+            not isinstance(digest, str)
+            or not HEX256_RE.fullmatch(digest)
+            or set(digest) == {"0"}
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+        ):
+            raise IntegrityError(
+                f"ProductionV3 qualification manifest has invalid {role} binding"
+            )
+
+    staged_bindings = {
+        "independent_verifier_binary": (
+            PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME,
+            verifier_binary.stat().st_size,
+            verifier_binary_sha256,
+        ),
+        "verifier_report": (
+            PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+            len(verifier_report_bytes),
+            verifier_report_sha256,
+        ),
+    }
+    for role, (name, size, digest) in staged_bindings.items():
+        row = artifacts[role]
+        if (
+            row.get("file_name") != name
+            or row.get("bytes") != size
+            or row.get("sha256") != digest
+        ):
+            raise IntegrityError(
+                f"staged ProductionV3 {role} does not match the qualification manifest"
+            )
+
+    verifier_expectations = {
+        "report_version": 2,
+        "network_id": "72" * 32,
+        "verifier_only": True,
+        "producer_report_checked": True,
+        "qualification_journal_checked": True,
+    }
+    for field, expected in verifier_expectations.items():
+        if verifier_report.get(field) != expected:
+            raise IntegrityError(
+                f"ProductionV3 independent verifier report has invalid {field}"
+            )
 
 
 def _sha256_bytes(data: bytes) -> str:

@@ -2298,6 +2298,13 @@ combined ceremony model or a signed type-5 ceremony prefix.
 
 Windows PowerShell producer invocation:
 
+For an operator-grade Windows run, use
+[`scripts/run-production-v3-qualification.ps1`](../../scripts/run-production-v3-qualification.ps1)
+and follow [`docs/production-v3-qualification-windows.md`](../production-v3-qualification-windows.md).
+The harness preserves exact process output, enforces the code scratch floor
+plus an operator margin, launches the verifier in a fresh process, and creates
+only a non-activating evidence candidate after complete verification.
+
 ```text
 .\target\release\cmfd-consensus.exe dory-v3-qualify `
   --bank D:\qualification\MODEL-V2.bank `

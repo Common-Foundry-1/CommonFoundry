@@ -1479,6 +1479,12 @@ fn projected_candidate_scratch_space()
 }
 
 #[cfg(feature = "whir-prototype")]
+pub(crate) fn projected_candidate_required_free_scratch_bytes()
+-> Result<u64, BlsDoryV3CandidateError> {
+    Ok(projected_candidate_scratch_space()?.required_free_bytes)
+}
+
+#[cfg(feature = "whir-prototype")]
 pub(crate) fn preflight_candidate_scratch(
     scratch_directory: &Path,
 ) -> Result<(u64, u64), BlsDoryV3CandidateError> {

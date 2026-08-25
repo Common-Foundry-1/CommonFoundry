@@ -4,12 +4,14 @@
 //! V3 consensus. It joins the already-reviewed opaque capabilities into one
 //! operator entry point that can measure an exact n=33 run without exposing a
 //! second, configurable proof construction path.
-//! The report is written second and is the graceful-completion marker. The two
-//! separate output paths cannot be made crash-atomic as one filesystem commit.
+//! The report is written after the proof and is the graceful-completion marker.
+//! The required hash-chained journal records durable progress diagnostics, not
+//! completion or resumability. The separate outputs cannot be made crash-atomic
+//! as one filesystem commit.
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -24,7 +26,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::{
-    BlockChallenge, BlockProof, ForgeMatrixV3CandidateProof,
+    BlockChallenge, BlockProof, ForgeMatrixV3CandidateProof, MODEL_BANK_HEADER_BYTES,
     dory_bls12_381_aggregate::BLS_DORY_COMPOSED_AGGREGATE_CLAIMS,
     dory_bls12_381_blake3::{
         BlsDoryBlake3ProductionPreflightError, projected_bls_dory_blake3_production_resources,
@@ -32,7 +34,7 @@ use crate::{
     dory_bls12_381_candidate::{
         BlsDoryV3CandidateError, BlsDoryV3CandidatePayload, CANDIDATE_PAYLOAD_HEADER_BYTES,
         CANDIDATE_PAYLOAD_MAGIC, preflight_candidate_scratch,
-        verify_bls_dory_v3_layout_v5_candidate,
+        projected_candidate_required_free_scratch_bytes, verify_bls_dory_v3_layout_v5_candidate,
     },
     dory_bls12_381_execution_provider::{
         BlsDoryV3WinningNonceClaim, BlsDoryV3WinningNonceReplayError,
@@ -61,13 +63,44 @@ use crate::{
     wire::{MAX_PROOF_BYTES, WireError, decode_forgematrix_proof, encode_forgematrix_proof},
 };
 
-const QUALIFICATION_REPORT_VERSION: u16 = 2;
+const QUALIFICATION_REPORT_VERSION: u16 = 3;
+const QUALIFICATION_JOURNAL_VERSION: u16 = 1;
 const QUALIFICATION_REQUEST_GENERATION_REPORT_VERSION: u16 = 1;
 const VERIFIER_REPORT_VERSION: u16 = 1;
 const MAX_QUALIFICATION_REQUEST_JSON_BYTES: usize = 16 * 1024;
+const MAX_QUALIFICATION_REPORT_JSON_BYTES: usize = 128 * 1024;
+const MAX_QUALIFICATION_JOURNAL_BYTES: usize = 64 * 1024;
 const MAX_RECORD_V2_JSON_BYTES: usize = 64 * 1024;
 const SCRATCH_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const QUALIFICATION_REQUEST_DIGEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/QUALIFICATION-REQUEST/V1";
+const QUALIFICATION_RUN_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/V3/QUALIFICATION-RUN-IDENTITY/V1";
+const QUALIFICATION_JOURNAL_RECORD_DIGEST_DOMAIN: &str =
+    "CMFD/FORGEMATRIX/V3/QUALIFICATION-JOURNAL-RECORD/V1";
+const QUALIFICATION_JOURNAL_FILE_DIGEST_DOMAIN: &str =
+    "CMFD/FORGEMATRIX/V3/QUALIFICATION-JOURNAL-COMPLETE-FILE/V1";
+const EXACT_RESERVATION_PEAK_SCOPE: &str = "exact high-water mark of declared final logical-byte reservations for the six instrumented Dory scratch artifact writer classes used by this runner; the sampled comparison is only a consistency check and does not prove an exact whole-directory peak or exclude uninstrumented transient files; excludes filesystem allocation granularity, metadata, physical bytes, and RAM";
+const WHOLE_PROCESS_PEAK_RSS_SCOPE: &str =
+    "OS process-lifetime high-water mark; run the CLI in a fresh process for qualification";
+const COOPERATIVE_CANCELLATION_SCOPE: &str = "the CLI maps Ctrl-C to the supplied flag; winning-claim replay polls it, other long stages observe it only after returning to a runner boundary";
+
+const QUALIFICATION_JOURNAL_STAGES: [&str; 16] = [
+    "preflight_completed",
+    "resource_preflight_completed",
+    "setup_validation_completed",
+    "record_validation_completed",
+    "bank_authentication_completed",
+    "fixed_model_preparation_completed",
+    "winning_claim_replay_completed",
+    "candidate_resource_preflight_completed",
+    "layout_v5_preparation_completed",
+    "native_and_aggregate_composition_completed",
+    "cp02_seal_completed",
+    "scratch_cleanup_completed",
+    "first_verification_completed",
+    "wire_round_trip_completed",
+    "second_verification_completed",
+    "prepublication_verification_recorded",
+];
 
 const _: [(); 33] = [(); DORY_V3_PADDED_VARIABLES as usize];
 const _: [(); DORY_V3_PADDED_VARIABLES as usize] = [(); BLS_DORY_SHARED_PRODUCTION_VARIABLES];
@@ -136,7 +169,8 @@ pub struct ProductionDoryV3QualificationRequestGenerationReport {
 /// across the six instrumented Dory artifact writer classes used by this
 /// runner. They do not establish an exact whole-directory peak and are not
 /// physical disk allocation, filesystem metadata, or RAM measurements.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductionDoryV3QualificationReport {
     pub report_version: u16,
     pub padded_variables: u32,
@@ -178,12 +212,13 @@ pub struct ProductionDoryV3QualificationReport {
     pub instrumented_scratch_reservation_events: u64,
     pub exact_peak_scratch_instrumented: bool,
     pub exact_reservation_peak_instrumented: bool,
-    pub exact_reservation_peak_scope: &'static str,
+    pub exact_reservation_peak_scope: String,
     pub retained_scratch_entries: u64,
     pub retained_scratch_logical_bytes: u64,
     pub whole_process_peak_rss_bytes: u64,
-    pub whole_process_peak_rss_scope: &'static str,
-    pub cooperative_cancellation_scope: &'static str,
+    pub whole_process_peak_rss_scope: String,
+    pub cooperative_cancellation_scope: String,
+    pub qualification_journal: ProductionDoryV3QualificationJournalSummary,
     pub report_output_is_completion_marker: bool,
     pub publication_crash_atomic: bool,
     pub parent_directory_sync_performed: bool,
@@ -203,6 +238,81 @@ pub struct ProductionDoryV3QualificationReport {
     pub prepublication_qualification_nanoseconds: u64,
 }
 
+/// Hash-chain identity retained by a successful producer report.
+///
+/// The journal is durable progress diagnostics only. It neither proves a
+/// successful qualification nor supports restart or resumption.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionDoryV3QualificationJournalSummary {
+    pub journal_version: u16,
+    pub run_identity: Digest32,
+    pub final_record_digest: Digest32,
+    pub event_count: u64,
+    pub journal_bytes: u64,
+    pub complete_file_digest: Digest32,
+    pub diagnostic_only: bool,
+    pub completion_marker: bool,
+    pub resumable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationEffectiveConfiguration {
+    qualification_report_version: u16,
+    padded_variables: u32,
+    composed_claims: u16,
+    verifier_passes: u8,
+    maximum_native_block_rows: u64,
+    algorithm_version: u32,
+    proof_version: u32,
+    shared_layout_version: u16,
+    scratch_sample_interval_milliseconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationAuthenticatedIdentities {
+    record_digest: Digest32,
+    model_identity_digest: Digest32,
+    setup_identity: Digest32,
+}
+
+#[derive(Serialize)]
+struct QualificationJournalRecord<'a> {
+    journal_version: u16,
+    sequence: u64,
+    previous_record_digest: Digest32,
+    run_identity: Digest32,
+    request_digest: Digest32,
+    stage: &'a str,
+    diagnostic_only: bool,
+    completion_marker: bool,
+    resumable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_configuration: Option<&'a QualificationEffectiveConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authenticated_identities: Option<QualificationAuthenticatedIdentities>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictQualificationJournalRecord {
+    journal_version: u16,
+    sequence: u64,
+    previous_record_digest: Digest32,
+    run_identity: Digest32,
+    request_digest: Digest32,
+    stage: String,
+    diagnostic_only: bool,
+    completion_marker: bool,
+    resumable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_configuration: Option<QualificationEffectiveConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authenticated_identities: Option<QualificationAuthenticatedIdentities>,
+}
+
 /// Measurements from independently loading and verifying one persisted proof.
 ///
 /// This runner never proves, mines, publishes, or creates a chain-admission
@@ -217,6 +327,10 @@ pub struct ProductionDoryV3VerifierReport {
     pub record_digest: Digest32,
     pub model_identity_digest: Digest32,
     pub setup_identity: Digest32,
+    pub bank_content_blake3_digest: Digest32,
+    pub bank_content_bytes: u64,
+    pub producer_report_blake3_digest: Digest32,
+    pub qualification_journal: ProductionDoryV3QualificationJournalSummary,
     pub wire_blake3_digest: Digest32,
     pub wire_bytes: u64,
     pub cp02_bytes: u64,
@@ -226,10 +340,13 @@ pub struct ProductionDoryV3VerifierReport {
     pub parse_and_canonicalization_nanoseconds: u64,
     pub record_and_bank_authentication_nanoseconds: u64,
     pub verification_nanoseconds: u64,
+    pub bank_final_stability_scan_nanoseconds: u64,
     pub total_nanoseconds: u64,
     pub whole_process_peak_rss_bytes: u64,
     pub whole_process_peak_rss_scope: &'static str,
     pub verifier_only: bool,
+    pub producer_report_checked: bool,
+    pub qualification_journal_checked: bool,
 }
 
 /// Fail-closed errors from the production qualification orchestrator.
@@ -303,8 +420,26 @@ pub enum ProductionDoryV3QualificationError {
     ProofWireTooLarge { max: usize },
     #[error("qualification request JSON exceeds the {max}-byte limit")]
     QualificationRequestJsonTooLarge { max: usize },
+    #[error("qualification producer report JSON exceeds the {max}-byte limit")]
+    QualificationReportJsonTooLarge { max: usize },
+    #[error("qualification journal exceeds the {max}-byte limit")]
+    QualificationJournalTooLarge { max: usize },
     #[error("Record V2 JSON exceeds the {max}-byte limit")]
     RecordV2JsonTooLarge { max: usize },
+    #[error("qualification journal is invalid: {0}")]
+    InvalidJournal(&'static str),
+    #[error("qualification producer report is noncanonical")]
+    NonCanonicalProducerReport,
+    #[error("qualification evidence does not match: {0}")]
+    EvidenceMismatch(&'static str),
+    #[error("qualification input is not a regular non-reparse file: {0}")]
+    InputNotRegular(PathBuf),
+    #[error("qualification input has {links} hard links instead of exactly one: {path}")]
+    InputHardLinks { path: PathBuf, links: u64 },
+    #[error("qualification input path was replaced while it was being read: {0}")]
+    InputReplaced(PathBuf),
+    #[error("qualification input bytes changed while they were being read: {0}")]
+    InputChanged(PathBuf),
     #[error("qualification JSON encoding or decoding failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("deterministic n=33 setup failed: {0}")]
@@ -527,6 +662,7 @@ pub fn run_production_dory_v3_qualification(
     scratch_path: &Path,
     proof_output: &Path,
     report_output: &Path,
+    journal_output: &Path,
     maximum_native_block_rows: usize,
     cancel: &AtomicBool,
 ) -> Result<ProductionDoryV3QualificationReport, ProductionDoryV3QualificationError> {
@@ -543,7 +679,15 @@ pub fn run_production_dory_v3_qualification(
             "maximum_native_block_rows must be nonzero",
         ));
     }
-    let paths = QualificationPaths::preflight(scratch_path, proof_output, report_output)?;
+    let effective_configuration = qualification_effective_configuration(maximum_native_block_rows)?;
+    let request_digest = qualification_request_digest(request);
+    let paths =
+        QualificationPaths::preflight(scratch_path, proof_output, report_output, journal_output)?;
+    let mut journal = QualificationJournal::create(
+        paths.journal_output.clone(),
+        request_digest,
+        effective_configuration,
+    )?;
 
     let native_projection = projected_bls_dory_blake3_production_resources()?;
     let scratch_parent =
@@ -570,6 +714,7 @@ pub fn run_production_dory_v3_qualification(
         native_projection.provisional_available_memory_gate_bytes,
         observed_available_memory_before_bytes,
     )?;
+    journal.append_stage("resource_preflight_completed", None)?;
 
     let mut scratch = OwnedScratchDirectory::create(paths.scratch.clone())?;
     let mut exact_scratch = ExactScratchReservationSession::start(scratch.path())
@@ -580,6 +725,7 @@ pub fn run_production_dory_v3_qualification(
     let setup = deterministic_bls_dory_setup(DORY_V3_PADDED_VARIABLES as usize)?;
     setup.validate()?;
     let setup_nanoseconds = elapsed_nanoseconds(setup_started)?;
+    journal.append_stage("setup_validation_completed", None)?;
     check_cancel(cancel)?;
 
     let record_started = Instant::now();
@@ -590,6 +736,7 @@ pub fn run_production_dory_v3_qualification(
         .model_identity()
         .validate_production_structure(audit_record.manifest(), &setup)?;
     let record_load_and_validation_nanoseconds = elapsed_nanoseconds(record_started)?;
+    journal.append_stage("record_validation_completed", None)?;
     check_cancel(cancel)?;
 
     let bank_reauthentication_started = Instant::now();
@@ -602,6 +749,15 @@ pub fn run_production_dory_v3_qualification(
         return Err(ProductionDoryV3QualificationError::RecordReproductionMismatch);
     }
     let bank_reauthentication_nanoseconds = elapsed_nanoseconds(bank_reauthentication_started)?;
+    let authenticated_identities = QualificationAuthenticatedIdentities {
+        record_digest: audit_record.record_digest(),
+        model_identity_digest: audit_record.model_identity_digest(),
+        setup_identity: audit_record.setup_identity(),
+    };
+    journal.append_stage(
+        "bank_authentication_completed",
+        Some(authenticated_identities),
+    )?;
     check_cancel(cancel)?;
 
     let fixed_model_started = Instant::now();
@@ -614,6 +770,7 @@ pub fn run_production_dory_v3_qualification(
         )
         .map_err(|error| pipeline_error("fixed-model preparation", error))?;
     let fixed_model_preparation_nanoseconds = elapsed_nanoseconds(fixed_model_started)?;
+    journal.append_stage("fixed_model_preparation_completed", None)?;
     check_cancel(cancel)?;
 
     let replay_started = Instant::now();
@@ -644,12 +801,14 @@ pub fn run_production_dory_v3_qualification(
         error => pipeline_error("winning-claim CPU replay", error),
     })?;
     let winning_claim_replay_nanoseconds = elapsed_nanoseconds(replay_started)?;
+    journal.append_stage("winning_claim_replay_completed", None)?;
     check_cancel(cancel)?;
 
     let candidate_resource_started = Instant::now();
     let (candidate_required_free_scratch_bytes, candidate_available_free_scratch_bytes) =
         preflight_candidate_scratch(scratch.path())?;
     let candidate_resource_preflight_nanoseconds = elapsed_nanoseconds(candidate_resource_started)?;
+    journal.append_stage("candidate_resource_preflight_completed", None)?;
     check_cancel(cancel)?;
 
     let layout_started = Instant::now();
@@ -663,6 +822,7 @@ pub fn run_production_dory_v3_qualification(
     )
     .map_err(|error| pipeline_error("Layout V5 preparation", error))?;
     let layout_v5_preparation_nanoseconds = elapsed_nanoseconds(layout_started)?;
+    journal.append_stage("layout_v5_preparation_completed", None)?;
     check_cancel(cancel)?;
 
     let composition_started = Instant::now();
@@ -674,6 +834,7 @@ pub fn run_production_dory_v3_qualification(
     )
     .map_err(|error| pipeline_error("native and 134-claim composition", error))?;
     let native_and_aggregate_composition_nanoseconds = elapsed_nanoseconds(composition_started)?;
+    journal.append_stage("native_and_aggregate_composition_completed", None)?;
     check_cancel(cancel)?;
 
     let seal_started = Instant::now();
@@ -685,6 +846,7 @@ pub fn run_production_dory_v3_qualification(
     )?;
     let payload = validate_cp02(&candidate)?;
     let cp02_seal_nanoseconds = elapsed_nanoseconds(seal_started)?;
+    journal.append_stage("cp02_seal_completed", None)?;
     check_cancel(cancel)?;
 
     let scratch_cleanup_started = Instant::now();
@@ -712,6 +874,7 @@ pub fn run_production_dory_v3_qualification(
     }
     scratch.remove_empty()?;
     let scratch_cleanup_nanoseconds = elapsed_nanoseconds(scratch_cleanup_started)?;
+    journal.append_stage("scratch_cleanup_completed", None)?;
     check_cancel(cancel)?;
 
     let first_verification_started = Instant::now();
@@ -723,6 +886,7 @@ pub fn run_production_dory_v3_qualification(
         &setup,
     )?;
     let first_verification_nanoseconds = elapsed_nanoseconds(first_verification_started)?;
+    journal.append_stage("first_verification_completed", None)?;
     check_cancel(cancel)?;
 
     let wire_started = Instant::now();
@@ -743,6 +907,7 @@ pub fn run_production_dory_v3_qualification(
         return Err(ProductionDoryV3QualificationError::NonCanonicalWire);
     }
     let wire_round_trip_nanoseconds = elapsed_nanoseconds(wire_started)?;
+    journal.append_stage("wire_round_trip_completed", None)?;
     check_cancel(cancel)?;
 
     let second_verification_started = Instant::now();
@@ -754,25 +919,25 @@ pub fn run_production_dory_v3_qualification(
         &setup,
     )?;
     let second_verification_nanoseconds = elapsed_nanoseconds(second_verification_started)?;
+    journal.append_stage("second_verification_completed", None)?;
     check_cancel(cancel)?;
     let whole_process_peak_rss_bytes =
         peak_whole_process_rss_bytes().map_err(ProductionDoryV3QualificationError::MemoryQuery)?;
+    let qualification_journal = journal.finish("prepublication_verification_recorded")?;
 
     let report = ProductionDoryV3QualificationReport {
         report_version: QUALIFICATION_REPORT_VERSION,
-        padded_variables: DORY_V3_PADDED_VARIABLES,
-        composed_claims: u16::try_from(BLS_DORY_COMPOSED_AGGREGATE_CLAIMS)
-            .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?,
-        verifier_passes: 2,
-        maximum_native_block_rows: u64::try_from(maximum_native_block_rows)
-            .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?,
+        padded_variables: effective_configuration.padded_variables,
+        composed_claims: effective_configuration.composed_claims,
+        verifier_passes: effective_configuration.verifier_passes,
+        maximum_native_block_rows: effective_configuration.maximum_native_block_rows,
         network_id: Digest32::new(request.block.network_id),
         block_height: request.block.height,
         nonce: request.nonce,
-        request_digest: qualification_request_digest(request),
-        record_digest: audit_record.record_digest(),
-        model_identity_digest: audit_record.model_identity_digest(),
-        setup_identity: audit_record.setup_identity(),
+        request_digest,
+        record_digest: authenticated_identities.record_digest,
+        model_identity_digest: authenticated_identities.model_identity_digest,
+        setup_identity: authenticated_identities.setup_identity,
         challenge_digest: Digest32::new(candidate.challenge_digest),
         final_activation_digest: Digest32::new(candidate.final_activation_digest),
         work_digest: Digest32::new(candidate.work_digest),
@@ -807,12 +972,13 @@ pub fn run_production_dory_v3_qualification(
         instrumented_scratch_reservation_events: exact_scratch_reservations.reservation_events,
         exact_peak_scratch_instrumented: false,
         exact_reservation_peak_instrumented: true,
-        exact_reservation_peak_scope: "exact high-water mark of declared final logical-byte reservations for the six instrumented Dory scratch artifact writer classes used by this runner; the sampled comparison is only a consistency check and does not prove an exact whole-directory peak or exclude uninstrumented transient files; excludes filesystem allocation granularity, metadata, physical bytes, and RAM",
+        exact_reservation_peak_scope: EXACT_RESERVATION_PEAK_SCOPE.into(),
         retained_scratch_entries,
         retained_scratch_logical_bytes,
         whole_process_peak_rss_bytes,
-        whole_process_peak_rss_scope: "OS process-lifetime high-water mark; run the CLI in a fresh process for qualification",
-        cooperative_cancellation_scope: "the CLI maps Ctrl-C to the supplied flag; winning-claim replay polls it, other long stages observe it only after returning to a runner boundary",
+        whole_process_peak_rss_scope: WHOLE_PROCESS_PEAK_RSS_SCOPE.into(),
+        cooperative_cancellation_scope: COOPERATIVE_CANCELLATION_SCOPE.into(),
+        qualification_journal,
         report_output_is_completion_marker: true,
         publication_crash_atomic: false,
         parent_directory_sync_performed: cfg!(unix),
@@ -831,6 +997,7 @@ pub fn run_production_dory_v3_qualification(
         second_verification_nanoseconds,
         prepublication_qualification_nanoseconds: elapsed_nanoseconds(qualification_started)?,
     };
+    validate_producer_report_invariants(&report, effective_configuration)?;
 
     let mut report_bytes = serde_json::to_vec_pretty(&report)?;
     report_bytes.push(b'\n');
@@ -855,23 +1022,114 @@ pub fn run_production_dory_v3_verifier(
     record_path: &Path,
     request_path: &Path,
     proof_path: &Path,
+    producer_report_path: &Path,
+    journal_path: &Path,
     report_output: &Path,
 ) -> Result<ProductionDoryV3VerifierReport, ProductionDoryV3QualificationError> {
     ensure_absolute_paths(
-        &[bank_path, record_path, request_path, proof_path],
-        "verifier bank, Record V2, request, and proof paths must be absolute",
+        &[
+            bank_path,
+            record_path,
+            request_path,
+            proof_path,
+            producer_report_path,
+            journal_path,
+        ],
+        "verifier bank, Record V2, request, proof, producer report, and journal paths must be absolute",
     )?;
+    let verifier_inputs = [
+        bank_path,
+        record_path,
+        request_path,
+        proof_path,
+        producer_report_path,
+        journal_path,
+    ];
+    for (index, left) in verifier_inputs.iter().enumerate() {
+        for right in &verifier_inputs[index + 1..] {
+            if paths_equal_for_platform(left, right) {
+                return Err(ProductionDoryV3QualificationError::Configuration(
+                    "verifier input paths must be pairwise distinct",
+                ));
+            }
+        }
+    }
     let report_output = preflight_verifier_report_output(report_output)?;
+    for input in verifier_inputs {
+        if paths_equal_for_platform(input, &report_output) {
+            return Err(ProductionDoryV3QualificationError::Configuration(
+                "verifier report output must be distinct from every verifier input",
+            ));
+        }
+    }
     let verifier_started = Instant::now();
 
+    // Retain every parsed input handle until the verifier report is published.
+    // Windows denies write/delete sharing; Unix uses no-follow opens, retained
+    // identity, exact byte rereads for bounded inputs, and change-time checks.
+    let mut request_input = RetainedStrictInput::open(request_path)?;
+    let mut proof_input = RetainedStrictInput::open(proof_path)?;
+
     let parse_started = Instant::now();
-    let request = load_bounded_qualification_request(request_path)?;
-    let wire = read_bounded_proof_wire(proof_path)?;
-    let (candidate, _payload) = decode_canonical_v3_layout_v5_wire(&wire, &request)?;
+    let request_bytes = request_input.read_bounded(
+        MAX_QUALIFICATION_REQUEST_JSON_BYTES,
+        ProductionDoryV3QualificationError::QualificationRequestJsonTooLarge {
+            max: MAX_QUALIFICATION_REQUEST_JSON_BYTES,
+        },
+    )?;
+    let request: ProductionDoryV3QualificationRequest = serde_json::from_slice(&request_bytes)?;
+    let wire = proof_input.read_bounded(
+        MAX_PROOF_BYTES,
+        ProductionDoryV3QualificationError::ProofWireTooLarge {
+            max: MAX_PROOF_BYTES,
+        },
+    )?;
+    let (candidate, payload) = decode_canonical_v3_layout_v5_wire(&wire, &request)?;
+    let mut producer_report_input = RetainedStrictInput::open(producer_report_path)?;
+    let mut journal_input = RetainedStrictInput::open(journal_path)?;
+    let producer_report_bytes = producer_report_input.read_bounded(
+        MAX_QUALIFICATION_REPORT_JSON_BYTES,
+        ProductionDoryV3QualificationError::QualificationReportJsonTooLarge {
+            max: MAX_QUALIFICATION_REPORT_JSON_BYTES,
+        },
+    )?;
+    let producer_report = parse_canonical_qualification_report(&producer_report_bytes)?;
+    let expected_configuration = validate_producer_report_request_and_proof(
+        &producer_report,
+        &request,
+        &wire,
+        &candidate,
+        &payload,
+    )?;
+    let journal_bytes = journal_input.read_bounded(
+        MAX_QUALIFICATION_JOURNAL_BYTES,
+        ProductionDoryV3QualificationError::QualificationJournalTooLarge {
+            max: MAX_QUALIFICATION_JOURNAL_BYTES,
+        },
+    )?;
+    let audited_journal = audit_qualification_journal(
+        &journal_bytes,
+        qualification_request_digest(&request),
+        expected_configuration,
+        QualificationAuthenticatedIdentities {
+            record_digest: producer_report.record_digest,
+            model_identity_digest: producer_report.model_identity_digest,
+            setup_identity: producer_report.setup_identity,
+        },
+    )?;
+    require_matching_journal_summary(&audited_journal, &producer_report.qualification_journal)?;
     let parse_and_canonicalization_nanoseconds = elapsed_nanoseconds(parse_started)?;
 
     let authentication_started = Instant::now();
-    let audit_record = load_bounded_record_v2(record_path)?;
+    let mut record_input = RetainedStrictInput::open(record_path)?;
+    let mut bank_input = RetainedStrictInput::open(bank_path)?;
+    let record_bytes = record_input.read_bounded(
+        MAX_RECORD_V2_JSON_BYTES,
+        ProductionDoryV3QualificationError::RecordV2JsonTooLarge {
+            max: MAX_RECORD_V2_JSON_BYTES,
+        },
+    )?;
+    let audit_record: DoryV3ModelCommitmentRecordV2 = serde_json::from_slice(&record_bytes)?;
     validate_verifier_record_static_identity(&audit_record)?;
     let setup = deterministic_bls_dory_setup(DORY_V3_PADDED_VARIABLES as usize)?;
     setup.validate()?;
@@ -879,13 +1137,48 @@ pub fn run_production_dory_v3_verifier(
     let structural = audit_record
         .model_identity()
         .validate_production_structure(audit_record.manifest(), &setup)?;
+    let expected_bank_bytes = audit_record
+        .manifest()
+        .payload_bytes
+        .checked_add(MODEL_BANK_HEADER_BYTES as u64)
+        .ok_or(ProductionDoryV3QualificationError::SizeOverflow)?;
+    if bank_input.bytes() != expected_bank_bytes {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "bank length and Record V2 manifest",
+        ));
+    }
+    bank_input.recheck()?;
+    bank_input.seek_start()?;
+    let mut bank_reader = Blake3CountingReader::new(&mut bank_input.file);
     let authenticated = derive_bank_authenticated_dory_v3_model_commitment_record_v2(
-        open_input(bank_path)?,
+        &mut bank_reader,
         &structural,
         &setup,
     )?;
+    io::copy(&mut bank_reader, &mut io::sink()).map_err(|source| {
+        ProductionDoryV3QualificationError::ReadInput {
+            path: bank_path.to_path_buf(),
+            source,
+        }
+    })?;
+    let authenticated_bank_content = bank_reader.finish();
+    if authenticated_bank_content.bytes != expected_bank_bytes {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "authenticated bank byte length",
+        ));
+    }
+    bank_input.recheck()?;
     if authenticated.record() != &audit_record {
         return Err(ProductionDoryV3QualificationError::RecordReproductionMismatch);
+    }
+    if audit_record.record_digest() != producer_report.record_digest
+        || audit_record.model_identity_digest() != producer_report.model_identity_digest
+        || audit_record.setup_identity() != producer_report.setup_identity
+        || byte_len(&audit_record.canonical_bytes())? != producer_report.record_canonical_bytes
+    {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "producer report authenticated identities",
+        ));
     }
     validate_verifier_candidate_binding(&candidate, &request, audit_record.manifest_digest())?;
     let record_and_bank_authentication_nanoseconds = elapsed_nanoseconds(authentication_started)?;
@@ -902,6 +1195,22 @@ pub fn run_production_dory_v3_verifier(
     let whole_process_peak_rss_bytes =
         peak_whole_process_rss_bytes().map_err(ProductionDoryV3QualificationError::MemoryQuery)?;
 
+    // A second complete sequential read is the bounded-memory content-stability
+    // check. It detects in-place mutation after authentication; the retained
+    // no-follow handle and final named-path recheck detect replacement.
+    let bank_final_stability_scan_started = Instant::now();
+    bank_input.confirm_content_identity(authenticated_bank_content)?;
+    let bank_final_stability_scan_nanoseconds =
+        elapsed_nanoseconds(bank_final_stability_scan_started)?;
+    request_input.confirm_exact_bytes(&request_bytes)?;
+    proof_input.confirm_exact_bytes(&wire)?;
+    record_input.confirm_exact_bytes(&record_bytes)?;
+    producer_report_input.confirm_exact_bytes(&producer_report_bytes)?;
+    journal_input.confirm_exact_bytes(&journal_bytes)?;
+    // Bank last: a same-inode write after the final scan changes its retained
+    // state, while replacement changes the named-path identity.
+    bank_input.recheck()?;
+
     let report = ProductionDoryV3VerifierReport {
         report_version: VERIFIER_REPORT_VERSION,
         network_id: Digest32::new(request.block.network_id),
@@ -911,6 +1220,10 @@ pub fn run_production_dory_v3_verifier(
         record_digest: audit_record.record_digest(),
         model_identity_digest: audit_record.model_identity_digest(),
         setup_identity: audit_record.setup_identity(),
+        bank_content_blake3_digest: authenticated_bank_content.blake3,
+        bank_content_bytes: authenticated_bank_content.bytes,
+        producer_report_blake3_digest: blake3_digest(&producer_report_bytes),
+        qualification_journal: audited_journal,
         wire_blake3_digest: blake3_digest(&wire),
         wire_bytes: byte_len(&wire)?,
         cp02_bytes: byte_len(&candidate.structured_proof)?,
@@ -920,10 +1233,13 @@ pub fn run_production_dory_v3_verifier(
         parse_and_canonicalization_nanoseconds,
         record_and_bank_authentication_nanoseconds,
         verification_nanoseconds,
+        bank_final_stability_scan_nanoseconds,
         total_nanoseconds: elapsed_nanoseconds(verifier_started)?,
         whole_process_peak_rss_bytes,
         whole_process_peak_rss_scope: "OS process-lifetime high-water mark; run the verifier CLI in a fresh process for an isolated measurement",
         verifier_only: true,
+        producer_report_checked: true,
+        qualification_journal_checked: true,
     };
     let mut report_bytes = serde_json::to_vec_pretty(&report)?;
     report_bytes.push(b'\n');
@@ -961,6 +1277,7 @@ struct QualificationPaths {
     scratch: PathBuf,
     proof_output: PathBuf,
     report_output: PathBuf,
+    journal_output: PathBuf,
 }
 
 struct QualificationRequestPaths {
@@ -978,14 +1295,14 @@ impl QualificationRequestPaths {
                 "request scratch and output paths must be absolute",
             ));
         }
-        if request_output.starts_with(scratch) {
+        if path_starts_with_for_platform(request_output, scratch) {
             return Err(ProductionDoryV3QualificationError::Configuration(
                 "request output must not be inside runner-owned scratch",
             ));
         }
         let scratch = resolve_new_path(scratch)?;
         let request_output = resolve_new_path(request_output)?;
-        if request_output.starts_with(&scratch) {
+        if path_starts_with_for_platform(&request_output, &scratch) {
             return Err(ProductionDoryV3QualificationError::Configuration(
                 "request output must not be inside runner-owned scratch",
             ));
@@ -1004,33 +1321,563 @@ impl QualificationPaths {
         scratch: &Path,
         proof_output: &Path,
         report_output: &Path,
+        journal_output: &Path,
     ) -> Result<Self, ProductionDoryV3QualificationError> {
-        if !scratch.is_absolute() || !proof_output.is_absolute() || !report_output.is_absolute() {
+        if !scratch.is_absolute()
+            || !proof_output.is_absolute()
+            || !report_output.is_absolute()
+            || !journal_output.is_absolute()
+        {
             return Err(ProductionDoryV3QualificationError::Configuration(
-                "qualification scratch, proof, and report paths must be absolute",
+                "qualification scratch, proof, report, and journal paths must be absolute",
+            ));
+        }
+        if paths_equal_for_platform(proof_output, report_output)
+            || paths_equal_for_platform(journal_output, proof_output)
+            || paths_equal_for_platform(journal_output, report_output)
+        {
+            return Err(ProductionDoryV3QualificationError::Configuration(
+                "proof, report, and journal outputs must be distinct",
+            ));
+        }
+        if path_starts_with_for_platform(proof_output, scratch)
+            || path_starts_with_for_platform(report_output, scratch)
+            || path_starts_with_for_platform(journal_output, scratch)
+            || path_starts_with_for_platform(scratch, journal_output)
+        {
+            return Err(ProductionDoryV3QualificationError::Configuration(
+                "proof, report, and journal outputs must not overlap runner-owned scratch",
             ));
         }
         let scratch = resolve_new_path(scratch)?;
         let proof_output = resolve_new_path(proof_output)?;
         let report_output = resolve_new_path(report_output)?;
-        if proof_output == report_output {
+        let journal_output = resolve_new_path(journal_output)?;
+        if paths_equal_for_platform(&proof_output, &report_output)
+            || paths_equal_for_platform(&journal_output, &proof_output)
+            || paths_equal_for_platform(&journal_output, &report_output)
+        {
             return Err(ProductionDoryV3QualificationError::Configuration(
-                "proof and report outputs must be distinct",
+                "proof, report, and journal outputs must be distinct",
             ));
         }
-        if proof_output.starts_with(&scratch) || report_output.starts_with(&scratch) {
+        if path_starts_with_for_platform(&proof_output, &scratch)
+            || path_starts_with_for_platform(&report_output, &scratch)
+            || path_starts_with_for_platform(&journal_output, &scratch)
+            || path_starts_with_for_platform(&scratch, &journal_output)
+        {
             return Err(ProductionDoryV3QualificationError::Configuration(
-                "outputs must not be inside runner-owned scratch",
+                "proof, report, and journal outputs must not overlap runner-owned scratch",
             ));
         }
         ensure_path_absent(&scratch)?;
         ensure_path_absent(&proof_output)?;
         ensure_path_absent(&report_output)?;
+        ensure_path_absent(&journal_output)?;
         Ok(Self {
             scratch,
             proof_output,
             report_output,
+            journal_output,
         })
+    }
+}
+
+fn qualification_effective_configuration(
+    maximum_native_block_rows: usize,
+) -> Result<QualificationEffectiveConfiguration, ProductionDoryV3QualificationError> {
+    Ok(QualificationEffectiveConfiguration {
+        qualification_report_version: QUALIFICATION_REPORT_VERSION,
+        padded_variables: DORY_V3_PADDED_VARIABLES,
+        composed_claims: u16::try_from(BLS_DORY_COMPOSED_AGGREGATE_CLAIMS)
+            .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?,
+        verifier_passes: 2,
+        maximum_native_block_rows: u64::try_from(maximum_native_block_rows)
+            .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?,
+        algorithm_version: DORY_V3_ALGORITHM_VERSION,
+        proof_version: DORY_V3_PROOF_VERSION,
+        shared_layout_version: DORY_V3_SHARED_LAYOUT_VERSION,
+        scratch_sample_interval_milliseconds: u64::try_from(SCRATCH_SAMPLE_INTERVAL.as_millis())
+            .map_err(|_| ProductionDoryV3QualificationError::DurationOverflow)?,
+    })
+}
+
+fn qualification_run_identity(
+    request_digest: Digest32,
+    configuration: &QualificationEffectiveConfiguration,
+) -> Digest32 {
+    let mut hasher = blake3::Hasher::new_derive_key(QUALIFICATION_RUN_IDENTITY_DOMAIN);
+    hasher.update(request_digest.as_bytes());
+    hasher.update(&configuration.qualification_report_version.to_le_bytes());
+    hasher.update(&configuration.padded_variables.to_le_bytes());
+    hasher.update(&configuration.composed_claims.to_le_bytes());
+    hasher.update(&[configuration.verifier_passes]);
+    hasher.update(&configuration.maximum_native_block_rows.to_le_bytes());
+    hasher.update(&configuration.algorithm_version.to_le_bytes());
+    hasher.update(&configuration.proof_version.to_le_bytes());
+    hasher.update(&configuration.shared_layout_version.to_le_bytes());
+    hasher.update(
+        &configuration
+            .scratch_sample_interval_milliseconds
+            .to_le_bytes(),
+    );
+    Digest32::new(*hasher.finalize().as_bytes())
+}
+
+fn qualification_journal_record_digest(record_bytes: &[u8]) -> Digest32 {
+    let mut hasher = blake3::Hasher::new_derive_key(QUALIFICATION_JOURNAL_RECORD_DIGEST_DOMAIN);
+    hasher.update(record_bytes);
+    Digest32::new(*hasher.finalize().as_bytes())
+}
+
+fn qualification_journal_complete_file_digest(
+    journal_bytes: &[u8],
+) -> Result<Digest32, ProductionDoryV3QualificationError> {
+    let length = u64::try_from(journal_bytes.len())
+        .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?;
+    let mut hasher = blake3::Hasher::new_derive_key(QUALIFICATION_JOURNAL_FILE_DIGEST_DOMAIN);
+    hasher.update(&length.to_le_bytes());
+    hasher.update(journal_bytes);
+    Ok(Digest32::new(*hasher.finalize().as_bytes()))
+}
+
+fn audit_qualification_journal(
+    journal_bytes: &[u8],
+    request_digest: Digest32,
+    configuration: QualificationEffectiveConfiguration,
+    identities: QualificationAuthenticatedIdentities,
+) -> Result<ProductionDoryV3QualificationJournalSummary, ProductionDoryV3QualificationError> {
+    if journal_bytes.is_empty() {
+        return Err(ProductionDoryV3QualificationError::InvalidJournal(
+            "journal is empty",
+        ));
+    }
+    if journal_bytes.last() != Some(&b'\n') {
+        return Err(ProductionDoryV3QualificationError::InvalidJournal(
+            "journal is missing its final LF",
+        ));
+    }
+
+    let raw_records = journal_bytes[..journal_bytes.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .collect::<Vec<_>>();
+    if raw_records.len() != QUALIFICATION_JOURNAL_STAGES.len() {
+        return Err(ProductionDoryV3QualificationError::InvalidJournal(
+            "journal event count or stage sequence length is wrong",
+        ));
+    }
+
+    let run_identity = qualification_run_identity(request_digest, &configuration);
+    let mut previous_record_digest = Digest32::ZERO;
+    for (index, (raw_record, expected_stage)) in raw_records
+        .iter()
+        .zip(QUALIFICATION_JOURNAL_STAGES)
+        .enumerate()
+    {
+        if raw_record.is_empty() {
+            return Err(ProductionDoryV3QualificationError::InvalidJournal(
+                "journal contains an empty record",
+            ));
+        }
+        let record: StrictQualificationJournalRecord = serde_json::from_slice(raw_record)?;
+        if serde_json::to_vec(&record)? != *raw_record {
+            return Err(ProductionDoryV3QualificationError::InvalidJournal(
+                "journal record is not canonical JSON",
+            ));
+        }
+        let sequence =
+            u64::try_from(index).map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?;
+        if record.journal_version != QUALIFICATION_JOURNAL_VERSION
+            || record.sequence != sequence
+            || record.previous_record_digest != previous_record_digest
+            || record.run_identity != run_identity
+            || record.request_digest != request_digest
+            || record.stage != expected_stage
+            || !record.diagnostic_only
+            || record.completion_marker
+            || record.resumable
+        {
+            return Err(ProductionDoryV3QualificationError::InvalidJournal(
+                "journal record header, chain, identity, stage, or diagnostic flags are wrong",
+            ));
+        }
+
+        let expected_configuration = (index == 0).then_some(configuration);
+        if record.effective_configuration != expected_configuration {
+            return Err(ProductionDoryV3QualificationError::InvalidJournal(
+                "journal effective configuration is missing, duplicated, or wrong",
+            ));
+        }
+        let expected_identities =
+            (expected_stage == "bank_authentication_completed").then_some(identities);
+        if record.authenticated_identities != expected_identities {
+            return Err(ProductionDoryV3QualificationError::InvalidJournal(
+                "journal authenticated identities are missing, duplicated, or wrong",
+            ));
+        }
+        previous_record_digest = qualification_journal_record_digest(raw_record);
+    }
+
+    Ok(ProductionDoryV3QualificationJournalSummary {
+        journal_version: QUALIFICATION_JOURNAL_VERSION,
+        run_identity,
+        final_record_digest: previous_record_digest,
+        event_count: u64::try_from(raw_records.len())
+            .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?,
+        journal_bytes: byte_len(journal_bytes)?,
+        complete_file_digest: qualification_journal_complete_file_digest(journal_bytes)?,
+        diagnostic_only: true,
+        completion_marker: false,
+        resumable: false,
+    })
+}
+
+fn require_matching_journal_summary(
+    audited: &ProductionDoryV3QualificationJournalSummary,
+    reported: &ProductionDoryV3QualificationJournalSummary,
+) -> Result<(), ProductionDoryV3QualificationError> {
+    if audited != reported {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "producer report journal summary",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_producer_report_invariants(
+    report: &ProductionDoryV3QualificationReport,
+    configuration: QualificationEffectiveConfiguration,
+) -> Result<(), ProductionDoryV3QualificationError> {
+    if report.maximum_native_block_rows == 0 {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "producer report maximum native block rows",
+        ));
+    }
+    let native_projection = projected_bls_dory_blake3_production_resources()?;
+    let candidate_required = projected_candidate_required_free_scratch_bytes()?;
+    let expected_events = u64::try_from(QUALIFICATION_JOURNAL_STAGES.len())
+        .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?;
+    let stage_timing_sum = [
+        report.setup_nanoseconds,
+        report.record_load_and_validation_nanoseconds,
+        report.bank_reauthentication_nanoseconds,
+        report.fixed_model_preparation_nanoseconds,
+        report.winning_claim_replay_nanoseconds,
+        report.candidate_resource_preflight_nanoseconds,
+        report.layout_v5_preparation_nanoseconds,
+        report.native_and_aggregate_composition_nanoseconds,
+        report.cp02_seal_nanoseconds,
+        report.scratch_cleanup_nanoseconds,
+        report.first_verification_nanoseconds,
+        report.wire_round_trip_nanoseconds,
+        report.second_verification_nanoseconds,
+    ]
+    .into_iter()
+    .try_fold(0_u64, u64::checked_add)
+    .ok_or(ProductionDoryV3QualificationError::EvidenceMismatch(
+        "producer report stage timing overflow",
+    ))?;
+    if report.report_version != configuration.qualification_report_version
+        || report.padded_variables != configuration.padded_variables
+        || report.composed_claims != configuration.composed_claims
+        || report.verifier_passes != configuration.verifier_passes
+        || report.maximum_native_block_rows != configuration.maximum_native_block_rows
+        || report.scratch_sample_interval_milliseconds
+            != configuration.scratch_sample_interval_milliseconds
+        || report.setup_identity != DORY_V3_SETUP_IDENTITY
+        || report.provisional_scratch_floor_bytes
+            != native_projection.provisional_scratch_gate_bytes
+        || report.initial_available_scratch_bytes < report.provisional_scratch_floor_bytes
+        || report.candidate_required_free_scratch_bytes != candidate_required
+        || report.candidate_available_free_scratch_bytes
+            < report.candidate_required_free_scratch_bytes
+        || report.provisional_available_memory_floor_bytes
+            != native_projection.provisional_available_memory_gate_bytes
+        || report.observed_available_memory_before_bytes
+            < report.provisional_available_memory_floor_bytes
+        || report.native_resource_projection_complete != native_projection.is_complete()
+        || report.instrumented_scratch_reservation_events == 0
+        || report.exact_peak_instrumented_scratch_reserved_logical_bytes == 0
+        || report.exact_peak_instrumented_scratch_live_artifacts == 0
+        || report.exact_peak_instrumented_scratch_live_artifacts
+            > report.instrumented_scratch_reservation_events
+        || report.sampled_peak_scratch_entries_lower_bound
+            > report.exact_peak_instrumented_scratch_live_artifacts
+        || report.sampled_peak_scratch_logical_bytes_lower_bound
+            > report.exact_peak_instrumented_scratch_reserved_logical_bytes
+        || report.exact_peak_scratch_instrumented
+        || !report.exact_reservation_peak_instrumented
+        || report.exact_reservation_peak_scope != EXACT_RESERVATION_PEAK_SCOPE
+        || report.retained_scratch_entries != 0
+        || report.retained_scratch_logical_bytes != 0
+        || report.whole_process_peak_rss_scope != WHOLE_PROCESS_PEAK_RSS_SCOPE
+        || report.cooperative_cancellation_scope != COOPERATIVE_CANCELLATION_SCOPE
+        || stage_timing_sum > report.prepublication_qualification_nanoseconds
+        || (cfg!(any(target_os = "windows", target_os = "linux"))
+            && report.whole_process_peak_rss_bytes == 0)
+        || report.qualification_journal.journal_version != QUALIFICATION_JOURNAL_VERSION
+        || report.qualification_journal.event_count != expected_events
+        || report.qualification_journal.journal_bytes == 0
+        || !report.qualification_journal.diagnostic_only
+        || report.qualification_journal.completion_marker
+        || report.qualification_journal.resumable
+        || !report.report_output_is_completion_marker
+        || report.publication_crash_atomic
+        || report.parent_directory_sync_performed != cfg!(unix)
+    {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "producer report qualification invariants",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_producer_report_request_and_proof(
+    report: &ProductionDoryV3QualificationReport,
+    request: &ProductionDoryV3QualificationRequest,
+    wire: &[u8],
+    candidate: &ForgeMatrixV3CandidateProof,
+    payload: &BlsDoryV3CandidatePayload,
+) -> Result<QualificationEffectiveConfiguration, ProductionDoryV3QualificationError> {
+    if report.maximum_native_block_rows == 0 {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "producer report maximum native block rows",
+        ));
+    }
+    let maximum_native_block_rows = usize::try_from(report.maximum_native_block_rows)
+        .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?;
+    let configuration = qualification_effective_configuration(maximum_native_block_rows)?;
+    validate_producer_report_invariants(report, configuration)?;
+    if report.network_id != Digest32::new(request.block.network_id)
+        || report.block_height != request.block.height
+        || report.nonce != request.nonce
+        || report.request_digest != qualification_request_digest(request)
+        || report.final_activation_digest != request.final_activation_digest
+        || report.work_digest != request.work_digest
+    {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "producer report qualification request",
+        ));
+    }
+    if report.challenge_digest != Digest32::new(candidate.challenge_digest)
+        || report.final_activation_digest != Digest32::new(candidate.final_activation_digest)
+        || report.work_digest != Digest32::new(candidate.work_digest)
+        || report.cp02_blake3_digest != blake3_digest(&candidate.structured_proof)
+        || report.dory_proof_blake3_digest != blake3_digest(&payload.dory_proof)
+        || report.native_proof_blake3_digest != blake3_digest(&payload.native_blake3_proof)
+        || report.wire_blake3_digest != blake3_digest(wire)
+        || report.cp02_bytes != byte_len(&candidate.structured_proof)?
+        || report.cp02_header_bytes
+            != u64::try_from(CANDIDATE_PAYLOAD_HEADER_BYTES)
+                .map_err(|_| ProductionDoryV3QualificationError::SizeOverflow)?
+        || report.dory_proof_bytes != byte_len(&payload.dory_proof)?
+        || report.native_proof_bytes != byte_len(&payload.native_blake3_proof)?
+        || report.wire_bytes != byte_len(wire)?
+    {
+        return Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+            "producer report persisted proof",
+        ));
+    }
+    Ok(configuration)
+}
+
+#[cfg(test)]
+fn load_canonical_qualification_report(
+    path: &Path,
+) -> Result<(ProductionDoryV3QualificationReport, Vec<u8>), ProductionDoryV3QualificationError> {
+    let bytes = read_bounded_strict_input(
+        path,
+        MAX_QUALIFICATION_REPORT_JSON_BYTES,
+        ProductionDoryV3QualificationError::QualificationReportJsonTooLarge {
+            max: MAX_QUALIFICATION_REPORT_JSON_BYTES,
+        },
+    )?;
+    let report = parse_canonical_qualification_report(&bytes)?;
+    Ok((report, bytes))
+}
+
+fn parse_canonical_qualification_report(
+    bytes: &[u8],
+) -> Result<ProductionDoryV3QualificationReport, ProductionDoryV3QualificationError> {
+    let report: ProductionDoryV3QualificationReport = serde_json::from_slice(bytes)?;
+    let mut canonical = serde_json::to_vec_pretty(&report)?;
+    canonical.push(b'\n');
+    if canonical != *bytes {
+        return Err(ProductionDoryV3QualificationError::NonCanonicalProducerReport);
+    }
+    Ok(report)
+}
+
+struct QualificationJournal {
+    path: PathBuf,
+    parent: PathBuf,
+    file: File,
+    identity: SameFileHandle,
+    expected_bytes: Vec<u8>,
+    next_sequence: u64,
+    previous_record_digest: Digest32,
+    run_identity: Digest32,
+    request_digest: Digest32,
+}
+
+impl QualificationJournal {
+    fn create(
+        path: PathBuf,
+        request_digest: Digest32,
+        configuration: QualificationEffectiveConfiguration,
+    ) -> Result<Self, ProductionDoryV3QualificationError> {
+        let parent = path
+            .parent()
+            .ok_or(ProductionDoryV3QualificationError::Configuration(
+                "journal output must have a parent directory",
+            ))?
+            .to_path_buf();
+        let file = OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| ProductionDoryV3QualificationError::CreateOutput {
+                path: path.clone(),
+                source,
+            })?;
+        let identity = file
+            .try_clone()
+            .and_then(SameFileHandle::from_file)
+            .map_err(
+                |source| ProductionDoryV3QualificationError::OutputIdentity {
+                    path: path.clone(),
+                    source,
+                },
+            )?;
+        let run_identity = qualification_run_identity(request_digest, &configuration);
+        let mut journal = Self {
+            path,
+            parent,
+            file,
+            identity,
+            expected_bytes: Vec::new(),
+            next_sequence: 0,
+            previous_record_digest: Digest32::new([0; 32]),
+            run_identity,
+            request_digest,
+        };
+        journal.append("preflight_completed", Some(&configuration), None)?;
+        Ok(journal)
+    }
+
+    fn append_stage(
+        &mut self,
+        stage: &'static str,
+        authenticated_identities: Option<QualificationAuthenticatedIdentities>,
+    ) -> Result<(), ProductionDoryV3QualificationError> {
+        self.append(stage, None, authenticated_identities)
+    }
+
+    fn finish(
+        &mut self,
+        final_stage: &'static str,
+    ) -> Result<ProductionDoryV3QualificationJournalSummary, ProductionDoryV3QualificationError>
+    {
+        self.append_stage(final_stage, None)?;
+        Ok(ProductionDoryV3QualificationJournalSummary {
+            journal_version: QUALIFICATION_JOURNAL_VERSION,
+            run_identity: self.run_identity,
+            final_record_digest: self.previous_record_digest,
+            event_count: self.next_sequence,
+            journal_bytes: byte_len(&self.expected_bytes)?,
+            complete_file_digest: qualification_journal_complete_file_digest(&self.expected_bytes)?,
+            diagnostic_only: true,
+            completion_marker: false,
+            resumable: false,
+        })
+    }
+
+    fn append(
+        &mut self,
+        stage: &'static str,
+        effective_configuration: Option<&QualificationEffectiveConfiguration>,
+        authenticated_identities: Option<QualificationAuthenticatedIdentities>,
+    ) -> Result<(), ProductionDoryV3QualificationError> {
+        let record = QualificationJournalRecord {
+            journal_version: QUALIFICATION_JOURNAL_VERSION,
+            sequence: self.next_sequence,
+            previous_record_digest: self.previous_record_digest,
+            run_identity: self.run_identity,
+            request_digest: self.request_digest,
+            stage,
+            diagnostic_only: true,
+            completion_marker: false,
+            resumable: false,
+            effective_configuration,
+            authenticated_identities,
+        };
+        let record_bytes = serde_json::to_vec(&record)?;
+        let record_digest = qualification_journal_record_digest(&record_bytes);
+        let mut framed_record = record_bytes;
+        framed_record.push(b'\n');
+
+        self.file.write_all(&framed_record).map_err(|source| {
+            ProductionDoryV3QualificationError::WriteOutput {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        self.file
+            .flush()
+            .map_err(|source| ProductionDoryV3QualificationError::WriteOutput {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.file
+            .sync_all()
+            .map_err(|source| ProductionDoryV3QualificationError::SyncOutput {
+                path: self.path.clone(),
+                source,
+            })?;
+        sync_output_parent_directory(&self.parent)?;
+
+        let mut expected = self.expected_bytes.clone();
+        expected.extend_from_slice(&framed_record);
+        let mut reopened = File::open(&self.path).map_err(|source| {
+            ProductionDoryV3QualificationError::ReopenOutput {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        let reopened_identity = reopened
+            .try_clone()
+            .and_then(SameFileHandle::from_file)
+            .map_err(
+                |source| ProductionDoryV3QualificationError::OutputIdentity {
+                    path: self.path.clone(),
+                    source,
+                },
+            )?;
+        if reopened_identity != self.identity {
+            return Err(ProductionDoryV3QualificationError::OutputReplaced(
+                self.path.clone(),
+            ));
+        }
+        let mut actual = Vec::new();
+        reopened.read_to_end(&mut actual).map_err(|source| {
+            ProductionDoryV3QualificationError::ReopenOutput {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        if actual != expected {
+            return Err(ProductionDoryV3QualificationError::OutputMismatch(
+                self.path.clone(),
+            ));
+        }
+
+        self.expected_bytes = expected;
+        self.previous_record_digest = record_digest;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(ProductionDoryV3QualificationError::SizeOverflow)?;
+        Ok(())
     }
 }
 
@@ -1055,6 +1902,48 @@ fn ensure_absolute_paths(
         return Err(ProductionDoryV3QualificationError::Configuration(message));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn path_component_eq_for_platform(
+    left: &std::path::Component<'_>,
+    right: &std::path::Component<'_>,
+) -> bool {
+    left.as_os_str().to_string_lossy().to_lowercase()
+        == right.as_os_str().to_string_lossy().to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn path_component_eq_for_platform(
+    left: &std::path::Component<'_>,
+    right: &std::path::Component<'_>,
+) -> bool {
+    left == right
+}
+
+fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
+    let mut left_components = left.components();
+    let mut right_components = right.components();
+    loop {
+        match (left_components.next(), right_components.next()) {
+            (Some(left), Some(right)) if path_component_eq_for_platform(&left, &right) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn path_starts_with_for_platform(path: &Path, base: &Path) -> bool {
+    let mut path_components = path.components();
+    for base_component in base.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        if !path_component_eq_for_platform(&path_component, &base_component) {
+            return false;
+        }
+    }
+    true
 }
 
 fn resolve_new_path(path: &Path) -> Result<PathBuf, ProductionDoryV3QualificationError> {
@@ -1214,55 +2103,405 @@ fn qualification_request_digest(request: &ProductionDoryV3QualificationRequest) 
     Digest32::new(*hasher.finalize().as_bytes())
 }
 
+#[cfg(test)]
 fn load_bounded_qualification_request(
     path: &Path,
 ) -> Result<ProductionDoryV3QualificationRequest, ProductionDoryV3QualificationError> {
-    let bytes = read_input_prefix(path, MAX_QUALIFICATION_REQUEST_JSON_BYTES)?;
-    if bytes.len() > MAX_QUALIFICATION_REQUEST_JSON_BYTES {
-        return Err(
-            ProductionDoryV3QualificationError::QualificationRequestJsonTooLarge {
-                max: MAX_QUALIFICATION_REQUEST_JSON_BYTES,
-            },
-        );
-    }
+    let bytes = read_bounded_strict_input(
+        path,
+        MAX_QUALIFICATION_REQUEST_JSON_BYTES,
+        ProductionDoryV3QualificationError::QualificationRequestJsonTooLarge {
+            max: MAX_QUALIFICATION_REQUEST_JSON_BYTES,
+        },
+    )?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[cfg(test)]
 fn load_bounded_record_v2(
     path: &Path,
 ) -> Result<DoryV3ModelCommitmentRecordV2, ProductionDoryV3QualificationError> {
-    let bytes = read_input_prefix(path, MAX_RECORD_V2_JSON_BYTES)?;
-    if bytes.len() > MAX_RECORD_V2_JSON_BYTES {
-        return Err(ProductionDoryV3QualificationError::RecordV2JsonTooLarge {
+    let bytes = read_bounded_strict_input(
+        path,
+        MAX_RECORD_V2_JSON_BYTES,
+        ProductionDoryV3QualificationError::RecordV2JsonTooLarge {
             max: MAX_RECORD_V2_JSON_BYTES,
-        });
-    }
+        },
+    )?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[cfg(test)]
 fn read_bounded_proof_wire(path: &Path) -> Result<Vec<u8>, ProductionDoryV3QualificationError> {
-    let bytes = read_input_prefix(path, MAX_PROOF_BYTES)?;
-    if bytes.len() > MAX_PROOF_BYTES {
-        return Err(ProductionDoryV3QualificationError::ProofWireTooLarge {
+    read_bounded_strict_input(
+        path,
+        MAX_PROOF_BYTES,
+        ProductionDoryV3QualificationError::ProofWireTooLarge {
             max: MAX_PROOF_BYTES,
-        });
-    }
+        },
+    )
+}
+
+#[cfg(test)]
+fn read_bounded_strict_input(
+    path: &Path,
+    maximum_bytes: usize,
+    oversized: ProductionDoryV3QualificationError,
+) -> Result<Vec<u8>, ProductionDoryV3QualificationError> {
+    let mut input = RetainedStrictInput::open(path)?;
+    let bytes = input.read_bounded(maximum_bytes, oversized)?;
+    input.confirm_exact_bytes(&bytes)?;
     Ok(bytes)
 }
 
-fn read_input_prefix(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StrictInputState {
+    bytes: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StrictContentIdentity {
+    bytes: u64,
+    blake3: Digest32,
+}
+
+struct RetainedStrictInput {
+    path: PathBuf,
+    file: File,
+    identity: SameFileHandle,
+    state: StrictInputState,
+}
+
+impl RetainedStrictInput {
+    fn open(path: &Path) -> Result<Self, ProductionDoryV3QualificationError> {
+        let file = open_strict_input_no_follow(path).map_err(|source| {
+            ProductionDoryV3QualificationError::OpenInput {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        let (identity, state) = strict_input_identity_and_state(path, &file)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            identity,
+            state,
+        })
+    }
+
+    fn read_bounded(
+        &mut self,
+        maximum_bytes: usize,
+        oversized: ProductionDoryV3QualificationError,
+    ) -> Result<Vec<u8>, ProductionDoryV3QualificationError> {
+        self.seek_start()?;
+        let mut bytes = Vec::new();
+        Read::take(&mut self.file, (maximum_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|source| ProductionDoryV3QualificationError::ReadInput {
+                path: self.path.clone(),
+                source,
+            })?;
+        if bytes.len() > maximum_bytes {
+            return Err(oversized);
+        }
+        self.recheck()?;
+        Ok(bytes)
+    }
+
+    fn confirm_exact_bytes(
+        &mut self,
+        expected: &[u8],
+    ) -> Result<(), ProductionDoryV3QualificationError> {
+        self.recheck()?;
+        let mut named = self.open_named()?;
+        let mut confirmed = Vec::with_capacity(expected.len().saturating_add(1));
+        Read::take(&mut named, (expected.len().saturating_add(1)) as u64)
+            .read_to_end(&mut confirmed)
+            .map_err(|source| ProductionDoryV3QualificationError::ReadInput {
+                path: self.path.clone(),
+                source,
+            })?;
+        if confirmed != expected {
+            return Err(ProductionDoryV3QualificationError::InputChanged(
+                self.path.clone(),
+            ));
+        }
+        self.recheck()
+    }
+
+    fn complete_content_identity(
+        &mut self,
+    ) -> Result<StrictContentIdentity, ProductionDoryV3QualificationError> {
+        self.recheck()?;
+        self.seek_start()?;
+        let mut reader = Blake3CountingReader::new(&mut self.file);
+        io::copy(&mut reader, &mut io::sink()).map_err(|source| {
+            ProductionDoryV3QualificationError::ReadInput {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        let identity = reader.finish();
+        self.recheck()?;
+        Ok(identity)
+    }
+
+    fn confirm_content_identity(
+        &mut self,
+        expected: StrictContentIdentity,
+    ) -> Result<(), ProductionDoryV3QualificationError> {
+        if self.complete_content_identity()? != expected {
+            return Err(ProductionDoryV3QualificationError::InputChanged(
+                self.path.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn recheck(&self) -> Result<(), ProductionDoryV3QualificationError> {
+        drop(self.open_named()?);
+        let (retained_identity, retained_state) =
+            strict_input_identity_and_state(&self.path, &self.file)?;
+        if retained_identity != self.identity {
+            return Err(ProductionDoryV3QualificationError::InputReplaced(
+                self.path.clone(),
+            ));
+        }
+        if retained_state != self.state {
+            return Err(ProductionDoryV3QualificationError::InputChanged(
+                self.path.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_named(&self) -> Result<File, ProductionDoryV3QualificationError> {
+        let named = open_strict_input_no_follow(&self.path).map_err(|source| {
+            ProductionDoryV3QualificationError::OpenInput {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        let (identity, state) = strict_input_identity_and_state(&self.path, &named)?;
+        if identity != self.identity {
+            return Err(ProductionDoryV3QualificationError::InputReplaced(
+                self.path.clone(),
+            ));
+        }
+        if state != self.state {
+            return Err(ProductionDoryV3QualificationError::InputChanged(
+                self.path.clone(),
+            ));
+        }
+        Ok(named)
+    }
+
+    fn seek_start(&mut self) -> Result<(), ProductionDoryV3QualificationError> {
+        self.file.seek(SeekFrom::Start(0)).map_err(|source| {
+            ProductionDoryV3QualificationError::ReadInput {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        Ok(())
+    }
+
+    const fn bytes(&self) -> u64 {
+        self.state.bytes
+    }
+}
+
+fn strict_input_identity_and_state(
     path: &Path,
-    maximum_bytes: usize,
-) -> Result<Vec<u8>, ProductionDoryV3QualificationError> {
-    let mut bytes = Vec::new();
-    open_input(path)?
-        .take((maximum_bytes + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|source| ProductionDoryV3QualificationError::ReadInput {
+    file: &File,
+) -> Result<(SameFileHandle, StrictInputState), ProductionDoryV3QualificationError> {
+    let metadata =
+        file.metadata()
+            .map_err(|source| ProductionDoryV3QualificationError::OpenInput {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    if !metadata.file_type().is_file() || metadata_is_reparse_point(&metadata) {
+        return Err(ProductionDoryV3QualificationError::InputNotRegular(
+            path.to_path_buf(),
+        ));
+    }
+    let links = hard_link_count(file, &metadata).map_err(|source| {
+        ProductionDoryV3QualificationError::OpenInput {
             path: path.to_path_buf(),
             source,
-        })?;
-    Ok(bytes)
+        }
+    })?;
+    if links != 1 {
+        return Err(ProductionDoryV3QualificationError::InputHardLinks {
+            path: path.to_path_buf(),
+            links,
+        });
+    }
+    let identity = SameFileHandle::from_file(file.try_clone().map_err(|source| {
+        ProductionDoryV3QualificationError::OpenInput {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?)
+    .map_err(|source| ProductionDoryV3QualificationError::OpenInput {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok((identity, strict_input_state(&metadata)))
+}
+
+fn strict_input_state(metadata: &fs::Metadata) -> StrictInputState {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        StrictInputState {
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        StrictInputState {
+            bytes: metadata.len(),
+            last_write_time: metadata.last_write_time(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        unreachable!("strict qualification inputs are supported only on Unix and Windows")
+    }
+}
+
+fn open_strict_input_no_follow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = options;
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict no-follow qualification inputs are supported only on Unix and Windows",
+        ));
+    }
+    options.open(path)
+}
+
+struct Blake3CountingReader<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+    bytes: u64,
+}
+
+impl<R> Blake3CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> StrictContentIdentity {
+        StrictContentIdentity {
+            bytes: self.bytes,
+            blake3: Digest32::new(*self.hasher.finalize().as_bytes()),
+        }
+    }
+}
+
+impl<R: Read> Read for Blake3CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.bytes = self
+            .bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("qualification input byte count overflow"))?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn hard_link_count(file: &File, metadata: &fs::Metadata) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let _ = file;
+        Ok(metadata.nlink())
+    }
+    #[cfg(windows)]
+    {
+        use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let _ = metadata;
+        let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // SAFETY: `file` owns a live handle and the output points to the exact
+        // structure initialized by GetFileInformationByHandle.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a nonzero return initialized the entire structure.
+        Ok(u64::from(
+            unsafe { information.assume_init() }.nNumberOfLinks,
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, metadata);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard-link count is unavailable on this platform",
+        ))
+    }
 }
 
 fn decode_canonical_v3_layout_v5_wire(
@@ -2027,6 +3266,156 @@ mod tests {
         }
     }
 
+    fn complete_journal_fixture() -> (
+        TestDirectory,
+        PathBuf,
+        QualificationEffectiveConfiguration,
+        Digest32,
+        QualificationAuthenticatedIdentities,
+        ProductionDoryV3QualificationJournalSummary,
+        Vec<u8>,
+    ) {
+        let directory = TestDirectory::create();
+        let path = directory.0.join("complete-journal.jsonl");
+        let configuration = qualification_effective_configuration(131_072).unwrap();
+        let request_digest = Digest32::new([0x11; 32]);
+        let identities = QualificationAuthenticatedIdentities {
+            record_digest: Digest32::new([0x22; 32]),
+            model_identity_digest: Digest32::new([0x33; 32]),
+            setup_identity: Digest32::new([0x44; 32]),
+        };
+        let mut journal =
+            QualificationJournal::create(path.clone(), request_digest, configuration).unwrap();
+        for stage in &QUALIFICATION_JOURNAL_STAGES[1..QUALIFICATION_JOURNAL_STAGES.len() - 1] {
+            journal
+                .append_stage(
+                    stage,
+                    (*stage == "bank_authentication_completed").then_some(identities),
+                )
+                .unwrap();
+        }
+        let summary = journal
+            .finish(QUALIFICATION_JOURNAL_STAGES[QUALIFICATION_JOURNAL_STAGES.len() - 1])
+            .unwrap();
+        drop(journal);
+        let bytes = fs::read(&path).unwrap();
+        (
+            directory,
+            path,
+            configuration,
+            request_digest,
+            identities,
+            summary,
+            bytes,
+        )
+    }
+
+    fn decode_strict_journal_records(bytes: &[u8]) -> Vec<StrictQualificationJournalRecord> {
+        bytes[..bytes.len() - 1]
+            .split(|byte| *byte == b'\n')
+            .map(|record| serde_json::from_slice(record).unwrap())
+            .collect()
+    }
+
+    fn encode_strict_journal_records(records: &[StrictQualificationJournalRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            bytes.extend_from_slice(&serde_json::to_vec(record).unwrap());
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn producer_report_fixture(
+        summary: ProductionDoryV3QualificationJournalSummary,
+    ) -> (
+        ProductionDoryV3QualificationReport,
+        ProductionDoryV3QualificationRequest,
+        Vec<u8>,
+        ForgeMatrixV3CandidateProof,
+        BlsDoryV3CandidatePayload,
+    ) {
+        let request = request();
+        let candidate = verifier_candidate(&request, [0x55; 32]);
+        let payload = validate_cp02(&candidate).unwrap();
+        let native_projection = projected_bls_dory_blake3_production_resources().unwrap();
+        let candidate_required = projected_candidate_required_free_scratch_bytes().unwrap();
+        let wire = encode_forgematrix_proof(
+            &BlockProof::V3Candidate(Box::new(candidate.clone())),
+            request.block.network_id,
+        )
+        .unwrap();
+        let report = ProductionDoryV3QualificationReport {
+            report_version: QUALIFICATION_REPORT_VERSION,
+            padded_variables: DORY_V3_PADDED_VARIABLES,
+            composed_claims: u16::try_from(BLS_DORY_COMPOSED_AGGREGATE_CLAIMS).unwrap(),
+            verifier_passes: 2,
+            maximum_native_block_rows: 131_072,
+            network_id: Digest32::new(request.block.network_id),
+            block_height: request.block.height,
+            nonce: request.nonce,
+            request_digest: qualification_request_digest(&request),
+            record_digest: Digest32::new([0x22; 32]),
+            model_identity_digest: Digest32::new([0x33; 32]),
+            setup_identity: DORY_V3_SETUP_IDENTITY,
+            challenge_digest: Digest32::new(candidate.challenge_digest),
+            final_activation_digest: request.final_activation_digest,
+            work_digest: request.work_digest,
+            cp02_blake3_digest: blake3_digest(&candidate.structured_proof),
+            dory_proof_blake3_digest: blake3_digest(&payload.dory_proof),
+            native_proof_blake3_digest: blake3_digest(&payload.native_blake3_proof),
+            wire_blake3_digest: blake3_digest(&wire),
+            record_canonical_bytes: 166,
+            cp02_bytes: byte_len(&candidate.structured_proof).unwrap(),
+            cp02_header_bytes: u64::try_from(CANDIDATE_PAYLOAD_HEADER_BYTES).unwrap(),
+            dory_proof_bytes: byte_len(&payload.dory_proof).unwrap(),
+            native_proof_bytes: byte_len(&payload.native_blake3_proof).unwrap(),
+            wire_bytes: byte_len(&wire).unwrap(),
+            provisional_scratch_floor_bytes: native_projection.provisional_scratch_gate_bytes,
+            initial_available_scratch_bytes: native_projection.provisional_scratch_gate_bytes,
+            candidate_required_free_scratch_bytes: candidate_required,
+            candidate_available_free_scratch_bytes: candidate_required,
+            provisional_available_memory_floor_bytes: native_projection
+                .provisional_available_memory_gate_bytes,
+            observed_available_memory_before_bytes: native_projection
+                .provisional_available_memory_gate_bytes,
+            native_resource_projection_complete: native_projection.is_complete(),
+            sampled_peak_scratch_entries_lower_bound: 1,
+            sampled_peak_scratch_logical_bytes_lower_bound: 1,
+            scratch_sample_interval_milliseconds: 100,
+            exact_peak_instrumented_scratch_reserved_logical_bytes: 1,
+            exact_peak_instrumented_scratch_live_artifacts: 1,
+            instrumented_scratch_reservation_events: 1,
+            exact_peak_scratch_instrumented: false,
+            exact_reservation_peak_instrumented: true,
+            exact_reservation_peak_scope: EXACT_RESERVATION_PEAK_SCOPE.into(),
+            retained_scratch_entries: 0,
+            retained_scratch_logical_bytes: 0,
+            whole_process_peak_rss_bytes: 1,
+            whole_process_peak_rss_scope: WHOLE_PROCESS_PEAK_RSS_SCOPE.into(),
+            cooperative_cancellation_scope: COOPERATIVE_CANCELLATION_SCOPE.into(),
+            qualification_journal: summary,
+            report_output_is_completion_marker: true,
+            publication_crash_atomic: false,
+            parent_directory_sync_performed: cfg!(unix),
+            setup_nanoseconds: 1,
+            record_load_and_validation_nanoseconds: 1,
+            bank_reauthentication_nanoseconds: 1,
+            fixed_model_preparation_nanoseconds: 1,
+            winning_claim_replay_nanoseconds: 1,
+            candidate_resource_preflight_nanoseconds: 1,
+            layout_v5_preparation_nanoseconds: 1,
+            native_and_aggregate_composition_nanoseconds: 1,
+            cp02_seal_nanoseconds: 1,
+            scratch_cleanup_nanoseconds: 1,
+            first_verification_nanoseconds: 1,
+            wire_round_trip_nanoseconds: 1,
+            second_verification_nanoseconds: 1,
+            prepublication_qualification_nanoseconds: 13,
+        };
+        (report, request, wire, candidate, payload)
+    }
+
     fn seed() -> ProductionDoryV3QualificationSeed {
         ProductionDoryV3QualificationSeed {
             block: BlockChallenge {
@@ -2202,37 +3591,70 @@ mod tests {
         let scratch = directory.0.join("scratch");
         let proof = directory.0.join("proof.bin");
         let report = directory.0.join("report.json");
-        let paths = QualificationPaths::preflight(&scratch, &proof, &report).unwrap();
+        let journal = directory.0.join("journal.jsonl");
+        let paths = QualificationPaths::preflight(&scratch, &proof, &report, &journal).unwrap();
         assert_eq!(paths.scratch, scratch);
+        assert_eq!(paths.journal_output, journal);
 
         assert!(matches!(
-            QualificationPaths::preflight(Path::new("relative"), &proof, &report),
+            QualificationPaths::preflight(Path::new("relative"), &proof, &report, &journal),
             Err(ProductionDoryV3QualificationError::Configuration(_))
         ));
         assert!(matches!(
-            QualificationPaths::preflight(&scratch, Path::new("relative-proof"), &report),
+            QualificationPaths::preflight(&scratch, Path::new("relative-proof"), &report, &journal),
             Err(ProductionDoryV3QualificationError::Configuration(_))
         ));
         assert!(matches!(
-            QualificationPaths::preflight(&scratch, &proof, Path::new("relative-report")),
+            QualificationPaths::preflight(&scratch, &proof, Path::new("relative-report"), &journal),
             Err(ProductionDoryV3QualificationError::Configuration(_))
         ));
         assert!(matches!(
-            QualificationPaths::preflight(&scratch, &proof, &proof),
+            QualificationPaths::preflight(&scratch, &proof, &report, Path::new("relative-journal")),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        assert!(matches!(
+            QualificationPaths::preflight(&scratch, &proof, &proof, &journal),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        assert!(matches!(
+            QualificationPaths::preflight(&scratch, &proof, &report, &proof),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        let alias_directory = directory.0.join("alias");
+        fs::create_dir(&alias_directory).unwrap();
+        let aliased_proof = alias_directory.join("..").join("proof.bin");
+        assert!(matches!(
+            QualificationPaths::preflight(&scratch, &proof, &report, &aliased_proof),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        assert!(matches!(
+            QualificationPaths::preflight(
+                &scratch,
+                &proof,
+                &report,
+                &scratch.join("journal.jsonl")
+            ),
             Err(ProductionDoryV3QualificationError::Configuration(_))
         ));
 
         fs::create_dir(&scratch).unwrap();
         assert!(matches!(
-            QualificationPaths::preflight(&scratch, &proof, &report),
+            QualificationPaths::preflight(&scratch, &proof, &report, &journal),
             Err(ProductionDoryV3QualificationError::PathExists(path)) if path == scratch
         ));
         fs::remove_dir(&scratch).unwrap();
 
         fs::write(&proof, b"existing").unwrap();
         assert!(matches!(
-            QualificationPaths::preflight(&scratch, &proof, &report),
+            QualificationPaths::preflight(&scratch, &proof, &report, &journal),
             Err(ProductionDoryV3QualificationError::PathExists(path)) if path == proof
+        ));
+        fs::remove_file(&proof).unwrap();
+
+        fs::write(&journal, b"existing").unwrap();
+        assert!(matches!(
+            QualificationPaths::preflight(&scratch, &proof, &report, &journal),
+            Err(ProductionDoryV3QualificationError::PathExists(path)) if path == journal
         ));
     }
 
@@ -2328,6 +3750,7 @@ mod tests {
             Path::new("relative-scratch"),
             Path::new("proof"),
             Path::new("report"),
+            Path::new("journal"),
             1,
             &cancel,
         );
@@ -2367,6 +3790,596 @@ mod tests {
         let mut changed_block = original;
         changed_block.block.timestamp += 1;
         assert_ne!(qualification_request_digest(&changed_block), digest);
+    }
+
+    #[test]
+    fn qualification_journal_is_canonical_hash_chained_and_diagnostic_only() {
+        let directory = TestDirectory::create();
+        let path = directory.0.join("qualification.jsonl");
+        let configuration = qualification_effective_configuration(131_072).unwrap();
+        let request_digest = Digest32::new([0x11; 32]);
+        let identities = QualificationAuthenticatedIdentities {
+            record_digest: Digest32::new([0x22; 32]),
+            model_identity_digest: Digest32::new([0x33; 32]),
+            setup_identity: Digest32::new([0x44; 32]),
+        };
+        let mut journal =
+            QualificationJournal::create(path.clone(), request_digest, configuration).unwrap();
+        journal
+            .append_stage("bank_authentication_completed", Some(identities))
+            .unwrap();
+        let summary = journal
+            .finish("prepublication_verification_recorded")
+            .unwrap();
+        drop(journal);
+
+        assert_eq!(QUALIFICATION_REPORT_VERSION, 3);
+        assert_eq!(summary.journal_version, QUALIFICATION_JOURNAL_VERSION);
+        assert_eq!(
+            summary.run_identity.to_hex(),
+            "48f34f8a77e6aa42bc181c095423d2cb55e2b9cd9d637d668e8e1935fa5dc01d"
+        );
+        assert_eq!(summary.event_count, 3);
+        assert!(summary.diagnostic_only);
+        assert!(!summary.completion_marker);
+        assert!(!summary.resumable);
+
+        let journal_bytes = fs::read(&path).unwrap();
+        assert_eq!(journal_bytes.last(), Some(&b'\n'));
+        let records = journal_bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|record| !record.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        let decoded = records
+            .iter()
+            .map(|record| serde_json::from_slice::<serde_json::Value>(record).unwrap())
+            .collect::<Vec<_>>();
+        for (sequence, value) in decoded.iter().enumerate() {
+            assert_eq!(value["sequence"], json!(sequence));
+            assert_eq!(value["run_identity"], json!(summary.run_identity.to_hex()));
+            assert_eq!(value["request_digest"], json!(request_digest.to_hex()));
+            assert_eq!(value["diagnostic_only"], json!(true));
+            assert_eq!(value["completion_marker"], json!(false));
+            assert_eq!(value["resumable"], json!(false));
+        }
+        assert_eq!(
+            std::str::from_utf8(records[0]).unwrap(),
+            format!(
+                "{{\"journal_version\":1,\"sequence\":0,\"previous_record_digest\":\"{}\",\"run_identity\":\"{}\",\"request_digest\":\"{}\",\"stage\":\"preflight_completed\",\"diagnostic_only\":true,\"completion_marker\":false,\"resumable\":false,\"effective_configuration\":{{\"qualification_report_version\":3,\"padded_variables\":33,\"composed_claims\":134,\"verifier_passes\":2,\"maximum_native_block_rows\":131072,\"algorithm_version\":2,\"proof_version\":1,\"shared_layout_version\":5,\"scratch_sample_interval_milliseconds\":100}}}}",
+                "00".repeat(32),
+                summary.run_identity.to_hex(),
+                request_digest.to_hex()
+            )
+        );
+        assert_eq!(decoded[0]["previous_record_digest"], json!("00".repeat(32)));
+        assert_eq!(decoded[0]["stage"], json!("preflight_completed"));
+        assert_ne!(
+            qualification_journal_record_digest(records[0]),
+            Digest32::ZERO
+        );
+        assert_eq!(
+            decoded[0]["effective_configuration"]["maximum_native_block_rows"],
+            json!(131_072)
+        );
+        assert_eq!(
+            decoded[1]["previous_record_digest"],
+            json!(qualification_journal_record_digest(records[0]).to_hex())
+        );
+        assert_eq!(
+            decoded[1]["authenticated_identities"]["record_digest"],
+            json!(identities.record_digest.to_hex())
+        );
+        assert_eq!(
+            decoded[2]["previous_record_digest"],
+            json!(qualification_journal_record_digest(records[1]).to_hex())
+        );
+        assert_eq!(
+            summary.final_record_digest,
+            qualification_journal_record_digest(records[2])
+        );
+        assert_eq!(summary.journal_bytes, byte_len(&journal_bytes).unwrap());
+        assert_eq!(
+            summary.complete_file_digest,
+            qualification_journal_complete_file_digest(&journal_bytes).unwrap()
+        );
+        assert_eq!(
+            decoded[2]["stage"],
+            json!("prepublication_verification_recorded")
+        );
+
+        let encoded_summary = serde_json::to_string(&summary).unwrap();
+        assert_eq!(
+            encoded_summary,
+            format!(
+                "{{\"journal_version\":1,\"run_identity\":\"{}\",\"final_record_digest\":\"{}\",\"event_count\":3,\"journal_bytes\":{},\"complete_file_digest\":\"{}\",\"diagnostic_only\":true,\"completion_marker\":false,\"resumable\":false}}",
+                summary.run_identity.to_hex(),
+                summary.final_record_digest.to_hex(),
+                summary.journal_bytes,
+                summary.complete_file_digest.to_hex()
+            )
+        );
+
+        assert!(matches!(
+            QualificationJournal::create(path, request_digest, configuration),
+            Err(ProductionDoryV3QualificationError::CreateOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn qualification_journal_detects_unexpected_appended_bytes() {
+        let directory = TestDirectory::create();
+        let path = directory.0.join("qualification.jsonl");
+        let configuration = qualification_effective_configuration(1).unwrap();
+        let mut journal =
+            QualificationJournal::create(path.clone(), Digest32::new([0x55; 32]), configuration)
+                .unwrap();
+        journal.file.write_all(b"{}\n").unwrap();
+        journal.file.flush().unwrap();
+        journal.file.sync_all().unwrap();
+
+        assert!(matches!(
+            journal.append_stage("setup_validation_completed", None),
+            Err(ProductionDoryV3QualificationError::OutputMismatch(found)) if found == path
+        ));
+    }
+
+    #[test]
+    fn independent_journal_auditor_accepts_only_the_complete_exact_stage_grammar() {
+        let (_directory, _path, configuration, request_digest, identities, summary, bytes) =
+            complete_journal_fixture();
+        let audited =
+            audit_qualification_journal(&bytes, request_digest, configuration, identities).unwrap();
+        assert_eq!(audited, summary);
+        require_matching_journal_summary(&audited, &summary).unwrap();
+        assert_eq!(audited.event_count, 16);
+        assert_eq!(audited.journal_bytes, byte_len(&bytes).unwrap());
+        assert_eq!(
+            audited.complete_file_digest,
+            qualification_journal_complete_file_digest(&bytes).unwrap()
+        );
+
+        let records = decode_strict_journal_records(&bytes);
+        for (record, stage) in records.iter().zip(QUALIFICATION_JOURNAL_STAGES) {
+            assert_eq!(record.stage, stage);
+            assert!(record.diagnostic_only);
+            assert!(!record.completion_marker);
+            assert!(!record.resumable);
+        }
+    }
+
+    #[test]
+    fn independent_journal_auditor_rejects_mutated_headers_chain_and_bindings() {
+        let (_directory, _path, configuration, request_digest, identities, _summary, bytes) =
+            complete_journal_fixture();
+        let original = decode_strict_journal_records(&bytes);
+        let rejects = |records: Vec<StrictQualificationJournalRecord>| {
+            let mutated = encode_strict_journal_records(&records);
+            assert!(
+                audit_qualification_journal(&mutated, request_digest, configuration, identities)
+                    .is_err()
+            );
+        };
+
+        let mut records = original.clone();
+        records[2].sequence += 1;
+        rejects(records);
+
+        let mut records = original.clone();
+        records[1].previous_record_digest = Digest32::new([0x90; 32]);
+        rejects(records);
+
+        let mut records = original.clone();
+        records[1].run_identity = Digest32::new([0x91; 32]);
+        rejects(records);
+
+        let mut records = original.clone();
+        records[1].request_digest = Digest32::new([0x92; 32]);
+        rejects(records);
+
+        let mut records = original.clone();
+        records[1].stage = "record_validation_completed".into();
+        rejects(records);
+
+        let mut records = original.clone();
+        records[0]
+            .effective_configuration
+            .as_mut()
+            .unwrap()
+            .maximum_native_block_rows += 1;
+        rejects(records);
+
+        let mut records = original.clone();
+        records[4]
+            .authenticated_identities
+            .as_mut()
+            .unwrap()
+            .record_digest = Digest32::new([0x93; 32]);
+        rejects(records);
+
+        let mut records = original.clone();
+        records[3].authenticated_identities = Some(identities);
+        rejects(records);
+
+        let mut records = original.clone();
+        records[5].diagnostic_only = false;
+        rejects(records);
+
+        let mut records = original.clone();
+        records[5].completion_marker = true;
+        rejects(records);
+
+        let mut records = original;
+        records[5].resumable = true;
+        rejects(records);
+    }
+
+    #[test]
+    fn independent_journal_auditor_rejects_noncanonical_missing_unknown_and_suffix_bytes() {
+        let (_directory, _path, configuration, request_digest, identities, _summary, bytes) =
+            complete_journal_fixture();
+        let assert_rejected = |mutated: &[u8]| {
+            assert!(
+                audit_qualification_journal(mutated, request_digest, configuration, identities)
+                    .is_err()
+            );
+        };
+
+        let mut missing_final_lf = bytes.clone();
+        missing_final_lf.pop();
+        assert_rejected(&missing_final_lf);
+
+        let first_lf = bytes.iter().position(|byte| *byte == b'\n').unwrap();
+        let journal_only_interruption = &bytes[..=first_lf];
+        assert_rejected(journal_only_interruption);
+
+        let mut suffix_record = bytes.clone();
+        suffix_record.extend_from_slice(&bytes[..=first_lf]);
+        assert_rejected(&suffix_record);
+
+        let mut suffix_bytes = bytes.clone();
+        suffix_bytes.extend_from_slice(b"suffix\n");
+        assert_rejected(&suffix_bytes);
+
+        let mut noncanonical = bytes.clone();
+        noncanonical.insert(first_lf, b' ');
+        assert_rejected(&noncanonical);
+
+        let mut values = bytes[..bytes.len() - 1]
+            .split(|byte| *byte == b'\n')
+            .map(|record| serde_json::from_slice::<serde_json::Value>(record).unwrap())
+            .collect::<Vec<_>>();
+        values[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), json!(true));
+        let mut unknown_field = serde_json::to_vec(&values[0]).unwrap();
+        unknown_field.push(b'\n');
+        for value in &values[1..] {
+            unknown_field.extend_from_slice(&serde_json::to_vec(value).unwrap());
+            unknown_field.push(b'\n');
+        }
+        assert_rejected(&unknown_field);
+
+        values[0].as_object_mut().unwrap().remove("diagnostic_only");
+        values[0].as_object_mut().unwrap().remove("unknown");
+        let mut missing_field = serde_json::to_vec(&values[0]).unwrap();
+        missing_field.push(b'\n');
+        for value in &values[1..] {
+            missing_field.extend_from_slice(&serde_json::to_vec(value).unwrap());
+            missing_field.push(b'\n');
+        }
+        assert_rejected(&missing_field);
+    }
+
+    #[test]
+    fn producer_report_summary_must_match_count_last_digest_length_and_complete_file_digest() {
+        let (_directory, _path, configuration, request_digest, identities, summary, bytes) =
+            complete_journal_fixture();
+        let audited =
+            audit_qualification_journal(&bytes, request_digest, configuration, identities).unwrap();
+
+        let mut wrong = summary.clone();
+        wrong.event_count -= 1;
+        assert!(require_matching_journal_summary(&audited, &wrong).is_err());
+
+        let mut wrong = summary.clone();
+        wrong.final_record_digest = Digest32::new([0xa1; 32]);
+        assert!(require_matching_journal_summary(&audited, &wrong).is_err());
+
+        let mut wrong = summary.clone();
+        wrong.journal_bytes += 1;
+        assert!(require_matching_journal_summary(&audited, &wrong).is_err());
+
+        let mut wrong = summary;
+        wrong.complete_file_digest = Digest32::new([0xa2; 32]);
+        assert!(require_matching_journal_summary(&audited, &wrong).is_err());
+    }
+
+    #[test]
+    fn producer_report_loader_requires_strict_complete_canonical_json() {
+        let (directory, _journal_path, _configuration, _request_digest, _identities, summary, _) =
+            complete_journal_fixture();
+        let (report, _request, _wire, _candidate, _payload) = producer_report_fixture(summary);
+        let canonical_path = directory.0.join("canonical-producer-report.json");
+        let mut canonical = serde_json::to_vec_pretty(&report).unwrap();
+        canonical.push(b'\n');
+        fs::write(&canonical_path, &canonical).unwrap();
+        let (decoded, decoded_bytes) =
+            load_canonical_qualification_report(&canonical_path).unwrap();
+        assert_eq!(decoded, report);
+        assert_eq!(decoded_bytes, canonical);
+
+        let compact_path = directory.0.join("compact-producer-report.json");
+        fs::write(&compact_path, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(matches!(
+            load_canonical_qualification_report(&compact_path),
+            Err(ProductionDoryV3QualificationError::NonCanonicalProducerReport)
+        ));
+
+        let mut value = serde_json::to_value(&report).unwrap();
+        value["unknown"] = json!(true);
+        let unknown_path = directory.0.join("unknown-producer-report.json");
+        fs::write(&unknown_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert!(matches!(
+            load_canonical_qualification_report(&unknown_path),
+            Err(ProductionDoryV3QualificationError::Json(_))
+        ));
+
+        value.as_object_mut().unwrap().remove("unknown");
+        value.as_object_mut().unwrap().remove("wire_bytes");
+        let missing_path = directory.0.join("missing-producer-report.json");
+        fs::write(&missing_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert!(matches!(
+            load_canonical_qualification_report(&missing_path),
+            Err(ProductionDoryV3QualificationError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn producer_report_must_match_request_and_exact_proof_bytes() {
+        let (_directory, _journal_path, _configuration, _request_digest, _identities, summary, _) =
+            complete_journal_fixture();
+        let (report, request, wire, candidate, payload) = producer_report_fixture(summary);
+        validate_producer_report_request_and_proof(&report, &request, &wire, &candidate, &payload)
+            .unwrap();
+
+        let mut wrong = report.clone();
+        wrong.wire_blake3_digest = Digest32::new([0xb1; 32]);
+        assert!(
+            validate_producer_report_request_and_proof(
+                &wrong, &request, &wire, &candidate, &payload
+            )
+            .is_err()
+        );
+
+        let mut wrong = report.clone();
+        wrong.request_digest = Digest32::new([0xb2; 32]);
+        assert!(
+            validate_producer_report_request_and_proof(
+                &wrong, &request, &wire, &candidate, &payload
+            )
+            .is_err()
+        );
+
+        let mut wrong = report;
+        wrong.padded_variables += 1;
+        assert!(
+            validate_producer_report_request_and_proof(
+                &wrong, &request, &wire, &candidate, &payload
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn producer_report_rejects_one_field_invariant_mutations() {
+        let (_directory, _journal_path, _configuration, _request_digest, _identities, summary, _) =
+            complete_journal_fixture();
+        let (report, request, wire, candidate, payload) = producer_report_fixture(summary);
+        let rejects = |mutated: ProductionDoryV3QualificationReport| {
+            assert!(
+                validate_producer_report_request_and_proof(
+                    &mutated, &request, &wire, &candidate, &payload
+                )
+                .is_err()
+            );
+        };
+
+        let mut mutated = report.clone();
+        mutated.maximum_native_block_rows = 0;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.provisional_scratch_floor_bytes += 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.initial_available_scratch_bytes = mutated.provisional_scratch_floor_bytes - 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.candidate_required_free_scratch_bytes += 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.candidate_available_free_scratch_bytes =
+            mutated.candidate_required_free_scratch_bytes - 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.provisional_available_memory_floor_bytes += 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.observed_available_memory_before_bytes =
+            mutated.provisional_available_memory_floor_bytes - 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.native_resource_projection_complete = !mutated.native_resource_projection_complete;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.instrumented_scratch_reservation_events = 0;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.exact_peak_instrumented_scratch_live_artifacts =
+            mutated.instrumented_scratch_reservation_events + 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.sampled_peak_scratch_entries_lower_bound =
+            mutated.exact_peak_instrumented_scratch_live_artifacts + 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.sampled_peak_scratch_logical_bytes_lower_bound =
+            mutated.exact_peak_instrumented_scratch_reserved_logical_bytes + 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.exact_reservation_peak_scope.push('!');
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.whole_process_peak_rss_scope.push('!');
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.cooperative_cancellation_scope.push('!');
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.prepublication_qualification_nanoseconds -= 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.setup_nanoseconds = u64::MAX;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.whole_process_peak_rss_bytes = 0;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.qualification_journal.event_count -= 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.report_output_is_completion_marker = false;
+        rejects(mutated);
+
+        let mut mutated = report;
+        mutated.parent_directory_sync_performed = !mutated.parent_directory_sync_performed;
+        rejects(mutated);
+    }
+
+    #[test]
+    fn strict_evidence_reader_rejects_hardlinks_and_symlinks() {
+        let directory = TestDirectory::create();
+        let original = directory.0.join("evidence.jsonl");
+        fs::write(&original, b"evidence\n").unwrap();
+        let hardlink = directory.0.join("hardlink.jsonl");
+        fs::hard_link(&original, &hardlink).unwrap();
+        assert!(matches!(
+            read_bounded_strict_input(
+                &original,
+                64,
+                ProductionDoryV3QualificationError::QualificationJournalTooLarge { max: 64 }
+            ),
+            Err(ProductionDoryV3QualificationError::InputHardLinks { links: 2, .. })
+        ));
+        fs::remove_file(&hardlink).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let mut retained = RetainedStrictInput::open(&original).unwrap();
+            let exact = retained
+                .read_bounded(
+                    64,
+                    ProductionDoryV3QualificationError::QualificationJournalTooLarge { max: 64 },
+                )
+                .unwrap();
+            fs::remove_file(&original).unwrap();
+            fs::write(&original, b"replacement\n").unwrap();
+            assert!(matches!(
+                retained.confirm_exact_bytes(&exact),
+                Err(ProductionDoryV3QualificationError::InputReplaced(path))
+                    if path == original
+            ));
+
+            let symlink_path = directory.0.join("symlink.jsonl");
+            symlink(&original, &symlink_path).unwrap();
+            assert!(
+                read_bounded_strict_input(
+                    &symlink_path,
+                    64,
+                    ProductionDoryV3QualificationError::QualificationJournalTooLarge { max: 64 }
+                )
+                .is_err()
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_file;
+
+            let symlink_path = directory.0.join("symlink.jsonl");
+            if symlink_file(&original, &symlink_path).is_ok() {
+                assert!(RetainedStrictInput::open(&symlink_path).is_err());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_strict_input_rejects_same_inode_content_mutation() {
+        let directory = TestDirectory::create();
+        let path = directory.0.join("stable.bin");
+        fs::write(&path, b"original").unwrap();
+        let mut input = RetainedStrictInput::open(&path).unwrap();
+        let first = input.complete_content_identity().unwrap();
+        fs::write(&path, b"mutated!").unwrap();
+        let changed = input.confirm_content_identity(first);
+        assert!(
+            matches!(
+                &changed,
+                Err(ProductionDoryV3QualificationError::InputChanged(found)) if found == &path
+            ),
+            "unexpected retained-input result: {changed:?}"
+        );
+        assert_eq!(first.bytes, 8);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_strict_input_denies_concurrent_windows_writes() {
+        let directory = TestDirectory::create();
+        let path = directory.0.join("stable.bin");
+        fs::write(&path, b"original").unwrap();
+        let mut input = RetainedStrictInput::open(&path).unwrap();
+        let first = input.complete_content_identity().unwrap();
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        assert_eq!(input.complete_content_identity().unwrap(), first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn qualification_preflight_rejects_windows_case_only_output_aliases() {
+        let directory = TestDirectory::create();
+        let scratch = directory.0.join("scratch");
+        let proof = directory.0.join("Proof.cmfd");
+        let report = directory.0.join("proof.CMFD");
+        let journal = directory.0.join("journal.jsonl");
+        assert!(matches!(
+            QualificationPaths::preflight(&scratch, &proof, &report, &journal),
+            Err(ProductionDoryV3QualificationError::Configuration(
+                "proof, report, and journal outputs must be distinct"
+            ))
+        ));
     }
 
     #[test]
@@ -2627,6 +4640,42 @@ mod tests {
                 max: MAX_RECORD_V2_JSON_BYTES
             })
         ));
+
+        let report_path = directory.0.join("oversize-producer-report.json");
+        fs::write(
+            &report_path,
+            vec![b' '; MAX_QUALIFICATION_REPORT_JSON_BYTES + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            load_canonical_qualification_report(&report_path),
+            Err(
+                ProductionDoryV3QualificationError::QualificationReportJsonTooLarge {
+                    max: MAX_QUALIFICATION_REPORT_JSON_BYTES
+                }
+            )
+        ));
+
+        let journal_path = directory.0.join("oversize-journal.jsonl");
+        fs::write(
+            &journal_path,
+            vec![b' '; MAX_QUALIFICATION_JOURNAL_BYTES + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            read_bounded_strict_input(
+                &journal_path,
+                MAX_QUALIFICATION_JOURNAL_BYTES,
+                ProductionDoryV3QualificationError::QualificationJournalTooLarge {
+                    max: MAX_QUALIFICATION_JOURNAL_BYTES
+                }
+            ),
+            Err(
+                ProductionDoryV3QualificationError::QualificationJournalTooLarge {
+                    max: MAX_QUALIFICATION_JOURNAL_BYTES
+                }
+            )
+        ));
     }
 
     #[test]
@@ -2655,6 +4704,8 @@ mod tests {
             &directory.0.join("unused-record-v2.json"),
             &request_path,
             &proof_path,
+            &directory.0.join("unused-producer-report.json"),
+            &directory.0.join("unused-journal.jsonl"),
             &report_path,
         )
         .unwrap_err();
@@ -2663,6 +4714,50 @@ mod tests {
             ProductionDoryV3QualificationError::ProofRequestMismatch("nonce")
         ));
         assert!(!report_path.exists());
+    }
+
+    #[test]
+    fn fresh_verifier_rejects_journal_only_interruption_before_bank_authentication() {
+        let (
+            directory,
+            _journal_path,
+            _configuration,
+            _request_digest,
+            _identities,
+            summary,
+            bytes,
+        ) = complete_journal_fixture();
+        let (report, request, wire, _candidate, _payload) = producer_report_fixture(summary);
+        let request_path = directory.0.join("qualification-request.json");
+        let proof_path = directory.0.join("proof.cmfd");
+        let producer_report_path = directory.0.join("producer-report.json");
+        let interrupted_journal_path = directory.0.join("interrupted-journal.jsonl");
+        let verifier_report_path = directory.0.join("fresh-verifier-report.json");
+        let first_lf = bytes.iter().position(|byte| *byte == b'\n').unwrap();
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        fs::write(&proof_path, wire).unwrap();
+        let mut producer_report_bytes = serde_json::to_vec_pretty(&report).unwrap();
+        producer_report_bytes.push(b'\n');
+        fs::write(&producer_report_path, producer_report_bytes).unwrap();
+        fs::write(&interrupted_journal_path, &bytes[..=first_lf]).unwrap();
+
+        let error = run_production_dory_v3_verifier(
+            &directory.0.join("unused-bank.cmfdmb02"),
+            &directory.0.join("unused-record-v2.json"),
+            &request_path,
+            &proof_path,
+            &producer_report_path,
+            &interrupted_journal_path,
+            &verifier_report_path,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProductionDoryV3QualificationError::InvalidJournal(
+                "journal event count or stage sequence length is wrong"
+            )
+        ));
+        assert!(!verifier_report_path.exists());
     }
 
     #[test]

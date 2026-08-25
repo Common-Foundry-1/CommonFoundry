@@ -138,7 +138,7 @@ pub fn canonical_network_info_json() -> Result<Vec<u8>, NodeError> {
     let params = devnet_params()?;
     let descriptor = match params.pow {
         PowParameters::V2Reference(descriptor) => descriptor,
-        PowParameters::V1Legacy(_) => unreachable!("the compiled profile passed validation as v2"),
+        _ => unreachable!("the compiled Devnet manifest passed validation as v2"),
     };
     let model_manifest_digest = descriptor
         .model

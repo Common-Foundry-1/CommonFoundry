@@ -37,6 +37,7 @@ jobs:
       - run: cargo check -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype --locked
       - run: cargo check -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype,whir-prototype --locked
       - run: cargo check -p cmfd-consensus --all-targets --no-default-features --features dory-v3-consensus-adapter --locked
+      - run: cargo check --workspace --all-targets --features cmfd-consensus/dory-v3-consensus-adapter --locked
       - run: cargo check -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
       - run: cargo check -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked
 

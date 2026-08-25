@@ -563,6 +563,8 @@ impl ConsensusPowVerifier {
         match self {
             Self::V2Reference(reference) => Ok(reference.accelerator_model_identity()?),
             Self::V1Legacy(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "dory-v3-consensus-adapter")]
+            Self::V3Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 
@@ -1079,6 +1081,10 @@ mod tests {
         ));
         assert!(matches!(
             verifier.v2_accelerator_model(),
+            Err(PowError::WrongProofType)
+        ));
+        assert!(matches!(
+            verifier.v2_accelerator_model_identity(),
             Err(PowError::WrongProofType)
         ));
         let preverified = verifier.preverify(&challenge, &proof).unwrap();

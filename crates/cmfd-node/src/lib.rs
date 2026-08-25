@@ -21,7 +21,7 @@ use cmfd_consensus::{
     NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
     PowParameters, PreverifiedBlockProof, TRANSACTION_VERSION, Transaction, TxInput, TxOutput,
     WireError, add_chain_work, chain_work_bytes, decode_block, decode_transaction, encode_block,
-    encode_transaction, merkle_root, v2_test_reference, validate_block_resources,
+    encode_transaction, merkle_root, v2_reference_for_network, validate_block_resources,
 };
 use cmfd_proof_worker::{
     ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
@@ -34,16 +34,21 @@ use serde_json::json;
 use thiserror::Error;
 
 pub mod logging;
+pub mod network_info;
+pub mod network_profile;
 pub mod p2p;
 pub mod peer;
 pub mod pool;
 
-pub const DEVNET_NETWORK_ID: [u8; 32] = [0x63; 32];
-pub const DEVNET_GENESIS_HASH: [u8; 32] = [0x47; 32];
-pub const DEVNET_GENESIS_TIMESTAMP: u64 = 1_700_000_000;
+pub use network_info::canonical_network_info_json;
+pub use network_profile::{DEVNET_PROFILE, NetworkProfile};
+
+pub const DEVNET_NETWORK_ID: [u8; 32] = DEVNET_PROFILE.network_id;
+pub const DEVNET_GENESIS_HASH: [u8; 32] = DEVNET_PROFILE.virtual_genesis_hash;
+pub const DEVNET_GENESIS_TIMESTAMP: u64 = DEVNET_PROFILE.virtual_genesis_timestamp;
 pub const DEFAULT_RPC_ADDRESS: &str = "127.0.0.1:18443";
 pub const DEFAULT_P2P_ADDRESS: &str = "127.0.0.1:18444";
-pub const DEFAULT_DATA_DIR: &str = "commonfoundry-devnet0";
+pub const DEFAULT_DATA_DIR: &str = DEVNET_PROFILE.default_data_dir_identity;
 pub const DEFAULT_MINING_ATTEMPTS: u64 = 1_000_000;
 /// Maximum work accepted by one cancellable immutable mining-job search.
 pub const MAX_MINING_SEARCH_ATTEMPTS: u64 = DEFAULT_MINING_ATTEMPTS;
@@ -877,7 +882,7 @@ impl MiningWork {
                 "mining challenge does not belong to this Devnet".to_owned(),
             ));
         }
-        let reference = v2_test_reference().map_err(PowError::from)?;
+        let reference = v2_reference_for_network(params.network_id).map_err(PowError::from)?;
         Ok(Self {
             challenge,
             verifier: ConsensusPowVerifier::v2_reference(reference),
@@ -1254,13 +1259,13 @@ struct BlockPreparationContext<'a> {
     preverified: Option<&'a PreverifiedBlockProof>,
 }
 
-pub fn devnet_params() -> Result<NetworkParams, NodeError> {
-    let reference = v2_test_reference().map_err(PowError::from)?;
+fn network_params_for_profile(profile: NetworkProfile) -> Result<NetworkParams, NodeError> {
+    let reference = v2_reference_for_network(profile.network_id).map_err(PowError::from)?;
     let params = NetworkParams {
-        network_id: DEVNET_NETWORK_ID,
+        network_id: profile.network_id,
         protocol_version: NETWORK_PROTOCOL_VERSION,
-        genesis_hash: DEVNET_GENESIS_HASH,
-        genesis_timestamp: DEVNET_GENESIS_TIMESTAMP,
+        genesis_hash: profile.virtual_genesis_hash,
+        genesis_timestamp: profile.virtual_genesis_timestamp,
         pow_limit: target_with_leading_zero_bits(8),
         pow: PowParameters::V2Reference(reference.descriptor()),
         monetary_policy: DEFAULT_MONETARY_POLICY,
@@ -1273,6 +1278,10 @@ pub fn devnet_params() -> Result<NetworkParams, NodeError> {
     };
     params.validate()?;
     Ok(params)
+}
+
+pub fn devnet_params() -> Result<NetworkParams, NodeError> {
+    network_params_for_profile(DEVNET_PROFILE)
 }
 
 pub fn default_miner_destination() -> [u8; 32] {
@@ -1311,7 +1320,7 @@ impl Node {
         let (wallet_signing_key, legacy_shared_wallet) =
             load_or_create_wallet_key(&data_dir, metadata)?;
 
-        let reference = v2_test_reference().map_err(PowError::from)?;
+        let reference = v2_reference_for_network(params.network_id).map_err(PowError::from)?;
         let verifier = ConsensusPowVerifier::v2_reference(reference);
         let block_preverifier = BlockPreverifier::new(verifier.clone());
         let mut state = ChainState::new(params, verifier.clone())?;
@@ -1400,7 +1409,7 @@ impl Node {
             proof_verification_memory_limit_bytes,
         ) = self.block_preverifier.backend_status();
         Ok(NodeStatus {
-            network: "CommonFoundry Devnet-0",
+            network: DEVNET_PROFILE.name,
             network_id: hex::encode(self.params.network_id),
             consensus_fingerprint: hex::encode(self.fingerprint),
             proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
@@ -1602,7 +1611,7 @@ impl Node {
         history.truncate(MAX_WALLET_HISTORY);
 
         Ok(WalletSnapshot {
-            network: "CommonFoundry Devnet-0",
+            network: DEVNET_PROFILE.name,
             devnet_only: true,
             insecure_demo_wallet: true,
             warning: self.wallet_warning(),
@@ -1730,7 +1739,7 @@ impl Node {
         }
         let entry = self.submit_transaction(transaction)?;
         Ok(WalletSendResponse {
-            network: "CommonFoundry Devnet-0",
+            network: DEVNET_PROFILE.name,
             devnet_only: true,
             insecure_demo_wallet: true,
             warning: self.wallet_warning(),
@@ -1826,7 +1835,7 @@ impl Node {
         let inputs_consolidated = transaction.inputs.len();
         let entry = self.submit_transaction(transaction)?;
         Ok(WalletConsolidateResponse {
-            network: "CommonFoundry Devnet-0",
+            network: DEVNET_PROFILE.name,
             devnet_only: true,
             insecure_demo_wallet: true,
             warning: self.wallet_warning(),
@@ -2999,7 +3008,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             json!({
                 "ok": false,
                 "storage_healthy": false,
-                "network": "CommonFoundry Devnet-0"
+                "network": DEVNET_PROFILE.name
             }),
         ),
         ("GET", "/health") => RpcResponse::json(
@@ -3008,7 +3017,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             json!({
                 "ok": true,
                 "storage_healthy": true,
-                "network": "CommonFoundry Devnet-0"
+                "network": DEVNET_PROFILE.name
             }),
         ),
         ("GET", "/v1/status") => match node.status() {
@@ -3396,7 +3405,7 @@ fn template_json(template: &BlockTemplate) -> serde_json::Value {
         })
         .collect();
     json!({
-        "network": "CommonFoundry Devnet-0",
+        "network": DEVNET_PROFILE.name,
         "proof_type": "forgematrix-v2-reference",
         "block_version": BLOCK_VERSION,
         "network_id": hex::encode(template.challenge.network_id),
@@ -3903,7 +3912,7 @@ mod tests {
 
     use cmfd_consensus::{
         ForgeMatrixV2CompactProof, InputWitness, TEST_PROFILE, TRANSACTION_VERSION, TxInput,
-        TxOutput,
+        TxOutput, v2_test_reference,
     };
 
     use super::*;
@@ -4446,6 +4455,63 @@ mod tests {
             hex::encode(devnet_params().unwrap().fingerprint().unwrap()),
             "7ae1b8fadadc6e9316e480968fe2647b3a627df33a1a1c7f7c6c53433a4ff778"
         );
+    }
+
+    #[test]
+    fn compile_time_profile_preserves_defaults_and_separates_fresh_networks() {
+        assert_eq!(DEVNET_NETWORK_ID, DEVNET_PROFILE.network_id);
+        assert_eq!(DEVNET_GENESIS_HASH, DEVNET_PROFILE.virtual_genesis_hash);
+        assert_eq!(
+            DEVNET_GENESIS_TIMESTAMP,
+            DEVNET_PROFILE.virtual_genesis_timestamp
+        );
+        assert_eq!(DEFAULT_DATA_DIR, DEVNET_PROFILE.default_data_dir_identity);
+        assert_eq!(
+            DEFAULT_RPC_ADDRESS.parse::<SocketAddr>().unwrap(),
+            DEVNET_PROFILE.rpc_address()
+        );
+        assert_eq!(
+            DEFAULT_P2P_ADDRESS.parse::<SocketAddr>().unwrap(),
+            DEVNET_PROFILE.p2p_address()
+        );
+        assert_eq!(
+            pool::DEFAULT_POOL_ADDRESS.parse::<SocketAddr>().unwrap(),
+            DEVNET_PROFILE.pool_address()
+        );
+
+        const ALTERNATE_PROFILE: NetworkProfile = NetworkProfile {
+            name: "CommonFoundry profile-separation test",
+            network_id: [0x64; 32],
+            virtual_genesis_hash: [0x48; 32],
+            virtual_genesis_timestamp: DEVNET_GENESIS_TIMESTAMP + 1,
+            rpc_port: 28_443,
+            p2p_port: 28_444,
+            pool_port: 28_445,
+            bootstrap_ipv4: std::net::Ipv4Addr::new(192, 0, 2, 1),
+            default_data_dir_identity: "commonfoundry-profile-separation-test",
+            wallet_data_dir_identity: "profile-separation-test",
+        };
+
+        let current = devnet_params().unwrap();
+        let alternate = network_params_for_profile(ALTERNATE_PROFILE).unwrap();
+        assert_ne!(
+            alternate.fingerprint().unwrap(),
+            current.fingerprint().unwrap()
+        );
+
+        let current_reference = v2_test_reference().unwrap();
+        let alternate_reference = v2_reference_for_network(ALTERNATE_PROFILE.network_id).unwrap();
+        assert_ne!(
+            alternate_reference.descriptor(),
+            current_reference.descriptor()
+        );
+        assert!(matches!(
+            ChainState::new(
+                alternate,
+                ConsensusPowVerifier::v2_reference(current_reference)
+            ),
+            Err(ChainError::PowParameterMismatch)
+        ));
     }
 
     #[test]

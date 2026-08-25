@@ -1,7 +1,7 @@
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
-use cmfd_node::DEFAULT_P2P_ADDRESS;
+use cmfd_node::DEVNET_PROFILE;
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +23,7 @@ pub(crate) struct NodeRuntimeConfig {
     pub(super) verbose: u8,
 }
 
-pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr =
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(107, 214, 187, 2)), 18444);
+pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr = DEVNET_PROFILE.bootstrap_peer();
 
 impl NodeRuntimeConfig {
     pub(crate) fn from_process_args() -> Result<ProcessCommand, ConfigError> {
@@ -43,9 +42,7 @@ impl NodeRuntimeConfig {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let default_bind = DEFAULT_P2P_ADDRESS
-            .parse()
-            .map_err(|_| ConfigError::InvalidBuiltInDefault)?;
+        let default_bind = DEVNET_PROFILE.p2p_address();
 
         let mut asked_for_help = false;
         let mut asked_for_version = false;
@@ -207,7 +204,6 @@ fn parse_address(option: &'static str, value: &str) -> Result<SocketAddr, Config
 #[derive(Debug)]
 pub(crate) enum ConfigError {
     NonUnicodeArgument,
-    InvalidBuiltInDefault,
     UnknownArgument(String),
     MissingValue(&'static str),
     DuplicateOption(&'static str),
@@ -228,9 +224,6 @@ impl fmt::Display for ConfigError {
         match self {
             Self::NonUnicodeArgument => {
                 formatter.write_str("wallet node arguments must be valid Unicode")
-            }
-            Self::InvalidBuiltInDefault => {
-                formatter.write_str("the built-in P2P listener address is invalid")
             }
             Self::UnknownArgument(argument) => {
                 write!(formatter, "unknown wallet argument: {argument}")

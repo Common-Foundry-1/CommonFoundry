@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
@@ -9,11 +10,11 @@ use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_node::p2p::{spawn_inbound_listener_with_policy, spawn_static_peer_polling};
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
-    DEFAULT_POOL_ADDRESS, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolServerConfig, certificate_sha256,
-    generate_pool_certificate, spawn_pool_server,
+    DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolServerConfig,
+    certificate_sha256, generate_pool_certificate, spawn_pool_server,
 };
 use cmfd_node::{
-    DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, DEFAULT_P2P_ADDRESS, DEFAULT_RPC_ADDRESS, Node,
+    DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, DEVNET_PROFILE, Node, canonical_network_info_json,
     parse_miner_destination, spawn_rpc_server, unix_time_seconds,
 };
 use cmfd_proof_worker::VerifierWorkerConfig;
@@ -55,11 +56,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the compiled network identity and consensus manifest.
+    NetworkInfo,
     /// Run loopback RPC and bounded P2P services.
     Run {
-        #[arg(long, default_value = DEFAULT_RPC_ADDRESS)]
+        #[arg(long, default_value_t = DEVNET_PROFILE.rpc_address())]
         bind: SocketAddr,
-        #[arg(long, default_value = DEFAULT_P2P_ADDRESS)]
+        #[arg(long, default_value_t = DEVNET_PROFILE.p2p_address())]
         p2p_bind: SocketAddr,
         /// Static peer address. Public IPs require --allow-public-peers.
         #[arg(long = "peer")]
@@ -89,9 +92,9 @@ enum Command {
     },
     /// Run the authenticated, non-Stratum Devnet-0 pool service.
     PoolServe {
-        #[arg(long, default_value = DEFAULT_POOL_ADDRESS)]
+        #[arg(long, default_value_t = DEFAULT_POOL_SOCKET_ADDRESS)]
         bind: SocketAddr,
-        #[arg(long, default_value = DEFAULT_P2P_ADDRESS)]
+        #[arg(long, default_value_t = DEVNET_PROFILE.p2p_address())]
         p2p_bind: SocketAddr,
         /// Static peer address. Public IPs require --allow-public-peers.
         #[arg(long = "peer")]
@@ -119,9 +122,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(cmfd_proof_worker::worker_main());
     }
     let cli = Cli::parse();
+    if matches!(&cli.command, Command::NetworkInfo) {
+        io::stdout()
+            .lock()
+            .write_all(&canonical_network_info_json()?)?;
+        return Ok(());
+    }
     let verifier_worker = verifier_worker_config(&cli)?;
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
+        Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
         Command::Run {
             bind,
             p2p_bind,
@@ -434,6 +444,43 @@ fn peer_warning(allow_public_peers: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_defaults_follow_the_compile_time_network_profile() {
+        let cli = Cli::try_parse_from(["cmfd-node", "run"]).unwrap();
+        assert_eq!(cli.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        let Command::Run { bind, p2p_bind, .. } = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(bind, DEVNET_PROFILE.rpc_address());
+        assert_eq!(p2p_bind, DEVNET_PROFILE.p2p_address());
+
+        let cli = Cli::try_parse_from([
+            "cmfd-node",
+            "pool-serve",
+            "--certificate",
+            "certificate.der",
+            "--private-key",
+            "private-key.der",
+        ])
+        .unwrap();
+        let Command::PoolServe { bind, p2p_bind, .. } = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(bind, DEVNET_PROFILE.pool_address());
+        assert_eq!(p2p_bind, DEVNET_PROFILE.p2p_address());
+    }
+
+    #[test]
+    fn network_info_accepts_no_command_specific_inputs() {
+        assert!(matches!(
+            Cli::try_parse_from(["cmfd-node", "network-info"])
+                .unwrap()
+                .command,
+            Command::NetworkInfo
+        ));
+        assert!(Cli::try_parse_from(["cmfd-node", "network-info", "unexpected"]).is_err());
+    }
 
     #[test]
     fn shutdown_wait_reports_an_unexpected_service_exit() {

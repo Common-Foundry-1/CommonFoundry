@@ -36,6 +36,23 @@ pub struct ProductionV3ArtifactIdentityPins {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionV3VerifierWorkerIdentityPins {
+    pub windows_x86_64_sha256: [u8; 32],
+    pub linux_x86_64_sha256: [u8; 32],
+}
+
+impl ProductionV3VerifierWorkerIdentityPins {
+    #[allow(dead_code)] // build.rs includes this module but does not select a runtime target.
+    pub(crate) fn for_target(self, os: &str, arch: &str) -> Option<[u8; 32]> {
+        match (os, arch) {
+            ("windows", "x86_64") => Some(self.windows_x86_64_sha256),
+            ("linux", "x86_64") => Some(self.linux_x86_64_sha256),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProductionRcNetworkIdentityPin {
     pub network_id: [u8; 32],
     pub virtual_genesis_hash: [u8; 32],
@@ -52,6 +69,11 @@ pub struct CompiledReleaseProfile {
     pub proof: ConsensusProofSelection,
     pub activation: Option<ProductionV3ActivationEvidence>,
     pub production_v3_artifacts: Option<ProductionV3ArtifactIdentityPins>,
+    /// Platform SHA-256 pins for the packaged persistent `cmfd-proof-worker`.
+    /// This is separate from `fresh_process_verifier_binary_sha256`, which
+    /// identifies the qualification harness executable rather than the runtime
+    /// sidecar shipped to nodes and wallets.
+    pub production_v3_verifier_workers: Option<ProductionV3VerifierWorkerIdentityPins>,
     pub production_network_identity: Option<ProductionRcNetworkIdentityPin>,
 }
 
@@ -67,6 +89,7 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     proof: ConsensusProofSelection::DevnetV2Reference,
     activation: None,
     production_v3_artifacts: None,
+    production_v3_verifier_workers: None,
     production_network_identity: None,
 };
 
@@ -112,6 +135,10 @@ fn valid_file_identity_pin(pin: ProductionV3FileIdentityPin) -> bool {
 
 fn is_repeated_byte(value: [u8; 32]) -> bool {
     value.iter().all(|byte| *byte == value[0])
+}
+
+fn valid_binary_identity_pin(value: [u8; 32]) -> bool {
+    value != [0; 32] && !is_repeated_byte(value)
 }
 
 fn is_rfc5737(address: [u8; 4]) -> bool {
@@ -204,6 +231,15 @@ pub fn validate_production_rc(
     {
         return Err("ProductionV3 artifact identity pins are invalid");
     }
+    let verifier_workers = profile
+        .production_v3_verifier_workers
+        .ok_or("ProductionV3 runtime verifier-worker pin is absent")?;
+    if !valid_binary_identity_pin(verifier_workers.windows_x86_64_sha256)
+        || !valid_binary_identity_pin(verifier_workers.linux_x86_64_sha256)
+        || verifier_workers.windows_x86_64_sha256 == verifier_workers.linux_x86_64_sha256
+    {
+        return Err("ProductionV3 runtime verifier-worker pin is invalid");
+    }
     Ok(())
 }
 
@@ -285,7 +321,6 @@ mod tests {
         },
     };
     const BUILD_SOURCE_COMMIT: &str = "5555555555555555555555555555555555555555";
-
     const fn varied(seed: u8) -> [u8; 32] {
         let mut value = [0_u8; 32];
         let mut index = 0;
@@ -295,6 +330,12 @@ mod tests {
         }
         value
     }
+
+    const VERIFIER_WORKERS: ProductionV3VerifierWorkerIdentityPins =
+        ProductionV3VerifierWorkerIdentityPins {
+            windows_x86_64_sha256: varied(0x5a),
+            linux_x86_64_sha256: varied(0x9a),
+        };
 
     const NETWORK_IDENTITY: ProductionRcNetworkIdentityPin = ProductionRcNetworkIdentityPin {
         network_id: varied(1),
@@ -331,6 +372,7 @@ mod tests {
             proof: ConsensusProofSelection::DevnetV2Reference,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
+            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
@@ -343,6 +385,7 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: None,
             production_v3_artifacts: Some(ARTIFACTS),
+            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
@@ -355,12 +398,75 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
             production_v3_artifacts: None,
+            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
             validate_production_rc(no_artifacts, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 artifact identity pins are absent")
         );
+
+        let no_runtime_worker = CompiledReleaseProfile {
+            network: CompiledNetworkProfile::Rcnet,
+            proof: ConsensusProofSelection::ProductionV3,
+            activation: Some(EVIDENCE),
+            production_v3_artifacts: Some(ARTIFACTS),
+            production_v3_verifier_workers: None,
+            production_network_identity: Some(NETWORK_IDENTITY),
+        };
+        assert_eq!(
+            validate_production_rc(no_runtime_worker, BUILD_SOURCE_COMMIT),
+            Err("ProductionV3 runtime verifier-worker pin is absent")
+        );
+
+        let zero_runtime_worker = CompiledReleaseProfile {
+            production_v3_verifier_workers: Some(ProductionV3VerifierWorkerIdentityPins {
+                windows_x86_64_sha256: [0; 32],
+                linux_x86_64_sha256: [0x5b; 32],
+            }),
+            ..no_runtime_worker
+        };
+        assert_eq!(
+            validate_production_rc(zero_runtime_worker, BUILD_SOURCE_COMMIT),
+            Err("ProductionV3 runtime verifier-worker pin is invalid")
+        );
+
+        let placeholder_runtime_worker = CompiledReleaseProfile {
+            production_v3_verifier_workers: Some(ProductionV3VerifierWorkerIdentityPins {
+                windows_x86_64_sha256: [0x5a; 32],
+                linux_x86_64_sha256: varied(0x9a),
+            }),
+            ..no_runtime_worker
+        };
+        assert_eq!(
+            validate_production_rc(placeholder_runtime_worker, BUILD_SOURCE_COMMIT),
+            Err("ProductionV3 runtime verifier-worker pin is invalid")
+        );
+
+        let identical_runtime_workers = CompiledReleaseProfile {
+            production_v3_verifier_workers: Some(ProductionV3VerifierWorkerIdentityPins {
+                windows_x86_64_sha256: varied(0x5a),
+                linux_x86_64_sha256: varied(0x5a),
+            }),
+            ..no_runtime_worker
+        };
+        assert_eq!(
+            validate_production_rc(identical_runtime_workers, BUILD_SOURCE_COMMIT),
+            Err("ProductionV3 runtime verifier-worker pin is invalid")
+        );
+    }
+
+    #[test]
+    fn runtime_verifier_worker_pin_is_platform_specific_and_fail_closed() {
+        assert_eq!(
+            VERIFIER_WORKERS.for_target("windows", "x86_64"),
+            Some(varied(0x5a))
+        );
+        assert_eq!(
+            VERIFIER_WORKERS.for_target("linux", "x86_64"),
+            Some(varied(0x9a))
+        );
+        assert_eq!(VERIFIER_WORKERS.for_target("macos", "aarch64"), None);
     }
 
     #[test]
@@ -370,6 +476,7 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
+            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(validate_production_rc(profile, BUILD_SOURCE_COMMIT), Ok(()));
@@ -396,6 +503,7 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
+            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         let encoded =
@@ -421,6 +529,7 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
+            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
             production_network_identity: identity,
         };
         assert_eq!(

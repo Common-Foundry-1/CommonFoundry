@@ -150,6 +150,8 @@ jobs:
         run: cargo test --locked -p cmfd-node --lib stalled_
       - name: Exercise operating-system shutdown signals
         run: cargo test --locked -p cmfd-node --test graceful_shutdown -- --test-threads=1
+      - name: Exercise persistent verifier containment and restart
+        run: cargo test --locked -p cmfd-proof-worker --test verifier_worker -- --test-threads=1
 
   wallet:
     runs-on: ubuntu-latest

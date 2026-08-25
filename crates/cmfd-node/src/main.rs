@@ -2,7 +2,7 @@ use std::io::{self, Write};
 #[cfg(feature = "production-v3")]
 use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,9 +20,9 @@ use cmfd_node::rcnet_candidate::{
     RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
 };
 use cmfd_node::{
-    COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
-    canonical_network_info_json_with_artifacts, parse_miner_destination, spawn_rpc_server,
-    unix_time_seconds,
+    COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node, ProofProfile,
+    canonical_network_info_json_with_artifacts, compiled_production_v3_worker_sha256,
+    parse_miner_destination, production_v3_package_layout, spawn_rpc_server, unix_time_seconds,
 };
 use cmfd_proof_worker::{ProductionV3VerifierArtifacts, VerifierWorkerConfig};
 use serde_json::json;
@@ -68,6 +68,10 @@ struct Cli {
     /// Kill the proof-verifier worker after this many milliseconds.
     #[arg(long, global = true, default_value_t = 30_000)]
     proof_verifier_timeout_ms: u64,
+    /// Kill startup if model authentication and the capability handshake do not
+    /// complete within this many milliseconds.
+    #[arg(long, global = true, default_value_t = 900_000)]
+    proof_verifier_startup_timeout_ms: u64,
     /// Hard worker address-space/job memory limit in bytes.
     #[arg(long, global = true, default_value_t = 2_147_483_648)]
     proof_verifier_memory_bytes: u64,
@@ -221,6 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_candidate_create_new(output, &candidate)?;
         return Ok(());
     }
+    validate_production_v3_override_set(&cli)?;
     let production_v3_artifacts = production_v3_artifacts(&cli)?;
     if matches!(&cli.command, Command::NetworkInfo) {
         io::stdout()
@@ -528,22 +533,34 @@ fn verifier_worker_config(
     cli: &Cli,
     production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
 ) -> Result<Option<VerifierWorkerConfig>, Box<dyn std::error::Error>> {
-    let Some(worker_executable) = cli.proof_verifier_worker.clone() else {
-        return Ok(None);
+    let production_v3 = COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV3;
+    let worker_executable = match (&cli.proof_verifier_worker, production_v3) {
+        (Some(path), _) => path.clone(),
+        (None, true) => packaged_production_v3_layout()?.worker,
+        (None, false) => return Ok(None),
     };
-    let hash = cli
-        .proof_verifier_worker_sha256
-        .as_deref()
-        .ok_or("--proof-verifier-worker-sha256 is required with --proof-verifier-worker")?;
-    if hash.len() != 64 {
-        return Err("proof-verifier worker SHA-256 must contain exactly 64 hex characters".into());
-    }
-    let mut worker_sha256 = [0_u8; 32];
-    hex::decode_to_slice(hash, &mut worker_sha256)
-        .map_err(|_| "proof-verifier worker SHA-256 must contain exactly 64 hex characters")?;
+    let worker_sha256 =
+        if production_v3 {
+            let compiled = compiled_production_v3_worker_sha256()?;
+            if let Some(configured) = cli.proof_verifier_worker_sha256.as_deref() {
+                let configured = parse_worker_sha256(configured)?;
+                if configured != compiled {
+                    return Err(
+                    "proof-verifier worker SHA-256 does not match the compiled ProductionV3 pin"
+                        .into(),
+                );
+                }
+            }
+            compiled
+        } else {
+            parse_worker_sha256(cli.proof_verifier_worker_sha256.as_deref().ok_or(
+                "--proof-verifier-worker-sha256 is required with --proof-verifier-worker",
+            )?)?
+        };
     Ok(Some(VerifierWorkerConfig {
-        worker_executable,
+        worker_executable: canonical_regular_file(&worker_executable, "proof-verifier worker")?,
         worker_sha256,
+        startup_timeout: Duration::from_millis(cli.proof_verifier_startup_timeout_ms),
         timeout: Duration::from_millis(cli.proof_verifier_timeout_ms),
         memory_limit_bytes: cli.proof_verifier_memory_bytes,
         production_v3_artifacts,
@@ -558,16 +575,86 @@ fn production_v3_artifacts(
         cli.production_v3_manifest.clone(),
         cli.production_v3_record_v2.clone(),
     ) {
+        (None, None, None)
+            if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV3 =>
+        {
+            let layout = packaged_production_v3_layout()?;
+            Ok(Some(layout.artifacts))
+        }
         (None, None, None) => Ok(None),
         (Some(bank), Some(manifest), Some(record_v2)) => {
             Ok(Some(ProductionV3VerifierArtifacts {
-                bank,
-                manifest,
-                record_v2,
+                bank: canonical_regular_file(&bank, "production V3 model bank")?,
+                manifest: canonical_regular_file(&manifest, "production V3 manifest")?,
+                record_v2: canonical_regular_file(&record_v2, "production V3 Record V2")?,
             }))
         }
         _ => Err("--production-v3-bank, --production-v3-manifest, and --production-v3-record-v2 must be supplied together".into()),
     }
+}
+
+fn validate_production_v3_override_set(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV3 {
+        return Ok(());
+    }
+    let count = [
+        cli.proof_verifier_worker.as_ref(),
+        cli.production_v3_bank.as_ref(),
+        cli.production_v3_manifest.as_ref(),
+        cli.production_v3_record_v2.as_ref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some())
+    .count();
+    if count == 0 || count == 4 {
+        Ok(())
+    } else {
+        Err("ProductionV3 requires either the complete fixed package layout or all four explicit artifact and worker paths".into())
+    }
+}
+
+fn packaged_production_v3_layout()
+-> Result<cmfd_node::ProductionV3PackageLayout, Box<dyn std::error::Error>> {
+    let executable = std::env::current_exe()
+        .map_err(|_| "could not resolve the signed package executable directory")?;
+    let mut layout = production_v3_package_layout(&executable)?;
+    layout.worker = canonical_regular_file(&layout.worker, "packaged proof-verifier worker")?;
+    layout.artifacts.bank =
+        canonical_regular_file(&layout.artifacts.bank, "packaged production V3 model bank")?;
+    layout.artifacts.manifest = canonical_regular_file(
+        &layout.artifacts.manifest,
+        "packaged production V3 manifest",
+    )?;
+    layout.artifacts.record_v2 = canonical_regular_file(
+        &layout.artifacts.record_v2,
+        "packaged production V3 Record V2",
+    )?;
+    Ok(layout)
+}
+
+fn canonical_regular_file(
+    path: &Path,
+    component: &'static str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if !path.is_absolute() {
+        return Err(format!("{component} path must be absolute").into());
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| format!("{component} is missing from the package"))?;
+    if !std::fs::metadata(&canonical)?.is_file() {
+        return Err(format!("{component} path is not a regular file").into());
+    }
+    Ok(canonical)
+}
+
+fn parse_worker_sha256(value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    if value.len() != 64 {
+        return Err("proof-verifier worker SHA-256 must contain exactly 64 hex characters".into());
+    }
+    let mut digest = [0_u8; 32];
+    hex::decode_to_slice(value, &mut digest)
+        .map_err(|_| "proof-verifier worker SHA-256 must contain exactly 64 hex characters")?;
+    Ok(digest)
 }
 
 fn open_node(

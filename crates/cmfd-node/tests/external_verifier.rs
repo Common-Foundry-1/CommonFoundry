@@ -8,7 +8,7 @@ use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, Coinbase, ConsensusPowVerifier,
     v2_test_reference,
 };
-use cmfd_node::Node;
+use cmfd_node::{MAX_CONCURRENT_PROOF_VERIFICATIONS, MAX_QUEUED_PROOF_VERIFICATIONS, Node};
 use cmfd_proof_worker::VerifierWorkerConfig;
 use sha2::{Digest, Sha256};
 
@@ -33,6 +33,7 @@ fn worker_config() -> VerifierWorkerConfig {
     VerifierWorkerConfig {
         worker_sha256: sha256(&worker),
         worker_executable: worker,
+        startup_timeout: Duration::from_secs(10),
         timeout: Duration::from_secs(10),
         memory_limit_bytes: 512 * 1024 * 1024,
         production_v3_artifacts: None,
@@ -86,6 +87,14 @@ fn node_admission_uses_the_pinned_worker_and_reports_its_limits() {
     let status = node.status().unwrap();
     assert_eq!(status.proof_verification_mode, "external_worker");
     assert_eq!(status.proof_verification_timeout_ms, Some(10_000));
+    assert_eq!(
+        status.proof_verification_capacity,
+        MAX_CONCURRENT_PROOF_VERIFICATIONS
+    );
+    assert_eq!(
+        status.proof_verification_queue_capacity,
+        MAX_QUEUED_PROOF_VERIFICATIONS
+    );
     assert_eq!(
         status.proof_verification_memory_limit_bytes,
         Some(512 * 1024 * 1024)

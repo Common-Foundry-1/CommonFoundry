@@ -5,7 +5,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,7 +30,7 @@ use cmfd_consensus::{
 };
 pub use cmfd_proof_worker::ProductionV3VerifierArtifacts;
 use cmfd_proof_worker::{
-    ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
+    PersistentVerifierWorker, ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError,
 };
 use fs2::FileExt;
 use k256::schnorr::{SigningKey, VerifyingKey};
@@ -79,6 +79,65 @@ pub const MAX_OBSERVED_PEERS: usize = 64;
 pub const MAX_CONCURRENT_PROOF_VERIFICATIONS: usize = 1;
 /// Bounded waiters prevent peer floods from creating unbounded verifier work.
 pub const MAX_QUEUED_PROOF_VERIFICATIONS: usize = 8;
+pub const PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v3";
+pub const PRODUCTION_V3_PACKAGE_BANK: &str = "MODEL-V2.bank";
+pub const PRODUCTION_V3_PACKAGE_MANIFEST: &str = "MODEL-V2.manifest.json";
+pub const PRODUCTION_V3_PACKAGE_RECORD_V2: &str = "DORY-V3-MODEL-RECORD-V2.json";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionV3PackageLayout {
+    pub worker: PathBuf,
+    pub artifacts: ProductionV3VerifierArtifacts,
+}
+
+/// Fixed, download-free sidecar layout used when an RC package is launched
+/// without artifact arguments. Callers must canonicalize these paths and pass
+/// them through the compiled hash/length gates before starting any service.
+pub fn production_v3_package_layout(
+    executable: &Path,
+) -> Result<ProductionV3PackageLayout, NodeError> {
+    let directory = executable
+        .parent()
+        .ok_or(NodeError::ProductionV3ActivationEvidence(
+            "package executable has no parent directory",
+        ))?;
+    let artifacts = directory.join(PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY);
+    Ok(ProductionV3PackageLayout {
+        worker: directory.join(format!("cmfd-proof-worker{}", std::env::consts::EXE_SUFFIX)),
+        artifacts: ProductionV3VerifierArtifacts {
+            bank: artifacts.join(PRODUCTION_V3_PACKAGE_BANK),
+            manifest: artifacts.join(PRODUCTION_V3_PACKAGE_MANIFEST),
+            record_v2: artifacts.join(PRODUCTION_V3_PACKAGE_RECORD_V2),
+        },
+    })
+}
+
+/// Returns the only verifier-worker executable identity trusted by a compiled
+/// ProductionV3 package. The pin is part of the activation evidence; operators
+/// may select another path only when its bytes match this exact identity.
+pub fn compiled_production_v3_worker_sha256() -> Result<[u8; 32], NodeError> {
+    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV3 {
+        return Err(NodeError::ProductionV3ActivationEvidence(
+            "compiled proof profile is not ProductionV3",
+        ));
+    }
+    let pins = release_gate::COMPILED_RELEASE_PROFILE
+        .production_v3_verifier_workers
+        .ok_or(NodeError::ProductionV3ActivationEvidence(
+            "compiled runtime verifier-worker pin is absent",
+        ))?;
+    let digest = pins
+        .for_target(std::env::consts::OS, std::env::consts::ARCH)
+        .ok_or(NodeError::ProductionV3ActivationEvidence(
+            "compiled runtime verifier-worker pin is unavailable for this platform",
+        ))?;
+    if digest == [0; 32] {
+        return Err(NodeError::ProductionV3ActivationEvidence(
+            "compiled runtime verifier-worker pin is zero",
+        ));
+    }
+    Ok(digest)
+}
 
 const METADATA_FILE: &str = "network.meta";
 const BLOCK_LOG_FILE: &str = "blocks.log";
@@ -420,30 +479,53 @@ impl Drop for ProofVerificationPermit<'_> {
 pub struct BlockPreverifier {
     verifier: ConsensusPowVerifier,
     queue: Arc<ProofVerificationQueue>,
-    backend: ProofVerificationBackend,
+    backend: Arc<RwLock<ProofVerificationBackend>>,
 }
 
 #[derive(Clone)]
 enum ProofVerificationBackend {
+    Unavailable,
     InProcess,
-    External(Arc<VerifierWorkerConfig>),
+    External(PersistentVerifierWorker),
 }
 
 impl BlockPreverifier {
-    fn new(verifier: ConsensusPowVerifier) -> Self {
-        Self::with_limits(
+    fn new(verifier: ConsensusPowVerifier, proof_profile: ProofProfile) -> Self {
+        let backend = match proof_profile {
+            ProofProfile::DevnetV2Reference => ProofVerificationBackend::InProcess,
+            ProofProfile::ProductionV3 => ProofVerificationBackend::Unavailable,
+        };
+        Self::with_limits_and_backend(
             verifier,
             MAX_CONCURRENT_PROOF_VERIFICATIONS,
             MAX_QUEUED_PROOF_VERIFICATIONS,
             PROOF_VERIFICATION_QUEUE_TIMEOUT,
+            backend,
         )
     }
 
+    #[cfg(test)]
     fn with_limits(
         verifier: ConsensusPowVerifier,
         max_active: usize,
         max_queued: usize,
         wait_timeout: Duration,
+    ) -> Self {
+        Self::with_limits_and_backend(
+            verifier,
+            max_active,
+            max_queued,
+            wait_timeout,
+            ProofVerificationBackend::InProcess,
+        )
+    }
+
+    fn with_limits_and_backend(
+        verifier: ConsensusPowVerifier,
+        max_active: usize,
+        max_queued: usize,
+        wait_timeout: Duration,
+        backend: ProofVerificationBackend,
     ) -> Self {
         Self {
             verifier,
@@ -452,31 +534,42 @@ impl BlockPreverifier {
                 max_queued,
                 wait_timeout,
             )),
-            backend: ProofVerificationBackend::InProcess,
+            backend: Arc::new(RwLock::new(backend)),
         }
     }
 
     fn use_external_worker(
-        &mut self,
+        &self,
         config: VerifierWorkerConfig,
+        network_id: [u8; 32],
     ) -> Result<(), VerifierWorkerError> {
-        config.validate_executable()?;
-        self.backend = ProofVerificationBackend::External(Arc::new(config));
+        let worker = PersistentVerifierWorker::start(config, self.verifier.clone(), network_id)?;
+        *self
+            .backend
+            .write()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)? =
+            ProofVerificationBackend::External(worker);
         Ok(())
     }
 
     pub fn preverify(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
         validate_block_resources(block)?;
         encode_block(block)?;
-        match &self.backend {
+        let backend = self
+            .backend
+            .read()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?
+            .clone();
+        match backend {
+            ProofVerificationBackend::Unavailable => Err(NodeError::ProductionV3Unavailable),
             ProofVerificationBackend::InProcess => self.run_guarded(|| {
                 self.verifier
                     .preverify(&block.challenge, &block.proof)
                     .map_err(NodeError::from)
             }),
-            ProofVerificationBackend::External(config) => self.run_guarded(|| {
-                verify_block_out_of_process(config, &self.verifier, block).map_err(NodeError::from)
-            }),
+            ProofVerificationBackend::External(worker) => {
+                self.run_guarded(|| worker.verify_block(block).map_err(NodeError::from))
+            }
         }
     }
 
@@ -491,15 +584,20 @@ impl BlockPreverifier {
         }
     }
 
-    fn backend_status(&self) -> (&'static str, Option<u64>, Option<u64>) {
-        match &self.backend {
+    fn backend_status(&self) -> Result<(&'static str, Option<u64>, Option<u64>), NodeError> {
+        let backend = self
+            .backend
+            .read()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+        Ok(match &*backend {
+            ProofVerificationBackend::Unavailable => ("unavailable", None, None),
             ProofVerificationBackend::InProcess => ("in_process", None, None),
-            ProofVerificationBackend::External(config) => (
+            ProofVerificationBackend::External(worker) => (
                 "external_worker",
-                Some(config.timeout.as_millis().min(u128::from(u64::MAX)) as u64),
-                Some(config.memory_limit_bytes),
+                Some(worker.timeout().as_millis().min(u128::from(u64::MAX)) as u64),
+                Some(worker.memory_limit_bytes()),
             ),
-        }
+        })
     }
 }
 
@@ -1781,7 +1879,7 @@ impl Node {
         let (wallet_signing_key, legacy_shared_wallet) =
             load_or_create_wallet_key(&data_dir, metadata)?;
 
-        let block_preverifier = BlockPreverifier::new(verifier.clone());
+        let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
         let mut state = ChainState::new(params, verifier.clone())?;
         let mut index = BlockIndex::new(params.genesis_hash);
         replay_log(
@@ -1877,7 +1975,18 @@ impl Node {
         if configured_for_v3 != matches!(self.profile.proof, ProofProfile::ProductionV3) {
             return Err(NodeError::ProofVerifierProfileMismatch);
         }
-        self.block_preverifier.use_external_worker(config)?;
+        if configured_for_v3 {
+            let expected = compiled_production_v3_worker_sha256()?;
+            if config.worker_sha256 != expected {
+                return Err(NodeError::ProofVerifierWorker(
+                    VerifierWorkerError::Process(ProofWorkerError::HashMismatch {
+                        component: "compiled production verifier worker",
+                    }),
+                ));
+            }
+        }
+        self.block_preverifier
+            .use_external_worker(config, self.profile.network_id)?;
         Ok(())
     }
 
@@ -1904,7 +2013,7 @@ impl Node {
             proof_verification_mode,
             proof_verification_timeout_ms,
             proof_verification_memory_limit_bytes,
-        ) = self.block_preverifier.backend_status();
+        ) = self.block_preverifier.backend_status()?;
         Ok(NodeStatus {
             network: self.profile.name,
             network_short_name: self.profile.short_name(),
@@ -2866,13 +2975,17 @@ impl Node {
     }
 
     pub fn submit_block(&mut self, block: Block, accepted_at: u64) -> Result<u64, NodeError> {
+        if matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            let preverified = self.block_preverifier.preverify(&block)?;
+            return self.submit_block_with_preverification(block, accepted_at, Some(&preverified));
+        }
         self.submit_block_with_preverification(block, accepted_at, None)
     }
 
     /// Consumes process-local proof evidence produced outside the node lock.
     /// Every state-dependent consensus and durability check remains identical
     /// to [`Self::submit_block`].
-    pub fn submit_preverified_block(
+    pub(crate) fn submit_preverified_block(
         &mut self,
         block: Block,
         accepted_at: u64,
@@ -4551,6 +4664,30 @@ mod tests {
             Err(NodeError::ProofVerifierPanicked)
         ));
         assert_eq!(verifier.queue.counts().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn production_preverifier_clones_share_a_fail_closed_backend() {
+        let verifier = BlockPreverifier::new(
+            ConsensusPowVerifier::v2_reference(v2_test_reference().unwrap()),
+            ProofProfile::ProductionV3,
+        );
+        let clone_created_before_worker_install = verifier.clone();
+        assert_eq!(
+            verifier.backend_status().unwrap().0,
+            "unavailable",
+            "ProductionV3 must not expose an in-process fallback"
+        );
+
+        *verifier.backend.write().unwrap() = ProofVerificationBackend::InProcess;
+        assert_eq!(
+            clone_created_before_worker_install
+                .backend_status()
+                .unwrap()
+                .0,
+            "in_process",
+            "pre-install clones must observe the atomically installed backend"
+        );
     }
 
     fn mined_candidate(node: &Node, now: u64) -> Block {

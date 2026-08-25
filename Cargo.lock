@@ -1011,6 +1011,7 @@ dependencies = [
  "blake3",
  "cmfd-consensus",
  "cmfd-proof-accel",
+ "getrandom 0.3.4",
  "hex",
  "libc",
  "sha2",

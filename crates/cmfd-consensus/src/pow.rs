@@ -850,15 +850,29 @@ impl ConsensusPowVerifier {
         })
     }
 
+    /// Returns the verifier identity used by the external-preverification
+    /// capability protocol for this exact network. A persistent verifier uses
+    /// this during its startup handshake so a wrong-profile or wrong-model
+    /// worker is rejected before the node starts accepting peers.
+    pub fn external_preverification_identity(
+        &self,
+        network_id: [u8; 32],
+    ) -> Result<[u8; 32], PowError> {
+        self.preverification_identity(network_id)
+    }
+
     /// Issues the process-local capability after a trusted external verifier
     /// has accepted the exact bound statement.
     ///
     /// # Safety
     ///
     /// The caller must have obtained `binding` from a fail-closed verifier
-    /// process whose executable identity, canonical request/response, exit
-    /// status, execution time, memory, and output were independently bounded.
-    /// Calling this based only on untrusted bytes bypasses proof verification.
+    /// process whose executable identity, verifier profile, canonical
+    /// request/response, execution time, memory, and output were independently
+    /// bounded. A one-shot process must have exited successfully; a persistent
+    /// process must have completed its authenticated startup handshake and
+    /// remained live through the exact successful response. Calling this based
+    /// only on untrusted bytes bypasses proof verification.
     pub unsafe fn issue_external_preverification(
         &self,
         block: &BlockChallenge,

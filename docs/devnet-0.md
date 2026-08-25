@@ -367,10 +367,11 @@ valuable funds.
 
 ## Optional isolated proof verification
 
-The node can verify externally received Devnet blocks in a short-lived child
-instead of inside the long-running process. This is optional for Devnet. The
-same `cmfd-node` executable can act as its own hash-pinned worker, so no
-additional binary is required.
+The node can verify externally received Devnet blocks in a persistent contained
+child instead of inside the long-running process. This remains optional for
+Devnet. The same `cmfd-node` executable can act as its own hash-pinned worker,
+so no additional binary is required. The worker completes its startup identity
+self-test once and then serves canonical requests sequentially.
 
 On Windows PowerShell:
 
@@ -400,10 +401,12 @@ worker_hash="$(sha256sum "$worker" | cut -d ' ' -f 1)"
 
 Startup fails if the path is not absolute, the hash does not match, or either
 limit is zero. Node status reports `external_worker` plus the active limits.
-Each request rechecks the executable hash. Timeout, crash, invalid proof,
-malformed or oversized output, and response substitution reject only that
-candidate. The worker currently supports the active V2 Devnet verifier; the
-reserved V3 candidate remains disabled.
+The node runs a private synchronized copy and rechecks its hash before every
+process generation. Timeout, crash, malformed or oversized output, and response
+substitution kill that generation and reject the candidate; a later request
+must pass startup again. Invalid proofs are rejected without restarting a
+healthy generation. Devnet keeps its V2 verifier and never opts into V3 merely
+because an external worker was configured.
 
 ## Loopback RPC
 

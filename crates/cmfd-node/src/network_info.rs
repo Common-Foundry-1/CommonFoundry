@@ -111,6 +111,7 @@ struct ProductionV3ProofOfWorkIdentity {
     profile: &'static str,
     build_source_commit: &'static str,
     activation_evidence_sha256: String,
+    runtime_verifier_worker_sha256: String,
     wire_type: u16,
     pow_limit: String,
     algorithm_version: u32,
@@ -274,6 +275,9 @@ fn canonical_network_info_json_for_profile(
                 profile: profile.proof_name(),
                 build_source_commit,
                 activation_evidence_sha256: hex::encode(Sha256::digest(&activation_evidence)),
+                runtime_verifier_worker_sha256: hex::encode(
+                    crate::compiled_production_v3_worker_sha256()?,
+                ),
                 wire_type: POW_TYPE_V3_CANDIDATE,
                 pow_limit: hex::encode(params.pow_limit),
                 algorithm_version: parameters.algorithm_version(),

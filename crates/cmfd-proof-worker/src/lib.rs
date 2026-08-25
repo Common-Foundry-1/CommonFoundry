@@ -13,8 +13,9 @@ pub mod spill {
 mod verifier;
 
 pub use verifier::{
-    MAX_VERIFIER_REQUEST_BYTES, MAX_VERIFIER_RESPONSE_BYTES, ProductionV3VerifierArtifacts,
-    VerifierProtocolError, VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
+    MAX_VERIFIER_REQUEST_BYTES, MAX_VERIFIER_RESPONSE_BYTES, PersistentVerifierWorker,
+    ProductionV3VerifierArtifacts, VerifierProtocolError, VerifierWorkerConfig,
+    VerifierWorkerError, verify_block_out_of_process,
 };
 
 use std::ffi::{OsStr, OsString};
@@ -22,7 +23,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -434,14 +435,19 @@ struct Capture {
 
 struct ContainedChild {
     child: Child,
+    terminator: ProcessTerminator,
+}
+
+#[derive(Clone)]
+struct ProcessTerminator {
     #[cfg(unix)]
     process_group: libc::pid_t,
     #[cfg(windows)]
-    job: WindowsJob,
+    job: Arc<WindowsJob>,
 }
 
-impl ContainedChild {
-    fn terminate_tree(&mut self) {
+impl ProcessTerminator {
+    fn terminate_tree(&self) {
         #[cfg(unix)]
         // SAFETY: `process_group` is the positive child PID assigned as its
         // new process-group ID before spawn. Negating it targets that group,
@@ -451,6 +457,16 @@ impl ContainedChild {
         }
         #[cfg(windows)]
         let _ = self.job.terminate();
+    }
+}
+
+impl ContainedChild {
+    fn termination_handle(&self) -> ProcessTerminator {
+        self.terminator.clone()
+    }
+
+    fn terminate_tree(&mut self) {
+        self.terminator.terminate_tree();
 
         // Retain a direct-child fallback for setup/platform edge cases. The
         // process-group/job operation above is what contains descendants.
@@ -469,7 +485,11 @@ impl ContainedChild {
                 }
             }
             #[cfg(windows)]
-            let process_tree_reaped = self.job.active_processes().is_ok_and(|active| active == 0);
+            let process_tree_reaped = self
+                .terminator
+                .job
+                .active_processes()
+                .is_ok_and(|active| active == 0);
             #[cfg(not(windows))]
             let process_tree_reaped = direct_child_reaped;
 
@@ -494,6 +514,18 @@ impl Drop for ContainedChild {
 struct WindowsJob {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
+
+#[cfg(windows)]
+// SAFETY: a Windows Job Object handle is a process-wide kernel handle. This
+// wrapper owns it, never aliases mutable Rust state through the raw value, and
+// closes it exactly once in `Drop`, so transferring ownership between threads
+// is supported by the Win32 handle contract.
+unsafe impl Send for WindowsJob {}
+#[cfg(windows)]
+// SAFETY: Job Object operations accept a process-wide kernel handle and do not
+// expose aliased Rust memory. Concurrent terminate/query calls are supported by
+// the Win32 object contract, and the final Arc owner closes the handle once.
+unsafe impl Sync for WindowsJob {}
 
 #[cfg(windows)]
 impl WindowsJob {
@@ -650,18 +682,18 @@ fn spawn_contained(
         };
         Ok(ContainedChild {
             child,
-            process_group,
+            terminator: ProcessTerminator { process_group },
         })
     }
 
     #[cfg(windows)]
     {
-        let job = WindowsJob::create(memory_limit_bytes).map_err(|source| {
+        let job = Arc::new(WindowsJob::create(memory_limit_bytes).map_err(|source| {
             ProofWorkerError::Containment {
                 operation: "creating a Windows Job Object",
                 source,
             }
-        })?;
+        })?);
         let mut child = command.spawn().map_err(ProofWorkerError::Spawn)?;
         if let Err(source) = job.assign(&child) {
             let _ = child.kill();
@@ -671,7 +703,10 @@ fn spawn_contained(
                 source,
             });
         }
-        Ok(ContainedChild { child, job })
+        Ok(ContainedChild {
+            child,
+            terminator: ProcessTerminator { job },
+        })
     }
 
     #[cfg(not(any(unix, windows)))]

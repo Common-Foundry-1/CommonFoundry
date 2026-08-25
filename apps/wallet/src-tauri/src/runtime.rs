@@ -8,6 +8,7 @@ use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
 use cmfd_node::peer::PeerLimits;
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError, ProofProfile,
+    compiled_production_v3_worker_sha256, production_v3_package_layout,
 };
 use cmfd_proof_worker::{
     ProductionV3VerifierArtifacts, ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError,
@@ -20,7 +21,10 @@ mod config;
 mod peers;
 
 pub(crate) use config::{ConfigError, NodeRuntimeConfig, ProcessCommand};
-use config::{DEFAULT_PROOF_VERIFIER_MEMORY_BYTES, DEFAULT_PROOF_VERIFIER_TIMEOUT_MS};
+use config::{
+    DEFAULT_PROOF_VERIFIER_MEMORY_BYTES, DEFAULT_PROOF_VERIFIER_STARTUP_TIMEOUT_MS,
+    DEFAULT_PROOF_VERIFIER_TIMEOUT_MS,
+};
 pub(crate) use peers::{PeerManager, PeerSettings, UpdatePeerSettingsRequest};
 
 const STATIC_PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -232,6 +236,29 @@ fn prepare_node_security(
     profile: NetworkProfile,
     config: &NodeRuntimeConfig,
 ) -> Result<PreparedNodeSecurity, NodeClientError> {
+    if profile.proof != ProofProfile::ProductionV3 {
+        return prepare_node_security_with_package(profile, config, Path::new("."), None);
+    }
+    let package_executable = std::env::current_exe().map_err(|_| {
+        startup_error(
+            "production_v3_package_unavailable",
+            "The wallet could not resolve its signed package directory.",
+            false,
+        )
+    })?;
+    let expected_worker_sha256 = Some(
+        compiled_production_v3_worker_sha256()
+            .map_err(|error| sanitize_node_startup_error(profile, error))?,
+    );
+    prepare_node_security_with_package(profile, config, &package_executable, expected_worker_sha256)
+}
+
+fn prepare_node_security_with_package(
+    profile: NetworkProfile,
+    config: &NodeRuntimeConfig,
+    package_executable: &Path,
+    expected_worker_sha256: Option<[u8; 32]>,
+) -> Result<PreparedNodeSecurity, NodeClientError> {
     let options = &config.production_v3;
     match profile.proof {
         ProofProfile::DevnetV2Reference => {
@@ -252,45 +279,94 @@ fn prepare_node_security(
             })
         }
         ProofProfile::ProductionV3 => {
-            let (bank, manifest, record_v2, verifier_worker, verifier_worker_sha256) = match (
+            let expected_worker_sha256 = expected_worker_sha256.ok_or_else(|| {
+                startup_error(
+                    "proof_verifier_configuration",
+                    format!(
+                        "{} ({}) has no compiled proof-verifier worker identity.",
+                        profile.short_name(),
+                        profile.proof.profile_name()
+                    ),
+                    false,
+                )
+            })?;
+            if options
+                .verifier_worker_sha256
+                .is_some_and(|configured| configured != expected_worker_sha256)
+            {
+                return Err(startup_error(
+                    "proof_verifier_identity_mismatch",
+                    format!(
+                        "{} ({}) rejected a proof-verifier SHA-256 that does not match the compiled package pin.",
+                        profile.short_name(),
+                        profile.proof.profile_name()
+                    ),
+                    false,
+                ));
+            }
+            let path_override_count = [
                 options.bank.as_ref(),
                 options.manifest.as_ref(),
                 options.record_v2.as_ref(),
                 options.verifier_worker.as_ref(),
-                options.verifier_worker_sha256,
-            ) {
+            ]
+            .into_iter()
+            .filter(|value| value.is_some())
+            .count();
+            let (bank, manifest, record_v2, verifier_worker) = if path_override_count == 0 {
+                let layout = production_v3_package_layout(package_executable)
+                    .map_err(|error| sanitize_node_startup_error(profile, error))?;
                 (
-                    Some(bank),
-                    Some(manifest),
-                    Some(record_v2),
-                    Some(worker),
-                    Some(worker_sha256),
-                ) => (bank, manifest, record_v2, worker, worker_sha256),
-                _ => {
-                    return Err(startup_error(
-                        "production_v3_configuration_missing",
-                        format!(
-                            "{} ({}) requires explicit model-bank, manifest, Record V2, proof-verifier worker, and worker SHA-256 launch settings.",
-                            profile.short_name(),
-                            profile.proof.profile_name()
-                        ),
-                        false,
-                    ));
-                }
+                    layout.artifacts.bank,
+                    layout.artifacts.manifest,
+                    layout.artifacts.record_v2,
+                    layout.worker,
+                )
+            } else if path_override_count == 4 {
+                (
+                    options.bank.clone().expect("all four paths were counted"),
+                    options
+                        .manifest
+                        .clone()
+                        .expect("all four paths were counted"),
+                    options
+                        .record_v2
+                        .clone()
+                        .expect("all four paths were counted"),
+                    options
+                        .verifier_worker
+                        .clone()
+                        .expect("all four paths were counted"),
+                )
+            } else {
+                return Err(startup_error(
+                    "production_v3_configuration_missing",
+                    format!(
+                        "{} ({}) requires either the complete packaged sidecar layout or all four explicit artifact and worker paths.",
+                        profile.short_name(),
+                        profile.proof.profile_name()
+                    ),
+                    false,
+                ));
             };
 
             let artifacts = ProductionV3VerifierArtifacts {
-                bank: canonical_runtime_file(profile, "model bank", bank)?,
-                manifest: canonical_runtime_file(profile, "model-bank manifest", manifest)?,
-                record_v2: canonical_runtime_file(profile, "Record V2", record_v2)?,
+                bank: canonical_runtime_file(profile, "model bank", &bank)?,
+                manifest: canonical_runtime_file(profile, "model-bank manifest", &manifest)?,
+                record_v2: canonical_runtime_file(profile, "Record V2", &record_v2)?,
             };
             let worker = VerifierWorkerConfig {
                 worker_executable: canonical_runtime_file(
                     profile,
                     "proof-verifier worker",
-                    verifier_worker,
+                    &verifier_worker,
                 )?,
-                worker_sha256: verifier_worker_sha256,
+                worker_sha256: expected_worker_sha256,
+                startup_timeout: Duration::from_millis(
+                    options
+                        .verifier_startup_timeout_ms
+                        .unwrap_or(DEFAULT_PROOF_VERIFIER_STARTUP_TIMEOUT_MS),
+                ),
                 timeout: Duration::from_millis(
                     options
                         .verifier_timeout_ms
@@ -470,16 +546,20 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
     if profile.proof == ProofProfile::ProductionV3 {
         help.push_str(&format!(
             concat!(
-                "ProductionV3 startup (all file paths must be explicit and absolute):\n",
+                "ProductionV3 startup uses the fixed packaged sidecars beside the wallet when no paths are supplied.\n",
+                "Explicit overrides must be complete, absolute, and match the compiled pins:\n",
                 "  --production-v3-bank <path>                 Authenticated production model bank\n",
                 "  --production-v3-manifest <path>             Canonical model-bank manifest\n",
                 "  --production-v3-record-v2 <path>            Canonical Dory Record V2\n",
                 "  --proof-verifier-worker <path>               Hash-pinned verifier worker\n",
                 "  --proof-verifier-worker-sha256 <hex>         Exact worker SHA-256\n",
+                "  --proof-verifier-startup-timeout-ms <integer> Model authentication timeout (default {})\n",
                 "  --proof-verifier-timeout-ms <integer>        Worker timeout (default {})\n",
                 "  --proof-verifier-memory-bytes <integer>      Worker memory cap (default {})\n",
             ),
-            DEFAULT_PROOF_VERIFIER_TIMEOUT_MS, DEFAULT_PROOF_VERIFIER_MEMORY_BYTES
+            DEFAULT_PROOF_VERIFIER_STARTUP_TIMEOUT_MS,
+            DEFAULT_PROOF_VERIFIER_TIMEOUT_MS,
+            DEFAULT_PROOF_VERIFIER_MEMORY_BYTES
         ));
     }
     help
@@ -565,10 +645,25 @@ mod tests {
             record_v2: Some(files.write("record-v2.json", b"bounded Record V2 fixture")),
             verifier_worker: Some(files.write("cmfd-proof-worker.bin", b"bounded worker fixture")),
             verifier_worker_sha256: Some(worker_sha256),
+            verifier_startup_timeout_ms: Some(1_234),
             verifier_timeout_ms: Some(1_234),
             verifier_memory_bytes: Some(4_096),
         };
         config
+    }
+
+    fn prepare_for_test(
+        profile: NetworkProfile,
+        config: &NodeRuntimeConfig,
+        package_root: &Path,
+    ) -> Result<PreparedNodeSecurity, NodeClientError> {
+        let package_executable = package_root.join(format!(
+            "common-foundry-wallet{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let expected = (profile.proof == ProofProfile::ProductionV3)
+            .then(|| sha256(b"bounded worker fixture"));
+        prepare_node_security_with_package(profile, config, &package_executable, expected)
     }
 
     #[test]
@@ -612,33 +707,75 @@ mod tests {
     }
 
     #[test]
-    fn production_v3_requires_every_artifact_and_the_worker_pin() {
+    fn production_v3_no_argument_package_missing_and_partial_overrides_fail_closed() {
+        let files = TestFiles::new();
         let empty = base_config(RCNET1_PROFILE);
-        let error = security_error(prepare_node_security(RCNET1_PROFILE, &empty));
-        assert_eq!(error.code, "production_v3_configuration_missing");
+        let error = security_error(prepare_for_test(RCNET1_PROFILE, &empty, &files.root));
+        assert_eq!(error.code, "production_v3_file_unavailable");
         assert!(error.message.contains("RCNet-1 (ProductionV3)"));
 
-        let files = TestFiles::new();
         let mut partial = base_config(RCNET1_PROFILE);
         partial.production_v3.bank = Some(files.write("only.bank", b"bank"));
-        let error = security_error(prepare_node_security(RCNET1_PROFILE, &partial));
+        let error = security_error(prepare_for_test(RCNET1_PROFILE, &partial, &files.root));
         assert_eq!(error.code, "production_v3_configuration_missing");
     }
 
     #[test]
+    fn production_v3_no_argument_package_layout_resolves_fixed_sidecars() {
+        let files = TestFiles::new();
+        let artifact_root = files
+            .root
+            .join(cmfd_node::PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY);
+        fs::create_dir(&artifact_root).unwrap();
+        files.write(
+            &format!("cmfd-proof-worker{}", std::env::consts::EXE_SUFFIX),
+            b"bounded worker fixture",
+        );
+        fs::write(
+            artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_BANK),
+            b"bounded model bank fixture",
+        )
+        .unwrap();
+        fs::write(
+            artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_MANIFEST),
+            b"bounded manifest fixture",
+        )
+        .unwrap();
+        fs::write(
+            artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_RECORD_V2),
+            b"bounded Record V2 fixture",
+        )
+        .unwrap();
+
+        let security =
+            prepare_for_test(RCNET1_PROFILE, &base_config(RCNET1_PROFILE), &files.root).unwrap();
+        let artifacts = security.production_v3_artifacts.unwrap();
+        assert_eq!(
+            artifacts.bank,
+            fs::canonicalize(artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_BANK)).unwrap()
+        );
+        assert_eq!(
+            security.verifier_worker.unwrap().worker_sha256,
+            sha256(b"bounded worker fixture")
+        );
+    }
+
+    #[test]
     fn production_v3_rejects_relative_paths_without_echoing_them() {
+        let files = TestFiles::new();
         let mut config = base_config(RCNET1_PROFILE);
         config.production_v3 = config::ProductionV3RuntimeOptions {
             bank: Some(PathBuf::from("private/model.bank")),
             manifest: Some(PathBuf::from("private/manifest.json")),
             record_v2: Some(PathBuf::from("private/record-v2.json")),
             verifier_worker: Some(PathBuf::from("private/worker.exe")),
-            verifier_worker_sha256: Some([1; 32]),
+            verifier_worker_sha256: Some(sha256(b"bounded worker fixture")),
+            verifier_startup_timeout_ms: None,
             verifier_timeout_ms: None,
             verifier_memory_bytes: None,
         };
 
-        let error = security_error(prepare_node_security(RCNET1_PROFILE, &config));
+        let error = security_error(prepare_for_test(RCNET1_PROFILE, &config, &files.root));
         assert_eq!(error.code, "production_v3_path_invalid");
         assert!(!error.message.contains("private"));
         assert!(!error.message.contains("model.bank"));
@@ -649,7 +786,7 @@ mod tests {
         let files = TestFiles::new();
         let config = configured_rc(&files, [0; 32]);
 
-        let error = security_error(prepare_node_security(RCNET1_PROFILE, &config));
+        let error = security_error(prepare_for_test(RCNET1_PROFILE, &config, &files.root));
         assert_eq!(error.code, "proof_verifier_identity_mismatch");
         assert!(
             !error
@@ -663,7 +800,7 @@ mod tests {
         let files = TestFiles::new();
         let worker_bytes = b"bounded worker fixture";
         let config = configured_rc(&files, sha256(worker_bytes));
-        let security = prepare_node_security(RCNET1_PROFILE, &config).unwrap();
+        let security = prepare_for_test(RCNET1_PROFILE, &config, &files.root).unwrap();
         let artifacts = security.production_v3_artifacts.as_ref().unwrap();
         assert!(artifacts.bank.is_absolute());
         assert!(artifacts.manifest.is_absolute());
@@ -671,6 +808,7 @@ mod tests {
         let worker = security.verifier_worker.as_ref().unwrap();
         assert!(worker.worker_executable.is_absolute());
         assert_eq!(worker.production_v3_artifacts.as_ref(), Some(artifacts));
+        assert_eq!(worker.startup_timeout, Duration::from_millis(1_234));
         assert_eq!(worker.timeout, Duration::from_millis(1_234));
         assert_eq!(worker.memory_limit_bytes, 4_096);
 
@@ -721,7 +859,7 @@ mod tests {
     #[test]
     fn devnet_runtime_keeps_the_original_no_artifact_startup_path() {
         let config = base_config(DEVNET_PROFILE);
-        let security = prepare_node_security(DEVNET_PROFILE, &config).unwrap();
+        let security = prepare_for_test(DEVNET_PROFILE, &config, Path::new("unused")).unwrap();
         assert!(security.production_v3_artifacts.is_none());
         assert!(security.verifier_worker.is_none());
         assert!(!command_help_text_for_profile(DEVNET_PROFILE).contains("ProductionV3 startup"));
@@ -744,7 +882,7 @@ mod tests {
     fn devnet_rejects_production_inputs_instead_of_silently_ignoring_them() {
         let files = TestFiles::new();
         let config = configured_rc(&files, sha256(b"bounded worker fixture"));
-        let error = security_error(prepare_node_security(DEVNET_PROFILE, &config));
+        let error = security_error(prepare_for_test(DEVNET_PROFILE, &config, &files.root));
         assert_eq!(error.code, "production_v3_configuration_unexpected");
     }
 }

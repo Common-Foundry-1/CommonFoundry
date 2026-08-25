@@ -8,15 +8,24 @@ The worker independently rehashes the CUDA library immediately before loading
 it. A returned proof is never accepted until the parent runs the unchanged
 `verify_structured_blake3` CPU verifier over the exact response bytes.
 
-The same containment layer also supports operator-enabled block proof
-verification. The node sends one canonical bounded block plus identities for
-the exact verifier and statement. The child currently reconstructs only the
-active V2 Devnet verifier, verifies the proof, and echoes both identities.
-The parent issues a process-local preverification capability only after the
-hash-pinned child exits successfully within explicit wall-time, memory,
-stdout, and stderr limits. A release can use either the standalone worker or
-the same `cmfd-node` executable as the worker. V3 remains unsupported and
-therefore fails closed.
+The same containment layer supports block-proof verification in one persistent
+worker per node. Before P2P starts, the node copies the pinned executable into a
+private random runtime directory, starts it under the memory limit, and requires
+an exact profile, network, verifier-identity, and challenge-response self-test.
+For ProductionV3 the worker authenticates the bank, manifest, and Record V2 once
+at startup. It then handles bounded canonical block requests sequentially; the
+node's admission queue permits one active request and only a bounded number of
+waiters. No ProductionV3 failure can select the V2 Devnet verifier.
+
+Each request has its own deadline and response bounds. Timeout, crash, malformed
+protocol, identity mismatch, or internal worker failure kills that process tree
+and rejects the candidate. The next request may start only a new worker that
+passes the complete startup handshake. A canonical invalid-proof response is
+statement-local and does not poison an otherwise authenticated generation.
+Explicit shutdown uses a separate process-tree handle, so it does not wait
+behind an in-flight request. Stderr is retained only through 64 KiB; the reader
+terminates the process tree immediately on the first excess byte instead of
+waiting for a request timeout.
 
 The hash-pinned worker path has been exercised end to end with a 64-byte tree
 proof using the wired CUDA DFT/LDE and value-MMCS Poseidon2 first-digest path.
@@ -41,10 +50,17 @@ arguments; there is no environment or default-path selection and no CPU
 fallback after CUDA is selected.
 
 This boundary isolates ordinary worker crashes and many worker OOM failures
-from the parent. It is **not an OS sandbox**. In particular, it does not protect
-against a same-user attacker replacing the worker, CUDA DLL, or a transitive
-dependency between hashing and execution/loading. Production operators need an
-OS-enforced sandbox and file/ACL isolation if that attacker is in scope.
+from the parent. It is **not an OS sandbox**. The verifier runtime copy is hashed
+while it is copied, synchronized, made non-writable, and hashed again immediately
+before every execution. Both source metadata and bytes actually copied are
+bounded to 512 MiB. Its random directory is mode `0700` on Unix; Windows inherits
+the user's temporary-directory ACL and marks the file read-only. This narrows
+but does not eliminate a same-user check/exec race: the same user or an
+administrator can restore write access between the final hash and process
+creation, and the operating-system loader can still resolve an unpinned dynamic
+dependency after the executable check.
+Production packaging must use OS ACL/signing controls if that attacker is in
+scope. CUDA proof generation retains its separate caller-pinned DLL boundary.
 For proof generation the parent independently verifies returned proof bytes.
 For verifier mode, repeating verification in the parent would defeat the
 isolation, so the pinned worker outcome is explicitly trusted after the exact

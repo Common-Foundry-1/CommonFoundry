@@ -6,6 +6,7 @@ use cmfd_node::COMPILED_NETWORK_PROFILE;
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 
 pub(super) const DEFAULT_PROOF_VERIFIER_TIMEOUT_MS: u64 = 30_000;
+pub(super) const DEFAULT_PROOF_VERIFIER_STARTUP_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 pub(super) const DEFAULT_PROOF_VERIFIER_MEMORY_BYTES: u64 = 2_147_483_648;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub(super) struct ProductionV3RuntimeOptions {
     pub(super) record_v2: Option<PathBuf>,
     pub(super) verifier_worker: Option<PathBuf>,
     pub(super) verifier_worker_sha256: Option<[u8; 32]>,
+    pub(super) verifier_startup_timeout_ms: Option<u64>,
     pub(super) verifier_timeout_ms: Option<u64>,
     pub(super) verifier_memory_bytes: Option<u64>,
 }
@@ -46,6 +48,7 @@ impl ProductionV3RuntimeOptions {
             || self.record_v2.is_some()
             || self.verifier_worker.is_some()
             || self.verifier_worker_sha256.is_some()
+            || self.verifier_startup_timeout_ms.is_some()
             || self.verifier_timeout_ms.is_some()
             || self.verifier_memory_bytes.is_some()
     }
@@ -166,6 +169,14 @@ impl NodeRuntimeConfig {
                     set_sha256_option(
                         &mut production_v3.verifier_worker_sha256,
                         "--proof-verifier-worker-sha256",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-startup-timeout-ms" => {
+                    has_control_arg = true;
+                    set_positive_integer_option(
+                        &mut production_v3.verifier_startup_timeout_ms,
+                        "--proof-verifier-startup-timeout-ms",
                         arguments.next(),
                     )?;
                 }
@@ -583,6 +594,8 @@ mod tests {
             "C:\\rc\\cmfd-proof-worker.exe",
             "--proof-verifier-worker-sha256",
             "1111111111111111111111111111111111111111111111111111111111111111",
+            "--proof-verifier-startup-timeout-ms",
+            "600000",
             "--proof-verifier-timeout-ms",
             "45000",
             "--proof-verifier-memory-bytes",
@@ -596,6 +609,10 @@ mod tests {
         assert_eq!(
             config.production_v3.verifier_worker_sha256,
             Some([0x11; 32])
+        );
+        assert_eq!(
+            config.production_v3.verifier_startup_timeout_ms,
+            Some(600_000)
         );
         assert_eq!(config.production_v3.verifier_timeout_ms, Some(45_000));
         assert_eq!(

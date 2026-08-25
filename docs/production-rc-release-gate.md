@@ -13,8 +13,12 @@ SHA-256, fresh-process verifier binary SHA-256, and fresh-process verifier repor
 SHA-256. A production build must also receive the exact release checkout as
 the trusted `CMFD_BUILD_SOURCE_COMMIT` input. It must also pin the exact byte
 length, BLAKE3 digest, and SHA-256 digest of the production bank, manifest, and
-Record V2. The current source selection is Devnet/V2 with no activation
-evidence, artifact pins, or final production-network identity pin, so this
+Record V2, plus distinct Windows x86-64 and Linux x86-64 SHA-256 identities for
+the packaged persistent `cmfd-proof-worker`. The qualification evidence's
+`fresh_process_verifier_binary_sha256` identifies the `cmfd-consensus`
+qualification harness and must not be reused as the runtime-worker pin. The
+current source selection is Devnet/V2 with no activation evidence, artifact
+pins, runtime-worker pins, or final production-network identity pin, so this
 command must fail:
 
 ```text
@@ -85,3 +89,64 @@ the checked-out commit.
 Changing a label, branch name, archive name, or package name cannot satisfy
 these checks. Activation requires the real profile/proof integration and the
 committed qualification evidence; no override or fallback flag exists.
+
+## Runtime sidecar contract
+
+An activated RC node or wallet launched without artifact arguments resolves one
+fixed layout relative to its own executable directory:
+
+```text
+cmfd-node[.exe] or common-foundry-wallet[.exe]
+cmfd-proof-worker[.exe]
+production-v3/MODEL-V2.bank
+production-v3/MODEL-V2.manifest.json
+production-v3/DORY-V3-MODEL-RECORD-V2.json
+```
+
+Every path is canonicalized and must be a regular file. The existing compiled
+byte-length/BLAKE3/SHA-256 artifact gates authenticate the three model files.
+The selected platform's compiled worker SHA-256 authenticates the sidecar.
+Explicit paths are accepted only as one complete set and still must match those
+compiled identities. Startup never downloads, discovers, or invents a missing
+artifact.
+
+The worker hashes while copying the sidecar into a private runtime directory,
+synchronizes and makes that copy non-writable, then rehashes immediately before
+each execution. Source metadata and the streaming copy are both bounded to 512
+MiB so a mismatched package path cannot fill the runtime disk before its digest
+is rejected. This does not close the same-user loader race or pin transitive
+dynamic libraries; package ACLs/signatures remain a release responsibility.
+
+The worker pin is not source-circular with the node profile: the worker does not
+depend on `cmfd-node`, its release-profile constants, or
+`CMFD_BUILD_SOURCE_COMMIT`. The ceremony must nevertheless freeze its source,
+dependencies, features, versions, toolchain, target, and compiler flags; build
+and hash the ProductionV3 worker independently on Windows and Linux; insert only
+those hashes into the node profile; then rebuild both workers from clean target
+directories and require byte-identical hashes before building node/wallet
+packages.
+
+The current node still performs the existing retained-handle, two-pass artifact
+authentication once in the parent to construct its local consensus authority,
+then the persistent worker performs its own authentication once per process
+generation. Startup block-log replay also uses that parent authority before the
+worker handshake. Both happen before P2P and neither reloads the bank per live
+block, but they are not a single global artifact load. Reconstructing a stored
+side branch also replays that branch in-process under the node state lock, so a
+long branch can repeat V3 verification outside the worker limits. Removing
+these boundaries requires an external-only consensus authority and a replay
+protocol (or authenticated persisted validation cache) that establishes exact
+preverification capabilities without first minting local bank-authenticated
+authority; that design is not implemented here.
+
+The current 2 GiB worker memory-limit default is a containment setting, not a
+qualified production requirement. The final Windows and Linux package smoke
+must authenticate the real bank under the configured job/address-space limit,
+record peak RSS/commit and startup time, and raise or otherwise qualify the
+default before activation.
+
+The current Tauri/CI finalizer does not yet stage or inspect this runtime
+sidecar layout. A real ProductionV3 package is therefore still blocked until
+the final artifacts exist and packaging compares the staged worker bytes to the
+compiled `NETWORK-INFO.json` pin on both platforms. Unit package-layout fixtures
+do not substitute for that final packaged smoke test.

@@ -44,11 +44,13 @@ describe("NetworkView", () => {
     peerApi.get.mockReset().mockResolvedValue({
       peers: [bootstrap],
       bootstrap_peer: bootstrap,
+      default_peer_port: 18444,
       max_peers: 16,
     });
     peerApi.update.mockReset().mockImplementation(async (peers: string[]) => ({
       peers: peers.map((peer) => peer.includes(":") ? peer : `${peer}:18444`),
       bootstrap_peer: bootstrap,
+      default_peer_port: 18444,
       max_peers: 16,
     }));
   });
@@ -123,7 +125,7 @@ describe("NetworkView", () => {
       />,
     );
 
-    const input = view.getByPlaceholderText("203.0.113.20 or 203.0.113.20:18444");
+    const input = await view.findByPlaceholderText("203.0.113.20 or 203.0.113.20:18444");
     await waitFor(() => expect(input).toBeEnabled());
     await user.type(input, "192.168.1.20");
     await user.click(view.getByRole("button", { name: "Add peer" }));

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use cmfd_consensus::{
     Block, ConsensusPowVerifier, ExternalPreverificationBinding, MAX_BLOCK_BYTES,
-    PreverifiedBlockProof, decode_block, encode_block, v2_test_reference,
+    PreverifiedBlockProof, decode_block, encode_block, v2_reference_for_network,
 };
 use thiserror::Error;
 
@@ -331,7 +331,7 @@ fn run_verifier_worker() -> Result<ExternalPreverificationBinding, (u16, String)
 
     // The only active network verifier is the tiny V2 reference. V3 remains
     // deliberately fail-closed until its final parser and parameters exist.
-    let reference = v2_test_reference().map_err(|error| {
+    let reference = v2_reference_for_network(request.network_id).map_err(|error| {
         (
             ERROR_INTERNAL,
             format!("could not load V2 verifier: {error}"),
@@ -451,6 +451,7 @@ impl<'a> Cursor<'a> {
 mod tests {
     use cmfd_consensus::{
         BLOCK_VERSION, BlockChallenge, BlockProof, Coinbase, ForgeMatrixV3CandidateProof,
+        v2_test_reference,
     };
 
     use super::*;

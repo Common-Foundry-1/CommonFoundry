@@ -167,7 +167,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
                 </button>
               </div>
               <p className="peer-panel-help">
-                Add a numeric IP address. Port 18444 is used automatically when no port is entered.
+                Add a numeric IP address. Port {peerSettings?.default_peer_port ?? "—"} is used automatically when no port is entered.
               </p>
               <form className="peer-add-form" onSubmit={(event) => { event.preventDefault(); void addPeer(); }}>
                 <label className="sr-only" htmlFor="peer-address">Peer IP address</label>
@@ -176,7 +176,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
                   className="form-input form-input-mono"
                   value={peerInput}
                   onChange={(event) => setPeerInput(event.target.value)}
-                  placeholder="203.0.113.20 or 203.0.113.20:18444"
+                  placeholder={`203.0.113.20 or 203.0.113.20:${peerSettings?.default_peer_port ?? "port"}`}
                   autoComplete="off"
                   spellCheck={false}
                   disabled={!peerSettings || peerSaving}

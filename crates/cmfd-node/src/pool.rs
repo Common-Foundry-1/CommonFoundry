@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
     BlockChallenge, ConsensusPowVerifier, ForgeMatrixV2AcceleratorBatch,
-    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, PowError, v2_test_reference,
+    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, PowError, v2_reference_for_network,
 };
 use k256::schnorr::VerifyingKey;
 use rcgen::generate_simple_self_signed;
@@ -35,11 +35,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    MAX_MINING_SEARCH_ATTEMPTS, MiningJob, Node, NodeError, devnet_params, unix_time_seconds,
+    DEVNET_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, Node, NodeError, devnet_params,
+    unix_time_seconds,
 };
 
 pub const POOL_PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_POOL_ADDRESS: &str = "127.0.0.1:18445";
+pub const DEFAULT_POOL_SOCKET_ADDRESS: SocketAddr = DEVNET_PROFILE.pool_address();
 pub const DEFAULT_SHARE_LEADING_ZERO_BITS: u16 = 7;
 pub const DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE: u64 = 1;
 pub const POOL_MAX_FRAME_BYTES: usize = 16 * 1024;
@@ -280,7 +282,7 @@ impl PoolMiningWork {
                 "share target is harder than the immutable chain target".to_owned(),
             ));
         }
-        let reference = v2_test_reference().map_err(PowError::from)?;
+        let reference = v2_reference_for_network(params.network_id).map_err(PowError::from)?;
         Ok(Self {
             job,
             verifier: ConsensusPowVerifier::v2_reference(reference),

@@ -125,7 +125,7 @@ export function App() {
               ? (usesEmbeddedNode ? "Embedded node offline" : "RPC offline")
               : (usesEmbeddedNode ? "Embedded node connected" : "RPC connected")
           }</span>
-          <span>CommonFoundry Devnet-0</span>
+          <span>{data.status?.network ?? "Network unavailable"}</span>
           <span>Height {data.status?.accepted_height ?? "—"}</span>
           <span>{data.status?.storage_healthy ? "Storage healthy" : "Storage unavailable"}</span>
           <span className="statusbar-update">{data.lastUpdated ? `Updated ${data.lastUpdated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : "Waiting for node"}</span>

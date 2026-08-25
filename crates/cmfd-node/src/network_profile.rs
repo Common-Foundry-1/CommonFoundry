@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 /// consensus identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkProfile {
+    pub proof: ProofProfile,
     pub name: &'static str,
     pub network_id: [u8; 32],
     pub virtual_genesis_hash: [u8; 32],
@@ -20,7 +21,26 @@ pub struct NetworkProfile {
     pub wallet_data_dir_identity: &'static str,
 }
 
+/// Consensus proof relation selected by a network profile.
+///
+/// The launch-candidate value deliberately has no fallback to the tiny Devnet
+/// relation. Until a production V3 verifier is wired into `PowParameters` and
+/// `ConsensusPowVerifier`, selecting that profile must fail before node storage
+/// is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofProfile {
+    DevnetV2Reference,
+    ProductionV3,
+}
+
 impl NetworkProfile {
+    pub const fn proof_name(self) -> &'static str {
+        match self.proof {
+            ProofProfile::DevnetV2Reference => "ForgeMatrix-v2 tiny full-recompute reference",
+            ProofProfile::ProductionV3 => "ForgeMatrix-v3 production Dory",
+        }
+    }
+
     pub const fn rpc_address(self) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.rpc_port)
     }
@@ -39,6 +59,7 @@ impl NetworkProfile {
 }
 
 pub const DEVNET_PROFILE: NetworkProfile = NetworkProfile {
+    proof: ProofProfile::DevnetV2Reference,
     name: "CommonFoundry Devnet-0",
     network_id: [0x63; 32],
     virtual_genesis_hash: [0x47; 32],
@@ -50,3 +71,53 @@ pub const DEVNET_PROFILE: NetworkProfile = NetworkProfile {
     default_data_dir_identity: "commonfoundry-devnet0",
     wallet_data_dir_identity: "devnet-0",
 };
+
+/// Isolated rehearsal identity for the first launch-candidate network.
+///
+/// RCNet-1 is not mainnet and cannot currently start. Its identity, service
+/// ports, and storage paths are intentionally disjoint from Devnet-0 so a
+/// future production-V3 integration cannot accidentally reuse Devnet state.
+/// The production proof selector is the hard gate: code must never substitute
+/// the tiny V2 reference relation for this profile.
+pub const RCNET1_PROFILE: NetworkProfile = NetworkProfile {
+    proof: ProofProfile::ProductionV3,
+    name: "CommonFoundry RCNet-1",
+    network_id: [0x72; 32],
+    virtual_genesis_hash: [0x52; 32],
+    virtual_genesis_timestamp: 1_787_616_000,
+    rpc_port: 19_443,
+    p2p_port: 19_444,
+    pool_port: 19_445,
+    // RFC 5737 TEST-NET-1. A real bootstrap must be selected and published as
+    // part of the launch-candidate manifest before RCNet-1 is enabled.
+    bootstrap_ipv4: Ipv4Addr::new(192, 0, 2, 1),
+    default_data_dir_identity: "commonfoundry-rcnet1",
+    wallet_data_dir_identity: "rcnet-1",
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rcnet_is_identity_and_storage_isolated_from_devnet() {
+        assert_ne!(RCNET1_PROFILE.network_id, DEVNET_PROFILE.network_id);
+        assert_ne!(
+            RCNET1_PROFILE.virtual_genesis_hash,
+            DEVNET_PROFILE.virtual_genesis_hash
+        );
+        assert_ne!(RCNET1_PROFILE.rpc_port, DEVNET_PROFILE.rpc_port);
+        assert_ne!(RCNET1_PROFILE.p2p_port, DEVNET_PROFILE.p2p_port);
+        assert_ne!(RCNET1_PROFILE.pool_port, DEVNET_PROFILE.pool_port);
+        assert_ne!(
+            RCNET1_PROFILE.default_data_dir_identity,
+            DEVNET_PROFILE.default_data_dir_identity
+        );
+        assert_ne!(
+            RCNET1_PROFILE.wallet_data_dir_identity,
+            DEVNET_PROFILE.wallet_data_dir_identity
+        );
+        assert_eq!(RCNET1_PROFILE.proof, ProofProfile::ProductionV3);
+        assert_eq!(DEVNET_PROFILE.proof, ProofProfile::DevnetV2Reference);
+    }
+}

@@ -41,7 +41,7 @@ pub mod peer;
 pub mod pool;
 
 pub use network_info::canonical_network_info_json;
-pub use network_profile::{DEVNET_PROFILE, NetworkProfile};
+pub use network_profile::{DEVNET_PROFILE, NetworkProfile, ProofProfile, RCNET1_PROFILE};
 
 pub const DEVNET_NETWORK_ID: [u8; 32] = DEVNET_PROFILE.network_id;
 pub const DEVNET_GENESIS_HASH: [u8; 32] = DEVNET_PROFILE.virtual_genesis_hash;
@@ -100,6 +100,10 @@ pub enum NodeError {
     },
     #[error("network metadata is corrupt or unsupported")]
     InvalidMetadata,
+    #[error(
+        "CommonFoundry RCNet-1 requires the production V3 proof verifier; the tiny Devnet V2 relation is never used as a fallback"
+    )]
+    ProductionV3Unavailable,
     #[error("network metadata is missing while a nonempty block log already exists")]
     MissingMetadata,
     #[error("data directory belongs to a different immutable network fingerprint")]
@@ -208,6 +212,7 @@ impl NodeError {
             Self::DataDirLocked(_) => ("data_dir_locked", 409, false),
             Self::Io { .. } => ("storage_io", 500, false),
             Self::InvalidMetadata => ("invalid_metadata", 500, false),
+            Self::ProductionV3Unavailable => ("production_v3_unavailable", 503, false),
             Self::MissingMetadata => ("missing_metadata", 500, false),
             Self::FingerprintMismatch => ("fingerprint_mismatch", 409, false),
             Self::InvalidWalletKey => ("invalid_wallet_key", 500, false),
@@ -1141,6 +1146,7 @@ impl DataDirLock {
 
 pub struct Node {
     data_dir: PathBuf,
+    profile: NetworkProfile,
     params: NetworkParams,
     fingerprint: [u8; 32],
     wallet_signing_key: SigningKey,
@@ -1260,14 +1266,20 @@ struct BlockPreparationContext<'a> {
 }
 
 fn network_params_for_profile(profile: NetworkProfile) -> Result<NetworkParams, NodeError> {
-    let reference = v2_reference_for_network(profile.network_id).map_err(PowError::from)?;
+    let pow = match profile.proof {
+        ProofProfile::DevnetV2Reference => {
+            let reference = v2_reference_for_network(profile.network_id).map_err(PowError::from)?;
+            PowParameters::V2Reference(reference.descriptor())
+        }
+        ProofProfile::ProductionV3 => return Err(NodeError::ProductionV3Unavailable),
+    };
     let params = NetworkParams {
         network_id: profile.network_id,
         protocol_version: NETWORK_PROTOCOL_VERSION,
         genesis_hash: profile.virtual_genesis_hash,
         genesis_timestamp: profile.virtual_genesis_timestamp,
         pow_limit: target_with_leading_zero_bits(8),
-        pow: PowParameters::V2Reference(reference.descriptor()),
+        pow,
         monetary_policy: DEFAULT_MONETARY_POLICY,
         rewards: FixedRewardDestinations {
             // These deterministic keys are intentionally public and insecure.
@@ -1312,9 +1324,21 @@ pub fn unix_time_seconds() -> Result<u64, NodeError> {
 
 impl Node {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, NodeError> {
+        Self::open_with_profile(data_dir, DEVNET_PROFILE)
+    }
+
+    /// Opens the node on an explicit immutable network profile.
+    ///
+    /// RCNet-1 fails before acquiring a data-directory lock until the real V3
+    /// consensus verifier is available. This ordering prevents a failed RC
+    /// attempt from creating or modifying either RC or Devnet storage.
+    pub fn open_with_profile(
+        data_dir: impl AsRef<Path>,
+        profile: NetworkProfile,
+    ) -> Result<Self, NodeError> {
+        let params = network_params_for_profile(profile)?;
         let data_dir = data_dir.as_ref().to_path_buf();
         let lock = DataDirLock::acquire(&data_dir)?;
-        let params = devnet_params()?;
         let fingerprint = params.fingerprint()?;
         let metadata = load_metadata(&data_dir, fingerprint)?;
         let (wallet_signing_key, legacy_shared_wallet) =
@@ -1346,6 +1370,7 @@ impl Node {
 
         Ok(Self {
             data_dir,
+            profile,
             params,
             fingerprint,
             wallet_signing_key,
@@ -1366,6 +1391,10 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn network_profile(&self) -> NetworkProfile {
+        self.profile
     }
 
     pub fn block_preverifier(&self) -> BlockPreverifier {
@@ -1409,10 +1438,10 @@ impl Node {
             proof_verification_memory_limit_bytes,
         ) = self.block_preverifier.backend_status();
         Ok(NodeStatus {
-            network: DEVNET_PROFILE.name,
+            network: self.profile.name,
             network_id: hex::encode(self.params.network_id),
             consensus_fingerprint: hex::encode(self.fingerprint),
-            proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
+            proof_of_work: self.profile.proof_name(),
             tip: hex::encode(self.state.tip()),
             cumulative_work: hex::encode(chain_work_bytes(self.index.active_work)),
             accepted_height: self.state.next_height().saturating_sub(1),
@@ -1611,7 +1640,7 @@ impl Node {
         history.truncate(MAX_WALLET_HISTORY);
 
         Ok(WalletSnapshot {
-            network: DEVNET_PROFILE.name,
+            network: self.profile.name,
             devnet_only: true,
             insecure_demo_wallet: true,
             warning: self.wallet_warning(),
@@ -1739,7 +1768,7 @@ impl Node {
         }
         let entry = self.submit_transaction(transaction)?;
         Ok(WalletSendResponse {
-            network: DEVNET_PROFILE.name,
+            network: self.profile.name,
             devnet_only: true,
             insecure_demo_wallet: true,
             warning: self.wallet_warning(),
@@ -1835,7 +1864,7 @@ impl Node {
         let inputs_consolidated = transaction.inputs.len();
         let entry = self.submit_transaction(transaction)?;
         Ok(WalletConsolidateResponse {
-            network: DEVNET_PROFILE.name,
+            network: self.profile.name,
             devnet_only: true,
             insecure_demo_wallet: true,
             warning: self.wallet_warning(),
@@ -3008,7 +3037,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             json!({
                 "ok": false,
                 "storage_healthy": false,
-                "network": DEVNET_PROFILE.name
+                "network": node.profile.name
             }),
         ),
         ("GET", "/health") => RpcResponse::json(
@@ -3017,7 +3046,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             json!({
                 "ok": true,
                 "storage_healthy": true,
-                "network": DEVNET_PROFILE.name
+                "network": node.profile.name
             }),
         ),
         ("GET", "/v1/status") => match node.status() {
@@ -3091,7 +3120,9 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
                 }
             };
             match node.build_template(miner, now) {
-                Ok(template) => RpcResponse::json(200, "OK", template_json(&template)),
+                Ok(template) => {
+                    RpcResponse::json(200, "OK", template_json(&template, node.profile))
+                }
                 Err(NodeError::StorageFaulted) => {
                     RpcResponse::json_error(503, "Service Unavailable", NodeError::StorageFaulted)
                 }
@@ -3106,7 +3137,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
                     "Content-Type must be application/octet-stream",
                 );
             }
-            let transaction = match decode_transaction(&request.body, DEVNET_NETWORK_ID) {
+            let transaction = match decode_transaction(&request.body, node.params.network_id) {
                 Ok(transaction) => transaction,
                 Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
             };
@@ -3169,7 +3200,7 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             }
         }
         ("POST", "/v1/block") => {
-            let block = match decode_canonical_rpc_block(&request) {
+            let block = match decode_canonical_rpc_block(&request, node.params.network_id) {
                 Ok(block) => block,
                 Err(response) => return response,
             };
@@ -3193,7 +3224,11 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
 }
 
 fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) -> RpcResponse {
-    let block = match decode_canonical_rpc_block(&request) {
+    let network_id = match shared.lock() {
+        Ok(node) => node.params.network_id,
+        Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
+    };
+    let block = match decode_canonical_rpc_block(&request, network_id) {
         Ok(block) => block,
         Err(response) => return response,
     };
@@ -3223,7 +3258,10 @@ fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) ->
     }
 }
 
-fn decode_canonical_rpc_block(request: &RpcRequest) -> Result<Block, RpcResponse> {
+fn decode_canonical_rpc_block(
+    request: &RpcRequest,
+    network_id: [u8; 32],
+) -> Result<Block, RpcResponse> {
     if !has_octet_stream_content_type(request.content_type.as_deref()) {
         return Err(RpcResponse::json_error(
             415,
@@ -3231,7 +3269,7 @@ fn decode_canonical_rpc_block(request: &RpcRequest) -> Result<Block, RpcResponse
             "Content-Type must be application/octet-stream",
         ));
     }
-    let block = decode_block(&request.body, DEVNET_NETWORK_ID)
+    let block = decode_block(&request.body, network_id)
         .map_err(|error| RpcResponse::json_error(400, "Bad Request", error))?;
     match encode_block(&block) {
         Ok(canonical) if canonical == request.body => Ok(block),
@@ -3387,7 +3425,7 @@ fn validate_dev_mine_request(request: &DevMineRequest) -> Result<([u8; 32], u64)
     Ok((miner, request.attempts))
 }
 
-fn template_json(template: &BlockTemplate) -> serde_json::Value {
+fn template_json(template: &BlockTemplate, profile: NetworkProfile) -> serde_json::Value {
     let outputs: Vec<_> = template
         .coinbase
         .outputs
@@ -3405,8 +3443,8 @@ fn template_json(template: &BlockTemplate) -> serde_json::Value {
         })
         .collect();
     json!({
-        "network": DEVNET_PROFILE.name,
-        "proof_type": "forgematrix-v2-reference",
+        "network": profile.name,
+        "proof_type": profile.proof_name(),
         "block_version": BLOCK_VERSION,
         "network_id": hex::encode(template.challenge.network_id),
         "previous_block": hex::encode(template.challenge.previous_block),
@@ -4480,6 +4518,7 @@ mod tests {
         );
 
         const ALTERNATE_PROFILE: NetworkProfile = NetworkProfile {
+            proof: ProofProfile::DevnetV2Reference,
             name: "CommonFoundry profile-separation test",
             network_id: [0x64; 32],
             virtual_genesis_hash: [0x48; 32],
@@ -4512,6 +4551,22 @@ mod tests {
             ),
             Err(ChainError::PowParameterMismatch)
         ));
+    }
+
+    #[test]
+    fn rcnet_profile_fails_closed_without_touching_storage() {
+        let path = test_dir("rcnet-production-v3-gate");
+        clean_test_dir(&path);
+
+        assert!(matches!(
+            network_params_for_profile(RCNET1_PROFILE),
+            Err(NodeError::ProductionV3Unavailable)
+        ));
+        assert!(matches!(
+            Node::open_with_profile(&path, RCNET1_PROFILE),
+            Err(NodeError::ProductionV3Unavailable)
+        ));
+        assert!(!path.exists());
     }
 
     #[test]

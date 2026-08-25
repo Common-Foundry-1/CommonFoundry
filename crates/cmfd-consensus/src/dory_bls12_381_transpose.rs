@@ -7,18 +7,17 @@
 //! exposed to the commitment path.
 
 use std::{
-    fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use same_file::Handle;
 use thiserror::Error;
 
-use crate::dory_scratch_telemetry::{
-    register_scratch_artifact_reservation, release_scratch_artifact_reservation,
-};
+#[cfg(test)]
+use std::fs::OpenOptions;
+
+use crate::dory_scratch_telemetry::TrackedScratchFile;
 
 const MAGIC: [u8; 8] = *b"CFDBLST1";
 const VERSION: u16 = 1;
@@ -71,7 +70,7 @@ pub enum BlsDoryTransposeError {
 
 pub struct BlsDoryWordTransposeWriter {
     path: Option<PathBuf>,
-    file: File,
+    file: Option<TrackedScratchFile>,
     rows: usize,
     columns: usize,
     chunk_rows: usize,
@@ -100,19 +99,10 @@ impl BlsDoryWordTransposeWriter {
             "cmfd-dory-word-transpose-{}-{nonce}.bin",
             std::process::id()
         ));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        if let Err(error) = register_scratch_artifact_reservation(&path, geometry.total_bytes) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
-        }
+        let file = TrackedScratchFile::create_new(&path)?;
         let mut writer = Self {
             path: Some(path),
-            file,
+            file: Some(file),
             rows,
             columns,
             chunk_rows,
@@ -120,10 +110,10 @@ impl BlsDoryWordTransposeWriter {
             buffered_rows: 0,
             row_buffer,
         };
-        writer.file.set_len(geometry.total_bytes)?;
+        writer.file_mut()?.set_len(geometry.total_bytes)?;
         let header = encode_header(rows, columns, geometry.data_bytes, [0; 32])?;
-        writer.file.seek(SeekFrom::Start(0))?;
-        writer.file.write_all(&header)?;
+        writer.file_mut()?.seek(SeekFrom::Start(0))?;
+        writer.file_mut()?.write_all(&header)?;
         Ok(writer)
     }
 
@@ -149,20 +139,25 @@ impl BlsDoryWordTransposeWriter {
         if self.written_rows != self.rows {
             return Err(BlsDoryTransposeError::Incomplete);
         }
-        self.file.flush()?;
-        let snapshot = authenticate_file(&mut self.file, self.rows, self.columns)?;
-        self.file.seek(SeekFrom::Start(DIGEST_OFFSET))?;
-        self.file.write_all(&snapshot.digest)?;
-        self.file.flush()?;
+        self.file_mut()?.flush()?;
+        let rows = self.rows;
+        let columns = self.columns;
+        let snapshot = authenticate_file(self.file_mut()?, rows, columns)?;
+        self.file_mut()?.seek(SeekFrom::Start(DIGEST_OFFSET))?;
+        self.file_mut()?.write_all(&snapshot.digest)?;
+        self.file_mut()?.flush()?;
         let authentication_buffer_len = self
             .rows
             .min(AUTHENTICATION_BLOCK_ROWS)
             .checked_mul(WORD_BYTES as usize)
             .ok_or(BlsDoryTransposeError::InvalidShape)?;
         let authentication_buffer = zeroed_bytes(authentication_buffer_len)?;
-        let file = self.file.try_clone()?;
         let path = self
             .path
+            .take()
+            .ok_or(BlsDoryTransposeError::InvalidShape)?;
+        let file = self
+            .file
             .take()
             .ok_or(BlsDoryTransposeError::InvalidShape)?;
         Ok(BlsDoryWordTransposeArtifact {
@@ -209,8 +204,8 @@ impl BlsDoryWordTransposeWriter {
                         .ok_or(BlsDoryTransposeError::InvalidShape)?,
                 )
                 .ok_or(BlsDoryTransposeError::InvalidShape)?;
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.write_all(&encoded)?;
+            self.file_mut()?.seek(SeekFrom::Start(offset))?;
+            self.file_mut()?.write_all(&encoded)?;
         }
         self.written_rows = self
             .written_rows
@@ -220,19 +215,26 @@ impl BlsDoryWordTransposeWriter {
         self.row_buffer.clear();
         Ok(())
     }
+
+    fn file_mut(&mut self) -> Result<&mut TrackedScratchFile, BlsDoryTransposeError> {
+        self.file
+            .as_mut()
+            .ok_or(BlsDoryTransposeError::InvalidShape)
+    }
 }
 
 impl Drop for BlsDoryWordTransposeWriter {
     fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            remove_if_owned(path, &self.file);
+        if let Some(mut file) = self.file.take() {
+            let _ = file.remove_if_owned();
         }
+        self.path.take();
     }
 }
 
 pub struct BlsDoryWordTransposeArtifact {
     path: PathBuf,
-    file: File,
+    file: TrackedScratchFile,
     rows: usize,
     columns: usize,
     digest: [u8; 32],
@@ -403,7 +405,8 @@ impl BlsDoryWordTransposeArtifact {
 
 impl Drop for BlsDoryWordTransposeArtifact {
     fn drop(&mut self) {
-        remove_if_owned(&self.path, &self.file);
+        debug_assert_eq!(self.file.path(), self.path);
+        let _ = self.file.remove_if_owned();
     }
 }
 
@@ -497,7 +500,7 @@ fn authentication_block_digest(
 }
 
 fn validate_authenticated_header(
-    file: &mut File,
+    file: &mut TrackedScratchFile,
     rows: usize,
     columns: usize,
     digest: [u8; 32],
@@ -556,7 +559,7 @@ fn encode_header(
 }
 
 fn authenticate_file(
-    file: &mut File,
+    file: &mut TrackedScratchFile,
     rows: usize,
     columns: usize,
 ) -> Result<AuthenticationSnapshot, BlsDoryTransposeError> {
@@ -576,7 +579,7 @@ fn authenticate_file(
     }
     let mut hasher = blake3::Hasher::new_derive_key(HASH_DOMAIN);
     hasher.update(&prefix);
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file.try_clone()?);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file.try_clone_reader()?);
     reader.seek(SeekFrom::Start(HEADER_BYTES))?;
     let buffer_len = rows
         .min(AUTHENTICATION_BLOCK_ROWS)
@@ -625,18 +628,6 @@ fn authenticate_file(
         digest: *hasher.finalize().as_bytes(),
         block_digests,
     })
-}
-
-fn remove_if_owned(path: &Path, file: &File) {
-    let Ok(held) = file.try_clone().and_then(Handle::from_file) else {
-        return;
-    };
-    let Ok(live) = Handle::from_path(path) else {
-        return;
-    };
-    if held == live && std::fs::remove_file(path).is_ok() {
-        release_scratch_artifact_reservation(path);
-    }
 }
 
 #[cfg(test)]

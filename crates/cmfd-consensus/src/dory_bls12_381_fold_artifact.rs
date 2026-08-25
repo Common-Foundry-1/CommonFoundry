@@ -4,7 +4,6 @@
 //! enter Fiat-Shamir. A read, decode, length, or digest failure aborts the proof
 //! attempt; callers must not retry from an unauthenticated or dense fallback.
 
-use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,14 +13,14 @@ use dory_pcs::primitives::{
     arithmetic::Field,
     serialization::{Compress, Validate},
 };
-use same_file::Handle;
 use thiserror::Error;
+
+#[cfg(test)]
+use std::fs::OpenOptions;
 
 use crate::{
     dory_bls12_381_prototype::BlsDoryFr,
-    dory_scratch_telemetry::{
-        register_scratch_artifact_reservation, release_scratch_artifact_reservation,
-    },
+    dory_scratch_telemetry::{TrackedScratchFile, TrackedScratchReader},
 };
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSF2";
@@ -100,7 +99,7 @@ pub enum BlsDoryFoldArtifactError {
 
 pub struct BlsDoryFoldArtifactWriter {
     path: Option<PathBuf>,
-    file: Option<BufWriter<File>>,
+    file: Option<BufWriter<TrackedScratchFile>>,
     spec: BlsDoryFoldArtifactSpec,
     hasher: blake3::Hasher,
     written: u64,
@@ -124,17 +123,7 @@ impl BlsDoryFoldArtifactWriter {
             std::process::id(),
         ));
         let header = spec.encode()?;
-        let reserved_logical_bytes = spec.encoded_bytes()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        if let Err(error) = register_scratch_artifact_reservation(&path, reserved_logical_bytes) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
-        }
+        let file = TrackedScratchFile::create_new(&path)?;
         let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
@@ -183,17 +172,16 @@ impl BlsDoryFoldArtifactWriter {
         {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
-        let file = self
-            .file
-            .as_ref()
-            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?
-            .get_ref()
-            .try_clone()?;
         let path = self
             .path
             .take()
             .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
-        drop(self.file.take());
+        let file = self
+            .file
+            .take()
+            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?
+            .into_inner()
+            .map_err(|error| error.into_error())?;
         Ok(BlsDoryFoldArtifact {
             path,
             file,
@@ -202,7 +190,7 @@ impl BlsDoryFoldArtifactWriter {
         })
     }
 
-    fn file_mut(&mut self) -> Result<&mut BufWriter<File>, BlsDoryFoldArtifactError> {
+    fn file_mut(&mut self) -> Result<&mut BufWriter<TrackedScratchFile>, BlsDoryFoldArtifactError> {
         self.file
             .as_mut()
             .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)
@@ -211,15 +199,18 @@ impl BlsDoryFoldArtifactWriter {
 
 impl Drop for BlsDoryFoldArtifactWriter {
     fn drop(&mut self) {
-        if let (Some(path), Some(file)) = (&self.path, &self.file) {
-            remove_if_owned(path, file.get_ref());
+        if let Some(file) = self.file.take() {
+            let (mut file, buffered) = file.into_parts();
+            drop(buffered);
+            let _ = file.remove_if_owned();
         }
+        self.path.take();
     }
 }
 
 pub struct BlsDoryFoldArtifact {
     path: PathBuf,
-    file: File,
+    file: TrackedScratchFile,
     spec: BlsDoryFoldArtifactSpec,
     digest: [u8; 32],
 }
@@ -275,7 +266,7 @@ impl BlsDoryFoldArtifact {
     fn validate_live_file(
         &self,
         consume: impl FnOnce(
-            &mut BufReader<File>,
+            &mut BufReader<TrackedScratchReader>,
             &mut blake3::Hasher,
         ) -> Result<(), BlsDoryFoldArtifactError>,
     ) -> Result<(), BlsDoryFoldArtifactError> {
@@ -283,7 +274,7 @@ impl BlsDoryFoldArtifact {
         if self.file.metadata()?.len() != expected_len {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
-        let mut file = self.file.try_clone()?;
+        let mut file = self.file.try_clone_reader()?;
         file.seek(SeekFrom::Start(0))?;
         let mut reader = BufReader::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file);
         let mut header = [0u8; ARTIFACT_HEADER_BYTES];
@@ -314,7 +305,8 @@ impl BlsDoryFoldArtifact {
 
 impl Drop for BlsDoryFoldArtifact {
     fn drop(&mut self) {
-        remove_if_owned(&self.path, &self.file);
+        debug_assert_eq!(self.file.path(), self.path);
+        let _ = self.file.remove_if_owned();
     }
 }
 
@@ -346,18 +338,6 @@ fn decode_scalar(encoded: [u8; 32]) -> Result<BlsDoryFr, BlsDoryFoldArtifactErro
         return Err(BlsDoryFoldArtifactError::InvalidScalar);
     }
     Ok(scalar)
-}
-
-fn remove_if_owned(path: &Path, file: &File) {
-    let Ok(held) = file.try_clone().and_then(Handle::from_file) else {
-        return;
-    };
-    let Ok(live) = Handle::from_path(path) else {
-        return;
-    };
-    if held == live && std::fs::remove_file(path).is_ok() {
-        release_scratch_artifact_reservation(path);
-    }
 }
 
 #[cfg(test)]

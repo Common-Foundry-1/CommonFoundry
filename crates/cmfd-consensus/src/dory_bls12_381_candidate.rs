@@ -1120,7 +1120,7 @@ pub(crate) fn verify_bls_dory_v3_layout_v5_candidate(
 /// Verify the complete Layout V5/native-BLAKE3 relation without applying the
 /// block target. This is the V3 counterpart of the pool-share relation check;
 /// the target remains part of the challenge and transcript.
-#[cfg(feature = "whir-prototype")]
+#[cfg(feature = "dory-v3-consensus-adapter")]
 pub(crate) fn verify_bls_dory_v3_layout_v5_candidate_relation(
     network_id: [u8; 32],
     authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,

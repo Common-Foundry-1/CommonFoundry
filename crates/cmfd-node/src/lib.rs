@@ -34,11 +34,13 @@ use serde_json::json;
 use thiserror::Error;
 
 pub mod logging;
+pub mod network_info;
 pub mod network_profile;
 pub mod p2p;
 pub mod peer;
 pub mod pool;
 
+pub use network_info::canonical_network_info_json;
 pub use network_profile::{DEVNET_PROFILE, NetworkProfile};
 
 pub const DEVNET_NETWORK_ID: [u8; 32] = DEVNET_PROFILE.network_id;

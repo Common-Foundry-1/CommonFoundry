@@ -598,6 +598,9 @@ enum Command {
         /// Existing absolute canonical persisted proof wire.
         #[arg(long, value_parser = parse_absolute_path)]
         proof: std::path::PathBuf,
+        /// New absolute human-readable verifier report. Existing paths are never overwritten.
+        #[arg(long, value_parser = parse_absolute_path)]
+        report_output: std::path::PathBuf,
     },
 }
 
@@ -1816,9 +1819,11 @@ fn run_cli() -> Result<()> {
             record,
             request,
             proof,
+            report_output,
         } => {
-            let report = run_production_dory_v3_verifier(&bank, &record, &request, &proof)
-                .context("production Dory V3 persisted-proof verification failed")?;
+            let report =
+                run_production_dory_v3_verifier(&bank, &record, &request, &proof, &report_output)
+                    .context("production Dory V3 persisted-proof verification failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
@@ -2133,12 +2138,13 @@ mod tests {
 
     #[cfg(feature = "whir-prototype")]
     #[test]
-    fn dory_v3_verify_qualification_cli_requires_only_absolute_verifier_inputs() {
+    fn dory_v3_verify_qualification_cli_requires_absolute_paths_and_report_output() {
         let directory = std::env::current_dir().unwrap();
         let bank = directory.join("model.cmfdmb02");
         let record = directory.join("record-v2.json");
         let request = directory.join("qualification-request.json");
         let proof = directory.join("proof.cmfd");
+        let report_output = directory.join("fresh-verifier-report.json");
         let valid_args = || {
             vec![
                 "cmfd-consensus".into(),
@@ -2151,6 +2157,8 @@ mod tests {
                 request.clone().into_os_string(),
                 "--proof".into(),
                 proof.clone().into_os_string(),
+                "--report-output".into(),
+                report_output.clone().into_os_string(),
             ]
         };
 
@@ -2161,11 +2169,13 @@ mod tests {
                 record: parsed_record,
                 request: parsed_request,
                 proof: parsed_proof,
+                report_output: parsed_report_output,
             } => {
                 assert_eq!(parsed_bank, bank);
                 assert_eq!(parsed_record, record);
                 assert_eq!(parsed_request, request);
                 assert_eq!(parsed_proof, proof);
+                assert_eq!(parsed_report_output, report_output);
             }
             other => panic!("unexpected parsed command: {other:?}"),
         }
@@ -2176,7 +2186,13 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
-        for required in ["--bank", "--record", "--request", "--proof"] {
+        for required in [
+            "--bank",
+            "--record",
+            "--request",
+            "--proof",
+            "--report-output",
+        ] {
             assert!(help.contains(required), "missing help option {required}");
         }
         for forbidden in ["--scratch", "--proof-output", "--private-key"] {
@@ -2186,5 +2202,13 @@ mod tests {
         let mut relative_proof = valid_args();
         relative_proof[9] = "proof.cmfd".into();
         assert!(Cli::try_parse_from(relative_proof).is_err());
+
+        let mut relative_report = valid_args();
+        relative_report[11] = "fresh-verifier-report.json".into();
+        assert!(Cli::try_parse_from(relative_report).is_err());
+
+        let mut missing_report = valid_args();
+        missing_report.truncate(missing_report.len() - 2);
+        assert!(Cli::try_parse_from(missing_report).is_err());
     }
 }

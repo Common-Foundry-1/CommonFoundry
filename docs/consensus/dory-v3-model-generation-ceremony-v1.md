@@ -2246,7 +2246,10 @@ type-5 ceremony prefix.
 
 After `dory-v3-qualify` persists the proof, run a second, fresh process with the
 feature-gated `dory-v3-verify-qualification` command and the exact same bank,
-Record V2, request, and proof paths. The verifier caps the request at 16 KiB,
+Record V2, request, and proof paths. Supply a new absolute `--report-output`
+path. The verifier creates that human-readable JSON only after successful
+verification, refuses an existing path, synchronizes and reopens the file, and
+checks its exact bytes before reporting success. The verifier caps the request at 16 KiB,
 Record V2 at 64 KiB, and the proof at the consensus proof limit before decoding.
 It requires canonical V3, `CFV3CP02`, and Layout V5 encodings, reauthenticates
 the complete bank, reproduces the supplied Record V2, checks every request and
@@ -2256,6 +2259,28 @@ stage timings, exact wire sizes, and the process-lifetime peak RSS. Run it in a
 fresh process so that RSS is an isolated verifier measurement. This command
 does not prove, publish, mine, create a chain-admission capability, or change an
 activation flag.
+
+Windows PowerShell:
+
+```text
+.\target\release\cmfd-consensus.exe dory-v3-verify-qualification `
+  --bank D:\qualification\MODEL-V2.bank `
+  --record D:\qualification\DORY-V3-MODEL-RECORD-V2.json `
+  --request D:\qualification\qualification-request.json `
+  --proof D:\qualification\qualification-proof.cmfd `
+  --report-output D:\qualification\fresh-verifier-report.json
+```
+
+Linux:
+
+```text
+./target/release/cmfd-consensus dory-v3-verify-qualification \
+  --bank /qualification/MODEL-V2.bank \
+  --record /qualification/DORY-V3-MODEL-RECORD-V2.json \
+  --request /qualification/qualification-request.json \
+  --proof /qualification/qualification-proof.cmfd \
+  --report-output /qualification/fresh-verifier-report.json
+```
 
 At the frozen production geometry, request generation reads the
 `6,442,975,416`-byte bank twice, performs `824,633,720,832` integer

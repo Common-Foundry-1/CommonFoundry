@@ -847,7 +847,9 @@ pub fn run_production_dory_v3_verifier(
     record_path: &Path,
     request_path: &Path,
     proof_path: &Path,
+    report_output: &Path,
 ) -> Result<ProductionDoryV3VerifierReport, ProductionDoryV3QualificationError> {
+    let report_output = preflight_verifier_report_output(report_output)?;
     let verifier_started = Instant::now();
 
     let parse_started = Instant::now();
@@ -888,7 +890,7 @@ pub fn run_production_dory_v3_verifier(
     let whole_process_peak_rss_bytes =
         peak_whole_process_rss_bytes().map_err(ProductionDoryV3QualificationError::MemoryQuery)?;
 
-    Ok(ProductionDoryV3VerifierReport {
+    let report = ProductionDoryV3VerifierReport {
         report_version: VERIFIER_REPORT_VERSION,
         network_id: Digest32::new(request.block.network_id),
         block_height: request.block.height,
@@ -910,7 +912,11 @@ pub fn run_production_dory_v3_verifier(
         whole_process_peak_rss_bytes,
         whole_process_peak_rss_scope: "OS process-lifetime high-water mark; run the verifier CLI in a fresh process for an isolated measurement",
         verifier_only: true,
-    })
+    };
+    let mut report_bytes = serde_json::to_vec_pretty(&report)?;
+    report_bytes.push(b'\n');
+    write_verified_output(&report_output, &report_bytes)?;
+    Ok(report)
 }
 
 #[derive(Deserialize)]
@@ -1014,6 +1020,19 @@ impl QualificationPaths {
             report_output,
         })
     }
+}
+
+fn preflight_verifier_report_output(
+    report_output: &Path,
+) -> Result<PathBuf, ProductionDoryV3QualificationError> {
+    if !report_output.is_absolute() {
+        return Err(ProductionDoryV3QualificationError::Configuration(
+            "verifier report output path must be absolute",
+        ));
+    }
+    let report_output = resolve_new_path(report_output)?;
+    ensure_path_absent(&report_output)?;
+    Ok(report_output)
 }
 
 fn resolve_new_path(path: &Path) -> Result<PathBuf, ProductionDoryV3QualificationError> {
@@ -1867,7 +1886,7 @@ fn write_verified_output(
     let parent = output_path
         .parent()
         .ok_or(ProductionDoryV3QualificationError::Configuration(
-            "request output must have a parent directory",
+            "output must have a parent directory",
         ))?;
     sync_output_parent_directory(parent)?;
     outputs.confirm();
@@ -2213,6 +2232,23 @@ mod tests {
         assert!(matches!(
             QualificationRequestPaths::preflight(&scratch, &output),
             Err(ProductionDoryV3QualificationError::PathExists(path)) if path == output
+        ));
+    }
+
+    #[test]
+    fn verifier_report_output_requires_a_new_absolute_path() {
+        let directory = TestDirectory::create();
+        let report = directory.0.join("fresh-verifier-report.json");
+        assert_eq!(preflight_verifier_report_output(&report).unwrap(), report);
+        assert!(matches!(
+            preflight_verifier_report_output(Path::new("relative-report.json")),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+
+        fs::write(&report, b"existing").unwrap();
+        assert!(matches!(
+            preflight_verifier_report_output(&report),
+            Err(ProductionDoryV3QualificationError::PathExists(path)) if path == report
         ));
     }
 
@@ -2566,18 +2602,21 @@ mod tests {
         let mut wrong_request = original_request;
         wrong_request.nonce += 1;
         let request_path = directory.0.join("wrong-request.json");
+        let report_path = directory.0.join("fresh-verifier-report.json");
         fs::write(&request_path, serde_json::to_vec(&wrong_request).unwrap()).unwrap();
         let error = run_production_dory_v3_verifier(
             &directory.0.join("unused-bank.cmfdmb02"),
             &directory.0.join("unused-record-v2.json"),
             &request_path,
             &proof_path,
+            &report_path,
         )
         .unwrap_err();
         assert!(matches!(
             error,
             ProductionDoryV3QualificationError::ProofRequestMismatch("nonce")
         ));
+        assert!(!report_path.exists());
     }
 
     #[test]

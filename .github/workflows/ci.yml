@@ -114,7 +114,7 @@ jobs:
           --no-default-features --features dory-bls12-381-prototype,whir-prototype
           tests::dory_v3_verify_qualification_cli_requires_absolute_paths_and_report_output
           -- --exact
-      - name: Require absolute Dory V3 qualification CLI paths
+      - name: Require absolute Dory V3 qualification CLI paths and journal
         run: >-
           cargo test --locked -p cmfd-consensus --bin cmfd-consensus
           --no-default-features --features dory-bls12-381-prototype,whir-prototype

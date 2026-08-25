@@ -218,7 +218,6 @@ impl AuthenticatedInput {
         parent.validate_child(path)?;
         parent.recheck()?;
         let opened = (|| {
-            validate_input_path_type(path)?;
             let file = open_input_no_follow(path).map_err(|source| CeremonyFsError::OpenInput {
                 path: path.to_path_buf(),
                 source,
@@ -660,20 +659,6 @@ fn validate_parent_handle(path: &Path, file: &File) -> Result<(), CeremonyFsErro
         })? {
             return Err(CeremonyFsError::UnsafeParent(path.to_path_buf()));
         }
-    }
-    Ok(())
-}
-
-fn validate_input_path_type(path: &Path) -> Result<(), CeremonyFsError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| CeremonyFsError::OpenInput {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata_is_reparse_point(&metadata) {
-        return Err(CeremonyFsError::InputReparsePoint(path.to_path_buf()));
-    }
-    if !metadata.file_type().is_file() {
-        return Err(CeremonyFsError::InputNotRegular(path.to_path_buf()));
     }
     Ok(())
 }

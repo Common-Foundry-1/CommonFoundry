@@ -144,7 +144,7 @@ enum Command {
         #[arg(long)]
         private_key: PathBuf,
     },
-    /// Run the authenticated, non-Stratum reference pool service.
+    /// Run the authenticated Devnet-0 pool; Production V3 fails closed as unsupported.
     PoolServe {
         #[arg(long, default_value_t = DEFAULT_POOL_SOCKET_ADDRESS)]
         bind: SocketAddr,

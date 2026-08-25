@@ -20,7 +20,14 @@ use crate::{
         verify_bls_dory_v3_layout_v5_candidate_relation,
     },
     dory_bls12_381_execution_provider::{
-        BlsDoryV3WinningNonceClaim, prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim,
+        BlsDoryV3WinningNonceClaim,
+        prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model,
+        prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim,
+        validate_dory_v3_replay_claim,
+    },
+    dory_bls12_381_layout::{
+        BlsDoryPreparedFixedModelV5,
+        prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch_and_cancel,
     },
     dory_bls12_381_prototype::DeterministicBlsDorySetup,
     dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
@@ -28,6 +35,7 @@ use crate::{
         DORY_V3_ALGORITHM_VERSION, DORY_V3_PROOF_VERSION, DORY_V3_SETUP_IDENTITY,
         production_dory_v3_suite_digest,
     },
+    dory_v3_transcript::{DoryV3TranscriptContext, dory_v3_mask_coefficients},
 };
 
 pub const POW_TYPE_V1_LEGACY: u16 = 1;
@@ -40,6 +48,8 @@ pub const POW_TYPE_V3_CANDIDATE: u16 = 3;
 /// must still select and report an explicit nonzero value for every run.
 #[cfg(feature = "dory-v3-consensus-adapter")]
 pub const MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS: usize = 131_072;
+#[cfg(feature = "dory-v3-consensus-adapter")]
+pub const MAX_PRODUCTION_V3_ACCELERATOR_BATCH: u32 = 64;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const FORGEMATRIX_V3_BLOCK_ID_PROOF_FIELDS: &str = "pow_type_u16le,algorithm_version_u32le,proof_version_u32le,nonce_u64le,model_manifest_digest[32],challenge_digest[32],final_activation_digest[32],work_digest[32],structured_length_u64le,structured_bytes";
 const PREVERIFIED_VERIFIER_DOMAIN: &str = "CMFD/POW/PREVERIFIED-VERIFIER/V1";
@@ -85,6 +95,64 @@ pub struct ForgeMatrixV3WinningNonceClaim {
     nonce: u64,
     final_activation_digest: [u8; 32],
     work_digest: [u8; 32],
+}
+
+/// Exact transcript coefficients for a bounded batch of Production V3 nonces.
+///
+/// Fields are private so an accelerator cannot detach outputs from the block,
+/// network, and authenticated model identities used to derive its masks.
+#[cfg(feature = "dory-v3-consensus-adapter")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMatrixV3AcceleratorBatch {
+    block: BlockChallenge,
+    model_record_digest: [u8; 32],
+    model_identity_digest: [u8; 32],
+    start_nonce: u64,
+    count: u32,
+    activation_len: usize,
+    coefficients: Vec<u8>,
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+impl ForgeMatrixV3AcceleratorBatch {
+    pub const fn start_nonce(&self) -> u64 {
+        self.start_nonce
+    }
+
+    pub const fn count(&self) -> u32 {
+        self.count
+    }
+
+    pub const fn activation_len(&self) -> usize {
+        self.activation_len
+    }
+
+    pub fn coefficients(&self) -> &[u8] {
+        &self.coefficients
+    }
+
+    pub fn nonce_at(&self, index: usize) -> Option<u64> {
+        (index < self.count as usize).then(|| self.start_nonce.wrapping_add(index as u64))
+    }
+}
+
+/// Reusable fixed-model prover state prepared once from the authenticated
+/// production bank and shared by every immutable mining job in the process.
+#[cfg(feature = "dory-v3-consensus-adapter")]
+#[derive(Clone)]
+pub struct PreparedForgeMatrixV3Model {
+    parameters: ForgeMatrixV3CandidateParameters,
+    prepared: Arc<BlsDoryPreparedFixedModelV5>,
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+impl fmt::Debug for PreparedForgeMatrixV3Model {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedForgeMatrixV3Model")
+            .field("parameters", &self.parameters)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
@@ -497,8 +565,100 @@ impl ConsensusPowVerifier {
         let Self::V3Candidate(verifier) = self else {
             return Err(PowError::WrongProofType);
         };
-        verifier.validate_winning_nonce_claim_identity(block, claim)?;
+        let cancel = AtomicBool::new(false);
+        verifier.validate_winning_nonce_claim(block, claim, &cancel)?;
         Ok(())
+    }
+
+    /// Derive the exact virtual-input and 384 transition masks consumed by the
+    /// authenticated production CUDA evaluator for a bounded nonce batch.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    pub fn prepare_v3_accelerator_batch(
+        &self,
+        block: &BlockChallenge,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV3AcceleratorBatch, PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.prepare_accelerator_batch(block, start_nonce, count)
+    }
+
+    /// Authenticate one accelerator output against the exact batch statement.
+    /// High work is a normal non-winning result; malformed or mismatched
+    /// batches fail closed.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    pub fn v3_winning_nonce_claim_from_accelerator_batch_output(
+        &self,
+        block: &BlockChallenge,
+        batch: &ForgeMatrixV3AcceleratorBatch,
+        index: usize,
+        final_activation: &[u8],
+    ) -> Result<Option<ForgeMatrixV3WinningNonceClaim>, PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.winning_nonce_claim_from_accelerator_batch_output(
+            block,
+            batch,
+            index,
+            final_activation,
+        )
+    }
+
+    /// Authenticate and prepare the fixed production model once. The returned
+    /// capability can be cheaply cloned across immutable mining work.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    pub fn prepare_v3_fixed_model<FixedModelBank: Read>(
+        &self,
+        fixed_model_bank: FixedModelBank,
+        scratch_directory: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<PreparedForgeMatrixV3Model, PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        if !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
+            return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+        }
+        let (authenticated, setup) = verifier.production_authority()?;
+        let prepared =
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch_and_cancel(
+                fixed_model_bank,
+                authenticated,
+                setup,
+                scratch_directory,
+                cancel,
+            )
+            .map_err(BlsDoryV3CandidateError::from)?;
+        if !prepared.is_bound_to_bank_authenticated_record(authenticated) {
+            return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+        }
+        Ok(PreparedForgeMatrixV3Model {
+            parameters: verifier.parameters,
+            prepared: Arc::new(prepared),
+        })
+    }
+
+    /// Borrow the exact non-serializable authority that authenticated this
+    /// production verifier. Accelerator initialization may use this capability
+    /// to authenticate a resident model once; loose records cannot construct
+    /// it or bypass the pinned artifact gate.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    pub fn v3_production_authority(
+        &self,
+    ) -> Result<
+        (
+            &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            &DeterministicBlsDorySetup,
+        ),
+        PowError,
+    > {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.production_authority()
     }
 
     /// Convert one accelerator-produced final activation into a typed winning
@@ -550,7 +710,7 @@ impl ConsensusPowVerifier {
         let Self::V3Candidate(verifier) = self else {
             return Err(PowError::WrongProofType);
         };
-        verifier.validate_winning_nonce_claim_identity(block, claim)?;
+        verifier.validate_winning_nonce_claim(block, claim, cancel)?;
         if maximum_native_block_rows == 0
             || maximum_native_block_rows > MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS
         {
@@ -576,6 +736,49 @@ impl ConsensusPowVerifier {
             },
             setup,
             fixed_model_bank,
+            replay_bank,
+            scratch_directory,
+            maximum_native_block_rows,
+            cancel,
+        )?;
+        Ok(BlockProof::V3Candidate(Box::new(proof)))
+    }
+
+    /// Prove one winning claim with process-reusable fixed-model state. Claim
+    /// and target validation happens before the replay reader is touched.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_v3_winning_nonce_claim_with_prepared_model<ReplayBank: Read>(
+        &self,
+        block: &BlockChallenge,
+        claim: ForgeMatrixV3WinningNonceClaim,
+        prepared_model: &PreparedForgeMatrixV3Model,
+        replay_bank: ReplayBank,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+        cancel: &AtomicBool,
+    ) -> Result<BlockProof, PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.validate_winning_nonce_claim(block, claim, cancel)?;
+        if prepared_model.parameters != verifier.parameters
+            || maximum_native_block_rows == 0
+            || maximum_native_block_rows > MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS
+        {
+            return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+        }
+        let (authenticated, setup) = verifier.production_authority()?;
+        let proof = prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model(
+            authenticated,
+            block,
+            BlsDoryV3WinningNonceClaim {
+                nonce: claim.nonce,
+                final_activation_digest: claim.final_activation_digest,
+                work_digest: claim.work_digest,
+            },
+            setup,
+            prepared_model.prepared.as_ref(),
             replay_bank,
             scratch_directory,
             maximum_native_block_rows,
@@ -845,6 +1048,129 @@ impl ConsensusPowVerifier {
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
 impl ForgeMatrixV3ConsensusVerifier {
+    fn production_authority(
+        &self,
+    ) -> Result<
+        (
+            &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            &DeterministicBlsDorySetup,
+        ),
+        PowError,
+    > {
+        match &self.authority {
+            ForgeMatrixV3VerifierAuthority::Production {
+                authenticated,
+                setup,
+            } => Ok((authenticated, setup)),
+            #[cfg(test)]
+            ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => {
+                Err(BlsDoryV3CandidateError::ProverConfiguration.into())
+            }
+        }
+    }
+
+    fn prepare_accelerator_batch(
+        &self,
+        block: &BlockChallenge,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV3AcceleratorBatch, PowError> {
+        if count == 0 || count > MAX_PRODUCTION_V3_ACCELERATOR_BATCH {
+            return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+        }
+        let (authenticated, _) = self.production_authority()?;
+        let transcript = DoryV3TranscriptContext::from_bank_authenticated_record(
+            block.network_id,
+            authenticated,
+        )
+        .map_err(BlsDoryV3CandidateError::from)?;
+        let identity = authenticated.record().model_identity();
+        let rows = usize::try_from(identity.batch())
+            .map_err(|_| BlsDoryV3CandidateError::ProductionGeometry)?;
+        let columns = usize::try_from(identity.dimension())
+            .map_err(|_| BlsDoryV3CandidateError::ProductionGeometry)?;
+        let layers = identity
+            .weight_bank_count()
+            .ok()
+            .and_then(|banks| banks.checked_mul(identity.layers_per_bank()))
+            .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?;
+        let activation_len = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?;
+        let coefficient_count = 1usize
+            .checked_add(rows.ilog2() as usize)
+            .and_then(|value| value.checked_add(columns.ilog2() as usize))
+            .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?;
+        let coefficients_per_nonce = usize::try_from(layers)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_mul(coefficient_count))
+            .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?;
+        let mut coefficients = Vec::with_capacity(
+            (count as usize)
+                .checked_mul(coefficients_per_nonce)
+                .ok_or(BlsDoryV3CandidateError::ProductionGeometry)?,
+        );
+        for offset in 0..count {
+            let nonce = start_nonce.wrapping_add(u64::from(offset));
+            let challenge_digest = transcript
+                .challenge_digest(block, nonce)
+                .map_err(BlsDoryV3CandidateError::from)?;
+            coefficients.extend(
+                dory_v3_mask_coefficients(&challenge_digest, u32::MAX, rows, columns)
+                    .map_err(BlsDoryV3CandidateError::from)?,
+            );
+            for layer in 0..layers {
+                coefficients.extend(
+                    dory_v3_mask_coefficients(&challenge_digest, layer, rows, columns)
+                        .map_err(BlsDoryV3CandidateError::from)?,
+                );
+            }
+        }
+        if coefficients.len() != (count as usize) * coefficients_per_nonce {
+            return Err(BlsDoryV3CandidateError::ProductionGeometry.into());
+        }
+        Ok(ForgeMatrixV3AcceleratorBatch {
+            block: *block,
+            model_record_digest: self.parameters.model_record_digest,
+            model_identity_digest: self.parameters.model_identity_digest,
+            start_nonce,
+            count,
+            activation_len,
+            coefficients,
+        })
+    }
+
+    fn winning_nonce_claim_from_accelerator_batch_output(
+        &self,
+        block: &BlockChallenge,
+        batch: &ForgeMatrixV3AcceleratorBatch,
+        index: usize,
+        final_activation: &[u8],
+    ) -> Result<Option<ForgeMatrixV3WinningNonceClaim>, PowError> {
+        let nonce = batch
+            .nonce_at(index)
+            .ok_or(BlsDoryV3CandidateError::ProverConfiguration)?;
+        if batch.block != *block
+            || batch.model_record_digest != self.parameters.model_record_digest
+            || batch.model_identity_digest != self.parameters.model_identity_digest
+            || final_activation.len() != batch.activation_len
+        {
+            return Err(BlsDoryV3CandidateError::ChallengeDigest.into());
+        }
+        match self.winning_nonce_claim_from_accelerator_output(
+            block,
+            batch.model_record_digest,
+            batch.model_identity_digest,
+            nonce,
+            final_activation,
+        ) {
+            Ok(claim) => Ok(Some(claim)),
+            Err(PowError::V3(BlsDoryV3CandidateError::HighHash)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn winning_nonce_claim_from_accelerator_output(
         &self,
         block: &BlockChallenge,
@@ -895,10 +1221,11 @@ impl ForgeMatrixV3ConsensusVerifier {
         ))
     }
 
-    fn validate_winning_nonce_claim_identity(
+    fn validate_winning_nonce_claim(
         &self,
         block: &BlockChallenge,
         claim: ForgeMatrixV3WinningNonceClaim,
+        cancel: &AtomicBool,
     ) -> Result<(), PowError> {
         if block.network_id != self.parameters.network_id
             || claim.network_id != self.parameters.network_id
@@ -911,6 +1238,31 @@ impl ForgeMatrixV3ConsensusVerifier {
         if claim.model_identity_digest != self.parameters.model_identity_digest {
             return Err(BlsDoryV3CandidateError::ModelIdentityDigest.into());
         }
+        #[cfg(test)]
+        if matches!(
+            self.authority,
+            ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. }
+        ) {
+            return Ok(());
+        }
+        let (authenticated, _) = self.production_authority()?;
+        let transcript = DoryV3TranscriptContext::from_bank_authenticated_record(
+            block.network_id,
+            authenticated,
+        )
+        .map_err(BlsDoryV3CandidateError::from)?;
+        let _ = validate_dory_v3_replay_claim(
+            authenticated,
+            transcript,
+            block,
+            BlsDoryV3WinningNonceClaim {
+                nonce: claim.nonce,
+                final_activation_digest: claim.final_activation_digest,
+                work_digest: claim.work_digest,
+            },
+            cancel,
+        )
+        .map_err(BlsDoryV3CandidateError::from)?;
         Ok(())
     }
 

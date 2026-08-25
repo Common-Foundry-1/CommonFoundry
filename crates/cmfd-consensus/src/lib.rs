@@ -181,8 +181,9 @@ pub use pow::{
 };
 #[cfg(feature = "dory-v3-consensus-adapter")]
 pub use pow::{
-    ForgeMatrixV3CandidateParameters, ForgeMatrixV3ConsensusVerifier,
-    ForgeMatrixV3WinningNonceClaim, MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS,
+    ForgeMatrixV3AcceleratorBatch, ForgeMatrixV3CandidateParameters,
+    ForgeMatrixV3ConsensusVerifier, ForgeMatrixV3WinningNonceClaim,
+    MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS, PreparedForgeMatrixV3Model,
 };
 #[cfg(feature = "remainder-prototype")]
 pub use remainder_proof::{

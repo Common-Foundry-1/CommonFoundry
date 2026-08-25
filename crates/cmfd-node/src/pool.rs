@@ -35,8 +35,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    COMPILED_NETWORK_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, Node, NodeError,
-    devnet_params, unix_time_seconds,
+    COMPILED_NETWORK_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, NetworkProfile, Node,
+    NodeError, ProofProfile, devnet_params, unix_time_seconds,
 };
 
 pub const POOL_PROTOCOL_VERSION: u16 = 1;
@@ -62,6 +62,10 @@ const POOL_NONCE_ORIGIN_DOMAIN: &str = "CMFD/DEVNET-POOL/NONCE-ORIGIN/V1";
 
 #[derive(Debug, Error)]
 pub enum PoolError {
+    #[error(
+        "Production V3 pool shares are not implemented; RCNet pool service is disabled rather than accepting V2 shares"
+    )]
+    ProductionV3Unsupported,
     #[error("pool address must be a numeric private or loopback address, received {0}")]
     PublicAddress(SocketAddr),
     #[error("pool worker name must match [A-Za-z0-9._-]{{1,{POOL_MAX_WORKER_BYTES}}}")]
@@ -572,6 +576,11 @@ pub fn spawn_pool_server(
     node: Arc<Mutex<Node>>,
     config: PoolServerConfig,
 ) -> Result<PoolServerHandle, PoolError> {
+    let profile = node
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?
+        .network_profile();
+    ensure_pool_profile_supported(profile)?;
     validate_private_address(config.bind)?;
     if config.max_connections == 0 || config.max_connections > POOL_MAX_CONNECTIONS {
         return Err(PoolError::InvalidConnectionLimit);
@@ -643,6 +652,13 @@ pub fn spawn_pool_server(
         shared,
         thread: Some(thread),
     })
+}
+
+fn ensure_pool_profile_supported(profile: NetworkProfile) -> Result<(), PoolError> {
+    if matches!(profile.proof, ProofProfile::ProductionV3) {
+        return Err(PoolError::ProductionV3Unsupported);
+    }
+    Ok(())
 }
 
 fn pool_listener(listener: TcpListener, shared: Arc<SharedServer>) -> Result<(), PoolError> {
@@ -1799,6 +1815,15 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], PoolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_v3_pool_fails_closed_without_v2_share_fallback() {
+        assert!(matches!(
+            ensure_pool_profile_supported(crate::RCNET1_PROFILE),
+            Err(PoolError::ProductionV3Unsupported)
+        ));
+        assert!(ensure_pool_profile_supported(crate::DEVNET_PROFILE).is_ok());
+    }
     use crate::{Node, default_miner_destination};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);

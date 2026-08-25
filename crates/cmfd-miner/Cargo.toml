@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+production-v3 = [
+    "cmfd-consensus/dory-v3-consensus-adapter",
+    "cmfd-node/production-v3",
+]
+production-rc = ["production-v3", "cmfd-node/production-rc"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

@@ -1,4 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "production-v3")]
+use std::fs::File;
+#[cfg(feature = "production-v3")]
+use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "production-v3")]
+use cmfd_consensus::ForgeMatrixV3WinningNonceClaim;
 use cmfd_consensus::{BlockProof, ForgeMatrixV2AcceleratorModel};
 use cmfd_cuda::{CudaDevice, CudaLibrary};
 use cmfd_node::p2p::{
@@ -20,9 +26,11 @@ use cmfd_node::peer::{
     BlockSubmissionStatus, MiningTemplate, PeerAddressPolicy, PeerLimits, StaticPeerConfig,
 };
 use cmfd_node::{
-    COMPILED_NETWORK_PROFILE, MiningShareSearchResult, MiningWork, NetworkProfile, Node,
+    COMPILED_NETWORK_PROFILE, MiningShareSearchResult, MiningWork, Node, ProofProfile,
     parse_miner_destination, unix_time_seconds,
 };
+#[cfg(feature = "production-v3")]
+use cmfd_node::{ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts};
 
 mod telemetry;
 
@@ -30,8 +38,13 @@ use telemetry::{GpuTelemetry, query_nvidia_smi};
 
 const DEFAULT_MINER_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.miner_data_dir_identity();
 const DEFAULT_MINER_P2P_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.miner_p2p_address();
-const DEFAULT_BATCH_SIZE: u32 = 8_192;
+const DEFAULT_BATCH_SIZE: u32 = match COMPILED_NETWORK_PROFILE.proof {
+    ProofProfile::DevnetV2Reference => 8_192,
+    ProofProfile::ProductionV3 => 64,
+};
 const MAX_BATCH_SIZE: u32 = 65_536;
+#[cfg(feature = "production-v3")]
+const MAX_PRODUCTION_V3_BATCH_SIZE: u32 = 64;
 const AUTO_WORKERS_PER_GPU: usize = 0;
 const MAX_WORKERS_PER_GPU: usize = 16;
 const DEFAULT_STATS_SECONDS: u64 = 5;
@@ -48,6 +61,26 @@ struct Cli {
     command: Command,
 }
 
+#[cfg(feature = "production-v3")]
+#[derive(Debug, clap::Args)]
+struct ProductionV3Cli {
+    /// Absolute path to the pinned production V3 model bank.
+    #[arg(long)]
+    production_v3_bank: Option<PathBuf>,
+    /// Absolute path to the pinned production V3 model manifest.
+    #[arg(long)]
+    production_v3_manifest: Option<PathBuf>,
+    /// Absolute path to the pinned production V3 Record V2.
+    #[arg(long)]
+    production_v3_record_v2: Option<PathBuf>,
+    /// Existing absolute scratch directory for fixed-model preparation and proof construction.
+    #[arg(long)]
+    production_v3_scratch: Option<PathBuf>,
+    /// Explicit native proof row cap, from 1 through 131072.
+    #[arg(long)]
+    production_v3_max_rows: Option<usize>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List CUDA devices visible to the standalone miner.
@@ -58,10 +91,10 @@ enum Command {
     },
     /// Mine node-provided templates without maintaining another chain database.
     Mine {
-        /// Node that provides jobs and accepts blocks. Repeat for failover.
+        /// Compiled-network node that provides jobs and accepts blocks. Repeat for failover.
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
-        /// Allow numeric public peer addresses for network testing.
+        /// Allow numeric public peer addresses for explicitly enabled public testing.
         #[arg(long)]
         allow_public_peers: bool,
         /// CUDA device index. Repeat to select several; omitted means every supported GPU.
@@ -82,6 +115,9 @@ enum Command {
         /// Seconds between rig-rate reports.
         #[arg(long, default_value_t = DEFAULT_STATS_SECONDS)]
         stats_seconds: u64,
+        #[cfg(feature = "production-v3")]
+        #[command(flatten)]
+        production_v3: ProductionV3Cli,
     },
     /// Mine with an embedded full node and local chain database.
     FullNode {
@@ -89,10 +125,10 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long, default_value_t = DEFAULT_MINER_P2P_ADDRESS)]
         p2p_bind: SocketAddr,
-        /// Static network peer. Repeat to configure more than one.
+        /// Static compiled-network peer. Repeat to configure more than one.
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
-        /// Allow numeric public peer addresses for network testing.
+        /// Allow numeric public peer addresses for explicitly enabled public testing.
         #[arg(long)]
         allow_public_peers: bool,
         /// CUDA device index. Repeat to select several; omitted means every supported GPU.
@@ -113,6 +149,9 @@ enum Command {
         /// Seconds between rig-rate reports.
         #[arg(long, default_value_t = DEFAULT_STATS_SECONDS)]
         stats_seconds: u64,
+        #[cfg(feature = "production-v3")]
+        #[command(flatten)]
+        production_v3: ProductionV3Cli,
     },
 }
 
@@ -138,6 +177,13 @@ enum WorkerMessage {
         proof: BlockProof,
         attempts: u64,
     },
+    #[cfg(feature = "production-v3")]
+    FoundV3 {
+        job_id: u64,
+        device: i32,
+        claim: ForgeMatrixV3WinningNonceClaim,
+        attempts: u64,
+    },
     Idle {
         job_id: u64,
         device: i32,
@@ -152,7 +198,15 @@ enum WorkerMessage {
 }
 
 enum JobOutcome {
-    Found { device: i32, proof: BlockProof },
+    Found {
+        device: i32,
+        proof: BlockProof,
+    },
+    #[cfg(feature = "production-v3")]
+    FoundV3 {
+        device: i32,
+        claim: ForgeMatrixV3WinningNonceClaim,
+    },
     Stale,
     Disconnected,
     Shutdown,
@@ -211,6 +265,8 @@ fn main() -> Result<()> {
             workers_per_gpu,
             miner,
             stats_seconds,
+            #[cfg(feature = "production-v3")]
+            production_v3,
         } => run_thin_miner(ThinMinerOptions {
             peers,
             allow_public_peers,
@@ -220,6 +276,8 @@ fn main() -> Result<()> {
             workers_per_gpu,
             miner,
             stats_seconds,
+            #[cfg(feature = "production-v3")]
+            production_v3,
         }),
         Command::FullNode {
             data_dir,
@@ -232,6 +290,8 @@ fn main() -> Result<()> {
             workers_per_gpu,
             miner,
             stats_seconds,
+            #[cfg(feature = "production-v3")]
+            production_v3,
         } => run_full_node_miner(FullNodeMinerOptions {
             data_dir,
             p2p_bind,
@@ -243,6 +303,8 @@ fn main() -> Result<()> {
             workers_per_gpu,
             miner,
             stats_seconds,
+            #[cfg(feature = "production-v3")]
+            production_v3,
         }),
     }
 }
@@ -293,6 +355,8 @@ struct ThinMinerOptions {
     workers_per_gpu: usize,
     miner: Option<String>,
     stats_seconds: u64,
+    #[cfg(feature = "production-v3")]
+    production_v3: ProductionV3Cli,
 }
 
 struct FullNodeMinerOptions {
@@ -306,6 +370,69 @@ struct FullNodeMinerOptions {
     workers_per_gpu: usize,
     miner: Option<String>,
     stats_seconds: u64,
+    #[cfg(feature = "production-v3")]
+    production_v3: ProductionV3Cli,
+}
+
+#[cfg(feature = "production-v3")]
+struct ProductionWorkerPool {
+    parameters: cmfd_consensus::ForgeMatrixV3CandidateParameters,
+    devices: Vec<CudaDevice>,
+    commands: Vec<Sender<WorkerCommand>>,
+    receiver: Receiver<WorkerMessage>,
+    handles: Vec<JoinHandle<()>>,
+    next_job_id: u64,
+}
+
+#[cfg(feature = "production-v3")]
+struct ProductionWorkerSpec {
+    cuda: CudaLibrary,
+    device: CudaDevice,
+    ordinal: usize,
+    worker_count: usize,
+    batch_size: u32,
+    factory: ProductionV3MiningWorkFactory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiningRuntime {
+    DevnetV2,
+    ProductionV3,
+}
+
+const fn mining_runtime(profile: cmfd_node::NetworkProfile) -> MiningRuntime {
+    match profile.proof {
+        ProofProfile::DevnetV2Reference => MiningRuntime::DevnetV2,
+        ProofProfile::ProductionV3 => MiningRuntime::ProductionV3,
+    }
+}
+
+#[cfg(feature = "production-v3")]
+#[derive(Clone)]
+struct ProductionV3RuntimeOptions {
+    artifacts: ProductionV3VerifierArtifacts,
+    scratch_directory: PathBuf,
+    maximum_native_block_rows: usize,
+}
+
+#[cfg(feature = "production-v3")]
+impl ProductionV3Cli {
+    fn into_runtime(self) -> Result<ProductionV3RuntimeOptions> {
+        let missing = || {
+            anyhow!(
+                "Production V3 requires explicit --production-v3-bank, --production-v3-manifest, --production-v3-record-v2, --production-v3-scratch, and --production-v3-max-rows"
+            )
+        };
+        Ok(ProductionV3RuntimeOptions {
+            artifacts: ProductionV3VerifierArtifacts {
+                bank: self.production_v3_bank.ok_or_else(missing)?,
+                manifest: self.production_v3_manifest.ok_or_else(missing)?,
+                record_v2: self.production_v3_record_v2.ok_or_else(missing)?,
+            },
+            scratch_directory: self.production_v3_scratch.ok_or_else(missing)?,
+            maximum_native_block_rows: self.production_v3_max_rows.ok_or_else(missing)?,
+        })
+    }
 }
 
 struct ContinuousMiningConfig {
@@ -476,20 +603,26 @@ fn format_duration(duration: Duration) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn ensure_profile_supports_standalone_mining(profile: NetworkProfile) -> Result<()> {
-    if profile.proof.supports_bounded_reference_mining() {
-        Ok(())
-    } else {
-        bail!(
-            "{} ({}) standalone mining is not wired to the ProductionV3 work path; no DevnetV2 fallback is permitted",
-            profile.short_name(),
-            profile.proof.profile_name()
-        )
+fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
+    match mining_runtime(COMPILED_NETWORK_PROFILE) {
+        MiningRuntime::DevnetV2 => run_thin_miner_v2(options),
+        MiningRuntime::ProductionV3 => {
+            #[cfg(feature = "production-v3")]
+            {
+                run_thin_miner_v3(options)
+            }
+            #[cfg(not(feature = "production-v3"))]
+            {
+                let _ = options;
+                bail!(
+                    "this binary selects Production V3 but was built without the production-v3 feature"
+                )
+            }
+        }
     }
 }
 
-fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
-    ensure_profile_supports_standalone_mining(COMPILED_NETWORK_PROFILE)?;
+fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
     validate_mining_controls(
         options.batch_size,
         options.workers_per_gpu,
@@ -681,6 +814,226 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
                     )?;
                 }
             }
+            #[cfg(feature = "production-v3")]
+            JobOutcome::FoundV3 { .. } => {
+                bail!("Devnet worker returned a Production V3 claim")
+            }
+        }
+    }
+    if let Some(mut pool) = worker_pool {
+        pool.stop()?;
+    }
+    println!("Miner stopped.");
+    Ok(())
+}
+
+#[cfg(feature = "production-v3")]
+fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
+    validate_mining_controls(
+        options.batch_size,
+        options.workers_per_gpu,
+        options.stats_seconds,
+    )?;
+    if options.batch_size > MAX_PRODUCTION_V3_BATCH_SIZE {
+        bail!("Production V3 --batch-size must be between 1 and {MAX_PRODUCTION_V3_BATCH_SIZE}");
+    }
+    if !matches!(options.workers_per_gpu, AUTO_WORKERS_PER_GPU | 1) {
+        bail!(
+            "Production V3 uses exactly one authenticated CUDA context per GPU; --workers-per-gpu must be 0 or 1"
+        );
+    }
+    if options.peers.is_empty() {
+        bail!("thin mining requires at least one --peer node address");
+    }
+    let payout = options
+        .miner
+        .as_deref()
+        .ok_or_else(|| anyhow!("thin mining requires --miner with your wallet receive address"))
+        .and_then(|value| parse_miner_destination(value).map_err(anyhow::Error::from))?;
+    let address_policy = if options.allow_public_peers {
+        PeerAddressPolicy::AllowPublic
+    } else {
+        PeerAddressPolicy::PrivateOnly
+    };
+    let limits = PeerLimits::default();
+    StaticPeerConfig {
+        listen_address: DEFAULT_MINER_P2P_ADDRESS,
+        peers: options.peers.clone(),
+        limits,
+        address_policy,
+    }
+    .validate_client_peers()?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Release))?;
+    let runtime = options.production_v3.into_runtime()?;
+    println!("Authenticating and preparing the pinned Production V3 model...");
+    let factory = ProductionV3MiningWorkFactory::load(
+        runtime.artifacts,
+        runtime.scratch_directory,
+        runtime.maximum_native_block_rows,
+        &shutdown,
+    )?;
+    let cuda = load_cuda(options.cuda_library.as_deref())?;
+    let available = cuda.devices().map_err(anyhow::Error::msg)?;
+    let devices = select_devices(&available, &options.requested_devices)?;
+
+    println!(
+        "Common Foundry Production V3 thin CUDA miner v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "{} library: {}",
+        cuda.backend().name(),
+        cuda.path().display()
+    );
+    println!("Payout: {}", hex::encode(payout));
+    println!("Configured node(s):");
+    for peer in &options.peers {
+        println!("  {peer}");
+    }
+    println!(
+        "Using {} GPU(s), one authenticated production evaluator per GPU:",
+        devices.len()
+    );
+    for device in &devices {
+        println!("  GPU {}: {}", device.index, device.label());
+    }
+    println!("Hashrate unit: 1 H/s = 1 complete Production V3 nonce evaluation per second.");
+    println!("Winning CUDA claims are CPU-replayed before Layout V5 proof construction.");
+    println!("Press Ctrl+C to stop.\n");
+
+    let mut statistics = SessionStatistics::new(&devices);
+    let mut preferred_peer = None;
+    let mut worker_pool = None;
+    while !shutdown.load(Ordering::Acquire) {
+        let Some((source, template, remote_height)) = wait_for_template(
+            &options.peers,
+            preferred_peer,
+            payout,
+            limits,
+            address_policy,
+            &shutdown,
+        )?
+        else {
+            break;
+        };
+        preferred_peer = Some(source);
+        let parent = template.challenge.previous_block;
+        let height = template.challenge.height;
+        let work = factory.work(template.challenge)?;
+        println!(
+            "Connected to {source} at node height {remote_height}. Mining Production V3 height {height} on {} GPU(s)...",
+            devices.len()
+        );
+        if worker_pool.is_none() {
+            worker_pool = Some(ProductionWorkerPool::new(
+                cuda.clone(),
+                devices.clone(),
+                options.batch_size,
+                &work,
+                &factory,
+            )?);
+        }
+        let mut last_node_check = Instant::now();
+        let outcome = worker_pool
+            .as_mut()
+            .expect("Production V3 worker pool is initialized")
+            .mine(
+                work.clone(),
+                JobMiningConfig {
+                    stats_interval: Duration::from_secs(options.stats_seconds),
+                },
+                Arc::clone(&shutdown),
+                &mut statistics,
+                &mut || {
+                    if last_node_check.elapsed() < PEER_RETRY_INTERVAL {
+                        return Ok(WorkStatus::Current);
+                    }
+                    last_node_check = Instant::now();
+                    match fetch_template_from_any(
+                        &options.peers,
+                        preferred_peer,
+                        payout,
+                        limits,
+                        address_policy,
+                    ) {
+                        Some((peer, response)) => {
+                            preferred_peer = Some(peer);
+                            if response.template.challenge.previous_block == parent {
+                                Ok(WorkStatus::Current)
+                            } else {
+                                Ok(WorkStatus::Stale)
+                            }
+                        }
+                        None => Ok(WorkStatus::Disconnected),
+                    }
+                },
+            )?;
+        match outcome {
+            JobOutcome::Shutdown => break,
+            JobOutcome::Stale => {
+                statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                println!("Node tip changed; rebuilding Production V3 work.");
+            }
+            JobOutcome::Disconnected => {
+                println!("Node connection lost; GPU work paused until a node is reachable.");
+            }
+            JobOutcome::FoundV3 { device, claim } => {
+                println!(
+                    "GPU {device} found a target nonce; CPU replay and Layout V5 proof construction started."
+                );
+                let proof = work.prove_v3_winning_nonce_claim(claim, &shutdown)?;
+                let block = template.into_block(proof);
+                let block_id = block.block_id();
+                let mut acknowledged = 0_usize;
+                let mut rejected = 0_usize;
+                for peer in ordered_peers(&options.peers, preferred_peer) {
+                    match submit_mined_block_once_with_policy(
+                        peer,
+                        block.clone(),
+                        limits,
+                        address_policy,
+                    ) {
+                        Ok(result) if block_is_active_acknowledgement(&result, block_id) => {
+                            acknowledged += 1;
+                            preferred_peer = Some(peer);
+                        }
+                        Ok(_) => rejected += 1,
+                        Err(_) => {}
+                    }
+                }
+                if acknowledged > 0 {
+                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
+                    println!(
+                        "BLOCK ACCEPTED | GPU {device} | height {height} | {} | node acknowledgement {acknowledged}/{} | session blocks {}",
+                        hex::encode(block_id),
+                        options.peers.len(),
+                        statistics.blocks_found
+                    );
+                } else if rejected > 0 {
+                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                    println!("Production V3 block was rejected as stale; rebuilding work.");
+                } else {
+                    println!(
+                        "Block proved, but every node disconnected before acceptance; retrying."
+                    );
+                    retry_found_block(
+                        &options.peers,
+                        &mut preferred_peer,
+                        block,
+                        limits,
+                        address_policy,
+                        &shutdown,
+                        &mut statistics,
+                        device,
+                    )?;
+                }
+            }
+            JobOutcome::Found { .. } => {
+                bail!("Production V3 worker returned a Devnet V2 proof")
+            }
         }
     }
     if let Some(mut pool) = worker_pool {
@@ -848,7 +1201,25 @@ fn interruptible_wait(duration: Duration, shutdown: &AtomicBool) -> bool {
 }
 
 fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
-    ensure_profile_supports_standalone_mining(COMPILED_NETWORK_PROFILE)?;
+    match mining_runtime(COMPILED_NETWORK_PROFILE) {
+        MiningRuntime::DevnetV2 => run_full_node_miner_v2(options),
+        MiningRuntime::ProductionV3 => {
+            #[cfg(feature = "production-v3")]
+            {
+                run_full_node_miner_v3(options)
+            }
+            #[cfg(not(feature = "production-v3"))]
+            {
+                let _ = options;
+                bail!(
+                    "this binary selects Production V3 but was built without the production-v3 feature"
+                )
+            }
+        }
+    }
+}
+
+fn run_full_node_miner_v2(options: FullNodeMinerOptions) -> Result<()> {
     validate_mining_controls(
         options.batch_size,
         options.workers_per_gpu,
@@ -949,6 +1320,126 @@ fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
             stats_interval: Duration::from_secs(options.stats_seconds),
         },
         shutdown,
+    );
+    let poll_result = match poller {
+        Some(poller) => poller.stop().map_err(anyhow::Error::from),
+        None => Ok(()),
+    };
+    let inbound_result = inbound.stop().map_err(anyhow::Error::from);
+    mining_result?;
+    poll_result?;
+    inbound_result?;
+    Ok(())
+}
+
+#[cfg(feature = "production-v3")]
+fn run_full_node_miner_v3(options: FullNodeMinerOptions) -> Result<()> {
+    validate_mining_controls(
+        options.batch_size,
+        options.workers_per_gpu,
+        options.stats_seconds,
+    )?;
+    if options.batch_size > MAX_PRODUCTION_V3_BATCH_SIZE {
+        bail!("Production V3 --batch-size must be between 1 and {MAX_PRODUCTION_V3_BATCH_SIZE}");
+    }
+    if !matches!(options.workers_per_gpu, AUTO_WORKERS_PER_GPU | 1) {
+        bail!(
+            "Production V3 uses exactly one authenticated CUDA context per GPU; --workers-per-gpu must be 0 or 1"
+        );
+    }
+    let runtime = options.production_v3.into_runtime()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Release))?;
+
+    let cuda = load_cuda(options.cuda_library.as_deref())?;
+    let available = cuda.devices().map_err(anyhow::Error::msg)?;
+    let devices = select_devices(&available, &options.requested_devices)?;
+    let address_policy = if options.allow_public_peers {
+        PeerAddressPolicy::AllowPublic
+    } else {
+        PeerAddressPolicy::PrivateOnly
+    };
+    let mut node = Node::open_with_artifacts(&options.data_dir, Some(&runtime.artifacts))
+        .with_context(|| format!("open miner data directory {}", options.data_dir.display()))?;
+    node.set_public_peer_mode(options.allow_public_peers);
+    let payout = match options.miner.as_deref() {
+        Some(value) => parse_miner_destination(value)?,
+        None => node.wallet_destination(),
+    };
+    println!("Preparing reusable Production V3 fixed-model proof state...");
+    let factory = node.production_v3_mining_work_factory(
+        runtime.scratch_directory,
+        runtime.maximum_native_block_rows,
+        &shutdown,
+    )?;
+    let shared = Arc::new(Mutex::new(node));
+    let limits = PeerLimits::default();
+    let p2p_socket = TcpListener::bind(options.p2p_bind)
+        .with_context(|| format!("bind miner P2P listener at {}", options.p2p_bind))?;
+    let p2p_address = p2p_socket.local_addr()?;
+    let inbound = spawn_inbound_listener_with_policy(
+        Arc::clone(&shared),
+        p2p_socket,
+        limits,
+        address_policy,
+    )?;
+    let peer_config = StaticPeerConfig {
+        listen_address: p2p_address,
+        peers: options.peers,
+        limits,
+        address_policy,
+    };
+
+    println!(
+        "Common Foundry Production V3 standalone CUDA miner v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "{} library: {}",
+        cuda.backend().name(),
+        cuda.path().display()
+    );
+    println!("P2P listener: {p2p_address}");
+    println!("Payout: {}", hex::encode(payout));
+    println!(
+        "Using {} GPU(s), one authenticated production evaluator per GPU:",
+        devices.len()
+    );
+    for device in &devices {
+        println!("  GPU {}: {}", device.index, device.label());
+    }
+    println!("Hashrate unit: 1 H/s = 1 complete Production V3 nonce evaluation per second.");
+    println!("Winning CUDA claims are CPU-replayed before Layout V5 proof construction.");
+    println!("Press Ctrl+C to stop.\n");
+
+    if !synchronize_before_mining(Arc::clone(&shared), &peer_config, &shutdown)? {
+        let _ = inbound.stop();
+        println!("Miner stopped.");
+        return Ok(());
+    }
+    let poller = if peer_config.peers.is_empty() {
+        None
+    } else {
+        Some(spawn_static_peer_polling(
+            Arc::clone(&shared),
+            peer_config.clone(),
+            Duration::from_secs(2),
+        )?)
+    };
+    let mining_result = continuous_production_mining(
+        Arc::clone(&shared),
+        cuda,
+        devices,
+        ContinuousMiningConfig {
+            payout,
+            peers: peer_config,
+            batch_size: options.batch_size,
+            workers_per_gpu: 1,
+            stats_interval: Duration::from_secs(options.stats_seconds),
+        },
+        shutdown,
+        factory,
     );
     let poll_result = match poller {
         Some(poller) => poller.stop().map_err(anyhow::Error::from),
@@ -1163,6 +1654,135 @@ fn continuous_mining(
                 } else {
                     println!("Candidate became stale before submission; rebuilding work.");
                 }
+            }
+            #[cfg(feature = "production-v3")]
+            JobOutcome::FoundV3 { .. } => {
+                bail!("Devnet worker returned a Production V3 claim")
+            }
+        }
+    }
+    if let Some(mut pool) = worker_pool {
+        pool.stop()?;
+    }
+    println!("Miner stopped.");
+    Ok(())
+}
+
+#[cfg(feature = "production-v3")]
+fn continuous_production_mining(
+    node: Arc<Mutex<Node>>,
+    cuda: CudaLibrary,
+    devices: Vec<CudaDevice>,
+    config: ContinuousMiningConfig,
+    shutdown: Arc<AtomicBool>,
+    factory: ProductionV3MiningWorkFactory,
+) -> Result<()> {
+    let mut statistics = SessionStatistics::new(&devices);
+    let mut worker_pool = None;
+    while !shutdown.load(Ordering::Acquire) {
+        let job = {
+            let node = node.lock().map_err(|_| anyhow!("node mutex is poisoned"))?;
+            node.build_mining_job(config.payout, unix_time_seconds()?)?
+        };
+        println!(
+            "Mining Production V3 height {} on {} GPU(s)...",
+            job.challenge().height,
+            devices.len()
+        );
+        let expected_parent = hex::encode(job.challenge().previous_block);
+        let work = factory.work(*job.challenge())?;
+        if worker_pool.is_none() {
+            worker_pool = Some(ProductionWorkerPool::new(
+                cuda.clone(),
+                devices.clone(),
+                config.batch_size,
+                &work,
+                &factory,
+            )?);
+        }
+        let outcome = worker_pool
+            .as_mut()
+            .expect("Production V3 worker pool is initialized")
+            .mine(
+                work.clone(),
+                JobMiningConfig {
+                    stats_interval: config.stats_interval,
+                },
+                Arc::clone(&shutdown),
+                &mut statistics,
+                &mut || {
+                    let current_tip = node
+                        .lock()
+                        .map_err(|_| anyhow!("node mutex is poisoned"))?
+                        .status()?
+                        .tip;
+                    if current_tip == expected_parent {
+                        Ok(WorkStatus::Current)
+                    } else {
+                        Ok(WorkStatus::Stale)
+                    }
+                },
+            )?;
+        match outcome {
+            JobOutcome::Shutdown => break,
+            JobOutcome::Disconnected => {
+                println!("Embedded node became unavailable; rebuilding Production V3 work.");
+            }
+            JobOutcome::Stale => {
+                statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                println!("New chain tip received; rebuilding Production V3 work.");
+            }
+            JobOutcome::FoundV3 { device, claim } => {
+                println!(
+                    "GPU {device} found a target nonce; CPU replay and Layout V5 proof construction started."
+                );
+                let proof = work.prove_v3_winning_nonce_claim(claim, &shutdown)?;
+                let Some(block) = job.build_block_if_chain_valid(&proof)? else {
+                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                    println!("Candidate no longer met the chain target; rebuilding work.");
+                    continue;
+                };
+                let block_id = block.block_id();
+                let height = block.challenge.height;
+                let expected_parent = hex::encode(block.challenge.previous_block);
+                let accepted = {
+                    let mut node = node.lock().map_err(|_| anyhow!("node mutex is poisoned"))?;
+                    if node.status()?.tip != expected_parent {
+                        false
+                    } else {
+                        node.submit_block(*block, unix_time_seconds()?)?;
+                        true
+                    }
+                };
+                if accepted {
+                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
+                    let relayed = config
+                        .peers
+                        .peers
+                        .iter()
+                        .filter(|peer| {
+                            relay_blocks_to_peer_once_with_policy(
+                                Arc::clone(&node),
+                                **peer,
+                                config.peers.limits,
+                                config.peers.address_policy,
+                            )
+                            .is_ok_and(|report| report.peer_tip == block_id)
+                        })
+                        .count();
+                    println!(
+                        "BLOCK FOUND | GPU {device} | height {height} | {} | node sync {relayed}/{} | session blocks {}",
+                        hex::encode(block_id),
+                        config.peers.peers.len(),
+                        statistics.blocks_found
+                    );
+                } else {
+                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                    println!("Candidate became stale before submission; rebuilding work.");
+                }
+            }
+            JobOutcome::Found { .. } => {
+                bail!("Production V3 worker returned a Devnet V2 proof")
             }
         }
     }
@@ -1602,6 +2222,435 @@ fn monitor_workers(
     }
 }
 
+#[cfg(feature = "production-v3")]
+impl ProductionWorkerPool {
+    fn new(
+        cuda: CudaLibrary,
+        devices: Vec<CudaDevice>,
+        batch_size: u32,
+        initial_work: &MiningWork,
+        factory: &ProductionV3MiningWorkFactory,
+    ) -> Result<Self> {
+        if devices.is_empty() {
+            bail!("production GPU pool requires at least one worker");
+        }
+        if batch_size == 0 || batch_size > MAX_PRODUCTION_V3_BATCH_SIZE {
+            bail!(
+                "Production V3 --batch-size must be between 1 and {MAX_PRODUCTION_V3_BATCH_SIZE}"
+            );
+        }
+        let parameters = initial_work.v3_candidate_parameters()?;
+        let worker_count = devices.len();
+        let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(4).max(4));
+        let mut commands = Vec::with_capacity(worker_count);
+        let mut handles = Vec::with_capacity(worker_count);
+        for (ordinal, device) in devices.iter().enumerate() {
+            let (command_sender, command_receiver) = mpsc::channel();
+            let spec = ProductionWorkerSpec {
+                cuda: cuda.clone(),
+                device: device.clone(),
+                ordinal,
+                worker_count,
+                batch_size,
+                factory: factory.clone(),
+            };
+            handles.push(spawn_production_worker(
+                spec,
+                command_receiver,
+                sender.clone(),
+            )?);
+            commands.push(command_sender);
+        }
+        drop(sender);
+        let mut pool = Self {
+            parameters,
+            devices,
+            commands,
+            receiver,
+            handles,
+            next_job_id: 1,
+        };
+        pool.wait_until_initialized(worker_count)?;
+        Ok(pool)
+    }
+
+    fn wait_until_initialized(&mut self, worker_count: usize) -> Result<()> {
+        let mut initialized = BTreeSet::new();
+        while initialized.len() < worker_count {
+            match self.receiver.recv() {
+                Ok(WorkerMessage::Initialized { device, lane }) => {
+                    initialized.insert((device, lane));
+                    println!(
+                        "GPU {device} authenticated Production V3 context ({}/{worker_count})",
+                        initialized.len()
+                    );
+                }
+                Ok(WorkerMessage::Failed {
+                    device,
+                    lane,
+                    error,
+                    ..
+                }) => bail!("GPU {device} Production V3 worker {lane} failed: {error}"),
+                Ok(_) => bail!("Production V3 worker sent job output before initialization"),
+                Err(_) => bail!("Production V3 workers disconnected during initialization"),
+            }
+        }
+        Ok(())
+    }
+
+    fn mine(
+        &mut self,
+        work: MiningWork,
+        config: JobMiningConfig,
+        shutdown: Arc<AtomicBool>,
+        statistics: &mut SessionStatistics,
+        check_status: &mut dyn FnMut() -> Result<WorkStatus>,
+    ) -> Result<JobOutcome> {
+        if work.v3_candidate_parameters()? != self.parameters {
+            bail!("Production V3 model changed while GPU contexts were active");
+        }
+        let job_id = self.next_job_id;
+        self.next_job_id = self
+            .next_job_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("GPU job identifier exhausted"))?;
+        let worker_cancel = Arc::new(AtomicBool::new(false));
+        for command in &self.commands {
+            if command
+                .send(WorkerCommand::Mine {
+                    job_id,
+                    work: work.clone(),
+                    cancel: Arc::clone(&worker_cancel),
+                })
+                .is_err()
+            {
+                worker_cancel.store(true, Ordering::Release);
+                let _ = self.stop();
+                bail!("Production V3 worker disconnected before job {job_id}");
+            }
+        }
+        let outcome = monitor_production_workers(
+            &self.devices,
+            &work,
+            &self.receiver,
+            job_id,
+            MonitorControl {
+                stats_interval: config.stats_interval,
+                shutdown,
+                worker_cancel: Arc::clone(&worker_cancel),
+            },
+            statistics,
+            check_status,
+        );
+        worker_cancel.store(true, Ordering::Release);
+        match outcome {
+            Ok(outcome) => {
+                self.wait_until_idle(job_id, statistics)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = self.stop();
+                Err(error)
+            }
+        }
+    }
+
+    fn wait_until_idle(&self, job_id: u64, statistics: &mut SessionStatistics) -> Result<()> {
+        let mut idle = BTreeSet::new();
+        while idle.len() < self.commands.len() {
+            match self.receiver.recv() {
+                Ok(WorkerMessage::Idle {
+                    job_id: message_job,
+                    device,
+                    lane,
+                }) if message_job == job_id => {
+                    idle.insert((device, lane));
+                }
+                Ok(WorkerMessage::Progress {
+                    job_id: message_job,
+                    device,
+                    attempts,
+                }) if message_job == job_id => statistics.record_attempts(device, attempts),
+                Ok(WorkerMessage::FoundV3 {
+                    job_id: message_job,
+                    device,
+                    attempts,
+                    ..
+                }) if message_job == job_id => statistics.record_attempts(device, attempts),
+                Ok(WorkerMessage::Ready {
+                    job_id: message_job,
+                    ..
+                }) if message_job == job_id => {}
+                Ok(WorkerMessage::Failed {
+                    job_id: failed_job,
+                    device,
+                    lane,
+                    error,
+                }) if failed_job.is_none() || failed_job == Some(job_id) => {
+                    bail!("GPU {device} Production V3 worker {lane} failed: {error}")
+                }
+                Ok(_) => bail!("Production V3 worker returned an out-of-order message"),
+                Err(_) => bail!("Production V3 workers disconnected while settling job {job_id}"),
+            }
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        for command in &self.commands {
+            let _ = command.send(WorkerCommand::Shutdown);
+        }
+        self.commands.clear();
+        let mut panic_seen = false;
+        for handle in self.handles.drain(..) {
+            panic_seen |= handle.join().is_err();
+        }
+        if panic_seen {
+            bail!("a Production V3 GPU worker thread panicked");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "production-v3")]
+impl Drop for ProductionWorkerPool {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+#[cfg(feature = "production-v3")]
+fn spawn_production_worker(
+    spec: ProductionWorkerSpec,
+    commands: Receiver<WorkerCommand>,
+    sender: SyncSender<WorkerMessage>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("cmfd-v3-gpu-{}", spec.device.index))
+        .spawn(move || {
+            if let Err(failure) = run_production_worker(&spec, &commands, &sender) {
+                let _ = sender.send(WorkerMessage::Failed {
+                    job_id: failure.job_id,
+                    device: spec.device.index,
+                    lane: 0,
+                    error: failure.error,
+                });
+            }
+        })
+}
+
+#[cfg(feature = "production-v3")]
+fn run_production_worker(
+    spec: &ProductionWorkerSpec,
+    commands: &Receiver<WorkerCommand>,
+    sender: &SyncSender<WorkerMessage>,
+) -> Result<(), WorkerThreadError> {
+    let bank = File::open(spec.factory.bank_path()).map_err(|error| WorkerThreadError {
+        job_id: None,
+        error: format!("open production bank: {error}"),
+    })?;
+    let (authenticated, setup) =
+        spec.factory
+            .production_authority()
+            .map_err(|error| WorkerThreadError {
+                job_id: None,
+                error: error.client_error().message,
+            })?;
+    let mut miner = spec
+        .cuda
+        .create_production(
+            BufReader::new(bank),
+            authenticated,
+            setup,
+            spec.device.index,
+        )
+        .map_err(|error| WorkerThreadError {
+            job_id: None,
+            error,
+        })?;
+    if !miner.is_bound_to_bank_authenticated_record(authenticated) {
+        return Err(WorkerThreadError {
+            job_id: None,
+            error: "CUDA evaluator did not retain the authenticated Record V2 identity".to_owned(),
+        });
+    }
+    sender
+        .send(WorkerMessage::Initialized {
+            device: spec.device.index,
+            lane: 0,
+        })
+        .map_err(|_| WorkerThreadError {
+            job_id: None,
+            error: "miner coordinator closed during Production V3 initialization".to_owned(),
+        })?;
+
+    while let Ok(command) = commands.recv() {
+        match command {
+            WorkerCommand::Mine {
+                job_id,
+                work,
+                cancel,
+            } => {
+                run_production_worker_job(spec, &mut miner, job_id, &work, &cancel, sender)
+                    .map_err(|error| WorkerThreadError {
+                        job_id: Some(job_id),
+                        error,
+                    })?;
+                sender
+                    .send(WorkerMessage::Idle {
+                        job_id,
+                        device: spec.device.index,
+                        lane: 0,
+                    })
+                    .map_err(|_| WorkerThreadError {
+                        job_id: Some(job_id),
+                        error: "miner coordinator closed while settling Production V3 job"
+                            .to_owned(),
+                    })?;
+            }
+            WorkerCommand::Shutdown => break,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v3")]
+fn run_production_worker_job(
+    spec: &ProductionWorkerSpec,
+    miner: &mut cmfd_cuda::ProductionCudaMiner,
+    job_id: u64,
+    work: &MiningWork,
+    cancel: &AtomicBool,
+    sender: &SyncSender<WorkerMessage>,
+) -> Result<(), String> {
+    sender
+        .send(WorkerMessage::Ready {
+            job_id,
+            device: spec.device.index,
+            lane: 0,
+        })
+        .map_err(|_| "miner coordinator closed during Production V3 startup".to_owned())?;
+    let stride = nonce_stride(spec.batch_size, spec.worker_count);
+    let mut next_nonce = nonce_start(spec.batch_size, spec.ordinal);
+    let mut pending_attempts = 0_u64;
+    while !cancel.load(Ordering::Acquire) {
+        let batch = work
+            .prepare_v3_accelerator_batch(next_nonce, spec.batch_size)
+            .map_err(|error| error.client_error().message)?;
+        let outputs = miner.evaluate(batch.coefficients(), batch.count())?;
+        pending_attempts = pending_attempts.saturating_add(u64::from(batch.count()));
+        let expected = (batch.count() as usize)
+            .checked_mul(batch.activation_len())
+            .ok_or_else(|| "Production V3 output length overflow".to_owned())?;
+        if outputs.len() != expected {
+            return Err("Production V3 CUDA output shape mismatch".to_owned());
+        }
+        for (index, output) in outputs.chunks_exact(batch.activation_len()).enumerate() {
+            if let Some(claim) = work
+                .v3_winning_nonce_claim_from_accelerator_batch_output(&batch, index, output)
+                .map_err(|error| error.client_error().message)?
+            {
+                sender
+                    .send(WorkerMessage::FoundV3 {
+                        job_id,
+                        device: spec.device.index,
+                        claim,
+                        attempts: pending_attempts,
+                    })
+                    .map_err(|_| {
+                        "miner coordinator closed before Production V3 proof replay".to_owned()
+                    })?;
+                cancel.store(true, Ordering::Release);
+                return Ok(());
+            }
+        }
+        if sender
+            .try_send(WorkerMessage::Progress {
+                job_id,
+                device: spec.device.index,
+                attempts: pending_attempts,
+            })
+            .is_ok()
+        {
+            pending_attempts = 0;
+        }
+        next_nonce = next_nonce.wrapping_add(stride);
+    }
+    if pending_attempts > 0 {
+        let _ = sender.try_send(WorkerMessage::Progress {
+            job_id,
+            device: spec.device.index,
+            attempts: pending_attempts,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v3")]
+fn monitor_production_workers(
+    devices: &[CudaDevice],
+    work: &MiningWork,
+    receiver: &Receiver<WorkerMessage>,
+    job_id: u64,
+    control: MonitorControl,
+    statistics: &mut SessionStatistics,
+    check_status: &mut dyn FnMut() -> Result<WorkStatus>,
+) -> Result<JobOutcome> {
+    loop {
+        if control.shutdown.load(Ordering::Acquire) {
+            control.worker_cancel.store(true, Ordering::Release);
+            return Ok(JobOutcome::Shutdown);
+        }
+        match receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(WorkerMessage::Ready {
+                job_id: message_job,
+                ..
+            }) if message_job == job_id => {}
+            Ok(WorkerMessage::Progress {
+                job_id: message_job,
+                device,
+                attempts,
+            }) if message_job == job_id => statistics.record_attempts(device, attempts),
+            Ok(WorkerMessage::FoundV3 {
+                job_id: message_job,
+                device,
+                claim,
+                attempts,
+            }) if message_job == job_id => {
+                statistics.record_attempts(device, attempts);
+                control.worker_cancel.store(true, Ordering::Release);
+                return Ok(JobOutcome::FoundV3 { device, claim });
+            }
+            Ok(WorkerMessage::Failed {
+                job_id: failed_job,
+                device,
+                lane,
+                error,
+            }) if failed_job.is_none() || failed_job == Some(job_id) => {
+                control.worker_cancel.store(true, Ordering::Release);
+                bail!("GPU {device} Production V3 worker {lane} failed: {error}");
+            }
+            Ok(_) => bail!("Production V3 worker returned an out-of-order job message"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("all Production V3 CUDA workers exited")
+            }
+        }
+        statistics.report_if_due(devices, work.challenge().height, control.stats_interval);
+        match check_status()? {
+            WorkStatus::Current => {}
+            WorkStatus::Stale => {
+                control.worker_cancel.store(true, Ordering::Release);
+                return Ok(JobOutcome::Stale);
+            }
+            WorkStatus::Disconnected => {
+                control.worker_cancel.store(true, Ordering::Release);
+                return Ok(JobOutcome::Disconnected);
+            }
+        }
+    }
+}
+
 fn select_devices(available: &[CudaDevice], requested: &[i32]) -> Result<Vec<CudaDevice>> {
     let by_index: BTreeMap<_, _> = available
         .iter()
@@ -1654,7 +2703,6 @@ fn nonce_stride(batch_size: u32, workers: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cmfd_node::{DEVNET_PROFILE, RCNET1_PROFILE};
 
     #[test]
     fn full_node_defaults_follow_the_compiled_network_profile() {
@@ -1670,13 +2718,15 @@ mod tests {
     }
 
     #[test]
-    fn production_profile_never_falls_back_to_devnet_v2_mining() {
-        assert!(ensure_profile_supports_standalone_mining(DEVNET_PROFILE).is_ok());
-        let error = ensure_profile_supports_standalone_mining(RCNET1_PROFILE)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("RCNet-1 (ProductionV3)"));
-        assert!(error.contains("no DevnetV2 fallback"));
+    fn compiled_profile_selection_never_maps_rcnet_to_devnet_mining() {
+        assert_eq!(
+            mining_runtime(cmfd_node::DEVNET_PROFILE),
+            MiningRuntime::DevnetV2
+        );
+        assert_eq!(
+            mining_runtime(cmfd_node::RCNET1_PROFILE),
+            MiningRuntime::ProductionV3
+        );
     }
 
     fn device(index: i32, major: u32, minor: u32) -> CudaDevice {

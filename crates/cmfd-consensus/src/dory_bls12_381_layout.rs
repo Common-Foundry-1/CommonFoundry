@@ -8,6 +8,7 @@
 
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -775,6 +776,28 @@ pub fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scrat
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>> {
+    let cancel = AtomicBool::new(false);
+    prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch_and_cancel(
+        reader,
+        authenticated,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+/// Prepare the reusable production fixed model while honoring cancellation at
+/// every authenticated model chunk and before publishing finalized artifacts.
+/// No partial polynomial capability escapes after cancellation.
+pub fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch_and_cancel<
+    R: Read,
+>(
+    reader: R,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>> {
     let record = authenticated.record();
     record.validate_production(setup).map_err(|_| {
         ModelBankFieldStreamError::Sink(BlsDoryFixedModelStreamError::InvalidIdentity)
@@ -790,6 +813,7 @@ pub fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scrat
         record.model_identity_digest(),
         setup,
         scratch_directory,
+        cancel,
     )
     .map_err(ModelBankFieldStreamError::Sink)?;
     verify_model_bank_into_staged_field_layout_sink(
@@ -810,6 +834,7 @@ pub(crate) fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>> {
+    let cancel = AtomicBool::new(false);
     let record = authenticated.record();
     if record.setup_identity().into_bytes() != setup.identity()
         || usize::try_from(record.padded_variables()).ok() != Some(setup.max_log_n())
@@ -829,6 +854,7 @@ pub(crate) fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for
         record.model_identity_digest(),
         setup,
         scratch_directory,
+        &cancel,
     )
     .map_err(ModelBankFieldStreamError::Sink)?;
     verify_model_bank_into_staged_field_layout_sink(
@@ -842,6 +868,8 @@ pub(crate) fn prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BlsDoryFixedModelStreamError {
+    #[error("authenticated fixed-model preparation was cancelled")]
+    Cancelled,
     #[error("the streamed fixed-model setup or padded geometry is invalid")]
     InvalidGeometry,
     #[error("the streamed fixed-model chunk order, offset, or length is invalid")]
@@ -1085,6 +1113,7 @@ struct BlsDoryPreparedFixedModelV5Sink<'a> {
     model_identity: DoryV3ModelIdentityV1,
     roles: Vec<PreparedDoryRole<'a>>,
     next_role: usize,
+    cancel: &'a AtomicBool,
 }
 
 impl<'a> BlsDoryPreparedFixedModelV5Sink<'a> {
@@ -1096,7 +1125,11 @@ impl<'a> BlsDoryPreparedFixedModelV5Sink<'a> {
         model_identity_digest: Digest32,
         setup: &'a DeterministicBlsDorySetup,
         scratch_directory: &Path,
+        cancel: &'a AtomicBool,
     ) -> Result<Self, BlsDoryFixedModelStreamError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryFixedModelStreamError::Cancelled);
+        }
         model_identity
             .validate()
             .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
@@ -1197,6 +1230,7 @@ impl<'a> BlsDoryPreparedFixedModelV5Sink<'a> {
             model_identity: model_identity.clone(),
             roles,
             next_role: 0,
+            cancel,
         })
     }
 }
@@ -1206,6 +1240,9 @@ impl StagedModelFieldLayoutSink for BlsDoryPreparedFixedModelV5Sink<'_> {
     type Output = BlsDoryPreparedFixedModelV5;
 
     fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryFixedModelStreamError::Cancelled);
+        }
         let role = self
             .roles
             .get_mut(self.next_role)
@@ -1252,6 +1289,9 @@ impl StagedModelFieldLayoutSink for BlsDoryPreparedFixedModelV5Sink<'_> {
         if chunk_end == role.expected_elements {
             self.next_role += 1;
         }
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryFixedModelStreamError::Cancelled);
+        }
         Ok(())
     }
 
@@ -1259,6 +1299,9 @@ impl StagedModelFieldLayoutSink for BlsDoryPreparedFixedModelV5Sink<'_> {
         self,
         receipt: VerifiedModelBankLayoutReceipt,
     ) -> Result<Self::Output, Self::Error> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryFixedModelStreamError::Cancelled);
+        }
         let expected_weight_count = self
             .model_identity
             .weight_bank_count()
@@ -1275,18 +1318,29 @@ impl StagedModelFieldLayoutSink for BlsDoryPreparedFixedModelV5Sink<'_> {
             return Err(BlsDoryFixedModelStreamError::ReceiptMismatch);
         }
 
-        let mut polynomials = self.roles.into_iter().map(|role| {
-            match role.writer {
-                PreparedDoryWriter::Scalar(writer) | PreparedDoryWriter::SignedByte(writer) => {
-                    writer.finish()
-                }
-            }
-            .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage)
-        });
-        let base_input = polynomials
+        let mut roles = self.roles.into_iter();
+        let base_role = roles
             .next()
-            .ok_or(BlsDoryFixedModelStreamError::InvalidIdentity)??;
-        let weight_banks = polynomials.collect::<Result<Vec<_>, _>>()?;
+            .ok_or(BlsDoryFixedModelStreamError::InvalidIdentity)?;
+        let finish_role = |role: PreparedDoryRole<'_>| match role.writer {
+            PreparedDoryWriter::Scalar(writer) | PreparedDoryWriter::SignedByte(writer) => writer
+                .finish()
+                .map_err(|_| BlsDoryFixedModelStreamError::ProverStorage),
+        };
+        let base_input = finish_role(base_role)?;
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryFixedModelStreamError::Cancelled);
+        }
+        let mut weight_banks = Vec::with_capacity(roles.len());
+        for role in roles {
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(BlsDoryFixedModelStreamError::Cancelled);
+            }
+            weight_banks.push(finish_role(role)?);
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(BlsDoryFixedModelStreamError::Cancelled);
+            }
+        }
         if base_input.commitment() != self.model_identity.base_input_commitment() {
             return Err(BlsDoryFixedModelStreamError::DoryV3CommitmentMismatch { role: 0 });
         }
@@ -1297,11 +1351,18 @@ impl StagedModelFieldLayoutSink for BlsDoryPreparedFixedModelV5Sink<'_> {
         for (index, (actual, expected)) in
             weight_banks.iter().zip(expected_weights.iter()).enumerate()
         {
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(BlsDoryFixedModelStreamError::Cancelled);
+            }
             if actual.commitment() != *expected {
                 let role = u32::try_from(index + 1)
                     .map_err(|_| BlsDoryFixedModelStreamError::InvalidIdentity)?;
                 return Err(BlsDoryFixedModelStreamError::DoryV3CommitmentMismatch { role });
             }
+        }
+
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryFixedModelStreamError::Cancelled);
         }
 
         Ok(BlsDoryPreparedFixedModelV5 {
@@ -7000,6 +7061,56 @@ mod tests {
         }
     }
 
+    struct CancelAfterPositionReader<'a> {
+        inner: Cursor<Vec<u8>>,
+        cancel_after: u64,
+        cancel: &'a AtomicBool,
+    }
+
+    impl<'a> CancelAfterPositionReader<'a> {
+        fn new(bytes: Vec<u8>, cancel_after: usize, cancel: &'a AtomicBool) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                cancel_after: u64::try_from(cancel_after).unwrap(),
+                cancel,
+            }
+        }
+    }
+
+    impl Read for CancelAfterPositionReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            if self.inner.position() >= self.cancel_after {
+                self.cancel.store(true, Ordering::Release);
+            }
+            Ok(read)
+        }
+    }
+
+    struct CancelOnEofRead<'a> {
+        inner: Cursor<Vec<u8>>,
+        cancel: &'a AtomicBool,
+    }
+
+    impl<'a> CancelOnEofRead<'a> {
+        fn new(bytes: Vec<u8>, cancel: &'a AtomicBool) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                cancel,
+            }
+        }
+    }
+
+    impl Read for CancelOnEofRead<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            if read == 0 {
+                self.cancel.store(true, Ordering::Release);
+            }
+            Ok(read)
+        }
+    }
+
     struct ScratchDirectory(std::path::PathBuf);
 
     impl ScratchDirectory {
@@ -7283,6 +7394,17 @@ mod tests {
         scratch_directory: &Path,
     ) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>>
     {
+        let cancel = AtomicBool::new(false);
+        prepare_v5_fixture_reader_with_cancel(fixture, reader, scratch_directory, &cancel)
+    }
+
+    fn prepare_v5_fixture_reader_with_cancel<R: Read>(
+        fixture: &PreparedV5Fixture,
+        reader: R,
+        scratch_directory: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<BlsDoryPreparedFixedModelV5, ModelBankFieldStreamError<BlsDoryFixedModelStreamError>>
+    {
         let model_identity_digest = Digest32::new(fixture.identity.digest().unwrap());
         let sink = BlsDoryPreparedFixedModelV5Sink::new(
             &fixture.built.manifest,
@@ -7291,6 +7413,7 @@ mod tests {
             model_identity_digest,
             &fixture.setup,
             scratch_directory,
+            cancel,
         )
         .map_err(ModelBankFieldStreamError::Sink)?;
         verify_model_bank_into_staged_field_layout_sink(
@@ -7414,6 +7537,44 @@ mod tests {
                 ModelBankError::Truncated
             ))
         ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn v5_prepared_model_cancellation_during_stream_cleans_unpublished_scratch() {
+        let fixture = prepared_v5_fixture(None);
+        let scratch = ScratchDirectory::create();
+        let cancel = AtomicBool::new(false);
+        let cancel_after = MODEL_BANK_HEADER_BYTES
+            + usize::try_from(fixture.built.manifest.base_input_bytes).unwrap()
+            + usize::try_from(fixture.built.manifest.bytes_per_layer).unwrap();
+        let reader =
+            CancelAfterPositionReader::new(fixture.built.bytes.clone(), cancel_after, &cancel);
+
+        assert!(matches!(
+            prepare_v5_fixture_reader_with_cancel(&fixture, reader, &scratch.0, &cancel),
+            Err(ModelBankFieldStreamError::Sink(
+                BlsDoryFixedModelStreamError::Cancelled
+            ))
+        ));
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn v5_prepared_model_cancellation_before_finalization_cleans_unpublished_scratch() {
+        let fixture = prepared_v5_fixture(None);
+        let scratch = ScratchDirectory::create();
+        let cancel = AtomicBool::new(false);
+        let reader = CancelOnEofRead::new(fixture.built.bytes.clone(), &cancel);
+
+        assert!(matches!(
+            prepare_v5_fixture_reader_with_cancel(&fixture, reader, &scratch.0, &cancel),
+            Err(ModelBankFieldStreamError::Sink(
+                BlsDoryFixedModelStreamError::Cancelled
+            ))
+        ));
+        assert!(cancel.load(Ordering::Acquire));
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

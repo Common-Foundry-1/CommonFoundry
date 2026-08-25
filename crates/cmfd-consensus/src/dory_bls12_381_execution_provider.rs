@@ -22,7 +22,7 @@ use crate::{
     dory_bls12_381_blake3::prepare_production_dory_v3_native_blake3_opening,
     dory_bls12_381_candidate::{
         BlsDoryV3CandidateError, BlsDoryV3CandidatePayload,
-        validate_dory_v3_layout_v5_record_setup_binding, verify_bls_dory_v3_layout_v5_candidate,
+        validate_dory_v3_layout_v5_record_setup_binding,
     },
     dory_bls12_381_execution_artifact::{
         BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
@@ -35,9 +35,7 @@ use crate::{
         ValidatedBlsDorySharedLayoutV5ExecutionPreparation,
         finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening,
         preflight_bls_dory_shared_layout_v5_execution_preparation,
-        preflight_prepared_bls_dory_shared_layout_v5_composition,
-        prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch,
-        signed_model_value,
+        preflight_prepared_bls_dory_shared_layout_v5_composition, signed_model_value,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
@@ -67,6 +65,12 @@ use crate::{
     structured_transition::{
         StructuredMaskPolynomial, StructuredTransitionError, StructuredTransitionStatement,
     },
+};
+
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
+use crate::{
+    dory_bls12_381_candidate::verify_bls_dory_v3_layout_v5_candidate,
+    dory_bls12_381_layout::prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch_and_cancel,
 };
 
 const MAX_TRANSITION_MASK: u64 = 5_000;
@@ -1046,6 +1050,7 @@ pub(crate) fn seal_composed_bls_dory_v3_layout_v5_candidate(
 /// same non-serializable Record V2 authority. The scratch directory and native
 /// row limit are explicit process resources, never consensus parameters.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
 pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
     FixedModelBank: Read,
     ReplayBank: Read,
@@ -1068,17 +1073,62 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
     }
     check_runtime_prover_cancel(cancel)?;
 
+    let transcript =
+        DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
+    let _ = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
+
     let prepared_model =
-        prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch(
+        prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch_and_cancel(
             fixed_model_bank,
             authenticated,
             setup,
             scratch_directory,
+            cancel,
         )?;
+    check_runtime_prover_cancel(cancel)?;
+
+    prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model(
+        authenticated,
+        block,
+        claim,
+        setup,
+        &prepared_model,
+        replay_bank,
+        scratch_directory,
+        maximum_native_block_rows,
+        cancel,
+    )
+}
+
+/// Replay and prove a winning nonce with fixed-model polynomials prepared once
+/// for the process. The untrusted claim is fully transcript- and target-checked
+/// before the replay reader is touched, and replay repeats the same validation
+/// defensively before authenticating model bytes.
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
+pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<ReplayBank: Read>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    claim: BlsDoryV3WinningNonceClaim,
+    setup: &DeterministicBlsDorySetup,
+    prepared_model: &BlsDoryPreparedFixedModelV5,
+    replay_bank: ReplayBank,
+    scratch_directory: &Path,
+    maximum_native_block_rows: usize,
+    cancel: &AtomicBool,
+) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+    if maximum_native_block_rows == 0
+        || !scratch_directory.is_absolute()
+        || !scratch_directory.is_dir()
+        || !prepared_model.is_bound_to_bank_authenticated_record(authenticated)
+    {
+        return Err(BlsDoryV3CandidateError::ProverConfiguration);
+    }
     check_runtime_prover_cancel(cancel)?;
 
     let transcript =
         DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
+    let _ = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
     let execution = replay_dory_v3_winning_nonce_from_bank_authenticated_record(
         authenticated,
         transcript,
@@ -1094,7 +1144,7 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
     let prepared = prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch(
         execution,
         authenticated,
-        &prepared_model,
+        prepared_model,
         block,
         setup,
         scratch_directory,
@@ -1123,6 +1173,7 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
     Ok(candidate)
 }
 
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
 fn check_runtime_prover_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryV3CandidateError> {
     if cancel.load(Ordering::Acquire) {
         return Err(BlsDoryV3WinningNonceReplayError::Cancelled.into());
@@ -1130,6 +1181,7 @@ fn check_runtime_prover_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryV3Candi
     Ok(())
 }
 
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
 fn map_layout_v5_preparation_error(
     error: BlsDoryV3LayoutV5PreparationError,
 ) -> BlsDoryV3CandidateError {
@@ -1139,6 +1191,7 @@ fn map_layout_v5_preparation_error(
     }
 }
 
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
 fn map_layout_v5_composition_error(
     error: BlsDoryV3LayoutV5CompositionError,
 ) -> BlsDoryV3CandidateError {
@@ -1373,7 +1426,7 @@ fn validate_dory_v3_derivation_context(
     Ok(challenge)
 }
 
-fn validate_dory_v3_replay_claim(
+pub(crate) fn validate_dory_v3_replay_claim(
     authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     transcript: DoryV3TranscriptContext,
     block: &BlockChallenge,
@@ -2629,7 +2682,10 @@ mod tests {
         fs::{self, OpenOptions},
         io::{self, Cursor, Read, Seek, SeekFrom, Write},
         path::{Path, PathBuf},
-        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        },
     };
 
     use dory_pcs::primitives::arithmetic::Field;
@@ -2990,6 +3046,19 @@ mod tests {
     impl Read for PanicReader {
         fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
             panic!("an inconsistent claim must be rejected before the reader is touched")
+        }
+    }
+
+    struct CountingReader<R> {
+        inner: R,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
         }
     }
 
@@ -5550,6 +5619,161 @@ mod tests {
             BlsDoryV3WinningNonceReplayError::HighHash
         ));
         assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_candidate_prevalidation_precedes_both_bank_reads() {
+        let fixture = dory_v3_layout_v5_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let prove = |block: &BlockChallenge, claim: BlsDoryV3WinningNonceClaim| {
+            prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim(
+                &fixture.authenticated,
+                block,
+                claim,
+                &fixture.setup,
+                PanicReader,
+                PanicReader,
+                scratch.path(),
+                1,
+                &AtomicBool::new(false),
+            )
+            .unwrap_err()
+        };
+
+        let mut wrong_claim = fixture.claim;
+        wrong_claim.work_digest[0] ^= 1;
+        assert!(matches!(
+            prove(&fixture.block, wrong_claim),
+            BlsDoryV3CandidateError::WinningNonceReplay(
+                BlsDoryV3WinningNonceReplayError::WorkDigest
+            )
+        ));
+
+        let mut stale_block = fixture.block;
+        stale_block.timestamp += 1;
+        assert!(matches!(
+            prove(&stale_block, fixture.claim),
+            BlsDoryV3CandidateError::WinningNonceReplay(
+                BlsDoryV3WinningNonceReplayError::WorkDigest
+            )
+        ));
+
+        let mut changed_target = fixture.block;
+        changed_target.target = [0; 32];
+        let changed_target_challenge = fixture
+            .transcript
+            .challenge_context(&changed_target, fixture.claim.nonce)
+            .unwrap();
+        let changed_target_claim = BlsDoryV3WinningNonceClaim {
+            nonce: fixture.claim.nonce,
+            final_activation_digest: fixture.claim.final_activation_digest,
+            work_digest: changed_target_challenge
+                .work_digest(fixture.claim.final_activation_digest),
+        };
+        assert_ne!(changed_target_claim.work_digest, changed_target.target);
+        assert!(matches!(
+            prove(&changed_target, changed_target_claim),
+            BlsDoryV3CandidateError::WinningNonceReplay(BlsDoryV3WinningNonceReplayError::HighHash)
+        ));
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_prepared_model_streams_once_and_revalidates_each_job_before_replay_reads() {
+        let fixture = dory_v3_layout_v5_replay_fixture(0);
+        let fixed_scratch = ScratchDirectory::create();
+        let fixed_bytes_read = Arc::new(AtomicUsize::new(0));
+        let prepared_model =
+            prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_for_test_with_scratch(
+                CountingReader {
+                    inner: Cursor::new(&fixture.bank.bytes),
+                    bytes_read: Arc::clone(&fixed_bytes_read),
+                },
+                &fixture.authenticated,
+                &fixture.setup,
+                fixed_scratch.path(),
+            )
+            .unwrap();
+        assert_eq!(
+            fixed_bytes_read.load(Ordering::Relaxed),
+            fixture.bank.bytes.len()
+        );
+        let fixed_stream_bytes = fixed_bytes_read.load(Ordering::Relaxed);
+        let proof_scratch = ScratchDirectory::create();
+        let prove = |block: &BlockChallenge, claim: BlsDoryV3WinningNonceClaim| {
+            prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model(
+                &fixture.authenticated,
+                block,
+                claim,
+                &fixture.setup,
+                &prepared_model,
+                PanicReader,
+                proof_scratch.path(),
+                1,
+                &AtomicBool::new(false),
+            )
+            .unwrap_err()
+        };
+
+        let mut stale_block = fixture.block;
+        stale_block.previous_block[0] ^= 1;
+        assert!(matches!(
+            prove(&stale_block, fixture.claim),
+            BlsDoryV3CandidateError::WinningNonceReplay(
+                BlsDoryV3WinningNonceReplayError::WorkDigest
+            )
+        ));
+
+        let mut changed_target = fixture.block;
+        changed_target.target = [0; 32];
+        let changed_target_challenge = fixture
+            .transcript
+            .challenge_context(&changed_target, fixture.claim.nonce)
+            .unwrap();
+        let changed_target_claim = BlsDoryV3WinningNonceClaim {
+            nonce: fixture.claim.nonce,
+            final_activation_digest: fixture.claim.final_activation_digest,
+            work_digest: changed_target_challenge
+                .work_digest(fixture.claim.final_activation_digest),
+        };
+        assert_ne!(changed_target_claim.work_digest, changed_target.target);
+        assert!(matches!(
+            prove(&changed_target, changed_target_claim),
+            BlsDoryV3CandidateError::WinningNonceReplay(BlsDoryV3WinningNonceReplayError::HighHash)
+        ));
+
+        let mut wrong_claim = fixture.claim;
+        wrong_claim.work_digest[0] ^= 1;
+        assert!(matches!(
+            prove(&fixture.block, wrong_claim),
+            BlsDoryV3CandidateError::WinningNonceReplay(
+                BlsDoryV3WinningNonceReplayError::WorkDigest
+            )
+        ));
+
+        let execution_scratch = ScratchDirectory::create();
+        let replay_error = replay_dory_v3_winning_nonce_from_bank_authenticated_record_for_test(
+            &fixture.authenticated,
+            fixture.transcript,
+            &stale_block,
+            fixture.claim,
+            &fixture.setup,
+            PanicReader,
+            execution_scratch.path(),
+            &AtomicBool::new(false),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            replay_error,
+            BlsDoryV3WinningNonceReplayError::WorkDigest
+        ));
+        assert_eq!(proof_scratch.entry_count(), 0);
+        assert_eq!(execution_scratch.entry_count(), 0);
+        assert_eq!(fixed_scratch.entry_count(), 4);
+        assert_eq!(fixed_bytes_read.load(Ordering::Relaxed), fixed_stream_bytes);
+        drop(prepared_model);
+        assert_eq!(fixed_scratch.entry_count(), 0);
     }
 
     #[test]

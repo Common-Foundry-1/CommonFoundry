@@ -23,10 +23,14 @@ use cmfd_consensus::{
     encode_transaction, merkle_root, v2_reference_for_network, validate_block_resources,
 };
 #[cfg(feature = "production-v3")]
-use cmfd_consensus::{ForgeMatrixV3CandidateParameters, ForgeMatrixV3WinningNonceClaim};
+use cmfd_consensus::{
+    ForgeMatrixV3AcceleratorBatch, ForgeMatrixV3CandidateParameters,
+    ForgeMatrixV3WinningNonceClaim, MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS,
+    PreparedForgeMatrixV3Model,
+};
+pub use cmfd_proof_worker::ProductionV3VerifierArtifacts;
 use cmfd_proof_worker::{
-    ProductionV3VerifierArtifacts, ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError,
-    verify_block_out_of_process,
+    ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
 };
 use fs2::FileExt;
 use k256::schnorr::{SigningKey, VerifyingKey};
@@ -124,6 +128,10 @@ pub enum NodeError {
     ProductionV3ActivationEvidence(&'static str),
     #[error("the authenticated production V3 {0} does not match its compiled identity pin")]
     ProductionV3ArtifactIdentityMismatch(&'static str),
+    #[error(
+        "production V3 mining requires absolute, pairwise-distinct artifact paths, an existing absolute scratch directory, and max rows between 1 and 131072"
+    )]
+    ProductionV3MiningConfiguration,
     #[cfg(feature = "production-v3")]
     #[error("production V3 verifier artifacts failed authentication: {0}")]
     ProductionV3Artifacts(
@@ -246,6 +254,7 @@ impl NodeError {
             | Self::ProductionV3ArtifactPinsMissing
             | Self::ProductionV3ActivationEvidence(_)
             | Self::ProductionV3ArtifactIdentityMismatch(_)
+            | Self::ProductionV3MiningConfiguration
             | Self::ProofVerifierProfileMismatch => ("proof_verifier_configuration", 500, false),
             #[cfg(feature = "production-v3")]
             Self::ProductionV3Artifacts(_) => ("proof_verifier_configuration", 500, false),
@@ -607,6 +616,28 @@ pub struct MiningJob {
 pub struct MiningWork {
     challenge: BlockChallenge,
     verifier: ConsensusPowVerifier,
+    #[cfg(feature = "production-v3")]
+    production_v3: Option<Arc<ProductionV3MiningContext>>,
+}
+
+/// Process-persistent, authenticated Production V3 mining state. Artifact
+/// authentication and fixed-model preparation happen only while constructing
+/// this factory. Every challenge then receives a cheap immutable `Arc` clone.
+#[cfg(feature = "production-v3")]
+#[derive(Debug, Clone)]
+pub struct ProductionV3MiningWorkFactory {
+    context: Arc<ProductionV3MiningContext>,
+}
+
+#[cfg(feature = "production-v3")]
+#[derive(Debug)]
+struct ProductionV3MiningContext {
+    params: NetworkParams,
+    verifier: ConsensusPowVerifier,
+    prepared_model: PreparedForgeMatrixV3Model,
+    artifacts: ProductionV3VerifierArtifacts,
+    scratch_directory: PathBuf,
+    maximum_native_block_rows: usize,
 }
 
 /// Exact progress from one bounded immutable mining-job search.
@@ -668,6 +699,8 @@ impl MiningJob {
         MiningWork {
             challenge: self.template.challenge,
             verifier: self.verifier.clone(),
+            #[cfg(feature = "production-v3")]
+            production_v3: None,
         }
     }
 
@@ -990,6 +1023,124 @@ impl MiningJob {
     }
 }
 
+#[cfg(feature = "production-v3")]
+impl ProductionV3MiningWorkFactory {
+    /// Authenticate the compiled network's pinned artifacts and prepare its
+    /// fixed model exactly once for all subsequent immutable mining work.
+    pub fn load(
+        artifacts: ProductionV3VerifierArtifacts,
+        scratch_directory: PathBuf,
+        maximum_native_block_rows: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Self, NodeError> {
+        if !matches!(COMPILED_NETWORK_PROFILE.proof, ProofProfile::ProductionV3) {
+            return Err(NodeError::ProductionV3Unavailable);
+        }
+        validate_production_v3_mining_configuration(
+            &artifacts,
+            &scratch_directory,
+            maximum_native_block_rows,
+        )?;
+        let (params, verifier) =
+            network_params_and_verifier_for_profile(COMPILED_NETWORK_PROFILE, Some(&artifacts))?;
+        Self::from_authenticated_verifier(
+            params,
+            verifier,
+            artifacts,
+            scratch_directory,
+            maximum_native_block_rows,
+            cancel,
+        )
+    }
+
+    fn from_authenticated_verifier(
+        params: NetworkParams,
+        verifier: ConsensusPowVerifier,
+        artifacts: ProductionV3VerifierArtifacts,
+        scratch_directory: PathBuf,
+        maximum_native_block_rows: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Self, NodeError> {
+        validate_production_v3_mining_configuration(
+            &artifacts,
+            &scratch_directory,
+            maximum_native_block_rows,
+        )?;
+        let bank = File::open(&artifacts.bank).map_err(|source| {
+            io_error("open production V3 mining bank", &artifacts.bank, source)
+        })?;
+        let prepared_model =
+            verifier.prepare_v3_fixed_model(BufReader::new(bank), &scratch_directory, cancel)?;
+        Ok(Self {
+            context: Arc::new(ProductionV3MiningContext {
+                params,
+                verifier,
+                prepared_model,
+                artifacts,
+                scratch_directory,
+                maximum_native_block_rows,
+            }),
+        })
+    }
+
+    /// Create one challenge-bound view without rereading any artifact.
+    pub fn work(&self, challenge: BlockChallenge) -> Result<MiningWork, NodeError> {
+        if challenge.network_id != self.context.params.network_id
+            || challenge.target > self.context.params.pow_limit
+        {
+            return Err(NodeError::InvalidRpcRequest(
+                "mining challenge does not belong to the compiled Production V3 network".to_owned(),
+            ));
+        }
+        Ok(MiningWork {
+            challenge,
+            verifier: self.context.verifier.clone(),
+            production_v3: Some(Arc::clone(&self.context)),
+        })
+    }
+
+    /// Borrow the authenticated authority used by production CUDA context
+    /// initialization. The bank path is exposed only as process configuration;
+    /// the CUDA loader independently authenticates its complete stream.
+    pub fn production_authority(
+        &self,
+    ) -> Result<
+        (
+            &cmfd_consensus::dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+            &cmfd_consensus::dory_bls12_381_prototype::DeterministicBlsDorySetup,
+        ),
+        NodeError,
+    > {
+        Ok(self.context.verifier.v3_production_authority()?)
+    }
+
+    pub fn bank_path(&self) -> &Path {
+        &self.context.artifacts.bank
+    }
+}
+
+#[cfg(feature = "production-v3")]
+fn validate_production_v3_mining_configuration(
+    artifacts: &ProductionV3VerifierArtifacts,
+    scratch_directory: &Path,
+    maximum_native_block_rows: usize,
+) -> Result<(), NodeError> {
+    if !artifacts.bank.is_absolute()
+        || !artifacts.manifest.is_absolute()
+        || !artifacts.record_v2.is_absolute()
+        || artifacts.bank == artifacts.manifest
+        || artifacts.bank == artifacts.record_v2
+        || artifacts.manifest == artifacts.record_v2
+        || !scratch_directory.is_absolute()
+        || !scratch_directory.is_dir()
+        || maximum_native_block_rows == 0
+        || maximum_native_block_rows > MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS
+    {
+        return Err(NodeError::ProductionV3MiningConfiguration);
+    }
+    Ok(())
+}
+
 impl MiningWork {
     pub fn from_devnet_challenge(challenge: BlockChallenge) -> Result<Self, NodeError> {
         let params = devnet_params()?;
@@ -1002,30 +1153,8 @@ impl MiningWork {
         Ok(Self {
             challenge,
             verifier: ConsensusPowVerifier::v2_reference(reference),
-        })
-    }
-
-    /// Construct thin-miner work for the compiled Production V3 network only
-    /// after the same authenticated, build-pinned artifact gate used by node
-    /// startup. A V2 build or missing/mismatched V3 artifacts fails closed.
-    #[cfg(feature = "production-v3")]
-    pub fn from_compiled_v3_challenge(
-        challenge: BlockChallenge,
-        artifacts: &ProductionV3VerifierArtifacts,
-    ) -> Result<Self, NodeError> {
-        if !matches!(COMPILED_NETWORK_PROFILE.proof, ProofProfile::ProductionV3) {
-            return Err(NodeError::ProductionV3Unavailable);
-        }
-        let (params, verifier) =
-            network_params_and_verifier_for_profile(COMPILED_NETWORK_PROFILE, Some(artifacts))?;
-        if challenge.network_id != params.network_id || challenge.target > params.pow_limit {
-            return Err(NodeError::InvalidRpcRequest(
-                "mining challenge does not belong to the compiled Production V3 network".to_owned(),
-            ));
-        }
-        Ok(Self {
-            challenge,
-            verifier,
+            #[cfg(feature = "production-v3")]
+            production_v3: None,
         })
     }
 
@@ -1125,6 +1254,34 @@ impl MiningWork {
     }
 
     #[cfg(feature = "production-v3")]
+    pub fn prepare_v3_accelerator_batch(
+        &self,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV3AcceleratorBatch, NodeError> {
+        Ok(self
+            .verifier
+            .prepare_v3_accelerator_batch(&self.challenge, start_nonce, count)?)
+    }
+
+    #[cfg(feature = "production-v3")]
+    pub fn v3_winning_nonce_claim_from_accelerator_batch_output(
+        &self,
+        batch: &ForgeMatrixV3AcceleratorBatch,
+        index: usize,
+        final_activation: &[u8],
+    ) -> Result<Option<ForgeMatrixV3WinningNonceClaim>, NodeError> {
+        Ok(self
+            .verifier
+            .v3_winning_nonce_claim_from_accelerator_batch_output(
+                &self.challenge,
+                batch,
+                index,
+                final_activation,
+            )?)
+    }
+
+    #[cfg(feature = "production-v3")]
     pub fn v3_winning_nonce_claim_from_accelerator_output(
         &self,
         accelerator_model_record_digest: [u8; 32],
@@ -1143,28 +1300,39 @@ impl MiningWork {
             )?)
     }
 
-    /// Prove one Production V3 claim for a remote node-provided challenge.
-    /// The resulting proof remains bound to this exact immutable challenge.
+    /// Replay and prove a Production V3 winning claim with process-reusable
+    /// fixed-model state. Exact claim/target validation happens before opening
+    /// the bank, and the replay path validates it again before its first read.
     #[cfg(feature = "production-v3")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn prove_v3_winning_nonce_claim<FixedModelBank: Read, ReplayBank: Read>(
+    pub fn prove_v3_winning_nonce_claim(
         &self,
         claim: ForgeMatrixV3WinningNonceClaim,
-        fixed_model_bank: FixedModelBank,
-        replay_bank: ReplayBank,
-        scratch_directory: &Path,
-        maximum_native_block_rows: usize,
         cancel: &AtomicBool,
     ) -> Result<BlockProof, NodeError> {
-        Ok(self.verifier.prove_v3_winning_nonce_claim(
-            &self.challenge,
-            claim,
-            fixed_model_bank,
-            replay_bank,
-            scratch_directory,
-            maximum_native_block_rows,
-            cancel,
-        )?)
+        let context = self
+            .production_v3
+            .as_ref()
+            .ok_or(NodeError::ProductionV3MiningConfiguration)?;
+        self.verifier
+            .validate_v3_winning_nonce_claim(&self.challenge, claim)?;
+        let replay_bank = File::open(&context.artifacts.bank).map_err(|source| {
+            io_error(
+                "open production V3 winning-nonce replay bank",
+                &context.artifacts.bank,
+                source,
+            )
+        })?;
+        Ok(self
+            .verifier
+            .prove_v3_winning_nonce_claim_with_prepared_model(
+                &self.challenge,
+                claim,
+                &context.prepared_model,
+                BufReader::new(replay_bank),
+                &context.scratch_directory,
+                context.maximum_native_block_rows,
+                cancel,
+            )?)
     }
 }
 
@@ -1339,6 +1507,8 @@ pub struct Node {
     wallet_signing_key: SigningKey,
     legacy_shared_wallet: bool,
     verifier: ConsensusPowVerifier,
+    #[cfg(feature = "production-v3")]
+    production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
     block_preverifier: BlockPreverifier,
     state: ChainState,
     index: BlockIndex,
@@ -1641,6 +1811,8 @@ impl Node {
             wallet_signing_key,
             legacy_shared_wallet,
             verifier,
+            #[cfg(feature = "production-v3")]
+            production_v3_artifacts: production_v3_artifacts.cloned(),
             block_preverifier,
             state,
             index,
@@ -1660,6 +1832,33 @@ impl Node {
 
     pub fn network_profile(&self) -> NetworkProfile {
         self.profile
+    }
+
+    /// Prepare process-reusable Production V3 mining state from the verifier
+    /// already authenticated by this node. This avoids authenticating the
+    /// manifest and Record V2 a second time in embedded-node mining mode.
+    #[cfg(feature = "production-v3")]
+    pub fn production_v3_mining_work_factory(
+        &self,
+        scratch_directory: PathBuf,
+        maximum_native_block_rows: usize,
+        cancel: &AtomicBool,
+    ) -> Result<ProductionV3MiningWorkFactory, NodeError> {
+        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            return Err(NodeError::ProductionV3Unavailable);
+        }
+        let artifacts = self
+            .production_v3_artifacts
+            .clone()
+            .ok_or(NodeError::ProductionV3ArtifactsMissing)?;
+        ProductionV3MiningWorkFactory::from_authenticated_verifier(
+            self.params,
+            self.verifier.clone(),
+            artifacts,
+            scratch_directory,
+            maximum_native_block_rows,
+            cancel,
+        )
     }
 
     pub fn block_preverifier(&self) -> BlockPreverifier {
@@ -4900,8 +5099,10 @@ mod tests {
             job.v3_candidate_parameters(),
             Err(NodeError::Pow(PowError::WrongProofType))
         ));
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
         assert!(matches!(
-            MiningWork::from_compiled_v3_challenge(*job.challenge(), &artifacts),
+            ProductionV3MiningWorkFactory::load(artifacts, scratch, 1, &AtomicBool::new(false)),
             Err(NodeError::ProductionV3Unavailable)
         ));
         drop(node);
@@ -4929,6 +5130,47 @@ mod tests {
             Err(NodeError::ProductionV3ArtifactPinsMissing)
         ));
         assert!(!data_dir.exists());
+        clean_test_dir(&root);
+    }
+
+    #[cfg(feature = "production-v3")]
+    #[test]
+    fn production_v3_mining_configuration_requires_explicit_bounded_absolute_paths() {
+        let root = test_dir("v3-mining-configuration");
+        clean_test_dir(&root);
+        fs::create_dir_all(&root).unwrap();
+        let valid = ProductionV3VerifierArtifacts {
+            bank: root.join("model.bank"),
+            manifest: root.join("model.manifest.json"),
+            record_v2: root.join("model.record-v2.json"),
+        };
+        assert!(validate_production_v3_mining_configuration(&valid, &root, 1).is_ok());
+        assert!(matches!(
+            validate_production_v3_mining_configuration(&valid, &root, 0),
+            Err(NodeError::ProductionV3MiningConfiguration)
+        ));
+        assert!(matches!(
+            validate_production_v3_mining_configuration(
+                &ProductionV3VerifierArtifacts {
+                    bank: PathBuf::from("relative.bank"),
+                    ..valid.clone()
+                },
+                &root,
+                1,
+            ),
+            Err(NodeError::ProductionV3MiningConfiguration)
+        ));
+        assert!(matches!(
+            validate_production_v3_mining_configuration(
+                &ProductionV3VerifierArtifacts {
+                    manifest: valid.bank.clone(),
+                    ..valid
+                },
+                &root,
+                1,
+            ),
+            Err(NodeError::ProductionV3MiningConfiguration)
+        ));
         clean_test_dir(&root);
     }
 

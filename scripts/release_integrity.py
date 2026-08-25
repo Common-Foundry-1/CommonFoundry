@@ -8,6 +8,7 @@ import datetime as dt
 import gzip
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -31,6 +32,7 @@ MAX_RELEASE_GATE_JSON_BYTES = 1024 * 1024
 FULL_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HEX256_RE = re.compile(r"[0-9a-f]{64}\Z")
 PRODUCTION_RC_NETWORK_INFO_NAME = "NETWORK-INFO.json"
+PRODUCTION_RC_LAUNCH_CANDIDATE_NAME = "RCNET-LAUNCH-CANDIDATE.json"
 PRODUCTION_V3_ACTIVATION_NAME = "PRODUCTION-V3-ACTIVATION.json"
 PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME = (
     "PRODUCTION-V3-QUALIFICATION-MANIFEST.json"
@@ -41,6 +43,10 @@ PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME = (
 PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME = (
     "PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json"
 )
+INSECURE_DEV_REWARD_DESTINATIONS = {
+    "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "6360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7",
+}
 RECEIPT_FIELDS = (
     "SCHEMA",
     "TRUST_SCOPE",
@@ -103,6 +109,206 @@ def _bounded_json_object(path: Path, label: str) -> tuple[dict[str, object], byt
     return value, data
 
 
+def _require_exact_fields(
+    value: object, fields: set[str], label: str
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise IntegrityError(f"{label} has missing or unknown fields")
+    return value
+
+
+def _require_hex256(value: object, label: str, *, reject_repeated: bool) -> str:
+    if not isinstance(value, str) or not HEX256_RE.fullmatch(value):
+        raise IntegrityError(f"{label} is not a 32-byte lowercase hexadecimal value")
+    raw = bytes.fromhex(value)
+    if raw == bytes(32) or (reject_repeated and len(set(raw)) == 1):
+        raise IntegrityError(f"{label} is zero or a known placeholder")
+    return value
+
+
+def _validate_rcnet_launch_candidate(
+    candidate: dict[str, object], network_info: dict[str, object]
+) -> None:
+    _require_exact_fields(
+        candidate,
+        {"schema", "payload", "launch_root", "network_id", "virtual_genesis_hash"},
+        "RCNet launch candidate",
+    )
+    if candidate["schema"] != "CMFD_RCNET_LAUNCH_CANDIDATE_V1":
+        raise IntegrityError("RCNet launch candidate schema is unsupported")
+    payload = _require_exact_fields(
+        candidate["payload"],
+        {
+            "profile",
+            "record_v2",
+            "virtual_genesis_timestamp_unix_seconds",
+            "services",
+            "consensus",
+            "proof_of_work",
+            "monetary_policy",
+            "reward_destinations",
+        },
+        "RCNet launch payload",
+    )
+    if payload["profile"] != "CommonFoundry RCNet-1":
+        raise IntegrityError("RCNet launch candidate profile is invalid")
+    launch_root = _require_hex256(candidate["launch_root"], "RCNet launch root", reject_repeated=True)
+    network_id = _require_hex256(candidate["network_id"], "RCNet network ID", reject_repeated=True)
+    genesis = _require_hex256(
+        candidate["virtual_genesis_hash"], "RCNet virtual genesis", reject_repeated=True
+    )
+    if len({launch_root, network_id, genesis}) != 3:
+        raise IntegrityError("RCNet launch root and derived identities are not distinct")
+
+    record = _require_exact_fields(
+        payload["record_v2"],
+        {
+            "record_version",
+            "record_digest",
+            "manifest_digest",
+            "model_identity_digest",
+            "suite_digest",
+            "setup_identity",
+            "padded_variables",
+            "commitment_root",
+        },
+        "RCNet Record V2 identity",
+    )
+    if record["record_version"] != 2 or record["padded_variables"] != 33:
+        raise IntegrityError("RCNet Record V2 identity has invalid geometry")
+    for field in (
+        "record_digest",
+        "manifest_digest",
+        "model_identity_digest",
+        "suite_digest",
+        "setup_identity",
+        "commitment_root",
+    ):
+        _require_hex256(record[field], f"RCNet Record V2 {field}", reject_repeated=False)
+
+    services = _require_exact_fields(
+        payload["services"],
+        {"bootstrap_ipv4", "rpc_port", "p2p_port", "pool_port"},
+        "RCNet service parameters",
+    )
+    try:
+        bootstrap = ipaddress.IPv4Address(services["bootstrap_ipv4"])
+    except (ipaddress.AddressValueError, TypeError) as error:
+        raise IntegrityError("RCNet bootstrap IPv4 address is invalid") from error
+    if bootstrap in ipaddress.IPv4Network("192.0.2.0/24") or bootstrap in ipaddress.IPv4Network(
+        "198.51.100.0/24"
+    ) or bootstrap in ipaddress.IPv4Network("203.0.113.0/24"):
+        raise IntegrityError("RCNet bootstrap is an RFC 5737 documentation address")
+    ports = [services.get(name) for name in ("rpc_port", "p2p_port", "pool_port")]
+    if any(not isinstance(port, int) or isinstance(port, bool) or not 0 < port <= 65535 for port in ports) or len(set(ports)) != 3:
+        raise IntegrityError("RCNet service ports are invalid")
+
+    proof = _require_exact_fields(
+        payload["proof_of_work"],
+        {
+            "algorithm_version",
+            "proof_version",
+            "banks",
+            "layers_per_bank",
+            "maximum_structured_proof_bytes",
+            "pow_limit",
+        },
+        "RCNet proof-of-work parameters",
+    )
+    pow_limit = _require_hex256(proof["pow_limit"], "RCNet proof-of-work limit", reject_repeated=False)
+    rewards = _require_exact_fields(
+        payload["reward_destinations"],
+        {"steward_xonly_public_key", "community_xonly_public_key"},
+        "RCNet reward destinations",
+    )
+    for field in ("steward_xonly_public_key", "community_xonly_public_key"):
+        destination = _require_hex256(rewards[field], f"RCNet {field}", reject_repeated=False)
+        if destination in INSECURE_DEV_REWARD_DESTINATIONS:
+            raise IntegrityError("RCNet reward destination is a known insecure development key")
+
+    consensus = _require_exact_fields(payload["consensus"], {
+        "network_protocol_version", "block_version", "transaction_version", "wire_version",
+        "maximum_future_offset_seconds", "target_spacing_seconds", "coinbase_maturity_blocks",
+        "median_time_window", "max_block_transactions", "max_transaction_inputs",
+        "max_transaction_outputs", "max_block_aggregate_inputs", "max_block_aggregate_outputs",
+        "max_block_signature_checks", "max_coinbase_outputs", "consensus_signature_bytes",
+        "dgw_window", "wire_header_bytes", "max_transaction_bytes", "max_proof_bytes",
+        "max_block_bytes",
+    }, "RCNet consensus parameters")
+    monetary_policy = _require_exact_fields(payload["monetary_policy"], {
+        "atoms_per_coin", "initial_subsidy_atoms", "tail_height", "tail_subsidy_atoms",
+        "steward_percent", "community_percent",
+    }, "RCNet monetary policy")
+
+    network = network_info.get("network")
+    compiled_proof = network_info.get("proof_of_work")
+    compiled_services = network_info.get("services")
+    compiled_rewards = network_info.get("reward_destinations")
+    compiled_consensus = network_info.get("consensus")
+    compiled_monetary_policy = network_info.get("monetary_policy")
+    if not isinstance(network, dict) or (
+        network.get("network_id") != network_id
+        or network.get("virtual_genesis_hash") != genesis
+        or network.get("virtual_genesis_timestamp_unix_seconds")
+        != str(payload["virtual_genesis_timestamp_unix_seconds"])
+    ):
+        raise IntegrityError("compiled RCNet identity does not match the launch candidate")
+    if not isinstance(compiled_proof, dict) or compiled_proof.get("pow_limit") != pow_limit:
+        raise IntegrityError("compiled RCNet proof-of-work limit does not match the launch candidate")
+    for field in ("algorithm_version", "proof_version", "banks", "layers_per_bank"):
+        if compiled_proof.get(field) != proof[field]:
+            raise IntegrityError(
+                "compiled RCNet proof-of-work parameters do not match the launch candidate"
+            )
+    if compiled_proof.get("maximum_structured_proof_bytes") != str(
+        proof["maximum_structured_proof_bytes"]
+    ):
+        raise IntegrityError(
+            "compiled RCNet proof-of-work parameters do not match the launch candidate"
+        )
+    if not isinstance(compiled_services, dict) or (
+        compiled_services.get("rpc_port") != ports[0]
+        or compiled_services.get("p2p_port") != ports[1]
+        or compiled_services.get("pool_port") != ports[2]
+        or compiled_services.get("bootstrap_peer") != f"{bootstrap}:{ports[1]}"
+    ):
+        raise IntegrityError("compiled RCNet services do not match the launch candidate")
+    if not isinstance(compiled_rewards, dict) or compiled_rewards != rewards:
+        raise IntegrityError("compiled RCNet reward destinations do not match the launch candidate")
+    model = compiled_proof.get("model")
+    for field in ("record_digest", "manifest_digest", "model_identity_digest", "suite_digest", "setup_identity", "padded_variables"):
+        if not isinstance(model, dict) or model.get(field) != record[field]:
+            raise IntegrityError("compiled RCNet Record V2 identity does not match the launch candidate")
+    if not isinstance(compiled_consensus, dict):
+        raise IntegrityError("compiled RCNet consensus parameters are missing")
+    versions = compiled_consensus.get("versions")
+    limits = compiled_consensus.get("limits")
+    version_fields = {
+        "network_protocol_version",
+        "block_version",
+        "transaction_version",
+        "wire_version",
+    }
+    for field in version_fields:
+        if not isinstance(versions, dict) or versions.get(field) != consensus[field]:
+            raise IntegrityError(
+                "compiled RCNet consensus parameters do not match the launch candidate"
+            )
+    for field in set(consensus) - version_fields:
+        if not isinstance(limits, dict) or limits.get(field) != str(consensus[field]):
+            raise IntegrityError(
+                "compiled RCNet consensus parameters do not match the launch candidate"
+            )
+    if not isinstance(compiled_monetary_policy, dict):
+        raise IntegrityError("compiled RCNet monetary policy is missing")
+    for field, value in monetary_policy.items():
+        expected = value if field.endswith("_percent") else str(value)
+        if compiled_monetary_policy.get(field) != expected:
+            raise IntegrityError(
+                "compiled RCNet monetary policy does not match the launch candidate"
+            )
+
+
 def validate_production_rc_artifacts(
     *, version: str, commit: str, stage_files: dict[str, Path]
 ) -> None:
@@ -111,6 +317,7 @@ def validate_production_rc_artifacts(
 
     required = {
         PRODUCTION_RC_NETWORK_INFO_NAME,
+        PRODUCTION_RC_LAUNCH_CANDIDATE_NAME,
         PRODUCTION_V3_ACTIVATION_NAME,
         PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME,
         PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME,
@@ -125,6 +332,9 @@ def validate_production_rc_artifacts(
 
     network_info, _ = _bounded_json_object(
         stage_files[PRODUCTION_RC_NETWORK_INFO_NAME], "compiled network information"
+    )
+    launch_candidate, _ = _bounded_json_object(
+        stage_files[PRODUCTION_RC_LAUNCH_CANDIDATE_NAME], "RCNet launch candidate"
     )
     evidence, evidence_bytes = _bounded_json_object(
         stage_files[PRODUCTION_V3_ACTIVATION_NAME], "ProductionV3 activation evidence"
@@ -148,8 +358,7 @@ def validate_production_rc_artifacts(
     proof = network_info.get("proof_of_work")
     if not isinstance(network, dict) or network.get("name") != "CommonFoundry RCNet-1":
         raise IntegrityError("production RC compiled network profile is not RCNet-1")
-    if network.get("network_id") != "72" * 32:
-        raise IntegrityError("production RC compiled network ID is not RCNet-1")
+    _validate_rcnet_launch_candidate(launch_candidate, network_info)
     if not isinstance(proof, dict) or proof.get("selection") != "ProductionV3":
         raise IntegrityError("production RC compiled proof selection is not ProductionV3")
     if proof.get("build_source_commit") != commit:
@@ -181,6 +390,9 @@ def validate_production_rc_artifacts(
         "fresh_process_verifier_binary_sha256": verifier_binary_sha256,
         "fresh_process_verifier_report_sha256": verifier_report_sha256,
     }
+    _require_exact_fields(
+        evidence, set(expected_evidence), "ProductionV3 activation evidence"
+    )
     for field, expected in expected_evidence.items():
         if evidence.get(field) != expected:
             raise IntegrityError(
@@ -342,7 +554,7 @@ def validate_production_rc_artifacts(
 
     verifier_expectations = {
         "report_version": 2,
-        "network_id": "72" * 32,
+        "network_id": network["network_id"],
         "verifier_only": True,
         "producer_report_checked": True,
         "qualification_journal_checked": True,

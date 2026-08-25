@@ -36,11 +36,23 @@ pub struct ProductionV3ArtifactIdentityPins {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionRcNetworkIdentityPin {
+    pub network_id: [u8; 32],
+    pub virtual_genesis_hash: [u8; 32],
+    pub virtual_genesis_timestamp: u64,
+    pub bootstrap_ipv4: [u8; 4],
+    pub pow_limit: [u8; 32],
+    pub steward_reward_destination: [u8; 32],
+    pub community_reward_destination: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledReleaseProfile {
     pub network: CompiledNetworkProfile,
     pub proof: ConsensusProofSelection,
     pub activation: Option<ProductionV3ActivationEvidence>,
     pub production_v3_artifacts: Option<ProductionV3ArtifactIdentityPins>,
+    pub production_network_identity: Option<ProductionRcNetworkIdentityPin>,
 }
 
 /// The identity actually selected by the current source tree.
@@ -55,7 +67,17 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     proof: ConsensusProofSelection::DevnetV2Reference,
     activation: None,
     production_v3_artifacts: None,
+    production_network_identity: None,
 };
+
+const INSECURE_DEV_STEWARD_DESTINATION: [u8; 32] = [
+    0x4f, 0x35, 0x5b, 0xdc, 0xb7, 0xcc, 0x0a, 0xf7, 0x28, 0xef, 0x3c, 0xce, 0xb9, 0x61, 0x5d, 0x90,
+    0x68, 0x4b, 0xb5, 0xb2, 0xca, 0x5f, 0x85, 0x9a, 0xb0, 0xf0, 0xb7, 0x04, 0x07, 0x58, 0x71, 0xaa,
+];
+const INSECURE_DEV_COMMUNITY_DESTINATION: [u8; 32] = [
+    0x63, 0x60, 0xe8, 0x56, 0x31, 0x0c, 0xe5, 0xd2, 0x94, 0xe8, 0xbe, 0x33, 0xfc, 0x80, 0x70, 0x77,
+    0xdc, 0x56, 0xac, 0x80, 0xd9, 0x5d, 0x9c, 0xd4, 0xdd, 0xbd, 0x21, 0x32, 0x5e, 0xff, 0x73, 0xf7,
+];
 
 pub fn is_production_rc_label(label: &str) -> bool {
     let normalized = label.trim().to_ascii_lowercase();
@@ -88,6 +110,51 @@ fn valid_file_identity_pin(pin: ProductionV3FileIdentityPin) -> bool {
     pin.bytes != 0 && pin.blake3 != [0; 32] && pin.sha256 != [0; 32]
 }
 
+fn is_repeated_byte(value: [u8; 32]) -> bool {
+    value.iter().all(|byte| *byte == value[0])
+}
+
+fn is_rfc5737(address: [u8; 4]) -> bool {
+    matches!(
+        address,
+        [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+    )
+}
+
+fn validate_production_network_identity(
+    identity: ProductionRcNetworkIdentityPin,
+) -> Result<(), &'static str> {
+    if identity.network_id == [0; 32] || is_repeated_byte(identity.network_id) {
+        return Err("production RC network identifier is zero or a known placeholder");
+    }
+    if identity.virtual_genesis_hash == [0; 32] || is_repeated_byte(identity.virtual_genesis_hash) {
+        return Err("production RC virtual genesis is zero or a known placeholder");
+    }
+    if identity.network_id == identity.virtual_genesis_hash {
+        return Err("production RC network identifier and virtual genesis are not distinct");
+    }
+    if identity.virtual_genesis_timestamp == 0 {
+        return Err("production RC virtual genesis timestamp is invalid");
+    }
+    if is_rfc5737(identity.bootstrap_ipv4) {
+        return Err("production RC bootstrap address is an RFC 5737 documentation address");
+    }
+    if identity.pow_limit == [0; 32] {
+        return Err("production RC proof-of-work limit is zero");
+    }
+    for destination in [
+        identity.steward_reward_destination,
+        identity.community_reward_destination,
+    ] {
+        if destination == INSECURE_DEV_STEWARD_DESTINATION
+            || destination == INSECURE_DEV_COMMUNITY_DESTINATION
+        {
+            return Err("production RC reward destination uses a known insecure development key");
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_production_rc(
     profile: CompiledReleaseProfile,
     build_source_commit: &str,
@@ -98,6 +165,11 @@ pub fn validate_production_rc(
     if profile.proof != ConsensusProofSelection::ProductionV3 {
         return Err("compiled consensus proof selection is not ProductionV3");
     }
+    validate_production_network_identity(
+        profile
+            .production_network_identity
+            .ok_or("production RC network identity pin is absent")?,
+    )?;
     let evidence = profile
         .activation
         .ok_or("ProductionV3 activation evidence is absent")?;
@@ -170,6 +242,20 @@ pub fn canonical_production_v3_activation_evidence_json(
     .into_bytes())
 }
 
+pub fn validate_production_rc_for_network(
+    profile: CompiledReleaseProfile,
+    build_source_commit: &str,
+    compiled_network_identity: ProductionRcNetworkIdentityPin,
+) -> Result<(), &'static str> {
+    validate_production_rc(profile, build_source_commit)?;
+    if profile.production_network_identity != Some(compiled_network_identity) {
+        return Err(
+            "production RC network identity pin does not match the compiled network profile",
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +286,26 @@ mod tests {
     };
     const BUILD_SOURCE_COMMIT: &str = "5555555555555555555555555555555555555555";
 
+    const fn varied(seed: u8) -> [u8; 32] {
+        let mut value = [0_u8; 32];
+        let mut index = 0;
+        while index < value.len() {
+            value[index] = seed.wrapping_add(index as u8);
+            index += 1;
+        }
+        value
+    }
+
+    const NETWORK_IDENTITY: ProductionRcNetworkIdentityPin = ProductionRcNetworkIdentityPin {
+        network_id: varied(1),
+        virtual_genesis_hash: varied(65),
+        virtual_genesis_timestamp: 1_800_000_000,
+        bootstrap_ipv4: [1, 1, 1, 1],
+        pow_limit: [0xff; 32],
+        steward_reward_destination: varied(129),
+        community_reward_destination: varied(193),
+    };
+
     #[test]
     fn production_rc_labels_are_distinct_from_devnet_rc_labels() {
         for label in ["production-rc1", "mainnet-rc.2", "v1.0.0-rc1"] {
@@ -225,6 +331,7 @@ mod tests {
             proof: ConsensusProofSelection::DevnetV2Reference,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
+            production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
             validate_production_rc(no_v3, BUILD_SOURCE_COMMIT),
@@ -236,6 +343,7 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: None,
             production_v3_artifacts: Some(ARTIFACTS),
+            production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
             validate_production_rc(no_evidence, BUILD_SOURCE_COMMIT),
@@ -247,6 +355,7 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
             production_v3_artifacts: None,
+            production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
             validate_production_rc(no_artifacts, BUILD_SOURCE_COMMIT),
@@ -261,8 +370,19 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
+            production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(validate_production_rc(profile, BUILD_SOURCE_COMMIT), Ok(()));
+        assert_eq!(
+            validate_production_rc_for_network(profile, BUILD_SOURCE_COMMIT, NETWORK_IDENTITY),
+            Ok(())
+        );
+        let mut mismatched = NETWORK_IDENTITY;
+        mismatched.pow_limit[0] ^= 1;
+        assert_eq!(
+            validate_production_rc_for_network(profile, BUILD_SOURCE_COMMIT, mismatched),
+            Err("production RC network identity pin does not match the compiled network profile")
+        );
         assert_eq!(
             validate_production_rc(profile, ""),
             Err("trusted production RC build source commit is invalid")
@@ -276,6 +396,7 @@ mod tests {
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
+            production_network_identity: Some(NETWORK_IDENTITY),
         };
         let encoded =
             canonical_production_v3_activation_evidence_json(profile, BUILD_SOURCE_COMMIT).unwrap();
@@ -290,6 +411,53 @@ mod tests {
                 "\"schema\":\"CMFD_PRODUCTION_V3_ACTIVATION_V1\",",
                 "\"source_commit\":\"5555555555555555555555555555555555555555\"}\n"
             )
+        );
+    }
+
+    #[test]
+    fn gate_rejects_placeholder_and_unsafe_network_identity_values() {
+        let profile = |identity| CompiledReleaseProfile {
+            network: CompiledNetworkProfile::Rcnet,
+            proof: ConsensusProofSelection::ProductionV3,
+            activation: Some(EVIDENCE),
+            production_v3_artifacts: Some(ARTIFACTS),
+            production_network_identity: identity,
+        };
+        assert_eq!(
+            validate_production_rc(profile(None), BUILD_SOURCE_COMMIT),
+            Err("production RC network identity pin is absent")
+        );
+
+        let mut identity = NETWORK_IDENTITY;
+        identity.network_id = [0x72; 32];
+        assert!(
+            validate_production_rc(profile(Some(identity)), BUILD_SOURCE_COMMIT)
+                .unwrap_err()
+                .contains("placeholder")
+        );
+
+        let mut identity = NETWORK_IDENTITY;
+        identity.virtual_genesis_hash = [0x52; 32];
+        assert!(
+            validate_production_rc(profile(Some(identity)), BUILD_SOURCE_COMMIT)
+                .unwrap_err()
+                .contains("placeholder")
+        );
+
+        let mut identity = NETWORK_IDENTITY;
+        identity.bootstrap_ipv4 = [203, 0, 113, 10];
+        assert!(
+            validate_production_rc(profile(Some(identity)), BUILD_SOURCE_COMMIT)
+                .unwrap_err()
+                .contains("RFC 5737")
+        );
+
+        let mut identity = NETWORK_IDENTITY;
+        identity.steward_reward_destination = INSECURE_DEV_STEWARD_DESTINATION;
+        assert!(
+            validate_production_rc(profile(Some(identity)), BUILD_SOURCE_COMMIT)
+                .unwrap_err()
+                .contains("insecure development key")
         );
     }
 }

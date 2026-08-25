@@ -1,4 +1,6 @@
 use std::io::{self, Write};
+#[cfg(feature = "production-v3")]
+use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
@@ -13,6 +15,10 @@ use cmfd_node::pool::{
     DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolServerConfig,
     certificate_sha256, generate_pool_certificate, spawn_pool_server,
 };
+#[cfg(feature = "production-v3")]
+use cmfd_node::rcnet_candidate::{
+    RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
+};
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
     canonical_network_info_json_with_artifacts, parse_miner_destination, spawn_rpc_server,
@@ -22,6 +28,21 @@ use cmfd_proof_worker::{ProductionV3VerifierArtifacts, VerifierWorkerConfig};
 use serde_json::json;
 
 const SERVICE_SUPERVISION_POLL: Duration = Duration::from_millis(50);
+
+#[cfg(feature = "production-v3")]
+fn parse_hex32(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("expected exactly 64 lowercase hexadecimal characters".to_owned());
+    }
+    hex::decode(value)
+        .map_err(|_| "expected a 32-byte hexadecimal value".to_owned())?
+        .try_into()
+        .map_err(|_| "expected a 32-byte hexadecimal value".to_owned())
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,6 +89,30 @@ struct Cli {
 enum Command {
     /// Print the compiled network identity and consensus manifest.
     NetworkInfo,
+    /// Derive a canonical RCNet identity candidate from a final Record V2.
+    #[cfg(feature = "production-v3")]
+    RcnetCandidate {
+        #[arg(long)]
+        record_v2: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        virtual_genesis_timestamp: u64,
+        #[arg(long)]
+        bootstrap_ipv4: Ipv4Addr,
+        #[arg(long)]
+        rpc_port: u16,
+        #[arg(long)]
+        p2p_port: u16,
+        #[arg(long)]
+        pool_port: u16,
+        #[arg(long, value_parser = parse_hex32)]
+        pow_limit: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        steward_reward_destination: [u8; 32],
+        #[arg(long, value_parser = parse_hex32)]
+        community_reward_destination: [u8; 32],
+    },
     /// Run loopback RPC and bounded P2P services.
     Run {
         #[arg(long, default_value_t = COMPILED_NETWORK_PROFILE.rpc_address())]
@@ -132,6 +177,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(cmfd_proof_worker::worker_main());
     }
     let cli = Cli::parse();
+    #[cfg(feature = "production-v3")]
+    if let Command::RcnetCandidate {
+        record_v2,
+        output,
+        virtual_genesis_timestamp,
+        bootstrap_ipv4,
+        rpc_port,
+        p2p_port,
+        pool_port,
+        pow_limit,
+        steward_reward_destination,
+        community_reward_destination,
+    } = &cli.command
+    {
+        let bytes = std::fs::read(record_v2)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err("Record V2 exceeds the 1 MiB candidate-generator limit".into());
+        }
+        let record: cmfd_consensus::dory_v3_model_record::DoryV3ModelCommitmentRecordV2 =
+            serde_json::from_slice(&bytes)?;
+        if bytes
+            != cmfd_consensus::dory_v3_model_record::canonical_dory_v3_model_record_v2_json(
+                &record,
+            )?
+        {
+            return Err("Record V2 is not canonically encoded".into());
+        }
+        let candidate = RcnetLaunchCandidate::from_record(
+            &record,
+            RcnetLaunchConfiguration {
+                virtual_genesis_timestamp: *virtual_genesis_timestamp,
+                bootstrap_ipv4: *bootstrap_ipv4,
+                rpc_port: *rpc_port,
+                p2p_port: *p2p_port,
+                pool_port: *pool_port,
+                pow_limit: *pow_limit,
+                rewards: cmfd_consensus::FixedRewardDestinations {
+                    steward: *steward_reward_destination,
+                    community: *community_reward_destination,
+                },
+            },
+        )?;
+        write_candidate_create_new(output, &candidate)?;
+        return Ok(());
+    }
     let production_v3_artifacts = production_v3_artifacts(&cli)?;
     if matches!(&cli.command, Command::NetworkInfo) {
         io::stdout()
@@ -145,6 +235,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
+        #[cfg(feature = "production-v3")]
+        Command::RcnetCandidate { .. } => {
+            unreachable!("RCNet candidate generation exits before node initialization")
+        }
         Command::Run {
             bind,
             p2p_bind,

@@ -219,7 +219,7 @@ impl DoryV3ModelCommitmentRecordV2 {
 
 /// Encode the exact human-readable Record V2 artifact: pretty JSON followed
 /// by exactly one line feed.
-pub(crate) fn canonical_dory_v3_model_record_v2_json(
+pub fn canonical_dory_v3_model_record_v2_json(
     record: &DoryV3ModelCommitmentRecordV2,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut encoded = serde_json::to_vec_pretty(record)?;

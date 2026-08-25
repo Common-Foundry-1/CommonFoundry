@@ -14,20 +14,30 @@ SHA-256. A production build must also receive the exact release checkout as
 the trusted `CMFD_BUILD_SOURCE_COMMIT` input. It must also pin the exact byte
 length, BLAKE3 digest, and SHA-256 digest of the production bank, manifest, and
 Record V2. The current source selection is Devnet/V2 with no activation
-evidence or artifact pins, so this command must fail:
+evidence, artifact pins, or final production-network identity pin, so this
+command must fail:
 
 ```text
 cargo check --locked -p cmfd-node --features production-rc
 ```
 
 Release finalization applies a second, artifact-level check. Any production-RC
-stage must inventory `NETWORK-INFO.json`, `PRODUCTION-V3-ACTIVATION.json`, the
-actual `PRODUCTION-V3-QUALIFICATION-MANIFEST.json`, the exact
+stage must inventory `NETWORK-INFO.json`, `RCNET-LAUNCH-CANDIDATE.json`,
+`PRODUCTION-V3-ACTIVATION.json`, the actual
+`PRODUCTION-V3-QUALIFICATION-MANIFEST.json`, the exact
 `PRODUCTION-V3-FRESH-PROCESS-VERIFIER.bin`, and its
 `PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json`. The compiled manifest must
 identify RCNet-1, select `ProductionV3`, bind the checked-out release commit
 provided by the trusted build job, and bind the exact activation-evidence bytes
 by SHA-256.
+
+`cmfd-node rcnet-candidate` creates the launch-candidate file without
+overwriting an existing path. It accepts the canonical final Record V2 and
+explicit timestamp, bootstrap, port, proof-of-work limit, and reward
+destinations. Its launch root binds those values, every compiled consensus and
+economic parameter, and the Record V2/model identities. The network ID and
+virtual genesis are independently derived from that root under distinct
+BLAKE3 domains; neither derived value is an input to the root.
 
 The finalizer recomputes SHA-256 over the staged qualification manifest,
 fresh-process verifier binary, and fresh-process verifier report and requires
@@ -39,6 +49,13 @@ same-build verifier report. This is process isolation, not an independently
 built verifier claim. Arbitrary well-formed nonzero digest strings cannot pass.
 These files then become ordinary hashed release artifacts in `BUILDINFO.json`
 and `SHA256SUMS.txt`.
+
+Both build and finalization gates reject zero or repeated-byte network/genesis
+identities, RFC 5737 documentation bootstraps, and the known deterministic
+Devnet reward keys. Finalization additionally requires the compiled network
+manifest to match the candidate's identity, timestamp, services, difficulty
+limit, rewards, and Record V2 identity. The current RCNet constants remain
+placeholders and therefore cannot pass these checks.
 
 The qualification manifest records the older exact commit used to build and
 run the qualifying verifier. The final activation evidence separately records

@@ -17,12 +17,20 @@ pub struct NetworkProfile {
     pub network_id: [u8; 32],
     pub virtual_genesis_hash: [u8; 32],
     pub virtual_genesis_timestamp: u64,
+    pub pow_limit: [u8; 32],
+    pub rewards: RewardDestinations,
     pub rpc_port: u16,
     pub p2p_port: u16,
     pub pool_port: u16,
     pub bootstrap_ipv4: Ipv4Addr,
     pub default_data_dir_identity: &'static str,
     pub wallet_data_dir_identity: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewardDestinations {
+    pub steward: [u8; 32],
+    pub community: [u8; 32],
 }
 
 /// Consensus proof relation selected by a network profile.
@@ -68,6 +76,23 @@ pub const DEVNET_PROFILE: NetworkProfile = NetworkProfile {
     network_id: [0x63; 32],
     virtual_genesis_hash: [0x47; 32],
     virtual_genesis_timestamp: 1_700_000_000,
+    pow_limit: [
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff,
+    ],
+    rewards: RewardDestinations {
+        steward: [
+            0x4f, 0x35, 0x5b, 0xdc, 0xb7, 0xcc, 0x0a, 0xf7, 0x28, 0xef, 0x3c, 0xce, 0xb9, 0x61,
+            0x5d, 0x90, 0x68, 0x4b, 0xb5, 0xb2, 0xca, 0x5f, 0x85, 0x9a, 0xb0, 0xf0, 0xb7, 0x04,
+            0x07, 0x58, 0x71, 0xaa,
+        ],
+        community: [
+            0x63, 0x60, 0xe8, 0x56, 0x31, 0x0c, 0xe5, 0xd2, 0x94, 0xe8, 0xbe, 0x33, 0xfc, 0x80,
+            0x70, 0x77, 0xdc, 0x56, 0xac, 0x80, 0xd9, 0x5d, 0x9c, 0xd4, 0xdd, 0xbd, 0x21, 0x32,
+            0x5e, 0xff, 0x73, 0xf7,
+        ],
+    },
     rpc_port: 18_443,
     p2p_port: 18_444,
     pool_port: 18_445,
@@ -89,6 +114,10 @@ pub const RCNET1_PROFILE: NetworkProfile = NetworkProfile {
     network_id: [0x72; 32],
     virtual_genesis_hash: [0x52; 32],
     virtual_genesis_timestamp: 1_787_616_000,
+    // These remain explicit blockers, not proposed launch values. The final
+    // candidate must pin a reviewed limit and non-development destinations.
+    pow_limit: DEVNET_PROFILE.pow_limit,
+    rewards: DEVNET_PROFILE.rewards,
     rpc_port: 19_443,
     p2p_port: 19_444,
     pool_port: 19_445,

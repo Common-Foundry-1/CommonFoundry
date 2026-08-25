@@ -459,12 +459,95 @@ class ProductionRcGateTests(unittest.TestCase):
         return path
 
     def valid_stage_files(self) -> dict[str, Path]:
+        launch_root = bytes(range(1, 33)).hex()
+        network_id = bytes(range(33, 65)).hex()
+        virtual_genesis = bytes(range(65, 97)).hex()
+        pow_limit = "00" + "ff" * 31
+        steward = bytes(range(97, 129)).hex()
+        community = bytes(range(129, 161)).hex()
+        record = {
+            "record_version": 2,
+            "record_digest": "11" * 32,
+            "manifest_digest": "22" * 32,
+            "model_identity_digest": "33" * 32,
+            "suite_digest": "44" * 32,
+            "setup_identity": "55" * 32,
+            "padded_variables": 33,
+            "commitment_root": "66" * 32,
+        }
+        services = {
+            "bootstrap_ipv4": "8.8.8.8",
+            "rpc_port": 19443,
+            "p2p_port": 19444,
+            "pool_port": 19445,
+        }
+        rewards = {
+            "steward_xonly_public_key": steward,
+            "community_xonly_public_key": community,
+        }
+        consensus = {
+            "network_protocol_version": 1,
+            "block_version": 1,
+            "transaction_version": 1,
+            "wire_version": 1,
+            "maximum_future_offset_seconds": 86400,
+            "target_spacing_seconds": 60,
+            "coinbase_maturity_blocks": 100,
+            "median_time_window": 11,
+            "max_block_transactions": 1024,
+            "max_transaction_inputs": 128,
+            "max_transaction_outputs": 128,
+            "max_block_aggregate_inputs": 4096,
+            "max_block_aggregate_outputs": 4096,
+            "max_block_signature_checks": 2048,
+            "max_coinbase_outputs": 3,
+            "consensus_signature_bytes": 64,
+            "dgw_window": 180,
+            "wire_header_bytes": 16,
+            "max_transaction_bytes": 65536,
+            "max_proof_bytes": 262144,
+            "max_block_bytes": 1048576,
+        }
+        monetary_policy = {
+            "atoms_per_coin": 100000000,
+            "initial_subsidy_atoms": 50000000000,
+            "tail_height": 2628001,
+            "tail_subsidy_atoms": 500000000,
+            "steward_percent": 25,
+            "community_percent": 5,
+        }
+        launch_candidate = self.write_json(
+            integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME,
+            {
+                "schema": "CMFD_RCNET_LAUNCH_CANDIDATE_V1",
+                "payload": {
+                    "profile": "CommonFoundry RCNet-1",
+                    "record_v2": record,
+                    "virtual_genesis_timestamp_unix_seconds": 1_800_000_000,
+                    "services": services,
+                    "consensus": consensus,
+                    "proof_of_work": {
+                        "algorithm_version": 2,
+                        "proof_version": 1,
+                        "banks": 1,
+                        "layers_per_bank": 4,
+                        "maximum_structured_proof_bytes": 262144,
+                        "pow_limit": pow_limit,
+                    },
+                    "monetary_policy": monetary_policy,
+                    "reward_destinations": rewards,
+                },
+                "launch_root": launch_root,
+                "network_id": network_id,
+                "virtual_genesis_hash": virtual_genesis,
+            },
+        )
         verifier_binary = self.root / integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME
         verifier_binary.write_bytes(b"fresh-process verifier fixture")
         verifier_report = self.write_json(
             integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME,
             {
-                "network_id": "72" * 32,
+                "network_id": network_id,
                 "producer_report_checked": True,
                 "qualification_journal_checked": True,
                 "report_version": 2,
@@ -575,17 +658,67 @@ class ProductionRcGateTests(unittest.TestCase):
             {
                 "network": {
                     "name": "CommonFoundry RCNet-1",
-                    "network_id": "72" * 32,
+                    "network_id": network_id,
+                    "virtual_genesis_hash": virtual_genesis,
+                    "virtual_genesis_timestamp_unix_seconds": "1800000000",
                 },
                 "proof_of_work": {
                     "activation_evidence_sha256": integrity._sha256_file(evidence),
                     "build_source_commit": self.commit,
                     "selection": "ProductionV3",
+                    "pow_limit": pow_limit,
+                    "algorithm_version": 2,
+                    "proof_version": 1,
+                    "banks": 1,
+                    "layers_per_bank": 4,
+                    "maximum_structured_proof_bytes": "262144",
+                    "model": {
+                        "record_digest": record["record_digest"],
+                        "manifest_digest": record["manifest_digest"],
+                        "model_identity_digest": record["model_identity_digest"],
+                        "suite_digest": record["suite_digest"],
+                        "setup_identity": record["setup_identity"],
+                        "padded_variables": record["padded_variables"],
+                    },
+                },
+                "services": {
+                    "rpc_port": services["rpc_port"],
+                    "p2p_port": services["p2p_port"],
+                    "pool_port": services["pool_port"],
+                    "bootstrap_peer": f"{services['bootstrap_ipv4']}:{services['p2p_port']}",
+                },
+                "reward_destinations": rewards,
+                "consensus": {
+                    "versions": {
+                        field: consensus[field]
+                        for field in (
+                            "network_protocol_version",
+                            "block_version",
+                            "transaction_version",
+                            "wire_version",
+                        )
+                    },
+                    "limits": {
+                        field: str(value)
+                        for field, value in consensus.items()
+                        if field
+                        not in {
+                            "network_protocol_version",
+                            "block_version",
+                            "transaction_version",
+                            "wire_version",
+                        }
+                    },
+                },
+                "monetary_policy": {
+                    field: value if field.endswith("_percent") else str(value)
+                    for field, value in monetary_policy.items()
                 },
             },
         )
         return {
             integrity.PRODUCTION_RC_NETWORK_INFO_NAME: network_info,
+            integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME: launch_candidate,
             integrity.PRODUCTION_V3_ACTIVATION_NAME: evidence,
             integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME: qualification_manifest,
             integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME: verifier_binary,
@@ -623,6 +756,61 @@ class ProductionRcGateTests(unittest.TestCase):
             commit=self.commit,
             stage_files=self.valid_stage_files(),
         )
+
+    def test_launch_candidate_unknown_fields_are_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME]
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        candidate["payload"]["unknown"] = True
+        self.write_json(integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate)
+        with self.assertRaisesRegex(integrity.IntegrityError, "unknown fields"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_placeholder_identity_and_documentation_bootstrap_are_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME]
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        candidate["network_id"] = "72" * 32
+        self.write_json(integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate)
+        with self.assertRaisesRegex(integrity.IntegrityError, "placeholder"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME]
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        candidate["payload"]["services"]["bootstrap_ipv4"] = "203.0.113.9"
+        self.write_json(integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate)
+        with self.assertRaisesRegex(integrity.IntegrityError, "RFC 5737"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_development_reward_and_pow_limit_mutation_are_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME]
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        candidate["payload"]["reward_destinations"]["steward_xonly_public_key"] = (
+            next(iter(integrity.INSECURE_DEV_REWARD_DESTINATIONS))
+        )
+        self.write_json(integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate)
+        with self.assertRaisesRegex(integrity.IntegrityError, "insecure development"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME]
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        candidate["payload"]["proof_of_work"]["pow_limit"] = "01" + "ff" * 31
+        self.write_json(integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate)
+        with self.assertRaisesRegex(integrity.IntegrityError, "proof-of-work limit"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
 
     def test_dynamic_release_commit_must_match_the_checkout(self) -> None:
         stage_files = self.valid_stage_files()

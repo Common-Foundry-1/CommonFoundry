@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+#[path = "src/network_profile.rs"]
+mod network_profile;
 #[path = "release_gate.rs"]
 mod release_gate;
 
@@ -14,6 +17,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed={variable}");
     }
     println!("cargo:rerun-if-changed=release_gate.rs");
+    println!("cargo:rerun-if-changed=src/network_profile.rs");
 
     let requested = env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some()
         || ["CMFD_RELEASE_LABEL", "GITHUB_REF", "GITHUB_REF_NAME"]
@@ -24,9 +28,20 @@ fn main() {
 
     if requested {
         let source_commit = env::var("CMFD_BUILD_SOURCE_COMMIT").unwrap_or_default();
-        match release_gate::validate_production_rc(
+        let network = network_profile::RCNET1_PROFILE;
+        let compiled_network_identity = release_gate::ProductionRcNetworkIdentityPin {
+            network_id: network.network_id,
+            virtual_genesis_hash: network.virtual_genesis_hash,
+            virtual_genesis_timestamp: network.virtual_genesis_timestamp,
+            bootstrap_ipv4: network.bootstrap_ipv4.octets(),
+            pow_limit: network.pow_limit,
+            steward_reward_destination: network.rewards.steward,
+            community_reward_destination: network.rewards.community,
+        };
+        match release_gate::validate_production_rc_for_network(
             release_gate::COMPILED_RELEASE_PROFILE,
             &source_commit,
+            compiled_network_identity,
         ) {
             Ok(()) => {
                 println!("cargo:rustc-env=CMFD_BUILD_SOURCE_COMMIT={source_commit}");

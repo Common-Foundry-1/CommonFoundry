@@ -11,7 +11,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
 use cmfd_consensus::chain::ValidatedBlock;
-use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, COIN, ChainError,
     ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY, EconomicsError,
@@ -43,6 +42,8 @@ pub mod network_profile;
 pub mod p2p;
 pub mod peer;
 pub mod pool;
+#[cfg(feature = "production-v3")]
+pub mod rcnet_candidate;
 
 #[path = "../release_gate.rs"]
 #[allow(dead_code)]
@@ -1358,13 +1359,12 @@ pub(crate) fn network_params_and_verifier_for_profile(
         protocol_version: NETWORK_PROTOCOL_VERSION,
         genesis_hash: profile.virtual_genesis_hash,
         genesis_timestamp: profile.virtual_genesis_timestamp,
-        pow_limit: target_with_leading_zero_bits(8),
+        pow_limit: profile.pow_limit,
         pow,
         monetary_policy: DEFAULT_MONETARY_POLICY,
         rewards: FixedRewardDestinations {
-            // These deterministic keys are intentionally public and insecure.
-            steward: insecure_dev_destination(0x11),
-            community: insecure_dev_destination(0x12),
+            steward: profile.rewards.steward,
+            community: profile.rewards.community,
         },
         max_future_offset_secs: MAX_FUTURE_OFFSET_SECS,
     };
@@ -3727,6 +3727,7 @@ fn write_rpc_response(stream: &mut impl Write, response: RpcResponse) -> Result<
     stream.flush().map_err(NodeError::RpcIo)
 }
 
+#[cfg(test)]
 fn insecure_dev_destination(secret_byte: u8) -> [u8; 32] {
     let signing = SigningKey::from_bytes(&[secret_byte; 32])
         .expect("fixed nonzero development signing key must be valid");
@@ -4646,6 +4647,8 @@ mod tests {
             network_id: [0x64; 32],
             virtual_genesis_hash: [0x48; 32],
             virtual_genesis_timestamp: DEVNET_GENESIS_TIMESTAMP + 1,
+            pow_limit: DEVNET_PROFILE.pow_limit,
+            rewards: DEVNET_PROFILE.rewards,
             rpc_port: 28_443,
             p2p_port: 28_444,
             pool_port: 28_445,

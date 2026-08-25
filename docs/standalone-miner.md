@@ -33,6 +33,10 @@ to install the CUDA Toolkit.
 - Each worker owns a separate CUDA context and model allocation on its assigned
   GPU. By default, the miner divides available host threads across the selected
   GPUs, capped at 16 workers per GPU.
+- Worker contexts and resident model bytes are created once, then retained
+  across block-template changes. Every new template still runs a differential
+  canary before nonce search begins. This is lifecycle infrastructure for the
+  bounded Devnet v2 profile; it does not activate the production V3 proof.
 - `--workers-per-gpu 0` selects that automatic mode. Set an explicit value from
   1 through 16 to reduce host power use or tune a particular rig.
 - Worker `i` begins at batch `i`; later batches advance by `total worker count ×

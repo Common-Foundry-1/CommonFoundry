@@ -892,6 +892,10 @@ impl MiningWork {
         Ok(self.verifier.v2_accelerator_model()?)
     }
 
+    pub fn accelerator_model_identity(&self) -> Result<[u8; 32], NodeError> {
+        Ok(self.verifier.v2_accelerator_model_identity()?)
+    }
+
     pub fn prepare_accelerator_batch(
         &self,
         start_nonce: u64,

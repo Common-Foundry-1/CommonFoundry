@@ -407,6 +407,15 @@ impl ForgeMatrixV2Reference {
         }
     }
 
+    /// Stable identity of the exact model bytes loaded by an accelerator.
+    ///
+    /// Long-lived accelerator contexts use this to reject work for a different
+    /// model instead of silently reusing resident weights across a network or
+    /// parameter change.
+    pub fn accelerator_model_identity(&self) -> Result<[u8; 32], ForgeMatrixV2Error> {
+        Ok(self.descriptor.model.digest()?)
+    }
+
     /// Prepares authoritative challenge-dependent masks for a wrapping nonce
     /// interval. Matrix evaluation may be delegated; digest construction and
     /// any below-target candidate remain subject to Rust recomputation.
@@ -1369,6 +1378,10 @@ mod tests {
         assert_eq!(model.activation_len(), 8);
         assert_eq!(model.base_input().len(), 8);
         assert_eq!(model.weights().len(), 64);
+        assert_eq!(
+            oracle.accelerator_model_identity().unwrap(),
+            oracle.descriptor().model.digest().unwrap()
+        );
 
         assert!(matches!(
             oracle.prepare_accelerator_batch(&block(), 0, 0),

@@ -29,6 +29,7 @@ class GitFixture:
         self.write("README.md", "fixture\n")
         self.write("gpu/CMakeLists.txt", "project(fixture)\n")
         self.write("gpu/forgematrix_v2_miner.cu", "// cuda fixture\n")
+        self.write("gpu/forgematrix_v2_tensor_core.cu", "// tensor fixture\n")
         self.write("gpu/forgematrix_v2_opencl.cpp", "// opencl fixture\n")
         self.write("scripts/build-cuda-miner.ps1", "Write-Output cuda\n")
         self.write("scripts/build-opencl-miner.ps1", "Write-Output opencl\n")
@@ -107,6 +108,7 @@ class NativeBuildReceiptTests(unittest.TestCase):
         fields = self.verify_receipt()
         self.assertEqual(fields["GIT_COMMIT"], self.fixture.commit)
         self.assertEqual(fields["LIBRARY_SHA256"], integrity._sha256_file(self.library))
+        self.assertIn("gpu/forgematrix_v2_tensor_core.cu", fields["SOURCE_FILES"])
         self.assertEqual(
             fields["TRUST_SCOPE"], "IDENTITY_GUARD_ONLY_NOT_AUTHENTICATION"
         )

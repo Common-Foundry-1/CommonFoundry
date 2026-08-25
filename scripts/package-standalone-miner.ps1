@@ -78,7 +78,7 @@ Invoke-ReleaseIntegrity -ToolArguments @(
     '--receipt', $cudaReceipt,
     '--expected-build-script', 'scripts/build-cuda-miner.ps1',
     '--expected-target', 'x86_64-pc-windows-msvc',
-    '--expected-architectures', 'sm_70;sm_75;sm_86;sm_89;sm_120;compute_70',
+    '--expected-architectures', 'sm_70;sm_75;sm_86;sm_89;sm_120;compute_70;compute_75-tensor-core',
     '--source-date-epoch', $sourceDateEpoch
 )
 
@@ -158,6 +158,7 @@ if ($openClLibrary) {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\opencl-miner.md') -Destination $stage
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md') -Destination $stage
 
 Invoke-ReleaseIntegrity -ToolArguments @(
     'archive-zip',
@@ -172,5 +173,5 @@ $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvar
     Bytes = $file.Length
     SHA256 = $hash
     NativeArchitectures = 'sm_70, sm_75, sm_86, sm_89, sm_120'
-    PtxFallback = 'compute_70'
+    PtxFallback = 'compute_70, compute_75 tensor core'
 }

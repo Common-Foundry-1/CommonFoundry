@@ -59,8 +59,16 @@ type EvaluateFn = unsafe extern "C" fn(
     usize,
 ) -> i32;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
-type ProductionBeginV2Fn =
-    unsafe extern "C" fn(i32, u32, *mut u32, *mut *mut c_void, *mut c_char, usize) -> i32;
+type ProductionBeginV3Fn = unsafe extern "C" fn(
+    i32,
+    u32,
+    u32,
+    *mut u32,
+    *mut u32,
+    *mut *mut c_void,
+    *mut c_char,
+    usize,
+) -> i32;
 type ProductionUploadFn =
     unsafe extern "C" fn(*mut c_void, u32, u32, u64, *const i8, usize, *mut c_char, usize) -> i32;
 type ProductionFinalizeFn = unsafe extern "C" fn(*mut c_void, *mut c_char, usize) -> i32;
@@ -75,8 +83,10 @@ type ProductionEvaluateFn = unsafe extern "C" fn(
     usize,
 ) -> i32;
 type ProductionDestroyFn = unsafe extern "C" fn(*mut c_void);
-type DifferentialLayerV2Fn = unsafe extern "C" fn(
+type DifferentialLayerV3Fn = unsafe extern "C" fn(
     i32,
+    u32,
+    *mut u32,
     u32,
     *mut u32,
     u32,
@@ -123,13 +133,13 @@ struct CudaApi {
     evaluate: EvaluateFn,
     destroy: DestroyFn,
     production: Option<ProductionApi>,
-    differential_layer_v2: Option<DifferentialLayerV2Fn>,
+    differential_layer_v3: Option<DifferentialLayerV3Fn>,
     _library: Library,
 }
 
 #[derive(Clone, Copy)]
 struct ProductionApi {
-    begin_v2: ProductionBeginV2Fn,
+    begin_v3: ProductionBeginV3Fn,
     upload: ProductionUploadFn,
     finalize: ProductionFinalizeFn,
     evaluate: ProductionEvaluateFn,
@@ -151,9 +161,9 @@ impl CudaApi {
                 evaluate: load_symbol(&library, b"cmfd_cuda_evaluate\0")?,
                 destroy: load_symbol(&library, b"cmfd_cuda_destroy\0")?,
                 production: load_production_api(&library),
-                differential_layer_v2: load_optional_symbol(
+                differential_layer_v3: load_optional_symbol(
                     &library,
-                    b"cmfd_cuda_differential_layer_v2\0",
+                    b"cmfd_cuda_differential_layer_v3\0",
                 ),
                 _library: library,
             };
@@ -179,7 +189,7 @@ unsafe fn load_production_api(library: &Library) -> Option<ProductionApi> {
     // unavailable instead of mixing production ABI revisions.
     unsafe {
         Some(ProductionApi {
-            begin_v2: load_optional_symbol(library, b"cmfd_cuda_production_begin_v2\0")?,
+            begin_v3: load_optional_symbol(library, b"cmfd_cuda_production_begin_v3\0")?,
             upload: load_optional_symbol(library, b"cmfd_cuda_production_upload\0")?,
             finalize: load_optional_symbol(library, b"cmfd_cuda_production_finalize\0")?,
             evaluate: load_optional_symbol(library, b"cmfd_cuda_production_evaluate\0")?,
@@ -233,6 +243,31 @@ impl ProductionResidency {
             2 => Ok(Self::HostBacked),
             _ => Err(format!(
                 "CUDA backend returned invalid active production residency {value}"
+            )),
+        }
+    }
+}
+
+/// Exact matrix engine used for every production layer.
+///
+/// `Auto` selects CUTLASS INT8 Tensor Cores on compute capability 7.5 and
+/// newer when they were compiled into the library. Volta and builds without
+/// the pinned CUTLASS backend use the exact DP4A implementation.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionEngine {
+    Auto = 0,
+    Dp4a = 1,
+    TensorCore = 2,
+}
+
+impl ProductionEngine {
+    fn from_active(value: u32) -> Result<Self, String> {
+        match value {
+            1 => Ok(Self::Dp4a),
+            2 => Ok(Self::TensorCore),
+            _ => Err(format!(
+                "CUDA backend returned invalid active production engine {value}"
             )),
         }
     }
@@ -432,8 +467,8 @@ impl CudaLibrary {
         })
     }
 
-    /// Streams one canonical production Dory V3 model bank into resident GPU
-    /// memory under the same Record V2 capability used by the verifier.
+    /// Streams one canonical production Dory V3 model bank into authenticated
+    /// evaluator storage under the same Record V2 capability used by the verifier.
     ///
     /// The returned context is published only after the complete byte stream
     /// authenticates against the manifest and exact role layout enclosed by
@@ -448,12 +483,13 @@ impl CudaLibrary {
         setup: &DeterministicBlsDorySetup,
         device_index: i32,
     ) -> Result<ProductionCudaMiner, String> {
-        self.create_production_with_residency(
+        self.create_production_with_options(
             reader,
             authenticated,
             setup,
             device_index,
             ProductionResidency::Auto,
+            ProductionEngine::Auto,
         )
     }
 
@@ -466,6 +502,29 @@ impl CudaLibrary {
         setup: &DeterministicBlsDorySetup,
         device_index: i32,
         residency: ProductionResidency,
+    ) -> Result<ProductionCudaMiner, String> {
+        self.create_production_with_options(
+            reader,
+            authenticated,
+            setup,
+            device_index,
+            residency,
+            ProductionEngine::Auto,
+        )
+    }
+
+    /// Construct the authenticated production evaluator with explicit storage
+    /// and matrix-engine policies. Explicit options fail rather than falling
+    /// back or silently changing implementation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_production_with_options<R: Read>(
+        &self,
+        reader: R,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+        device_index: i32,
+        residency: ProductionResidency,
+        engine: ProductionEngine,
     ) -> Result<ProductionCudaMiner, String> {
         if self.backend != GpuBackend::Cuda {
             return Err(
@@ -487,7 +546,8 @@ impl CudaLibrary {
             ));
         }
 
-        let sink = ProductionModelSink::begin(Arc::clone(&self.api), api, device, residency)?;
+        let sink =
+            ProductionModelSink::begin(Arc::clone(&self.api), api, device, residency, engine)?;
         verify_dory_v3_model_bank_into_staged_field_sink(reader, authenticated, setup, sink)
             .map_err(format_dory_model_stream_error)
     }
@@ -504,7 +564,7 @@ impl CudaLibrary {
         weights: &[i8],
         coefficients: &[u8],
     ) -> Result<Vec<u8>, String> {
-        self.evaluate_differential_layer_with_residency(
+        self.evaluate_differential_layer_with_options(
             device_index,
             rows,
             width,
@@ -512,8 +572,9 @@ impl CudaLibrary {
             weights,
             coefficients,
             ProductionResidency::Auto,
+            ProductionEngine::Auto,
         )
-        .map(|(output, _)| output)
+        .map(|(output, _, _)| output)
     }
 
     /// Qualification-only exact layer evaluation with deterministic residency
@@ -529,11 +590,39 @@ impl CudaLibrary {
         coefficients: &[u8],
         residency: ProductionResidency,
     ) -> Result<(Vec<u8>, ProductionResidency), String> {
+        self.evaluate_differential_layer_with_options(
+            device_index,
+            rows,
+            width,
+            activation,
+            weights,
+            coefficients,
+            residency,
+            ProductionEngine::Auto,
+        )
+        .map(|(output, active_residency, _)| (output, active_residency))
+    }
+
+    /// Qualification-only exact layer evaluation with deterministic storage
+    /// and matrix-engine selection. Both backend-confirmed active options are
+    /// returned and explicit requests fail closed on any mismatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_differential_layer_with_options(
+        &self,
+        device_index: i32,
+        rows: u32,
+        width: u32,
+        activation: &[i8],
+        weights: &[i8],
+        coefficients: &[u8],
+        residency: ProductionResidency,
+        engine: ProductionEngine,
+    ) -> Result<(Vec<u8>, ProductionResidency, ProductionEngine), String> {
         if self.backend != GpuBackend::Cuda {
             return Err("the differential layer requires the CUDA backend".to_owned());
         }
-        let evaluate = self.api.differential_layer_v2.ok_or_else(|| {
-            "CUDA library does not export the residency-aware differential ABI".to_owned()
+        let evaluate = self.api.differential_layer_v3.ok_or_else(|| {
+            "CUDA library does not export the production-option differential ABI".to_owned()
         })?;
         let activation_len = (rows as usize)
             .checked_mul(width as usize)
@@ -546,6 +635,7 @@ impl CudaLibrary {
         }
         let mut output = vec![0_u8; activation_len];
         let mut active_residency = ProductionResidency::Auto as u32;
+        let mut active_engine = ProductionEngine::Auto as u32;
         let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
         // SAFETY: slices remain live for the call and their exact lengths are
         // passed to the qualification-only C ABI.
@@ -554,6 +644,8 @@ impl CudaLibrary {
                 device_index,
                 residency as u32,
                 &mut active_residency,
+                engine as u32,
+                &mut active_engine,
                 rows,
                 width,
                 activation.as_ptr(),
@@ -570,10 +662,14 @@ impl CudaLibrary {
         };
         check_result(result, &error)?;
         let active_residency = ProductionResidency::from_active(active_residency)?;
+        let active_engine = ProductionEngine::from_active(active_engine)?;
         if residency != ProductionResidency::Auto && active_residency != residency {
             return Err("CUDA backend changed an explicit differential residency mode".to_owned());
         }
-        Ok((output, active_residency))
+        if engine != ProductionEngine::Auto && active_engine != engine {
+            return Err("CUDA backend changed an explicit differential matrix engine".to_owned());
+        }
+        Ok((output, active_residency, active_engine))
     }
 }
 
@@ -641,6 +737,7 @@ pub struct ProductionCudaMiner {
     production_api: ProductionApi,
     device: CudaDevice,
     residency: ProductionResidency,
+    engine: ProductionEngine,
     manifest: ModelBankManifest,
     record_digest: Digest32,
     model_identity_digest: Digest32,
@@ -658,6 +755,10 @@ impl ProductionCudaMiner {
 
     pub const fn residency(&self) -> ProductionResidency {
         self.residency
+    }
+
+    pub const fn engine(&self) -> ProductionEngine {
+        self.engine
     }
 
     pub const fn record_digest(&self) -> Digest32 {
@@ -751,6 +852,7 @@ struct ProductionModelSink {
     production_api: ProductionApi,
     device: Option<CudaDevice>,
     residency: ProductionResidency,
+    engine: ProductionEngine,
     pending_role: Option<ModelPcsRole>,
     pending_start: u64,
     next_offset: u64,
@@ -763,17 +865,21 @@ impl ProductionModelSink {
         production_api: ProductionApi,
         device: CudaDevice,
         requested_residency: ProductionResidency,
+        requested_engine: ProductionEngine,
     ) -> Result<Self, String> {
         let mut context = std::ptr::null_mut();
         let mut active_residency = ProductionResidency::Auto as u32;
+        let mut active_engine = ProductionEngine::Auto as u32;
         let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
         // SAFETY: output and error pointers are valid for the duration of the
         // call. The returned provisional context is owned by this sink.
         let result = unsafe {
-            (production_api.begin_v2)(
+            (production_api.begin_v3)(
                 device.index,
                 requested_residency as u32,
+                requested_engine as u32,
                 &mut active_residency,
+                &mut active_engine,
                 &mut context,
                 error.as_mut_ptr(),
                 error.len(),
@@ -790,11 +896,25 @@ impl ProductionModelSink {
                 return Err(error);
             }
         };
+        let engine = match ProductionEngine::from_active(active_engine) {
+            Ok(engine) => engine,
+            Err(error) => {
+                // SAFETY: this unpublished context came from the same API.
+                unsafe { (production_api.destroy)(context.as_ptr()) };
+                return Err(error);
+            }
+        };
         if requested_residency != ProductionResidency::Auto && residency != requested_residency {
             // SAFETY: this unpublished context came from the same API table,
             // but the backend violated explicit mode selection.
             unsafe { (production_api.destroy)(context.as_ptr()) };
             return Err("CUDA backend changed an explicit production residency mode".to_owned());
+        }
+        if requested_engine != ProductionEngine::Auto && engine != requested_engine {
+            // SAFETY: this unpublished context came from the same API table,
+            // but the backend violated explicit engine selection.
+            unsafe { (production_api.destroy)(context.as_ptr()) };
+            return Err("CUDA backend changed an explicit production matrix engine".to_owned());
         }
         Ok(Self {
             context: Some(context),
@@ -802,6 +922,7 @@ impl ProductionModelSink {
             production_api,
             device: Some(device),
             residency,
+            engine,
             pending_role: None,
             pending_start: 0,
             next_offset: 0,
@@ -905,6 +1026,7 @@ impl StagedDoryV3ModelFieldSink for ProductionModelSink {
             production_api: self.production_api,
             device,
             residency: self.residency,
+            engine: self.engine,
             manifest: *receipt.manifest(),
             record_digest: receipt.record_digest(),
             model_identity_digest: receipt.model_identity_digest(),
@@ -1169,6 +1291,20 @@ mod tests {
         );
         assert!(ProductionResidency::from_active(0).is_err());
         assert!(ProductionResidency::from_active(3).is_err());
+    }
+
+    #[test]
+    fn active_production_engine_is_fail_closed() {
+        assert_eq!(
+            ProductionEngine::from_active(1).unwrap(),
+            ProductionEngine::Dp4a
+        );
+        assert_eq!(
+            ProductionEngine::from_active(2).unwrap(),
+            ProductionEngine::TensorCore
+        );
+        assert!(ProductionEngine::from_active(0).is_err());
+        assert!(ProductionEngine::from_active(3).is_err());
     }
 
     #[test]

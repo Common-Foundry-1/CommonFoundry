@@ -11,6 +11,18 @@
 #include <string>
 #include <vector>
 
+#ifndef CMFD_CUTLASS_ENABLED
+#define CMFD_CUTLASS_ENABLED 0
+#endif
+
+#if CMFD_CUTLASS_ENABLED
+extern "C" int32_t cmfd_cutlass_int8_gemm(const int8_t* activation,
+                                           const int8_t* transposed_weights,
+                                           int32_t* accumulators, uint32_t rows,
+                                           uint32_t width, char* error,
+                                           size_t error_len);
+#endif
+
 #if defined(_WIN32)
 #define CMFD_CUDA_EXPORT extern "C" __declspec(dllexport)
 #else
@@ -37,6 +49,9 @@ constexpr uint32_t PRODUCTION_MAX_NONCES = 64;
 constexpr uint32_t PRODUCTION_RESIDENCY_AUTO = 0;
 constexpr uint32_t PRODUCTION_RESIDENCY_FULL = 1;
 constexpr uint32_t PRODUCTION_RESIDENCY_HOST = 2;
+constexpr uint32_t PRODUCTION_ENGINE_AUTO = 0;
+constexpr uint32_t PRODUCTION_ENGINE_DP4A = 1;
+constexpr uint32_t PRODUCTION_ENGINE_TENSOR_CORE = 2;
 constexpr size_t PRODUCTION_ACTIVATION_VALUES =
     size_t(PRODUCTION_ROWS) * PRODUCTION_WIDTH;
 constexpr size_t PRODUCTION_LAYER_BYTES = size_t(PRODUCTION_WIDTH) * PRODUCTION_WIDTH;
@@ -72,6 +87,7 @@ struct Context {
 struct ProductionContext {
     int device_index = -1;
     uint32_t residency = PRODUCTION_RESIDENCY_AUTO;
+    uint32_t engine = PRODUCTION_ENGINE_AUTO;
     bool finalized = false;
     size_t base_uploaded = 0;
     std::array<size_t, PRODUCTION_BANKS> bank_uploaded{};
@@ -320,6 +336,29 @@ void launch_exact_matrix_layer(const int8_t* activation, const int8_t* transpose
     cuda_check(cudaGetLastError(), "evaluate exact INT8xINT8 matrix layer");
 }
 
+void launch_production_matrix_layer(uint32_t engine, const int8_t* activation,
+                                    const int8_t* transposed_weights,
+                                    int32_t* accumulators, uint32_t rows,
+                                    uint32_t width) {
+    if (engine == PRODUCTION_ENGINE_DP4A) {
+        launch_exact_matrix_layer(activation, transposed_weights, accumulators, rows, width);
+        return;
+    }
+    if (engine == PRODUCTION_ENGINE_TENSOR_CORE) {
+#if CMFD_CUTLASS_ENABLED
+        char error[256]{};
+        if (cmfd_cutlass_int8_gemm(activation, transposed_weights, accumulators, rows,
+                                   width, error, sizeof(error)) != 0) {
+            throw std::runtime_error(std::string("CUTLASS tensor-core GEMM: ") + error);
+        }
+        return;
+#else
+        throw std::runtime_error("production tensor-core engine is not compiled into this library");
+#endif
+    }
+    throw std::runtime_error("production matrix engine is invalid");
+}
+
 void ensure_production_coefficient_capacity(ProductionContext& context, size_t bytes) {
     if (context.coefficient_capacity >= bytes) return;
     cudaFree(context.device_coefficients);
@@ -333,6 +372,8 @@ void ensure_production_coefficient_capacity(ProductionContext& context, size_t b
 struct ProductionDeviceCapacity {
     size_t free_bytes;
     size_t total_bytes;
+    int compute_major;
+    int compute_minor;
 };
 
 ProductionDeviceCapacity validate_production_device(int device_index) {
@@ -345,7 +386,44 @@ ProductionDeviceCapacity validate_production_device(int device_index) {
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "read CUDA memory capacity");
-    return {free_bytes, total_bytes};
+    return {free_bytes, total_bytes, properties.major, properties.minor};
+}
+
+uint32_t select_production_engine(uint32_t requested,
+                                  const ProductionDeviceCapacity& capacity,
+                                  uint32_t matrix_width) {
+    if (requested != PRODUCTION_ENGINE_AUTO && requested != PRODUCTION_ENGINE_DP4A &&
+        requested != PRODUCTION_ENGINE_TENSOR_CORE) {
+        throw std::runtime_error("production matrix engine is invalid");
+    }
+    if (requested == PRODUCTION_ENGINE_TENSOR_CORE) {
+#if CMFD_CUTLASS_ENABLED
+        const bool tensor_capable =
+            capacity.compute_major > 7 ||
+            (capacity.compute_major == 7 && capacity.compute_minor >= 5);
+        if (!tensor_capable) {
+            throw std::runtime_error(
+                "production tensor-core engine requires compute capability 7.5+");
+        }
+        if (matrix_width < 16 || matrix_width % 16 != 0) {
+            throw std::runtime_error(
+                "production tensor-core engine requires matrix width divisible by 16");
+        }
+        return PRODUCTION_ENGINE_TENSOR_CORE;
+#else
+        throw std::runtime_error("production tensor-core engine is not compiled into this library");
+#endif
+    }
+    if (requested == PRODUCTION_ENGINE_DP4A) return PRODUCTION_ENGINE_DP4A;
+#if CMFD_CUTLASS_ENABLED
+    const bool tensor_capable =
+        capacity.compute_major > 7 ||
+        (capacity.compute_major == 7 && capacity.compute_minor >= 5);
+    if (tensor_capable && matrix_width >= 16 && matrix_width % 16 == 0) {
+        return PRODUCTION_ENGINE_TENSOR_CORE;
+    }
+#endif
+    return PRODUCTION_ENGINE_DP4A;
 }
 
 size_t production_common_device_bytes(uint32_t residency) {
@@ -385,17 +463,23 @@ uint32_t select_production_residency(uint32_t requested,
 
 std::unique_ptr<ProductionContext> allocate_production_context(int device_index,
                                                                uint32_t requested_residency,
-                                                               uint32_t* active_residency) {
-    if (active_residency == nullptr) {
-        throw std::runtime_error("active production residency output is null");
+                                                               uint32_t requested_engine,
+                                                               uint32_t* active_residency,
+                                                               uint32_t* active_engine) {
+    if (active_residency == nullptr || active_engine == nullptr) {
+        throw std::runtime_error("active production option output is null");
     }
     *active_residency = PRODUCTION_RESIDENCY_AUTO;
+    *active_engine = PRODUCTION_ENGINE_AUTO;
     const ProductionDeviceCapacity capacity = validate_production_device(device_index);
     const uint32_t residency = select_production_residency(requested_residency, capacity);
+    const uint32_t engine =
+        select_production_engine(requested_engine, capacity, PRODUCTION_WIDTH);
 
     auto context = std::make_unique<ProductionContext>();
     context->device_index = device_index;
     context->residency = residency;
+    context->engine = engine;
     cuda_check(cudaMalloc(&context->device_base, PRODUCTION_ACTIVATION_VALUES),
                "allocate production base input");
     if (residency == PRODUCTION_RESIDENCY_FULL) {
@@ -421,6 +505,7 @@ std::unique_ptr<ProductionContext> allocate_production_context(int device_index,
     cuda_check(cudaMalloc(&context->device_encoded_output, PRODUCTION_ACTIVATION_VALUES),
                "allocate production encoded output");
     *active_residency = residency;
+    *active_engine = engine;
     return context;
 }
 
@@ -613,8 +698,10 @@ CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_begin(int32_t device_index,
         if (output_context == nullptr) throw std::runtime_error("context output is null");
         *output_context = nullptr;
         uint32_t active_residency = PRODUCTION_RESIDENCY_AUTO;
+        uint32_t active_engine = PRODUCTION_ENGINE_AUTO;
         auto context = allocate_production_context(device_index, PRODUCTION_RESIDENCY_AUTO,
-                                                   &active_residency);
+                                                   PRODUCTION_ENGINE_AUTO, &active_residency,
+                                                   &active_engine);
         *output_context = context.release();
         return 0;
     } catch (const std::exception& exception) {
@@ -629,8 +716,28 @@ CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_begin_v2(
     try {
         if (output_context == nullptr) throw std::runtime_error("context output is null");
         *output_context = nullptr;
-        auto context =
-            allocate_production_context(device_index, requested_residency, active_residency);
+        uint32_t active_engine = PRODUCTION_ENGINE_AUTO;
+        auto context = allocate_production_context(device_index, requested_residency,
+                                                   PRODUCTION_ENGINE_AUTO, active_residency,
+                                                   &active_engine);
+        *output_context = context.release();
+        return 0;
+    } catch (const std::exception& exception) {
+        write_error(error, error_len, exception.what());
+        return 1;
+    }
+}
+
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_begin_v3(
+    int32_t device_index, uint32_t requested_residency, uint32_t requested_engine,
+    uint32_t* active_residency, uint32_t* active_engine, void** output_context,
+    char* error, size_t error_len) {
+    try {
+        if (output_context == nullptr) throw std::runtime_error("context output is null");
+        *output_context = nullptr;
+        auto context = allocate_production_context(device_index, requested_residency,
+                                                   requested_engine, active_residency,
+                                                   active_engine);
         *output_context = context.release();
         return 0;
     } catch (const std::exception& exception) {
@@ -791,8 +898,9 @@ CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_evaluate(
                 } else {
                     throw std::runtime_error("production residency mode is invalid");
                 }
-                launch_exact_matrix_layer(current, weights, context.device_accumulators,
-                                          PRODUCTION_ROWS, PRODUCTION_WIDTH);
+                launch_production_matrix_layer(context.engine, current, weights,
+                                               context.device_accumulators,
+                                               PRODUCTION_ROWS, PRODUCTION_WIDTH);
                 reduce_production_layer<<<blocks, THREADS>>>(
                     context.device_accumulators,
                     nonce_coefficients + size_t(layer + 1) * PRODUCTION_COEFFICIENTS, next,
@@ -825,10 +933,10 @@ CMFD_CUDA_EXPORT void cmfd_cuda_production_destroy(void* opaque_context) {
 // mining path.
 int32_t differential_layer_impl(
     int32_t device_index, uint32_t requested_residency, uint32_t* active_residency,
-    uint32_t rows, uint32_t width, const int8_t* activation,
-    size_t activation_len, const int8_t* weights, size_t weights_len,
-    const uint8_t* coefficients, size_t coefficients_len, uint8_t* output,
-    size_t output_len, char* error, size_t error_len) {
+    uint32_t requested_engine, uint32_t* active_engine, uint32_t rows, uint32_t width,
+    const int8_t* activation, size_t activation_len, const int8_t* weights,
+    size_t weights_len, const uint8_t* coefficients, size_t coefficients_len,
+    uint8_t* output, size_t output_len, char* error, size_t error_len) {
     int8_t* device_activation = nullptr;
     int8_t* device_weights = nullptr;
     int8_t* device_transposed_weights = nullptr;
@@ -837,10 +945,11 @@ int32_t differential_layer_impl(
     uint8_t* device_encoded = nullptr;
     uint8_t* device_coefficients = nullptr;
     try {
-        if (active_residency == nullptr) {
-            throw std::runtime_error("active differential residency output is null");
+        if (active_residency == nullptr || active_engine == nullptr) {
+            throw std::runtime_error("active differential option output is null");
         }
         *active_residency = PRODUCTION_RESIDENCY_AUTO;
+        *active_engine = PRODUCTION_ENGINE_AUTO;
         if (rows == 0 || rows > PRODUCTION_ROWS || width == 0 || width > PRODUCTION_WIDTH) {
             throw std::runtime_error("differential dimensions exceed production geometry");
         }
@@ -859,6 +968,7 @@ int32_t differential_layer_impl(
         const ProductionDeviceCapacity capacity = validate_production_device(device_index);
         const uint32_t residency =
             select_production_residency(requested_residency, capacity);
+        const uint32_t engine = select_production_engine(requested_engine, capacity, width);
         std::unique_ptr<int8_t[]> host_weights;
         if (residency == PRODUCTION_RESIDENCY_HOST) {
             host_weights.reset(new (std::nothrow) int8_t[expected_weights]);
@@ -892,8 +1002,8 @@ int32_t differential_layer_impl(
                               cudaMemcpyHostToDevice),
                    "copy differential coefficients");
         transpose_layer(device_weights, device_transposed_weights, width);
-        launch_exact_matrix_layer(device_activation, device_transposed_weights,
-                                  device_accumulators, rows, width);
+        launch_production_matrix_layer(engine, device_activation, device_transposed_weights,
+                                       device_accumulators, rows, width);
         const uint32_t blocks =
             static_cast<uint32_t>((expected_activation + THREADS - 1) / THREADS);
         reduce_production_layer<<<blocks, THREADS>>>(device_accumulators, device_coefficients,
@@ -913,6 +1023,7 @@ int32_t differential_layer_impl(
         cudaFree(device_weights);
         cudaFree(device_activation);
         *active_residency = residency;
+        *active_engine = engine;
         return 0;
     } catch (const std::exception& exception) {
         cudaFree(device_coefficients);
@@ -933,10 +1044,11 @@ CMFD_CUDA_EXPORT int32_t cmfd_cuda_differential_layer(
     const uint8_t* coefficients, size_t coefficients_len, uint8_t* output,
     size_t output_len, char* error, size_t error_len) {
     uint32_t active_residency = PRODUCTION_RESIDENCY_AUTO;
+    uint32_t active_engine = PRODUCTION_ENGINE_AUTO;
     return differential_layer_impl(
-        device_index, PRODUCTION_RESIDENCY_AUTO, &active_residency, rows, width, activation,
-        activation_len, weights, weights_len, coefficients, coefficients_len, output,
-        output_len, error, error_len);
+        device_index, PRODUCTION_RESIDENCY_AUTO, &active_residency, PRODUCTION_ENGINE_AUTO,
+        &active_engine, rows, width, activation, activation_len, weights, weights_len,
+        coefficients, coefficients_len, output, output_len, error, error_len);
 }
 
 CMFD_CUDA_EXPORT int32_t cmfd_cuda_differential_layer_v2(
@@ -945,8 +1057,21 @@ CMFD_CUDA_EXPORT int32_t cmfd_cuda_differential_layer_v2(
     const int8_t* weights, size_t weights_len, const uint8_t* coefficients,
     size_t coefficients_len, uint8_t* output, size_t output_len, char* error,
     size_t error_len) {
+    uint32_t active_engine = PRODUCTION_ENGINE_AUTO;
     return differential_layer_impl(
-        device_index, requested_residency, active_residency, rows, width, activation,
-        activation_len, weights, weights_len, coefficients, coefficients_len, output,
-        output_len, error, error_len);
+        device_index, requested_residency, active_residency, PRODUCTION_ENGINE_AUTO,
+        &active_engine, rows, width, activation, activation_len, weights, weights_len,
+        coefficients, coefficients_len, output, output_len, error, error_len);
+}
+
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_differential_layer_v3(
+    int32_t device_index, uint32_t requested_residency, uint32_t* active_residency,
+    uint32_t requested_engine, uint32_t* active_engine, uint32_t rows, uint32_t width,
+    const int8_t* activation, size_t activation_len, const int8_t* weights,
+    size_t weights_len, const uint8_t* coefficients, size_t coefficients_len,
+    uint8_t* output, size_t output_len, char* error, size_t error_len) {
+    return differential_layer_impl(
+        device_index, requested_residency, active_residency, requested_engine, active_engine,
+        rows, width, activation, activation_len, weights, weights_len, coefficients,
+        coefficients_len, output, output_len, error, error_len);
 }

@@ -38,7 +38,7 @@ python3 "$RELEASE_INTEGRITY" receipt-verify \
   --receipt "$CUDA_RECEIPT" \
   --expected-build-script scripts/build-cuda-miner.sh \
   --expected-target x86_64-unknown-linux-gnu \
-  --expected-architectures 'sm_70;sm_75;sm_86;sm_89;sm_120;compute_70' \
+  --expected-architectures 'sm_70;sm_75;sm_86;sm_89;sm_120;compute_70;compute_75-tensor-core' \
   --source-date-epoch "$SOURCE_DATE_EPOCH_VALUE"
 
 if [[ -f "$OPENCL_LIBRARY" ]]; then
@@ -91,6 +91,7 @@ install -m 0755 "$PROJECT_ROOT/packaging/standalone-miner/linux/start-miner.sh" 
 install -m 0644 "$PROJECT_ROOT/packaging/standalone-miner/linux/README.txt" "$TEMP_STAGE/README.txt"
 install -m 0644 "$PROJECT_ROOT/docs/standalone-miner.md" "$TEMP_STAGE/standalone-miner.md"
 install -m 0644 "$PROJECT_ROOT/LICENSE" "$TEMP_STAGE/LICENSE"
+install -m 0644 "$PROJECT_ROOT/THIRD_PARTY_NOTICES.md" "$TEMP_STAGE/THIRD_PARTY_NOTICES.md"
 
 python3 "$RELEASE_INTEGRITY" archive-tar-gz \
   --stage "$TEMP_STAGE" \
@@ -104,7 +105,7 @@ SHA256="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
 
 printf 'Package: %s\nBytes: %s\nSHA256: %s\n' "$ARCHIVE" "$BYTES" "$SHA256"
 printf 'Native architectures: sm_70, sm_75, sm_86, sm_89, sm_120\n'
-printf 'PTX fallback: compute_70\n'
+printf 'PTX fallbacks: compute_70, compute_75 tensor core\n'
 if [[ -f "$OPENCL_LIBRARY" ]]; then
   printf 'OpenCL backend: included\n'
 fi

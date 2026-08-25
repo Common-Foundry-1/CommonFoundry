@@ -5,6 +5,7 @@ param(
     [string]$ExpectedCommit,
     [string]$BuildDirectory,
     [string]$CudaToolkit,
+    [string]$CutlassRoot,
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
     [switch]$SkipDifferentialTest
@@ -15,6 +16,9 @@ Set-StrictMode -Version Latest
 
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $releaseIntegrity = Join-Path $PSScriptRoot 'release_integrity.py'
+$cutlassCommit = 'ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e'
+$cutlassRepository = 'https://github.com/NVIDIA/cutlass.git'
+$cutlassTag = 'v3.9.2'
 
 function Invoke-ReleaseIntegrity {
     param([Parameter(Mandatory)][string[]]$ToolArguments)
@@ -42,6 +46,38 @@ if (-not $BuildDirectory) {
     $BuildDirectory = Join-Path $projectRoot 'target\gpu-miner-build'
 }
 $BuildDirectory = [System.IO.Path]::GetFullPath($BuildDirectory)
+
+$git = Get-Command git.exe -ErrorAction SilentlyContinue
+if (-not $git) {
+    throw 'Git is required to acquire and verify the pinned CUTLASS source.'
+}
+if (-not $CutlassRoot) {
+    $CutlassRoot = Join-Path $BuildDirectory '_deps\cutlass-3.9.2'
+}
+$CutlassRoot = [System.IO.Path]::GetFullPath($CutlassRoot)
+if (-not (Test-Path -LiteralPath $CutlassRoot)) {
+    $cutlassParent = Split-Path -Parent $CutlassRoot
+    New-Item -ItemType Directory -Path $cutlassParent -Force | Out-Null
+    & $git.Source clone --filter=blob:none --depth=1 --branch $cutlassTag `
+        $cutlassRepository $CutlassRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not clone the pinned CUTLASS source.'
+    }
+    & $git.Source -C $CutlassRoot checkout --detach $cutlassCommit
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not check out CUTLASS commit $cutlassCommit."
+    }
+}
+$cutlassRevisionOutput = @(& $git.Source -C $CutlassRoot rev-parse HEAD)
+$cutlassRevisionExitCode = $LASTEXITCODE
+$actualCutlassCommit = ($cutlassRevisionOutput -join '').Trim()
+if ($cutlassRevisionExitCode -ne 0 -or $actualCutlassCommit -ne $cutlassCommit) {
+    throw "CUTLASS must be the pinned commit $cutlassCommit; got $actualCutlassCommit."
+}
+$cutlassChanges = @(& $git.Source -C $CutlassRoot status --porcelain --untracked-files=all)
+if ($LASTEXITCODE -ne 0 -or $cutlassChanges.Count -ne 0) {
+    throw 'The pinned CUTLASS checkout has local or untracked changes.'
+}
 
 $toolkitCandidates = @()
 if ($CudaToolkit) {
@@ -83,8 +119,8 @@ if (-not $devCommand) {
 }
 
 $gpuSource = Join-Path $projectRoot 'gpu'
-$configureAndBuild = '"{0}" -arch=x64 -host_arch=x64 && cmake -S "{1}" -B "{2}" -G Ninja -DCMAKE_BUILD_TYPE={3} -DCMAKE_CUDA_COMPILER="{4}" && cmake --build "{2}" --target cmfd-forgematrix-v2-miner' -f `
-    $devCommand, $gpuSource, $BuildDirectory, $Configuration, $nvcc
+$configureAndBuild = '"{0}" -arch=x64 -host_arch=x64 && cmake -S "{1}" -B "{2}" -G Ninja -DCMAKE_BUILD_TYPE={3} -DCMAKE_CUDA_COMPILER="{4}" -DCMFD_CUTLASS_ROOT="{5}" && cmake --build "{2}" --target cmfd-forgematrix-v2-miner' -f `
+    $devCommand, $gpuSource, $BuildDirectory, $Configuration, $nvcc, $CutlassRoot
 & cmd.exe /d /s /c $configureAndBuild
 if ($LASTEXITCODE -ne 0) {
     throw "CUDA miner build failed with exit code $LASTEXITCODE."
@@ -110,12 +146,22 @@ foreach ($architecture in @('sm_70', 'sm_75', 'sm_86', 'sm_89', 'sm_120')) {
 if (-not ($ptxImages -match 'sm_70')) {
     throw 'The library is missing its forward-compatible compute_70 PTX image.'
 }
+if (-not ($ptxImages -match 'sm_75')) {
+    throw 'The library is missing its signed-INT8 Tensor Core compute_75 PTX image.'
+}
+$ptxAssembly = @(& $cuobjdump --dump-ptx $library)
+if ($LASTEXITCODE -ne 0 -or -not ($ptxAssembly -match `
+        'mma\.sync\.aligned\.m8n8k16\.row\.col\.satfinite\.s32\.s8\.s8\.s32')) {
+    throw 'The compute_75 PTX does not contain the required signed-INT8 Tensor Core MMA.'
+}
 
 if (-not $SkipDifferentialTest) {
     Push-Location $projectRoot
     try {
         $previousLibrary = $env:CMFD_CUDA_MINER_LIBRARY
+        $previousRequireTensorCore = $env:CMFD_REQUIRE_TENSOR_CORE
         $env:CMFD_CUDA_MINER_LIBRARY = $library
+        $env:CMFD_REQUIRE_TENSOR_CORE = '1'
         & cargo test -p common-foundry-wallet `
             cuda::tests::available_cuda_backend_matches_authoritative_v2_digests -- --nocapture
         if ($LASTEXITCODE -ne 0) {
@@ -127,6 +173,7 @@ if (-not $SkipDifferentialTest) {
         }
     } finally {
         $env:CMFD_CUDA_MINER_LIBRARY = $previousLibrary
+        $env:CMFD_REQUIRE_TENSOR_CORE = $previousRequireTensorCore
         Pop-Location
     }
 }
@@ -162,9 +209,9 @@ Invoke-ReleaseIntegrity -ToolArguments @(
     '--kind', 'cuda',
     '--library', $library,
     '--build-script', 'scripts/build-cuda-miner.ps1',
-    '--toolchain', "$nvccVersion; $cmakeVersion; $devCommand",
+    '--toolchain', "$nvccVersion; $cmakeVersion; $devCommand; CUTLASS $actualCutlassCommit",
     '--target', 'x86_64-pc-windows-msvc',
-    '--architectures', 'sm_70;sm_75;sm_86;sm_89;sm_120;compute_70',
+    '--architectures', 'sm_70;sm_75;sm_86;sm_89;sm_120;compute_70;compute_75-tensor-core',
     '--output', $receipt
 )
 [pscustomobject]@{
@@ -173,5 +220,6 @@ Invoke-ReleaseIntegrity -ToolArguments @(
     Bytes = $file.Length
     SHA256 = $hash
     NativeArchitectures = 'sm_70, sm_75, sm_86, sm_89, sm_120'
-    PtxFallback = 'compute_70'
+    PtxFallback = 'compute_70, compute_75 tensor core'
+    CutlassCommit = $actualCutlassCommit
 }

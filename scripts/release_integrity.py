@@ -69,6 +69,7 @@ NATIVE_SOURCES = {
     "cuda": (
         "gpu/CMakeLists.txt",
         "gpu/forgematrix_v2_miner.cu",
+        "gpu/forgematrix_v2_tensor_core.cu",
     ),
     "opencl": (
         "gpu/CMakeLists.txt",

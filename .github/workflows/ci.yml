@@ -49,6 +49,8 @@ jobs:
           bash -n scripts/release-linux-common.sh
           bash -n scripts/build-cuda-miner.sh
           bash -n scripts/build-opencl-miner.sh
+          bash -n scripts/prepare-tauri-appimage-tools.sh
+          bash -n scripts/normalize-linux-appimage.sh
           bash -n scripts/normalize-linux-deb.sh
           bash -n scripts/package-standalone-miner.sh
       - name: Install Linux desktop dependencies
@@ -145,12 +147,15 @@ jobs:
         include:
           - os: windows-latest
             artifact: common-foundry-wallet-windows
-            bundle-path: target/release/bundle
+            package-paths: |
+              target/release/bundle/nsis/Common Foundry Wallet_0.1.0-devnet.14_x64-setup.exe
             binary-path: target/release/common-foundry-wallet.exe
             node-path: target/release/cmfd-node.exe
           - os: ubuntu-22.04
             artifact: common-foundry-wallet-linux
-            bundle-path: target/release/bundle
+            package-paths: |
+              target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.14_amd64.AppImage
+              target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.14_amd64.deb
             binary-path: target/release/common-foundry-wallet
             node-path: target/release/cmfd-node
     runs-on: ${{ matrix.os }}
@@ -170,6 +175,7 @@ jobs:
             libxdo-dev \
             librsvg2-dev \
             patchelf \
+            squashfs-tools \
             wget
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable snapshot 2026-08-05
         with:
@@ -189,8 +195,27 @@ jobs:
       - name: Build Linux node CLI
         if: runner.os == 'Linux'
         run: cargo build --release --locked -p cmfd-node
+      - name: Install pinned Tauri AppImage tools
+        if: runner.os == 'Linux'
+        env:
+          CMFD_RELEASE_COMMIT: ${{ github.sha }}
+        run: bash scripts/prepare-tauri-appimage-tools.sh "$CMFD_RELEASE_COMMIT" prepare
       - run: npm run desktop:build -- --ci -- --locked
         working-directory: apps/wallet
+      - name: Verify pinned Tauri AppImage tools
+        if: runner.os == 'Linux'
+        env:
+          CMFD_RELEASE_COMMIT: ${{ github.sha }}
+        run: bash scripts/prepare-tauri-appimage-tools.sh "$CMFD_RELEASE_COMMIT" verify
+      - name: Normalize and verify Linux AppImage
+        if: runner.os == 'Linux'
+        env:
+          CMFD_RELEASE_COMMIT: ${{ github.sha }}
+        run: >-
+          bash scripts/normalize-linux-appimage.sh
+          "target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.14_amd64.AppImage"
+          "$CMFD_RELEASE_COMMIT"
+          "0.1.0-devnet.14"
       - name: Normalize Linux deb package
         if: runner.os == 'Linux'
         env:
@@ -204,7 +229,7 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            ${{ matrix.bundle-path }}
+            ${{ matrix.package-paths }}
             ${{ matrix.binary-path }}
             ${{ matrix.node-path }}
           if-no-files-found: error

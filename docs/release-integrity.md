@@ -29,6 +29,13 @@ export CMFD_RELEASE_COMMIT='<full-lowercase-release-commit>'
 bash scripts/build-cuda-miner.sh
 bash scripts/build-opencl-miner.sh
 bash scripts/package-standalone-miner.sh
+bash scripts/prepare-tauri-appimage-tools.sh "$CMFD_RELEASE_COMMIT" prepare
+(cd apps/wallet && npm run desktop:build -- --ci -- --locked)
+bash scripts/prepare-tauri-appimage-tools.sh "$CMFD_RELEASE_COMMIT" verify
+bash scripts/normalize-linux-appimage.sh \
+  "target/release/bundle/appimage/Common Foundry Wallet_0.1.0-devnet.14_amd64.AppImage" \
+  "$CMFD_RELEASE_COMMIT" \
+  "0.1.0-devnet.14"
 bash scripts/normalize-linux-deb.sh \
   "target/release/bundle/deb/Common Foundry Wallet_0.1.0-devnet.14_amd64.deb" \
   "$CMFD_RELEASE_COMMIT" \
@@ -51,6 +58,22 @@ byte-identical second normalization pass before atomically replacing the Tauri
 output. It requires an Ubuntu 22.04-compatible GNU userland with `dpkg-deb`
 support for root ownership and uniform compression, and prints the semantic
 package hash plus exact packaging-tool versions in the build log.
+
+Before Tauri runs, the release workflow downloads or reuses all five AppImage
+helpers only when they match their pinned SHA-256 digests. The GTK and
+GStreamer scripts use immutable commit URLs; mutable release assets are
+accepted only when their bytes match the recorded digest. The tools are checked
+again after Tauri exits so a build-time replacement cannot pass unnoticed.
+
+The Linux AppImage normalizer extracts the Tauri-built image without mounting
+it, rejects escaping links, hard links, and special files, removes group/world
+write and set-id permission, and makes the wrapper and application entrypoints
+executable by ordinary users. It fixes payload timestamps to
+`SOURCE_DATE_EPOCH`, compares the complete content, mode, and symlink inventory
+before and after repacking, runs both the extracted entrypoints and outer image
+as an unprivileged user, and requires a byte-identical second repack before
+atomically replacing the Tauri output. CI uploads only the final AppImage and
+`.deb`; raw AppDir and Debian staging trees are not release artifacts.
 
 The final flat asset directory is constrained by the tracked
 `packaging/releases/v0.1.0-devnet.14.inventory`. `BUILDINFO.json` and

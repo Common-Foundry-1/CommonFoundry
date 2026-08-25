@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
-
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +26,23 @@ constexpr uint32_t MAX_LAYERS = 4;
 constexpr uint32_t MAX_ACTIVATION_VALUES = MAX_WIDTH * MAX_ROWS;
 constexpr uint32_t MAX_BATCH = 65'536;
 constexpr uint32_t THREADS = 128;
+constexpr uint32_t PRODUCTION_ROWS = 128;
+constexpr uint32_t PRODUCTION_WIDTH = 4096;
+constexpr uint32_t PRODUCTION_LAYERS = 384;
+constexpr uint32_t PRODUCTION_BANKS = 3;
+constexpr uint32_t PRODUCTION_LAYERS_PER_BANK = 128;
+constexpr uint32_t PRODUCTION_COEFFICIENTS = 20;
+constexpr uint32_t PRODUCTION_STAGES = PRODUCTION_LAYERS + 1;
+constexpr uint32_t PRODUCTION_MAX_NONCES = 64;
+constexpr size_t PRODUCTION_ACTIVATION_VALUES =
+    size_t(PRODUCTION_ROWS) * PRODUCTION_WIDTH;
+constexpr size_t PRODUCTION_LAYER_BYTES = size_t(PRODUCTION_WIDTH) * PRODUCTION_WIDTH;
+constexpr size_t PRODUCTION_BANK_BYTES =
+    size_t(PRODUCTION_LAYERS_PER_BANK) * PRODUCTION_LAYER_BYTES;
+constexpr size_t PRODUCTION_WEIGHT_BYTES = size_t(PRODUCTION_LAYERS) * PRODUCTION_LAYER_BYTES;
+
+static_assert(PRODUCTION_COEFFICIENTS == 1 + 7 + 12);
+static_assert(PRODUCTION_WEIGHT_BYTES == size_t(6'442'450'944ULL));
 
 struct Context {
     int device_index = 0;
@@ -44,6 +61,34 @@ struct Context {
         if (device_index >= 0) cudaSetDevice(device_index);
         cudaFree(device_outputs);
         cudaFree(device_coefficients);
+        cudaFree(device_weights);
+        cudaFree(device_base);
+    }
+};
+
+struct ProductionContext {
+    int device_index = -1;
+    bool finalized = false;
+    size_t base_uploaded = 0;
+    std::array<size_t, PRODUCTION_BANKS> bank_uploaded{};
+    int8_t* device_base = nullptr;
+    int8_t* device_weights = nullptr;
+    int8_t* device_activation_a = nullptr;
+    int8_t* device_activation_b = nullptr;
+    int8_t* device_transpose_layer = nullptr;
+    int32_t* device_accumulators = nullptr;
+    uint8_t* device_coefficients = nullptr;
+    uint8_t* device_encoded_output = nullptr;
+    size_t coefficient_capacity = 0;
+
+    ~ProductionContext() {
+        if (device_index >= 0) cudaSetDevice(device_index);
+        cudaFree(device_encoded_output);
+        cudaFree(device_coefficients);
+        cudaFree(device_accumulators);
+        cudaFree(device_transpose_layer);
+        cudaFree(device_activation_b);
+        cudaFree(device_activation_a);
         cudaFree(device_weights);
         cudaFree(device_base);
     }
@@ -167,6 +212,134 @@ __global__ void evaluate_batch(const uint8_t* base, const int8_t* transposed_wei
     if (index < activation_len) {
         outputs[size_t(nonce_index) * activation_len + index] =
             static_cast<uint8_t>(int32_t(activation[layers & 1U][index]) + 125);
+    }
+}
+
+__global__ void initialize_production_activation(const int8_t* base,
+                                                 const uint8_t* coefficients,
+                                                 int8_t* activation, uint32_t rows,
+                                                 uint32_t width) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t activation_len = size_t(rows) * width;
+    if (index >= activation_len) return;
+    const uint32_t row = static_cast<uint32_t>(index / width);
+    const uint32_t col = static_cast<uint32_t>(index % width);
+    const uint32_t row_bits = __ffs(static_cast<int>(rows)) - 1;
+    const uint32_t col_bits = __ffs(static_cast<int>(width)) - 1;
+    const int32_t z = int32_t(base[index]) +
+                      coordinate_mask(coefficients, row, col, row_bits, col_bits);
+    activation[index] = cubic_reduce(z);
+}
+
+__global__ void reduce_production_layer(const int32_t* accumulators,
+                                        const uint8_t* coefficients, int8_t* activation,
+                                        uint32_t rows, uint32_t width) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t activation_len = size_t(rows) * width;
+    if (index >= activation_len) return;
+    const uint32_t row = static_cast<uint32_t>(index / width);
+    const uint32_t col = static_cast<uint32_t>(index % width);
+    const uint32_t row_bits = __ffs(static_cast<int>(rows)) - 1;
+    const uint32_t col_bits = __ffs(static_cast<int>(width)) - 1;
+    const int32_t z = accumulators[index] +
+                      coordinate_mask(coefficients, row, col, row_bits, col_bits);
+    activation[index] = cubic_reduce(z);
+}
+
+__global__ void encode_production_activation(const int8_t* activation, uint8_t* output,
+                                              size_t length) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < length) output[index] = static_cast<uint8_t>(int32_t(activation[index]) + 125);
+}
+
+__global__ void transpose_square_layer(const int8_t* input, int8_t* output, uint32_t width) {
+    __shared__ int8_t tile[32][33];
+    const uint32_t source_col = blockIdx.x * 32 + threadIdx.x;
+    const uint32_t source_row = blockIdx.y * 32 + threadIdx.y;
+    for (uint32_t offset = 0; offset < 32; offset += 8) {
+        if (source_col < width && source_row + offset < width) {
+            tile[threadIdx.y + offset][threadIdx.x] =
+                input[size_t(source_row + offset) * width + source_col];
+        }
+    }
+    __syncthreads();
+    const uint32_t target_col = blockIdx.y * 32 + threadIdx.x;
+    const uint32_t target_row = blockIdx.x * 32 + threadIdx.y;
+    for (uint32_t offset = 0; offset < 32; offset += 8) {
+        if (target_col < width && target_row + offset < width) {
+            output[size_t(target_row + offset) * width + target_col] =
+                tile[threadIdx.x][threadIdx.y + offset];
+        }
+    }
+}
+
+__global__ void exact_int8_matrix_layer(const int8_t* activation,
+                                        const int8_t* transposed_weights,
+                                        int32_t* accumulators, uint32_t rows,
+                                        uint32_t width) {
+    extern __shared__ int8_t row_activation[];
+    const uint32_t row = blockIdx.y;
+    for (uint32_t common = threadIdx.x; common < width; common += blockDim.x) {
+        row_activation[common] = activation[size_t(row) * width + common];
+    }
+    __syncthreads();
+    const uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || col >= width) return;
+    const int8_t* weights = transposed_weights + size_t(col) * width;
+    int32_t accumulator = 0;
+    uint32_t common = 0;
+    for (; common + 4 <= width; common += 4) {
+        accumulator = __dp4a(pack_int8x4(row_activation + common),
+                             pack_int8x4(weights + common), accumulator);
+    }
+    for (; common < width; ++common) {
+        accumulator += int32_t(row_activation[common]) * int32_t(weights[common]);
+    }
+    accumulators[size_t(row) * width + col] = accumulator;
+}
+
+void transpose_layer(const int8_t* source, int8_t* destination, uint32_t width) {
+    const dim3 threads(32, 8);
+    const dim3 blocks((width + 31) / 32, (width + 31) / 32);
+    transpose_square_layer<<<blocks, threads>>>(source, destination, width);
+    cuda_check(cudaGetLastError(), "transpose canonical production weight layer");
+}
+
+void launch_exact_matrix_layer(const int8_t* activation, const int8_t* transposed_weights,
+                               int32_t* accumulators, uint32_t rows, uint32_t width) {
+    const dim3 blocks((width + THREADS - 1) / THREADS, rows);
+    exact_int8_matrix_layer<<<blocks, THREADS, width>>>(activation, transposed_weights,
+                                                       accumulators, rows, width);
+    cuda_check(cudaGetLastError(), "evaluate exact INT8xINT8 matrix layer");
+}
+
+void ensure_production_coefficient_capacity(ProductionContext& context, size_t bytes) {
+    if (context.coefficient_capacity >= bytes) return;
+    cudaFree(context.device_coefficients);
+    context.device_coefficients = nullptr;
+    context.coefficient_capacity = 0;
+    cuda_check(cudaMalloc(&context.device_coefficients, bytes),
+               "allocate production mask coefficients");
+    context.coefficient_capacity = bytes;
+}
+
+void validate_production_device(int device_index) {
+    cuda_check(cudaSetDevice(device_index), "select CUDA device");
+    cudaDeviceProp properties{};
+    cuda_check(cudaGetDeviceProperties(&properties, device_index), "read CUDA device");
+    if (properties.major < 7) {
+        throw std::runtime_error("production CUDA backend requires compute capability 7.0+");
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "read CUDA memory capacity");
+    const size_t required = PRODUCTION_WEIGHT_BYTES + PRODUCTION_ACTIVATION_VALUES * 4 +
+                            PRODUCTION_ACTIVATION_VALUES * sizeof(int32_t) +
+                            PRODUCTION_LAYER_BYTES;
+    if (free_bytes < required) {
+        throw std::runtime_error("production CUDA backend requires at least " +
+                                 std::to_string(required) + " free device bytes; only " +
+                                 std::to_string(free_bytes) + " are available");
     }
 }
 
@@ -345,4 +518,283 @@ CMFD_CUDA_EXPORT int32_t cmfd_cuda_evaluate(void* opaque_context,
 
 CMFD_CUDA_EXPORT void cmfd_cuda_destroy(void* opaque_context) {
     delete static_cast<Context*>(opaque_context);
+}
+
+// The production ABI is deliberately separate from the bounded Devnet ABI.
+// A caller must stream every centered model byte, in canonical role order,
+// and finalize the context before evaluation is permitted. The Rust wrapper
+// only exposes a finalized context after the same stream authenticates against
+// the trusted model-bank manifest and PCS identity.
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_begin(int32_t device_index,
+                                                    void** output_context, char* error,
+                                                    size_t error_len) {
+    try {
+        if (output_context == nullptr) throw std::runtime_error("context output is null");
+        *output_context = nullptr;
+        validate_production_device(device_index);
+
+        auto context = std::make_unique<ProductionContext>();
+        context->device_index = device_index;
+        cuda_check(cudaMalloc(&context->device_base, PRODUCTION_ACTIVATION_VALUES),
+                   "allocate production base input");
+        cuda_check(cudaMalloc(&context->device_weights, PRODUCTION_WEIGHT_BYTES),
+                   "allocate resident production weights");
+        cuda_check(cudaMalloc(&context->device_activation_a, PRODUCTION_ACTIVATION_VALUES),
+                   "allocate production activation A");
+        cuda_check(cudaMalloc(&context->device_activation_b, PRODUCTION_ACTIVATION_VALUES),
+                   "allocate production activation B");
+        cuda_check(cudaMalloc(&context->device_transpose_layer, PRODUCTION_LAYER_BYTES),
+                   "allocate production transpose staging layer");
+        cuda_check(cudaMalloc(&context->device_accumulators,
+                              PRODUCTION_ACTIVATION_VALUES * sizeof(int32_t)),
+                   "allocate production INT32 accumulators");
+        cuda_check(cudaMalloc(&context->device_encoded_output, PRODUCTION_ACTIVATION_VALUES),
+                   "allocate production encoded output");
+        *output_context = context.release();
+        return 0;
+    } catch (const std::exception& exception) {
+        write_error(error, error_len, exception.what());
+        return 1;
+    }
+}
+
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_upload(
+    void* opaque_context, uint32_t role, uint32_t bank_index, uint64_t role_offset,
+    const int8_t* centered_values, size_t centered_values_len, char* error,
+    size_t error_len) {
+    try {
+        if (opaque_context == nullptr) throw std::runtime_error("production context is null");
+        if (centered_values == nullptr || centered_values_len == 0) {
+            throw std::runtime_error("production upload is empty");
+        }
+        auto& context = *static_cast<ProductionContext*>(opaque_context);
+        if (context.finalized) throw std::runtime_error("production context is already finalized");
+        cuda_check(cudaSetDevice(context.device_index), "select CUDA device");
+
+        int8_t* destination = nullptr;
+        size_t* uploaded = nullptr;
+        size_t capacity = 0;
+        if (role == 0) {
+            if (bank_index != 0) throw std::runtime_error("base-input bank index must be zero");
+            destination = context.device_base;
+            uploaded = &context.base_uploaded;
+            capacity = PRODUCTION_ACTIVATION_VALUES;
+        } else if (role == 1) {
+            if (bank_index >= PRODUCTION_BANKS) {
+                throw std::runtime_error("production weight-bank index is out of range");
+            }
+            destination = context.device_weights + size_t(bank_index) * PRODUCTION_BANK_BYTES;
+            uploaded = &context.bank_uploaded[bank_index];
+            capacity = PRODUCTION_BANK_BYTES;
+        } else {
+            throw std::runtime_error("production model role is invalid");
+        }
+        if (*uploaded > capacity || role_offset != *uploaded ||
+            centered_values_len > capacity - *uploaded) {
+            throw std::runtime_error("production model chunks must be contiguous and exact");
+        }
+        cuda_check(cudaMemcpy(destination + *uploaded, centered_values, centered_values_len,
+                              cudaMemcpyHostToDevice),
+                   "upload authenticated production model chunk");
+        *uploaded += centered_values_len;
+        return 0;
+    } catch (const std::exception& exception) {
+        write_error(error, error_len, exception.what());
+        return 1;
+    }
+}
+
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_finalize(void* opaque_context, char* error,
+                                                       size_t error_len) {
+    try {
+        if (opaque_context == nullptr) throw std::runtime_error("production context is null");
+        auto& context = *static_cast<ProductionContext*>(opaque_context);
+        if (context.finalized) throw std::runtime_error("production context is already finalized");
+        if (context.base_uploaded != PRODUCTION_ACTIVATION_VALUES) {
+            throw std::runtime_error("production base input is incomplete");
+        }
+        for (uint32_t bank = 0; bank < PRODUCTION_BANKS; ++bank) {
+            if (context.bank_uploaded[bank] != PRODUCTION_BANK_BYTES) {
+                throw std::runtime_error("production weight bank " + std::to_string(bank) +
+                                         " is incomplete");
+            }
+        }
+        cuda_check(cudaSetDevice(context.device_index), "select CUDA device");
+        for (uint32_t layer = 0; layer < PRODUCTION_LAYERS; ++layer) {
+            int8_t* weights =
+                context.device_weights + size_t(layer) * PRODUCTION_LAYER_BYTES;
+            transpose_layer(weights, context.device_transpose_layer, PRODUCTION_WIDTH);
+            cuda_check(cudaMemcpy(weights, context.device_transpose_layer,
+                                  PRODUCTION_LAYER_BYTES, cudaMemcpyDeviceToDevice),
+                       "store transposed production weight layer");
+        }
+        context.finalized = true;
+        return 0;
+    } catch (const std::exception& exception) {
+        write_error(error, error_len, exception.what());
+        return 1;
+    }
+}
+
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_evaluate(
+    void* opaque_context, const uint8_t* coefficients, size_t coefficients_len,
+    uint32_t count, uint8_t* outputs, size_t outputs_len, char* error, size_t error_len) {
+    try {
+        if (opaque_context == nullptr) throw std::runtime_error("production context is null");
+        if (count == 0 || count > PRODUCTION_MAX_NONCES) {
+            throw std::runtime_error("production nonce batch must be between 1 and 64");
+        }
+        auto& context = *static_cast<ProductionContext*>(opaque_context);
+        if (!context.finalized) throw std::runtime_error("production model is not authenticated");
+        const size_t coefficients_per_nonce =
+            size_t(PRODUCTION_STAGES) * PRODUCTION_COEFFICIENTS;
+        const size_t expected_coefficients = size_t(count) * coefficients_per_nonce;
+        const size_t expected_outputs = size_t(count) * PRODUCTION_ACTIVATION_VALUES;
+        if (coefficients == nullptr || coefficients_len != expected_coefficients ||
+            outputs == nullptr || outputs_len != expected_outputs) {
+            throw std::runtime_error("production batch buffer length mismatch");
+        }
+        validate_canonical(coefficients, coefficients_len, "production mask coefficients");
+        cuda_check(cudaSetDevice(context.device_index), "select CUDA device");
+        ensure_production_coefficient_capacity(context, expected_coefficients);
+        cuda_check(cudaMemcpy(context.device_coefficients, coefficients, coefficients_len,
+                              cudaMemcpyHostToDevice),
+                   "copy production mask coefficients");
+
+        const uint32_t blocks = static_cast<uint32_t>(
+            (PRODUCTION_ACTIVATION_VALUES + THREADS - 1) / THREADS);
+        for (uint32_t nonce = 0; nonce < count; ++nonce) {
+            const uint8_t* nonce_coefficients =
+                context.device_coefficients + size_t(nonce) * coefficients_per_nonce;
+            initialize_production_activation<<<blocks, THREADS>>>(
+                context.device_base, nonce_coefficients, context.device_activation_a,
+                PRODUCTION_ROWS, PRODUCTION_WIDTH);
+            cuda_check(cudaGetLastError(), "launch production input transition");
+
+            int8_t* current = context.device_activation_a;
+            int8_t* next = context.device_activation_b;
+            for (uint32_t layer = 0; layer < PRODUCTION_LAYERS; ++layer) {
+                const int8_t* weights =
+                    context.device_weights + size_t(layer) * PRODUCTION_LAYER_BYTES;
+                launch_exact_matrix_layer(current, weights, context.device_accumulators,
+                                          PRODUCTION_ROWS, PRODUCTION_WIDTH);
+                reduce_production_layer<<<blocks, THREADS>>>(
+                    context.device_accumulators,
+                    nonce_coefficients + size_t(layer + 1) * PRODUCTION_COEFFICIENTS, next,
+                    PRODUCTION_ROWS, PRODUCTION_WIDTH);
+                cuda_check(cudaGetLastError(), "launch production layer transition");
+                std::swap(current, next);
+            }
+            encode_production_activation<<<blocks, THREADS>>>(
+                current, context.device_encoded_output, PRODUCTION_ACTIVATION_VALUES);
+            cuda_check(cudaGetLastError(), "launch production output encoding");
+            cuda_check(cudaMemcpy(outputs + size_t(nonce) * PRODUCTION_ACTIVATION_VALUES,
+                                  context.device_encoded_output, PRODUCTION_ACTIVATION_VALUES,
+                                  cudaMemcpyDeviceToHost),
+                       "copy production ForgeMatrix output");
+        }
+        return 0;
+    } catch (const std::exception& exception) {
+        write_error(error, error_len, exception.what());
+        return 1;
+    }
+}
+
+CMFD_CUDA_EXPORT void cmfd_cuda_production_destroy(void* opaque_context) {
+    delete static_cast<ProductionContext*>(opaque_context);
+}
+
+// Qualification seam: execute one exact matrix/transition layer at any valid
+// power-of-two research or production shape. It shares the same DP4A and
+// reduction routines as the production evaluator and is never called by the
+// mining path.
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_differential_layer(
+    int32_t device_index, uint32_t rows, uint32_t width, const int8_t* activation,
+    size_t activation_len, const int8_t* weights, size_t weights_len,
+    const uint8_t* coefficients, size_t coefficients_len, uint8_t* output,
+    size_t output_len, char* error, size_t error_len) {
+    int8_t* device_activation = nullptr;
+    int8_t* device_weights = nullptr;
+    int8_t* device_transposed_weights = nullptr;
+    int32_t* device_accumulators = nullptr;
+    int8_t* device_output = nullptr;
+    uint8_t* device_encoded = nullptr;
+    uint8_t* device_coefficients = nullptr;
+    try {
+        if (rows == 0 || rows > PRODUCTION_ROWS || width == 0 || width > PRODUCTION_WIDTH) {
+            throw std::runtime_error("differential dimensions exceed production geometry");
+        }
+        const uint32_t row_bits = exact_log2(rows);
+        const uint32_t col_bits = exact_log2(width);
+        const size_t expected_activation = size_t(rows) * width;
+        const size_t expected_weights = size_t(width) * width;
+        const size_t expected_coefficients = 1 + row_bits + col_bits;
+        if (activation == nullptr || activation_len != expected_activation ||
+            weights == nullptr || weights_len != expected_weights || coefficients == nullptr ||
+            coefficients_len != expected_coefficients || output == nullptr ||
+            output_len != expected_activation) {
+            throw std::runtime_error("differential layer buffer length mismatch");
+        }
+        validate_canonical(coefficients, coefficients_len, "differential mask coefficients");
+        cuda_check(cudaSetDevice(device_index), "select CUDA device");
+        cudaDeviceProp properties{};
+        cuda_check(cudaGetDeviceProperties(&properties, device_index), "read CUDA device");
+        if (properties.major < 7) {
+            throw std::runtime_error("differential CUDA path requires compute capability 7.0+");
+        }
+        cuda_check(cudaMalloc(&device_activation, expected_activation),
+                   "allocate differential activation");
+        cuda_check(cudaMalloc(&device_weights, expected_weights),
+                   "allocate differential weights");
+        cuda_check(cudaMalloc(&device_transposed_weights, expected_weights),
+                   "allocate differential transposed weights");
+        cuda_check(cudaMalloc(&device_accumulators, expected_activation * sizeof(int32_t)),
+                   "allocate differential accumulators");
+        cuda_check(cudaMalloc(&device_output, expected_activation),
+                   "allocate differential output");
+        cuda_check(cudaMalloc(&device_encoded, expected_activation),
+                   "allocate differential encoding");
+        cuda_check(cudaMalloc(&device_coefficients, expected_coefficients),
+                   "allocate differential coefficients");
+        cuda_check(cudaMemcpy(device_activation, activation, expected_activation,
+                              cudaMemcpyHostToDevice),
+                   "copy differential activation");
+        cuda_check(cudaMemcpy(device_weights, weights, expected_weights, cudaMemcpyHostToDevice),
+                   "copy differential weights");
+        cuda_check(cudaMemcpy(device_coefficients, coefficients, expected_coefficients,
+                              cudaMemcpyHostToDevice),
+                   "copy differential coefficients");
+        transpose_layer(device_weights, device_transposed_weights, width);
+        launch_exact_matrix_layer(device_activation, device_transposed_weights,
+                                  device_accumulators, rows, width);
+        const uint32_t blocks =
+            static_cast<uint32_t>((expected_activation + THREADS - 1) / THREADS);
+        reduce_production_layer<<<blocks, THREADS>>>(device_accumulators, device_coefficients,
+                                                    device_output, rows, width);
+        cuda_check(cudaGetLastError(), "launch differential transition");
+        encode_production_activation<<<blocks, THREADS>>>(device_output, device_encoded,
+                                                         expected_activation);
+        cuda_check(cudaGetLastError(), "launch differential output encoding");
+        cuda_check(cudaMemcpy(output, device_encoded, expected_activation,
+                              cudaMemcpyDeviceToHost),
+                   "copy differential output");
+        cudaFree(device_coefficients);
+        cudaFree(device_encoded);
+        cudaFree(device_output);
+        cudaFree(device_accumulators);
+        cudaFree(device_transposed_weights);
+        cudaFree(device_weights);
+        cudaFree(device_activation);
+        return 0;
+    } catch (const std::exception& exception) {
+        cudaFree(device_coefficients);
+        cudaFree(device_encoded);
+        cudaFree(device_output);
+        cudaFree(device_accumulators);
+        cudaFree(device_transposed_weights);
+        cudaFree(device_weights);
+        cudaFree(device_activation);
+        write_error(error, error_len, exception.what());
+        return 1;
+    }
 }

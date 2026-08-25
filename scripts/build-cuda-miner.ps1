@@ -121,6 +121,10 @@ if (-not $SkipDifferentialTest) {
         if ($LASTEXITCODE -ne 0) {
             throw "CUDA differential test failed with exit code $LASTEXITCODE."
         }
+        & cargo run --release -p cmfd-cuda --example production_differential
+        if ($LASTEXITCODE -ne 0) {
+            throw "Production-geometry CUDA differential test failed with exit code $LASTEXITCODE."
+        }
     } finally {
         $env:CMFD_CUDA_MINER_LIBRARY = $previousLibrary
         Pop-Location

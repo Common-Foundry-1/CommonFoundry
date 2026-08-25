@@ -928,6 +928,7 @@ dependencies = [
 name = "cmfd-cuda"
 version = "0.1.0-devnet.14"
 dependencies = [
+ "blake3",
  "cmfd-consensus",
  "libloading 0.8.9",
 ]

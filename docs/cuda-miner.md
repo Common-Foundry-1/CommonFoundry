@@ -50,6 +50,65 @@ This design makes a CUDA bug a performance or availability failure rather than
 a consensus bypass. The displayed `matrix attempts/s` measures complete nonce
 attempts through this pipeline, not raw GPU TOPS.
 
+## Dormant production-geometry evaluator
+
+The same library now contains a separate, fail-closed production evaluator.
+It does **not** replace the tiny Devnet ABI and it is not selected by the node,
+wallet, or standalone miner. Its fixed geometry is:
+
+- 128 activation rows by 4,096 columns;
+- 384 ordered 4,096 by 4,096 weight layers in three 128-layer banks;
+- 524,288 activation bytes and 6,442,450,944 resident weight bytes;
+- 385 challenge-mask stages with 20 canonical coefficients per nonce.
+
+Construction accepts only the canonical production model-bank stream. Rust
+checks the exact geometry, nonzero manifest roots, model byte root, ordered PCS
+identity, and three-bank commitment root. While that same authenticated stream
+is read, canonical Goldilocks model elements are converted back to centered
+INT8 and uploaded in order. A usable context is published only after the full
+6,442,975,232-byte payload authenticates and CUDA confirms every role byte was
+uploaded. A read error, altered byte, wrong identity, skipped chunk, missing
+production ABI, non-CUDA backend, or unsupported GPU destroys the provisional
+context.
+
+Weights remain resident and are transposed once at finalization. Each real
+layer then uses exact signed `INT8 x INT8 -> INT32` DP4A accumulation, the same
+coordinate mask, the 134,217,689 transition-field cubic, and reduction modulo
+251 as Rust. There is no dummy power loop. The implementation is self-contained
+in the existing static-runtime DLL and retains the Volta-through-Blackwell
+targets; it does not introduce a cuBLAS installation requirement.
+
+The qualification seam runs the same transpose, DP4A, mask, cubic, and output
+encoding code without activating production consensus:
+
+```powershell
+$env:CMFD_CUDA_MINER_LIBRARY = '<absolute-path-to-cmfd-forgematrix-v2-miner.dll>'
+cargo run --release -p cmfd-cuda --example production_differential
+```
+
+On August 25, 2026, an RTX 5090 (driver 610.88, compute capability 12.0) with a
+CUDA 12.9.86 build matched Rust byte-for-byte on both vectors:
+
+| Vector | Values | BLAKE3 output digest | GPU time |
+| --- | ---: | --- | ---: |
+| Dense 4 x 32 | 128 | `bd24f76f7269c861b72d904240d5a862233a4dd759564cf1e0c5811326e2ece5` | 187.471 ms |
+| One full 128 x 4,096 layer | 524,288 | `36661181f19654dc9d8f40bccf296372e511fb48aff18cba05762c28553e08bd` | 44.481 ms |
+
+Those timings include qualification allocation, upload, and weight transpose;
+they are not steady-state hashrate. A separate zero-centered synthetic canary
+allocated the complete 6.44 GB geometry, uploaded all three banks, traversed all
+384 layers, and matched its analytical all-zero 524,288-byte output. Allocation
+took 0.170 seconds, upload 0.430 seconds, one-time transpose 0.013 seconds, and
+one complete nonce evaluation 14.934 seconds. The canary proves control-flow and
+shape correctness, not the identity or output of the ceremony model. At roughly
+0.067 nonces per second, this first self-contained DP4A path is a correctness
+baseline; architecture-specific tensor-core work is still needed before its
+performance can represent an RC.
+
+A complete authenticated 384-layer ceremony-model run and winning-nonce proof
+also remain required before this path can be selected or described as a
+production release candidate.
+
 ## Build on Windows
 
 Requirements:
@@ -68,8 +127,9 @@ $releaseCommit = '<full-lowercase-release-commit>'
 
 The script builds `target\gpu-miner-build\cmfd-forgematrix-v2-miner.dll`,
 checks for native `sm_70`, `sm_75`, `sm_86`, `sm_89`, and `sm_120` images,
-confirms the `compute_70` PTX fallback, and runs a 128-nonce CPU/CUDA
-differential test. It also emits an identity-only `.build-receipt`; this receipt
+confirms the `compute_70` PTX fallback, runs the Devnet CPU/CUDA differential,
+and then runs the dense and production-geometry Rust/CUDA vectors above. It
+also emits an identity-only `.build-receipt`; this receipt
 detects mixed inputs but is not a signature or authenticated build attestation.
 
 To build a Windows wallet installer that bundles the library:

@@ -1,14 +1,33 @@
 use std::env;
 use std::ffi::{CStr, c_char, c_void};
+use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use cmfd_consensus::{ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel};
+use cmfd_consensus::{
+    ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, GOLDILOCKS_MODULUS,
+    forgematrix_v2::{
+        PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
+        PRODUCTION_V2_LAYERS_PER_BANK,
+    },
+    model_bank::{
+        ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk, ModelPcsIdentity,
+        ModelPcsRole, StagedModelFieldSink, VerifiedModelBankReceipt,
+        verify_model_bank_into_staged_field_sink,
+    },
+};
 use libloading::Library;
 
 const CUDA_API_VERSION: u32 = 1;
 const ERROR_BUFFER_BYTES: usize = 512;
+const PRODUCTION_COEFFICIENT_COUNT: usize = 20;
+const PRODUCTION_UPLOAD_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+pub const PRODUCTION_ACTIVATION_VALUES: usize =
+    PRODUCTION_V2_BATCH as usize * PRODUCTION_V2_DIMENSION as usize;
+pub const PRODUCTION_COEFFICIENTS_PER_NONCE: usize =
+    (PRODUCTION_V2_LAYERS as usize + 1) * PRODUCTION_COEFFICIENT_COUNT;
 
 type ApiVersionFn = unsafe extern "C" fn() -> u32;
 type DeviceCountFn = unsafe extern "C" fn(*mut i32, *mut c_char, usize) -> i32;
@@ -38,6 +57,36 @@ type EvaluateFn = unsafe extern "C" fn(
     usize,
 ) -> i32;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
+type ProductionBeginFn = unsafe extern "C" fn(i32, *mut *mut c_void, *mut c_char, usize) -> i32;
+type ProductionUploadFn =
+    unsafe extern "C" fn(*mut c_void, u32, u32, u64, *const i8, usize, *mut c_char, usize) -> i32;
+type ProductionFinalizeFn = unsafe extern "C" fn(*mut c_void, *mut c_char, usize) -> i32;
+type ProductionEvaluateFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const u8,
+    usize,
+    u32,
+    *mut u8,
+    usize,
+    *mut c_char,
+    usize,
+) -> i32;
+type ProductionDestroyFn = unsafe extern "C" fn(*mut c_void);
+type DifferentialLayerFn = unsafe extern "C" fn(
+    i32,
+    u32,
+    u32,
+    *const i8,
+    usize,
+    *const i8,
+    usize,
+    *const u8,
+    usize,
+    *mut u8,
+    usize,
+    *mut c_char,
+    usize,
+) -> i32;
 
 #[repr(C)]
 struct RawDeviceInfo {
@@ -68,7 +117,18 @@ struct CudaApi {
     create: CreateFn,
     evaluate: EvaluateFn,
     destroy: DestroyFn,
+    production: Option<ProductionApi>,
+    differential_layer: Option<DifferentialLayerFn>,
     _library: Library,
+}
+
+#[derive(Clone, Copy)]
+struct ProductionApi {
+    begin: ProductionBeginFn,
+    upload: ProductionUploadFn,
+    finalize: ProductionFinalizeFn,
+    evaluate: ProductionEvaluateFn,
+    destroy: ProductionDestroyFn,
 }
 
 impl CudaApi {
@@ -85,6 +145,11 @@ impl CudaApi {
                 create: load_symbol(&library, b"cmfd_cuda_create\0")?,
                 evaluate: load_symbol(&library, b"cmfd_cuda_evaluate\0")?,
                 destroy: load_symbol(&library, b"cmfd_cuda_destroy\0")?,
+                production: load_production_api(&library),
+                differential_layer: load_optional_symbol(
+                    &library,
+                    b"cmfd_cuda_differential_layer\0",
+                ),
                 _library: library,
             };
             let version = api_version();
@@ -95,6 +160,26 @@ impl CudaApi {
             }
             Ok(api)
         }
+    }
+}
+
+unsafe fn load_optional_symbol<T: Copy>(library: &Library, symbol: &[u8]) -> Option<T> {
+    // SAFETY: callers provide the exact ABI type and the owning CudaApi keeps
+    // the library loaded for the lifetime of every copied function pointer.
+    unsafe { library.get::<T>(symbol).ok().map(|loaded| *loaded) }
+}
+
+unsafe fn load_production_api(library: &Library) -> Option<ProductionApi> {
+    // Loading is all-or-nothing. A partially upgraded backend therefore stays
+    // unavailable instead of mixing production ABI revisions.
+    unsafe {
+        Some(ProductionApi {
+            begin: load_optional_symbol(library, b"cmfd_cuda_production_begin\0")?,
+            upload: load_optional_symbol(library, b"cmfd_cuda_production_upload\0")?,
+            finalize: load_optional_symbol(library, b"cmfd_cuda_production_finalize\0")?,
+            evaluate: load_optional_symbol(library, b"cmfd_cuda_production_evaluate\0")?,
+            destroy: load_optional_symbol(library, b"cmfd_cuda_production_destroy\0")?,
+        })
     }
 }
 
@@ -315,6 +400,94 @@ impl CudaLibrary {
             device,
         })
     }
+
+    /// Streams one canonical production model bank into resident GPU memory.
+    ///
+    /// The returned context is published only after the complete byte stream
+    /// authenticates against both `manifest` and `identity`. Production shape,
+    /// model commitment, CUDA support, chunk order, and final byte counts all
+    /// fail closed. This loads an evaluator only; it does not activate V3 or
+    /// make the current node accept a production proof.
+    pub fn create_production<R: Read>(
+        &self,
+        reader: R,
+        manifest: &ModelBankManifest,
+        identity: &ModelPcsIdentity,
+        device_index: i32,
+    ) -> Result<ProductionCudaMiner, String> {
+        if self.backend != GpuBackend::Cuda {
+            return Err(
+                "the production ForgeMatrix evaluator requires the CUDA backend".to_owned(),
+            );
+        }
+        validate_production_model(manifest, identity)?;
+        let api = self.api.production.ok_or_else(|| {
+            "CUDA library does not export the production ForgeMatrix ABI".to_owned()
+        })?;
+        let device = read_device(&self.api, self.backend, device_index)?;
+        if !device.is_supported() {
+            return Err(format!(
+                "{} reports CUDA {}.{}, but production ForgeMatrix requires 7.0 or newer",
+                device.name, device.compute_major, device.compute_minor
+            ));
+        }
+
+        let sink = ProductionModelSink::begin(Arc::clone(&self.api), api, device)?;
+        verify_model_bank_into_staged_field_sink(reader, manifest, identity, sink)
+            .map_err(format_model_stream_error)
+    }
+
+    /// Executes one exact INT8xINT8->INT32 matrix transition through the same
+    /// implementation used by the production evaluator. This seam exists for
+    /// Rust-vs-GPU qualification vectors and is not part of mining selection.
+    pub fn evaluate_differential_layer(
+        &self,
+        device_index: i32,
+        rows: u32,
+        width: u32,
+        activation: &[i8],
+        weights: &[i8],
+        coefficients: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if self.backend != GpuBackend::Cuda {
+            return Err("the differential layer requires the CUDA backend".to_owned());
+        }
+        let evaluate = self.api.differential_layer.ok_or_else(|| {
+            "CUDA library does not export the production differential ABI".to_owned()
+        })?;
+        let activation_len = (rows as usize)
+            .checked_mul(width as usize)
+            .ok_or_else(|| "differential activation length overflow".to_owned())?;
+        let weights_len = (width as usize)
+            .checked_mul(width as usize)
+            .ok_or_else(|| "differential weight length overflow".to_owned())?;
+        if activation.len() != activation_len || weights.len() != weights_len {
+            return Err("differential input shape mismatch".to_owned());
+        }
+        let mut output = vec![0_u8; activation_len];
+        let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
+        // SAFETY: slices remain live for the call and their exact lengths are
+        // passed to the qualification-only C ABI.
+        let result = unsafe {
+            evaluate(
+                device_index,
+                rows,
+                width,
+                activation.as_ptr(),
+                activation.len(),
+                weights.as_ptr(),
+                weights.len(),
+                coefficients.as_ptr(),
+                coefficients.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        check_result(result, &error)?;
+        Ok(output)
+    }
 }
 
 pub struct CudaMiner {
@@ -369,6 +542,298 @@ impl Drop for CudaMiner {
         // called exactly once while the backing library remains loaded.
         unsafe { (self.api.destroy)(self.context.as_ptr()) };
     }
+}
+
+/// Authenticated, GPU-resident production-geometry evaluator.
+///
+/// Construction is possible only through [`CudaLibrary::create_production`].
+/// The type intentionally has no constructor from loose model bytes.
+pub struct ProductionCudaMiner {
+    context: NonNull<c_void>,
+    _api_owner: Arc<CudaApi>,
+    production_api: ProductionApi,
+    device: CudaDevice,
+    manifest: ModelBankManifest,
+    identity_digest: [u8; 32],
+}
+
+impl ProductionCudaMiner {
+    pub fn device(&self) -> &CudaDevice {
+        &self.device
+    }
+
+    pub fn manifest(&self) -> &ModelBankManifest {
+        &self.manifest
+    }
+
+    pub fn identity_digest(&self) -> [u8; 32] {
+        self.identity_digest
+    }
+
+    /// Evaluates complete 128x4096 activations across all 384 resident layers.
+    /// Coefficients are nonce-major and contain 385 stages of 20 canonical
+    /// bytes. The output is one canonical 524,288-byte activation per nonce.
+    pub fn evaluate(&mut self, coefficients: &[u8], count: u32) -> Result<Vec<u8>, String> {
+        if count == 0 || count > 64 {
+            return Err("production nonce batch must be between 1 and 64".to_owned());
+        }
+        let expected_coefficients = (count as usize)
+            .checked_mul(PRODUCTION_COEFFICIENTS_PER_NONCE)
+            .ok_or_else(|| "production coefficient length overflow".to_owned())?;
+        if coefficients.len() != expected_coefficients
+            || coefficients.iter().any(|byte| *byte > 250)
+        {
+            return Err(
+                "production coefficients are noncanonical or have the wrong length".to_owned(),
+            );
+        }
+        let output_len = (count as usize)
+            .checked_mul(PRODUCTION_ACTIVATION_VALUES)
+            .ok_or_else(|| "production output length overflow".to_owned())?;
+        let mut outputs = vec![0_u8; output_len];
+        let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
+        // SAFETY: this context was finalized by the matching production API;
+        // all slices remain live and their exact lengths are supplied.
+        let result = unsafe {
+            (self.production_api.evaluate)(
+                self.context.as_ptr(),
+                coefficients.as_ptr(),
+                coefficients.len(),
+                count,
+                outputs.as_mut_ptr(),
+                outputs.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        check_result(result, &error)?;
+        Ok(outputs)
+    }
+}
+
+impl Drop for ProductionCudaMiner {
+    fn drop(&mut self) {
+        // SAFETY: construction owns this unique context. The retained API
+        // owner keeps the library loaded until after the destroy call.
+        unsafe { (self.production_api.destroy)(self.context.as_ptr()) };
+    }
+}
+
+#[derive(Debug)]
+struct ProductionSinkError(String);
+
+impl fmt::Display for ProductionSinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProductionSinkError {}
+
+struct ProductionModelSink {
+    context: Option<NonNull<c_void>>,
+    api_owner: Arc<CudaApi>,
+    production_api: ProductionApi,
+    device: Option<CudaDevice>,
+    pending_role: Option<ModelPcsRole>,
+    pending_start: u64,
+    next_offset: u64,
+    pending: Vec<i8>,
+}
+
+impl ProductionModelSink {
+    fn begin(
+        api_owner: Arc<CudaApi>,
+        production_api: ProductionApi,
+        device: CudaDevice,
+    ) -> Result<Self, String> {
+        let mut context = std::ptr::null_mut();
+        let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
+        // SAFETY: output and error pointers are valid for the duration of the
+        // call. The returned provisional context is owned by this sink.
+        let result = unsafe {
+            (production_api.begin)(device.index, &mut context, error.as_mut_ptr(), error.len())
+        };
+        check_result(result, &error)?;
+        let context = NonNull::new(context)
+            .ok_or_else(|| "CUDA backend returned a null production context".to_owned())?;
+        Ok(Self {
+            context: Some(context),
+            api_owner,
+            production_api,
+            device: Some(device),
+            pending_role: None,
+            pending_start: 0,
+            next_offset: 0,
+            pending: Vec::with_capacity(PRODUCTION_UPLOAD_BUFFER_BYTES),
+        })
+    }
+
+    fn flush(&mut self) -> Result<(), ProductionSinkError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let context = self
+            .context
+            .ok_or_else(|| ProductionSinkError("production context is unavailable".to_owned()))?;
+        let role = self.pending_role.ok_or_else(|| {
+            ProductionSinkError("production model role is unavailable".to_owned())
+        })?;
+        let (role_code, bank_index) = match role {
+            ModelPcsRole::BaseInput => (0, 0),
+            ModelPcsRole::WeightBank { index } => (1, index),
+        };
+        let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
+        // SAFETY: the context and upload function come from the same library;
+        // pending data remains live and its exact length is provided.
+        let result = unsafe {
+            (self.production_api.upload)(
+                context.as_ptr(),
+                role_code,
+                bank_index,
+                self.pending_start,
+                self.pending.as_ptr(),
+                self.pending.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        check_result(result, &error).map_err(ProductionSinkError)?;
+        self.pending.clear();
+        self.pending_start = self.next_offset;
+        Ok(())
+    }
+}
+
+impl StagedModelFieldSink for ProductionModelSink {
+    type Error = ProductionSinkError;
+    type Output = ProductionCudaMiner;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        if self.pending_role != Some(chunk.role) {
+            self.flush()?;
+            self.pending_role = Some(chunk.role);
+            self.pending_start = chunk.role_offset;
+            self.next_offset = chunk.role_offset;
+        }
+        if chunk.role_offset != self.next_offset {
+            return Err(ProductionSinkError(
+                "authenticated production chunks are not contiguous".to_owned(),
+            ));
+        }
+        if self.pending.len() + chunk.elements.len() > PRODUCTION_UPLOAD_BUFFER_BYTES {
+            self.flush()?;
+        }
+        for value in chunk.elements {
+            self.pending.push(centered_field_to_i8(*value)?);
+        }
+        self.next_offset = self
+            .next_offset
+            .checked_add(chunk.elements.len() as u64)
+            .ok_or_else(|| ProductionSinkError("production model offset overflow".to_owned()))?;
+        if self.pending.len() >= PRODUCTION_UPLOAD_BUFFER_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn finish_verified(
+        mut self,
+        receipt: VerifiedModelBankReceipt,
+    ) -> Result<Self::Output, Self::Error> {
+        self.flush()?;
+        let identity_digest = receipt
+            .identity()
+            .digest()
+            .map_err(|error| ProductionSinkError(error.to_string()))?;
+        let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
+        let context = self
+            .context
+            .ok_or_else(|| ProductionSinkError("production context is unavailable".to_owned()))?;
+        // SAFETY: every authenticated model chunk has been uploaded to this
+        // provisional context. Finalize checks exact production byte counts.
+        let result = unsafe {
+            (self.production_api.finalize)(context.as_ptr(), error.as_mut_ptr(), error.len())
+        };
+        check_result(result, &error).map_err(ProductionSinkError)?;
+        let context = self.context.take().ok_or_else(|| {
+            ProductionSinkError("production context was already published".to_owned())
+        })?;
+        let device = self
+            .device
+            .take()
+            .ok_or_else(|| ProductionSinkError("production device is unavailable".to_owned()))?;
+        Ok(ProductionCudaMiner {
+            context,
+            _api_owner: Arc::clone(&self.api_owner),
+            production_api: self.production_api,
+            device,
+            manifest: *receipt.manifest(),
+            identity_digest,
+        })
+    }
+}
+
+impl Drop for ProductionModelSink {
+    fn drop(&mut self) {
+        if let Some(context) = self.context.take() {
+            // SAFETY: an unpublished sink uniquely owns its provisional
+            // context; authentication or upload failures destroy it here.
+            unsafe { (self.production_api.destroy)(context.as_ptr()) };
+        }
+    }
+}
+
+fn centered_field_to_i8(value: u64) -> Result<i8, ProductionSinkError> {
+    if value <= 125 {
+        return Ok(value as i8);
+    }
+    if value >= GOLDILOCKS_MODULUS - 125 {
+        let magnitude = GOLDILOCKS_MODULUS - value;
+        return i8::try_from(magnitude).map(|value| -value).map_err(|_| {
+            ProductionSinkError("model field element is not a centered byte".to_owned())
+        });
+    }
+    Err(ProductionSinkError(
+        "model field element is not a centered byte".to_owned(),
+    ))
+}
+
+fn validate_production_model(
+    manifest: &ModelBankManifest,
+    identity: &ModelPcsIdentity,
+) -> Result<(), String> {
+    let expected_layer_bytes =
+        u64::from(PRODUCTION_V2_DIMENSION) * u64::from(PRODUCTION_V2_DIMENSION);
+    let expected_base_bytes = u64::from(PRODUCTION_V2_BATCH) * u64::from(PRODUCTION_V2_DIMENSION);
+    let expected_payload_bytes =
+        expected_base_bytes + u64::from(PRODUCTION_V2_LAYERS) * expected_layer_bytes;
+    if manifest.model_version != 2
+        || manifest.dimension != PRODUCTION_V2_DIMENSION
+        || manifest.batch != PRODUCTION_V2_BATCH
+        || manifest.layers != PRODUCTION_V2_LAYERS
+        || manifest.base_input_bytes != expected_base_bytes
+        || manifest.bytes_per_layer != expected_layer_bytes
+        || manifest.payload_bytes != expected_payload_bytes
+        || identity.layers_per_bank != PRODUCTION_V2_LAYERS_PER_BANK
+        || identity.weight_bank_commitments.len() != PRODUCTION_V2_BANKS as usize
+    {
+        return Err("model bank is not the exact 128x4096x384 production geometry".to_owned());
+    }
+    if manifest.raw_blake3_root == [0; 32]
+        || manifest.layer_roots_aggregate == [0; 32]
+        || manifest.pcs_parameter_digest == [0; 32]
+        || manifest.pcs_commitment_root == [0; 32]
+    {
+        return Err("production model manifest contains an uncommitted root".to_owned());
+    }
+    manifest
+        .verify_pcs_identity(identity)
+        .map_err(|error| format!("production model identity mismatch: {error}"))
+}
+
+fn format_model_stream_error(error: ModelBankFieldStreamError<ProductionSinkError>) -> String {
+    format!("production model authentication failed: {error}")
 }
 
 fn device_count(api: &CudaApi) -> Result<i32, String> {
@@ -493,6 +958,37 @@ fn check_result(result: i32, error: &[c_char]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn production_identity() -> ModelPcsIdentity {
+        ModelPcsIdentity {
+            model_version: 2,
+            batch: PRODUCTION_V2_BATCH,
+            dimension: PRODUCTION_V2_DIMENSION,
+            layers_per_bank: PRODUCTION_V2_LAYERS_PER_BANK,
+            model_byte_root: [0x11; 32],
+            pcs_suite_parameter_digest: [0x22; 32],
+            base_input_commitment: [0x33; 32],
+            weight_bank_commitments: vec![[0x44; 32], [0x55; 32], [0x66; 32]],
+        }
+    }
+
+    fn production_manifest(identity: &ModelPcsIdentity) -> ModelBankManifest {
+        let layer_bytes = u64::from(PRODUCTION_V2_DIMENSION).pow(2);
+        let base_bytes = u64::from(PRODUCTION_V2_BATCH) * u64::from(PRODUCTION_V2_DIMENSION);
+        ModelBankManifest {
+            model_version: 2,
+            dimension: PRODUCTION_V2_DIMENSION,
+            batch: PRODUCTION_V2_BATCH,
+            layers: PRODUCTION_V2_LAYERS,
+            base_input_bytes: base_bytes,
+            bytes_per_layer: layer_bytes,
+            payload_bytes: base_bytes + u64::from(PRODUCTION_V2_LAYERS) * layer_bytes,
+            raw_blake3_root: identity.model_byte_root,
+            layer_roots_aggregate: [0x77; 32],
+            pcs_parameter_digest: identity.pcs_suite_parameter_digest,
+            pcs_commitment_root: identity.commitment_root().unwrap(),
+        }
+    }
+
     #[test]
     fn explicit_library_path_is_the_only_candidate() {
         let path = Path::new("custom-cuda-backend.dll");
@@ -572,5 +1068,42 @@ mod tests {
         device.compute_major = 12;
         device.compute_minor = 0;
         assert!(device.is_supported());
+    }
+
+    #[test]
+    fn production_geometry_and_identity_are_fail_closed() {
+        let identity = production_identity();
+        let manifest = production_manifest(&identity);
+        validate_production_model(&manifest, &identity).unwrap();
+        assert_eq!(manifest.payload_bytes, 6_442_975_232);
+        assert_eq!(PRODUCTION_ACTIVATION_VALUES, 524_288);
+        assert_eq!(PRODUCTION_COEFFICIENTS_PER_NONCE, 7_700);
+
+        let mut wrong_shape = manifest;
+        wrong_shape.layers -= 1;
+        assert!(validate_production_model(&wrong_shape, &identity).is_err());
+
+        let mut wrong_identity = identity.clone();
+        wrong_identity.weight_bank_commitments[1][0] ^= 1;
+        assert!(validate_production_model(&manifest, &wrong_identity).is_err());
+
+        let mut uncommitted = manifest;
+        uncommitted.layer_roots_aggregate = [0; 32];
+        assert!(validate_production_model(&uncommitted, &identity).is_err());
+    }
+
+    #[test]
+    fn canonical_model_fields_round_trip_to_exact_centered_int8() {
+        for byte in 0_u64..=250 {
+            let centered = byte as i64 - 125;
+            let field = if centered >= 0 {
+                centered as u64
+            } else {
+                GOLDILOCKS_MODULUS - centered.unsigned_abs()
+            };
+            assert_eq!(centered_field_to_i8(field).unwrap(), centered as i8);
+        }
+        assert!(centered_field_to_i8(126).is_err());
+        assert!(centered_field_to_i8(GOLDILOCKS_MODULUS - 126).is_err());
     }
 }

@@ -144,10 +144,12 @@ $nvccVersion = ((& $nvcc --version) -join ' ').Trim()
 if ($LASTEXITCODE -ne 0) {
     throw 'Could not capture the CUDA compiler version.'
 }
-$cmakeVersion = ((& cmake --version | Select-Object -First 1) -join ' ').Trim()
-if ($LASTEXITCODE -ne 0) {
+$cmakeVersionOutput = @(& cmake --version)
+$cmakeVersionExitCode = $LASTEXITCODE
+if ($cmakeVersionExitCode -ne 0) {
     throw 'Could not capture the CMake version.'
 }
+$cmakeVersion = (($cmakeVersionOutput | Select-Object -First 1) -join ' ').Trim()
 $receipt = "$library.build-receipt"
 Invoke-ReleaseIntegrity -ToolArguments @(
     'receipt-write',

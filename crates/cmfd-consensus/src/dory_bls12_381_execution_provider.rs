@@ -22,7 +22,7 @@ use crate::{
     dory_bls12_381_blake3::prepare_production_dory_v3_native_blake3_opening,
     dory_bls12_381_candidate::{
         BlsDoryV3CandidateError, BlsDoryV3CandidatePayload,
-        validate_dory_v3_layout_v5_record_setup_binding,
+        validate_dory_v3_layout_v5_record_setup_binding, verify_bls_dory_v3_layout_v5_candidate,
     },
     dory_bls12_381_execution_artifact::{
         BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
@@ -35,7 +35,9 @@ use crate::{
         ValidatedBlsDorySharedLayoutV5ExecutionPreparation,
         finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening,
         preflight_bls_dory_shared_layout_v5_execution_preparation,
-        preflight_prepared_bls_dory_shared_layout_v5_composition, signed_model_value,
+        preflight_prepared_bls_dory_shared_layout_v5_composition,
+        prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch,
+        signed_model_value,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
@@ -647,7 +649,7 @@ impl BlsDoryV3ExecutionArtifactReader<'_> {
 
 #[derive(Debug, Error)]
 #[allow(dead_code)]
-pub(crate) enum BlsDoryV3WinningNonceReplayError {
+pub enum BlsDoryV3WinningNonceReplayError {
     #[error("Dory V3 replay transcript does not match the authenticated model record")]
     Context,
     #[error("Dory V3 winning-nonce work digest does not match the claimed final activation")]
@@ -1033,6 +1035,122 @@ pub(crate) fn seal_composed_bls_dory_v3_layout_v5_candidate(
     seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(
         execution, transcript, block, &context,
     )
+}
+
+/// Reauthenticate the fixed model and one accelerator-proposed winning nonce,
+/// construct the complete Record-V2/Layout-V5 proof, and self-verify the exact
+/// candidate before returning any proof bytes.
+///
+/// The two bank readers are deliberately independent. Fixed-model publication
+/// and execution replay must each authenticate the complete bank against the
+/// same non-serializable Record V2 authority. The scratch directory and native
+/// row limit are explicit process resources, never consensus parameters.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
+    FixedModelBank: Read,
+    ReplayBank: Read,
+>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    claim: BlsDoryV3WinningNonceClaim,
+    setup: &DeterministicBlsDorySetup,
+    fixed_model_bank: FixedModelBank,
+    replay_bank: ReplayBank,
+    scratch_directory: &Path,
+    maximum_native_block_rows: usize,
+    cancel: &AtomicBool,
+) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+    if maximum_native_block_rows == 0
+        || !scratch_directory.is_absolute()
+        || !scratch_directory.is_dir()
+    {
+        return Err(BlsDoryV3CandidateError::ProverConfiguration);
+    }
+    check_runtime_prover_cancel(cancel)?;
+
+    let prepared_model =
+        prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch(
+            fixed_model_bank,
+            authenticated,
+            setup,
+            scratch_directory,
+        )?;
+    check_runtime_prover_cancel(cancel)?;
+
+    let transcript =
+        DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
+    let execution = replay_dory_v3_winning_nonce_from_bank_authenticated_record(
+        authenticated,
+        transcript,
+        block,
+        claim,
+        setup,
+        replay_bank,
+        scratch_directory,
+        cancel,
+    )?;
+    check_runtime_prover_cancel(cancel)?;
+
+    let prepared = prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch(
+        execution,
+        authenticated,
+        &prepared_model,
+        block,
+        setup,
+        scratch_directory,
+    )
+    .map_err(map_layout_v5_preparation_error)?;
+    check_runtime_prover_cancel(cancel)?;
+
+    let composed = finish_prepared_bls_dory_v3_layout_v5_execution_with_composition(
+        prepared,
+        setup,
+        scratch_directory,
+        maximum_native_block_rows,
+    )
+    .map_err(map_layout_v5_composition_error)?;
+    check_runtime_prover_cancel(cancel)?;
+
+    let candidate =
+        seal_composed_bls_dory_v3_layout_v5_candidate(composed, authenticated, block, setup)?;
+    let _verified = verify_bls_dory_v3_layout_v5_candidate(
+        block.network_id,
+        authenticated,
+        block,
+        &candidate,
+        setup,
+    )?;
+    Ok(candidate)
+}
+
+fn check_runtime_prover_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryV3CandidateError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryV3WinningNonceReplayError::Cancelled.into());
+    }
+    Ok(())
+}
+
+fn map_layout_v5_preparation_error(
+    error: BlsDoryV3LayoutV5PreparationError,
+) -> BlsDoryV3CandidateError {
+    match error {
+        BlsDoryV3LayoutV5PreparationError::Replay(error) => error.into(),
+        BlsDoryV3LayoutV5PreparationError::Layout(error) => error.into(),
+    }
+}
+
+fn map_layout_v5_composition_error(
+    error: BlsDoryV3LayoutV5CompositionError,
+) -> BlsDoryV3CandidateError {
+    match error {
+        BlsDoryV3LayoutV5CompositionError::Configuration => {
+            BlsDoryV3CandidateError::ProverConfiguration
+        }
+        BlsDoryV3LayoutV5CompositionError::ReplayAuthority(error) => error.into(),
+        BlsDoryV3LayoutV5CompositionError::OutputBridge(error) => error.into(),
+        BlsDoryV3LayoutV5CompositionError::Native(error) => error.into(),
+        BlsDoryV3LayoutV5CompositionError::Layout(error) => error.into(),
+    }
 }
 
 fn seal_composed_bls_dory_v3_layout_v5_candidate_after_authority(

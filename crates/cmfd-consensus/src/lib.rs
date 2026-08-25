@@ -180,7 +180,10 @@ pub use pow::{
     PreverifiedBlockProof,
 };
 #[cfg(feature = "dory-v3-consensus-adapter")]
-pub use pow::{ForgeMatrixV3CandidateParameters, ForgeMatrixV3ConsensusVerifier};
+pub use pow::{
+    ForgeMatrixV3CandidateParameters, ForgeMatrixV3ConsensusVerifier,
+    ForgeMatrixV3WinningNonceClaim, MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS,
+};
 #[cfg(feature = "remainder-prototype")]
 pub use remainder_proof::{
     ForgeMatrixV2RemainderProof, MAX_REMAINDER_PROTOTYPE_PROOF_BYTES, REMAINDER_BACKEND_REVISION,

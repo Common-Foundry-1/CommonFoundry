@@ -51,14 +51,14 @@ use crate::{
         BlsDoryExecutionAccumulatorArtifactError,
     },
     dory_bls12_381_execution_provider::{
-        BlsDoryWinningNonceClaim, BlsDoryWinningNonceReplayError,
+        BlsDoryV3WinningNonceReplayError, BlsDoryWinningNonceClaim, BlsDoryWinningNonceReplayError,
         VerifiedBlsDoryWinningNonceExecution,
         replay_winning_nonce_from_verified_bank as replay_verified_winning_nonce,
     },
     dory_bls12_381_layout::{
-        BlsDoryPrecommittedMatrixProverInput, BlsDoryPreparedFixedModel,
-        BlsDorySharedLayoutV5Context, BlsDorySharedLayoutV5Proof, BlsDoryTransitionProverInput,
-        PreparedBlsDorySharedLayoutProverState,
+        BlsDoryFixedModelStreamError, BlsDoryPrecommittedMatrixProverInput,
+        BlsDoryPreparedFixedModel, BlsDorySharedLayoutV5Context, BlsDorySharedLayoutV5Proof,
+        BlsDoryTransitionProverInput, PreparedBlsDorySharedLayoutProverState,
         extract_bls_dory_final_activation_from_execution_artifact,
         prepare_bls_dory_shared_layout_from_execution_artifact_with_scratch,
         prepare_bls_dory_shared_layout_v5_verifier_state,
@@ -80,6 +80,7 @@ use crate::{
     dory_v3_suite::{DORY_V3_ALGORITHM_VERSION, DORY_V3_PROOF_VERSION},
     dory_v3_transcript::{DoryV3TranscriptContext, DoryV3TranscriptError},
     forgematrix_v2::output_digest,
+    model_bank::ModelBankFieldStreamError,
 };
 
 pub(crate) const ALGEBRAIC_BINDING_VERSION: u16 = 1;
@@ -294,8 +295,20 @@ pub enum BlsDoryV3CandidateError {
     #[error("candidate Record V2 authority is invalid: {0}")]
     DoryV3Record(#[from] DoryV3ModelCommitmentRecordError),
     #[cfg(feature = "whir-prototype")]
+    #[error("candidate fixed-model bank preparation failed: {0}")]
+    FixedModelPreparation(#[from] ModelBankFieldStreamError<BlsDoryFixedModelStreamError>),
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate winning-nonce replay failed: {0}")]
+    WinningNonceReplay(#[from] BlsDoryV3WinningNonceReplayError),
+    #[cfg(feature = "whir-prototype")]
     #[error("candidate Dory V3 transcript is invalid: {0}")]
     DoryV3Transcript(#[from] DoryV3TranscriptError),
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate model-record digest mismatch")]
+    ModelRecordDigest,
+    #[cfg(feature = "whir-prototype")]
+    #[error("candidate model-identity digest mismatch")]
+    ModelIdentityDigest,
 }
 
 impl BlsDoryV3CandidatePayload {

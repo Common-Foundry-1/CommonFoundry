@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
-use std::fmt;
+use std::{fmt, io::Read, path::Path, sync::atomic::AtomicBool};
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,9 @@ use crate::{
         BlsDoryV3CandidateError, verify_bls_dory_v3_layout_v5_candidate,
         verify_bls_dory_v3_layout_v5_candidate_relation,
     },
+    dory_bls12_381_execution_provider::{
+        BlsDoryV3WinningNonceClaim, prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim,
+    },
     dory_bls12_381_prototype::DeterministicBlsDorySetup,
     dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     dory_v3_suite::{
@@ -31,6 +34,12 @@ pub const POW_TYPE_V1_LEGACY: u16 = 1;
 pub const POW_TYPE_V2_REFERENCE: u16 = 2;
 /// Reserved wire identity for the fail-closed structured production candidate.
 pub const POW_TYPE_V3_CANDIDATE: u16 = 3;
+/// Largest native BLAKE3 block-row batch accepted by the runtime V3 prover.
+///
+/// This is an operational memory bound, not a consensus parameter. Callers
+/// must still select and report an explicit nonzero value for every run.
+#[cfg(feature = "dory-v3-consensus-adapter")]
+pub const MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS: usize = 131_072;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const FORGEMATRIX_V3_BLOCK_ID_PROOF_FIELDS: &str = "pow_type_u16le,algorithm_version_u32le,proof_version_u32le,nonce_u64le,model_manifest_digest[32],challenge_digest[32],final_activation_digest[32],work_digest[32],structured_length_u64le,structured_bytes";
 const PREVERIFIED_VERIFIER_DOMAIN: &str = "CMFD/POW/PREVERIFIED-VERIFIER/V1";
@@ -60,6 +69,67 @@ pub struct ForgeMatrixV3CandidateParameters {
     model_manifest_digest: [u8; 32],
     model_identity_digest: [u8; 32],
     setup_identity: [u8; 32],
+}
+
+/// Untrusted accelerator claim for one possible Production V3 winning nonce.
+///
+/// The model identities make accidental cross-bank submission cheap to reject.
+/// They do not authorize the claim: the runtime prover replays the nonce from
+/// the authenticated bank and recomputes both digests before proving.
+#[cfg(feature = "dory-v3-consensus-adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeMatrixV3WinningNonceClaim {
+    network_id: [u8; 32],
+    model_record_digest: [u8; 32],
+    model_identity_digest: [u8; 32],
+    nonce: u64,
+    final_activation_digest: [u8; 32],
+    work_digest: [u8; 32],
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+impl ForgeMatrixV3WinningNonceClaim {
+    const fn new(
+        network_id: [u8; 32],
+        model_record_digest: [u8; 32],
+        model_identity_digest: [u8; 32],
+        nonce: u64,
+        final_activation_digest: [u8; 32],
+        work_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            network_id,
+            model_record_digest,
+            model_identity_digest,
+            nonce,
+            final_activation_digest,
+            work_digest,
+        }
+    }
+
+    pub const fn network_id(self) -> [u8; 32] {
+        self.network_id
+    }
+
+    pub const fn model_record_digest(self) -> [u8; 32] {
+        self.model_record_digest
+    }
+
+    pub const fn model_identity_digest(self) -> [u8; 32] {
+        self.model_identity_digest
+    }
+
+    pub const fn nonce(self) -> u64 {
+        self.nonce
+    }
+
+    pub const fn final_activation_digest(self) -> [u8; 32] {
+        self.final_activation_digest
+    }
+
+    pub const fn work_digest(self) -> [u8; 32] {
+        self.work_digest
+    }
 }
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
@@ -416,12 +486,118 @@ impl ConsensusPowVerifier {
         )))
     }
 
+    /// Reject a Production V3 accelerator claim unless its immutable network
+    /// and model identities match this exact verifier.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    pub fn validate_v3_winning_nonce_claim(
+        &self,
+        block: &BlockChallenge,
+        claim: ForgeMatrixV3WinningNonceClaim,
+    ) -> Result<(), PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.validate_winning_nonce_claim_identity(block, claim)?;
+        Ok(())
+    }
+
+    /// Convert one accelerator-produced final activation into a typed winning
+    /// claim under this verifier's authenticated transcript. The accelerator's
+    /// retained model identities must match before its large output is hashed.
+    /// The activation remains untrusted; [`Self::prove_v3_winning_nonce_claim`]
+    /// replays the nonce from the bank and refuses any mismatch before proof
+    /// construction.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    pub fn v3_winning_nonce_claim_from_accelerator_output(
+        &self,
+        block: &BlockChallenge,
+        accelerator_model_record_digest: [u8; 32],
+        accelerator_model_identity_digest: [u8; 32],
+        nonce: u64,
+        final_activation: &[u8],
+    ) -> Result<ForgeMatrixV3WinningNonceClaim, PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.winning_nonce_claim_from_accelerator_output(
+            block,
+            accelerator_model_record_digest,
+            accelerator_model_identity_digest,
+            nonce,
+            final_activation,
+        )
+    }
+
+    /// Reauthenticate and replay an exact accelerator winning-nonce claim,
+    /// build the complete Layout V5/Dory proof, and self-verify it.
+    ///
+    /// This operation is intentionally independent of node state. Callers
+    /// should obtain an immutable mining job under their node lock, release
+    /// that lock, run this method, and reacquire the lock only to submit the
+    /// returned block. Both readers must start at byte zero of the pinned bank.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_v3_winning_nonce_claim<FixedModelBank: Read, ReplayBank: Read>(
+        &self,
+        block: &BlockChallenge,
+        claim: ForgeMatrixV3WinningNonceClaim,
+        fixed_model_bank: FixedModelBank,
+        replay_bank: ReplayBank,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+        cancel: &AtomicBool,
+    ) -> Result<BlockProof, PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.validate_winning_nonce_claim_identity(block, claim)?;
+        if maximum_native_block_rows == 0
+            || maximum_native_block_rows > MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS
+        {
+            return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+        }
+        let (authenticated, setup) = match &verifier.authority {
+            ForgeMatrixV3VerifierAuthority::Production {
+                authenticated,
+                setup,
+            } => (authenticated, setup),
+            #[cfg(test)]
+            ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => {
+                return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+            }
+        };
+        let proof = prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim(
+            authenticated,
+            block,
+            BlsDoryV3WinningNonceClaim {
+                nonce: claim.nonce,
+                final_activation_digest: claim.final_activation_digest,
+                work_digest: claim.work_digest,
+            },
+            setup,
+            fixed_model_bank,
+            replay_bank,
+            scratch_directory,
+            maximum_native_block_rows,
+            cancel,
+        )?;
+        Ok(BlockProof::V3Candidate(Box::new(proof)))
+    }
+
     pub fn parameters(&self) -> PowParameters {
         match self {
             Self::V1Legacy(verifier) => PowParameters::V1Legacy(verifier.profile()),
             Self::V2Reference(reference) => PowParameters::V2Reference(reference.descriptor()),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(verifier) => PowParameters::V3Candidate(verifier.parameters),
+        }
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    pub fn v3_candidate_parameters(&self) -> Result<ForgeMatrixV3CandidateParameters, PowError> {
+        match self {
+            Self::V3Candidate(verifier) => Ok(verifier.parameters),
+            _ => Err(PowError::WrongProofType),
         }
     }
 
@@ -669,6 +845,75 @@ impl ConsensusPowVerifier {
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
 impl ForgeMatrixV3ConsensusVerifier {
+    fn winning_nonce_claim_from_accelerator_output(
+        &self,
+        block: &BlockChallenge,
+        accelerator_model_record_digest: [u8; 32],
+        accelerator_model_identity_digest: [u8; 32],
+        nonce: u64,
+        final_activation: &[u8],
+    ) -> Result<ForgeMatrixV3WinningNonceClaim, PowError> {
+        if block.network_id != self.parameters.network_id {
+            return Err(BlsDoryV3CandidateError::WrongNetwork.into());
+        }
+        if accelerator_model_record_digest != self.parameters.model_record_digest {
+            return Err(BlsDoryV3CandidateError::ModelRecordDigest.into());
+        }
+        if accelerator_model_identity_digest != self.parameters.model_identity_digest {
+            return Err(BlsDoryV3CandidateError::ModelIdentityDigest.into());
+        }
+        let authenticated = match &self.authority {
+            ForgeMatrixV3VerifierAuthority::Production { authenticated, .. } => authenticated,
+            #[cfg(test)]
+            ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => {
+                return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+            }
+        };
+        let transcript =
+            crate::dory_v3_transcript::DoryV3TranscriptContext::from_bank_authenticated_record(
+                block.network_id,
+                authenticated,
+            )
+            .map_err(BlsDoryV3CandidateError::from)?;
+        let challenge = transcript
+            .challenge_context(block, nonce)
+            .map_err(BlsDoryV3CandidateError::from)?;
+        let final_activation_digest = challenge
+            .output_digest(final_activation)
+            .map_err(BlsDoryV3CandidateError::from)?;
+        let work_digest = challenge.work_digest(final_activation_digest);
+        if work_digest > block.target {
+            return Err(BlsDoryV3CandidateError::HighHash.into());
+        }
+        Ok(ForgeMatrixV3WinningNonceClaim::new(
+            self.parameters.network_id,
+            self.parameters.model_record_digest,
+            self.parameters.model_identity_digest,
+            nonce,
+            final_activation_digest,
+            work_digest,
+        ))
+    }
+
+    fn validate_winning_nonce_claim_identity(
+        &self,
+        block: &BlockChallenge,
+        claim: ForgeMatrixV3WinningNonceClaim,
+    ) -> Result<(), PowError> {
+        if block.network_id != self.parameters.network_id
+            || claim.network_id != self.parameters.network_id
+        {
+            return Err(BlsDoryV3CandidateError::WrongNetwork.into());
+        }
+        if claim.model_record_digest != self.parameters.model_record_digest {
+            return Err(BlsDoryV3CandidateError::ModelRecordDigest.into());
+        }
+        if claim.model_identity_digest != self.parameters.model_identity_digest {
+            return Err(BlsDoryV3CandidateError::ModelIdentityDigest.into());
+        }
+        Ok(())
+    }
+
     fn verify(
         &self,
         block: &BlockChallenge,
@@ -932,6 +1177,159 @@ mod tests {
                 statement_identity: preverified_statement_identity(challenge, &proof),
             },
         }))
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    fn v3_winning_claim(
+        parameters: ForgeMatrixV3CandidateParameters,
+    ) -> ForgeMatrixV3WinningNonceClaim {
+        ForgeMatrixV3WinningNonceClaim::new(
+            parameters.network_id(),
+            parameters.model_record_digest(),
+            parameters.model_identity_digest(),
+            9,
+            [0x81; 32],
+            [0x92; 32],
+        )
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn v3_winning_claim_is_bound_to_the_exact_network_and_model() {
+        let parameters = v3_parameters();
+        let challenge = block(parameters.network_id());
+        let proof = v3_proof();
+        let verifier = bound_v3_test_verifier(parameters, &challenge, &proof);
+        let claim = v3_winning_claim(parameters);
+        verifier
+            .validate_v3_winning_nonce_claim(&challenge, claim)
+            .unwrap();
+
+        let wrong_network = ForgeMatrixV3WinningNonceClaim::new(
+            [0x11; 32],
+            claim.model_record_digest(),
+            claim.model_identity_digest(),
+            claim.nonce(),
+            claim.final_activation_digest(),
+            claim.work_digest(),
+        );
+        assert!(matches!(
+            verifier.validate_v3_winning_nonce_claim(&challenge, wrong_network),
+            Err(PowError::V3(BlsDoryV3CandidateError::WrongNetwork))
+        ));
+
+        let wrong_record = ForgeMatrixV3WinningNonceClaim::new(
+            claim.network_id(),
+            [0x22; 32],
+            claim.model_identity_digest(),
+            claim.nonce(),
+            claim.final_activation_digest(),
+            claim.work_digest(),
+        );
+        assert!(matches!(
+            verifier.validate_v3_winning_nonce_claim(&challenge, wrong_record),
+            Err(PowError::V3(BlsDoryV3CandidateError::ModelRecordDigest))
+        ));
+
+        let wrong_model = ForgeMatrixV3WinningNonceClaim::new(
+            claim.network_id(),
+            claim.model_record_digest(),
+            [0x33; 32],
+            claim.nonce(),
+            claim.final_activation_digest(),
+            claim.work_digest(),
+        );
+        assert!(matches!(
+            verifier.validate_v3_winning_nonce_claim(&challenge, wrong_model),
+            Err(PowError::V3(BlsDoryV3CandidateError::ModelIdentityDigest))
+        ));
+
+        let mut wrong_challenge = challenge;
+        wrong_challenge.network_id[0] ^= 1;
+        assert!(matches!(
+            verifier.validate_v3_winning_nonce_claim(&wrong_challenge, claim),
+            Err(PowError::V3(BlsDoryV3CandidateError::WrongNetwork))
+        ));
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn v3_accelerator_output_rejects_wrong_model_identity_before_replay() {
+        let parameters = v3_parameters();
+        let challenge = block(parameters.network_id());
+        let proof = v3_proof();
+        let verifier = bound_v3_test_verifier(parameters, &challenge, &proof);
+
+        assert!(matches!(
+            verifier.v3_winning_nonce_claim_from_accelerator_output(
+                &challenge,
+                [0x22; 32],
+                parameters.model_identity_digest(),
+                9,
+                &[],
+            ),
+            Err(PowError::V3(BlsDoryV3CandidateError::ModelRecordDigest))
+        ));
+        assert!(matches!(
+            verifier.v3_winning_nonce_claim_from_accelerator_output(
+                &challenge,
+                parameters.model_record_digest(),
+                [0x33; 32],
+                9,
+                &[],
+            ),
+            Err(PowError::V3(BlsDoryV3CandidateError::ModelIdentityDigest))
+        ));
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn v2_verifier_never_accepts_or_falls_back_for_a_v3_winning_claim() {
+        let reference = v2_test_reference().unwrap();
+        let challenge = block(reference.descriptor().network_id);
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let parameters = v3_parameters();
+        let claim = v3_winning_claim(parameters);
+        assert!(matches!(
+            verifier.validate_v3_winning_nonce_claim(&challenge, claim),
+            Err(PowError::WrongProofType)
+        ));
+        assert!(matches!(
+            verifier.prove_v3_winning_nonce_claim(
+                &challenge,
+                claim,
+                std::io::empty(),
+                std::io::empty(),
+                &std::env::current_dir().unwrap(),
+                MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS,
+                &AtomicBool::new(false),
+            ),
+            Err(PowError::WrongProofType)
+        ));
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn runtime_v3_prover_rejects_unbounded_native_row_limits_before_bank_reads() {
+        let parameters = v3_parameters();
+        let challenge = block(parameters.network_id());
+        let proof = v3_proof();
+        let verifier = bound_v3_test_verifier(parameters, &challenge, &proof);
+        let claim = v3_winning_claim(parameters);
+        for rows in [0, MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS + 1] {
+            assert!(matches!(
+                verifier.prove_v3_winning_nonce_claim(
+                    &challenge,
+                    claim,
+                    std::io::empty(),
+                    std::io::empty(),
+                    &std::env::current_dir().unwrap(),
+                    rows,
+                    &AtomicBool::new(false),
+                ),
+                Err(PowError::V3(BlsDoryV3CandidateError::ProverConfiguration))
+            ));
+        }
     }
 
     #[cfg(feature = "dory-v3-consensus-adapter")]

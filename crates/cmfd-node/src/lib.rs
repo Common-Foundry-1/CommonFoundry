@@ -22,6 +22,8 @@ use cmfd_consensus::{
     add_chain_work, chain_work_bytes, decode_block, decode_transaction, encode_block,
     encode_transaction, merkle_root, v2_reference_for_network, validate_block_resources,
 };
+#[cfg(feature = "production-v3")]
+use cmfd_consensus::{ForgeMatrixV3CandidateParameters, ForgeMatrixV3WinningNonceClaim};
 use cmfd_proof_worker::{
     ProductionV3VerifierArtifacts, ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError,
     verify_block_out_of_process,
@@ -753,6 +755,70 @@ impl MiningJob {
         })
     }
 
+    /// Return the immutable Production V3 model identities that an accelerator
+    /// must report before its winning claim is eligible for CPU replay.
+    #[cfg(feature = "production-v3")]
+    pub fn v3_candidate_parameters(&self) -> Result<ForgeMatrixV3CandidateParameters, NodeError> {
+        Ok(self.verifier.v3_candidate_parameters()?)
+    }
+
+    #[cfg(feature = "production-v3")]
+    pub fn v3_winning_nonce_claim_from_accelerator_output(
+        &self,
+        accelerator_model_record_digest: [u8; 32],
+        accelerator_model_identity_digest: [u8; 32],
+        nonce: u64,
+        final_activation: &[u8],
+    ) -> Result<ForgeMatrixV3WinningNonceClaim, NodeError> {
+        Ok(self
+            .verifier
+            .v3_winning_nonce_claim_from_accelerator_output(
+                &self.template.challenge,
+                accelerator_model_record_digest,
+                accelerator_model_identity_digest,
+                nonce,
+                final_activation,
+            )?)
+    }
+
+    /// Prove one identity-bound Production V3 winning claim without borrowing
+    /// mutable node state. This is the long-running phase: callers must release
+    /// any shared node mutex before invoking it and submit the returned block
+    /// through [`Node::submit_block`] afterward.
+    #[cfg(feature = "production-v3")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_v3_winning_nonce_claim<FixedModelBank: Read, ReplayBank: Read>(
+        &self,
+        claim: ForgeMatrixV3WinningNonceClaim,
+        fixed_model_bank: FixedModelBank,
+        replay_bank: ReplayBank,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Box<Block>, NodeError> {
+        let proof = self.verifier.prove_v3_winning_nonce_claim(
+            &self.template.challenge,
+            claim,
+            fixed_model_bank,
+            replay_bank,
+            scratch_directory,
+            maximum_native_block_rows,
+            cancel,
+        )?;
+        let BlockProof::V3Candidate(_) = proof else {
+            return Err(NodeError::CorruptLog(
+                "Production V3 prover produced a non-v3 proof".to_owned(),
+            ));
+        };
+        Ok(Box::new(Block {
+            version: BLOCK_VERSION,
+            challenge: self.template.challenge,
+            proof,
+            coinbase: self.template.coinbase.clone(),
+            transactions: self.template.transactions.clone(),
+        }))
+    }
+
     /// Searches a bounded wrapping nonce range without accessing mutable node
     /// state. `should_cancel` is checked before every nonce evaluation.
     ///
@@ -931,6 +997,30 @@ impl MiningWork {
         })
     }
 
+    /// Construct thin-miner work for the compiled Production V3 network only
+    /// after the same authenticated, build-pinned artifact gate used by node
+    /// startup. A V2 build or missing/mismatched V3 artifacts fails closed.
+    #[cfg(feature = "production-v3")]
+    pub fn from_compiled_v3_challenge(
+        challenge: BlockChallenge,
+        artifacts: &ProductionV3VerifierArtifacts,
+    ) -> Result<Self, NodeError> {
+        if !matches!(COMPILED_NETWORK_PROFILE.proof, ProofProfile::ProductionV3) {
+            return Err(NodeError::ProductionV3Unavailable);
+        }
+        let (params, verifier) =
+            network_params_and_verifier_for_profile(COMPILED_NETWORK_PROFILE, Some(artifacts))?;
+        if challenge.network_id != params.network_id || challenge.target > params.pow_limit {
+            return Err(NodeError::InvalidRpcRequest(
+                "mining challenge does not belong to the compiled Production V3 network".to_owned(),
+            ));
+        }
+        Ok(Self {
+            challenge,
+            verifier,
+        })
+    }
+
     pub fn challenge(&self) -> &BlockChallenge {
         &self.challenge
     }
@@ -1019,6 +1109,54 @@ impl MiningWork {
             attempts_completed: batch.count().into(),
             next_nonce: batch.start_nonce().wrapping_add(u64::from(batch.count())),
         })
+    }
+
+    #[cfg(feature = "production-v3")]
+    pub fn v3_candidate_parameters(&self) -> Result<ForgeMatrixV3CandidateParameters, NodeError> {
+        Ok(self.verifier.v3_candidate_parameters()?)
+    }
+
+    #[cfg(feature = "production-v3")]
+    pub fn v3_winning_nonce_claim_from_accelerator_output(
+        &self,
+        accelerator_model_record_digest: [u8; 32],
+        accelerator_model_identity_digest: [u8; 32],
+        nonce: u64,
+        final_activation: &[u8],
+    ) -> Result<ForgeMatrixV3WinningNonceClaim, NodeError> {
+        Ok(self
+            .verifier
+            .v3_winning_nonce_claim_from_accelerator_output(
+                &self.challenge,
+                accelerator_model_record_digest,
+                accelerator_model_identity_digest,
+                nonce,
+                final_activation,
+            )?)
+    }
+
+    /// Prove one Production V3 claim for a remote node-provided challenge.
+    /// The resulting proof remains bound to this exact immutable challenge.
+    #[cfg(feature = "production-v3")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_v3_winning_nonce_claim<FixedModelBank: Read, ReplayBank: Read>(
+        &self,
+        claim: ForgeMatrixV3WinningNonceClaim,
+        fixed_model_bank: FixedModelBank,
+        replay_bank: ReplayBank,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+        cancel: &AtomicBool,
+    ) -> Result<BlockProof, NodeError> {
+        Ok(self.verifier.prove_v3_winning_nonce_claim(
+            &self.challenge,
+            claim,
+            fixed_model_bank,
+            replay_bank,
+            scratch_directory,
+            maximum_native_block_rows,
+            cancel,
+        )?)
     }
 }
 
@@ -4726,6 +4864,33 @@ mod tests {
             devnet_params().unwrap().pow,
             PowParameters::V2Reference(_)
         ));
+    }
+
+    #[cfg(feature = "production-v3")]
+    #[test]
+    fn devnet_mining_work_cannot_select_or_fall_back_to_v3() {
+        let root = test_dir("devnet-v3-mining-rejection");
+        clean_test_dir(&root);
+        let node = Node::open(&root).unwrap();
+        let job = node
+            .build_mining_job(default_miner_destination(), 1_800_000_000)
+            .unwrap();
+        let artifacts = ProductionV3VerifierArtifacts {
+            bank: root.with_extension("bank"),
+            manifest: root.with_extension("manifest"),
+            record_v2: root.with_extension("record-v2"),
+        };
+
+        assert!(matches!(
+            job.v3_candidate_parameters(),
+            Err(NodeError::Pow(PowError::WrongProofType))
+        ));
+        assert!(matches!(
+            MiningWork::from_compiled_v3_challenge(*job.challenge(), &artifacts),
+            Err(NodeError::ProductionV3Unavailable)
+        ));
+        drop(node);
+        clean_test_dir(&root);
     }
 
     #[cfg(feature = "production-v3")]

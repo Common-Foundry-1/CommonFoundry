@@ -10,9 +10,15 @@ EXPECTED_COMMIT="$(cmfd_release_commit "${2:-}")"
 RELEASE_INTEGRITY="$PROJECT_ROOT/scripts/release_integrity.py"
 
 cmfd_require_linux_gnu_x86_64
-for command_name in cargo cmake git grep ninja python3 sed tr; do
+for command_name in cargo cmake git grep ninja python3 sed strip tr; do
   cmfd_require_command "$command_name"
 done
+STRIP="$(command -v strip)"
+STRIP_VERSION="$("$STRIP" --version | sed -n '1p')"
+if [[ "$STRIP_VERSION" != 'GNU strip '* ]]; then
+  printf 'GNU strip is required; found: %s\n' "$STRIP_VERSION" >&2
+  exit 1
+fi
 
 NVCC="${CUDACXX:-}"
 if [[ -z "$NVCC" ]]; then
@@ -44,6 +50,7 @@ cmake -S "$PROJECT_ROOT/gpu" -B "$BUILD_DIRECTORY" -G Ninja \
 cmake --build "$BUILD_DIRECTORY" --target cmfd-forgematrix-v2-miner
 
 LIBRARY="$BUILD_DIRECTORY/cmfd-forgematrix-v2-miner.so"
+"$STRIP" --strip-unneeded "$LIBRARY"
 cmfd_require_elf_x86_64 "$LIBRARY" shared
 NATIVE_IMAGES="$($CUOBJDUMP --list-elf "$LIBRARY")"
 PTX_IMAGES="$($CUOBJDUMP --list-ptx "$LIBRARY")"
@@ -65,7 +72,7 @@ if [[ "${CMFD_SKIP_DIFFERENTIAL_TEST:-0}" != "1" ]]; then
     cuda::tests::available_cuda_backend_matches_authoritative_v2_digests -- --nocapture
 fi
 
-TOOLCHAIN="$("$NVCC" --version | tr '\n' ' '); $(cmake --version | sed -n '1p')"
+TOOLCHAIN="$("$NVCC" --version | tr '\n' ' '); $(cmake --version | sed -n '1p'); $STRIP_VERSION"
 RECEIPT="$LIBRARY.build-receipt"
 python3 "$RELEASE_INTEGRITY" receipt-write \
   --repo "$PROJECT_ROOT" \

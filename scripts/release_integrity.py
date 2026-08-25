@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -24,6 +25,8 @@ BUILDINFO_NAME = "BUILDINFO.json"
 CHECKSUM_NAME = "SHA256SUMS.txt"
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_BUILDINFO_BYTES = 4 * 1024 * 1024
+MAX_DEB_BYTES = 512 * 1024 * 1024
+MAX_DEB_MEMBERS = 100_000
 FULL_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HEX256_RE = re.compile(r"[0-9a-f]{64}\Z")
 RECEIPT_FIELDS = (
@@ -54,6 +57,7 @@ NATIVE_SOURCES = {
         "gpu/forgematrix_v2_opencl.cpp",
     ),
 }
+DEB_AR_MEMBERS = ("debian-binary", "control.tar.gz", "data.tar.gz")
 
 
 class IntegrityError(RuntimeError):
@@ -633,6 +637,166 @@ def verify_deterministic_tar_gz(stage: Path, archive_path: Path, epoch: int) -> 
         raise IntegrityError(f"cannot verify tar.gz archive: {error}") from error
 
 
+def _ar_number(field: bytes, label: str, base: int = 10) -> int:
+    try:
+        text = field.decode("ascii", "strict").strip()
+        if not text or not re.fullmatch(r"[0-9]+", text):
+            raise ValueError
+        return int(text, base)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise IntegrityError(f"Debian ar header has an invalid {label}") from error
+
+
+def _deb_ar_members(path: Path) -> dict[str, bytes]:
+    path = _regular_file(path, "Debian package")
+    if path.stat().st_size > MAX_DEB_BYTES:
+        raise IntegrityError("Debian package exceeds its size limit")
+    data = path.read_bytes()
+    if not data.startswith(b"!<arch>\n"):
+        raise IntegrityError("Debian package does not have an ar archive header")
+    offset = 8
+    rows: list[tuple[str, bytes]] = []
+    while offset < len(data):
+        if offset + 60 > len(data):
+            raise IntegrityError("Debian ar member header is truncated")
+        header = data[offset : offset + 60]
+        offset += 60
+        if header[58:60] != b"`\n":
+            raise IntegrityError("Debian ar member header has an invalid trailer")
+        try:
+            encoded_name = header[:16].decode("ascii", "strict").rstrip()
+        except UnicodeDecodeError as error:
+            raise IntegrityError("Debian ar member name is not ASCII") from error
+        name = encoded_name[:-1] if encoded_name.endswith("/") else encoded_name
+        if name not in DEB_AR_MEMBERS:
+            raise IntegrityError(f"Debian ar member is unexpected: {name!r}")
+        _ar_number(header[16:28], "timestamp")
+        _ar_number(header[28:34], "owner")
+        _ar_number(header[34:40], "group")
+        _ar_number(header[40:48], "mode", 8)
+        size = _ar_number(header[48:58], "size")
+        end = offset + size
+        if end > len(data):
+            raise IntegrityError("Debian ar member payload is truncated")
+        rows.append((name, data[offset:end]))
+        offset = end
+        if size % 2:
+            if offset >= len(data) or data[offset : offset + 1] != b"\n":
+                raise IntegrityError("Debian ar member padding is invalid")
+            offset += 1
+    names = tuple(name for name, _ in rows)
+    if names != DEB_AR_MEMBERS:
+        raise IntegrityError("Debian ar members are missing, reordered, or repeated")
+    members = dict(rows)
+    if members["debian-binary"] != b"2.0\n":
+        raise IntegrityError("Debian package format marker is not canonical 2.0")
+    return members
+
+
+def _deb_tar_name(value: str) -> str:
+    if not value or "\\" in value or "\0" in value or "\n" in value or "\r" in value:
+        raise IntegrityError(f"unsafe Debian tar member name: {value!r}")
+    normalized = value[2:] if value.startswith("./") else value
+    if normalized == ".":
+        return normalized
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or path.is_absolute()
+        or path.as_posix() != normalized
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise IntegrityError(f"unsafe Debian tar member name: {value!r}")
+    return normalized
+
+
+def _deb_tar_manifest(data: bytes, label: str) -> list[dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    seen: set[str] = set()
+    total_size = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            for member_number, member in enumerate(archive, start=1):
+                if member_number > MAX_DEB_MEMBERS:
+                    raise IntegrityError(f"Debian {label} tar has too many members")
+                name = _deb_tar_name(member.name)
+                if name in seen:
+                    raise IntegrityError(
+                        f"Debian {label} tar repeats member: {name!r}"
+                    )
+                seen.add(name)
+                if member.linkname or member.pax_headers:
+                    raise IntegrityError(
+                        "Debian "
+                        f"{label} tar contains link or extended metadata: {name!r}"
+                    )
+                row: dict[str, object] = {
+                    "mode": member.mode & 0o7777,
+                    "name": name,
+                }
+                if member.isdir():
+                    if member.size != 0:
+                        raise IntegrityError(
+                            f"Debian {label} directory has content: {name!r}"
+                        )
+                    row["type"] = "directory"
+                    if name == ".":
+                        if row["mode"] != 0o755:
+                            raise IntegrityError(
+                                f"Debian {label} root mode is not 0755"
+                            )
+                        continue
+                elif member.isreg() and name != ".":
+                    total_size += member.size
+                    if total_size > MAX_DEB_BYTES:
+                        raise IntegrityError(
+                            f"Debian {label} tar exceeds its content size limit"
+                        )
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise IntegrityError(
+                            f"Debian {label} file cannot be read: {name!r}"
+                        )
+                    content = extracted.read()
+                    if len(content) != member.size:
+                        raise IntegrityError(
+                            f"Debian {label} file size is inconsistent: {name!r}"
+                        )
+                    row.update(
+                        {
+                            "sha256": _sha256_bytes(content),
+                            "size": member.size,
+                            "type": "file",
+                        }
+                    )
+                else:
+                    raise IntegrityError(
+                        f"Debian {label} tar contains a link or special file: {name!r}"
+                    )
+                rows[name] = row
+    except (OSError, tarfile.TarError) as error:
+        raise IntegrityError(f"cannot inspect Debian {label} tar: {error}") from error
+    return [rows[name] for name in sorted(rows)]
+
+
+def inspect_debian_package(path: Path) -> str:
+    members = _deb_ar_members(path)
+    control = _deb_tar_manifest(members["control.tar.gz"], "control")
+    payload = _deb_tar_manifest(members["data.tar.gz"], "payload")
+    control_by_name = {row["name"]: row for row in control}
+    payload_by_name = {row["name"]: row for row in payload}
+    if control_by_name.get("control", {}).get("type") != "file":
+        raise IntegrityError("Debian control tar lacks a regular control file")
+    if payload_by_name.get("usr/bin/common-foundry-wallet", {}).get("type") != "file":
+        raise IntegrityError("Debian payload lacks the Common Foundry wallet binary")
+    semantic = {
+        "control": control,
+        "payload": payload,
+        "schema": "CMFD_DEB_SEMANTIC_V1",
+    }
+    return _sha256_bytes(_canonical_json(semantic))
+
+
 def _inventory_names(path: Path) -> tuple[list[str], bytes]:
     path = _regular_file(path, "release inventory")
     data = path.read_bytes()
@@ -879,6 +1043,11 @@ def _parser() -> argparse.ArgumentParser:
     tar_command.add_argument("--output", type=Path, required=True)
     tar_command.add_argument("--source-date-epoch", required=True)
 
+    deb_inspect = commands.add_parser(
+        "deb-inspect", help="fail closed on unsafe Debian members and hash semantics"
+    )
+    deb_inspect.add_argument("--deb", type=Path, required=True)
+
     finalize = commands.add_parser(
         "finalize", help="generate and re-verify canonical release metadata"
     )
@@ -929,6 +1098,8 @@ def main(arguments: list[str] | None = None) -> int:
             epoch = _source_date_epoch(None, args.source_date_epoch)
             create_deterministic_tar_gz(args.stage, args.output, epoch)
             print(f"{_sha256_file(args.output)}  {args.output.name}")
+        elif args.command == "deb-inspect":
+            print(inspect_debian_package(args.deb))
         elif args.command == "finalize":
             result = finalize_release(
                 repo=args.repo,

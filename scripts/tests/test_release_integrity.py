@@ -272,6 +272,174 @@ class DeterministicArchiveTests(unittest.TestCase):
             integrity.verify_deterministic_zip(stage, archive_path, self.epoch)
 
 
+class DebianPackageInspectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    @staticmethod
+    def tar_gz(
+        rows: list[tuple[str, str, bytes | str]], epoch: int, owner: int
+    ) -> bytes:
+        buffer = io.BytesIO()
+        with (
+            gzip.GzipFile(
+                filename="", mode="wb", fileobj=buffer, mtime=epoch
+            ) as zipped,
+            tarfile.open(
+                fileobj=zipped, mode="w", format=tarfile.GNU_FORMAT
+            ) as archive,
+        ):
+            for name, kind, value in rows:
+                member = tarfile.TarInfo(name)
+                member.mtime = epoch
+                member.uid = owner
+                member.gid = owner
+                member.mode = 0o755 if kind == "directory" else 0o644
+                if kind == "directory":
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                elif kind == "file":
+                    assert isinstance(value, bytes)
+                    member.type = tarfile.REGTYPE
+                    member.size = len(value)
+                    archive.addfile(member, io.BytesIO(value))
+                elif kind == "symlink":
+                    assert isinstance(value, str)
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = value
+                    archive.addfile(member)
+                else:  # pragma: no cover - fixture helper contract.
+                    raise AssertionError(kind)
+        return buffer.getvalue()
+
+    @staticmethod
+    def ar(rows: list[tuple[str, bytes]], epoch: int, owner: int) -> bytes:
+        output = bytearray(b"!<arch>\n")
+        for name, content in rows:
+            fields = (
+                f"{name}/".ljust(16)
+                + str(epoch).ljust(12)
+                + str(owner).ljust(6)
+                + str(owner).ljust(6)
+                + f"{0o100644:o}".ljust(8)
+                + str(len(content)).ljust(10)
+                + "`\n"
+            )
+            output.extend(fields.encode("ascii"))
+            output.extend(content)
+            if len(content) % 2:
+                output.extend(b"\n")
+        return bytes(output)
+
+    def package(
+        self,
+        name: str,
+        epoch: int,
+        owner: int = 0,
+        control_rows: list[tuple[str, str, bytes | str]] | None = None,
+        payload_rows: list[tuple[str, str, bytes | str]] | None = None,
+        ar_order: tuple[str, ...] = integrity.DEB_AR_MEMBERS,
+    ) -> Path:
+        control = self.tar_gz(
+            control_rows
+            or [("./control", "file", b"Package: common-foundry-wallet\n")],
+            epoch,
+            owner,
+        )
+        payload = self.tar_gz(
+            payload_rows
+            or [
+                (".", "directory", b""),
+                ("./usr", "directory", b""),
+                ("./usr/bin", "directory", b""),
+                ("./usr/bin/common-foundry-wallet", "file", b"wallet"),
+            ],
+            epoch,
+            owner,
+        )
+        members = {
+            "debian-binary": b"2.0\n",
+            "control.tar.gz": control,
+            "data.tar.gz": payload,
+        }
+        path = self.root / name
+        path.write_bytes(
+            self.ar([(member, members[member]) for member in ar_order], epoch, owner)
+        )
+        return path
+
+    def test_semantic_hash_ignores_only_container_time_and_owner(self) -> None:
+        first = self.package("first.deb", 1_700_000_000, 0)
+        second = self.package("second.deb", 1_800_000_000, 1001)
+        self.assertNotEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(
+            integrity.inspect_debian_package(first),
+            integrity.inspect_debian_package(second),
+        )
+
+    def test_optional_canonical_root_directory_is_container_metadata(self) -> None:
+        without_root = self.package(
+            "without-root.deb",
+            1_700_000_000,
+            payload_rows=[
+                ("./usr", "directory", b""),
+                ("./usr/bin", "directory", b""),
+                ("./usr/bin/common-foundry-wallet", "file", b"wallet"),
+            ],
+        )
+        with_root = self.package(
+            "with-root.deb",
+            1_800_000_000,
+            control_rows=[
+                (".", "directory", b""),
+                ("./control", "file", b"Package: common-foundry-wallet\n"),
+            ],
+        )
+        self.assertEqual(
+            integrity.inspect_debian_package(without_root),
+            integrity.inspect_debian_package(with_root),
+        )
+
+    def test_symlinked_payload_is_rejected_before_extraction(self) -> None:
+        package = self.package(
+            "symlink.deb",
+            1_700_000_000,
+            payload_rows=[
+                (".", "directory", b""),
+                ("./usr", "directory", b""),
+                ("./usr/bin", "directory", b""),
+                ("./usr/bin/common-foundry-wallet", "symlink", "../../escape"),
+            ],
+        )
+        with self.assertRaisesRegex(integrity.IntegrityError, "contains link"):
+            integrity.inspect_debian_package(package)
+
+    def test_parent_traversal_member_is_rejected_before_extraction(self) -> None:
+        package = self.package(
+            "traversal.deb",
+            1_700_000_000,
+            payload_rows=[
+                ("../escape", "file", b"escape"),
+                ("usr/bin/common-foundry-wallet", "file", b"wallet"),
+            ],
+        )
+        with self.assertRaisesRegex(integrity.IntegrityError, "unsafe"):
+            integrity.inspect_debian_package(package)
+
+    def test_reordered_ar_members_are_rejected(self) -> None:
+        package = self.package(
+            "reordered.deb",
+            1_700_000_000,
+            ar_order=("control.tar.gz", "debian-binary", "data.tar.gz"),
+        )
+        with self.assertRaisesRegex(integrity.IntegrityError, "reordered"):
+            integrity.inspect_debian_package(package)
+
+
 class ReleaseFinalizerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = GitFixture()

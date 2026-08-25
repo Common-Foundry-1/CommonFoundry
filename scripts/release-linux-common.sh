@@ -17,9 +17,9 @@ cmfd_release_commit() {
   printf '%s\n' "$supplied"
 }
 
-cmfd_require_linux_gnu_x86_64() {
+cmfd_require_linux_glibc_x86_64() {
   local command_name
-  for command_name in awk file getconf grep readelf rustc uname; do
+  for command_name in getconf uname; do
     cmfd_require_command "$command_name"
   done
   if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
@@ -30,6 +30,14 @@ cmfd_require_linux_gnu_x86_64() {
     echo 'This release package requires a glibc build host.' >&2
     return 1
   fi
+}
+
+cmfd_require_linux_gnu_x86_64() {
+  cmfd_require_linux_glibc_x86_64
+  local command_name
+  for command_name in awk file grep readelf rustc; do
+    cmfd_require_command "$command_name"
+  done
   local rust_host
   rust_host="$(rustc -vV | awk '/^host: / { print $2 }')"
   if [[ "$rust_host" != "x86_64-unknown-linux-gnu" ]]; then

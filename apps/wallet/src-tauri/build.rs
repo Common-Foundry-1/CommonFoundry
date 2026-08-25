@@ -13,6 +13,17 @@ fn main() {
         "stop_mining",
     ];
 
+    let wallet_permissions = include_str!("permissions/wallet-commands.toml");
+    for command in COMMANDS {
+        let permission = format!("\"{command}\",");
+        assert!(
+            wallet_permissions
+                .lines()
+                .any(|line| line.trim() == permission),
+            "wallet-commands permission does not allow registered command {command}"
+        );
+    }
+
     tauri_build::try_build(
         tauri_build::Attributes::new()
             .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),

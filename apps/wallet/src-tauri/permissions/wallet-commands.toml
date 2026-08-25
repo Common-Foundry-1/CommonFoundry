@@ -1,8 +1,10 @@
 [[permission]]
 identifier = "wallet-commands"
-description = "Allows the main wallet window to use the nine bounded embedded Devnet node and solo-mining operations."
+description = "Allows the main wallet window to use the eleven bounded embedded Devnet node and solo-mining operations."
 commands.allow = [
   "get_node_status",
+  "get_peer_settings",
+  "update_peer_settings",
   "get_wallet_snapshot",
   "get_mempool_snapshot",
   "send_wallet_transaction",

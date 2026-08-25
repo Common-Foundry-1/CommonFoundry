@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+production-v3 = ["cmfd-consensus/dory-v3-consensus-adapter"]
+
 [dependencies]
 cmfd-consensus = { path = "../cmfd-consensus", features = ["gpu-proof-prover"] }
 cmfd-proof-accel = { path = "../cmfd-proof-accel" }

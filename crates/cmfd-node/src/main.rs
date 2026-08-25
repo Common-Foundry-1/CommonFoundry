@@ -15,9 +15,10 @@ use cmfd_node::pool::{
 };
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
-    canonical_network_info_json, parse_miner_destination, spawn_rpc_server, unix_time_seconds,
+    canonical_network_info_json_with_artifacts, parse_miner_destination, spawn_rpc_server,
+    unix_time_seconds,
 };
-use cmfd_proof_worker::VerifierWorkerConfig;
+use cmfd_proof_worker::{ProductionV3VerifierArtifacts, VerifierWorkerConfig};
 use serde_json::json;
 
 const SERVICE_SUPERVISION_POLL: Duration = Duration::from_millis(50);
@@ -50,6 +51,15 @@ struct Cli {
     /// Hard worker address-space/job memory limit in bytes.
     #[arg(long, global = true, default_value_t = 2_147_483_648)]
     proof_verifier_memory_bytes: u64,
+    /// Absolute path to the authenticated production V3 model bank.
+    #[arg(long, global = true)]
+    production_v3_bank: Option<PathBuf>,
+    /// Absolute path to the canonical production V3 model-bank manifest.
+    #[arg(long, global = true)]
+    production_v3_manifest: Option<PathBuf>,
+    /// Absolute path to the canonical production V3 Record V2.
+    #[arg(long, global = true)]
+    production_v3_record_v2: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -122,13 +132,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(cmfd_proof_worker::worker_main());
     }
     let cli = Cli::parse();
+    let production_v3_artifacts = production_v3_artifacts(&cli)?;
     if matches!(&cli.command, Command::NetworkInfo) {
         io::stdout()
             .lock()
-            .write_all(&canonical_network_info_json()?)?;
+            .write_all(&canonical_network_info_json_with_artifacts(
+                production_v3_artifacts.as_ref(),
+            )?)?;
         return Ok(());
     }
-    let verifier_worker = verifier_worker_config(&cli)?;
+    let verifier_worker = verifier_worker_config(&cli, production_v3_artifacts.clone())?;
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
@@ -140,7 +153,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let shutdown = install_shutdown_handler()?;
             let address_policy = peer_address_policy(allow_public_peers);
-            let mut node = open_node(&cli.data_dir, verifier_worker.as_ref())?;
+            let mut node = open_node(
+                &cli.data_dir,
+                production_v3_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+            )?;
             node.set_public_peer_mode(allow_public_peers);
             let status = node.status()?;
             let shared = Arc::new(Mutex::new(node));
@@ -207,7 +224,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::MineOnce { miner, attempts } => {
-            let mut node = open_node(&cli.data_dir, verifier_worker.as_ref())?;
+            let mut node = open_node(
+                &cli.data_dir,
+                production_v3_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+            )?;
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
                 None => node.wallet_destination(),
@@ -228,7 +249,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::Status => {
-            let node = open_node(&cli.data_dir, verifier_worker.as_ref())?;
+            let node = open_node(
+                &cli.data_dir,
+                production_v3_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+            )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
             Ok(())
         }
@@ -266,7 +291,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             let address_policy = peer_address_policy(allow_public_peers);
-            let mut node_instance = open_node(&cli.data_dir, verifier_worker.as_ref())?;
+            let mut node_instance = open_node(
+                &cli.data_dir,
+                production_v3_artifacts.as_ref(),
+                verifier_worker.as_ref(),
+            )?;
             node_instance.set_public_peer_mode(allow_public_peers);
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
@@ -392,6 +421,7 @@ fn install_shutdown_handler() -> Result<ShutdownSignal, ctrlc::Error> {
 
 fn verifier_worker_config(
     cli: &Cli,
+    production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
 ) -> Result<Option<VerifierWorkerConfig>, Box<dyn std::error::Error>> {
     let Some(worker_executable) = cli.proof_verifier_worker.clone() else {
         return Ok(None);
@@ -411,14 +441,36 @@ fn verifier_worker_config(
         worker_sha256,
         timeout: Duration::from_millis(cli.proof_verifier_timeout_ms),
         memory_limit_bytes: cli.proof_verifier_memory_bytes,
+        production_v3_artifacts,
     }))
+}
+
+fn production_v3_artifacts(
+    cli: &Cli,
+) -> Result<Option<ProductionV3VerifierArtifacts>, Box<dyn std::error::Error>> {
+    match (
+        cli.production_v3_bank.clone(),
+        cli.production_v3_manifest.clone(),
+        cli.production_v3_record_v2.clone(),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(bank), Some(manifest), Some(record_v2)) => {
+            Ok(Some(ProductionV3VerifierArtifacts {
+                bank,
+                manifest,
+                record_v2,
+            }))
+        }
+        _ => Err("--production-v3-bank, --production-v3-manifest, and --production-v3-record-v2 must be supplied together".into()),
+    }
 }
 
 fn open_node(
     data_dir: &PathBuf,
+    production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
     verifier_worker: Option<&VerifierWorkerConfig>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    let mut node = Node::open(data_dir)?;
+    let mut node = Node::open_with_artifacts(data_dir, production_v3_artifacts)?;
     if let Some(config) = verifier_worker {
         node.use_external_proof_verifier(config.clone())?;
     }

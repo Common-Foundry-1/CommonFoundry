@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    MODEL_BANK_HEADER_BYTES, ModelBankManifest,
+    ConsensusPowVerifier, MODEL_BANK_HEADER_BYTES, ModelBankManifest, PowError,
     dory_bls12_381_prototype::{
         BlsDoryPrototypeError, DeterministicBlsDorySetup, deterministic_bls_dory_setup,
     },
@@ -185,6 +185,38 @@ pub enum ProductionDoryV3ModelBankRecordValidationError {
     RecordReproductionMismatch,
     #[error("a final retained small-file reread no longer matches the validated chain")]
     FinalSmallFileMismatch,
+    #[error("failed to construct the production V3 consensus verifier: {0}")]
+    ConsensusVerifier(#[source] PowError),
+}
+
+/// Authenticated production V3 verifier together with the exact filesystem
+/// identities observed while its bank, manifest, and Record V2 were retained.
+/// A network launcher must compare these identities with its compiled pins
+/// before accepting the verifier as consensus authority.
+#[must_use]
+pub struct LoadedProductionDoryV3ConsensusVerifier {
+    verifier: ConsensusPowVerifier,
+    bank_file: FileIdentity,
+    manifest_file: FileIdentity,
+    record_v2_file: FileIdentity,
+}
+
+impl LoadedProductionDoryV3ConsensusVerifier {
+    pub const fn bank_file(&self) -> &FileIdentity {
+        &self.bank_file
+    }
+
+    pub const fn manifest_file(&self) -> &FileIdentity {
+        &self.manifest_file
+    }
+
+    pub const fn record_v2_file(&self) -> &FileIdentity {
+        &self.record_v2_file
+    }
+
+    pub fn into_verifier(self) -> ConsensusPowVerifier {
+        self.verifier
+    }
 }
 
 /// Validate one existing production bank, canonical manifest, and canonical
@@ -242,6 +274,43 @@ pub fn validate_existing_production_dory_v3_model_bank_record_chain(
                 .map_err(ProductionDoryV3ModelBankRecordValidationError::Record)
         },
     )
+}
+
+/// Load the exact production bank, manifest, and Record V2 and construct the
+/// corresponding fail-closed consensus verifier.
+///
+/// The retained-handle validator authenticates the complete bank twice and
+/// bounds both JSON inputs before this function can mint verifier authority.
+/// Paths and file bytes never become consensus parameters; only the identities
+/// derived from the authenticated Record V2 are retained by the verifier.
+pub fn load_production_dory_v3_consensus_verifier(
+    network_id: [u8; 32],
+    bank_path: &Path,
+    manifest_path: &Path,
+    record_v2_path: &Path,
+) -> Result<LoadedProductionDoryV3ConsensusVerifier, ProductionDoryV3ModelBankRecordValidationError>
+{
+    let validated = validate_existing_production_dory_v3_model_bank_record_chain(
+        bank_path,
+        manifest_path,
+        record_v2_path,
+    )?;
+    let setup = pinned_production_setup()?;
+    let bank_file = validated.bank_file().clone();
+    let manifest_file = validated.manifest_file().clone();
+    let record_v2_file = validated.record_v2_file().clone();
+    let ValidatedProductionDoryV3ModelBankRecordChain {
+        authenticated_record,
+        ..
+    } = validated;
+    let verifier = ConsensusPowVerifier::v3_candidate(network_id, authenticated_record, setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ConsensusVerifier)?;
+    Ok(LoadedProductionDoryV3ConsensusVerifier {
+        verifier,
+        bank_file,
+        manifest_file,
+        record_v2_file,
+    })
 }
 
 fn validate_existing_dory_v3_model_bank_record_chain_core<C>(

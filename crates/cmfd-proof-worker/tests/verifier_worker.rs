@@ -31,6 +31,7 @@ fn worker_config() -> VerifierWorkerConfig {
         worker_executable: worker,
         timeout: Duration::from_secs(10),
         memory_limit_bytes: 512 * 1024 * 1024,
+        production_v3_artifacts: None,
     }
 }
 

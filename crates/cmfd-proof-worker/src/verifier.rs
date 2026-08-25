@@ -16,6 +16,9 @@ const REQUEST_MAGIC: &[u8; 8] = b"CMFDVWQ1";
 const RESPONSE_MAGIC: &[u8; 8] = b"CMFDVWR1";
 const PROTOCOL_VERSION: u32 = 1;
 const VERIFY_MODE: &str = "--verify-block";
+const V3_BANK_ARGUMENT: &str = "--production-v3-bank";
+const V3_MANIFEST_ARGUMENT: &str = "--production-v3-manifest";
+const V3_RECORD_ARGUMENT: &str = "--production-v3-record-v2";
 const REQUEST_FIXED_BYTES: usize = 8 + 4 + 32 + 32 + 32 + 4;
 const SUCCESS_RESPONSE_BYTES: usize = 8 + 4 + 1 + 32 + 32;
 const ERROR_RESPONSE_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
@@ -39,6 +42,36 @@ pub struct VerifierWorkerConfig {
     pub worker_sha256: [u8; 32],
     pub timeout: Duration,
     pub memory_limit_bytes: u64,
+    pub production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
+}
+
+/// Local paths to the three authenticated artifacts required by the V3
+/// verifier. Paths are process configuration only and never enter consensus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionV3VerifierArtifacts {
+    pub bank: PathBuf,
+    pub manifest: PathBuf,
+    pub record_v2: PathBuf,
+}
+
+impl ProductionV3VerifierArtifacts {
+    fn validate(&self) -> Result<(), VerifierWorkerError> {
+        if !self.bank.is_absolute() || !self.manifest.is_absolute() || !self.record_v2.is_absolute()
+        {
+            return Err(VerifierWorkerError::InvalidConfig(
+                "production V3 artifact paths must be absolute",
+            ));
+        }
+        if self.bank == self.manifest
+            || self.bank == self.record_v2
+            || self.manifest == self.record_v2
+        {
+            return Err(VerifierWorkerError::InvalidConfig(
+                "production V3 artifact paths must be pairwise distinct",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl VerifierWorkerConfig {
@@ -62,6 +95,9 @@ impl VerifierWorkerConfig {
             return Err(VerifierWorkerError::InvalidConfig(
                 "worker memory limit does not fit this platform",
             ));
+        }
+        if let Some(artifacts) = &self.production_v3_artifacts {
+            artifacts.validate()?;
         }
         Ok(())
     }
@@ -162,8 +198,17 @@ pub fn verify_block_out_of_process(
         block: canonical,
     })?;
     let mut command = Command::new(&config.worker_executable);
+    command.arg(VERIFY_MODE);
+    if let Some(artifacts) = &config.production_v3_artifacts {
+        command
+            .arg(V3_BANK_ARGUMENT)
+            .arg(&artifacts.bank)
+            .arg(V3_MANIFEST_ARGUMENT)
+            .arg(&artifacts.manifest)
+            .arg(V3_RECORD_ARGUMENT)
+            .arg(&artifacts.record_v2);
+    }
     command
-        .arg(VERIFY_MODE)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -311,10 +356,8 @@ fn decode_response(bytes: &[u8]) -> Result<VerifierResponse, VerifierProtocolErr
 }
 
 fn run_verifier_worker() -> Result<ExternalPreverificationBinding, (u16, String)> {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 1 || arguments[0].as_os_str() != OsStr::new(VERIFY_MODE) {
-        return Err((ERROR_REQUEST, "expected exactly --verify-block".to_owned()));
-    }
+    let artifacts = parse_verifier_worker_arguments(std::env::args_os().skip(1))
+        .map_err(|message| (ERROR_REQUEST, message.to_owned()))?;
     let request_bytes = read_stdin_bounded()
         .map_err(|error| (ERROR_INTERNAL, format!("could not read request: {error}")))?;
     let request =
@@ -329,15 +372,18 @@ fn run_verifier_worker() -> Result<ExternalPreverificationBinding, (u16, String)
         ));
     }
 
-    // The only active network verifier is the tiny V2 reference. V3 remains
-    // deliberately fail-closed until its final parser and parameters exist.
-    let reference = v2_reference_for_network(request.network_id).map_err(|error| {
-        (
-            ERROR_INTERNAL,
-            format!("could not load V2 verifier: {error}"),
-        )
-    })?;
-    let verifier = ConsensusPowVerifier::v2_reference(reference);
+    let verifier = match artifacts {
+        Some(artifacts) => load_production_v3_verifier(request.network_id, &artifacts)?,
+        None => {
+            let reference = v2_reference_for_network(request.network_id).map_err(|error| {
+                (
+                    ERROR_INTERNAL,
+                    format!("could not load V2 verifier: {error}"),
+                )
+            })?;
+            ConsensusPowVerifier::v2_reference(reference)
+        }
+    };
     let expected = verifier
         .external_preverification_binding(&block.challenge, &block.proof)
         .map_err(|error| (ERROR_UNSUPPORTED_VERIFIER, error.to_string()))?;
@@ -357,6 +403,65 @@ fn run_verifier_worker() -> Result<ExternalPreverificationBinding, (u16, String)
         .verify(&block.challenge, &block.proof)
         .map_err(|error| (ERROR_PROOF_REJECTED, error.to_string()))?;
     Ok(expected)
+}
+
+fn parse_verifier_worker_arguments(
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Option<ProductionV3VerifierArtifacts>, &'static str> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    if arguments.len() == 1 && arguments[0].as_os_str() == OsStr::new(VERIFY_MODE) {
+        return Ok(None);
+    }
+    if arguments.len() != 7
+        || arguments[0].as_os_str() != OsStr::new(VERIFY_MODE)
+        || arguments[1].as_os_str() != OsStr::new(V3_BANK_ARGUMENT)
+        || arguments[3].as_os_str() != OsStr::new(V3_MANIFEST_ARGUMENT)
+        || arguments[5].as_os_str() != OsStr::new(V3_RECORD_ARGUMENT)
+    {
+        return Err(
+            "expected --verify-block alone or with the exact production V3 bank, manifest, and Record V2 arguments",
+        );
+    }
+    let artifacts = ProductionV3VerifierArtifacts {
+        bank: PathBuf::from(&arguments[2]),
+        manifest: PathBuf::from(&arguments[4]),
+        record_v2: PathBuf::from(&arguments[6]),
+    };
+    artifacts
+        .validate()
+        .map_err(|_| "production V3 verifier artifact paths are invalid")?;
+    Ok(Some(artifacts))
+}
+
+#[cfg(feature = "production-v3")]
+fn load_production_v3_verifier(
+    network_id: [u8; 32],
+    artifacts: &ProductionV3VerifierArtifacts,
+) -> Result<ConsensusPowVerifier, (u16, String)> {
+    cmfd_consensus::dory_v3_model_bank_record_validation::load_production_dory_v3_consensus_verifier(
+        network_id,
+        &artifacts.bank,
+        &artifacts.manifest,
+        &artifacts.record_v2,
+    )
+    .map(|loaded| loaded.into_verifier())
+    .map_err(|error| {
+        (
+            ERROR_INTERNAL,
+            format!("could not authenticate production V3 verifier artifacts: {error}"),
+        )
+    })
+}
+
+#[cfg(not(feature = "production-v3"))]
+fn load_production_v3_verifier(
+    _network_id: [u8; 32],
+    _artifacts: &ProductionV3VerifierArtifacts,
+) -> Result<ConsensusPowVerifier, (u16, String)> {
+    Err((
+        ERROR_UNSUPPORTED_VERIFIER,
+        "this proof worker was built without production V3 verifier support".to_owned(),
+    ))
 }
 
 pub(super) fn verifier_mode_requested() -> bool {
@@ -586,12 +691,53 @@ mod tests {
     }
 
     #[test]
+    fn verifier_worker_arguments_never_infer_or_fallback_between_profiles() {
+        assert_eq!(
+            parse_verifier_worker_arguments([std::ffi::OsString::from(VERIFY_MODE)]).unwrap(),
+            None
+        );
+
+        let root = std::env::current_dir().unwrap();
+        let bank = root.join("model.bank");
+        let manifest = root.join("model.manifest.json");
+        let record_v2 = root.join("model.record-v2.json");
+        let parsed = parse_verifier_worker_arguments([
+            std::ffi::OsString::from(VERIFY_MODE),
+            std::ffi::OsString::from(V3_BANK_ARGUMENT),
+            bank.clone().into_os_string(),
+            std::ffi::OsString::from(V3_MANIFEST_ARGUMENT),
+            manifest.clone().into_os_string(),
+            std::ffi::OsString::from(V3_RECORD_ARGUMENT),
+            record_v2.clone().into_os_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ProductionV3VerifierArtifacts {
+                bank,
+                manifest,
+                record_v2,
+            }
+        );
+
+        assert!(
+            parse_verifier_worker_arguments([
+                std::ffi::OsString::from(VERIFY_MODE),
+                std::ffi::OsString::from(V3_BANK_ARGUMENT),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn verifier_config_requires_absolute_path_and_nonzero_limits() {
         let mut config = VerifierWorkerConfig {
             worker_executable: PathBuf::from("worker"),
             worker_sha256: [0; 32],
             timeout: Duration::from_secs(1),
             memory_limit_bytes: 1,
+            production_v3_artifacts: None,
         };
         assert!(matches!(
             config.validate(),
@@ -605,6 +751,16 @@ mod tests {
         ));
         config.timeout = Duration::from_secs(1);
         config.memory_limit_bytes = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(VerifierWorkerError::InvalidConfig(_))
+        ));
+        config.memory_limit_bytes = 1;
+        config.production_v3_artifacts = Some(ProductionV3VerifierArtifacts {
+            bank: PathBuf::from("relative-bank"),
+            manifest: PathBuf::from("relative-manifest"),
+            record_v2: PathBuf::from("relative-record"),
+        });
         assert!(matches!(
             config.validate(),
             Err(VerifierWorkerError::InvalidConfig(_))

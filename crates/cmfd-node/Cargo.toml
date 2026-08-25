@@ -8,7 +8,11 @@ build = "build.rs"
 
 [features]
 default = []
-production-rc = []
+production-v3 = [
+    "cmfd-consensus/dory-v3-consensus-adapter",
+    "cmfd-proof-worker/production-v3",
+]
+production-rc = ["production-v3"]
 
 [dependencies]
 blake3.workspace = true

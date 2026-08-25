@@ -1,3 +1,11 @@
+#[cfg(feature = "production-v3")]
+use cmfd_consensus::POW_TYPE_V3_CANDIDATE;
+#[cfg(feature = "production-v3")]
+use cmfd_consensus::dory_v3_suite::{
+    DORY_V3_BANKS, DORY_V3_BATCH, DORY_V3_DIMENSION, DORY_V3_LAYERS, DORY_V3_LAYERS_PER_BANK,
+    DORY_V3_MAX_STRUCTURED_PROOF_BYTES, DORY_V3_MODEL_BANK_FORMAT_VERSION,
+    DORY_V3_MODEL_RECORD_VERSION, DORY_V3_MODEL_VERSION, DORY_V3_PADDED_VARIABLES,
+};
 use cmfd_consensus::{
     BLOCK_VERSION, COIN, COINBASE_MATURITY, CONSENSUS_SIGNATURE_BYTES, DGW_WINDOW,
     ForgeMatrixV2Error, MAX_BLOCK_AGGREGATE_INPUTS, MAX_BLOCK_AGGREGATE_OUTPUTS, MAX_BLOCK_BYTES,
@@ -6,13 +14,15 @@ use cmfd_consensus::{
     POW_TYPE_V2_REFERENCE, PowError, PowParameters, TARGET_SPACING_SECONDS, TRANSACTION_VERSION,
     WIRE_HEADER_BYTES, WIRE_VERSION,
 };
+use cmfd_proof_worker::ProductionV3VerifierArtifacts;
 use serde::Serialize;
 
-use crate::{COMPILED_NETWORK_PROFILE, NodeError, devnet_params};
+use crate::{
+    COMPILED_NETWORK_PROFILE, NetworkProfile, NodeError, network_params_and_verifier_for_profile,
+};
 
 const NETWORK_INFO_FORMAT: &str = "commonfoundry-network-info";
 const NETWORK_INFO_FORMAT_VERSION: u32 = 1;
-const DEVNET_POW_PROFILE: &str = "ForgeMatrix-v2 tiny full-recompute reference";
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct NetworkInfo {
@@ -72,7 +82,15 @@ struct ConsensusLimits {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct ProofOfWorkIdentity {
+#[serde(untagged)]
+enum ProofOfWorkIdentity {
+    V2Reference(V2ProofOfWorkIdentity),
+    #[cfg(feature = "production-v3")]
+    ProductionV3(ProductionV3ProofOfWorkIdentity),
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct V2ProofOfWorkIdentity {
     profile: &'static str,
     wire_type: u16,
     pow_limit: String,
@@ -81,6 +99,54 @@ struct ProofOfWorkIdentity {
     banks: u32,
     layers_per_bank: u32,
     model: ModelIdentity,
+}
+
+#[cfg(feature = "production-v3")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV3ProofOfWorkIdentity {
+    profile: &'static str,
+    wire_type: u16,
+    pow_limit: String,
+    algorithm_version: u32,
+    proof_version: u32,
+    banks: u32,
+    layers_per_bank: u32,
+    maximum_structured_proof_bytes: String,
+    artifacts: ProductionV3ArtifactIdentities,
+    model: ProductionV3ModelIdentity,
+}
+
+#[cfg(feature = "production-v3")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV3ArtifactIdentities {
+    bank: ProductionV3FileIdentity,
+    manifest: ProductionV3FileIdentity,
+    record_v2: ProductionV3FileIdentity,
+}
+
+#[cfg(feature = "production-v3")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV3FileIdentity {
+    bytes: String,
+    blake3: String,
+    sha256: String,
+}
+
+#[cfg(feature = "production-v3")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV3ModelIdentity {
+    bank_format_version: u32,
+    record_version: u16,
+    record_digest: String,
+    manifest_digest: String,
+    model_identity_digest: String,
+    suite_digest: String,
+    setup_identity: String,
+    model_version: u32,
+    dimension: u32,
+    batch: u32,
+    layers: u32,
+    padded_variables: u32,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -135,22 +201,99 @@ struct RewardDestinationIdentity {
 /// may cross JSON implementations as consensus-sized integers use base-10 strings.
 /// Struct field order and the single trailing LF are part of the version-1 encoding.
 pub fn canonical_network_info_json() -> Result<Vec<u8>, NodeError> {
-    let params = devnet_params()?;
-    let descriptor = match params.pow {
-        PowParameters::V2Reference(descriptor) => descriptor,
-        _ => unreachable!("the compiled Devnet manifest passed validation as v2"),
+    canonical_network_info_json_with_artifacts(None)
+}
+
+/// Returns the canonical manifest for the compiled network, authenticating
+/// the production model artifacts first when the profile selects V3.
+pub fn canonical_network_info_json_with_artifacts(
+    production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+) -> Result<Vec<u8>, NodeError> {
+    canonical_network_info_json_for_profile(COMPILED_NETWORK_PROFILE, production_v3_artifacts)
+}
+
+fn canonical_network_info_json_for_profile(
+    profile: NetworkProfile,
+    production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+) -> Result<Vec<u8>, NodeError> {
+    let (params, verifier) =
+        network_params_and_verifier_for_profile(profile, production_v3_artifacts)?;
+    let proof_of_work = match verifier.parameters() {
+        PowParameters::V2Reference(descriptor) => {
+            let model_manifest_digest = descriptor
+                .model
+                .digest()
+                .map_err(ForgeMatrixV2Error::from)
+                .map_err(PowError::from)?;
+            ProofOfWorkIdentity::V2Reference(V2ProofOfWorkIdentity {
+                profile: profile.proof_name(),
+                wire_type: POW_TYPE_V2_REFERENCE,
+                pow_limit: hex::encode(params.pow_limit),
+                algorithm_version: descriptor.algorithm_version,
+                proof_version: descriptor.proof_version,
+                banks: descriptor.banks,
+                layers_per_bank: descriptor.layers_per_bank,
+                model: ModelIdentity {
+                    manifest_digest: hex::encode(model_manifest_digest),
+                    model_version: descriptor.model.model_version,
+                    dimension: descriptor.model.dimension,
+                    batch: descriptor.model.batch,
+                    layers: descriptor.model.layers,
+                    base_input_bytes: descriptor.model.base_input_bytes.to_string(),
+                    bytes_per_layer: descriptor.model.bytes_per_layer.to_string(),
+                    payload_bytes: descriptor.model.payload_bytes.to_string(),
+                    raw_blake3_root: hex::encode(descriptor.model.raw_blake3_root),
+                    layer_roots_aggregate: hex::encode(descriptor.model.layer_roots_aggregate),
+                    pcs_parameter_digest: hex::encode(descriptor.model.pcs_parameter_digest),
+                    pcs_commitment_root: hex::encode(descriptor.model.pcs_commitment_root),
+                },
+            })
+        }
+        #[cfg(feature = "production-v3")]
+        PowParameters::V3Candidate(parameters) => {
+            let artifacts = crate::release_gate::COMPILED_RELEASE_PROFILE
+                .production_v3_artifacts
+                .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?;
+            ProofOfWorkIdentity::ProductionV3(ProductionV3ProofOfWorkIdentity {
+                profile: profile.proof_name(),
+                wire_type: POW_TYPE_V3_CANDIDATE,
+                pow_limit: hex::encode(params.pow_limit),
+                algorithm_version: parameters.algorithm_version(),
+                proof_version: parameters.proof_version(),
+                banks: DORY_V3_BANKS,
+                layers_per_bank: DORY_V3_LAYERS_PER_BANK,
+                maximum_structured_proof_bytes: DORY_V3_MAX_STRUCTURED_PROOF_BYTES.to_string(),
+                artifacts: ProductionV3ArtifactIdentities {
+                    bank: production_v3_file_identity(artifacts.bank),
+                    manifest: production_v3_file_identity(artifacts.manifest),
+                    record_v2: production_v3_file_identity(artifacts.record_v2),
+                },
+                model: ProductionV3ModelIdentity {
+                    bank_format_version: DORY_V3_MODEL_BANK_FORMAT_VERSION,
+                    record_version: DORY_V3_MODEL_RECORD_VERSION,
+                    record_digest: hex::encode(parameters.model_record_digest()),
+                    manifest_digest: hex::encode(parameters.model_manifest_digest()),
+                    model_identity_digest: hex::encode(parameters.model_identity_digest()),
+                    suite_digest: hex::encode(parameters.suite_digest()),
+                    setup_identity: hex::encode(parameters.setup_identity()),
+                    model_version: DORY_V3_MODEL_VERSION,
+                    dimension: DORY_V3_DIMENSION,
+                    batch: DORY_V3_BATCH,
+                    layers: DORY_V3_LAYERS,
+                    padded_variables: DORY_V3_PADDED_VARIABLES,
+                },
+            })
+        }
+        PowParameters::V1Legacy(_) => {
+            unreachable!("no compiled network profile selects the legacy V1 proof")
+        }
     };
-    let model_manifest_digest = descriptor
-        .model
-        .digest()
-        .map_err(ForgeMatrixV2Error::from)
-        .map_err(PowError::from)?;
 
     let info = NetworkInfo {
         format: NETWORK_INFO_FORMAT,
         format_version: NETWORK_INFO_FORMAT_VERSION,
         network: NetworkIdentity {
-            name: COMPILED_NETWORK_PROFILE.name,
+            name: profile.name,
             network_id: hex::encode(params.network_id),
             virtual_genesis_hash: hex::encode(params.genesis_hash),
             virtual_genesis_timestamp_unix_seconds: params.genesis_timestamp.to_string(),
@@ -183,38 +326,16 @@ pub fn canonical_network_info_json() -> Result<Vec<u8>, NodeError> {
                 max_block_bytes: MAX_BLOCK_BYTES.to_string(),
             },
         },
-        proof_of_work: ProofOfWorkIdentity {
-            profile: DEVNET_POW_PROFILE,
-            wire_type: POW_TYPE_V2_REFERENCE,
-            pow_limit: hex::encode(params.pow_limit),
-            algorithm_version: descriptor.algorithm_version,
-            proof_version: descriptor.proof_version,
-            banks: descriptor.banks,
-            layers_per_bank: descriptor.layers_per_bank,
-            model: ModelIdentity {
-                manifest_digest: hex::encode(model_manifest_digest),
-                model_version: descriptor.model.model_version,
-                dimension: descriptor.model.dimension,
-                batch: descriptor.model.batch,
-                layers: descriptor.model.layers,
-                base_input_bytes: descriptor.model.base_input_bytes.to_string(),
-                bytes_per_layer: descriptor.model.bytes_per_layer.to_string(),
-                payload_bytes: descriptor.model.payload_bytes.to_string(),
-                raw_blake3_root: hex::encode(descriptor.model.raw_blake3_root),
-                layer_roots_aggregate: hex::encode(descriptor.model.layer_roots_aggregate),
-                pcs_parameter_digest: hex::encode(descriptor.model.pcs_parameter_digest),
-                pcs_commitment_root: hex::encode(descriptor.model.pcs_commitment_root),
-            },
-        },
+        proof_of_work,
         services: ServiceIdentity {
-            rpc_port: COMPILED_NETWORK_PROFILE.rpc_port,
-            p2p_port: COMPILED_NETWORK_PROFILE.p2p_port,
-            pool_port: COMPILED_NETWORK_PROFILE.pool_port,
-            bootstrap_peer: COMPILED_NETWORK_PROFILE.bootstrap_peer().to_string(),
+            rpc_port: profile.rpc_port,
+            p2p_port: profile.p2p_port,
+            pool_port: profile.pool_port,
+            bootstrap_peer: profile.bootstrap_peer().to_string(),
         },
         data_directories: DataDirectoryIdentity {
-            node: COMPILED_NETWORK_PROFILE.default_data_dir_identity,
-            wallet: COMPILED_NETWORK_PROFILE.wallet_data_dir_identity,
+            node: profile.default_data_dir_identity,
+            wallet: profile.wallet_data_dir_identity,
         },
         monetary_policy: MonetaryPolicyIdentity {
             atoms_per_coin: COIN.to_string(),
@@ -233,6 +354,17 @@ pub fn canonical_network_info_json() -> Result<Vec<u8>, NodeError> {
     let mut encoded = serde_json::to_vec_pretty(&info)?;
     encoded.push(b'\n');
     Ok(encoded)
+}
+
+#[cfg(feature = "production-v3")]
+fn production_v3_file_identity(
+    pin: crate::release_gate::ProductionV3FileIdentityPin,
+) -> ProductionV3FileIdentity {
+    ProductionV3FileIdentity {
+        bytes: pin.bytes.to_string(),
+        blake3: hex::encode(pin.blake3),
+        sha256: hex::encode(pin.sha256),
+    }
 }
 
 #[cfg(test)]
@@ -330,5 +462,17 @@ mod tests {
             canonical_network_info_json().unwrap(),
             EXPECTED_DEVNET_NETWORK_INFO.as_bytes()
         );
+    }
+
+    #[test]
+    fn rcnet_network_info_never_falls_back_to_the_devnet_manifest() {
+        let result = canonical_network_info_json_for_profile(crate::RCNET1_PROFILE, None);
+        #[cfg(feature = "production-v3")]
+        assert!(matches!(
+            result,
+            Err(NodeError::ProductionV3ArtifactsMissing)
+        ));
+        #[cfg(not(feature = "production-v3"))]
+        assert!(matches!(result, Err(NodeError::ProductionV3Unavailable)));
     }
 }

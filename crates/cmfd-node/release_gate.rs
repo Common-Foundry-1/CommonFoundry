@@ -21,10 +21,25 @@ pub struct ProductionV3ActivationEvidence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionV3FileIdentityPin {
+    pub bytes: u64,
+    pub blake3: [u8; 32],
+    pub sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionV3ArtifactIdentityPins {
+    pub bank: ProductionV3FileIdentityPin,
+    pub manifest: ProductionV3FileIdentityPin,
+    pub record_v2: ProductionV3FileIdentityPin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledReleaseProfile {
     pub network: CompiledNetworkProfile,
     pub proof: ConsensusProofSelection,
     pub activation: Option<ProductionV3ActivationEvidence>,
+    pub production_v3_artifacts: Option<ProductionV3ArtifactIdentityPins>,
 }
 
 /// The identity actually selected by the current source tree.
@@ -36,6 +51,7 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     network: CompiledNetworkProfile::Devnet,
     proof: ConsensusProofSelection::DevnetV2Reference,
     activation: None,
+    production_v3_artifacts: None,
 };
 
 pub fn is_production_rc_label(label: &str) -> bool {
@@ -65,6 +81,10 @@ fn is_nonzero_lower_hex(value: &str, bytes: usize) -> bool {
         && value.bytes().any(|byte| byte != b'0')
 }
 
+fn valid_file_identity_pin(pin: ProductionV3FileIdentityPin) -> bool {
+    pin.bytes != 0 && pin.blake3 != [0; 32] && pin.sha256 != [0; 32]
+}
+
 pub fn validate_production_rc(profile: CompiledReleaseProfile) -> Result<(), &'static str> {
     if profile.network != CompiledNetworkProfile::Rcnet {
         return Err("compiled network profile is not RCNet");
@@ -89,6 +109,15 @@ pub fn validate_production_rc(profile: CompiledReleaseProfile) -> Result<(), &'s
     if !is_nonzero_lower_hex(evidence.independent_verifier_sha256, 32) {
         return Err("ProductionV3 independent verifier digest is invalid");
     }
+    let artifacts = profile
+        .production_v3_artifacts
+        .ok_or("ProductionV3 artifact identity pins are absent")?;
+    if !valid_file_identity_pin(artifacts.bank)
+        || !valid_file_identity_pin(artifacts.manifest)
+        || !valid_file_identity_pin(artifacts.record_v2)
+    {
+        return Err("ProductionV3 artifact identity pins are invalid");
+    }
     Ok(())
 }
 
@@ -101,6 +130,23 @@ mod tests {
         source_commit: "1111111111111111111111111111111111111111",
         qualification_manifest_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
         independent_verifier_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+    };
+    const ARTIFACTS: ProductionV3ArtifactIdentityPins = ProductionV3ArtifactIdentityPins {
+        bank: ProductionV3FileIdentityPin {
+            bytes: 1,
+            blake3: [0x44; 32],
+            sha256: [0x45; 32],
+        },
+        manifest: ProductionV3FileIdentityPin {
+            bytes: 2,
+            blake3: [0x46; 32],
+            sha256: [0x47; 32],
+        },
+        record_v2: ProductionV3FileIdentityPin {
+            bytes: 3,
+            blake3: [0x48; 32],
+            sha256: [0x49; 32],
+        },
     };
 
     #[test]
@@ -122,11 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn gate_requires_production_v3_and_activation_evidence() {
+    fn gate_requires_production_v3_activation_and_artifact_pins() {
         let no_v3 = CompiledReleaseProfile {
             network: CompiledNetworkProfile::Rcnet,
             proof: ConsensusProofSelection::DevnetV2Reference,
             activation: Some(EVIDENCE),
+            production_v3_artifacts: Some(ARTIFACTS),
         };
         assert_eq!(
             validate_production_rc(no_v3),
@@ -137,10 +184,22 @@ mod tests {
             network: CompiledNetworkProfile::Rcnet,
             proof: ConsensusProofSelection::ProductionV3,
             activation: None,
+            production_v3_artifacts: Some(ARTIFACTS),
         };
         assert_eq!(
             validate_production_rc(no_evidence),
             Err("ProductionV3 activation evidence is absent")
+        );
+
+        let no_artifacts = CompiledReleaseProfile {
+            network: CompiledNetworkProfile::Rcnet,
+            proof: ConsensusProofSelection::ProductionV3,
+            activation: Some(EVIDENCE),
+            production_v3_artifacts: None,
+        };
+        assert_eq!(
+            validate_production_rc(no_artifacts),
+            Err("ProductionV3 artifact identity pins are absent")
         );
     }
 
@@ -150,6 +209,7 @@ mod tests {
             network: CompiledNetworkProfile::Rcnet,
             proof: ConsensusProofSelection::ProductionV3,
             activation: Some(EVIDENCE),
+            production_v3_artifacts: Some(ARTIFACTS),
         };
         assert_eq!(validate_production_rc(profile), Ok(()));
     }

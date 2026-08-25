@@ -9,8 +9,10 @@ testnet RC labels are deliberately excluded.
 The build proceeds only when the source-selected profile is RCNet, its consensus
 proof selector is `ProductionV3`, and the compiled profile contains complete
 activation evidence: the activating source commit, the qualification-manifest
-SHA-256, and an independent-verifier SHA-256. The current source selection is
-Devnet/V2 with no activation evidence, so this command must fail:
+SHA-256, and an independent-verifier SHA-256. It must also pin the exact byte
+length, BLAKE3 digest, and SHA-256 digest of the production bank, manifest, and
+Record V2. The current source selection is Devnet/V2 with no activation
+evidence or artifact pins, so this command must fail:
 
 ```text
 cargo check --locked -p cmfd-node --features production-rc

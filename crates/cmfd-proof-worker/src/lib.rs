@@ -13,8 +13,8 @@ pub mod spill {
 mod verifier;
 
 pub use verifier::{
-    MAX_VERIFIER_REQUEST_BYTES, MAX_VERIFIER_RESPONSE_BYTES, VerifierProtocolError,
-    VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
+    MAX_VERIFIER_REQUEST_BYTES, MAX_VERIFIER_RESPONSE_BYTES, ProductionV3VerifierArtifacts,
+    VerifierProtocolError, VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
 };
 
 use std::ffi::{OsStr, OsString};

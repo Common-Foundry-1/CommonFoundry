@@ -2,9 +2,10 @@ use std::env;
 use std::error::Error;
 use std::time::Instant;
 
-use cmfd_cuda::{CudaLibrary, GpuBackend};
+use cmfd_cuda::{CudaLibrary, GpuBackend, ProductionResidency};
 
 const TRANSITION_MODULUS: i64 = 134_217_689;
+const FULL_DEVICE_BYTES: u64 = 6_463_422_464;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let library = CudaLibrary::load_backend(GpuBackend::Cuda, None)?
@@ -21,15 +22,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("device={}", device.label());
 
     let dense = dense_vector();
-    run_vector(&library, device_index, "dense-4x32", dense)?;
+    run_vector(&library, &device, "dense-4x32", &dense)?;
 
     let production = production_geometry_vector();
-    run_vector(
-        &library,
-        device_index,
-        "production-layer-128x4096",
-        production,
-    )?;
+    run_vector(&library, &device, "production-layer-128x4096", &production)?;
     Ok(())
 }
 
@@ -91,42 +87,59 @@ fn production_geometry_vector() -> Vector {
 
 fn run_vector(
     library: &CudaLibrary,
-    device_index: i32,
+    device: &cmfd_cuda::CudaDevice,
     name: &str,
-    vector: Vector,
+    vector: &Vector,
 ) -> Result<(), Box<dyn Error>> {
     let cpu_started = Instant::now();
-    let expected = cpu_exact_layer(&vector);
+    let expected = cpu_exact_layer(vector);
     let cpu_elapsed = cpu_started.elapsed();
-    let gpu_started = Instant::now();
-    let actual = library.evaluate_differential_layer(
-        device_index,
-        vector.rows,
-        vector.width,
-        &vector.activation,
-        &vector.weights,
-        &vector.coefficients,
-    )?;
-    let gpu_elapsed = gpu_started.elapsed();
-    if actual != expected {
-        let mismatch = actual
-            .iter()
-            .zip(&expected)
-            .position(|(actual, expected)| actual != expected)
-            .unwrap_or(0);
-        return Err(format!(
-            "{name} mismatch at {mismatch}: GPU={} Rust={}",
-            actual[mismatch], expected[mismatch]
-        )
-        .into());
+    let mut residencies = vec![ProductionResidency::HostBacked];
+    if device.total_memory_bytes >= FULL_DEVICE_BYTES {
+        residencies.push(ProductionResidency::FullDevice);
+    } else {
+        println!(
+            "vector={name} residency=FullDevice result=skipped total_device_bytes={} required_device_bytes={FULL_DEVICE_BYTES}",
+            device.total_memory_bytes
+        );
     }
-    println!(
-        "vector={name} values={} digest={} rust_ms={:.3} gpu_ms={:.3} result=exact",
-        actual.len(),
-        blake3::hash(&actual).to_hex(),
-        cpu_elapsed.as_secs_f64() * 1_000.0,
-        gpu_elapsed.as_secs_f64() * 1_000.0,
-    );
+    for residency in residencies {
+        let gpu_started = Instant::now();
+        let (actual, active) = library.evaluate_differential_layer_with_residency(
+            device.index,
+            vector.rows,
+            vector.width,
+            &vector.activation,
+            &vector.weights,
+            &vector.coefficients,
+            residency,
+        )?;
+        let gpu_elapsed = gpu_started.elapsed();
+        if active != residency {
+            return Err(
+                format!("{name} requested {residency:?} but backend selected {active:?}").into(),
+            );
+        }
+        if actual != expected {
+            let mismatch = actual
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(0);
+            return Err(format!(
+                "{name} {residency:?} mismatch at {mismatch}: GPU={} Rust={}",
+                actual[mismatch], expected[mismatch]
+            )
+            .into());
+        }
+        println!(
+            "vector={name} residency={residency:?} values={} digest={} rust_ms={:.3} gpu_ms={:.3} result=exact",
+            actual.len(),
+            blake3::hash(&actual).to_hex(),
+            cpu_elapsed.as_secs_f64() * 1_000.0,
+            gpu_elapsed.as_secs_f64() * 1_000.0,
+        );
+    }
     Ok(())
 }
 

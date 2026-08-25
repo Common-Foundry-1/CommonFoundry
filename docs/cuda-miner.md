@@ -58,7 +58,7 @@ wallet, or standalone miner. Its fixed geometry is:
 
 - 128 activation rows by 4,096 columns;
 - 384 ordered 4,096 by 4,096 weight layers in three 128-layer banks;
-- 524,288 activation bytes and 6,442,450,944 resident weight bytes;
+- 524,288 activation bytes and 6,442,450,944 authenticated weight bytes;
 - 385 challenge-mask stages with 20 canonical coefficients per nonce.
 
 Construction requires the non-serializable
@@ -80,8 +80,17 @@ altered byte, different manifest or record, setup mismatch, skipped chunk,
 missing production ABI, non-CUDA backend, or unsupported GPU destroys the
 provisional context.
 
-Weights remain resident and are transposed once at finalization. Each real
-layer then uses exact signed `INT8 x INT8 -> INT32` DP4A accumulation, the same
+The evaluator has two exact residency modes. `FullDevice` retains all
+6,442,450,944 weight bytes in VRAM and transposes them once at finalization.
+`HostBacked` retains the same authenticated bytes in owned host memory and
+streams one canonical 16 MiB layer into one 16 MiB device buffer, then
+transposes it into a second 16 MiB device buffer. Its fixed device allocation
+is about 36 MiB plus coefficients and CUDA runtime overhead, so a 6 GB RTX 2060
+does not need a reduced model or geometry. `Auto` selects full residency only
+when current free VRAM can hold the complete allocation; explicit selection
+fails instead of silently changing modes.
+
+Both modes use exact signed `INT8 x INT8 -> INT32` DP4A accumulation, the same
 coordinate mask, the 134,217,689 transition-field cubic, and reduction modulo
 251 as Rust. There is no dummy power loop. The implementation is self-contained
 in the existing static-runtime DLL and retains the Volta-through-Blackwell
@@ -96,23 +105,31 @@ cargo run --release -p cmfd-cuda --example production_differential
 ```
 
 On August 25, 2026, an RTX 5090 (driver 610.88, compute capability 12.0) with a
-CUDA 12.9.86 build matched Rust byte-for-byte on both vectors:
+CUDA 12.9.86 build matched Rust byte-for-byte in both forced residency modes:
 
-| Vector | Values | BLAKE3 output digest | GPU time |
-| --- | ---: | --- | ---: |
-| Dense 4 x 32 | 128 | `bd24f76f7269c861b72d904240d5a862233a4dd759564cf1e0c5811326e2ece5` | 187.471 ms |
-| One full 128 x 4,096 layer | 524,288 | `36661181f19654dc9d8f40bccf296372e511fb48aff18cba05762c28553e08bd` | 44.481 ms |
+| Vector | Residency | Values | BLAKE3 output digest | GPU time |
+| --- | --- | ---: | --- | ---: |
+| Dense 4 x 32 | Host backed | 128 | `bd24f76f7269c861b72d904240d5a862233a4dd759564cf1e0c5811326e2ece5` | 66.085 ms |
+| Dense 4 x 32 | Full device | 128 | `bd24f76f7269c861b72d904240d5a862233a4dd759564cf1e0c5811326e2ece5` | 0.630 ms |
+| One full 128 x 4,096 layer | Host backed | 524,288 | `36661181f19654dc9d8f40bccf296372e511fb48aff18cba05762c28553e08bd` | 16.129 ms |
+| One full 128 x 4,096 layer | Full device | 524,288 | `36661181f19654dc9d8f40bccf296372e511fb48aff18cba05762c28553e08bd` | 13.717 ms |
 
 Those timings include qualification allocation, upload, and weight transpose;
-they are not steady-state hashrate. A separate zero-centered synthetic canary
-allocated the complete 6.44 GB geometry, uploaded all three banks, traversed all
-384 layers, and matched its analytical all-zero 524,288-byte output. Allocation
-took 0.170 seconds, upload 0.430 seconds, one-time transpose 0.013 seconds, and
-one complete nonce evaluation 14.934 seconds. The canary proves control-flow and
-shape correctness, not the identity or output of the ceremony model. At roughly
-0.067 nonces per second, this first self-contained DP4A path is a correctness
-baseline; architecture-specific tensor-core work is still needed before its
-performance can represent an RC.
+the first row also includes CUDA context initialization. They are not
+steady-state hashrate. A separate zero-centered synthetic canary
+forced each residency mode, uploaded all three banks, traversed all 384 layers,
+and matched its analytical all-zero 524,288-byte output:
+
+| Residency | Allocation | Upload | Finalize | One nonce |
+| --- | ---: | ---: | ---: | ---: |
+| Full device | 0.092 s | 0.344 s | 0.006 s | 5.744 s |
+| Host backed | 0.081 s | 0.948 s | 0.000 s | 6.257 s |
+
+The canary proves exact buffer shape, layer traversal, and matching output in
+both storage paths. It does not prove the identity or output of the ceremony
+model. This first self-contained DP4A implementation is a correctness baseline;
+architecture-specific tensor-core work is still needed before its performance
+can represent a release candidate.
 
 A complete authenticated 384-layer ceremony-model run and winning-nonce proof
 also remain required before this path can be selected or described as a

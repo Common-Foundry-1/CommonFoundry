@@ -59,7 +59,8 @@ type EvaluateFn = unsafe extern "C" fn(
     usize,
 ) -> i32;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
-type ProductionBeginFn = unsafe extern "C" fn(i32, *mut *mut c_void, *mut c_char, usize) -> i32;
+type ProductionBeginV2Fn =
+    unsafe extern "C" fn(i32, u32, *mut u32, *mut *mut c_void, *mut c_char, usize) -> i32;
 type ProductionUploadFn =
     unsafe extern "C" fn(*mut c_void, u32, u32, u64, *const i8, usize, *mut c_char, usize) -> i32;
 type ProductionFinalizeFn = unsafe extern "C" fn(*mut c_void, *mut c_char, usize) -> i32;
@@ -74,8 +75,10 @@ type ProductionEvaluateFn = unsafe extern "C" fn(
     usize,
 ) -> i32;
 type ProductionDestroyFn = unsafe extern "C" fn(*mut c_void);
-type DifferentialLayerFn = unsafe extern "C" fn(
+type DifferentialLayerV2Fn = unsafe extern "C" fn(
     i32,
+    u32,
+    *mut u32,
     u32,
     u32,
     *const i8,
@@ -120,13 +123,13 @@ struct CudaApi {
     evaluate: EvaluateFn,
     destroy: DestroyFn,
     production: Option<ProductionApi>,
-    differential_layer: Option<DifferentialLayerFn>,
+    differential_layer_v2: Option<DifferentialLayerV2Fn>,
     _library: Library,
 }
 
 #[derive(Clone, Copy)]
 struct ProductionApi {
-    begin: ProductionBeginFn,
+    begin_v2: ProductionBeginV2Fn,
     upload: ProductionUploadFn,
     finalize: ProductionFinalizeFn,
     evaluate: ProductionEvaluateFn,
@@ -148,9 +151,9 @@ impl CudaApi {
                 evaluate: load_symbol(&library, b"cmfd_cuda_evaluate\0")?,
                 destroy: load_symbol(&library, b"cmfd_cuda_destroy\0")?,
                 production: load_production_api(&library),
-                differential_layer: load_optional_symbol(
+                differential_layer_v2: load_optional_symbol(
                     &library,
-                    b"cmfd_cuda_differential_layer\0",
+                    b"cmfd_cuda_differential_layer_v2\0",
                 ),
                 _library: library,
             };
@@ -176,7 +179,7 @@ unsafe fn load_production_api(library: &Library) -> Option<ProductionApi> {
     // unavailable instead of mixing production ABI revisions.
     unsafe {
         Some(ProductionApi {
-            begin: load_optional_symbol(library, b"cmfd_cuda_production_begin\0")?,
+            begin_v2: load_optional_symbol(library, b"cmfd_cuda_production_begin_v2\0")?,
             upload: load_optional_symbol(library, b"cmfd_cuda_production_upload\0")?,
             finalize: load_optional_symbol(library, b"cmfd_cuda_production_finalize\0")?,
             evaluate: load_optional_symbol(library, b"cmfd_cuda_production_evaluate\0")?,
@@ -207,6 +210,32 @@ unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &[u8]) -> Result<T, St
 pub enum GpuBackend {
     Cuda,
     OpenCl,
+}
+
+/// Where the authenticated 6.44 GB production model is retained.
+///
+/// `Auto` chooses full device residency only when current free VRAM can hold
+/// the complete model and fixed evaluator scratch. `HostBacked` retains the
+/// exact authenticated model in host memory and streams one 16 MiB layer at a
+/// time, allowing 6 GB cards to execute the unchanged production geometry.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionResidency {
+    Auto = 0,
+    FullDevice = 1,
+    HostBacked = 2,
+}
+
+impl ProductionResidency {
+    fn from_active(value: u32) -> Result<Self, String> {
+        match value {
+            1 => Ok(Self::FullDevice),
+            2 => Ok(Self::HostBacked),
+            _ => Err(format!(
+                "CUDA backend returned invalid active production residency {value}"
+            )),
+        }
+    }
 }
 
 impl GpuBackend {
@@ -419,6 +448,25 @@ impl CudaLibrary {
         setup: &DeterministicBlsDorySetup,
         device_index: i32,
     ) -> Result<ProductionCudaMiner, String> {
+        self.create_production_with_residency(
+            reader,
+            authenticated,
+            setup,
+            device_index,
+            ProductionResidency::Auto,
+        )
+    }
+
+    /// Construct the authenticated production evaluator with an explicit
+    /// model-residency policy. Explicit modes fail rather than falling back.
+    pub fn create_production_with_residency<R: Read>(
+        &self,
+        reader: R,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+        device_index: i32,
+        residency: ProductionResidency,
+    ) -> Result<ProductionCudaMiner, String> {
         if self.backend != GpuBackend::Cuda {
             return Err(
                 "the production ForgeMatrix evaluator requires the CUDA backend".to_owned(),
@@ -439,7 +487,7 @@ impl CudaLibrary {
             ));
         }
 
-        let sink = ProductionModelSink::begin(Arc::clone(&self.api), api, device)?;
+        let sink = ProductionModelSink::begin(Arc::clone(&self.api), api, device, residency)?;
         verify_dory_v3_model_bank_into_staged_field_sink(reader, authenticated, setup, sink)
             .map_err(format_dory_model_stream_error)
     }
@@ -456,11 +504,36 @@ impl CudaLibrary {
         weights: &[i8],
         coefficients: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.evaluate_differential_layer_with_residency(
+            device_index,
+            rows,
+            width,
+            activation,
+            weights,
+            coefficients,
+            ProductionResidency::Auto,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Qualification-only exact layer evaluation with deterministic residency
+    /// selection. The returned mode is the backend-confirmed active mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_differential_layer_with_residency(
+        &self,
+        device_index: i32,
+        rows: u32,
+        width: u32,
+        activation: &[i8],
+        weights: &[i8],
+        coefficients: &[u8],
+        residency: ProductionResidency,
+    ) -> Result<(Vec<u8>, ProductionResidency), String> {
         if self.backend != GpuBackend::Cuda {
             return Err("the differential layer requires the CUDA backend".to_owned());
         }
-        let evaluate = self.api.differential_layer.ok_or_else(|| {
-            "CUDA library does not export the production differential ABI".to_owned()
+        let evaluate = self.api.differential_layer_v2.ok_or_else(|| {
+            "CUDA library does not export the residency-aware differential ABI".to_owned()
         })?;
         let activation_len = (rows as usize)
             .checked_mul(width as usize)
@@ -472,12 +545,15 @@ impl CudaLibrary {
             return Err("differential input shape mismatch".to_owned());
         }
         let mut output = vec![0_u8; activation_len];
+        let mut active_residency = ProductionResidency::Auto as u32;
         let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
         // SAFETY: slices remain live for the call and their exact lengths are
         // passed to the qualification-only C ABI.
         let result = unsafe {
             evaluate(
                 device_index,
+                residency as u32,
+                &mut active_residency,
                 rows,
                 width,
                 activation.as_ptr(),
@@ -493,7 +569,11 @@ impl CudaLibrary {
             )
         };
         check_result(result, &error)?;
-        Ok(output)
+        let active_residency = ProductionResidency::from_active(active_residency)?;
+        if residency != ProductionResidency::Auto && active_residency != residency {
+            return Err("CUDA backend changed an explicit differential residency mode".to_owned());
+        }
+        Ok((output, active_residency))
     }
 }
 
@@ -551,7 +631,7 @@ impl Drop for CudaMiner {
     }
 }
 
-/// Authenticated, GPU-resident production-geometry evaluator.
+/// GPU-executed evaluator for an authenticated production-geometry model.
 ///
 /// Construction is possible only through [`CudaLibrary::create_production`].
 /// The type intentionally has no constructor from loose model bytes.
@@ -560,6 +640,7 @@ pub struct ProductionCudaMiner {
     _api_owner: Arc<CudaApi>,
     production_api: ProductionApi,
     device: CudaDevice,
+    residency: ProductionResidency,
     manifest: ModelBankManifest,
     record_digest: Digest32,
     model_identity_digest: Digest32,
@@ -575,6 +656,10 @@ impl ProductionCudaMiner {
         &self.manifest
     }
 
+    pub const fn residency(&self) -> ProductionResidency {
+        self.residency
+    }
+
     pub const fn record_digest(&self) -> Digest32 {
         self.record_digest
     }
@@ -588,7 +673,7 @@ impl ProductionCudaMiner {
     }
 
     /// Return true only for the exact bank-authenticated Record V2 capability
-    /// that authorized this resident context.
+    /// that authorized this evaluator context.
     pub fn is_bound_to_bank_authenticated_record(
         &self,
         authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
@@ -600,7 +685,7 @@ impl ProductionCudaMiner {
             && self.model_identity == *record.model_identity()
     }
 
-    /// Evaluates complete 128x4096 activations across all 384 resident layers.
+    /// Evaluates complete 128x4096 activations across all 384 ordered layers.
     /// Coefficients are nonce-major and contain 385 stages of 20 canonical
     /// bytes. The output is one canonical 524,288-byte activation per nonce.
     pub fn evaluate(&mut self, coefficients: &[u8], count: u32) -> Result<Vec<u8>, String> {
@@ -665,6 +750,7 @@ struct ProductionModelSink {
     api_owner: Arc<CudaApi>,
     production_api: ProductionApi,
     device: Option<CudaDevice>,
+    residency: ProductionResidency,
     pending_role: Option<ModelPcsRole>,
     pending_start: u64,
     next_offset: u64,
@@ -676,22 +762,46 @@ impl ProductionModelSink {
         api_owner: Arc<CudaApi>,
         production_api: ProductionApi,
         device: CudaDevice,
+        requested_residency: ProductionResidency,
     ) -> Result<Self, String> {
         let mut context = std::ptr::null_mut();
+        let mut active_residency = ProductionResidency::Auto as u32;
         let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
         // SAFETY: output and error pointers are valid for the duration of the
         // call. The returned provisional context is owned by this sink.
         let result = unsafe {
-            (production_api.begin)(device.index, &mut context, error.as_mut_ptr(), error.len())
+            (production_api.begin_v2)(
+                device.index,
+                requested_residency as u32,
+                &mut active_residency,
+                &mut context,
+                error.as_mut_ptr(),
+                error.len(),
+            )
         };
         check_result(result, &error)?;
         let context = NonNull::new(context)
             .ok_or_else(|| "CUDA backend returned a null production context".to_owned())?;
+        let residency = match ProductionResidency::from_active(active_residency) {
+            Ok(residency) => residency,
+            Err(error) => {
+                // SAFETY: this unpublished context came from the same API.
+                unsafe { (production_api.destroy)(context.as_ptr()) };
+                return Err(error);
+            }
+        };
+        if requested_residency != ProductionResidency::Auto && residency != requested_residency {
+            // SAFETY: this unpublished context came from the same API table,
+            // but the backend violated explicit mode selection.
+            unsafe { (production_api.destroy)(context.as_ptr()) };
+            return Err("CUDA backend changed an explicit production residency mode".to_owned());
+        }
         Ok(Self {
             context: Some(context),
             api_owner,
             production_api,
             device: Some(device),
+            residency,
             pending_role: None,
             pending_start: 0,
             next_offset: 0,
@@ -794,6 +904,7 @@ impl StagedDoryV3ModelFieldSink for ProductionModelSink {
             _api_owner: Arc::clone(&self.api_owner),
             production_api: self.production_api,
             device,
+            residency: self.residency,
             manifest: *receipt.manifest(),
             record_digest: receipt.record_digest(),
             model_identity_digest: receipt.model_identity_digest(),
@@ -1044,6 +1155,20 @@ mod tests {
         assert_eq!(payload_bytes, 6_442_975_232);
         assert_eq!(PRODUCTION_ACTIVATION_VALUES, 524_288);
         assert_eq!(PRODUCTION_COEFFICIENTS_PER_NONCE, 7_700);
+    }
+
+    #[test]
+    fn active_production_residency_is_fail_closed() {
+        assert_eq!(
+            ProductionResidency::from_active(1).unwrap(),
+            ProductionResidency::FullDevice
+        );
+        assert_eq!(
+            ProductionResidency::from_active(2).unwrap(),
+            ProductionResidency::HostBacked
+        );
+        assert!(ProductionResidency::from_active(0).is_err());
+        assert!(ProductionResidency::from_active(3).is_err());
     }
 
     #[test]

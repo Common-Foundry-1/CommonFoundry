@@ -69,6 +69,7 @@ dory-bls12-381-prototype = [
     "dep:sha2",
     "dep:windows-sys",
 ]
+dory-v3-consensus-adapter = ["dory-bls12-381-prototype", "whir-prototype"]
 dory-opening-prototype = ["dep:ark-serialize", "dep:dory-pcs"]
 gpu-proof-prover = ["whir-prototype", "dep:cmfd-proof-accel", "dep:fs2"]
 production-whir-candidate = ["whir-prototype"]

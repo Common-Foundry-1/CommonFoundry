@@ -1,11 +1,13 @@
-//! Non-consensus verifier boundary for the production-shaped composed BLS/Dory proof.
+//! Research verifier boundary for the production-shaped composed BLS/Dory proof.
 //!
 //! The composed research path verifies both the shared ForgeMatrix arithmetic
 //! layout and the native final-output BLAKE3 argument in one aggregate. This
-//! module intentionally cannot produce [`crate::PreverifiedBlockProof`]: the
-//! production prover and preprocessing registry are not complete, the exact
-//! n=33 run has not completed, and the required review and audit gates remain
-//! open.
+//! module does not itself produce [`crate::PreverifiedBlockProof`]. When the
+//! `dory-v3-consensus-adapter` Cargo feature is enabled, however,
+//! [`crate::ConsensusPowVerifier`] can use the complete Layout V5 relation to
+//! authorize V3 chain admission. No shipped network selects that verifier; the
+//! Cargo feature is the current research gate while the production prover,
+//! preprocessing registry, exact n=33 run, review, and audit gates remain open.
 
 use std::sync::Arc;
 #[cfg(feature = "whir-prototype")]
@@ -172,8 +174,10 @@ pub struct BlsDoryV3CandidateWitness<'a> {
 }
 
 /// Opaque evidence that the Dory execution proof and native BLAKE3 argument
-/// verified in one aggregate against one candidate statement. Consensus activation stays
-/// disabled until the remaining benchmark and review gates are complete.
+/// verified in one aggregate against one candidate statement. The feature-gated
+/// consensus adapter does not consume this legacy capability. No shipped network
+/// selects V3; the `dory-v3-consensus-adapter` Cargo feature is the current
+/// research gate.
 #[must_use]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedBlsDoryV3Candidate {
@@ -182,8 +186,10 @@ pub struct VerifiedBlsDoryV3Candidate {
 }
 
 /// Opaque evidence that the Record-V2-owned Layout V5 and Dory-V3 native
-/// frames verified together. This dormant capability is deliberately distinct
-/// from the legacy V4 candidate capability and cannot authorize consensus.
+/// frames verified together. This capability is deliberately distinct from the
+/// legacy V4 candidate capability. The `dory-v3-consensus-adapter` Cargo feature
+/// can use successful Layout V5 verification to authorize V3, but no shipped
+/// network selects that verifier.
 #[cfg(feature = "whir-prototype")]
 #[must_use]
 #[allow(dead_code)]
@@ -472,8 +478,10 @@ impl BlsDoryV3AlgebraicVerifier {
 
     /// Construct and self-verify one exact production-shaped research
     /// candidate. All public fields, statements, masks, and fixed commitments
-    /// are derived from this verifier's pinned configuration. This method does
-    /// not create a chain-admission capability or enable production consensus.
+    /// are derived from this verifier's pinned configuration. This method returns
+    /// proof bytes rather than a chain-admission capability. The feature-gated
+    /// consensus adapter can verify and authorize a complete Layout V5 proof, but
+    /// no shipped network selects that verifier.
     #[cfg(feature = "whir-prototype")]
     #[allow(clippy::too_many_arguments)]
     pub fn prove_candidate(
@@ -874,8 +882,9 @@ impl BlsDoryV3AlgebraicVerifier {
     }
 
     /// Verify the composed V3 research candidate. This establishes the
-    /// execution/hash relation but intentionally does not create the
-    /// chain-admission capability while production gates remain open.
+    /// execution/hash relation for the legacy candidate layout but does not
+    /// itself create a chain-admission capability. The feature-gated consensus
+    /// adapter authorizes only the complete Layout V5 relation.
     #[cfg(feature = "whir-prototype")]
     pub fn verify_candidate(
         &self,
@@ -936,6 +945,7 @@ fn validate_dory_v3_layout_v5_candidate_statement(
     block: &BlockChallenge,
     proof: &ForgeMatrixV3CandidateProof,
     setup: &DeterministicBlsDorySetup,
+    enforce_target: bool,
 ) -> Result<ValidatedBlsDoryV3LayoutV5CandidateStatement, BlsDoryV3CandidateError> {
     validate_dory_v3_layout_v5_candidate_public_envelope(network_id, block, proof)?;
     validate_dory_v3_layout_v5_record_setup_binding(authenticated, setup)?;
@@ -945,6 +955,7 @@ fn validate_dory_v3_layout_v5_candidate_statement(
         authenticated,
         block,
         proof,
+        enforce_target,
     )
 }
 
@@ -998,6 +1009,7 @@ fn validate_dory_v3_layout_v5_candidate_statement_after_authority(
     authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     block: &BlockChallenge,
     proof: &ForgeMatrixV3CandidateProof,
+    enforce_target: bool,
 ) -> Result<ValidatedBlsDoryV3LayoutV5CandidateStatement, BlsDoryV3CandidateError> {
     let transcript =
         DoryV3TranscriptContext::from_bank_authenticated_record(network_id, authenticated)?;
@@ -1013,7 +1025,7 @@ fn validate_dory_v3_layout_v5_candidate_statement_after_authority(
     {
         return Err(BlsDoryV3CandidateError::WorkDigest);
     }
-    if proof.work_digest > block.target {
+    if enforce_target && proof.work_digest > block.target {
         return Err(BlsDoryV3CandidateError::HighHash);
     }
 
@@ -1050,6 +1062,7 @@ pub(crate) fn validate_dory_v3_layout_v5_candidate_statement_for_test(
         authenticated,
         block,
         proof,
+        true,
     )?;
     Ok(())
 }
@@ -1079,9 +1092,12 @@ pub(crate) fn decode_dory_v3_layout_v5_candidate_payload(
     Ok((shared_proof, payload))
 }
 
-/// Verify only the dormant Record-V2/Layout-V5 research candidate route.
-/// Failure to parse or verify V5 is terminal; the legacy V4 route is never
-/// retried or reinterpreted.
+/// Verify the complete, target-enforcing Record-V2/Layout-V5 research route.
+///
+/// With the `dory-v3-consensus-adapter` Cargo feature, success can authorize V3
+/// chain admission. No shipped network selects that verifier; compiling the
+/// feature is the current explicit research gate. Failure to parse or verify V5
+/// is terminal; the legacy V4 route is never retried or reinterpreted.
 #[cfg(feature = "whir-prototype")]
 #[allow(dead_code)]
 pub(crate) fn verify_bls_dory_v3_layout_v5_candidate(
@@ -1091,12 +1107,53 @@ pub(crate) fn verify_bls_dory_v3_layout_v5_candidate(
     proof: &ForgeMatrixV3CandidateProof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<VerifiedBlsDoryV3LayoutV5Candidate, BlsDoryV3CandidateError> {
+    verify_bls_dory_v3_layout_v5_candidate_inner(
+        network_id,
+        authenticated,
+        block,
+        proof,
+        setup,
+        true,
+    )
+}
+
+/// Verify the complete Layout V5/native-BLAKE3 relation without applying the
+/// block target. This is the V3 counterpart of the pool-share relation check;
+/// the target remains part of the challenge and transcript.
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn verify_bls_dory_v3_layout_v5_candidate_relation(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<VerifiedBlsDoryV3LayoutV5Candidate, BlsDoryV3CandidateError> {
+    verify_bls_dory_v3_layout_v5_candidate_inner(
+        network_id,
+        authenticated,
+        block,
+        proof,
+        setup,
+        false,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn verify_bls_dory_v3_layout_v5_candidate_inner(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+    enforce_target: bool,
+) -> Result<VerifiedBlsDoryV3LayoutV5Candidate, BlsDoryV3CandidateError> {
     let validated = validate_dory_v3_layout_v5_candidate_statement(
         network_id,
         authenticated,
         block,
         proof,
         setup,
+        enforce_target,
     )?;
     let context =
         BlsDorySharedLayoutV5Context::from_bank_authenticated_record(authenticated, setup)?;
@@ -1419,6 +1476,12 @@ fn projected_candidate_scratch_space()
         native_aggregate_peak_bytes,
         required_free_bytes,
     })
+}
+
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn projected_candidate_required_free_scratch_bytes()
+-> Result<u64, BlsDoryV3CandidateError> {
+    Ok(projected_candidate_scratch_space()?.required_free_bytes)
 }
 
 #[cfg(feature = "whir-prototype")]
@@ -1802,10 +1865,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "dory-v3-consensus-adapter"))]
     fn pow_parameters_still_have_no_v3_selector() {
         let parameters =
             crate::PowParameters::V2Reference(crate::v2_test_reference().unwrap().descriptor());
         assert!(matches!(parameters, crate::PowParameters::V2Reference(_)));
+    }
+
+    #[test]
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    fn consensus_adapter_does_not_change_activation_readiness() {
+        // These readiness flags remain research diagnostics, not the adapter's
+        // enforcement layer. The Cargo feature is the current explicit gate.
+        const {
+            assert!(!crate::dory_v3_suite::DORY_V3_SUITE_ACTIVATION_READY);
+        }
+        assert!(matches!(
+            crate::dory_bls12_381_layout::require_bls_dory_shared_layout_production_ready(),
+            Err(crate::dory_bls12_381_layout::BlsDorySharedLayoutError::NotProductionReady)
+        ));
     }
 
     #[test]

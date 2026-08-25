@@ -290,9 +290,13 @@ fn perform_sync_from_peer_once_inner_with_policy(
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
 ) -> Result<SyncReport, P2pError> {
-    let (hello, locator) = {
+    let (hello, locator, block_preverifier) = {
         let node = lock_node(&shared)?;
-        (node.peer_hello(), node.block_locator(MAX_BLOCKS_PER_SYNC))
+        (
+            node.peer_hello(),
+            node.block_locator(MAX_BLOCKS_PER_SYNC),
+            node.block_preverifier(),
+        )
     };
     let hello = with_nonce(hello, nonce_override);
 
@@ -357,16 +361,22 @@ fn perform_sync_from_peer_once_inner_with_policy(
             });
         }
 
-        // `Node::submit_block` currently performs proof verification and the
-        // durable append under `&mut self`, so this is the one deliberately
-        // unavoidable long node critical section. Socket I/O is never done
-        // while holding the mutex.
+        let preverified = block_preverifier.preverify(&block)?;
         let accepted_at = unix_time_seconds()?;
-        {
+        let accepted = {
             let mut node = lock_node(&shared)?;
-            node.submit_block(block, accepted_at)?;
+            if node.contains_block(*requested) {
+                false
+            } else {
+                node.submit_preverified_block(block, accepted_at, preverified)?;
+                true
+            }
+        };
+        if accepted {
+            accepted_blocks += 1;
+        } else {
+            already_known += 1;
         }
-        accepted_blocks += 1;
         previous_inventory_id = Some(*requested);
     }
 
@@ -622,13 +632,13 @@ fn perform_respond_to_peer_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
     observation_address: String,
 ) -> Result<(), P2pError> {
-    let hello = with_nonce(
-        {
+    let (hello, block_preverifier) = {
+        let (hello, block_preverifier) = {
             let node = lock_node(&shared)?;
-            node.peer_hello()
-        },
-        nonce_override,
-    );
+            (node.peer_hello(), node.block_preverifier())
+        };
+        (with_nonce(hello, nonce_override), block_preverifier)
+    };
     let network_id = hello.network_id;
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::from_stream_with_policy(stream, session, address_policy)?;
@@ -709,16 +719,27 @@ fn perform_respond_to_peer_inner_with_policy(
             }
             PeerMessage::SubmitBlock(block) => {
                 let block_id = block.block_id();
-                let accepted_at = unix_time_seconds()?;
-                let status = {
+                let already_known = {
+                    let node = lock_node(&shared)?;
+                    node.contains_block(block_id)
+                };
+                let status = if already_known {
+                    BlockSubmissionStatus::AlreadyKnown
+                } else if let Ok(preverified) = block_preverifier.preverify(&block) {
+                    let accepted_at = unix_time_seconds()?;
                     let mut node = lock_node(&shared)?;
                     if node.contains_block(block_id) {
                         BlockSubmissionStatus::AlreadyKnown
-                    } else if node.submit_block(block, accepted_at).is_ok() {
+                    } else if node
+                        .submit_preverified_block(block, accepted_at, preverified)
+                        .is_ok()
+                    {
                         BlockSubmissionStatus::Accepted
                     } else {
                         BlockSubmissionStatus::Rejected
                     }
+                } else {
+                    BlockSubmissionStatus::Rejected
                 };
                 let peer = {
                     let node = lock_node(&shared)?;

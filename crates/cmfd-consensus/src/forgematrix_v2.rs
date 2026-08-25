@@ -33,15 +33,17 @@ pub const V2_TEST_BATCH: u32 = 2;
 pub const V2_TEST_LAYERS: u32 = 4;
 pub const V2_ACCELERATOR_MAX_BATCH: u32 = 65_536;
 
-const CHALLENGE_DOMAIN: &str = "CMFD/FORGEMATRIX/CHALLENGE/V2";
-const MASK_DOMAIN: &str = "CMFD/FORGEMATRIX/MASKCOEFF/V2";
-const OUTPUT_DOMAIN: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
-const WORK_DOMAIN: &str = "CMFD/FORGEMATRIX/WORK/V2";
+pub(crate) const CHALLENGE_DOMAIN: &str = "CMFD/FORGEMATRIX/CHALLENGE/V2";
+pub(crate) const MASK_DOMAIN: &str = "CMFD/FORGEMATRIX/MASKCOEFF/V2";
+pub(crate) const OUTPUT_DOMAIN: &str = "CMFD/FORGEMATRIX/OUTPUT/V2";
+pub(crate) const WORK_DOMAIN: &str = "CMFD/FORGEMATRIX/WORK/V2";
 
 pub const V2_TRANSITION_MODULUS: u32 = 134_217_689;
-const OUTPUT_MODULUS: u64 = 251;
-const CENTER: i16 = 125;
-const MAX_OUTPUT_QUOTIENT: u32 = 534_731;
+pub const V2_OUTPUT_MODULUS: u64 = 251;
+pub const V2_MODEL_VALUE_CENTER: i16 = 125;
+pub const V2_MAX_OUTPUT_QUOTIENT: u32 = 534_731;
+pub const V2_MODEL_VALUE_ENCODING: &str =
+    "u8 x in 0..=250 maps to the canonical signed integer x - 125";
 
 /// Consensus-owned public identity of the v2 relation.
 ///
@@ -316,11 +318,12 @@ impl ForgeMatrixV2AcceleratorBatch {
         (index < self.count as usize).then(|| self.start_nonce.wrapping_add(index as u64))
     }
 
-    /// Computes the digest claimed by one untrusted accelerator output.
-    ///
-    /// This is a fast target prefilter only. A below-target result must be
-    /// recomputed with [`ForgeMatrixV2Reference::prove_compact`] before use.
-    pub fn candidate_work_digest(
+    #[cfg(feature = "remainder-prototype")]
+    pub(crate) fn challenge_at(&self, index: usize) -> Option<[u8; 32]> {
+        self.challenges.get(index).copied()
+    }
+
+    pub(crate) fn candidate_output_digest(
         &self,
         index: usize,
         final_activation: &[u8],
@@ -331,8 +334,20 @@ impl ForgeMatrixV2AcceleratorBatch {
         if final_activation.iter().any(|value| *value > 250) {
             return Err(ForgeMatrixV2Error::ActivationEncoding);
         }
+        Ok(output_digest(self.challenges[index], final_activation))
+    }
+
+    /// Computes the digest claimed by one untrusted accelerator output.
+    ///
+    /// This is a fast target prefilter only. A below-target result must be
+    /// recomputed with [`ForgeMatrixV2Reference::prove_compact`] before use.
+    pub fn candidate_work_digest(
+        &self,
+        index: usize,
+        final_activation: &[u8],
+    ) -> Result<[u8; 32], ForgeMatrixV2Error> {
+        let output = self.candidate_output_digest(index, final_activation)?;
         let challenge = self.challenges[index];
-        let output = output_digest(challenge, final_activation);
         Ok(work_digest(&self.descriptor, challenge, output))
     }
 
@@ -804,7 +819,7 @@ pub fn v2_test_reference() -> Result<ForgeMatrixV2Reference, ForgeMatrixV2Error>
     ForgeMatrixV2Reference::from_explicit_model(descriptor, base, layers)
 }
 
-fn challenge_digest(
+pub(crate) fn challenge_digest(
     descriptor: &ForgeMatrixV2Descriptor,
     block: &BlockChallenge,
     nonce: u64,
@@ -831,7 +846,12 @@ fn challenge_digest(
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn mask_coefficients(challenge: &[u8; 32], layer: u32, rows: usize, width: usize) -> Vec<u8> {
+pub(crate) fn mask_coefficients(
+    challenge: &[u8; 32],
+    layer: u32,
+    rows: usize,
+    width: usize,
+) -> Vec<u8> {
     let count = 1 + rows.ilog2() as usize + width.ilog2() as usize;
     let mut hasher = Hasher::new_derive_key(MASK_DOMAIN);
     hasher.update(challenge);
@@ -894,8 +914,8 @@ fn reduction_witness(z: i32) -> Result<ReductionWitness, ForgeMatrixV2Error> {
     let cube_product = square_remainder * u64::from(encoded_z);
     let cube_quotient = cube_product / u64::from(V2_TRANSITION_MODULUS);
     let cube_remainder = cube_product % u64::from(V2_TRANSITION_MODULUS);
-    let output_quotient = cube_remainder / OUTPUT_MODULUS;
-    let output_remainder = cube_remainder % OUTPUT_MODULUS;
+    let output_quotient = cube_remainder / V2_OUTPUT_MODULUS;
+    let output_remainder = cube_remainder % V2_OUTPUT_MODULUS;
     let witness = ReductionWitness {
         z,
         encoded_z,
@@ -926,7 +946,7 @@ fn check_reduction(z: i32, witness: &ReductionWitness) -> Result<(), ForgeMatrix
     {
         return Err(ForgeMatrixV2Error::TransitionFieldRange);
     }
-    if witness.output_quotient > MAX_OUTPUT_QUOTIENT || witness.output_remainder > 250 {
+    if witness.output_quotient > V2_MAX_OUTPUT_QUOTIENT || witness.output_remainder > 250 {
         return Err(ForgeMatrixV2Error::OutputRange);
     }
     let expected_encoded = if z >= 0 {
@@ -949,7 +969,8 @@ fn check_reduction(z: i32, witness: &ReductionWitness) -> Result<(), ForgeMatrix
         return Err(ForgeMatrixV2Error::CubeRelation);
     }
     if u64::from(witness.cube_remainder)
-        != OUTPUT_MODULUS * u64::from(witness.output_quotient) + u64::from(witness.output_remainder)
+        != V2_OUTPUT_MODULUS * u64::from(witness.output_quotient)
+            + u64::from(witness.output_remainder)
     {
         return Err(ForgeMatrixV2Error::OutputRelation);
     }
@@ -960,18 +981,21 @@ fn centered_activation(value: u16) -> Result<i16, ForgeMatrixV2Error> {
     if value > 250 {
         return Err(ForgeMatrixV2Error::OutputRange);
     }
-    Ok(i16::try_from(value).map_err(|_| ForgeMatrixV2Error::ActivationEncoding)? - CENTER)
+    Ok(
+        i16::try_from(value).map_err(|_| ForgeMatrixV2Error::ActivationEncoding)?
+            - V2_MODEL_VALUE_CENTER,
+    )
 }
 
 fn decode_model_byte(value: u8) -> i16 {
-    i16::from(value) - CENTER
+    i16::from(value) - V2_MODEL_VALUE_CENTER
 }
 
 fn activation_bytes(values: &[i16]) -> Result<Vec<u8>, ForgeMatrixV2Error> {
     values
         .iter()
         .map(|value| {
-            let encoded = *value + CENTER;
+            let encoded = *value + V2_MODEL_VALUE_CENTER;
             u8::try_from(encoded)
                 .ok()
                 .filter(|byte| *byte <= 250)
@@ -980,7 +1004,7 @@ fn activation_bytes(values: &[i16]) -> Result<Vec<u8>, ForgeMatrixV2Error> {
         .collect()
 }
 
-fn output_digest(challenge: [u8; 32], final_bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn output_digest(challenge: [u8; 32], final_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new_derive_key(OUTPUT_DOMAIN);
     hasher.update(&challenge);
     hasher.update(&(final_bytes.len() as u64).to_le_bytes());
@@ -993,10 +1017,24 @@ fn work_digest(
     challenge: [u8; 32],
     final_activation_digest: [u8; 32],
 ) -> [u8; 32] {
+    work_digest_from_roots(
+        challenge,
+        descriptor.model.raw_blake3_root,
+        descriptor.model.pcs_commitment_root,
+        final_activation_digest,
+    )
+}
+
+pub(crate) fn work_digest_from_roots(
+    challenge: [u8; 32],
+    model_byte_root: [u8; 32],
+    model_pcs_root: [u8; 32],
+    final_activation_digest: [u8; 32],
+) -> [u8; 32] {
     let mut hasher = Hasher::new_derive_key(WORK_DOMAIN);
     hasher.update(&challenge);
-    hasher.update(&descriptor.model.raw_blake3_root);
-    hasher.update(&descriptor.model.pcs_commitment_root);
+    hasher.update(&model_byte_root);
+    hasher.update(&model_pcs_root);
     hasher.update(&final_activation_digest);
     *hasher.finalize().as_bytes()
 }
@@ -1354,6 +1392,10 @@ mod tests {
         let final_bytes = activation_bytes(&proof.layers.last().unwrap().output).unwrap();
         let claimed = batch.candidate_work_digest(0, &final_bytes).unwrap();
         assert_eq!(claimed, proof.work_digest);
+        assert!(matches!(
+            batch.candidate_work_digest(3, &final_bytes),
+            Err(ForgeMatrixV2Error::AcceleratorOutputShape)
+        ));
         oracle
             .verify_accelerator_candidate(&block(), &batch, 0, claimed)
             .unwrap();

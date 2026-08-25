@@ -362,6 +362,46 @@ automatic bans, reputation, or demonstrated DDoS resistance. Stop the public
 listener after the bounded test, never expose RPC, and never use this mode with
 valuable funds.
 
+## Optional isolated proof verification
+
+The node can verify externally received Devnet blocks in a short-lived child
+instead of inside the long-running process. This is optional for Devnet. The
+same `cmfd-node` executable can act as its own hash-pinned worker, so no
+additional binary is required.
+
+On Windows PowerShell:
+
+```powershell
+$worker = (Resolve-Path .\cmfd-node.exe).Path
+$workerHash = (Get-FileHash -Algorithm SHA256 $worker).Hash
+.\cmfd-node.exe `
+  --proof-verifier-worker $worker `
+  --proof-verifier-worker-sha256 $workerHash `
+  --proof-verifier-timeout-ms 30000 `
+  --proof-verifier-memory-bytes 2147483648 `
+  run --allow-public-peers
+```
+
+On Linux:
+
+```bash
+worker="$(readlink -f ./cmfd-node)"
+worker_hash="$(sha256sum "$worker" | cut -d ' ' -f 1)"
+./cmfd-node \
+  --proof-verifier-worker "$worker" \
+  --proof-verifier-worker-sha256 "$worker_hash" \
+  --proof-verifier-timeout-ms 30000 \
+  --proof-verifier-memory-bytes 2147483648 \
+  run --allow-public-peers
+```
+
+Startup fails if the path is not absolute, the hash does not match, or either
+limit is zero. Node status reports `external_worker` plus the active limits.
+Each request rechecks the executable hash. Timeout, crash, invalid proof,
+malformed or oversized output, and response substitution reject only that
+candidate. The worker currently supports the active V2 Devnet verifier; the
+reserved V3 candidate remains disabled.
+
 ## Loopback RPC
 
 The first node above uses `http://127.0.0.1:18443`.

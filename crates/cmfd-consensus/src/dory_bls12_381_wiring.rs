@@ -1,0 +1,3202 @@
+//! BLS12-381 successor-wiring argument authenticated by Dory.
+//!
+//! The initial activation table and up to three input/output bank pairs are
+//! packed into eight selector slots under one commitment. Random multilinear
+//! identities prove every within-bank successor, initialization edge, and
+//! cross-bank boundary. One distinct-point Dory aggregate authenticates all
+//! evaluations used by those identities.
+
+use std::io::Cursor;
+use std::path::Path;
+
+use dory_pcs::primitives::{
+    DoryDeserialize, DorySerialize,
+    arithmetic::{Field, Group},
+    serialization::{Compress, Validate},
+    transcript::Transcript,
+};
+use thiserror::Error;
+
+use crate::{
+    StructuredMaskPolynomial, StructuredTransitionStatement, StructuredWiringError,
+    StructuredWiringStatement,
+    dory_bls12_381_aggregate::{
+        BlsDoryAggregateError, BlsDoryAggregateLayout, BlsDoryCompactRowSource,
+        BlsDoryDeferredOpeningSet, BlsDoryOpeningClaim, MAX_BLS_DORY_AGGREGATE_BYTES,
+        bounded_signed_code, bounded_signed_dictionary,
+        commit_bls_dory_compact_row_source_with_scratch, commit_bls_dory_polynomial,
+        commit_bls_dory_row_source_with_scratch, projected_bls_dory_aggregate_bytes,
+        prove_bls_dory_deferred_opening_sets, verify_bls_dory_openings,
+    },
+    dory_bls12_381_execution_artifact::{
+        BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS, BlsDoryExecutionAccumulatorArtifact,
+        BlsDoryExecutionAccumulatorArtifactContext, BlsDoryExecutionAccumulatorColumn,
+    },
+    dory_bls12_381_prototype::{
+        BlsDoryFr, BlsDoryGt, BlsDoryTranscript, DeterministicBlsDorySetup,
+    },
+    dory_bls12_381_streaming::BlsDoryRowSource,
+    dory_bls12_381_transition::derive_transition_regular_row_from_mask,
+    structured_wiring::{validate_streaming_tables, validate_successors, validate_tables},
+};
+
+#[cfg(feature = "whir-prototype")]
+use crate::dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader;
+
+/// Version of the scalar-field wiring transcript.
+pub const BLS_DORY_WIRING_VERSION: u16 = 1;
+/// Three bits address the initial table and up to three input/output bank pairs.
+pub const BLS_DORY_WIRING_SELECTOR_VARIABLES: usize = 3;
+/// Production banks have 26 table variables and add three selector variables.
+pub const PRODUCTION_BLS_DORY_WIRING_VARIABLES: usize = 29;
+/// This checkpoint is not accepted by consensus.
+pub const BLS_DORY_WIRING_PRODUCTION_READY: bool = false;
+/// Remaining gates on the scalar wiring path.
+pub const BLS_DORY_WIRING_PRODUCTION_BLOCKERS: [&str; 3] = [
+    "the scratch prover streams signed wiring tables with bounded evaluation memory; after the first Dory row its canonical authenticated source uses one-byte codes for the fixed bounded-activation dictionary, preserves the exact commitment, claims, and opening proof, and projects to 470,687,704 bytes (about 449 MiB) without first-eight-generation fold files, but n=29 latency, peak disk, and peak memory have not been measured",
+    "the executable algebraic union bound exists, but Dory knowledge soundness has not been independently reviewed",
+    "the scalar wiring transcript and packed opening path have not received an external audit",
+];
+
+const WIRING_SLOTS: usize = 1 << BLS_DORY_WIRING_SELECTOR_VARIABLES;
+const INITIAL_SLOT: usize = 0;
+pub(crate) const PROOF_MAGIC: [u8; 8] = *b"CFBLSW01";
+const PROOF_HEADER_BYTES: usize = 18;
+const MAX_WIRING_PROOF_BYTES: usize = 262_128;
+const MAX_WIRING_BINDING_BYTES: usize = 4_096;
+
+/// Witness-free scalar wiring proof plus its canonical Dory opening payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlsDoryWiringProof {
+    pub protocol_version: u16,
+    pub packed_variables: u16,
+    pub oracle_commitment: BlsDoryGt,
+    pub evaluations: Vec<BlsDoryFr>,
+    pub transcript_digest: [u8; 32],
+    pub opening_proof: Vec<u8>,
+}
+
+pub(crate) struct PreparedBlsDoryWiringProof {
+    pub(crate) proof: BlsDoryWiringProof,
+    pub(crate) openings: BlsDoryDeferredOpeningSet,
+}
+
+impl BlsDoryWiringProof {
+    /// Encode the exact statement-derived proof shape canonically.
+    pub fn encode(
+        &self,
+        statement: StructuredWiringStatement,
+    ) -> Result<Vec<u8>, BlsDoryWiringError> {
+        self.encode_with_opening(statement, true)
+    }
+
+    pub(crate) fn encode_deferred(
+        &self,
+        statement: StructuredWiringStatement,
+    ) -> Result<Vec<u8>, BlsDoryWiringError> {
+        self.encode_with_opening(statement, false)
+    }
+
+    fn encode_with_opening(
+        &self,
+        statement: StructuredWiringStatement,
+        require_opening: bool,
+    ) -> Result<Vec<u8>, BlsDoryWiringError> {
+        validate_proof_shape_with_opening(
+            statement,
+            self,
+            usize::from(self.packed_variables),
+            require_opening,
+        )?;
+        if !require_opening && !self.opening_proof.is_empty() {
+            return Err(BlsDoryWiringError::InvalidProofShape);
+        }
+        let opening_len = u32::try_from(self.opening_proof.len())
+            .map_err(|_| BlsDoryWiringError::ProofTooLarge)?;
+        let expected = wiring_wire_bytes(self.evaluations.len(), self.opening_proof.len())?;
+        let mut encoded = Vec::with_capacity(expected);
+        encoded.extend_from_slice(&PROOF_MAGIC);
+        encoded.extend_from_slice(&self.protocol_version.to_le_bytes());
+        encoded.extend_from_slice(&self.packed_variables.to_le_bytes());
+        encoded.extend_from_slice(&(self.evaluations.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&opening_len.to_le_bytes());
+        append_serialized(&mut encoded, &self.oracle_commitment)?;
+        for evaluation in &self.evaluations {
+            append_serialized(&mut encoded, evaluation)?;
+        }
+        encoded.extend_from_slice(&self.transcript_digest);
+        encoded.extend_from_slice(&self.opening_proof);
+        if encoded.len() != expected || encoded.len() > MAX_WIRING_PROOF_BYTES {
+            return Err(BlsDoryWiringError::ProofTooLarge);
+        }
+        Ok(encoded)
+    }
+
+    /// Decode only the bounded shape implied by the trusted statement.
+    pub fn decode(
+        encoded: &[u8],
+        statement: StructuredWiringStatement,
+    ) -> Result<Self, BlsDoryWiringError> {
+        let expected_variables = packed_wiring_variables(statement)?;
+        Self::decode_with_variables(encoded, statement, expected_variables)
+    }
+
+    /// Decode using the exact shared aggregate geometry selected by consensus.
+    pub fn decode_with_variables(
+        encoded: &[u8],
+        statement: StructuredWiringStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryWiringError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, true)
+    }
+
+    pub(crate) fn decode_deferred_with_variables(
+        encoded: &[u8],
+        statement: StructuredWiringStatement,
+        expected_variables: usize,
+    ) -> Result<Self, BlsDoryWiringError> {
+        Self::decode_with_variables_and_opening(encoded, statement, expected_variables, false)
+    }
+
+    fn decode_with_variables_and_opening(
+        encoded: &[u8],
+        statement: StructuredWiringStatement,
+        expected_variables: usize,
+        require_opening: bool,
+    ) -> Result<Self, BlsDoryWiringError> {
+        statement.validate_verifier_shape()?;
+        validate_target_variables(packed_wiring_variables(statement)?, expected_variables)?;
+        if encoded.len() < PROOF_HEADER_BYTES || encoded.len() > MAX_WIRING_PROOF_BYTES {
+            return Err(BlsDoryWiringError::ProofTooLarge);
+        }
+        if encoded[..8] != PROOF_MAGIC {
+            return Err(BlsDoryWiringError::InvalidEncoding);
+        }
+        let protocol_version = read_u16(encoded, 8)?;
+        let packed_variables = read_u16(encoded, 10)?;
+        let evaluation_count = read_u16(encoded, 12)? as usize;
+        let opening_len = read_u32(encoded, 14)? as usize;
+        let expected_evaluations = wiring_evaluation_count(statement)?;
+        if protocol_version != BLS_DORY_WIRING_VERSION
+            || usize::from(packed_variables) != expected_variables
+            || evaluation_count != expected_evaluations
+            || (require_opening && opening_len == 0)
+            || (!require_opening && opening_len != 0)
+            || opening_len > MAX_BLS_DORY_AGGREGATE_BYTES
+            || encoded.len() != wiring_wire_bytes(evaluation_count, opening_len)?
+        {
+            return Err(BlsDoryWiringError::InvalidProofShape);
+        }
+
+        let mut reader = Cursor::new(&encoded[PROOF_HEADER_BYTES..]);
+        let oracle_commitment = read_serialized(&mut reader)?;
+        let mut evaluations = Vec::with_capacity(evaluation_count);
+        for _ in 0..evaluation_count {
+            evaluations.push(read_serialized(&mut reader)?);
+        }
+        let payload_offset = PROOF_HEADER_BYTES + reader.position() as usize;
+        let digest_end = payload_offset
+            .checked_add(32)
+            .ok_or(BlsDoryWiringError::InvalidProofShape)?;
+        let transcript_digest = encoded
+            .get(payload_offset..digest_end)
+            .ok_or(BlsDoryWiringError::InvalidProofShape)?
+            .try_into()
+            .map_err(|_| BlsDoryWiringError::InvalidProofShape)?;
+        let opening_proof = encoded
+            .get(digest_end..)
+            .ok_or(BlsDoryWiringError::InvalidProofShape)?
+            .to_vec();
+        if opening_proof.len() != opening_len {
+            return Err(BlsDoryWiringError::InvalidProofShape);
+        }
+        let proof = Self {
+            protocol_version,
+            packed_variables,
+            oracle_commitment,
+            evaluations,
+            transcript_digest,
+            opening_proof,
+        };
+        if proof.encode_with_opening(statement, require_opening)? != encoded {
+            return Err(BlsDoryWiringError::InvalidEncoding);
+        }
+        Ok(proof)
+    }
+}
+
+/// Errors from the scalar successor-wiring checkpoint.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BlsDoryWiringError {
+    #[error("structured wiring input is invalid: {0}")]
+    Structured(#[from] StructuredWiringError),
+    #[error("Dory opening authentication failed: {0}")]
+    Aggregate(#[from] BlsDoryAggregateError),
+    #[error("packed wiring dimensions overflow or exceed this checkpoint")]
+    InvalidDimensions,
+    #[error("scalar wiring proof has the wrong fixed shape")]
+    InvalidProofShape,
+    #[error("a scalar initialization, successor, or bank-boundary identity failed")]
+    WiringIdentity,
+    #[error("wiring transcript digest mismatch")]
+    Transcript,
+    #[error("Dory claims do not match the wiring evaluations")]
+    Opening,
+    #[error("wiring public binding exceeds the bounded transcript limit")]
+    PublicBindingTooLarge,
+    #[error("wiring proof exceeds the network payload cap")]
+    ProofTooLarge,
+    #[error("wiring proof encoding is malformed or non-canonical")]
+    InvalidEncoding,
+    #[error("authenticated execution-accumulator artifact failed")]
+    ExecutionArtifact,
+    #[error("the BLS12-381 wiring checkpoint is not production ready")]
+    NotProductionReady,
+}
+
+/// Fail closed while any production blocker remains.
+pub fn require_bls_dory_wiring_production_ready() -> Result<(), BlsDoryWiringError> {
+    Err(BlsDoryWiringError::NotProductionReady)
+}
+
+/// Project the canonical Dory opening payload for production wiring.
+pub fn projected_production_wiring_opening_bytes() -> Result<usize, BlsDoryWiringError> {
+    projected_bls_dory_aggregate_bytes(PRODUCTION_BLS_DORY_WIRING_VARIABLES)
+        .map_err(BlsDoryWiringError::Aggregate)
+}
+
+/// Project the complete canonical production wiring proof.
+pub fn projected_production_wiring_proof_bytes() -> Result<usize, BlsDoryWiringError> {
+    let statement = production_wiring_statement();
+    wiring_wire_bytes(
+        wiring_evaluation_count(statement)?,
+        projected_production_wiring_opening_bytes()?,
+    )
+}
+
+/// Prove every wiring edge and authenticate every evaluation under one commitment.
+pub fn prove_bls_dory_wiring(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryWiringProof, BlsDoryWiringError> {
+    let packed_variables = packed_wiring_variables(statement)?;
+    prove_bls_dory_wiring_at_variables(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+    )
+}
+
+/// Prove every wiring edge at an exact shared aggregate geometry.
+pub fn prove_bls_dory_wiring_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<BlsDoryWiringProof, BlsDoryWiringError> {
+    let mut prepared = prove_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+    )?;
+    let opening_binding = opening_binding(binding, &prepared.proof.transcript_digest);
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        packed_variables / 2,
+        packed_variables - packed_variables / 2,
+    )?;
+    let (claims, opening_proof) = prove_bls_dory_deferred_opening_sets(
+        &opening_binding,
+        aggregate_layout,
+        &[&prepared.openings],
+        setup,
+    )?;
+    if claims != prepared.openings.claims() {
+        return Err(BlsDoryWiringError::Opening);
+    }
+    prepared.proof.opening_proof = opening_proof;
+    verify_bls_dory_wiring_at_variables(
+        binding,
+        statement,
+        &prepared.proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(prepared.proof)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_wiring_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_wiring_deferred_at_variables_with_scratch(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
+        binding,
+        statement,
+        initial,
+        inputs,
+        outputs,
+        packed_variables,
+        setup,
+        Some(scratch_directory),
+    )
+}
+
+/// Prove successor wiring directly from the authenticated execution artifact.
+///
+/// `transition_statements[0]` and `mask_polynomials[0]` describe the virtual
+/// initialization transition. The remaining entries describe bank transitions
+/// in canonical bank order. Inputs are derived as the preceding transition
+/// activation, so this path never accepts or allocates production wiring
+/// tables.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    transition_statements: &[StructuredTransitionStatement],
+    mask_polynomials: &[&StructuredMaskPolynomial],
+    artifact: &mut BlsDoryExecutionAccumulatorArtifact,
+    expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    if binding.len() > MAX_WIRING_BINDING_BYTES {
+        return Err(BlsDoryWiringError::PublicBindingTooLarge);
+    }
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() || expected_context.setup_identity() != setup.identity()
+    {
+        return Err(BlsDoryWiringError::ExecutionArtifact);
+    }
+    let nu = packed_variables / 2;
+    let sigma = packed_variables - nu;
+    let rows = 1usize
+        .checked_shl(nu as u32)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    let columns = 1usize
+        .checked_shl(sigma as u32)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    let mut source = WiringExecutionArtifactRowSource::new(
+        statement,
+        transition_statements,
+        mask_polynomials,
+        artifact,
+        expected_context,
+        rows,
+        columns,
+    )?;
+    let committed = if source.explicit_scalars.is_multiple_of(columns) {
+        commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )?
+    } else {
+        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)?
+    };
+    let oracle_commitment = committed.commitment();
+
+    let mut transcript = wiring_transcript(binding, statement, &oracle_commitment);
+    let points = WiringPoints::derive(statement, &mut transcript);
+    let evaluations = compute_execution_artifact_evaluations(statement, &points, &mut source)?;
+    verify_identities(statement, &points, &evaluations)?;
+    let flattened = evaluations.flatten(statement)?;
+    absorb_evaluations(&mut transcript, &flattened);
+    let transcript_digest = transcript.digest();
+    let opening_points = opening_points(statement, &points, packed_variables)?;
+    let expected_claims = opening_claims(oracle_commitment, &opening_points, &flattened)?;
+    let openings = BlsDoryDeferredOpeningSet::new(
+        vec![committed],
+        vec![0; opening_points.len()],
+        opening_points,
+    )?;
+    if openings.claims() != expected_claims {
+        return Err(BlsDoryWiringError::Opening);
+    }
+    let proof = BlsDoryWiringProof {
+        protocol_version: BLS_DORY_WIRING_VERSION,
+        packed_variables: u16::try_from(packed_variables)
+            .map_err(|_| BlsDoryWiringError::InvalidDimensions)?,
+        oracle_commitment,
+        evaluations: flattened,
+        transcript_digest,
+        opening_proof: Vec::new(),
+    };
+    verify_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        &proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryWiringProof { proof, openings })
+}
+
+#[cfg(feature = "whir-prototype")]
+struct DoryV3WiringDescriptor {
+    statement: StructuredWiringStatement,
+    initialization_statement: StructuredTransitionStatement,
+    bank_statement: StructuredTransitionStatement,
+    masks: Vec<StructuredMaskPolynomial>,
+}
+
+#[cfg(feature = "whir-prototype")]
+fn dory_v3_wiring_descriptor(
+    reader: &BlsDoryV3ExecutionArtifactReader<'_>,
+) -> Result<DoryV3WiringDescriptor, BlsDoryWiringError> {
+    let rows = reader.canonical_rows();
+    let cols = reader.canonical_columns();
+    rows.checked_mul(cols)
+        .filter(|cells| *cells == reader.cells_per_column())
+        .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+    let statement = StructuredWiringStatement {
+        banks: reader.banks(),
+        layers_per_bank: reader.layers_per_bank(),
+        rows,
+        cols,
+        max_abs_activation: 125,
+    };
+    statement
+        .validate_verifier_shape()
+        .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+    let initialization_statement = StructuredTransitionStatement {
+        layers: 1,
+        rows,
+        cols,
+        max_abs_accumulator: 125,
+        max_mask: 5_000,
+    };
+    let bank_statement = StructuredTransitionStatement {
+        layers: reader.layers_per_bank(),
+        rows,
+        cols,
+        max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+        max_mask: 5_000,
+    };
+    initialization_statement
+        .validate_verifier_shape()
+        .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+    bank_statement
+        .validate_verifier_shape()
+        .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+
+    let mut masks = Vec::new();
+    masks
+        .try_reserve_exact(
+            reader
+                .banks()
+                .checked_add(1)
+                .ok_or(BlsDoryWiringError::ExecutionArtifact)?,
+        )
+        .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+    let initialization_mask = reader
+        .v3_initialization_mask()
+        .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+    initialization_mask
+        .validate(initialization_statement)
+        .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+    masks.push(initialization_mask);
+    for bank in 0..reader.banks() {
+        let mask = reader
+            .v3_bank_mask(bank)
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        mask.validate(bank_statement)
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        masks.push(mask);
+    }
+    Ok(DoryV3WiringDescriptor {
+        statement,
+        initialization_statement,
+        bank_statement,
+        masks,
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn preflight_dory_v3_wiring_dimensions(
+    statement: StructuredWiringStatement,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(usize, usize, usize, usize), BlsDoryWiringError> {
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    let nu = packed_variables / 2;
+    let sigma = packed_variables - nu;
+    let rows = 1usize
+        .checked_shl(nu as u32)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    let columns = 1usize
+        .checked_shl(sigma as u32)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    Ok((nu, sigma, rows, columns))
+}
+
+/// Prove every V3 successor edge from the authority-checked execution reader.
+///
+/// The statement, transition roles, V3 masks, and all bank/layer addressing are
+/// derived internally. No raw artifact, context, challenge, caller mask, or
+/// caller-selected wiring topology enters this path.
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
+    binding: &[u8],
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    reader
+        .validate_setup(setup)
+        .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+    if binding.len() > MAX_WIRING_BINDING_BYTES {
+        return Err(BlsDoryWiringError::PublicBindingTooLarge);
+    }
+    let descriptor = dory_v3_wiring_descriptor(reader)?;
+    let statement = descriptor.statement;
+    let (nu, sigma, rows, columns) =
+        preflight_dory_v3_wiring_dimensions(statement, packed_variables, setup)?;
+    let mut source =
+        DoryV3WiringExecutionArtifactRowSource::new(descriptor, reader, rows, columns)?;
+    let committed = if source.explicit_scalars.is_multiple_of(columns) {
+        commit_bls_dory_compact_row_source_with_scratch(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+        )?
+    } else {
+        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)?
+    };
+    let oracle_commitment = committed.commitment();
+
+    let mut transcript = wiring_transcript(binding, statement, &oracle_commitment);
+    let points = WiringPoints::derive(statement, &mut transcript);
+    let evaluations =
+        compute_dory_v3_execution_artifact_evaluations(statement, &points, &mut source)?;
+    verify_identities(statement, &points, &evaluations)?;
+    let flattened = evaluations.flatten(statement)?;
+    absorb_evaluations(&mut transcript, &flattened);
+    let transcript_digest = transcript.digest();
+    let opening_points = opening_points(statement, &points, packed_variables)?;
+    let expected_claims = opening_claims(oracle_commitment, &opening_points, &flattened)?;
+    let openings = BlsDoryDeferredOpeningSet::new(
+        vec![committed],
+        vec![0; opening_points.len()],
+        opening_points,
+    )?;
+    if openings.claims() != expected_claims {
+        return Err(BlsDoryWiringError::Opening);
+    }
+    let proof = BlsDoryWiringProof {
+        protocol_version: BLS_DORY_WIRING_VERSION,
+        packed_variables: u16::try_from(packed_variables)
+            .map_err(|_| BlsDoryWiringError::InvalidDimensions)?,
+        oracle_commitment,
+        evaluations: flattened,
+        transcript_digest,
+        opening_proof: Vec::new(),
+    };
+    verify_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        &proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryWiringProof { proof, openings })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_wiring_deferred_at_variables_with_optional_scratch(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    if binding.len() > MAX_WIRING_BINDING_BYTES {
+        return Err(BlsDoryWiringError::PublicBindingTooLarge);
+    }
+    if scratch_directory.is_some() {
+        validate_streaming_tables(statement, initial, inputs, outputs)?;
+    } else {
+        validate_tables(statement, initial, inputs, outputs)?;
+    }
+    validate_successors(statement, initial, inputs, outputs)?;
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    let nu = packed_variables / 2;
+    let sigma = packed_variables - nu;
+    let materialized = if scratch_directory.is_none() {
+        let initial_values = signed_values(initial);
+        let input_banks = bank_field_values(statement, inputs)?;
+        let output_banks = bank_field_values(statement, outputs)?;
+        Some((initial_values, input_banks, output_banks))
+    } else {
+        None
+    };
+    let committed = if let Some(scratch_directory) = scratch_directory {
+        let rows = 1usize
+            .checked_shl(nu as u32)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let columns = 1usize
+            .checked_shl(sigma as u32)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let mut source =
+            WiringSignedRowSource::new(statement, initial, inputs, outputs, rows, columns)?;
+        if source.explicit_scalars.is_multiple_of(columns) {
+            commit_bls_dory_compact_row_source_with_scratch(
+                &mut source,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )?
+        } else {
+            commit_bls_dory_row_source_with_scratch(
+                &mut source,
+                nu,
+                sigma,
+                setup,
+                scratch_directory,
+            )?
+        }
+    } else {
+        let (initial_values, input_banks, output_banks) = materialized
+            .as_ref()
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let mut packed_coefficients =
+            pack_wiring_tables(statement, initial_values, input_banks, output_banks)?;
+        let padded_len = 1usize
+            .checked_shl(packed_variables as u32)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        packed_coefficients.resize(padded_len, BlsDoryFr::zero());
+        commit_bls_dory_polynomial(packed_coefficients, nu, sigma, setup)?
+    };
+    let oracle_commitment = committed.commitment();
+
+    let mut transcript = wiring_transcript(binding, statement, &oracle_commitment);
+    let points = WiringPoints::derive(statement, &mut transcript);
+    let evaluations = if let Some((initial_values, input_banks, output_banks)) = &materialized {
+        compute_evaluations(
+            statement,
+            &points,
+            initial_values,
+            input_banks,
+            output_banks,
+        )?
+    } else {
+        compute_signed_evaluations(statement, &points, initial, inputs, outputs)?
+    };
+    verify_identities(statement, &points, &evaluations)?;
+    let flattened = evaluations.flatten(statement)?;
+    absorb_evaluations(&mut transcript, &flattened);
+    let transcript_digest = transcript.digest();
+    let opening_points = opening_points(statement, &points, packed_variables)?;
+    let expected_claims = opening_claims(oracle_commitment, &opening_points, &flattened)?;
+    let openings = BlsDoryDeferredOpeningSet::new(
+        vec![committed],
+        vec![0; opening_points.len()],
+        opening_points,
+    )?;
+    if openings.claims() != expected_claims {
+        return Err(BlsDoryWiringError::Opening);
+    }
+
+    let proof = BlsDoryWiringProof {
+        protocol_version: BLS_DORY_WIRING_VERSION,
+        packed_variables: u16::try_from(packed_variables)
+            .map_err(|_| BlsDoryWiringError::InvalidDimensions)?,
+        oracle_commitment,
+        evaluations: flattened,
+        transcript_digest,
+        opening_proof: Vec::new(),
+    };
+    verify_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        &proof,
+        packed_variables,
+        setup,
+    )?;
+    Ok(PreparedBlsDoryWiringProof { proof, openings })
+}
+
+/// Verify wiring identities and their Dory-authenticated evaluations without a witness.
+pub fn verify_bls_dory_wiring(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryWiringError> {
+    let packed_variables = packed_wiring_variables(statement)?;
+    verify_bls_dory_wiring_at_variables(binding, statement, proof, packed_variables, setup)
+}
+
+/// Verify wiring against the exact shared aggregate geometry.
+pub fn verify_bls_dory_wiring_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryWiringError> {
+    let claims = verify_bls_dory_wiring_deferred_at_variables(
+        binding,
+        statement,
+        proof,
+        packed_variables,
+        setup,
+    )?;
+    let binding = opening_binding(binding, &proof.transcript_digest);
+    let aggregate_layout = BlsDoryAggregateLayout::new(
+        packed_variables / 2,
+        packed_variables - packed_variables / 2,
+    )?;
+    verify_bls_dory_openings(
+        &binding,
+        aggregate_layout,
+        &claims,
+        &proof.opening_proof,
+        setup,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn verify_bls_dory_wiring_deferred_at_variables(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<Vec<BlsDoryOpeningClaim>, BlsDoryWiringError> {
+    if binding.len() > MAX_WIRING_BINDING_BYTES {
+        return Err(BlsDoryWiringError::PublicBindingTooLarge);
+    }
+    statement.validate_verifier_shape()?;
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
+    if packed_variables > setup.max_log_n() {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    validate_deferred_proof_shape(statement, proof, packed_variables)?;
+    let mut transcript = wiring_transcript(binding, statement, &proof.oracle_commitment);
+    let points = WiringPoints::derive(statement, &mut transcript);
+    let evaluations = WiringEvaluations::from_flat(statement, &proof.evaluations)?;
+    verify_identities(statement, &points, &evaluations)?;
+    absorb_evaluations(&mut transcript, &proof.evaluations);
+    if transcript.digest() != proof.transcript_digest {
+        return Err(BlsDoryWiringError::Transcript);
+    }
+    let points = opening_points(statement, &points, packed_variables)?;
+    let claims = opening_claims(proof.oracle_commitment, &points, &proof.evaluations)?;
+    Ok(claims)
+}
+
+fn production_wiring_statement() -> StructuredWiringStatement {
+    StructuredWiringStatement {
+        banks: 3,
+        layers_per_bank: 128,
+        rows: 128,
+        cols: 4096,
+        max_abs_activation: 125,
+    }
+}
+
+fn validate_deferred_proof_shape(
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    expected_variables: usize,
+) -> Result<(), BlsDoryWiringError> {
+    validate_proof_shape_with_opening(statement, proof, expected_variables, false)
+}
+
+fn validate_proof_shape_with_opening(
+    statement: StructuredWiringStatement,
+    proof: &BlsDoryWiringProof,
+    expected_variables: usize,
+    require_opening: bool,
+) -> Result<(), BlsDoryWiringError> {
+    statement.validate_verifier_shape()?;
+    validate_target_variables(packed_wiring_variables(statement)?, expected_variables)?;
+    if proof.protocol_version != BLS_DORY_WIRING_VERSION
+        || usize::from(proof.packed_variables) != expected_variables
+        || proof.evaluations.len() != wiring_evaluation_count(statement)?
+        || (require_opening && proof.opening_proof.is_empty())
+        || proof.opening_proof.len() > MAX_BLS_DORY_AGGREGATE_BYTES
+    {
+        return Err(BlsDoryWiringError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+fn validate_target_variables(
+    minimum_variables: usize,
+    target_variables: usize,
+) -> Result<(), BlsDoryWiringError> {
+    if target_variables < minimum_variables || target_variables > 64 {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    Ok(())
+}
+
+fn wiring_wire_bytes(
+    evaluations: usize,
+    opening_bytes: usize,
+) -> Result<usize, BlsDoryWiringError> {
+    PROOF_HEADER_BYTES
+        .checked_add(BlsDoryGt::identity().compressed_size())
+        .and_then(|size| {
+            size.checked_add(evaluations.checked_mul(BlsDoryFr::zero().compressed_size())?)
+        })
+        .and_then(|size| size.checked_add(32))
+        .and_then(|size| size.checked_add(opening_bytes))
+        .filter(|size| *size <= MAX_WIRING_PROOF_BYTES)
+        .ok_or(BlsDoryWiringError::ProofTooLarge)
+}
+
+fn append_serialized<T: DorySerialize>(
+    output: &mut Vec<u8>,
+    value: &T,
+) -> Result<(), BlsDoryWiringError> {
+    value
+        .serialize_compressed(output)
+        .map_err(|_| BlsDoryWiringError::InvalidEncoding)
+}
+
+fn read_serialized<T: DoryDeserialize>(
+    reader: &mut Cursor<&[u8]>,
+) -> Result<T, BlsDoryWiringError> {
+    T::deserialize_with_mode(reader, Compress::Yes, Validate::Yes)
+        .map_err(|_| BlsDoryWiringError::InvalidEncoding)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, BlsDoryWiringError> {
+    let value: [u8; 2] = bytes
+        .get(offset..offset + 2)
+        .ok_or(BlsDoryWiringError::InvalidProofShape)?
+        .try_into()
+        .map_err(|_| BlsDoryWiringError::InvalidProofShape)?;
+    Ok(u16::from_le_bytes(value))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, BlsDoryWiringError> {
+    let value: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .ok_or(BlsDoryWiringError::InvalidProofShape)?
+        .try_into()
+        .map_err(|_| BlsDoryWiringError::InvalidProofShape)?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn packed_wiring_variables(
+    statement: StructuredWiringStatement,
+) -> Result<usize, BlsDoryWiringError> {
+    statement.validate_verifier_shape()?;
+    let bank_elements = statement.bank_elements()?;
+    let table_variables = usize::try_from(bank_elements.ilog2())
+        .map_err(|_| BlsDoryWiringError::InvalidDimensions)?;
+    table_variables
+        .checked_add(BLS_DORY_WIRING_SELECTOR_VARIABLES)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)
+}
+
+fn wiring_evaluation_count(
+    statement: StructuredWiringStatement,
+) -> Result<usize, BlsDoryWiringError> {
+    let layer_variables = statement.layers_per_bank.ilog2() as usize;
+    statement
+        .banks
+        .checked_mul(layer_variables + 3)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(BlsDoryWiringError::InvalidDimensions)
+}
+
+fn wiring_transcript(
+    binding: &[u8],
+    statement: StructuredWiringStatement,
+    commitment: &BlsDoryGt,
+) -> BlsDoryTranscript {
+    let mut transcript = BlsDoryTranscript::new(b"successor-wiring");
+    transcript.append_bytes(b"protocol-version", &BLS_DORY_WIRING_VERSION.to_le_bytes());
+    transcript.append_bytes(b"public-binding", binding);
+    for value in [
+        statement.banks as u64,
+        statement.layers_per_bank as u64,
+        statement.rows as u64,
+        statement.cols as u64,
+        statement.max_abs_activation,
+    ] {
+        transcript.append_bytes(b"statement-field", &value.to_le_bytes());
+    }
+    transcript.append_group(b"packed-wiring-commitment", commitment);
+    transcript
+}
+
+fn challenge_vector(
+    transcript: &mut BlsDoryTranscript,
+    label: &[u8],
+    count: usize,
+) -> Vec<BlsDoryFr> {
+    (0..count)
+        .map(|index| {
+            transcript.append_bytes(b"point-index", &(index as u64).to_le_bytes());
+            transcript.challenge_scalar(label)
+        })
+        .collect()
+}
+
+fn absorb_evaluations(transcript: &mut BlsDoryTranscript, evaluations: &[BlsDoryFr]) {
+    transcript.append_bytes(
+        b"evaluation-count",
+        &(evaluations.len() as u64).to_le_bytes(),
+    );
+    for evaluation in evaluations {
+        transcript.append_field(b"wiring-evaluation", evaluation);
+    }
+}
+
+fn opening_binding(binding: &[u8], transcript_digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher =
+        blake3::Hasher::new_derive_key("CMFD/FORGEMATRIX/BLS-DORY-WIRING-OPENING-BINDING/V1");
+    hasher.update(&(binding.len() as u64).to_le_bytes());
+    hasher.update(binding);
+    hasher.update(transcript_digest);
+    *hasher.finalize().as_bytes()
+}
+
+fn signed_values(values: &[i64]) -> Vec<BlsDoryFr> {
+    values.iter().copied().map(BlsDoryFr::from_i64).collect()
+}
+
+struct WiringSignedRowSource<'a> {
+    initial: &'a [i64],
+    inputs: &'a [i64],
+    outputs: &'a [i64],
+    cells: usize,
+    bank_elements: usize,
+    banks: usize,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+    word_scalar_count: usize,
+    word_group_len: usize,
+    signed_word_selectors: u64,
+    dictionary: Vec<BlsDoryFr>,
+    code_maximum: Option<u8>,
+}
+
+impl<'a> WiringSignedRowSource<'a> {
+    fn new(
+        statement: StructuredWiringStatement,
+        initial: &'a [i64],
+        inputs: &'a [i64],
+        outputs: &'a [i64],
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryWiringError> {
+        let cells = statement
+            .rows
+            .checked_mul(statement.cols)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let bank_elements = statement.bank_elements()?;
+        let used_slots = statement
+            .banks
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let explicit_scalars = bank_elements
+            .checked_mul(used_slots)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let logical_scalars = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        if explicit_scalars > logical_scalars {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let code_maximum = u8::try_from(statement.max_abs_activation)
+            .ok()
+            .filter(|maximum| *maximum <= 127);
+        let code_dictionary = code_maximum
+            .and_then(bounded_signed_dictionary)
+            .filter(|_| explicit_scalars > columns);
+        let use_codes = code_dictionary.is_some();
+        let (word_scalar_count, word_group_len, signed_word_selectors, dictionary) =
+            if let Some(dictionary) = code_dictionary {
+                (columns, columns, 1, dictionary)
+            } else {
+                (
+                    explicit_scalars,
+                    bank_elements,
+                    (1u64 << used_slots) - 1,
+                    vec![BlsDoryFr::zero()],
+                )
+            };
+        Ok(Self {
+            initial,
+            inputs,
+            outputs,
+            cells,
+            bank_elements,
+            banks: statement.banks,
+            rows,
+            columns,
+            explicit_scalars,
+            word_scalar_count,
+            word_group_len,
+            signed_word_selectors,
+            dictionary,
+            code_maximum: if use_codes { code_maximum } else { None },
+        })
+    }
+
+    fn value(&self, index: usize) -> i64 {
+        let slot = index / self.bank_elements;
+        let offset = index % self.bank_elements;
+        let value = if slot == INITIAL_SLOT {
+            if offset < self.cells {
+                self.initial.get(offset).copied()
+            } else {
+                None
+            }
+        } else if slot <= self.banks * 2 {
+            let bank = (slot - 1) / 2;
+            let bank_offset = bank * self.bank_elements + offset;
+            if slot.is_multiple_of(2) {
+                self.outputs.get(bank_offset).copied()
+            } else {
+                self.inputs.get(bank_offset).copied()
+            }
+        } else {
+            None
+        };
+        value.unwrap_or(0)
+    }
+
+    fn scalar(&self, index: usize) -> BlsDoryFr {
+        BlsDoryFr::from_i64(self.value(index))
+    }
+}
+
+impl BlsDoryCompactRowSource for WiringSignedRowSource<'_> {
+    type Error = BlsDoryWiringError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.word_scalar_count
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.word_group_len
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        self.signed_word_selectors
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index * self.columns;
+        for (column, word) in output.iter_mut().enumerate() {
+            *word = u64::from_le_bytes(self.value(start + column).to_le_bytes());
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let maximum = self
+            .code_maximum
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, code) in output.iter_mut().enumerate() {
+            *code = bounded_signed_code(self.value(start + column), maximum).ok_or(
+                BlsDoryWiringError::Structured(StructuredWiringError::ValueOutOfRange),
+            )?;
+        }
+        Ok(output.len())
+    }
+}
+
+impl BlsDoryRowSource for WiringSignedRowSource<'_> {
+    type Error = std::convert::Infallible;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        let start = row_index * self.columns;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            *scalar = self.scalar(start + column);
+        }
+        Ok(output.len())
+    }
+}
+
+struct WiringExecutionAccumulatorReader<'a> {
+    artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+    context: BlsDoryExecutionAccumulatorArtifactContext,
+    cached_column: Option<BlsDoryExecutionAccumulatorColumn>,
+    cached_start: usize,
+    cached_len: usize,
+    cache: Vec<i32>,
+}
+
+impl<'a> WiringExecutionAccumulatorReader<'a> {
+    fn new(
+        artifact: &'a mut BlsDoryExecutionAccumulatorArtifact,
+        expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+    ) -> Result<Self, BlsDoryWiringError> {
+        if artifact.context() != expected_context {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        let mut cache = Vec::new();
+        cache
+            .try_reserve_exact(expected_context.authentication_chunk_cells())
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        cache.resize(expected_context.authentication_chunk_cells(), 0);
+        Ok(Self {
+            artifact,
+            context: expected_context,
+            cached_column: None,
+            cached_start: 0,
+            cached_len: 0,
+            cache,
+        })
+    }
+
+    fn accumulator(
+        &mut self,
+        column: BlsDoryExecutionAccumulatorColumn,
+        cell: usize,
+    ) -> Result<i64, BlsDoryWiringError> {
+        if cell >= self.context.cells_per_column() {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        let chunk_cells = self.context.authentication_chunk_cells();
+        let chunk_start = cell / chunk_cells * chunk_cells;
+        let chunk_len = self
+            .context
+            .cells_per_column()
+            .checked_sub(chunk_start)
+            .map(|remaining| remaining.min(chunk_cells))
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+        if self.cached_column != Some(column)
+            || self.cached_start != chunk_start
+            || self.cached_len != chunk_len
+        {
+            self.cached_column = None;
+            self.cached_start = 0;
+            self.cached_len = 0;
+            self.artifact
+                .read_column_segment(column, chunk_start, &mut self.cache[..chunk_len])
+                .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+            self.cached_column = Some(column);
+            self.cached_start = chunk_start;
+            self.cached_len = chunk_len;
+        }
+        self.cache
+            .get(cell - chunk_start)
+            .copied()
+            .map(i64::from)
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)
+    }
+}
+
+struct WiringExecutionArtifactRowSource<'artifact, 'input> {
+    statement: StructuredWiringStatement,
+    transition_statements: &'input [StructuredTransitionStatement],
+    mask_polynomials: &'input [&'input StructuredMaskPolynomial],
+    reader: WiringExecutionAccumulatorReader<'artifact>,
+    cells: usize,
+    bank_elements: usize,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+    word_scalar_count: usize,
+    word_group_len: usize,
+    signed_word_selectors: u64,
+    dictionary: Vec<BlsDoryFr>,
+    code_maximum: Option<u8>,
+}
+
+impl<'artifact, 'input> WiringExecutionArtifactRowSource<'artifact, 'input> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        statement: StructuredWiringStatement,
+        transition_statements: &'input [StructuredTransitionStatement],
+        mask_polynomials: &'input [&'input StructuredMaskPolynomial],
+        artifact: &'artifact mut BlsDoryExecutionAccumulatorArtifact,
+        expected_context: BlsDoryExecutionAccumulatorArtifactContext,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryWiringError> {
+        statement.validate_verifier_shape()?;
+        let cells = statement
+            .rows
+            .checked_mul(statement.cols)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let bank_elements = statement.bank_elements()?;
+        if artifact.context() != expected_context
+            || expected_context.canonical_rows() != statement.rows
+            || expected_context.canonical_columns() != statement.cols
+            || expected_context.cells_per_column() != cells
+            || expected_context.banks() != statement.banks
+            || expected_context.layers_per_bank() != statement.layers_per_bank
+            || transition_statements.len() != statement.banks + 1
+            || mask_polynomials.len() != transition_statements.len()
+        {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        for (index, (transition, mask)) in transition_statements
+            .iter()
+            .zip(mask_polynomials)
+            .enumerate()
+        {
+            transition
+                .validate_verifier_shape()
+                .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+            let expected_layers = if index == 0 {
+                1
+            } else {
+                statement.layers_per_bank
+            };
+            if transition.layers != expected_layers
+                || transition.rows != statement.rows
+                || transition.cols != statement.cols
+                || transition.max_abs_accumulator
+                    > u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS)
+            {
+                return Err(BlsDoryWiringError::ExecutionArtifact);
+            }
+            let challenge = expected_context.challenge_identity();
+            let expected_mask = if index == 0 {
+                StructuredMaskPolynomial::from_virtual_challenge(
+                    &challenge,
+                    statement.rows,
+                    statement.cols,
+                )
+            } else {
+                let first_layer = (index - 1)
+                    .checked_mul(statement.layers_per_bank)
+                    .and_then(|layer| u32::try_from(layer).ok())
+                    .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+                StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                    &challenge,
+                    first_layer,
+                    statement.layers_per_bank,
+                    statement.rows,
+                    statement.cols,
+                )
+            }
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+            if *mask != &expected_mask {
+                return Err(BlsDoryWiringError::ExecutionArtifact);
+            }
+            mask.validate(*transition)
+                .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        }
+        let used_slots = statement
+            .banks
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let explicit_scalars = bank_elements
+            .checked_mul(used_slots)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let logical_scalars = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        if explicit_scalars > logical_scalars {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let code_maximum = u8::try_from(statement.max_abs_activation)
+            .ok()
+            .filter(|maximum| *maximum <= 127);
+        let code_dictionary = code_maximum
+            .and_then(bounded_signed_dictionary)
+            .filter(|_| explicit_scalars > columns);
+        let use_codes = code_dictionary.is_some();
+        let (word_scalar_count, word_group_len, signed_word_selectors, dictionary) =
+            if let Some(dictionary) = code_dictionary {
+                (columns, columns, 1, dictionary)
+            } else {
+                (
+                    explicit_scalars,
+                    bank_elements,
+                    (1u64 << used_slots) - 1,
+                    vec![BlsDoryFr::zero()],
+                )
+            };
+        Ok(Self {
+            statement,
+            transition_statements,
+            mask_polynomials,
+            reader: WiringExecutionAccumulatorReader::new(artifact, expected_context)?,
+            cells,
+            bank_elements,
+            rows,
+            columns,
+            explicit_scalars,
+            word_scalar_count,
+            word_group_len,
+            signed_word_selectors,
+            dictionary,
+            code_maximum: if use_codes { code_maximum } else { None },
+        })
+    }
+
+    fn activation(
+        &mut self,
+        transition_index: usize,
+        layer: usize,
+        cell: usize,
+    ) -> Result<i64, BlsDoryWiringError> {
+        let transition = *self
+            .transition_statements
+            .get(transition_index)
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+        if layer >= transition.layers || cell >= self.cells {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        let index = layer
+            .checked_mul(self.cells)
+            .and_then(|index| index.checked_add(cell))
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+        let column = if transition_index == 0 {
+            BlsDoryExecutionAccumulatorColumn::Initialization
+        } else {
+            BlsDoryExecutionAccumulatorColumn::BankLayer {
+                bank: transition_index - 1,
+                layer,
+            }
+        };
+        let accumulator = self.reader.accumulator(column, cell)?;
+        let mask = self
+            .mask_polynomials
+            .get(transition_index)
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)?
+            .value_at_boolean_index_prevalidated(transition, index)
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        let activation =
+            derive_transition_regular_row_from_mask(transition, index, accumulator, mask)
+                .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?
+                .activation;
+        if activation.unsigned_abs() > self.statement.max_abs_activation {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        Ok(activation)
+    }
+
+    fn value(&mut self, index: usize) -> Result<i64, BlsDoryWiringError> {
+        if index >= self.explicit_scalars {
+            return Ok(0);
+        }
+        let slot = index / self.bank_elements;
+        let offset = index % self.bank_elements;
+        if slot == INITIAL_SLOT {
+            return if offset < self.cells {
+                self.activation(0, 0, offset)
+            } else {
+                Ok(0)
+            };
+        }
+        let bank = (slot - 1) / 2;
+        let layer = offset / self.cells;
+        let cell = offset % self.cells;
+        if slot.is_multiple_of(2) {
+            self.activation(bank + 1, layer, cell)
+        } else if layer > 0 {
+            self.activation(bank + 1, layer - 1, cell)
+        } else if bank > 0 {
+            self.activation(bank, self.statement.layers_per_bank - 1, cell)
+        } else {
+            self.activation(0, 0, cell)
+        }
+    }
+}
+
+impl BlsDoryCompactRowSource for WiringExecutionArtifactRowSource<'_, '_> {
+    type Error = BlsDoryWiringError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.word_scalar_count
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.word_group_len
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        self.signed_word_selectors
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        if row_index >= self.rows || output.len() != self.columns {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, word) in output.iter_mut().enumerate() {
+            *word = u64::from_le_bytes(self.value(start + column)?.to_le_bytes());
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        if row_index >= self.rows || output.len() != self.columns {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let maximum = self
+            .code_maximum
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, code) in output.iter_mut().enumerate() {
+            let index = start + column;
+            *code = if index < self.explicit_scalars {
+                bounded_signed_code(self.value(index)?, maximum)
+                    .ok_or(BlsDoryWiringError::ExecutionArtifact)?
+            } else {
+                0
+            };
+        }
+        Ok(output.len())
+    }
+}
+
+impl BlsDoryRowSource for WiringExecutionArtifactRowSource<'_, '_> {
+    type Error = BlsDoryWiringError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        if row_index >= self.rows || output.len() != self.columns {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            *scalar = BlsDoryFr::from_i64(self.value(start + column)?);
+        }
+        Ok(output.len())
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+struct DoryV3WiringExecutionAccumulatorReader<'a, 'r> {
+    reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+    cached_column: Option<BlsDoryExecutionAccumulatorColumn>,
+    cached_start: usize,
+    cached_len: usize,
+    cache: Vec<i32>,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl<'a, 'r> DoryV3WiringExecutionAccumulatorReader<'a, 'r> {
+    fn new(reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>) -> Result<Self, BlsDoryWiringError>
+    where
+        'r: 'a,
+    {
+        let mut cache = Vec::new();
+        cache
+            .try_reserve_exact(reader.authentication_chunk_cells())
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        cache.resize(reader.authentication_chunk_cells(), 0);
+        Ok(Self {
+            reader,
+            cached_column: None,
+            cached_start: 0,
+            cached_len: 0,
+            cache,
+        })
+    }
+
+    fn accumulator(
+        &mut self,
+        column: BlsDoryExecutionAccumulatorColumn,
+        cell: usize,
+    ) -> Result<i64, BlsDoryWiringError> {
+        if cell >= self.reader.cells_per_column() {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        let chunk_cells = self.reader.authentication_chunk_cells();
+        let chunk_start = cell / chunk_cells * chunk_cells;
+        let chunk_len = self
+            .reader
+            .cells_per_column()
+            .checked_sub(chunk_start)
+            .map(|remaining| remaining.min(chunk_cells))
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+        if self.cached_column != Some(column)
+            || self.cached_start != chunk_start
+            || self.cached_len != chunk_len
+        {
+            self.cached_column = None;
+            self.cached_start = 0;
+            self.cached_len = 0;
+            let read = match column {
+                BlsDoryExecutionAccumulatorColumn::Initialization => self
+                    .reader
+                    .read_initialization_segment(chunk_start, &mut self.cache[..chunk_len]),
+                BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer } => {
+                    self.reader.read_bank_layer_segment(
+                        bank,
+                        layer,
+                        chunk_start,
+                        &mut self.cache[..chunk_len],
+                    )
+                }
+            }
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+            if read != chunk_len {
+                return Err(BlsDoryWiringError::ExecutionArtifact);
+            }
+            self.cached_column = Some(column);
+            self.cached_start = chunk_start;
+            self.cached_len = chunk_len;
+        }
+        self.cache
+            .get(cell - chunk_start)
+            .copied()
+            .map(i64::from)
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+struct DoryV3WiringExecutionArtifactRowSource<'a, 'r> {
+    statement: StructuredWiringStatement,
+    initialization_statement: StructuredTransitionStatement,
+    bank_statement: StructuredTransitionStatement,
+    masks: Vec<StructuredMaskPolynomial>,
+    reader: DoryV3WiringExecutionAccumulatorReader<'a, 'r>,
+    cells: usize,
+    bank_elements: usize,
+    rows: usize,
+    columns: usize,
+    explicit_scalars: usize,
+    word_scalar_count: usize,
+    word_group_len: usize,
+    signed_word_selectors: u64,
+    dictionary: Vec<BlsDoryFr>,
+    code_maximum: Option<u8>,
+}
+
+#[cfg(feature = "whir-prototype")]
+impl<'a, 'r> DoryV3WiringExecutionArtifactRowSource<'a, 'r> {
+    fn new(
+        descriptor: DoryV3WiringDescriptor,
+        reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, BlsDoryWiringError>
+    where
+        'r: 'a,
+    {
+        let DoryV3WiringDescriptor {
+            statement,
+            initialization_statement,
+            bank_statement,
+            masks,
+        } = descriptor;
+        statement
+            .validate_verifier_shape()
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        let cells = statement
+            .rows
+            .checked_mul(statement.cols)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let bank_elements = statement.bank_elements()?;
+        if statement.rows != reader.canonical_rows()
+            || statement.cols != reader.canonical_columns()
+            || statement.banks != reader.banks()
+            || statement.layers_per_bank != reader.layers_per_bank()
+            || cells != reader.cells_per_column()
+            || initialization_statement
+                != (StructuredTransitionStatement {
+                    layers: 1,
+                    rows: statement.rows,
+                    cols: statement.cols,
+                    max_abs_accumulator: 125,
+                    max_mask: 5_000,
+                })
+            || bank_statement
+                != (StructuredTransitionStatement {
+                    layers: statement.layers_per_bank,
+                    rows: statement.rows,
+                    cols: statement.cols,
+                    max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+                    max_mask: 5_000,
+                })
+            || masks.len() != statement.banks + 1
+        {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        masks[0]
+            .validate(initialization_statement)
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        for mask in &masks[1..] {
+            mask.validate(bank_statement)
+                .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        }
+        let used_slots = statement
+            .banks
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let explicit_scalars = bank_elements
+            .checked_mul(used_slots)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let logical_scalars = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        if explicit_scalars > logical_scalars {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let code_maximum = u8::try_from(statement.max_abs_activation)
+            .ok()
+            .filter(|maximum| *maximum <= 127);
+        let code_dictionary = code_maximum
+            .and_then(bounded_signed_dictionary)
+            .filter(|_| explicit_scalars > columns);
+        let use_codes = code_dictionary.is_some();
+        let (word_scalar_count, word_group_len, signed_word_selectors, dictionary) =
+            if let Some(dictionary) = code_dictionary {
+                (columns, columns, 1, dictionary)
+            } else {
+                (
+                    explicit_scalars,
+                    bank_elements,
+                    (1u64 << used_slots) - 1,
+                    vec![BlsDoryFr::zero()],
+                )
+            };
+        Ok(Self {
+            statement,
+            initialization_statement,
+            bank_statement,
+            masks,
+            reader: DoryV3WiringExecutionAccumulatorReader::new(reader)?,
+            cells,
+            bank_elements,
+            rows,
+            columns,
+            explicit_scalars,
+            word_scalar_count,
+            word_group_len,
+            signed_word_selectors,
+            dictionary,
+            code_maximum: if use_codes { code_maximum } else { None },
+        })
+    }
+
+    fn activation(
+        &mut self,
+        transition_index: usize,
+        layer: usize,
+        cell: usize,
+    ) -> Result<i64, BlsDoryWiringError> {
+        let (transition, column) = if transition_index == 0 {
+            if layer != 0 {
+                return Err(BlsDoryWiringError::ExecutionArtifact);
+            }
+            (
+                self.initialization_statement,
+                BlsDoryExecutionAccumulatorColumn::Initialization,
+            )
+        } else {
+            let bank = transition_index
+                .checked_sub(1)
+                .filter(|bank| *bank < self.statement.banks)
+                .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+            if layer >= self.statement.layers_per_bank {
+                return Err(BlsDoryWiringError::ExecutionArtifact);
+            }
+            (
+                self.bank_statement,
+                BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
+            )
+        };
+        if cell >= self.cells {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        let index = layer
+            .checked_mul(self.cells)
+            .and_then(|index| index.checked_add(cell))
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)?;
+        let accumulator = self.reader.accumulator(column, cell)?;
+        let mask = self
+            .masks
+            .get(transition_index)
+            .ok_or(BlsDoryWiringError::ExecutionArtifact)?
+            .value_at_boolean_index_prevalidated(transition, index)
+            .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
+        let activation =
+            derive_transition_regular_row_from_mask(transition, index, accumulator, mask)
+                .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?
+                .activation;
+        if activation.unsigned_abs() > self.statement.max_abs_activation {
+            return Err(BlsDoryWiringError::ExecutionArtifact);
+        }
+        Ok(activation)
+    }
+
+    fn value(&mut self, index: usize) -> Result<i64, BlsDoryWiringError> {
+        if index >= self.explicit_scalars {
+            return Ok(0);
+        }
+        let slot = index / self.bank_elements;
+        let offset = index % self.bank_elements;
+        if slot == INITIAL_SLOT {
+            return if offset < self.cells {
+                self.activation(0, 0, offset)
+            } else {
+                Ok(0)
+            };
+        }
+        let bank = (slot - 1) / 2;
+        let layer = offset / self.cells;
+        let cell = offset % self.cells;
+        if slot.is_multiple_of(2) {
+            self.activation(bank + 1, layer, cell)
+        } else if layer > 0 {
+            self.activation(bank + 1, layer - 1, cell)
+        } else if bank > 0 {
+            self.activation(bank, self.statement.layers_per_bank - 1, cell)
+        } else {
+            self.activation(0, 0, cell)
+        }
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryCompactRowSource for DoryV3WiringExecutionArtifactRowSource<'_, '_> {
+    type Error = BlsDoryWiringError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn word_scalar_count(&self) -> usize {
+        self.word_scalar_count
+    }
+
+    fn word_group_len(&self) -> usize {
+        self.word_group_len
+    }
+
+    fn signed_word_selectors(&self) -> u64 {
+        self.signed_word_selectors
+    }
+
+    fn dictionary(&self) -> &[BlsDoryFr] {
+        &self.dictionary
+    }
+
+    fn read_word_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [u64],
+    ) -> Result<usize, Self::Error> {
+        if row_index >= self.rows || output.len() != self.columns {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, word) in output.iter_mut().enumerate() {
+            *word = u64::from_le_bytes(self.value(start + column)?.to_le_bytes());
+        }
+        Ok(output.len())
+    }
+
+    fn read_code_row(&mut self, row_index: usize, output: &mut [u8]) -> Result<usize, Self::Error> {
+        if row_index >= self.rows || output.len() != self.columns {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let maximum = self
+            .code_maximum
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, code) in output.iter_mut().enumerate() {
+            let index = start + column;
+            *code = if index < self.explicit_scalars {
+                bounded_signed_code(self.value(index)?, maximum)
+                    .ok_or(BlsDoryWiringError::ExecutionArtifact)?
+            } else {
+                0
+            };
+        }
+        Ok(output.len())
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl BlsDoryRowSource for DoryV3WiringExecutionArtifactRowSource<'_, '_> {
+    type Error = BlsDoryWiringError;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn explicit_scalar_count(&self) -> usize {
+        self.explicit_scalars
+    }
+
+    fn read_row(
+        &mut self,
+        row_index: usize,
+        output: &mut [BlsDoryFr],
+    ) -> Result<usize, Self::Error> {
+        if row_index >= self.rows || output.len() != self.columns {
+            return Err(BlsDoryWiringError::InvalidDimensions);
+        }
+        let start = row_index
+            .checked_mul(self.columns)
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        for (column, scalar) in output.iter_mut().enumerate() {
+            *scalar = BlsDoryFr::from_i64(self.value(start + column)?);
+        }
+        Ok(output.len())
+    }
+}
+
+fn bank_field_values(
+    statement: StructuredWiringStatement,
+    values: &[i64],
+) -> Result<Vec<Vec<BlsDoryFr>>, BlsDoryWiringError> {
+    let bank_elements = statement.bank_elements()?;
+    Ok(values
+        .chunks_exact(bank_elements)
+        .map(signed_values)
+        .collect())
+}
+
+fn pack_wiring_tables(
+    statement: StructuredWiringStatement,
+    initial: &[BlsDoryFr],
+    inputs: &[Vec<BlsDoryFr>],
+    outputs: &[Vec<BlsDoryFr>],
+) -> Result<Vec<BlsDoryFr>, BlsDoryWiringError> {
+    let bank_elements = statement.bank_elements()?;
+    let cells = statement
+        .rows
+        .checked_mul(statement.cols)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    if initial.len() != cells
+        || inputs.len() != statement.banks
+        || outputs.len() != statement.banks
+        || inputs.iter().any(|bank| bank.len() != bank_elements)
+        || outputs.iter().any(|bank| bank.len() != bank_elements)
+    {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    let total = bank_elements
+        .checked_mul(WIRING_SLOTS)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    let mut packed = Vec::with_capacity(total);
+    packed.extend_from_slice(initial);
+    packed.resize(bank_elements, BlsDoryFr::zero());
+    for bank in 0..statement.banks {
+        packed.extend_from_slice(&inputs[bank]);
+        packed.extend_from_slice(&outputs[bank]);
+    }
+    packed.resize(total, BlsDoryFr::zero());
+    Ok(packed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WiringEvaluations {
+    initial: BlsDoryFr,
+    output_random: Vec<BlsDoryFr>,
+    output_last: Vec<BlsDoryFr>,
+    input_shift: Vec<BlsDoryFr>,
+    input_first: Vec<BlsDoryFr>,
+}
+
+impl WiringEvaluations {
+    fn flatten(
+        &self,
+        statement: StructuredWiringStatement,
+    ) -> Result<Vec<BlsDoryFr>, BlsDoryWiringError> {
+        let layer_variables = statement.layers_per_bank.ilog2() as usize;
+        if self.output_random.len() != statement.banks
+            || self.output_last.len() != statement.banks
+            || self.input_shift.len() != statement.banks * layer_variables
+            || self.input_first.len() != statement.banks
+        {
+            return Err(BlsDoryWiringError::InvalidProofShape);
+        }
+        let mut flattened = Vec::with_capacity(wiring_evaluation_count(statement)?);
+        flattened.push(self.initial);
+        for bank in 0..statement.banks {
+            flattened.push(self.output_random[bank]);
+            flattened.push(self.output_last[bank]);
+            let start = bank * layer_variables;
+            flattened.extend_from_slice(&self.input_shift[start..start + layer_variables]);
+            flattened.push(self.input_first[bank]);
+        }
+        Ok(flattened)
+    }
+
+    fn from_flat(
+        statement: StructuredWiringStatement,
+        flattened: &[BlsDoryFr],
+    ) -> Result<Self, BlsDoryWiringError> {
+        if flattened.len() != wiring_evaluation_count(statement)? {
+            return Err(BlsDoryWiringError::InvalidProofShape);
+        }
+        let layer_variables = statement.layers_per_bank.ilog2() as usize;
+        let mut cursor = 1;
+        let mut output_random = Vec::with_capacity(statement.banks);
+        let mut output_last = Vec::with_capacity(statement.banks);
+        let mut input_shift = Vec::with_capacity(statement.banks * layer_variables);
+        let mut input_first = Vec::with_capacity(statement.banks);
+        for _ in 0..statement.banks {
+            output_random.push(flattened[cursor]);
+            output_last.push(flattened[cursor + 1]);
+            cursor += 2;
+            input_shift.extend_from_slice(&flattened[cursor..cursor + layer_variables]);
+            cursor += layer_variables;
+            input_first.push(flattened[cursor]);
+            cursor += 1;
+        }
+        Ok(Self {
+            initial: flattened[0],
+            output_random,
+            output_last,
+            input_shift,
+            input_first,
+        })
+    }
+}
+
+struct WiringPoints {
+    cell: Vec<BlsDoryFr>,
+    layer: Vec<BlsDoryFr>,
+}
+
+impl WiringPoints {
+    fn derive(statement: StructuredWiringStatement, transcript: &mut BlsDoryTranscript) -> Self {
+        Self {
+            cell: challenge_vector(
+                transcript,
+                b"cell-point",
+                statement.cell_variables() as usize,
+            ),
+            layer: challenge_vector(
+                transcript,
+                b"layer-point",
+                statement.layers_per_bank.ilog2() as usize,
+            ),
+        }
+    }
+
+    fn random_table(&self) -> Vec<BlsDoryFr> {
+        point_with_layer(&self.cell, &self.layer)
+    }
+
+    fn last_table(&self) -> Vec<BlsDoryFr> {
+        point_with_layer(&self.cell, &vec![BlsDoryFr::one(); self.layer.len()])
+    }
+
+    fn first_table(&self) -> Vec<BlsDoryFr> {
+        point_with_layer(&self.cell, &vec![BlsDoryFr::zero(); self.layer.len()])
+    }
+
+    fn input_shift(&self, trailing_ones: usize) -> Vec<BlsDoryFr> {
+        let mut layer = self.layer.clone();
+        for value in layer.iter_mut().take(trailing_ones) {
+            *value = BlsDoryFr::zero();
+        }
+        layer[trailing_ones] = BlsDoryFr::one();
+        point_with_layer(&self.cell, &layer)
+    }
+}
+
+fn compute_evaluations(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    initial: &[BlsDoryFr],
+    inputs: &[Vec<BlsDoryFr>],
+    outputs: &[Vec<BlsDoryFr>],
+) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    let random_point = points.random_table();
+    let last_point = points.last_table();
+    let first_point = points.first_table();
+    let layer_variables = points.layer.len();
+    let mut output_random = Vec::with_capacity(statement.banks);
+    let mut output_last = Vec::with_capacity(statement.banks);
+    let mut input_shift = Vec::with_capacity(statement.banks * layer_variables);
+    let mut input_first = Vec::with_capacity(statement.banks);
+    for bank in 0..statement.banks {
+        output_random.push(evaluate_mle(&outputs[bank], &random_point)?);
+        output_last.push(evaluate_mle(&outputs[bank], &last_point)?);
+        for trailing_ones in 0..layer_variables {
+            input_shift.push(evaluate_mle(
+                &inputs[bank],
+                &points.input_shift(trailing_ones),
+            )?);
+        }
+        input_first.push(evaluate_mle(&inputs[bank], &first_point)?);
+    }
+    Ok(WiringEvaluations {
+        initial: evaluate_mle(initial, &points.cell)?,
+        output_random,
+        output_last,
+        input_shift,
+        input_first,
+    })
+}
+
+fn compute_signed_evaluations(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    initial: &[i64],
+    inputs: &[i64],
+    outputs: &[i64],
+) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    let bank_elements = statement.bank_elements()?;
+    let random_point = points.random_table();
+    let last_point = points.last_table();
+    let first_point = points.first_table();
+    let layer_variables = points.layer.len();
+    let mut output_random = Vec::with_capacity(statement.banks);
+    let mut output_last = Vec::with_capacity(statement.banks);
+    let mut input_shift = Vec::with_capacity(statement.banks * layer_variables);
+    let mut input_first = Vec::with_capacity(statement.banks);
+    for bank in 0..statement.banks {
+        let start = bank * bank_elements;
+        let end = start + bank_elements;
+        let input = &inputs[start..end];
+        let output = &outputs[start..end];
+        output_random.push(evaluate_signed_mle(output, &random_point)?);
+        output_last.push(evaluate_signed_mle(output, &last_point)?);
+        for trailing_ones in 0..layer_variables {
+            input_shift.push(evaluate_signed_mle(
+                input,
+                &points.input_shift(trailing_ones),
+            )?);
+        }
+        input_first.push(evaluate_signed_mle(input, &first_point)?);
+    }
+    Ok(WiringEvaluations {
+        initial: evaluate_signed_mle(initial, &points.cell)?,
+        output_random,
+        output_last,
+        input_shift,
+        input_first,
+    })
+}
+
+trait WiringExecutionActivationSource {
+    fn wiring_statement(&self) -> StructuredWiringStatement;
+
+    fn wiring_activation(
+        &mut self,
+        transition_index: usize,
+        layer: usize,
+        cell: usize,
+    ) -> Result<i64, BlsDoryWiringError>;
+}
+
+impl WiringExecutionActivationSource for WiringExecutionArtifactRowSource<'_, '_> {
+    fn wiring_statement(&self) -> StructuredWiringStatement {
+        self.statement
+    }
+
+    fn wiring_activation(
+        &mut self,
+        transition_index: usize,
+        layer: usize,
+        cell: usize,
+    ) -> Result<i64, BlsDoryWiringError> {
+        self.activation(transition_index, layer, cell)
+    }
+}
+
+#[cfg(feature = "whir-prototype")]
+impl WiringExecutionActivationSource for DoryV3WiringExecutionArtifactRowSource<'_, '_> {
+    fn wiring_statement(&self) -> StructuredWiringStatement {
+        self.statement
+    }
+
+    fn wiring_activation(
+        &mut self,
+        transition_index: usize,
+        layer: usize,
+        cell: usize,
+    ) -> Result<i64, BlsDoryWiringError> {
+        self.activation(transition_index, layer, cell)
+    }
+}
+
+fn compute_execution_artifact_evaluations(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    source: &mut WiringExecutionArtifactRowSource<'_, '_>,
+) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    compute_execution_source_evaluations(statement, points, source)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn compute_dory_v3_execution_artifact_evaluations(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    source: &mut DoryV3WiringExecutionArtifactRowSource<'_, '_>,
+) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    compute_execution_source_evaluations(statement, points, source)
+}
+
+fn compute_execution_source_evaluations(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    source: &mut impl WiringExecutionActivationSource,
+) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    if source.wiring_statement() != statement {
+        return Err(BlsDoryWiringError::ExecutionArtifact);
+    }
+    let cells = statement
+        .rows
+        .checked_mul(statement.cols)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    let layer_variables = points.layer.len();
+    let output_layer_weights = collect_equality_weights(&points.layer, statement.layers_per_bank)?;
+    let mut input_layer_weights = Vec::with_capacity(layer_variables);
+    for trailing_ones in 0..layer_variables {
+        let point = points.input_shift(trailing_ones);
+        input_layer_weights.push(collect_equality_weights(
+            &point[points.cell.len()..],
+            statement.layers_per_bank,
+        )?);
+    }
+
+    let mut initial = BlsDoryFr::zero();
+    let mut output_random = vec![BlsDoryFr::zero(); statement.banks];
+    let mut output_last = vec![BlsDoryFr::zero(); statement.banks];
+    let mut input_shift = vec![BlsDoryFr::zero(); statement.banks * layer_variables];
+    let mut input_first = vec![BlsDoryFr::zero(); statement.banks];
+
+    let mut cell_weights = EqualityWeightIterator::new(&points.cell);
+    for cell in 0..cells {
+        let cell_weight = cell_weights
+            .next()
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        let weighted = BlsDoryFr::from_i64(source.wiring_activation(0, 0, cell)?) * cell_weight;
+        initial = initial + weighted;
+        input_first[0] = input_first[0] + weighted;
+        for (trailing_ones, layer_weights) in input_layer_weights.iter().enumerate() {
+            input_shift[trailing_ones] = input_shift[trailing_ones] + weighted * layer_weights[0];
+        }
+    }
+    if cell_weights.next().is_some() {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+
+    for bank in 0..statement.banks {
+        for (layer, output_layer_weight) in output_layer_weights.iter().copied().enumerate() {
+            let mut cell_weights = EqualityWeightIterator::new(&points.cell);
+            for cell in 0..cells {
+                let cell_weight = cell_weights
+                    .next()
+                    .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+                let weighted =
+                    BlsDoryFr::from_i64(source.wiring_activation(bank + 1, layer, cell)?)
+                        * cell_weight;
+                output_random[bank] = output_random[bank] + weighted * output_layer_weight;
+                if layer + 1 == statement.layers_per_bank {
+                    output_last[bank] = output_last[bank] + weighted;
+                }
+
+                let successor = if layer + 1 < statement.layers_per_bank {
+                    Some((bank, layer + 1))
+                } else if bank + 1 < statement.banks {
+                    Some((bank + 1, 0))
+                } else {
+                    None
+                };
+                if let Some((successor_bank, successor_layer)) = successor {
+                    if successor_layer == 0 {
+                        input_first[successor_bank] = input_first[successor_bank] + weighted;
+                    }
+                    for (trailing_ones, layer_weights) in input_layer_weights.iter().enumerate() {
+                        let index = successor_bank * layer_variables + trailing_ones;
+                        input_shift[index] =
+                            input_shift[index] + weighted * layer_weights[successor_layer];
+                    }
+                }
+            }
+            if cell_weights.next().is_some() {
+                return Err(BlsDoryWiringError::InvalidDimensions);
+            }
+        }
+    }
+    Ok(WiringEvaluations {
+        initial,
+        output_random,
+        output_last,
+        input_shift,
+        input_first,
+    })
+}
+
+fn collect_equality_weights(
+    point: &[BlsDoryFr],
+    expected: usize,
+) -> Result<Vec<BlsDoryFr>, BlsDoryWiringError> {
+    let weights = EqualityWeightIterator::new(point).collect::<Vec<_>>();
+    if weights.len() != expected {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    Ok(weights)
+}
+
+struct EqualityWeightIterator<'a> {
+    point: &'a [BlsDoryFr],
+    stack: Vec<(usize, BlsDoryFr)>,
+}
+
+impl<'a> EqualityWeightIterator<'a> {
+    fn new(point: &'a [BlsDoryFr]) -> Self {
+        Self {
+            point,
+            stack: vec![(point.len(), BlsDoryFr::one())],
+        }
+    }
+}
+
+impl Iterator for EqualityWeightIterator<'_> {
+    type Item = BlsDoryFr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((remaining, prefix)) = self.stack.pop() {
+            if remaining == 0 {
+                return Some(prefix);
+            }
+            let coordinate = self.point[remaining - 1];
+            self.stack.push((remaining - 1, prefix * coordinate));
+            self.stack
+                .push((remaining - 1, prefix * (BlsDoryFr::one() - coordinate)));
+        }
+        None
+    }
+}
+
+fn evaluate_signed_mle(
+    values: &[i64],
+    point: &[BlsDoryFr],
+) -> Result<BlsDoryFr, BlsDoryWiringError> {
+    let expected = 1usize
+        .checked_shl(point.len() as u32)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    if values.len() != expected {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    let mut weights = EqualityWeightIterator::new(point);
+    let mut evaluation = BlsDoryFr::zero();
+    for value in values {
+        let weight = weights
+            .next()
+            .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+        evaluation = evaluation + BlsDoryFr::from_i64(*value) * weight;
+    }
+    if weights.next().is_some() {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    Ok(evaluation)
+}
+
+fn verify_identities(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    evaluations: &WiringEvaluations,
+) -> Result<(), BlsDoryWiringError> {
+    let layer_variables = points.layer.len();
+    let last_selector = points
+        .layer
+        .iter()
+        .fold(BlsDoryFr::one(), |product, value| product * value);
+    for bank in 0..statement.banks {
+        let masked_output =
+            evaluations.output_random[bank] - last_selector * evaluations.output_last[bank];
+        let mut shifted_input = BlsDoryFr::zero();
+        let mut trailing_selector = BlsDoryFr::one();
+        for trailing_ones in 0..layer_variables {
+            let coefficient = trailing_selector * (BlsDoryFr::one() - points.layer[trailing_ones]);
+            shifted_input = shifted_input
+                + coefficient * evaluations.input_shift[bank * layer_variables + trailing_ones];
+            trailing_selector = trailing_selector * points.layer[trailing_ones];
+        }
+        if masked_output != shifted_input {
+            return Err(BlsDoryWiringError::WiringIdentity);
+        }
+    }
+    if evaluations.initial != evaluations.input_first[0] {
+        return Err(BlsDoryWiringError::WiringIdentity);
+    }
+    for boundary in 0..statement.banks - 1 {
+        if evaluations.output_last[boundary] != evaluations.input_first[boundary + 1] {
+            return Err(BlsDoryWiringError::WiringIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn opening_points(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    packed_variables: usize,
+) -> Result<Vec<Vec<BlsDoryFr>>, BlsDoryWiringError> {
+    validate_target_variables(packed_wiring_variables(statement)?, packed_variables)?;
+    let mut openings = Vec::with_capacity(1 + statement.banks * (points.layer.len() + 3));
+    openings.push(pad_point(
+        &packed_point(&points.first_table(), INITIAL_SLOT),
+        packed_variables,
+    )?);
+    for bank in 0..statement.banks {
+        openings.push(pad_point(
+            &packed_point(&points.random_table(), output_slot(bank)),
+            packed_variables,
+        )?);
+        openings.push(pad_point(
+            &packed_point(&points.last_table(), output_slot(bank)),
+            packed_variables,
+        )?);
+        for trailing_ones in 0..points.layer.len() {
+            openings.push(pad_point(
+                &packed_point(&points.input_shift(trailing_ones), input_slot(bank)),
+                packed_variables,
+            )?);
+        }
+        openings.push(pad_point(
+            &packed_point(&points.first_table(), input_slot(bank)),
+            packed_variables,
+        )?);
+    }
+    Ok(openings)
+}
+
+fn opening_claims(
+    commitment: BlsDoryGt,
+    points: &[Vec<BlsDoryFr>],
+    evaluations: &[BlsDoryFr],
+) -> Result<Vec<BlsDoryOpeningClaim>, BlsDoryWiringError> {
+    if points.len() != evaluations.len() {
+        return Err(BlsDoryWiringError::InvalidProofShape);
+    }
+    Ok(points
+        .iter()
+        .zip(evaluations)
+        .map(|(point, evaluation)| BlsDoryOpeningClaim {
+            commitment,
+            point: point.clone(),
+            evaluation: *evaluation,
+        })
+        .collect())
+}
+
+fn input_slot(bank: usize) -> usize {
+    1 + bank * 2
+}
+
+fn output_slot(bank: usize) -> usize {
+    2 + bank * 2
+}
+
+fn packed_point(table_point: &[BlsDoryFr], slot: usize) -> Vec<BlsDoryFr> {
+    let mut point = Vec::with_capacity(table_point.len() + BLS_DORY_WIRING_SELECTOR_VARIABLES);
+    point.extend_from_slice(table_point);
+    for bit in 0..BLS_DORY_WIRING_SELECTOR_VARIABLES {
+        point.push(if (slot >> bit) & 1 == 0 {
+            BlsDoryFr::zero()
+        } else {
+            BlsDoryFr::one()
+        });
+    }
+    point
+}
+
+fn pad_point(point: &[BlsDoryFr], variables: usize) -> Result<Vec<BlsDoryFr>, BlsDoryWiringError> {
+    if point.len() > variables {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    let mut padded = Vec::with_capacity(variables);
+    padded.extend_from_slice(point);
+    padded.resize(variables, BlsDoryFr::zero());
+    Ok(padded)
+}
+
+fn point_with_layer(cell: &[BlsDoryFr], layer: &[BlsDoryFr]) -> Vec<BlsDoryFr> {
+    let mut point = Vec::with_capacity(cell.len() + layer.len());
+    point.extend_from_slice(cell);
+    point.extend_from_slice(layer);
+    point
+}
+
+fn evaluate_mle(
+    values: &[BlsDoryFr],
+    point: &[BlsDoryFr],
+) -> Result<BlsDoryFr, BlsDoryWiringError> {
+    let expected = 1usize
+        .checked_shl(point.len() as u32)
+        .ok_or(BlsDoryWiringError::InvalidDimensions)?;
+    if values.len() != expected {
+        return Err(BlsDoryWiringError::InvalidDimensions);
+    }
+    let mut folded = values.to_vec();
+    for coordinate in point {
+        folded = folded
+            .chunks_exact(2)
+            .map(|pair| pair[0] + *coordinate * (pair[1] - pair[0]))
+            .collect();
+    }
+    folded
+        .first()
+        .copied()
+        .ok_or(BlsDoryWiringError::InvalidDimensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::{
+        dory_bls12_381_aggregate::{
+            prove_bls_dory_deferred_opening_sets, prove_bls_dory_deferred_opening_sets_with_scratch,
+        },
+        dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorArtifactWriter,
+        dory_bls12_381_prototype::deterministic_bls_dory_setup,
+    };
+
+    static SCRATCH_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn create() -> Self {
+            let nonce = SCRATCH_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cmfd-dory-wiring-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (StructuredWiringStatement, Vec<i64>, Vec<i64>, Vec<i64>) {
+        let statement = StructuredWiringStatement {
+            banks: 2,
+            layers_per_bank: 2,
+            rows: 2,
+            cols: 2,
+            max_abs_activation: 100,
+        };
+        let initial = vec![1, 2, 3, 4];
+        let inputs = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let outputs = vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        (statement, initial, inputs, outputs)
+    }
+
+    struct ArtifactWiringFixture {
+        statement: StructuredWiringStatement,
+        transition_statements: Vec<StructuredTransitionStatement>,
+        masks: Vec<StructuredMaskPolynomial>,
+        initial: Vec<i64>,
+        inputs: Vec<i64>,
+        outputs: Vec<i64>,
+        context: BlsDoryExecutionAccumulatorArtifactContext,
+        artifact: BlsDoryExecutionAccumulatorArtifact,
+    }
+
+    fn artifact_wiring_fixture(
+        directory: &Path,
+        setup_identity: [u8; 32],
+    ) -> ArtifactWiringFixture {
+        let statement = StructuredWiringStatement {
+            banks: 2,
+            layers_per_bank: 4,
+            rows: 2,
+            cols: 2,
+            max_abs_activation: 125,
+        };
+        let initialization_statement = StructuredTransitionStatement {
+            layers: 1,
+            rows: statement.rows,
+            cols: statement.cols,
+            max_abs_accumulator: 65_536,
+            max_mask: 5_000,
+        };
+        let bank_statement = StructuredTransitionStatement {
+            layers: statement.layers_per_bank,
+            ..initialization_statement
+        };
+        let transition_statements = vec![initialization_statement, bank_statement, bank_statement];
+        let challenge = [0x44; 32];
+        let masks = vec![
+            StructuredMaskPolynomial::from_virtual_challenge(
+                &challenge,
+                statement.rows,
+                statement.cols,
+            )
+            .unwrap(),
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                &challenge,
+                0,
+                statement.layers_per_bank,
+                statement.rows,
+                statement.cols,
+            )
+            .unwrap(),
+            StructuredMaskPolynomial::from_challenge_at_layer_offset(
+                &challenge,
+                statement.layers_per_bank as u32,
+                statement.layers_per_bank,
+                statement.rows,
+                statement.cols,
+            )
+            .unwrap(),
+        ];
+        let cells = statement.rows * statement.cols;
+        let initialization_accumulators = [-37_i32, 11, 43, -19];
+        let bank_accumulators = (0..statement.banks * statement.layers_per_bank)
+            .map(|column| {
+                (0..cells)
+                    .map(|cell| ((column * 31 + cell * 17) % 101) as i32 - 50)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for (statement, mask) in transition_statements.iter().zip(&masks) {
+            mask.validate(*statement).unwrap();
+        }
+        let initial = initialization_accumulators
+            .iter()
+            .enumerate()
+            .map(|(cell, accumulator)| {
+                let mask = masks[0]
+                    .value_at_boolean_index_prevalidated(initialization_statement, cell)
+                    .unwrap();
+                derive_transition_regular_row_from_mask(
+                    initialization_statement,
+                    cell,
+                    i64::from(*accumulator),
+                    mask,
+                )
+                .unwrap()
+                .activation
+            })
+            .collect::<Vec<_>>();
+        let mut outputs = Vec::with_capacity(statement.banks * statement.layers_per_bank * cells);
+        for bank in 0..statement.banks {
+            for layer in 0..statement.layers_per_bank {
+                let accumulators = &bank_accumulators[bank * statement.layers_per_bank + layer];
+                for (cell, accumulator) in accumulators.iter().copied().enumerate() {
+                    let index = layer * cells + cell;
+                    let mask = masks[bank + 1]
+                        .value_at_boolean_index_prevalidated(bank_statement, index)
+                        .unwrap();
+                    outputs.push(
+                        derive_transition_regular_row_from_mask(
+                            bank_statement,
+                            index,
+                            i64::from(accumulator),
+                            mask,
+                        )
+                        .unwrap()
+                        .activation,
+                    );
+                }
+            }
+        }
+        let mut inputs = Vec::with_capacity(outputs.len());
+        let mut previous = initial.clone();
+        for layer_output in outputs.chunks_exact(cells) {
+            inputs.extend_from_slice(&previous);
+            previous.clear();
+            previous.extend_from_slice(layer_output);
+        }
+
+        let context = BlsDoryExecutionAccumulatorArtifactContext::for_test(
+            [[0x11; 32], [0x22; 32], setup_identity, challenge],
+            statement.rows,
+            statement.cols,
+            statement.banks,
+            statement.layers_per_bank,
+            2,
+        )
+        .unwrap();
+        let mut writer =
+            BlsDoryExecutionAccumulatorArtifactWriter::create_new(directory, context).unwrap();
+        for chunk in initialization_accumulators.chunks_exact(context.authentication_chunk_cells())
+        {
+            writer
+                .write_column_chunk(BlsDoryExecutionAccumulatorColumn::Initialization, chunk)
+                .unwrap();
+        }
+        for bank in 0..statement.banks {
+            for layer in 0..statement.layers_per_bank {
+                let column = BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer };
+                for chunk in bank_accumulators[bank * statement.layers_per_bank + layer]
+                    .chunks_exact(context.authentication_chunk_cells())
+                {
+                    writer.write_column_chunk(column, chunk).unwrap();
+                }
+            }
+        }
+        ArtifactWiringFixture {
+            statement,
+            transition_statements,
+            masks,
+            initial,
+            inputs,
+            outputs,
+            context,
+            artifact: writer.finish().unwrap(),
+        }
+    }
+
+    #[test]
+    fn signed_streaming_source_and_evaluations_match_materialized_tables() {
+        let (statement, initial, inputs, outputs) = fixture();
+        let variables = packed_wiring_variables(statement).unwrap();
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let initial_values = signed_values(&initial);
+        let input_banks = bank_field_values(statement, &inputs).unwrap();
+        let output_banks = bank_field_values(statement, &outputs).unwrap();
+        let packed =
+            pack_wiring_tables(statement, &initial_values, &input_banks, &output_banks).unwrap();
+        let mut source =
+            WiringSignedRowSource::new(statement, &initial, &inputs, &outputs, rows, columns)
+                .unwrap();
+        let explicit = source.explicit_scalars;
+        assert_eq!(source.word_scalar_count, columns);
+        assert_eq!(source.word_group_len, columns);
+        assert_eq!(source.signed_word_selectors, 1);
+        assert_eq!(source.dictionary.len(), 201);
+        assert_eq!(source.code_maximum, Some(100));
+        let mut streamed = Vec::new();
+        let mut row = vec![BlsDoryFr::zero(); columns];
+        for row_index in 0..explicit.div_ceil(columns) {
+            source.read_row(row_index, &mut row).unwrap();
+            streamed.extend_from_slice(&row);
+        }
+        streamed.truncate(explicit);
+        assert_eq!(streamed, packed[..explicit]);
+
+        let points = WiringPoints {
+            cell: vec![BlsDoryFr::from_u64(3), BlsDoryFr::from_u64(5)],
+            layer: vec![BlsDoryFr::from_u64(7)],
+        };
+        assert_eq!(
+            compute_signed_evaluations(statement, &points, &initial, &inputs, &outputs).unwrap(),
+            compute_evaluations(
+                statement,
+                &points,
+                &initial_values,
+                &input_banks,
+                &output_banks,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_successor_wiring_is_authenticated_by_one_packed_commitment() {
+        let (statement, initial, inputs, outputs) = fixture();
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let proof = prove_bls_dory_wiring(
+            b"block-binding",
+            statement,
+            &initial,
+            &inputs,
+            &outputs,
+            &setup,
+        )
+        .unwrap();
+        verify_bls_dory_wiring(b"block-binding", statement, &proof, &setup).unwrap();
+        assert_eq!(proof.packed_variables, 6);
+        assert_eq!(proof.evaluations.len(), 9);
+        assert_eq!(proof.opening_proof.len(), 13_615);
+
+        let encoded = proof.encode(statement).unwrap();
+        assert_eq!(encoded.len(), 14_529);
+        let decoded = BlsDoryWiringProof::decode(&encoded, statement).unwrap();
+        assert_eq!(decoded, proof);
+        verify_bls_dory_wiring(b"block-binding", statement, &decoded, &setup).unwrap();
+    }
+
+    #[test]
+    fn bounded_dictionary_scratch_source_preserves_exact_opening_proof() {
+        let (statement, initial, inputs, outputs) = fixture();
+        let variables = packed_wiring_variables(statement).unwrap();
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let dense = prove_bls_dory_wiring_deferred_at_variables(
+            b"signed-word-wiring",
+            statement,
+            &initial,
+            &inputs,
+            &outputs,
+            variables,
+            &setup,
+        )
+        .unwrap();
+        let scratch_directory = ScratchDirectory::create();
+        let scratch = prove_bls_dory_wiring_deferred_at_variables_with_scratch(
+            b"signed-word-wiring",
+            statement,
+            &initial,
+            &inputs,
+            &outputs,
+            variables,
+            &setup,
+            &scratch_directory.0,
+        )
+        .unwrap();
+        assert_eq!(scratch.proof, dense.proof);
+        assert_eq!(scratch.openings.claims(), dense.openings.claims());
+        let aggregate_binding =
+            opening_binding(b"signed-word-wiring", &scratch.proof.transcript_digest);
+        let aggregate_layout =
+            BlsDoryAggregateLayout::new(variables / 2, variables - variables / 2).unwrap();
+        let dense_opening = prove_bls_dory_deferred_opening_sets(
+            &aggregate_binding,
+            aggregate_layout,
+            &[&dense.openings],
+            &setup,
+        )
+        .unwrap();
+        let scratch_opening = prove_bls_dory_deferred_opening_sets_with_scratch(
+            &aggregate_binding,
+            aggregate_layout,
+            &[&scratch.openings],
+            &setup,
+            &scratch_directory.0,
+        )
+        .unwrap();
+        assert_eq!(scratch_opening, dense_opening);
+        drop(scratch);
+        drop(dense);
+        assert_eq!(std::fs::read_dir(&scratch_directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn execution_artifact_source_preserves_wiring_proof_bytes_and_cleans_scratch() {
+        let setup = deterministic_bls_dory_setup(7).unwrap();
+        let artifact_directory = ScratchDirectory::create();
+        let wrong_artifact_directory = ScratchDirectory::create();
+        let materialized_directory = ScratchDirectory::create();
+        let streamed_directory = ScratchDirectory::create();
+        let mut wrong_fixture = artifact_wiring_fixture(&wrong_artifact_directory.0, [0x55; 32]);
+        let wrong_mask_refs = wrong_fixture.masks.iter().collect::<Vec<_>>();
+        let wrong_variables = packed_wiring_variables(wrong_fixture.statement).unwrap();
+        assert_eq!(
+            prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch(
+                b"execution-artifact-wiring",
+                wrong_fixture.statement,
+                &wrong_fixture.transition_statements,
+                &wrong_mask_refs,
+                &mut wrong_fixture.artifact,
+                wrong_fixture.context,
+                wrong_variables,
+                &setup,
+                &streamed_directory.0,
+            )
+            .err(),
+            Some(BlsDoryWiringError::ExecutionArtifact)
+        );
+        drop(wrong_mask_refs);
+        drop(wrong_fixture);
+        assert_eq!(
+            std::fs::read_dir(&wrong_artifact_directory.0)
+                .unwrap()
+                .count(),
+            0
+        );
+
+        let mut fixture = artifact_wiring_fixture(&artifact_directory.0, setup.identity());
+        let mask_refs = fixture.masks.iter().collect::<Vec<_>>();
+        let variables = packed_wiring_variables(fixture.statement).unwrap();
+        let binding = b"execution-artifact-wiring";
+        let wrong_bank_mask = StructuredMaskPolynomial::from_challenge_at_layer_offset(
+            &[0x45; 32],
+            0,
+            fixture.statement.layers_per_bank,
+            fixture.statement.rows,
+            fixture.statement.cols,
+        )
+        .unwrap();
+        let mut wrong_challenge_mask_refs = mask_refs.clone();
+        wrong_challenge_mask_refs[1] = &wrong_bank_mask;
+        assert_eq!(
+            prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch(
+                binding,
+                fixture.statement,
+                &fixture.transition_statements,
+                &wrong_challenge_mask_refs,
+                &mut fixture.artifact,
+                fixture.context,
+                variables,
+                &setup,
+                &streamed_directory.0,
+            )
+            .err(),
+            Some(BlsDoryWiringError::ExecutionArtifact)
+        );
+        assert_eq!(std::fs::read_dir(&streamed_directory.0).unwrap().count(), 0);
+
+        let materialized = prove_bls_dory_wiring_deferred_at_variables_with_scratch(
+            binding,
+            fixture.statement,
+            &fixture.initial,
+            &fixture.inputs,
+            &fixture.outputs,
+            variables,
+            &setup,
+            &materialized_directory.0,
+        )
+        .unwrap();
+        let streamed = prove_bls_dory_wiring_deferred_from_execution_artifact_with_scratch(
+            binding,
+            fixture.statement,
+            &fixture.transition_statements,
+            &mask_refs,
+            &mut fixture.artifact,
+            fixture.context,
+            variables,
+            &setup,
+            &streamed_directory.0,
+        )
+        .unwrap();
+
+        assert_eq!(streamed.proof, materialized.proof);
+        assert_eq!(streamed.openings.claims(), materialized.openings.claims());
+        assert_eq!(
+            streamed.openings.polynomial(0).unwrap().row_commitments(),
+            materialized
+                .openings
+                .polynomial(0)
+                .unwrap()
+                .row_commitments()
+        );
+        assert_eq!(
+            streamed.proof.encode_deferred(fixture.statement).unwrap(),
+            materialized
+                .proof
+                .encode_deferred(fixture.statement)
+                .unwrap()
+        );
+
+        let aggregate_binding = opening_binding(binding, &streamed.proof.transcript_digest);
+        let aggregate_layout =
+            BlsDoryAggregateLayout::new(variables / 2, variables - variables / 2).unwrap();
+        let materialized_opening = prove_bls_dory_deferred_opening_sets_with_scratch(
+            &aggregate_binding,
+            aggregate_layout,
+            &[&materialized.openings],
+            &setup,
+            &materialized_directory.0,
+        )
+        .unwrap();
+        let streamed_opening = prove_bls_dory_deferred_opening_sets_with_scratch(
+            &aggregate_binding,
+            aggregate_layout,
+            &[&streamed.openings],
+            &setup,
+            &streamed_directory.0,
+        )
+        .unwrap();
+        assert_eq!(streamed_opening, materialized_opening);
+
+        let mut materialized_proof = materialized.proof.clone();
+        materialized_proof.opening_proof = materialized_opening.1;
+        let mut streamed_proof = streamed.proof.clone();
+        streamed_proof.opening_proof = streamed_opening.1;
+        assert_eq!(
+            streamed_proof.encode(fixture.statement).unwrap(),
+            materialized_proof.encode(fixture.statement).unwrap()
+        );
+        verify_bls_dory_wiring_at_variables(
+            binding,
+            fixture.statement,
+            &streamed_proof,
+            variables,
+            &setup,
+        )
+        .unwrap();
+
+        drop(streamed);
+        drop(materialized);
+        drop(fixture);
+        assert_eq!(std::fs::read_dir(&streamed_directory.0).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(&materialized_directory.0)
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(std::fs::read_dir(&artifact_directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn binding_statement_commitment_evaluations_and_opening_are_bound() {
+        let (statement, initial, inputs, outputs) = fixture();
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let proof =
+            prove_bls_dory_wiring(b"binding", statement, &initial, &inputs, &outputs, &setup)
+                .unwrap();
+        assert!(verify_bls_dory_wiring(b"other", statement, &proof, &setup).is_err());
+
+        let mut changed_statement = statement;
+        changed_statement.max_abs_activation += 1;
+        assert!(verify_bls_dory_wiring(b"binding", changed_statement, &proof, &setup).is_err());
+
+        let mut commitment = proof.clone();
+        commitment.oracle_commitment = BlsDoryGt::identity();
+        assert!(verify_bls_dory_wiring(b"binding", statement, &commitment, &setup).is_err());
+
+        for index in 0..proof.evaluations.len() {
+            let mut evaluation = proof.clone();
+            evaluation.evaluations[index] = evaluation.evaluations[index] + BlsDoryFr::one();
+            assert!(
+                verify_bls_dory_wiring(b"binding", statement, &evaluation, &setup).is_err(),
+                "evaluation {index} was not bound"
+            );
+        }
+
+        let mut digest = proof.clone();
+        digest.transcript_digest[0] ^= 1;
+        assert!(verify_bls_dory_wiring(b"binding", statement, &digest, &setup).is_err());
+
+        let mut opening = proof.clone();
+        let opening_middle = opening.opening_proof.len() / 2;
+        opening.opening_proof[opening_middle] ^= 1;
+        assert!(verify_bls_dory_wiring(b"binding", statement, &opening, &setup).is_err());
+
+        let mut invalid_outputs = outputs;
+        invalid_outputs[0] += 1;
+        assert_eq!(
+            prove_bls_dory_wiring(
+                b"binding",
+                statement,
+                &initial,
+                &inputs,
+                &invalid_outputs,
+                &setup,
+            ),
+            Err(BlsDoryWiringError::Structured(
+                StructuredWiringError::WiringIdentity
+            ))
+        );
+    }
+
+    #[test]
+    fn production_geometry_and_gate_remain_explicit() {
+        let statement = production_wiring_statement();
+        assert_eq!(PRODUCTION_BLS_DORY_WIRING_VARIABLES, 26 + 3);
+        assert_eq!(wiring_evaluation_count(statement).unwrap(), 31);
+        assert_eq!(statement.soundness_error_numerator().unwrap(), 135);
+        assert_eq!(projected_production_wiring_opening_bytes().unwrap(), 62_479);
+        assert_eq!(projected_production_wiring_proof_bytes().unwrap(), 64_097);
+        assert!(projected_production_wiring_proof_bytes().unwrap() < 262_128);
+        assert_eq!(
+            require_bls_dory_wiring_production_ready(),
+            Err(BlsDoryWiringError::NotProductionReady)
+        );
+        assert_eq!(BLS_DORY_WIRING_PRODUCTION_BLOCKERS.len(), 3);
+    }
+
+    #[test]
+    fn outer_parser_rejects_shape_mutations_before_curve_decoding() {
+        let (statement, initial, inputs, outputs) = fixture();
+        let setup = deterministic_bls_dory_setup(6).unwrap();
+        let proof =
+            prove_bls_dory_wiring(b"parser", statement, &initial, &inputs, &outputs, &setup)
+                .unwrap();
+        let encoded = proof.encode(statement).unwrap();
+
+        let mut variables = encoded.clone();
+        variables[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            BlsDoryWiringProof::decode(&variables, statement),
+            Err(BlsDoryWiringError::InvalidProofShape)
+        );
+
+        let mut evaluations = encoded.clone();
+        evaluations[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            BlsDoryWiringProof::decode(&evaluations, statement),
+            Err(BlsDoryWiringError::InvalidProofShape)
+        );
+
+        let mut opening = encoded.clone();
+        opening[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            BlsDoryWiringProof::decode(&opening, statement),
+            Err(BlsDoryWiringError::InvalidProofShape)
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            BlsDoryWiringProof::decode(&trailing, statement),
+            Err(BlsDoryWiringError::InvalidProofShape)
+        );
+        assert!(BlsDoryWiringProof::decode(&encoded[..encoded.len() - 1], statement).is_err());
+        assert_eq!(
+            verify_bls_dory_wiring(
+                &vec![0; MAX_WIRING_BINDING_BYTES + 1],
+                statement,
+                &proof,
+                &setup
+            ),
+            Err(BlsDoryWiringError::PublicBindingTooLarge)
+        );
+    }
+}

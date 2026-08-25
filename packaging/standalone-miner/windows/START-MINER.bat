@@ -12,6 +12,8 @@ set "GPU_INDEXES="
 rem PAYOUT_ADDRESS is your wallet's 64-character receive address.
 set "PAYOUT_ADDRESS="
 set "BATCH_SIZE=8192"
+rem 0 automatically divides host CPU threads across the selected GPUs (maximum 16 each).
+set "WORKERS_PER_GPU=0"
 set "STATS_SECONDS=5"
 rem ================================================================
 rem GPU_INDEXES examples:
@@ -60,6 +62,7 @@ echo.
   !DEVICE_ARGS! ^
   --miner %PAYOUT_ADDRESS% ^
   --batch-size %BATCH_SIZE% ^
+  --workers-per-gpu %WORKERS_PER_GPU% ^
   --stats-seconds %STATS_SECONDS%
 
 echo.

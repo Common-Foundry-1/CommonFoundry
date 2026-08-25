@@ -84,6 +84,7 @@ describe("wallet dialog safety", () => {
     await screen.findByText("125.00");
 
     await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Send CMFD" })).toHaveFocus());
     const amount = screen.getByRole("textbox", { name: "Amount" });
     await user.click(amount);
     expect(amount).toHaveFocus();
@@ -112,6 +113,7 @@ describe("wallet dialog safety", () => {
     render(<App />);
     await screen.findByText("125.00");
     await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Send CMFD" })).toHaveFocus());
     await user.type(screen.getByRole("textbox", { name: "Recipient" }), destination);
     await user.type(screen.getByRole("textbox", { name: "Amount" }), "1");
     await user.click(screen.getByRole("button", { name: "Review transaction" }));

@@ -1,0 +1,7 @@
+candidate_magic="CFV3CP02"
+candidate_version="\x02\x00"
+empty_dory_length="\x00\x00\x00\x00"
+one_byte_dory_length="\x01\x00\x00\x00"
+maximum_payload_length="\x3b\xff\x03\x00"
+native_execution_magic="CFB3EX01"
+native_adjacency_magic="CFB3AD01"

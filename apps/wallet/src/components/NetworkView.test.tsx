@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NodeStatus } from "../types";
 import { NetworkView } from "./NetworkView";
 
@@ -20,6 +20,8 @@ const status: NodeStatus = {
   public_peer_mode: true,
   peers: [],
 };
+
+afterEach(() => cleanup());
 
 describe("NetworkView", () => {
   it("shows public P2P status without obscuring diagnostics", () => {

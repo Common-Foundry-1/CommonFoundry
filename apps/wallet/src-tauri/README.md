@@ -1,14 +1,17 @@
 # Desktop node peer configuration
 
 Common Foundry Wallet normally starts by double-clicking its shortcut. With no
-arguments, the embedded Devnet-0 node listens on `127.0.0.1:18444` and does not
-make outbound peer connections.
+arguments, the embedded Devnet-0 node listens on `127.0.0.1:18444` and connects
+to a bootstrap peer at `107.214.187.2:18444` for initial sync.
 
 Operators can start the packaged executable from a terminal and add one or more
 static peers. `--peer` is repeatable. `--p2p-bind` changes the address
 used for inbound P2P connections; it is optional and defaults to
 `127.0.0.1:18444`. Close any running wallet first: a second launch only focuses
 the existing single-instance window and cannot change that process's peer list.
+
+Additional flags: `--help`, `--version`, and `-v | -vv | -vvv` for basic
+startup verbosity logging.
 
 Windows PowerShell (replace the executable path with the installed location):
 

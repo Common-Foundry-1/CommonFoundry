@@ -1,0 +1,6 @@
+aggregate_magic="CMFDSA03"
+transition_magic="CMFDST01"
+matrix_magic="CMFDSM01"
+wiring_magic="CMFDSW01"
+protocol_v3="\x03\x00\x00\x00"
+zero_u32="\x00\x00\x00\x00"

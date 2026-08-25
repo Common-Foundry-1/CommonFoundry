@@ -26,6 +26,13 @@ proof, model-link certificate, soundness analysis, benchmarks, independent
 implementations, adversarial public testnet, and two audits are still required;
 the full gates are in [SECURITY.md](SECURITY.md).
 
+The optional `remainder-prototype` feature is a complete proof experiment for
+the tiny 2x4x4 relation, not an activated block proof. Its measured transcript
+is about 302.7 MB and takes about 123 seconds to verify, so the generic backend
+has been rejected for production use. It remains useful only for checking that
+the proposed matrix, transition, range, block, nonce, target, and output
+bindings are expressible end to end.
+
 ## What ForgeMatrix proves
 
 ForgeMatrix v1 evaluates a fixed, committed sequence of dense integer matrices.
@@ -83,10 +90,273 @@ See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
 boundary, supported architectures, wallet packaging, and tester procedure, and
 [ForgeMatrix v2 OpenCL miner](docs/opencl-miner.md) for the Intel Arc backend,
 its backend-selection variables, and its known limits.
+
+The feature-gated succinct-proof research has a separate optional CUDA backend
+for exact Goldilocks DFT/LDE work and the value-MMCS Poseidon2 first digest
+layer. CPU proving remains the default, and the accelerated entry point accepts
+only an explicit CUDA library path and device. The direct API loads native code
+in-process and is for trusted development only; every returned proof must pass
+the unchanged CPU verifier. Callers that need crash containment can instead use
+the separate proof worker, which pins the worker executable and CUDA library by
+SHA-256 and adds bounded binary IPC and process-tree termination. That path has
+been tested end to end with a 64-byte tree proof, but it is not an
+operating-system sandbox.
+
+External block admission can also run the active V2 verifier in a short-lived
+child process. The operator supplies an absolute `cmfd-node` or
+`cmfd-proof-worker` path and its SHA-256 pin through
+`--proof-verifier-worker` and `--proof-verifier-worker-sha256`; wall-time and
+memory limits are explicit. The parent accepts a result only after a canonical
+response echoes identities bound to the exact verifier parameters, block
+challenge, proof type, and proof bytes. Timeout, crash, output overflow,
+malformed response, identity substitution, and hash mismatch all fail closed.
+This mode is optional on Devnet and supports only the active V2 verifier. It
+does not activate the reserved V3 proof or replace the required production
+parser, measurements, and audit.
+
+At the 32,768-row checkpoint on an RTX 5090, an unoptimized Cargo test-profile
+CPU run took 348.28 seconds (64.503 setup, 283.416 prove; 238,698-byte canonical
+zlib payload). CUDA DFT plus Poseidon2 took 76.71 seconds (7.700 setup, 68.551
+prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. The monolithic
+Poseidon2 CUDA ABI v1 is test-profile-only: it caps a call at `2^24` rows and
+`2^31` field limbs. The production `2^27`-row LDE would require 291 GiB and
+87 GiB inputs for widths 291 and 87, plus a 4 GiB digest layer, so a
+streaming/out-of-core prover remains required.
+
+The independent `proof_stream` ABI v1 now accepts up to 64 ordered, equal-height
+physical-bit-reversed coefficient matrices, a `2^20` source height, seven added
+bits, `2^27` output rows, 4,096 total columns, and `2^31` input limbs. It emits
+monotonic power-of-two row chunks of at most `2^16` rows, without crossing a
+source-height coset block, together with exact unpadded Poseidon2 leaf digests.
+At `32,768 x 291`, `+7`, its digest-only stream phase measured 308.345 ms and
+13.60 million rows/s on an RTX 5090 while avoiding a 9.094 GiB host LDE.
+
+The worker can drain those rows into a no-overwrite sealed spill artifact whose
+ordered matrix widths and shifts, geometry, physical layout, and canonical
+little-endian limbs are BLAKE3-bound. Partial or failed artifacts are not
+published; a reader authenticates the complete file when opening it and the
+fixed-size chunks used by every later row read. This is a storage-integrity seam, not a
+consensus proof or a production prover. Production-scale Plonky3 PCS
+consumption is not yet fully out of core. See
+[the custom proof specification](docs/consensus/forgematrix-custom-proof.md)
+for the measured scope and remaining activation gates.
+
+The WHIR path also has authenticated ephemeral residual and extension-codeword
+artifacts. The production residual geometry is 24 GiB plus about 2 MiB of
+authentication metadata; the next `2^29`-row cubic extension codeword is
+exactly 48 GiB plus about 2 MiB. A fallible artifact-backed WHIR state now
+consumes those residuals, adopts disk-backed extension commitments and
+authenticated BLAKE3 openings, and streams later folding and constraint rounds
+with bounded buffers. Tested commitments, openings, transcript challenges, and
+complete proof bytes match the dense prover; storage failure poisons the
+attempt without a dense retry. The prover state now uses the
+demand-authenticated format-v2 tree, whose exact `2^29`-row artifact is
+34,359,738,592 bytes and whose openings authenticate only the requested paths
+against separately authenticated codeword rows. The legacy format-v1 store
+remains capped at `2^18` rows, while the exact reference extension encoder is
+still capped at `2^20` rows. Its current file-backed DFT would move about
+1.97 TiB at production geometry, so a blocked or GPU transform for the
+`2^29`-row extension codeword of an n=31 role still stands between this
+checkpoint and a complete proof run. The native v2 proof codec is now fixed-width and
+configuration-derived, with a canonical first-reference Merkle dictionary and
+no general-purpose compression. Its decoder enforces a tree-level,
+configuration-derived maximum on distinct authentication nodes; the inner
+codec is hard-versioned so the stricter accepted grammar is part of the WHIR
+suite identity. Ten real 13-variable explicit envelopes
+measured 188,104 through 190,024 bytes and passed the unchanged verifier, but
+the Merkle-tree geometry also gives a transcript-independent maximum of
+203,576 bytes including the outer wire header. This is one WHIR proof rather
+than the complete production aggregate. The public 16-variable and 1 MiB
+research limits therefore remain unchanged; 15- and 16-variable standalone
+envelopes are deliberately rejected because they cannot fit the network proof
+budget.
+
+The opt-in `production-whir-candidate` feature now derives a separately
+versioned verifier/parser geometry for the exact n=19 base and n=31 weight
+roles without raising those legacy limits. It pins the n=19 native
+dictionary-free floor at 133,298 bytes and the n=31 floor at 268,640 bytes.
+Because the latter already exceeds the complete 262,128-byte proof payload by
+6,512 bytes before any Merkle dictionary or outer aggregate component, n=31
+parsing fails closed before proof decoding or proof-sized allocation.
+Production therefore needs a smaller proof geometry or a different
+aggregation/compression design; increasing the wire cap is not treated as
+completion.
+
+The execution-trace candidate now pins 439 ordered semantic columns in a
+512-slot, nine-selector layout over a 26-variable local domain. Executable
+budget checks show that thirteen independent proofs have a 3,365,110-byte
+dictionary-free floor and that even selector-first opening needs 1,085,208
+bytes of first-round semantic values before Merkle paths or other messages
+(4,340,832 bytes with the ordinary local fold). A bounded
+reference commits four columns, folds the selector variables, and completes one
+CPU-verified WHIR proof while rejecting substitution, reordering, omission,
+and transcript replay. The algebraic row fold is therefore fixed; a succinct
+authenticated opening for it remains the production proof-size gate.
+
+The trace-specific parameter boundary is now executable rather than inferred.
+Goldilocks two-adicity limits the selector-first starting inverse rate to
+`2^-6`. At the required 128-bit non-conjectural unique-decoding setting, zero
+grinding needs 131 initial queries (536,576 value bytes), and even a practical
+16-bit grinding ceiling needs 115 (471,040 bytes). An otherwise empty proof can
+fit at most 63 such queries, which would require at least 67 bits of grinding.
+A CapacityBound comparison fits conservatively in 193,444 bytes with no
+grinding but relies on the pinned library's Reed-Solomon capacity/correlated-
+agreement conjecture; a JohnsonBound comparison fits in 239,616 bytes only
+with 48-bit grinding. Neither is an activation candidate. Production therefore
+still requires a non-conjectural succinct commitment rather than a parameter
+change disguised as completion.
+
+The next non-conjectural layout is now fixed in code. It keeps only the 12
+algebraic transition values in each core table (11 for initialization because
+its input is fixed), giving 47 semantic columns. An earlier four-column,
+64-row transpose was rejected after exact FRI accounting: its bank trace had
+`n=32`, so log blowup four would require an impossible `n=36` Goldilocks LDE.
+The replacement packs two range specifications into each of four rows per
+cell, using 28 digit columns and seven table-multiplicity columns. Main widths
+are 46 for initialization and 47 for a bank. Its bank trace is `n=28`; the FRI
+LDE is exactly `n=32`, within Goldilocks two-adicity. The reusable 66-column
+preprocessing plan contains selectors, lookup IDs, the fixed nibble table, and
+the exact 7 layer, 7 row, and 12 column bits; it contains no per-block mask.
+The AIR selects the challenge-derived affine coefficients from those bits and
+enforces the mask directly. Canonical rows, padding, lookup topology, source
+bounds, ordered core mapping, and V2 layout digest are tested. Actual
+production PCS roots and aggregate payload measurement are still required
+before this layout can mint a verified production trace.
+
+A test-only 128-cell batch-STARK proves that packed range handoff and the
+transition arithmetic end to end. The core mask is rederived from the
+challenge polynomial, all seven ForgeMatrix transition equations are enforced,
+eight independent LogUp buses bind each core source/slack pair, and seven
+nibble buses range-check four packed digit columns apiece against the fixed
+`0..15` table. The pinned prototype has maximum degree nine, 145 constraints,
+three quotient splits, 48 base-field lookup auxiliary openings at each local
+and next evaluation, and 128-bit computed list-decoding security at FRI log
+blowup four with 57 queries, one above the measured minimum. Its shared-pair
+LogUp challenge error is bounded below `2^-163`. The 512-row proof has a
+222,960-byte fixed-width bincode baseline; repeated best-zlib runs measured
+160,461 to 160,667 bytes, and a 165,000-byte regression ceiling is tested.
+This is not the production native codec or a production-shape size result.
+Every core column, active digit, padding, multiplicity, preprocessing, and
+degree-shape mutation is rejected.
+
+Exact production geometry also rules out ordinary batch-STARK FRI as the
+activation transport for this reduction. A valid 57-query transcript whose
+queries occupy distinct six-bit prefix buckets has a 333,792-byte lower bound
+even with globally deduplicated Merkle paths. That is already 71,664 bytes over
+the 262,128-byte native proof budget before roots, proof-of-work witnesses,
+lookup terminals, input commitment paths, or headers. The compact arithmetic
+and range reduction remains useful, but production needs a different succinct
+commitment or aggregation layer; the current FRI path cannot guarantee the
+wire cap.
+
+The feature-gated BLS12-381 Dory replacement now aggregates the production
+matrix, transition, range, wiring, fixed-model, equality-link, and final-output
+claims into a canonical n=33 frame projected at 133,409 bytes. A companion
+cross-field AIR proves that the exact activation bytes hashed by BLAKE3 have the
+same multilinear evaluation opened by Dory. Its bounded canonical zlib codec
+measured 156,500 to 156,650 bytes on the 32-byte bridge fixture, down from
+222,256 to 222,384 native bytes. The resulting cross-shape composition remains
+27,980 to 28,130 bytes over the 261,947-byte V3 structured-proof cap.
+Query/grinding and
+higher-blowup sweeps do not close that gap at an operationally acceptable cost,
+and a 56-point sweep across FRI terminal lengths zero through seven and maximum
+fold arities one through seven found a best 154,606-byte bridge at terminal
+length six and maximum fold arity two. That still composes to 288,033 bytes,
+26,086 bytes over the cap. The V3 selector therefore remains absent and
+consensus fails closed. A narrower bridge
+or different sound aggregation layer, a complete n=33 run, independent review,
+and audits remain activation gates.
+
+The next fail-closed design removes the separate FRI bridge instead of tuning
+it. It projects the exact BLAKE3 execution as a BLS/Dory sumcheck plus a
+row-indexed LogUp adjacency argument, so prover-supplied local and next rows
+cannot be unrelated. The two sumchecks expose 746 execution and 580 adjacency
+terminal evaluations. Transcript-random selector batching reduces execution to
+one Dory opening claim. Adjacency requires two because its source must be
+committed before the lookup challenge and its inverse must be committed after
+it. Composed with the existing 128 claims, the future aggregate needs 131
+claims under a proposed 256-claim bound;
+the active parser remains capped at 128. Conservative accounting projects
+36,020- and 21,748-byte component frames and places the complete V3 payload at
+191,185 bytes with 70,762 bytes of headroom. This remains a budget, not an
+activated proof. A test-only canonical translator now regenerates all 1,305
+existing BLAKE3 AIR equations as centered integer expressions and evaluates
+them over BLS12-381. A nonconstant 32-byte activation at a nonzero point
+satisfies every translated equation across all 256 rows; changing either one
+trace cell or one public point value is rejected. The largest translated
+constant is exactly `2^33`. A second test-only relation removes exactly nine
+three-limb evaluation equations, retains 1,296 translated BLAKE3 equations, and
+adds three native accumulator equations. The resulting 1,299-constraint trace
+has the projected 289 main columns and reaches the Dory-authenticated raw-byte
+evaluation; accumulator, hashed-byte, Dory-point, and final-evaluation
+mutations are rejected. The production out-of-core execution prover, adjacency
+argument, soundness analysis, end-to-end verification, and audit remain incomplete.
+
+A bounded dense execution sumcheck now mixes all 1,299 native constraints under
+Fiat-Shamir and verifies the 256-row fixture in eight degree-17 rounds with 18
+samples per round. It exposes the expected 746 terminal evaluations and rejects
+round-message and terminal-evaluation mutations. A transcript-derived random
+selector batches those values into packed Dory openings. The bounded fixture
+uses four commitments only because the prototype is capped at 16 variables:
+three hold the 578 main terminals and one holds the 168 preprocessing terminals.
+All 746 values authenticate in one four-claim Dory proof, and an opening-proof
+mutation fails. The projected production layout places main and preprocessing
+tables in separate 1,024-slot halves of one 31-variable commitment and uses one
+opening claim, but its out-of-core prover is not implemented or measured.
+
+The companion bounded adjacency fixture commits its local/next source before
+compressing each complete main row, then commits its two inverse tables after
+the lookup challenge and proves equality of the cyclic row-indexed multisets
+`(r, next[r])` and `((r - 1) mod N, local[r])`. The inverse tables
+enforce the LogUp denominators locally, while their global sum binds the
+permutation. The 256-row fixture verifies in eight degree-three rounds with four
+samples per round and exposes 580 terminal evaluations. It rejects a changed
+cell, reordered or duplicated rows, a changed wrap boundary, and altered round
+or terminal values. A 16-row, full-289-column Dory fixture packs the 578 source
+tables into one commitment and the two inverse tables into a second commitment.
+Two selector-batched opening claims authenticate all 580 terminals; source-
+commitment, terminal, and opening-proof mutations fail. Production geometry
+reuses the 31-variable execution source commitment with its half selector fixed,
+plus one 31-variable inverse commitment. Its out-of-core path and complete
+soundness bound remain open.
+
+The composed 256-row fixture now reuses the exact same three bounded main
+commitments in both sumchecks. Its single Dory aggregate has eight openings:
+four for execution, three for adjacency at its independent sumcheck point, and
+one for the inverse commitment. Three optimized repeats proved in
+8.298--8.621 seconds (8.476-second median), verified in 0.759--0.773 seconds
+(0.762-second median), and produced the same 34,015-byte aggregate opening.
+Replacing a shared source commitment, an adjacency terminal, the
+inverse commitment, or the aggregate proof is rejected. The production layout
+compresses the four bounded execution groups into the one 31-variable source
+commitment described above; this remains a projection until the out-of-core
+path is implemented. These are 256-row, 16-variable fixture measurements, not
+production extrapolations.
+
+An executable production-geometry union bound now itemizes every added
+algebraic reduction. The largest terms are 303,038,464 for row compression and
+2,097,151 for the LogUp lookup challenge; all BLAKE3 terms total 305,137,386.
+Adding the existing shared proof's 19,781,388,263 numerator gives
+20,086,525,649 over at least `2^254` nonzero scalar challenges. The resulting
+floor remains 219 algebraic bits, with 91 bits above the 128-bit requirement.
+This is not an end-to-end security claim: independent review, Dory knowledge
+soundness, the BLAKE3 Fiat-Shamir transcript, and external audit remain open.
+
+The complete tiny structured fixture now combines its arithmetic arguments, a
+split WHIR opening proof, and the exact one-block BLAKE3 argument below the
+network limit. Geometry-derived maxima are 154,252 bytes for WHIR and 87,556
+bytes for BLAKE3; with 16,804 fixed aggregate bytes, the aggregate is bounded at
+258,612 bytes. Retaining the current 193-byte V2 frame and a four-byte aggregate
+length gives a 258,809-byte full-wire ceiling, 3,335 bytes below 256 KiB. This is
+a deterministic tiny-profile bound, not a production-profile measurement.
+
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`
 launchers. Its live console reports per-GPU and rig hashrate, power, hashes per
 watt, temperature, fan, utilization, clocks, VRAM use, uptime, and work counts.
+Automatic multi-worker scheduling divides host preparation threads across the
+selected GPUs to keep more CUDA batches in flight; operators can override the
+worker count per GPU when tuning power use.
 Normal standalone mining is a thin client: the selected wallet/node supplies a
 complete payout-bound template and remains responsible for chain sync and block
 acceptance. The rig stores no separate chain database and reports a block only

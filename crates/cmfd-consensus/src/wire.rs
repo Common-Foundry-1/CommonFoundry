@@ -4,26 +4,43 @@ use thiserror::Error;
 
 use crate::{
     Block, BlockChallenge, BlockProof, CONSENSUS_SIGNATURE_BYTES, Coinbase, ForgeMatrixProof,
-    ForgeMatrixV2CompactProof, InputWitness, MAX_BLOCK_AGGREGATE_INPUTS,
-    MAX_BLOCK_AGGREGATE_OUTPUTS, MAX_BLOCK_SIGNATURE_CHECKS, MAX_BLOCK_TRANSACTIONS,
-    MAX_COINBASE_OUTPUTS, MAX_TRANSACTION_INPUTS, MAX_TRANSACTION_OUTPUTS, OutPoint, OutputLock,
-    Transaction, TxInput, TxOutput,
+    ForgeMatrixV2CompactProof, ForgeMatrixV3CandidateProof, InputWitness,
+    MAX_BLOCK_AGGREGATE_INPUTS, MAX_BLOCK_AGGREGATE_OUTPUTS, MAX_BLOCK_SIGNATURE_CHECKS,
+    MAX_BLOCK_TRANSACTIONS, MAX_COINBASE_OUTPUTS, MAX_TRANSACTION_INPUTS, MAX_TRANSACTION_OUTPUTS,
+    OutPoint, OutputLock, Transaction, TxInput, TxOutput,
 };
 
 pub const WIRE_HEADER_BYTES: usize = 16;
 pub const WIRE_VERSION: u16 = 1;
+pub const WIRE_HEADER_FIELDS: &str =
+    "magic[4],network_magic[4],version_u16le,kind_u8,reserved_zero_u8,payload_length_u32le";
 pub const TRANSACTION_KIND: u8 = 1;
 pub const FORGEMATRIX_PROOF_KIND: u8 = 2;
 pub const BLOCK_KIND: u8 = 3;
 pub const FORGEMATRIX_V1_PROOF_TAG: u8 = 1;
 pub const FORGEMATRIX_V2_PROOF_TAG: u8 = 2;
+/// Reserved, fail-closed production-candidate proof tag.
+pub const FORGEMATRIX_V3_CANDIDATE_PROOF_TAG: u8 = 3;
 
 pub const MAX_TRANSACTION_BYTES: usize = 64 * 1024;
 pub const MAX_PROOF_BYTES: usize = 256 * 1024;
 pub const MAX_BLOCK_BYTES: usize = 1024 * 1024;
 
-const FRAME_MAGIC: [u8; 4] = *b"CMFD";
-const NETWORK_MAGIC_DOMAIN: &str = "CMFD/WIRE/NETWORK-MAGIC/V1";
+pub(crate) const FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES: usize = 1 + 32 + 4 + 4 + 8 + 4 * 32;
+pub(crate) const FORGEMATRIX_V3_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub(crate) const FORGEMATRIX_V3_WIRE_PREFIX_FIELDS: &str = "v3_wire_tag_u8,network_id[32],algorithm_version_u32le,proof_version_u32le,nonce_u64le,model_manifest_digest[32],challenge_digest[32],final_activation_digest[32],work_digest[32]";
+#[cfg(feature = "dory-bls12-381-prototype")]
+pub(crate) const FORGEMATRIX_V3_WIRE_TAIL_FIELDS: &str =
+    "structured_length_u32le,structured_bytes; exact EOF";
+/// Exact V3 aggregate allowance beneath the complete 256 KiB proof-frame cap.
+pub const MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES: usize = MAX_PROOF_BYTES
+    - WIRE_HEADER_BYTES
+    - FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES
+    - FORGEMATRIX_V3_LENGTH_BYTES;
+
+pub(crate) const FRAME_MAGIC: [u8; 4] = *b"CMFD";
+pub(crate) const NETWORK_MAGIC_DOMAIN: &str = "CMFD/WIRE/NETWORK-MAGIC/V1";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {
@@ -61,6 +78,8 @@ pub enum WireError {
     SignatureLength { actual: usize },
     #[error("wire length arithmetic overflowed")]
     LengthOverflow,
+    #[error("{field} must not be empty")]
+    EmptyField { field: &'static str },
 }
 
 /// Derives the four-byte frame discriminator from all 32 bytes of a network ID.
@@ -277,6 +296,31 @@ fn encode_forgematrix_proof_payload(
             writer.bytes(&proof.final_activation_digest)?;
             writer.bytes(&proof.work_digest)?;
         }
+        BlockProof::V3Candidate(proof) => {
+            if proof.structured_proof.is_empty() {
+                return Err(WireError::EmptyField {
+                    field: "structured production proof",
+                });
+            }
+            writer.u8(FORGEMATRIX_V3_CANDIDATE_PROOF_TAG)?;
+            writer.bytes(&network_id)?;
+            writer.u32(proof.algorithm_version)?;
+            writer.u32(proof.proof_version)?;
+            writer.u64(proof.nonce)?;
+            writer.bytes(&proof.model_manifest_digest)?;
+            writer.bytes(&proof.challenge_digest)?;
+            writer.bytes(&proof.final_activation_digest)?;
+            writer.bytes(&proof.work_digest)?;
+            check_byte_length(
+                proof.structured_proof.len(),
+                MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
+                "structured production proof",
+            )?;
+            let structured_length = u32::try_from(proof.structured_proof.len())
+                .map_err(|_| WireError::LengthOverflow)?;
+            writer.u32(structured_length)?;
+            writer.bytes(&proof.structured_proof)?;
+        }
     }
     Ok(writer.finish())
 }
@@ -312,6 +356,38 @@ fn decode_forgematrix_proof_payload(
             final_activation_digest: reader.array()?,
             work_digest: reader.array()?,
         }),
+        FORGEMATRIX_V3_CANDIDATE_PROOF_TAG => {
+            let algorithm_version = reader.u32()?;
+            let proof_version = reader.u32()?;
+            let nonce = reader.u64()?;
+            let model_manifest_digest = reader.array()?;
+            let challenge_digest = reader.array()?;
+            let final_activation_digest = reader.array()?;
+            let work_digest = reader.array()?;
+            let structured_length =
+                usize::try_from(reader.u32()?).map_err(|_| WireError::LengthOverflow)?;
+            check_byte_length(
+                structured_length,
+                MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
+                "structured production proof",
+            )?;
+            let structured_proof = reader.bytes(structured_length)?.to_vec();
+            if structured_proof.is_empty() {
+                return Err(WireError::EmptyField {
+                    field: "structured production proof",
+                });
+            }
+            BlockProof::V3Candidate(Box::new(ForgeMatrixV3CandidateProof {
+                algorithm_version,
+                proof_version,
+                nonce,
+                model_manifest_digest,
+                challenge_digest,
+                final_activation_digest,
+                work_digest,
+                structured_proof,
+            }))
+        }
         tag => {
             return Err(WireError::UnknownTag {
                 field: "ForgeMatrix proof",
@@ -699,6 +775,17 @@ fn check_count(actual: usize, max: usize, field: &'static str) -> Result<(), Wir
     Ok(())
 }
 
+fn check_byte_length(actual: usize, max: usize, object: &'static str) -> Result<(), WireError> {
+    if actual > max {
+        return Err(WireError::SizeLimit {
+            object,
+            actual,
+            max,
+        });
+    }
+    Ok(())
+}
+
 fn payload_limit(maximum_frame_bytes: usize) -> usize {
     maximum_frame_bytes - WIRE_HEADER_BYTES
 }
@@ -1078,6 +1165,19 @@ mod tests {
         })
     }
 
+    fn v3_proof() -> BlockProof {
+        BlockProof::V3Candidate(Box::new(ForgeMatrixV3CandidateProof {
+            algorithm_version: 51,
+            proof_version: 52,
+            nonce: 53,
+            model_manifest_digest: [54; 32],
+            challenge_digest: [55; 32],
+            final_activation_digest: [56; 32],
+            work_digest: [57; 32],
+            structured_proof: b"CMFDSA03-canonical-candidate".to_vec(),
+        }))
+    }
+
     fn block() -> Block {
         Block {
             version: 37,
@@ -1119,6 +1219,7 @@ mod tests {
         for (proof, tag) in [
             (proof(), FORGEMATRIX_V1_PROOF_TAG),
             (v2_proof(), FORGEMATRIX_V2_PROOF_TAG),
+            (v3_proof(), FORGEMATRIX_V3_CANDIDATE_PROOF_TAG),
         ] {
             let encoded_proof = encode_forgematrix_proof(&proof, NETWORK_ID).unwrap();
             assert_header(&encoded_proof, FORGEMATRIX_PROOF_KIND, MAX_PROOF_BYTES);
@@ -1148,6 +1249,14 @@ mod tests {
         assert_eq!(
             decode_block(&encoded_v2_block, NETWORK_ID).unwrap(),
             v2_block
+        );
+
+        let mut v3_block = block();
+        v3_block.proof = v3_proof();
+        let encoded_v3_block = encode_block(&v3_block).unwrap();
+        assert_eq!(
+            decode_block(&encoded_v3_block, NETWORK_ID).unwrap(),
+            v3_block
         );
     }
 
@@ -1241,7 +1350,7 @@ mod tests {
             })
         );
 
-        for proof in [proof(), v2_proof()] {
+        for proof in [proof(), v2_proof(), v3_proof()] {
             let mut encoded_proof = encode_forgematrix_proof(&proof, NETWORK_ID).unwrap();
             encoded_proof[WIRE_HEADER_BYTES + 1] ^= 1;
             assert_eq!(
@@ -1283,14 +1392,23 @@ mod tests {
     fn proof_tags_are_explicit_and_cannot_be_substituted() {
         let v1 = encode_forgematrix_proof(&proof(), NETWORK_ID).unwrap();
         let v2 = encode_forgematrix_proof(&v2_proof(), NETWORK_ID).unwrap();
+        let v3 = encode_forgematrix_proof(&v3_proof(), NETWORK_ID).unwrap();
 
         let mut v1_as_v2 = v1.clone();
         v1_as_v2[WIRE_HEADER_BYTES] = FORGEMATRIX_V2_PROOF_TAG;
         assert!(decode_forgematrix_proof(&v1_as_v2, NETWORK_ID).is_err());
 
-        let mut v2_as_v1 = v2;
+        let mut v2_as_v1 = v2.clone();
         v2_as_v1[WIRE_HEADER_BYTES] = FORGEMATRIX_V1_PROOF_TAG;
         assert!(decode_forgematrix_proof(&v2_as_v1, NETWORK_ID).is_err());
+
+        let mut v2_as_v3 = v2;
+        v2_as_v3[WIRE_HEADER_BYTES] = FORGEMATRIX_V3_CANDIDATE_PROOF_TAG;
+        assert!(decode_forgematrix_proof(&v2_as_v3, NETWORK_ID).is_err());
+
+        let mut v3_as_v2 = v3;
+        v3_as_v2[WIRE_HEADER_BYTES] = FORGEMATRIX_V2_PROOF_TAG;
+        assert!(decode_forgematrix_proof(&v3_as_v2, NETWORK_ID).is_err());
 
         let mut unknown = v1;
         unknown[WIRE_HEADER_BYTES] = 0xff;
@@ -1301,6 +1419,99 @@ mod tests {
                 tag: 0xff,
             })
         );
+    }
+
+    #[test]
+    fn v3_candidate_frame_has_an_exact_whole_frame_cap_and_stays_fail_closed() {
+        assert_eq!(
+            WIRE_HEADER_BYTES
+                + FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES
+                + FORGEMATRIX_V3_LENGTH_BYTES
+                + MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
+            MAX_PROOF_BYTES
+        );
+
+        let BlockProof::V3Candidate(mut proof) = v3_proof() else {
+            unreachable!();
+        };
+        proof.structured_proof = vec![0x5a; MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES];
+        let encoded =
+            encode_forgematrix_proof(&BlockProof::V3Candidate(proof.clone()), NETWORK_ID).unwrap();
+        assert_eq!(encoded.len(), MAX_PROOF_BYTES);
+        assert_eq!(
+            decode_forgematrix_proof(&encoded, NETWORK_ID).unwrap(),
+            BlockProof::V3Candidate(proof.clone())
+        );
+
+        proof.structured_proof.push(0);
+        assert_eq!(
+            encode_forgematrix_proof(&BlockProof::V3Candidate(proof), NETWORK_ID),
+            Err(WireError::SizeLimit {
+                object: "structured production proof",
+                actual: MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES + 1,
+                max: MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
+            })
+        );
+
+        let BlockProof::V3Candidate(mut empty) = v3_proof() else {
+            unreachable!();
+        };
+        empty.structured_proof.clear();
+        assert_eq!(
+            encode_forgematrix_proof(&BlockProof::V3Candidate(empty), NETWORK_ID),
+            Err(WireError::EmptyField {
+                field: "structured production proof",
+            })
+        );
+
+        let encoded_candidate = encode_forgematrix_proof(&v3_proof(), NETWORK_ID).unwrap();
+        let structured_length_offset = WIRE_HEADER_BYTES + FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES;
+        let mut declared_oversized = encoded_candidate.clone();
+        declared_oversized[structured_length_offset..structured_length_offset + 4].copy_from_slice(
+            &u32::try_from(MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert_eq!(
+            decode_forgematrix_proof(&declared_oversized, NETWORK_ID),
+            Err(WireError::SizeLimit {
+                object: "structured production proof",
+                actual: MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES + 1,
+                max: MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
+            })
+        );
+
+        let mut declared_empty = encoded_candidate;
+        declared_empty[structured_length_offset..structured_length_offset + 4]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            decode_forgematrix_proof(&declared_empty, NETWORK_ID),
+            Err(WireError::EmptyField {
+                field: "structured production proof",
+            })
+        );
+
+        let verifier =
+            crate::ConsensusPowVerifier::v2_reference(crate::v2_test_reference().unwrap());
+        let wrong_network = verifier.parameters();
+        assert!(matches!(
+            wrong_network,
+            crate::PowParameters::V2Reference(_)
+        ));
+        assert!(matches!(
+            verifier.verify(
+                &BlockChallenge {
+                    network_id: NETWORK_ID,
+                    previous_block: [1; 32],
+                    transaction_root: [2; 32],
+                    height: 1,
+                    timestamp: 60,
+                    target: [0xff; 32],
+                },
+                &v3_proof(),
+            ),
+            Err(crate::PowError::WrongProofType)
+        ));
     }
 
     #[test]
@@ -1441,22 +1652,26 @@ mod tests {
             decode_transaction(bytes, NETWORK_ID).map(drop)
         });
 
-        for proof in [proof(), v2_proof()] {
+        for proof in [proof(), v2_proof(), v3_proof()] {
             let proof = encode_forgematrix_proof(&proof, NETWORK_ID).unwrap();
             assert_all_truncations(&proof, |bytes| {
                 decode_forgematrix_proof(bytes, NETWORK_ID).map(drop)
             });
         }
 
-        let block = encode_block(&block()).unwrap();
-        assert_all_truncations(&block, |bytes| decode_block(bytes, NETWORK_ID).map(drop));
-        for index in 0..block.len() {
-            let mut mutated = block.clone();
-            mutated[index] ^= 0x80;
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| decode_block(&mutated, NETWORK_ID))).is_ok(),
-                "decoder panicked after mutating byte {index}"
-            );
+        let mut v3_block = block();
+        v3_block.proof = v3_proof();
+        for block in [block(), v3_block] {
+            let block = encode_block(&block).unwrap();
+            assert_all_truncations(&block, |bytes| decode_block(bytes, NETWORK_ID).map(drop));
+            for index in 0..block.len() {
+                let mut mutated = block.clone();
+                mutated[index] ^= 0x80;
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| decode_block(&mutated, NETWORK_ID))).is_ok(),
+                    "decoder panicked after mutating byte {index}"
+                );
+            }
         }
 
         let mut state = 0x9e37_79b9_u32;

@@ -6,6 +6,15 @@ members = [
     "crates/cmfd-marketplace",
     "crates/cmfd-miner",
     "crates/cmfd-node",
+    "crates/cmfd-proof-accel",
+    "crates/cmfd-proof-worker",
+]
+exclude = [
+    "fuzz",
+    "third_party/p3-fri-0.6.3-out-of-core",
+    "third_party/p3-merkle-tree-0.6.3-gpu-first-layer",
+    "third_party/p3-whir-0.6.3-generic-initial-matrix",
+    "third_party/p3-util-0.6.3-msrv",
 ]
 resolver = "2"
 
@@ -16,7 +25,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1.0"
-blake3 = "1.8"
+blake3 = "=1.8.6"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4"
 fs2 = "0.4.3"
@@ -24,9 +33,29 @@ hex = "0.4"
 k256 = { version = "0.13", features = ["schnorr"] }
 libloading = "0.8.9"
 primitive-types = "0.13"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+rayon = "=1.12.0"
+same-file = "1.0.6"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "0.10"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+# Plonky3 0.6.3 uses slice::assume_init_ref, which stabilized after our Rust 1.88 MSRV.
+# This is the exact 0.6.3 source with only its former equivalent conversion restored.
+p3-util = { path = "third_party/p3-util-0.6.3-msrv" }
+# Plonky3 0.6.3 has no bulk first-digest-layer injection seam. This exact
+# source copy adds only a checked prover-side hook while preserving the
+# standard Merkle tree, openings, and verifier.
+p3-merkle-tree = { path = "third_party/p3-merkle-tree-0.6.3-gpu-first-layer" }
+# Plonky3 0.6.3 fixes its prover-side input LDEs to in-memory row-major
+# matrices. This exact source copy generalizes only that prover-data matrix
+# type; commitments, openings, proof encoding, and verification are unchanged.
+p3-fri = { path = "third_party/p3-fri-0.6.3-out-of-core" }
+# Plonky3 0.6.3 fixes the initial WHIR prover-data matrix to DenseMatrix.
+# This exact source copy generalizes only that internal initial matrix type;
+# the existing adapter, proof, transcript, and verifier remain unchanged.
+p3-whir = { path = "third_party/p3-whir-0.6.3-generic-initial-matrix" }

@@ -1,0 +1,35 @@
+[package]
+name = "cmfd-proof-worker"
+version = "0.1.0-devnet.11"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cmfd-consensus = { path = "../cmfd-consensus", features = ["gpu-proof-prover"] }
+cmfd-proof-accel = { path = "../cmfd-proof-accel" }
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[lib]
+name = "cmfd_proof_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cmfd-proof-worker"
+path = "src/main.rs"

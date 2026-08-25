@@ -33,7 +33,8 @@ CUDA, and OpenCL agree bit for bit.
 ## Build
 
 ```powershell
-.\scripts\build-opencl-miner.ps1
+$releaseCommit = '<full-lowercase-release-commit>'
+.\scripts\build-opencl-miner.ps1 -ExpectedCommit $releaseCommit
 ```
 
 The script configures `gpu/CMakeLists.txt` with `-DCMFD_ENABLE_CUDA=OFF`,
@@ -41,9 +42,12 @@ builds `cmfd-forgematrix-v2-opencl.dll`, runs the CPU differential canary
 against it, and prints the library's SHA-256. On Linux the equivalent is:
 
 ```bash
-cmake -S gpu -B target/gpu-opencl-build -DCMFD_ENABLE_CUDA=OFF
-cmake --build target/gpu-opencl-build --target cmfd-forgematrix-v2-opencl
+export CMFD_RELEASE_COMMIT='<full-release-commit>'
+bash scripts/build-opencl-miner.sh
 ```
+
+Both wrappers create a `.build-receipt` from the same build invocation. The
+receipt is an identity guard, not a signature or authenticated attestation.
 
 ## Selecting the backend
 

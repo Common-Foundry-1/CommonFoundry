@@ -963,10 +963,12 @@ dependencies = [
  "clap",
  "cmfd-consensus",
  "cmfd-proof-worker",
+ "ctrlc",
  "fs2",
  "getrandom 0.3.4",
  "hex",
  "k256",
+ "libc",
  "primitive-types",
  "rcgen",
  "rustls",
@@ -978,6 +980,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

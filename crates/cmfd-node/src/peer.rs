@@ -7,7 +7,8 @@
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use cmfd_consensus::{
@@ -33,6 +34,7 @@ pub const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 const HELLO_PAYLOAD_BYTES: usize = 200;
 const MIN_SESSION_HANDSHAKE_BYTES: u64 = 2 * (PEER_FRAME_HEADER_BYTES + HELLO_PAYLOAD_BYTES) as u64;
+const PEER_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub const HELLO_KIND: u8 = 1;
 pub const GET_HEADERS_KIND: u8 = 2;
@@ -316,6 +318,8 @@ pub enum PeerError {
     TotalTimeout,
     #[error("peer connection exceeded its idle timeout")]
     IdleTimeout,
+    #[error("peer connection was cancelled")]
+    Cancelled,
     #[error("peer I/O failed: {0}")]
     Io(#[source] io::Error),
     #[error("block frame is not canonical")]
@@ -1148,6 +1152,7 @@ pub struct PeerConnection {
     stream: TcpStream,
     session: PeerSession,
     deadline: Instant,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl PeerConnection {
@@ -1184,11 +1189,20 @@ impl PeerConnection {
             stream,
             session,
             deadline: Instant::now() + limits.total_timeout,
+            cancellation: None,
         })
     }
 
     pub fn session(&self) -> &PeerSession {
         &self.session
+    }
+
+    pub(crate) fn try_clone_stream(&self) -> Result<TcpStream, PeerError> {
+        self.stream.try_clone().map_err(PeerError::Io)
+    }
+
+    pub(crate) fn set_cancellation(&mut self, cancellation: Arc<AtomicBool>) {
+        self.cancellation = Some(cancellation);
     }
 
     pub fn send_hello(&mut self) -> Result<(), PeerError> {
@@ -1228,8 +1242,10 @@ impl PeerConnection {
     fn read_exact_bounded(&mut self, length: usize) -> Result<Vec<u8>, PeerError> {
         let mut bytes = vec![0_u8; length];
         let mut offset = 0;
+        let mut last_progress = Instant::now();
         while offset < length {
-            self.set_read_timeout()?;
+            self.ensure_not_cancelled()?;
+            self.set_read_timeout(last_progress)?;
             match self.stream.read(&mut bytes[offset..]) {
                 Ok(0) => {
                     return Err(PeerError::Truncated {
@@ -1237,12 +1253,19 @@ impl PeerConnection {
                         remaining: offset,
                     });
                 }
-                Ok(read) => offset += read,
+                Ok(read) => {
+                    offset += read;
+                    last_progress = Instant::now();
+                }
                 Err(error)
                     if error.kind() == io::ErrorKind::TimedOut
                         || error.kind() == io::ErrorKind::WouldBlock =>
                 {
-                    return Err(self.timeout_error());
+                    if self.cancellation.is_none() {
+                        return Err(self.timeout_error());
+                    }
+                    self.ensure_not_cancelled()?;
+                    self.ensure_io_deadlines(last_progress)?;
                 }
                 Err(error) => return Err(PeerError::Io(error)),
             }
@@ -1252,8 +1275,10 @@ impl PeerConnection {
 
     fn write_all_bounded(&mut self, bytes: &[u8]) -> Result<(), PeerError> {
         let mut offset = 0;
+        let mut last_progress = Instant::now();
         while offset < bytes.len() {
-            self.set_write_timeout()?;
+            self.ensure_not_cancelled()?;
+            self.set_write_timeout(last_progress)?;
             match self.stream.write(&bytes[offset..]) {
                 Ok(0) => {
                     return Err(PeerError::Io(io::Error::new(
@@ -1261,12 +1286,19 @@ impl PeerConnection {
                         "peer socket wrote zero bytes",
                     )));
                 }
-                Ok(written) => offset += written,
+                Ok(written) => {
+                    offset += written;
+                    last_progress = Instant::now();
+                }
                 Err(error)
                     if error.kind() == io::ErrorKind::TimedOut
                         || error.kind() == io::ErrorKind::WouldBlock =>
                 {
-                    return Err(self.timeout_error());
+                    if self.cancellation.is_none() {
+                        return Err(self.timeout_error());
+                    }
+                    self.ensure_not_cancelled()?;
+                    self.ensure_io_deadlines(last_progress)?;
                 }
                 Err(error) => return Err(PeerError::Io(error)),
             }
@@ -1274,18 +1306,54 @@ impl PeerConnection {
         Ok(())
     }
 
-    fn set_read_timeout(&self) -> Result<(), PeerError> {
-        let remaining = self.remaining_total()?;
+    fn set_read_timeout(&self, last_progress: Instant) -> Result<(), PeerError> {
+        let remaining = self.io_timeout(last_progress)?;
         self.stream
-            .set_read_timeout(Some(remaining.min(self.session.limits.idle_timeout)))
+            .set_read_timeout(Some(remaining))
             .map_err(PeerError::Io)
     }
 
-    fn set_write_timeout(&self) -> Result<(), PeerError> {
-        let remaining = self.remaining_total()?;
+    fn set_write_timeout(&self, last_progress: Instant) -> Result<(), PeerError> {
+        let remaining = self.io_timeout(last_progress)?;
         self.stream
-            .set_write_timeout(Some(remaining.min(self.session.limits.idle_timeout)))
+            .set_write_timeout(Some(remaining))
             .map_err(PeerError::Io)
+    }
+
+    fn io_timeout(&self, last_progress: Instant) -> Result<Duration, PeerError> {
+        let total = self.remaining_total()?;
+        let idle = self
+            .session
+            .limits
+            .idle_timeout
+            .checked_sub(last_progress.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(PeerError::IdleTimeout)?;
+        let bounded = total.min(idle);
+        Ok(if self.cancellation.is_some() {
+            bounded.min(PEER_CANCEL_POLL_INTERVAL)
+        } else {
+            bounded
+        })
+    }
+
+    fn ensure_io_deadlines(&self, last_progress: Instant) -> Result<(), PeerError> {
+        self.remaining_total()?;
+        if last_progress.elapsed() >= self.session.limits.idle_timeout {
+            return Err(PeerError::IdleTimeout);
+        }
+        Ok(())
+    }
+
+    fn ensure_not_cancelled(&self) -> Result<(), PeerError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            return Err(PeerError::Cancelled);
+        }
+        Ok(())
     }
 
     fn remaining_total(&self) -> Result<Duration, PeerError> {

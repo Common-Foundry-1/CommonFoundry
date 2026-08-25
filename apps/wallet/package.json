@@ -13,7 +13,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
-    "cuda:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../scripts/build-cuda-miner.ps1",
+    "cuda:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../scripts/build-cuda-miner.ps1 -ExpectedCommit %CMFD_RELEASE_COMMIT%",
     "desktop:build:cuda:windows": "npm run cuda:build:windows && tauri build --config src-tauri/tauri.cuda.windows.conf.json"
   },
   "dependencies": {

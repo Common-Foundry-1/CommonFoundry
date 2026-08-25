@@ -4,7 +4,9 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
@@ -73,6 +75,7 @@ const RPC_HEADER_LIMIT: usize = 8 * 1024;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const RPC_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const PROOF_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
 const LEGACY_DEV_WALLET_WARNING: &str = "Devnet-0 legacy wallet: this upgraded data directory retains its original demonstration key so existing test coins remain available.";
@@ -2788,22 +2791,178 @@ pub fn serve_rpc(node: Node, bind: SocketAddr) -> Result<(), NodeError> {
 
 /// Runs the bounded RPC service against a node shared with the P2P runtime.
 pub fn serve_rpc_shared(shared: Arc<Mutex<Node>>, bind: SocketAddr) -> Result<(), NodeError> {
+    spawn_rpc_server(shared, bind)?.wait()
+}
+
+/// A cancellable RPC listener. `stop` wakes the nonblocking accept loop and
+/// joins it after any already accepted, bounded request completes or times out.
+pub struct RpcServerHandle {
+    local_address: SocketAddr,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    #[cfg(test)]
+    active_request: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<(), NodeError>>>,
+}
+
+impl RpcServerHandle {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_address
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    pub fn stop(mut self) -> Result<(), NodeError> {
+        self.stop_inner()
+    }
+
+    fn wait(mut self) -> Result<(), NodeError> {
+        join_rpc_thread(self.thread.take())
+    }
+
+    fn stop_inner(&mut self) -> Result<(), NodeError> {
+        signal_rpc_stop(&self.stop)?;
+        join_rpc_thread(self.thread.take())
+    }
+}
+
+impl Drop for RpcServerHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
+    }
+}
+
+/// Starts the bounded RPC service and returns a handle that owns its listener
+/// thread. The bind remains loopback-only, including when port zero is used by
+/// an isolated test.
+pub fn spawn_rpc_server(
+    shared: Arc<Mutex<Node>>,
+    bind: SocketAddr,
+) -> Result<RpcServerHandle, NodeError> {
     if !bind.ip().is_loopback() {
         return Err(NodeError::NonLoopbackRpc(bind));
     }
     let listener = TcpListener::bind(bind)
         .map_err(|source| io_error("bind RPC listener", PathBuf::from(bind.to_string()), source))?;
-    for connection in listener.incoming() {
-        let mut stream = match connection {
-            Ok(stream) => stream,
-            Err(_) => continue,
-        };
-        if let Err(error) = handle_rpc_connection_shared(&mut stream, &shared) {
-            let response = RpcResponse::node_error(error);
-            let _ = write_rpc_response(&mut stream, response);
+    spawn_rpc_server_with_listener(shared, listener)
+}
+
+fn spawn_rpc_server_with_listener(
+    shared: Arc<Mutex<Node>>,
+    listener: TcpListener,
+) -> Result<RpcServerHandle, NodeError> {
+    let local_address = listener.local_addr().map_err(NodeError::RpcIo)?;
+    if !local_address.ip().is_loopback() {
+        return Err(NodeError::NonLoopbackRpc(local_address));
+    }
+    listener.set_nonblocking(true).map_err(NodeError::RpcIo)?;
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let active_request = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
+    let observed_active_request = Arc::clone(&active_request);
+    let thread_stop = Arc::clone(&stop);
+    let thread = thread::Builder::new()
+        .name("cmfd-rpc-listener".to_owned())
+        .spawn(move || rpc_listener_loop(shared, listener, thread_stop, active_request))
+        .map_err(NodeError::RpcIo)?;
+    Ok(RpcServerHandle {
+        local_address,
+        stop,
+        #[cfg(test)]
+        active_request: observed_active_request,
+        thread: Some(thread),
+    })
+}
+
+fn rpc_listener_loop(
+    shared: Arc<Mutex<Node>>,
+    listener: TcpListener,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    active_request: Arc<AtomicBool>,
+) -> Result<(), NodeError> {
+    loop {
+        if rpc_stopped(&stop)? {
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                // Accepted sockets can inherit the listener's nonblocking mode
+                // on some platforms. Requests retain their existing bounded,
+                // blocking read and write deadlines.
+                stream.set_nonblocking(false).map_err(NodeError::RpcIo)?;
+                let _active_request = ActiveRpcRequest::new(Arc::clone(&active_request));
+                if let Err(error) = handle_rpc_connection_shared(&mut stream, &shared) {
+                    let response = RpcResponse::node_error(error);
+                    let _ = write_rpc_response(&mut stream, response);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if wait_for_rpc_stop(&stop)? {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(NodeError::RpcIo(error)),
         }
     }
+}
+
+struct ActiveRpcRequest(Arc<AtomicBool>);
+
+impl ActiveRpcRequest {
+    fn new(active: Arc<AtomicBool>) -> Self {
+        active.store(true, Ordering::Release);
+        Self(active)
+    }
+}
+
+impl Drop for ActiveRpcRequest {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn rpc_stopped(stop: &Arc<(Mutex<bool>, Condvar)>) -> Result<bool, NodeError> {
+    stop.0
+        .lock()
+        .map(|stopped| *stopped)
+        .map_err(|_| rpc_lifecycle_error("RPC shutdown state is poisoned"))
+}
+
+fn wait_for_rpc_stop(stop: &Arc<(Mutex<bool>, Condvar)>) -> Result<bool, NodeError> {
+    let stopped = stop
+        .0
+        .lock()
+        .map_err(|_| rpc_lifecycle_error("RPC shutdown state is poisoned"))?;
+    let (stopped, _) = stop
+        .1
+        .wait_timeout_while(stopped, RPC_ACCEPT_POLL, |stopped| !*stopped)
+        .map_err(|_| rpc_lifecycle_error("RPC shutdown state is poisoned"))?;
+    Ok(*stopped)
+}
+
+fn signal_rpc_stop(stop: &Arc<(Mutex<bool>, Condvar)>) -> Result<(), NodeError> {
+    let mut stopped = stop
+        .0
+        .lock()
+        .map_err(|_| rpc_lifecycle_error("RPC shutdown state is poisoned"))?;
+    *stopped = true;
+    stop.1.notify_all();
     Ok(())
+}
+
+fn join_rpc_thread(thread: Option<JoinHandle<Result<(), NodeError>>>) -> Result<(), NodeError> {
+    let Some(thread) = thread else {
+        return Ok(());
+    };
+    thread
+        .join()
+        .map_err(|_| rpc_lifecycle_error("RPC service thread panicked"))?
+}
+
+fn rpc_lifecycle_error(message: &'static str) -> NodeError {
+    NodeError::RpcIo(io::Error::other(message))
 }
 
 fn handle_rpc_connection_shared(
@@ -3737,8 +3896,9 @@ fn log_read_error(path: &Path, source: io::Error, truncated_message: String) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::thread;
 
     use cmfd_consensus::{
@@ -3759,6 +3919,63 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove isolated test directory");
         }
+    }
+
+    #[test]
+    fn rpc_stop_wakes_idle_accept_and_finishes_an_accepted_request() {
+        let path = test_dir("rpc-graceful-stop");
+        clean_test_dir(&path);
+        let shared = Arc::new(Mutex::new(Node::open(&path).unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        // Hold the node lock so the queued request is observably active when
+        // cancellation begins. Releasing it lets that bounded request finish.
+        let node_guard = shared.lock().unwrap();
+        let server = spawn_rpc_server_with_listener(Arc::clone(&shared), listener).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !server.active_request.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(server.active_request.load(Ordering::Acquire));
+        let stop_state = Arc::clone(&server.stop);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let stopper = thread::spawn(move || stopped_tx.send(server.stop()).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !*stop_state.0.lock().unwrap() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(*stop_state.0.lock().unwrap());
+        assert!(matches!(
+            stopped_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(node_guard);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        stopped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        stopper.join().unwrap();
+        drop(client);
+
+        let rebound = TcpListener::bind(address).unwrap();
+        drop(rebound);
+        drop(shared);
+        let replayed = Node::open(&path).unwrap();
+        assert!(replayed.status().unwrap().storage_healthy);
+        drop(replayed);
+        clean_test_dir(&path);
     }
 
     #[test]

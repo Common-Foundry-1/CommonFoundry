@@ -76,20 +76,23 @@ Volta and RTX 20/30/40/50-series fat library and run the CPU/CUDA differential
 canary with:
 
 ```powershell
-.\scripts\build-cuda-miner.ps1
+$releaseCommit = '<full-lowercase-release-commit>'
+.\scripts\build-cuda-miner.ps1 -ExpectedCommit $releaseCommit
 ```
 
 Intel Arc and other OpenCL GPUs use a second backend library that speaks the
 same ABI:
 
 ```powershell
-.\scripts\build-opencl-miner.ps1
+.\scripts\build-opencl-miner.ps1 -ExpectedCommit $releaseCommit
 ```
 
 See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
 boundary, supported architectures, wallet packaging, and tester procedure, and
 [ForgeMatrix v2 OpenCL miner](docs/opencl-miner.md) for the Intel Arc backend,
 its backend-selection variables, and its known limits.
+Release builders, native build receipts, the tracked asset inventory, and their
+trust boundary are documented in [Release identity guards](docs/release-integrity.md).
 
 The feature-gated succinct-proof research has a separate optional CUDA backend
 for exact Goldilocks DFT/LDE work and the value-MMCS Poseidon2 first digest

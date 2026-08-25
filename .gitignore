@@ -8,5 +8,7 @@
 wallet.key
 *.profraw
 *.profdata
+__pycache__/
+*.py[cod]
 .idea/
 .vscode/

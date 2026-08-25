@@ -1,5 +1,8 @@
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory)]
+    [ValidatePattern('^(?:[0-9a-f]{40}|[0-9a-f]{64})$')]
+    [string]$ExpectedCommit,
     [string]$BuildDirectory,
     [string]$CudaToolkit,
     [ValidateSet('Release', 'Debug')]
@@ -11,6 +14,30 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$releaseIntegrity = Join-Path $PSScriptRoot 'release_integrity.py'
+
+function Invoke-ReleaseIntegrity {
+    param([Parameter(Mandatory)][string[]]$ToolArguments)
+
+    $python = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($python) {
+        $toolOutput = @(& $python.Source -3 $releaseIntegrity @ToolArguments 2>&1)
+    } else {
+        $python = Get-Command python3.exe -ErrorAction SilentlyContinue
+        if (-not $python) {
+            $python = Get-Command python.exe -ErrorAction SilentlyContinue
+        }
+        if (-not $python) {
+            throw 'Python 3 is required for the native build identity receipt.'
+        }
+        $toolOutput = @(& $python.Source $releaseIntegrity @ToolArguments 2>&1)
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "release-integrity failed: $($toolOutput -join [Environment]::NewLine)"
+    }
+    Write-Verbose ($toolOutput -join [Environment]::NewLine)
+}
+
 if (-not $BuildDirectory) {
     $BuildDirectory = Join-Path $projectRoot 'target\gpu-miner-build'
 }
@@ -113,8 +140,32 @@ try {
     $stream.Dispose()
 }
 $hash = -join ($digest | ForEach-Object { $_.ToString('x2') })
+$nvccVersion = ((& $nvcc --version) -join ' ').Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not capture the CUDA compiler version.'
+}
+$cmakeVersionOutput = @(& cmake --version)
+$cmakeVersionExitCode = $LASTEXITCODE
+if ($cmakeVersionExitCode -ne 0) {
+    throw 'Could not capture the CMake version.'
+}
+$cmakeVersion = (($cmakeVersionOutput | Select-Object -First 1) -join ' ').Trim()
+$receipt = "$library.build-receipt"
+Invoke-ReleaseIntegrity -ToolArguments @(
+    'receipt-write',
+    '--repo', $projectRoot,
+    '--expected-commit', $ExpectedCommit,
+    '--kind', 'cuda',
+    '--library', $library,
+    '--build-script', 'scripts/build-cuda-miner.ps1',
+    '--toolchain', "$nvccVersion; $cmakeVersion; $devCommand",
+    '--target', 'x86_64-pc-windows-msvc',
+    '--architectures', 'sm_70;sm_75;sm_86;sm_89;sm_120;compute_70',
+    '--output', $receipt
+)
 [pscustomobject]@{
     Library = $file.FullName
+    BuildReceipt = $receipt
     Bytes = $file.Length
     SHA256 = $hash
     NativeArchitectures = 'sm_70, sm_75, sm_86, sm_89, sm_120'

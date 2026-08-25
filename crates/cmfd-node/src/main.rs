@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,10 +14,12 @@ use cmfd_node::pool::{
 };
 use cmfd_node::{
     DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, DEFAULT_P2P_ADDRESS, DEFAULT_RPC_ADDRESS, Node,
-    parse_miner_destination, serve_rpc_shared, unix_time_seconds,
+    parse_miner_destination, spawn_rpc_server, unix_time_seconds,
 };
 use cmfd_proof_worker::VerifierWorkerConfig;
 use serde_json::json;
+
+const SERVICE_SUPERVISION_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -125,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             peers,
             allow_public_peers,
         } => {
+            let shutdown = install_shutdown_handler()?;
             let address_policy = peer_address_policy(allow_public_peers);
             let mut node = open_node(&cli.data_dir, verifier_worker.as_ref())?;
             node.set_public_peer_mode(allow_public_peers);
@@ -153,10 +157,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Duration::from_secs(2),
                 )?)
             };
+            let rpc = spawn_rpc_server(Arc::clone(&shared), bind)?;
+            let rpc_address = rpc.local_addr();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "rpc": bind.to_string(),
+                    "rpc": rpc_address.to_string(),
                     "p2p": p2p_address.to_string(),
                     "static_peers": peers.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     "status": status,
@@ -164,15 +170,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "warning": peer_warning(allow_public_peers)
                 }))?
             );
-            let rpc_result = serve_rpc_shared(shared, bind);
+            let service_exit = shutdown.wait_for_service_exit(|| {
+                if rpc.is_finished() {
+                    Some("RPC")
+                } else if inbound.is_finished() {
+                    Some("inbound P2P")
+                } else if poller.as_ref().is_some_and(|poller| poller.is_finished()) {
+                    Some("static-peer polling")
+                } else {
+                    None
+                }
+            })?;
+            let rpc_result = rpc.stop();
             let poll_result = match poller {
                 Some(poller) => poller.stop(),
                 None => Ok(()),
             };
             let inbound_result = inbound.stop();
+            drop(shared);
             rpc_result?;
             poll_result?;
             inbound_result?;
+            if let Some(service) = service_exit {
+                return Err(format!("{service} service exited unexpectedly").into());
+            }
             Ok(())
         }
         Command::MineOnce { miner, attempts } => {
@@ -228,6 +249,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             miner,
             share_leading_zero_bits,
         } => {
+            let shutdown = install_shutdown_handler()?;
             if share_leading_zero_bits >= 8 {
                 return Err(
                     "pool share-leading-zero-bits must be between 0 and 7 on Devnet-0".into(),
@@ -288,14 +310,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "accounting": "session-only accounting records; nonwithdrawable; not funds; not an on-chain balance or payout"
                 }))?
             );
-            // Keep all service handles alive; their Drop implementations
-            // signal their worker threads during any unwinding shutdown.
-            let _services = (pool, inbound, poller);
-            loop {
-                std::thread::park();
+            let service_exit = shutdown.wait_for_service_exit(|| {
+                if pool.is_finished() {
+                    Some("pool")
+                } else if inbound.is_finished() {
+                    Some("inbound P2P")
+                } else if poller.as_ref().is_some_and(|poller| poller.is_finished()) {
+                    Some("static-peer polling")
+                } else {
+                    None
+                }
+            })?;
+            let pool_result = pool.stop();
+            let poll_result = match poller {
+                Some(poller) => poller.stop(),
+                None => Ok(()),
+            };
+            let inbound_result = inbound.stop();
+            pool_result?;
+            poll_result?;
+            inbound_result?;
+            if let Some(service) = service_exit {
+                return Err(format!("{service} service exited unexpectedly").into());
+            }
+            Ok(())
+        }
+    }
+}
+
+struct ShutdownSignal {
+    receiver: Receiver<()>,
+}
+
+impl ShutdownSignal {
+    fn wait_for_service_exit(
+        self,
+        mut exited: impl FnMut() -> Option<&'static str>,
+    ) -> Result<Option<&'static str>, Box<dyn std::error::Error>> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(()) => return Ok(None),
+                Err(TryRecvError::Disconnected) => {
+                    return Err("shutdown signal channel disconnected".into());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            if let Some(service) = exited() {
+                return Ok(Some(service));
+            }
+            match self.receiver.recv_timeout(SERVICE_SUPERVISION_POLL) {
+                Ok(()) => return Ok(None),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("shutdown signal channel disconnected".into());
+                }
             }
         }
     }
+}
+
+fn install_shutdown_handler() -> Result<ShutdownSignal, ctrlc::Error> {
+    // A capacity of one coalesces repeated console events while the main
+    // thread is stopping and joining services. The handler performs no I/O or
+    // cleanup; it only signals the normal control flow below.
+    let (sender, receiver) = sync_channel(1);
+    ctrlc::set_handler(move || {
+        let _ = sender.try_send(());
+    })?;
+    Ok(ShutdownSignal { receiver })
 }
 
 fn verifier_worker_config(
@@ -346,5 +428,29 @@ fn peer_warning(allow_public_peers: bool) -> &'static str {
         "Public Devnet P2P enabled; node RPC remains on loopback"
     } else {
         "Common Foundry Devnet-0 testing network"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_wait_reports_an_unexpected_service_exit() {
+        let (_sender, receiver) = sync_channel(1);
+        let reason = ShutdownSignal { receiver }
+            .wait_for_service_exit(|| Some("RPC"))
+            .unwrap();
+        assert_eq!(reason, Some("RPC"));
+    }
+
+    #[test]
+    fn shutdown_signal_wins_when_service_exit_is_also_observed() {
+        let (sender, receiver) = sync_channel(1);
+        sender.send(()).unwrap();
+        let reason = ShutdownSignal { receiver }
+            .wait_for_service_exit(|| Some("RPC"))
+            .unwrap();
+        assert_eq!(reason, None);
     }
 }

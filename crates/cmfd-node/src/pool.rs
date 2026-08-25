@@ -5,16 +5,16 @@
 //! only the server-issued job identifier and a nonce; the server recomputes
 //! the exact ForgeMatrix evaluation before crediting anything.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
@@ -501,6 +501,8 @@ struct SharedServer {
     ledger: Mutex<Ledger>,
     stop: AtomicBool,
     active_connections: AtomicUsize,
+    active_sockets: Mutex<HashMap<u64, TcpStream>>,
+    next_connection_id: AtomicU64,
     next_session_id: AtomicU64,
     network_id: [u8; 32],
     consensus_fingerprint: [u8; 32],
@@ -521,6 +523,10 @@ pub struct PoolServerHandle {
 impl PoolServerHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     pub fn ledger_snapshot(&self) -> Result<PoolLedgerSnapshot, PoolError> {
@@ -544,11 +550,13 @@ impl PoolServerHandle {
 
     fn stop_inner(&mut self) -> Result<(), PoolError> {
         self.shared.stop.store(true, Ordering::Release);
-        let Some(thread) = self.thread.take() else {
-            return Ok(());
+        let socket_result = shutdown_active_connections(&self.shared);
+        let thread_result = match self.thread.take() {
+            Some(thread) => thread.join().map_err(|_| PoolError::ThreadPanicked)?,
+            None => Ok(()),
         };
-        thread.join().map_err(|_| PoolError::ThreadPanicked)??;
-        Ok(())
+        socket_result?;
+        thread_result
     }
 }
 
@@ -612,6 +620,8 @@ pub fn spawn_pool_server(
         ledger: Mutex::new(Ledger::default()),
         stop: AtomicBool::new(false),
         active_connections: AtomicUsize::new(0),
+        active_sockets: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(0),
         next_session_id: AtomicU64::new(1),
         network_id,
         consensus_fingerprint,
@@ -646,13 +656,31 @@ fn pool_listener(listener: TcpListener, shared: Arc<SharedServer>) -> Result<(),
                     drop(stream);
                     continue;
                 }
+                let shutdown_stream = match stream.try_clone() {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                };
+                let socket_guard = match register_active_connection(&shared, shutdown_stream)? {
+                    Some(guard) => guard,
+                    None => {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                };
                 shared.active_connections.fetch_add(1, Ordering::AcqRel);
                 let connection_shared = Arc::clone(&shared);
+                let connection_guard = ConnectionGuard {
+                    shared: Arc::clone(&shared),
+                    _socket: socket_guard,
+                };
                 connections.push(
                     thread::Builder::new()
                         .name("cmfd-pool-session".to_owned())
                         .spawn(move || {
-                            let _guard = ConnectionGuard(&connection_shared.active_connections);
+                            let _guard = connection_guard;
                             let _ = handle_connection(stream, Arc::clone(&connection_shared));
                         })?,
                 );
@@ -684,23 +712,76 @@ fn reap_finished_connections(connections: &mut Vec<JoinHandle<()>>) -> Result<()
     Ok(())
 }
 
-struct ConnectionGuard<'a>(&'a AtomicUsize);
+fn register_active_connection(
+    shared: &Arc<SharedServer>,
+    stream: TcpStream,
+) -> Result<Option<ActiveSocketGuard>, PoolError> {
+    let mut sockets = shared
+        .active_sockets
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    if shared.stop.load(Ordering::Acquire) {
+        let _ = stream.shutdown(Shutdown::Both);
+        return Ok(None);
+    }
+    let id = shared.next_connection_id.fetch_add(1, Ordering::AcqRel);
+    sockets.insert(id, stream);
+    Ok(Some(ActiveSocketGuard {
+        shared: Arc::clone(shared),
+        id,
+    }))
+}
 
-impl Drop for ConnectionGuard<'_> {
+fn shutdown_active_connections(shared: &SharedServer) -> Result<(), PoolError> {
+    let sockets = shared
+        .active_sockets
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    for stream in sockets.values() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    Ok(())
+}
+
+struct ActiveSocketGuard {
+    shared: Arc<SharedServer>,
+    id: u64,
+}
+
+impl Drop for ActiveSocketGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        if let Ok(mut sockets) = self.shared.active_sockets.lock() {
+            sockets.remove(&self.id);
+        }
+    }
+}
+
+struct ConnectionGuard {
+    shared: Arc<SharedServer>,
+    _socket: ActiveSocketGuard,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.shared
+            .active_connections
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(), PoolError> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(POOL_HANDSHAKE_TIMEOUT))?;
+    stream.set_read_timeout(Some(POOL_READ_TIMEOUT))?;
     stream.set_write_timeout(Some(POOL_WRITE_TIMEOUT))?;
     stream.set_nodelay(true)?;
     let connection = ServerConnection::new(Arc::clone(&shared.tls))
         .map_err(|error| PoolError::Tls(error.to_string()))?;
     let mut stream = StreamOwned::new(connection, stream);
-    let hello: ClientMessage = read_frame(&mut stream)?;
+    let hello: ClientMessage = read_frame_interruptible_until(
+        &mut stream,
+        &shared.stop,
+        Instant::now() + POOL_HANDSHAKE_TIMEOUT,
+    )?;
     let (worker, payout) = match hello {
         ClientMessage::Hello {
             protocol_version,
@@ -1612,14 +1693,30 @@ fn read_frame_interruptible<R: Read, T: DeserializeOwned>(
     reader: &mut R,
     stop: &AtomicBool,
 ) -> Result<T, PoolError> {
+    read_frame_interruptible_inner(reader, stop, None)
+}
+
+fn read_frame_interruptible_until<R: Read, T: DeserializeOwned>(
+    reader: &mut R,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> Result<T, PoolError> {
+    read_frame_interruptible_inner(reader, stop, Some(deadline))
+}
+
+fn read_frame_interruptible_inner<R: Read, T: DeserializeOwned>(
+    reader: &mut R,
+    stop: &AtomicBool,
+    deadline: Option<Instant>,
+) -> Result<T, PoolError> {
     let mut length = [0_u8; 4];
-    read_exact_interruptible(reader, &mut length, stop)?;
+    read_exact_interruptible(reader, &mut length, stop, deadline)?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > POOL_MAX_FRAME_BYTES {
         return Err(PoolError::FrameLimit);
     }
     let mut body = vec![0_u8; length];
-    read_exact_interruptible(reader, &mut body, stop)?;
+    read_exact_interruptible(reader, &mut body, stop, deadline)?;
     Ok(serde_json::from_slice(&body)?)
 }
 
@@ -1627,11 +1724,18 @@ fn read_exact_interruptible<R: Read>(
     reader: &mut R,
     output: &mut [u8],
     stop: &AtomicBool,
+    deadline: Option<Instant>,
 ) -> Result<(), PoolError> {
     let mut offset = 0;
     while offset < output.len() {
         if stop.load(Ordering::Acquire) {
             return Err(PoolError::ConnectionClosed);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(PoolError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pool handshake timed out",
+            )));
         }
         match reader.read(&mut output[offset..]) {
             Ok(0) => return Err(PoolError::ConnectionClosed),
@@ -1775,6 +1879,29 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, PoolError::CertificatePinMismatch));
         server.stop().unwrap();
+    }
+
+    #[test]
+    fn stop_interrupts_a_client_stalled_before_tls_handshake() {
+        let (server, _node, _pin) = server("stalled-pre-tls");
+        let address = server.local_addr();
+        let stream = TcpStream::connect(address).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while server.shared.active_connections.load(Ordering::Acquire) == 0
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(server.shared.active_connections.load(Ordering::Acquire), 1);
+
+        let started = std::time::Instant::now();
+        server.stop().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "pool stop waited for the normal TLS handshake deadline"
+        );
+        drop(stream);
+        TcpListener::bind(address).unwrap();
     }
 
     #[test]

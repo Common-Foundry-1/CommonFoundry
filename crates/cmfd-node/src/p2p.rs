@@ -5,10 +5,10 @@
 //! defaults to loopback/private addresses; public peers require an explicit
 //! unsafe Devnet opt-in enforced by `peer`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,6 +46,10 @@ pub enum P2pError {
     PoisonedNode,
     #[error("peer runtime stop mutex is poisoned")]
     PoisonedStop,
+    #[error("peer runtime active-socket registry is poisoned")]
+    PoisonedActiveSockets,
+    #[error("peer service is stopping")]
+    ServiceStopping,
     #[error("unexpected peer message: expected {expected}, received {actual}")]
     UnexpectedMessage {
         expected: &'static str,
@@ -224,7 +228,7 @@ pub fn sync_from_peer_once_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Result<SyncReport, P2pError> {
-    sync_from_peer_once_inner_with_policy(shared, address, limits, address_policy, None)
+    sync_from_peer_once_inner_with_policy(shared, address, limits, address_policy, None, None)
 }
 
 fn sync_from_peer_once_inner(
@@ -239,6 +243,7 @@ fn sync_from_peer_once_inner(
         limits,
         PeerAddressPolicy::PrivateOnly,
         nonce_override,
+        None,
     )
 }
 
@@ -249,6 +254,7 @@ fn sync_from_peer_once_inner_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<SyncReport, P2pError> {
     let observation_address = observed_address(PeerDirection::Outbound, address);
     record_peer_started(
@@ -262,6 +268,7 @@ fn sync_from_peer_once_inner_with_policy(
         limits,
         address_policy,
         nonce_override,
+        active_sockets,
     );
     if let Ok(report) = &result {
         record_peer_succeeded(
@@ -289,6 +296,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<SyncReport, P2pError> {
     let (hello, locator, block_preverifier) = {
         let node = lock_node(&shared)?;
@@ -302,6 +310,13 @@ fn perform_sync_from_peer_once_inner_with_policy(
 
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
+    if let Some(registry) = active_sockets {
+        connection.set_cancellation(Arc::clone(&registry.stopping));
+    }
+    let _active_socket = match active_sockets {
+        Some(registry) => Some(registry.register(connection.try_clone_stream()?)?),
+        None => None,
+    };
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
 
@@ -449,7 +464,7 @@ pub fn relay_blocks_to_peer_once_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Result<RelayReport, P2pError> {
-    relay_blocks_to_peer_once_inner_with_policy(shared, address, limits, address_policy, None)
+    relay_blocks_to_peer_once_inner_with_policy(shared, address, limits, address_policy, None, None)
 }
 
 #[tracing::instrument(skip_all, fields(peer = %address, direction = "outbound"))]
@@ -459,6 +474,7 @@ fn relay_blocks_to_peer_once_inner_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<RelayReport, P2pError> {
     let observation_address = observed_address(PeerDirection::Outbound, address);
     record_peer_started(
@@ -472,6 +488,7 @@ fn relay_blocks_to_peer_once_inner_with_policy(
         limits,
         address_policy,
         nonce_override,
+        active_sockets,
     );
     if let Ok(report) = &result {
         record_peer_succeeded(
@@ -499,6 +516,7 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<RelayReport, P2pError> {
     let hello = with_nonce(
         {
@@ -510,6 +528,13 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
     let network_id = hello.network_id;
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
+    if let Some(registry) = active_sockets {
+        connection.set_cancellation(Arc::clone(&registry.stopping));
+    }
+    let _active_socket = match active_sockets {
+        Some(registry) => Some(registry.register(connection.try_clone_stream()?)?),
+        None => None,
+    };
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
 
@@ -588,6 +613,7 @@ fn respond_to_peer_inner(
         limits,
         PeerAddressPolicy::PrivateOnly,
         nonce_override,
+        None,
     )
 }
 
@@ -597,6 +623,7 @@ fn respond_to_peer_inner_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<(), P2pError> {
     let remote_address = stream.peer_addr().map_err(P2pError::ListenerIo)?;
     let span =
@@ -611,6 +638,7 @@ fn respond_to_peer_inner_with_policy(
         address_policy,
         nonce_override,
         observation_address.clone(),
+        cancellation,
     );
     if let Err(error) = &result {
         tracing::warn!(%error, "inbound peer session ended with error");
@@ -631,6 +659,7 @@ fn perform_respond_to_peer_inner_with_policy(
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
     observation_address: String,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<(), P2pError> {
     let (hello, block_preverifier) = {
         let (hello, block_preverifier) = {
@@ -642,6 +671,9 @@ fn perform_respond_to_peer_inner_with_policy(
     let network_id = hello.network_id;
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::from_stream_with_policy(stream, session, address_policy)?;
+    if let Some(cancellation) = cancellation {
+        connection.set_cancellation(cancellation);
+    }
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
     record_peer_succeeded(
@@ -814,6 +846,7 @@ fn record_peer_ended(
 /// connection; listener failures remain visible through `stop`.
 pub struct InboundPeerHandle {
     stop: Arc<AtomicBool>,
+    active_sockets: Arc<ActiveSocketRegistry>,
     local_address: SocketAddr,
     thread: Option<JoinHandle<Result<(), P2pError>>>,
 }
@@ -823,15 +856,23 @@ impl InboundPeerHandle {
         self.local_address
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
     pub fn stop(mut self) -> Result<(), P2pError> {
         self.stop.store(true, Ordering::Release);
-        join_service_thread(self.thread.take())
+        let socket_result = self.active_sockets.stop();
+        let join_result = join_service_thread(self.thread.take());
+        socket_result?;
+        join_result
     }
 }
 
 impl Drop for InboundPeerHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let _ = self.active_sockets.stop();
     }
 }
 
@@ -888,7 +929,9 @@ fn spawn_inbound_listener_inner_with_policy(
         .map_err(P2pError::ListenerIo)?;
 
     let stop = Arc::new(AtomicBool::new(false));
+    let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
+    let thread_active_sockets = Arc::clone(&active_sockets);
     let thread = thread::Builder::new()
         .name("cmfd-peer-listener".to_owned())
         .spawn(move || {
@@ -898,12 +941,14 @@ fn spawn_inbound_listener_inner_with_policy(
                 limits,
                 address_policy,
                 thread_stop,
+                thread_active_sockets,
                 nonce_override,
             )
         })
         .map_err(P2pError::ListenerIo)?;
     Ok(InboundPeerHandle {
         stop,
+        active_sockets,
         local_address,
         thread: Some(thread),
     })
@@ -915,6 +960,7 @@ fn listener_loop(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     stop: Arc<AtomicBool>,
+    active_sockets: Arc<ActiveSocketRegistry>,
     nonce_override: Option<[u8; 32]>,
 ) -> Result<(), P2pError> {
     let active = Arc::new(AtomicUsize::new(0));
@@ -935,10 +981,39 @@ fn listener_loop(
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
+                let shutdown_stream = match stream.try_clone() {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                };
+                let socket_guard = match active_sockets.register(shutdown_stream) {
+                    Ok(guard) => guard,
+                    Err(P2pError::ServiceStopping) => {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    Err(error) => {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return Err(error);
+                    }
+                };
                 let worker_node = Arc::clone(&shared);
                 let worker_active = Arc::clone(&active);
+                let worker_stop = Arc::clone(&stop);
                 workers.push(thread::spawn(move || {
-                    let _guard = ActiveConnectionGuard(worker_active);
+                    let _guard = ActiveConnectionGuard {
+                        active: worker_active,
+                        _socket: socket_guard,
+                    };
+                    if worker_stop.load(Ordering::Acquire) {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return;
+                    }
                     // A malformed or incompatible peer closes only its own
                     // connection; it must not stop the listener. The error is
                     // already logged via tracing inside
@@ -949,6 +1024,7 @@ fn listener_loop(
                         limits,
                         address_policy,
                         nonce_override,
+                        Some(worker_stop),
                     );
                 }));
             }
@@ -983,11 +1059,65 @@ fn reserve_connection(active: &AtomicUsize, max: usize) -> bool {
     }
 }
 
-struct ActiveConnectionGuard(Arc<AtomicUsize>);
+struct ActiveConnectionGuard {
+    active: Arc<AtomicUsize>,
+    _socket: ActiveSocketGuard,
+}
 
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Default)]
+struct ActiveSocketRegistry {
+    stopping: Arc<AtomicBool>,
+    next_id: AtomicU64,
+    sockets: Mutex<HashMap<u64, TcpStream>>,
+}
+
+impl ActiveSocketRegistry {
+    fn register(self: &Arc<Self>, stream: TcpStream) -> Result<ActiveSocketGuard, P2pError> {
+        let mut sockets = self
+            .sockets
+            .lock()
+            .map_err(|_| P2pError::PoisonedActiveSockets)?;
+        if self.stopping.load(Ordering::Acquire) {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Err(P2pError::ServiceStopping);
+        }
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        sockets.insert(id, stream);
+        Ok(ActiveSocketGuard {
+            registry: Arc::clone(self),
+            id,
+        })
+    }
+
+    fn stop(&self) -> Result<(), P2pError> {
+        self.stopping.store(true, Ordering::Release);
+        let sockets = self
+            .sockets
+            .lock()
+            .map_err(|_| P2pError::PoisonedActiveSockets)?;
+        for stream in sockets.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Ok(())
+    }
+}
+
+struct ActiveSocketGuard {
+    registry: Arc<ActiveSocketRegistry>,
+    id: u64,
+}
+
+impl Drop for ActiveSocketGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sockets) = self.registry.sockets.lock() {
+            sockets.remove(&self.id);
+        }
     }
 }
 
@@ -1008,14 +1138,27 @@ fn reap_workers(workers: &mut Vec<JoinHandle<()>>) {
 /// follow that peer's tip. Failures never suppress later peers or later rounds.
 pub struct StaticPeerPollHandle {
     stop: Arc<(Mutex<bool>, Condvar)>,
+    active_sockets: Arc<ActiveSocketRegistry>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl StaticPeerPollHandle {
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
     pub fn stop(mut self) -> Result<(), P2pError> {
-        signal_poll_stop(&self.stop)?;
-        let thread = self.thread.take().ok_or(P2pError::ThreadPanicked)?;
-        thread.join().map_err(|_| P2pError::ThreadPanicked)
+        let signal_result = signal_poll_stop(&self.stop);
+        let socket_result = self.active_sockets.stop();
+        let join_result = self
+            .thread
+            .take()
+            .ok_or(P2pError::ThreadPanicked)?
+            .join()
+            .map_err(|_| P2pError::ThreadPanicked);
+        signal_result?;
+        socket_result?;
+        join_result
     }
 }
 
@@ -1025,6 +1168,7 @@ impl Drop for StaticPeerPollHandle {
             *stopped = true;
             self.stop.1.notify_all();
         }
+        let _ = self.active_sockets.stop();
     }
 }
 
@@ -1047,15 +1191,25 @@ fn spawn_static_peer_polling_inner(
         return Err(P2pError::ZeroPollInterval);
     }
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
+    let thread_active_sockets = Arc::clone(&active_sockets);
     let thread = thread::Builder::new()
         .name("cmfd-static-peer-poll".to_owned())
         .spawn(move || {
-            static_peer_poll_loop(shared, config, poll_interval, thread_stop, nonce_override)
+            static_peer_poll_loop(
+                shared,
+                config,
+                poll_interval,
+                thread_stop,
+                thread_active_sockets,
+                nonce_override,
+            )
         })
         .map_err(P2pError::ListenerIo)?;
     Ok(StaticPeerPollHandle {
         stop,
+        active_sockets,
         thread: Some(thread),
     })
 }
@@ -1065,6 +1219,7 @@ fn static_peer_poll_loop(
     config: StaticPeerConfig,
     poll_interval: Duration,
     stop: Arc<(Mutex<bool>, Condvar)>,
+    active_sockets: Arc<ActiveSocketRegistry>,
     nonce_override: Option<[u8; 32]>,
 ) {
     loop {
@@ -1083,13 +1238,18 @@ fn static_peer_poll_loop(
                 config.limits,
                 config.address_policy,
                 nonce_override,
+                Some(&active_sockets),
             );
+            if poll_stopped(&stop) {
+                return;
+            }
             let _ = relay_blocks_to_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 *peer,
                 config.limits,
                 config.address_policy,
                 nonce_override,
+                Some(&active_sockets),
             );
         }
 
@@ -1229,6 +1389,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use cmfd_consensus::{
@@ -2216,6 +2377,91 @@ mod tests {
         drop(first);
         drop(second);
         service.stop().unwrap();
+        drop(node);
+        clean_test_dir(&node_path);
+    }
+
+    #[test]
+    fn listener_stop_interrupts_a_stalled_peer_session() {
+        let node_path = test_dir("stalled-inbound-stop");
+        let node = open_shared(&node_path);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = test_limits();
+        limits.idle_timeout = Duration::from_secs(30);
+        limits.total_timeout = Duration::from_secs(60);
+        let service =
+            spawn_inbound_listener_inner(Arc::clone(&node), listener, limits, Some(SOURCE_NONCE))
+                .unwrap();
+
+        let stream = TcpStream::connect(address).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.active_sockets.sockets.lock().unwrap().is_empty() && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(service.active_sockets.sockets.lock().unwrap().len(), 1);
+
+        let started = Instant::now();
+        service.stop().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "listener stop waited for the normal peer idle deadline"
+        );
+        drop(stream);
+        TcpListener::bind(address).unwrap();
+        drop(node);
+        clean_test_dir(&node_path);
+    }
+
+    #[test]
+    fn static_poller_stop_interrupts_a_stalled_outbound_session() {
+        let node_path = test_dir("stalled-outbound-stop");
+        let node = open_shared(&node_path);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_sender, accepted_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let stalled_peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accepted_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            drop(stream);
+        });
+        let mut limits = test_limits();
+        limits.idle_timeout = Duration::from_secs(30);
+        limits.total_timeout = Duration::from_secs(60);
+        let poller = spawn_static_peer_polling_inner(
+            Arc::clone(&node),
+            StaticPeerConfig {
+                listen_address: "127.0.0.1:28446".parse().unwrap(),
+                peers: vec![address],
+                limits,
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_secs(30),
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while poller.active_sockets.sockets.lock().unwrap().is_empty() && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(poller.active_sockets.sockets.lock().unwrap().len(), 1);
+
+        let started = Instant::now();
+        poller.stop().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "static-poller stop waited for the normal peer idle deadline"
+        );
+        release_sender.send(()).unwrap();
+        stalled_peer.join().unwrap();
         drop(node);
         clean_test_dir(&node_path);
     }

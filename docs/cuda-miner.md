@@ -62,17 +62,20 @@ Requirements:
 From the repository root:
 
 ```powershell
-.\scripts\build-cuda-miner.ps1
+$releaseCommit = '<full-lowercase-release-commit>'
+.\scripts\build-cuda-miner.ps1 -ExpectedCommit $releaseCommit
 ```
 
 The script builds `target\gpu-miner-build\cmfd-forgematrix-v2-miner.dll`,
 checks for native `sm_70`, `sm_75`, `sm_86`, `sm_89`, and `sm_120` images,
 confirms the `compute_70` PTX fallback, and runs a 128-nonce CPU/CUDA
-differential test.
+differential test. It also emits an identity-only `.build-receipt`; this receipt
+detects mixed inputs but is not a signature or authenticated build attestation.
 
 To build a Windows wallet installer that bundles the library:
 
 ```powershell
+$env:CMFD_RELEASE_COMMIT = '<full-release-commit>'
 Set-Location .\apps\wallet
 npm ci
 npm run desktop:build:cuda:windows

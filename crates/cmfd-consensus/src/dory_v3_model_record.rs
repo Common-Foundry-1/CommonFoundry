@@ -474,8 +474,9 @@ mod tests {
     use std::{
         cell::Cell,
         fs::File,
-        io::{self, Cursor},
+        io::{self, Cursor, Read},
         path::PathBuf,
+        rc::Rc,
     };
 
     use dory_pcs::primitives::arithmetic::Field;
@@ -483,10 +484,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        SmallModelBankFixture, build_small_model_bank,
+        ModelFieldChunk, SmallModelBankFixture, build_small_model_bank,
         dory_bls12_381_aggregate::commit_bls_dory_polynomial,
         dory_bls12_381_prototype::{BlsDoryFr, BlsDoryGt, deterministic_bls_dory_setup},
         dory_v3_model::CanonicalBlsDoryGtHex,
+        dory_v3_model_stream::{
+            BankAuthenticatedDoryV3ModelFieldStreamError, StagedDoryV3ModelFieldSink,
+            VerifiedBankAuthenticatedDoryV3ModelReceipt,
+            verify_dory_v3_model_bank_into_staged_field_sink_for_test,
+        },
         dory_v3_suite::{
             DORY_V3_MODEL_IDENTITY_VERSION, DORY_V3_PADDED_VARIABLES,
             DORY_V3_PRODUCTION_SUITE_DIGEST,
@@ -685,6 +691,85 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    struct StreamState {
+        reads: Cell<usize>,
+        chunks: Cell<usize>,
+        drops: Cell<usize>,
+        published: Cell<bool>,
+    }
+
+    struct ReadProbe {
+        inner: Cursor<Vec<u8>>,
+        state: Rc<StreamState>,
+    }
+
+    impl Read for ReadProbe {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.state.reads.set(self.state.reads.get() + 1);
+            self.inner.read(bytes)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StreamSinkError;
+
+    impl std::fmt::Display for StreamSinkError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("stream sink failed")
+        }
+    }
+
+    impl std::error::Error for StreamSinkError {}
+
+    struct StreamSink {
+        state: Rc<StreamState>,
+    }
+
+    impl StagedDoryV3ModelFieldSink for StreamSink {
+        type Error = StreamSinkError;
+        type Output = VerifiedBankAuthenticatedDoryV3ModelReceipt;
+
+        fn write_chunk(&mut self, _chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+            self.state.chunks.set(self.state.chunks.get() + 1);
+            Ok(())
+        }
+
+        fn finish_verified(
+            self,
+            receipt: VerifiedBankAuthenticatedDoryV3ModelReceipt,
+        ) -> Result<Self::Output, Self::Error> {
+            self.state.published.set(true);
+            Ok(receipt)
+        }
+    }
+
+    impl Drop for StreamSink {
+        fn drop(&mut self) {
+            self.state.drops.set(self.state.drops.get() + 1);
+        }
+    }
+
+    fn stream_fixture(
+        fixture: &Fixture,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+        state: Rc<StreamState>,
+    ) -> Result<
+        VerifiedBankAuthenticatedDoryV3ModelReceipt,
+        BankAuthenticatedDoryV3ModelFieldStreamError<StreamSinkError>,
+    > {
+        verify_dory_v3_model_bank_into_staged_field_sink_for_test(
+            ReadProbe {
+                inner: Cursor::new(fixture.bytes.clone()),
+                state: Rc::clone(&state),
+            },
+            authenticated,
+            setup,
+            StreamSink { state },
+        )
+    }
+
     #[test]
     fn record_v2_derives_from_one_authenticated_reader_and_matches_every_role() {
         let fixture = fixture();
@@ -699,6 +784,69 @@ mod tests {
             fixture.setup.identity()
         );
         assert_eq!(record.model_identity().weight_bank_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn authenticated_stream_rejects_mismatched_setup_before_reading_or_publishing() {
+        let fixture = fixture();
+        let authenticated = derive_fixture(&fixture);
+        let wrong_setup = deterministic_bls_dory_setup(VARIABLES + 1).unwrap();
+        let state = Rc::new(StreamState::default());
+
+        let error =
+            stream_fixture(&fixture, &authenticated, &wrong_setup, Rc::clone(&state)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BankAuthenticatedDoryV3ModelFieldStreamError::Authority(
+                DoryV3ModelCommitmentRecordError::SetupIdentityMismatch
+            )
+        ));
+        assert_eq!(state.reads.get(), 0);
+        assert_eq!(state.chunks.get(), 0);
+        assert_eq!(state.drops.get(), 1);
+        assert!(!state.published.get());
+    }
+
+    #[test]
+    fn authenticated_stream_rejects_bank_from_a_different_manifest() {
+        const RAW_ROOT_OFFSET: usize = 56;
+        let mut fixture = fixture();
+        let authenticated = derive_fixture(&fixture);
+        fixture.bytes[RAW_ROOT_OFFSET] ^= 1;
+        let state = Rc::new(StreamState::default());
+
+        let error = stream_fixture(&fixture, &authenticated, &fixture.setup, Rc::clone(&state))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BankAuthenticatedDoryV3ModelFieldStreamError::ModelBank(
+                ModelBankError::ManifestMismatch
+            )
+        ));
+        assert!(state.reads.get() > 0);
+        assert_eq!(state.chunks.get(), 0);
+        assert_eq!(state.drops.get(), 1);
+        assert!(!state.published.get());
+    }
+
+    #[test]
+    fn authenticated_stream_receipt_binds_the_exact_record_v2() {
+        let fixture = fixture();
+        let authenticated = derive_fixture(&fixture);
+        let state = Rc::new(StreamState::default());
+        let receipt =
+            stream_fixture(&fixture, &authenticated, &fixture.setup, Rc::clone(&state)).unwrap();
+        assert!(receipt.is_bound_to_bank_authenticated_record(&authenticated));
+        assert!(state.published.get());
+
+        let setup = deterministic_bls_dory_setup(VARIABLES).unwrap();
+        let (base_input, weight_banks) = actual_commitments(&setup);
+        let other =
+            fixture_with_commitments(setup, base_input, weight_banks, LAYERS_PER_BANK, [0x52; 32]);
+        let other_authenticated = derive_fixture(&other);
+        assert!(!receipt.is_bound_to_bank_authenticated_record(&other_authenticated));
     }
 
     #[test]

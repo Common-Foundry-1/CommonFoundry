@@ -61,15 +61,24 @@ wallet, or standalone miner. Its fixed geometry is:
 - 524,288 activation bytes and 6,442,450,944 resident weight bytes;
 - 385 challenge-mask stages with 20 canonical coefficients per nonce.
 
-Construction accepts only the canonical production model-bank stream. Rust
-checks the exact geometry, nonzero manifest roots, model byte root, ordered PCS
-identity, and three-bank commitment root. While that same authenticated stream
-is read, canonical Goldilocks model elements are converted back to centered
-INT8 and uploaded in order. A usable context is published only after the full
-6,442,975,232-byte payload authenticates and CUDA confirms every role byte was
-uploaded. A read error, altered byte, wrong identity, skipped chunk, missing
-production ABI, non-CUDA backend, or unsupported GPU destroys the provisional
-context.
+Construction requires the non-serializable
+`BankAuthenticatedDoryV3ModelCommitmentRecordV2` capability used by the Dory V3
+verifier plus its exact deterministic setup. Rust validates the complete
+production Record V2 and setup before allocating GPU state. The manifest,
+three-bank role layout, Dory model identity, and record/model digests are then
+taken only from that capability; callers cannot supply a separate legacy
+`ModelPcsIdentity` or loose manifest.
+
+While the model bank is streamed, its header, payload roots, length, and EOF are
+reauthenticated against the capability's manifest. Canonical Goldilocks model
+elements are converted back to centered INT8 and uploaded in order. A usable
+context is published only after the full 6,442,975,232-byte payload
+authenticates and CUDA confirms every role byte was uploaded. The context
+retains the complete immutable Dory identity plus both Record V2 binding
+digests so it can be compared with the verifier capability. A read error,
+altered byte, different manifest or record, setup mismatch, skipped chunk,
+missing production ABI, non-CUDA backend, or unsupported GPU destroys the
+provisional context.
 
 Weights remain resident and are transposed once at finalization. Each real
 layer then uses exact signed `INT8 x INT8 -> INT32` DP4A accumulation, the same

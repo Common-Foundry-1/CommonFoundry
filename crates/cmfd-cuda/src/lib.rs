@@ -8,15 +8,17 @@ use std::sync::Arc;
 
 use cmfd_consensus::{
     ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, GOLDILOCKS_MODULUS,
-    forgematrix_v2::{
-        PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
-        PRODUCTION_V2_LAYERS_PER_BANK,
+    dory_bls12_381_prototype::DeterministicBlsDorySetup,
+    dory_v3_model::DoryV3ModelIdentityV1,
+    dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    dory_v3_model_stream::{
+        BankAuthenticatedDoryV3ModelFieldStreamError, StagedDoryV3ModelFieldSink,
+        VerifiedBankAuthenticatedDoryV3ModelReceipt,
+        verify_dory_v3_model_bank_into_staged_field_sink,
     },
-    model_bank::{
-        ModelBankFieldStreamError, ModelBankManifest, ModelFieldChunk, ModelPcsIdentity,
-        ModelPcsRole, StagedModelFieldSink, VerifiedModelBankReceipt,
-        verify_model_bank_into_staged_field_sink,
-    },
+    dory_v3_suite::Digest32,
+    forgematrix_v2::{PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS},
+    model_bank::{ModelBankManifest, ModelFieldChunk, ModelPcsRole},
 };
 use libloading::Library;
 
@@ -401,18 +403,20 @@ impl CudaLibrary {
         })
     }
 
-    /// Streams one canonical production model bank into resident GPU memory.
+    /// Streams one canonical production Dory V3 model bank into resident GPU
+    /// memory under the same Record V2 capability used by the verifier.
     ///
     /// The returned context is published only after the complete byte stream
-    /// authenticates against both `manifest` and `identity`. Production shape,
-    /// model commitment, CUDA support, chunk order, and final byte counts all
-    /// fail closed. This loads an evaluator only; it does not activate V3 or
-    /// make the current node accept a production proof.
+    /// authenticates against the manifest and exact role layout enclosed by
+    /// `authenticated`. Record, Dory identity, setup, CUDA support, chunk
+    /// order, and final byte counts all fail closed. This loads an evaluator
+    /// only; it does not activate V3 or make the node accept a production
+    /// proof.
     pub fn create_production<R: Read>(
         &self,
         reader: R,
-        manifest: &ModelBankManifest,
-        identity: &ModelPcsIdentity,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
         device_index: i32,
     ) -> Result<ProductionCudaMiner, String> {
         if self.backend != GpuBackend::Cuda {
@@ -420,7 +424,10 @@ impl CudaLibrary {
                 "the production ForgeMatrix evaluator requires the CUDA backend".to_owned(),
             );
         }
-        validate_production_model(manifest, identity)?;
+        authenticated
+            .record()
+            .validate_production(setup)
+            .map_err(|error| format!("production Dory V3 authority is invalid: {error}"))?;
         let api = self.api.production.ok_or_else(|| {
             "CUDA library does not export the production ForgeMatrix ABI".to_owned()
         })?;
@@ -433,8 +440,8 @@ impl CudaLibrary {
         }
 
         let sink = ProductionModelSink::begin(Arc::clone(&self.api), api, device)?;
-        verify_model_bank_into_staged_field_sink(reader, manifest, identity, sink)
-            .map_err(format_model_stream_error)
+        verify_dory_v3_model_bank_into_staged_field_sink(reader, authenticated, setup, sink)
+            .map_err(format_dory_model_stream_error)
     }
 
     /// Executes one exact INT8xINT8->INT32 matrix transition through the same
@@ -554,7 +561,9 @@ pub struct ProductionCudaMiner {
     production_api: ProductionApi,
     device: CudaDevice,
     manifest: ModelBankManifest,
-    identity_digest: [u8; 32],
+    record_digest: Digest32,
+    model_identity_digest: Digest32,
+    model_identity: DoryV3ModelIdentityV1,
 }
 
 impl ProductionCudaMiner {
@@ -566,8 +575,29 @@ impl ProductionCudaMiner {
         &self.manifest
     }
 
-    pub fn identity_digest(&self) -> [u8; 32] {
-        self.identity_digest
+    pub const fn record_digest(&self) -> Digest32 {
+        self.record_digest
+    }
+
+    pub const fn model_identity_digest(&self) -> Digest32 {
+        self.model_identity_digest
+    }
+
+    pub const fn model_identity(&self) -> &DoryV3ModelIdentityV1 {
+        &self.model_identity
+    }
+
+    /// Return true only for the exact bank-authenticated Record V2 capability
+    /// that authorized this resident context.
+    pub fn is_bound_to_bank_authenticated_record(
+        &self,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    ) -> bool {
+        let record = authenticated.record();
+        self.record_digest == record.record_digest()
+            && self.model_identity_digest == record.model_identity_digest()
+            && self.manifest == *record.manifest()
+            && self.model_identity == *record.model_identity()
     }
 
     /// Evaluates complete 128x4096 activations across all 384 resident layers.
@@ -705,7 +735,7 @@ impl ProductionModelSink {
     }
 }
 
-impl StagedModelFieldSink for ProductionModelSink {
+impl StagedDoryV3ModelFieldSink for ProductionModelSink {
     type Error = ProductionSinkError;
     type Output = ProductionCudaMiner;
 
@@ -739,13 +769,9 @@ impl StagedModelFieldSink for ProductionModelSink {
 
     fn finish_verified(
         mut self,
-        receipt: VerifiedModelBankReceipt,
+        receipt: VerifiedBankAuthenticatedDoryV3ModelReceipt,
     ) -> Result<Self::Output, Self::Error> {
         self.flush()?;
-        let identity_digest = receipt
-            .identity()
-            .digest()
-            .map_err(|error| ProductionSinkError(error.to_string()))?;
         let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
         let context = self
             .context
@@ -769,7 +795,9 @@ impl StagedModelFieldSink for ProductionModelSink {
             production_api: self.production_api,
             device,
             manifest: *receipt.manifest(),
-            identity_digest,
+            record_digest: receipt.record_digest(),
+            model_identity_digest: receipt.model_identity_digest(),
+            model_identity: receipt.model_identity().clone(),
         })
     }
 }
@@ -799,41 +827,10 @@ fn centered_field_to_i8(value: u64) -> Result<i8, ProductionSinkError> {
     ))
 }
 
-fn validate_production_model(
-    manifest: &ModelBankManifest,
-    identity: &ModelPcsIdentity,
-) -> Result<(), String> {
-    let expected_layer_bytes =
-        u64::from(PRODUCTION_V2_DIMENSION) * u64::from(PRODUCTION_V2_DIMENSION);
-    let expected_base_bytes = u64::from(PRODUCTION_V2_BATCH) * u64::from(PRODUCTION_V2_DIMENSION);
-    let expected_payload_bytes =
-        expected_base_bytes + u64::from(PRODUCTION_V2_LAYERS) * expected_layer_bytes;
-    if manifest.model_version != 2
-        || manifest.dimension != PRODUCTION_V2_DIMENSION
-        || manifest.batch != PRODUCTION_V2_BATCH
-        || manifest.layers != PRODUCTION_V2_LAYERS
-        || manifest.base_input_bytes != expected_base_bytes
-        || manifest.bytes_per_layer != expected_layer_bytes
-        || manifest.payload_bytes != expected_payload_bytes
-        || identity.layers_per_bank != PRODUCTION_V2_LAYERS_PER_BANK
-        || identity.weight_bank_commitments.len() != PRODUCTION_V2_BANKS as usize
-    {
-        return Err("model bank is not the exact 128x4096x384 production geometry".to_owned());
-    }
-    if manifest.raw_blake3_root == [0; 32]
-        || manifest.layer_roots_aggregate == [0; 32]
-        || manifest.pcs_parameter_digest == [0; 32]
-        || manifest.pcs_commitment_root == [0; 32]
-    {
-        return Err("production model manifest contains an uncommitted root".to_owned());
-    }
-    manifest
-        .verify_pcs_identity(identity)
-        .map_err(|error| format!("production model identity mismatch: {error}"))
-}
-
-fn format_model_stream_error(error: ModelBankFieldStreamError<ProductionSinkError>) -> String {
-    format!("production model authentication failed: {error}")
+fn format_dory_model_stream_error(
+    error: BankAuthenticatedDoryV3ModelFieldStreamError<ProductionSinkError>,
+) -> String {
+    format!("production Dory V3 model authentication failed: {error}")
 }
 
 fn device_count(api: &CudaApi) -> Result<i32, String> {
@@ -958,37 +955,6 @@ fn check_result(result: i32, error: &[c_char]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn production_identity() -> ModelPcsIdentity {
-        ModelPcsIdentity {
-            model_version: 2,
-            batch: PRODUCTION_V2_BATCH,
-            dimension: PRODUCTION_V2_DIMENSION,
-            layers_per_bank: PRODUCTION_V2_LAYERS_PER_BANK,
-            model_byte_root: [0x11; 32],
-            pcs_suite_parameter_digest: [0x22; 32],
-            base_input_commitment: [0x33; 32],
-            weight_bank_commitments: vec![[0x44; 32], [0x55; 32], [0x66; 32]],
-        }
-    }
-
-    fn production_manifest(identity: &ModelPcsIdentity) -> ModelBankManifest {
-        let layer_bytes = u64::from(PRODUCTION_V2_DIMENSION).pow(2);
-        let base_bytes = u64::from(PRODUCTION_V2_BATCH) * u64::from(PRODUCTION_V2_DIMENSION);
-        ModelBankManifest {
-            model_version: 2,
-            dimension: PRODUCTION_V2_DIMENSION,
-            batch: PRODUCTION_V2_BATCH,
-            layers: PRODUCTION_V2_LAYERS,
-            base_input_bytes: base_bytes,
-            bytes_per_layer: layer_bytes,
-            payload_bytes: base_bytes + u64::from(PRODUCTION_V2_LAYERS) * layer_bytes,
-            raw_blake3_root: identity.model_byte_root,
-            layer_roots_aggregate: [0x77; 32],
-            pcs_parameter_digest: identity.pcs_suite_parameter_digest,
-            pcs_commitment_root: identity.commitment_root().unwrap(),
-        }
-    }
-
     #[test]
     fn explicit_library_path_is_the_only_candidate() {
         let path = Path::new("custom-cuda-backend.dll");
@@ -1071,25 +1037,13 @@ mod tests {
     }
 
     #[test]
-    fn production_geometry_and_identity_are_fail_closed() {
-        let identity = production_identity();
-        let manifest = production_manifest(&identity);
-        validate_production_model(&manifest, &identity).unwrap();
-        assert_eq!(manifest.payload_bytes, 6_442_975_232);
+    fn production_geometry_constants_are_exact() {
+        let layer_bytes = u64::from(PRODUCTION_V2_DIMENSION).pow(2);
+        let base_bytes = u64::from(PRODUCTION_V2_BATCH) * u64::from(PRODUCTION_V2_DIMENSION);
+        let payload_bytes = base_bytes + u64::from(PRODUCTION_V2_LAYERS) * layer_bytes;
+        assert_eq!(payload_bytes, 6_442_975_232);
         assert_eq!(PRODUCTION_ACTIVATION_VALUES, 524_288);
         assert_eq!(PRODUCTION_COEFFICIENTS_PER_NONCE, 7_700);
-
-        let mut wrong_shape = manifest;
-        wrong_shape.layers -= 1;
-        assert!(validate_production_model(&wrong_shape, &identity).is_err());
-
-        let mut wrong_identity = identity.clone();
-        wrong_identity.weight_bank_commitments[1][0] ^= 1;
-        assert!(validate_production_model(&manifest, &wrong_identity).is_err());
-
-        let mut uncommitted = manifest;
-        uncommitted.layer_roots_aggregate = [0; 32];
-        assert!(validate_production_model(&uncommitted, &identity).is_err());
     }
 
     #[test]

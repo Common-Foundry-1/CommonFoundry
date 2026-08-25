@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
 use cmfd_node::peer::PeerLimits;
-use cmfd_node::{DEVNET_PROFILE, Node, NodeClientError};
+use cmfd_node::{COMPILED_NETWORK_PROFILE, Node, NodeClientError};
 use tauri::{App, Manager, Runtime};
 
 use crate::mining::MiningManager;
@@ -142,7 +142,7 @@ fn start_embedded_node<R: Runtime>(
                 false,
             )
         })?
-        .join(DEVNET_PROFILE.wallet_data_dir_identity);
+        .join(COMPILED_NETWORK_PROFILE.wallet_data_dir_identity);
     let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
     let node = Node::open(&data_dir).map_err(|error| error.client_error())?;
     let shared = Arc::new(Mutex::new(node));
@@ -217,7 +217,7 @@ pub(crate) fn command_help_text() -> String {
             "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
             "                          (the default bootstrap peer is always added if no --peer is configured)\n",
         ),
-        DEVNET_PROFILE.p2p_address(),
+        COMPILED_NETWORK_PROFILE.p2p_address(),
     )
 }
 

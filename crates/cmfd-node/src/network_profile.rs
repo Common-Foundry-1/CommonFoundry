@@ -1,5 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use crate::release_gate::{
+    COMPILED_RELEASE_PROFILE, CompiledNetworkProfile, ConsensusProofSelection,
+};
+
 /// Compile-time identity and default endpoints for one Common Foundry network.
 ///
 /// Consensus identity fields are bound through [`crate::devnet_params`]. The
@@ -95,6 +99,16 @@ pub const RCNET1_PROFILE: NetworkProfile = NetworkProfile {
     wallet_data_dir_identity: "rcnet-1",
 };
 
+/// Network identity selected into every node-dependent artifact.
+pub const COMPILED_NETWORK_PROFILE: NetworkProfile = match (
+    COMPILED_RELEASE_PROFILE.network,
+    COMPILED_RELEASE_PROFILE.proof,
+) {
+    (CompiledNetworkProfile::Devnet, ConsensusProofSelection::DevnetV2Reference) => DEVNET_PROFILE,
+    (CompiledNetworkProfile::Rcnet, ConsensusProofSelection::ProductionV3) => RCNET1_PROFILE,
+    _ => panic!("compiled network and consensus proof selections are inconsistent"),
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +133,14 @@ mod tests {
         );
         assert_eq!(RCNET1_PROFILE.proof, ProofProfile::ProductionV3);
         assert_eq!(DEVNET_PROFILE.proof, ProofProfile::DevnetV2Reference);
+    }
+
+    #[test]
+    fn compiled_profile_matches_the_release_gate_selection() {
+        assert_eq!(COMPILED_NETWORK_PROFILE, DEVNET_PROFILE);
+        assert_eq!(
+            COMPILED_NETWORK_PROFILE.proof,
+            ProofProfile::DevnetV2Reference
+        );
     }
 }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::config::{DEFAULT_BOOTSTRAP_PEER, NodeRuntimeConfig};
 
 const PEER_SETTINGS_VERSION: u8 = 1;
-const DEFAULT_PEER_PORT: u16 = cmfd_node::DEVNET_PROFILE.p2p_port;
+const DEFAULT_PEER_PORT: u16 = cmfd_node::COMPILED_NETWORK_PROFILE.p2p_port;
 const MAX_PEER_INPUT_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

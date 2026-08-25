@@ -56,6 +56,10 @@ if (-not $CudaBuildDirectory) {
 }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $CudaBuildDirectory = [System.IO.Path]::GetFullPath($CudaBuildDirectory)
+$metadata = & cargo metadata `
+    --manifest-path (Join-Path $projectRoot 'Cargo.toml') `
+    --no-deps --format-version 1 --locked | ConvertFrom-Json
+$version = ($metadata.packages | Where-Object name -eq 'cmfd-miner').version
 
 $cudaLibrary = Join-Path $CudaBuildDirectory 'cmfd-forgematrix-v2-miner.dll'
 if (-not (Test-Path -LiteralPath $cudaLibrary)) {
@@ -110,8 +114,10 @@ if (-not $SkipOpenCl) {
 }
 
 $previousRustFlags = $env:RUSTFLAGS
+$previousReleaseLabel = $env:CMFD_RELEASE_LABEL
 try {
     $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    $env:CMFD_RELEASE_LABEL = $version
     Push-Location $projectRoot
     try {
         & cargo build --release --locked -p cmfd-miner
@@ -123,10 +129,9 @@ try {
     }
 } finally {
     $env:RUSTFLAGS = $previousRustFlags
+    $env:CMFD_RELEASE_LABEL = $previousReleaseLabel
 }
 
-$metadata = & cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
-$version = ($metadata.packages | Where-Object name -eq 'cmfd-miner').version
 $packageName = "commonfoundry-miner-v$version-windows-x86_64"
 $stage = Join-Path $OutputDirectory $packageName
 $archive = Join-Path $OutputDirectory "$packageName.zip"

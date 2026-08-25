@@ -19,6 +19,10 @@ for command_name in cargo cp cut git install mktemp python3 sed sha256sum stat; 
   cmfd_require_command "$command_name"
 done
 SOURCE_DATE_EPOCH_VALUE="${SOURCE_DATE_EPOCH:-$(git -C "$PROJECT_ROOT" show -s --format=%ct "$EXPECTED_COMMIT")}"
+VERSION="$(
+  cargo pkgid --manifest-path "$PROJECT_ROOT/Cargo.toml" -p cmfd-miner --locked |
+    sed -E 's/.*#//'
+)"
 
 if [[ ! -f "$CUDA_LIBRARY" ]]; then
   echo "CUDA library is missing: $CUDA_LIBRARY" >&2
@@ -52,15 +56,11 @@ if [[ -f "$OPENCL_LIBRARY" ]]; then
 fi
 
 TARGET_DIRECTORY="$OUTPUT_DIRECTORY/rust-target"
-CARGO_TARGET_DIR="$TARGET_DIRECTORY" cargo build \
+CMFD_RELEASE_LABEL="$VERSION" CARGO_TARGET_DIR="$TARGET_DIRECTORY" cargo build \
   --manifest-path "$PROJECT_ROOT/Cargo.toml" \
   --release --locked -p cmfd-miner
 cmfd_require_elf_x86_64 "$TARGET_DIRECTORY/release/cmfd-miner" executable
 
-VERSION="$(
-  cargo pkgid --manifest-path "$PROJECT_ROOT/Cargo.toml" -p cmfd-miner --locked |
-    sed -E 's/.*#//'
-)"
 PACKAGE_NAME="commonfoundry-miner-v${VERSION}-linux-x86_64-gnu"
 STAGE="$OUTPUT_DIRECTORY/$PACKAGE_NAME"
 ARCHIVE="$OUTPUT_DIRECTORY/$PACKAGE_NAME.tar.gz"

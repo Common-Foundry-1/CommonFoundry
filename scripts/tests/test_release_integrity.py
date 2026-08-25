@@ -440,6 +440,87 @@ class DebianPackageInspectionTests(unittest.TestCase):
             integrity.inspect_debian_package(package)
 
 
+class ProductionRcGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.commit = "1" * 40
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def write_json(self, name: str, value: object) -> Path:
+        path = self.root / name
+        path.write_text(
+            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        return path
+
+    def valid_stage_files(self) -> dict[str, Path]:
+        evidence = self.write_json(
+            integrity.PRODUCTION_V3_ACTIVATION_NAME,
+            {
+                "independent_verifier_sha256": "3" * 64,
+                "network_profile": "RCNet-1",
+                "proof_selection": "ProductionV3",
+                "qualification_manifest_sha256": "2" * 64,
+                "schema": "CMFD_PRODUCTION_V3_ACTIVATION_V1",
+                "source_commit": self.commit,
+            },
+        )
+        network_info = self.write_json(
+            integrity.PRODUCTION_RC_NETWORK_INFO_NAME,
+            {
+                "network": {
+                    "name": "CommonFoundry RCNet-1",
+                    "network_id": "72" * 32,
+                },
+                "proof_of_work": {
+                    "activation_evidence_sha256": integrity._sha256_file(evidence),
+                    "selection": "ProductionV3",
+                },
+            },
+        )
+        return {
+            integrity.PRODUCTION_RC_NETWORK_INFO_NAME: network_info,
+            integrity.PRODUCTION_V3_ACTIVATION_NAME: evidence,
+        }
+
+    def test_production_rc_labels_exclude_devnet_candidates(self) -> None:
+        for label in ("production-rc1", "mainnet-rc.2", "v1.0.0-rc1"):
+            self.assertTrue(integrity.is_production_rc_label(label), label)
+        for label in ("0.1.0-devnet.14", "v0.1.0-devnet.14-rc1", "debug"):
+            self.assertFalse(integrity.is_production_rc_label(label), label)
+
+    def test_production_rc_without_compiled_evidence_fails_closed(self) -> None:
+        with self.assertRaisesRegex(integrity.IntegrityError, "missing compiled"):
+            integrity.validate_production_rc_artifacts(
+                version="1.0.0-rc1", commit=self.commit, stage_files={}
+            )
+
+    def test_devnet_or_v2_compiled_identity_is_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        network_info = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        value = json.loads(network_info.read_text(encoding="utf-8"))
+        value["network"]["name"] = "CommonFoundry Devnet-0"
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, value)
+        with self.assertRaisesRegex(integrity.IntegrityError, "not RCNet-1"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1",
+                commit=self.commit,
+                stage_files=stage_files,
+            )
+
+    def test_complete_compiled_identity_and_evidence_pass(self) -> None:
+        integrity.validate_production_rc_artifacts(
+            version="production-rc1",
+            commit=self.commit,
+            stage_files=self.valid_stage_files(),
+        )
+
+
 class ReleaseFinalizerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = GitFixture()
@@ -493,6 +574,19 @@ class ReleaseFinalizerTests(unittest.TestCase):
                 inventory=self.inventory,
                 source_date_epoch=self.epoch,
             )
+
+    def test_production_rc_finalization_fails_before_metadata_is_written(self) -> None:
+        self.make_valid_assets()
+        with self.assertRaisesRegex(integrity.IntegrityError, "missing compiled"):
+            integrity.finalize_release(
+                repo=self.fixture.root,
+                expected_commit=self.fixture.commit,
+                version="1.0.0-rc1",
+                stage=self.stage,
+                inventory=self.inventory,
+                source_date_epoch=self.epoch,
+            )
+        self.assertFalse((self.stage / integrity.BUILDINFO_NAME).exists())
 
     def test_wrong_expected_commit_is_rejected(self) -> None:
         self.make_valid_assets()

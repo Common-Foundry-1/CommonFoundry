@@ -14,8 +14,8 @@ use cmfd_node::pool::{
     certificate_sha256, generate_pool_certificate, spawn_pool_server,
 };
 use cmfd_node::{
-    DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, DEVNET_PROFILE, Node, canonical_network_info_json,
-    parse_miner_destination, spawn_rpc_server, unix_time_seconds,
+    COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
+    canonical_network_info_json, parse_miner_destination, spawn_rpc_server, unix_time_seconds,
 };
 use cmfd_proof_worker::VerifierWorkerConfig;
 use serde_json::json;
@@ -60,9 +60,9 @@ enum Command {
     NetworkInfo,
     /// Run loopback RPC and bounded P2P services.
     Run {
-        #[arg(long, default_value_t = DEVNET_PROFILE.rpc_address())]
+        #[arg(long, default_value_t = COMPILED_NETWORK_PROFILE.rpc_address())]
         bind: SocketAddr,
-        #[arg(long, default_value_t = DEVNET_PROFILE.p2p_address())]
+        #[arg(long, default_value_t = COMPILED_NETWORK_PROFILE.p2p_address())]
         p2p_bind: SocketAddr,
         /// Static peer address. Public IPs require --allow-public-peers.
         #[arg(long = "peer")]
@@ -94,7 +94,7 @@ enum Command {
     PoolServe {
         #[arg(long, default_value_t = DEFAULT_POOL_SOCKET_ADDRESS)]
         bind: SocketAddr,
-        #[arg(long, default_value_t = DEVNET_PROFILE.p2p_address())]
+        #[arg(long, default_value_t = COMPILED_NETWORK_PROFILE.p2p_address())]
         p2p_bind: SocketAddr,
         /// Static peer address. Public IPs require --allow-public-peers.
         #[arg(long = "peer")]
@@ -452,8 +452,8 @@ mod tests {
         let Command::Run { bind, p2p_bind, .. } = cli.command else {
             unreachable!()
         };
-        assert_eq!(bind, DEVNET_PROFILE.rpc_address());
-        assert_eq!(p2p_bind, DEVNET_PROFILE.p2p_address());
+        assert_eq!(bind, COMPILED_NETWORK_PROFILE.rpc_address());
+        assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
 
         let cli = Cli::try_parse_from([
             "cmfd-node",
@@ -467,8 +467,8 @@ mod tests {
         let Command::PoolServe { bind, p2p_bind, .. } = cli.command else {
             unreachable!()
         };
-        assert_eq!(bind, DEVNET_PROFILE.pool_address());
-        assert_eq!(p2p_bind, DEVNET_PROFILE.p2p_address());
+        assert_eq!(bind, COMPILED_NETWORK_PROFILE.pool_address());
+        assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
     }
 
     #[test]

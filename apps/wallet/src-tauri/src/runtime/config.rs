@@ -1,7 +1,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 
-use cmfd_node::DEVNET_PROFILE;
+use cmfd_node::COMPILED_NETWORK_PROFILE;
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub(crate) struct NodeRuntimeConfig {
     pub(super) verbose: u8,
 }
 
-pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr = DEVNET_PROFILE.bootstrap_peer();
+pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr = COMPILED_NETWORK_PROFILE.bootstrap_peer();
 
 impl NodeRuntimeConfig {
     pub(crate) fn from_process_args() -> Result<ProcessCommand, ConfigError> {
@@ -42,7 +42,7 @@ impl NodeRuntimeConfig {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let default_bind = DEVNET_PROFILE.p2p_address();
+        let default_bind = COMPILED_NETWORK_PROFILE.p2p_address();
 
         let mut asked_for_help = false;
         let mut asked_for_version = false;

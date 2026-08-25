@@ -40,15 +40,21 @@ pub mod p2p;
 pub mod peer;
 pub mod pool;
 
-pub use network_info::canonical_network_info_json;
-pub use network_profile::{DEVNET_PROFILE, NetworkProfile, ProofProfile, RCNET1_PROFILE};
+#[path = "../release_gate.rs"]
+#[allow(dead_code)]
+mod release_gate;
 
-pub const DEVNET_NETWORK_ID: [u8; 32] = DEVNET_PROFILE.network_id;
-pub const DEVNET_GENESIS_HASH: [u8; 32] = DEVNET_PROFILE.virtual_genesis_hash;
-pub const DEVNET_GENESIS_TIMESTAMP: u64 = DEVNET_PROFILE.virtual_genesis_timestamp;
+pub use network_info::canonical_network_info_json;
+pub use network_profile::{
+    COMPILED_NETWORK_PROFILE, DEVNET_PROFILE, NetworkProfile, ProofProfile, RCNET1_PROFILE,
+};
+
+pub const DEVNET_NETWORK_ID: [u8; 32] = COMPILED_NETWORK_PROFILE.network_id;
+pub const DEVNET_GENESIS_HASH: [u8; 32] = COMPILED_NETWORK_PROFILE.virtual_genesis_hash;
+pub const DEVNET_GENESIS_TIMESTAMP: u64 = COMPILED_NETWORK_PROFILE.virtual_genesis_timestamp;
 pub const DEFAULT_RPC_ADDRESS: &str = "127.0.0.1:18443";
 pub const DEFAULT_P2P_ADDRESS: &str = "127.0.0.1:18444";
-pub const DEFAULT_DATA_DIR: &str = DEVNET_PROFILE.default_data_dir_identity;
+pub const DEFAULT_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.default_data_dir_identity;
 pub const DEFAULT_MINING_ATTEMPTS: u64 = 1_000_000;
 /// Maximum work accepted by one cancellable immutable mining-job search.
 pub const MAX_MINING_SEARCH_ATTEMPTS: u64 = DEFAULT_MINING_ATTEMPTS;
@@ -1297,7 +1303,7 @@ fn network_params_for_profile(profile: NetworkProfile) -> Result<NetworkParams, 
 }
 
 pub fn devnet_params() -> Result<NetworkParams, NodeError> {
-    network_params_for_profile(DEVNET_PROFILE)
+    network_params_for_profile(COMPILED_NETWORK_PROFILE)
 }
 
 pub fn default_miner_destination() -> [u8; 32] {
@@ -1328,7 +1334,7 @@ pub fn unix_time_seconds() -> Result<u64, NodeError> {
 
 impl Node {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, NodeError> {
-        Self::open_with_profile(data_dir, DEVNET_PROFILE)
+        Self::open_with_profile(data_dir, COMPILED_NETWORK_PROFILE)
     }
 
     /// Opens the node on an explicit immutable network profile.

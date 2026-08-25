@@ -8,7 +8,7 @@ use cmfd_consensus::{
 };
 use serde::Serialize;
 
-use crate::{DEVNET_PROFILE, NodeError, devnet_params};
+use crate::{COMPILED_NETWORK_PROFILE, NodeError, devnet_params};
 
 const NETWORK_INFO_FORMAT: &str = "commonfoundry-network-info";
 const NETWORK_INFO_FORMAT_VERSION: u32 = 1;
@@ -150,7 +150,7 @@ pub fn canonical_network_info_json() -> Result<Vec<u8>, NodeError> {
         format: NETWORK_INFO_FORMAT,
         format_version: NETWORK_INFO_FORMAT_VERSION,
         network: NetworkIdentity {
-            name: DEVNET_PROFILE.name,
+            name: COMPILED_NETWORK_PROFILE.name,
             network_id: hex::encode(params.network_id),
             virtual_genesis_hash: hex::encode(params.genesis_hash),
             virtual_genesis_timestamp_unix_seconds: params.genesis_timestamp.to_string(),
@@ -207,14 +207,14 @@ pub fn canonical_network_info_json() -> Result<Vec<u8>, NodeError> {
             },
         },
         services: ServiceIdentity {
-            rpc_port: DEVNET_PROFILE.rpc_port,
-            p2p_port: DEVNET_PROFILE.p2p_port,
-            pool_port: DEVNET_PROFILE.pool_port,
-            bootstrap_peer: DEVNET_PROFILE.bootstrap_peer().to_string(),
+            rpc_port: COMPILED_NETWORK_PROFILE.rpc_port,
+            p2p_port: COMPILED_NETWORK_PROFILE.p2p_port,
+            pool_port: COMPILED_NETWORK_PROFILE.pool_port,
+            bootstrap_peer: COMPILED_NETWORK_PROFILE.bootstrap_peer().to_string(),
         },
         data_directories: DataDirectoryIdentity {
-            node: DEVNET_PROFILE.default_data_dir_identity,
-            wallet: DEVNET_PROFILE.wallet_data_dir_identity,
+            node: COMPILED_NETWORK_PROFILE.default_data_dir_identity,
+            wallet: COMPILED_NETWORK_PROFILE.wallet_data_dir_identity,
         },
         monetary_policy: MonetaryPolicyIdentity {
             atoms_per_coin: COIN.to_string(),

@@ -27,8 +27,11 @@ MAX_RECEIPT_BYTES = 64 * 1024
 MAX_BUILDINFO_BYTES = 4 * 1024 * 1024
 MAX_DEB_BYTES = 512 * 1024 * 1024
 MAX_DEB_MEMBERS = 100_000
+MAX_RELEASE_GATE_JSON_BYTES = 1024 * 1024
 FULL_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 HEX256_RE = re.compile(r"[0-9a-f]{64}\Z")
+PRODUCTION_RC_NETWORK_INFO_NAME = "NETWORK-INFO.json"
+PRODUCTION_V3_ACTIVATION_NAME = "PRODUCTION-V3-ACTIVATION.json"
 RECEIPT_FIELDS = (
     "SCHEMA",
     "TRUST_SCOPE",
@@ -62,6 +65,82 @@ DEB_AR_MEMBERS = ("debian-binary", "control.tar.gz", "data.tar.gz")
 
 class IntegrityError(RuntimeError):
     """An input failed a release-integrity invariant."""
+
+
+def is_production_rc_label(label: str) -> bool:
+    normalized = label.strip().lower()
+    if not normalized or "devnet" in normalized or "testnet" in normalized:
+        return False
+    tokens = [token for token in re.split(r"[^a-z0-9]+", normalized) if token]
+    return (
+        "production-rc" in normalized
+        or "production_rc" in normalized
+        or "mainnet-rc" in normalized
+        or any(re.fullmatch(r"rc[0-9]*", token) for token in tokens)
+    )
+
+
+def _bounded_json_object(path: Path, label: str) -> tuple[dict[str, object], bytes]:
+    path = _regular_file(path, label)
+    data = path.read_bytes()
+    if len(data) > MAX_RELEASE_GATE_JSON_BYTES:
+        raise IntegrityError(f"{label} exceeds its size limit")
+    try:
+        value = json.loads(data.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IntegrityError(f"{label} is not valid UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise IntegrityError(f"{label} must contain a JSON object")
+    return value, data
+
+
+def validate_production_rc_artifacts(
+    *, version: str, commit: str, stage_files: dict[str, Path]
+) -> None:
+    if not is_production_rc_label(version):
+        return
+
+    required = {PRODUCTION_RC_NETWORK_INFO_NAME, PRODUCTION_V3_ACTIVATION_NAME}
+    missing = sorted(required - set(stage_files))
+    if missing:
+        raise IntegrityError(
+            f"production RC release gate is blocked; missing compiled activation artifacts: {missing}"
+        )
+
+    network_info, _ = _bounded_json_object(
+        stage_files[PRODUCTION_RC_NETWORK_INFO_NAME], "compiled network information"
+    )
+    evidence, evidence_bytes = _bounded_json_object(
+        stage_files[PRODUCTION_V3_ACTIVATION_NAME], "ProductionV3 activation evidence"
+    )
+    network = network_info.get("network")
+    proof = network_info.get("proof_of_work")
+    if not isinstance(network, dict) or network.get("name") != "CommonFoundry RCNet-1":
+        raise IntegrityError("production RC compiled network profile is not RCNet-1")
+    if network.get("network_id") != "72" * 32:
+        raise IntegrityError("production RC compiled network ID is not RCNet-1")
+    if not isinstance(proof, dict) or proof.get("selection") != "ProductionV3":
+        raise IntegrityError("production RC compiled proof selection is not ProductionV3")
+    if proof.get("activation_evidence_sha256") != _sha256_bytes(evidence_bytes):
+        raise IntegrityError(
+            "compiled ProductionV3 selection is not bound to the staged activation evidence"
+        )
+
+    expected_evidence = {
+        "schema": "CMFD_PRODUCTION_V3_ACTIVATION_V1",
+        "source_commit": commit,
+        "network_profile": "RCNet-1",
+        "proof_selection": "ProductionV3",
+    }
+    for field, expected in expected_evidence.items():
+        if evidence.get(field) != expected:
+            raise IntegrityError(
+                f"ProductionV3 activation evidence has invalid {field}"
+            )
+    for field in ("qualification_manifest_sha256", "independent_verifier_sha256"):
+        value = evidence.get(field)
+        if not isinstance(value, str) or not HEX256_RE.fullmatch(value) or set(value) == {"0"}:
+            raise IntegrityError(f"ProductionV3 activation evidence has invalid {field}")
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -906,6 +985,9 @@ def verify_release(
     inventory = _tracked_input_file(repo, inventory, "release inventory")
     names, inventory_data = _inventory_names(inventory)
     stage_files = _stage_files(stage)
+    validate_production_rc_artifacts(
+        version=version, commit=commit, stage_files=stage_files
+    )
     expected_names = set(names) | {BUILDINFO_NAME, CHECKSUM_NAME}
     if set(stage_files) != expected_names:
         missing = sorted(expected_names - set(stage_files))
@@ -951,6 +1033,9 @@ def finalize_release(
     inventory = _tracked_input_file(repo, inventory, "release inventory")
     names, inventory_data = _inventory_names(inventory)
     stage_files = _stage_files(stage)
+    validate_production_rc_artifacts(
+        version=version, commit=commit, stage_files=stage_files
+    )
     if BUILDINFO_NAME in stage_files or CHECKSUM_NAME in stage_files:
         raise IntegrityError("generated release metadata already exists")
     if set(stage_files) != set(names):

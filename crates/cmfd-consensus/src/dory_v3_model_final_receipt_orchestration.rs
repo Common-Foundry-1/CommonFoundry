@@ -655,7 +655,7 @@ fn preflight_open_file_descriptor_capacity(
     }
     // SAFETY: the successful call above initialized the complete value.
     let limit = unsafe { limit.assume_init() };
-    let actual = (limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur as u64);
+    let actual = (limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur);
     require_open_file_descriptor_soft_limit(required, actual)
 }
 

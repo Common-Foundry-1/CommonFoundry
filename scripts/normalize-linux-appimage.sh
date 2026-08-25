@@ -246,12 +246,11 @@ build_appimage() {
 }
 
 run_unprivileged() {
+  cmfd_require_command setpriv
   if [[ "$(id -u)" == '0' ]]; then
-    cmfd_require_command setpriv
-    setpriv --reuid=65534 --regid=65534 --clear-groups "$@"
+    setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs "$@"
   else
-    cmfd_require_command sudo
-    sudo -n -u nobody -- "$@"
+    setpriv --no-new-privs "$@"
   fi
 }
 

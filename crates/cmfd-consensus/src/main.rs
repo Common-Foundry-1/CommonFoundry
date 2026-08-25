@@ -6,6 +6,7 @@ use cmfd_consensus::dory_bls12_381_blake3::derive_bls_dory_blake3_preprocessing_
 use cmfd_consensus::dory_v3_qualification::{
     ProductionDoryV3QualificationRequest, ProductionDoryV3QualificationSeed,
     generate_production_dory_v3_qualification_request, run_production_dory_v3_qualification,
+    run_production_dory_v3_verifier,
 };
 use cmfd_consensus::forgematrix::CANDIDATE_16GB_PROFILE;
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
@@ -560,27 +561,55 @@ enum Command {
     /// Run one unchanged n=33 Dory V3 production qualification.
     #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
     DoryV3Qualify {
-        /// Canonical production model bank.
-        #[arg(long)]
+        /// Existing absolute canonical production model bank.
+        #[arg(long, value_parser = parse_absolute_path)]
         bank: std::path::PathBuf,
-        /// Canonical production Record V2 JSON.
-        #[arg(long)]
+        /// Existing absolute canonical production Record V2 JSON.
+        #[arg(long, value_parser = parse_absolute_path)]
         record: std::path::PathBuf,
-        /// Strict qualification request JSON containing the block and winning claim.
-        #[arg(long)]
+        /// Existing absolute strict qualification request containing the winning claim.
+        #[arg(long, value_parser = parse_absolute_path)]
         request: std::path::PathBuf,
         /// New absolute runner-owned scratch directory.
-        #[arg(long)]
+        #[arg(long, value_parser = parse_absolute_path)]
         scratch: std::path::PathBuf,
-        /// New canonical proof-wire output path.
-        #[arg(long)]
+        /// New absolute canonical proof-wire output path.
+        #[arg(long, value_parser = parse_absolute_path)]
         proof_output: std::path::PathBuf,
-        /// New report written last as the completion marker; publication is not crash-atomic.
-        #[arg(long)]
+        /// New absolute report written last as the completion marker; publication is not crash-atomic.
+        #[arg(long, value_parser = parse_absolute_path)]
         report_output: std::path::PathBuf,
+        /// New absolute append-only diagnostics journal outside scratch; it is not resumable or completion evidence.
+        #[arg(long, value_parser = parse_absolute_path)]
+        journal_output: std::path::PathBuf,
         /// Maximum native BLAKE3 rows materialized in one block.
         #[arg(long)]
         maximum_native_block_rows: usize,
+    },
+    /// Independently verify one persisted production Dory V3 Layout V5 proof.
+    #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+    DoryV3VerifyQualification {
+        /// Existing absolute canonical production model bank.
+        #[arg(long, value_parser = parse_absolute_path)]
+        bank: std::path::PathBuf,
+        /// Existing absolute canonical production Record V2 JSON.
+        #[arg(long, value_parser = parse_absolute_path)]
+        record: std::path::PathBuf,
+        /// Existing absolute strict qualification-request JSON.
+        #[arg(long, value_parser = parse_absolute_path)]
+        request: std::path::PathBuf,
+        /// Existing absolute canonical persisted proof wire.
+        #[arg(long, value_parser = parse_absolute_path)]
+        proof: std::path::PathBuf,
+        /// Existing absolute canonical producer report written after the proof.
+        #[arg(long, value_parser = parse_absolute_path)]
+        producer_report: std::path::PathBuf,
+        /// Existing absolute canonical diagnostics journal bound by the producer report.
+        #[arg(long, value_parser = parse_absolute_path)]
+        journal: std::path::PathBuf,
+        /// New absolute human-readable verifier report. Existing paths are never overwritten.
+        #[arg(long, value_parser = parse_absolute_path)]
+        report_output: std::path::PathBuf,
     },
 }
 
@@ -1767,6 +1796,7 @@ fn run_cli() -> Result<()> {
             scratch,
             proof_output,
             report_output,
+            journal_output,
             maximum_native_block_rows,
         } => {
             let request_reader = std::fs::File::open(&request)
@@ -1787,10 +1817,33 @@ fn run_cli() -> Result<()> {
                 &scratch,
                 &proof_output,
                 &report_output,
+                &journal_output,
                 maximum_native_block_rows,
                 cancel.as_ref(),
             )
             .context("production Dory V3 qualification failed")?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
+        Command::DoryV3VerifyQualification {
+            bank,
+            record,
+            request,
+            proof,
+            producer_report,
+            journal,
+            report_output,
+        } => {
+            let report = run_production_dory_v3_verifier(
+                &bank,
+                &record,
+                &request,
+                &proof,
+                &producer_report,
+                &journal,
+                &report_output,
+            )
+            .context("production Dory V3 persisted-proof verification failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
@@ -2101,5 +2154,154 @@ mod tests {
         let mut private_key = valid_args();
         private_key.extend(["--private-key".into(), "00".into()]);
         assert!(Cli::try_parse_from(private_key).is_err());
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn dory_v3_qualification_cli_requires_absolute_paths() {
+        let directory = std::env::current_dir().unwrap();
+        let bank = directory.join("model.cmfdmb02");
+        let record = directory.join("record-v2.json");
+        let request = directory.join("qualification-request.json");
+        let scratch = directory.join("proof-scratch");
+        let proof_output = directory.join("proof.cmfd");
+        let report_output = directory.join("producer-report.json");
+        let journal_output = directory.join("producer-journal.jsonl");
+        let valid_args = || {
+            vec![
+                "cmfd-consensus".into(),
+                "dory-v3-qualify".into(),
+                "--bank".into(),
+                bank.clone().into_os_string(),
+                "--record".into(),
+                record.clone().into_os_string(),
+                "--request".into(),
+                request.clone().into_os_string(),
+                "--scratch".into(),
+                scratch.clone().into_os_string(),
+                "--proof-output".into(),
+                proof_output.clone().into_os_string(),
+                "--report-output".into(),
+                report_output.clone().into_os_string(),
+                "--journal-output".into(),
+                journal_output.clone().into_os_string(),
+                "--maximum-native-block-rows".into(),
+                "131072".into(),
+            ]
+        };
+
+        let parsed = Cli::try_parse_from(valid_args()).unwrap();
+        match parsed.command {
+            Command::DoryV3Qualify {
+                journal_output: parsed_journal_output,
+                ..
+            } => assert_eq!(parsed_journal_output, journal_output),
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("dory-v3-qualify")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--journal-output"));
+        assert!(help.contains("not resumable or completion evidence"));
+
+        let mut missing_journal = valid_args();
+        missing_journal.drain(14..16);
+        assert!(Cli::try_parse_from(missing_journal).is_err());
+
+        for path_index in [3, 5, 7, 9, 11, 13, 15] {
+            let mut relative_path = valid_args();
+            relative_path[path_index] = "relative-path".into();
+            assert!(Cli::try_parse_from(relative_path).is_err());
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn dory_v3_verify_qualification_cli_requires_absolute_paths_and_report_output() {
+        let directory = std::env::current_dir().unwrap();
+        let bank = directory.join("model.cmfdmb02");
+        let record = directory.join("record-v2.json");
+        let request = directory.join("qualification-request.json");
+        let proof = directory.join("proof.cmfd");
+        let producer_report = directory.join("producer-report.json");
+        let journal = directory.join("producer-journal.jsonl");
+        let report_output = directory.join("fresh-verifier-report.json");
+        let valid_args = || {
+            vec![
+                "cmfd-consensus".into(),
+                "dory-v3-verify-qualification".into(),
+                "--bank".into(),
+                bank.clone().into_os_string(),
+                "--record".into(),
+                record.clone().into_os_string(),
+                "--request".into(),
+                request.clone().into_os_string(),
+                "--proof".into(),
+                proof.clone().into_os_string(),
+                "--producer-report".into(),
+                producer_report.clone().into_os_string(),
+                "--journal".into(),
+                journal.clone().into_os_string(),
+                "--report-output".into(),
+                report_output.clone().into_os_string(),
+            ]
+        };
+
+        let parsed = Cli::try_parse_from(valid_args()).unwrap();
+        match parsed.command {
+            Command::DoryV3VerifyQualification {
+                bank: parsed_bank,
+                record: parsed_record,
+                request: parsed_request,
+                proof: parsed_proof,
+                producer_report: parsed_producer_report,
+                journal: parsed_journal,
+                report_output: parsed_report_output,
+            } => {
+                assert_eq!(parsed_bank, bank);
+                assert_eq!(parsed_record, record);
+                assert_eq!(parsed_request, request);
+                assert_eq!(parsed_proof, proof);
+                assert_eq!(parsed_producer_report, producer_report);
+                assert_eq!(parsed_journal, journal);
+                assert_eq!(parsed_report_output, report_output);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("dory-v3-verify-qualification")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for required in [
+            "--bank",
+            "--record",
+            "--request",
+            "--proof",
+            "--producer-report",
+            "--journal",
+            "--report-output",
+        ] {
+            assert!(help.contains(required), "missing help option {required}");
+        }
+        for forbidden in ["--scratch", "--proof-output", "--private-key"] {
+            assert!(!help.contains(forbidden), "unsafe help option {forbidden}");
+        }
+
+        for path_index in [3, 5, 7, 9, 11, 13, 15] {
+            let mut relative_path = valid_args();
+            relative_path[path_index] = "relative-path".into();
+            assert!(Cli::try_parse_from(relative_path).is_err());
+        }
+
+        let mut missing_report = valid_args();
+        missing_report.truncate(missing_report.len() - 2);
+        assert!(Cli::try_parse_from(missing_report).is_err());
     }
 }

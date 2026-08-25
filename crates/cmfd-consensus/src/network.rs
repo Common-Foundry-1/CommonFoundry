@@ -88,8 +88,9 @@ impl NetworkParams {
     }
 
     pub fn fingerprint(&self) -> Result<[u8; 32], NetworkError> {
-        // A future PowParameters variant that actually activates proof type 3
-        // must explicitly bump this domain and bind that verifier's identity.
+        // The dormant V3 adapter absorbs its complete immutable identity below.
+        // Actual activation still requires a deliberate network-domain review;
+        // this adapter does not change the active V2 network fingerprint.
         self.validate_without_pow()?;
         let mut hasher = Hasher::new_derive_key(NETWORK_PARAMS_DOMAIN);
         hasher.update(&self.network_id);
@@ -146,6 +147,12 @@ impl NetworkParams {
         {
             return Err(NetworkError::WrongPowNetwork);
         }
+        #[cfg(feature = "dory-v3-consensus-adapter")]
+        if let PowParameters::V3Candidate(parameters) = self.pow
+            && parameters.network_id() != self.network_id
+        {
+            return Err(NetworkError::WrongPowNetwork);
+        }
         Ok(())
     }
 
@@ -193,6 +200,8 @@ fn map_pow_parameter_error(error: PowError) -> NetworkError {
         | PowError::WrongProofType
         | PowError::ParameterMismatch
         | PowError::PreverificationMismatch => NetworkError::InvalidPowParameters,
+        #[cfg(feature = "dory-v3-consensus-adapter")]
+        PowError::V3(_) => NetworkError::InvalidPowParameters,
     }
 }
 

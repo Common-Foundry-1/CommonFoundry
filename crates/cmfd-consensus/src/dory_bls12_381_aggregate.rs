@@ -5644,6 +5644,9 @@ mod tests {
             points,
         } = fixture(6, 3);
         let scratch = ScratchDirectory::create();
+        let mut exact =
+            crate::dory_scratch_telemetry::ExactScratchReservationSession::start(&scratch.0)
+                .unwrap();
         let ordinary = prove_bls_dory_openings(
             b"scratch-equivalence",
             layout,
@@ -5672,6 +5675,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        let exact = exact.finish_and_remove_root().unwrap();
+        assert!(exact.peak_logical_bytes > 0);
+        assert!(exact.file_creation_events > 0);
         assert_eq!(
             prove_bls_dory_openings_with_scratch(
                 b"scratch-equivalence",

@@ -179,6 +179,9 @@ pub enum ChainError {
     Proof(#[from] ForgeMatrixError),
     #[error("ForgeMatrix v2 proof failed validation")]
     InvalidV2Proof,
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[error("ForgeMatrix Dory v3 candidate proof failed validation")]
+    InvalidV3Proof,
     #[error("block proof type does not match the configured proof-of-work algorithm")]
     WrongProofType,
     #[error("proof verifier identity does not match the immutable network parameters")]
@@ -1137,6 +1140,8 @@ fn map_pow_error(error: PowError) -> ChainError {
     match error {
         PowError::V1(error) => ChainError::Proof(error),
         PowError::V2(_) => ChainError::InvalidV2Proof,
+        #[cfg(feature = "dory-v3-consensus-adapter")]
+        PowError::V3(_) => ChainError::InvalidV3Proof,
         PowError::WrongProofType => ChainError::WrongProofType,
         PowError::ParameterMismatch => ChainError::PowParameterMismatch,
         PowError::PreverificationMismatch => ChainError::PreverifiedProofMismatch,

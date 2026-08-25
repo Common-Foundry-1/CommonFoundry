@@ -2240,9 +2240,156 @@ pipeline qualification, use a fixed nonce such as `0` and a target containing
 target needs a separate batched accelerator search, whose result must still be
 replayed by the CPU verifier. The subsequent `dory-v3-qualify` command performs
 its own Record V2 validation, bank authentication, and full winning-claim CPU
-replay. A request generated from a single qualification payload is evidence for
-the proof toolchain only. It is not a combined ceremony model or a signed
-type-5 ceremony prefix.
+replay. Its bank, Record V2, request, scratch, proof-output, report-output, and
+journal-output paths must all be absolute. The journal must be outside
+runner-owned scratch and distinct from the proof and report. All three outputs
+and the scratch directory must be absent. The CLI parser and qualification
+library reject relative, existing, aliased, or overlapping paths before
+resource queries, model preparation, or proof work. On Windows this comparison
+is case-insensitive, so names that differ only by letter case are also rejected
+before any expensive work.
+
+The required journal is compact canonical JSONL. Its first completed-preflight
+record binds a deterministic run identity to the qualification-request digest
+and the complete effective configuration. Subsequent completed-stage records
+use monotonic sequence numbers and carry the domain-separated BLAKE3 digest of
+the preceding canonical record. The bank-authentication transition adds the
+authenticated Record V2, model, and setup identities. Every record is appended,
+flushed, synchronized, reopened, identity-checked, and byte-checked before the
+next stage; its parent directory is also synchronized where the platform
+supports directory synchronization. Every record explicitly carries
+`diagnostic_only: true`, `completion_marker: false`, and `resumable: false`.
+The final event is `prepublication_verification_recorded`; its diagnostic name
+and flags cannot be interpreted as published completion. Version 4 of the
+producer report binds the final journal-record digest, exact event count, exact
+journal byte length, and a complete-file digest. Its periodically sampled
+whole-directory scratch fields are informational non-atomic observations:
+one traversal can combine files that never coexisted, so the observations are
+neither lower nor upper bounds and are not compared with the exact fields. The
+authoritative scratch fields are the exact per-session high-water marks of
+tracked logical file lengths and live entries, plus tracked file-creation and
+size-mutation event counts. They cover all seven Dory scratch writer classes,
+including the dormant index writer, under the session mutation lock. They do
+not measure allocated blocks, filesystem metadata, RAM, or mutation through a
+handle outside the tracked scratch capability.
+
+The run identity uses BLAKE3 derive-key domain
+`CMFD/FORGEMATRIX/V3/QUALIFICATION-RUN-IDENTITY/V1` over, in order, the
+32-byte request digest and report version (`LE16`), padded-variable count
+(`LE32`), composed-claim count (`LE16`), verifier-pass count (one byte), maximum
+native block rows (`LE64`), algorithm version (`LE32`), proof version (`LE32`),
+shared-layout version (`LE16`), and scratch-sample interval (`LE64`). The
+first record carries 32 zero bytes as its previous-record digest. Each later
+previous-record digest uses derive-key domain
+`CMFD/FORGEMATRIX/V3/QUALIFICATION-JOURNAL-RECORD/V1` over the preceding compact
+JSON object bytes, excluding its terminating line feed. Every record repeats
+the run identity and request digest. The complete-file digest uses BLAKE3
+derive-key domain
+`CMFD/FORGEMATRIX/V3/QUALIFICATION-JOURNAL-COMPLETE-FILE/V1` over the exact
+journal byte length (`LE64`) followed by all exact JSONL bytes, including every
+terminating line feed.
+
+This journal is interruption and progress diagnostics only. A partial or even
+fully chained journal is not qualification-completion evidence, does not permit
+restart or resumption, and is not a checkpoint. The create-new producer report
+remains the graceful completion marker. A request generated from a single
+qualification payload is evidence for the proof toolchain only. It is not a
+combined ceremony model or a signed type-5 ceremony prefix.
+
+Windows PowerShell producer invocation:
+
+```text
+.\target\release\cmfd-consensus.exe dory-v3-qualify `
+  --bank D:\qualification\MODEL-V2.bank `
+  --record D:\qualification\DORY-V3-MODEL-RECORD-V2.json `
+  --request D:\qualification\qualification-request.json `
+  --scratch D:\qualification\producer-scratch `
+  --proof-output D:\qualification\qualification-proof.cmfd `
+  --report-output D:\qualification\producer-report.json `
+  --journal-output D:\qualification\producer-journal.jsonl `
+  --maximum-native-block-rows 131072
+```
+
+Linux producer invocation:
+
+```text
+./target/release/cmfd-consensus dory-v3-qualify \
+  --bank /qualification/MODEL-V2.bank \
+  --record /qualification/DORY-V3-MODEL-RECORD-V2.json \
+  --request /qualification/qualification-request.json \
+  --scratch /qualification/producer-scratch \
+  --proof-output /qualification/qualification-proof.cmfd \
+  --report-output /qualification/producer-report.json \
+  --journal-output /qualification/producer-journal.jsonl \
+  --maximum-native-block-rows 131072
+```
+
+After `dory-v3-qualify` persists the proof, run a second, fresh process with the
+feature-gated `dory-v3-verify-qualification` command and the exact same bank,
+Record V2, request, and proof paths. It also requires the exact canonical
+producer report and journal. Supply a new absolute `--report-output` path. The
+verifier creates that human-readable JSON only after successful verification,
+refuses an existing path, synchronizes and reopens the file, and checks its
+exact bytes before reporting success. The verifier caps the request at 16 KiB,
+Record V2 at 64 KiB, producer report at 128 KiB, journal at 64 KiB, and proof at
+the consensus proof limit before decoding. Bank, Record V2, request, proof,
+producer-report, and journal inputs are opened without following symbolic links
+or Windows reparse points, must be regular files with exactly one link, and
+retain their opened identities through report construction. The verifier keeps
+the exact bounded bytes and rereads them through the still-named identity after
+cryptographic verification, rejecting replacement or mutation. The producer
+report must be canonical Version 4 pretty JSON; the fresh verifier rejects
+earlier report schemas and emits verifier report Version 2.
+The journal must use the exact 16-record stage grammar, canonical compact JSON,
+one LF per record including the final record, correct sequence and hash chain,
+and exact request, configuration, and authenticated identities. The verifier
+recomputes and compares the report's event count, last-record digest, complete
+byte length, and domain-separated complete-file digest; trailing bytes or
+records reject.
+
+It then requires canonical V3, `CFV3CP02`, and Layout V5 encodings,
+reauthenticates the complete bank, reproduces the supplied Record V2, checks
+every request, report, journal, proof, and model binding, and invokes the full
+Layout V5 cryptographic verifier. Its JSON report records the request, Record,
+model, setup, bank-content, producer-report, journal, and proof-wire identities,
+stage timings, exact wire sizes, and the process-lifetime peak RSS. After proof
+verification it performs one additional complete sequential bank read through
+the retained handle and requires the exact byte count and BLAKE3 digest to
+match the authentication pass, followed by a bank-last path, identity, link,
+length, and modification-state recheck. At production size this stability pass
+adds exactly 6,442,975,416 bytes of sequential input I/O and only a fixed-size
+hashing buffer, not a second in-memory bank. Windows retains a handle that
+denies write and delete sharing; Unix additionally compares retained
+nanosecond mtime and ctime around both passes. Run the verifier in a fresh
+process so that RSS is an isolated verifier measurement. This command does not
+prove, publish, mine, create a chain-admission capability, or change an
+activation flag.
+
+Windows PowerShell:
+
+```text
+.\target\release\cmfd-consensus.exe dory-v3-verify-qualification `
+  --bank D:\qualification\MODEL-V2.bank `
+  --record D:\qualification\DORY-V3-MODEL-RECORD-V2.json `
+  --request D:\qualification\qualification-request.json `
+  --proof D:\qualification\qualification-proof.cmfd `
+  --producer-report D:\qualification\producer-report.json `
+  --journal D:\qualification\producer-journal.jsonl `
+  --report-output D:\qualification\fresh-verifier-report.json
+```
+
+Linux:
+
+```text
+./target/release/cmfd-consensus dory-v3-verify-qualification \
+  --bank /qualification/MODEL-V2.bank \
+  --record /qualification/DORY-V3-MODEL-RECORD-V2.json \
+  --request /qualification/qualification-request.json \
+  --proof /qualification/qualification-proof.cmfd \
+  --producer-report /qualification/producer-report.json \
+  --journal /qualification/producer-journal.jsonl \
+  --report-output /qualification/fresh-verifier-report.json
+```
 
 At the frozen production geometry, request generation reads the
 `6,442,975,416`-byte bank twice, performs `824,633,720,832` integer
@@ -2315,7 +2462,11 @@ Already implemented in this repository:
   validator, including two complete same-handle commitment derivations and
   dual whole-file identities; and
 - the one-nonce, exact-CPU `dory-v3-qualify-request` generator with strict
-  create-new output and an independently replaying `dory-v3-qualify` consumer.
+  create-new output, an independently replaying `dory-v3-qualify` consumer
+  with a required durable hash-chained diagnostics journal, and a bounded
+  fresh-process `dory-v3-verify-qualification` verifier that independently
+  audits the strict producer report and exact complete journal before accepting
+  the proof. The journal provides neither completion evidence nor resumability.
 
 Not implemented or not completed by this document:
 
@@ -2330,6 +2481,9 @@ Not implemented or not completed by this document:
   type-1-through-type-5 authoring and prefix-staging paths;
 - independent external review and a production-scale qualification of the
   reference combiner;
+- one unchanged n=33 proof accepted by `dory-v3-verify-qualification` in a
+  separate fresh process, with proof size, verification time, and peak RSS
+  retained alongside the producer report;
 - external signature collection, public append-only publication, and
   independent mirroring of a locally staged type-7 abort record;
 - a full-length qualification of the roots and structural-report tools on a

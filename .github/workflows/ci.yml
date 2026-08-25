@@ -36,6 +36,7 @@ jobs:
       - run: cargo check -p cmfd-consensus --all-targets --features whir-prototype --locked
       - run: cargo check -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype --locked
       - run: cargo check -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype,whir-prototype --locked
+      - run: cargo check -p cmfd-consensus --all-targets --no-default-features --features dory-v3-consensus-adapter --locked
       - run: cargo check -p cmfd-consensus --all-targets --features gpu-proof-prover --locked
       - run: cargo check -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked
 
@@ -78,10 +79,20 @@ jobs:
       - run: cargo clippy -p cmfd-consensus --all-targets --features whir-prototype --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --no-default-features --features dory-bls12-381-prototype,whir-prototype --locked -- -D warnings
+      - run: cargo clippy -p cmfd-consensus --all-targets --no-default-features --features dory-v3-consensus-adapter --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features gpu-proof-prover --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate --locked -- -D warnings
       - run: cargo clippy -p cmfd-consensus --all-targets --features production-whir-candidate,gpu-proof-prover --locked --no-deps -- -D warnings
       - run: cargo test --workspace --all-targets --locked
+      - run: >-
+          cargo test -p cmfd-consensus --lib --no-default-features
+          --features dory-v3-consensus-adapter --locked pow::tests::
+      - run: >-
+          cargo test -p cmfd-consensus --lib --no-default-features
+          --features dory-v3-consensus-adapter --locked network::tests::
+      - run: >-
+          cargo test -p cmfd-consensus --lib --no-default-features
+          --features dory-v3-consensus-adapter --locked chain::tests::
       - run: cargo test -p cmfd-consensus --lib --no-default-features --features dory-bls12-381-prototype --locked dory_v3_
       - run: cargo test -p cmfd-consensus --lib --no-default-features --features dory-bls12-381-prototype,whir-prototype --locked dory_bls12_381_layout::tests::dory_final_output_and_blake3_argument_share_exact_activation_bytes -- --exact
       - run: cargo test -p cmfd-consensus --all-targets --features whir-prototype --locked
@@ -105,6 +116,23 @@ jobs:
         run: cargo test --locked -p cmfd-consensus --lib --features whir-prototype native_codec
       - name: Exercise Dory Type-6 CLI
         run: cargo test --locked -p cmfd-consensus --bin cmfd-consensus --no-default-features --features dory-bls12-381-prototype
+      - name: Exercise the complete Dory V3 qualification verifier boundary
+        run: >-
+          cargo test --locked -p cmfd-consensus --lib --no-default-features
+          --features dory-bls12-381-prototype,whir-prototype
+          dory_v3_qualification::tests::
+      - name: Require verifier-only Dory V3 qualification CLI inputs
+        run: >-
+          cargo test --locked -p cmfd-consensus --bin cmfd-consensus
+          --no-default-features --features dory-bls12-381-prototype,whir-prototype
+          tests::dory_v3_verify_qualification_cli_requires_absolute_paths_and_report_output
+          -- --exact
+      - name: Require absolute Dory V3 qualification CLI paths and journal
+        run: >-
+          cargo test --locked -p cmfd-consensus --bin cmfd-consensus
+          --no-default-features --features dory-bls12-381-prototype,whir-prototype
+          tests::dory_v3_qualification_cli_requires_absolute_paths
+          -- --exact
 
   node-shutdown:
     strategy:

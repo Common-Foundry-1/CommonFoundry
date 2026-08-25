@@ -1,14 +1,18 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use cmfd_node::COMPILED_NETWORK_PROFILE;
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
+
+pub(super) const DEFAULT_PROOF_VERIFIER_TIMEOUT_MS: u64 = 30_000;
+pub(super) const DEFAULT_PROOF_VERIFIER_MEMORY_BYTES: u64 = 2_147_483_648;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProcessCommand {
     Help,
     Version,
-    Run(NodeRuntimeConfig),
+    Run(Box<NodeRuntimeConfig>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +25,30 @@ pub(crate) struct NodeRuntimeConfig {
     /// the console. The file log under the node's data directory is always
     /// debug level, regardless of this count.
     pub(super) verbose: u8,
+    pub(super) production_v3: ProductionV3RuntimeOptions,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ProductionV3RuntimeOptions {
+    pub(super) bank: Option<PathBuf>,
+    pub(super) manifest: Option<PathBuf>,
+    pub(super) record_v2: Option<PathBuf>,
+    pub(super) verifier_worker: Option<PathBuf>,
+    pub(super) verifier_worker_sha256: Option<[u8; 32]>,
+    pub(super) verifier_timeout_ms: Option<u64>,
+    pub(super) verifier_memory_bytes: Option<u64>,
+}
+
+impl ProductionV3RuntimeOptions {
+    pub(super) fn is_configured(&self) -> bool {
+        self.bank.is_some()
+            || self.manifest.is_some()
+            || self.record_v2.is_some()
+            || self.verifier_worker.is_some()
+            || self.verifier_worker_sha256.is_some()
+            || self.verifier_timeout_ms.is_some()
+            || self.verifier_memory_bytes.is_some()
+    }
 }
 
 pub(crate) const DEFAULT_BOOTSTRAP_PEER: SocketAddr = COMPILED_NETWORK_PROFILE.bootstrap_peer();
@@ -53,6 +81,7 @@ impl NodeRuntimeConfig {
         let mut allow_public_peers = false;
         let mut peers_explicit = false;
         let mut verbose: u8 = 0;
+        let mut production_v3 = ProductionV3RuntimeOptions::default();
         let mut arguments = arguments.into_iter().map(Into::into);
 
         while let Some(argument) = arguments.next() {
@@ -100,6 +129,62 @@ impl NodeRuntimeConfig {
                     has_control_arg = true;
                     verbose = verbose.saturating_add(1);
                 }
+                "--production-v3-bank" => {
+                    has_control_arg = true;
+                    set_path_option(
+                        &mut production_v3.bank,
+                        "--production-v3-bank",
+                        arguments.next(),
+                    )?;
+                }
+                "--production-v3-manifest" => {
+                    has_control_arg = true;
+                    set_path_option(
+                        &mut production_v3.manifest,
+                        "--production-v3-manifest",
+                        arguments.next(),
+                    )?;
+                }
+                "--production-v3-record-v2" => {
+                    has_control_arg = true;
+                    set_path_option(
+                        &mut production_v3.record_v2,
+                        "--production-v3-record-v2",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-worker" => {
+                    has_control_arg = true;
+                    set_path_option(
+                        &mut production_v3.verifier_worker,
+                        "--proof-verifier-worker",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-worker-sha256" => {
+                    has_control_arg = true;
+                    set_sha256_option(
+                        &mut production_v3.verifier_worker_sha256,
+                        "--proof-verifier-worker-sha256",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-timeout-ms" => {
+                    has_control_arg = true;
+                    set_positive_integer_option(
+                        &mut production_v3.verifier_timeout_ms,
+                        "--proof-verifier-timeout-ms",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-memory-bytes" => {
+                    has_control_arg = true;
+                    set_positive_integer_option(
+                        &mut production_v3.verifier_memory_bytes,
+                        "--proof-verifier-memory-bytes",
+                        arguments.next(),
+                    )?;
+                }
                 _ if is_short_verbose_flag(&argument) => {
                     has_control_arg = true;
                     verbose = verbose.saturating_add(argument.len() as u8 - 1);
@@ -127,6 +212,11 @@ impl NodeRuntimeConfig {
                         "did you mean --peer <ip:port>?".to_owned(),
                     ));
                 }
+                _ if argument.starts_with("--production-v3-")
+                    || argument.starts_with("--proof-verifier-") =>
+                {
+                    return Err(ConfigError::MalformedProductionV3Argument);
+                }
                 _ => return Err(ConfigError::UnknownArgument(argument)),
             }
         }
@@ -151,11 +241,12 @@ impl NodeRuntimeConfig {
             allow_public_peers,
             peers_explicit,
             verbose,
+            production_v3,
         }
         .with_default_bootstrap();
         config.static_peers(PeerLimits::default()).validate()?;
 
-        Ok(ProcessCommand::Run(config))
+        Ok(ProcessCommand::Run(Box::new(config)))
     }
 
     fn with_default_bootstrap(mut self) -> Self {
@@ -201,6 +292,58 @@ fn parse_address(option: &'static str, value: &str) -> Result<SocketAddr, Config
     })
 }
 
+fn set_path_option(
+    destination: &mut Option<PathBuf>,
+    option: &'static str,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    if destination.is_some() {
+        return Err(ConfigError::DuplicateOption(option));
+    }
+    let value = value.ok_or(ConfigError::MissingValue(option))?;
+    if value.is_empty() {
+        return Err(ConfigError::MissingValue(option));
+    }
+    *destination = Some(PathBuf::from(value));
+    Ok(())
+}
+
+fn set_sha256_option(
+    destination: &mut Option<[u8; 32]>,
+    option: &'static str,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    if destination.is_some() {
+        return Err(ConfigError::DuplicateOption(option));
+    }
+    let value = value.ok_or(ConfigError::MissingValue(option))?;
+    if value.len() != 64 {
+        return Err(ConfigError::InvalidSha256(option));
+    }
+    let mut decoded = [0_u8; 32];
+    hex::decode_to_slice(value, &mut decoded).map_err(|_| ConfigError::InvalidSha256(option))?;
+    *destination = Some(decoded);
+    Ok(())
+}
+
+fn set_positive_integer_option(
+    destination: &mut Option<u64>,
+    option: &'static str,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    if destination.is_some() {
+        return Err(ConfigError::DuplicateOption(option));
+    }
+    let value = value.ok_or(ConfigError::MissingValue(option))?;
+    let value = value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or(ConfigError::InvalidPositiveInteger(option))?;
+    *destination = Some(value);
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) enum ConfigError {
     NonUnicodeArgument,
@@ -208,6 +351,9 @@ pub(crate) enum ConfigError {
     MissingValue(&'static str),
     DuplicateOption(&'static str),
     InvalidAddress { option: &'static str, value: String },
+    InvalidSha256(&'static str),
+    InvalidPositiveInteger(&'static str),
+    MalformedProductionV3Argument,
     InvalidPeerConfiguration(String),
     HelpWithArguments,
     VersionWithArguments,
@@ -228,7 +374,7 @@ impl fmt::Display for ConfigError {
             Self::UnknownArgument(argument) => {
                 write!(formatter, "unknown wallet argument: {argument}")
             }
-            Self::MissingValue(option) => write!(formatter, "{option} requires an IP:port value"),
+            Self::MissingValue(option) => write!(formatter, "{option} requires a value"),
             Self::DuplicateOption(option) => {
                 write!(formatter, "{option} may only be specified once")
             }
@@ -238,6 +384,18 @@ impl fmt::Display for ConfigError {
                     "{option} requires a numeric IP:port, received {value}"
                 )
             }
+            Self::InvalidSha256(option) => {
+                write!(
+                    formatter,
+                    "{option} requires exactly 64 hexadecimal characters"
+                )
+            }
+            Self::InvalidPositiveInteger(option) => {
+                write!(formatter, "{option} requires a nonzero unsigned integer")
+            }
+            Self::MalformedProductionV3Argument => formatter.write_str(
+                "ProductionV3 options require an exact supported name and a separate value",
+            ),
             Self::InvalidPeerConfiguration(message) => formatter.write_str(message),
             Self::HelpWithArguments => {
                 formatter.write_str("--help cannot be combined with other arguments")
@@ -259,7 +417,7 @@ mod tests {
 
     fn parsed_run_config(arguments: impl IntoIterator<Item = &'static str>) -> NodeRuntimeConfig {
         match parse_command(arguments) {
-            ProcessCommand::Run(config) => config,
+            ProcessCommand::Run(config) => *config,
             ProcessCommand::Help => {
                 panic!("expected run configuration, got help")
             }
@@ -278,6 +436,7 @@ mod tests {
         assert!(config.allow_public_peers);
         assert!(!config.peers_explicit);
         assert_eq!(config.verbose, 0);
+        assert!(!config.production_v3.is_configured());
     }
 
     #[test]
@@ -409,5 +568,67 @@ mod tests {
             NodeRuntimeConfig::parse(["--version"]),
             Ok(ProcessCommand::Version)
         ));
+    }
+
+    #[test]
+    fn production_v3_arguments_preserve_every_explicit_launch_input() {
+        let config = parsed_run_config([
+            "--production-v3-bank",
+            "C:\\rc\\model.bank",
+            "--production-v3-manifest",
+            "C:\\rc\\manifest.json",
+            "--production-v3-record-v2",
+            "C:\\rc\\record-v2.json",
+            "--proof-verifier-worker",
+            "C:\\rc\\cmfd-proof-worker.exe",
+            "--proof-verifier-worker-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--proof-verifier-timeout-ms",
+            "45000",
+            "--proof-verifier-memory-bytes",
+            "3221225472",
+        ]);
+
+        assert_eq!(
+            config.production_v3.bank,
+            Some(PathBuf::from("C:\\rc\\model.bank"))
+        );
+        assert_eq!(
+            config.production_v3.verifier_worker_sha256,
+            Some([0x11; 32])
+        );
+        assert_eq!(config.production_v3.verifier_timeout_ms, Some(45_000));
+        assert_eq!(
+            config.production_v3.verifier_memory_bytes,
+            Some(3_221_225_472)
+        );
+    }
+
+    #[test]
+    fn malformed_or_unpinned_worker_arguments_are_rejected() {
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--proof-verifier-worker-sha256", "abcd"]),
+            Err(ConfigError::InvalidSha256("--proof-verifier-worker-sha256"))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--proof-verifier-timeout-ms", "0"]),
+            Err(ConfigError::InvalidPositiveInteger(
+                "--proof-verifier-timeout-ms"
+            ))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse([
+                "--production-v3-bank",
+                "first.bank",
+                "--production-v3-bank",
+                "second.bank"
+            ]),
+            Err(ConfigError::DuplicateOption("--production-v3-bank"))
+        ));
+
+        let error =
+            NodeRuntimeConfig::parse(["--production-v3-bank=C:\\private\\model.bank"]).unwrap_err();
+        assert!(matches!(error, ConfigError::MalformedProductionV3Argument));
+        assert!(!error.to_string().contains("C:\\private"));
     }
 }

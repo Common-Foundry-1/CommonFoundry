@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "common-foundry-wallet"
 path = "src/main.rs"
 
+[features]
+default = []
+production-v3 = [
+    "cmfd-node/production-v3",
+    "cmfd-proof-worker/production-v3",
+]
+production-rc = ["production-v3", "cmfd-node/production-rc"]
+
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }
 
@@ -20,8 +28,12 @@ tauri-build = { version = "=2.6.3", features = [] }
 cmfd-consensus = { path = "../../../crates/cmfd-consensus" }
 cmfd-cuda = { path = "../../../crates/cmfd-cuda" }
 cmfd-node = { path = "../../../crates/cmfd-node" }
+cmfd-proof-worker = { path = "../../../crates/cmfd-proof-worker" }
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-single-instance = "=2.4.3"
+
+[dev-dependencies]
+sha2.workspace = true

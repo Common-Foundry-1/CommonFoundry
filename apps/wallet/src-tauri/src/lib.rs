@@ -28,7 +28,7 @@ pub fn run() -> i32 {
             println!(env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        runtime::ProcessCommand::Run(config) => config,
+        runtime::ProcessCommand::Run(config) => *config,
     };
 
     let app = match tauri::Builder::default()

@@ -403,6 +403,10 @@ pub fn generate_production_dory_v3_qualification_request(
 {
     let generation_started = Instant::now();
     check_cancel(cancel)?;
+    ensure_absolute_paths(
+        &[bank_path, record_path],
+        "qualification request bank and Record V2 paths must be absolute",
+    )?;
     let paths = QualificationRequestPaths::preflight(scratch_path, request_output)?;
     let mut scratch = OwnedScratchDirectory::create(paths.scratch.clone())?;
 
@@ -530,6 +534,10 @@ pub fn run_production_dory_v3_qualification(
     if cancel.load(Ordering::Relaxed) {
         return Err(ProductionDoryV3QualificationError::Cancelled);
     }
+    ensure_absolute_paths(
+        &[bank_path, record_path],
+        "qualification bank and Record V2 paths must be absolute",
+    )?;
     if maximum_native_block_rows == 0 {
         return Err(ProductionDoryV3QualificationError::Configuration(
             "maximum_native_block_rows must be nonzero",
@@ -849,6 +857,10 @@ pub fn run_production_dory_v3_verifier(
     proof_path: &Path,
     report_output: &Path,
 ) -> Result<ProductionDoryV3VerifierReport, ProductionDoryV3QualificationError> {
+    ensure_absolute_paths(
+        &[bank_path, record_path, request_path, proof_path],
+        "verifier bank, Record V2, request, and proof paths must be absolute",
+    )?;
     let report_output = preflight_verifier_report_output(report_output)?;
     let verifier_started = Instant::now();
 
@@ -993,9 +1005,9 @@ impl QualificationPaths {
         proof_output: &Path,
         report_output: &Path,
     ) -> Result<Self, ProductionDoryV3QualificationError> {
-        if !scratch.is_absolute() {
+        if !scratch.is_absolute() || !proof_output.is_absolute() || !report_output.is_absolute() {
             return Err(ProductionDoryV3QualificationError::Configuration(
-                "scratch path must be absolute",
+                "qualification scratch, proof, and report paths must be absolute",
             ));
         }
         let scratch = resolve_new_path(scratch)?;
@@ -1033,6 +1045,16 @@ fn preflight_verifier_report_output(
     let report_output = resolve_new_path(report_output)?;
     ensure_path_absent(&report_output)?;
     Ok(report_output)
+}
+
+fn ensure_absolute_paths(
+    paths: &[&Path],
+    message: &'static str,
+) -> Result<(), ProductionDoryV3QualificationError> {
+    if paths.iter().any(|path| !path.is_absolute()) {
+        return Err(ProductionDoryV3QualificationError::Configuration(message));
+    }
+    Ok(())
 }
 
 fn resolve_new_path(path: &Path) -> Result<PathBuf, ProductionDoryV3QualificationError> {
@@ -2188,6 +2210,14 @@ mod tests {
             Err(ProductionDoryV3QualificationError::Configuration(_))
         ));
         assert!(matches!(
+            QualificationPaths::preflight(&scratch, Path::new("relative-proof"), &report),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        assert!(matches!(
+            QualificationPaths::preflight(&scratch, &proof, Path::new("relative-report")),
+            Err(ProductionDoryV3QualificationError::Configuration(_))
+        ));
+        assert!(matches!(
             QualificationPaths::preflight(&scratch, &proof, &proof),
             Err(ProductionDoryV3QualificationError::Configuration(_))
         ));
@@ -2203,6 +2233,22 @@ mod tests {
         assert!(matches!(
             QualificationPaths::preflight(&scratch, &proof, &report),
             Err(ProductionDoryV3QualificationError::PathExists(path)) if path == proof
+        ));
+    }
+
+    #[test]
+    fn qualification_library_inputs_require_absolute_paths() {
+        let directory = TestDirectory::create();
+        let absolute = directory.0.join("input");
+        ensure_absolute_paths(&[&absolute], "test paths must be absolute").unwrap();
+        assert!(matches!(
+            ensure_absolute_paths(
+                &[Path::new("relative-input")],
+                "test paths must be absolute"
+            ),
+            Err(ProductionDoryV3QualificationError::Configuration(
+                "test paths must be absolute"
+            ))
         ));
     }
 

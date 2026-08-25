@@ -561,23 +561,23 @@ enum Command {
     /// Run one unchanged n=33 Dory V3 production qualification.
     #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
     DoryV3Qualify {
-        /// Canonical production model bank.
-        #[arg(long)]
+        /// Existing absolute canonical production model bank.
+        #[arg(long, value_parser = parse_absolute_path)]
         bank: std::path::PathBuf,
-        /// Canonical production Record V2 JSON.
-        #[arg(long)]
+        /// Existing absolute canonical production Record V2 JSON.
+        #[arg(long, value_parser = parse_absolute_path)]
         record: std::path::PathBuf,
-        /// Strict qualification request JSON containing the block and winning claim.
-        #[arg(long)]
+        /// Existing absolute strict qualification request containing the winning claim.
+        #[arg(long, value_parser = parse_absolute_path)]
         request: std::path::PathBuf,
         /// New absolute runner-owned scratch directory.
-        #[arg(long)]
+        #[arg(long, value_parser = parse_absolute_path)]
         scratch: std::path::PathBuf,
-        /// New canonical proof-wire output path.
-        #[arg(long)]
+        /// New absolute canonical proof-wire output path.
+        #[arg(long, value_parser = parse_absolute_path)]
         proof_output: std::path::PathBuf,
-        /// New report written last as the completion marker; publication is not crash-atomic.
-        #[arg(long)]
+        /// New absolute report written last as the completion marker; publication is not crash-atomic.
+        #[arg(long, value_parser = parse_absolute_path)]
         report_output: std::path::PathBuf,
         /// Maximum native BLAKE3 rows materialized in one block.
         #[arg(long)]
@@ -2134,6 +2134,46 @@ mod tests {
         let mut private_key = valid_args();
         private_key.extend(["--private-key".into(), "00".into()]);
         assert!(Cli::try_parse_from(private_key).is_err());
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    #[test]
+    fn dory_v3_qualification_cli_requires_absolute_paths() {
+        let directory = std::env::current_dir().unwrap();
+        let bank = directory.join("model.cmfdmb02");
+        let record = directory.join("record-v2.json");
+        let request = directory.join("qualification-request.json");
+        let scratch = directory.join("proof-scratch");
+        let proof_output = directory.join("proof.cmfd");
+        let report_output = directory.join("producer-report.json");
+        let valid_args = || {
+            vec![
+                "cmfd-consensus".into(),
+                "dory-v3-qualify".into(),
+                "--bank".into(),
+                bank.clone().into_os_string(),
+                "--record".into(),
+                record.clone().into_os_string(),
+                "--request".into(),
+                request.clone().into_os_string(),
+                "--scratch".into(),
+                scratch.clone().into_os_string(),
+                "--proof-output".into(),
+                proof_output.clone().into_os_string(),
+                "--report-output".into(),
+                report_output.clone().into_os_string(),
+                "--maximum-native-block-rows".into(),
+                "131072".into(),
+            ]
+        };
+
+        Cli::try_parse_from(valid_args()).unwrap();
+
+        for path_index in [3, 5, 7, 9, 11, 13] {
+            let mut relative_path = valid_args();
+            relative_path[path_index] = "relative-path".into();
+            assert!(Cli::try_parse_from(relative_path).is_err());
+        }
     }
 
     #[cfg(feature = "whir-prototype")]

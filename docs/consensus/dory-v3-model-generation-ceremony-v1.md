@@ -2240,8 +2240,11 @@ pipeline qualification, use a fixed nonce such as `0` and a target containing
 target needs a separate batched accelerator search, whose result must still be
 replayed by the CPU verifier. The subsequent `dory-v3-qualify` command performs
 its own Record V2 validation, bank authentication, and full winning-claim CPU
-replay. A request generated from a single qualification payload is evidence for
-the proof toolchain only. It is not a combined ceremony model or a signed
+replay. Its bank, Record V2, request, scratch, proof-output, and report-output
+paths must all be absolute; both the CLI parser and qualification library reject
+relative paths before model preparation or proof work. A request generated from
+a single qualification payload is evidence for the proof toolchain only. It is
+not a combined ceremony model or a signed
 type-5 ceremony prefix.
 
 After `dory-v3-qualify` persists the proof, run a second, fresh process with the

@@ -103,6 +103,17 @@ jobs:
         run: cargo test --locked -p cmfd-consensus --lib --features whir-prototype native_codec
       - name: Exercise Dory Type-6 CLI
         run: cargo test --locked -p cmfd-consensus --bin cmfd-consensus --no-default-features --features dory-bls12-381-prototype
+      - name: Exercise the complete Dory V3 qualification verifier boundary
+        run: >-
+          cargo test --locked -p cmfd-consensus --lib --no-default-features
+          --features dory-bls12-381-prototype,whir-prototype
+          dory_v3_qualification::tests::
+      - name: Require verifier-only Dory V3 qualification CLI inputs
+        run: >-
+          cargo test --locked -p cmfd-consensus --bin cmfd-consensus
+          --no-default-features --features dory-bls12-381-prototype,whir-prototype
+          tests::dory_v3_verify_qualification_cli_requires_only_absolute_verifier_inputs
+          -- --exact
 
   node-shutdown:
     strategy:

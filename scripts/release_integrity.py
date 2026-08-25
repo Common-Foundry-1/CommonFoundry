@@ -35,11 +35,11 @@ PRODUCTION_V3_ACTIVATION_NAME = "PRODUCTION-V3-ACTIVATION.json"
 PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME = (
     "PRODUCTION-V3-QUALIFICATION-MANIFEST.json"
 )
-PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME = (
-    "PRODUCTION-V3-INDEPENDENT-VERIFIER.bin"
+PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME = (
+    "PRODUCTION-V3-FRESH-PROCESS-VERIFIER.bin"
 )
-PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME = (
-    "PRODUCTION-V3-INDEPENDENT-VERIFIER-REPORT.json"
+PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME = (
+    "PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json"
 )
 RECEIPT_FIELDS = (
     "SCHEMA",
@@ -113,8 +113,8 @@ def validate_production_rc_artifacts(
         PRODUCTION_RC_NETWORK_INFO_NAME,
         PRODUCTION_V3_ACTIVATION_NAME,
         PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME,
-        PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME,
-        PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+        PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME,
+        PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME,
     }
     missing = sorted(required - set(stage_files))
     if missing:
@@ -134,12 +134,12 @@ def validate_production_rc_artifacts(
         "ProductionV3 qualification manifest",
     )
     verifier_binary = _regular_file(
-        stage_files[PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME],
-        "ProductionV3 independent verifier binary",
+        stage_files[PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME],
+        "ProductionV3 fresh-process verifier binary",
     )
     verifier_report, verifier_report_bytes = _bounded_json_object(
-        stage_files[PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME],
-        "ProductionV3 independent verifier report",
+        stage_files[PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME],
+        "ProductionV3 fresh-process verifier report",
     )
     qualification_manifest_sha256 = _sha256_bytes(qualification_manifest_bytes)
     verifier_binary_sha256 = _sha256_file(verifier_binary)
@@ -178,8 +178,8 @@ def validate_production_rc_artifacts(
         "network_profile": "RCNet-1",
         "proof_selection": "ProductionV3",
         "qualification_manifest_sha256": qualification_manifest_sha256,
-        "independent_verifier_binary_sha256": verifier_binary_sha256,
-        "independent_verifier_report_sha256": verifier_report_sha256,
+        "fresh_process_verifier_binary_sha256": verifier_binary_sha256,
+        "fresh_process_verifier_report_sha256": verifier_report_sha256,
     }
     for field, expected in expected_evidence.items():
         if evidence.get(field) != expected:
@@ -247,12 +247,16 @@ def validate_production_rc_artifacts(
         raise IntegrityError("ProductionV3 qualification manifest artifacts are missing")
     required_bound_roles = {
         "bank",
+        "cargo",
+        "cargo_config",
+        "consensus_executable",
         "record_v2",
         "request",
         "proof",
         "producer_report",
         "journal",
-        "independent_verifier_binary",
+        "rustc",
+        "fresh_process_verifier_binary",
         "verifier_report",
     }
     if not required_bound_roles.issubset(artifacts):
@@ -279,14 +283,48 @@ def validate_production_rc_artifacts(
                 f"ProductionV3 qualification manifest has invalid {role} binding"
             )
 
+    toolchain = qualification_manifest.get("toolchain")
+    if not isinstance(toolchain, dict):
+        raise IntegrityError("ProductionV3 qualification toolchain identity is missing")
+    toolchain_identity = {
+        "cargo_sha256": artifacts["cargo"]["sha256"],
+        "cargo_version": toolchain.get("cargo_version"),
+        "rustc_sha256": artifacts["rustc"]["sha256"],
+        "rustc_version": toolchain.get("rustc_version"),
+        "cargo_config_sha256": artifacts["cargo_config"]["sha256"],
+        "environment_policy": "CMFD_QUALIFICATION_ALLOWLIST_V1",
+    }
+    if (
+        not isinstance(toolchain_identity["cargo_version"], str)
+        or not toolchain_identity["cargo_version"]
+        or not isinstance(toolchain_identity["rustc_version"], str)
+        or not toolchain_identity["rustc_version"]
+        or toolchain.get("cargo_sha256") != toolchain_identity["cargo_sha256"]
+        or toolchain.get("rustc_sha256") != toolchain_identity["rustc_sha256"]
+        or toolchain.get("cargo_config_sha256")
+        != toolchain_identity["cargo_config_sha256"]
+        or toolchain.get("environment_policy")
+        != toolchain_identity["environment_policy"]
+        or toolchain.get("identity_sha256")
+        != _sha256_bytes(
+            json.dumps(
+                toolchain_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        )
+    ):
+        raise IntegrityError("ProductionV3 qualification toolchain identity is invalid")
+
     staged_bindings = {
-        "independent_verifier_binary": (
-            PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME,
+        "fresh_process_verifier_binary": (
+            PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME,
             verifier_binary.stat().st_size,
             verifier_binary_sha256,
         ),
         "verifier_report": (
-            PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+            PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME,
             len(verifier_report_bytes),
             verifier_report_sha256,
         ),
@@ -312,7 +350,7 @@ def validate_production_rc_artifacts(
     for field, expected in verifier_expectations.items():
         if verifier_report.get(field) != expected:
             raise IntegrityError(
-                f"ProductionV3 independent verifier report has invalid {field}"
+                f"ProductionV3 fresh-process verifier report has invalid {field}"
             )
 
 

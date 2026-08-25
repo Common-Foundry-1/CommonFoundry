@@ -6,6 +6,14 @@ param(
     [string]$ExpectedCommit,
 
     [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-f]{64}$')]
+    [string]$ExpectedCargoSha256,
+
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-f]{64}$')]
+    [string]$ExpectedRustcSha256,
+
+    [Parameter(Mandatory)]
     [string]$Bank,
 
     [Parameter(Mandatory)]
@@ -57,6 +65,8 @@ $arguments = @(
     $harness,
     '--repo', $projectRoot,
     '--expected-commit', $ExpectedCommit,
+    '--expected-cargo-sha256', $ExpectedCargoSha256,
+    '--expected-rustc-sha256', $ExpectedRustcSha256,
     '--bank', $Bank,
     '--record', $Record,
     '--request', $Request,

@@ -9,7 +9,7 @@ testnet RC labels are deliberately excluded.
 The build proceeds only when the source-selected profile is RCNet, its consensus
 proof selector is `ProductionV3`, and the compiled profile contains complete
 activation evidence: the qualification source commit, qualification-manifest
-SHA-256, independent-verifier binary SHA-256, and independent-verifier report
+SHA-256, fresh-process verifier binary SHA-256, and fresh-process verifier report
 SHA-256. A production build must also receive the exact release checkout as
 the trusted `CMFD_BUILD_SOURCE_COMMIT` input. It must also pin the exact byte
 length, BLAKE3 digest, and SHA-256 digest of the production bank, manifest, and
@@ -23,19 +23,22 @@ cargo check --locked -p cmfd-node --features production-rc
 Release finalization applies a second, artifact-level check. Any production-RC
 stage must inventory `NETWORK-INFO.json`, `PRODUCTION-V3-ACTIVATION.json`, the
 actual `PRODUCTION-V3-QUALIFICATION-MANIFEST.json`, the exact
-`PRODUCTION-V3-INDEPENDENT-VERIFIER.bin`, and its
-`PRODUCTION-V3-INDEPENDENT-VERIFIER-REPORT.json`. The compiled manifest must
+`PRODUCTION-V3-FRESH-PROCESS-VERIFIER.bin`, and its
+`PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json`. The compiled manifest must
 identify RCNet-1, select `ProductionV3`, bind the checked-out release commit
 provided by the trusted build job, and bind the exact activation-evidence bytes
 by SHA-256.
 
 The finalizer recomputes SHA-256 over the staged qualification manifest,
-verifier binary, and verifier report and requires exact matches in the
-activation evidence. It also checks that the qualification manifest binds the
-staged verifier artifacts, production n=33/134-claim geometry, an RCNet-1
-qualification identity, and a successful fresh-process verifier report. Arbitrary well-formed
-nonzero digest strings cannot pass. These files then become ordinary hashed
-release artifacts in `BUILDINFO.json` and `SHA256SUMS.txt`.
+fresh-process verifier binary, and fresh-process verifier report and requires
+exact matches in the activation evidence. It also checks that the qualification
+manifest binds the staged verifier artifacts, the pinned Cargo and rustc
+binaries, the generated Cargo configuration, production n=33/134-claim
+geometry, an RCNet-1 qualification identity, and a successful fresh-process
+same-build verifier report. This is process isolation, not an independently
+built verifier claim. Arbitrary well-formed nonzero digest strings cannot pass.
+These files then become ordinary hashed release artifacts in `BUILDINFO.json`
+and `SHA256SUMS.txt`.
 
 The qualification manifest records the older exact commit used to build and
 run the qualifying verifier. The final activation evidence separately records

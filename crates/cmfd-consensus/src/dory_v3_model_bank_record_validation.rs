@@ -14,8 +14,10 @@ use std::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+#[cfg(feature = "dory-v3-consensus-adapter")]
+use crate::{ConsensusPowVerifier, PowError};
 use crate::{
-    ConsensusPowVerifier, MODEL_BANK_HEADER_BYTES, ModelBankManifest, PowError,
+    MODEL_BANK_HEADER_BYTES, ModelBankManifest,
     dory_bls12_381_prototype::{
         BlsDoryPrototypeError, DeterministicBlsDorySetup, deterministic_bls_dory_setup,
     },
@@ -185,6 +187,7 @@ pub enum ProductionDoryV3ModelBankRecordValidationError {
     RecordReproductionMismatch,
     #[error("a final retained small-file reread no longer matches the validated chain")]
     FinalSmallFileMismatch,
+    #[cfg(feature = "dory-v3-consensus-adapter")]
     #[error("failed to construct the production V3 consensus verifier: {0}")]
     ConsensusVerifier(#[source] PowError),
 }
@@ -194,6 +197,7 @@ pub enum ProductionDoryV3ModelBankRecordValidationError {
 /// A network launcher must compare these identities with its compiled pins
 /// before accepting the verifier as consensus authority.
 #[must_use]
+#[cfg(feature = "dory-v3-consensus-adapter")]
 pub struct LoadedProductionDoryV3ConsensusVerifier {
     verifier: ConsensusPowVerifier,
     bank_file: FileIdentity,
@@ -201,6 +205,7 @@ pub struct LoadedProductionDoryV3ConsensusVerifier {
     record_v2_file: FileIdentity,
 }
 
+#[cfg(feature = "dory-v3-consensus-adapter")]
 impl LoadedProductionDoryV3ConsensusVerifier {
     pub const fn bank_file(&self) -> &FileIdentity {
         &self.bank_file
@@ -283,6 +288,7 @@ pub fn validate_existing_production_dory_v3_model_bank_record_chain(
 /// bounds both JSON inputs before this function can mint verifier authority.
 /// Paths and file bytes never become consensus parameters; only the identities
 /// derived from the authenticated Record V2 are retained by the verifier.
+#[cfg(feature = "dory-v3-consensus-adapter")]
 pub fn load_production_dory_v3_consensus_verifier(
     network_id: [u8; 32],
     bank_path: &Path,

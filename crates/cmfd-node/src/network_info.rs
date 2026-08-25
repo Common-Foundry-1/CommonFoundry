@@ -16,6 +16,8 @@ use cmfd_consensus::{
 };
 use cmfd_proof_worker::ProductionV3VerifierArtifacts;
 use serde::Serialize;
+#[cfg(feature = "production-v3")]
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, NodeError, network_params_and_verifier_for_profile,
@@ -83,6 +85,7 @@ struct ConsensusLimits {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)] // Serialized once for NETWORK-INFO; boxing adds needless heap indirection.
 enum ProofOfWorkIdentity {
     V2Reference(V2ProofOfWorkIdentity),
     #[cfg(feature = "production-v3")]
@@ -104,7 +107,10 @@ struct V2ProofOfWorkIdentity {
 #[cfg(feature = "production-v3")]
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ProductionV3ProofOfWorkIdentity {
+    selection: &'static str,
     profile: &'static str,
+    build_source_commit: &'static str,
+    activation_evidence_sha256: String,
     wire_type: u16,
     pow_limit: String,
     algorithm_version: u32,
@@ -254,8 +260,20 @@ fn canonical_network_info_json_for_profile(
             let artifacts = crate::release_gate::COMPILED_RELEASE_PROFILE
                 .production_v3_artifacts
                 .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?;
+            let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").ok_or(
+                NodeError::ProductionV3ActivationEvidence("trusted build source commit is absent"),
+            )?;
+            let activation_evidence =
+                crate::release_gate::canonical_production_v3_activation_evidence_json(
+                    crate::release_gate::COMPILED_RELEASE_PROFILE,
+                    build_source_commit,
+                )
+                .map_err(NodeError::ProductionV3ActivationEvidence)?;
             ProofOfWorkIdentity::ProductionV3(ProductionV3ProofOfWorkIdentity {
+                selection: "ProductionV3",
                 profile: profile.proof_name(),
+                build_source_commit,
+                activation_evidence_sha256: hex::encode(Sha256::digest(&activation_evidence)),
                 wire_type: POW_TYPE_V3_CANDIDATE,
                 pow_limit: hex::encode(params.pow_limit),
                 algorithm_version: parameters.algorithm_version(),

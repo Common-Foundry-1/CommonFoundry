@@ -459,10 +459,10 @@ class ProductionRcGateTests(unittest.TestCase):
         return path
 
     def valid_stage_files(self) -> dict[str, Path]:
-        verifier_binary = self.root / integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME
-        verifier_binary.write_bytes(b"independent verifier fixture")
+        verifier_binary = self.root / integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME
+        verifier_binary.write_bytes(b"fresh-process verifier fixture")
         verifier_report = self.write_json(
-            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+            integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME,
             {
                 "network_id": "72" * 32,
                 "producer_report_checked": True,
@@ -479,22 +479,34 @@ class ProductionRcGateTests(unittest.TestCase):
             }
             for role in (
                 "bank",
+                "cargo",
+                "cargo_config",
+                "consensus_executable",
                 "record_v2",
                 "request",
                 "proof",
                 "producer_report",
                 "journal",
+                "rustc",
             )
         }
-        artifact_rows["independent_verifier_binary"] = {
+        artifact_rows["fresh_process_verifier_binary"] = {
             "bytes": verifier_binary.stat().st_size,
-            "file_name": integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME,
+            "file_name": integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME,
             "sha256": integrity._sha256_file(verifier_binary),
         }
         artifact_rows["verifier_report"] = {
             "bytes": verifier_report.stat().st_size,
-            "file_name": integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME,
+            "file_name": integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME,
             "sha256": integrity._sha256_file(verifier_report),
+        }
+        toolchain_identity = {
+            "cargo_sha256": artifact_rows["cargo"]["sha256"],
+            "cargo_version": "cargo fixture",
+            "rustc_sha256": artifact_rows["rustc"]["sha256"],
+            "rustc_version": "rustc fixture",
+            "cargo_config_sha256": artifact_rows["cargo_config"]["sha256"],
+            "environment_policy": "CMFD_QUALIFICATION_ALLOWLIST_V1",
         }
         qualification_manifest = self.write_json(
             integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME,
@@ -526,15 +538,26 @@ class ProductionRcGateTests(unittest.TestCase):
                 "schema": "CMFD_PRODUCTION_V3_QUALIFICATION_MANIFEST_V1",
                 "source_commit": "9" * 40,
                 "status": "qualification_complete_activation_disabled",
+                "toolchain": {
+                    **toolchain_identity,
+                    "identity_sha256": integrity._sha256_bytes(
+                        json.dumps(
+                            toolchain_identity,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                        ).encode("utf-8")
+                    ),
+                },
             },
         )
         evidence = self.write_json(
             integrity.PRODUCTION_V3_ACTIVATION_NAME,
             {
-                "independent_verifier_binary_sha256": integrity._sha256_file(
+                "fresh_process_verifier_binary_sha256": integrity._sha256_file(
                     verifier_binary
                 ),
-                "independent_verifier_report_sha256": integrity._sha256_file(
+                "fresh_process_verifier_report_sha256": integrity._sha256_file(
                     verifier_report
                 ),
                 "network_profile": "RCNet-1",
@@ -565,8 +588,8 @@ class ProductionRcGateTests(unittest.TestCase):
             integrity.PRODUCTION_RC_NETWORK_INFO_NAME: network_info,
             integrity.PRODUCTION_V3_ACTIVATION_NAME: evidence,
             integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME: qualification_manifest,
-            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME: verifier_binary,
-            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME: verifier_report,
+            integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME: verifier_binary,
+            integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME: verifier_report,
         }
 
     def test_production_rc_labels_exclude_devnet_candidates(self) -> None:
@@ -638,10 +661,10 @@ class ProductionRcGateTests(unittest.TestCase):
     def test_tampered_verifier_binary_is_rejected(self) -> None:
         stage_files = self.valid_stage_files()
         stage_files[
-            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_BINARY_NAME
+            integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME
         ].write_bytes(b"tampered verifier")
         with self.assertRaisesRegex(
-            integrity.IntegrityError, "independent_verifier_binary_sha256"
+            integrity.IntegrityError, "fresh_process_verifier_binary_sha256"
         ):
             integrity.validate_production_rc_artifacts(
                 version="production-rc1",
@@ -652,12 +675,39 @@ class ProductionRcGateTests(unittest.TestCase):
     def test_tampered_verifier_report_is_rejected(self) -> None:
         stage_files = self.valid_stage_files()
         report = stage_files[
-            integrity.PRODUCTION_V3_INDEPENDENT_VERIFIER_REPORT_NAME
+            integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME
         ]
         report.write_bytes(report.read_bytes() + b"\n")
         with self.assertRaisesRegex(
-            integrity.IntegrityError, "independent_verifier_report_sha256"
+            integrity.IntegrityError, "fresh_process_verifier_report_sha256"
         ):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1",
+                commit=self.commit,
+                stage_files=stage_files,
+            )
+
+    def test_unbound_toolchain_identity_is_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        manifest_path = stage_files[
+            integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME
+        ]
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["toolchain"]["cargo_sha256"] = "f" * 64
+        self.write_json(integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME, manifest)
+        evidence_path = stage_files[integrity.PRODUCTION_V3_ACTIVATION_NAME]
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["qualification_manifest_sha256"] = integrity._sha256_file(
+            manifest_path
+        )
+        self.write_json(integrity.PRODUCTION_V3_ACTIVATION_NAME, evidence)
+        network_path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(network_path.read_text(encoding="utf-8"))
+        network["proof_of_work"]["activation_evidence_sha256"] = (
+            integrity._sha256_file(evidence_path)
+        )
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(integrity.IntegrityError, "toolchain identity"):
             integrity.validate_production_rc_artifacts(
                 version="production-rc1",
                 commit=self.commit,

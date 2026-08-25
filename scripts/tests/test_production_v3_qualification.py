@@ -63,9 +63,12 @@ class QualificationEvidenceTests(unittest.TestCase):
         self.proof = root / "qualification-proof.cmfd"
         self.journal = root / "producer-journal.jsonl"
         self.executable = root / "cmfd-consensus.exe"
-        self.independent_verifier_binary = (
-            root / qualification.INDEPENDENT_VERIFIER_BINARY_NAME
+        self.fresh_process_verifier_binary = (
+            root / qualification.FRESH_PROCESS_VERIFIER_BINARY_NAME
         )
+        self.cargo = root / "cargo.exe"
+        self.rustc = root / "rustc.exe"
+        self.cargo_config = root / "cargo-config.toml"
         self.build_stdout = root / "build-stdout.log"
         self.build_stderr = root / "build-stderr.log"
         self.producer_stdout = root / "producer-stdout.json"
@@ -73,7 +76,7 @@ class QualificationEvidenceTests(unittest.TestCase):
         self.verifier_stdout = root / "fresh-verifier-stdout.json"
         self.verifier_stderr = root / "fresh-verifier-stderr.log"
         self.producer_report = root / "producer-report.json"
-        self.verifier_report = root / qualification.INDEPENDENT_VERIFIER_REPORT_NAME
+        self.verifier_report = root / qualification.FRESH_PROCESS_VERIFIER_REPORT_NAME
         self.manifest = root / qualification.QUALIFICATION_MANIFEST_NAME
         self.candidate = root / "PRODUCTION-V3-ACTIVATION-CANDIDATE.json"
 
@@ -83,7 +86,10 @@ class QualificationEvidenceTests(unittest.TestCase):
         self.proof.write_bytes(b"proof-wire")
         self.journal.write_bytes(b"diagnostic journal fixture\n")
         self.executable.write_bytes(b"executable")
-        self.independent_verifier_binary.write_bytes(b"executable")
+        self.fresh_process_verifier_binary.write_bytes(b"executable")
+        self.cargo.write_bytes(b"cargo")
+        self.rustc.write_bytes(b"rustc")
+        self.cargo_config.write_bytes(b"[net]\ngit-fetch-with-cli = false\n")
         self.build_stdout.write_bytes(b"")
         self.build_stderr.write_bytes(b"build diagnostics")
         self.producer_stderr.write_bytes(b"")
@@ -172,8 +178,12 @@ class QualificationEvidenceTests(unittest.TestCase):
         return qualification._artifact_bindings(
             {
                 "bank": self.bank,
+                "cargo": self.cargo,
+                "cargo_config": self.cargo_config,
+                "consensus_executable": self.executable,
                 "record_v2": self.record,
                 "request": self.request,
+                "rustc": self.rustc,
                 "proof": self.proof,
                 "producer_report": self.producer_report,
                 "journal": self.journal,
@@ -197,7 +207,11 @@ class QualificationEvidenceTests(unittest.TestCase):
             journal=self.journal,
             verifier_report=self.verifier_report,
             consensus_executable=self.executable,
-            independent_verifier_binary=self.independent_verifier_binary,
+            fresh_process_verifier_binary=self.fresh_process_verifier_binary,
+            cargo=self.cargo,
+            rustc=self.rustc,
+            cargo_config=self.cargo_config,
+            tool_versions={"cargo": "cargo fixture", "rustc": "rustc fixture"},
             build_stdout=self.build_stdout,
             build_stderr=self.build_stderr,
             producer_stdout=self.producer_stdout,
@@ -225,14 +239,25 @@ class QualificationEvidenceTests(unittest.TestCase):
         self.assertFalse(manifest["journal_semantics"]["used_as_completion_evidence"])
         for role in (
             "bank",
+            "cargo",
+            "cargo_config",
+            "consensus_executable",
             "record_v2",
             "request",
             "proof",
             "producer_report",
             "journal",
+            "rustc",
             "verifier_report",
+            "fresh_process_verifier_binary",
         ):
             self.assertRegex(manifest["artifacts"][role]["sha256"], r"^[0-9a-f]{64}$")
+        toolchain_identity = dict(manifest["toolchain"])
+        identity_sha256 = toolchain_identity.pop("identity_sha256")
+        self.assertEqual(
+            identity_sha256,
+            qualification._canonical_json_sha256(toolchain_identity),
+        )
         self.assertEqual(candidate["schema"], qualification.CANDIDATE_SCHEMA)
         self.assertEqual(candidate["status"], "candidate_only_not_activated")
         self.assertFalse(candidate["eligible_for_automatic_activation"])
@@ -241,12 +266,12 @@ class QualificationEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(candidate["qualification_manifest_sha256"], manifest_sha256)
         self.assertEqual(
-            candidate["independent_verifier_report_sha256"],
+            candidate["fresh_process_verifier_report_sha256"],
             manifest["artifacts"]["verifier_report"]["sha256"],
         )
         self.assertEqual(
-            candidate["independent_verifier_binary_sha256"],
-            manifest["artifacts"]["independent_verifier_binary"]["sha256"],
+            candidate["fresh_process_verifier_binary_sha256"],
+            manifest["artifacts"]["fresh_process_verifier_binary"]["sha256"],
         )
         self.assertEqual(qualification._sha256_file(self.candidate), candidate_sha256)
 
@@ -327,7 +352,11 @@ class QualificationEvidenceTests(unittest.TestCase):
                 journal=self.journal,
                 verifier_report=self.verifier_report,
                 consensus_executable=self.executable,
-                independent_verifier_binary=self.independent_verifier_binary,
+                fresh_process_verifier_binary=self.fresh_process_verifier_binary,
+                cargo=self.cargo,
+                rustc=self.rustc,
+                cargo_config=self.cargo_config,
+                tool_versions={"cargo": "cargo fixture", "rustc": "rustc fixture"},
                 build_stdout=self.build_stdout,
                 build_stderr=self.build_stderr,
                 producer_stdout=self.producer_stdout,
@@ -369,6 +398,8 @@ class QualificationArgumentTests(unittest.TestCase):
         required = [
             "--repo", "C:\\repo",
             "--expected-commit", "1" * 40,
+            "--expected-cargo-sha256", "2" * 64,
+            "--expected-rustc-sha256", "3" * 64,
             "--bank", "D:\\bank",
             "--record", "D:\\record",
             "--request", "D:\\request",
@@ -380,6 +411,46 @@ class QualificationArgumentTests(unittest.TestCase):
                 parser.parse_args(required + ["--scratch-margin-bytes", "0"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(required + ["--maximum-native-block-rows", "0"])
+
+    def test_malicious_ambient_rust_and_cargo_overrides_are_rejected(self) -> None:
+        for name in (
+            "RUSTC_WRAPPER",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_HOME",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                qualification.QualificationHarnessError, name
+            ):
+                qualification._reject_ambient_build_overrides({name: "malicious"})
+
+    def test_subprocess_environment_is_an_explicit_allowlist(self) -> None:
+        sanitized = qualification._allowlisted_environment(
+            {
+                "PATH": r"C:\tools",
+                "SYSTEMROOT": r"C:\Windows",
+                "RUST_LOG": "trace",
+                "CMFD_CUDA_MINER_LIBRARY": r"C:\malicious.dll",
+            },
+            explicit={"RUSTC": r"C:\pinned\rustc.exe"},
+        )
+        self.assertEqual(
+            sanitized,
+            {
+                "PATH": r"C:\tools",
+                "SYSTEMROOT": r"C:\Windows",
+                "RUSTC": r"C:\pinned\rustc.exe",
+            },
+        )
+
+    def test_expected_tool_hashes_are_strict_nonzero_lowercase_sha256(self) -> None:
+        self.assertEqual(
+            qualification._require_expected_sha256("a" * 64, "cargo"), "a" * 64
+        )
+        for value in ("0" * 64, "A" * 64, "a" * 63, "not-a-hash"):
+            with self.assertRaises(qualification.QualificationHarnessError):
+                qualification._require_expected_sha256(value, "cargo")
 
 
 if __name__ == "__main__":

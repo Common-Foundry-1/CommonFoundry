@@ -17,8 +17,8 @@ pub struct ProductionV3ActivationEvidence {
     pub schema: &'static str,
     pub qualification_source_commit: &'static str,
     pub qualification_manifest_sha256: &'static str,
-    pub independent_verifier_binary_sha256: &'static str,
-    pub independent_verifier_report_sha256: &'static str,
+    pub fresh_process_verifier_binary_sha256: &'static str,
+    pub fresh_process_verifier_report_sha256: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +117,11 @@ pub fn validate_production_rc(
     if !is_nonzero_lower_hex(evidence.qualification_manifest_sha256, 32) {
         return Err("ProductionV3 qualification manifest digest is invalid");
     }
-    if !is_nonzero_lower_hex(evidence.independent_verifier_binary_sha256, 32) {
-        return Err("ProductionV3 independent verifier binary digest is invalid");
+    if !is_nonzero_lower_hex(evidence.fresh_process_verifier_binary_sha256, 32) {
+        return Err("ProductionV3 fresh-process verifier binary digest is invalid");
     }
-    if !is_nonzero_lower_hex(evidence.independent_verifier_report_sha256, 32) {
-        return Err("ProductionV3 independent verifier report digest is invalid");
+    if !is_nonzero_lower_hex(evidence.fresh_process_verifier_report_sha256, 32) {
+        return Err("ProductionV3 fresh-process verifier report digest is invalid");
     }
     let artifacts = profile
         .production_v3_artifacts
@@ -135,6 +135,41 @@ pub fn validate_production_rc(
     Ok(())
 }
 
+/// Exact activation-evidence bytes hashed into the compiled ProductionV3
+/// network manifest and staged by the release finalizer.
+///
+/// The dynamic release checkout commit is supplied by the trusted build job;
+/// it is deliberately absent from source constants to avoid self-reference.
+#[allow(dead_code)] // build.rs includes this shared module but does not serialize evidence.
+pub fn canonical_production_v3_activation_evidence_json(
+    profile: CompiledReleaseProfile,
+    build_source_commit: &str,
+) -> Result<Vec<u8>, &'static str> {
+    validate_production_rc(profile, build_source_commit)?;
+    let evidence = profile
+        .activation
+        .ok_or("ProductionV3 activation evidence is absent")?;
+    Ok(format!(
+        concat!(
+            "{{\"fresh_process_verifier_binary_sha256\":\"{}\",",
+            "\"fresh_process_verifier_report_sha256\":\"{}\",",
+            "\"network_profile\":\"RCNet-1\",",
+            "\"proof_selection\":\"ProductionV3\",",
+            "\"qualification_manifest_sha256\":\"{}\",",
+            "\"qualification_source_commit\":\"{}\",",
+            "\"schema\":\"{}\",",
+            "\"source_commit\":\"{}\"}}\n"
+        ),
+        evidence.fresh_process_verifier_binary_sha256,
+        evidence.fresh_process_verifier_report_sha256,
+        evidence.qualification_manifest_sha256,
+        evidence.qualification_source_commit,
+        evidence.schema,
+        build_source_commit,
+    )
+    .into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,8 +178,8 @@ mod tests {
         schema: "CMFD_PRODUCTION_V3_ACTIVATION_V1",
         qualification_source_commit: "1111111111111111111111111111111111111111",
         qualification_manifest_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
-        independent_verifier_binary_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
-        independent_verifier_report_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
+        fresh_process_verifier_binary_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+        fresh_process_verifier_report_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
     };
     const ARTIFACTS: ProductionV3ArtifactIdentityPins = ProductionV3ArtifactIdentityPins {
         bank: ProductionV3FileIdentityPin {
@@ -231,6 +266,30 @@ mod tests {
         assert_eq!(
             validate_production_rc(profile, ""),
             Err("trusted production RC build source commit is invalid")
+        );
+    }
+
+    #[test]
+    fn activation_evidence_encoding_is_canonical_and_uses_dynamic_build_commit() {
+        let profile = CompiledReleaseProfile {
+            network: CompiledNetworkProfile::Rcnet,
+            proof: ConsensusProofSelection::ProductionV3,
+            activation: Some(EVIDENCE),
+            production_v3_artifacts: Some(ARTIFACTS),
+        };
+        let encoded =
+            canonical_production_v3_activation_evidence_json(profile, BUILD_SOURCE_COMMIT).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            concat!(
+                "{\"fresh_process_verifier_binary_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
+                "\"fresh_process_verifier_report_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+                "\"network_profile\":\"RCNet-1\",\"proof_selection\":\"ProductionV3\",",
+                "\"qualification_manifest_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+                "\"qualification_source_commit\":\"1111111111111111111111111111111111111111\",",
+                "\"schema\":\"CMFD_PRODUCTION_V3_ACTIVATION_V1\",",
+                "\"source_commit\":\"5555555555555555555555555555555555555555\"}\n"
+            )
         );
     }
 }

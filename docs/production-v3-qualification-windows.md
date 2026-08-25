@@ -9,6 +9,9 @@ or make a build releasable as RC1.
 ## Preconditions
 
 - Use 64-bit Windows, PowerShell 7, Python 3, Git, and the Rust toolchain.
+- Obtain the trusted SHA-256 values for the actual Cargo and rustc binaries in
+  the selected sysroot before the run. The harness rejects missing, uppercase,
+  zero, or mismatched hashes.
 - Check out the exact source commit to qualify. The worktree must be completely
   clean for the whole run.
 - Keep the model bank, canonical Record V2, and strict qualification request at
@@ -58,6 +61,9 @@ Resolve and record the complete commit first:
 
 ```powershell
 $commit = (git -C C:\Source\CommonFoundry rev-parse HEAD).Trim()
+$sysroot = (& rustc --print sysroot).Trim()
+$cargoSha256 = (Get-FileHash -LiteralPath (Join-Path $sysroot 'bin\cargo.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+$rustcSha256 = (Get-FileHash -LiteralPath (Join-Path $sysroot 'bin\rustc.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
 ```
 
 Then run the harness with the real artifacts and new destinations:
@@ -65,6 +71,8 @@ Then run the harness with the real artifacts and new destinations:
 ```powershell
 C:\Source\CommonFoundry\scripts\run-production-v3-qualification.ps1 `
   -ExpectedCommit $commit `
+  -ExpectedCargoSha256 $cargoSha256 `
+  -ExpectedRustcSha256 $rustcSha256 `
   -Bank D:\cmfd-model\MODEL-V2.bank `
   -Record D:\cmfd-model\DORY-V3-MODEL-RECORD-V2.json `
   -Request D:\cmfd-model\qualification-request.json `
@@ -72,6 +80,13 @@ C:\Source\CommonFoundry\scripts\run-production-v3-qualification.ps1 `
   -ScratchDirectory D:\cmfd-qualification-scratch\run-001 `
   -MaximumNativeBlockRows 131072
 ```
+
+Before building, the harness rejects ambient Cargo/Rust compiler overrides and
+repository or ancestor `.cargo/config*` files. It uses an explicit environment
+allowlist, the hash-pinned Cargo and rustc binaries, a new empty `CARGO_HOME`,
+and a generated create-new Cargo configuration. The tool binaries, exact
+version output, configuration, and environment-policy identity are recorded in
+the manifest.
 
 The harness builds a new `cmfd-consensus.exe` from the named clean commit with
 exactly these feature gates:
@@ -85,10 +100,12 @@ create-new report allows the workflow to continue. The JSONL journal is always
 treated as diagnostic-only, non-resumable state; even a 16-record journal is
 never interpreted as completion.
 
-After the producer exits, the harness starts
+After the producer exits, the harness starts the same newly built executable's
 `dory-v3-verify-qualification` as a new operating-system process. The fresh
 verifier rereads and authenticates all persisted inputs, the report, the exact
-journal, and the proof. The producer and verifier process IDs must differ.
+journal, and the proof. The producer and verifier process IDs must differ. This
+is a fresh-process same-build verifier, not a separately implemented or
+independently built verifier.
 
 ## Interruption and retry
 
@@ -110,8 +127,8 @@ The new output directory contains:
 | `qualification-proof.cmfd` | Canonical persisted Production V3 proof wire. |
 | `producer-report.json` | Producer completion marker and exact measurements. |
 | `producer-journal.jsonl` | Diagnostic-only, non-resumable progress journal. |
-| `PRODUCTION-V3-INDEPENDENT-VERIFIER-REPORT.json` | Report from the separate verifier process. |
-| `PRODUCTION-V3-INDEPENDENT-VERIFIER.bin` | Create-new exact copy of the verifier executable used. |
+| `PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json` | Report from the fresh same-build verifier process. |
+| `PRODUCTION-V3-FRESH-PROCESS-VERIFIER.bin` | Create-new exact copy of the same-build verifier executable used. |
 | `producer-stdout.json` | Exact producer stdout; it must byte-match the producer report. |
 | `fresh-verifier-stdout.json` | Exact verifier stdout; it must byte-match the verifier report. |
 | `*-stderr.log` and `build-*.log` | Exact process output retained and hashed. |
@@ -119,12 +136,13 @@ The new output directory contains:
 | `PRODUCTION-V3-QUALIFICATION-MANIFEST.json` | SHA-256 bindings for source, tool, inputs, proof, reports, journal, and exact logs. |
 | `PRODUCTION-V3-ACTIVATION-CANDIDATE.json` | Non-activating pointer to the manifest and fresh-verifier report digest. |
 
-The manifest records the source commit, the exact bank, Record V2, request,
-proof, producer report, journal, verifier report, executable, stdout, and
-stderr hashes. It also records both process IDs and the free-space floor,
-margin, and observed free bytes. Input hashes are captured before their
-verified use and recomputed during finalization, so a file changed after the
-producer or verifier consumed it blocks the candidate.
+The manifest records the source commit, exact Cargo and rustc binaries and
+versions, generated Cargo configuration, bank, Record V2, request, proof,
+producer report, journal, verifier report, executable, stdout, and stderr
+hashes. It also records both process IDs and the free-space floor, margin, and
+observed free bytes. Input hashes are captured before their verified use and
+recomputed during finalization, so a file changed after the producer or
+verifier consumed it blocks the candidate.
 
 The candidate intentionally uses
 `CMFD_PRODUCTION_V3_ACTIVATION_CANDIDATE_V1`, not the release gate's activation

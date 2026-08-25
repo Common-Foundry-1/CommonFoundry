@@ -120,6 +120,8 @@ pub enum NodeError {
     ProductionV3ArtifactsUnexpected,
     #[error("the compiled production V3 bank, manifest, and Record V2 identity pins are absent")]
     ProductionV3ArtifactPinsMissing,
+    #[error("compiled production V3 activation evidence is invalid: {0}")]
+    ProductionV3ActivationEvidence(&'static str),
     #[error("the authenticated production V3 {0} does not match its compiled identity pin")]
     ProductionV3ArtifactIdentityMismatch(&'static str),
     #[cfg(feature = "production-v3")]
@@ -242,6 +244,7 @@ impl NodeError {
             Self::ProductionV3ArtifactsMissing
             | Self::ProductionV3ArtifactsUnexpected
             | Self::ProductionV3ArtifactPinsMissing
+            | Self::ProductionV3ActivationEvidence(_)
             | Self::ProductionV3ArtifactIdentityMismatch(_)
             | Self::ProofVerifierProfileMismatch => ("proof_verifier_configuration", 500, false),
             #[cfg(feature = "production-v3")]

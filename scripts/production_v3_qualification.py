@@ -33,11 +33,70 @@ MANIFEST_SCHEMA = "CMFD_PRODUCTION_V3_QUALIFICATION_MANIFEST_V1"
 CANDIDATE_SCHEMA = "CMFD_PRODUCTION_V3_ACTIVATION_CANDIDATE_V1"
 RCNET1_NETWORK_ID_HEX = "72" * 32
 QUALIFICATION_MANIFEST_NAME = "PRODUCTION-V3-QUALIFICATION-MANIFEST.json"
-INDEPENDENT_VERIFIER_BINARY_NAME = "PRODUCTION-V3-INDEPENDENT-VERIFIER.bin"
-INDEPENDENT_VERIFIER_REPORT_NAME = "PRODUCTION-V3-INDEPENDENT-VERIFIER-REPORT.json"
+FRESH_PROCESS_VERIFIER_BINARY_NAME = "PRODUCTION-V3-FRESH-PROCESS-VERIFIER.bin"
+FRESH_PROCESS_VERIFIER_REPORT_NAME = (
+    "PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json"
+)
 FULL_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+MAX_TOOL_VERSION_BYTES = 64 * 1024
+QUALIFICATION_ENVIRONMENT_ALLOWLIST = {
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "INCLUDE",
+    "LIB",
+    "LIBPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "UCRTVERSION",
+    "UNIVERSALCRTSDKDIR",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "VCINSTALLDIR",
+    "VCTOOLSINSTALLDIR",
+    "VCTOOLSVERSION",
+    "VSINSTALLDIR",
+    "WINDIR",
+    "WINDOWSSDKDIR",
+    "WINDOWSSDKVERSION",
+}
+FORBIDDEN_AMBIENT_BUILD_ENVIRONMENT = {
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_TARGET",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
+    "RUSTUP_TOOLCHAIN",
+}
 
 
 class QualificationHarnessError(RuntimeError):
@@ -95,6 +154,125 @@ def _sha256_file_with_size(path: Path) -> tuple[str, int]:
 
 def _sha256_file(path: Path) -> str:
     return _sha256_file_with_size(path)[0]
+
+
+def _require_expected_sha256(value: str, label: str) -> str:
+    normalized = value.strip().lower()
+    if value != normalized or not SHA256_RE.fullmatch(normalized) or set(normalized) == {"0"}:
+        raise QualificationHarnessError(
+            f"expected {label} SHA-256 must be 64 lowercase nonzero hex characters"
+        )
+    return normalized
+
+
+def _reject_ambient_build_overrides(environment: dict[str, str]) -> None:
+    present = sorted(
+        key
+        for key in environment
+        if key.upper() in FORBIDDEN_AMBIENT_BUILD_ENVIRONMENT
+        or key.upper().startswith("CARGO_TARGET_")
+    )
+    if present:
+        raise QualificationHarnessError(
+            "ambient Rust/Cargo build overrides are forbidden: " + ", ".join(present)
+        )
+
+
+def _allowlisted_environment(
+    environment: dict[str, str], *, explicit: dict[str, str] | None = None
+) -> dict[str, str]:
+    sanitized = {
+        key: value
+        for key, value in environment.items()
+        if key.upper() in QUALIFICATION_ENVIRONMENT_ALLOWLIST
+    }
+    if explicit:
+        sanitized.update(explicit)
+    return sanitized
+
+
+def _tool_output(path: Path, *arguments: str, environment: dict[str, str]) -> str:
+    try:
+        result = subprocess.run(
+            [str(path), *arguments],
+            check=True,
+            cwd=path.parent,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise QualificationHarnessError(
+            f"could not inspect pinned tool {path.name}"
+        ) from error
+    if len(result.stdout) > MAX_TOOL_VERSION_BYTES or result.stderr:
+        raise QualificationHarnessError(
+            f"pinned tool {path.name} emitted noncanonical identity output"
+        )
+    try:
+        output = result.stdout.decode("utf-8", "strict").strip()
+    except UnicodeDecodeError as error:
+        raise QualificationHarnessError(
+            f"pinned tool {path.name} identity is not UTF-8"
+        ) from error
+    if not output or "\x00" in output or "\r" in output:
+        raise QualificationHarnessError(
+            f"pinned tool {path.name} identity is malformed"
+        )
+    return output
+
+
+def _resolve_pinned_toolchain(
+    *, expected_cargo_sha256: str, expected_rustc_sha256: str
+) -> tuple[Path, Path, dict[str, str]]:
+    _reject_ambient_build_overrides(os.environ)
+    base_environment = _allowlisted_environment(os.environ)
+    rustc_proxy_name = shutil.which("rustc.exe") or shutil.which("rustc")
+    if not rustc_proxy_name:
+        raise QualificationHarnessError("rustc was not found on PATH")
+    rustc_proxy = _regular_file(Path(rustc_proxy_name), "rustc launcher")
+    sysroot = Path(
+        _tool_output(rustc_proxy, "--print", "sysroot", environment=base_environment)
+    )
+    if not sysroot.is_absolute():
+        raise QualificationHarnessError("rustc returned a non-absolute sysroot")
+    executable_suffix = ".exe" if os.name == "nt" else ""
+    rustc = _regular_file(sysroot / "bin" / f"rustc{executable_suffix}", "pinned rustc")
+    cargo = _regular_file(sysroot / "bin" / f"cargo{executable_suffix}", "pinned cargo")
+    expected_rustc = _require_expected_sha256(expected_rustc_sha256, "rustc")
+    expected_cargo = _require_expected_sha256(expected_cargo_sha256, "cargo")
+    if _sha256_file(rustc) != expected_rustc:
+        raise QualificationHarnessError("pinned rustc SHA-256 does not match the operator input")
+    if _sha256_file(cargo) != expected_cargo:
+        raise QualificationHarnessError("pinned cargo SHA-256 does not match the operator input")
+    tool_environment = _allowlisted_environment(
+        os.environ, explicit={"RUSTC": str(rustc)}
+    )
+    versions = {
+        "cargo": _tool_output(cargo, "-vV", environment=tool_environment),
+        "rustc": _tool_output(rustc, "-vV", environment=tool_environment),
+    }
+    return cargo, rustc, versions
+
+
+def _reject_ambient_cargo_configs(repo: Path) -> None:
+    for directory in (repo, *repo.parents):
+        for name in ("config", "config.toml"):
+            candidate = directory / ".cargo" / name
+            if candidate.exists() or candidate.is_symlink():
+                raise QualificationHarnessError(
+                    f"ambient Cargo config is forbidden during qualification: {candidate}"
+                )
+
+
+def _create_clean_cargo_home(path: Path) -> tuple[Path, Path]:
+    path.mkdir()
+    cargo_home = _regular_directory(path, "clean Cargo home")
+    config = cargo_home / "config.toml"
+    with config.open("xb") as handle:
+        handle.write(b"[net]\ngit-fetch-with-cli = false\n")
+        _sync_file(handle)
+    return cargo_home, _regular_file(config, "pinned Cargo config")
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -422,6 +600,13 @@ def _write_json_create_new(path: Path, value: dict[str, object]) -> bytes:
     return encoded
 
 
+def _canonical_json_sha256(value: dict[str, object]) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return _sha256_bytes(encoded)
+
+
 def _copy_file_create_new(source: Path, destination: Path) -> None:
     source_digest, source_size = _sha256_file_with_size(source)
     with source.open("rb") as reader, destination.open("xb") as writer:
@@ -430,7 +615,7 @@ def _copy_file_create_new(source: Path, destination: Path) -> None:
     destination_digest, destination_size = _sha256_file_with_size(destination)
     if destination_size != source_size or destination_digest != source_digest:
         raise QualificationHarnessError(
-            "independent verifier binary copy did not preserve the exact executable bytes"
+            "fresh-process verifier binary copy did not preserve the exact executable bytes"
         )
 
 
@@ -446,7 +631,11 @@ def finalize_evidence(
     journal: Path,
     verifier_report: Path,
     consensus_executable: Path,
-    independent_verifier_binary: Path,
+    fresh_process_verifier_binary: Path,
+    cargo: Path,
+    rustc: Path,
+    cargo_config: Path,
+    tool_versions: dict[str, str],
     build_stdout: Path,
     build_stderr: Path,
     producer_stdout: Path,
@@ -486,9 +675,12 @@ def finalize_evidence(
         "consensus_executable": _regular_file(
             consensus_executable, "feature-gated consensus executable"
         ),
-        "independent_verifier_binary": _regular_file(
-            independent_verifier_binary, "independent verifier binary"
+        "fresh_process_verifier_binary": _regular_file(
+            fresh_process_verifier_binary, "fresh-process verifier binary"
         ),
+        "cargo": _regular_file(cargo, "pinned cargo"),
+        "rustc": _regular_file(rustc, "pinned rustc"),
+        "cargo_config": _regular_file(cargo_config, "pinned Cargo config"),
         "build_stdout": _regular_file(build_stdout, "build stdout"),
         "build_stderr": _regular_file(build_stderr, "build stderr"),
         "producer_stdout": _regular_file(producer_stdout, "producer stdout"),
@@ -525,8 +717,12 @@ def finalize_evidence(
 
     required_preverified_roles = {
         "bank",
+        "cargo",
+        "cargo_config",
+        "consensus_executable",
         "record_v2",
         "request",
+        "rustc",
         "proof",
         "producer_report",
         "journal",
@@ -545,6 +741,19 @@ def finalize_evidence(
             raise QualificationHarnessError(
                 f"{role} changed after the bytes were used by qualification"
             )
+    if set(tool_versions) != {"cargo", "rustc"} or any(
+        not isinstance(value, str) or not value or "\n\n" in value
+        for value in tool_versions.values()
+    ):
+        raise QualificationHarnessError("pinned toolchain versions are invalid")
+    toolchain_identity: dict[str, object] = {
+        "cargo_sha256": artifacts["cargo"]["sha256"],
+        "cargo_version": tool_versions["cargo"],
+        "rustc_sha256": artifacts["rustc"]["sha256"],
+        "rustc_version": tool_versions["rustc"],
+        "cargo_config_sha256": artifacts["cargo_config"]["sha256"],
+        "environment_policy": "CMFD_QUALIFICATION_ALLOWLIST_V1",
+    }
     manifest: dict[str, object] = {
         "schema": MANIFEST_SCHEMA,
         "status": "qualification_complete_activation_disabled",
@@ -569,6 +778,10 @@ def finalize_evidence(
             "producer": _process_manifest(producer_receipt),
             "fresh_verifier": _process_manifest(verifier_receipt),
         },
+        "toolchain": {
+            **toolchain_identity,
+            "identity_sha256": _canonical_json_sha256(toolchain_identity),
+        },
         "artifacts": artifacts,
         "journal_semantics": {
             "diagnostic_only": True,
@@ -583,16 +796,16 @@ def finalize_evidence(
     }
     manifest_bytes = _write_json_create_new(manifest_output, manifest)
     manifest_sha256 = _sha256_bytes(manifest_bytes)
-    verifier_binary_sha256 = artifacts["independent_verifier_binary"]["sha256"]
+    verifier_binary_sha256 = artifacts["fresh_process_verifier_binary"]["sha256"]
     verifier_report_sha256 = artifacts["verifier_report"]["sha256"]
     if not isinstance(verifier_binary_sha256, str) or not SHA256_RE.fullmatch(
         verifier_binary_sha256
     ):
-        raise QualificationHarnessError("independent verifier binary digest is invalid")
+        raise QualificationHarnessError("fresh-process verifier binary digest is invalid")
     if not isinstance(verifier_report_sha256, str) or not SHA256_RE.fullmatch(
         verifier_report_sha256
     ):
-        raise QualificationHarnessError("independent verifier report digest is invalid")
+        raise QualificationHarnessError("fresh-process verifier report digest is invalid")
 
     candidate: dict[str, object] = {
         "schema": CANDIDATE_SCHEMA,
@@ -602,8 +815,8 @@ def finalize_evidence(
         "network_profile": "RCNet-1",
         "proof_selection": "ProductionV3",
         "qualification_manifest_sha256": manifest_sha256,
-        "independent_verifier_binary_sha256": verifier_binary_sha256,
-        "independent_verifier_report_sha256": verifier_report_sha256,
+        "fresh_process_verifier_binary_sha256": verifier_binary_sha256,
+        "fresh_process_verifier_report_sha256": verifier_report_sha256,
         "activation_notice": (
             "This candidate does not change the compiled release profile, enable RCNet-1, "
             "or satisfy the production release gate by itself."
@@ -663,6 +876,11 @@ def run_qualification(args: argparse.Namespace) -> None:
         raise QualificationHarnessError("the operator harness must run on Windows")
     repo, bank, record, request, output, scratch = _prepare_paths(args)
     _verify_source(repo, args.expected_commit)
+    _reject_ambient_cargo_configs(repo)
+    cargo, rustc, tool_versions = _resolve_pinned_toolchain(
+        expected_cargo_sha256=args.expected_cargo_sha256,
+        expected_rustc_sha256=args.expected_rustc_sha256,
+    )
     initial_available = _preflight_free_space(scratch, args.scratch_margin_bytes)
     preverified_artifacts = _artifact_bindings(
         {
@@ -676,13 +894,27 @@ def run_qualification(args: argparse.Namespace) -> None:
     build_stdout = output / "build-stdout.log"
     build_stderr = output / "build-stderr.log"
     target_directory = output / "cargo-target"
-    cargo = shutil.which("cargo.exe") or shutil.which("cargo")
-    if not cargo:
-        raise QualificationHarnessError("cargo was not found on PATH")
-    build_environment = os.environ.copy()
-    build_environment["CARGO_TARGET_DIR"] = str(target_directory)
+    cargo_home, cargo_config = _create_clean_cargo_home(output / "cargo-home")
+    build_environment = _allowlisted_environment(
+        os.environ,
+        explicit={
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_TARGET_DIR": str(target_directory),
+            "RUSTC": str(rustc),
+        },
+    )
+    runtime_environment = _allowlisted_environment(os.environ)
+    preverified_artifacts.update(
+        _artifact_bindings(
+            {
+                "cargo": cargo,
+                "cargo_config": cargo_config,
+                "rustc": rustc,
+            }
+        )
+    )
     build_argv = (
-        cargo,
+        str(cargo),
         "build",
         "--release",
         "--locked",
@@ -704,6 +936,9 @@ def run_qualification(args: argparse.Namespace) -> None:
         "newly built feature-gated consensus executable",
     )
     consensus_executable_sha256 = _sha256_file(consensus_executable)
+    preverified_artifacts.update(
+        _artifact_bindings({"consensus_executable": consensus_executable})
+    )
     _verify_source(repo, args.expected_commit)
 
     proof = output / "qualification-proof.cmfd"
@@ -743,7 +978,7 @@ def run_qualification(args: argparse.Namespace) -> None:
         cwd=repo,
         stdout_path=producer_stdout,
         stderr_path=producer_stderr,
-        environment=os.environ.copy(),
+        environment=runtime_environment,
         cancellation_grace_seconds=args.cancellation_grace_seconds,
     )
     if scratch.exists():
@@ -766,7 +1001,7 @@ def run_qualification(args: argparse.Namespace) -> None:
         )
     )
 
-    verifier_report = output / INDEPENDENT_VERIFIER_REPORT_NAME
+    verifier_report = output / FRESH_PROCESS_VERIFIER_REPORT_NAME
     verifier_stdout = output / "fresh-verifier-stdout.json"
     verifier_stderr = output / "fresh-verifier-stderr.log"
     verifier_argv = (
@@ -796,7 +1031,7 @@ def run_qualification(args: argparse.Namespace) -> None:
         cwd=repo,
         stdout_path=verifier_stdout,
         stderr_path=verifier_stderr,
-        environment=os.environ.copy(),
+        environment=runtime_environment,
         cancellation_grace_seconds=args.cancellation_grace_seconds,
     )
     if producer_receipt.pid == verifier_receipt.pid:
@@ -806,8 +1041,8 @@ def run_qualification(args: argparse.Namespace) -> None:
             "feature-gated consensus executable changed during verification"
         )
 
-    independent_verifier_binary = output / INDEPENDENT_VERIFIER_BINARY_NAME
-    _copy_file_create_new(consensus_executable, independent_verifier_binary)
+    fresh_process_verifier_binary = output / FRESH_PROCESS_VERIFIER_BINARY_NAME
+    _copy_file_create_new(consensus_executable, fresh_process_verifier_binary)
 
     manifest_output = output / QUALIFICATION_MANIFEST_NAME
     candidate_output = output / "PRODUCTION-V3-ACTIVATION-CANDIDATE.json"
@@ -822,7 +1057,11 @@ def run_qualification(args: argparse.Namespace) -> None:
         journal=journal,
         verifier_report=verifier_report,
         consensus_executable=consensus_executable,
-        independent_verifier_binary=independent_verifier_binary,
+        fresh_process_verifier_binary=fresh_process_verifier_binary,
+        cargo=cargo,
+        rustc=rustc,
+        cargo_config=cargo_config,
+        tool_versions=tool_versions,
         build_stdout=build_stdout,
         build_stderr=build_stderr,
         producer_stdout=producer_stdout,
@@ -857,6 +1096,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-cargo-sha256", required=True)
+    parser.add_argument("--expected-rustc-sha256", required=True)
     parser.add_argument("--bank", required=True, type=Path)
     parser.add_argument("--record", required=True, type=Path)
     parser.add_argument("--request", required=True, type=Path)

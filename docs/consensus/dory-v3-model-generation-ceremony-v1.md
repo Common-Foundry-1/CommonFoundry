@@ -2260,9 +2260,18 @@ next stage; its parent directory is also synchronized where the platform
 supports directory synchronization. Every record explicitly carries
 `diagnostic_only: true`, `completion_marker: false`, and `resumable: false`.
 The final event is `prepublication_verification_recorded`; its diagnostic name
-and flags cannot be interpreted as published completion. Version 3 of the
+and flags cannot be interpreted as published completion. Version 4 of the
 producer report binds the final journal-record digest, exact event count, exact
-journal byte length, and a complete-file digest.
+journal byte length, and a complete-file digest. Its periodically sampled
+whole-directory scratch fields are informational non-atomic observations:
+one traversal can combine files that never coexisted, so the observations are
+neither lower nor upper bounds and are not compared with the exact fields. The
+authoritative scratch fields are the exact per-session high-water marks of
+tracked logical file lengths and live entries, plus tracked file-creation and
+size-mutation event counts. They cover all seven Dory scratch writer classes,
+including the dormant index writer, under the session mutation lock. They do
+not measure allocated blocks, filesystem metadata, RAM, or mutation through a
+handle outside the tracked scratch capability.
 
 The run identity uses BLAKE3 derive-key domain
 `CMFD/FORGEMATRIX/V3/QUALIFICATION-RUN-IDENTITY/V1` over, in order, the
@@ -2328,8 +2337,9 @@ producer-report, and journal inputs are opened without following symbolic links
 or Windows reparse points, must be regular files with exactly one link, and
 retain their opened identities through report construction. The verifier keeps
 the exact bounded bytes and rereads them through the still-named identity after
-cryptographic verification, rejecting replacement or mutation. The report must
-use the producer's exact canonical pretty JSON encoding.
+cryptographic verification, rejecting replacement or mutation. The producer
+report must be canonical Version 4 pretty JSON; the fresh verifier rejects
+earlier report schemas and emits verifier report Version 2.
 The journal must use the exact 16-record stage grammar, canonical compact JSON,
 one LF per record including the final record, correct sequence and hash chain,
 and exact request, configuration, and authenticated identities. The verifier

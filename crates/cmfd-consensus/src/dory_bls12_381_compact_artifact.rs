@@ -7,21 +7,20 @@
 //! indices into a small scalar dictionary. Prover-local metadata never enters
 //! Fiat-Shamir; any framing, scalar, code, digest, or I/O failure aborts proving.
 
-use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dory_pcs::primitives::{DorySerialize, arithmetic::Field};
-use same_file::Handle;
 use thiserror::Error;
+
+#[cfg(test)]
+use std::fs::OpenOptions;
 
 use crate::{
     dory_bls12_381_prototype::BlsDoryFr,
-    dory_scratch_telemetry::{
-        register_scratch_artifact_reservation, release_scratch_artifact_reservation,
-    },
+    dory_scratch_telemetry::{TrackedScratchFile, TrackedScratchReader},
 };
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSC1";
@@ -188,7 +187,7 @@ pub enum BlsDoryCompactArtifactError {
 
 pub struct BlsDoryCompactArtifactWriter {
     path: Option<PathBuf>,
-    file: Option<BufWriter<File>>,
+    file: Option<BufWriter<TrackedScratchFile>>,
     spec: BlsDoryCompactArtifactSpec,
     dictionary: Vec<BlsDoryFr>,
     hasher: blake3::Hasher,
@@ -219,17 +218,7 @@ impl BlsDoryCompactArtifactWriter {
             "cmfd-dory-compact-{context}-{}-{nonce}.tmp",
             std::process::id(),
         ));
-        let reserved_logical_bytes = artifact_file_bytes(spec, dictionary.len())?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        if let Err(error) = register_scratch_artifact_reservation(&path, reserved_logical_bytes) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
-        }
+        let file = TrackedScratchFile::create_new(&path)?;
         let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file)),
@@ -378,17 +367,16 @@ impl BlsDoryCompactArtifactWriter {
         if file.get_ref().metadata()?.len() != expected_len {
             return Err(BlsDoryCompactArtifactError::InvalidArtifact);
         }
-        let file = self
-            .file
-            .as_ref()
-            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
-            .get_ref()
-            .try_clone()?;
         let path = self
             .path
             .take()
             .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
-        drop(self.file.take());
+        let file = self
+            .file
+            .take()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
+            .into_inner()
+            .map_err(|error| error.into_error())?;
         Ok(BlsDoryCompactArtifact {
             path,
             file,
@@ -398,7 +386,9 @@ impl BlsDoryCompactArtifactWriter {
         })
     }
 
-    fn file_mut(&mut self) -> Result<&mut BufWriter<File>, BlsDoryCompactArtifactError> {
+    fn file_mut(
+        &mut self,
+    ) -> Result<&mut BufWriter<TrackedScratchFile>, BlsDoryCompactArtifactError> {
         self.file
             .as_mut()
             .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)
@@ -407,9 +397,12 @@ impl BlsDoryCompactArtifactWriter {
 
 impl Drop for BlsDoryCompactArtifactWriter {
     fn drop(&mut self) {
-        if let (Some(path), Some(file)) = (&self.path, &self.file) {
-            remove_if_owned(path, file.get_ref());
+        if let Some(file) = self.file.take() {
+            let (mut file, buffered) = file.into_parts();
+            drop(buffered);
+            let _ = file.remove_if_owned();
         }
+        self.path.take();
     }
 }
 
@@ -417,7 +410,7 @@ impl Drop for BlsDoryCompactArtifactWriter {
 /// cell chunks while retaining the ordinary canonical v4 artifact layout.
 pub struct BlsDoryGroupedCompactArtifactWriter {
     path: Option<PathBuf>,
-    file: Option<File>,
+    file: Option<TrackedScratchFile>,
     spec: BlsDoryCompactArtifactSpec,
     dictionary: Vec<BlsDoryFr>,
     word_offsets: Vec<u64>,
@@ -518,16 +511,7 @@ impl BlsDoryGroupedCompactArtifactWriter {
             "cmfd-dory-compact-{context}-{}-{nonce}.tmp",
             std::process::id(),
         ));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        if let Err(error) = register_scratch_artifact_reservation(&path, expected_len) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
-        }
+        let file = TrackedScratchFile::create_new(&path)?;
         let mut writer = Self {
             path: Some(path),
             file: Some(file),
@@ -744,16 +728,14 @@ impl BlsDoryGroupedCompactArtifactWriter {
         if file.metadata()?.len() != expected_len {
             return Err(BlsDoryCompactArtifactError::InvalidArtifact);
         }
-        let file = self
-            .file
-            .as_ref()
-            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
-            .try_clone()?;
         let path = self
             .path
             .take()
             .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
-        drop(self.file.take());
+        let file = self
+            .file
+            .take()
+            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
         Ok(BlsDoryCompactArtifact {
             path,
             file,
@@ -771,7 +753,7 @@ impl BlsDoryGroupedCompactArtifactWriter {
             .file
             .as_ref()
             .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?
-            .try_clone()?;
+            .try_clone_reader()?;
         if file.metadata()?.len() != expected_len {
             return Err(BlsDoryCompactArtifactError::InvalidArtifact);
         }
@@ -887,7 +869,7 @@ impl BlsDoryGroupedCompactArtifactWriter {
         Ok(*hasher.finalize().as_bytes())
     }
 
-    fn file_mut(&mut self) -> Result<&mut File, BlsDoryCompactArtifactError> {
+    fn file_mut(&mut self) -> Result<&mut TrackedScratchFile, BlsDoryCompactArtifactError> {
         self.file
             .as_mut()
             .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)
@@ -903,15 +885,16 @@ impl BlsDoryGroupedCompactArtifactWriter {
 
 impl Drop for BlsDoryGroupedCompactArtifactWriter {
     fn drop(&mut self) {
-        if let (Some(path), Some(file)) = (&self.path, &self.file) {
-            remove_if_owned(path, file);
+        if let Some(mut file) = self.file.take() {
+            let _ = file.remove_if_owned();
         }
+        self.path.take();
     }
 }
 
 pub struct BlsDoryCompactArtifact {
     path: PathBuf,
-    file: File,
+    file: TrackedScratchFile,
     spec: BlsDoryCompactArtifactSpec,
     dictionary: Vec<BlsDoryFr>,
     digest: [u8; 32],
@@ -1103,14 +1086,14 @@ impl BlsDoryCompactArtifact {
     fn validate_live_file(
         &self,
         consume: impl FnOnce(
-            &mut BufReader<File>,
+            &mut BufReader<TrackedScratchReader>,
             &mut blake3::Hasher,
         ) -> Result<(), BlsDoryCompactArtifactError>,
     ) -> Result<(), BlsDoryCompactArtifactError> {
         if self.file.metadata()?.len() != artifact_file_bytes(self.spec, self.dictionary.len())? {
             return Err(BlsDoryCompactArtifactError::InvalidArtifact);
         }
-        let mut file = self.file.try_clone()?;
+        let mut file = self.file.try_clone_reader()?;
         file.seek(SeekFrom::Start(0))?;
         let mut reader = BufReader::with_capacity(ARTIFACT_IO_BUFFER_BYTES, file);
         let mut header = [0u8; ARTIFACT_HEADER_BYTES];
@@ -1305,7 +1288,8 @@ impl BlsDoryMappedCompactArtifact {
 
 impl Drop for BlsDoryCompactArtifact {
     fn drop(&mut self) {
-        remove_if_owned(&self.path, &self.file);
+        debug_assert_eq!(self.file.path(), self.path);
+        let _ = self.file.remove_if_owned();
     }
 }
 
@@ -1428,18 +1412,6 @@ fn encode_scalar(scalar: &BlsDoryFr) -> Result<[u8; 32], BlsDoryCompactArtifactE
     encoded
         .try_into()
         .map_err(|_| BlsDoryCompactArtifactError::InvalidScalar)
-}
-
-fn remove_if_owned(path: &Path, file: &File) {
-    let Ok(held) = file.try_clone().and_then(Handle::from_file) else {
-        return;
-    };
-    let Ok(live) = Handle::from_path(path) else {
-        return;
-    };
-    if held == live && std::fs::remove_file(path).is_ok() {
-        release_scratch_artifact_reservation(path);
-    }
 }
 
 #[cfg(test)]

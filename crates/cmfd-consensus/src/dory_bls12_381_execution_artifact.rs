@@ -8,21 +8,19 @@
 //! list is covered by root and final digests before any value is exposed.
 
 use std::{
-    fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use same_file::Handle;
 use thiserror::Error;
+
+#[cfg(test)]
+use std::fs::OpenOptions;
 
 use crate::{
     PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
-    PRODUCTION_V2_LAYERS_PER_BANK,
-    dory_scratch_telemetry::{
-        register_scratch_artifact_reservation, release_scratch_artifact_reservation,
-    },
+    PRODUCTION_V2_LAYERS_PER_BANK, dory_scratch_telemetry::TrackedScratchFile,
 };
 
 const ARTIFACT_MAGIC: [u8; 8] = *b"CFDBLSE1";
@@ -343,7 +341,7 @@ struct ArtifactGeometry {
 
 pub struct BlsDoryExecutionAccumulatorArtifactWriter {
     path: Option<PathBuf>,
-    file: Option<BufWriter<File>>,
+    file: Option<BufWriter<TrackedScratchFile>>,
     context: BlsDoryExecutionAccumulatorArtifactContext,
     context_digest: [u8; 32],
     geometry: ArtifactGeometry,
@@ -375,16 +373,7 @@ impl BlsDoryExecutionAccumulatorArtifactWriter {
             "cmfd-dory-execution-accumulators-{context_prefix}-{}-{nonce}.tmp",
             std::process::id()
         ));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        if let Err(error) = register_scratch_artifact_reservation(&path, geometry.total_bytes) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
-        }
+        let file = TrackedScratchFile::create_new(&path)?;
         let mut writer = Self {
             path: Some(path),
             file: Some(BufWriter::with_capacity(IO_BUFFER_BYTES, file)),
@@ -506,17 +495,16 @@ impl BlsDoryExecutionAccumulatorArtifactWriter {
         segment_buffer
             .try_reserve_exact(authentication_buffer.len())
             .map_err(|_| BlsDoryExecutionAccumulatorArtifactError::InvalidShape)?;
-        let artifact_file = self
-            .file
-            .as_ref()
-            .ok_or(BlsDoryExecutionAccumulatorArtifactError::Incomplete)?
-            .get_ref()
-            .try_clone()?;
         let path = self
             .path
             .take()
             .ok_or(BlsDoryExecutionAccumulatorArtifactError::Incomplete)?;
-        drop(self.file.take());
+        let artifact_file = self
+            .file
+            .take()
+            .ok_or(BlsDoryExecutionAccumulatorArtifactError::Incomplete)?
+            .into_inner()
+            .map_err(|error| error.into_error())?;
         let context = self.context;
         let mut artifact = BlsDoryExecutionAccumulatorArtifact {
             path,
@@ -537,7 +525,7 @@ impl BlsDoryExecutionAccumulatorArtifactWriter {
 
     fn file_mut(
         &mut self,
-    ) -> Result<&mut BufWriter<File>, BlsDoryExecutionAccumulatorArtifactError> {
+    ) -> Result<&mut BufWriter<TrackedScratchFile>, BlsDoryExecutionAccumulatorArtifactError> {
         self.file
             .as_mut()
             .ok_or(BlsDoryExecutionAccumulatorArtifactError::Incomplete)
@@ -551,15 +539,18 @@ impl BlsDoryExecutionAccumulatorArtifactWriter {
 
 impl Drop for BlsDoryExecutionAccumulatorArtifactWriter {
     fn drop(&mut self) {
-        if let (Some(path), Some(file)) = (&self.path, &self.file) {
-            remove_if_owned(path, file.get_ref());
+        if let Some(file) = self.file.take() {
+            let (mut file, buffered) = file.into_parts();
+            drop(buffered);
+            let _ = file.remove_if_owned();
         }
+        self.path.take();
     }
 }
 
 pub struct BlsDoryExecutionAccumulatorArtifact {
     path: PathBuf,
-    file: File,
+    file: TrackedScratchFile,
     context: BlsDoryExecutionAccumulatorArtifactContext,
     context_digest: [u8; 32],
     geometry: ArtifactGeometry,
@@ -755,14 +746,15 @@ impl BlsDoryExecutionAccumulatorArtifact {
     }
 
     #[cfg(test)]
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
 
 impl Drop for BlsDoryExecutionAccumulatorArtifact {
     fn drop(&mut self) {
-        remove_if_owned(&self.path, &self.file);
+        debug_assert_eq!(self.file.path(), self.path);
+        let _ = self.file.remove_if_owned();
     }
 }
 
@@ -837,7 +829,7 @@ fn validate_geometry(
 }
 
 fn authenticate_file(
-    file: &mut File,
+    file: &mut TrackedScratchFile,
     context: &BlsDoryExecutionAccumulatorArtifactContext,
     buffer: &mut [u8],
 ) -> Result<AuthenticationSnapshot, BlsDoryExecutionAccumulatorArtifactError> {
@@ -856,7 +848,7 @@ fn authenticate_file(
     chunk_digests
         .try_reserve_exact(geometry.chunk_digest_count)
         .map_err(|_| BlsDoryExecutionAccumulatorArtifactError::InvalidShape)?;
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file.try_clone()?);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file.try_clone_reader()?);
     reader.seek(SeekFrom::Start(HEADER_BYTES))?;
     for column in 0..geometry.columns {
         for chunk in 0..geometry.chunks_per_column {
@@ -916,7 +908,7 @@ fn authenticate_file(
 
 #[allow(clippy::too_many_arguments)]
 fn read_authenticated_chunk<'a>(
-    file: &mut File,
+    file: &mut TrackedScratchFile,
     context: &BlsDoryExecutionAccumulatorArtifactContext,
     context_digest: [u8; 32],
     geometry: ArtifactGeometry,
@@ -968,7 +960,7 @@ fn read_authenticated_chunk<'a>(
 }
 
 fn validate_header_and_length(
-    file: &mut File,
+    file: &mut TrackedScratchFile,
     context: &BlsDoryExecutionAccumulatorArtifactContext,
     geometry: ArtifactGeometry,
 ) -> Result<(), BlsDoryExecutionAccumulatorArtifactError> {
@@ -985,7 +977,7 @@ fn validate_header_and_length(
 }
 
 fn validate_live_envelope(
-    file: &mut File,
+    file: &mut TrackedScratchFile,
     context: &BlsDoryExecutionAccumulatorArtifactContext,
     expected_root: [u8; 32],
     expected_final: [u8; 32],
@@ -1143,18 +1135,6 @@ fn zeroed_bytes(len: usize) -> Result<Vec<u8>, BlsDoryExecutionAccumulatorArtifa
         .map_err(|_| BlsDoryExecutionAccumulatorArtifactError::InvalidShape)?;
     bytes.resize(len, 0);
     Ok(bytes)
-}
-
-fn remove_if_owned(path: &Path, file: &File) {
-    let Ok(held) = file.try_clone().and_then(Handle::from_file) else {
-        return;
-    };
-    let Ok(live) = Handle::from_path(path) else {
-        return;
-    };
-    if held == live && std::fs::remove_file(path).is_ok() {
-        release_scratch_artifact_reservation(path);
-    }
 }
 
 fn is_live_authentication_failure(error: &BlsDoryExecutionAccumulatorArtifactError) -> bool {
@@ -1545,21 +1525,15 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_deletes_only_the_file_owned_by_the_held_handle() {
+    fn cleanup_deletes_the_owned_file_and_preserves_siblings() {
         let directory = TestDirectory::create();
         let owned_path = directory.0.join("owned.tmp");
         let unrelated_path = directory.0.join("unrelated.tmp");
-        let owned = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&owned_path)
-            .unwrap();
+        let mut owned = TrackedScratchFile::create_new(&owned_path).unwrap();
         std::fs::write(&unrelated_path, b"preserve me").unwrap();
 
-        remove_if_owned(&unrelated_path, &owned);
+        owned.remove_if_owned().unwrap();
         assert_eq!(std::fs::read(&unrelated_path).unwrap(), b"preserve me");
-        remove_if_owned(&owned_path, &owned);
         assert!(!owned_path.exists());
     }
 }

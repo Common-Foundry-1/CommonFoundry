@@ -557,6 +557,15 @@ impl ConsensusPowVerifier {
         }
     }
 
+    /// Returns the committed identity of the model bytes expected by the v2
+    /// accelerator contract.
+    pub fn v2_accelerator_model_identity(&self) -> Result<[u8; 32], PowError> {
+        match self {
+            Self::V2Reference(reference) => Ok(reference.accelerator_model_identity()?),
+            Self::V1Legacy(_) => Err(PowError::WrongProofType),
+        }
+    }
+
     pub fn prepare_v2_accelerator_batch(
         &self,
         block: &BlockChallenge,

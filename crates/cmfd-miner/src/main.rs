@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use cmfd_consensus::BlockProof;
+use cmfd_consensus::{BlockProof, ForgeMatrixV2AcceleratorModel};
 use cmfd_cuda::{CudaDevice, CudaLibrary};
 use cmfd_node::p2p::{
     relay_blocks_to_peer_once_with_policy, request_mining_template_once_with_policy,
@@ -117,20 +117,33 @@ enum Command {
 
 #[derive(Debug)]
 enum WorkerMessage {
+    Initialized {
+        device: i32,
+        lane: usize,
+    },
     Ready {
+        job_id: u64,
         device: i32,
         lane: usize,
     },
     Progress {
+        job_id: u64,
         device: i32,
         attempts: u64,
     },
     Found {
+        job_id: u64,
         device: i32,
         proof: BlockProof,
         attempts: u64,
     },
+    Idle {
+        job_id: u64,
+        device: i32,
+        lane: usize,
+    },
     Failed {
+        job_id: Option<u64>,
         device: i32,
         lane: usize,
         error: String,
@@ -151,9 +164,23 @@ enum WorkStatus {
     Disconnected,
 }
 
-struct WorkerSet {
-    cancel: Arc<AtomicBool>,
+enum WorkerCommand {
+    Mine {
+        job_id: u64,
+        work: MiningWork,
+        cancel: Arc<AtomicBool>,
+    },
+    Shutdown,
+}
+
+struct PersistentWorkerPool {
+    model_identity: [u8; 32],
+    devices: Vec<CudaDevice>,
+    workers_per_gpu: usize,
+    commands: Vec<Sender<WorkerCommand>>,
+    receiver: Receiver<WorkerMessage>,
     handles: Vec<JoinHandle<()>>,
+    next_job_id: u64,
 }
 
 struct WorkerSpec {
@@ -162,20 +189,13 @@ struct WorkerSpec {
     ordinal: usize,
     lane: usize,
     worker_count: usize,
-    work: MiningWork,
     batch_size: u32,
+    model: Arc<ForgeMatrixV2AcceleratorModel>,
 }
 
-impl WorkerSet {
-    fn stop(self) -> Result<()> {
-        self.cancel.store(true, Ordering::Release);
-        for handle in self.handles {
-            handle
-                .join()
-                .map_err(|_| anyhow!("a CUDA worker thread panicked"))?;
-        }
-        Ok(())
-    }
+struct WorkerThreadError {
+    job_id: Option<u64>,
+    error: String,
 }
 
 fn main() -> Result<()> {
@@ -297,8 +317,6 @@ struct ContinuousMiningConfig {
 
 #[derive(Clone, Copy)]
 struct JobMiningConfig {
-    batch_size: u32,
-    workers_per_gpu: usize,
     stats_interval: Duration,
 }
 
@@ -521,6 +539,7 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
 
     let mut statistics = SessionStatistics::new(&devices);
     let mut preferred_peer = None;
+    let mut worker_pool = None;
     while !shutdown.load(Ordering::Acquire) {
         let Some((source, template, remote_height)) = wait_for_template(
             &options.peers,
@@ -543,41 +562,49 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
         );
 
         let mut last_node_check = Instant::now();
-        let outcome = mine_work(
-            cuda.clone(),
-            devices.clone(),
-            work,
-            JobMiningConfig {
-                batch_size: options.batch_size,
+        if worker_pool.is_none() {
+            worker_pool = Some(PersistentWorkerPool::new(
+                cuda.clone(),
+                devices.clone(),
                 workers_per_gpu,
-                stats_interval: Duration::from_secs(options.stats_seconds),
-            },
-            Arc::clone(&shutdown),
-            &mut statistics,
-            &mut || {
-                if last_node_check.elapsed() < PEER_RETRY_INTERVAL {
-                    return Ok(WorkStatus::Current);
-                }
-                last_node_check = Instant::now();
-                match fetch_template_from_any(
-                    &options.peers,
-                    preferred_peer,
-                    payout,
-                    limits,
-                    address_policy,
-                ) {
-                    Some((peer, response)) => {
-                        preferred_peer = Some(peer);
-                        if response.template.challenge.previous_block == parent {
-                            Ok(WorkStatus::Current)
-                        } else {
-                            Ok(WorkStatus::Stale)
-                        }
+                options.batch_size,
+                &work,
+            )?);
+        }
+        let outcome = worker_pool
+            .as_mut()
+            .expect("worker pool is initialized")
+            .mine(
+                work,
+                JobMiningConfig {
+                    stats_interval: Duration::from_secs(options.stats_seconds),
+                },
+                Arc::clone(&shutdown),
+                &mut statistics,
+                &mut || {
+                    if last_node_check.elapsed() < PEER_RETRY_INTERVAL {
+                        return Ok(WorkStatus::Current);
                     }
-                    None => Ok(WorkStatus::Disconnected),
-                }
-            },
-        )?;
+                    last_node_check = Instant::now();
+                    match fetch_template_from_any(
+                        &options.peers,
+                        preferred_peer,
+                        payout,
+                        limits,
+                        address_policy,
+                    ) {
+                        Some((peer, response)) => {
+                            preferred_peer = Some(peer);
+                            if response.template.challenge.previous_block == parent {
+                                Ok(WorkStatus::Current)
+                            } else {
+                                Ok(WorkStatus::Stale)
+                            }
+                        }
+                        None => Ok(WorkStatus::Disconnected),
+                    }
+                },
+            )?;
 
         match outcome {
             JobOutcome::Shutdown => break,
@@ -636,6 +663,9 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
                 }
             }
         }
+    }
+    if let Some(mut pool) = worker_pool {
+        pool.stop()?;
     }
     println!("Miner stopped.");
     Ok(())
@@ -995,6 +1025,7 @@ fn continuous_mining(
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut statistics = SessionStatistics::new(&devices);
+    let mut worker_pool = None;
     while !shutdown.load(Ordering::Acquire) {
         let job = {
             let node = node.lock().map_err(|_| anyhow!("node mutex is poisoned"))?;
@@ -1006,30 +1037,39 @@ fn continuous_mining(
             devices.len()
         );
         let expected_parent = hex::encode(job.challenge().previous_block);
-        match mine_work(
-            cuda.clone(),
-            devices.clone(),
-            job.work(),
-            JobMiningConfig {
-                batch_size: config.batch_size,
-                workers_per_gpu: config.workers_per_gpu,
-                stats_interval: config.stats_interval,
-            },
-            Arc::clone(&shutdown),
-            &mut statistics,
-            &mut || {
-                let current_tip = node
-                    .lock()
-                    .map_err(|_| anyhow!("node mutex is poisoned"))?
-                    .status()?
-                    .tip;
-                if current_tip == expected_parent {
-                    Ok(WorkStatus::Current)
-                } else {
-                    Ok(WorkStatus::Stale)
-                }
-            },
-        )? {
+        let work = job.work();
+        if worker_pool.is_none() {
+            worker_pool = Some(PersistentWorkerPool::new(
+                cuda.clone(),
+                devices.clone(),
+                config.workers_per_gpu,
+                config.batch_size,
+                &work,
+            )?);
+        }
+        match worker_pool
+            .as_mut()
+            .expect("worker pool is initialized")
+            .mine(
+                work,
+                JobMiningConfig {
+                    stats_interval: config.stats_interval,
+                },
+                Arc::clone(&shutdown),
+                &mut statistics,
+                &mut || {
+                    let current_tip = node
+                        .lock()
+                        .map_err(|_| anyhow!("node mutex is poisoned"))?
+                        .status()?
+                        .tip;
+                    if current_tip == expected_parent {
+                        Ok(WorkStatus::Current)
+                    } else {
+                        Ok(WorkStatus::Stale)
+                    }
+                },
+            )? {
             JobOutcome::Shutdown => break,
             JobOutcome::Disconnected => {
                 println!("Embedded node became unavailable; rebuilding work.");
@@ -1101,148 +1141,351 @@ fn continuous_mining(
             }
         }
     }
+    if let Some(mut pool) = worker_pool {
+        pool.stop()?;
+    }
     println!("Miner stopped.");
     Ok(())
 }
 
-fn mine_work(
-    cuda: CudaLibrary,
-    devices: Vec<CudaDevice>,
-    work: MiningWork,
-    config: JobMiningConfig,
-    shutdown: Arc<AtomicBool>,
-    statistics: &mut SessionStatistics,
-    check_status: &mut dyn FnMut() -> Result<WorkStatus>,
-) -> Result<JobOutcome> {
-    let worker_cancel = Arc::new(AtomicBool::new(false));
-    let worker_count = devices
-        .len()
-        .checked_mul(config.workers_per_gpu)
-        .ok_or_else(|| anyhow!("CUDA worker count overflow"))?;
-    let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(4).max(4));
-    let mut handles = Vec::with_capacity(worker_count);
-    for (device_ordinal, device) in devices.iter().enumerate() {
-        for lane in 0..config.workers_per_gpu {
-            handles.push(spawn_worker(
-                WorkerSpec {
-                    cuda: cuda.clone(),
-                    device: device.clone(),
-                    ordinal: device_ordinal * config.workers_per_gpu + lane,
+impl PersistentWorkerPool {
+    fn new(
+        cuda: CudaLibrary,
+        devices: Vec<CudaDevice>,
+        workers_per_gpu: usize,
+        batch_size: u32,
+        initial_work: &MiningWork,
+    ) -> Result<Self> {
+        let worker_count = devices
+            .len()
+            .checked_mul(workers_per_gpu)
+            .ok_or_else(|| anyhow!("GPU worker count overflow"))?;
+        if worker_count == 0 {
+            bail!("persistent GPU pool requires at least one worker");
+        }
+        let model_identity = initial_work.accelerator_model_identity()?;
+        let model = Arc::new(initial_work.accelerator_model()?);
+        let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(4).max(4));
+        let mut commands = Vec::with_capacity(worker_count);
+        let mut handles = Vec::with_capacity(worker_count);
+        for (device_ordinal, device) in devices.iter().enumerate() {
+            for lane in 0..workers_per_gpu {
+                let (command_sender, command_receiver) = mpsc::channel();
+                handles.push(spawn_persistent_worker(
+                    WorkerSpec {
+                        cuda: cuda.clone(),
+                        device: device.clone(),
+                        ordinal: device_ordinal * workers_per_gpu + lane,
+                        lane,
+                        worker_count,
+                        batch_size,
+                        model: Arc::clone(&model),
+                    },
+                    command_receiver,
+                    sender.clone(),
+                )?);
+                commands.push(command_sender);
+            }
+        }
+        drop(sender);
+
+        let mut pool = Self {
+            model_identity,
+            devices,
+            workers_per_gpu,
+            commands,
+            receiver,
+            handles,
+            next_job_id: 1,
+        };
+        pool.wait_until_initialized(worker_count)?;
+        Ok(pool)
+    }
+
+    fn wait_until_initialized(&mut self, worker_count: usize) -> Result<()> {
+        let mut initialized = BTreeSet::new();
+        while initialized.len() < worker_count {
+            match self.receiver.recv() {
+                Ok(WorkerMessage::Initialized { device, lane }) => {
+                    initialized.insert((device, lane));
+                    let device_ready = initialized
+                        .iter()
+                        .filter(|(ready_device, _)| *ready_device == device)
+                        .count();
+                    if device_ready == self.workers_per_gpu {
+                        println!(
+                            "GPU {device} context initialized with {} worker(s) ({}/{})",
+                            self.workers_per_gpu,
+                            initialized.len(),
+                            worker_count
+                        );
+                    }
+                }
+                Ok(WorkerMessage::Failed {
+                    device,
                     lane,
-                    worker_count,
+                    error,
+                    ..
+                }) => bail!("GPU {device} worker {lane} failed to initialize: {error}"),
+                Ok(_) => bail!("GPU worker sent job output before initialization completed"),
+                Err(_) => bail!("GPU workers disconnected during initialization"),
+            }
+        }
+        Ok(())
+    }
+
+    fn mine(
+        &mut self,
+        work: MiningWork,
+        config: JobMiningConfig,
+        shutdown: Arc<AtomicBool>,
+        statistics: &mut SessionStatistics,
+        check_status: &mut dyn FnMut() -> Result<WorkStatus>,
+    ) -> Result<JobOutcome> {
+        if work.accelerator_model_identity()? != self.model_identity {
+            bail!("mining model changed while GPU contexts were active");
+        }
+        let job_id = self.next_job_id;
+        self.next_job_id = self
+            .next_job_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("GPU job identifier exhausted"))?;
+        let worker_cancel = Arc::new(AtomicBool::new(false));
+        for command in &self.commands {
+            if command
+                .send(WorkerCommand::Mine {
+                    job_id,
                     work: work.clone(),
-                    batch_size: config.batch_size,
-                },
-                Arc::clone(&worker_cancel),
-                sender.clone(),
-            ));
+                    cancel: Arc::clone(&worker_cancel),
+                })
+                .is_err()
+            {
+                worker_cancel.store(true, Ordering::Release);
+                let _ = self.stop();
+                bail!("GPU worker disconnected before job {job_id}");
+            }
+        }
+
+        let outcome = monitor_workers(
+            &self.devices,
+            &work,
+            &self.receiver,
+            job_id,
+            MonitorControl {
+                stats_interval: config.stats_interval,
+                shutdown,
+                worker_cancel: Arc::clone(&worker_cancel),
+            },
+            statistics,
+            check_status,
+        );
+        worker_cancel.store(true, Ordering::Release);
+        match outcome {
+            Ok(outcome) => {
+                self.wait_until_idle(job_id, statistics)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = self.stop();
+                Err(error)
+            }
         }
     }
-    drop(sender);
-    let workers = WorkerSet {
-        cancel: Arc::clone(&worker_cancel),
-        handles,
-    };
 
-    let outcome = monitor_workers(
-        &devices,
-        &work,
-        &receiver,
-        MonitorControl {
-            stats_interval: config.stats_interval,
-            shutdown,
-            worker_cancel,
-        },
-        config.workers_per_gpu,
-        statistics,
-        check_status,
-    );
-    workers.stop()?;
-    outcome
+    fn wait_until_idle(&self, job_id: u64, statistics: &mut SessionStatistics) -> Result<()> {
+        let worker_count = self.commands.len();
+        let mut idle = BTreeSet::new();
+        while idle.len() < worker_count {
+            match self.receiver.recv() {
+                Ok(WorkerMessage::Idle {
+                    job_id: message_job,
+                    device,
+                    lane,
+                }) if message_job == job_id => {
+                    idle.insert((device, lane));
+                }
+                Ok(WorkerMessage::Progress {
+                    job_id: message_job,
+                    device,
+                    attempts,
+                }) if message_job == job_id => statistics.record_attempts(device, attempts),
+                Ok(WorkerMessage::Found {
+                    job_id: message_job,
+                    device,
+                    attempts,
+                    ..
+                }) if message_job == job_id => statistics.record_attempts(device, attempts),
+                Ok(WorkerMessage::Ready {
+                    job_id: message_job,
+                    ..
+                }) if message_job == job_id => {}
+                Ok(WorkerMessage::Failed {
+                    job_id: failed_job,
+                    device,
+                    lane,
+                    error,
+                }) if failed_job.is_none() || failed_job == Some(job_id) => {
+                    bail!("GPU {device} worker {lane} failed: {error}")
+                }
+                Ok(_) => bail!("GPU worker returned an out-of-order job message"),
+                Err(_) => bail!("GPU workers disconnected while settling job {job_id}"),
+            }
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        for command in &self.commands {
+            let _ = command.send(WorkerCommand::Shutdown);
+        }
+        self.commands.clear();
+        let mut panic_seen = false;
+        for handle in self.handles.drain(..) {
+            panic_seen |= handle.join().is_err();
+        }
+        if panic_seen {
+            bail!("a persistent GPU worker thread panicked");
+        }
+        Ok(())
+    }
 }
 
-fn spawn_worker(
+impl Drop for PersistentWorkerPool {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn spawn_persistent_worker(
     spec: WorkerSpec,
-    cancel: Arc<AtomicBool>,
+    commands: Receiver<WorkerCommand>,
     sender: SyncSender<WorkerMessage>,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("cmfd-gpu-{}-lane-{}", spec.device.index, spec.lane))
         .spawn(move || {
-            if let Err(error) = run_worker(&spec, &cancel, &sender) {
-                cancel.store(true, Ordering::Release);
+            if let Err(failure) = run_persistent_worker(&spec, &commands, &sender) {
                 let _ = sender.send(WorkerMessage::Failed {
+                    job_id: failure.job_id,
                     device: spec.device.index,
                     lane: spec.lane,
-                    error,
+                    error: failure.error,
                 });
             }
         })
-        .expect("named CUDA worker thread creation should succeed")
 }
 
-fn run_worker(
+fn run_persistent_worker(
     spec: &WorkerSpec,
+    commands: &Receiver<WorkerCommand>,
+    sender: &SyncSender<WorkerMessage>,
+) -> Result<(), WorkerThreadError> {
+    let mut miner = spec
+        .cuda
+        .create(&spec.model, spec.device.index)
+        .map_err(|error| WorkerThreadError {
+            job_id: None,
+            error,
+        })?;
+    sender
+        .send(WorkerMessage::Initialized {
+            device: spec.device.index,
+            lane: spec.lane,
+        })
+        .map_err(|_| WorkerThreadError {
+            job_id: None,
+            error: "miner coordinator closed during initialization".to_owned(),
+        })?;
+
+    while let Ok(command) = commands.recv() {
+        match command {
+            WorkerCommand::Mine {
+                job_id,
+                work,
+                cancel,
+            } => {
+                run_worker_job(spec, &mut miner, job_id, &work, &cancel, sender).map_err(
+                    |error| WorkerThreadError {
+                        job_id: Some(job_id),
+                        error,
+                    },
+                )?;
+                sender
+                    .send(WorkerMessage::Idle {
+                        job_id,
+                        device: spec.device.index,
+                        lane: spec.lane,
+                    })
+                    .map_err(|_| WorkerThreadError {
+                        job_id: Some(job_id),
+                        error: "miner coordinator closed while settling a job".to_owned(),
+                    })?;
+            }
+            WorkerCommand::Shutdown => break,
+        }
+    }
+    Ok(())
+}
+
+fn run_worker_job(
+    spec: &WorkerSpec,
+    miner: &mut cmfd_cuda::CudaMiner,
+    job_id: u64,
+    work: &MiningWork,
     cancel: &AtomicBool,
     sender: &SyncSender<WorkerMessage>,
 ) -> Result<(), String> {
-    let model = spec
-        .work
-        .accelerator_model()
-        .map_err(|error| error.client_error().message)?;
-    let mut miner = spec.cuda.create(&model, spec.device.index)?;
-    let canary = spec
-        .work
+    let canary = work
         .prepare_accelerator_batch(spec.ordinal as u64, 1)
         .map_err(|error| error.client_error().message)?;
     let canary_output = miner.evaluate(&canary)?;
-    spec.work
-        .verify_accelerator_output(&canary, 0, &canary_output)
+    work.verify_accelerator_output(&canary, 0, &canary_output)
         .map_err(|error| {
             format!(
-                "CUDA differential check failed: {}",
+                "GPU differential check failed: {}",
                 error.client_error().message
             )
         })?;
     sender
         .send(WorkerMessage::Ready {
+            job_id,
             device: spec.device.index,
             lane: spec.lane,
         })
-        .map_err(|_| "miner coordinator closed during startup".to_owned())?;
+        .map_err(|_| "miner coordinator closed during job startup".to_owned())?;
 
     let stride = nonce_stride(spec.batch_size, spec.worker_count);
     let mut next_nonce = nonce_start(spec.batch_size, spec.ordinal);
     let mut pending_attempts = 0_u64;
     while !cancel.load(Ordering::Acquire) {
-        let batch = spec
-            .work
+        let batch = work
             .prepare_accelerator_batch(next_nonce, spec.batch_size)
             .map_err(|error| error.client_error().message)?;
         let outputs = miner.evaluate(&batch)?;
         pending_attempts = pending_attempts.saturating_add(u64::from(spec.batch_size));
-        let result = spec
-            .work
+        let result = work
             .complete_accelerator_batch(&batch, &outputs)
             .map_err(|error| error.client_error().message)?;
         match result {
             MiningShareSearchResult::Found { proof, .. } => {
-                cancel.store(true, Ordering::Release);
                 sender
                     .send(WorkerMessage::Found {
+                        job_id,
                         device: spec.device.index,
                         proof,
                         attempts: pending_attempts,
                     })
                     .map_err(|_| "miner coordinator closed before block submission".to_owned())?;
+                cancel.store(true, Ordering::Release);
                 return Ok(());
             }
             MiningShareSearchResult::Exhausted { .. } => {}
-            MiningShareSearchResult::Cancelled { .. } => return Ok(()),
+            MiningShareSearchResult::Cancelled { .. } => break,
         }
 
         if sender
             .try_send(WorkerMessage::Progress {
+                job_id,
                 device: spec.device.index,
                 attempts: pending_attempts,
             })
@@ -1252,6 +1495,13 @@ fn run_worker(
         }
         next_nonce = next_nonce.wrapping_add(stride);
     }
+    if pending_attempts > 0 {
+        let _ = sender.try_send(WorkerMessage::Progress {
+            job_id,
+            device: spec.device.index,
+            attempts: pending_attempts,
+        });
+    }
     Ok(())
 }
 
@@ -1259,53 +1509,52 @@ fn monitor_workers(
     devices: &[CudaDevice],
     work: &MiningWork,
     receiver: &Receiver<WorkerMessage>,
+    job_id: u64,
     control: MonitorControl,
-    workers_per_gpu: usize,
     statistics: &mut SessionStatistics,
     check_status: &mut dyn FnMut() -> Result<WorkStatus>,
 ) -> Result<JobOutcome> {
     let mut ready = BTreeSet::new();
-
     loop {
         if control.shutdown.load(Ordering::Acquire) {
             control.worker_cancel.store(true, Ordering::Release);
             return Ok(JobOutcome::Shutdown);
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(WorkerMessage::Ready { device, lane }) => {
+            Ok(WorkerMessage::Ready {
+                job_id: message_job,
+                device,
+                lane,
+            }) if message_job == job_id => {
                 ready.insert((device, lane));
-                let device_ready = ready
-                    .iter()
-                    .filter(|(ready_device, _)| *ready_device == device)
-                    .count();
-                if device_ready == workers_per_gpu {
-                    println!(
-                        "GPU {device} initialized with {workers_per_gpu} worker(s) ({}/{})",
-                        ready.len(),
-                        devices.len().saturating_mul(workers_per_gpu)
-                    );
-                }
             }
-            Ok(WorkerMessage::Progress { device, attempts }) => {
+            Ok(WorkerMessage::Progress {
+                job_id: message_job,
+                device,
+                attempts,
+            }) if message_job == job_id => {
                 statistics.record_attempts(device, attempts);
             }
             Ok(WorkerMessage::Found {
+                job_id: message_job,
                 device,
                 proof,
                 attempts,
-            }) => {
+            }) if message_job == job_id => {
                 statistics.record_attempts(device, attempts);
                 control.worker_cancel.store(true, Ordering::Release);
                 return Ok(JobOutcome::Found { device, proof });
             }
             Ok(WorkerMessage::Failed {
+                job_id: failed_job,
                 device,
                 lane,
                 error,
-            }) => {
+            }) if failed_job.is_none() || failed_job == Some(job_id) => {
                 control.worker_cancel.store(true, Ordering::Release);
                 bail!("GPU {device} worker {lane} failed: {error}");
             }
+            Ok(_) => bail!("GPU worker returned an out-of-order job message"),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("all CUDA workers exited before finding or cancelling work")

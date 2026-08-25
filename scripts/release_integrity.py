@@ -47,6 +47,23 @@ INSECURE_DEV_REWARD_DESTINATIONS = {
     "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
     "6360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7",
 }
+PRODUCTION_RC_SERVICE_PORTS = {
+    "rpc_port": 19_443,
+    "p2p_port": 19_444,
+    "pool_port": 19_445,
+}
+PRODUCTION_RC_VERSION_FILES = (
+    "apps/wallet/package.json",
+    "apps/wallet/src-tauri/Cargo.toml",
+    "apps/wallet/src-tauri/tauri.conf.json",
+    "apps/wallet/src-tauri/tauri.rcnet.conf.json",
+    "crates/cmfd-miner/Cargo.toml",
+    "crates/cmfd-node/Cargo.toml",
+    "crates/cmfd-proof-worker/Cargo.toml",
+)
+SOURCE_ASSET_TOKEN_RE = re.compile(
+    r"(?:^|[-_.])(source|sources|src)(?:[-_.]|$)", re.IGNORECASE
+)
 RECEIPT_FIELDS = (
     "SCHEMA",
     "TRUST_SCOPE",
@@ -94,6 +111,20 @@ def is_production_rc_label(label: str) -> bool:
         or "mainnet-rc" in normalized
         or any(re.fullmatch(r"rc[0-9]*", token) for token in tokens)
     )
+
+
+def reject_production_rc_source_assets(stage_files: dict[str, Path]) -> None:
+    """Keep reviewed binary stages from accidentally carrying source bundles."""
+    for name in stage_files:
+        normalized = name.strip().lower()
+        if (
+            SOURCE_ASSET_TOKEN_RE.search(normalized)
+            or normalized in {"cargo.toml", "cargo.lock"}
+            or normalized.endswith((".crate", ".rs"))
+        ):
+            raise IntegrityError(
+                f"production RC binary release contains a source-like asset: {name}"
+            )
 
 
 def _bounded_json_object(path: Path, label: str) -> tuple[dict[str, object], bytes]:
@@ -203,6 +234,11 @@ def _validate_rcnet_launch_candidate(
     ports = [services.get(name) for name in ("rpc_port", "p2p_port", "pool_port")]
     if any(not isinstance(port, int) or isinstance(port, bool) or not 0 < port <= 65535 for port in ports) or len(set(ports)) != 3:
         raise IntegrityError("RCNet service ports are invalid")
+    if any(services[name] != port for name, port in PRODUCTION_RC_SERVICE_PORTS.items()):
+        raise IntegrityError(
+            "RCNet service ports must reserve loopback RPC 19443, public P2P 19444, "
+            "and closed-by-default pool 19445"
+        )
 
     proof = _require_exact_fields(
         payload["proof_of_work"],
@@ -315,6 +351,8 @@ def validate_production_rc_artifacts(
 ) -> None:
     if not is_production_rc_label(version):
         return
+
+    reject_production_rc_source_assets(stage_files)
 
     required = {
         PRODUCTION_RC_NETWORK_INFO_NAME,
@@ -707,6 +745,53 @@ def _tracked_blob(repo: Path, relative: str) -> bytes:
     safe = _safe_repo_relative(relative)
     _tracked_file(repo, safe)
     return _run_git_bytes(repo, "cat-file", "blob", f"HEAD:{safe}")
+
+
+def _manifest_version(repo: Path, relative: str) -> str:
+    data = _tracked_blob(repo, relative)
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise IntegrityError(f"release version manifest is not UTF-8: {relative}") from error
+    if relative.endswith(".json"):
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise IntegrityError(
+                f"release version manifest is not valid JSON: {relative}"
+            ) from error
+        version = value.get("version") if isinstance(value, dict) else None
+    else:
+        package = re.search(
+            r"(?ms)^\[package\]\s*$\n(.*?)(?=^\[|\Z)",
+            text,
+        )
+        package_version = (
+            re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', package.group(1))
+            if package is not None
+            else None
+        )
+        version = package_version.group(1) if package_version is not None else None
+    if not isinstance(version, str) or not version:
+        raise IntegrityError(f"release version manifest has no package version: {relative}")
+    return _single_line(f"version in {relative}", version)
+
+
+def validate_production_rc_source_versions(*, repo: Path, version: str) -> None:
+    if not is_production_rc_label(version):
+        return
+    mismatches: dict[str, str] = {}
+    for relative in PRODUCTION_RC_VERSION_FILES:
+        actual = _manifest_version(repo, relative)
+        if actual != version:
+            mismatches[relative] = actual
+    if mismatches:
+        details = ", ".join(
+            f"{relative}={actual}" for relative, actual in sorted(mismatches.items())
+        )
+        raise IntegrityError(
+            f"production RC version {version} does not match package manifests: {details}"
+        )
 
 
 def _tracked_input_file(repo: Path, path: Path, label: str) -> Path:
@@ -1412,6 +1497,7 @@ def verify_release(
     validate_production_rc_artifacts(
         version=version, commit=commit, stage_files=stage_files
     )
+    validate_production_rc_source_versions(repo=repo, version=version)
     expected_names = set(names) | {BUILDINFO_NAME, CHECKSUM_NAME}
     if set(stage_files) != expected_names:
         missing = sorted(expected_names - set(stage_files))
@@ -1460,6 +1546,7 @@ def finalize_release(
     validate_production_rc_artifacts(
         version=version, commit=commit, stage_files=stage_files
     )
+    validate_production_rc_source_versions(repo=repo, version=version)
     if BUILDINFO_NAME in stage_files or CHECKSUM_NAME in stage_files:
         raise IntegrityError("generated release metadata already exists")
     if set(stage_files) != set(names):

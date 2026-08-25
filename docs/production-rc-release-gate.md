@@ -57,6 +57,24 @@ manifest to match the candidate's identity, timestamp, services, difficulty
 limit, rewards, and Record V2 identity. The current RCNet constants remain
 placeholders and therefore cannot pass these checks.
 
+For the binary-only RC, finalization also pins the service allocation to RPC
+`19443`, P2P `19444`, and pool `19445`; rejects source-like top-level release
+assets; and requires the wallet JavaScript package, Tauri package/config, node,
+miner, and proof-worker manifests that produce shipped applications to carry
+the exact same non-Devnet RC version supplied to the finalizer. Internal
+library crates retain independent semantic versions. Runtime policy keeps RPC
+loopback-only. Release launchers and firewall instructions must expose only TCP
+`19444`; they must not start or expose the pool service on `19445`.
+
+These checks do not sign binaries or `SHA256SUMS.txt`, generate an SBOM, inspect
+the contents of GitHub's automatically generated source archives, or distribute
+the multi-gigabyte model bank. Those are separate release gates. A public
+binary repository must contain only reviewed binary-release metadata, and the
+model bank must be delivered through a create-new partial download that checks
+the compiled byte length, BLAKE3, and SHA-256 pins before atomic publication.
+The node then authenticates the bank, manifest, and Record V2 again before
+opening chain storage.
+
 The qualification manifest records the older exact commit used to build and
 run the qualifying verifier. The final activation evidence separately records
 the release checkout commit supplied as trusted CI input. This avoids the

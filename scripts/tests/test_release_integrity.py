@@ -739,6 +739,16 @@ class ProductionRcGateTests(unittest.TestCase):
                 version="1.0.0-rc1", commit=self.commit, stage_files={}
             )
 
+    def test_production_rc_rejects_source_like_release_assets(self) -> None:
+        stage_files = self.valid_stage_files()
+        source = self.root / "CommonFoundry-1.0.0-rc1-source.zip"
+        source.write_bytes(b"source")
+        stage_files[source.name] = source
+        with self.assertRaisesRegex(integrity.IntegrityError, "source-like asset"):
+            integrity.validate_production_rc_artifacts(
+                version="1.0.0-rc1", commit=self.commit, stage_files=stage_files
+            )
+
     def test_devnet_or_v2_compiled_identity_is_rejected(self) -> None:
         stage_files = self.valid_stage_files()
         network_info = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
@@ -787,6 +797,30 @@ class ProductionRcGateTests(unittest.TestCase):
         candidate["payload"]["services"]["bootstrap_ipv4"] = "203.0.113.9"
         self.write_json(integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate)
         with self.assertRaisesRegex(integrity.IntegrityError, "RFC 5737"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_rcnet_service_ports_are_fixed_for_the_binary_release(self) -> None:
+        stage_files = self.valid_stage_files()
+        candidate_path = stage_files[integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME]
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        candidate["payload"]["services"].update(
+            {"rpc_port": 28443, "p2p_port": 28444, "pool_port": 28445}
+        )
+        self.write_json(integrity.PRODUCTION_RC_LAUNCH_CANDIDATE_NAME, candidate)
+        network_path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(network_path.read_text(encoding="utf-8"))
+        network["services"].update(
+            {
+                "rpc_port": 28443,
+                "p2p_port": 28444,
+                "pool_port": 28445,
+                "bootstrap_peer": "8.8.8.8:28444",
+            }
+        )
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(integrity.IntegrityError, "RPC 19443"):
             integrity.validate_production_rc_artifacts(
                 version="production-rc1", commit=self.commit, stage_files=stage_files
             )
@@ -902,6 +936,50 @@ class ProductionRcGateTests(unittest.TestCase):
                 version="production-rc1",
                 commit=self.commit,
                 stage_files=stage_files,
+            )
+
+
+class ProductionRcVersionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = GitFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def commit_versions(self, version: str, *, node_version: str | None = None) -> None:
+        for relative in integrity.PRODUCTION_RC_VERSION_FILES:
+            selected = (
+                node_version
+                if relative == "crates/cmfd-node/Cargo.toml" and node_version is not None
+                else version
+            )
+            if relative.endswith(".json"):
+                content = json.dumps(
+                    {"name": "fixture", "version": selected},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n"
+            else:
+                content = (
+                    "[package]\n"
+                    f'name = "{Path(relative).parent.name}"\n'
+                    f'version = "{selected}"\n'
+                )
+            self.fixture.write(relative, content)
+        self.fixture.git("add", "--", "apps", "crates")
+        self.fixture.git("commit", "--quiet", "-m", "release versions")
+
+    def test_production_rc_requires_one_exact_version_in_every_package(self) -> None:
+        self.commit_versions("1.0.0-rc1")
+        integrity.validate_production_rc_source_versions(
+            repo=self.fixture.root, version="1.0.0-rc1"
+        )
+
+    def test_production_rc_rejects_a_stale_devnet_component_version(self) -> None:
+        self.commit_versions("1.0.0-rc1", node_version="0.1.0-devnet.14")
+        with self.assertRaisesRegex(integrity.IntegrityError, "cmfd-node/Cargo.toml"):
+            integrity.validate_production_rc_source_versions(
+                repo=self.fixture.root, version="1.0.0-rc1"
             )
 
 

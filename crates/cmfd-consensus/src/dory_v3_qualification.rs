@@ -63,10 +63,10 @@ use crate::{
     wire::{MAX_PROOF_BYTES, WireError, decode_forgematrix_proof, encode_forgematrix_proof},
 };
 
-const QUALIFICATION_REPORT_VERSION: u16 = 3;
+const QUALIFICATION_REPORT_VERSION: u16 = 4;
 const QUALIFICATION_JOURNAL_VERSION: u16 = 1;
 const QUALIFICATION_REQUEST_GENERATION_REPORT_VERSION: u16 = 1;
-const VERIFIER_REPORT_VERSION: u16 = 1;
+const VERIFIER_REPORT_VERSION: u16 = 2;
 const MAX_QUALIFICATION_REQUEST_JSON_BYTES: usize = 16 * 1024;
 const MAX_QUALIFICATION_REPORT_JSON_BYTES: usize = 128 * 1024;
 const MAX_QUALIFICATION_JOURNAL_BYTES: usize = 64 * 1024;
@@ -78,7 +78,8 @@ const QUALIFICATION_JOURNAL_RECORD_DIGEST_DOMAIN: &str =
     "CMFD/FORGEMATRIX/V3/QUALIFICATION-JOURNAL-RECORD/V1";
 const QUALIFICATION_JOURNAL_FILE_DIGEST_DOMAIN: &str =
     "CMFD/FORGEMATRIX/V3/QUALIFICATION-JOURNAL-COMPLETE-FILE/V1";
-const EXACT_RESERVATION_PEAK_SCOPE: &str = "exact high-water mark of declared final logical-byte reservations for the six instrumented Dory scratch artifact writer classes used by this runner; the sampled comparison is only a consistency check and does not prove an exact whole-directory peak or exclude uninstrumented transient files; excludes filesystem allocation granularity, metadata, physical bytes, and RAM";
+const SAMPLED_SCRATCH_OBSERVATION_SCOPE: &str = "informational non-atomic periodic whole-directory observation; one traversal can combine files that never coexisted, so it is neither a lower nor upper bound and is not comparable to exact_peak_instrumented_scratch_*; exact instrumentation is authoritative";
+const EXACT_SCRATCH_PEAK_SCOPE: &str = "exact per-session high-water mark of metadata.len logical bytes and live entries across all seven Dory scratch writer classes (the six runner-reachable classes plus dormant BlsDoryIndex); a per-session mutation lock spans tracked create, write, write_vectored, set_len, and same-file unlink with their ledger updates; excludes allocation blocks, filesystem metadata, RAM, and external mutation through handles outside TrackedScratchFile";
 const WHOLE_PROCESS_PEAK_RSS_SCOPE: &str =
     "OS process-lifetime high-water mark; run the CLI in a fresh process for qualification";
 const COOPERATIVE_CANCELLATION_SCOPE: &str = "the CLI maps Ctrl-C to the supplied flag; winning-claim replay polls it, other long stages observe it only after returning to a runner boundary";
@@ -135,7 +136,8 @@ pub struct ProductionDoryV3QualificationSeed {
 }
 
 /// Measurements and identities retained after one request is derived and published.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductionDoryV3QualificationRequestGenerationReport {
     pub report_version: u16,
     pub network_id: Digest32,
@@ -164,11 +166,13 @@ pub struct ProductionDoryV3QualificationRequestGenerationReport {
 ///
 /// Artifact byte counts are exact and timings are wall-clock nanoseconds around
 /// the named stage. Peak RSS is the OS process-lifetime high-water mark. The
-/// sampled scratch fields remain a whole-directory lower bound. The exact
-/// reservation fields account for declared final logical-byte reservations
-/// across the six instrumented Dory artifact writer classes used by this
-/// runner. They do not establish an exact whole-directory peak and are not
-/// physical disk allocation, filesystem metadata, or RAM measurements.
+/// periodically sampled whole-directory scratch fields are informational,
+/// non-atomic observations: one traversal can combine files that never existed
+/// concurrently, so they are neither a lower nor upper bound and are not
+/// comparable to the authoritative exact scratch fields. Those exact fields
+/// account for live tracked entries and their `metadata.len()` logical lengths
+/// across every Dory scratch writer class. They are not physical disk
+/// allocation, filesystem metadata, or RAM measurements.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductionDoryV3QualificationReport {
@@ -204,15 +208,16 @@ pub struct ProductionDoryV3QualificationReport {
     pub provisional_available_memory_floor_bytes: u64,
     pub observed_available_memory_before_bytes: u64,
     pub native_resource_projection_complete: bool,
-    pub sampled_peak_scratch_entries_lower_bound: u64,
-    pub sampled_peak_scratch_logical_bytes_lower_bound: u64,
+    pub sampled_peak_scratch_entries_observation: u64,
+    pub sampled_peak_scratch_logical_bytes_observation: u64,
     pub scratch_sample_interval_milliseconds: u64,
-    pub exact_peak_instrumented_scratch_reserved_logical_bytes: u64,
-    pub exact_peak_instrumented_scratch_live_artifacts: u64,
-    pub instrumented_scratch_reservation_events: u64,
+    pub sampled_peak_scratch_observation_scope: String,
+    pub exact_peak_instrumented_scratch_logical_bytes: u64,
+    pub exact_peak_instrumented_scratch_live_entries: u64,
+    pub instrumented_scratch_file_creation_events: u64,
+    pub instrumented_scratch_size_mutation_events: u64,
     pub exact_peak_scratch_instrumented: bool,
-    pub exact_reservation_peak_instrumented: bool,
-    pub exact_reservation_peak_scope: String,
+    pub exact_peak_scratch_scope: String,
     pub retained_scratch_entries: u64,
     pub retained_scratch_logical_bytes: u64,
     pub whole_process_peak_rss_bytes: u64,
@@ -317,7 +322,8 @@ struct StrictQualificationJournalRecord {
 ///
 /// This runner never proves, mines, publishes, or creates a chain-admission
 /// capability. Layout V5 decoding includes its canonical re-encoding check.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductionDoryV3VerifierReport {
     pub report_version: u16,
     pub network_id: Digest32,
@@ -343,7 +349,7 @@ pub struct ProductionDoryV3VerifierReport {
     pub bank_final_stability_scan_nanoseconds: u64,
     pub total_nanoseconds: u64,
     pub whole_process_peak_rss_bytes: u64,
-    pub whole_process_peak_rss_scope: &'static str,
+    pub whole_process_peak_rss_scope: String,
     pub verifier_only: bool,
     pub producer_report_checked: bool,
     pub qualification_journal_checked: bool,
@@ -475,7 +481,7 @@ pub enum ProductionDoryV3QualificationError {
     SizeOverflow,
     #[error("scratch high-water observer thread panicked")]
     ScratchObserverPanicked,
-    #[error("exact scratch reservation instrumentation failed: {0}")]
+    #[error("exact scratch logical-length instrumentation failed: {0}")]
     ScratchInstrumentation(#[source] io::Error),
     #[error("failed to create new output {path}: {source}")]
     CreateOutput {
@@ -852,27 +858,20 @@ pub fn run_production_dory_v3_qualification(
     let scratch_cleanup_started = Instant::now();
     drop(prepared_model);
     let scratch_high_water = scratch_observer.stop()?;
-    let (retained_scratch_entries, retained_scratch_logical_bytes) = scratch.measure_retained()?;
-    if retained_scratch_entries != 0 || retained_scratch_logical_bytes != 0 {
-        return Err(ProductionDoryV3QualificationError::RetainedScratch {
-            entries: retained_scratch_entries,
-            logical_bytes: retained_scratch_logical_bytes,
-        });
-    }
-    let exact_scratch_reservations = exact_scratch
-        .finish()
+    let exact_scratch_snapshot = exact_scratch
+        .finish_and_remove_root()
         .map_err(ProductionDoryV3QualificationError::ScratchInstrumentation)?;
-    if exact_scratch_reservations.reservation_events == 0
-        || scratch_high_water.entries > exact_scratch_reservations.peak_live_artifacts
-        || scratch_high_water.logical_bytes > exact_scratch_reservations.peak_reserved_logical_bytes
+    scratch.mark_removed();
+    if exact_scratch_snapshot.file_creation_events == 0
+        || exact_scratch_snapshot.size_mutation_events == 0
     {
         return Err(ProductionDoryV3QualificationError::ScratchInstrumentation(
             io::Error::other(
-                "scratch reservation instrumentation was empty or its peak was below a sampled scratch observation",
+                "scratch logical-length instrumentation recorded no file or size-changing operations",
             ),
         ));
     }
-    scratch.remove_empty()?;
+    let (retained_scratch_entries, retained_scratch_logical_bytes) = (0, 0);
     let scratch_cleanup_nanoseconds = elapsed_nanoseconds(scratch_cleanup_started)?;
     journal.append_stage("scratch_cleanup_completed", None)?;
     check_cancel(cancel)?;
@@ -961,18 +960,17 @@ pub fn run_production_dory_v3_qualification(
             .provisional_available_memory_gate_bytes,
         observed_available_memory_before_bytes,
         native_resource_projection_complete: native_projection.is_complete(),
-        sampled_peak_scratch_entries_lower_bound: scratch_high_water.entries,
-        sampled_peak_scratch_logical_bytes_lower_bound: scratch_high_water.logical_bytes,
+        sampled_peak_scratch_entries_observation: scratch_high_water.entries,
+        sampled_peak_scratch_logical_bytes_observation: scratch_high_water.logical_bytes,
         scratch_sample_interval_milliseconds: u64::try_from(SCRATCH_SAMPLE_INTERVAL.as_millis())
             .map_err(|_| ProductionDoryV3QualificationError::DurationOverflow)?,
-        exact_peak_instrumented_scratch_reserved_logical_bytes: exact_scratch_reservations
-            .peak_reserved_logical_bytes,
-        exact_peak_instrumented_scratch_live_artifacts: exact_scratch_reservations
-            .peak_live_artifacts,
-        instrumented_scratch_reservation_events: exact_scratch_reservations.reservation_events,
-        exact_peak_scratch_instrumented: false,
-        exact_reservation_peak_instrumented: true,
-        exact_reservation_peak_scope: EXACT_RESERVATION_PEAK_SCOPE.into(),
+        sampled_peak_scratch_observation_scope: SAMPLED_SCRATCH_OBSERVATION_SCOPE.into(),
+        exact_peak_instrumented_scratch_logical_bytes: exact_scratch_snapshot.peak_logical_bytes,
+        exact_peak_instrumented_scratch_live_entries: exact_scratch_snapshot.peak_live_entries,
+        instrumented_scratch_file_creation_events: exact_scratch_snapshot.file_creation_events,
+        instrumented_scratch_size_mutation_events: exact_scratch_snapshot.size_mutation_events,
+        exact_peak_scratch_instrumented: true,
+        exact_peak_scratch_scope: EXACT_SCRATCH_PEAK_SCOPE.into(),
         retained_scratch_entries,
         retained_scratch_logical_bytes,
         whole_process_peak_rss_bytes,
@@ -1236,7 +1234,7 @@ pub fn run_production_dory_v3_verifier(
         bank_final_stability_scan_nanoseconds,
         total_nanoseconds: elapsed_nanoseconds(verifier_started)?,
         whole_process_peak_rss_bytes,
-        whole_process_peak_rss_scope: "OS process-lifetime high-water mark; run the verifier CLI in a fresh process for an isolated measurement",
+        whole_process_peak_rss_scope: "OS process-lifetime high-water mark; run the verifier CLI in a fresh process for an isolated measurement".into(),
         verifier_only: true,
         producer_report_checked: true,
         qualification_journal_checked: true,
@@ -1596,18 +1594,15 @@ fn validate_producer_report_invariants(
         || report.observed_available_memory_before_bytes
             < report.provisional_available_memory_floor_bytes
         || report.native_resource_projection_complete != native_projection.is_complete()
-        || report.instrumented_scratch_reservation_events == 0
-        || report.exact_peak_instrumented_scratch_reserved_logical_bytes == 0
-        || report.exact_peak_instrumented_scratch_live_artifacts == 0
-        || report.exact_peak_instrumented_scratch_live_artifacts
-            > report.instrumented_scratch_reservation_events
-        || report.sampled_peak_scratch_entries_lower_bound
-            > report.exact_peak_instrumented_scratch_live_artifacts
-        || report.sampled_peak_scratch_logical_bytes_lower_bound
-            > report.exact_peak_instrumented_scratch_reserved_logical_bytes
-        || report.exact_peak_scratch_instrumented
-        || !report.exact_reservation_peak_instrumented
-        || report.exact_reservation_peak_scope != EXACT_RESERVATION_PEAK_SCOPE
+        || report.sampled_peak_scratch_observation_scope != SAMPLED_SCRATCH_OBSERVATION_SCOPE
+        || report.exact_peak_instrumented_scratch_logical_bytes == 0
+        || report.exact_peak_instrumented_scratch_live_entries == 0
+        || report.instrumented_scratch_file_creation_events == 0
+        || report.instrumented_scratch_size_mutation_events == 0
+        || report.exact_peak_instrumented_scratch_live_entries
+            > report.instrumented_scratch_file_creation_events
+        || !report.exact_peak_scratch_instrumented
+        || report.exact_peak_scratch_scope != EXACT_SCRATCH_PEAK_SCOPE
         || report.retained_scratch_entries != 0
         || report.retained_scratch_logical_bytes != 0
         || report.whole_process_peak_rss_scope != WHOLE_PROCESS_PEAK_RSS_SCOPE
@@ -2031,6 +2026,10 @@ impl OwnedScratchDirectory {
         })?;
         self.removed = true;
         Ok(())
+    }
+
+    fn mark_removed(&mut self) {
+        self.removed = true;
     }
 }
 
@@ -2668,12 +2667,12 @@ impl ScratchHighWaterObserver {
         let join = thread::spawn(move || {
             let mut peak = ScratchHighWaterSample::default();
             while !thread_stop.load(Ordering::Relaxed) {
-                let sample = sample_scratch_lower_bound(&path)?;
+                let sample = sample_scratch_observation(&path)?;
                 peak.entries = peak.entries.max(sample.entries);
                 peak.logical_bytes = peak.logical_bytes.max(sample.logical_bytes);
                 thread::sleep(SCRATCH_SAMPLE_INTERVAL);
             }
-            let sample = sample_scratch_lower_bound(&path)?;
+            let sample = sample_scratch_observation(&path)?;
             peak.entries = peak.entries.max(sample.entries);
             peak.logical_bytes = peak.logical_bytes.max(sample.logical_bytes);
             Ok(peak)
@@ -2710,7 +2709,7 @@ impl Drop for ScratchHighWaterObserver {
     }
 }
 
-fn sample_scratch_lower_bound(root: &Path) -> io::Result<ScratchHighWaterSample> {
+fn sample_scratch_observation(root: &Path) -> io::Result<ScratchHighWaterSample> {
     let mut sample = ScratchHighWaterSample::default();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -3380,15 +3379,16 @@ mod tests {
             observed_available_memory_before_bytes: native_projection
                 .provisional_available_memory_gate_bytes,
             native_resource_projection_complete: native_projection.is_complete(),
-            sampled_peak_scratch_entries_lower_bound: 1,
-            sampled_peak_scratch_logical_bytes_lower_bound: 1,
+            sampled_peak_scratch_entries_observation: 1,
+            sampled_peak_scratch_logical_bytes_observation: 1,
             scratch_sample_interval_milliseconds: 100,
-            exact_peak_instrumented_scratch_reserved_logical_bytes: 1,
-            exact_peak_instrumented_scratch_live_artifacts: 1,
-            instrumented_scratch_reservation_events: 1,
-            exact_peak_scratch_instrumented: false,
-            exact_reservation_peak_instrumented: true,
-            exact_reservation_peak_scope: EXACT_RESERVATION_PEAK_SCOPE.into(),
+            sampled_peak_scratch_observation_scope: SAMPLED_SCRATCH_OBSERVATION_SCOPE.into(),
+            exact_peak_instrumented_scratch_logical_bytes: 1,
+            exact_peak_instrumented_scratch_live_entries: 1,
+            instrumented_scratch_file_creation_events: 1,
+            instrumented_scratch_size_mutation_events: 1,
+            exact_peak_scratch_instrumented: true,
+            exact_peak_scratch_scope: EXACT_SCRATCH_PEAK_SCOPE.into(),
             retained_scratch_entries: 0,
             retained_scratch_logical_bytes: 0,
             whole_process_peak_rss_bytes: 1,
@@ -3813,11 +3813,14 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        assert_eq!(QUALIFICATION_REPORT_VERSION, 3);
+        assert_eq!(QUALIFICATION_REPORT_VERSION, 4);
+        assert_eq!(VERIFIER_REPORT_VERSION, 2);
+        assert_eq!(QUALIFICATION_REQUEST_GENERATION_REPORT_VERSION, 1);
+        assert_eq!(QUALIFICATION_JOURNAL_VERSION, 1);
         assert_eq!(summary.journal_version, QUALIFICATION_JOURNAL_VERSION);
         assert_eq!(
             summary.run_identity.to_hex(),
-            "48f34f8a77e6aa42bc181c095423d2cb55e2b9cd9d637d668e8e1935fa5dc01d"
+            "779177cafbf61172bb9f3281afa58ba46782c18c7cf3219afadae6d0a0a18906"
         );
         assert_eq!(summary.event_count, 3);
         assert!(summary.diagnostic_only);
@@ -3846,7 +3849,7 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(records[0]).unwrap(),
             format!(
-                "{{\"journal_version\":1,\"sequence\":0,\"previous_record_digest\":\"{}\",\"run_identity\":\"{}\",\"request_digest\":\"{}\",\"stage\":\"preflight_completed\",\"diagnostic_only\":true,\"completion_marker\":false,\"resumable\":false,\"effective_configuration\":{{\"qualification_report_version\":3,\"padded_variables\":33,\"composed_claims\":134,\"verifier_passes\":2,\"maximum_native_block_rows\":131072,\"algorithm_version\":2,\"proof_version\":1,\"shared_layout_version\":5,\"scratch_sample_interval_milliseconds\":100}}}}",
+                "{{\"journal_version\":1,\"sequence\":0,\"previous_record_digest\":\"{}\",\"run_identity\":\"{}\",\"request_digest\":\"{}\",\"stage\":\"preflight_completed\",\"diagnostic_only\":true,\"completion_marker\":false,\"resumable\":false,\"effective_configuration\":{{\"qualification_report_version\":4,\"padded_variables\":33,\"composed_claims\":134,\"verifier_passes\":2,\"maximum_native_block_rows\":131072,\"algorithm_version\":2,\"proof_version\":1,\"shared_layout_version\":5,\"scratch_sample_interval_milliseconds\":100}}}}",
                 "00".repeat(32),
                 summary.run_identity.to_hex(),
                 request_digest.to_hex()
@@ -4173,6 +4176,28 @@ mod tests {
     }
 
     #[test]
+    fn fresh_verifier_accepts_only_v4_and_does_not_compare_sampled_to_exact_scratch() {
+        let (_directory, _journal_path, _configuration, _request_digest, _identities, summary, _) =
+            complete_journal_fixture();
+        let (mut report, request, wire, candidate, payload) = producer_report_fixture(summary);
+
+        report.sampled_peak_scratch_entries_observation = u64::MAX;
+        report.sampled_peak_scratch_logical_bytes_observation = u64::MAX;
+        validate_producer_report_request_and_proof(&report, &request, &wire, &candidate, &payload)
+            .unwrap();
+
+        report.report_version = 3;
+        assert!(matches!(
+            validate_producer_report_request_and_proof(
+                &report, &request, &wire, &candidate, &payload
+            ),
+            Err(ProductionDoryV3QualificationError::EvidenceMismatch(
+                "producer report qualification invariants"
+            ))
+        ));
+    }
+
+    #[test]
     fn producer_report_rejects_one_field_invariant_mutations() {
         let (_directory, _journal_path, _configuration, _request_digest, _identities, summary, _) =
             complete_journal_fixture();
@@ -4221,26 +4246,36 @@ mod tests {
         rejects(mutated);
 
         let mut mutated = report.clone();
-        mutated.instrumented_scratch_reservation_events = 0;
+        mutated.instrumented_scratch_file_creation_events = 0;
         rejects(mutated);
 
         let mut mutated = report.clone();
-        mutated.exact_peak_instrumented_scratch_live_artifacts =
-            mutated.instrumented_scratch_reservation_events + 1;
+        mutated.instrumented_scratch_size_mutation_events = 0;
         rejects(mutated);
 
         let mut mutated = report.clone();
-        mutated.sampled_peak_scratch_entries_lower_bound =
-            mutated.exact_peak_instrumented_scratch_live_artifacts + 1;
+        mutated.exact_peak_instrumented_scratch_logical_bytes = 0;
         rejects(mutated);
 
         let mut mutated = report.clone();
-        mutated.sampled_peak_scratch_logical_bytes_lower_bound =
-            mutated.exact_peak_instrumented_scratch_reserved_logical_bytes + 1;
+        mutated.exact_peak_instrumented_scratch_live_entries = 0;
         rejects(mutated);
 
         let mut mutated = report.clone();
-        mutated.exact_reservation_peak_scope.push('!');
+        mutated.exact_peak_instrumented_scratch_live_entries =
+            mutated.instrumented_scratch_file_creation_events + 1;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.exact_peak_scratch_instrumented = false;
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.sampled_peak_scratch_observation_scope.push('!');
+        rejects(mutated);
+
+        let mut mutated = report.clone();
+        mutated.exact_peak_scratch_scope.push('!');
         rejects(mutated);
 
         let mut mutated = report.clone();
@@ -4422,7 +4457,7 @@ mod tests {
     }
 
     #[test]
-    fn scratch_observer_reports_only_a_sampled_lower_bound() {
+    fn scratch_observer_reports_an_informational_non_atomic_observation() {
         let directory = TestDirectory::create();
         let mut observer = ScratchHighWaterObserver::start(directory.0.clone());
         fs::write(directory.0.join("artifact"), vec![0_u8; 4_096]).unwrap();
@@ -4430,6 +4465,30 @@ mod tests {
         let sample = observer.stop().unwrap();
         assert!(sample.entries >= 1);
         assert!(sample.logical_bytes >= 4_096);
+    }
+
+    #[test]
+    fn qualification_scratch_fixture_keeps_sampled_and_exact_metrics_independent() {
+        let directory = TestDirectory::create();
+        let scratch = directory.0.join("scratch-fixture");
+        fs::create_dir(&scratch).unwrap();
+        let mut exact = ExactScratchReservationSession::start(&scratch).unwrap();
+        let mut observer = ScratchHighWaterObserver::start(scratch.clone());
+        let mut file = crate::dory_scratch_telemetry::TrackedScratchFile::create_new(
+            &scratch.join("artifact"),
+        )
+        .unwrap();
+        file.set_len(4_096).unwrap();
+        thread::sleep(SCRATCH_SAMPLE_INTERVAL + SCRATCH_SAMPLE_INTERVAL);
+        let sampled = observer.stop().unwrap();
+        file.remove_if_owned().unwrap();
+        let exact = exact.finish_and_remove_root().unwrap();
+
+        assert!(sampled.entries >= 1);
+        assert!(sampled.logical_bytes >= 4_096);
+        assert_eq!(exact.peak_live_entries, 1);
+        assert_eq!(exact.peak_logical_bytes, 4_096);
+        assert!(!scratch.exists());
     }
 
     #[test]

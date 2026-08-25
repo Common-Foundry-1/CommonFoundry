@@ -32,11 +32,16 @@ void write_error(char* output, size_t output_len, const char* message) {
 
 }  // namespace
 
-extern "C" int32_t cmfd_cutlass_int8_gemm(const int8_t* activation,
-                                           const int8_t* transposed_weights,
-                                           int32_t* accumulators, uint32_t rows,
-                                           uint32_t width, char* error,
-                                           size_t error_len) {
+#if defined(_WIN32)
+#define CMFD_CUDA_INTERNAL extern "C"
+#else
+#define CMFD_CUDA_INTERNAL extern "C" __attribute__((visibility("hidden")))
+#endif
+
+CMFD_CUDA_INTERNAL int32_t cmfd_cutlass_int8_gemm(
+    const int8_t* activation, const int8_t* transposed_weights,
+    int32_t* accumulators, uint32_t rows, uint32_t width, char* error,
+    size_t error_len) {
     if (activation == nullptr || transposed_weights == nullptr || accumulators == nullptr) {
         write_error(error, error_len, "CUTLASS GEMM received a null matrix pointer");
         return 1;

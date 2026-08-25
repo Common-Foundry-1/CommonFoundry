@@ -16,11 +16,16 @@
 #endif
 
 #if CMFD_CUTLASS_ENABLED
-extern "C" int32_t cmfd_cutlass_int8_gemm(const int8_t* activation,
-                                           const int8_t* transposed_weights,
-                                           int32_t* accumulators, uint32_t rows,
-                                           uint32_t width, char* error,
-                                           size_t error_len);
+#if defined(_WIN32)
+#define CMFD_CUDA_INTERNAL extern "C"
+#else
+#define CMFD_CUDA_INTERNAL extern "C" __attribute__((visibility("hidden")))
+#endif
+
+CMFD_CUDA_INTERNAL int32_t cmfd_cutlass_int8_gemm(
+    const int8_t* activation, const int8_t* transposed_weights,
+    int32_t* accumulators, uint32_t rows, uint32_t width, char* error,
+    size_t error_len);
 #endif
 
 #if defined(_WIN32)

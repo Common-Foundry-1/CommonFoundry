@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
 const status = {
-  network: "CommonFoundry Devnet-0",
+  network: "CommonFoundry Profile Test",
   network_id: "11".repeat(32),
   consensus_fingerprint: "22".repeat(32),
   proof_of_work: "ForgeMatrix-v2 tiny full-recompute reference",
@@ -20,7 +20,7 @@ const status = {
 };
 
 const wallet = {
-  network: "CommonFoundry Devnet-0",
+  network: "CommonFoundry Profile Test",
   devnet_only: true,
   insecure_demo_wallet: true,
   warning: "Shared insecure Devnet wallet key. Never use for real value.",
@@ -96,6 +96,7 @@ describe("Common Foundry wallet", () => {
     render(<App />);
 
     expect(await screen.findByText("177.50")).toBeInTheDocument();
+    expect(screen.getByText("CommonFoundry Profile Test")).toBeInTheDocument();
     expect(screen.getByText("Block height").nextElementSibling).toHaveTextContent("128");
     expect(screen.getByText("Mined reward")).toBeInTheDocument();
     expect(screen.getByText(/Testing network/)).toBeInTheDocument();

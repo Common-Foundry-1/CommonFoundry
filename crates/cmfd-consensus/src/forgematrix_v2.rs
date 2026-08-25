@@ -794,8 +794,11 @@ impl ForgeMatrixV2Reference {
     }
 }
 
-/// Fixed explicit test model used by Rust/CUDA differential vectors.
-pub fn v2_test_reference() -> Result<ForgeMatrixV2Reference, ForgeMatrixV2Error> {
+/// Fixed explicit test model used by Rust/CUDA differential vectors, bound to
+/// the supplied network identifier.
+pub fn v2_reference_for_network(
+    network_id: [u8; 32],
+) -> Result<ForgeMatrixV2Reference, ForgeMatrixV2Error> {
     let base = vec![0, 1, 2, 3, 247, 248, 249, 250];
     let layers: Vec<Vec<u8>> = (0..V2_TEST_LAYERS as usize)
         .map(|layer| {
@@ -815,8 +818,13 @@ pub fn v2_test_reference() -> Result<ForgeMatrixV2Reference, ForgeMatrixV2Error>
         pcs_commitment_root: [0xa2; 32],
     })?;
     let descriptor =
-        ForgeMatrixV2Descriptor::new_research([0x63; 32], 1, V2_TEST_LAYERS, built.manifest)?;
+        ForgeMatrixV2Descriptor::new_research(network_id, 1, V2_TEST_LAYERS, built.manifest)?;
     ForgeMatrixV2Reference::from_explicit_model(descriptor, base, layers)
+}
+
+/// Current Devnet-0 wrapper retained for byte-for-byte compatibility.
+pub fn v2_test_reference() -> Result<ForgeMatrixV2Reference, ForgeMatrixV2Error> {
+    v2_reference_for_network([0x63; 32])
 }
 
 pub(crate) fn challenge_digest(
@@ -1045,6 +1053,33 @@ mod tests {
 
     fn fixture() -> ForgeMatrixV2Reference {
         v2_test_reference().unwrap()
+    }
+
+    #[test]
+    fn current_v2_wrapper_is_byte_stable_and_network_parameterized() {
+        let current = v2_test_reference().unwrap();
+        let parameterized = v2_reference_for_network([0x63; 32]).unwrap();
+        assert_eq!(current.descriptor(), parameterized.descriptor());
+        assert_eq!(
+            current.accelerator_model(),
+            parameterized.accelerator_model()
+        );
+
+        let descriptor_bytes = serde_json::to_vec(&current.descriptor()).unwrap();
+        assert_eq!(descriptor_bytes.len(), 876);
+        assert_eq!(
+            hex::encode(blake3::hash(&descriptor_bytes).as_bytes()),
+            "889b5adf0e457b6de8757f1896cada03eecb28fc7210af1590763f9eb233ddb3"
+        );
+
+        let alternate = v2_reference_for_network([0x64; 32]).unwrap();
+        assert_ne!(alternate.descriptor(), current.descriptor());
+        assert_eq!(alternate.descriptor().model, current.descriptor().model);
+        assert_eq!(alternate.accelerator_model(), current.accelerator_model());
+        assert!(matches!(
+            v2_reference_for_network([0; 32]),
+            Err(ForgeMatrixV2Error::UncommittedDescriptor)
+        ));
     }
 
     fn block() -> BlockChallenge {

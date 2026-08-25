@@ -17,6 +17,7 @@ export interface PeerObservation {
 export interface PeerSettings {
   peers: string[];
   bootstrap_peer: string;
+  default_peer_port: number;
   max_peers: number;
 }
 

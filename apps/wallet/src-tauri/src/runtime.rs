@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
 use cmfd_node::peer::PeerLimits;
-use cmfd_node::{Node, NodeClientError};
+use cmfd_node::{DEVNET_PROFILE, Node, NodeClientError};
 use tauri::{App, Manager, Runtime};
 
 use crate::mining::MiningManager;
@@ -142,7 +142,7 @@ fn start_embedded_node<R: Runtime>(
                 false,
             )
         })?
-        .join("devnet-0");
+        .join(DEVNET_PROFILE.wallet_data_dir_identity);
     let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
     let node = Node::open(&data_dir).map_err(|error| error.client_error())?;
     let shared = Arc::new(Mutex::new(node));
@@ -203,20 +203,22 @@ pub(crate) fn parse_command() -> Result<ProcessCommand, ConfigError> {
     NodeRuntimeConfig::from_process_args()
 }
 
-pub(crate) fn command_help_text() -> &'static str {
-    const HELP: &str = concat!(
-        "Common Foundry Wallet\n",
-        "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v...]\n",
-        "Arguments:\n",
-        "  --help (-h)             Show this help\n",
-        "  --version (-V)          Print version\n",
-        "  -v, --verbose           Increase console verbosity (repeatable)\n",
-        "  --p2p-bind <addr>       Local P2P bind address (default 127.0.0.1:18444)\n",
-        "  --peer <addr>           Public or private outbound peer (repeatable)\n",
-        "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
-        "                          (the default bootstrap peer is always added if no --peer is configured)\n"
-    );
-    HELP
+pub(crate) fn command_help_text() -> String {
+    format!(
+        concat!(
+            "Common Foundry Wallet\n",
+            "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v...]\n",
+            "Arguments:\n",
+            "  --help (-h)             Show this help\n",
+            "  --version (-V)          Print version\n",
+            "  -v, --verbose           Increase console verbosity (repeatable)\n",
+            "  --p2p-bind <addr>       Local P2P bind address (default {})\n",
+            "  --peer <addr>           Public or private outbound peer (repeatable)\n",
+            "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
+            "                          (the default bootstrap peer is always added if no --peer is configured)\n",
+        ),
+        DEVNET_PROFILE.p2p_address(),
+    )
 }
 
 pub fn startup_error(

@@ -10,7 +10,14 @@ cargo-fuzz = true
 
 [dependencies]
 cmfd-consensus = { path = "../crates/cmfd-consensus", features = ["dory-bls12-381-prototype"] }
+cmfd-node = { path = "../crates/cmfd-node" }
 libfuzzer-sys = "0.4"
+
+[patch.crates-io]
+p3-fri = { path = "../third_party/p3-fri-0.6.3-out-of-core" }
+p3-merkle-tree = { path = "../third_party/p3-merkle-tree-0.6.3-gpu-first-layer" }
+p3-util = { path = "../third_party/p3-util-0.6.3-msrv" }
+p3-whir = { path = "../third_party/p3-whir-0.6.3-generic-initial-matrix" }
 
 [[bin]]
 name = "structured_aggregate_decode"
@@ -29,6 +36,13 @@ bench = false
 [[bin]]
 name = "bls_v3_candidate_decode"
 path = "fuzz_targets/bls_v3_candidate_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_admission"
+path = "fuzz_targets/p2p_admission.rs"
 test = false
 doc = false
 bench = false

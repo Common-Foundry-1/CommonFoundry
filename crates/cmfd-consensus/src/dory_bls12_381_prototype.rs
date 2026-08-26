@@ -15,12 +15,13 @@ use std::ops::{Add, Mul, Neg, Sub};
 
 use ark_bls12_381::{Bls12_381, Fr, G1Projective, G2Projective, g1, g2};
 use ark_ec::{
-    AffineRepr,
+    AffineRepr, CurveGroup, VariableBaseMSM,
     hashing::{HashToCurve, curve_maps::wb::WBMap, map_to_curve_hasher::MapToCurveBasedHasher},
     pairing::{MillerLoopOutput, Pairing, PairingOutput},
 };
 use ark_ff::{
-    BigInteger, Field as ArkField, PrimeField, UniformRand, Zero, field_hashers::DefaultFieldHasher,
+    BigInteger, Field as ArkField, One, PrimeField, UniformRand, Zero,
+    field_hashers::DefaultFieldHasher,
 };
 use ark_serialize::{
     CanonicalDeserialize, CanonicalSerialize, Compress as ArkCompress, Valid as ArkValid,
@@ -461,16 +462,54 @@ pub struct BlsDoryG1Routines;
 /// Parallel reference routines for BLS12-381 G2.
 pub struct BlsDoryG2Routines;
 
+const MIN_PARALLEL_MSM_SCALARS: usize = 2;
+
+fn parallel_msm_chunk_size(total: usize) -> Option<usize> {
+    let threads = rayon::current_num_threads();
+    if total < MIN_PARALLEL_MSM_SCALARS || threads <= 1 || rayon::current_thread_index().is_some() {
+        return None;
+    }
+    Some(total.div_ceil(threads))
+}
+
 macro_rules! impl_reference_routines {
-    ($routines:ty, $group:ty) => {
+    ($routines:ty, $group:ident, $projective:ty) => {
         impl DoryRoutines<$group> for $routines {
             fn msm(bases: &[$group], scalars: &[BlsDoryFr]) -> $group {
                 assert_eq!(bases.len(), scalars.len());
+                if bases.is_empty() {
+                    return <$group>::identity();
+                }
+
+                let msm_chunk = |bases: &[$group], scalars: &[BlsDoryFr]| -> $group {
+                    let affine_bases = if bases.iter().all(|base| base.0.z.is_one()) {
+                        bases
+                            .iter()
+                            .map(|base| base.0.into_affine())
+                            .collect::<Vec<_>>()
+                    } else {
+                        let projective_bases = bases.iter().map(|base| base.0).collect::<Vec<_>>();
+                        <$projective>::normalize_batch(&projective_bases)
+                    };
+                    let scalar_fields = scalars.iter().map(|scalar| scalar.0).collect::<Vec<_>>();
+                    $group(
+                        <$projective as VariableBaseMSM>::msm(&affine_bases, &scalar_fields)
+                            .expect("MSM chunk inputs have equal length"),
+                    )
+                };
+
+                let Some(chunk_size) = parallel_msm_chunk_size(bases.len()) else {
+                    return msm_chunk(bases, scalars);
+                };
+                // Indexed collection fixes chunk order; the following serial fold fixes
+                // reduction order independently of Rayon scheduling.
                 bases
-                    .par_iter()
-                    .zip(scalars.par_iter())
-                    .map(|(base, scalar)| base.scale(scalar))
-                    .reduce(<$group>::identity, |sum, value| sum + value)
+                    .par_chunks(chunk_size)
+                    .zip(scalars.par_chunks(chunk_size))
+                    .map(|(base_chunk, scalar_chunk)| msm_chunk(base_chunk, scalar_chunk))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .fold(<$group>::identity(), |sum, partial| sum + partial)
             }
 
             fn fixed_base_vector_scalar_mul(base: &$group, scalars: &[BlsDoryFr]) -> Vec<$group> {
@@ -507,8 +546,8 @@ macro_rules! impl_reference_routines {
     };
 }
 
-impl_reference_routines!(BlsDoryG1Routines, BlsDoryG1);
-impl_reference_routines!(BlsDoryG2Routines, BlsDoryG2);
+impl_reference_routines!(BlsDoryG1Routines, BlsDoryG1, G1Projective);
+impl_reference_routines!(BlsDoryG2Routines, BlsDoryG2, G2Projective);
 
 /// Evaluation-form multilinear polynomial over the BLS12-381 scalar field.
 #[derive(Clone, Debug)]
@@ -1027,6 +1066,57 @@ fn append_serialized<T: DorySerialize>(
 mod tests {
     use super::*;
 
+    struct NaiveBlsDoryG1Routines;
+    struct NaiveBlsDoryG2Routines;
+
+    macro_rules! impl_naive_msm_routines {
+        ($routines:ty, $group:ty, $optimized:ty) => {
+            impl DoryRoutines<$group> for $routines {
+                fn msm(bases: &[$group], scalars: &[BlsDoryFr]) -> $group {
+                    assert_eq!(bases.len(), scalars.len());
+                    bases
+                        .iter()
+                        .zip(scalars)
+                        .fold(<$group>::identity(), |sum, (base, scalar)| {
+                            sum + base.scale(scalar)
+                        })
+                }
+
+                fn fixed_base_vector_scalar_mul(
+                    base: &$group,
+                    scalars: &[BlsDoryFr],
+                ) -> Vec<$group> {
+                    <$optimized as DoryRoutines<$group>>::fixed_base_vector_scalar_mul(
+                        base, scalars,
+                    )
+                }
+
+                fn fixed_scalar_mul_bases_then_add(
+                    bases: &[$group],
+                    values: &mut [$group],
+                    scalar: &BlsDoryFr,
+                ) {
+                    <$optimized as DoryRoutines<$group>>::fixed_scalar_mul_bases_then_add(
+                        bases, values, scalar,
+                    );
+                }
+
+                fn fixed_scalar_mul_vs_then_add(
+                    values: &mut [$group],
+                    addends: &[$group],
+                    scalar: &BlsDoryFr,
+                ) {
+                    <$optimized as DoryRoutines<$group>>::fixed_scalar_mul_vs_then_add(
+                        values, addends, scalar,
+                    );
+                }
+            }
+        };
+    }
+
+    impl_naive_msm_routines!(NaiveBlsDoryG1Routines, BlsDoryG1, BlsDoryG1Routines);
+    impl_naive_msm_routines!(NaiveBlsDoryG2Routines, BlsDoryG2, BlsDoryG2Routines);
+
     fn deterministic_pairing_inputs(len: usize) -> (Vec<BlsDoryG1>, Vec<BlsDoryG2>) {
         let g1 = ark_bls12_381::G1Affine::generator().into_group();
         let g2 = ark_bls12_381::G2Affine::generator().into_group();
@@ -1068,6 +1158,12 @@ mod tests {
         encoded
     }
 
+    fn compressed_group<G: DorySerialize>(value: &G) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        value.serialize_compressed(&mut encoded).unwrap();
+        encoded
+    }
+
     struct OpeningFixture {
         setup: DeterministicBlsDorySetup,
         commitment: BlsDoryGt,
@@ -1076,7 +1172,12 @@ mod tests {
         proof: DoryProof<BlsDoryG1, BlsDoryG2, BlsDoryGt>,
     }
 
-    fn opening_fixture() -> Result<OpeningFixture, BlsDoryPrototypeError> {
+    fn opening_fixture_with_routines<M1, M2>()
+    -> Result<(OpeningFixture, [u8; 32]), BlsDoryPrototypeError>
+    where
+        M1: DoryRoutines<BlsDoryG1>,
+        M2: DoryRoutines<BlsDoryG2>,
+    {
         let setup = deterministic_bls_dory_setup(8)?;
         let polynomial = BlsDoryPolynomial::new(
             (0..256)
@@ -1084,7 +1185,7 @@ mod tests {
                 .collect(),
         )?;
         let (commitment, rows, blind) = polynomial
-            .commit::<BlsDoryCurve, Transparent, BlsDoryG1Routines>(4, 4, &setup.prover)
+            .commit::<BlsDoryCurve, Transparent, M1>(4, 4, &setup.prover)
             .map_err(|error| BlsDoryPrototypeError::Dory(error.to_string()))?;
         assert!(blind.is_zero());
         let point = (0..8)
@@ -1092,26 +1193,34 @@ mod tests {
             .collect::<Vec<_>>();
         let evaluation = polynomial.evaluate(&point);
         let mut transcript = opening_transcript(&setup.identity, &commitment, &point, &evaluation);
-        let (proof, hidden_evaluation) =
-            prove::<_, BlsDoryCurve, BlsDoryG1Routines, BlsDoryG2Routines, _, _, Transparent>(
-                &polynomial,
-                &point,
-                rows.clone(),
-                BlsDoryFr::zero(),
-                4,
-                4,
-                &setup.prover,
-                &mut transcript,
-            )
-            .map_err(|error| BlsDoryPrototypeError::Dory(error.to_string()))?;
+        let (proof, hidden_evaluation) = prove::<_, BlsDoryCurve, M1, M2, _, _, Transparent>(
+            &polynomial,
+            &point,
+            rows.clone(),
+            BlsDoryFr::zero(),
+            4,
+            4,
+            &setup.prover,
+            &mut transcript,
+        )
+        .map_err(|error| BlsDoryPrototypeError::Dory(error.to_string()))?;
         assert!(hidden_evaluation.is_none());
-        Ok(OpeningFixture {
-            setup,
-            commitment,
-            point,
-            evaluation,
-            proof,
-        })
+        let transcript_digest = transcript.digest();
+        Ok((
+            OpeningFixture {
+                setup,
+                commitment,
+                point,
+                evaluation,
+                proof,
+            },
+            transcript_digest,
+        ))
+    }
+
+    fn opening_fixture() -> Result<OpeningFixture, BlsDoryPrototypeError> {
+        opening_fixture_with_routines::<BlsDoryG1Routines, BlsDoryG2Routines>()
+            .map(|(fixture, _)| fixture)
     }
 
     #[test]
@@ -1166,6 +1275,112 @@ mod tests {
                 "canonical bytes differ at length {len}"
             );
         }
+    }
+
+    #[test]
+    fn variable_base_msm_matches_naive_identity_and_edge_scalars() {
+        let scalars = vec![
+            BlsDoryFr::zero(),
+            BlsDoryFr::one(),
+            -BlsDoryFr::one(),
+            BlsDoryFr::from_u64(2),
+            BlsDoryFr::from_u64(u64::MAX),
+            BlsDoryFr(Fr::from(17_u64).square()),
+        ];
+        let g1 = ark_bls12_381::G1Affine::generator().into_group();
+        let g1_bases = vec![
+            BlsDoryG1::identity(),
+            BlsDoryG1(g1),
+            BlsDoryG1(-g1),
+            BlsDoryG1(g1 * Fr::from(2_u64)),
+            BlsDoryG1(g1 * Fr::from(37_u64)),
+            BlsDoryG1((g1 * Fr::from(11_u64)) + (g1 * Fr::from(19_u64))),
+        ];
+        let expected_g1 = NaiveBlsDoryG1Routines::msm(&g1_bases, &scalars);
+        let actual_g1 = BlsDoryG1Routines::msm(&g1_bases, &scalars);
+        assert_eq!(actual_g1, expected_g1);
+        assert_eq!(compressed_group(&actual_g1), compressed_group(&expected_g1));
+
+        let g2 = ark_bls12_381::G2Affine::generator().into_group();
+        let g2_bases = vec![
+            BlsDoryG2::identity(),
+            BlsDoryG2(g2),
+            BlsDoryG2(-g2),
+            BlsDoryG2(g2 * Fr::from(2_u64)),
+            BlsDoryG2(g2 * Fr::from(37_u64)),
+            BlsDoryG2((g2 * Fr::from(11_u64)) + (g2 * Fr::from(19_u64))),
+        ];
+        let expected_g2 = NaiveBlsDoryG2Routines::msm(&g2_bases, &scalars);
+        let actual_g2 = BlsDoryG2Routines::msm(&g2_bases, &scalars);
+        assert_eq!(actual_g2, expected_g2);
+        assert_eq!(compressed_group(&actual_g2), compressed_group(&expected_g2));
+
+        assert_eq!(BlsDoryG1Routines::msm(&[], &[]), BlsDoryG1::identity());
+        assert_eq!(BlsDoryG2Routines::msm(&[], &[]), BlsDoryG2::identity());
+    }
+
+    #[test]
+    fn variable_base_msm_parallel_chunks_match_nested_serial_path() {
+        const TERMS: usize = 257;
+        let generator = ark_bls12_381::G1Affine::generator().into_group();
+        let bases = (0..TERMS)
+            .map(|index| {
+                if index % 67 == 0 {
+                    BlsDoryG1::identity()
+                } else {
+                    BlsDoryG1(generator * Fr::from((index as u64).wrapping_mul(29).wrapping_add(3)))
+                }
+            })
+            .collect::<Vec<_>>();
+        let scalars = (0..TERMS)
+            .map(|index| match index % 19 {
+                0 => BlsDoryFr::zero(),
+                1 => -BlsDoryFr::one(),
+                _ => BlsDoryFr::from_u64((index as u64).wrapping_mul(41).wrapping_add(7)),
+            })
+            .collect::<Vec<_>>();
+
+        if rayon::current_num_threads() > 1 {
+            assert!(parallel_msm_chunk_size(TERMS).is_some());
+        }
+        let expected = NaiveBlsDoryG1Routines::msm(&bases, &scalars);
+        let parallel = BlsDoryG1Routines::msm(&bases, &scalars);
+        assert_eq!(compressed_group(&parallel), compressed_group(&expected));
+
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let nested = pool.install(|| {
+                assert!(parallel_msm_chunk_size(TERMS).is_none());
+                BlsDoryG1Routines::msm(&bases, &scalars)
+            });
+            assert_eq!(
+                compressed_group(&nested),
+                compressed_group(&parallel),
+                "canonical bytes differ with a nested {threads}-thread Rayon caller"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_base_msm_preserves_opening_proof_and_transcript_bytes() {
+        let (optimized, optimized_transcript) =
+            opening_fixture_with_routines::<BlsDoryG1Routines, BlsDoryG2Routines>().unwrap();
+        let (naive, naive_transcript) =
+            opening_fixture_with_routines::<NaiveBlsDoryG1Routines, NaiveBlsDoryG2Routines>()
+                .unwrap();
+
+        assert_eq!(
+            compressed_group(&optimized.commitment),
+            compressed_group(&naive.commitment)
+        );
+        assert_eq!(
+            encode_transparent_proof(&optimized.proof).unwrap(),
+            encode_transparent_proof(&naive.proof).unwrap()
+        );
+        assert_eq!(optimized_transcript, naive_transcript);
     }
 
     #[test]

@@ -19,7 +19,10 @@ use cmfd_consensus::{
     dory_bls12_381_model_commitment::derive_bls_dory_model_commitment_record,
     dory_bls12_381_prototype::deterministic_bls_dory_setup,
     dory_v3_model_bank_bootstrap::run_production_dory_v3_model_bank_bootstrap,
-    dory_v3_model_ceremony::run_production_dory_v3_model_record_v2_ceremony,
+    dory_v3_model_ceremony::{
+        ProductionDoryV3ModelRecordV2CeremonyProgress,
+        run_production_dory_v3_model_record_v2_ceremony_with_progress,
+    },
     dory_v3_model_ceremony_authoring::{
         ProductionDoryV3CeremonyAttestationSigner, prepare_production_dory_v3_ceremony_attestation,
         prepare_production_dory_v3_ceremony_record, stage_production_dory_v3_ceremony_attestation,
@@ -723,6 +726,25 @@ fn read_ceremony_transcript(path: &std::path::Path, description: &str) -> Result
 }
 
 #[cfg(feature = "dory-bls12-381-prototype")]
+fn write_model_record_v2_progress<W: std::io::Write>(
+    writer: &mut W,
+    progress: &ProductionDoryV3ModelRecordV2CeremonyProgress,
+) -> std::io::Result<()> {
+    writer.write_all(b"CMFD_MODEL_RECORD_V2_PROGRESS ")?;
+    serde_json::to_writer(&mut *writer, progress).map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
+fn write_model_record_v2_progress_best_effort<W: std::io::Write>(
+    writer: &mut W,
+    progress: &ProductionDoryV3ModelRecordV2CeremonyProgress,
+) {
+    let _write_result = write_model_record_v2_progress(writer, progress);
+}
+
+#[cfg(feature = "dory-bls12-381-prototype")]
 fn print_structural_error_evidence(
     evidence: &AuthenticatedProductionDoryV3StructuralErrorEvidence,
 ) {
@@ -905,9 +927,16 @@ fn run_cli() -> Result<()> {
                 .with_context(|| format!("failed to open {}", manifest.display()))?;
             let trusted_manifest: ModelBankManifest = serde_json::from_reader(manifest_reader)
                 .with_context(|| format!("failed to parse {}", manifest.display()))?;
-            let report =
-                run_production_dory_v3_model_record_v2_ceremony(&bank, &trusted_manifest, &output)
-                    .context("production Dory V3 Model Record V2 ceremony failed")?;
+            let report = run_production_dory_v3_model_record_v2_ceremony_with_progress(
+                &bank,
+                &trusted_manifest,
+                &output,
+                |progress| {
+                    let mut stderr = std::io::stderr().lock();
+                    write_model_record_v2_progress_best_effort(&mut stderr, &progress);
+                },
+            )
+            .context("production Dory V3 Model Record V2 ceremony failed")?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(feature = "dory-bls12-381-prototype")]
@@ -1871,6 +1900,55 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory as _;
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("forced progress writer failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("forced progress writer failure"))
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushFailingWriter(Vec<u8>);
+
+    impl std::io::Write for FlushFailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("forced progress flush failure"))
+        }
+    }
+
+    #[test]
+    fn model_record_v2_progress_writer_is_machine_readable_and_fallible() {
+        let progress = ProductionDoryV3ModelRecordV2CeremonyProgress::PassOneStarted;
+        let mut bytes = Vec::new();
+        write_model_record_v2_progress(&mut bytes, &progress).unwrap();
+        assert_eq!(
+            bytes,
+            b"CMFD_MODEL_RECORD_V2_PROGRESS {\"phase\":\"pass_one_started\"}\n"
+        );
+
+        assert!(write_model_record_v2_progress(&mut FailingWriter, &progress).is_err());
+
+        let mut flush_failing = FlushFailingWriter::default();
+        assert!(write_model_record_v2_progress(&mut flush_failing, &progress).is_err());
+        assert_eq!(
+            flush_failing.0,
+            b"CMFD_MODEL_RECORD_V2_PROGRESS {\"phase\":\"pass_one_started\"}\n"
+        );
+
+        write_model_record_v2_progress_best_effort(&mut FailingWriter, &progress);
+        write_model_record_v2_progress_best_effort(&mut FlushFailingWriter::default(), &progress);
+    }
 
     #[test]
     fn line_output_paths_are_json_escaped_and_round_trip() {

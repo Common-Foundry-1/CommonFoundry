@@ -10,6 +10,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -54,6 +55,26 @@ pub struct ProductionDoryV3ModelRecordV2CeremonyReport {
     pub setup_elapsed_micros: u64,
     pub pass_1_elapsed_micros: u64,
     pub pass_2_elapsed_micros: u64,
+}
+
+/// Durable phase markers for long-running production Record V2 ceremonies.
+///
+/// These markers do not contain commitments or other ceremony results. They
+/// only identify the last boundary reached so an interrupted multi-hour run
+/// cannot be mistaken for a cryptographic failure in an unknown pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum ProductionDoryV3ModelRecordV2CeremonyProgress {
+    PreflightStarted,
+    PreflightCompleted,
+    SetupStarted,
+    SetupCompleted { elapsed_micros: u64 },
+    PassOneStarted,
+    PassOneCompleted { elapsed_micros: u64 },
+    PassTwoStarted,
+    PassTwoCompleted { elapsed_micros: u64 },
+    OutputStarted,
+    Completed,
 }
 
 /// Fail-closed errors from the two-pass production ceremony.
@@ -230,9 +251,40 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
     output_path: &Path,
 ) -> Result<ProductionDoryV3ModelRecordV2CeremonyReport, ProductionDoryV3ModelRecordV2CeremonyError>
 {
+    run_production_dory_v3_model_record_v2_ceremony_with_progress(
+        bank_path,
+        trusted_manifest,
+        output_path,
+        |_| {},
+    )
+}
+
+/// Run the canonical production ceremony while reporting phase boundaries to
+/// an operator-owned sink. Progress is advisory and never influences success.
+pub fn run_production_dory_v3_model_record_v2_ceremony_with_progress<F>(
+    bank_path: &Path,
+    trusted_manifest: &ModelBankManifest,
+    output_path: &Path,
+    mut progress: F,
+) -> Result<ProductionDoryV3ModelRecordV2CeremonyReport, ProductionDoryV3ModelRecordV2CeremonyError>
+where
+    F: FnMut(ProductionDoryV3ModelRecordV2CeremonyProgress),
+{
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::PreflightStarted,
+    );
     reject_existing_output(output_path)?;
     let manifest_digest = preflight_production_dory_v3_model_bank_manifest(trusted_manifest)?;
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::PreflightCompleted,
+    );
 
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::SetupStarted,
+    );
     let setup_started = Instant::now();
     let setup = deterministic_bls_dory_setup(DORY_V3_PADDED_VARIABLES as usize)
         .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Setup)?;
@@ -246,7 +298,17 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
         return Err(ProductionDoryV3ModelRecordV2CeremonyError::PinnedSetupMismatch);
     }
     let setup_elapsed = setup_started.elapsed();
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::SetupCompleted {
+            elapsed_micros: elapsed_micros(setup_elapsed),
+        },
+    );
 
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::PassOneStarted,
+    );
     let pass_one_started = Instant::now();
     let pass_one_reader = open_bank(bank_path, 1)?;
     let derived = derive_bls_dory_model_commitments_from_verified_layout(
@@ -285,7 +347,17 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
     let first_bytes = canonical_dory_v3_model_record_v2_json(&first_record)
         .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Serialize)?;
     let pass_one_elapsed = pass_one_started.elapsed();
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::PassOneCompleted {
+            elapsed_micros: elapsed_micros(pass_one_elapsed),
+        },
+    );
 
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::PassTwoStarted,
+    );
     let pass_two_started = Instant::now();
     let decoded_record: DoryV3ModelCommitmentRecordV2 = serde_json::from_slice(&first_bytes)
         .map_err(ProductionDoryV3ModelRecordV2CeremonyError::Serialize)?;
@@ -321,6 +393,12 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
         return Err(ProductionDoryV3ModelRecordV2CeremonyError::ReproductionMismatch);
     }
     let pass_two_elapsed = pass_two_started.elapsed();
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::PassTwoCompleted {
+            elapsed_micros: elapsed_micros(pass_two_elapsed),
+        },
+    );
 
     let record_json_bytes = u64::try_from(first_bytes.len())
         .map_err(|_| ProductionDoryV3ModelRecordV2CeremonyError::RecordLengthOverflow)?;
@@ -330,6 +408,10 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
     // not confirm success unless the pathname still names the same regular
     // file after the parent-directory durability step where the platform
     // supports syncing directory entries.
+    emit_progress(
+        &mut progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::OutputStarted,
+    );
     let mut output = write_new_output(output_path, &first_bytes)?;
     let completion = (|| {
         let reopened_bytes = read_exact_output(&output, &first_bytes)?;
@@ -365,7 +447,22 @@ pub fn run_production_dory_v3_model_record_v2_ceremony(
             pass_2_elapsed_micros: elapsed_micros(pass_two_elapsed),
         })
     })();
-    finish_or_cleanup_output(&mut output, completion)
+    finish_or_cleanup_output_with_progress(&mut output, completion, &mut progress)
+}
+
+fn emit_progress<F>(progress: &mut F, phase: ProductionDoryV3ModelRecordV2CeremonyProgress)
+where
+    F: FnMut(ProductionDoryV3ModelRecordV2CeremonyProgress),
+{
+    // Progress must never alter ceremony control flow, including after the
+    // canonical output has been durably confirmed. This catches unwind-mode
+    // sink failures; the release profiles retain Rust's default unwind mode.
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| progress(phase))) {
+        // A user-defined panic payload may itself panic when dropped. Leaking
+        // the payload is the only way to keep an advisory sink from changing
+        // ceremony control flow in that hostile case.
+        std::mem::forget(payload);
+    }
 }
 
 fn reject_existing_output(
@@ -526,6 +623,22 @@ fn finish_or_cleanup_output<T>(
         },
         Err(error) => Err(cleanup_after_error(output, error)),
     }
+}
+
+fn finish_or_cleanup_output_with_progress<T, F>(
+    output: &mut PublishedRecordOutput,
+    completion: Result<T, ProductionDoryV3ModelRecordV2CeremonyError>,
+    progress: &mut F,
+) -> Result<T, ProductionDoryV3ModelRecordV2CeremonyError>
+where
+    F: FnMut(ProductionDoryV3ModelRecordV2CeremonyProgress),
+{
+    let value = finish_or_cleanup_output(output, completion)?;
+    emit_progress(
+        progress,
+        ProductionDoryV3ModelRecordV2CeremonyProgress::Completed,
+    );
+    Ok(value)
 }
 
 fn cleanup_after_error(
@@ -754,6 +867,73 @@ mod tests {
     }
 
     #[test]
+    fn ceremony_progress_markers_are_stable_machine_readable_boundaries() {
+        assert_eq!(
+            serde_json::to_string(&ProductionDoryV3ModelRecordV2CeremonyProgress::PassOneStarted)
+                .unwrap(),
+            r#"{"phase":"pass_one_started"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &ProductionDoryV3ModelRecordV2CeremonyProgress::PassTwoCompleted {
+                    elapsed_micros: 42,
+                }
+            )
+            .unwrap(),
+            r#"{"phase":"pass_two_completed","elapsed_micros":42}"#
+        );
+    }
+
+    #[test]
+    fn progress_sink_panics_are_best_effort_at_every_boundary() {
+        let mut calls = 0;
+        let mut sink = |_| {
+            calls += 1;
+            panic!("forced progress sink panic");
+        };
+
+        emit_progress(
+            &mut sink,
+            ProductionDoryV3ModelRecordV2CeremonyProgress::PreflightStarted,
+        );
+        emit_progress(
+            &mut sink,
+            ProductionDoryV3ModelRecordV2CeremonyProgress::Completed,
+        );
+
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn completed_progress_panic_cannot_reverse_durable_publication() {
+        struct PanickingDrop;
+
+        impl Drop for PanickingDrop {
+            fn drop(&mut self) {
+                panic!("forced panic payload drop");
+            }
+        }
+
+        let output_path = temp_path("completed-progress-panic");
+        let expected = b"durably published";
+        let mut output = write_new_output(&output_path, expected).unwrap();
+        let mut sink = |phase| {
+            assert_eq!(
+                phase,
+                ProductionDoryV3ModelRecordV2CeremonyProgress::Completed
+            );
+            std::panic::panic_any(PanickingDrop);
+        };
+
+        let value = finish_or_cleanup_output_with_progress(&mut output, Ok(42_u8), &mut sink)
+            .expect("advisory completion progress cannot reverse publication");
+
+        assert_eq!(value, 42);
+        assert_eq!(fs::read(&output_path).unwrap(), expected);
+        fs::remove_file(output_path).unwrap();
+    }
+
+    #[test]
     fn production_manifest_preflight_accepts_only_exact_geometry_and_suite_digest() {
         let manifest = production_manifest();
         assert_eq!(
@@ -794,16 +974,22 @@ mod tests {
         fs::write(&output, b"do not overwrite").unwrap();
         let missing_bank = output.with_extension("missing-bank");
 
-        let error = run_production_dory_v3_model_record_v2_ceremony(
+        let mut progress = Vec::new();
+        let error = run_production_dory_v3_model_record_v2_ceremony_with_progress(
             &missing_bank,
             &production_manifest(),
             &output,
+            |phase| progress.push(phase),
         )
         .unwrap_err();
         assert!(matches!(
             error,
             ProductionDoryV3ModelRecordV2CeremonyError::OutputExists(path) if path == output
         ));
+        assert_eq!(
+            progress,
+            vec![ProductionDoryV3ModelRecordV2CeremonyProgress::PreflightStarted]
+        );
         assert_eq!(fs::read(&output).unwrap(), b"do not overwrite");
         fs::remove_file(output).unwrap();
     }

@@ -101,15 +101,117 @@ sandbox-status mismatch, or any sandbox setup error aborts ProductionV3 startup
 before P2P is enabled. A legitimate runtime syscall omitted from the allowlist
 returns `EPERM`, so real-bank package qualification is mandatory before release.
 
-Windows ProductionV3 remains deliberately unavailable. A Job Object alone does
-not provide least privilege and the current spawn-then-assign sequence is not an
-AppContainer boundary. Activation requires an atomic `STARTUPINFOEX` launch
-with AppContainer/LPAC security capabilities, Job and inherited-handle lists,
-child-process and UI restrictions, and already-open read-only artifact handles.
-The current retained-file validator is pathname based and rejects the DACL
-changes that a path-based AppContainer grant would require, so a pathless
-retained-handle validation entry point is also required. Until both the launch
-and escape tests exist, the Windows ProductionV3 constructor fails closed.
+Windows ProductionV3 now uses a direct
+[`CreateProcessW`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)
+`STARTUPINFOEX` launch. The process is created suspended with a unique
+zero-capability AppContainer profile, the documented
+`PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT` attribute for LPAC, an
+exact six-handle inheritance list (bounded protocol stdio plus three retained
+read-only artifacts), and an atomic Job list. The Job has kill-on-close, exact
+process/job memory limits, and an active-process limit of one. Child-process
+and Win32k mitigations are applied in the same attribute list. The parent
+re-queries the token, zero capability count, exact AppContainer SID, DEP, ASLR,
+dynamic-code, image-load, Win32k, SEHOP, strict-handle-check, extension-point,
+and child-process policies, Job membership, and Job limits before resuming the
+primary thread. Before reading artifact contents or IPC, the child queries its
+own process heap and requires the exact enabled
+`HeapEnableTerminationOnCorruption` state; query failure or a disabled state
+fails closed. It also queries the system loopback-exemption table and fails
+closed if the exact new profile SID is exempt. The launcher never changes the
+configured executable or directory ACL. It opens the source without
+write/delete sharing, rejects
+reparse points and hardlink ambiguity, copies into a fresh per-launch
+directory, verifies the exact destination object's pinned SHA-256 and length,
+and retains the source, destination, and directory handles through process
+lifetime. Only those new private objects receive the unique AppContainer SID;
+`CreateProcessW` executes only the verified private path. After confirmed
+process-tree exit, the parent marks the exact private file and directory for
+deletion through their retained `DELETE` handles. Each handle is bound with
+the full 128-bit `FILE_ID_INFO`; replacement, reparse, or added-hardlink
+ambiguity fails closed. An unconfirmed exit or uncertain exact-object cleanup
+retains the process, Job, profile, and runtime pins and permanently blocks new
+worker launches in that process.
+
+Before `CreateAppContainerProfile`, a protected owner-only ledger records the
+unique name as a durable ownership intent. Only the live same-process guard
+created from that intent may delete the registration. Profile deletion uses
+the bounded delays `0, 10, 20, 40, 80, 160, 320, 500 ms`; exhausted deletion or
+marker cleanup remains retryable on that guard. Marker initialization and
+cleanup failures latch worker health and retain quarantine evidence. A later
+process never deletes an AppContainer profile from a persisted name: any stale
+session, including an empty partial session, blocks launch for manual
+remediation. Every successful profile creation is immediately placed in this
+RAII ownership before SID validation or another fallible step; panic
+subprocess regressions compare the exact CMFD registry mapping and randomized
+temporary-root `FILE_ID_INFO` sets before and after unwinding. See
+Microsoft's primary documentation for
+[`UpdateProcThreadAttribute`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
+[`CreateAppContainerProfile`](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createappcontainerprofile),
+[`GetTokenInformation`](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation),
+and [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
+
+The worker receives no pathname fallback and independently re-authenticates
+the object identity, length, BLAKE3, and SHA-256 of each inherited artifact
+handle before the consensus loader consumes it. Its environment is a newly
+constructed, sorted, double-NUL UTF-16 allowlist derived from a fresh
+[`CreateEnvironmentBlock`](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createenvironmentblock)
+source; a null environment pointer is never used. The headless worker is a
+Windows-subsystem executable and all normal protocol and diagnostics still use
+the explicit stdio handles.
+
+On Windows build 26200, the documented `TokenIsLessPrivilegedAppContainer`
+information class returned `ERROR_INVALID_PARAMETER` for both fixed-size and
+sizing queries. The launcher therefore does not claim a successful query of
+that class: it requires the documented LPAC opt-out attribute and the native
+behavioral sentinel proves denial of arbitrary file data and metadata access,
+artifact mutation, exact `WSAStartup` error 10107, and denial of a real
+`WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP)` request. The LPAC therefore
+never owns a socket on which `connect`, `bind`, or `listen` could genuinely be
+called. A separate, less-restricted regular AppContainer sentinel uses the same
+new zero-capability, non-loopback-exempt profile and the same exact six
+non-socket inherited handles. It initializes Winsock and creates its own valid
+sockets. On the qualified host, its bounded outbound connection to a concrete
+parent listener never completes and the parent accepts nothing. Its local
+`bind` and `listen` setup calls succeed, but a parent connection to that live
+listener times out, the child accepts nothing, and the endpoint is reusable
+after teardown. These are precise same-host observations, not a claim that the
+regular AppContainer is the production LPAC or a substitute for the packaged
+external-host network gate. No registry or network capability is granted.
+
+That remaining gate must use the packaged binary on the qualification host and
+a separately routed fleet peer. The packaged production LPAC must repeat its
+exact Winsock-init/socket-creation denial. Its zero-capability regular
+AppContainer companion must attempt an outbound connection to a peer-owned
+listener while the peer records no accept or traffic, then create a concrete
+non-loopback listener while the peer attempts to connect and the child records
+no accept or traffic. Both directions require bounded poll/`SO_ERROR` evidence,
+the exact profile SID and no-loopback-exemption attestation, and endpoint reuse
+after teardown. A connection, accept, payload, ambiguous timeout, or missing
+capture fails the gate. This external-peer harness and evidence are not yet
+complete, so ProductionV3 release remains blocked on them.
+
+The inherited handle list is security-critical: a socket created outside an
+AppContainer can retain authority when inherited. Production and both
+sentinels therefore reject any seventh handle before process creation; a
+regression supplies a real socket as the extra-handle case. The native sentinel
+also covers child creation and ambient environment. Its child reports `READY`,
+accepts `ARM` over the already-authorized stdin channel, reports `ARMED`, then
+blocks on that channel. Immediately before closing the final kill-on-close Job
+handle without calling `TerminateJobObject`, the parent requires the process
+to be nonsignaled and Job accounting to report exactly one active process.
+Only the qualified host's exact zero Job-close exit code is accepted;
+`STATUS_INVALID_HANDLE` and every other pre-close/post-handshake crash are
+rejected. The executable and libtest parents set
+`SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX`, and each worker/sentinel entry
+sets `WER_FAULT_REPORTING_NO_UI`, so the exact fault status remains diagnostic
+without opening an interactive dialog.
+For an omitted inheritable file, the trusted parent probes the suspended
+child's exact numeric slot with `DuplicateHandle` before resume and requires
+`ERROR_INVALID_HANDLE`; an inherited identity, another file identity, or
+non-file numeric-slot reuse all fail the sentinel. This closes the Windows isolation implementation
+tranche only. ProductionV3 activation stays closed pending external-host
+inbound/outbound qualification of the packaged worker, packaged real-bank and
+known-block qualification, independent review, and the other release gates.
 
 The Linux sandbox is designed to contain a verifier compromised by hostile
 proof input, and its current sentinels cover file-content reads, file and

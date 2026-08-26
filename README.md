@@ -115,10 +115,19 @@ substitution, hash mismatch, and sandbox setup failure all fail closed. Devnet
 V2 uses process-tree crash containment only. ProductionV3 on Linux x86-64 also
 requires Landlock ABI 3 or newer together with a mandatory default-deny seccomp
 filter before reading/loading artifact contents or untrusted IPC. ProductionV3
-on Windows remains unavailable until the AppContainer/LPAC and
-inherited-artifact-handle release gate is implemented and qualified. This
-boundary does not by itself establish production readiness; per-worker CPU/PID
-enforcement is also still a release gate.
+on Windows now has an atomic zero-capability LPAC launch with an exact
+inherited-handle and Job list, handle-only artifact loading, Win32k and
+child-process restrictions, a hash/identity-verified per-launch private
+executable pinned through process lifetime, child-side heap
+terminate-on-corruption attestation, panic-safe profile/runtime ownership, and
+a suspended-child parent-side omitted-handle sentinel. Its native sentinel
+uses an inherited-channel `READY`/`ARMED` barrier, live Job accounting, exact
+exit-status classification, and noninteractive Windows fault reporting; an
+invalid-handle or other pre-close crash is rejected. This implementation
+does not activate ProductionV3: packaged real-artifact qualification,
+known-valid and corrupt-block replay, independent review, and the remaining
+release gates are still required. This boundary does not by itself establish
+production readiness; per-worker CPU enforcement is also still a release gate.
 
 At the 32,768-row checkpoint on an RTX 5090, an unoptimized Cargo test-profile
 CPU run took 348.28 seconds (64.503 setup, 283.416 prove; 238,698-byte canonical

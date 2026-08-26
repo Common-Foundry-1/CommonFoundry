@@ -809,12 +809,22 @@ additionally requires Landlock ABI 3 or newer plus a mandatory default-deny
 seccomp policy before reading/loading model contents or untrusted IPC; Landlock
 ABI 3 is accepted only because seccomp allows only the audited verifier runtime
 surface and denies every unlisted syscall.
-ProductionV3 remains fail-closed on Windows until an atomic AppContainer/LPAC
-launch and inherited-handle artifact loader pass equivalent escape and
-full-worker tests. Per-worker CPU/PID containment also remains open on Linux;
-the per-real-UID task limit is not treated as a substitute. Sustained
-independent campaigns, real-bank resource
-measurements, and the Windows sandbox remain activation work.
+ProductionV3 on Windows now has an atomic zero-capability LPAC launch, exact
+Job/handle lists, handle-only artifact loading, a hash/identity-verified
+per-launch private executable pinned through process lifetime, and native
+escape sentinels. Before artifact or IPC reads, the child requires its own heap
+terminate-on-corruption state to be enabled. The suspended-child omitted-handle
+probe rejects both actual inheritance and numeric-slot reuse, and profile/temp
+ownership remains RAII-clean across panic unwinding. The native Job-close
+sentinel uses an inherited-channel `READY`/`ARMED` barrier, verifies the child
+is nonsignaled with exactly one active Job process immediately before close,
+and rejects invalid-handle or other crash exits while Windows fault UI remains
+noninteractive.
+Activation remains fail-closed until packaged real-bank and known-block
+qualification completes. Per-worker CPU/PID containment also remains open on
+Linux; the per-real-UID task limit is not treated as a substitute. Sustained
+independent campaigns, real-bank resource measurements, and Windows packaged
+qualification remain activation work.
 
 An optional prover-only CUDA path now implements the exact Goldilocks DFT and coset-LDE semantics used by this STARK and supplies the value-MMCS Poseidon2 first digest layer to actual proof generation. Merkle parent compression, openings, transcript operations, and verification remain on the CPU, and every resulting encoded proof must pass the unchanged CPU verifier. At the 32,768-row checkpoint on an RTX 5090, the same unoptimized Cargo test profile took 348.28 seconds on CPU (64.503 setup, 283.416 prove; 238,698-byte canonical zlib payload) and 76.71 seconds with CUDA DFT plus Poseidon2 (7.700 setup, 68.551 prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. The direct API loads native code in-process and is for trusted development only. The hash-pinned, bounded worker path has been tested with a 64-byte tree proof and terminates its whole process tree on timeout or overflow; this is crash containment, not an operating-system sandbox or a change to consensus.
 
@@ -1132,7 +1142,7 @@ Devnet fork choice is functionally testable, but its tiny CPU-recomputed work pr
 
 ### 12.3 Public-network gaps
 
-Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, bounded proof admission, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened share verifier. External block proof verification no longer holds the global node mutex: one proof runs while a bounded admission queue separates local and remote callers, panics are contained, and an identity-bound process-local capability prevents proof substitution before atomic submission. Devnet V2 can use the hash-pinned worker with process-tree, wall-time, memory, and output containment. ProductionV3 requires the stronger platform sandbox described above; Linux has a Landlock-plus-seccomp implementation, while Windows remains fail-closed pending AppContainer/LPAC and handle-only artifact loading. Side-branch reconstruction remains a scalability concern, and non-block RPC dispatch remains single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability remain limited.
+Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, bounded proof admission, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened share verifier. External block proof verification no longer holds the global node mutex: one proof runs while a bounded admission queue separates local and remote callers, panics are contained, and an identity-bound process-local capability prevents proof substitution before atomic submission. Devnet V2 can use the hash-pinned worker with process-tree, wall-time, memory, and output containment. ProductionV3 requires the stronger platform sandbox described above; Linux has a Landlock-plus-seccomp implementation, while Windows has an atomic zero-capability LPAC and handle-only artifact implementation but remains fail-closed pending packaged real-bank and known-block qualification. Side-branch reconstruction remains a scalability concern, and non-block RPC dispatch remains single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability remain limited.
 
 Release artifacts have SHA-256 checksums, and CI contains checked-in Windows
 and Linux desktop build jobs. The release tag and binaries remain unsigned,

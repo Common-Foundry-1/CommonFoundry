@@ -1,14 +1,13 @@
-//! Dormant handle-only production-artifact loading for the future Windows
-//! AppContainer launcher.
+//! Handle-only production-artifact transport for the Windows AppContainer
+//! launcher.
 //!
-//! Nothing in the current command-line protocol selects this path. Activation
-//! requires an atomic `STARTUPINFOEX` launch with an explicit inherited-handle
-//! list. That launcher must open each artifact with read/synchronize access
-//! only and sharing that excludes writers and deletion: stable Win32 APIs do
-//! not expose the granted-access mask of an existing handle for us to verify
-//! here.
+//! The trusted parent opens each artifact with read/synchronize access only and
+//! sharing that excludes writers and deletion, authenticates that retained
+//! handle, and duplicates only that handle into the explicit inherited-handle
+//! list. Stable Win32 APIs do not expose the granted-access mask of an existing
+//! handle, so the loader accepts only handles owned under that launch contract.
 
-#![allow(dead_code)]
+#![cfg_attr(not(feature = "production-v3"), allow(dead_code))]
 
 use std::{
     fs::File,
@@ -16,7 +15,7 @@ use std::{
     mem::MaybeUninit,
     os::windows::{
         fs::MetadataExt as _,
-        io::{AsRawHandle as _, OwnedHandle},
+        io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
     },
 };
 
@@ -27,6 +26,10 @@ use thiserror::Error;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_DISK,
     GetFileInformationByHandle, GetFileType,
+};
+use windows_sys::Win32::{
+    Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+    System::Threading::GetCurrentProcess,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,8 +48,8 @@ pub(crate) struct WindowsArtifactContentIdentity {
 /// Trusted launch metadata for one numeric handle inherited by the worker.
 ///
 /// This is transport metadata, not proof that the numeric value is live or
-/// owned. The future launcher must separately construct an `OwnedHandle` under
-/// its explicit inherited-handle ownership contract.
+/// owned. The launcher separately constructs an `OwnedHandle` under its
+/// explicit inherited-handle ownership contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WindowsArtifactHandleDescriptor {
     raw_handle: usize,
@@ -60,8 +63,9 @@ impl WindowsArtifactHandleDescriptor {
     /// Observe and authenticate a parent-owned artifact handle before launch.
     ///
     /// The returned numeric value remains borrowed in the parent. Only the
-    /// future explicit handle-list launch transfers an independently owned
-    /// inherited instance to the child.
+    /// explicit handle-list launch transfers an independently owned inherited
+    /// instance to the child.
+    #[cfg(test)]
     pub(crate) fn observe_parent(
         artifact: &'static str,
         file: &mut File,
@@ -86,6 +90,115 @@ impl WindowsArtifactHandleDescriptor {
         })
     }
 
+    /// Observe the complete identity of a retained parent handle when the
+    /// trusted caller has already selected the artifact path but does not carry
+    /// a second copy of its digest tuple. The child independently rechecks this
+    /// exact content and the consensus loader authenticates the artifact set.
+    pub(crate) fn observe_parent_content(
+        artifact: &'static str,
+        file: &mut File,
+    ) -> Result<Self, WindowsArtifactHandleError> {
+        let expected_bytes = file
+            .metadata()
+            .map_err(|source| WindowsArtifactHandleError::Io {
+                artifact,
+                operation: "reading parent metadata",
+                source,
+            })?
+            .len();
+        validate_disk_file(artifact, file, expected_bytes)?;
+        let expected_object = query_object_identity(artifact, file)?;
+        let expected = hash_open_file(artifact, file, expected_bytes)?;
+        validate_disk_file(artifact, file, expected_bytes)?;
+        if query_object_identity(artifact, file)? != expected_object {
+            return Err(WindowsArtifactHandleError::ObjectIdentity { artifact });
+        }
+        Ok(Self {
+            raw_handle: file.as_raw_handle() as usize,
+            expected_bytes,
+            expected_blake3: expected.blake3,
+            expected_sha256: expected.sha256,
+            expected_object,
+        })
+    }
+
+    pub(crate) fn for_inherited_handle(&self, raw_handle: usize) -> Self {
+        let mut inherited = self.clone();
+        inherited.raw_handle = raw_handle;
+        inherited
+    }
+
+    pub(crate) fn transport_argument(&self) -> String {
+        format!(
+            "{:x}:{}:{}:{}:{:08x}:{:016x}",
+            self.raw_handle,
+            self.expected_bytes,
+            hex::encode(self.expected_blake3),
+            hex::encode(self.expected_sha256),
+            self.expected_object.volume_serial,
+            self.expected_object.file_index,
+        )
+    }
+
+    pub(crate) fn parse_transport_argument(
+        value: &str,
+    ) -> Result<Self, WindowsArtifactHandleError> {
+        let fields = value.split(':').collect::<Vec<_>>();
+        let lowercase_hex = |field: &str| {
+            !field.is_empty()
+                && field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if fields.len() != 6
+            || fields[0].is_empty()
+            || fields[1].is_empty()
+            || fields[2].len() != 64
+            || fields[3].len() != 64
+            || fields[4].len() != 8
+            || fields[5].len() != 16
+            || !lowercase_hex(fields[0])
+            || !fields[1].bytes().all(|byte| byte.is_ascii_digit())
+            || !lowercase_hex(fields[2])
+            || !lowercase_hex(fields[3])
+            || !lowercase_hex(fields[4])
+            || !lowercase_hex(fields[5])
+        {
+            return Err(WindowsArtifactHandleError::TransportDescriptor);
+        }
+        let raw_handle = usize::from_str_radix(fields[0], 16)
+            .map_err(|_| WindowsArtifactHandleError::TransportDescriptor)?;
+        if raw_handle == 0 || raw_handle == usize::MAX {
+            return Err(WindowsArtifactHandleError::TransportDescriptor);
+        }
+        let expected_bytes = fields[1]
+            .parse::<u64>()
+            .map_err(|_| WindowsArtifactHandleError::TransportDescriptor)?;
+        if expected_bytes == 0 {
+            return Err(WindowsArtifactHandleError::TransportDescriptor);
+        }
+        let expected_blake3 = decode_digest(fields[2])?;
+        let expected_sha256 = decode_digest(fields[3])?;
+        let volume_serial = u32::from_str_radix(fields[4], 16)
+            .map_err(|_| WindowsArtifactHandleError::TransportDescriptor)?;
+        let file_index = u64::from_str_radix(fields[5], 16)
+            .map_err(|_| WindowsArtifactHandleError::TransportDescriptor)?;
+        let descriptor = Self {
+            raw_handle,
+            expected_bytes,
+            expected_blake3,
+            expected_sha256,
+            expected_object: WindowsFileObjectIdentity {
+                volume_serial,
+                file_index,
+            },
+        };
+        if descriptor.transport_argument() != value {
+            return Err(WindowsArtifactHandleError::TransportDescriptor);
+        }
+        Ok(descriptor)
+    }
+
     fn expected_content(&self) -> WindowsArtifactContentIdentity {
         WindowsArtifactContentIdentity {
             bytes: self.expected_bytes,
@@ -104,13 +217,10 @@ pub(crate) struct OwnedWindowsArtifactHandle {
 
 impl OwnedWindowsArtifactHandle {
     pub(crate) fn bind(
-        artifact: &'static str,
+        _artifact: &'static str,
         descriptor: WindowsArtifactHandleDescriptor,
         handle: OwnedHandle,
     ) -> Result<Self, WindowsArtifactHandleError> {
-        if handle.as_raw_handle() as usize != descriptor.raw_handle {
-            return Err(WindowsArtifactHandleError::TransportHandleMismatch { artifact });
-        }
         Ok(Self { descriptor, handle })
     }
 
@@ -129,6 +239,29 @@ pub(crate) struct OwnedWindowsProductionArtifactHandles {
 }
 
 impl OwnedWindowsProductionArtifactHandles {
+    pub(crate) fn from_inherited_descriptors(
+        descriptors: [WindowsArtifactHandleDescriptor; 3],
+    ) -> Result<Self, WindowsArtifactHandleError> {
+        let [bank, manifest, record_v2] = descriptors;
+        if bank.raw_handle == manifest.raw_handle
+            || bank.raw_handle == record_v2.raw_handle
+            || manifest.raw_handle == record_v2.raw_handle
+        {
+            return Err(WindowsArtifactHandleError::AliasedHandles);
+        }
+        // Numeric values supplied on the command line are borrowed. Duplicate
+        // each live handle before constructing any owner so malformed or stale
+        // transport metadata can never close an unrelated/reused raw value.
+        let bank_handle = duplicate_borrowed_handle("bank", bank.raw_handle)?;
+        let manifest_handle = duplicate_borrowed_handle("manifest", manifest.raw_handle)?;
+        let record_handle = duplicate_borrowed_handle("Record V2", record_v2.raw_handle)?;
+        Ok(Self {
+            bank: OwnedWindowsArtifactHandle::bind("bank", bank, bank_handle)?,
+            manifest: OwnedWindowsArtifactHandle::bind("manifest", manifest, manifest_handle)?,
+            record_v2: OwnedWindowsArtifactHandle::bind("Record V2", record_v2, record_handle)?,
+        })
+    }
+
     fn take_verified_files(
         self,
     ) -> Result<VerifiedProductionArtifacts, WindowsArtifactHandleError> {
@@ -155,9 +288,8 @@ impl OwnedWindowsProductionArtifactHandles {
     }
 }
 
-/// Dormant worker entry point for the future explicit AppContainer launch.
-/// Current Windows ProductionV3 startup remains fail-closed before this can be
-/// selected.
+/// Worker entry point selected only by the explicit AppContainer handle-list
+/// launch contract.
 #[cfg(feature = "production-v3")]
 pub(crate) fn load_production_v3_verifier_from_inherited_handles(
     network_id: [u8; 32],
@@ -194,8 +326,14 @@ struct VerifiedProductionArtifacts {
 
 #[derive(Debug, Error)]
 pub(crate) enum WindowsArtifactHandleError {
-    #[error("owned {artifact} handle does not match its transported numeric value")]
-    TransportHandleMismatch { artifact: &'static str },
+    #[error("inherited production artifact handle descriptor is not canonical")]
+    TransportDescriptor,
+    #[error("could not duplicate the borrowed inherited {artifact} handle: {source}")]
+    DuplicateTransportHandle {
+        artifact: &'static str,
+        #[source]
+        source: io::Error,
+    },
     #[error("inherited {artifact} handle does not refer to a regular disk file")]
     NotDiskFile { artifact: &'static str },
     #[error("inherited {artifact} handle has an unexpected byte length")]
@@ -219,6 +357,45 @@ pub(crate) enum WindowsArtifactHandleError {
         #[source]
         cmfd_consensus::dory_v3_model_bank_record_validation::ProductionDoryV3ModelBankRecordValidationError,
     ),
+}
+
+fn duplicate_borrowed_handle(
+    artifact: &'static str,
+    raw_handle: usize,
+) -> Result<OwnedHandle, WindowsArtifactHandleError> {
+    // SAFETY: the current-process pseudo handle is valid for both process
+    // parameters and must not be closed. `raw_handle` remains borrowed even
+    // when invalid; DuplicateHandle either returns a fresh owner or fails
+    // without transferring/closing the source value.
+    let current = unsafe { GetCurrentProcess() };
+    let mut duplicate = std::ptr::null_mut();
+    if unsafe {
+        DuplicateHandle(
+            current,
+            raw_handle as *mut _,
+            current,
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(WindowsArtifactHandleError::DuplicateTransportHandle {
+            artifact,
+            source: io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: DuplicateHandle returned one fresh owned handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(duplicate.cast()) })
+}
+
+fn decode_digest(value: &str) -> Result<[u8; 32], WindowsArtifactHandleError> {
+    let decoded =
+        hex::decode(value).map_err(|_| WindowsArtifactHandleError::TransportDescriptor)?;
+    decoded
+        .try_into()
+        .map_err(|_| WindowsArtifactHandleError::TransportDescriptor)
 }
 
 fn verify_claimed_file(
@@ -373,7 +550,7 @@ fn consensus_file_identity(
 mod tests {
     use std::{
         fs::{self, OpenOptions},
-        io::Read as _,
+        io::{Read as _, Seek as _, SeekFrom},
         os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _},
         path::PathBuf,
         sync::{
@@ -428,19 +605,6 @@ mod tests {
         OwnedWindowsArtifactHandle::bind(artifact, descriptor, file.into()).unwrap()
     }
 
-    fn invalid_descriptor(raw_handle: usize) -> WindowsArtifactHandleDescriptor {
-        WindowsArtifactHandleDescriptor {
-            raw_handle,
-            expected_bytes: 0,
-            expected_blake3: [0_u8; 32],
-            expected_sha256: [0_u8; 32],
-            expected_object: WindowsFileObjectIdentity {
-                volume_serial: 0,
-                file_index: 0,
-            },
-        }
-    }
-
     #[test]
     fn path_replacement_after_parent_observation_cannot_change_consumed_bytes() {
         let root = temporary_directory("path-replacement");
@@ -475,11 +639,71 @@ mod tests {
         let root = temporary_directory("malformed-transport");
         let path = root.join("artifact.bin");
         fs::write(&path, b"owned").unwrap();
-        let file = open_replaceable_file(&path);
+        let mut file = open_replaceable_file(&path);
+        let malformed = format!(
+            "{:x}:not-a-canonical-descriptor",
+            file.as_raw_handle() as usize
+        );
         assert!(matches!(
-            OwnedWindowsArtifactHandle::bind("artifact", invalid_descriptor(0), file.into()),
-            Err(WindowsArtifactHandleError::TransportHandleMismatch { .. })
+            WindowsArtifactHandleDescriptor::parse_transport_argument(&malformed),
+            Err(WindowsArtifactHandleError::TransportDescriptor)
         ));
+        let mut observed = Vec::new();
+        file.read_to_end(&mut observed).unwrap();
+        assert_eq!(
+            observed, b"owned",
+            "parsing adopted or closed the raw handle"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_inherited_descriptors_never_close_borrowed_source_handles() {
+        let root = temporary_directory("borrowed-source-lifetime");
+        let paths = ["bank", "manifest", "record"].map(|name| root.join(name));
+        let contents: [&[u8]; 3] = [b"bank", b"manifest", b"record"];
+        for (path, content) in paths.iter().zip(contents) {
+            fs::write(path, content).unwrap();
+        }
+        let mut sources = paths.map(|path| open_replaceable_file(&path));
+        let mut descriptors = [
+            WindowsArtifactHandleDescriptor::observe_parent(
+                "bank",
+                &mut sources[0],
+                content_identity(contents[0]),
+            )
+            .unwrap(),
+            WindowsArtifactHandleDescriptor::observe_parent(
+                "manifest",
+                &mut sources[1],
+                content_identity(contents[1]),
+            )
+            .unwrap(),
+            WindowsArtifactHandleDescriptor::observe_parent(
+                "Record V2",
+                &mut sources[2],
+                content_identity(contents[2]),
+            )
+            .unwrap(),
+        ];
+        descriptors[0].expected_blake3[0] ^= 1;
+        let inherited =
+            OwnedWindowsProductionArtifactHandles::from_inherited_descriptors(descriptors)
+                .expect("borrowed live handles can be duplicated");
+        assert!(matches!(
+            inherited.take_verified_files(),
+            Err(WindowsArtifactHandleError::ContentIdentity { artifact: "bank" })
+        ));
+
+        for (source, expected) in sources.iter_mut().zip(contents) {
+            source.seek(SeekFrom::Start(0)).unwrap();
+            let mut observed = Vec::new();
+            source.read_to_end(&mut observed).unwrap();
+            assert_eq!(
+                observed, expected,
+                "malformed inherited metadata closed or replaced a borrowed source handle"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -669,17 +893,24 @@ mod tests {
         });
         // Deterministically install the exact state produced by handle-value
         // reuse: stale trusted metadata now names an unrelated live handle
-        // owned by another thread. The safe binder must inspect only the
-        // `OwnedHandle` explicitly transferred to it.
+        // owned by another thread. The loader duplicates the borrowed value;
+        // it never converts that value itself into an owner.
         stale_descriptor.raw_handle = raw_receiver.recv().unwrap();
         assert_ne!(
             candidate.as_raw_handle() as usize,
             stale_descriptor.raw_handle
         );
+        let borrowed_duplicate =
+            duplicate_borrowed_handle("artifact", stale_descriptor.raw_handle).unwrap();
         assert!(matches!(
-            OwnedWindowsArtifactHandle::bind("artifact", stale_descriptor, candidate.into()),
-            Err(WindowsArtifactHandleError::TransportHandleMismatch { .. })
+            OwnedWindowsArtifactHandle::bind("artifact", stale_descriptor, borrowed_duplicate)
+                .unwrap()
+                .take_verified_file("artifact"),
+            Err(WindowsArtifactHandleError::ObjectIdentity { .. })
+                | Err(WindowsArtifactHandleError::Length { .. })
+                | Err(WindowsArtifactHandleError::ContentIdentity { .. })
         ));
+        drop(candidate);
         release_sender.send(()).unwrap();
         assert!(
             reuse_thread.join().unwrap(),

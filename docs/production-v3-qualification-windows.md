@@ -6,6 +6,25 @@ production release switch. A successful run creates a cryptographically bound
 evidence **candidate**; it does not enable RCNet-1, change a consensus selector,
 or make a build releasable as RC1.
 
+This producer/fresh-verifier harness is not the separate proof-worker isolation
+gate. A release candidate must also qualify the packaged `cmfd-proof-worker.exe`
+through the zero-capability LPAC path with the real pinned bank, manifest, and
+Record V2, known-valid and corrupt blocks, and the native escape sentinels. The
+current integration test runs the actual Cargo-built worker with authenticated
+small artifacts and confirms that the LPAC launch reaches their expected
+non-production format rejection. That is not the packaged real-bank smoke
+test. The launcher implementation, the small-artifact integration, or a
+successful run of this harness alone must not be treated as ProductionV3
+activation evidence.
+
+The packaged Windows sentinel must additionally record that the suspended
+child passed the parent-side omitted-handle probe (`DuplicateHandle` returned
+`ERROR_INVALID_HANDLE`, with numeric-slot reuse rejected), and that the child
+self-query found `HeapEnableTerminationOnCorruption` exactly enabled before it
+read artifact contents or IPC. Forced-panic qualification must leave the exact
+pre-existing CMFD profile-mapping and randomized temporary-root
+`FILE_ID_INFO` sets unchanged.
+
 ## Preconditions
 
 - Use 64-bit Windows, PowerShell 7, Python 3, Git, and the Rust toolchain.

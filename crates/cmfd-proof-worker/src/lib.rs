@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, test), windows_subsystem = "windows")]
+
 //! Crash-isolated process boundary for the optional CUDA BLAKE3 prover.
 //!
 //! The parent hashes an explicitly named worker executable and CUDA library,
@@ -21,6 +23,8 @@ mod sandbox;
 mod verifier;
 #[cfg(windows)]
 mod windows_artifacts;
+#[cfg(windows)]
+mod windows_launcher;
 
 pub use sandbox::VerifierSandboxStatus;
 pub use verifier::{
@@ -64,6 +68,18 @@ const SPILL_DIRECTORY_ATTEMPTS: usize = 1_024;
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const SPILL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 static NEXT_SPILL_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROCESS_CLEANUP_UNHEALTHY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn ensure_process_cleanup_healthy() -> Result<(), ProofWorkerError> {
+    if PROCESS_CLEANUP_UNHEALTHY.load(std::sync::atomic::Ordering::Acquire) {
+        Err(ProofWorkerError::InvalidConfig(
+            "a prior worker exit could not be confirmed; process cleanup health is permanently latched",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// Maximum canonical request size accepted by either process.
 pub const MAX_REQUEST_BYTES: usize = REQUEST_FIXED_BYTES
@@ -136,6 +152,12 @@ pub enum ProofWorkerError {
     )]
     Containment {
         operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("proof worker failed ({worker}); bounded process cleanup also failed: {source}")]
+    ProcessCleanupAfterFailure {
+        worker: Box<ProofWorkerError>,
         #[source]
         source: io::Error,
     },
@@ -449,14 +471,33 @@ struct Capture {
 }
 
 struct ContainedChild {
-    process: ManagedProcess,
-    terminator: ProcessTerminator,
+    process: Option<ManagedProcess>,
+    terminator: Option<ProcessTerminator>,
     direct_kill_attempted: bool,
     direct_child_reaped: bool,
     #[cfg(target_os = "linux")]
     cgroup: Option<Arc<Mutex<cgroup::LinuxWorkerCgroup>>>,
     #[cfg(all(test, target_os = "linux"))]
     reap_fault: TestReapFault,
+    #[cfg(test)]
+    forced_direct_kill_failures: usize,
+}
+
+struct ProcessCleanupReport {
+    exit_confirmed: bool,
+    error: Option<io::Error>,
+}
+
+impl ProcessCleanupReport {
+    fn into_result(self) -> io::Result<()> {
+        match self.error {
+            Some(error) => Err(error),
+            None if self.exit_confirmed => Ok(()),
+            None => Err(io::Error::other(
+                "contained worker cleanup did not confirm process exit",
+            )),
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -472,6 +513,10 @@ enum TestReapFault {
 #[derive(Clone)]
 struct ProcessTerminator {
     target: Arc<Mutex<Option<ProcessTerminationTarget>>>,
+    #[cfg(test)]
+    forced_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    forced_pre_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 enum ProcessTerminationTarget {
@@ -493,6 +538,10 @@ impl ProcessTerminator {
             target: Arc::new(Mutex::new(Some(ProcessTerminationTarget::ProcessGroup(
                 process_group,
             )))),
+            #[cfg(test)]
+            forced_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            forced_pre_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -506,6 +555,10 @@ impl ProcessTerminator {
                 process_group,
                 cgroup,
             }))),
+            #[cfg(test)]
+            forced_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            forced_pre_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -513,6 +566,10 @@ impl ProcessTerminator {
     fn job(job: Arc<WindowsJob>) -> Self {
         Self {
             target: Arc::new(Mutex::new(Some(ProcessTerminationTarget::Job(job)))),
+            #[cfg(test)]
+            forced_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            forced_pre_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -520,13 +577,33 @@ impl ProcessTerminator {
     /// handles share this slot, so shutdown, timeout, and Drop can never signal
     /// a PID/process group after the direct child has been reaped and its ID
     /// potentially reused.
-    fn terminate_tree(&self) -> bool {
+    fn terminate_tree(&self) -> io::Result<bool> {
+        #[cfg(test)]
+        if self
+            .forced_pre_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| {
+                    if remaining == 0 {
+                        None
+                    } else {
+                        Some(remaining - 1)
+                    }
+                },
+            )
+            .is_ok()
+        {
+            return Err(io::Error::other(
+                "forced pre-termination contained-process cleanup failure",
+            ));
+        }
         let target = match self.target.lock() {
             Ok(mut target) => target.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         let Some(target) = target else {
-            return false;
+            return Ok(false);
         };
         match target {
             #[cfg(unix)]
@@ -534,8 +611,11 @@ impl ProcessTerminator {
                 // SAFETY: `process_group` is the positive child PID assigned
                 // as its new process-group ID before spawn. It was atomically
                 // disarmed above, so no later teardown can signal a reused ID.
-                unsafe {
-                    libc::kill(-process_group, libc::SIGKILL);
+                if unsafe { libc::kill(-process_group, libc::SIGKILL) } != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
@@ -558,10 +638,40 @@ impl ProcessTerminator {
             }
             #[cfg(windows)]
             ProcessTerminationTarget::Job(job) => {
-                let _ = job.terminate();
+                job.terminate()?;
             }
         }
-        true
+        #[cfg(test)]
+        if self
+            .forced_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| {
+                    if remaining == 0 {
+                        None
+                    } else {
+                        Some(remaining - 1)
+                    }
+                },
+            )
+            .is_ok()
+        {
+            return Err(io::Error::other("forced contained-process cleanup failure"));
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn force_failures(&self, count: usize) {
+        self.forced_failures
+            .store(count, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn force_pre_failures(&self, count: usize) {
+        self.forced_pre_failures
+            .store(count, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -569,50 +679,145 @@ impl ContainedChild {
     #[cfg(windows)]
     fn new(process: ManagedProcess, terminator: ProcessTerminator) -> Self {
         Self {
-            process,
-            terminator,
+            process: Some(process),
+            terminator: Some(terminator),
             direct_kill_attempted: false,
             direct_child_reaped: false,
-            #[cfg(target_os = "linux")]
-            cgroup: None,
-            #[cfg(all(test, target_os = "linux"))]
-            reap_fault: TestReapFault::None,
+            #[cfg(test)]
+            forced_direct_kill_failures: 0,
         }
     }
 
     fn id(&self) -> u32 {
-        self.process.id()
+        self.process
+            .as_ref()
+            .expect("contained process is retained until confirmed exit")
+            .id()
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.process.try_wait()
+        self.process
+            .as_mut()
+            .expect("contained process is retained until confirmed exit")
+            .try_wait()
     }
 
     fn take_stdin(&mut self) -> Option<process::BlockingPipeWriter> {
-        self.process.take_stdin()
+        self.process
+            .as_mut()
+            .expect("contained process is retained until confirmed exit")
+            .take_stdin()
     }
 
     fn take_stdout(&mut self) -> Option<process::BlockingPipeReader> {
-        self.process.take_stdout()
+        self.process
+            .as_mut()
+            .expect("contained process is retained until confirmed exit")
+            .take_stdout()
     }
 
     fn take_stderr(&mut self) -> Option<process::BlockingPipeReader> {
-        self.process.take_stderr()
+        self.process
+            .as_mut()
+            .expect("contained process is retained until confirmed exit")
+            .take_stderr()
     }
 
     fn termination_handle(&self) -> ProcessTerminator {
-        self.terminator.clone()
+        self.terminator
+            .as_ref()
+            .expect("contained terminator is retained until confirmed exit")
+            .clone()
     }
 
-    fn terminate_tree(&mut self) {
-        self.terminator.terminate_tree();
+    #[cfg(test)]
+    fn force_termination_failures(&self, count: usize) {
+        self.terminator
+            .as_ref()
+            .expect("contained terminator is retained until confirmed exit")
+            .force_failures(count);
+    }
+
+    #[cfg(test)]
+    fn force_unconfirmed_cleanup_for_test(&mut self) {
+        self.terminator
+            .as_ref()
+            .expect("contained terminator is retained until confirmed exit")
+            .force_pre_failures(1);
+        self.forced_direct_kill_failures = 1;
+    }
+
+    #[cfg(all(test, windows))]
+    fn job_active_processes_for_test(&self) -> io::Result<u32> {
+        let target = self
+            .terminator
+            .as_ref()
+            .expect("contained terminator is retained until confirmed exit")
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match target.as_ref() {
+            Some(ProcessTerminationTarget::Job(job)) => job.active_processes(),
+            None => Err(io::Error::other(
+                "contained child no longer owns its Job handle",
+            )),
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    fn close_job_handle_without_termination_for_test(&mut self) -> bool {
+        let target = match self
+            .terminator
+            .as_ref()
+            .expect("contained terminator is retained until confirmed exit")
+            .target
+            .lock()
+        {
+            Ok(mut target) => target.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        match target {
+            Some(ProcessTerminationTarget::Job(job)) => {
+                // No TerminateJobObject call is made here. Dropping the final
+                // job handle exercises JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+                drop(job);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn terminate_tree(&mut self) -> io::Result<()> {
+        let tree_result = self
+            .terminator
+            .as_ref()
+            .expect("contained terminator is retained until confirmed exit")
+            .terminate_tree()
+            .map(|_| ());
 
         // Retain a direct-child fallback for setup/platform edge cases. The
         // process-group/job operation above is what contains descendants.
         if !self.direct_kill_attempted && !self.direct_child_reaped {
             self.direct_kill_attempted = true;
-            let _ = self.process.kill();
+            #[cfg(test)]
+            let kill_result = if self.forced_direct_kill_failures != 0 {
+                self.forced_direct_kill_failures -= 1;
+                Err(io::Error::other("forced direct-process cleanup failure"))
+            } else {
+                self.process
+                    .as_mut()
+                    .expect("contained process is retained until confirmed exit")
+                    .kill()
+            };
+            #[cfg(not(test))]
+            let kill_result = self
+                .process
+                .as_mut()
+                .expect("contained process is retained until confirmed exit")
+                .kill();
+            return combine_cleanup_results(tree_result, kill_result);
         }
+        tree_result
     }
 
     fn thaw_for_request(&self) -> Result<(), ProofWorkerError> {
@@ -709,7 +914,10 @@ impl ContainedChild {
             }
             TestReapFault::AlwaysPending => return Ok(None),
         }
-        self.process.try_wait()
+        self.process
+            .as_mut()
+            .expect("contained process is retained until confirmed exit")
+            .try_wait()
     }
 
     fn terminate_and_reap(&mut self) -> Result<(), ProofWorkerError> {
@@ -722,18 +930,30 @@ impl ContainedChild {
         // still occupy the containment tree. Consume the shared terminator
         // while the cgroup/job/process-group identity is still authoritative;
         // Drop must never signal it again after the leaf has been removed.
-        self.terminate_tree();
-        #[cfg(target_os = "linux")]
-        self.cleanup_cgroup()?;
-        Ok(())
+        self.terminate_and_reap()
     }
 
     fn terminate_and_reap_for(&mut self, timeout: Duration) -> Result<(), ProofWorkerError> {
-        self.terminate_tree();
+        self.terminate_and_reap_report_for(timeout)
+            .into_result()
+            .map_err(|source| ProofWorkerError::Containment {
+                operation: "reaping the killed worker before containment cleanup",
+                source,
+            })
+    }
+
+    fn terminate_and_reap_report(&mut self) -> ProcessCleanupReport {
+        self.terminate_and_reap_report_for(PROCESS_REAP_TIMEOUT)
+    }
+
+    fn terminate_and_reap_report_for(&mut self, timeout: Duration) -> ProcessCleanupReport {
+        let termination = self.terminate_tree();
         if self.direct_child_reaped {
-            #[cfg(target_os = "linux")]
-            self.cleanup_cgroup()?;
-            return Ok(());
+            let cleanup = self.cleanup_after_reap_report();
+            return ProcessCleanupReport {
+                exit_confirmed: true,
+                error: combine_cleanup_results(termination, cleanup).err(),
+            };
         }
         let started = Instant::now();
         let mut last_wait_error = None;
@@ -741,9 +961,11 @@ impl ContainedChild {
             match self.poll_child_reap() {
                 Ok(Some(_)) => {
                     self.direct_child_reaped = true;
-                    #[cfg(target_os = "linux")]
-                    self.cleanup_cgroup()?;
-                    return Ok(());
+                    let cleanup = self.cleanup_after_reap_report();
+                    return ProcessCleanupReport {
+                        exit_confirmed: true,
+                        error: combine_cleanup_results(termination, cleanup).err(),
+                    };
                 }
                 Ok(None) => {}
                 Err(source) => last_wait_error = Some(source),
@@ -752,7 +974,7 @@ impl ContainedChild {
                 let source = last_wait_error.unwrap_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "worker child was not reaped before the containment deadline",
+                        "contained worker did not reap within the bounded cleanup window",
                     )
                 });
                 #[cfg(target_os = "linux")]
@@ -760,12 +982,23 @@ impl ContainedChild {
                     "reaping the killed ProductionV3 worker before cgroup removal",
                     &source,
                 );
-                return Err(ProofWorkerError::Containment {
-                    operation: "reaping the killed worker before containment cleanup",
-                    source,
-                });
+                return ProcessCleanupReport {
+                    exit_confirmed: false,
+                    error: combine_cleanup_results(termination, Err(source)).err(),
+                };
             }
             thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn cleanup_after_reap_report(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.cleanup_cgroup().map_err(io::Error::other)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(())
         }
     }
 
@@ -777,7 +1010,26 @@ impl ContainedChild {
 
 impl Drop for ContainedChild {
     fn drop(&mut self) {
-        let _ = self.terminate_and_reap();
+        let report = self.terminate_and_reap_report();
+        if !report.exit_confirmed {
+            PROCESS_CLEANUP_UNHEALTHY.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(process) = self.process.take() {
+                std::mem::forget(process);
+            }
+            if let Some(terminator) = self.terminator.take() {
+                std::mem::forget(terminator);
+            }
+        }
+    }
+}
+
+fn combine_cleanup_results(first: io::Result<()>, second: io::Result<()>) -> io::Result<()> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(io::Error::other(format!(
+            "{first}; additional cleanup failure: {second}"
+        ))),
     }
 }
 
@@ -789,11 +1041,19 @@ struct WindowsJob {
 #[cfg(windows)]
 impl WindowsJob {
     fn create(memory_limit_bytes: Option<u64>) -> io::Result<Self> {
+        Self::create_with_process_limit(memory_limit_bytes, None)
+    }
+
+    fn create_with_process_limit(
+        memory_limit_bytes: Option<u64>,
+        active_process_limit: Option<u32>,
+    ) -> io::Result<Self> {
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectExtendedLimitInformation, SetInformationJobObject,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject, SetInformationJobObject,
         };
 
         // SAFETY: null security/name pointers request an unnamed job with
@@ -808,6 +1068,16 @@ impl WindowsJob {
         };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(active_process_limit) = active_process_limit {
+            if active_process_limit == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker active-process limit must be nonzero",
+                ));
+            }
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = active_process_limit;
+        }
         if let Some(memory_limit_bytes) = memory_limit_bytes {
             let memory_limit = usize::try_from(memory_limit_bytes).map_err(|_| {
                 io::Error::new(
@@ -833,7 +1103,71 @@ impl WindowsJob {
         if configured == 0 {
             return Err(io::Error::last_os_error());
         }
+        let mut observed = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let mut returned = 0_u32;
+        // SAFETY: `observed` is writable with the exact queried Win32 layout.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                std::os::windows::io::AsRawHandle::as_raw_handle(&job.handle).cast(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut observed).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                &mut returned,
+            )
+        };
+        if queried == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if returned != size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32
+            || observed.BasicLimitInformation.LimitFlags != limits.BasicLimitInformation.LimitFlags
+            || observed.BasicLimitInformation.ActiveProcessLimit
+                != limits.BasicLimitInformation.ActiveProcessLimit
+            || observed.ProcessMemoryLimit != limits.ProcessMemoryLimit
+            || observed.JobMemoryLimit != limits.JobMemoryLimit
+        {
+            return Err(io::Error::other(
+                "Job Object limits did not round-trip exactly",
+            ));
+        }
         Ok(job)
+    }
+
+    fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        self.handle.as_raw_handle().cast()
+    }
+
+    #[cfg(test)]
+    fn active_processes(&self) -> io::Result<u32> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let mut returned = 0_u32;
+        // SAFETY: the Job handle is live and `accounting` is writable with the
+        // exact layout requested below.
+        if unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle().cast(),
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut accounting).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if returned != size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32 {
+            return Err(io::Error::other(format!(
+                "Job accounting returned {returned} bytes; expected {}",
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>()
+            )));
+        }
+        Ok(accounting.ActiveProcesses)
     }
 
     fn assign(&self, child: &Child) -> io::Result<()> {
@@ -1002,14 +1336,16 @@ fn spawn_contained_unix(
     #[cfg(not(target_os = "linux"))]
     let terminator = ProcessTerminator::process_group(process_group);
     Ok(ContainedChild {
-        process: ManagedProcess::from_std(child),
-        terminator,
+        process: Some(ManagedProcess::from_std(child)),
+        terminator: Some(terminator),
         direct_kill_attempted: false,
         direct_child_reaped: false,
         #[cfg(target_os = "linux")]
         cgroup,
         #[cfg(all(test, target_os = "linux"))]
         reap_fault: TestReapFault::None,
+        #[cfg(test)]
+        forced_direct_kill_failures: 0,
     })
 }
 
@@ -1079,6 +1415,7 @@ fn spawn_contained_production(
     memory_limit_bytes: Option<u64>,
     cgroup_limits: cgroup::LinuxCgroupLimits,
 ) -> Result<ContainedChild, ProofWorkerError> {
+    ensure_process_cleanup_healthy()?;
     let sender = {
         let mut supervisor =
             PRODUCTION_SPAWN_SUPERVISOR
@@ -1174,6 +1511,7 @@ fn spawn_contained(
     command: &mut Command,
     memory_limit_bytes: Option<u64>,
 ) -> Result<ContainedChild, ProofWorkerError> {
+    ensure_process_cleanup_healthy()?;
     #[cfg(unix)]
     {
         spawn_contained_unix(
@@ -1246,6 +1584,10 @@ impl PipeThreadGuard {
             threads: threads.into_iter().collect(),
         }
     }
+
+    fn detach(&mut self) {
+        self.threads.clear();
+    }
 }
 
 impl Drop for PipeThreadGuard {
@@ -1287,21 +1629,21 @@ fn exchange_with_child(
     stdout_limit: usize,
 ) -> Result<Vec<u8>, ProofWorkerError> {
     let Some(mut stdin) = child.take_stdin() else {
-        terminate_child_bounded(&mut child)?;
-        return Err(ProofWorkerError::InvalidConfig(
-            "worker stdin pipe was not created",
+        return Err(cleanup_child_after_failure(
+            child,
+            ProofWorkerError::InvalidConfig("worker stdin pipe was not created"),
         ));
     };
     let Some(stdout) = child.take_stdout() else {
-        terminate_child_bounded(&mut child)?;
-        return Err(ProofWorkerError::InvalidConfig(
-            "worker stdout pipe was not created",
+        return Err(cleanup_child_after_failure(
+            child,
+            ProofWorkerError::InvalidConfig("worker stdout pipe was not created"),
         ));
     };
     let Some(stderr) = child.take_stderr() else {
-        terminate_child_bounded(&mut child)?;
-        return Err(ProofWorkerError::InvalidConfig(
-            "worker stderr pipe was not created",
+        return Err(cleanup_child_after_failure(
+            child,
+            ProofWorkerError::InvalidConfig("worker stderr pipe was not created"),
         ));
     };
 
@@ -1334,11 +1676,13 @@ fn exchange_with_child(
                 Ok(Some(status)) => exit_status = Some(status),
                 Ok(None) => {}
                 Err(source) => {
-                    terminate_child_bounded(resources.child_mut())?;
-                    return Err(ProofWorkerError::Pipe {
-                        operation: "waiting for worker",
-                        source,
-                    });
+                    return Err(cleanup_exchange_after_failure(
+                        &mut resources,
+                        ProofWorkerError::Pipe {
+                            operation: "waiting for worker",
+                            source,
+                        },
+                    ));
                 }
             }
         }
@@ -1350,51 +1694,65 @@ fn exchange_with_child(
             break;
         }
         if started.elapsed() >= timeout {
-            terminate_child_bounded(resources.child_mut())?;
-            return Err(ProofWorkerError::Timeout {
-                milliseconds: timeout.as_millis(),
-            });
+            return Err(cleanup_exchange_after_failure(
+                &mut resources,
+                ProofWorkerError::Timeout {
+                    milliseconds: timeout.as_millis(),
+                },
+            ));
         }
 
         let remaining = timeout.saturating_sub(started.elapsed());
         match event_rx.recv_timeout(remaining.min(Duration::from_millis(5))) {
             Ok(IoEvent::Input(Ok(()))) => input_complete = true,
             Ok(IoEvent::Input(Err(source))) => {
-                terminate_child_bounded(resources.child_mut())?;
-                return Err(ProofWorkerError::Pipe {
-                    operation: "writing stdin",
-                    source,
-                });
+                return Err(cleanup_exchange_after_failure(
+                    &mut resources,
+                    ProofWorkerError::Pipe {
+                        operation: "writing stdin",
+                        source,
+                    },
+                ));
             }
             Ok(IoEvent::Stdout(Ok(capture))) if capture.exceeded => {
-                terminate_child_bounded(resources.child_mut())?;
-                return Err(ProofWorkerError::StdoutTooLarge);
+                return Err(cleanup_exchange_after_failure(
+                    &mut resources,
+                    ProofWorkerError::StdoutTooLarge,
+                ));
             }
             Ok(IoEvent::Stdout(Ok(capture))) => stdout_capture = Some(capture),
             Ok(IoEvent::Stdout(Err(source))) => {
-                terminate_child_bounded(resources.child_mut())?;
-                return Err(ProofWorkerError::Pipe {
-                    operation: "reading stdout",
-                    source,
-                });
+                return Err(cleanup_exchange_after_failure(
+                    &mut resources,
+                    ProofWorkerError::Pipe {
+                        operation: "reading stdout",
+                        source,
+                    },
+                ));
             }
             Ok(IoEvent::Stderr(Ok(capture))) if capture.exceeded => {
-                terminate_child_bounded(resources.child_mut())?;
-                return Err(ProofWorkerError::StderrTooLarge);
+                return Err(cleanup_exchange_after_failure(
+                    &mut resources,
+                    ProofWorkerError::StderrTooLarge,
+                ));
             }
             Ok(IoEvent::Stderr(Ok(capture))) => stderr_capture = Some(capture),
             Ok(IoEvent::Stderr(Err(source))) => {
-                terminate_child_bounded(resources.child_mut())?;
-                return Err(ProofWorkerError::Pipe {
-                    operation: "reading stderr",
-                    source,
-                });
+                return Err(cleanup_exchange_after_failure(
+                    &mut resources,
+                    ProofWorkerError::Pipe {
+                        operation: "reading stderr",
+                        source,
+                    },
+                ));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if !io_collection_complete(input_complete, &stdout_capture, &stderr_capture) {
-                    terminate_child_bounded(resources.child_mut())?;
-                    return Err(ProofWorkerError::PipeThread("collecting worker pipes"));
+                    return Err(cleanup_exchange_after_failure(
+                        &mut resources,
+                        ProofWorkerError::PipeThread("collecting worker pipes"),
+                    ));
                 }
             }
         }
@@ -1418,8 +1776,49 @@ fn io_collection_complete(
     input_complete && stdout_capture.is_some() && stderr_capture.is_some()
 }
 
-fn terminate_child_bounded(child: &mut ContainedChild) -> Result<(), ProofWorkerError> {
-    child.terminate_and_reap()
+fn cleanup_child_after_failure(
+    mut child: ContainedChild,
+    primary: ProofWorkerError,
+) -> ProofWorkerError {
+    let report = child.terminate_and_reap_report();
+    if !report.exit_confirmed {
+        PROCESS_CLEANUP_UNHEALTHY.store(true, std::sync::atomic::Ordering::Release);
+        std::mem::forget(child);
+    }
+    compose_cleanup_report(primary, report)
+}
+
+fn cleanup_exchange_after_failure(
+    resources: &mut ExchangeResources,
+    primary: ProofWorkerError,
+) -> ProofWorkerError {
+    let report = resources.child_mut().terminate_and_reap_report();
+    if !report.exit_confirmed {
+        PROCESS_CLEANUP_UNHEALTHY.store(true, std::sync::atomic::Ordering::Release);
+        resources._pipe_threads.detach();
+        if let Some(child) = resources.child.take() {
+            std::mem::forget(child);
+        }
+    }
+    compose_cleanup_report(primary, report)
+}
+
+fn compose_cleanup_report(
+    primary: ProofWorkerError,
+    report: ProcessCleanupReport,
+) -> ProofWorkerError {
+    match report.error {
+        None if report.exit_confirmed => primary,
+        source => ProofWorkerError::ProcessCleanupAfterFailure {
+            worker: Box::new(primary),
+            source: source.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "contained worker exit could not be confirmed; process resources were quarantined and future launches are blocked",
+                )
+            }),
+        },
+    }
 }
 
 fn worker_exit_error(status: ExitStatus, stderr: &[u8]) -> ProofWorkerError {
@@ -1772,6 +2171,34 @@ fn run_worker() -> Result<Vec<u8>, (u16, String)> {
     .map_err(|error| (WORKER_ERROR_PROVER, error.to_string()))
 }
 
+/// Disables interactive Windows fault UI before the worker parses its mode or
+/// touches untrusted data. Public only so the tiny executable can call it as
+/// its first statement.
+#[doc(hidden)]
+pub fn configure_noninteractive_fault_reporting() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::{
+            Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode},
+            ErrorReporting::{WER_FAULT_REPORTING_NO_UI, WerSetFlags},
+        };
+
+        // This runs at the first statement in the executable entry point. The
+        // process error mode is inherited, so sentinel parents also call it
+        // before CreateProcessW to cover faults before the libtest entry runs.
+        unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
+        // SAFETY: the documented flag has no pointer or lifetime preconditions.
+        let status = unsafe { WerSetFlags(WER_FAULT_REPORTING_NO_UI) };
+        if status < 0 {
+            return Err(format!(
+                "WerSetFlags(WER_FAULT_REPORTING_NO_UI) failed with HRESULT 0x{:08x}",
+                status as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Binary entry point. This is public only so the tiny executable target can
 /// share the audited protocol and hashing implementation with the library.
 #[doc(hidden)]
@@ -1812,6 +2239,7 @@ mod tests {
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     const TEST_SPILL_DIRECTORY_ENV: &str = "CMFD_PROOF_WORKER_TEST_SPILL_DIRECTORY";
+    const TEST_UNCONFIRMED_CLEANUP_ENV: &str = "CMFD_PROOF_WORKER_TEST_UNCONFIRMED_CLEANUP";
     #[cfg(target_os = "linux")]
     const TEST_INHERITED_FD_ENV: &str = "CMFD_PROOF_WORKER_TEST_INHERITED_FD";
     #[cfg(target_os = "linux")]
@@ -2324,6 +2752,129 @@ mod tests {
         assert!(!leaf.unwrap().exists());
         assert!(root.is_dir());
         fs::remove_dir(root).unwrap();
+    }
+
+    fn forced_cleanup_child(stdin: Stdio) -> ContainedChild {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("tests::child_timeout_helper")
+            .arg("--nocapture")
+            .env("CMFD_PROOF_WORKER_TIMEOUT_HELPER", "1")
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_contained(&mut command, None).unwrap();
+        child.force_termination_failures(1);
+        child
+    }
+
+    fn assert_forced_cleanup_wrap(
+        error: ProofWorkerError,
+        primary: impl FnOnce(&ProofWorkerError) -> bool,
+    ) {
+        let ProofWorkerError::ProcessCleanupAfterFailure { worker, source } = error else {
+            panic!("cleanup failure was not composed with the primary error: {error}");
+        };
+        assert!(primary(&worker), "wrong primary error: {worker}");
+        assert!(
+            source
+                .to_string()
+                .contains("forced contained-process cleanup failure"),
+            "wrong cleanup error: {source}"
+        );
+    }
+
+    #[test]
+    fn one_shot_timeout_composes_a_forced_cleanup_failure() {
+        let child = forced_cleanup_child(Stdio::piped());
+        let error = exchange_with_child(
+            child,
+            Vec::new(),
+            Duration::from_millis(10),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap_err();
+        assert_forced_cleanup_wrap(error, |worker| {
+            matches!(worker, ProofWorkerError::Timeout { .. })
+        });
+    }
+
+    #[test]
+    fn one_shot_missing_pipe_composes_a_forced_cleanup_failure() {
+        let child = forced_cleanup_child(Stdio::null());
+        let error = exchange_with_child(
+            child,
+            Vec::new(),
+            Duration::from_secs(1),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap_err();
+        assert_forced_cleanup_wrap(
+            error,
+            |worker| matches!(worker, ProofWorkerError::InvalidConfig(message) if *message == "worker stdin pipe was not created"),
+        );
+    }
+
+    #[test]
+    fn one_shot_disconnect_composes_a_forced_cleanup_failure() {
+        let child = forced_cleanup_child(Stdio::piped());
+        let error = cleanup_child_after_failure(
+            child,
+            ProofWorkerError::PipeThread("collecting worker pipes"),
+        );
+        assert_forced_cleanup_wrap(error, |worker| {
+            matches!(
+                worker,
+                ProofWorkerError::PipeThread("collecting worker pipes")
+            )
+        });
+    }
+
+    #[test]
+    fn one_shot_unconfirmed_cleanup_detaches_pipe_threads_and_latches_health() {
+        if std::env::var_os(TEST_UNCONFIRMED_CLEANUP_ENV).is_some() {
+            let mut child = forced_cleanup_child(Stdio::piped());
+            child.force_unconfirmed_cleanup_for_test();
+            let started = Instant::now();
+            let error = exchange_with_child(
+                child,
+                Vec::new(),
+                Duration::from_millis(10),
+                MAX_RESPONSE_BYTES,
+            )
+            .unwrap_err();
+            assert!(started.elapsed() < Duration::from_millis(2_750));
+            let ProofWorkerError::ProcessCleanupAfterFailure { worker, source } = error else {
+                panic!("unconfirmed cleanup was not composed: {error}");
+            };
+            assert!(matches!(*worker, ProofWorkerError::Timeout { .. }));
+            let source = source.to_string();
+            assert!(source.contains("forced pre-termination"));
+            assert!(source.contains("forced direct-process"));
+            assert!(source.contains("did not reap within"));
+            assert!(
+                ensure_process_cleanup_healthy().is_err(),
+                "uncertain process exit must permanently block later launches"
+            );
+            return;
+        }
+
+        let started = Instant::now();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::one_shot_unconfirmed_cleanup_detaches_pipe_threads_and_latches_health")
+            .arg("--nocapture")
+            .env(TEST_UNCONFIRMED_CLEANUP_ENV, "1")
+            .output()
+            .expect("launch isolated unconfirmed-cleanup regression");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            output.status.success(),
+            "isolated unconfirmed-cleanup regression failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(target_os = "linux")]

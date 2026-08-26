@@ -114,8 +114,10 @@ The worker hashes while copying the sidecar into a private runtime directory,
 synchronizes and makes that copy non-writable, then rehashes immediately before
 each execution. Source metadata and the streaming copy are both bounded to 512
 MiB so a mismatched package path cannot fill the runtime disk before its digest
-is rejected. This does not close the same-user loader race or pin transitive
-dynamic libraries; package ACLs/signatures remain a release responsibility.
+is rejected. Retained exact-object handles prevent same-user replacement of the
+configured worker and private image through mapping and process lifetime. They
+do not pin transitive dynamic libraries; package ACLs/signatures remain a
+release responsibility.
 Request timeouts and process teardown terminate the contained process tree and
 never wait indefinitely for an inherited pipe reader. A pipe owner that somehow
 survives containment is detached and cannot yield a trusted response or
@@ -186,15 +188,84 @@ request inside the persistent worker. Release remains blocked until delegated
 cgroup v2 limits or an equivalently fail-closed, race-bounded watchdog enforce
 the budget for this worker rather than for the operator account as a whole.
 
-Windows ProductionV3 remains an explicit release blocker. The existing Job
-Object is crash, tree, and memory containment, but spawn-then-assign leaves a
-pre-assignment execution window and does not provide filesystem, network, UI,
-clipboard, or token isolation. The Windows gate requires an atomic
-`STARTUPINFOEX` AppContainer/LPAC launch with zero network capabilities, Job
-and exact inherited-handle lists, child-process and Win32k restrictions, and a
-handle-based artifact validator. The existing pathname validator intentionally
-rejects the AppContainer ACL grant that path traversal would require, so the
-trusted parent must instead validate and pass read-only artifact handles.
+The Windows isolation implementation now creates the verifier suspended in a
+zero-capability LPAC through one `STARTUPINFOEX` call. Its attribute list
+contains the documented LPAC opt-out, the preconfigured kill-on-close Job,
+exactly six inherited handles, child-process restriction, and Win32k and other
+process mitigations. Only bounded stdio and three parent-owned read-only
+artifact handles cross the boundary; the Windows worker has no artifact
+pathname fallback. The parent validates the resulting token, capability count,
+SID, DEP, ASLR, dynamic-code, image-load, Win32k, child-process, SEHOP,
+strict-handle-check, and extension-point mitigations, Job membership, and exact
+limits before resuming the primary thread. It also fails closed if the exact
+new profile SID appears in the system loopback-exemption table. It never
+mutates the shared configured executable or directory ACL. Every launch gets a
+fresh private
+directory and regular executable copy; no-write/no-delete-share handles pin the
+source, exact hash/length-verified destination, and directory through image
+mapping and process lifetime. Reparse or hardlink ambiguity fails closed, only
+the private objects receive the unique SID, and the worker executes only that
+verified path. After confirmed process-tree exit, the exact private file and
+directory are marked for deletion through their retained `DELETE` handles,
+bound by full 128-bit `FILE_ID_INFO`. An added alias, replacement, unconfirmed
+exit, or uncertain cleanup retains or quarantines all relevant pins and latches
+worker health.
+
+A protected owner-only ledger records a durable ownership intent before
+`CreateAppContainerProfile`. Only its live same-process guard can delete the
+registration. Deletion uses bounded delays of `0, 10, 20, 40, 80, 160, 320,
+500 ms`; exhausted deletion or marker cleanup is surfaced and remains
+retryable on that guard. Initialization failures retain quarantine evidence.
+No later process deletes a profile from a persisted name; any stale session,
+including an empty partial session, blocks launch for manual remediation.
+Successful creation is wrapped in that RAII guard before SID validation or
+another fallible step, and forced-panic subprocess regressions require exact
+before/after profile-mapping and temporary-root `FILE_ID_INFO` sets. A fresh
+allowlisted UTF-16 environment replaces ambient inheritance. The native
+sentinel covers supplied-handle reads, artifact and arbitrary-file data and
+metadata denial, exact `WSAStartup` failure 10107, and denial of a real
+`WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP)` request. No socket handle is
+inherited, so the production LPAC never reaches a genuine `connect`, `bind`, or
+`listen` call. A second, explicitly less-restricted regular AppContainer probe
+uses the same zero-capability, non-loopback-exempt profile but initializes
+Winsock and creates its own valid sockets. On the qualification host, a bounded
+outbound connection to the parent's concrete non-loopback listener never
+completes and the parent accepts nothing. Although local `bind` and `listen`
+setup succeed, a parent connection to that listener times out, the child accepts
+nothing, and the endpoint is reusable after teardown. This is measured
+same-host evidence, not production-token evidence and not a substitute for the
+packaged external-host network gate. Neither path grants a registry or network
+capability.
+
+The external-host gate must run the packaged binary on the qualification host
+against a separately routed fleet peer. The packaged production LPAC must
+repeat its exact Winsock-init/socket-creation denial. Its zero-capability
+regular AppContainer companion must attempt an outbound connection to a
+peer-owned listener while the peer records no accept or traffic, then create a
+concrete non-loopback listener while the peer attempts to connect and the child
+records no accept or traffic. Both directions require bounded poll/`SO_ERROR`
+results, the exact profile SID and no-loopback-exemption attestation, and proof
+that the endpoint is reusable after child teardown. Any connection, accept,
+payload, ambiguous timeout, or missing capture fails the gate. The external
+harness and signed evidence do not yet exist; this is an explicit release
+blocker, not a completed qualification claim.
+
+Sockets created outside an AppContainer can retain authority when inherited.
+The exact six-handle list is therefore an enforced boundary: production and
+both sentinels reject any extra handle before creation, and the regression uses
+a real socket as the forbidden seventh handle. The native sentinel also covers
+child creation and ambient environment. Kill-on-last-Job-handle evidence uses
+an inherited-stdio `READY`/`ARMED` barrier; immediately before close, the
+parent requires a nonsignaled process and exact Job accounting of one active
+process. Only the measured zero Job-close exit status passes.
+`STATUS_INVALID_HANDLE`, an arbitrary exception, and any pre-close exit fail.
+Process error mode and WER no-UI flags suppress interactive crash dialogs while
+retaining exact status diagnostics. No `TerminateJobObject` call is used in
+this sentinel path. Its omitted-file check is a trusted parent-side
+`DuplicateHandle` probe while the child is suspended: only
+`ERROR_INVALID_HANDLE` passes, and numeric-slot reuse is an explicit failure.
+The child also queries its own process heap before artifact/IPC reads and
+requires the exact enabled terminate-on-corruption state.
 
 Neither platform is qualified by unit tests alone. Release evidence must show
 the packaged worker reading the real pinned artifacts, completing the startup
@@ -202,7 +273,11 @@ handshake, accepting one known-valid ProductionV3 block, rejecting corruption,
 and passing file read/write, metadata mutation, network, process-spawn,
 unlisted-handle, environment, and teardown escape sentinels. Linux currently
 has the kernel-policy and sentinel implementation; its real-bank packaged run
-and per-worker CPU/PID containment are still outstanding. Windows has neither
-the AppContainer implementation nor its sentinel/full-worker evidence.
-Therefore this checkpoint must not activate RCNet or be described as
-cross-platform RC-ready.
+and per-worker CPU/PID containment are still outstanding. Windows now has the
+launcher, native escape sentinel, and a real-worker integration that passes
+authenticated deliberately small artifacts through the launcher and reaches
+their expected format rejection. It does not yet have the packaged real-bank,
+known-valid/corrupt-block replay, external-peer bidirectional network-isolation
+run, or independent release evidence. Therefore
+this checkpoint must not activate RCNet or be described as cross-platform
+RC-ready.

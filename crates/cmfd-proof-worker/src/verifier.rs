@@ -1119,7 +1119,7 @@ impl PersistentVerifierProcess {
         response_limit: usize,
     ) -> Result<Vec<u8>, VerifierWorkerError> {
         if let Err(error) = self.child.thaw_for_request() {
-            self.child.terminate_and_reap();
+            self.terminate_and_reap()?;
             return Err(VerifierWorkerError::Process(error));
         }
         let stdin = self.stdin.take().ok_or(VerifierWorkerError::Process(
@@ -1144,17 +1144,17 @@ impl PersistentVerifierProcess {
             Ok((stdin, stdout, result)) => {
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
                     self.transport_poisoned.store(true, Ordering::Release);
-                    self.child.terminate_and_reap();
+                    self.terminate_and_reap()?;
                     return Err(VerifierWorkerError::TransportPoisoned);
                 }
                 self.stdin = Some(stdin);
                 self.stdout = Some(stdout);
                 if let Err(error) = self.child.freeze_after_response() {
-                    self.child.terminate_and_reap();
+                    self.terminate_and_reap()?;
                     return Err(VerifierWorkerError::Process(error));
                 }
                 if self.stderr_exceeded()? {
-                    self.child.terminate_and_reap();
+                    self.terminate_and_reap()?;
                     return Err(VerifierWorkerError::Process(
                         ProofWorkerError::StderrTooLarge,
                     ));
@@ -1173,24 +1173,33 @@ impl PersistentVerifierProcess {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.child.terminate_and_reap();
+                let teardown = self.terminate_and_reap();
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
                     self.transport_poisoned.store(true, Ordering::Release);
                 }
+                teardown?;
                 Err(VerifierWorkerError::Process(ProofWorkerError::Timeout {
                     milliseconds: timeout.as_millis(),
                 }))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.child.terminate_and_reap();
+                let teardown = self.terminate_and_reap();
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
                     self.transport_poisoned.store(true, Ordering::Release);
                 }
+                teardown?;
                 Err(VerifierWorkerError::Process(ProofWorkerError::PipeThread(
                     "exchanging persistent verifier frames",
                 )))
             }
         }
+    }
+
+    fn terminate_and_reap(&mut self) -> Result<(), VerifierWorkerError> {
+        self.child.terminate_and_reap().map_err(|error| {
+            self.transport_poisoned.store(true, Ordering::Release);
+            VerifierWorkerError::Process(error)
+        })
     }
 
     fn stderr_exceeded(&self) -> Result<bool, VerifierWorkerError> {
@@ -1255,7 +1264,9 @@ fn capture_persistent_stderr(mut stderr: impl Read, capture: Arc<Mutex<StderrCap
 
 impl Drop for PersistentVerifierProcess {
     fn drop(&mut self) {
-        self.child.terminate_and_reap();
+        if self.child.terminate_and_reap().is_err() {
+            self.transport_poisoned.store(true, Ordering::Release);
+        }
         self.stdin.take();
         self.stdout.take();
         if let (Some(thread), Some(done)) = (self.stderr_thread.take(), self.stderr_done.take())
@@ -2643,7 +2654,10 @@ mod tests {
         // Replace the real stderr reader with a deliberately stuck handle.
         // Reap and join the real reader first so this test does not itself
         // create an untracked pipe thread.
-        process.child.terminate_and_reap();
+        process
+            .child
+            .terminate_and_reap()
+            .expect("terminate persistent teardown test child");
         process.stdin.take();
         process.stdout.take();
         assert!(finish_pipe_thread_bounded(

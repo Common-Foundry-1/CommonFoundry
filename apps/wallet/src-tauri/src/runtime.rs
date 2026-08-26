@@ -764,8 +764,19 @@ mod tests {
         )
         .unwrap();
 
-        let security =
-            prepare_for_test(RCNET1_PROFILE, &base_config(RCNET1_PROFILE), &files.root).unwrap();
+        let config = base_config(RCNET1_PROFILE);
+        #[cfg(target_os = "linux")]
+        let config = {
+            // Linux ProductionV3 deliberately has no packaged cgroup defaults;
+            // the operator-supplied measured limits remain explicit even when
+            // artifact sidecar paths are resolved from the package layout.
+            let mut config = config;
+            config.production_v3.verifier_cpu_quota_us = Some(100_000);
+            config.production_v3.verifier_cpu_period_us = Some(100_000);
+            config.production_v3.verifier_pids_limit = Some(16);
+            config
+        };
+        let security = prepare_for_test(RCNET1_PROFILE, &config, &files.root).unwrap();
         let artifacts = security.production_v3_artifacts.unwrap();
         assert_eq!(
             artifacts.bank,

@@ -14,9 +14,9 @@
 pub mod spill {
     pub use cmfd_proof_accel::spill::*;
 }
-mod process;
 #[cfg(target_os = "linux")]
 mod cgroup;
+mod process;
 mod sandbox;
 mod verifier;
 #[cfg(windows)]
@@ -33,7 +33,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::process::Child;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -455,6 +455,18 @@ struct ContainedChild {
     direct_child_reaped: bool,
     #[cfg(target_os = "linux")]
     cgroup: Option<Arc<Mutex<cgroup::LinuxWorkerCgroup>>>,
+    #[cfg(all(test, target_os = "linux"))]
+    reap_fault: TestReapFault,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Debug, Default)]
+enum TestReapFault {
+    #[default]
+    None,
+    ErrorsRemaining(usize),
+    AlwaysError,
+    AlwaysPending,
 }
 
 #[derive(Clone)]
@@ -554,6 +566,7 @@ impl ProcessTerminator {
 }
 
 impl ContainedChild {
+    #[cfg(windows)]
     fn new(process: ManagedProcess, terminator: ProcessTerminator) -> Self {
         Self {
             process,
@@ -562,6 +575,8 @@ impl ContainedChild {
             direct_child_reaped: false,
             #[cfg(target_os = "linux")]
             cgroup: None,
+            #[cfg(all(test, target_os = "linux"))]
+            reap_fault: TestReapFault::None,
         }
     }
 
@@ -637,51 +652,132 @@ impl ContainedChild {
     }
 
     #[cfg(target_os = "linux")]
-    fn cleanup_cgroup(&mut self) {
+    fn cleanup_cgroup(&mut self) -> Result<(), ProofWorkerError> {
         if !self.direct_child_reaped {
-            return;
+            return Ok(());
         }
-        if let Some(cgroup) = self.cgroup.take() {
+        let Some(cgroup) = self.cgroup.as_ref() else {
+            return Ok(());
+        };
+        let (cleanup, health) = match cgroup.lock() {
+            Ok(mut cgroup) => {
+                let cleanup = cgroup.cleanup();
+                let health = cgroup.ensure_healthy();
+                (cleanup, health)
+            }
+            Err(poisoned) => {
+                let mut cgroup = poisoned.into_inner();
+                let cleanup = cgroup.cleanup();
+                let health = cgroup.ensure_healthy();
+                (cleanup, health)
+            }
+        };
+        if cleanup.is_ok() {
+            self.cgroup.take();
+        }
+        cleanup.map_err(|source| ProofWorkerError::Containment {
+            operation: "cleaning the ProductionV3 worker cgroup after reap",
+            source,
+        })?;
+        health.map_err(|source| ProofWorkerError::Containment {
+            operation: "checking ProductionV3 cgroup containment health after teardown",
+            source,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poison_cgroup(&self, operation: &str, source: &io::Error) {
+        if let Some(cgroup) = &self.cgroup {
             match cgroup.lock() {
-                Ok(mut cgroup) => {
-                    let _ = cgroup.cleanup();
-                }
-                Err(poisoned) => {
-                    let _ = poisoned.into_inner().cleanup();
-                }
+                Ok(cgroup) => cgroup.poison(operation, source),
+                Err(poisoned) => poisoned.into_inner().poison(operation, source),
             }
         }
     }
 
-    fn terminate_and_reap(&mut self) {
+    fn poll_child_reap(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(all(test, target_os = "linux"))]
+        match &mut self.reap_fault {
+            TestReapFault::None => {}
+            TestReapFault::ErrorsRemaining(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                return Err(io::Error::other("injected child wait error"));
+            }
+            TestReapFault::ErrorsRemaining(_) => self.reap_fault = TestReapFault::None,
+            TestReapFault::AlwaysError => {
+                return Err(io::Error::other("injected persistent child wait error"));
+            }
+            TestReapFault::AlwaysPending => return Ok(None),
+        }
+        self.process.try_wait()
+    }
+
+    fn terminate_and_reap(&mut self) -> Result<(), ProofWorkerError> {
+        self.terminate_and_reap_for(PROCESS_REAP_TIMEOUT)
+    }
+
+    fn finish_reaped_and_cleanup(&mut self) -> Result<(), ProofWorkerError> {
+        self.direct_child_reaped = true;
+        // The direct child exited normally, but an untrusted descendant may
+        // still occupy the containment tree. Consume the shared terminator
+        // while the cgroup/job/process-group identity is still authoritative;
+        // Drop must never signal it again after the leaf has been removed.
+        self.terminate_tree();
+        #[cfg(target_os = "linux")]
+        self.cleanup_cgroup()?;
+        Ok(())
+    }
+
+    fn terminate_and_reap_for(&mut self, timeout: Duration) -> Result<(), ProofWorkerError> {
         self.terminate_tree();
         if self.direct_child_reaped {
             #[cfg(target_os = "linux")]
-            self.cleanup_cgroup();
-            return;
+            self.cleanup_cgroup()?;
+            return Ok(());
         }
         let started = Instant::now();
+        let mut last_wait_error = None;
         loop {
-            match self.process.try_wait() {
-                Ok(Some(_)) | Err(_) => {
+            match self.poll_child_reap() {
+                Ok(Some(_)) => {
                     self.direct_child_reaped = true;
                     #[cfg(target_os = "linux")]
-                    self.cleanup_cgroup();
-                    return;
+                    self.cleanup_cgroup()?;
+                    return Ok(());
                 }
                 Ok(None) => {}
+                Err(source) => last_wait_error = Some(source),
             }
-            if started.elapsed() >= PROCESS_REAP_TIMEOUT {
-                return;
+            if started.elapsed() >= timeout {
+                let source = last_wait_error.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "worker child was not reaped before the containment deadline",
+                    )
+                });
+                #[cfg(target_os = "linux")]
+                self.poison_cgroup(
+                    "reaping the killed ProductionV3 worker before cgroup removal",
+                    &source,
+                );
+                return Err(ProofWorkerError::Containment {
+                    operation: "reaping the killed worker before containment cleanup",
+                    source,
+                });
             }
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn set_reap_fault(&mut self, fault: TestReapFault) {
+        self.reap_fault = fault;
     }
 }
 
 impl Drop for ContainedChild {
     fn drop(&mut self) {
-        self.terminate_and_reap();
+        let _ = self.terminate_and_reap();
     }
 }
 
@@ -854,8 +950,7 @@ fn spawn_contained_unix(
         Err(source) => {
             #[cfg(target_os = "linux")]
             if let Some(cgroup) = production_cgroup.as_mut() {
-                let _ = cgroup.kill();
-                let _ = cgroup.cleanup();
+                abort_production_cgroup(cgroup, None, "cleaning a failed worker exec")?;
             }
             return Err(ProofWorkerError::Spawn(source));
         }
@@ -863,12 +958,18 @@ fn spawn_contained_unix(
     let process_group = match libc::pid_t::try_from(child.id()) {
         Ok(process_group) => process_group,
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
             #[cfg(target_os = "linux")]
             if let Some(cgroup) = production_cgroup.as_mut() {
-                let _ = cgroup.kill();
-                let _ = cgroup.cleanup();
+                abort_production_cgroup(
+                    cgroup,
+                    Some(&mut child),
+                    "cleaning a worker with an invalid process ID",
+                )?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = child.kill();
+                let _ = child.wait();
             }
             return Err(ProofWorkerError::InvalidConfig(
                 "worker PID does not fit the platform process ID type",
@@ -878,10 +979,11 @@ fn spawn_contained_unix(
     #[cfg(target_os = "linux")]
     let cgroup = if let Some(mut cgroup) = production_cgroup.take() {
         if let Err(source) = cgroup.finish_spawn(child.id()) {
-            let _ = cgroup.kill();
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = cgroup.cleanup();
+            abort_production_cgroup(
+                &mut cgroup,
+                Some(&mut child),
+                "cleaning a worker with invalid cgroup membership",
+            )?;
             return Err(ProofWorkerError::Containment {
                 operation: "confirming exact ProductionV3 worker cgroup membership",
                 source,
@@ -906,7 +1008,52 @@ fn spawn_contained_unix(
         direct_child_reaped: false,
         #[cfg(target_os = "linux")]
         cgroup,
+        #[cfg(all(test, target_os = "linux"))]
+        reap_fault: TestReapFault::None,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn abort_production_cgroup(
+    cgroup: &mut cgroup::LinuxWorkerCgroup,
+    mut child: Option<&mut Child>,
+    operation: &'static str,
+) -> Result<(), ProofWorkerError> {
+    let kill_error = cgroup.kill().err();
+    if let Some(child) = child.as_mut() {
+        let _ = child.kill();
+        if let Err(source) = reap_child_bounded(child, PROCESS_REAP_TIMEOUT) {
+            cgroup.poison("reaping a failed ProductionV3 worker launch", &source);
+            return Err(ProofWorkerError::Containment { operation, source });
+        }
+    }
+    let cleanup = cgroup.cleanup();
+    if let Some(source) = kill_error {
+        return Err(ProofWorkerError::Containment { operation, source });
+    }
+    cleanup.map_err(|source| ProofWorkerError::Containment { operation, source })
+}
+
+#[cfg(target_os = "linux")]
+fn reap_child_bounded(child: &mut Child, timeout: Duration) -> io::Result<()> {
+    let started = Instant::now();
+    let mut last_error = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(source) => last_error = Some(source),
+        }
+        if started.elapsed() >= timeout {
+            return Err(last_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "worker child was not reaped before the launch cleanup deadline",
+                )
+            }));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1140,19 +1287,19 @@ fn exchange_with_child(
     stdout_limit: usize,
 ) -> Result<Vec<u8>, ProofWorkerError> {
     let Some(mut stdin) = child.take_stdin() else {
-        terminate_child_bounded(&mut child);
+        terminate_child_bounded(&mut child)?;
         return Err(ProofWorkerError::InvalidConfig(
             "worker stdin pipe was not created",
         ));
     };
     let Some(stdout) = child.take_stdout() else {
-        terminate_child_bounded(&mut child);
+        terminate_child_bounded(&mut child)?;
         return Err(ProofWorkerError::InvalidConfig(
             "worker stdout pipe was not created",
         ));
     };
     let Some(stderr) = child.take_stderr() else {
-        terminate_child_bounded(&mut child);
+        terminate_child_bounded(&mut child)?;
         return Err(ProofWorkerError::InvalidConfig(
             "worker stderr pipe was not created",
         ));
@@ -1187,7 +1334,7 @@ fn exchange_with_child(
                 Ok(Some(status)) => exit_status = Some(status),
                 Ok(None) => {}
                 Err(source) => {
-                    terminate_child_bounded(resources.child_mut());
+                    terminate_child_bounded(resources.child_mut())?;
                     return Err(ProofWorkerError::Pipe {
                         operation: "waiting for worker",
                         source,
@@ -1203,7 +1350,7 @@ fn exchange_with_child(
             break;
         }
         if started.elapsed() >= timeout {
-            terminate_child_bounded(resources.child_mut());
+            terminate_child_bounded(resources.child_mut())?;
             return Err(ProofWorkerError::Timeout {
                 milliseconds: timeout.as_millis(),
             });
@@ -1213,31 +1360,31 @@ fn exchange_with_child(
         match event_rx.recv_timeout(remaining.min(Duration::from_millis(5))) {
             Ok(IoEvent::Input(Ok(()))) => input_complete = true,
             Ok(IoEvent::Input(Err(source))) => {
-                terminate_child_bounded(resources.child_mut());
+                terminate_child_bounded(resources.child_mut())?;
                 return Err(ProofWorkerError::Pipe {
                     operation: "writing stdin",
                     source,
                 });
             }
             Ok(IoEvent::Stdout(Ok(capture))) if capture.exceeded => {
-                terminate_child_bounded(resources.child_mut());
+                terminate_child_bounded(resources.child_mut())?;
                 return Err(ProofWorkerError::StdoutTooLarge);
             }
             Ok(IoEvent::Stdout(Ok(capture))) => stdout_capture = Some(capture),
             Ok(IoEvent::Stdout(Err(source))) => {
-                terminate_child_bounded(resources.child_mut());
+                terminate_child_bounded(resources.child_mut())?;
                 return Err(ProofWorkerError::Pipe {
                     operation: "reading stdout",
                     source,
                 });
             }
             Ok(IoEvent::Stderr(Ok(capture))) if capture.exceeded => {
-                terminate_child_bounded(resources.child_mut());
+                terminate_child_bounded(resources.child_mut())?;
                 return Err(ProofWorkerError::StderrTooLarge);
             }
             Ok(IoEvent::Stderr(Ok(capture))) => stderr_capture = Some(capture),
             Ok(IoEvent::Stderr(Err(source))) => {
-                terminate_child_bounded(resources.child_mut());
+                terminate_child_bounded(resources.child_mut())?;
                 return Err(ProofWorkerError::Pipe {
                     operation: "reading stderr",
                     source,
@@ -1246,7 +1393,7 @@ fn exchange_with_child(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if !io_collection_complete(input_complete, &stdout_capture, &stderr_capture) {
-                    terminate_child_bounded(resources.child_mut());
+                    terminate_child_bounded(resources.child_mut())?;
                     return Err(ProofWorkerError::PipeThread("collecting worker pipes"));
                 }
             }
@@ -1256,6 +1403,7 @@ fn exchange_with_child(
     let exit_status = exit_status.expect("loop exits only after worker status is available");
     let stdout = stdout_capture.expect("loop exits only after stdout is captured");
     let stderr = stderr_capture.expect("loop exits only after stderr is captured");
+    resources.child_mut().finish_reaped_and_cleanup()?;
     if !exit_status.success() {
         return Err(worker_exit_error(exit_status, &stderr.bytes));
     }
@@ -1270,8 +1418,8 @@ fn io_collection_complete(
     input_complete && stdout_capture.is_some() && stderr_capture.is_some()
 }
 
-fn terminate_child_bounded(child: &mut ContainedChild) {
-    child.terminate_and_reap();
+fn terminate_child_bounded(child: &mut ContainedChild) -> Result<(), ProofWorkerError> {
+    child.terminate_and_reap()
 }
 
 fn worker_exit_error(status: ExitStatus, stderr: &[u8]) -> ProofWorkerError {
@@ -1683,23 +1831,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn production_spawn_or_skip(command: Command) -> Option<ContainedChild> {
-        match spawn_contained_production(command, None, test_linux_cgroup_limits()) {
-            Ok(child) => Some(child),
-            Err(ProofWorkerError::Containment { source, .. })
-            | Err(ProofWorkerError::Spawn(source))
-                if matches!(
-                    source.kind(),
-                    io::ErrorKind::PermissionDenied
-                        | io::ErrorKind::ReadOnlyFilesystem
-                        | io::ErrorKind::NotFound
-                        | io::ErrorKind::Other
-                ) =>
-            {
-                eprintln!("skipping delegated cgroup test: {source}");
-                None
-            }
-            Err(error) => panic!("unexpected ProductionV3 containment failure: {error}"),
+        if let Err(unavailable) = cgroup::delegation_precheck() {
+            eprintln!("skipping delegated cgroup test: {unavailable}");
+            return None;
         }
+        Some(
+            spawn_contained_production(command, None, test_linux_cgroup_limits())
+                .expect("delegation precheck passed but ProductionV3 containment launch failed"),
+        )
     }
 
     fn statement() -> StructuredBlake3Statement {
@@ -2263,7 +2402,7 @@ mod tests {
             child.try_wait().unwrap().is_none(),
             "ProductionV3 worker died when its request thread returned"
         );
-        child.terminate_and_reap();
+        child.terminate_and_reap().expect("terminate test worker");
     }
 
     #[cfg(target_os = "linux")]

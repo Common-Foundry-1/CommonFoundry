@@ -5,16 +5,100 @@
 //! on the now-empty delegated root. Every worker generation then receives a
 //! unique sibling leaf with exact, read-back resource limits.
 
+#[cfg(test)]
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const REQUIRED_CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
 const FREEZE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct DelegationUnavailable(String);
+
+#[cfg(test)]
+impl fmt::Display for DelegationUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn delegation_precheck() -> Result<(), DelegationUnavailable> {
+    delegation_precheck_inner(true).map_err(|source| DelegationUnavailable(source.to_string()))
+}
+
+#[cfg(test)]
+fn integration_delegation_precheck() -> Result<(), DelegationUnavailable> {
+    delegation_precheck_inner(false).map_err(|source| DelegationUnavailable(source.to_string()))
+}
+
+#[cfg(test)]
+fn delegation_precheck_inner(require_exclusive_process_layout: bool) -> io::Result<()> {
+    let membership = fs::read_to_string("/proc/self/cgroup")?;
+    let cgroup_path = parse_unified_membership(&membership)?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let mount = find_cgroup2_mount(&mountinfo, &cgroup_path)?;
+    let relative = relative_to_mount_root(&cgroup_path, &mount.root)?;
+    let current = mount.mount_point.join(relative);
+    let root = test_delegated_root(&current)?;
+    let root_type = root.join("cgroup.type");
+    if root_type.exists() {
+        require_exact_control(&root_type, "domain")?;
+    } else if root != mount.mount_point {
+        return Err(io::Error::other(
+            "delegated non-root cgroup has no cgroup.type control",
+        ));
+    }
+    require_controllers(&root.join("cgroup.controllers"))?;
+    require_controllers(&root.join("cgroup.subtree_control"))?;
+    if require_exclusive_process_layout {
+        let root_processes = parse_pid_list(&fs::read_to_string(root.join("cgroup.procs"))?)?;
+        let current_processes = parse_pid_list(&fs::read_to_string(current.join("cgroup.procs"))?)?;
+        let process_layout_is_valid = if root == current {
+            root_processes.as_slice() == [std::process::id()]
+        } else {
+            root_processes.is_empty() && current_processes.as_slice() == [std::process::id()]
+        };
+        if !process_layout_is_valid {
+            return Err(io::Error::other(
+                "delegated cgroup root/supervisor does not exclusively contain this test process",
+            ));
+        }
+    }
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).map_err(|source| io::Error::other(source.to_string()))?;
+    let probe = root.join(format!(
+        "cmfd-delegation-probe-{}-{}",
+        std::process::id(),
+        hex::encode(random)
+    ));
+    fs::create_dir(&probe)?;
+    let result = require_exact_control(&probe.join("cgroup.type"), "domain")
+        .and_then(|()| require_writable_control(&probe.join("cgroup.procs")));
+    let cleanup = fs::remove_dir(&probe);
+    result?;
+    cleanup
+}
+
+#[cfg(test)]
+fn test_delegated_root(current: &Path) -> io::Result<PathBuf> {
+    let supervisor_name = format!("cmfd-supervisor-{}", std::process::id());
+    if current.file_name().and_then(|name| name.to_str()) == Some(supervisor_name.as_str()) {
+        return current
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| io::Error::other("test supervisor cgroup has no delegated parent"));
+    }
+    Ok(current.to_path_buf())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinuxCgroupLimits {
@@ -58,6 +142,7 @@ impl LinuxCgroupLimits {
 pub(crate) struct LinuxCgroupManager {
     delegated_root: PathBuf,
     delegated_cgroup_path: PathBuf,
+    health: Arc<ContainmentHealth>,
 }
 
 impl LinuxCgroupManager {
@@ -73,6 +158,7 @@ impl LinuxCgroupManager {
         Ok(Self {
             delegated_root,
             delegated_cgroup_path: cgroup_path,
+            health: Arc::new(ContainmentHealth::default()),
         })
     }
 
@@ -81,6 +167,7 @@ impl LinuxCgroupManager {
         name: &str,
         limits: LinuxCgroupLimits,
     ) -> io::Result<LinuxWorkerCgroup> {
+        self.health.ensure_healthy()?;
         validate_leaf_name(name)?;
         let limits = limits.validate()?;
         let path = self.delegated_root.join(name);
@@ -110,6 +197,9 @@ impl LinuxCgroupManager {
                 path: path.clone(),
                 expected_membership,
                 procs: Some(procs),
+                health: Arc::clone(&self.health),
+                #[cfg(test)]
+                cleanup_busy_failures: 0,
             };
             // Exercise every action-only containment control while the leaf is
             // empty. Production must fail before exec if the delegated root
@@ -119,10 +209,55 @@ impl LinuxCgroupManager {
             worker.kill()?;
             Ok(worker)
         })();
-        if result.is_err() {
-            let _ = fs::remove_dir(&path);
+        match result {
+            Ok(worker) => Ok(worker),
+            Err(source) => {
+                if let Err(cleanup) = cleanup_leaf_path(&path, CLEANUP_TIMEOUT, None) {
+                    self.health.poison(
+                        &path,
+                        "cleaning a failed ProductionV3 cgroup setup",
+                        &cleanup,
+                    );
+                    return Err(io::Error::other(format!(
+                        "worker cgroup setup failed: {source}; setup cleanup failed: {cleanup}"
+                    )));
+                }
+                Err(source)
+            }
         }
-        result
+    }
+}
+
+#[derive(Debug, Default)]
+struct ContainmentHealth {
+    failure: Mutex<Option<String>>,
+}
+
+impl ContainmentHealth {
+    fn ensure_healthy(&self) -> io::Result<()> {
+        let failure = match self.failure.lock() {
+            Ok(failure) => failure,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match failure.as_deref() {
+            Some(failure) => Err(io::Error::other(format!(
+                "ProductionV3 cgroup containment is poisoned: {failure}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&self, path: &Path, operation: &str, source: &io::Error) {
+        let mut failure = match self.failure.lock() {
+            Ok(failure) => failure,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if failure.is_none() {
+            *failure = Some(format!(
+                "{operation} for {} failed: {source}",
+                path.display()
+            ));
+        }
     }
 }
 
@@ -131,6 +266,9 @@ pub(crate) struct LinuxWorkerCgroup {
     path: PathBuf,
     expected_membership: PathBuf,
     procs: Option<File>,
+    health: Arc<ContainmentHealth>,
+    #[cfg(test)]
+    cleanup_busy_failures: usize,
 }
 
 impl LinuxWorkerCgroup {
@@ -146,22 +284,32 @@ impl LinuxWorkerCgroup {
 
     pub(crate) fn finish_spawn(&mut self, pid: u32) -> io::Result<()> {
         self.procs.take();
-        let membership = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
-        let actual = parse_unified_membership(&membership)?;
-        if actual != self.expected_membership {
-            return Err(io::Error::other(format!(
-                "worker joined {}, expected {}",
-                actual.display(),
-                self.expected_membership.display()
-            )));
+        let result = (|| {
+            let membership = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+            let actual = parse_unified_membership(&membership)?;
+            if actual != self.expected_membership {
+                return Err(io::Error::other(format!(
+                    "worker joined {}, expected {}",
+                    actual.display(),
+                    self.expected_membership.display()
+                )));
+            }
+            let direct = parse_pid_list(&fs::read_to_string(self.path.join("cgroup.procs"))?)?;
+            if direct.as_slice() != [pid] {
+                return Err(io::Error::other(format!(
+                    "worker cgroup must contain only PID {pid}, found {direct:?}"
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(source) = &result {
+            self.health.poison(
+                &self.path,
+                "confirming exact ProductionV3 worker membership",
+                source,
+            );
         }
-        let direct = parse_pid_list(&fs::read_to_string(self.path.join("cgroup.procs"))?)?;
-        if !direct.contains(&pid) {
-            return Err(io::Error::other(
-                "worker PID is absent from its exact cgroup leaf",
-            ));
-        }
-        Ok(())
+        result
     }
 
     pub(crate) fn freeze(&self) -> io::Result<()> {
@@ -173,55 +321,135 @@ impl LinuxWorkerCgroup {
     }
 
     fn set_frozen(&self, frozen: bool) -> io::Result<()> {
-        write_control(
-            &self.path.join("cgroup.freeze"),
-            if frozen { "1" } else { "0" },
-        )?;
-        let expected = if frozen { 1 } else { 0 };
-        let started = Instant::now();
-        loop {
-            let events = fs::read_to_string(self.path.join("cgroup.events"))?;
-            if parse_keyed_u64(&events, "frozen")? == expected {
-                return Ok(());
+        let result = (|| {
+            write_control(
+                &self.path.join("cgroup.freeze"),
+                if frozen { "1" } else { "0" },
+            )?;
+            let expected = if frozen { 1 } else { 0 };
+            let started = Instant::now();
+            loop {
+                let events = fs::read_to_string(self.path.join("cgroup.events"))?;
+                if parse_keyed_u64(&events, "frozen")? == expected {
+                    return Ok(());
+                }
+                if started.elapsed() >= FREEZE_TIMEOUT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        if frozen {
+                            "worker cgroup did not freeze"
+                        } else {
+                            "worker cgroup did not thaw"
+                        },
+                    ));
+                }
+                thread::sleep(Duration::from_millis(1));
             }
-            if started.elapsed() >= FREEZE_TIMEOUT {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    if frozen {
-                        "worker cgroup did not freeze"
-                    } else {
-                        "worker cgroup did not thaw"
-                    },
-                ));
-            }
-            thread::sleep(Duration::from_millis(1));
+        })();
+        if let Err(source) = &result {
+            self.health.poison(
+                &self.path,
+                if frozen {
+                    "freezing the ProductionV3 worker cgroup"
+                } else {
+                    "thawing the ProductionV3 worker cgroup"
+                },
+                source,
+            );
         }
+        result
     }
 
     /// `cgroup.kill` is the authoritative descendant-safe termination path.
     pub(crate) fn kill(&self) -> io::Result<()> {
-        write_control(&self.path.join("cgroup.kill"), "1")
+        let result = write_control(&self.path.join("cgroup.kill"), "1");
+        if let Err(source) = &result {
+            self.health
+                .poison(&self.path, "killing the ProductionV3 worker cgroup", source);
+        }
+        result
     }
 
     pub(crate) fn cleanup(&mut self) -> io::Result<()> {
+        self.cleanup_for(CLEANUP_TIMEOUT)
+    }
+
+    fn cleanup_for(&mut self, timeout: Duration) -> io::Result<()> {
         self.procs.take();
-        let started = Instant::now();
-        loop {
-            match fs::remove_dir(&self.path) {
-                Ok(()) => return Ok(()),
-                Err(source)
-                    if matches!(
-                        source.kind(),
-                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::PermissionDenied
-                    ) && started.elapsed() < CLEANUP_TIMEOUT =>
-                {
-                    thread::sleep(Duration::from_millis(1));
+        #[cfg(test)]
+        let injected_busy = Some(&mut self.cleanup_busy_failures);
+        #[cfg(not(test))]
+        let injected_busy = None;
+        let result = cleanup_leaf_path(&self.path, timeout, injected_busy);
+        if let Err(source) = &result {
+            self.health.poison(
+                &self.path,
+                "removing the empty ProductionV3 worker cgroup",
+                source,
+            );
+        }
+        result
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> io::Result<()> {
+        self.health.ensure_healthy()
+    }
+
+    pub(crate) fn poison(&self, operation: &str, source: &io::Error) {
+        self.health.poison(&self.path, operation, source);
+    }
+
+    #[cfg(test)]
+    fn set_cleanup_busy_failures(&mut self, failures: usize) {
+        self.cleanup_busy_failures = failures;
+    }
+}
+
+fn cleanup_leaf_path(
+    path: &Path,
+    timeout: Duration,
+    mut injected_busy: Option<&mut usize>,
+) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        let events = match fs::read_to_string(path.join("cgroup.events")) {
+            Ok(events) => events,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(path) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Ok(_) => return Err(source),
+                    Err(metadata) => return Err(metadata),
                 }
-                Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(source) => return Err(source),
             }
+            Err(source) => return Err(source),
+        };
+        let populated = parse_keyed_u64(&events, "populated")?;
+        let result = if populated != 0 {
+            Err(io::Error::from_raw_os_error(libc::EBUSY))
+        } else if injected_busy
+            .as_deref()
+            .is_some_and(|remaining| *remaining > 0)
+        {
+            if let Some(remaining) = injected_busy.as_deref_mut() {
+                *remaining = remaining.saturating_sub(1);
+            }
+            Err(io::Error::from_raw_os_error(libc::EBUSY))
+        } else {
+            fs::remove_dir(path)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) if is_resource_busy(&source) && started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(source) => return Err(source),
         }
     }
+}
+
+fn is_resource_busy(source: &io::Error) -> bool {
+    source.kind() == io::ErrorKind::ResourceBusy || source.raw_os_error() == Some(libc::EBUSY)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -539,6 +767,12 @@ mod tests {
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     const DELEGATED_HELPER_ENV: &str = "CMFD_CGROUP_DELEGATED_HELPER";
+    const HELPER_POSITIVE: &str = "positive";
+    const HELPER_EXTRA_PROCESS: &str = "extra-process";
+    const HELPER_WAIT_ERROR: &str = "wait-error";
+    const HELPER_WAIT_TIMEOUT: &str = "wait-timeout";
+    const HELPER_CLEANUP_BUSY: &str = "cleanup-busy";
+    const HELPER_SUCCESSIVE_EXCHANGE: &str = "successive-exchange";
 
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -647,6 +881,14 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_does_not_confuse_a_missing_events_control_with_a_removed_leaf() {
+        let existing = temp_dir("missing-events");
+        assert!(cleanup_leaf_path(&existing, Duration::ZERO, None).is_err());
+        fs::remove_dir(&existing).unwrap();
+        cleanup_leaf_path(&existing, Duration::ZERO, None).unwrap();
+    }
+
+    #[test]
     fn unwritable_or_wrong_type_controls_fail_closed() {
         let root = temp_dir("unwritable");
         let wrong_type = root.join("cgroup.kill");
@@ -655,26 +897,91 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn delegated_cgroup_runtime_helper() {
-        if std::env::var_os(DELEGATED_HELPER_ENV).is_none() {
-            return;
+    fn test_limits() -> LinuxCgroupLimits {
+        LinuxCgroupLimits {
+            cpu_quota_micros: 100_000,
+            cpu_period_micros: 100_000,
+            memory_bytes: 256 * 1024 * 1024,
+            pids: 16,
         }
+    }
+
+    fn sleep_command() -> std::process::Command {
         let mut command = std::process::Command::new("/bin/sleep");
         command
             .arg("30")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        command
+    }
+
+    fn worker_leaf_names(root: &Path) -> Vec<String> {
+        let mut leaves: Vec<_> = fs::read_dir(root)
+            .expect("read delegated test root")
+            .map(|entry| entry.expect("read delegated child").file_name())
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| name.starts_with("cmfd-worker-"))
+            .collect();
+        leaves.sort();
+        leaves
+    }
+
+    fn assert_no_worker_leaves(root: &Path) {
+        assert_eq!(worker_leaf_names(root), Vec::<String>::new());
+    }
+
+    fn direct_worker(manager: &LinuxCgroupManager, label: &str) -> crate::ContainedChild {
+        let name = format!(
+            "cmfd-worker-{label}-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let worker = manager
+            .create_worker(&name, test_limits())
+            .expect("create direct test worker leaf");
+        let mut command = sleep_command();
+        crate::spawn_contained_unix(
+            &mut command,
+            Some(test_limits().memory_bytes),
+            true,
+            Some(worker),
+        )
+        .expect("launch direct contained test worker")
+    }
+
+    fn current_worker_parent() -> PathBuf {
+        let membership = parse_unified_membership(
+            &fs::read_to_string("/proc/self/cgroup").expect("read helper cgroup membership"),
+        )
+        .expect("parse helper cgroup membership");
+        let mount = find_cgroup2_mount(
+            &fs::read_to_string("/proc/self/mountinfo").expect("read helper mountinfo"),
+            &membership,
+        )
+        .expect("find helper cgroup2 mount");
+        let current = mount
+            .mount_point
+            .join(relative_to_mount_root(&membership, &mount.root).expect("map helper cgroup"));
+        if current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("cmfd-supervisor-"))
+        {
+            current
+                .parent()
+                .expect("supervisor cgroup has a delegated parent")
+                .to_path_buf()
+        } else {
+            current
+        }
+    }
+
+    fn positive_helper() {
         let mut child = crate::spawn_contained_production(
-            command,
-            Some(256 * 1024 * 1024),
-            LinuxCgroupLimits {
-                cpu_quota_micros: 100_000,
-                cpu_period_micros: 100_000,
-                memory_bytes: 256 * 1024 * 1024,
-                pids: 16,
-            },
+            sleep_command(),
+            Some(test_limits().memory_bytes),
+            test_limits(),
         )
         .expect("delegated ProductionV3 cgroup launch");
         child
@@ -683,73 +990,240 @@ mod tests {
         child
             .thaw_for_request()
             .expect("thaw and confirm worker leaf");
-        child.terminate_and_reap();
+        child.terminate_and_reap().expect("kill and reap worker");
         assert!(child.direct_child_reaped, "cgroup.kill did not reap worker");
         assert!(child.cgroup.is_none(), "worker cgroup leaf was not removed");
+        assert_no_worker_leaves(&current_worker_parent());
+    }
+
+    fn extra_process_helper() {
+        use std::os::unix::process::CommandExt;
+
+        let manager = LinuxCgroupManager::initialize().expect("initialize delegated manager");
+        let name = format!(
+            "cmfd-worker-extra-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let worker = manager
+            .create_worker(&name, test_limits())
+            .expect("create extra-process worker leaf");
+        let procs_fd = worker.procs_fd();
+        let mut extra_command = sleep_command();
+        // SAFETY: only an async-signal-safe write is used before exec and the
+        // worker object retains the already-open cgroup.procs descriptor.
+        unsafe {
+            extra_command.pre_exec(move || {
+                const SELF_PID: &[u8] = b"0\n";
+                let written = libc::write(procs_fd, SELF_PID.as_ptr().cast(), SELF_PID.len());
+                if written == SELF_PID.len() as libc::ssize_t {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
+        let mut extra = extra_command
+            .spawn()
+            .expect("launch injected extra process");
+        let mut target = sleep_command();
+        let launch = crate::spawn_contained_unix(
+            &mut target,
+            Some(test_limits().memory_bytes),
+            true,
+            Some(worker),
+        );
+        assert!(
+            matches!(launch, Err(crate::ProofWorkerError::Containment { .. })),
+            "extra direct process must reject the launch"
+        );
+        let extra_status = extra.wait().expect("reap injected extra process");
+        assert!(
+            !extra_status.success(),
+            "cgroup.kill did not kill extra process"
+        );
+        assert_no_worker_leaves(&manager.delegated_root);
+        assert!(
+            manager
+                .create_worker("cmfd-worker-after-membership-poison", test_limits())
+                .is_err(),
+            "membership violation did not poison future generations"
+        );
+    }
+
+    fn wait_error_helper() {
+        let manager = LinuxCgroupManager::initialize().expect("initialize delegated manager");
+        let mut transient = direct_worker(&manager, "transient-wait-error");
+        transient.set_reap_fault(crate::TestReapFault::ErrorsRemaining(3));
+        transient
+            .terminate_and_reap_for(Duration::from_millis(250))
+            .expect("bounded reap retried transient wait errors");
+        assert!(transient.direct_child_reaped);
+        assert!(transient.cgroup.is_none());
+        assert_no_worker_leaves(&manager.delegated_root);
+
+        let mut persistent = direct_worker(&manager, "persistent-wait-error");
+        persistent.set_reap_fault(crate::TestReapFault::AlwaysError);
+        assert!(
+            persistent
+                .terminate_and_reap_for(Duration::from_millis(10))
+                .is_err()
+        );
+        assert!(!persistent.direct_child_reaped);
+        assert!(persistent.cgroup.is_some());
+        persistent.set_reap_fault(crate::TestReapFault::None);
+        assert!(
+            persistent
+                .terminate_and_reap_for(Duration::from_millis(250))
+                .is_err(),
+            "poisoned containment health must remain actionable after cleanup"
+        );
+        assert!(persistent.direct_child_reaped);
+        assert!(persistent.cgroup.is_none());
+        assert_no_worker_leaves(&manager.delegated_root);
+        assert!(
+            manager
+                .create_worker("cmfd-worker-after-wait-error", test_limits())
+                .is_err()
+        );
+    }
+
+    fn wait_timeout_helper() {
+        let manager = LinuxCgroupManager::initialize().expect("initialize delegated manager");
+        let mut child = direct_worker(&manager, "wait-timeout");
+        child.set_reap_fault(crate::TestReapFault::AlwaysPending);
+        assert!(
+            child
+                .terminate_and_reap_for(Duration::from_millis(10))
+                .is_err()
+        );
+        assert!(!child.direct_child_reaped);
+        assert!(child.cgroup.is_some());
+        child.set_reap_fault(crate::TestReapFault::None);
+        assert!(
+            child
+                .terminate_and_reap_for(Duration::from_millis(250))
+                .is_err()
+        );
+        assert!(child.direct_child_reaped);
+        assert!(child.cgroup.is_none());
+        assert_no_worker_leaves(&manager.delegated_root);
+        assert!(
+            manager
+                .create_worker("cmfd-worker-after-wait-timeout", test_limits())
+                .is_err()
+        );
+    }
+
+    fn cleanup_busy_helper() {
+        let manager = LinuxCgroupManager::initialize().expect("initialize delegated manager");
+        let mut transient = manager
+            .create_worker("cmfd-worker-transient-ebusy", test_limits())
+            .expect("create transient EBUSY leaf");
+        transient.set_cleanup_busy_failures(3);
+        transient
+            .cleanup_for(Duration::from_millis(250))
+            .expect("cleanup retried repeated EBUSY");
+        assert_no_worker_leaves(&manager.delegated_root);
+
+        let mut persistent = manager
+            .create_worker("cmfd-worker-persistent-ebusy", test_limits())
+            .expect("create persistent EBUSY leaf");
+        persistent.set_cleanup_busy_failures(usize::MAX);
+        assert!(persistent.cleanup_for(Duration::from_millis(10)).is_err());
+        assert!(
+            manager
+                .create_worker("cmfd-worker-after-cleanup-poison", test_limits())
+                .is_err(),
+            "failed cleanup did not poison future generations"
+        );
+        persistent.set_cleanup_busy_failures(0);
+        persistent
+            .cleanup_for(Duration::from_millis(250))
+            .expect("explicit retry removed poisoned empty leaf");
+        assert_no_worker_leaves(&manager.delegated_root);
+    }
+
+    fn cat_command() -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
+    fn successive_exchange_helper() {
+        for request in [b"first generation\n".as_slice(), b"second generation\n"] {
+            let child = crate::spawn_contained_production(
+                cat_command(),
+                Some(test_limits().memory_bytes),
+                test_limits(),
+            )
+            .expect("launch delegated one-shot worker generation");
+            let response =
+                crate::exchange_with_child(child, request.to_vec(), Duration::from_secs(2), 1024)
+                    .expect("complete delegated one-shot worker exchange");
+            assert_eq!(response, request);
+            assert_no_worker_leaves(&current_worker_parent());
+        }
     }
 
     #[test]
-    fn delegated_cgroup_v2_launch_freeze_kill_and_cleanup() {
-        use std::os::unix::process::CommandExt;
-
-        let membership = match fs::read_to_string("/proc/self/cgroup")
-            .and_then(|contents| parse_unified_membership(&contents))
-        {
-            Ok(path) => path,
-            Err(error) => {
-                eprintln!("skipping delegated cgroup integration test: {error}");
-                return;
-            }
-        };
-        let mount = match fs::read_to_string("/proc/self/mountinfo")
-            .and_then(|contents| find_cgroup2_mount(&contents, &membership))
-        {
-            Ok(mount) => mount,
-            Err(error) => {
-                eprintln!("skipping delegated cgroup integration test: {error}");
-                return;
-            }
-        };
-        let relative = relative_to_mount_root(&membership, &mount.root).unwrap();
-        let current = mount.mount_point.join(relative);
-        if require_controllers(&current.join("cgroup.subtree_control")).is_err() {
-            eprintln!("skipping delegated cgroup integration test: controllers are not delegated");
-            return;
+    fn delegated_cgroup_runtime_helper() {
+        match std::env::var(DELEGATED_HELPER_ENV).as_deref() {
+            Err(_) => {}
+            Ok(HELPER_POSITIVE) => positive_helper(),
+            Ok(HELPER_EXTRA_PROCESS) => extra_process_helper(),
+            Ok(HELPER_WAIT_ERROR) => wait_error_helper(),
+            Ok(HELPER_WAIT_TIMEOUT) => wait_timeout_helper(),
+            Ok(HELPER_CLEANUP_BUSY) => cleanup_busy_helper(),
+            Ok(HELPER_SUCCESSIVE_EXCHANGE) => successive_exchange_helper(),
+            Ok(mode) => panic!("unknown delegated helper mode {mode:?}"),
         }
+    }
 
+    fn prepare_delegated_helper_root() -> io::Result<(PathBuf, File)> {
+        let membership = parse_unified_membership(&fs::read_to_string("/proc/self/cgroup")?)?;
+        let mount = find_cgroup2_mount(&fs::read_to_string("/proc/self/mountinfo")?, &membership)?;
+        let relative = relative_to_mount_root(&membership, &mount.root)?;
+        let current = mount.mount_point.join(relative);
+        let delegated_root = test_delegated_root(&current)?;
+        require_controllers(&delegated_root.join("cgroup.subtree_control"))?;
         let name = format!(
             "cmfd-integration-{}-{}",
             std::process::id(),
             TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
-        let delegated = current.join(&name);
-        if let Err(error) = fs::create_dir(&delegated) {
-            eprintln!("skipping delegated cgroup integration test: {error}");
+        let delegated = delegated_root.join(name);
+        fs::create_dir(&delegated)?;
+        let procs = OpenOptions::new()
+            .write(true)
+            .open(delegated.join("cgroup.procs"))?;
+        Ok((delegated, procs))
+    }
+
+    fn run_delegated_helper(mode: &str) {
+        use std::os::unix::process::CommandExt;
+
+        if let Err(unavailable) = integration_delegation_precheck() {
+            eprintln!("skipping delegated cgroup integration test: {unavailable}");
             return;
         }
-        let procs = match OpenOptions::new()
-            .write(true)
-            .open(delegated.join("cgroup.procs"))
-        {
-            Ok(procs) => procs,
-            Err(error) => {
-                let _ = fs::remove_dir(&delegated);
-                eprintln!("skipping delegated cgroup integration test: {error}");
-                return;
-            }
-        };
+        let (delegated, procs) =
+            prepare_delegated_helper_root().expect("prepare isolated delegated helper root");
         let procs_fd = procs.as_raw_fd();
         let mut helper = std::process::Command::new(std::env::current_exe().unwrap());
         helper
             .arg("--exact")
             .arg("cgroup::tests::delegated_cgroup_runtime_helper")
             .arg("--nocapture")
-            .env(DELEGATED_HELPER_ENV, "1")
+            .env(DELEGATED_HELPER_ENV, mode)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit());
-        // SAFETY: only async-signal-safe write is used between fork and exec;
-        // the owned descriptor remains live in the parent through spawn.
+        // SAFETY: only an async-signal-safe write is used between fork and
+        // exec; the owned descriptor remains live in the parent through spawn.
         unsafe {
             helper.pre_exec(move || {
                 const SELF_PID: &[u8] = b"0\n";
@@ -764,15 +1238,57 @@ mod tests {
         let status = helper.status().expect("launch delegated cgroup helper");
         drop(procs);
 
-        if let Ok(entries) = fs::read_dir(&delegated) {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    let _ = fs::remove_dir(entry.path());
-                }
-            }
+        let entries: Vec<_> = fs::read_dir(&delegated)
+            .expect("read delegated helper root")
+            .map(|entry| entry.expect("read helper child cgroup"))
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .collect();
+        let worker_leaves: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("cmfd-worker-"))
+            .collect();
+        for entry in entries {
+            let path = entry.path();
+            let _ = write_control(&path.join("cgroup.kill"), "1");
+            cleanup_leaf_path(&path, CLEANUP_TIMEOUT, None)
+                .expect("remove empty helper child cgroup");
         }
-        let cleanup = fs::remove_dir(&delegated);
+        fs::remove_dir(&delegated).expect("remove delegated integration cgroup");
         assert!(status.success(), "delegated cgroup helper failed: {status}");
-        cleanup.expect("remove empty delegated integration cgroup");
+        assert!(
+            worker_leaves.is_empty(),
+            "delegated helper leaked worker leaves: {worker_leaves:?}"
+        );
+    }
+
+    #[test]
+    fn delegated_cgroup_v2_launch_freeze_kill_and_cleanup() {
+        run_delegated_helper(HELPER_POSITIVE);
+    }
+
+    #[test]
+    fn delegated_cgroup_rejects_extra_direct_process_and_cleans_leaf() {
+        run_delegated_helper(HELPER_EXTRA_PROCESS);
+    }
+
+    #[test]
+    fn delegated_cgroup_retries_wait_errors_then_poison_fails_closed() {
+        run_delegated_helper(HELPER_WAIT_ERROR);
+    }
+
+    #[test]
+    fn delegated_cgroup_wait_timeout_retains_then_cleans_poisoned_leaf() {
+        run_delegated_helper(HELPER_WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn delegated_cgroup_retries_ebusy_and_preserves_cleanup_poison() {
+        run_delegated_helper(HELPER_CLEANUP_BUSY);
+    }
+
+    #[test]
+    fn delegated_cgroup_successful_exchange_allows_a_second_generation() {
+        run_delegated_helper(HELPER_SUCCESSIVE_EXCHANGE);
     }
 }

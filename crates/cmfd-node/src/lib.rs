@@ -580,6 +580,28 @@ impl BlockPreverifier {
     pub fn preverify(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
         validate_block_resources(block)?;
         encode_block(block)?;
+        self.run_guarded(|| self.preverify_unqueued(block))
+    }
+
+    /// Completes a ProductionV3 branch snapshot and verifies its exact proof
+    /// under one bounded admission permit. Side-branch replay therefore stays
+    /// outside the node mutex without escaping the verifier concurrency and
+    /// queue limits.
+    fn complete_admission_and_preverify(
+        &self,
+        block: &Block,
+        admission: ExternalBlockAdmissionWork,
+    ) -> Result<(ExternalBlockAdmission, PreverifiedBlockProof), NodeError> {
+        validate_block_resources(block)?;
+        encode_block(block)?;
+        self.run_guarded(|| {
+            let admission = admission.complete(block)?;
+            let preverified = self.preverify_unqueued(block)?;
+            Ok((admission, preverified))
+        })
+    }
+
+    fn preverify_unqueued(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
         let backend = self
             .backend
             .read()
@@ -587,13 +609,12 @@ impl BlockPreverifier {
             .clone();
         match backend {
             ProofVerificationBackend::Unavailable => Err(NodeError::ProductionV3Unavailable),
-            ProofVerificationBackend::InProcess => self.run_guarded(|| {
-                self.verifier
-                    .preverify(&block.challenge, &block.proof)
-                    .map_err(NodeError::from)
-            }),
+            ProofVerificationBackend::InProcess => self
+                .verifier
+                .preverify(&block.challenge, &block.proof)
+                .map_err(NodeError::from),
             ProofVerificationBackend::External(worker) => {
-                self.run_guarded(|| worker.verify_block(block).map_err(NodeError::from))
+                worker.verify_block(block).map_err(NodeError::from)
             }
         }
     }
@@ -3144,11 +3165,12 @@ impl Node {
 
     pub fn submit_block(&mut self, block: Block, accepted_at: u64) -> Result<u64, NodeError> {
         if matches!(self.profile.proof, ProofProfile::ProductionV3) {
-            let admission = self
+            let admission_work = self
                 .begin_external_block_admission(&block, accepted_at)?
-                .ok_or(NodeError::ProductionV3Unavailable)?
-                .complete(&block)?;
-            let preverified = self.block_preverifier.preverify(&block)?;
+                .ok_or(NodeError::ProductionV3Unavailable)?;
+            let (admission, preverified) = self
+                .block_preverifier
+                .complete_admission_and_preverify(&block, admission_work)?;
             return self.submit_preverified_block_with_admission(
                 block,
                 accepted_at,
@@ -4243,15 +4265,16 @@ fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) ->
         }
         Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
     };
-    let admission = match admission_work {
-        Some(work) => match work.complete(&block) {
-            Ok(admission) => Some(admission),
-            Err(error) => return RpcResponse::node_error(error),
-        },
-        None => None,
+    let admission_and_preverified = match admission_work {
+        Some(work) => block_preverifier
+            .complete_admission_and_preverify(&block, work)
+            .map(|(admission, preverified)| (Some(admission), preverified)),
+        None => block_preverifier
+            .preverify(&block)
+            .map(|preverified| (None, preverified)),
     };
-    let preverified = match block_preverifier.preverify(&block) {
-        Ok(preverified) => preverified,
+    let (admission, preverified) = match admission_and_preverified {
+        Ok(result) => result,
         Err(error) => return RpcResponse::node_error(error),
     };
     let mut node = match shared.lock() {

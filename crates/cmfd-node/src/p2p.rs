@@ -381,10 +381,14 @@ fn perform_sync_from_peer_once_inner_with_policy(
             let node = lock_node(&shared)?;
             node.begin_external_block_admission(&block, accepted_at)?
         };
-        let admission = admission_work
-            .map(|work| work.complete(&block))
-            .transpose()?;
-        let preverified = block_preverifier.preverify(&block)?;
+        let (admission, preverified) = match admission_work {
+            Some(work) => {
+                let (admission, preverified) =
+                    block_preverifier.complete_admission_and_preverify(&block, work)?;
+                (Some(admission), preverified)
+            }
+            None => (None, block_preverifier.preverify(&block)?),
+        };
         let accepted = {
             let mut node = lock_node(&shared)?;
             if node.contains_block(*requested) {
@@ -779,38 +783,41 @@ fn perform_respond_to_peer_inner_with_policy(
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
                     Err(_) => BlockSubmissionStatus::Rejected,
                     Ok(admission_work) => {
-                        let admission =
-                            admission_work.map(|work| work.complete(&block)).transpose();
-                        match admission {
-                            Ok(admission) => match block_preverifier.preverify(&block) {
-                                Ok(preverified) => {
-                                    let mut node = lock_node(&shared)?;
-                                    if node.contains_block(block_id) {
-                                        BlockSubmissionStatus::AlreadyKnown
-                                    } else {
-                                        let submitted = match admission {
-                                            Some(admission) => node
-                                                .submit_preverified_block_with_admission(
-                                                    block,
-                                                    accepted_at,
-                                                    preverified,
-                                                    admission,
-                                                ),
-                                            None => node.submit_preverified_block(
+                        let admission_and_preverified = match admission_work {
+                            Some(work) => block_preverifier
+                                .complete_admission_and_preverify(&block, work)
+                                .map(|(admission, preverified)| (Some(admission), preverified)),
+                            None => block_preverifier
+                                .preverify(&block)
+                                .map(|preverified| (None, preverified)),
+                        };
+                        match admission_and_preverified {
+                            Ok((admission, preverified)) => {
+                                let mut node = lock_node(&shared)?;
+                                if node.contains_block(block_id) {
+                                    BlockSubmissionStatus::AlreadyKnown
+                                } else {
+                                    let submitted = match admission {
+                                        Some(admission) => node
+                                            .submit_preverified_block_with_admission(
                                                 block,
                                                 accepted_at,
                                                 preverified,
+                                                admission,
                                             ),
-                                        };
-                                        if submitted.is_ok() {
-                                            BlockSubmissionStatus::Accepted
-                                        } else {
-                                            BlockSubmissionStatus::Rejected
-                                        }
+                                        None => node.submit_preverified_block(
+                                            block,
+                                            accepted_at,
+                                            preverified,
+                                        ),
+                                    };
+                                    if submitted.is_ok() {
+                                        BlockSubmissionStatus::Accepted
+                                    } else {
+                                        BlockSubmissionStatus::Rejected
                                     }
                                 }
-                                Err(_) => BlockSubmissionStatus::Rejected,
-                            },
+                            }
                             Err(_) => BlockSubmissionStatus::Rejected,
                         }
                     }

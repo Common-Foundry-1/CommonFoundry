@@ -15,6 +15,11 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Embeds the built frontend and serves it over the tauri custom protocol.
+# Without this feature the tauri context bakes in the Vite dev URL, so a
+# release wallet built by plain `cargo build` opens an empty window. Every
+# packaged wallet build must enable it (the tauri CLI does so implicitly).
+custom-protocol = ["tauri/custom-protocol"]
 production-v3 = [
     "cmfd-node/production-v3",
     "cmfd-proof-worker/production-v3",

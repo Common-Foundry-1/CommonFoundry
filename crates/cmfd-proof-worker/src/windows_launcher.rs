@@ -107,6 +107,36 @@ const ATTRIBUTE_COUNT: u32 = 6;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const PROFILE_ATTEMPTS: usize = 16;
 const PRIVATE_RUNTIME_ATTEMPTS: usize = 16;
+/// Re-opening the just-written private runtime executable races real-time
+/// antivirus scanners: closing a freshly written image file triggers an
+/// on-access scan, and the scanner's handle briefly conflicts with the
+/// deny-write/deny-delete sharing this launcher requires. The pinned re-hash
+/// after the open still decides whether the bytes are trusted, so waiting the
+/// scan out loses no integrity, and the deadline keeps startup fail-closed.
+const SHARING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const SHARING_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ERROR_SHARING_VIOLATION as an `io::Error` raw OS error.
+const SHARING_VIOLATION: i32 = 32;
+
+/// Runs one `OpenOptions::open`-style attempt until it stops failing with
+/// `ERROR_SHARING_VIOLATION` or the bounded deadline elapses. Every other
+/// error is returned immediately, and the last sharing violation is returned
+/// unchanged once the deadline passes.
+fn open_through_scanner_races<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let deadline = std::time::Instant::now() + SHARING_RETRY_DEADLINE;
+    loop {
+        match attempt() {
+            Err(error)
+                if error.raw_os_error() == Some(SHARING_VIOLATION)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(SHARING_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
 
 // These values are the documented PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
 // DWORD64 flags. windows-sys exposes the low DEP/SEHOP values but not every
@@ -1263,16 +1293,30 @@ struct PrivateLaunchRuntime {
     transferred: bool,
 }
 
+/// Prefixes a private-runtime failure with the exact step that failed, so a
+/// containment report distinguishes a source-open conflict from, for example,
+/// a scanner racing the freshly written destination.
+fn runtime_step(step: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{step}: {error}"))
+}
+
 impl PrivateLaunchRuntime {
     fn create(source_path: &Path, expected_sha256: [u8; 32], sid: PSID) -> io::Result<Self> {
         let source = OpenOptions::new()
             .read(true)
-            // No write or delete sharing: the exact configured object cannot
-            // be modified or replaced from the first byte copied until the
-            // contained process has exited.
-            .share_mode(FILE_SHARE_READ)
+            // No data-write sharing: the source bytes cannot change from the
+            // first byte copied until the contained process has exited.
+            // Delete sharing is required, not optional: the persistent
+            // worker's PrivateRuntimeCopy supervises this same file through a
+            // retained DELETE-access cleanup handle, and a deny-delete open
+            // here fails with ERROR_SHARING_VIOLATION on every launch. A
+            // deletion or replacement race is still fail-closed: the identity
+            // check below binds this handle to the exact path, and the copy
+            // loop hashes the streamed bytes against the compiled pin.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
-            .open(source_path)?;
+            .open(source_path)
+            .map_err(|error| runtime_step("opening the pinned source executable", error))?;
         let source_information = regular_single_link_information(&source, "source executable")?;
         let source_identity = windows_file_identity(&source)?;
         verify_runtime_path_identity(source_path, false, source_identity)?;
@@ -1295,7 +1339,9 @@ impl PrivateLaunchRuntime {
                     break;
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(runtime_step("creating the private launch directory", error));
+                }
             }
         }
         let directory_path = directory_path.ok_or_else(|| {
@@ -1323,7 +1369,8 @@ impl PrivateLaunchRuntime {
                     )
                     .share_mode(FILE_SHARE_READ)
                     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-                    .open(&directory_path)?,
+                    .open(&directory_path)
+                    .map_err(|error| runtime_step("pinning the private launch directory", error))?,
             );
             let directory_handle = cleanup_directory_handle
                 .as_ref()
@@ -1348,7 +1395,10 @@ impl PrivateLaunchRuntime {
                     .create_new(true)
                     .share_mode(FILE_SHARE_READ)
                     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
-                    .open(&executable_path)?,
+                    .open(&executable_path)
+                    .map_err(|error| {
+                        runtime_step("creating the private runtime executable", error)
+                    })?,
             );
             let executable_handle = cleanup_executable_handle
                 .as_mut()
@@ -1427,23 +1477,31 @@ impl PrivateLaunchRuntime {
             // final handle again. The temporary share-write reader keeps the
             // pathname deletion-pinned across the handoff; any data race in
             // the narrow handoff is detected by the final hash.
-            let transition = OpenOptions::new()
-                .read(true)
-                .access_mode(GENERIC_READ | READ_CONTROL)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
-                .open(&executable_path)?;
+            let transition = open_through_scanner_races(|| {
+                OpenOptions::new()
+                    .read(true)
+                    .access_mode(GENERIC_READ | READ_CONTROL)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+                    .open(&executable_path)
+            })
+            .map_err(|error| runtime_step("opening the transition reader", error))?;
             let initial_executable_handle = cleanup_executable_handle
                 .take()
                 .expect("the writable executable handle is transitioned once");
             drop(initial_executable_handle);
             cleanup_executable_handle = Some(
-                OpenOptions::new()
-                    .read(true)
-                    .access_mode(DELETE | GENERIC_READ | READ_CONTROL | WRITE_DAC)
-                    .share_mode(FILE_SHARE_READ)
-                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
-                    .open(&executable_path)?,
+                open_through_scanner_races(|| {
+                    OpenOptions::new()
+                        .read(true)
+                        .access_mode(DELETE | GENERIC_READ | READ_CONTROL | WRITE_DAC)
+                        .share_mode(FILE_SHARE_READ)
+                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+                        .open(&executable_path)
+                })
+                .map_err(|error| {
+                    runtime_step("re-pinning the private runtime executable", error)
+                })?,
             );
             drop(transition);
             let executable_handle = cleanup_executable_handle
@@ -4248,10 +4306,29 @@ mod tests {
         let source = files.write("source.exe", b"private runtime pin test");
         let expected = <[u8; 32]>::from(Sha256::digest(b"private runtime pin test"));
         let mut profile = CreatedProfile::create().expect("create private-copy profile");
+        // Source data-writes stay excluded for the runtime's whole lifetime.
+        // Source deletion is deliberately shared: the persistent worker's
+        // PrivateRuntimeCopy owns the source through its own DELETE-access
+        // cleanup handle, and a deny-delete open here would refuse every
+        // launch it supervises. Trust in the bytes comes from the streamed
+        // copy hash against the compiled pin, not from pinning the source
+        // name. Probe both properties on a dedicated runtime so the main
+        // sequence below keeps an intact source for its identity rechecks.
+        {
+            let deletable = files.write("deletable-source.exe", b"private runtime pin test");
+            let probe = PrivateLaunchRuntime::create(&deletable, expected, profile.sid())
+                .expect("private copy of the deletable source");
+            assert!(OpenOptions::new().write(true).open(&deletable).is_err());
+            assert!(
+                fs::remove_file(&deletable).is_ok(),
+                "the supervising runtime copy must retain its delete rights over the source"
+            );
+            drop(probe);
+        }
+
         let runtime =
             PrivateLaunchRuntime::create(&source, expected, profile.sid()).expect("private copy");
         assert!(OpenOptions::new().write(true).open(&source).is_err());
-        assert!(fs::remove_file(&source).is_err());
         assert!(
             OpenOptions::new()
                 .write(true)

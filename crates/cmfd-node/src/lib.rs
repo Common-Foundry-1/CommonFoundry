@@ -4,8 +4,10 @@ use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+#[cfg(test)]
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -83,6 +85,24 @@ pub const MAX_QUEUED_PROOF_VERIFICATIONS: usize = 8;
 /// Local tip submissions have a separate bounded lane so a full remote queue
 /// cannot crowd out a block already found by the wallet, miner, or pool.
 pub const MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS: usize = 2;
+/// Maximum active-plus-waiting remote proof admissions. This is deliberately
+/// smaller than the listener's hard connection bound so honest non-proof P2P
+/// traffic retains headroom while the verifier is saturated.
+pub const MAX_REMOTE_PROOF_ADMISSIONS: usize = 8;
+/// Cooldown memory covers every concurrently live P2P session. Entries are
+/// removed only after their TTL; an unexpired identity is never evicted to
+/// make room for reconnect churn.
+const MAX_REMOTE_PROOF_COOLDOWNS: usize = crate::peer::MAX_CONFIGURED_PEERS;
+/// A remote verifier waiter has its own deadline, independent of worker
+/// startup and request timeouts. Sixty seconds tolerates honest queue bursts
+/// without pinning a session through a slow worker restart.
+pub const REMOTE_PROOF_ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// A session that consumed the verifier with a deterministically invalid proof
+/// cannot immediately take another turn.
+const INVALID_REMOTE_PROOF_COOLDOWN: Duration = Duration::from_secs(30);
+/// A disconnected P2P session is removed from the remote FIFO promptly without
+/// changing the honest-load admission deadline.
+const REMOTE_PROOF_CANCELLATION_POLL: Duration = Duration::from_millis(25);
 pub const MAX_REJECTED_BLOCK_IDS: usize = 1_024;
 pub const MAX_SUCCESSFUL_PROOF_CAPABILITIES: usize = 1_024;
 pub const MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE: usize = 8;
@@ -430,6 +450,14 @@ impl NodeError {
             Self::ProofVerifierWorker(VerifierWorkerError::Process(
                 ProofWorkerError::Timeout { .. },
             )) => ("proof_verifier_timeout", 503, true),
+            Self::ProofVerifierWorker(VerifierWorkerError::DispatchedRequest(error))
+                if matches!(
+                    error.as_ref(),
+                    VerifierWorkerError::Process(ProofWorkerError::Timeout { .. })
+                ) =>
+            {
+                ("proof_verifier_timeout", 503, true)
+            }
             Self::ProofVerifierWorker(VerifierWorkerError::InvalidConfig(_))
             | Self::ProofVerifierWorker(VerifierWorkerError::Process(
                 ProofWorkerError::HashMismatch { .. } | ProofWorkerError::FileRead { .. },
@@ -473,6 +501,8 @@ impl NodeError {
 #[derive(Debug)]
 struct ProofVerificationQueueState {
     active: usize,
+    normal_active: usize,
+    priority_active: usize,
     closing: bool,
     normal_queued: usize,
     priority_queued: usize,
@@ -482,12 +512,37 @@ struct ProofVerificationQueueState {
     next_priority_ticket: u64,
     serving_priority_ticket: u64,
     cancelled_priority_tickets: HashSet<u64>,
+    normal_wait_events: u64,
+    priority_wait_events: u64,
+    normal_rejections: u64,
+    priority_rejections: u64,
+    normal_proof_failures: u64,
+    priority_proof_failures: u64,
 }
 
 #[derive(Clone, Copy)]
 enum ProofQueueClass {
     Normal,
     Priority,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ProofAdmissionClassTelemetry {
+    pub active: usize,
+    pub queued: usize,
+    pub wait_events: u64,
+    /// Admission failures before a verifier request begins, including full,
+    /// duplicate, deadline, cooldown, and shutdown rejections.
+    pub rejections: u64,
+    /// Proof or request-scoped verifier failures after admission. This is
+    /// separate from `rejections` so saturation remains observable.
+    pub proof_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProofQueueTelemetry {
+    normal: ProofAdmissionClassTelemetry,
+    priority: ProofAdmissionClassTelemetry,
 }
 
 #[derive(Debug)]
@@ -497,6 +552,68 @@ struct ProofVerificationQueue {
     max_active: usize,
     max_queued: usize,
     wait_timeout: Duration,
+    #[cfg(test)]
+    deadline_wake_barrier: Mutex<Option<Arc<DeadlineWakeBarrier>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DeadlineWakeBarrier {
+    entered: Barrier,
+    release: Barrier,
+}
+
+#[cfg(test)]
+impl DeadlineWakeBarrier {
+    fn new() -> Self {
+        Self {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitPausePoint {
+    AfterDeadlineCheck,
+    AfterTransition,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CommitRaceBarrier {
+    point: CommitPausePoint,
+    entered: Barrier,
+    release: Barrier,
+}
+
+#[cfg(test)]
+impl CommitRaceBarrier {
+    fn new(point: CommitPausePoint) -> Self {
+        Self {
+            point,
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CompletionFaultBarrier {
+    entered: Barrier,
+    release: Barrier,
+}
+
+#[cfg(test)]
+impl CompletionFaultBarrier {
+    fn new() -> Self {
+        Self {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+        }
+    }
 }
 
 impl ProofVerificationQueue {
@@ -505,6 +622,8 @@ impl ProofVerificationQueue {
         Self {
             state: Mutex::new(ProofVerificationQueueState {
                 active: 0,
+                normal_active: 0,
+                priority_active: 0,
                 closing: false,
                 normal_queued: 0,
                 priority_queued: 0,
@@ -514,16 +633,35 @@ impl ProofVerificationQueue {
                 next_priority_ticket: 0,
                 serving_priority_ticket: 0,
                 cancelled_priority_tickets: HashSet::new(),
+                normal_wait_events: 0,
+                priority_wait_events: 0,
+                normal_rejections: 0,
+                priority_rejections: 0,
+                normal_proof_failures: 0,
+                priority_proof_failures: 0,
             }),
             wake: Condvar::new(),
             max_active,
             max_queued,
             wait_timeout,
+            #[cfg(test)]
+            deadline_wake_barrier: Mutex::new(None),
         }
     }
 
     fn acquire(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
-        self.acquire_class(ProofQueueClass::Normal, Some(self.wait_timeout))
+        self.acquire_class(ProofQueueClass::Normal, Some(self.wait_timeout), None)
+    }
+
+    fn acquire_cancellable(
+        self: &Arc<Self>,
+        request: RemoteProofRequest,
+    ) -> Result<ProofVerificationPermit, NodeError> {
+        self.acquire_class(
+            ProofQueueClass::Normal,
+            Some(self.wait_timeout),
+            Some(request),
+        )
     }
 
     fn acquire_priority(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
@@ -531,31 +669,41 @@ impl ProofVerificationQueue {
         // admitted to the bounded priority lane, wait until it is served or
         // terminal shutdown wakes it instead of discarding it behind a slow
         // remote verification or worker restart.
-        self.acquire_class(ProofQueueClass::Priority, None)
+        self.acquire_class(ProofQueueClass::Priority, None, None)
     }
 
     fn acquire_class(
         self: &Arc<Self>,
         class: ProofQueueClass,
         wait_timeout: Option<Duration>,
+        request: Option<RemoteProofRequest>,
     ) -> Result<ProofVerificationPermit, NodeError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
         if state.closing {
+            record_proof_queue_rejection(&mut state, class);
             return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        if remote_proof_cancelled(request.as_ref()) {
+            record_proof_queue_rejection(&mut state, class);
+            return Err(NodeError::ProofVerificationQueueTimeout);
         }
         if state.active < self.max_active && state.normal_queued == 0 && state.priority_queued == 0
         {
             state.active += 1;
+            record_proof_queue_active(&mut state, class, true);
             return Ok(ProofVerificationPermit {
                 queue: Arc::clone(self),
+                class,
+                proof_failed: false,
             });
         }
         let ticket = match class {
             ProofQueueClass::Normal => {
                 if state.normal_queued >= self.max_queued {
+                    record_proof_queue_rejection(&mut state, class);
                     return Err(NodeError::ProofVerificationQueueFull);
                 }
                 let ticket = state.next_normal_ticket;
@@ -565,6 +713,7 @@ impl ProofVerificationQueue {
             }
             ProofQueueClass::Priority => {
                 if state.priority_queued >= MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS {
+                    record_proof_queue_rejection(&mut state, class);
                     return Err(NodeError::ProofVerificationQueueFull);
                 }
                 let ticket = state.next_priority_ticket;
@@ -573,7 +722,8 @@ impl ProofVerificationQueue {
                 ticket
             }
         };
-        let waiting = |state: &mut ProofVerificationQueueState| {
+        record_proof_queue_wait(&mut state, class);
+        let waiting = |state: &ProofVerificationQueueState| {
             !state.closing
                 && (state.active >= self.max_active
                     || match class {
@@ -583,41 +733,93 @@ impl ProofVerificationQueue {
                         ProofQueueClass::Priority => state.serving_priority_ticket != ticket,
                     })
         };
-        let (mut state, timed_out) = if let Some(wait_timeout) = wait_timeout {
-            let (state, wait_result) = self
-                .wake
-                .wait_timeout_while(state, wait_timeout, waiting)
-                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
-            (state, wait_result.timed_out())
-        } else {
-            let state = self
-                .wake
-                .wait_while(state, waiting)
-                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
-            (state, false)
+        let timeout_deadline = match wait_timeout {
+            Some(timeout) => match checked_queue_deadline(Instant::now(), timeout) {
+                Ok(deadline) => Some(deadline),
+                Err(error) => {
+                    cancel_proof_ticket(&mut state, class, ticket);
+                    record_proof_queue_rejection(&mut state, class);
+                    self.wake.notify_all();
+                    return Err(error);
+                }
+            },
+            None => None,
         };
-        if state.closing {
-            cancel_proof_ticket(&mut state, class, ticket);
-            return Err(NodeError::ProofVerifierShuttingDown);
-        }
-        if timed_out
-            && (state.active >= self.max_active
-                || match class {
-                    ProofQueueClass::Normal => {
-                        state.priority_queued != 0 || state.serving_normal_ticket != ticket
-                    }
-                    ProofQueueClass::Priority => state.serving_priority_ticket != ticket,
-                })
-        {
-            cancel_proof_ticket(&mut state, class, ticket);
-            self.wake.notify_all();
-            return Err(NodeError::ProofVerificationQueueTimeout);
+        let deadline = match (timeout_deadline, request.as_ref()) {
+            (Some(timeout), Some(request)) => Some(timeout.min(request.deadline())),
+            (Some(timeout), None) => Some(timeout),
+            (None, Some(request)) => Some(request.deadline()),
+            (None, None) => None,
+        };
+        loop {
+            if state.closing {
+                cancel_proof_ticket(&mut state, class, ticket);
+                record_proof_queue_rejection(&mut state, class);
+                self.wake.notify_all();
+                return Err(NodeError::ProofVerifierShuttingDown);
+            }
+            if remote_proof_cancelled(request.as_ref()) {
+                cancel_proof_ticket(&mut state, class, ticket);
+                record_proof_queue_rejection(&mut state, class);
+                self.wake.notify_all();
+                return Err(NodeError::ProofVerificationQueueTimeout);
+            }
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    cancel_proof_ticket(&mut state, class, ticket);
+                    record_proof_queue_rejection(&mut state, class);
+                    self.wake.notify_all();
+                    return Err(NodeError::ProofVerificationQueueTimeout);
+                }
+            }
+            if !waiting(&state) {
+                break;
+            }
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let poll = if request.is_some() {
+                    remaining.min(REMOTE_PROOF_CANCELLATION_POLL)
+                } else {
+                    remaining
+                };
+                let (next_state, _) = self
+                    .wake
+                    .wait_timeout_while(state, poll, |state| {
+                        waiting(state) && !remote_proof_cancelled(request.as_ref())
+                    })
+                    .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+                state = next_state;
+                #[cfg(test)]
+                if let Some(barrier) = self
+                    .deadline_wake_barrier
+                    .lock()
+                    .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?
+                    .take()
+                {
+                    drop(state);
+                    barrier.entered.wait();
+                    barrier.release.wait();
+                    state = self
+                        .state
+                        .lock()
+                        .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+                }
+            } else {
+                state = self
+                    .wake
+                    .wait_while(state, |state| waiting(state))
+                    .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+            }
         }
         serve_proof_ticket(&mut state, class);
         state.active += 1;
+        record_proof_queue_active(&mut state, class, true);
         self.wake.notify_all();
         Ok(ProofVerificationPermit {
             queue: Arc::clone(self),
+            class,
+            proof_failed: false,
         })
     }
 
@@ -629,6 +831,28 @@ impl ProofVerificationQueue {
                     state.active,
                     state.normal_queued.saturating_add(state.priority_queued),
                 )
+            })
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)
+    }
+
+    fn telemetry(&self) -> Result<ProofQueueTelemetry, NodeError> {
+        self.state
+            .lock()
+            .map(|state| ProofQueueTelemetry {
+                normal: ProofAdmissionClassTelemetry {
+                    active: state.normal_active,
+                    queued: state.normal_queued,
+                    wait_events: state.normal_wait_events,
+                    rejections: state.normal_rejections,
+                    proof_failures: state.normal_proof_failures,
+                },
+                priority: ProofAdmissionClassTelemetry {
+                    active: state.priority_active,
+                    queued: state.priority_queued,
+                    wait_events: state.priority_wait_events,
+                    rejections: state.priority_rejections,
+                    proof_failures: state.priority_proof_failures,
+                },
             })
             .map_err(|_| NodeError::ProofVerificationQueuePoisoned)
     }
@@ -653,6 +877,38 @@ impl ProofVerificationQueue {
             Ok(())
         }
     }
+}
+
+fn record_proof_queue_active(
+    state: &mut ProofVerificationQueueState,
+    class: ProofQueueClass,
+    acquired: bool,
+) {
+    let active = match class {
+        ProofQueueClass::Normal => &mut state.normal_active,
+        ProofQueueClass::Priority => &mut state.priority_active,
+    };
+    if acquired {
+        *active = active.saturating_add(1);
+    } else {
+        *active = active.saturating_sub(1);
+    }
+}
+
+fn record_proof_queue_wait(state: &mut ProofVerificationQueueState, class: ProofQueueClass) {
+    let waits = match class {
+        ProofQueueClass::Normal => &mut state.normal_wait_events,
+        ProofQueueClass::Priority => &mut state.priority_wait_events,
+    };
+    *waits = waits.saturating_add(1);
+}
+
+fn record_proof_queue_rejection(state: &mut ProofVerificationQueueState, class: ProofQueueClass) {
+    let rejections = match class {
+        ProofQueueClass::Normal => &mut state.normal_rejections,
+        ProofQueueClass::Priority => &mut state.priority_rejections,
+    };
+    *rejections = rejections.saturating_add(1);
 }
 
 fn cancel_proof_ticket(
@@ -711,14 +967,544 @@ fn serve_proof_ticket(state: &mut ProofVerificationQueueState, class: ProofQueue
 
 struct ProofVerificationPermit {
     queue: Arc<ProofVerificationQueue>,
+    class: ProofQueueClass,
+    proof_failed: bool,
+}
+
+impl ProofVerificationPermit {
+    fn mark_proof_failure(&mut self) {
+        self.proof_failed = true;
+    }
 }
 
 impl Drop for ProofVerificationPermit {
     fn drop(&mut self) {
         if let Ok(mut state) = self.queue.state.lock() {
             state.active = state.active.saturating_sub(1);
+            record_proof_queue_active(&mut state, self.class, false);
+            if self.proof_failed {
+                let failures = match self.class {
+                    ProofQueueClass::Normal => &mut state.normal_proof_failures,
+                    ProofQueueClass::Priority => &mut state.priority_proof_failures,
+                };
+                *failures = failures.saturating_add(1);
+            }
             self.queue.wake.notify_all();
         }
+    }
+}
+
+/// Process-local P2P session identity assigned by the receiving node. It is
+/// never supplied by the peer and does not change the wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RemoteProofPeerId(u64);
+
+impl RemoteProofPeerId {
+    pub(crate) fn new(value: u64) -> Option<Self> {
+        (value != 0).then_some(Self(value))
+    }
+}
+
+/// Linearized lifetime for one inbound proof-bearing block request. The
+/// deadline is server-owned; a disconnect/deadline cancellation and the
+/// durable append race through the same atomic transition. A provisional
+/// `Committing` reservation is rechecked against the deadline; once that
+/// recheck succeeds, durability either completes or the node latches a
+/// storage fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RemoteProofRequestState {
+    Active = 0,
+    Cancelled = 1,
+    Committing = 2,
+    Completed = 3,
+    Faulted = 4,
+}
+
+impl RemoteProofRequestState {
+    fn load(value: u8) -> Self {
+        match value {
+            0 => Self::Active,
+            1 => Self::Cancelled,
+            2 => Self::Committing,
+            3 => Self::Completed,
+            _ => Self::Faulted,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RemoteProofRequestInner {
+    state: AtomicU8,
+    deadline: Instant,
+}
+
+/// Server-owned lifetime for one inbound proof-bearing block request. The
+/// peer cannot extend the deadline and disconnect observation can only shorten
+/// it by winning `Active -> Cancelled` before the commit reservation wins.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteProofRequest {
+    inner: Arc<RemoteProofRequestInner>,
+}
+
+impl RemoteProofRequest {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            inner: Arc::new(RemoteProofRequestInner {
+                state: AtomicU8::new(RemoteProofRequestState::Active as u8),
+                deadline,
+            }),
+        }
+    }
+
+    fn state(&self) -> RemoteProofRequestState {
+        RemoteProofRequestState::load(self.inner.state.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        self.inner
+            .state
+            .compare_exchange(
+                RemoteProofRequestState::Active as u8,
+                RemoteProofRequestState::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel_if_expired(&self) {
+        if Instant::now() >= self.inner.deadline {
+            self.cancel();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel_if_expired();
+        self.state() == RemoteProofRequestState::Cancelled
+    }
+
+    fn ensure_live(&self) -> Result<(), NodeError> {
+        self.cancel_if_expired();
+        if self.state() == RemoteProofRequestState::Active {
+            Ok(())
+        } else {
+            Err(NodeError::ProofVerificationQueueTimeout)
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, NodeError> {
+        self.ensure_live()?;
+        self.inner
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                self.cancel();
+                NodeError::ProofVerificationQueueTimeout
+            })
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.inner.deadline
+    }
+
+    fn begin_commit_after_check<F>(
+        &self,
+        after_deadline_check: F,
+    ) -> Result<RemoteProofCommitGuard, NodeError>
+    where
+        F: FnOnce(),
+    {
+        // Check before the atomic transition, then check again after it. The
+        // second check closes the preemption window between the first clock
+        // read and CAS: an already-expired request gives up its owned
+        // Committing state before any append begins.
+        if Instant::now() >= self.inner.deadline {
+            self.cancel();
+            return Err(NodeError::ProofVerificationQueueTimeout);
+        }
+        after_deadline_check();
+        self.inner
+            .state
+            .compare_exchange(
+                RemoteProofRequestState::Active as u8,
+                RemoteProofRequestState::Committing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|state| match RemoteProofRequestState::load(state) {
+                RemoteProofRequestState::Cancelled => NodeError::ProofVerificationQueueTimeout,
+                _ => NodeError::ProofVerificationQueuePoisoned,
+            })?;
+        if Instant::now() >= self.inner.deadline {
+            self.inner
+                .state
+                .compare_exchange(
+                    RemoteProofRequestState::Committing as u8,
+                    RemoteProofRequestState::Cancelled as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+            return Err(NodeError::ProofVerificationQueueTimeout);
+        }
+        Ok(RemoteProofCommitGuard {
+            inner: Arc::clone(&self.inner),
+            finished: false,
+        })
+    }
+}
+
+struct RemoteProofCommitGuard {
+    inner: Arc<RemoteProofRequestInner>,
+    finished: bool,
+}
+
+impl RemoteProofCommitGuard {
+    fn finish(mut self, state: RemoteProofRequestState) {
+        debug_assert!(matches!(
+            state,
+            RemoteProofRequestState::Completed | RemoteProofRequestState::Faulted
+        ));
+        let _ = self.inner.state.compare_exchange(
+            RemoteProofRequestState::Committing as u8,
+            state as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.finished = true;
+    }
+}
+
+impl Drop for RemoteProofCommitGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.inner.state.compare_exchange(
+                RemoteProofRequestState::Committing as u8,
+                RemoteProofRequestState::Faulted as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RemoteProofAdmissionState {
+    active: Option<RemoteProofPeerId>,
+    closing: bool,
+    waiting: VecDeque<RemoteProofPeerId>,
+    waiting_set: HashSet<RemoteProofPeerId>,
+    cooldowns: HashMap<RemoteProofPeerId, Instant>,
+    cooldown_order: VecDeque<RemoteProofPeerId>,
+    cooldown_saturated_until: Option<Instant>,
+    wait_events: u64,
+    rejections: u64,
+    proof_failures: u64,
+}
+
+#[derive(Debug)]
+struct RemoteProofAdmissionQueue {
+    state: Mutex<RemoteProofAdmissionState>,
+    wake: Condvar,
+    max_in_flight: usize,
+    wait_timeout: Duration,
+    invalid_cooldown: Duration,
+    #[cfg(test)]
+    deadline_wake_barrier: Mutex<Option<Arc<DeadlineWakeBarrier>>>,
+}
+
+impl RemoteProofAdmissionQueue {
+    fn new(max_in_flight: usize, wait_timeout: Duration, invalid_cooldown: Duration) -> Self {
+        assert!(max_in_flight > 0, "remote proof admission needs capacity");
+        assert!(
+            max_in_flight <= MAX_REMOTE_PROOF_ADMISSIONS,
+            "remote proof admission exceeds its hard capacity"
+        );
+        assert!(
+            !wait_timeout.is_zero(),
+            "remote proof admission needs a wait deadline"
+        );
+        Self {
+            state: Mutex::new(RemoteProofAdmissionState {
+                active: None,
+                closing: false,
+                waiting: VecDeque::new(),
+                waiting_set: HashSet::new(),
+                cooldowns: HashMap::new(),
+                cooldown_order: VecDeque::new(),
+                cooldown_saturated_until: None,
+                wait_events: 0,
+                rejections: 0,
+                proof_failures: 0,
+            }),
+            wake: Condvar::new(),
+            max_in_flight,
+            wait_timeout,
+            invalid_cooldown,
+            #[cfg(test)]
+            deadline_wake_barrier: Mutex::new(None),
+        }
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        peer: RemoteProofPeerId,
+    ) -> Result<RemoteProofAdmissionPermit, NodeError> {
+        self.acquire_with_cancellation(peer, None)
+    }
+
+    fn acquire_cancellable(
+        self: &Arc<Self>,
+        peer: RemoteProofPeerId,
+        request: RemoteProofRequest,
+    ) -> Result<RemoteProofAdmissionPermit, NodeError> {
+        self.acquire_with_cancellation(peer, Some(request))
+    }
+
+    fn acquire_with_cancellation(
+        self: &Arc<Self>,
+        peer: RemoteProofPeerId,
+        request: Option<RemoteProofRequest>,
+    ) -> Result<RemoteProofAdmissionPermit, NodeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        let now = Instant::now();
+        prune_remote_proof_cooldowns(&mut state, now);
+        if state.closing {
+            state.rejections = state.rejections.saturating_add(1);
+            return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        if remote_proof_cancelled(request.as_ref()) {
+            state.rejections = state.rejections.saturating_add(1);
+            return Err(NodeError::ProofVerificationQueueTimeout);
+        }
+        let in_flight = state.waiting.len() + usize::from(state.active.is_some());
+        if state
+            .cooldown_saturated_until
+            .is_some_and(|deadline| deadline > now)
+            || state.cooldowns.contains_key(&peer)
+            || state.active == Some(peer)
+            || state.waiting_set.contains(&peer)
+            || in_flight >= self.max_in_flight
+        {
+            state.rejections = state.rejections.saturating_add(1);
+            return Err(NodeError::ProofVerificationQueueFull);
+        }
+        if state.active.is_none() && state.waiting.is_empty() {
+            state.active = Some(peer);
+            return Ok(RemoteProofAdmissionPermit {
+                queue: Arc::clone(self),
+                peer,
+                proof_failed: false,
+                request,
+            });
+        }
+
+        state.waiting.push_back(peer);
+        state.waiting_set.insert(peer);
+        state.wait_events = state.wait_events.saturating_add(1);
+        // A waiter's own deadline is independent of worker startup/request
+        // containment. The cooldown is deliberately session-local: a
+        // reconnect receives a new identity, but it joins at the FIFO tail and
+        // therefore cannot overtake an already admitted valid session.
+        let queue_deadline = match checked_queue_deadline(Instant::now(), self.wait_timeout) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                remove_remote_proof_waiter(&mut state, peer);
+                state.rejections = state.rejections.saturating_add(1);
+                self.wake.notify_all();
+                return Err(error);
+            }
+        };
+        let deadline = request.as_ref().map_or(queue_deadline, |request| {
+            queue_deadline.min(request.deadline())
+        });
+        loop {
+            if state.closing {
+                remove_remote_proof_waiter(&mut state, peer);
+                state.rejections = state.rejections.saturating_add(1);
+                self.wake.notify_all();
+                return Err(NodeError::ProofVerifierShuttingDown);
+            }
+            if remote_proof_cancelled(request.as_ref()) {
+                remove_remote_proof_waiter(&mut state, peer);
+                state.rejections = state.rejections.saturating_add(1);
+                self.wake.notify_all();
+                return Err(NodeError::ProofVerificationQueueTimeout);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                remove_remote_proof_waiter(&mut state, peer);
+                state.rejections = state.rejections.saturating_add(1);
+                self.wake.notify_all();
+                return Err(NodeError::ProofVerificationQueueTimeout);
+            }
+            if !remote_proof_waiting(&state, peer) {
+                break;
+            }
+            let poll = remaining.min(REMOTE_PROOF_CANCELLATION_POLL);
+            let (next_state, _) = self
+                .wake
+                .wait_timeout_while(state, poll, |state| {
+                    remote_proof_waiting(state, peer) && !remote_proof_cancelled(request.as_ref())
+                })
+                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+            state = next_state;
+            #[cfg(test)]
+            if let Some(barrier) = self
+                .deadline_wake_barrier
+                .lock()
+                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?
+                .take()
+            {
+                drop(state);
+                barrier.entered.wait();
+                barrier.release.wait();
+                state = self
+                    .state
+                    .lock()
+                    .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+            }
+        }
+        let next = state.waiting.pop_front();
+        if next != Some(peer) || !state.waiting_set.remove(&peer) || state.active.is_some() {
+            state.rejections = state.rejections.saturating_add(1);
+            state.closing = true;
+            self.wake.notify_all();
+            return Err(NodeError::ProofVerificationQueuePoisoned);
+        }
+        state.active = Some(peer);
+        Ok(RemoteProofAdmissionPermit {
+            queue: Arc::clone(self),
+            peer,
+            proof_failed: false,
+            request,
+        })
+    }
+
+    fn telemetry(&self) -> Result<ProofAdmissionClassTelemetry, NodeError> {
+        self.state
+            .lock()
+            .map(|state| ProofAdmissionClassTelemetry {
+                active: usize::from(state.active.is_some()),
+                queued: state.waiting.len(),
+                wait_events: state.wait_events,
+                rejections: state.rejections,
+                proof_failures: state.proof_failures,
+            })
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)
+    }
+
+    fn close(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closing = true;
+        self.wake.notify_all();
+    }
+}
+
+fn prune_remote_proof_cooldowns(state: &mut RemoteProofAdmissionState, now: Instant) {
+    if state
+        .cooldown_saturated_until
+        .is_some_and(|deadline| deadline <= now)
+    {
+        state.cooldown_saturated_until = None;
+    }
+    while let Some(peer) = state.cooldown_order.front().copied() {
+        let expired = state
+            .cooldowns
+            .get(&peer)
+            .is_none_or(|deadline| *deadline <= now);
+        if !expired {
+            break;
+        }
+        state.cooldown_order.pop_front();
+        state.cooldowns.remove(&peer);
+    }
+}
+
+fn remove_remote_proof_waiter(state: &mut RemoteProofAdmissionState, peer: RemoteProofPeerId) {
+    state.waiting.retain(|candidate| *candidate != peer);
+    state.waiting_set.remove(&peer);
+}
+
+fn remote_proof_waiting(state: &RemoteProofAdmissionState, peer: RemoteProofPeerId) -> bool {
+    !state.closing && (state.active.is_some() || state.waiting.front() != Some(&peer))
+}
+
+fn remote_proof_cancelled(request: Option<&RemoteProofRequest>) -> bool {
+    request.is_some_and(RemoteProofRequest::is_cancelled)
+}
+
+fn checked_queue_deadline(start: Instant, duration: Duration) -> Result<Instant, NodeError> {
+    start
+        .checked_add(duration)
+        .ok_or(NodeError::ProofVerificationQueueTimeout)
+}
+
+struct RemoteProofAdmissionPermit {
+    queue: Arc<RemoteProofAdmissionQueue>,
+    peer: RemoteProofPeerId,
+    proof_failed: bool,
+    request: Option<RemoteProofRequest>,
+}
+
+impl RemoteProofAdmissionPermit {
+    fn mark_proof_failure(&mut self) {
+        self.proof_failed = true;
+    }
+
+    fn is_cancelled(&self) -> bool {
+        remote_proof_cancelled(self.request.as_ref())
+    }
+}
+
+impl Drop for RemoteProofAdmissionPermit {
+    fn drop(&mut self) {
+        let mut state = match self.queue.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.active == Some(self.peer) {
+            state.active = None;
+            if self.proof_failed {
+                state.proof_failures = state.proof_failures.saturating_add(1);
+                prune_remote_proof_cooldowns(&mut state, Instant::now());
+                state.cooldowns.remove(&self.peer);
+                state.cooldown_order.retain(|peer| *peer != self.peer);
+                let now = Instant::now();
+                let Some(cooldown_deadline) = now.checked_add(self.queue.invalid_cooldown) else {
+                    // Configuration overflow is impossible with the fixed
+                    // production value, but fail closed as retryable Busy
+                    // instead of panicking if a future configuration violates
+                    // that invariant.
+                    state.closing = true;
+                    self.queue.wake.notify_all();
+                    return;
+                };
+                if state.cooldowns.len() >= MAX_REMOTE_PROOF_COOLDOWNS {
+                    // Every unexpired identity remains binding. Exhausting the
+                    // live-session-sized TTL table rejects all remote proof
+                    // admissions for one full cooldown instead of silently
+                    // letting any untracked failing session retry. The queue
+                    // automatically reopens; lifecycle shutdown remains a
+                    // separate terminal state.
+                    state.cooldown_saturated_until = Some(cooldown_deadline);
+                } else {
+                    state.cooldowns.insert(self.peer, cooldown_deadline);
+                    state.cooldown_order.push_back(self.peer);
+                }
+            }
+        } else {
+            state.closing = true;
+        }
+        self.queue.wake.notify_all();
     }
 }
 
@@ -727,26 +1513,45 @@ impl Drop for ProofVerificationPermit {
 /// queued candidates cannot all verify against one stale revision.
 struct BlockPreverificationPermit {
     preverifier: BlockPreverifier,
-    _queue_permit: ProofVerificationPermit,
+    queue_permit: ProofVerificationPermit,
 }
 
 impl BlockPreverificationPermit {
     fn preverify(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
-        validate_block_resources(block)?;
-        encode_block(block)?;
-        self.run_guarded(|| self.preverifier.preverify_unqueued(block))
+        self.preverify_with_request(block, None)
     }
 
-    fn preverify_cached(
+    fn preverify_with_request(
+        &self,
+        block: &Block,
+        request: Option<&RemoteProofRequest>,
+    ) -> Result<PreverifiedBlockProof, NodeError> {
+        validate_block_resources(block)?;
+        encode_block(block)?;
+        if let Some(request) = request {
+            request.ensure_live()?;
+        }
+        let result = self.run_guarded(|| self.preverifier.preverify_unqueued(block, request));
+        if let Some(request) = request {
+            request.ensure_live()?;
+        }
+        result
+    }
+
+    fn preverify_cached_with_request(
         &self,
         block: &Block,
         cache_key: [u8; 32],
+        request: Option<&RemoteProofRequest>,
     ) -> Result<PreverifiedBlockProof, NodeError> {
+        if let Some(request) = request {
+            request.ensure_live()?;
+        }
         if let Some(preverified) = self.preverifier.cached_preverification(cache_key)? {
             return Ok(preverified);
         }
         let generation = self.preverifier.backend_generation.load(Ordering::Acquire);
-        let preverified = self.preverify(block)?;
+        let preverified = self.preverify_with_request(block, request)?;
         self.preverifier
             .remember_preverification(cache_key, generation, preverified.clone())?;
         Ok(preverified)
@@ -761,6 +1566,10 @@ impl BlockPreverificationPermit {
             Err(_) => Err(NodeError::ProofVerifierPanicked),
         }
     }
+
+    fn mark_proof_failure(&mut self) {
+        self.queue_permit.mark_proof_failure();
+    }
 }
 
 /// Cloneable, immutable admission handle for proof verification outside the
@@ -769,10 +1578,15 @@ impl BlockPreverificationPermit {
 pub struct BlockPreverifier {
     verifier: ConsensusPowVerifier,
     queue: Arc<ProofVerificationQueue>,
+    remote_admission: Arc<RemoteProofAdmissionQueue>,
     reconstruction_queue: Arc<ProofVerificationQueue>,
     backend: Arc<RwLock<ProofVerificationBackend>>,
     backend_generation: Arc<AtomicU64>,
     successful_proofs: Arc<Mutex<SuccessfulProofCache>>,
+    #[cfg(test)]
+    worker_dispatches: Arc<AtomicU64>,
+    #[cfg(test)]
+    proof_dispatch_delay: Arc<Mutex<Option<Duration>>>,
 }
 
 #[derive(Debug, Default)]
@@ -851,10 +1665,19 @@ impl BlockPreverifier {
                 max_queued,
                 wait_timeout,
             )),
+            remote_admission: Arc::new(RemoteProofAdmissionQueue::new(
+                MAX_REMOTE_PROOF_ADMISSIONS,
+                REMOTE_PROOF_ADMISSION_WAIT_TIMEOUT,
+                INVALID_REMOTE_PROOF_COOLDOWN,
+            )),
             reconstruction_queue: Arc::new(ProofVerificationQueue::new(1, 2, wait_timeout)),
             backend: Arc::new(RwLock::new(backend)),
             backend_generation: Arc::new(AtomicU64::new(0)),
             successful_proofs: Arc::new(Mutex::new(SuccessfulProofCache::default())),
+            #[cfg(test)]
+            worker_dispatches: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            proof_dispatch_delay: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -912,15 +1735,40 @@ impl BlockPreverifier {
     fn reserve(&self) -> Result<BlockPreverificationPermit, NodeError> {
         Ok(BlockPreverificationPermit {
             preverifier: self.clone(),
-            _queue_permit: self.queue.acquire()?,
+            queue_permit: self.queue.acquire()?,
+        })
+    }
+
+    fn reserve_cancellable(
+        &self,
+        request: RemoteProofRequest,
+    ) -> Result<BlockPreverificationPermit, NodeError> {
+        Ok(BlockPreverificationPermit {
+            preverifier: self.clone(),
+            queue_permit: self.queue.acquire_cancellable(request)?,
         })
     }
 
     fn reserve_priority(&self) -> Result<BlockPreverificationPermit, NodeError> {
         Ok(BlockPreverificationPermit {
             preverifier: self.clone(),
-            _queue_permit: self.queue.acquire_priority()?,
+            queue_permit: self.queue.acquire_priority()?,
         })
+    }
+
+    fn reserve_remote(
+        &self,
+        peer: RemoteProofPeerId,
+    ) -> Result<RemoteProofAdmissionPermit, NodeError> {
+        self.remote_admission.acquire(peer)
+    }
+
+    fn reserve_remote_cancellable(
+        &self,
+        peer: RemoteProofPeerId,
+        request: RemoteProofRequest,
+    ) -> Result<RemoteProofAdmissionPermit, NodeError> {
+        self.remote_admission.acquire_cancellable(peer, request)
     }
 
     fn reserve_reconstruction(&self) -> Result<ProofVerificationPermit, NodeError> {
@@ -931,7 +1779,21 @@ impl BlockPreverifier {
         self.reconstruction_queue.ensure_open()
     }
 
-    fn preverify_unqueued(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
+    fn preverify_unqueued(
+        &self,
+        block: &Block,
+        request: Option<&RemoteProofRequest>,
+    ) -> Result<PreverifiedBlockProof, NodeError> {
+        #[cfg(test)]
+        self.worker_dispatches.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(delay) = *self
+            .proof_dispatch_delay
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?
+        {
+            std::thread::sleep(delay);
+        }
         let backend = self
             .backend
             .read()
@@ -944,10 +1806,18 @@ impl BlockPreverifier {
                 .verifier
                 .preverify(&block.challenge, &block.proof)
                 .map_err(NodeError::from),
-            ProofVerificationBackend::External(worker) => {
-                worker.verify_block(block).map_err(NodeError::from)
-            }
+            ProofVerificationBackend::External(worker) => match request {
+                Some(request) => worker
+                    .verify_block_with_timeout(block, request.remaining()?)
+                    .map_err(NodeError::from),
+                None => worker.verify_block(block).map_err(NodeError::from),
+            },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_proof_dispatch_delay(&self, delay: Option<Duration>) {
+        *self.proof_dispatch_delay.lock().unwrap() = delay;
     }
 
     fn cached_preverification(
@@ -1038,7 +1908,21 @@ impl BlockPreverifier {
         })
     }
 
+    fn backend_teardown_failures(&self) -> Result<Option<u64>, NodeError> {
+        let backend = self
+            .backend
+            .read()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+        Ok(match &*backend {
+            ProofVerificationBackend::External(worker) => Some(worker.teardown_failures()),
+            ProofVerificationBackend::Unavailable
+            | ProofVerificationBackend::InProcess
+            | ProofVerificationBackend::Stopped => None,
+        })
+    }
+
     fn shutdown(&self) {
+        self.remote_admission.close();
         self.queue.close();
         self.reconstruction_queue.close();
         let worker = match self.backend.write() {
@@ -1098,11 +1982,21 @@ pub struct NodeStatus {
     pub mempool_bytes: usize,
     pub proof_verification_active: usize,
     pub proof_verification_queued: usize,
+    pub proof_verification_normal_admission: ProofAdmissionClassTelemetry,
+    pub proof_verification_priority_admission: ProofAdmissionClassTelemetry,
+    pub proof_verification_remote_admission: ProofAdmissionClassTelemetry,
+    /// Hard bound across active plus waiting remote proof sessions.
+    pub proof_verification_remote_admission_capacity: usize,
+    /// Independent deadline for one admitted remote session waiting its turn.
+    pub proof_verification_remote_admission_wait_timeout_ms: u64,
     pub proof_verification_capacity: usize,
     pub proof_verification_queue_capacity: usize,
     pub proof_verification_mode: &'static str,
     pub proof_verification_timeout_ms: Option<u64>,
     pub proof_verification_memory_limit_bytes: Option<u64>,
+    /// Failed cleanup attempts recorded without replacing the classified
+    /// verifier request error that triggered containment.
+    pub proof_verification_teardown_failures: Option<u64>,
     pub storage_healthy: bool,
     pub public_peer_mode: bool,
     pub peers: Vec<PeerObservation>,
@@ -2227,6 +3121,10 @@ pub struct Node {
     rejected_body_order: VecDeque<[u8; 32]>,
     public_peer_mode: bool,
     peer_observations: BTreeMap<PeerObservationKey, PeerObservationRecord>,
+    #[cfg(test)]
+    commit_race_barrier: Option<Arc<CommitRaceBarrier>>,
+    #[cfg(test)]
+    completion_fault_barrier: Option<Arc<CompletionFaultBarrier>>,
     _lock: DataDirLock,
 }
 
@@ -2570,6 +3468,8 @@ pub(crate) struct ExternalBlockAdmissionWork {
     verifier: ConsensusPowVerifier,
     block_preverifier: BlockPreverifier,
     state_snapshot: AdmissionStateSnapshot,
+    #[cfg(test)]
+    completion_fault_barrier: Option<Arc<CompletionFaultBarrier>>,
 }
 
 /// Completed admission state. This is not proof evidence: it only carries the
@@ -2617,12 +3517,20 @@ impl ExternalBlockAdmissionWork {
             AdmissionStateSnapshot::Branch(plan) => {
                 let target_parent = plan.target_parent;
                 let reaches_target = plan.reaches_target;
-                let (state, path) = complete_branch_state_plan(
+                let replay = complete_branch_state_plan(
                     self.params,
                     &self.verifier,
                     &self.block_preverifier,
                     plan,
-                )?;
+                );
+                #[cfg(test)]
+                if replay.as_ref().is_err_and(is_authenticated_storage_failure)
+                    && let Some(barrier) = &self.completion_fault_barrier
+                {
+                    barrier.entered.wait();
+                    barrier.release.wait();
+                }
+                let (state, path) = replay?;
                 if !reaches_target {
                     let block_id = state.tip();
                     return Ok(ExternalBlockAdmissionProgress::Checkpoint {
@@ -2707,7 +3615,7 @@ fn complete_branch_state_plan(
         // This reconstruction path exists only for externally admitted
         // ProductionV3 side branches. Never recover proof authority from the
         // index: freshly preverify the exact locator-backed block each time.
-        let preverified = match block_preverifier.preverify_unqueued(&block) {
+        let preverified = match block_preverifier.preverify_unqueued(&block, None) {
             Ok(preverified) => preverified,
             Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(error))) => {
                 return Err(NodeError::CorruptLog(format!(
@@ -3004,6 +3912,10 @@ impl Node {
             rejected_body_order: VecDeque::new(),
             public_peer_mode: false,
             peer_observations: BTreeMap::new(),
+            #[cfg(test)]
+            commit_race_barrier: None,
+            #[cfg(test)]
+            completion_fault_barrier: None,
             _lock: lock,
         })
     }
@@ -3020,6 +3932,18 @@ impl Node {
             self.storage_faulted = true;
         }
         result
+    }
+
+    #[cfg(test)]
+    fn pause_commit_race(&self, point: CommitPausePoint) {
+        if let Some(barrier) = self
+            .commit_race_barrier
+            .as_ref()
+            .filter(|barrier| barrier.point == point)
+        {
+            barrier.entered.wait();
+            barrier.release.wait();
+        }
     }
 
     fn latch_external_completion_failure(
@@ -3111,11 +4035,16 @@ impl Node {
     pub fn status(&self) -> Result<NodeStatus, NodeError> {
         let (proof_verification_active, proof_verification_queued) =
             self.block_preverifier.queue.counts()?;
+        let proof_queue_telemetry = self.block_preverifier.queue.telemetry()?;
+        let proof_verification_remote_admission =
+            self.block_preverifier.remote_admission.telemetry()?;
         let (
             proof_verification_mode,
             proof_verification_timeout_ms,
             proof_verification_memory_limit_bytes,
         ) = self.block_preverifier.backend_status()?;
+        let proof_verification_teardown_failures =
+            self.block_preverifier.backend_teardown_failures()?;
         Ok(NodeStatus {
             network: self.profile.name,
             network_short_name: self.profile.short_name(),
@@ -3142,6 +4071,20 @@ impl Node {
             mempool_bytes: self.mempool_bytes,
             proof_verification_active,
             proof_verification_queued,
+            proof_verification_normal_admission: proof_queue_telemetry.normal,
+            proof_verification_priority_admission: proof_queue_telemetry.priority,
+            proof_verification_remote_admission,
+            proof_verification_remote_admission_capacity: self
+                .block_preverifier
+                .remote_admission
+                .max_in_flight,
+            proof_verification_remote_admission_wait_timeout_ms: self
+                .block_preverifier
+                .remote_admission
+                .wait_timeout
+                .as_millis()
+                .min(u128::from(u64::MAX))
+                as u64,
             proof_verification_capacity: self.block_preverifier.queue.max_active,
             proof_verification_queue_capacity: self
                 .block_preverifier
@@ -3151,6 +4094,7 @@ impl Node {
             proof_verification_mode,
             proof_verification_timeout_ms,
             proof_verification_memory_limit_bytes,
+            proof_verification_teardown_failures,
             storage_healthy: !self.storage_faulted,
             public_peer_mode: self.public_peer_mode,
             peers: self.peer_observations(),
@@ -4116,7 +5060,7 @@ impl Node {
             // ProductionV3 callers must use `submit_shared_block`.
             return Err(NodeError::ProductionV3Unavailable);
         }
-        self.submit_block_with_preverification(block, accepted_at, None, None, None)
+        self.submit_block_with_preverification(block, accepted_at, None, None, None, None)
     }
 
     /// Rejects cheap duplicate, ancestry, and successor-header failures before
@@ -4175,6 +5119,11 @@ impl Node {
                     .preflight_block(block, validation_context)?;
             }
         }
+        // This verifier-owned path is also the first step of authoritative
+        // proof verification. In particular, a committed work digest above
+        // the independently derived block target never consumes queue or
+        // external-worker capacity.
+        self.verifier.preflight(&block.challenge, &block.proof)?;
         Ok(())
     }
 
@@ -4238,6 +5187,8 @@ impl Node {
             verifier: self.verifier.clone(),
             block_preverifier: self.block_preverifier.clone(),
             state_snapshot,
+            #[cfg(test)]
+            completion_fault_barrier: self.completion_fault_barrier.clone(),
         }))
     }
 
@@ -4260,6 +5211,7 @@ impl Node {
     /// Consumes process-local proof evidence produced outside the node lock.
     /// Every state-dependent consensus and durability check remains identical
     /// to [`Self::submit_block`].
+    #[cfg(test)]
     pub(crate) fn submit_preverified_block(
         &mut self,
         block: Block,
@@ -4269,9 +5221,37 @@ impl Node {
         if matches!(self.profile.proof, ProofProfile::ProductionV3) {
             return Err(NodeError::ProductionV3Unavailable);
         }
-        self.submit_block_with_preverification(block, accepted_at, Some(&preverified), None, None)
+        self.submit_block_with_preverification(
+            block,
+            accepted_at,
+            Some(&preverified),
+            None,
+            None,
+            None,
+        )
     }
 
+    fn submit_preverified_block_guarded(
+        &mut self,
+        block: Block,
+        accepted_at: u64,
+        preverified: PreverifiedBlockProof,
+        request: Option<&RemoteProofRequest>,
+    ) -> Result<u64, NodeError> {
+        if matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            return Err(NodeError::ProductionV3Unavailable);
+        }
+        self.submit_block_with_preverification(
+            block,
+            accepted_at,
+            Some(&preverified),
+            None,
+            None,
+            request,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn submit_preverified_block_with_admission(
         &mut self,
         block: Block,
@@ -4295,6 +5275,35 @@ impl Node {
             Some(&preverified),
             admission.branch_state,
             admission.activation_chain,
+            None,
+        )
+    }
+
+    fn submit_preverified_block_with_admission_guarded(
+        &mut self,
+        block: Block,
+        accepted_at: u64,
+        preverified: PreverifiedBlockProof,
+        admission: ExternalBlockAdmission,
+        request: Option<&RemoteProofRequest>,
+    ) -> Result<u64, NodeError> {
+        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            return Err(NodeError::ProofVerifierProfileMismatch);
+        }
+        if admission.revision != self.chain_revision
+            || admission.block_id != block.block_id()
+            || admission.parent != block.challenge.previous_block
+            || admission.accepted_at != accepted_at
+        {
+            return Err(NodeError::StaleBlockAdmission);
+        }
+        self.submit_block_with_preverification(
+            block,
+            accepted_at,
+            Some(&preverified),
+            admission.branch_state,
+            admission.activation_chain,
+            request,
         )
     }
 
@@ -4305,7 +5314,9 @@ impl Node {
         preverified: Option<&PreverifiedBlockProof>,
         branch_state: Option<Box<ChainState>>,
         activation_chain: Option<Vec<[u8; 32]>>,
+        request: Option<&RemoteProofRequest>,
     ) -> Result<u64, NodeError> {
+        ensure_remote_request_live(request)?;
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
@@ -4381,18 +5392,41 @@ impl Node {
             height: prepared.height,
             target: prepared.target,
         };
+        // The atomic transition and its immediate post-CAS deadline recheck
+        // form the request-lifetime linearization point. A cancellation that
+        // wins first can never append. Once the recheck succeeds, every later
+        // failure is a storage fault rather than an ordinary retryable result.
+        let mut commit_guard = request
+            .map(|request| {
+                request.begin_commit_after_check(|| {
+                    #[cfg(test)]
+                    self.pause_commit_race(CommitPausePoint::AfterDeadlineCheck);
+                })
+            })
+            .transpose()?;
+        #[cfg(test)]
+        self.pause_commit_race(CommitPausePoint::AfterTransition);
         if let Err(source) = self.log.write_all(&record) {
             self.storage_faulted = true;
+            if let Some(guard) = commit_guard.take() {
+                guard.finish(RemoteProofRequestState::Faulted);
+            }
             return Err(io_error("append block record", &log_path, source));
         }
         if let Err(source) = self.log.sync_all() {
             self.storage_faulted = true;
+            if let Some(guard) = commit_guard.take() {
+                guard.finish(RemoteProofRequestState::Faulted);
+            }
             return Err(io_error("sync block record", &log_path, source));
         }
         let durable_length = match self.log.metadata() {
             Ok(metadata) => metadata.len(),
             Err(source) => {
                 self.storage_faulted = true;
+                if let Some(guard) = commit_guard.take() {
+                    guard.finish(RemoteProofRequestState::Faulted);
+                }
                 return Err(io_error(
                     "inspect block log after durable append",
                     &log_path,
@@ -4402,12 +5436,18 @@ impl Node {
         };
         if durable_length != final_length {
             self.storage_faulted = true;
+            if let Some(guard) = commit_guard.take() {
+                guard.finish(RemoteProofRequestState::Faulted);
+            }
             return Err(NodeError::CorruptLog(
                 "durable block append did not end at its predicted locator".to_owned(),
             ));
         }
         if let Err(error) = verify_retained_block_log_path(&self.log, &log_path) {
             self.storage_faulted = true;
+            if let Some(guard) = commit_guard.take() {
+                guard.finish(RemoteProofRequestState::Faulted);
+            }
             return Err(error);
         }
         match commit_prepared(&mut self.state, &mut self.index, prepared, locator) {
@@ -4418,12 +5458,18 @@ impl Node {
                 if self.state.tip() != previous_tip {
                     self.revalidate_mempool(&confirmed_txids);
                 }
+                if let Some(guard) = commit_guard.take() {
+                    guard.finish(RemoteProofRequestState::Completed);
+                }
                 Ok(outcome.fees)
             }
             Err(error) => {
                 // The record is already durable. Refuse further work so a
                 // restart can reconstruct the authoritative state from disk.
                 self.storage_faulted = true;
+                if let Some(guard) = commit_guard.take() {
+                    guard.finish(RemoteProofRequestState::Faulted);
+                }
                 Err(error)
             }
         }
@@ -4569,7 +5615,34 @@ pub fn submit_shared_block(
     block: Block,
     accepted_at: u64,
 ) -> Result<u64, NodeError> {
-    submit_shared_block_with_policy(shared, block, accepted_at, SharedBlockPolicy::AnyBranch)
+    submit_shared_block_with_policy(
+        shared,
+        block,
+        accepted_at,
+        SharedBlockPolicy::AnyBranch,
+        None,
+        None,
+    )
+}
+
+/// P2P submission route with a connection-lifetime cancellation signal. A
+/// disconnected session is removed from both verifier queues before it can be
+/// granted scarce worker capacity.
+pub(crate) fn submit_shared_peer_block_cancellable(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    accepted_at: u64,
+    peer: RemoteProofPeerId,
+    request: RemoteProofRequest,
+) -> Result<u64, NodeError> {
+    submit_shared_block_with_policy(
+        shared,
+        block,
+        accepted_at,
+        SharedBlockPolicy::AnyBranch,
+        Some(peer),
+        Some(request),
+    )
 }
 
 /// Submits only if the candidate extends the active tip observed after it
@@ -4580,7 +5653,14 @@ pub fn submit_shared_tip_block(
     block: Block,
     accepted_at: u64,
 ) -> Result<u64, NodeError> {
-    submit_shared_block_with_policy(shared, block, accepted_at, SharedBlockPolicy::ActiveTipOnly)
+    submit_shared_block_with_policy(
+        shared,
+        block,
+        accepted_at,
+        SharedBlockPolicy::ActiveTipOnly,
+        None,
+        None,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -4589,15 +5669,108 @@ enum SharedBlockPolicy {
     ActiveTipOnly,
 }
 
+struct ProofAttemptStart {
+    remote_permit: Option<RemoteProofAdmissionPermit>,
+    cached: Option<PreverifiedBlockProof>,
+}
+
+fn ensure_remote_request_live(request: Option<&RemoteProofRequest>) -> Result<(), NodeError> {
+    match request {
+        Some(request) => request.ensure_live(),
+        None => Ok(()),
+    }
+}
+
+fn lock_shared_node<'a>(
+    shared: &'a Arc<Mutex<Node>>,
+    request: Option<&RemoteProofRequest>,
+) -> Result<MutexGuard<'a, Node>, NodeError> {
+    let Some(request) = request else {
+        return shared.lock().map_err(|_| NodeError::SharedNodePoisoned);
+    };
+    loop {
+        request.ensure_live()?;
+        match shared.try_lock() {
+            Ok(node) => {
+                request.ensure_live()?;
+                return Ok(node);
+            }
+            Err(TryLockError::WouldBlock) => {
+                thread::sleep(request.remaining()?.min(REMOTE_PROOF_CANCELLATION_POLL));
+            }
+            Err(TryLockError::Poisoned(_)) => return Err(NodeError::SharedNodePoisoned),
+        }
+    }
+}
+
+fn latch_shared_external_completion_failure(
+    shared: &Arc<Mutex<Node>>,
+    node_instance_id: u64,
+    chain_revision: u64,
+    error: &NodeError,
+) {
+    // Authenticated replay corruption outlives the remote request that exposed
+    // it. Cancellation cannot suppress the fail-closed storage latch.
+    let mut node = match shared.lock() {
+        Ok(node) => node,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    node.latch_external_completion_failure(node_instance_id, chain_revision, error);
+}
+
+fn begin_proof_attempt(
+    block_preverifier: &BlockPreverifier,
+    production_v3: bool,
+    remote_peer: Option<RemoteProofPeerId>,
+    remote_request: Option<&RemoteProofRequest>,
+    block_cache_digest: [u8; 32],
+) -> Result<ProofAttemptStart, NodeError> {
+    // Production remote sessions reserve FIFO admission before consulting the
+    // successful-proof cache. A cache hit avoids relation dispatch only; it
+    // cannot overtake a peer already waiting for network admission.
+    let remote_permit = if production_v3 {
+        match (remote_peer, remote_request) {
+            (Some(peer), Some(request)) => {
+                Some(block_preverifier.reserve_remote_cancellable(peer, request.clone())?)
+            }
+            (Some(peer), None) => Some(block_preverifier.reserve_remote(peer)?),
+            (None, _) => None,
+        }
+    } else {
+        None
+    };
+    if remote_permit
+        .as_ref()
+        .is_some_and(RemoteProofAdmissionPermit::is_cancelled)
+    {
+        return finalize_proof_attempt(
+            remote_permit,
+            None,
+            Err(NodeError::ProofVerificationQueueTimeout),
+        );
+    }
+    let cached = match block_preverifier.cached_preverification(block_cache_digest) {
+        Ok(cached) => cached,
+        Err(error) => return finalize_proof_attempt(remote_permit, None, Err(error)),
+    };
+    Ok(ProofAttemptStart {
+        remote_permit,
+        cached,
+    })
+}
+
 fn submit_shared_block_with_policy(
     shared: &Arc<Mutex<Node>>,
     block: Block,
     accepted_at: u64,
     policy: SharedBlockPolicy,
+    remote_peer: Option<RemoteProofPeerId>,
+    remote_request: Option<RemoteProofRequest>,
 ) -> Result<u64, NodeError> {
     let block_id = block.block_id();
+    ensure_remote_request_live(remote_request.as_ref())?;
     let (block_preverifier, production_v3) = {
-        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        let node = lock_shared_node(shared, remote_request.as_ref())?;
         (
             node.block_preverifier(),
             matches!(node.profile.proof, ProofProfile::ProductionV3),
@@ -4608,7 +5781,7 @@ fn submit_shared_block_with_policy(
         // parents, malformed bodies, and impossible headers out of the scarce
         // proof queue. This snapshot is deliberately discarded and repeated
         // authoritatively after the permit is acquired.
-        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        let node = lock_shared_node(shared, remote_request.as_ref())?;
         if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
             && block.challenge.previous_block != node.state.tip()
         {
@@ -4616,47 +5789,88 @@ fn submit_shared_block_with_policy(
         }
         node.preflight_external_block_admission(&block, accepted_at)?;
     }
+    ensure_remote_request_live(remote_request.as_ref())?;
     let block_cache_digest = canonical_block_cache_digest(&block)?;
+    let attempt = begin_proof_attempt(
+        &block_preverifier,
+        production_v3,
+        remote_peer,
+        remote_request.as_ref(),
+        block_cache_digest,
+    )?;
+    let remote_permit = attempt.remote_permit;
     // The scarce verifier reservation is released immediately after proof verification;
     // side-state replay uses a separate bounded lane so a proof-valid deep fork
     // cannot monopolize proof admission.
-    let preverified =
-        if let Some(preverified) = block_preverifier.cached_preverification(block_cache_digest)? {
-            preverified
+    let preverified = if let Some(preverified) = attempt.cached {
+        ensure_remote_request_live(remote_request.as_ref())?;
+        finalize_proof_attempt(remote_permit, None, Ok(preverified))?
+    } else {
+        // At most one proof from each locally identified P2P session may
+        // contend for the scarce verifier, and new sessions cannot
+        // overtake one already waiting. Local mined work bypasses this
+        // scheduler and retains the priority queue below.
+        if remote_permit
+            .as_ref()
+            .is_some_and(RemoteProofAdmissionPermit::is_cancelled)
+        {
+            return finalize_proof_attempt(
+                remote_permit,
+                None,
+                Err(NodeError::ProofVerificationQueueTimeout),
+            );
+        }
+        let permit = if let Some(request) = remote_request.as_ref() {
+            block_preverifier.reserve_cancellable(request.clone())?
         } else {
-            let permit = match policy {
+            match policy {
                 SharedBlockPolicy::AnyBranch => block_preverifier.reserve()?,
                 SharedBlockPolicy::ActiveTipOnly => block_preverifier.reserve_priority()?,
-            };
-            {
-                let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
-                if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
-                    && block.challenge.previous_block != node.state.tip()
-                {
-                    return Err(NodeError::StaleBlockAdmission);
-                }
-                if production_v3 {
-                    node.preflight_external_block_admission(&block, accepted_at)?;
-                }
-            }
-            match permit.preverify_cached(&block, block_cache_digest) {
-                Ok(preverified) => preverified,
-                Err(error) => {
-                    if production_v3 {
-                        let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
-                        if is_cacheable_proof_rejection(&error) {
-                            node.remember_rejected_proof(block_id);
-                        } else if is_cacheable_block_rejection(&error) {
-                            node.remember_rejected_body(block_cache_digest);
-                        }
-                    }
-                    return Err(error);
-                }
             }
         };
+        {
+            let node = lock_shared_node(shared, remote_request.as_ref())?;
+            if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+                && block.challenge.previous_block != node.state.tip()
+            {
+                return Err(NodeError::StaleBlockAdmission);
+            }
+            if production_v3 {
+                node.preflight_external_block_admission(&block, accepted_at)?;
+            }
+        }
+        let result = if remote_permit
+            .as_ref()
+            .is_some_and(RemoteProofAdmissionPermit::is_cancelled)
+        {
+            Err(NodeError::ProofVerificationQueueTimeout)
+        } else {
+            permit.preverify_cached_with_request(
+                &block,
+                block_cache_digest,
+                remote_request.as_ref(),
+            )
+        };
+        match finalize_proof_attempt(remote_permit, Some(permit), result) {
+            Ok(preverified) => preverified,
+            Err(error) => {
+                if production_v3 {
+                    let mut node = lock_shared_node(shared, remote_request.as_ref())?;
+                    if is_cacheable_proof_rejection(&error) {
+                        node.remember_rejected_proof(block_id);
+                    } else if is_cacheable_block_rejection(&error) {
+                        node.remember_rejected_body(block_cache_digest);
+                    }
+                }
+                return Err(error);
+            }
+        }
+    };
+
+    ensure_remote_request_live(remote_request.as_ref())?;
 
     let admission_work = {
-        let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        let mut node = lock_shared_node(shared, remote_request.as_ref())?;
         if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
             && block.challenge.previous_block != node.state.tip()
         {
@@ -4672,15 +5886,15 @@ fn submit_shared_block_with_policy(
                 .then(|| block_preverifier.reserve_reconstruction())
                 .transpose()?;
             loop {
+                ensure_remote_request_live(remote_request.as_ref())?;
                 let work_node_instance_id = work.node_instance_id;
                 let work_revision = work.revision;
                 let progress = match catch_unwind(AssertUnwindSafe(|| work.complete(&block))) {
                     Ok(Ok(progress)) => progress,
                     Ok(Err(error)) => {
                         if is_authenticated_storage_failure(&error) {
-                            let mut node =
-                                shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
-                            node.latch_external_completion_failure(
+                            latch_shared_external_completion_failure(
+                                shared,
                                 work_node_instance_id,
                                 work_revision,
                                 &error,
@@ -4690,11 +5904,12 @@ fn submit_shared_block_with_policy(
                     }
                     Err(_) => return Err(NodeError::ProofVerifierPanicked),
                 };
+                ensure_remote_request_live(remote_request.as_ref())?;
                 match progress {
                     ExternalBlockAdmissionProgress::Ready(admission) => break Some(admission),
                     ExternalBlockAdmissionProgress::Checkpoint { checkpoint } => {
                         block_preverifier.ensure_reconstruction_open()?;
-                        let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+                        let mut node = lock_shared_node(shared, remote_request.as_ref())?;
                         if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
                             && block.challenge.previous_block != node.state.tip()
                         {
@@ -4711,7 +5926,9 @@ fn submit_shared_block_with_policy(
         }
         None => None,
     };
-    let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+    ensure_remote_request_live(remote_request.as_ref())?;
+    let mut node = lock_shared_node(shared, remote_request.as_ref())?;
+    ensure_remote_request_live(remote_request.as_ref())?;
     if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
         && block.challenge.previous_block != node.state.tip()
     {
@@ -4728,9 +5945,20 @@ fn submit_shared_block_with_policy(
                     admission.activation_chain = None;
                 }
             }
-            node.submit_preverified_block_with_admission(block, accepted_at, preverified, admission)
+            node.submit_preverified_block_with_admission_guarded(
+                block,
+                accepted_at,
+                preverified,
+                admission,
+                remote_request.as_ref(),
+            )
         }
-        None => node.submit_preverified_block(block, accepted_at, preverified),
+        None => node.submit_preverified_block_guarded(
+            block,
+            accepted_at,
+            preverified,
+            remote_request.as_ref(),
+        ),
     };
     if externally_admitted && result.as_ref().is_err_and(is_cacheable_block_rejection) {
         node.remember_rejected_body(block_cache_digest);
@@ -4782,8 +6010,36 @@ fn is_cacheable_block_rejection(error: &NodeError) -> bool {
 fn is_cacheable_proof_rejection(error: &NodeError) -> bool {
     matches!(
         error,
-        NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(_))
+        NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(_)) | NodeError::Pow(_)
     )
+}
+
+fn is_remote_peer_proof_failure(error: &NodeError) -> bool {
+    matches!(
+        error,
+        NodeError::ProofVerifierWorker(worker_error)
+            if worker_error.is_dispatched_proof_failure()
+    ) || matches!(error, NodeError::Pow(_))
+}
+
+fn finalize_proof_attempt<T>(
+    mut remote_permit: Option<RemoteProofAdmissionPermit>,
+    mut proof_permit: Option<BlockPreverificationPermit>,
+    result: Result<T, NodeError>,
+) -> Result<T, NodeError> {
+    if let Err(error) = &result
+        && is_remote_peer_proof_failure(error)
+    {
+        if let Some(remote_permit) = &mut remote_permit {
+            remote_permit.mark_proof_failure();
+        }
+        if let Some(proof_permit) = &mut proof_permit {
+            proof_permit.mark_proof_failure();
+        }
+    }
+    drop(proof_permit);
+    drop(remote_permit);
+    result
 }
 
 fn is_authenticated_storage_failure(error: &NodeError) -> bool {
@@ -4977,7 +6233,7 @@ fn replay_indexed_state_to(
             now_unix_seconds: entry.accepted_at(),
         };
         let validated = if let Some(preverifier) = external_preverifier {
-            let preverified = match preverifier.preverify_unqueued(&block) {
+            let preverified = match preverifier.preverify_unqueued(&block, None) {
                 Ok(preverified) => preverified,
                 Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(error))) => {
                     return Err(NodeError::CorruptLog(format!(
@@ -5136,11 +6392,11 @@ struct DeadlineReader<'a> {
 }
 
 impl<'a> DeadlineReader<'a> {
-    fn new(stream: &'a mut TcpStream, total_timeout: Duration) -> Self {
-        Self {
-            stream,
-            deadline: Instant::now() + total_timeout,
-        }
+    fn new(stream: &'a mut TcpStream, total_timeout: Duration) -> io::Result<Self> {
+        let deadline = Instant::now()
+            .checked_add(total_timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RPC deadline overflow"))?;
+        Ok(Self { stream, deadline })
     }
 }
 
@@ -5385,7 +6641,8 @@ fn handle_rpc_connection_shared(
     stream
         .set_write_timeout(Some(RPC_WRITE_TIMEOUT))
         .map_err(NodeError::RpcIo)?;
-    let mut deadline_reader = DeadlineReader::new(stream, RPC_TOTAL_READ_TIMEOUT);
+    let mut deadline_reader =
+        DeadlineReader::new(stream, RPC_TOTAL_READ_TIMEOUT).map_err(NodeError::RpcIo)?;
     let request = match read_rpc_request(&mut deadline_reader) {
         Ok(request) => request,
         Err(error) => {
@@ -7478,6 +8735,16 @@ mod tests {
             queue.acquire(),
             Err(NodeError::ProofVerificationQueueFull)
         ));
+        assert_eq!(
+            queue.telemetry().unwrap().normal,
+            ProofAdmissionClassTelemetry {
+                active: 1,
+                queued: 1,
+                wait_events: 1,
+                rejections: 1,
+                proof_failures: 0,
+            }
+        );
         drop(active);
         waiter.join().unwrap().unwrap();
         assert_eq!(queue.counts().unwrap(), (0, 0));
@@ -7488,6 +8755,8 @@ mod tests {
             timeout_queue.acquire(),
             Err(NodeError::ProofVerificationQueueTimeout)
         ));
+        assert_eq!(timeout_queue.telemetry().unwrap().normal.wait_events, 1);
+        assert_eq!(timeout_queue.telemetry().unwrap().normal.rejections, 1);
         drop(active);
         assert_eq!(timeout_queue.counts().unwrap(), (0, 0));
 
@@ -7590,7 +8859,830 @@ mod tests {
             waiter.join().unwrap(),
             Err(NodeError::ProofVerifierShuttingDown)
         ));
+        assert_eq!(
+            close_queue.telemetry().unwrap().priority,
+            ProofAdmissionClassTelemetry {
+                active: 0,
+                queued: 0,
+                wait_events: 1,
+                rejections: 1,
+                proof_failures: 0,
+            }
+        );
         drop(active);
+    }
+
+    #[test]
+    fn remote_proof_scheduler_bounds_sixteen_invalid_peers_and_serves_valid_and_local_work() {
+        const INVALID_PEERS: u64 = 16;
+        let remote = Arc::new(RemoteProofAdmissionQueue::new(
+            MAX_REMOTE_PROOF_ADMISSIONS,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        ));
+        let proof = Arc::new(ProofVerificationQueue::new(
+            1,
+            MAX_QUEUED_PROOF_VERIFICATIONS,
+            Duration::from_secs(2),
+        ));
+        let remote_blocker = remote
+            .acquire(RemoteProofPeerId::new(10_000).unwrap())
+            .unwrap();
+        let proof_blocker = proof.acquire().unwrap();
+        let (served_tx, served_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+
+        for value in 1..MAX_REMOTE_PROOF_ADMISSIONS as u64 {
+            let worker_remote = Arc::clone(&remote);
+            let worker_proof = Arc::clone(&proof);
+            let served = served_tx.clone();
+            workers.push(thread::spawn(move || {
+                let peer = RemoteProofPeerId::new(value).unwrap();
+                let mut remote_permit = worker_remote.acquire(peer).unwrap();
+                let _proof_permit = worker_proof.acquire().unwrap();
+                // Each identity represents a distinct below-target envelope
+                // whose expensive relation check failed.
+                served.send(value).unwrap();
+                remote_permit.mark_proof_failure();
+            }));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while remote.telemetry().unwrap().queued != value as usize && Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+            assert_eq!(remote.telemetry().unwrap().queued, value as usize);
+        }
+
+        let local_proof = Arc::clone(&proof);
+        let local_served = served_tx.clone();
+        let local = thread::spawn(move || {
+            let _permit = local_proof.acquire_priority().unwrap();
+            local_served.send(0).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while proof.telemetry().unwrap().priority.queued != 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(proof.telemetry().unwrap().priority.queued, 1);
+
+        // Let the first remote session become active while both it and the
+        // locally mined block wait on the proof queue. The local priority lane
+        // must win once that queue opens.
+        drop(remote_blocker);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (remote.telemetry().unwrap().queued != MAX_REMOTE_PROOF_ADMISSIONS - 2
+            || proof.telemetry().unwrap().normal.queued != 1)
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(
+            remote.telemetry().unwrap().queued,
+            MAX_REMOTE_PROOF_ADMISSIONS - 2
+        );
+        assert_eq!(proof.telemetry().unwrap().normal.queued, 1);
+
+        let valid_peer = RemoteProofPeerId::new(INVALID_PEERS + 1).unwrap();
+        let valid_remote = Arc::clone(&remote);
+        let valid_proof = Arc::clone(&proof);
+        let valid_served = served_tx.clone();
+        workers.push(thread::spawn(move || {
+            let _remote_permit = valid_remote.acquire(valid_peer).unwrap();
+            let _proof_permit = valid_proof.acquire().unwrap();
+            valid_served.send(INVALID_PEERS + 1).unwrap();
+        }));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != MAX_REMOTE_PROOF_ADMISSIONS - 1
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(
+            remote.telemetry().unwrap().queued,
+            MAX_REMOTE_PROOF_ADMISSIONS - 1
+        );
+
+        // The remaining nine identities continuously retry bounded admission.
+        // They may fill newly opened tail slots, but none can overtake the
+        // valid session already admitted ahead of them.
+        for value in MAX_REMOTE_PROOF_ADMISSIONS as u64..=INVALID_PEERS {
+            let worker_remote = Arc::clone(&remote);
+            let worker_proof = Arc::clone(&proof);
+            let served = served_tx.clone();
+            workers.push(thread::spawn(move || {
+                let peer = RemoteProofPeerId::new(value).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut remote_permit = loop {
+                    match worker_remote.acquire(peer) {
+                        Ok(permit) => break permit,
+                        Err(NodeError::ProofVerificationQueueFull) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("remote retry failed: {error}"),
+                    }
+                };
+                let _proof_permit = worker_proof.acquire().unwrap();
+                served.send(value).unwrap();
+                remote_permit.mark_proof_failure();
+            }));
+        }
+
+        let overflow_sessions = INVALID_PEERS - MAX_REMOTE_PROOF_ADMISSIONS as u64 + 1;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().rejections < overflow_sessions
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert!(remote.telemetry().unwrap().rejections >= overflow_sessions);
+
+        drop(proof_blocker);
+        assert_eq!(served_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        local.join().unwrap();
+
+        for expected in 1..MAX_REMOTE_PROOF_ADMISSIONS as u64 {
+            assert_eq!(
+                served_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            served_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            INVALID_PEERS + 1,
+            "FIFO must serve the admitted valid session before retrying attackers"
+        );
+        let mut overflow = HashSet::new();
+        for _ in MAX_REMOTE_PROOF_ADMISSIONS as u64..=INVALID_PEERS {
+            overflow.insert(served_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        assert_eq!(
+            overflow,
+            (MAX_REMOTE_PROOF_ADMISSIONS as u64..=INVALID_PEERS).collect()
+        );
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let cooled = remote
+            .state
+            .lock()
+            .unwrap()
+            .cooldowns
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(cooled.len(), INVALID_PEERS as usize);
+        for peer in cooled {
+            assert!(matches!(
+                remote.acquire(peer),
+                Err(NodeError::ProofVerificationQueueFull)
+            ));
+        }
+        drop(remote.acquire(valid_peer).unwrap());
+
+        let remote_status = remote.telemetry().unwrap();
+        assert_eq!(remote_status.active, 0);
+        assert_eq!(remote_status.queued, 0);
+        assert!(remote_status.wait_events >= MAX_REMOTE_PROOF_ADMISSIONS as u64);
+        assert!(remote_status.wait_events <= INVALID_PEERS + 1);
+        assert_eq!(remote_status.proof_failures, INVALID_PEERS);
+        assert!(remote_status.rejections >= INVALID_PEERS);
+        let proof_status = proof.telemetry().unwrap();
+        assert_eq!(proof_status.normal.active, 0);
+        assert_eq!(proof_status.priority.active, 0);
+        assert_eq!(proof_status.priority.wait_events, 1);
+    }
+
+    #[test]
+    fn remote_proof_scheduler_bounds_sessions_rejects_duplicates_and_wakes_on_close() {
+        let remote = Arc::new(RemoteProofAdmissionQueue::new(
+            2,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let active_peer = RemoteProofPeerId::new(1).unwrap();
+        let waiting_peer = RemoteProofPeerId::new(2).unwrap();
+        let active = remote.acquire(active_peer).unwrap();
+
+        assert!(matches!(
+            remote.acquire(active_peer),
+            Err(NodeError::ProofVerificationQueueFull)
+        ));
+        let waiting_remote = Arc::clone(&remote);
+        let waiter = thread::spawn(move || waiting_remote.acquire(waiting_peer).map(drop));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(remote.telemetry().unwrap().queued, 1);
+        assert!(matches!(
+            remote.acquire(waiting_peer),
+            Err(NodeError::ProofVerificationQueueFull)
+        ));
+        assert!(matches!(
+            remote.acquire(RemoteProofPeerId::new(3).unwrap()),
+            Err(NodeError::ProofVerificationQueueFull)
+        ));
+        assert_eq!(
+            remote.telemetry().unwrap(),
+            ProofAdmissionClassTelemetry {
+                active: 1,
+                queued: 1,
+                wait_events: 1,
+                rejections: 3,
+                proof_failures: 0,
+            }
+        );
+
+        let close_started = Instant::now();
+        remote.close();
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NodeError::ProofVerifierShuttingDown)
+        ));
+        assert!(
+            close_started.elapsed() < Duration::from_secs(1),
+            "close must wake a remote waiter instead of waiting for its deadline"
+        );
+        assert_eq!(remote.telemetry().unwrap().queued, 0);
+        assert_eq!(remote.telemetry().unwrap().rejections, 4);
+        drop(active);
+        assert_eq!(remote.telemetry().unwrap().active, 0);
+    }
+
+    #[test]
+    fn remote_timeout_cleans_identity_and_retry_cannot_overtake_queued_valid_work() {
+        let remote = Arc::new(RemoteProofAdmissionQueue::new(
+            3,
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+        ));
+        let active = remote.acquire(RemoteProofPeerId::new(1).unwrap()).unwrap();
+        let timed_peer = RemoteProofPeerId::new(2).unwrap();
+        let valid_peer = RemoteProofPeerId::new(3).unwrap();
+
+        let timed_remote = Arc::clone(&remote);
+        let timed = thread::spawn(move || timed_remote.acquire(timed_peer).map(drop));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(remote.telemetry().unwrap().queued, 1);
+        thread::sleep(Duration::from_millis(75));
+
+        let (served_tx, served_rx) = mpsc::channel();
+        let (release_valid_tx, release_valid_rx) = mpsc::channel();
+        let valid_remote = Arc::clone(&remote);
+        let valid_served = served_tx.clone();
+        let valid = thread::spawn(move || {
+            let _permit = valid_remote.acquire(valid_peer).unwrap();
+            valid_served.send(3_u64).unwrap();
+            release_valid_rx.recv().unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != 2 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(remote.telemetry().unwrap().queued, 2);
+
+        assert!(matches!(
+            timed.join().unwrap(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        assert_eq!(remote.telemetry().unwrap().queued, 1);
+        assert_eq!(remote.telemetry().unwrap().rejections, 1);
+
+        let retry_remote = Arc::clone(&remote);
+        let retry_served = served_tx;
+        let retry = thread::spawn(move || {
+            let _permit = retry_remote.acquire(timed_peer).unwrap();
+            retry_served.send(2_u64).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != 2 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(remote.telemetry().unwrap().queued, 2);
+
+        drop(active);
+        assert_eq!(
+            served_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            3,
+            "a timed-out identity retry must join behind already queued valid work"
+        );
+        assert_eq!(remote.telemetry().unwrap().queued, 1);
+        release_valid_tx.send(()).unwrap();
+        assert_eq!(served_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        valid.join().unwrap();
+        retry.join().unwrap();
+        assert_eq!(remote.telemetry().unwrap().queued, 0);
+        assert_eq!(remote.telemetry().unwrap().wait_events, 3);
+    }
+
+    #[test]
+    fn remote_cancellation_removes_fifo_state_across_grant_and_close_races() {
+        let remote = Arc::new(RemoteProofAdmissionQueue::new(
+            3,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        ));
+        let active = remote.acquire(RemoteProofPeerId::new(1).unwrap()).unwrap();
+        let request =
+            RemoteProofRequest::new(Instant::now().checked_add(Duration::from_secs(60)).unwrap());
+        let waiting_remote = Arc::clone(&remote);
+        let waiting_request = request.clone();
+        let waiter = thread::spawn(move || {
+            waiting_remote.acquire_cancellable(RemoteProofPeerId::new(2).unwrap(), waiting_request)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(remote.telemetry().unwrap().queued, 1);
+
+        // Cancellation wins even if capacity becomes available in the same
+        // wakeup; the identity is removed from both FIFO structures.
+        assert!(request.cancel());
+        drop(active);
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        let state = remote.state.lock().unwrap();
+        assert!(state.waiting.is_empty());
+        assert!(state.waiting_set.is_empty());
+        assert!(state.active.is_none());
+        drop(state);
+        drop(remote.acquire(RemoteProofPeerId::new(3).unwrap()).unwrap());
+
+        let active = remote.acquire(RemoteProofPeerId::new(4).unwrap()).unwrap();
+        let waiting_remote = Arc::clone(&remote);
+        let waiter = thread::spawn(move || {
+            waiting_remote.acquire_cancellable(
+                RemoteProofPeerId::new(5).unwrap(),
+                RemoteProofRequest::new(
+                    Instant::now().checked_add(Duration::from_secs(60)).unwrap(),
+                ),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        remote.close();
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NodeError::ProofVerifierShuttingDown)
+        ));
+        drop(active);
+        let state = remote.state.lock().unwrap();
+        assert!(state.waiting.is_empty());
+        assert!(state.waiting_set.is_empty());
+        assert!(state.active.is_none());
+    }
+
+    #[test]
+    fn general_proof_queue_deadline_wins_when_capacity_is_released_after_expiry() {
+        let queue = Arc::new(ProofVerificationQueue::new(1, 8, Duration::from_secs(2)));
+        let active = queue.acquire().unwrap();
+        let wake_barrier = Arc::new(DeadlineWakeBarrier::new());
+        *queue.deadline_wake_barrier.lock().unwrap() = Some(Arc::clone(&wake_barrier));
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let waiting_queue = Arc::clone(&queue);
+        let waiter = thread::spawn(move || {
+            waiting_queue.acquire_cancellable(RemoteProofRequest::new(deadline))
+        });
+
+        // Hold the waiter immediately after its first condvar wake. Capacity
+        // becomes ready only after its authoritative deadline has expired.
+        wake_barrier.entered.wait();
+        while Instant::now() < deadline {
+            thread::yield_now();
+        }
+        drop(active);
+        wake_barrier.release.wait();
+
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.normal_queued, 0);
+        assert_eq!(state.priority_queued, 0);
+        assert!(state.cancelled_normal_tickets.is_empty());
+        assert!(state.cancelled_priority_tickets.is_empty());
+    }
+
+    #[test]
+    fn remote_proof_queue_deadline_wins_when_capacity_is_released_after_expiry() {
+        let queue = Arc::new(RemoteProofAdmissionQueue::new(
+            8,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        ));
+        let active = queue.acquire(RemoteProofPeerId::new(1).unwrap()).unwrap();
+        let wake_barrier = Arc::new(DeadlineWakeBarrier::new());
+        *queue.deadline_wake_barrier.lock().unwrap() = Some(Arc::clone(&wake_barrier));
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let waiting_queue = Arc::clone(&queue);
+        let waiter = thread::spawn(move || {
+            waiting_queue.acquire_cancellable(
+                RemoteProofPeerId::new(2).unwrap(),
+                RemoteProofRequest::new(deadline),
+            )
+        });
+
+        wake_barrier.entered.wait();
+        while Instant::now() < deadline {
+            thread::yield_now();
+        }
+        drop(active);
+        wake_barrier.release.wait();
+
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        let state = queue.state.lock().unwrap();
+        assert!(state.active.is_none());
+        assert!(state.waiting.is_empty());
+        assert!(state.waiting_set.is_empty());
+    }
+
+    #[test]
+    fn proof_queue_deadline_overflow_is_retryable_instead_of_panicking() {
+        assert!(matches!(
+            checked_queue_deadline(Instant::now(), Duration::MAX),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+    }
+
+    #[test]
+    fn production_finalization_cools_every_live_session_without_eviction() {
+        let timeout =
+            NodeError::ProofVerifierWorker(VerifierWorkerError::DispatchedRequest(Box::new(
+                VerifierWorkerError::Process(ProofWorkerError::Timeout { milliseconds: 1 }),
+            )));
+        let crash =
+            NodeError::ProofVerifierWorker(VerifierWorkerError::DispatchedRequest(Box::new(
+                VerifierWorkerError::Process(ProofWorkerError::WorkerExited {
+                    code: Some(9),
+                    stderr: String::new(),
+                }),
+            )));
+        let protocol = NodeError::ProofVerifierWorker(VerifierWorkerError::DispatchedRequest(
+            Box::new(VerifierWorkerError::Protocol(
+                cmfd_proof_worker::VerifierProtocolError::InvalidStatus,
+            )),
+        ));
+        assert!(is_remote_peer_proof_failure(&timeout));
+        assert!(is_remote_peer_proof_failure(&crash));
+        assert!(is_remote_peer_proof_failure(&protocol));
+        assert!(!is_remote_peer_proof_failure(
+            &NodeError::ProofVerifierWorker(VerifierWorkerError::Process(
+                ProofWorkerError::Timeout { milliseconds: 1 },
+            ))
+        ));
+        assert!(!is_remote_peer_proof_failure(
+            &NodeError::ProofVerifierWorker(VerifierWorkerError::Startup(
+                "startup authentication failed".to_owned(),
+            ))
+        ));
+        assert!(!is_remote_peer_proof_failure(
+            &NodeError::ProofVerificationQueueTimeout
+        ));
+
+        let path = test_dir("proof-finalization-live-session-cooldown");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let mut invalid = mined_candidate(&node, accepted_at);
+        let BlockProof::V2Reference(proof) = &mut invalid.proof else {
+            unreachable!();
+        };
+        proof.final_activation_digest[0] ^= 1;
+        let preverifier = node.block_preverifier.clone();
+        let remote = Arc::clone(&preverifier.remote_admission);
+
+        for value in 1..=9 {
+            let peer = RemoteProofPeerId::new(value).unwrap();
+            let remote_permit = preverifier.reserve_remote(peer).unwrap();
+            let proof_permit = preverifier.reserve().unwrap();
+            let result = proof_permit.preverify(&invalid);
+            assert!(matches!(result, Err(NodeError::Pow(PowError::V2(_)))));
+            assert!(matches!(
+                finalize_proof_attempt(Some(remote_permit), Some(proof_permit), result),
+                Err(NodeError::Pow(PowError::V2(_)))
+            ));
+        }
+        let priority_permit = preverifier.reserve_priority().unwrap();
+        let priority_result = priority_permit.preverify(&invalid);
+        assert!(matches!(
+            finalize_proof_attempt(None, Some(priority_permit), priority_result),
+            Err(NodeError::Pow(PowError::V2(_)))
+        ));
+        assert_eq!(preverifier.worker_dispatches.load(Ordering::Relaxed), 10);
+        assert_eq!(remote.telemetry().unwrap().proof_failures, 9);
+        assert_eq!(
+            preverifier.queue.telemetry().unwrap().normal.proof_failures,
+            9
+        );
+        assert_eq!(
+            preverifier
+                .queue
+                .telemetry()
+                .unwrap()
+                .priority
+                .proof_failures,
+            1
+        );
+        assert_eq!(remote.state.lock().unwrap().cooldowns.len(), 9);
+
+        assert!(matches!(
+            remote.acquire(RemoteProofPeerId::new(1).unwrap()),
+            Err(NodeError::ProofVerificationQueueFull)
+        ));
+        assert_eq!(
+            preverifier.worker_dispatches.load(Ordering::Relaxed),
+            10,
+            "the first live session must remain cooled without a second dispatch"
+        );
+        assert_eq!(remote.telemetry().unwrap().rejections, 1);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn dispatched_worker_error_records_proof_telemetry_and_peer_cooldown() {
+        let path = test_dir("dispatched-worker-error-classification");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let preverifier = node.block_preverifier.clone();
+        let remote = Arc::clone(&preverifier.remote_admission);
+        let peer = RemoteProofPeerId::new(1).unwrap();
+        let remote_permit = preverifier.reserve_remote(peer).unwrap();
+        let proof_permit = preverifier.reserve().unwrap();
+        let classified =
+            NodeError::ProofVerifierWorker(VerifierWorkerError::DispatchedRequest(Box::new(
+                VerifierWorkerError::Process(ProofWorkerError::Timeout { milliseconds: 7 }),
+            )));
+
+        assert!(matches!(
+            finalize_proof_attempt::<()>(Some(remote_permit), Some(proof_permit), Err(classified),),
+            Err(NodeError::ProofVerifierWorker(
+                VerifierWorkerError::DispatchedRequest(_)
+            ))
+        ));
+        assert_eq!(remote.telemetry().unwrap().proof_failures, 1);
+        assert_eq!(
+            preverifier.queue.telemetry().unwrap().normal.proof_failures,
+            1
+        );
+        assert!(remote.state.lock().unwrap().cooldowns.contains_key(&peer));
+        assert!(matches!(
+            remote.acquire(peer),
+            Err(NodeError::ProofVerificationQueueFull)
+        ));
+        assert_eq!(remote.telemetry().unwrap().rejections, 1);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn remote_deadline_during_proof_prevents_durable_acceptance() {
+        let path = test_dir("remote-deadline-before-append");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, accepted_at);
+        let block_id = block.block_id();
+        node.block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(250)));
+        let shared = Arc::new(Mutex::new(node));
+
+        let result = submit_shared_peer_block_cancellable(
+            &shared,
+            block.clone(),
+            accepted_at,
+            RemoteProofPeerId::new(1).unwrap(),
+            RemoteProofRequest::new(
+                Instant::now()
+                    .checked_add(Duration::from_millis(100))
+                    .unwrap(),
+            ),
+        );
+        assert!(matches!(
+            result,
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        {
+            let node = shared.lock().unwrap();
+            assert_eq!(node.peer_hello().height, 0);
+            assert!(!node.contains_block(block_id));
+            node.block_preverifier.set_proof_dispatch_delay(None);
+        }
+
+        // The timed-out request never appended or cached acceptance: the same
+        // honest candidate remains admissible under a fresh live request.
+        submit_shared_peer_block_cancellable(
+            &shared,
+            block,
+            accepted_at,
+            RemoteProofPeerId::new(2).unwrap(),
+            RemoteProofRequest::new(Instant::now().checked_add(Duration::from_secs(2)).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(shared.lock().unwrap().peer_hello().height, 1);
+
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn cancellation_wins_atomic_commit_race_without_log_or_height_mutation() {
+        let path = test_dir("remote-cancel-wins-commit-race");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, accepted_at);
+        let block_id = block.block_id();
+        let log_len = node.log.metadata().unwrap().len();
+        let barrier = Arc::new(CommitRaceBarrier::new(CommitPausePoint::AfterDeadlineCheck));
+        node.commit_race_barrier = Some(Arc::clone(&barrier));
+        let shared = Arc::new(Mutex::new(node));
+        let request =
+            RemoteProofRequest::new(Instant::now().checked_add(Duration::from_secs(2)).unwrap());
+        let submitted_request = request.clone();
+        let submitted = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            submit_shared_peer_block_cancellable(
+                &submitted,
+                block,
+                accepted_at,
+                RemoteProofPeerId::new(1).unwrap(),
+                submitted_request,
+            )
+        });
+
+        barrier.entered.wait();
+        assert!(request.cancel(), "cancellation must win before commit");
+        barrier.release.wait();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        let node = shared.lock().unwrap();
+        assert_eq!(request.state(), RemoteProofRequestState::Cancelled);
+        assert_eq!(node.peer_hello().height, 0);
+        assert!(!node.contains_block(block_id));
+        assert_eq!(node.log.metadata().unwrap().len(), log_len);
+        assert!(!node.storage_faulted);
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn deadline_expiring_between_precheck_and_commit_cannot_append() {
+        let path = test_dir("remote-deadline-preempts-commit-cas");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, accepted_at);
+        let block_id = block.block_id();
+        let log_len = node.log.metadata().unwrap().len();
+        let barrier = Arc::new(CommitRaceBarrier::new(CommitPausePoint::AfterDeadlineCheck));
+        node.commit_race_barrier = Some(Arc::clone(&barrier));
+        let shared = Arc::new(Mutex::new(node));
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(100))
+            .unwrap();
+        let request = RemoteProofRequest::new(deadline);
+        let submitted_request = request.clone();
+        let submitted = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            submit_shared_peer_block_cancellable(
+                &submitted,
+                block,
+                accepted_at,
+                RemoteProofPeerId::new(1).unwrap(),
+                submitted_request,
+            )
+        });
+
+        barrier.entered.wait();
+        while Instant::now() < deadline {
+            thread::yield_now();
+        }
+        barrier.release.wait();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeError::ProofVerificationQueueTimeout)
+        ));
+        let node = shared.lock().unwrap();
+        assert_eq!(request.state(), RemoteProofRequestState::Cancelled);
+        assert_eq!(node.peer_hello().height, 0);
+        assert!(!node.contains_block(block_id));
+        assert_eq!(node.log.metadata().unwrap().len(), log_len);
+        assert!(!node.storage_faulted);
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn committing_wins_atomic_cancel_race_and_completes_durably() {
+        let path = test_dir("remote-commit-wins-cancel-race");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, accepted_at);
+        let block_id = block.block_id();
+        let log_len = node.log.metadata().unwrap().len();
+        let barrier = Arc::new(CommitRaceBarrier::new(CommitPausePoint::AfterTransition));
+        node.commit_race_barrier = Some(Arc::clone(&barrier));
+        let shared = Arc::new(Mutex::new(node));
+        let request =
+            RemoteProofRequest::new(Instant::now().checked_add(Duration::from_secs(2)).unwrap());
+        let submitted_request = request.clone();
+        let submitted = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            submit_shared_peer_block_cancellable(
+                &submitted,
+                block,
+                accepted_at,
+                RemoteProofPeerId::new(1).unwrap(),
+                submitted_request,
+            )
+        });
+
+        barrier.entered.wait();
+        assert!(!request.cancel(), "committing must be a point of no return");
+        barrier.release.wait();
+        worker.join().unwrap().unwrap();
+        let node = shared.lock().unwrap();
+        assert_eq!(request.state(), RemoteProofRequestState::Completed);
+        assert_eq!(node.peer_hello().height, 1);
+        assert!(node.contains_block(block_id));
+        assert!(node.log.metadata().unwrap().len() > log_len);
+        assert!(!node.storage_faulted);
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn committing_io_failure_latches_storage_fault_instead_of_ordinary_retry() {
+        let path = test_dir("remote-commit-faults-after-linearization");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, accepted_at);
+        let block_id = block.block_id();
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let log_len = node.log.metadata().unwrap().len();
+        let read_only = OpenOptions::new().read(true).open(&log_path).unwrap();
+        drop(std::mem::replace(&mut node.log, read_only));
+        let barrier = Arc::new(CommitRaceBarrier::new(CommitPausePoint::AfterTransition));
+        node.commit_race_barrier = Some(Arc::clone(&barrier));
+        let shared = Arc::new(Mutex::new(node));
+        let request =
+            RemoteProofRequest::new(Instant::now().checked_add(Duration::from_secs(2)).unwrap());
+        let submitted_request = request.clone();
+        let submitted = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            submit_shared_peer_block_cancellable(
+                &submitted,
+                block,
+                accepted_at,
+                RemoteProofPeerId::new(1).unwrap(),
+                submitted_request,
+            )
+        });
+
+        barrier.entered.wait();
+        assert!(
+            !request.cancel(),
+            "committing must reject late cancellation"
+        );
+        barrier.release.wait();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeError::Io {
+                operation: "append block record",
+                ..
+            })
+        ));
+        let node = shared.lock().unwrap();
+        assert_eq!(request.state(), RemoteProofRequestState::Faulted);
+        assert_eq!(node.peer_hello().height, 0);
+        assert!(!node.contains_block(block_id));
+        assert_eq!(fs::metadata(log_path).unwrap().len(), log_len);
+        assert!(node.storage_faulted);
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
     }
 
     #[test]
@@ -7681,6 +9773,73 @@ mod tests {
             Err(VerifierWorkerError::Closed)
         ));
         assert_eq!(verifier.backend_status().unwrap().0, "stopped");
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn cached_proof_waits_for_remote_admission_without_redispatch() {
+        let path = test_dir("proof-capability-cache-remote-admission");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_candidate(&node, accepted_at);
+        let key = canonical_block_cache_digest(&block).unwrap();
+        let verifier = node.block_preverifier.clone();
+        let capability = verifier.preverify(&block).unwrap();
+        let generation = verifier.backend_generation.load(Ordering::Acquire);
+        verifier
+            .remember_preverification(key, generation, capability.clone())
+            .unwrap();
+        assert_eq!(verifier.worker_dispatches.load(Ordering::Relaxed), 1);
+
+        let remote = Arc::clone(&verifier.remote_admission);
+        let blocker = remote.acquire(RemoteProofPeerId::new(1).unwrap()).unwrap();
+        let waiting_verifier = verifier.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            result_tx
+                .send(begin_proof_attempt(
+                    &waiting_verifier,
+                    true,
+                    Some(RemoteProofPeerId::new(2).unwrap()),
+                    None,
+                    key,
+                ))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while remote.telemetry().unwrap().queued != 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(remote.telemetry().unwrap().queued, 1);
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            verifier.worker_dispatches.load(Ordering::Relaxed),
+            1,
+            "a seeded cache must not bypass saturated remote admission"
+        );
+
+        drop(blocker);
+        let attempt = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.cached, Some(capability.clone()));
+        let cached =
+            finalize_proof_attempt(attempt.remote_permit, None, Ok(attempt.cached.unwrap()))
+                .unwrap();
+        assert_eq!(cached, capability);
+        waiter.join().unwrap();
+
+        assert_eq!(verifier.worker_dispatches.load(Ordering::Relaxed), 1);
+        let telemetry = remote.telemetry().unwrap();
+        assert_eq!(telemetry.active, 0);
+        assert_eq!(telemetry.queued, 0);
+        assert_eq!(telemetry.wait_events, 1);
         drop(node);
         clean_test_dir(&path);
     }
@@ -8046,6 +10205,88 @@ mod tests {
             Err(NodeError::StorageFaulted)
         ));
 
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn cancellation_during_corrupt_side_replay_still_latches_storage_fault() {
+        let path = test_dir("production-side-corruption-cancelled");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let genesis = node.params.genesis_hash;
+        let t1 = DEVNET_GENESIS_TIMESTAMP + 60;
+        let t2 = t1 + 60;
+
+        let active = mined_child(&node, genesis, t1, 0x81);
+        node.submit_block(active, t1).unwrap();
+        let side = mined_child(&node, genesis, t1, 0x82);
+        let side_cap = node.block_preverifier.preverify(&side).unwrap();
+        node.submit_preverified_block(side.clone(), t1, side_cap)
+            .unwrap();
+        let child = mined_child(&node, side.block_id(), t2, 0x83);
+        let child_id = child.block_id();
+
+        let mut alternate_params = node.params;
+        alternate_params.max_future_offset_secs -= 1;
+        let mut alternate_state = ChainState::new(alternate_params, node.verifier.clone()).unwrap();
+        let alternate_validated = alternate_state
+            .validate_block(
+                &side,
+                BlockValidationContext {
+                    now_unix_seconds: t1,
+                },
+            )
+            .unwrap();
+        alternate_state
+            .commit_validated(alternate_validated)
+            .unwrap();
+        let forged_header = alternate_state.successor_header_preflight().unwrap();
+        Arc::get_mut(node.index.blocks.get_mut(&side.block_id()).unwrap())
+            .unwrap()
+            .successor_header = forged_header;
+
+        let original_tip = node.state.tip();
+        let original_revision = node.chain_revision;
+        let original_log_length = node.log.metadata().unwrap().len();
+        let barrier = Arc::new(CompletionFaultBarrier::new());
+        node.profile.proof = ProofProfile::ProductionV3;
+        node.completion_fault_barrier = Some(Arc::clone(&barrier));
+        let shared = Arc::new(Mutex::new(node));
+        let request =
+            RemoteProofRequest::new(Instant::now().checked_add(Duration::from_secs(60)).unwrap());
+        let submitted_request = request.clone();
+        let submitted = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            submit_shared_peer_block_cancellable(
+                &submitted,
+                child,
+                t2,
+                RemoteProofPeerId::new(1).unwrap(),
+                submitted_request,
+            )
+        });
+
+        barrier.entered.wait();
+        assert!(
+            request.cancel(),
+            "request must cancel during corrupt replay"
+        );
+        barrier.release.wait();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeError::CorruptLog(message))
+                if message.contains("header snapshot does not match replayed state")
+        ));
+
+        let node = shared.lock().unwrap();
+        assert_eq!(request.state(), RemoteProofRequestState::Cancelled);
+        assert!(node.storage_faulted);
+        assert_eq!(node.state.tip(), original_tip);
+        assert_eq!(node.chain_revision, original_revision);
+        assert!(!node.contains_block(child_id));
+        assert_eq!(node.log.metadata().unwrap().len(), original_log_length);
         drop(node);
         drop(shared);
         clean_test_dir(&path);
@@ -8805,6 +11046,24 @@ mod tests {
         assert!(!status.public_peer_mode);
         assert_eq!(status.proof_verification_active, 0);
         assert_eq!(status.proof_verification_queued, 0);
+        assert_eq!(
+            status.proof_verification_remote_admission,
+            ProofAdmissionClassTelemetry {
+                active: 0,
+                queued: 0,
+                wait_events: 0,
+                rejections: 0,
+                proof_failures: 0,
+            }
+        );
+        assert_eq!(
+            status.proof_verification_remote_admission_capacity,
+            MAX_REMOTE_PROOF_ADMISSIONS
+        );
+        assert_eq!(
+            status.proof_verification_remote_admission_wait_timeout_ms,
+            REMOTE_PROOF_ADMISSION_WAIT_TIMEOUT.as_millis() as u64
+        );
         assert_eq!(
             status.proof_verification_capacity,
             MAX_CONCURRENT_PROOF_VERIFICATIONS
@@ -11112,11 +13371,23 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let mut reader = DeadlineReader::new(&mut server, Duration::ZERO);
+        let mut reader = DeadlineReader::new(&mut server, Duration::ZERO).unwrap();
         let error = read_rpc_request(&mut reader).unwrap_err();
         assert!(matches!(
             error,
             NodeError::RpcIo(ref source) if source.kind() == io::ErrorKind::TimedOut
+        ));
+        drop(client);
+    }
+
+    #[test]
+    fn rpc_reader_deadline_overflow_is_controlled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        assert!(matches!(
+            DeadlineReader::new(&mut server, Duration::MAX),
+            Err(ref error) if error.kind() == io::ErrorKind::InvalidInput
         ));
         drop(client);
     }

@@ -403,10 +403,68 @@ Startup fails if the path is not absolute, the hash does not match, or either
 limit is zero. Node status reports `external_worker` plus the active limits.
 The node runs a private synchronized copy and rechecks its hash before every
 process generation. Timeout, crash, malformed or oversized output, and response
-substitution kill that generation and reject the candidate; a later request
-must pass startup again. Invalid proofs are rejected without restarting a
-healthy generation. Devnet keeps its V2 verifier and never opts into V3 merely
-because an external worker was configured.
+substitution kill that generation and fail the current verifier request; a
+later request must pass startup again. Replacement startup and authentication
+run in one single-flight supervisor outside the peer request. A failed
+replacement keeps that single-flight state through a bounded one-second
+backoff so peer retries cannot create a process-spawn storm. While the
+supervisor is running, or after its attempt is unavailable, block submissions
+receive the retryable `Busy` result; a request never waits through the
+900-second startup limit. The worker becomes admissible again only after its
+full authenticated handshake succeeds. Invalid proofs receive `Rejected`
+without restarting a healthy generation. Devnet keeps its V2 verifier and
+never opts into V3 merely because an external worker was configured.
+
+### P2P `SubmitBlock` timeout and admission contract
+
+Mining and relay clients use a dedicated 120-second response budget for
+`SubmitBlock`; the ordinary 10-second peer idle timeout does not apply while
+waiting for `BlockSubmissionResult`. The receiving node stops authoritative
+acceptance at 110 seconds and permits no response write at or after 115
+seconds. Those two five-second margins reserve bounded time for durable commit,
+response serialization, scheduling, and transport before the client deadline.
+The same 110-second server-owned deadline follows the request through FIFO
+admission, proof dispatch, reconstruction, and an atomic pre-append
+linearization point. Cancellation/deadline and commit race through one shared
+`Active -> Cancelled | Committing` state. `Cancelled` can never append. A
+post-CAS clock recheck relinquishes `Committing` to `Cancelled` if the deadline
+expired across the transition; otherwise append, synchronization, and state
+commit must complete or latch the node storage-faulted. The 115-second cutoff
+also bounds acquisition
+of the node-status lock, response serialization, and every response write; a
+late response writes no new frame bytes and the connection fails closed.
+
+Production-profile remote proof work has a hard cap of eight sessions across
+the active request and FIFO waiters. Its admission wait is at most 60 seconds.
+The shared verifier then permits one active proof and at most eight normal
+waiters with a five-second queue wait; locally found blocks use a separate
+two-waiter priority lane. Every wait and the worker request are additionally
+bounded by the request's remaining 110-second lifetime. Cached proofs still
+take their FIFO turn, but do not dispatch the expensive relation again.
+
+Capacity exhaustion, admission or request deadline expiry, and an unavailable
+or restarting worker return `Busy`. Miners must retain and retry the exact
+block/proof while a compatible peer still reports its parent as the active
+tip; they must not fetch a fresh template solely because of `Busy`. The
+standalone miner retries across reconnects for one interruptible 20-minute
+total budget, then records an abandonment; a changed tip records a distinct
+stale submission. A cryptographically invalid proof returns `Rejected`;
+duplicates return `AlreadyKnown`. Shutdown is polled during bounded connect
+attempts and throughout hello, submission-write, and response-read I/O.
+Submission disconnects and peer protocol errors (including malformed frames
+and wrong response IDs) have separate miner counters; neither is counted as a
+cryptographic rejection. Node status reports each admission class as
+`proof_verification_normal_admission`,
+`proof_verification_priority_admission`, and
+`proof_verification_remote_admission`, with `active`, `queued`, `wait_events`,
+`rejections`, and `proof_failures`. It also reports
+`proof_verification_remote_admission_capacity` and
+`proof_verification_remote_admission_wait_timeout_ms`. External-worker status
+also exposes `proof_verification_teardown_failures`; this counter can rise while
+the original request classification remains unchanged. Rejections count work
+refused before verifier dispatch; proof failures count invalid or faulted
+requests after dispatch, so operators can distinguish saturation from proof or
+worker faults.
 
 ## Loopback RPC
 

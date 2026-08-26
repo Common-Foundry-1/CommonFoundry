@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -56,6 +56,10 @@ const HANDSHAKE_SUCCESS_BYTES: usize = 8 + 4 + 1 + 1 + 1 + 32 + 32 + 32 + 32;
 const HANDSHAKE_ERROR_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
 const STARTUP_SELF_TEST_DOMAIN: &[u8] = b"Common Foundry persistent verifier startup self-test v2";
 const CONTAINMENT_PROFILE_DOMAIN: &[u8] = b"Common Foundry verifier containment profile v1";
+/// Keeps repeated, immediately failing supervised starts from turning peer
+/// retries into a process-spawn storm. `Restarting` remains published during
+/// this bounded delay, and terminal close still wins the state transition.
+const RESTART_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
 const LINUX_CGROUP_V2_DOMAIN_PROFILE: &[u8] = b"Common Foundry Linux cgroup-v2 domain containment v1: unified; delegated cpu,memory,pids; supervisor child; worker cgroup.type=domain; cpu.max; memory.max; memory.swap.max=0; pids.max; memory.oom.group=1; cgroup.max.depth=0; cgroup.max.descendants=0; exact cgroup.procs membership; cgroup.freeze; cgroup.kill";
 const PRIVATE_COPY_ATTEMPTS: usize = 128;
@@ -277,6 +281,17 @@ pub enum VerifierWorkerError {
     WorkerReported { code: u16, message: String },
     #[error("verifier worker response does not match the requested statement")]
     ResponseMismatch,
+    #[error("verifier worker is restarting")]
+    Restarting,
+    #[error("verifier worker is unavailable after a failed supervised restart")]
+    Unavailable,
+    #[error("verifier worker request deadline has expired")]
+    RequestDeadlineExpired,
+    /// An error that occurred only after a persistent verifier began handling
+    /// one canonical block request. Startup, configuration, authentication,
+    /// containment, and pre-dispatch failures are never wrapped here.
+    #[error("verifier worker failed while handling a dispatched request: {0}")]
+    DispatchedRequest(#[source] Box<VerifierWorkerError>),
     #[error("could not issue the externally verified capability: {0}")]
     Capability(String),
     #[error("could not create the private verifier runtime copy while {operation}: {source}")]
@@ -301,6 +316,20 @@ pub enum VerifierWorkerError {
     Closed,
     #[error("ProductionV3 verifier sandbox is unavailable: {0}")]
     SandboxUnavailable(&'static str),
+}
+
+impl VerifierWorkerError {
+    /// True only when a canonical proof request reached a persistent worker
+    /// and the request itself was rejected or the worker failed while serving
+    /// it. Startup, configuration, authentication, containment, and capability
+    /// failures that occur before dispatch are deliberately excluded.
+    pub fn is_dispatched_proof_failure(&self) -> bool {
+        match self {
+            Self::ProofRejected(_) | Self::DispatchedRequest(_) => true,
+            Self::CleanupAfterFailure { worker, .. } => worker.is_dispatched_proof_failure(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -392,6 +421,8 @@ struct PersistentVerifierWorkerInner {
     terminator: Mutex<Option<(u64, ProcessTerminator)>>,
     process_attempts: AtomicU64,
     process_starts: AtomicU64,
+    readiness: AtomicU8,
+    teardown_failures: Arc<AtomicU64>,
     shutdown_epoch: AtomicU64,
     terminated_generation: AtomicU64,
     sandbox_status: std::sync::atomic::AtomicU8,
@@ -403,6 +434,28 @@ struct PersistentVerifierWorkerInner {
     // Declared last so the process and its pipes are dropped before its private
     // executable copy is made writable for cleanup.
     runtime_copy: PrivateRuntimeCopy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PersistentWorkerReadiness {
+    Starting = 0,
+    Healthy = 1,
+    Restarting = 2,
+    Unavailable = 3,
+    Closed = 4,
+}
+
+impl PersistentWorkerReadiness {
+    fn load(value: u8) -> Self {
+        match value {
+            0 => Self::Starting,
+            1 => Self::Healthy,
+            2 => Self::Restarting,
+            3 => Self::Unavailable,
+            _ => Self::Closed,
+        }
+    }
 }
 
 impl PersistentVerifierWorker {
@@ -434,6 +487,8 @@ impl PersistentVerifierWorker {
                 terminator: Mutex::new(None),
                 process_attempts: AtomicU64::new(0),
                 process_starts: AtomicU64::new(0),
+                readiness: AtomicU8::new(PersistentWorkerReadiness::Starting as u8),
+                teardown_failures: Arc::new(AtomicU64::new(0)),
                 shutdown_epoch: AtomicU64::new(0),
                 terminated_generation: AtomicU64::new(0),
                 sandbox_status: std::sync::atomic::AtomicU8::new(
@@ -445,6 +500,10 @@ impl PersistentVerifierWorker {
             }),
         };
         worker.ensure_started()?;
+        worker
+            .inner
+            .readiness
+            .store(PersistentWorkerReadiness::Healthy as u8, Ordering::Release);
         Ok(worker)
     }
 
@@ -452,9 +511,25 @@ impl PersistentVerifierWorker {
         &self,
         block: &Block,
     ) -> Result<PreverifiedBlockProof, VerifierWorkerError> {
+        self.verify_block_with_timeout(block, self.inner.config.timeout)
+    }
+
+    /// Verifies one block without allowing this request to spend longer than
+    /// `timeout_limit` in the already-authenticated worker. Starting or
+    /// authenticating a replacement generation is always supervised outside
+    /// the submitting request.
+    pub fn verify_block_with_timeout(
+        &self,
+        block: &Block,
+        timeout_limit: Duration,
+    ) -> Result<PreverifiedBlockProof, VerifierWorkerError> {
+        if timeout_limit.is_zero() {
+            return Err(VerifierWorkerError::RequestDeadlineExpired);
+        }
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(VerifierWorkerError::Closed);
         }
+        self.ensure_request_ready()?;
         if block.challenge.network_id != self.inner.network_id {
             return Err(VerifierWorkerError::Startup(
                 "candidate belongs to another network".to_owned(),
@@ -486,64 +561,68 @@ impl PersistentVerifierWorker {
             .lock()
             .map_err(|_| VerifierWorkerError::StatePoisoned)?;
         if self.inner.closed.load(Ordering::Acquire) {
-            return Err(VerifierWorkerError::Closed);
+            let error = self
+                .inner
+                .finish_generation(&mut process, VerifierWorkerError::Closed);
+            return Err(error);
+        }
+        if PersistentWorkerReadiness::load(self.inner.readiness.load(Ordering::Acquire))
+            != PersistentWorkerReadiness::Healthy
+        {
+            return Err(VerifierWorkerError::Restarting);
         }
         let request_shutdown_epoch = self.inner.shutdown_epoch.load(Ordering::Acquire);
         self.inner.discard_terminated_generation(&mut process)?;
         if process.is_none() {
-            *process = Some(self.inner.start_process()?);
+            drop(process);
+            self.request_supervised_restart();
+            return Err(VerifierWorkerError::Restarting);
         }
         let response = match process
             .as_mut()
             .expect("persistent verifier was started above")
             .exchange(
                 request,
-                self.inner.config.timeout,
+                self.inner.config.timeout.min(timeout_limit),
                 MAX_VERIFIER_RESPONSE_BYTES,
+                PersistentExchangePhase::Request,
             ) {
             Ok(response) => response,
             Err(error) => {
-                let generation = process.as_ref().map(|process| process.generation);
-                if let Some(generation) = generation {
-                    self.inner.clear_terminator(generation)?;
-                }
-                process.take();
+                let error = self.inner.finish_generation(&mut process, error);
+                drop(process);
+                self.request_supervised_restart();
                 return Err(error);
             }
         };
         if let Err(error) =
             require_matching_success(&response, binding, required_sandbox, containment_profile)
         {
+            let error = wrap_dispatched_request_error(error);
             // A canonical proof rejection is an expected, statement-local
             // outcome. Protocol, identity, and worker-internal failures poison
             // this process generation and force a complete authenticated
             // restart before any later request.
             if !matches!(error, VerifierWorkerError::ProofRejected(_)) {
-                let generation = process.as_ref().map(|process| process.generation);
-                if let Some(generation) = generation {
-                    self.inner.clear_terminator(generation)?;
-                }
-                process.take();
+                let error = self.inner.finish_generation(&mut process, error);
+                drop(process);
+                self.request_supervised_restart();
+                return Err(error);
             }
             return Err(error);
         }
         if self.inner.shutdown_epoch.load(Ordering::Acquire) != request_shutdown_epoch {
-            let generation = process.as_ref().map(|process| process.generation);
-            if let Some(generation) = generation {
-                self.inner.clear_terminator(generation)?;
-            }
-            process.take();
-            return Err(VerifierWorkerError::Startup(
-                "worker request was cancelled".to_owned(),
-            ));
+            let error = self.inner.finish_generation(
+                &mut process,
+                VerifierWorkerError::Startup("worker request was cancelled".to_owned()),
+            );
+            return Err(error);
         }
         if self.inner.closed.load(Ordering::Acquire) {
-            let generation = process.as_ref().map(|process| process.generation);
-            if let Some(generation) = generation {
-                self.inner.clear_terminator(generation)?;
-            }
-            process.take();
-            return Err(VerifierWorkerError::Closed);
+            let error = self
+                .inner
+                .finish_generation(&mut process, VerifierWorkerError::Closed);
+            return Err(error);
         }
 
         // SAFETY: the exact binding was returned by the private-copy, pinned,
@@ -560,12 +639,13 @@ impl PersistentVerifierWorker {
         match capability {
             Ok(capability) => Ok(capability),
             Err(error) => {
-                let generation = process.as_ref().map(|process| process.generation);
-                if let Some(generation) = generation {
-                    self.inner.clear_terminator(generation)?;
-                }
-                process.take();
-                Err(VerifierWorkerError::Capability(error.to_string()))
+                let error = self.inner.finish_generation(
+                    &mut process,
+                    VerifierWorkerError::Capability(error.to_string()),
+                );
+                drop(process);
+                self.request_supervised_restart();
+                Err(error)
             }
         }
     }
@@ -576,6 +656,19 @@ impl PersistentVerifierWorker {
 
     pub fn memory_limit_bytes(&self) -> u64 {
         self.inner.config.memory_limit_bytes
+    }
+
+    /// True only after the current generation completed its authenticated
+    /// startup handshake. This is local admission state, not consensus proof.
+    pub fn is_ready(&self) -> bool {
+        PersistentWorkerReadiness::load(self.inner.readiness.load(Ordering::Acquire))
+            == PersistentWorkerReadiness::Healthy
+    }
+
+    /// Counts additional failures while tearing down a poisoned generation.
+    /// The request error that triggered teardown remains authoritative.
+    pub fn teardown_failures(&self) -> u64 {
+        self.inner.teardown_failures.load(Ordering::Acquire)
     }
 
     /// Last startup-authenticated isolation state. ProductionV3 construction
@@ -596,7 +689,14 @@ impl PersistentVerifierWorker {
             self.inner
                 .terminated_generation
                 .store(*generation, Ordering::Release);
-            terminate_for_shutdown(handle, &self.inner.transport_poisoned);
+            terminate_for_shutdown(
+                handle,
+                &self.inner.transport_poisoned,
+                &self.inner.teardown_failures,
+            );
+        }
+        if !self.inner.closed.load(Ordering::Acquire) {
+            self.request_supervised_restart();
         }
     }
 
@@ -604,7 +704,69 @@ impl PersistentVerifierWorker {
     /// Unlike `shutdown`, this is the terminal service-teardown operation.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
+        self.inner
+            .readiness
+            .store(PersistentWorkerReadiness::Closed as u8, Ordering::Release);
         self.shutdown();
+        let mut process = match self.inner.process.lock() {
+            Ok(process) => process,
+            Err(poisoned) => {
+                self.inner.transport_poisoned.store(true, Ordering::Release);
+                self.inner.teardown_failures.fetch_add(1, Ordering::AcqRel);
+                poisoned.into_inner()
+            }
+        };
+        let _ = self.inner.discard_generation(&mut process);
+    }
+
+    fn ensure_request_ready(&self) -> Result<(), VerifierWorkerError> {
+        match PersistentWorkerReadiness::load(self.inner.readiness.load(Ordering::Acquire)) {
+            PersistentWorkerReadiness::Healthy => Ok(()),
+            PersistentWorkerReadiness::Unavailable => {
+                self.request_supervised_restart();
+                Err(VerifierWorkerError::Unavailable)
+            }
+            PersistentWorkerReadiness::Starting | PersistentWorkerReadiness::Restarting => {
+                Err(VerifierWorkerError::Restarting)
+            }
+            PersistentWorkerReadiness::Closed => Err(VerifierWorkerError::Closed),
+        }
+    }
+
+    fn request_supervised_restart(&self) {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut observed = self.inner.readiness.load(Ordering::Acquire);
+        loop {
+            let readiness = PersistentWorkerReadiness::load(observed);
+            if matches!(
+                readiness,
+                PersistentWorkerReadiness::Starting
+                    | PersistentWorkerReadiness::Restarting
+                    | PersistentWorkerReadiness::Closed
+            ) {
+                return;
+            }
+            match self.inner.readiness.compare_exchange_weak(
+                observed,
+                PersistentWorkerReadiness::Restarting as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => observed = actual,
+            }
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let _supervisor = thread::Builder::new()
+            .name("cmfd-verifier-restart".to_owned())
+            .spawn(move || inner.supervise_restart());
+        // If resource exhaustion prevented supervision itself, deliberately
+        // keep the single-flight token fail-closed instead of allowing every
+        // peer retry to attempt another thread spawn. Terminal close still
+        // replaces this state; process restart is the recovery path.
     }
 
     fn ensure_started(&self) -> Result<(), VerifierWorkerError> {
@@ -644,6 +806,44 @@ impl PersistentVerifierWorker {
 }
 
 impl PersistentVerifierWorkerInner {
+    fn supervise_restart(self: Arc<Self>) {
+        let result = (|| {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(VerifierWorkerError::Closed);
+            }
+            let mut process = self
+                .process
+                .lock()
+                .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+            self.discard_terminated_generation(&mut process)?;
+            self.discard_generation(&mut process)?;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(VerifierWorkerError::Closed);
+            }
+            *process = Some(self.start_process()?);
+            Ok(())
+        })();
+        let readiness = if result.is_ok() {
+            PersistentWorkerReadiness::Healthy
+        } else {
+            if !self.closed.load(Ordering::Acquire) {
+                thread::sleep(RESTART_FAILURE_BACKOFF);
+            }
+            PersistentWorkerReadiness::Unavailable
+        };
+        // `Restarting` is the single-flight token. A racing close replaces it
+        // with the terminal `Closed` state, so this compare-and-exchange can
+        // never resurrect readiness after service teardown. A racing shutdown
+        // only advances the epoch/terminates the generation; the supervised
+        // attempt observes that and publishes `Unavailable` once.
+        let _ = self.readiness.compare_exchange(
+            PersistentWorkerReadiness::Restarting as u8,
+            readiness as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     fn start_process(&self) -> Result<PersistentVerifierProcess, VerifierWorkerError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(VerifierWorkerError::Closed);
@@ -720,30 +920,22 @@ impl PersistentVerifierWorkerInner {
             child,
             generation,
             Arc::clone(&self.transport_poisoned),
+            Arc::clone(&self.teardown_failures),
         )?;
-        self.set_terminator(generation, terminator.clone())?;
+        if let Err(error) = self.set_terminator(generation, terminator) {
+            return Err(process.preserve_error_after_teardown(error));
+        }
         if self.closed.load(Ordering::Acquire)
             || self.shutdown_epoch.load(Ordering::Acquire) != shutdown_epoch
         {
             self.terminated_generation
                 .store(generation, Ordering::Release);
-            let termination = terminator.terminate_tree();
-            self.clear_terminator(generation)?;
             let primary = if self.closed.load(Ordering::Acquire) {
                 VerifierWorkerError::Closed
             } else {
                 VerifierWorkerError::Startup("worker startup was cancelled".to_owned())
             };
-            return Err(match termination {
-                Ok(_) => primary,
-                Err(source) => {
-                    self.transport_poisoned.store(true, Ordering::Release);
-                    VerifierWorkerError::CleanupAfterFailure {
-                        worker: Box::new(primary),
-                        source,
-                    }
-                }
-            });
+            return Err(self.finish_local_generation(&mut process, primary));
         }
         let startup = (|| {
             let mut challenge = [0_u8; 32];
@@ -764,6 +956,7 @@ impl PersistentVerifierWorkerInner {
                 request,
                 self.config.startup_timeout,
                 HANDSHAKE_SUCCESS_BYTES.max(HANDSHAKE_ERROR_FIXED_BYTES + MAX_ERROR_BYTES),
+                PersistentExchangePhase::Startup,
             )?;
             let sandbox_status = require_startup_success(
                 &response,
@@ -779,8 +972,7 @@ impl PersistentVerifierWorkerInner {
             Ok(())
         })();
         if let Err(error) = startup {
-            self.clear_terminator(generation)?;
-            return Err(error);
+            return Err(self.finish_local_generation(&mut process, error));
         }
         self.process_starts.fetch_add(1, Ordering::AcqRel);
         Ok(process)
@@ -813,6 +1005,60 @@ impl PersistentVerifierWorkerInner {
         Ok(())
     }
 
+    fn finish_local_generation(
+        &self,
+        process: &mut PersistentVerifierProcess,
+        primary: VerifierWorkerError,
+    ) -> VerifierWorkerError {
+        let generation = process.generation;
+        let error = process.preserve_error_after_teardown(primary);
+        match self.clear_terminator(generation) {
+            Ok(()) => error,
+            Err(cleanup) => compose_additional_cleanup_failure(
+                error,
+                io::Error::other(cleanup),
+                &self.transport_poisoned,
+                &self.teardown_failures,
+            ),
+        }
+    }
+
+    fn finish_generation(
+        &self,
+        slot: &mut Option<PersistentVerifierProcess>,
+        primary: VerifierWorkerError,
+    ) -> VerifierWorkerError {
+        let Some(mut process) = slot.take() else {
+            return primary;
+        };
+        self.finish_local_generation(&mut process, primary)
+    }
+
+    fn discard_generation(
+        &self,
+        slot: &mut Option<PersistentVerifierProcess>,
+    ) -> Result<(), VerifierWorkerError> {
+        let Some(mut process) = slot.take() else {
+            return Ok(());
+        };
+        let generation = process.generation;
+        let teardown = process.finish_teardown();
+        let terminator = match self.clear_terminator(generation) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.transport_poisoned.store(true, Ordering::Release);
+                self.teardown_failures.fetch_add(1, Ordering::AcqRel);
+                Err(io::Error::other(error))
+            }
+        };
+        super::combine_cleanup_results(teardown, terminator).map_err(|source| {
+            VerifierWorkerError::Process(ProofWorkerError::Containment {
+                operation: "discarding a persistent verifier generation",
+                source,
+            })
+        })
+    }
+
     fn discard_terminated_generation(
         &self,
         process: &mut Option<PersistentVerifierProcess>,
@@ -821,8 +1067,7 @@ impl PersistentVerifierWorkerInner {
             return Ok(());
         };
         if self.terminated_generation.load(Ordering::Acquire) == generation {
-            self.clear_terminator(generation)?;
-            process.take();
+            self.discard_generation(process)?;
         }
         Ok(())
     }
@@ -830,8 +1075,23 @@ impl PersistentVerifierWorkerInner {
 
 impl Drop for PersistentVerifierWorkerInner {
     fn drop(&mut self) {
-        if let Ok(process) = self.process.get_mut() {
-            process.take();
+        let process = self
+            .process
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut process) = process.take() {
+            let generation = process.generation;
+            let _ = process.finish_teardown();
+            let terminator = self
+                .terminator
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if terminator
+                .as_ref()
+                .is_some_and(|(current, _)| *current == generation)
+            {
+                terminator.take();
+            }
         }
         #[cfg(windows)]
         if crate::process::shutdown_appcontainer_profile_cleanup().is_err() {
@@ -1515,8 +1775,52 @@ struct PersistentVerifierProcess {
     stdout: Option<super::process::BlockingPipeReader>,
     stderr_capture: Arc<Mutex<StderrCapture>>,
     transport_poisoned: Arc<AtomicBool>,
+    teardown_failures: Arc<AtomicU64>,
     stderr_done: Option<mpsc::Receiver<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PersistentExchangePhase {
+    Startup,
+    Request,
+}
+
+fn wrap_exchange_error(
+    phase: PersistentExchangePhase,
+    error: VerifierWorkerError,
+) -> VerifierWorkerError {
+    let request_scoped = matches!(phase, PersistentExchangePhase::Request)
+        && matches!(
+            &error,
+            VerifierWorkerError::TransportPoisoned
+                | VerifierWorkerError::Process(
+                    ProofWorkerError::Timeout { .. }
+                        | ProofWorkerError::Pipe { .. }
+                        | ProofWorkerError::PipeThread(_)
+                        | ProofWorkerError::WorkerExited { .. }
+                        | ProofWorkerError::StdoutTooLarge
+                        | ProofWorkerError::StderrTooLarge
+                )
+        );
+    if request_scoped {
+        VerifierWorkerError::DispatchedRequest(Box::new(error))
+    } else {
+        error
+    }
+}
+
+fn wrap_dispatched_request_error(error: VerifierWorkerError) -> VerifierWorkerError {
+    if matches!(
+        &error,
+        VerifierWorkerError::Protocol(_)
+            | VerifierWorkerError::WorkerReported { .. }
+            | VerifierWorkerError::ResponseMismatch
+    ) {
+        VerifierWorkerError::DispatchedRequest(Box::new(error))
+    } else {
+        error
+    }
 }
 
 impl PersistentVerifierProcess {
@@ -1524,6 +1828,7 @@ impl PersistentVerifierProcess {
         mut child: ContainedChild,
         generation: u64,
         transport_poisoned: Arc<AtomicBool>,
+        teardown_failures: Arc<AtomicU64>,
     ) -> Result<Self, VerifierWorkerError> {
         let stdin = match child.take_stdin() {
             Some(stdin) => stdin,
@@ -1575,6 +1880,7 @@ impl PersistentVerifierProcess {
             stdout: Some(stdout),
             stderr_capture,
             transport_poisoned,
+            teardown_failures,
             stderr_done: Some(stderr_done),
             stderr_thread: Some(stderr_thread),
         })
@@ -1585,24 +1891,34 @@ impl PersistentVerifierProcess {
         request: Vec<u8>,
         timeout: Duration,
         response_limit: usize,
+        phase: PersistentExchangePhase,
     ) -> Result<Vec<u8>, VerifierWorkerError> {
         if let Err(error) = self.child.thaw_for_request() {
-            return Err(self.cleanup_after_failure(VerifierWorkerError::Process(error)));
+            let original = wrap_exchange_error(phase, VerifierWorkerError::Process(error));
+            return Err(self.preserve_error_after_teardown(original));
         }
         let stdin = match self.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                return Err(self.cleanup_after_failure(VerifierWorkerError::Process(
-                    ProofWorkerError::InvalidConfig("persistent worker stdin pipe is unavailable"),
-                )));
+                let original = wrap_exchange_error(
+                    phase,
+                    VerifierWorkerError::Process(ProofWorkerError::InvalidConfig(
+                        "persistent worker stdin pipe is unavailable",
+                    )),
+                );
+                return Err(self.preserve_error_after_teardown(original));
             }
         };
         let stdout = match self.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                return Err(self.cleanup_after_failure(VerifierWorkerError::Process(
-                    ProofWorkerError::InvalidConfig("persistent worker stdout pipe is unavailable"),
-                )));
+                let original = wrap_exchange_error(
+                    phase,
+                    VerifierWorkerError::Process(ProofWorkerError::InvalidConfig(
+                        "persistent worker stdout pipe is unavailable",
+                    )),
+                );
+                return Err(self.preserve_error_after_teardown(original));
             }
         };
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -1621,69 +1937,158 @@ impl PersistentVerifierProcess {
             Ok((stdin, stdout, result)) => {
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
                     self.transport_poisoned.store(true, Ordering::Release);
-                    return Err(self.cleanup_after_failure(VerifierWorkerError::TransportPoisoned));
+                    let original =
+                        wrap_exchange_error(phase, VerifierWorkerError::TransportPoisoned);
+                    return Err(self.preserve_error_after_teardown(original));
                 }
                 self.stdin = Some(stdin);
                 self.stdout = Some(stdout);
                 if let Err(error) = self.child.freeze_after_response() {
-                    return Err(self.cleanup_after_failure(VerifierWorkerError::Process(error)));
+                    let original = wrap_exchange_error(phase, VerifierWorkerError::Process(error));
+                    return Err(self.preserve_error_after_teardown(original));
                 }
                 match self.stderr_exceeded() {
                     Ok(true) => {
-                        return Err(self.cleanup_after_failure(VerifierWorkerError::Process(
-                            ProofWorkerError::StderrTooLarge,
-                        )));
+                        let original = wrap_exchange_error(
+                            phase,
+                            VerifierWorkerError::Process(ProofWorkerError::StderrTooLarge),
+                        );
+                        return Err(self.preserve_error_after_teardown(original));
                     }
                     Ok(false) => {}
-                    Err(error) => return Err(self.cleanup_after_failure(error)),
+                    Err(error) => return Err(self.preserve_error_after_teardown(error)),
                 }
                 let response = match result {
                     Ok(response) => response,
                     Err(error) => {
-                        return Err(self.cleanup_after_failure(VerifierWorkerError::Process(error)));
+                        let original =
+                            wrap_exchange_error(phase, VerifierWorkerError::Process(error));
+                        return Err(self.preserve_error_after_teardown(original));
                     }
                 };
                 match self.child.try_wait() {
                     Ok(None) => Ok(response),
-                    Ok(Some(status)) => match self.stderr_bytes() {
-                        Ok(stderr) => Err(VerifierWorkerError::Process(worker_exit_error(
-                            status, &stderr,
-                        ))),
-                        Err(error) => Err(self.cleanup_after_failure(error)),
-                    },
-                    Err(source) => Err(self.cleanup_after_failure(VerifierWorkerError::Process(
-                        ProofWorkerError::Pipe {
-                            operation: "waiting for persistent verifier worker",
-                            source,
-                        },
-                    ))),
+                    Ok(Some(status)) => {
+                        let original = match self.stderr_bytes() {
+                            Ok(stderr) => wrap_exchange_error(
+                                phase,
+                                VerifierWorkerError::Process(worker_exit_error(status, &stderr)),
+                            ),
+                            Err(error) => error,
+                        };
+                        Err(self.preserve_error_after_confirmed_exit(original))
+                    }
+                    Err(source) => {
+                        let original = wrap_exchange_error(
+                            phase,
+                            VerifierWorkerError::Process(ProofWorkerError::Pipe {
+                                operation: "waiting for persistent verifier worker",
+                                source,
+                            }),
+                        );
+                        Err(self.preserve_error_after_teardown(original))
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let primary = VerifierWorkerError::Process(ProofWorkerError::Timeout {
-                    milliseconds: timeout.as_millis(),
-                });
-                let error = self.cleanup_after_failure(primary);
+                let original = wrap_exchange_error(
+                    phase,
+                    VerifierWorkerError::Process(ProofWorkerError::Timeout {
+                        milliseconds: timeout.as_millis(),
+                    }),
+                );
+                let mut error = self.preserve_error_after_teardown(original);
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
-                    self.transport_poisoned.store(true, Ordering::Release);
+                    error = compose_additional_cleanup_failure(
+                        error,
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "persistent verifier I/O thread did not stop after request timeout",
+                        ),
+                        &self.transport_poisoned,
+                        &self.teardown_failures,
+                    );
                 }
                 Err(error)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let primary = VerifierWorkerError::Process(ProofWorkerError::PipeThread(
-                    "exchanging persistent verifier frames",
-                ));
-                let error = self.cleanup_after_failure(primary);
+                let original = wrap_exchange_error(
+                    phase,
+                    VerifierWorkerError::Process(ProofWorkerError::PipeThread(
+                        "exchanging persistent verifier frames",
+                    )),
+                );
+                let mut error = self.preserve_error_after_teardown(original);
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
-                    self.transport_poisoned.store(true, Ordering::Release);
+                    error = compose_additional_cleanup_failure(
+                        error,
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "persistent verifier I/O thread did not stop after disconnect",
+                        ),
+                        &self.transport_poisoned,
+                        &self.teardown_failures,
+                    );
                 }
                 Err(error)
             }
         }
     }
 
-    fn cleanup_after_failure(&mut self, primary: VerifierWorkerError) -> VerifierWorkerError {
-        compose_persistent_cleanup(&mut self.child, &self.transport_poisoned, primary)
+    fn preserve_error_after_teardown(
+        &mut self,
+        original: VerifierWorkerError,
+    ) -> VerifierWorkerError {
+        let teardown = self.finish_teardown();
+        preserve_request_error(original, teardown)
+    }
+
+    fn preserve_error_after_confirmed_exit(
+        &mut self,
+        original: VerifierWorkerError,
+    ) -> VerifierWorkerError {
+        let child_cleanup = self
+            .child
+            .finish_reaped_and_cleanup()
+            .map_err(io::Error::other);
+        let teardown = super::combine_cleanup_results(child_cleanup, self.finish_pipe_resources());
+        self.record_teardown_result(&teardown);
+        preserve_request_error(original, teardown)
+    }
+
+    fn finish_teardown(&mut self) -> io::Result<()> {
+        let child_cleanup = persistent_process_cleanup(&mut self.child, &self.transport_poisoned);
+        let teardown = super::combine_cleanup_results(child_cleanup, self.finish_pipe_resources());
+        self.record_teardown_result(&teardown);
+        teardown
+    }
+
+    fn finish_pipe_resources(&mut self) -> io::Result<()> {
+        self.stdin.take();
+        self.stdout.take();
+        match (self.stderr_thread.take(), self.stderr_done.take()) {
+            (Some(thread), Some(done)) => {
+                if finish_pipe_thread_bounded(thread, done) {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "persistent verifier stderr reader did not stop after process teardown",
+                    ))
+                }
+            }
+            (None, None) => Ok(()),
+            _ => Err(io::Error::other(
+                "persistent verifier stderr teardown state is inconsistent",
+            )),
+        }
+    }
+
+    fn record_teardown_result(&self, teardown: &io::Result<()>) {
+        if teardown.is_err() {
+            self.transport_poisoned.store(true, Ordering::Release);
+            self.teardown_failures.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     fn stderr_exceeded(&self) -> Result<bool, VerifierWorkerError> {
@@ -1701,35 +2106,74 @@ impl PersistentVerifierProcess {
     }
 }
 
-fn compose_persistent_cleanup(
+fn persistent_process_cleanup(
     child: &mut ContainedChild,
     transport_poisoned: &AtomicBool,
-    primary: VerifierWorkerError,
-) -> VerifierWorkerError {
+) -> io::Result<()> {
     let report = child.terminate_and_reap_report();
     if !report.exit_confirmed {
         super::PROCESS_CLEANUP_UNHEALTHY.store(true, Ordering::Release);
     }
     match report.error {
-        None if report.exit_confirmed => primary,
+        None if report.exit_confirmed => Ok(()),
         source => {
             transport_poisoned.store(true, Ordering::Release);
-            VerifierWorkerError::CleanupAfterFailure {
-                worker: Box::new(primary),
-                source: source.unwrap_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "persistent verifier exit could not be confirmed; resources remain quarantined",
-                    )
-                }),
-            }
+            Err(source.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "persistent verifier exit could not be confirmed; resources remain quarantined",
+                )
+            }))
         }
     }
 }
 
-fn terminate_for_shutdown(terminator: &ProcessTerminator, transport_poisoned: &AtomicBool) {
+fn compose_persistent_cleanup(
+    child: &mut ContainedChild,
+    transport_poisoned: &AtomicBool,
+    primary: VerifierWorkerError,
+) -> VerifierWorkerError {
+    preserve_request_error(
+        primary,
+        persistent_process_cleanup(child, transport_poisoned),
+    )
+}
+
+fn preserve_request_error(
+    original: VerifierWorkerError,
+    teardown: io::Result<()>,
+) -> VerifierWorkerError {
+    match teardown {
+        Ok(()) => original,
+        Err(source) => VerifierWorkerError::CleanupAfterFailure {
+            worker: Box::new(original),
+            source,
+        },
+    }
+}
+
+fn compose_additional_cleanup_failure(
+    primary: VerifierWorkerError,
+    source: io::Error,
+    transport_poisoned: &AtomicBool,
+    teardown_failures: &AtomicU64,
+) -> VerifierWorkerError {
+    transport_poisoned.store(true, Ordering::Release);
+    teardown_failures.fetch_add(1, Ordering::AcqRel);
+    VerifierWorkerError::CleanupAfterFailure {
+        worker: Box::new(primary),
+        source,
+    }
+}
+
+fn terminate_for_shutdown(
+    terminator: &ProcessTerminator,
+    transport_poisoned: &AtomicBool,
+    teardown_failures: &AtomicU64,
+) {
     if terminator.terminate_tree().is_err() {
         transport_poisoned.store(true, Ordering::Release);
+        teardown_failures.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1780,20 +2224,7 @@ fn capture_persistent_stderr(mut stderr: impl Read, capture: Arc<Mutex<StderrCap
 
 impl Drop for PersistentVerifierProcess {
     fn drop(&mut self) {
-        let report = self.child.terminate_and_reap_report();
-        if report.error.is_some() || !report.exit_confirmed {
-            self.transport_poisoned.store(true, Ordering::Release);
-        }
-        if !report.exit_confirmed {
-            super::PROCESS_CLEANUP_UNHEALTHY.store(true, Ordering::Release);
-        }
-        self.stdin.take();
-        self.stdout.take();
-        if let (Some(thread), Some(done)) = (self.stderr_thread.take(), self.stderr_done.take())
-            && !finish_pipe_thread_bounded(thread, done)
-        {
-            self.transport_poisoned.store(true, Ordering::Release);
-        }
+        let _ = self.finish_teardown();
     }
 }
 
@@ -3333,6 +3764,88 @@ mod tests {
     }
 
     #[test]
+    fn dispatched_request_errors_preserve_the_startup_request_phase_boundary() {
+        let request_timeout = wrap_exchange_error(
+            PersistentExchangePhase::Request,
+            VerifierWorkerError::Process(ProofWorkerError::Timeout { milliseconds: 1 }),
+        );
+        assert!(matches!(
+            request_timeout,
+            VerifierWorkerError::DispatchedRequest(error)
+                if matches!(*error, VerifierWorkerError::Process(ProofWorkerError::Timeout { .. }))
+        ));
+
+        let request_stderr = wrap_exchange_error(
+            PersistentExchangePhase::Request,
+            VerifierWorkerError::Process(ProofWorkerError::StderrTooLarge),
+        );
+        assert!(matches!(
+            request_stderr,
+            VerifierWorkerError::DispatchedRequest(error)
+                if matches!(*error, VerifierWorkerError::Process(ProofWorkerError::StderrTooLarge))
+        ));
+
+        let startup_timeout = wrap_exchange_error(
+            PersistentExchangePhase::Startup,
+            VerifierWorkerError::Process(ProofWorkerError::Timeout { milliseconds: 1 }),
+        );
+        assert!(matches!(
+            startup_timeout,
+            VerifierWorkerError::Process(ProofWorkerError::Timeout { .. })
+        ));
+        let request_config = wrap_exchange_error(
+            PersistentExchangePhase::Request,
+            VerifierWorkerError::Process(ProofWorkerError::InvalidConfig("test")),
+        );
+        assert!(matches!(
+            request_config,
+            VerifierWorkerError::Process(ProofWorkerError::InvalidConfig("test"))
+        ));
+
+        for failure in [
+            VerifierWorkerError::Protocol(VerifierProtocolError::InvalidStatus),
+            VerifierWorkerError::WorkerReported {
+                code: 9,
+                message: "request failed".to_owned(),
+            },
+            VerifierWorkerError::ResponseMismatch,
+        ] {
+            assert!(matches!(
+                wrap_dispatched_request_error(failure),
+                VerifierWorkerError::DispatchedRequest(_)
+            ));
+        }
+        assert!(matches!(
+            wrap_dispatched_request_error(VerifierWorkerError::ProofRejected(
+                "invalid proof".to_owned()
+            )),
+            VerifierWorkerError::ProofRejected(_)
+        ));
+
+        let original = VerifierWorkerError::DispatchedRequest(Box::new(
+            VerifierWorkerError::Process(ProofWorkerError::Timeout { milliseconds: 7 }),
+        ));
+        let preserved =
+            preserve_request_error(original, Err(io::Error::other("injected teardown failure")));
+        assert!(preserved.is_dispatched_proof_failure());
+        assert!(matches!(
+            preserved,
+            VerifierWorkerError::CleanupAfterFailure { worker, source }
+                if matches!(
+                    worker.as_ref(),
+                    VerifierWorkerError::DispatchedRequest(error)
+                        if matches!(
+                            error.as_ref(),
+                            VerifierWorkerError::Process(ProofWorkerError::Timeout {
+                                milliseconds: 7
+                            })
+                        )
+                )
+                    && source.to_string().contains("injected teardown failure")
+        ));
+    }
+
+    #[test]
     fn persistent_teardown_child_helper() {
         if std::env::var_os("CMFD_PERSISTENT_TEARDOWN_CHILD").is_some() {
             thread::sleep(Duration::from_secs(5));
@@ -3352,8 +3865,13 @@ mod tests {
         let child = spawn_contained(&mut command, None).unwrap();
         child.force_termination_failures(1);
         let transport_poisoned = Arc::new(AtomicBool::new(false));
-        let process =
-            PersistentVerifierProcess::new(child, 1, Arc::clone(&transport_poisoned)).unwrap();
+        let process = PersistentVerifierProcess::new(
+            child,
+            1,
+            Arc::clone(&transport_poisoned),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
         (process, transport_poisoned)
     }
 
@@ -3379,12 +3897,21 @@ mod tests {
         process.stdin = Some(Box::new(io::sink()));
         process.stdout = Some(Box::new(SlowReader));
         let error = process
-            .exchange(Vec::new(), Duration::from_millis(10), 1024)
+            .exchange(
+                Vec::new(),
+                Duration::from_millis(10),
+                1024,
+                PersistentExchangePhase::Request,
+            )
             .unwrap_err();
         assert_persistent_cleanup_wrap(error, |worker| {
             matches!(
                 worker,
-                VerifierWorkerError::Process(ProofWorkerError::Timeout { .. })
+                VerifierWorkerError::DispatchedRequest(source)
+                    if matches!(
+                        source.as_ref(),
+                        VerifierWorkerError::Process(ProofWorkerError::Timeout { .. })
+                    )
             )
         });
         assert!(transport_poisoned.load(Ordering::Acquire));
@@ -3395,7 +3922,12 @@ mod tests {
         let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
         process.stdout.take();
         let error = process
-            .exchange(Vec::new(), Duration::from_secs(1), 1024)
+            .exchange(
+                Vec::new(),
+                Duration::from_secs(1),
+                1024,
+                PersistentExchangePhase::Request,
+            )
             .unwrap_err();
         assert_persistent_cleanup_wrap(error, |worker| {
             matches!(
@@ -3405,6 +3937,29 @@ mod tests {
             )
         });
         assert!(transport_poisoned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn persistent_protocol_failure_composes_forced_generation_cleanup() {
+        let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
+        let error = process.preserve_error_after_teardown(VerifierWorkerError::DispatchedRequest(
+            Box::new(VerifierWorkerError::Protocol(
+                VerifierProtocolError::InvalidStatus,
+            )),
+        ));
+        assert!(error.is_dispatched_proof_failure());
+        assert_persistent_cleanup_wrap(error, |worker| {
+            matches!(
+                worker,
+                VerifierWorkerError::DispatchedRequest(source)
+                    if matches!(
+                        source.as_ref(),
+                        VerifierWorkerError::Protocol(VerifierProtocolError::InvalidStatus)
+                    )
+            )
+        });
+        assert!(transport_poisoned.load(Ordering::Acquire));
+        assert_eq!(process.teardown_failures.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -3421,9 +3976,14 @@ mod tests {
         let child = spawn_contained(&mut command, None).unwrap();
         child.force_termination_failures(1);
         let transport_poisoned = Arc::new(AtomicBool::new(false));
-        let error = PersistentVerifierProcess::new(child, 1, Arc::clone(&transport_poisoned))
-            .err()
-            .expect("missing pipe must fail construction");
+        let error = PersistentVerifierProcess::new(
+            child,
+            1,
+            Arc::clone(&transport_poisoned),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .err()
+        .expect("missing pipe must fail construction");
         assert_persistent_cleanup_wrap(error, |worker| {
             matches!(
                 worker,
@@ -3460,14 +4020,23 @@ mod tests {
         let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
         process.stdin = Some(Box::new(PanickingWriter));
         let error = process
-            .exchange(Vec::new(), Duration::from_secs(1), 1024)
+            .exchange(
+                Vec::new(),
+                Duration::from_secs(1),
+                1024,
+                PersistentExchangePhase::Request,
+            )
             .unwrap_err();
         assert_persistent_cleanup_wrap(error, |worker| {
             matches!(
                 worker,
-                VerifierWorkerError::Process(ProofWorkerError::PipeThread(
-                    "exchanging persistent verifier frames"
-                ))
+                VerifierWorkerError::DispatchedRequest(source)
+                    if matches!(
+                        source.as_ref(),
+                        VerifierWorkerError::Process(ProofWorkerError::PipeThread(
+                            "exchanging persistent verifier frames"
+                        ))
+                    )
             )
         });
         assert!(transport_poisoned.load(Ordering::Acquire));
@@ -3477,7 +4046,7 @@ mod tests {
     fn shutdown_termination_failure_poisons_transport() {
         let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
         let terminator = process.child.termination_handle();
-        terminate_for_shutdown(&terminator, &transport_poisoned);
+        terminate_for_shutdown(&terminator, &transport_poisoned, &process.teardown_failures);
         assert!(transport_poisoned.load(Ordering::Acquire));
         process.child.terminate_and_reap().unwrap();
     }
@@ -3502,8 +4071,14 @@ mod tests {
             .stderr(Stdio::piped());
         let child = spawn_contained(&mut command, None).unwrap();
         let transport_poisoned = Arc::new(AtomicBool::new(false));
-        let mut process =
-            PersistentVerifierProcess::new(child, 1, Arc::clone(&transport_poisoned)).unwrap();
+        let teardown_failures = Arc::new(AtomicU64::new(0));
+        let mut process = PersistentVerifierProcess::new(
+            child,
+            1,
+            Arc::clone(&transport_poisoned),
+            Arc::clone(&teardown_failures),
+        )
+        .unwrap();
 
         // Replace the real stderr reader with a deliberately stuck handle.
         // Reap and join the real reader first so this test does not itself
@@ -3540,5 +4115,6 @@ mod tests {
             "persistent process teardown exceeded its bounded reap window"
         );
         assert!(transport_poisoned.load(Ordering::Acquire));
+        assert_eq!(teardown_failures.load(Ordering::Acquire), 1);
     }
 }

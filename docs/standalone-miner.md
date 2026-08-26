@@ -121,8 +121,20 @@ at least one configured node answers `Accepted` or `AlreadyKnown`.
 The miner checks its source node every two seconds. A changed parent cancels
 the current GPU job and fetches fresh work. A temporary disconnect pauses GPU
 work and retries the preferred node followed by the configured failover nodes.
-If all nodes disconnect after a block is found, the miner retains and retries
-that exact block until a node accepts or rejects it.
+After a block is found, `Busy` is not a rejection. While a compatible node
+still reports the candidate's exact parent as its tip, the miner retains and
+retries the byte-identical block, proof, and block ID across reconnects. It
+does not fetch a fresh template solely because a node returned `Busy`. Each
+connection repeats the network and consensus handshake and each response must
+name the submitted block. The retry is interruptible by shutdown and has one
+20-minute total budget, including connect, handshake, and response time. A tip
+change increments stale-submission telemetry and rebuilds work; budget expiry
+increments abandonment telemetry and logs the abandoned block ID. Shutdown is
+polled during short bounded connect attempts and every handshake, request, and
+response I/O wait, so an unreachable or silent peer cannot hold the miner open.
+Transport disconnects and peer protocol errors (including malformed frames or
+the wrong response block ID) have separate counters and diagnostics; neither
+is counted as a cryptographic block rejection.
 
 `--miner` (or `PAYOUT_ADDRESS` in the packaged launch file) selects the coinbase
 payout destination. It does not identify or locate a node. `--peer` selects the

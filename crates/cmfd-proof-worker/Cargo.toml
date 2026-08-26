@@ -49,3 +49,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "cmfd-proof-worker"
 path = "src/main.rs"
+
+[[test]]
+name = "persistent_fault_worker"
+path = "tests/persistent_fault_worker.rs"
+harness = false

@@ -1160,11 +1160,7 @@ pub fn validate_existing_production_dory_v3_independent_lineage(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::{fs, io, path::PathBuf, thread, time::Duration};
 
     use dory_pcs::primitives::{DorySerialize, arithmetic::Field};
     use k256::schnorr::{Signature, SigningKey};
@@ -1912,24 +1908,38 @@ pub(crate) mod tests {
         ));
     }
 
-    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let nonce = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("cmfd-lineage-{}-{nonce}", std::process::id()));
-            fs::create_dir(&path).unwrap();
-            prepare_test_parent(&path).unwrap();
-            Self(path)
+            for _ in 0..128 {
+                let mut id = [0_u8; 16];
+                getrandom::fill(&mut id).expect("obtain random lineage test-root identity");
+                let path = std::env::temp_dir().join(format!("cmfd-lineage-{}", hex::encode(id)));
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        let directory = Self(path);
+                        prepare_test_parent(&directory.0).unwrap();
+                        return directory;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create isolated lineage test root {path:?}: {error}"),
+                }
+            }
+            panic!("could not allocate a unique lineage test root after 128 random candidates")
         }
     }
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            for _ in 0..100 {
+                match fs::remove_dir_all(&self.0) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            eprintln!("could not remove isolated lineage test root {:?}", self.0);
         }
     }
 
@@ -1975,11 +1985,12 @@ pub(crate) mod tests {
     }
 
     struct MaterializedVerifiedLineage {
-        _directory: TestDirectory,
         lineage_path: PathBuf,
         evidence_paths: Vec<PathBuf>,
         report: ContextVerifiedProductionDoryV3ModelReproductionReport,
         lineage: VerifiedIndependentLineage,
+        // Retained lineage handles must close before the directory guard removes the tree.
+        _directory: TestDirectory,
     }
 
     fn materialize_verified_lineage(
@@ -2015,11 +2026,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         MaterializedVerifiedLineage {
-            _directory: directory,
             lineage_path,
             evidence_paths,
             report,
             lineage,
+            _directory: directory,
         }
     }
 

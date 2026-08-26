@@ -1357,17 +1357,35 @@ proof bytes. Outbound synchronization, inbound `SubmitBlock`, and the shared
 loopback block RPC verify before acquiring the node mutex, then consume that
 capability while rerunning every parent, height, target, timestamp,
 transaction, UTXO, coinbase, fork-choice, and persistence check. Admission is
-serialized to one active proof with at most eight waiting callers and a
-five-second queue timeout; saturation is retryable, verifier panics reject only
-the candidate, and active/queued counts are observable in node status. Devnet
-keeps bounded in-process admission as its default. Operators can select a
+serialized to one active proof with at most eight normal waiting callers and a
+five-second queue timeout. Production-profile remote sessions first take a
+FIFO slot capped at eight total active plus waiting sessions for at most 60
+seconds; cached proofs retain FIFO fairness, and locally found blocks use a
+separate two-waiter priority lane. P2P `SubmitBlock` uses a 120-second client
+response budget, a 110-second server acceptance deadline, and a 115-second
+server response cutoff. Disconnect/deadline state is checked after proof work
+and races durable append through one atomic
+`Active -> Cancelled | Committing` transition. Cancellation cannot append;
+after a post-CAS deadline recheck, committing must finish or latch a storage
+fault. The 115-second cutoff covers
+the status lock, serialization, and every write. Capacity and timeout failures
+are retryable `Busy`, while cryptographic invalidity is `Rejected`. A miner
+retains and reconnects with the exact block/proof for an interruptible
+20-minute total budget while the peer tip remains its parent; `Busy` alone does
+not rotate the template. Per-class
+active, queued, wait, rejection, and post-dispatch proof-failure counts are
+observable in node status. Devnet keeps bounded in-process admission as its
+default. Operators can select a
 hash-pinned persistent verifier process for external blocks. Its canonical
 request and response bind the exact verifier parameters, challenge, proof
 type, public fields, proof bytes, and startup sandbox status. Windows Job
 Objects and Unix process groups terminate the process tree on timeout, crash,
 malformed or oversized output, while an explicit Windows job-memory or Unix
 address-space limit bounds the worker. Hash mismatch and response substitution
-fail closed. Devnet V2 uses this crash/resource boundary without claiming an OS
+fail closed. Replacement startup is single-flight and supervised outside the
+peer request; restarting/unavailable workers remain `Busy` until their full
+authenticated startup succeeds, and terminal close cannot be resurrected.
+Devnet V2 uses this crash/resource boundary without claiming an OS
 sandbox. ProductionV3 on Linux x86-64 additionally requires Landlock ABI 3 or
 newer plus default-deny seccomp before reading/loading artifact contents or
 untrusted IPC. ABI 3 is accepted only with mandatory seccomp network denial.

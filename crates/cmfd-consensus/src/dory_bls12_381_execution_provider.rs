@@ -2792,7 +2792,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        BlockChallenge, ForgeMatrixV2Descriptor, ForgeMatrixV2Reference,
+        BlockChallenge, BlockProof, ForgeMatrixV2Descriptor, ForgeMatrixV2Reference,
         ForgeMatrixV2ReferenceProof, SmallModelBankFixture,
         dory_bls12_381_aggregate::commit_bls_dory_polynomial,
         dory_bls12_381_execution_artifact::BlsDoryExecutionAccumulatorColumn,
@@ -2812,8 +2812,10 @@ mod tests {
         StructuredWiringStatement,
         dory_bls12_381_aggregate::commit_bls_dory_padded_prefix_with_optional_scratch,
         dory_bls12_381_candidate::{
-            decode_dory_v3_layout_v5_candidate_payload,
+            decode_dory_v3_layout_v5_candidate_payload, layout_v5_relation_dispatches_for_test,
+            reset_layout_v5_relation_dispatches_for_test,
             validate_dory_v3_layout_v5_candidate_statement_for_test,
+            verify_bls_dory_v3_layout_v5_candidate_relation_for_test,
         },
         dory_bls12_381_layout::{
             bls_dory_shared_layout_v5_candidate_codec_fixture_for_test,
@@ -5191,6 +5193,77 @@ mod tests {
             &fixture.setup,
         )
         .unwrap();
+
+        // This test-only authority bypasses only the 25 GiB production-bank
+        // geometry check. It runs the same post-authority statement validator
+        // used by ProductionV3. Rebuild every target-bound public digest so
+        // HighHash, rather than an earlier binding check, is the rejection.
+        let mut above = fixture.block;
+        above.target = [0; 32];
+        let above_challenge = fixture
+            .transcript
+            .challenge_context(&above, proof.nonce)
+            .unwrap();
+        let above_final_activation_digest = [0x5a; 32];
+        let above_proof = ForgeMatrixV3CandidateProof {
+            algorithm_version: DORY_V3_ALGORITHM_VERSION,
+            proof_version: DORY_V3_PROOF_VERSION,
+            nonce: proof.nonce,
+            model_manifest_digest: fixture.transcript.manifest_digest().into_bytes(),
+            challenge_digest: above_challenge.digest(),
+            final_activation_digest: above_final_activation_digest,
+            work_digest: fixture
+                .transcript
+                .work_digest(above_challenge.digest(), above_final_activation_digest),
+            structured_proof: vec![1],
+        };
+        assert!(above_proof.work_digest > above.target);
+        let above_block_proof = BlockProof::V3Candidate(Box::new(above_proof));
+        let BlockProof::V3Candidate(above_proof) = &above_block_proof else {
+            unreachable!();
+        };
+        reset_layout_v5_relation_dispatches_for_test();
+        assert!(matches!(
+            verify_bls_dory_v3_layout_v5_candidate_relation_for_test(
+                fixture.block.network_id,
+                &fixture.authenticated,
+                &above,
+                above_proof,
+                &fixture.setup,
+            ),
+            Err(BlsDoryV3CandidateError::HighHash)
+        ));
+        assert_eq!(layout_v5_relation_dispatches_for_test(), 0);
+
+        // This is an authenticated, correctly bound V3 block-proof envelope.
+        // The small fixture cannot satisfy the production n=33 relation, but
+        // it must cross the exact production relation-dispatch point once;
+        // unlike the old statement-identity stub, the real context/decoder
+        // path owns the resulting fail-closed error.
+        let mut relation_envelope = proof.clone();
+        relation_envelope.structured_proof = vec![1];
+        let block_proof = BlockProof::V3Candidate(Box::new(relation_envelope));
+        let BlockProof::V3Candidate(relation_proof) = &block_proof else {
+            unreachable!();
+        };
+        assert!(relation_proof.work_digest <= fixture.block.target);
+        reset_layout_v5_relation_dispatches_for_test();
+        let relation_result = verify_bls_dory_v3_layout_v5_candidate_relation_for_test(
+            fixture.block.network_id,
+            &fixture.authenticated,
+            &fixture.block,
+            relation_proof,
+            &fixture.setup,
+        );
+        let relation_error = match relation_result {
+            Err(error) => error,
+            Ok(_) => panic!("small fixture must fail closed"),
+        };
+        assert!(
+            matches!(relation_error, BlsDoryV3CandidateError::Dory(_)),
+            "unexpected relation error: {relation_error:?}"
+        );
+        assert_eq!(layout_v5_relation_dispatches_for_test(), 1);
 
         let mut wrong_network = fixture.block;
         wrong_network.network_id[0] ^= 1;

@@ -105,6 +105,7 @@ fn node_admission_uses_the_pinned_worker_and_reports_its_limits() {
         status.proof_verification_memory_limit_bytes,
         Some(512 * 1024 * 1024)
     );
+    assert_eq!(status.proof_verification_teardown_failures, Some(0));
 
     let block = candidate_block();
     node.block_preverifier().preverify(&block).unwrap();

@@ -10,12 +10,13 @@ use std::process::Command;
 use std::process::Stdio;
 #[cfg(any(not(feature = "production-v3"), windows, target_os = "linux"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::PermissionsExt};
 
 use cmfd_consensus::{
-    BLOCK_VERSION, Block, BlockChallenge, BlockProof, Coinbase, ConsensusPowVerifier,
+    BLOCK_VERSION, Block, BlockChallenge, BlockProof, Coinbase, ConsensusPowVerifier, TEST_PROFILE,
     v2_test_reference,
 };
 #[cfg(not(feature = "production-v3"))]
@@ -87,6 +88,17 @@ fn worker_config() -> VerifierWorkerConfig {
         pids_limit: Some(16),
         production_v3_artifacts: None,
     }
+}
+
+fn wait_until_ready(worker: &PersistentVerifierWorker) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !worker.is_ready() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        worker.is_ready(),
+        "supervised verifier restart did not authenticate before the test deadline"
+    );
 }
 
 fn candidate_block() -> (ConsensusPowVerifier, Block) {
@@ -245,6 +257,55 @@ fn persistent_worker_loads_once_for_many_canonical_blocks() {
 }
 
 #[test]
+fn persistent_worker_rejection_is_request_scoped_without_poisoning_the_generation() {
+    let (verifier, mut block) = candidate_block();
+    let worker =
+        PersistentVerifierWorker::start(worker_config(), verifier, block.challenge.network_id)
+            .unwrap();
+    let BlockProof::V2Reference(proof) = &mut block.proof else {
+        unreachable!();
+    };
+    proof.work_digest[0] ^= 1;
+    let error = worker
+        .verify_block(&block)
+        .expect_err("the worker must reject an invalid canonical proof");
+    assert!(matches!(&error, VerifierWorkerError::ProofRejected(_)));
+    assert!(error.is_dispatched_proof_failure());
+    assert_eq!(worker.process_generation(), 1);
+}
+
+#[test]
+fn persistent_predispatch_config_and_capability_failures_are_not_peer_attributed() {
+    let (verifier, block) = candidate_block();
+    let mut invalid_config = worker_config();
+    invalid_config.timeout = Duration::ZERO;
+    let error = PersistentVerifierWorker::start(
+        invalid_config,
+        verifier.clone(),
+        block.challenge.network_id,
+    )
+    .err()
+    .expect("zero request timeout must fail before worker startup");
+    assert!(matches!(&error, VerifierWorkerError::InvalidConfig(_)));
+    assert!(!error.is_dispatched_proof_failure());
+
+    let worker =
+        PersistentVerifierWorker::start(worker_config(), verifier, block.challenge.network_id)
+            .unwrap();
+    let legacy = ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap();
+    let mut wrong_proof = block.clone();
+    wrong_proof.proof = legacy.mine(&wrong_proof.challenge, 0, 1).unwrap();
+    let error = worker
+        .verify_block(&wrong_proof)
+        .expect_err("wrong proof type must fail before request dispatch");
+    assert!(matches!(&error, VerifierWorkerError::Capability(_)));
+    assert!(!error.is_dispatched_proof_failure());
+    assert_eq!(worker.process_generation(), 1);
+    worker.verify_block(&block).unwrap();
+    assert_eq!(worker.process_generation(), 1);
+}
+
+#[test]
 fn persistent_worker_rejects_a_wrong_pin_before_startup() {
     let (verifier, block) = candidate_block();
     let mut config = worker_config();
@@ -374,10 +435,32 @@ fn crashed_persistent_worker_fails_the_request_then_restarts_authenticated() {
     let pid = worker.process_id().expect("worker process must be running");
     terminate_process(pid);
 
-    worker
+    let error = worker
         .verify_block(&block)
         .expect_err("the request observing a crashed generation must fail closed");
+    assert!(matches!(
+        &error,
+        VerifierWorkerError::DispatchedRequest(source)
+            if matches!(
+                source.as_ref(),
+                VerifierWorkerError::Process(
+                    cmfd_proof_worker::ProofWorkerError::Pipe { .. }
+                        | cmfd_proof_worker::ProofWorkerError::WorkerExited { .. }
+                )
+            )
+    ));
+    assert!(error.is_dispatched_proof_failure());
     assert_eq!(worker.process_generation(), 1);
+    let retry_started = Instant::now();
+    assert!(matches!(
+        worker.verify_block(&block),
+        Err(VerifierWorkerError::Restarting)
+    ));
+    assert!(
+        retry_started.elapsed() < Duration::from_secs(1),
+        "a peer request synchronously waited for worker restart"
+    );
+    wait_until_ready(&worker);
     worker.verify_block(&block).unwrap();
     assert_eq!(worker.process_generation(), 2);
 }
@@ -390,6 +473,11 @@ fn explicit_shutdown_makes_the_next_request_start_a_fresh_generation() {
             .unwrap();
     assert_eq!(worker.process_generation(), 1);
     worker.shutdown();
+    assert!(matches!(
+        worker.verify_block(&block),
+        Err(VerifierWorkerError::Restarting)
+    ));
+    wait_until_ready(&worker);
     worker.verify_block(&block).unwrap();
     assert_eq!(worker.process_generation(), 2);
 }
@@ -413,6 +501,7 @@ fn authenticated_private_copy_survives_original_removal_across_restart() {
 
     fs::remove_file(copied_original).unwrap();
     worker.shutdown();
+    wait_until_ready(&worker);
     worker.verify_block(&block).unwrap();
     assert_eq!(worker.process_generation(), 2);
 }
@@ -423,46 +512,74 @@ fn shutdown_racing_restart_remains_fail_closed_and_recoverable() {
     let worker =
         PersistentVerifierWorker::start(worker_config(), verifier, block.challenge.network_id)
             .unwrap();
-    let mut observed_cancelled_restart = false;
-    for _ in 0..32 {
-        worker.shutdown();
-        let previous_attempts = worker.process_attempts();
-        let contender = worker.clone();
-        let candidate = block.clone();
-        let request = std::thread::spawn(move || contender.verify_block(&candidate));
-
-        // ProductionV3 feature builds make the pinned worker materially larger;
-        // hashing the private copy precedes the observable spawn-attempt count.
-        // Give that bounded integrity pass enough time on slow release media.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while worker.process_attempts() == previous_attempts
-            && !request.is_finished()
-            && Instant::now() < deadline
-        {
-            std::thread::yield_now();
-        }
-        if request.is_finished() {
-            let _ = request.join().expect("verification thread must not panic");
-            continue;
-        }
-        assert!(
-            worker.process_attempts() > previous_attempts,
-            "restart attempt must become observable before the test deadline"
-        );
-        worker.shutdown();
-        request
-            .join()
-            .expect("verification thread must not panic")
-            .expect_err("shutdown overlapping a restart must cancel that request");
-        observed_cancelled_restart = true;
-        break;
-    }
-    assert!(
-        observed_cancelled_restart,
-        "test must observe and cancel an in-flight restart"
-    );
     worker.shutdown();
+    let first_attempt = worker.process_attempts();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while worker.process_attempts() == first_attempt && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    worker.shutdown();
+    assert!(matches!(
+        worker.verify_block(&block),
+        Err(VerifierWorkerError::Restarting)
+    ));
+    // If shutdown cancelled the already-running supervised attempt, this
+    // probe schedules exactly one fresh attempt after it publishes
+    // `Unavailable`.
+    let retry_deadline = Instant::now() + Duration::from_secs(30);
+    while !worker.is_ready() && Instant::now() < retry_deadline {
+        let _ = worker.verify_block(&block);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_until_ready(&worker);
+    worker.shutdown();
+    wait_until_ready(&worker);
     worker.verify_block(&block).unwrap();
+}
+
+#[test]
+fn concurrent_shutdown_and_close_are_single_flight_and_terminal() {
+    const SHUTDOWN_CALLERS: usize = 16;
+
+    let (verifier, block) = candidate_block();
+    let worker =
+        PersistentVerifierWorker::start(worker_config(), verifier, block.challenge.network_id)
+            .unwrap();
+    let initial_attempts = worker.process_attempts();
+    let barrier = Arc::new(Barrier::new(SHUTDOWN_CALLERS + 1));
+    let mut callers = Vec::new();
+    for _ in 0..SHUTDOWN_CALLERS {
+        let worker = worker.clone();
+        let barrier = Arc::clone(&barrier);
+        callers.push(std::thread::spawn(move || {
+            barrier.wait();
+            worker.shutdown();
+        }));
+    }
+
+    barrier.wait();
+    worker.close();
+    for caller in callers {
+        caller.join().unwrap();
+    }
+    let attempts_after_close = worker.process_attempts();
+    assert!(
+        attempts_after_close <= initial_attempts + 1,
+        "concurrent shutdown scheduled more than one supervised generation"
+    );
+    assert!(!worker.is_ready());
+    assert!(matches!(
+        worker.verify_block(&block),
+        Err(VerifierWorkerError::Closed)
+    ));
+
+    std::thread::sleep(Duration::from_millis(1_250));
+    assert_eq!(
+        worker.process_attempts(),
+        attempts_after_close,
+        "a supervisor resurrected or restarted after close"
+    );
+    assert!(!worker.is_ready());
 }
 
 #[test]
@@ -478,10 +595,18 @@ fn timed_out_generation_is_killed_and_the_next_request_starts_fresh() {
             .verify_block(&block)
             .expect_err("a one-nanosecond request deadline must fail closed");
         assert!(matches!(
-            error,
-            VerifierWorkerError::Process(cmfd_proof_worker::ProofWorkerError::Timeout { .. })
+            &error,
+            VerifierWorkerError::DispatchedRequest(source)
+                if matches!(
+                    source.as_ref(),
+                    VerifierWorkerError::Process(
+                        cmfd_proof_worker::ProofWorkerError::Timeout { .. }
+                    )
+                )
         ));
+        assert!(error.is_dispatched_proof_failure());
         assert_eq!(worker.process_generation(), expected_generation);
+        wait_until_ready(&worker);
     }
 }
 

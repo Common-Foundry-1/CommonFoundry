@@ -798,10 +798,21 @@ target without a crash, panic, timeout, or sanitizer report and reached nested
 matrix, transition, LogUp, wiring, and field-element parsing. These smoke runs
 establish a repeatable harness, not exhaustive assurance. External block
 admission now uses a one-active/eight-waiter in-process proof queue with a
-five-second admission timeout and panic containment. Verification runs outside
-the global node mutex and returns a nonserializable capability bound to the
-exact verifier, challenge, and proof; atomic chain validation consumes it
-without repeating the expensive proof. External block admission now also has a
+five-second queue timeout and panic containment. Production-profile remote
+proof sessions first enter a separate FIFO capped at eight total active plus
+waiting sessions, with a 60-second wait limit, invalid-session cooldown, and a
+separate two-waiter priority lane for locally found blocks. Verification runs
+outside the global node mutex and returns a nonserializable capability bound to
+the exact verifier, challenge, and proof; atomic chain validation consumes it
+without repeating the expensive proof. P2P block submission has one explicit
+120-second client response contract: server acceptance ends at 110 seconds and
+the server response cutoff is 115 seconds. Disconnect/deadline cancellation
+and durable commit race through one atomic `Active -> Cancelled | Committing`
+transition. Cancellation that wins cannot append; after a post-CAS deadline
+recheck, committing that wins must complete durability and state commit or
+latch a storage fault. The 115-second
+cutoff also covers status-lock acquisition, serialization, and every response
+write. External block admission now also has a
 hash-pinned persistent verifier with canonical statement-bound IPC, killable
 wall-time, bounded output, process-tree termination, and explicit Windows job
 memory or Unix address-space limits. ProductionV3 startup on Linux x86-64
@@ -809,6 +820,15 @@ additionally requires Landlock ABI 3 or newer plus a mandatory default-deny
 seccomp policy before reading/loading model contents or untrusted IPC; Landlock
 ABI 3 is accepted only because seccomp allows only the audited verifier runtime
 surface and denies every unlisted syscall.
+Verifier replacement is supervised single-flight outside a peer request. A
+restarting or unavailable worker and all admission timeouts map to retryable
+`Busy`; cryptographic invalidity maps to `Rejected`. Normal, local-priority,
+and remote admission telemetry separately exposes active, queued, wait,
+rejection, and post-dispatch proof-failure counters. The standalone miner
+treats `Busy` as retention rather than rejection: it reconnects with the
+byte-identical ProductionV3 block and proof while the peer tip remains the
+exact parent. The retry has an interruptible 20-minute total budget; a tip
+change and budget abandonment are logged and counted separately.
 ProductionV3 on Windows now has an atomic zero-capability LPAC launch, exact
 Job/handle lists, handle-only artifact loading, a hash/identity-verified
 per-launch private executable pinned through process lifetime, and native
@@ -820,10 +840,11 @@ sentinel uses an inherited-channel `READY`/`ARMED` barrier, verifies the child
 is nonsignaled with exactly one active Job process immediately before close,
 and rejects invalid-handle or other crash exits while Windows fault UI remains
 noninteractive.
-Activation remains fail-closed until packaged real-bank and known-block
-qualification completes. Per-worker CPU/PID containment also remains open on
-Linux; the per-real-UID task limit is not treated as a substitute. Sustained
-independent campaigns, real-bank resource measurements, and Windows packaged
+Linux ProductionV3 additionally requires caller-measured CPU and PID limits
+and enforces them, together with memory and swap limits, in a delegated
+per-worker cgroup v2 domain. ProductionV3 activation remains fail-closed until
+packaged real-bank and known-block qualification completes. Sustained
+independent campaigns, real-bank resource measurements, and platform-packaged
 qualification remain activation work.
 
 An optional prover-only CUDA path now implements the exact Goldilocks DFT and coset-LDE semantics used by this STARK and supplies the value-MMCS Poseidon2 first digest layer to actual proof generation. Merkle parent compression, openings, transcript operations, and verification remain on the CPU, and every resulting encoded proof must pass the unchanged CPU verifier. At the 32,768-row checkpoint on an RTX 5090, the same unoptimized Cargo test profile took 348.28 seconds on CPU (64.503 setup, 283.416 prove; 238,698-byte canonical zlib payload) and 76.71 seconds with CUDA DFT plus Poseidon2 (7.700 setup, 68.551 prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. The direct API loads native code in-process and is for trusted development only. The hash-pinned, bounded worker path has been tested with a 64-byte tree proof and terminates its whole process tree on timeout or overflow; this is crash containment, not an operating-system sandbox or a change to consensus.

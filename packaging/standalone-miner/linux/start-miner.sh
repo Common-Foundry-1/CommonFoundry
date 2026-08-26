@@ -50,6 +50,9 @@ if [[ -n "$GPU_INDEXES" ]]; then
 fi
 if [[ "$PRODUCTION_V3_READY" == 1 ]]; then
   mkdir -p "$SCRIPT_DIR/production-v3/scratch"
+  # ProductionV3 refuses to load model artifacts from a directory other accounts
+  # can reach, and tar restores 0755. Make the sidecar directory private to you.
+  chmod 700 "$SCRIPT_DIR/production-v3"
   ARGS+=(
     --production-v3-bank "$SCRIPT_DIR/production-v3/MODEL-V2.bank"
     --production-v3-manifest "$SCRIPT_DIR/production-v3/MODEL-V2.manifest.json"

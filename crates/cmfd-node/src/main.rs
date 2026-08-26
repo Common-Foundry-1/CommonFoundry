@@ -645,8 +645,10 @@ fn canonical_regular_file(
     if !path.is_absolute() {
         return Err(format!("{component} path must be absolute").into());
     }
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|_| format!("{component} is missing from the package"))?;
+    let canonical = cmfd_node::plain_package_path(
+        std::fs::canonicalize(path)
+            .map_err(|_| format!("{component} is missing from the package"))?,
+    );
     if !std::fs::metadata(&canonical)?.is_file() {
         return Err(format!("{component} path is not a regular file").into());
     }

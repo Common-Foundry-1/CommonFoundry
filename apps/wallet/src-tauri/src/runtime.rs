@@ -411,7 +411,7 @@ fn canonical_runtime_file(
             false,
         ));
     }
-    let canonical = fs::canonicalize(configured).map_err(|_| {
+    let canonical = cmfd_node::plain_package_path(fs::canonicalize(configured).map_err(|_| {
         startup_error(
             "production_v3_file_unavailable",
             format!(
@@ -421,7 +421,7 @@ fn canonical_runtime_file(
             ),
             false,
         )
-    })?;
+    })?);
     let metadata = fs::metadata(&canonical).map_err(|_| {
         startup_error(
             "production_v3_file_unavailable",
@@ -762,10 +762,15 @@ mod tests {
         };
         let security = prepare_for_test(RCNET1_PROFILE, &config, &files.root).unwrap();
         let record = security.production_v3_record.unwrap();
+        // The resolved path must be the plain form: the trusted ceremony
+        // filesystem rejects the `\\?\` verbatim syntax `fs::canonicalize`
+        // produces on Windows.
         assert_eq!(
             record.record_v2,
-            fs::canonicalize(artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_RECORD_V2))
-                .unwrap()
+            cmfd_node::plain_package_path(
+                fs::canonicalize(artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_RECORD_V2))
+                    .unwrap()
+            )
         );
         assert_eq!(
             security.verifier_worker.unwrap().worker_sha256,

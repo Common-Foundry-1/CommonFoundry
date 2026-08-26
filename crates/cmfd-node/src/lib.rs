@@ -143,6 +143,44 @@ pub fn production_v3_package_layout(
     })
 }
 
+/// Reduces a canonicalized sidecar path to the plain `D:\...` form the trusted
+/// ceremony filesystem accepts.
+///
+/// `std::fs::canonicalize` always returns a `\\?\` verbatim path on Windows,
+/// and [`dory_v3_model_ceremony_fs`] deliberately rejects verbatim, UNC, and
+/// device syntax, so a packaged ProductionV3 node or wallet would otherwise
+/// refuse its own sidecars. Only a verbatim *disk* prefix is reduced; verbatim
+/// UNC and every other prefix are returned untouched so they still fail closed.
+///
+/// [`dory_v3_model_ceremony_fs`]: cmfd_consensus::dory_v3_model_ceremony_fs
+#[cfg(windows)]
+#[must_use]
+pub fn plain_package_path(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+    let Prefix::VerbatimDisk(drive) = prefix.kind() else {
+        return path;
+    };
+    let mut plain = PathBuf::from(format!("{}:\\", char::from(drive)));
+    for component in components {
+        if !matches!(component, Component::RootDir) {
+            plain.push(component.as_os_str());
+        }
+    }
+    plain
+}
+
+/// Non-Windows canonical paths already have the plain form.
+#[cfg(not(windows))]
+#[must_use]
+pub fn plain_package_path(path: PathBuf) -> PathBuf {
+    path
+}
+
 pub fn compiled_production_v3_record_identity()
 -> Result<cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity, NodeError> {
     let pin = release_gate::COMPILED_RELEASE_PROFILE
@@ -8679,6 +8717,55 @@ mod tests {
     use super::*;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    /// A packaged ProductionV3 node canonicalizes its own sidecars before
+    /// handing them to the trusted ceremony filesystem, which rejects `\\?\`
+    /// verbatim syntax. Canonicalization on Windows always produces exactly
+    /// that, so the reduction below is what keeps a packaged node able to open
+    /// its own Record V2 and proof worker.
+    #[test]
+    fn canonical_package_paths_are_plain_enough_for_the_ceremony_filesystem() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmfd-plain-package-path-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join(PRODUCTION_V3_PACKAGE_RECORD_V2);
+        fs::write(&file, b"record").unwrap();
+
+        let canonical = fs::canonicalize(&file).unwrap();
+        let plain = plain_package_path(canonical.clone());
+
+        // Same file, and still absolute.
+        assert!(plain.is_absolute());
+        assert_eq!(fs::read(&plain).unwrap(), b"record");
+        assert_eq!(plain.file_name(), canonical.file_name());
+
+        #[cfg(windows)]
+        {
+            use std::path::{Component, Prefix};
+
+            assert!(
+                matches!(
+                    canonical.components().next(),
+                    Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+                ),
+                "canonicalize should produce a verbatim path for this test to be meaningful"
+            );
+            assert!(
+                matches!(
+                    plain.components().next(),
+                    Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+                ),
+                "the ceremony filesystem only accepts a plain disk prefix: {plain:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        assert_eq!(plain, canonical);
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);

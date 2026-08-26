@@ -45,6 +45,12 @@ if exist "%~dp0production-v3\MODEL-V2.bank" if exist "%~dp0production-v3\MODEL-V
   if "%LOCAL_PEER%"=="127.0.0.1:18444" set "LOCAL_PEER=127.0.0.1:21444"
   if "%BOOTSTRAP_PEER%"=="107.214.187.2:18444" set "BOOTSTRAP_PEER=107.214.187.2:21444"
   if not exist "%~dp0production-v3\scratch" mkdir "%~dp0production-v3\scratch"
+  rem ProductionV3 refuses to load model artifacts from a directory other
+  rem accounts can reach, and extracting a ZIP leaves inherited permissions in
+  rem place. SYSTEM and Administrators are named by well-known SID so this also
+  rem works on non-English Windows.
+  icacls "%~dp0production-v3" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >nul 2>&1
+  if errorlevel 1 echo WARNING: could not make production-v3 private; the miner may refuse to start.
   set "PRODUCTION_V3_READY=1"
 )
 

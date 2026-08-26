@@ -24,9 +24,10 @@ and rejects the candidate. The next request may start only a new worker that
 passes the complete startup handshake. A canonical invalid-proof response is
 statement-local and does not poison an otherwise authenticated generation.
 Explicit shutdown uses a separate process-tree handle, so it does not wait
-behind an in-flight request. Stderr is retained only through 64 KiB; the reader
-terminates the process tree immediately on the first excess byte instead of
-waiting for a request timeout.
+behind an in-flight request. Stderr is retained only through 64 KiB. On the
+first excess byte the reader closes and marks that generation as overflowed;
+an in-flight or subsequent exchange rejects it and terminates the process tree,
+and shutdown remains the final teardown path while the worker is idle.
 
 The hash-pinned worker path has been exercised end to end with a 64-byte tree
 proof using the wired CUDA DFT/LDE and value-MMCS Poseidon2 first-digest path.

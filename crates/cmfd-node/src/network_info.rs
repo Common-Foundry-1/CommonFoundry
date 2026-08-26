@@ -116,6 +116,7 @@ struct ProductionV3ProofOfWorkIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     activation_evidence_sha256: Option<String>,
     runtime_verifier_worker_sha256: String,
+    runtime_verifier_workers: ProductionV3VerifierWorkerIdentities,
     wire_type: u16,
     pow_limit: String,
     algorithm_version: u32,
@@ -125,6 +126,13 @@ struct ProductionV3ProofOfWorkIdentity {
     maximum_structured_proof_bytes: String,
     artifacts: ProductionV3ArtifactIdentities,
     model: ProductionV3ModelIdentity,
+}
+
+#[cfg(feature = "production-v3")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV3VerifierWorkerIdentities {
+    windows_x86_64_sha256: String,
+    linux_x86_64_sha256: String,
 }
 
 #[cfg(feature = "production-v3")]
@@ -262,9 +270,15 @@ fn canonical_network_info_json_for_profile(
         }
         #[cfg(feature = "production-v3")]
         PowParameters::V3Candidate(parameters) => {
-            let artifacts = crate::release_gate::COMPILED_RELEASE_PROFILE
+            let release_profile = crate::release_gate::COMPILED_RELEASE_PROFILE;
+            let artifacts = release_profile
                 .production_v3_artifacts
                 .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?;
+            let workers = release_profile.production_v3_verifier_workers.ok_or(
+                NodeError::ProductionV3ActivationEvidence(
+                    "compiled runtime verifier-worker pins are absent",
+                ),
+            )?;
             let (build_source_commit, activation_evidence_sha256) = match profile.kind {
                 NetworkProfileKind::Rcnet => {
                     let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").ok_or(
@@ -296,6 +310,10 @@ fn canonical_network_info_json_for_profile(
                 runtime_verifier_worker_sha256: hex::encode(
                     crate::compiled_production_v3_worker_sha256()?,
                 ),
+                runtime_verifier_workers: ProductionV3VerifierWorkerIdentities {
+                    windows_x86_64_sha256: hex::encode(workers.windows_x86_64_sha256),
+                    linux_x86_64_sha256: hex::encode(workers.linux_x86_64_sha256),
+                },
                 wire_type: POW_TYPE_V3_CANDIDATE,
                 pow_limit: hex::encode(params.pow_limit),
                 algorithm_version: parameters.algorithm_version(),

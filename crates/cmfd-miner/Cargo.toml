@@ -11,6 +11,7 @@ production-v3 = [
     "cmfd-consensus/dory-v3-consensus-adapter",
     "cmfd-node/production-v3",
 ]
+production-v3-testnet = ["production-v3", "cmfd-node/production-v3-testnet"]
 production-rc = ["production-v3", "cmfd-node/production-rc"]
 
 [dependencies]

@@ -36,7 +36,7 @@ use thiserror::Error;
 
 use crate::{
     COMPILED_NETWORK_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, NetworkProfile, Node,
-    NodeError, ProofProfile, devnet_params, submit_shared_tip_block, unix_time_seconds,
+    NodeError, ProofProfile, submit_shared_tip_block, unix_time_seconds,
 };
 
 pub const POOL_PROTOCOL_VERSION: u16 = 1;
@@ -63,7 +63,7 @@ const POOL_NONCE_ORIGIN_DOMAIN: &str = "CMFD/DEVNET-POOL/NONCE-ORIGIN/V1";
 #[derive(Debug, Error)]
 pub enum PoolError {
     #[error(
-        "Production V3 pool shares are not implemented; RCNet pool service is disabled rather than accepting V2 shares"
+        "Production V3 pool shares are not implemented; the ProductionV3 pool service is disabled rather than accepting V2 shares"
     )]
     ProductionV3Unsupported,
     #[error("pool address must be a numeric private or loopback address, received {0}")]
@@ -170,7 +170,7 @@ impl PoolClientConfig {
         worker: impl Into<String>,
         payout: [u8; 32],
     ) -> Result<Self, PoolError> {
-        let params = devnet_params()?;
+        let params = devnet_pool_params()?;
         Ok(Self {
             address,
             certificate_sha256,
@@ -279,7 +279,7 @@ impl fmt::Debug for PoolMiningWork {
 
 impl PoolMiningWork {
     pub fn from_job(job: PoolJob) -> Result<Self, PoolError> {
-        let params = devnet_params()?;
+        let params = devnet_pool_params()?;
         if job.challenge.network_id != params.network_id {
             return Err(PoolError::NetworkMismatch);
         }
@@ -422,6 +422,12 @@ impl PoolMiningWork {
             next_nonce: start_nonce.wrapping_add(attempts_completed),
         })
     }
+}
+
+fn devnet_pool_params() -> Result<cmfd_consensus::NetworkParams, PoolError> {
+    crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None)
+        .map(|(params, _)| params)
+        .map_err(PoolError::from)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1992,7 +1998,9 @@ mod tests {
     fn server(label: &str) -> (TestRoot, PoolServerHandle, Arc<Mutex<Node>>, [u8; 32]) {
         let root = TestRoot::new(label);
         let data = root.path().join("node");
-        let node = Arc::new(Mutex::new(Node::open(data).unwrap()));
+        let node = Arc::new(Mutex::new(
+            Node::open_with_profile(data, crate::DEVNET_PROFILE).unwrap(),
+        ));
         let (certificate, key, pin) = certificate(&root);
         let config = PoolServerConfig::devnet(
             "127.0.0.1:0".parse().unwrap(),

@@ -104,14 +104,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rcnet_packaging_override_has_a_distinct_application_identity() {
+    fn network_packaging_overrides_have_distinct_application_identities() {
         let devnet: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let production_v3_testnet: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.production-v3-testnet.conf.json")).unwrap();
         let rcnet: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.rcnet.conf.json")).unwrap();
 
         assert_eq!(devnet["identifier"], "org.commonfoundry.wallet.devnet");
+        assert_eq!(
+            production_v3_testnet["identifier"],
+            "org.commonfoundry.wallet.productionv3testnet1"
+        );
         assert_eq!(rcnet["identifier"], "org.commonfoundry.wallet.rcnet1");
+        assert_ne!(devnet["identifier"], production_v3_testnet["identifier"]);
+        assert_ne!(devnet["productName"], production_v3_testnet["productName"]);
+        assert_ne!(production_v3_testnet["identifier"], rcnet["identifier"]);
+        assert_ne!(production_v3_testnet["productName"], rcnet["productName"]);
         assert_ne!(devnet["identifier"], rcnet["identifier"]);
         assert_ne!(devnet["productName"], rcnet["productName"]);
     }

@@ -1708,7 +1708,8 @@ mod tests {
     }
 
     fn sample_block() -> Block {
-        let params = crate::devnet_params().unwrap();
+        let (params, _) =
+            crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None).unwrap();
         let reference = v2_test_reference().unwrap();
         let verifier = ConsensusPowVerifier::v2_reference(reference);
         let state = ChainState::new(params, verifier.clone()).unwrap();

@@ -380,7 +380,7 @@ mod tests {
     fn peer_inputs_accept_default_ports_and_reject_names() {
         assert_eq!(
             parse_peer_input("192.168.1.20").unwrap(),
-            "192.168.1.20:18444".parse().unwrap()
+            SocketAddr::new("192.168.1.20".parse().unwrap(), DEFAULT_PEER_PORT)
         );
         assert_eq!(
             parse_peer_input("[fd12::20]:19000").unwrap(),
@@ -388,7 +388,7 @@ mod tests {
         );
         assert_eq!(
             parse_peer_input("fd12::20").unwrap(),
-            "[fd12::20]:18444".parse().unwrap()
+            SocketAddr::new("fd12::20".parse().unwrap(), DEFAULT_PEER_PORT)
         );
         assert_eq!(
             parse_peer_input("peer.example.com").unwrap_err().code,

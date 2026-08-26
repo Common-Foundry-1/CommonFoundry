@@ -60,7 +60,8 @@ mod release_gate;
 
 pub use network_info::{canonical_network_info_json, canonical_network_info_json_with_artifacts};
 pub use network_profile::{
-    COMPILED_NETWORK_PROFILE, DEVNET_PROFILE, NetworkProfile, ProofProfile, RCNET1_PROFILE,
+    COMPILED_NETWORK_PROFILE, DEVNET_PROFILE, NetworkProfile, NetworkProfileKind,
+    PRODUCTION_V3_TESTNET_PROFILE, ProofProfile, RCNET1_PROFILE,
 };
 
 pub const DEVNET_NETWORK_ID: [u8; 32] = COMPILED_NETWORK_PROFILE.network_id;
@@ -240,10 +241,12 @@ pub enum NodeError {
     #[error("network metadata is corrupt or unsupported")]
     InvalidMetadata,
     #[error(
-        "CommonFoundry RCNet-1 requires the production V3 proof verifier; the tiny Devnet V2 relation is never used as a fallback"
+        "the compiled ProductionV3 network requires the production V3 proof verifier; the tiny Devnet V2 relation is never used as a fallback"
     )]
     ProductionV3Unavailable,
-    #[error("CommonFoundry RCNet-1 requires explicit production V3 bank, manifest, and Record V2 paths")]
+    #[error(
+        "the compiled ProductionV3 network requires explicit production V3 bank, manifest, and Record V2 paths"
+    )]
     ProductionV3ArtifactsMissing,
     #[error("production V3 artifacts were supplied for a network that selects the V2 reference proof")]
     ProductionV3ArtifactsUnexpected,
@@ -565,6 +568,7 @@ struct DeadlineWakeBarrier {
 
 #[cfg(test)]
 impl DeadlineWakeBarrier {
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     fn new() -> Self {
         Self {
             entered: Barrier::new(2),
@@ -590,6 +594,7 @@ struct CommitRaceBarrier {
 
 #[cfg(test)]
 impl CommitRaceBarrier {
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     fn new(point: CommitPausePoint) -> Self {
         Self {
             point,
@@ -608,6 +613,7 @@ struct CompletionFaultBarrier {
 
 #[cfg(test)]
 impl CompletionFaultBarrier {
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     fn new() -> Self {
         Self {
             entered: Barrier::new(2),
@@ -1636,6 +1642,7 @@ impl BlockPreverifier {
     }
 
     #[cfg(test)]
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     fn with_limits(
         verifier: ConsensusPowVerifier,
         max_active: usize,
@@ -1884,6 +1891,7 @@ impl BlockPreverifier {
     }
 
     #[cfg(test)]
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     fn run_guarded<T>(
         &self,
         operation: impl FnOnce() -> Result<T, NodeError>,
@@ -2091,10 +2099,50 @@ pub struct ProductionV3MiningWorkFactory {
     context: Arc<ProductionV3MiningContext>,
 }
 
+/// Opaque peer-handshake identity issued only after the ProductionV3 model
+/// artifacts have authenticated successfully. Thin miners pass this value to
+/// the P2P request helpers instead of reconstructing consensus parameters from
+/// an unauthenticated profile.
+#[cfg(feature = "production-v3")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionV3MiningPeerIdentity {
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    genesis_hash: [u8; 32],
+}
+
+#[cfg(feature = "production-v3")]
+impl ProductionV3MiningPeerIdentity {
+    pub(crate) fn peer_hello(self) -> peer::PeerHello {
+        peer::PeerHello {
+            network_id: self.network_id,
+            consensus_fingerprint: self.consensus_fingerprint,
+            node_nonce: peer::process_node_nonce(),
+            tip: self.genesis_hash,
+            height: 0,
+            cumulative_work: peer::ChainWork::ZERO,
+        }
+    }
+
+    #[cfg(test)]
+    const fn for_test(
+        network_id: [u8; 32],
+        consensus_fingerprint: [u8; 32],
+        genesis_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            network_id,
+            consensus_fingerprint,
+            genesis_hash,
+        }
+    }
+}
+
 #[cfg(feature = "production-v3")]
 #[derive(Debug)]
 struct ProductionV3MiningContext {
     params: NetworkParams,
+    consensus_fingerprint: [u8; 32],
     verifier: ConsensusPowVerifier,
     prepared_model: PreparedForgeMatrixV3Model,
     artifacts: ProductionV3VerifierArtifacts,
@@ -2528,6 +2576,7 @@ impl ProductionV3MiningWorkFactory {
             &scratch_directory,
             maximum_native_block_rows,
         )?;
+        let consensus_fingerprint = params.fingerprint()?;
         let bank = File::open(&artifacts.bank).map_err(|source| {
             io_error("open production V3 mining bank", &artifacts.bank, source)
         })?;
@@ -2536,6 +2585,7 @@ impl ProductionV3MiningWorkFactory {
         Ok(Self {
             context: Arc::new(ProductionV3MiningContext {
                 params,
+                consensus_fingerprint,
                 verifier,
                 prepared_model,
                 artifacts,
@@ -2578,6 +2628,16 @@ impl ProductionV3MiningWorkFactory {
 
     pub fn bank_path(&self) -> &Path {
         &self.context.artifacts.bank
+    }
+
+    /// Return the network/fingerprint authority established by the same
+    /// authenticated artifact load that prepared this mining factory.
+    pub fn peer_identity(&self) -> ProductionV3MiningPeerIdentity {
+        ProductionV3MiningPeerIdentity {
+            network_id: self.context.params.network_id,
+            consensus_fingerprint: self.context.consensus_fingerprint,
+            genesis_hash: self.context.params.genesis_hash,
+        }
     }
 }
 
@@ -3492,6 +3552,7 @@ enum ExternalBlockAdmissionProgress {
 
 #[cfg(test)]
 impl ExternalBlockAdmissionProgress {
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     fn into_ready(self) -> ExternalBlockAdmission {
         match self {
             Self::Ready(admission) => admission,
@@ -5212,6 +5273,7 @@ impl Node {
     /// Every state-dependent consensus and durability check remains identical
     /// to [`Self::submit_block`].
     #[cfg(test)]
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     pub(crate) fn submit_preverified_block(
         &mut self,
         block: Block,
@@ -5252,6 +5314,7 @@ impl Node {
     }
 
     #[cfg(test)]
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     pub(crate) fn submit_preverified_block_with_admission(
         &mut self,
         block: Block,
@@ -6466,6 +6529,7 @@ pub struct RpcServerHandle {
     local_address: SocketAddr,
     stop: Arc<(Mutex<bool>, Condvar)>,
     #[cfg(test)]
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     active_request: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<(), NodeError>>>,
 }
@@ -7427,6 +7491,7 @@ fn write_wallet_key(path: &Path, key: &SigningKey) -> Result<(), NodeError> {
 }
 
 #[cfg(test)]
+#[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
 fn encode_record_v1(accepted_at: u64, block: &[u8]) -> Result<Vec<u8>, NodeError> {
     let block_len = u32::try_from(block.len())
         .map_err(|_| NodeError::CorruptLog("block length exceeds u32".to_owned()))?;
@@ -8493,7 +8558,7 @@ fn log_read_error(path: &Path, source: io::Error, truncated_message: String) -> 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "production-v3-testnet")))]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     #[cfg(windows)]
@@ -10789,6 +10854,7 @@ mod tests {
         assert_eq!(pool::DEFAULT_POOL_ADDRESS, DEVNET_PROFILE.pool_address());
 
         const ALTERNATE_PROFILE: NetworkProfile = NetworkProfile {
+            kind: NetworkProfileKind::Devnet,
             proof: ProofProfile::DevnetV2Reference,
             name: "CommonFoundry profile-separation test",
             network_id: [0x64; 32],

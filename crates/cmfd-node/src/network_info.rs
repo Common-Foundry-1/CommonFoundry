@@ -1,4 +1,6 @@
 #[cfg(feature = "production-v3")]
+use crate::NetworkProfileKind;
+#[cfg(feature = "production-v3")]
 use cmfd_consensus::POW_TYPE_V3_CANDIDATE;
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::dory_v3_suite::{
@@ -109,8 +111,10 @@ struct V2ProofOfWorkIdentity {
 struct ProductionV3ProofOfWorkIdentity {
     selection: &'static str,
     profile: &'static str,
-    build_source_commit: &'static str,
-    activation_evidence_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_source_commit: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_evidence_sha256: Option<String>,
     runtime_verifier_worker_sha256: String,
     wire_type: u16,
     pow_limit: String,
@@ -261,20 +265,34 @@ fn canonical_network_info_json_for_profile(
             let artifacts = crate::release_gate::COMPILED_RELEASE_PROFILE
                 .production_v3_artifacts
                 .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?;
-            let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").ok_or(
-                NodeError::ProductionV3ActivationEvidence("trusted build source commit is absent"),
-            )?;
-            let activation_evidence =
-                crate::release_gate::canonical_production_v3_activation_evidence_json(
-                    crate::release_gate::COMPILED_RELEASE_PROFILE,
-                    build_source_commit,
-                )
-                .map_err(NodeError::ProductionV3ActivationEvidence)?;
+            let (build_source_commit, activation_evidence_sha256) = match profile.kind {
+                NetworkProfileKind::Rcnet => {
+                    let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").ok_or(
+                        NodeError::ProductionV3ActivationEvidence(
+                            "trusted build source commit is absent",
+                        ),
+                    )?;
+                    let activation_evidence =
+                        crate::release_gate::canonical_production_v3_activation_evidence_json(
+                            crate::release_gate::COMPILED_RELEASE_PROFILE,
+                            build_source_commit,
+                        )
+                        .map_err(NodeError::ProductionV3ActivationEvidence)?;
+                    (
+                        Some(build_source_commit),
+                        Some(hex::encode(Sha256::digest(&activation_evidence))),
+                    )
+                }
+                NetworkProfileKind::ProductionV3Testnet => (None, None),
+                NetworkProfileKind::Devnet => {
+                    unreachable!("the Devnet network profile cannot select ProductionV3 parameters")
+                }
+            };
             ProofOfWorkIdentity::ProductionV3(ProductionV3ProofOfWorkIdentity {
                 selection: "ProductionV3",
                 profile: profile.proof_name(),
                 build_source_commit,
-                activation_evidence_sha256: hex::encode(Sha256::digest(&activation_evidence)),
+                activation_evidence_sha256,
                 runtime_verifier_worker_sha256: hex::encode(
                     crate::compiled_production_v3_worker_sha256()?,
                 ),
@@ -393,6 +411,7 @@ fn production_v3_file_identity(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "production-v3-testnet"))]
     const EXPECTED_DEVNET_NETWORK_INFO: &str = r#"{
   "format": "commonfoundry-network-info",
   "format_version": 1,
@@ -478,12 +497,26 @@ mod tests {
 }
 "#;
 
+    #[cfg(not(feature = "production-v3-testnet"))]
     #[test]
     fn current_network_info_bytes_are_exact() {
         assert_eq!(
             canonical_network_info_json().unwrap(),
             EXPECTED_DEVNET_NETWORK_INFO.as_bytes()
         );
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn production_v3_testnet_network_info_requires_v3_artifacts_without_v2_fallback() {
+        assert_eq!(
+            COMPILED_NETWORK_PROFILE,
+            crate::PRODUCTION_V3_TESTNET_PROFILE
+        );
+        assert!(matches!(
+            canonical_network_info_json(),
+            Err(NodeError::ProductionV3ArtifactsMissing)
+        ));
     }
 
     #[test]

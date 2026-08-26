@@ -16,13 +16,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cmfd_consensus::{Block, Transaction, WireError, decode_block};
 use thiserror::Error;
 
+#[cfg(feature = "production-v3")]
+use crate::ProductionV3MiningPeerIdentity;
 use crate::peer::{
     BlockSubmissionResult, BlockSubmissionStatus, PeerAddressPolicy, PeerConnection, PeerError,
     PeerHello, PeerLimits, PeerMessage, PeerSession, SUBMIT_BLOCK_RESPONSE_BUDGET,
     StaticPeerConfig,
 };
 use crate::{
-    Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest, devnet_params,
+    Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest,
     submit_shared_peer_block_cancellable, unix_time_seconds,
 };
 
@@ -184,7 +186,41 @@ pub fn request_mining_template_once_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Result<MiningTemplateResponse, P2pError> {
-    let hello = thin_miner_hello()?;
+    request_mining_template_once_with_hello_and_policy(
+        address,
+        payout,
+        thin_miner_hello()?,
+        limits,
+        address_policy,
+    )
+}
+
+/// ProductionV3 template request whose handshake identity can only be issued
+/// by an already authenticated mining-work factory.
+#[cfg(feature = "production-v3")]
+pub fn request_production_v3_mining_template_once_with_policy(
+    address: SocketAddr,
+    payout: [u8; 32],
+    identity: ProductionV3MiningPeerIdentity,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<MiningTemplateResponse, P2pError> {
+    request_mining_template_once_with_hello_and_policy(
+        address,
+        payout,
+        identity.peer_hello(),
+        limits,
+        address_policy,
+    )
+}
+
+fn request_mining_template_once_with_hello_and_policy(
+    address: SocketAddr,
+    payout: [u8; 32],
+    hello: PeerHello,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<MiningTemplateResponse, P2pError> {
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
     connection.send_hello()?;
@@ -219,7 +255,36 @@ pub fn submit_mined_block_once_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Result<BlockSubmissionResult, P2pError> {
-    submit_mined_block_once_with_policy_deadline(address, block, limits, address_policy, None, None)
+    submit_mined_block_once_with_policy_deadline(
+        address,
+        block,
+        thin_miner_hello()?,
+        limits,
+        address_policy,
+        None,
+        None,
+    )
+}
+
+/// ProductionV3 exact-block submission using the identity issued by the
+/// authenticated mining-work factory.
+#[cfg(feature = "production-v3")]
+pub fn submit_production_v3_mined_block_once_with_policy(
+    address: SocketAddr,
+    block: Block,
+    identity: ProductionV3MiningPeerIdentity,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<BlockSubmissionResult, P2pError> {
+    submit_mined_block_once_with_policy_deadline(
+        address,
+        block,
+        identity.peer_hello(),
+        limits,
+        address_policy,
+        None,
+        None,
+    )
 }
 
 /// Same exact-block submission with an additional caller-owned absolute
@@ -236,6 +301,7 @@ pub fn submit_mined_block_once_with_policy_before(
     submit_mined_block_once_with_policy_deadline(
         address,
         block,
+        thin_miner_hello()?,
         limits,
         address_policy,
         Some(deadline),
@@ -258,6 +324,31 @@ pub fn submit_mined_block_once_with_policy_before_cancellable(
     submit_mined_block_once_with_policy_deadline(
         address,
         block,
+        thin_miner_hello()?,
+        limits,
+        address_policy,
+        Some(deadline),
+        Some(cancellation),
+    )
+}
+
+/// ProductionV3 exact-block submission with a caller-owned deadline and
+/// cancellation, retaining the factory-authenticated peer identity across
+/// reconnect attempts.
+#[cfg(feature = "production-v3")]
+pub fn submit_production_v3_mined_block_once_with_policy_before_cancellable(
+    address: SocketAddr,
+    block: Block,
+    identity: ProductionV3MiningPeerIdentity,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    deadline: Instant,
+    cancellation: Arc<AtomicBool>,
+) -> Result<BlockSubmissionResult, P2pError> {
+    submit_mined_block_once_with_policy_deadline(
+        address,
+        block,
+        identity.peer_hello(),
         limits,
         address_policy,
         Some(deadline),
@@ -268,13 +359,14 @@ pub fn submit_mined_block_once_with_policy_before_cancellable(
 fn submit_mined_block_once_with_policy_deadline(
     address: SocketAddr,
     block: Block,
+    local_hello: PeerHello,
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     deadline: Option<Instant>,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<BlockSubmissionResult, P2pError> {
     let submitted = block.block_id();
-    let session = PeerSession::new(thin_miner_hello()?, limits)?;
+    let session = PeerSession::new(local_hello, limits)?;
     let mut connection = match (deadline, cancellation) {
         (Some(deadline), Some(cancellation)) => {
             PeerConnection::connect_with_policy_before_cancellable(
@@ -305,7 +397,7 @@ fn submit_mined_block_once_with_policy_deadline(
 }
 
 fn thin_miner_hello() -> Result<PeerHello, P2pError> {
-    let params = devnet_params()?;
+    let (params, _) = crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None)?;
     Ok(PeerHello {
         network_id: params.network_id,
         consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
@@ -1636,6 +1728,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "production-v3-testnet")]
+    use cmfd_consensus::{BlockChallenge, Coinbase, merkle_root};
     use cmfd_consensus::{
         ConsensusPowVerifier, InputWitness, OutPoint, OutputLock, TRANSACTION_VERSION, TxInput,
         TxOutput, v2_test_reference,
@@ -1668,7 +1762,9 @@ mod tests {
 
     fn open_shared(path: &Path) -> Arc<Mutex<Node>> {
         clean_test_dir(path);
-        Arc::new(Mutex::new(Node::open(path).expect("open isolated node")))
+        Arc::new(Mutex::new(
+            Node::open_with_profile(path, crate::DEVNET_PROFILE).expect("open isolated node"),
+        ))
     }
 
     fn test_limits() -> PeerLimits {
@@ -1893,7 +1989,8 @@ mod tests {
         mine(&source, 3, now);
         drop(source);
         let source = Arc::new(Mutex::new(
-            Node::open(&source_path).expect("reopen locator-backed source node"),
+            Node::open_with_profile(&source_path, crate::DEVNET_PROFILE)
+                .expect("reopen locator-backed source node"),
         ));
         let (listener, address) = start_listener(Arc::clone(&source), SOURCE_NONCE);
 
@@ -2925,6 +3022,133 @@ mod tests {
         listener.stop().unwrap();
         drop(node);
         clean_test_dir(&node_path);
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    fn production_v3_test_peer_identity() -> ProductionV3MiningPeerIdentity {
+        ProductionV3MiningPeerIdentity::for_test(
+            crate::PRODUCTION_V3_TESTNET_PROFILE.network_id,
+            [0x93; 32],
+            crate::PRODUCTION_V3_TESTNET_PROFILE.virtual_genesis_hash,
+        )
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn production_v3_template_request_sends_the_factory_issued_testnet_hello() {
+        let identity = production_v3_test_peer_identity();
+        let expected = identity.peer_hello();
+        assert_eq!(
+            expected.network_id,
+            crate::PRODUCTION_V3_TESTNET_PROFILE.network_id
+        );
+        assert_eq!(
+            expected.tip,
+            crate::PRODUCTION_V3_TESTNET_PROFILE.virtual_genesis_hash
+        );
+        assert_eq!(expected.height, 0);
+        assert_eq!(expected.cumulative_work, crate::peer::ChainWork::ZERO);
+
+        let payout = insecure_dev_destination(0x79);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut server_hello = expected;
+            server_hello.node_nonce = TARGET_NONCE;
+            let session = PeerSession::new(server_hello, test_limits()).unwrap();
+            let mut connection = PeerConnection::from_stream(stream, session).unwrap();
+            connection.send_hello().unwrap();
+            let PeerMessage::Hello(received) = connection.receive().unwrap() else {
+                panic!("expected ProductionV3 thin-miner hello")
+            };
+            assert_eq!(
+                connection.receive().unwrap(),
+                PeerMessage::GetMiningTemplate { payout }
+            );
+            received
+        });
+
+        let error = request_production_v3_mining_template_once_with_policy(
+            address,
+            payout,
+            identity,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+        )
+        .unwrap_err();
+        assert!(error.is_transport_disconnect());
+        assert_eq!(server.join().unwrap(), expected);
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn production_v3_block_submission_sends_the_factory_issued_testnet_hello() {
+        let identity = production_v3_test_peer_identity();
+        let expected = identity.peer_hello();
+        let payout = insecure_dev_destination(0x78);
+        let coinbase = Coinbase {
+            height: 1,
+            outputs: vec![TxOutput {
+                value: 1,
+                lock: OutputLock::Key(payout),
+                spendable_height: 1,
+            }],
+        };
+        let block = Block {
+            version: cmfd_consensus::BLOCK_VERSION,
+            challenge: BlockChallenge {
+                network_id: expected.network_id,
+                previous_block: expected.tip,
+                transaction_root: merkle_root(&[coinbase.commitment(expected.network_id)]),
+                height: 1,
+                timestamp: crate::PRODUCTION_V3_TESTNET_PROFILE
+                    .virtual_genesis_timestamp
+                    .saturating_add(1),
+                target: crate::PRODUCTION_V3_TESTNET_PROFILE.pow_limit,
+            },
+            proof: submission_test_block("production-v3-hello-proof").proof,
+            coinbase,
+            transactions: Vec::new(),
+        };
+        let block_id = block.block_id();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut server_hello = expected;
+            server_hello.node_nonce = TARGET_NONCE;
+            let session = PeerSession::new(server_hello, test_limits()).unwrap();
+            let mut connection = PeerConnection::from_stream(stream, session).unwrap();
+            connection.send_hello().unwrap();
+            let PeerMessage::Hello(received) = connection.receive().unwrap() else {
+                panic!("expected ProductionV3 thin-miner hello")
+            };
+            let PeerMessage::SubmitBlock(submitted) = connection.receive().unwrap() else {
+                panic!("expected ProductionV3 block submission")
+            };
+            assert_eq!(submitted.block_id(), block_id);
+            connection
+                .send(PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                    block_id,
+                    status: BlockSubmissionStatus::Rejected,
+                    peer_height: 0,
+                    peer_tip: expected.tip,
+                }))
+                .unwrap();
+            received
+        });
+
+        let result = submit_production_v3_mined_block_once_with_policy(
+            address,
+            block,
+            identity,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+        )
+        .unwrap();
+        assert_eq!(result.status, BlockSubmissionStatus::Rejected);
+        assert_eq!(server.join().unwrap(), expected);
     }
 
     #[test]

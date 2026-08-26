@@ -2,12 +2,16 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompiledNetworkProfile {
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     Devnet,
+    #[cfg_attr(not(feature = "production-v3-testnet"), allow(dead_code))]
+    ProductionV3Testnet,
     Rcnet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusProofSelection {
+    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
     DevnetV2Reference,
     ProductionV3,
 }
@@ -77,13 +81,39 @@ pub struct CompiledReleaseProfile {
     pub production_network_identity: Option<ProductionRcNetworkIdentityPin>,
 }
 
-/// The identity actually selected by the current source tree.
+/// The private ProductionV3 test network remains fail-closed until the exact
+/// ceremony artifacts and platform workers have been built and inserted here.
+/// `None` is intentional: do not replace these with placeholders or with
+/// hashes from an RCNet/mainnet package.
+#[cfg(feature = "production-v3-testnet")]
+const PRODUCTION_V3_TESTNET_ARTIFACT_PINS: Option<ProductionV3ArtifactIdentityPins> = None;
+#[cfg(feature = "production-v3-testnet")]
+const PRODUCTION_V3_TESTNET_WORKER_PINS: Option<ProductionV3VerifierWorkerIdentityPins> = None;
+
+/// The identity actually selected by a private ProductionV3 test build.
 ///
-/// This remains intentionally blocked. A production RC build may change these
-/// values only together with the real RCNet/V3 integration and committed
-/// qualification evidence. The release checkout commit is deliberately not a
-/// source constant: trusted CI supplies it to the build gate so the finalizer
-/// can compare it with the exact checkout without a self-reference.
+/// Testnet deliberately does not carry production activation evidence or a
+/// production network-identity pin. Its real artifact and worker identities
+/// are still mandatory at runtime through the fail-closed pin insertion points
+/// above.
+#[cfg(feature = "production-v3-testnet")]
+pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
+    network: CompiledNetworkProfile::ProductionV3Testnet,
+    proof: ConsensusProofSelection::ProductionV3,
+    activation: None,
+    production_v3_artifacts: PRODUCTION_V3_TESTNET_ARTIFACT_PINS,
+    production_v3_verifier_workers: PRODUCTION_V3_TESTNET_WORKER_PINS,
+    production_network_identity: None,
+};
+
+/// The identity selected by an ordinary source-tree build.
+///
+/// A production RC build may change these values only together with the real
+/// RCNet/V3 integration and committed qualification evidence. The release
+/// checkout commit is deliberately not a source constant: trusted CI supplies
+/// it to the build gate so the finalizer can compare it with the exact checkout
+/// without a self-reference.
+#[cfg(not(feature = "production-v3-testnet"))]
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
     network: CompiledNetworkProfile::Devnet,
     proof: ConsensusProofSelection::DevnetV2Reference,

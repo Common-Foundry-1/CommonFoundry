@@ -472,7 +472,7 @@ mod tests {
     fn double_click_defaults_to_loopback_with_public_bootstrap_peer() {
         let config = parsed_run_config(Vec::<&str>::new());
 
-        assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
+        assert_eq!(config.p2p_bind, COMPILED_NETWORK_PROFILE.p2p_address());
         assert_eq!(config.peers, vec![DEFAULT_BOOTSTRAP_PEER]);
         assert!(config.allow_public_peers);
         assert!(!config.peers_explicit);
@@ -532,7 +532,6 @@ mod tests {
         for arguments in [
             ["--peer", "8.8.8.8:18444"].as_slice(),
             ["--p2p-bind", "0.0.0.0:18444"].as_slice(),
-            ["--peer", "127.0.0.1:18444"].as_slice(),
             ["--peer", "127.0.0.1:18454", "--peer", "127.0.0.1:18454"].as_slice(),
         ] {
             assert!(matches!(
@@ -540,6 +539,12 @@ mod tests {
                 Err(ConfigError::InvalidPeerConfiguration(_))
             ));
         }
+
+        let self_peer = COMPILED_NETWORK_PROFILE.p2p_address().to_string();
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--peer", self_peer.as_str()]),
+            Err(ConfigError::InvalidPeerConfiguration(_))
+        ));
     }
 
     #[test]

@@ -23,6 +23,11 @@ use cmfd_node::p2p::{
     submit_mined_block_once_with_policy, submit_mined_block_once_with_policy_before_cancellable,
     sync_from_peer_once_with_policy,
 };
+#[cfg(feature = "production-v3")]
+use cmfd_node::p2p::{
+    request_production_v3_mining_template_once_with_policy,
+    submit_production_v3_mined_block_once_with_policy_before_cancellable,
+};
 use cmfd_node::peer::{
     BlockSubmissionStatus, MiningTemplate, PeerAddressPolicy, PeerLimits, StaticPeerConfig,
 };
@@ -31,7 +36,9 @@ use cmfd_node::{
     parse_miner_destination, submit_shared_tip_block, unix_time_seconds,
 };
 #[cfg(feature = "production-v3")]
-use cmfd_node::{ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts};
+use cmfd_node::{
+    ProductionV3MiningPeerIdentity, ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts,
+};
 
 mod telemetry;
 
@@ -414,6 +421,70 @@ enum MiningRuntime {
     ProductionV3,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ThinMinerHandshakeIdentity {
+    Devnet,
+    #[cfg(feature = "production-v3")]
+    ProductionV3(ProductionV3MiningPeerIdentity),
+}
+
+impl ThinMinerHandshakeIdentity {
+    fn request_template(
+        self,
+        address: SocketAddr,
+        payout: [u8; 32],
+        limits: PeerLimits,
+        address_policy: PeerAddressPolicy,
+    ) -> Result<cmfd_node::p2p::MiningTemplateResponse, cmfd_node::p2p::P2pError> {
+        match self {
+            Self::Devnet => {
+                request_mining_template_once_with_policy(address, payout, limits, address_policy)
+            }
+            #[cfg(feature = "production-v3")]
+            Self::ProductionV3(identity) => request_production_v3_mining_template_once_with_policy(
+                address,
+                payout,
+                identity,
+                limits,
+                address_policy,
+            ),
+        }
+    }
+
+    fn submit_before_cancellable(
+        self,
+        address: SocketAddr,
+        block: cmfd_consensus::Block,
+        limits: PeerLimits,
+        address_policy: PeerAddressPolicy,
+        deadline: Instant,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<cmfd_node::peer::BlockSubmissionResult, cmfd_node::p2p::P2pError> {
+        match self {
+            Self::Devnet => submit_mined_block_once_with_policy_before_cancellable(
+                address,
+                block,
+                limits,
+                address_policy,
+                deadline,
+                cancellation,
+            ),
+            #[cfg(feature = "production-v3")]
+            Self::ProductionV3(identity) => {
+                submit_production_v3_mined_block_once_with_policy_before_cancellable(
+                    address,
+                    block,
+                    identity,
+                    limits,
+                    address_policy,
+                    deadline,
+                    cancellation,
+                )
+            }
+        }
+    }
+}
+
 const fn mining_runtime(profile: cmfd_node::NetworkProfile) -> MiningRuntime {
     match profile.proof {
         ProofProfile::DevnetV2Reference => MiningRuntime::DevnetV2,
@@ -723,6 +794,7 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
             &options.peers,
             preferred_peer,
             payout,
+            ThinMinerHandshakeIdentity::Devnet,
             limits,
             address_policy,
             &shutdown,
@@ -768,6 +840,7 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                         &options.peers,
                         preferred_peer,
                         payout,
+                        ThinMinerHandshakeIdentity::Devnet,
                         limits,
                         address_policy,
                     ) {
@@ -839,6 +912,7 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                         &options.peers,
                         &mut preferred_peer,
                         block,
+                        ThinMinerHandshakeIdentity::Devnet,
                         limits,
                         address_policy,
                         &shutdown,
@@ -857,6 +931,7 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                         &options.peers,
                         &mut preferred_peer,
                         block,
+                        ThinMinerHandshakeIdentity::Devnet,
                         limits,
                         address_policy,
                         &shutdown,
@@ -926,6 +1001,7 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
         runtime.maximum_native_block_rows,
         &shutdown,
     )?;
+    let peer_identity = ThinMinerHandshakeIdentity::ProductionV3(factory.peer_identity());
     let cuda = load_cuda(options.cuda_library.as_deref())?;
     let available = cuda.devices().map_err(anyhow::Error::msg)?;
     let devices = select_devices(&available, &options.requested_devices)?;
@@ -963,6 +1039,7 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
             &options.peers,
             preferred_peer,
             payout,
+            peer_identity,
             limits,
             address_policy,
             &shutdown,
@@ -1008,6 +1085,7 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                         &options.peers,
                         preferred_peer,
                         payout,
+                        peer_identity,
                         limits,
                         address_policy,
                     ) {
@@ -1051,6 +1129,7 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                             &options.peers,
                             preferred_peer,
                             payout,
+                            peer_identity,
                             limits,
                             address_policy,
                         ) {
@@ -1093,6 +1172,7 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                     &options.peers,
                     &mut preferred_peer,
                     block,
+                    peer_identity,
                     limits,
                     address_policy,
                     &shutdown,
@@ -1187,13 +1267,15 @@ fn fetch_template_from_any(
     peers: &[SocketAddr],
     preferred: Option<SocketAddr>,
     payout: [u8; 32],
+    identity: ThinMinerHandshakeIdentity,
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Option<(SocketAddr, cmfd_node::p2p::MiningTemplateResponse)> {
     ordered_peers(peers, preferred)
         .into_iter()
         .find_map(|peer| {
-            request_mining_template_once_with_policy(peer, payout, limits, address_policy)
+            identity
+                .request_template(peer, payout, limits, address_policy)
                 .ok()
                 .map(|response| (peer, response))
         })
@@ -1203,13 +1285,14 @@ fn wait_for_template(
     peers: &[SocketAddr],
     preferred: Option<SocketAddr>,
     payout: [u8; 32],
+    identity: ThinMinerHandshakeIdentity,
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     shutdown: &AtomicBool,
 ) -> Result<Option<(SocketAddr, MiningTemplate, u64)>> {
     while !shutdown.load(Ordering::Acquire) {
         if let Some((peer, response)) =
-            fetch_template_from_any(peers, preferred, payout, limits, address_policy)
+            fetch_template_from_any(peers, preferred, payout, identity, limits, address_policy)
         {
             return Ok(Some((
                 peer,
@@ -1233,6 +1316,7 @@ fn retry_found_block(
     peers: &[SocketAddr],
     preferred: &mut Option<SocketAddr>,
     block: cmfd_consensus::Block,
+    identity: ThinMinerHandshakeIdentity,
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     shutdown: &Arc<AtomicBool>,
@@ -1249,7 +1333,7 @@ fn retry_found_block(
         &block,
         deadline,
         shutdown,
-        |peer, candidate, deadline| match submit_mined_block_once_with_policy_before_cancellable(
+        |peer, candidate, deadline| match identity.submit_before_cancellable(
             peer,
             candidate,
             limits,
@@ -1564,6 +1648,12 @@ fn interruptible_wait(duration: Duration, shutdown: &AtomicBool) -> bool {
 }
 
 fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
+    if matches!(COMPILED_NETWORK_PROFILE.proof, ProofProfile::ProductionV3) {
+        bail!(
+            "ProductionV3 full-node mining is disabled because it does not install the required external proof-verifier worker; use `cmfd-miner mine --peer <node>:{} ...` against a packaged ProductionV3 node",
+            COMPILED_NETWORK_PROFILE.p2p_port
+        );
+    }
     match mining_runtime(COMPILED_NETWORK_PROFILE) {
         MiningRuntime::DevnetV2 => run_full_node_miner_v2(options),
         MiningRuntime::ProductionV3 => {
@@ -3314,6 +3404,36 @@ mod tests {
         };
         assert_eq!(data_dir, PathBuf::from(DEFAULT_MINER_DATA_DIR));
         assert_eq!(p2p_bind, COMPILED_NETWORK_PROFILE.miner_p2p_address());
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn production_v3_testnet_full_node_fails_before_artifact_or_cuda_work() {
+        let data_dir =
+            std::env::temp_dir().join(format!("cmfd-disabled-v3-full-node-{}", std::process::id()));
+        assert!(!data_dir.exists());
+        let error = run_full_node_miner(FullNodeMinerOptions {
+            data_dir: data_dir.clone(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            peers: Vec::new(),
+            allow_public_peers: false,
+            requested_devices: Vec::new(),
+            cuda_library: Some(PathBuf::from("missing-cuda-library")),
+            batch_size: 0,
+            workers_per_gpu: 0,
+            miner: None,
+            stats_seconds: 0,
+            production_v3: ProductionV3Cli {
+                production_v3_bank: None,
+                production_v3_manifest: None,
+                production_v3_record_v2: None,
+                production_v3_scratch: None,
+                production_v3_max_rows: None,
+            },
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("cmfd-miner mine --peer"));
+        assert!(!data_dir.exists());
     }
 
     #[test]

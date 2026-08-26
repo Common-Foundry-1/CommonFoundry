@@ -1,4 +1,4 @@
-#![cfg(any(unix, windows))]
+#![cfg(all(any(unix, windows), not(feature = "production-v3-testnet")))]
 
 use std::fs;
 use std::io::{Read, Write};

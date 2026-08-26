@@ -12,12 +12,19 @@ fn main() {
         "GITHUB_REF",
         "GITHUB_REF_NAME",
         "CARGO_FEATURE_PRODUCTION_RC",
+        "CARGO_FEATURE_PRODUCTION_V3_TESTNET",
         "CMFD_BUILD_SOURCE_COMMIT",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
     println!("cargo:rerun-if-changed=release_gate.rs");
     println!("cargo:rerun-if-changed=src/network_profile.rs");
+
+    if env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some()
+        && env::var_os("CARGO_FEATURE_PRODUCTION_V3_TESTNET").is_some()
+    {
+        panic!("production-rc and production-v3-testnet are mutually exclusive");
+    }
 
     let requested = env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some()
         || ["CMFD_RELEASE_LABEL", "GITHUB_REF", "GITHUB_REF_NAME"]

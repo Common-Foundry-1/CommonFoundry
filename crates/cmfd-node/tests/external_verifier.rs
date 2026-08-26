@@ -1,3 +1,5 @@
+#![cfg(not(feature = "production-v3-testnet"))]
+
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};

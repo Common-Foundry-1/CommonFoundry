@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -2135,6 +2135,9 @@ pub struct Node {
     /// Digest of the exact last complete block-log record. V2 appends bind to
     /// this value; it advances only after the durable record commits in memory.
     last_record_digest: [u8; 32],
+    /// Authenticated end offset established by startup replay and advanced only
+    /// after a complete record is durably written at that exact position.
+    block_log_length: u64,
     storage_faulted: bool,
     rejected_proof_ids: HashSet<[u8; 32]>,
     rejected_proof_order: VecDeque<[u8; 32]>,
@@ -2145,28 +2148,56 @@ pub struct Node {
     _lock: DataDirLock,
 }
 
-/// A fully validated block retained by the fork index.
+/// Compact durable location and authenticated identity of one block-log record.
 ///
-/// Devnet reconstructs side branches directly from the index. Production
-/// snapshots immutable ancestry under the node lock and performs the same
-/// reconstruction outside it using only externally issued capabilities.
-#[derive(Debug, Clone)]
-struct IndexedBlock {
+/// The locator is metadata only. Canonical block bytes and process-local proof
+/// capabilities are deliberately never retained in the fork index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockRecordLocator {
+    ordinal: u64,
+    offset: u64,
+    length: u64,
+    version: BlockRecordVersion,
+    complete_digest: [u8; 32],
+    accepted_at: u64,
     block_id: [u8; 32],
     parent: [u8; 32],
     height: u64,
-    accepted_at: u64,
-    canonical: Arc<[u8]>,
+    target: [u8; 32],
+}
+
+/// A fully validated block retained by the fork index.
+///
+/// The retained block log is authoritative for block bodies. The index keeps
+/// only authenticated record locators plus the compact fork-choice metadata
+/// needed without disk access.
+#[derive(Debug, Clone)]
+struct IndexedBlock {
+    locator: BlockRecordLocator,
     cumulative_work: U512,
     successor_header: SuccessorHeaderPreflight,
     /// Binary-lifting ancestors. Entry `k` is the `2^k`-th ancestor, allowing
     /// bounded checkpoint slices to be selected without a height-linear walk
     /// under the node mutex.
     ancestors: Vec<[u8; 32]>,
-    /// Process-local evidence that this exact proof was accepted. Production
-    /// entries always carry it; Devnet entries may use their in-process V2
-    /// verifier instead.
-    preverified: Option<PreverifiedBlockProof>,
+}
+
+impl IndexedBlock {
+    fn block_id(&self) -> [u8; 32] {
+        self.locator.block_id
+    }
+
+    fn parent(&self) -> [u8; 32] {
+        self.locator.parent
+    }
+
+    fn height(&self) -> u64 {
+        self.locator.height
+    }
+
+    fn accepted_at(&self) -> u64 {
+        self.locator.accepted_at
+    }
 }
 
 #[derive(Debug)]
@@ -2191,9 +2222,15 @@ struct BranchStatePlan {
     /// `None` denotes virtual genesis, which is cheap to reconstruct.
     base: Option<Box<ChainState>>,
     path: Vec<[u8; 32]>,
-    replay: Vec<Arc<IndexedBlock>>,
+    replay: Vec<BranchReplayBlock>,
     target_parent: [u8; 32],
     reaches_target: bool,
+}
+
+#[derive(Debug)]
+struct BranchReplayBlock {
+    indexed: Arc<IndexedBlock>,
+    block: Block,
 }
 
 impl BlockIndex {
@@ -2236,7 +2273,7 @@ impl BlockIndex {
                 NodeError::CorruptLog("fork index contains a missing parent".to_owned())
             })?;
             reversed.push(cursor);
-            cursor = entry.parent;
+            cursor = entry.parent();
         }
         reversed.reverse();
         Ok(reversed)
@@ -2259,7 +2296,7 @@ impl BlockIndex {
             .blocks
             .get(&tip)
             .ok_or(NodeError::UnknownParent(tip))?
-            .height;
+            .height();
         let mut distance = tip_height.checked_sub(target_height).ok_or_else(|| {
             NodeError::CorruptLog("ancestor height is above the indexed tip".to_owned())
         })?;
@@ -2306,6 +2343,10 @@ impl BlockIndex {
         &self,
         parent: [u8; 32],
         checkpoint: Option<BranchStateCheckpoint>,
+        log: &File,
+        log_path: &Path,
+        network_id: [u8; 32],
+        require_v2: bool,
     ) -> Result<BranchStatePlan, NodeError> {
         if parent == self.genesis {
             if checkpoint.is_some() {
@@ -2324,26 +2365,25 @@ impl BlockIndex {
             .blocks
             .get(&parent)
             .ok_or(NodeError::UnknownParent(parent))?
-            .height;
+            .height();
         let (base_height, base, path) = match checkpoint {
             Some(checkpoint) => {
                 let usable = checkpoint.state.tip() == checkpoint.block_id
                     && checkpoint.path.last() == Some(&checkpoint.block_id)
                     && checkpoint.path.first() == Some(&self.genesis)
                     && self.blocks.get(&checkpoint.block_id).is_some_and(|entry| {
-                        entry.preverified.is_some()
-                            && entry.height <= parent_height
-                            && usize::try_from(entry.height)
+                        entry.height() <= parent_height
+                            && usize::try_from(entry.height())
                                 .ok()
                                 .and_then(|height| height.checked_add(1))
                                 == Some(checkpoint.path.len())
                     })
                     && self.blocks.get(&checkpoint.block_id).is_some_and(|entry| {
-                        self.ancestor_at_height(parent, entry.height)
+                        self.ancestor_at_height(parent, entry.height())
                             .is_ok_and(|ancestor| ancestor == checkpoint.block_id)
                     });
                 if usable {
-                    let height = self.blocks[&checkpoint.block_id].height;
+                    let height = self.blocks[&checkpoint.block_id].height();
                     (height, Some(checkpoint.state), checkpoint.path)
                 } else {
                     (0, None, vec![self.genesis])
@@ -2358,12 +2398,19 @@ impl BlockIndex {
         );
         for height in base_height.saturating_add(1)..=end_height {
             let block_id = self.ancestor_at_height(parent, height)?;
-            replay.push(
-                self.blocks
-                    .get(&block_id)
-                    .cloned()
-                    .ok_or(NodeError::UnknownParent(block_id))?,
-            );
+            let indexed = self
+                .blocks
+                .get(&block_id)
+                .cloned()
+                .ok_or(NodeError::UnknownParent(block_id))?;
+            if indexed.block_id() != block_id {
+                return Err(NodeError::CorruptLog(
+                    "fork index key does not match its durable record locator".to_owned(),
+                ));
+            }
+            let block =
+                read_indexed_block(log, log_path, &indexed, block_id, network_id, require_v2)?;
+            replay.push(BranchReplayBlock { indexed, block });
         }
         Ok(BranchStatePlan {
             base,
@@ -2387,10 +2434,9 @@ struct PreparedBlock {
     block_id: [u8; 32],
     parent: [u8; 32],
     height: u64,
+    target: [u8; 32],
     accepted_at: u64,
-    canonical: Vec<u8>,
     cumulative_work: U512,
-    preverified: Option<PreverifiedBlockProof>,
     ancestors: Vec<[u8; 32]>,
     activation_chain: Option<Vec<[u8; 32]>>,
     candidate: ValidatedCandidate,
@@ -2412,6 +2458,8 @@ impl PreparedBlock {
 struct BlockPreparationContext<'a> {
     params: NetworkParams,
     verifier: &'a ConsensusPowVerifier,
+    block_log: &'a File,
+    block_log_path: &'a Path,
     accepted_at: u64,
     preverified: Option<&'a PreverifiedBlockProof>,
     branch_state: Option<Box<ChainState>>,
@@ -2427,7 +2475,6 @@ enum AdmissionStateSnapshot {
 
 /// Immutable, revision-bound work captured while holding the shared node
 /// mutex. Completing this value never touches live node state.
-#[derive(Debug)]
 pub(crate) struct ExternalBlockAdmissionWork {
     revision: u64,
     block_id: [u8; 32],
@@ -2435,6 +2482,7 @@ pub(crate) struct ExternalBlockAdmissionWork {
     accepted_at: u64,
     params: NetworkParams,
     verifier: ConsensusPowVerifier,
+    block_preverifier: BlockPreverifier,
     state_snapshot: AdmissionStateSnapshot,
 }
 
@@ -2483,7 +2531,12 @@ impl ExternalBlockAdmissionWork {
             AdmissionStateSnapshot::Branch(plan) => {
                 let target_parent = plan.target_parent;
                 let reaches_target = plan.reaches_target;
-                let (state, path) = complete_branch_state_plan(self.params, &self.verifier, plan)?;
+                let (state, path) = complete_branch_state_plan(
+                    self.params,
+                    &self.verifier,
+                    &self.block_preverifier,
+                    plan,
+                )?;
                 if !reaches_target {
                     let block_id = state.tip();
                     return Ok(ExternalBlockAdmissionProgress::Checkpoint {
@@ -2538,6 +2591,7 @@ impl ExternalBlockAdmissionWork {
 fn complete_branch_state_plan(
     params: NetworkParams,
     verifier: &ConsensusPowVerifier,
+    block_preverifier: &BlockPreverifier,
     plan: BranchStatePlan,
 ) -> Result<(ChainState, Vec<[u8; 32]>), NodeError> {
     let mut state = match plan.base {
@@ -2545,42 +2599,45 @@ fn complete_branch_state_plan(
         None => ChainState::new(params, verifier.clone())?,
     };
     let mut path = plan.path;
-    for entry in plan.replay {
-        if state.tip() != entry.parent {
+    for replay in plan.replay {
+        let entry = replay.indexed;
+        let block = replay.block;
+        if state.tip() != entry.parent() {
             return Err(NodeError::CorruptLog(
                 "bounded fork reconstruction has inconsistent ancestry".to_owned(),
             ));
         }
-        let block = decode_block(entry.canonical.as_ref(), params.network_id).map_err(|error| {
-            NodeError::CorruptLog(format!("captured indexed block cannot decode: {error}"))
-        })?;
-        if block.block_id() != entry.block_id
-            || block.challenge.previous_block != entry.parent
-            || block.challenge.height != entry.height
+        if block.block_id() != entry.block_id()
+            || block.challenge.previous_block != entry.parent()
+            || block.challenge.height != entry.height()
         {
             return Err(NodeError::CorruptLog(
                 "captured indexed block metadata does not match its canonical frame".to_owned(),
             ));
         }
-        let preverified = entry.preverified.as_ref().ok_or_else(|| {
-            NodeError::CorruptLog(
-                "production fork reconstruction is missing external proof evidence".to_owned(),
-            )
-        })?;
-        let validated = state.validate_block_preverified(
-            &block,
-            BlockValidationContext {
-                now_unix_seconds: entry.accepted_at,
-            },
-            preverified,
-        )?;
+        let context = BlockValidationContext {
+            now_unix_seconds: entry.accepted_at(),
+        };
+        // This reconstruction path exists only for externally admitted
+        // ProductionV3 side branches. Never recover proof authority from the
+        // index: freshly preverify the exact locator-backed block each time.
+        let preverified = match block_preverifier.preverify_unqueued(&block) {
+            Ok(preverified) => preverified,
+            Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(error))) => {
+                return Err(NodeError::CorruptLog(format!(
+                    "indexed production block proof is rejected during fresh fork replay: {error}"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        let validated = state.validate_block_preverified(&block, context, &preverified)?;
         state.commit_validated(validated)?;
         if state.successor_header_preflight()? != entry.successor_header {
             return Err(NodeError::CorruptLog(
                 "captured production fork header snapshot does not match replayed state".to_owned(),
             ));
         }
-        path.push(entry.block_id);
+        path.push(entry.block_id());
     }
     Ok((state, path))
 }
@@ -2798,7 +2855,7 @@ impl Node {
 
         let mut state = ChainState::new(params, verifier.clone())?;
         let mut index = BlockIndex::new(params.genesis_hash);
-        let last_record_digest = replay_log(
+        let replay = replay_log(
             &log,
             &log_path,
             &mut state,
@@ -2813,6 +2870,11 @@ impl Node {
         let chain_revision = u64::try_from(index.blocks.len()).map_err(|_| {
             NodeError::CorruptLog("block count exceeds the revision counter".to_owned())
         })?;
+        if chain_revision != replay.record_count {
+            return Err(NodeError::CorruptLog(
+                "startup record count does not match the fork index".to_owned(),
+            ));
+        }
 
         Ok(Self {
             data_dir,
@@ -2831,7 +2893,8 @@ impl Node {
             mempool: BTreeMap::new(),
             mempool_bytes: 0,
             log,
-            last_record_digest,
+            last_record_digest: replay.last_record_digest,
+            block_log_length: replay.log_length,
             storage_faulted: false,
             rejected_proof_ids: HashSet::new(),
             rejected_proof_order: VecDeque::new(),
@@ -3455,10 +3518,15 @@ impl Node {
             let indexed = self.index.blocks.get(block_id).ok_or_else(|| {
                 NodeError::CorruptLog("active wallet history refers to an absent block".to_owned())
             })?;
-            let block =
-                decode_block(&indexed.canonical, self.params.network_id).map_err(|error| {
-                    NodeError::CorruptLog(format!("active wallet history cannot decode: {error}"))
-                })?;
+            let log_path = self.data_dir.join(BLOCK_LOG_FILE);
+            let block = read_indexed_block(
+                &self.log,
+                &log_path,
+                indexed,
+                *block_id,
+                self.params.network_id,
+                matches!(self.profile.proof, ProofProfile::ProductionV3),
+            )?;
             let height = block.challenge.height;
             let confirmations = accepted_height.saturating_sub(height).saturating_add(1);
             let coinbase_txid = block.coinbase_outpoint_id();
@@ -3604,13 +3672,27 @@ impl Node {
         self.index.contains(block_id)
     }
 
-    /// Returns the exact canonical frame retained for a validated block.
-    /// Virtual genesis has no frame and therefore returns `None`.
-    pub fn canonical_block(&self, block_id: [u8; 32]) -> Option<&[u8]> {
-        self.index
-            .blocks
-            .get(&block_id)
-            .map(|entry| entry.canonical.as_ref())
+    /// Reads and authenticates the exact canonical frame for a validated block.
+    /// Virtual genesis and unknown identifiers have no frame and return
+    /// `None`; retained-log corruption and I/O failures are never hidden.
+    pub fn canonical_block(&self, block_id: [u8; 32]) -> Result<Option<Vec<u8>>, NodeError> {
+        let Some(indexed) = self.index.blocks.get(&block_id) else {
+            return Ok(None);
+        };
+        if indexed.block_id() != block_id {
+            return Err(NodeError::CorruptLog(
+                "fork index key does not match its durable record locator".to_owned(),
+            ));
+        }
+        let path = self.data_dir.join(BLOCK_LOG_FILE);
+        let (record, _) = read_located_record(
+            &self.log,
+            &path,
+            &indexed.locator,
+            self.params.network_id,
+            matches!(self.profile.proof, ProofProfile::ProductionV3),
+        )?;
+        Ok(Some(record.block_bytes))
     }
 
     /// Builds a bounded, newest-first active-chain locator. For every nonzero
@@ -3684,7 +3766,7 @@ impl Node {
             let Some(entry) = self.index.blocks.get(&cursor) else {
                 return Vec::new();
             };
-            cursor = entry.parent;
+            cursor = entry.parent();
         }
         let Some(position) = active_position else {
             return Vec::new();
@@ -3953,11 +4035,6 @@ impl Node {
                     .blocks
                     .get(&parent)
                     .ok_or(NodeError::UnknownParent(parent))?;
-                if parent_entry.preverified.is_none() {
-                    return Err(NodeError::CorruptLog(
-                        "production fork parent is missing external proof evidence".to_owned(),
-                    ));
-                }
                 parent_entry
                     .successor_header
                     .preflight_block(block, validation_context)?;
@@ -4005,7 +4082,15 @@ impl Node {
             }
             AdmissionStateSnapshot::Active
         } else {
-            AdmissionStateSnapshot::Branch(self.index.branch_state_plan(parent, checkpoint)?)
+            let log_path = self.data_dir.join(BLOCK_LOG_FILE);
+            AdmissionStateSnapshot::Branch(self.index.branch_state_plan(
+                parent,
+                checkpoint,
+                &self.log,
+                &log_path,
+                self.params.network_id,
+                true,
+            )?)
         };
         Ok(Some(ExternalBlockAdmissionWork {
             revision: self.chain_revision,
@@ -4014,6 +4099,7 @@ impl Node {
             accepted_at,
             params: self.params,
             verifier: self.verifier.clone(),
+            block_preverifier: self.block_preverifier.clone(),
             state_snapshot,
         }))
     }
@@ -4090,6 +4176,7 @@ impl Node {
         let confirmed_txids: HashSet<_> =
             block.transactions.iter().map(Transaction::txid).collect();
         let canonical = encode_block(&block)?;
+        let log_path = self.data_dir.join(BLOCK_LOG_FILE);
         let next_revision = self
             .chain_revision
             .checked_add(1)
@@ -4098,10 +4185,11 @@ impl Node {
             &self.state,
             &self.index,
             &block,
-            canonical.clone(),
             BlockPreparationContext {
                 params: self.params,
                 verifier: &self.verifier,
+                block_log: &self.log,
+                block_log_path: &log_path,
                 accepted_at,
                 preverified,
                 branch_state,
@@ -4116,7 +4204,36 @@ impl Node {
         })?;
         let record = encode_record_v2(accepted_at, &canonical, &delta, self.last_record_digest)?;
         let record_digest = complete_record_digest(&record);
-        let log_path = self.data_dir.join(BLOCK_LOG_FILE);
+        verify_retained_block_log_path(&self.log, &log_path)?;
+        let observed_length = self
+            .log
+            .metadata()
+            .map_err(|source| io_error("inspect block log before append", &log_path, source))?
+            .len();
+        if observed_length != self.block_log_length {
+            self.storage_faulted = true;
+            return Err(NodeError::CorruptLog(
+                "block log end changed after its last authenticated append".to_owned(),
+            ));
+        }
+        let record_length = u64::try_from(record.len())
+            .map_err(|_| NodeError::CorruptLog("block record length exceeds u64".to_owned()))?;
+        let final_length = self
+            .block_log_length
+            .checked_add(record_length)
+            .ok_or_else(|| NodeError::CorruptLog("block log length overflowed".to_owned()))?;
+        let locator = BlockRecordLocator {
+            ordinal: self.chain_revision,
+            offset: self.block_log_length,
+            length: record_length,
+            version: BlockRecordVersion::V2,
+            complete_digest: record_digest,
+            accepted_at: prepared.accepted_at,
+            block_id: prepared.block_id,
+            parent: prepared.parent,
+            height: prepared.height,
+            target: prepared.target,
+        };
         if let Err(source) = self.log.write_all(&record) {
             self.storage_faulted = true;
             return Err(io_error("append block record", &log_path, source));
@@ -4125,10 +4242,32 @@ impl Node {
             self.storage_faulted = true;
             return Err(io_error("sync block record", &log_path, source));
         }
-        match commit_prepared(&mut self.state, &mut self.index, prepared) {
+        let durable_length = match self.log.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(source) => {
+                self.storage_faulted = true;
+                return Err(io_error(
+                    "inspect block log after durable append",
+                    &log_path,
+                    source,
+                ));
+            }
+        };
+        if durable_length != final_length {
+            self.storage_faulted = true;
+            return Err(NodeError::CorruptLog(
+                "durable block append did not end at its predicted locator".to_owned(),
+            ));
+        }
+        if let Err(error) = verify_retained_block_log_path(&self.log, &log_path) {
+            self.storage_faulted = true;
+            return Err(error);
+        }
+        match commit_prepared(&mut self.state, &mut self.index, prepared, locator) {
             Ok(outcome) => {
                 self.chain_revision = next_revision;
                 self.last_record_digest = record_digest;
+                self.block_log_length = final_length;
                 if self.state.tip() != previous_tip {
                     self.revalidate_mempool(&confirmed_txids);
                 }
@@ -4512,12 +4651,13 @@ fn prepare_block(
     active_state: &ChainState,
     index: &BlockIndex,
     block: &Block,
-    canonical: Vec<u8>,
     context: BlockPreparationContext<'_>,
 ) -> Result<PreparedBlock, NodeError> {
     let BlockPreparationContext {
         params,
         verifier,
+        block_log,
+        block_log_path,
         accepted_at,
         preverified,
         branch_state,
@@ -4561,7 +4701,15 @@ fn prepare_block(
                 // Devnet keeps the original simple reconstruction. Production
                 // only permits this during startup replay, before a shared node
                 // mutex exists and after every proof was externally verified.
-                rebuild_state_to(index, params, verifier, parent)?
+                rebuild_state_to(
+                    block_log,
+                    block_log_path,
+                    index,
+                    params,
+                    verifier,
+                    parent,
+                    None,
+                )?
             }
             None => return Err(NodeError::ProductionV3Unavailable),
         };
@@ -4592,10 +4740,9 @@ fn prepare_block(
         block_id,
         parent,
         height: block.challenge.height,
+        target: block.challenge.target,
         accepted_at,
-        canonical,
         cumulative_work,
-        preverified: preverified.cloned(),
         ancestors,
         activation_chain,
         candidate,
@@ -4603,21 +4750,35 @@ fn prepare_block(
 }
 
 fn rebuild_state_to(
+    block_log: &File,
+    block_log_path: &Path,
     index: &BlockIndex,
     params: NetworkParams,
     verifier: &ConsensusPowVerifier,
     tip: [u8; 32],
+    external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<ChainState, NodeError> {
     let mut state = ChainState::new(params, verifier.clone())?;
-    replay_indexed_state_to(&mut state, index, params, tip)?;
+    replay_indexed_state_to(
+        block_log,
+        block_log_path,
+        &mut state,
+        index,
+        params,
+        tip,
+        external_preverifier,
+    )?;
     Ok(state)
 }
 
 fn replay_indexed_state_to(
+    block_log: &File,
+    block_log_path: &Path,
     state: &mut ChainState,
     index: &BlockIndex,
     params: NetworkParams,
     tip: [u8; 32],
+    external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<(), NodeError> {
     if state.tip() != index.genesis {
         return Err(NodeError::CorruptLog(
@@ -4628,38 +4789,50 @@ fn replay_indexed_state_to(
         let entry = index.blocks.get(&block_id).ok_or_else(|| {
             NodeError::CorruptLog("fork path refers to an absent block".to_owned())
         })?;
-        let block = decode_block(&entry.canonical, params.network_id).map_err(|error| {
-            NodeError::CorruptLog(format!("indexed block cannot decode: {error}"))
-        })?;
+        let block = read_indexed_block(
+            block_log,
+            block_log_path,
+            entry,
+            block_id,
+            params.network_id,
+            requires_external_preverification(&params),
+        )?;
         if block.block_id() != block_id
-            || block.challenge.previous_block != entry.parent
-            || block.challenge.height != entry.height
+            || block.challenge.previous_block != entry.parent()
+            || block.challenge.height != entry.height()
         {
             return Err(NodeError::CorruptLog(
                 "indexed block metadata does not match its canonical frame".to_owned(),
             ));
         }
         let context = BlockValidationContext {
-            now_unix_seconds: entry.accepted_at,
+            now_unix_seconds: entry.accepted_at(),
         };
-        let validated = match entry.preverified.as_ref() {
-            Some(preverified) => state
-                .validate_block_preverified(&block, context, preverified)
+        let validated = if let Some(preverifier) = external_preverifier {
+            let preverified = match preverifier.preverify_unqueued(&block) {
+                Ok(preverified) => preverified,
+                Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(error))) => {
+                    return Err(NodeError::CorruptLog(format!(
+                        "indexed production block proof is rejected during fresh replay: {error}"
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
+            state
+                .validate_block_preverified(&block, context, &preverified)
                 .map_err(|error| {
                     NodeError::CorruptLog(format!(
-                        "indexed side branch fails preverified consensus replay: {error}"
+                        "indexed side branch fails freshly preverified consensus replay: {error}"
                     ))
-                })?,
-            None if requires_external_preverification(&params) => {
-                return Err(NodeError::CorruptLog(
-                    "production side branch is missing external proof evidence".to_owned(),
-                ));
-            }
-            None => state.validate_block(&block, context).map_err(|error| {
+                })?
+        } else if requires_external_preverification(&params) {
+            return Err(NodeError::ProductionV3Unavailable);
+        } else {
+            state.validate_block(&block, context).map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "indexed side branch fails full consensus replay: {error}"
                 ))
-            })?,
+            })?
         };
         state.commit_validated(validated).map_err(|error| {
             NodeError::CorruptLog(format!(
@@ -4683,7 +4856,19 @@ fn commit_prepared(
     active_state: &mut ChainState,
     index: &mut BlockIndex,
     mut prepared: PreparedBlock,
+    locator: BlockRecordLocator,
 ) -> Result<CommitOutcome, NodeError> {
+    if locator.version != BlockRecordVersion::V2
+        || locator.block_id != prepared.block_id
+        || locator.parent != prepared.parent
+        || locator.height != prepared.height
+        || locator.target != prepared.target
+        || locator.accepted_at != prepared.accepted_at
+    {
+        return Err(NodeError::CorruptLog(
+            "prepared block metadata does not match its durable record locator".to_owned(),
+        ));
+    }
     let activates = prepared.cumulative_work > index.active_work;
     if matches!(prepared.candidate, ValidatedCandidate::Active(_)) && !activates {
         return Err(NodeError::CorruptLog(
@@ -4728,15 +4913,10 @@ fn commit_prepared(
     let previous = index.blocks.insert(
         prepared.block_id,
         Arc::new(IndexedBlock {
-            block_id: prepared.block_id,
-            parent: prepared.parent,
-            height: prepared.height,
-            accepted_at: prepared.accepted_at,
-            canonical: Arc::from(prepared.canonical),
+            locator,
             cumulative_work: prepared.cumulative_work,
             successor_header,
             ancestors: prepared.ancestors,
-            preverified: prepared.preverified,
         }),
     );
     if previous.is_some() {
@@ -5921,35 +6101,24 @@ struct ParsedLogRecord {
     complete_digest: [u8; 32],
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReplayRecordVersion {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockRecordVersion {
     LegacyV1,
     V2,
 }
 
-struct ReplayRecordLocator {
-    offset: u64,
-    length: u64,
-    complete_digest: [u8; 32],
-}
-
-struct ReplayRecord {
-    record_index: u64,
-    accepted_at: u64,
-    block_id: [u8; 32],
-    parent: [u8; 32],
-    height: u64,
-    target: [u8; 32],
-    canonical: Arc<[u8]>,
-    version: ReplayRecordVersion,
-    locator: ReplayRecordLocator,
-}
-
 struct ScannedReplayLog {
-    records: Vec<ReplayRecord>,
+    records: Vec<BlockRecordLocator>,
     children: HashMap<[u8; 32], Vec<usize>>,
     last_record_digest: [u8; 32],
     log_length: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayLogState {
+    last_record_digest: [u8; 32],
+    log_length: u64,
+    record_count: u64,
 }
 
 struct ReplayDfsFrame {
@@ -6098,6 +6267,223 @@ fn read_log_record(
     }))
 }
 
+#[cfg(unix)]
+fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::ReOpenFile;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    // This transient reader must share with the already-open append handle.
+    // The retained append handle itself still grants only FILE_SHARE_READ, so
+    // no other process can acquire write or delete access to the log.
+    // SAFETY: the source handle remains owned by `file`; ReOpenFile returns a
+    // new independently owned handle to the same file object. `from_raw_handle`
+    // takes ownership of only that returned handle.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle().cast(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `handle` was returned successfully by ReOpenFile and is not
+    // owned anywhere else.
+    let mut independent = unsafe { File::from_raw_handle(handle.cast()) };
+    independent.seek(SeekFrom::Start(offset))?;
+    independent.read(buffer)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.read(buffer)
+}
+
+fn positioned_read_exact(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buffer.is_empty() {
+        match positioned_read(file, buffer, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(read) => {
+                offset = offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("positioned read offset overflow"))?;
+                buffer = &mut buffer[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_located_record(
+    file: &File,
+    path: &Path,
+    locator: &BlockRecordLocator,
+    network_id: [u8; 32],
+    require_v2: bool,
+) -> Result<(ParsedLogRecord, Block), NodeError> {
+    let (minimum_length, maximum_length) = match locator.version {
+        BlockRecordVersion::LegacyV1 => (
+            RECORD_V1_HEADER_BYTES + RECORD_CHECKSUM_BYTES,
+            checked_record_len(RECORD_V1_HEADER_BYTES, MAX_BLOCK_BYTES, 0)?,
+        ),
+        BlockRecordVersion::V2 => (
+            RECORD_V2_HEADER_BYTES + RECORD_CHECKSUM_BYTES,
+            checked_record_len(
+                RECORD_V2_HEADER_BYTES,
+                MAX_BLOCK_BYTES,
+                MAX_REVERSIBLE_STATE_DELTA_BYTES,
+            )?,
+        ),
+    };
+    let length = usize::try_from(locator.length).map_err(|_| {
+        NodeError::CorruptLog(format!(
+            "record {} locator length does not fit this platform",
+            locator.ordinal
+        ))
+    })?;
+    if !(minimum_length..=maximum_length).contains(&length) {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} locator length is outside its version bounds",
+            locator.ordinal
+        )));
+    }
+    let end = locator.offset.checked_add(locator.length).ok_or_else(|| {
+        NodeError::CorruptLog(format!(
+            "record {} locator end offset overflowed",
+            locator.ordinal
+        ))
+    })?;
+    let file_length = file
+        .metadata()
+        .map_err(|source| {
+            io_error(
+                "inspect retained block log for positioned read",
+                path,
+                source,
+            )
+        })?
+        .len();
+    if end > file_length {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} locator extends beyond the retained block log",
+            locator.ordinal
+        )));
+    }
+
+    let mut bytes = vec![0_u8; length];
+    positioned_read_exact(file, &mut bytes, locator.offset).map_err(|source| {
+        log_read_error(
+            path,
+            source,
+            format!(
+                "record {} is truncated at its authenticated locator",
+                locator.ordinal
+            ),
+        )
+    })?;
+    let mut reader = Cursor::new(bytes.as_slice());
+    let record = read_log_record(&mut reader, path, locator.ordinal)?.ok_or_else(|| {
+        NodeError::CorruptLog(format!(
+            "record {} disappeared at its authenticated locator",
+            locator.ordinal
+        ))
+    })?;
+    if reader.position() != locator.length {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} locator does not contain exactly one record",
+            locator.ordinal
+        )));
+    }
+    if record.complete_digest != locator.complete_digest {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} complete digest changed",
+            locator.ordinal
+        )));
+    }
+    let actual_version = match &record.payload {
+        ParsedRecordPayload::LegacyV1 => BlockRecordVersion::LegacyV1,
+        ParsedRecordPayload::V2 { .. } => BlockRecordVersion::V2,
+    };
+    if actual_version != locator.version {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} version changed",
+            locator.ordinal
+        )));
+    }
+    if require_v2 && actual_version != BlockRecordVersion::V2 {
+        return Err(NodeError::ProductionLegacyBlockLog(locator.ordinal));
+    }
+    if record.accepted_at != locator.accepted_at {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} acceptance time changed",
+            locator.ordinal
+        )));
+    }
+    let block = decode_block(&record.block_bytes, network_id).map_err(|error| {
+        NodeError::CorruptLog(format!(
+            "record {} cannot decode at its authenticated locator: {error}",
+            locator.ordinal
+        ))
+    })?;
+    let canonical = encode_block(&block).map_err(|error| {
+        NodeError::CorruptLog(format!(
+            "record {} cannot re-encode at its authenticated locator: {error}",
+            locator.ordinal
+        ))
+    })?;
+    if canonical != record.block_bytes {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} is not canonical at its authenticated locator",
+            locator.ordinal
+        )));
+    }
+    if block.block_id() != locator.block_id
+        || block.challenge.previous_block != locator.parent
+        || block.challenge.height != locator.height
+        || block.challenge.target != locator.target
+    {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} metadata does not match its authenticated block",
+            locator.ordinal
+        )));
+    }
+    Ok((record, block))
+}
+
+fn read_indexed_block(
+    file: &File,
+    path: &Path,
+    indexed: &IndexedBlock,
+    expected_block_id: [u8; 32],
+    network_id: [u8; 32],
+    require_v2: bool,
+) -> Result<Block, NodeError> {
+    if indexed.block_id() != expected_block_id {
+        return Err(NodeError::CorruptLog(
+            "fork index key does not match its durable record locator".to_owned(),
+        ));
+    }
+    let (_, block) = read_located_record(file, path, &indexed.locator, network_id, require_v2)?;
+    Ok(block)
+}
+
 fn replay_log(
     log: &File,
     path: &Path,
@@ -6106,10 +6492,10 @@ fn replay_log(
     verifier: &ConsensusPowVerifier,
     params: NetworkParams,
     external_preverifier: Option<&BlockPreverifier>,
-) -> Result<[u8; 32], NodeError> {
+) -> Result<ReplayLogState, NodeError> {
     let mut replayed_state = ChainState::new(params, verifier.clone())?;
     let mut replayed_index = BlockIndex::new(params.genesis_hash);
-    let last_record_digest = replay_log_into(
+    let replay = replay_log_into(
         log,
         path,
         &mut replayed_state,
@@ -6119,7 +6505,7 @@ fn replay_log(
     )?;
     *state = replayed_state;
     *index = replayed_index;
-    Ok(last_record_digest)
+    Ok(replay)
 }
 
 /// Reconstructs every logged fork with one mutable consensus state and a
@@ -6133,7 +6519,7 @@ fn replay_log_into(
     index: &mut BlockIndex,
     params: NetworkParams,
     external_preverifier: Option<&BlockPreverifier>,
-) -> Result<[u8; 32], NodeError> {
+) -> Result<ReplayLogState, NodeError> {
     if state.tip() != params.genesis_hash
         || !index.blocks.is_empty()
         || index.active_chain != [params.genesis_hash]
@@ -6151,7 +6537,7 @@ fn replay_log_into(
         .seek(SeekFrom::Start(0))
         .map_err(|source| io_error("rewind retained block log for startup scan", path, source))?;
     let scanned = scan_replay_log(scan_file, path, params, params.network_id)?;
-    let mut replay_file = log
+    let replay_file = log
         .try_clone()
         .map_err(|source| io_error("clone retained block log for bounded replay", path, source))?;
     if replay_file
@@ -6165,9 +6551,13 @@ fn replay_log_into(
         ));
     }
     if scanned.records.is_empty() {
-        verify_scanned_replay_log_unchanged(&mut replay_file, path, &scanned)?;
+        verify_scanned_replay_log_unchanged(&replay_file, path, &scanned, params.network_id)?;
         verify_retained_block_log_path(log, path)?;
-        return Ok(scanned.last_record_digest);
+        return Ok(ReplayLogState {
+            last_record_digest: scanned.last_record_digest,
+            log_length: scanned.log_length,
+            record_count: 0,
+        });
     }
 
     let mut stack = vec![ReplayDfsFrame {
@@ -6196,14 +6586,14 @@ fn replay_log_into(
             if state.tip() != record.parent {
                 return Err(NodeError::CorruptLog(format!(
                     "record {} DFS parent state is inconsistent",
-                    record.record_index
+                    record.ordinal
                 )));
             }
-            let reread = reread_replay_record(&mut replay_file, path, record)?;
+            let reread = reread_replay_record(&replay_file, path, record, params.network_id)?;
             let block = decode_block(&reread.block_bytes, params.network_id).map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "record {} cannot decode during DFS replay: {error}",
-                    record.record_index
+                    record.ordinal
                 ))
             })?;
             if block.block_id() != record.block_id
@@ -6213,7 +6603,7 @@ fn replay_log_into(
             {
                 return Err(NodeError::CorruptLog(format!(
                     "record {} metadata changed after its startup scan",
-                    record.record_index
+                    record.ordinal
                 )));
             }
             let preverified = if let Some(preverifier) = external_preverifier {
@@ -6224,7 +6614,7 @@ fn replay_log_into(
                     ))) => {
                         return Err(NodeError::CorruptLog(format!(
                             "record {} proof is rejected during external replay: {error}",
-                            record.record_index
+                            record.ordinal
                         )));
                     }
                     Err(error) => return Err(error),
@@ -6243,19 +6633,19 @@ fn replay_log_into(
                     .map_err(|error| {
                         NodeError::CorruptLog(format!(
                             "record {} fails preverified DFS replay: {error}",
-                            record.record_index
+                            record.ordinal
                         ))
                     })?,
                 None if requires_external_preverification(&params) => {
                     return Err(NodeError::CorruptLog(format!(
                         "record {} is missing external proof evidence during DFS replay",
-                        record.record_index
+                        record.ordinal
                     )));
                 }
                 None => state.validate_block(&block, context).map_err(|error| {
                     NodeError::CorruptLog(format!(
                         "record {} fails full DFS replay: {error}",
-                        record.record_index
+                        record.ordinal
                     ))
                 })?,
             };
@@ -6265,14 +6655,14 @@ fn replay_log_into(
                         validated.encode_reversible_state_delta().map_err(|error| {
                             NodeError::CorruptLog(format!(
                                 "record {} cannot derive canonical legacy undo bytes: {error}",
-                                record.record_index
+                                record.ordinal
                             ))
                         })?;
                     legacy_undo_stack_bytes = legacy_undo_stack_bytes
                         .checked_add(canonical_delta.len())
                         .filter(|total| *total <= MAX_LEGACY_REPLAY_UNDO_STACK_BYTES)
                         .ok_or(NodeError::LegacyReplayResourceLimit {
-                            record_index: record.record_index,
+                            record_index: record.ordinal,
                             maximum: MAX_LEGACY_REPLAY_UNDO_STACK_BYTES,
                         })?;
                     let capability =
@@ -6281,7 +6671,7 @@ fn replay_log_into(
                             .map_err(|error| {
                                 NodeError::CorruptLog(format!(
                                     "record {} cannot issue a legacy undo capability: {error}",
-                                    record.record_index
+                                    record.ordinal
                                 ))
                             })?;
                     ReplayUndo::LegacyV1 {
@@ -6301,7 +6691,7 @@ fn replay_log_into(
                     .map_err(|error| {
                         NodeError::CorruptLog(format!(
                             "record {} reversible state delta does not match full validation: {error}",
-                            record.record_index
+                            record.ordinal
                         ))
                     })?;
                     let capability =
@@ -6310,7 +6700,7 @@ fn replay_log_into(
                             .map_err(|error| {
                                 NodeError::CorruptLog(format!(
                                     "record {} cannot issue a V2 undo capability: {error}",
-                                    record.record_index
+                                    record.ordinal
                                 ))
                             })?;
                     ReplayUndo::V2 {
@@ -6322,31 +6712,31 @@ fn replay_log_into(
             let parent_work = index.work_at(record.parent).ok_or_else(|| {
                 NodeError::CorruptLog(format!(
                     "record {} DFS parent is absent from the fork index",
-                    record.record_index
+                    record.ordinal
                 ))
             })?;
             let cumulative_work = add_chain_work(parent_work, record.target).map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "record {} cumulative work is invalid: {error}",
-                    record.record_index
+                    record.ordinal
                 ))
             })?;
             let ancestors = index.ancestor_table(record.parent).map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "record {} ancestor table cannot be restored: {error}",
-                    record.record_index
+                    record.ordinal
                 ))
             })?;
             state.commit_validated(validated).map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "record {} cannot commit DFS state: {error}",
-                    record.record_index
+                    record.ordinal
                 ))
             })?;
             let successor_header = state.successor_header_preflight().map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "record {} cannot snapshot its successor header: {error}",
-                    record.record_index
+                    record.ordinal
                 ))
             })?;
             let block_id = record.block_id;
@@ -6355,30 +6745,25 @@ fn replay_log_into(
                 .insert(
                     block_id,
                     Arc::new(IndexedBlock {
-                        block_id,
-                        parent: record.parent,
-                        height: record.height,
-                        accepted_at: record.accepted_at,
-                        canonical: Arc::clone(&record.canonical),
+                        locator: *record,
                         cumulative_work,
                         successor_header,
                         ancestors,
-                        preverified,
                     }),
                 )
                 .is_some()
             {
                 return Err(NodeError::CorruptLog(format!(
                     "record {} duplicates an indexed block",
-                    record.record_index
+                    record.ordinal
                 )));
             }
             if cumulative_work > winning_work
-                || (cumulative_work == winning_work && record.record_index < winning_record_index)
+                || (cumulative_work == winning_work && record.ordinal < winning_record_index)
             {
                 winning_tip = block_id;
                 winning_work = cumulative_work;
-                winning_record_index = record.record_index;
+                winning_record_index = record.ordinal;
             }
             stack.push(ReplayDfsFrame {
                 block_id,
@@ -6407,7 +6792,7 @@ fn replay_log_into(
             let record = scanned.records.get(record_position).ok_or_else(|| {
                 NodeError::CorruptLog("startup undo locator is invalid".to_owned())
             })?;
-            let reread = reread_replay_record(&mut replay_file, path, record)?;
+            let reread = reread_replay_record(&replay_file, path, record, params.network_id)?;
             let delta_bytes = match (reread.payload, canonical_delta) {
                 (ParsedRecordPayload::LegacyV1, Some(canonical_delta)) => canonical_delta,
                 (ParsedRecordPayload::V2 { delta_bytes, .. }, None) => {
@@ -6416,7 +6801,7 @@ fn replay_log_into(
                 _ => {
                     return Err(NodeError::CorruptLog(format!(
                         "record {} undo payload version changed",
-                        record.record_index
+                        record.ordinal
                     )));
                 }
             };
@@ -6430,7 +6815,7 @@ fn replay_log_into(
             .map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "record {} cannot recover its validation-bound undo delta: {error}",
-                    record.record_index
+                    record.ordinal
                 ))
             })?;
             state
@@ -6438,13 +6823,13 @@ fn replay_log_into(
                 .map_err(|error| {
                     NodeError::CorruptLog(format!(
                         "record {} authenticated reversible state delta cannot restore its parent: {error}",
-                        record.record_index
+                        record.ordinal
                     ))
                 })?;
             if state.tip() != record.parent {
                 return Err(NodeError::CorruptLog(format!(
                     "record {} undo did not return to its parent",
-                    record.record_index
+                    record.ordinal
                 )));
             }
             legacy_undo_stack_bytes = legacy_undo_stack_bytes
@@ -6471,7 +6856,7 @@ fn replay_log_into(
             index
                 .blocks
                 .get(&winning_tip)
-                .map_or(0, |entry| entry.height),
+                .map_or(0, |entry| entry.height()),
         )
         .unwrap_or(0)
         .saturating_add(1),
@@ -6480,15 +6865,24 @@ fn replay_log_into(
     active_chain.extend(index.path_to(winning_tip)?);
     index.active_chain = active_chain;
     index.active_work = winning_work;
-    replay_indexed_state_to(state, index, params, winning_tip).map_err(|error| {
-        NodeError::CorruptLog(format!(
-            "selected active branch cannot be fully replayed from genesis: {error}"
-        ))
-    })?;
+    replay_indexed_state_to(
+        log,
+        path,
+        state,
+        index,
+        params,
+        winning_tip,
+        external_preverifier,
+    )?;
 
-    verify_scanned_replay_log_unchanged(&mut replay_file, path, &scanned)?;
+    verify_scanned_replay_log_unchanged(&replay_file, path, &scanned, params.network_id)?;
     verify_retained_block_log_path(log, path)?;
-    Ok(scanned.last_record_digest)
+    Ok(ReplayLogState {
+        last_record_digest: scanned.last_record_digest,
+        log_length: scanned.log_length,
+        record_count: u64::try_from(scanned.records.len())
+            .map_err(|_| NodeError::CorruptLog("block record count exceeds u64".to_owned()))?,
+    })
 }
 
 fn scan_replay_log(
@@ -6577,25 +6971,22 @@ fn scan_replay_log(
             )));
         }
         let version = match payload {
-            ParsedRecordPayload::LegacyV1 => ReplayRecordVersion::LegacyV1,
-            ParsedRecordPayload::V2 { .. } => ReplayRecordVersion::V2,
+            ParsedRecordPayload::LegacyV1 => BlockRecordVersion::LegacyV1,
+            ParsedRecordPayload::V2 { .. } => BlockRecordVersion::V2,
         };
         let position = records.len();
         children.entry(parent).or_default().push(position);
-        records.push(ReplayRecord {
-            record_index,
+        records.push(BlockRecordLocator {
+            ordinal: record_index,
+            offset,
+            length,
+            version,
+            complete_digest,
             accepted_at,
             block_id,
             parent,
             height: block.challenge.height,
             target: block.challenge.target,
-            canonical: Arc::from(block_bytes),
-            version,
-            locator: ReplayRecordLocator {
-                offset,
-                length,
-                complete_digest,
-            },
         });
         last_record_digest = complete_digest;
         record_index = record_index
@@ -6605,57 +6996,38 @@ fn scan_replay_log(
 }
 
 fn reread_replay_record(
-    file: &mut File,
+    file: &File,
     path: &Path,
-    expected: &ReplayRecord,
+    expected: &BlockRecordLocator,
+    network_id: [u8; 32],
 ) -> Result<ParsedLogRecord, NodeError> {
-    file.seek(SeekFrom::Start(expected.locator.offset))
-        .map_err(|source| io_error("seek block log for bounded replay", path, source))?;
-    let mut bounded = file.take(expected.locator.length);
-    let record = read_log_record(&mut bounded, path, expected.record_index)?.ok_or_else(|| {
-        NodeError::CorruptLog(format!(
-            "record {} disappeared during startup replay",
-            expected.record_index
-        ))
-    })?;
-    if bounded.limit() != 0
-        || record.accepted_at != expected.accepted_at
-        || record.block_bytes.as_slice() != expected.canonical.as_ref()
-        || record.complete_digest != expected.locator.complete_digest
-    {
-        return Err(NodeError::CorruptLog(format!(
-            "record {} changed after its startup scan",
-            expected.record_index
-        )));
-    }
-    let version_matches = matches!(
-        (&record.payload, expected.version),
-        (ParsedRecordPayload::LegacyV1, ReplayRecordVersion::LegacyV1)
-            | (ParsedRecordPayload::V2 { .. }, ReplayRecordVersion::V2)
-    );
-    if !version_matches {
-        return Err(NodeError::CorruptLog(format!(
-            "record {} changed version after its startup scan",
-            expected.record_index
-        )));
-    }
+    let (record, _) = read_located_record(file, path, expected, network_id, false).map_err(
+        |error| match error {
+            NodeError::CorruptLog(message) => NodeError::CorruptLog(format!(
+                "record {} changed after its startup scan: {message}",
+                expected.ordinal
+            )),
+            other => other,
+        },
+    )?;
     Ok(record)
 }
 
 fn verify_scanned_replay_log_unchanged(
-    file: &mut File,
+    file: &File,
     path: &Path,
     scanned: &ScannedReplayLog,
+    network_id: [u8; 32],
 ) -> Result<(), NodeError> {
     let mut last_record_digest = EMPTY_RECORD_CHAIN_ROOT;
     let mut saw_v2 = false;
     for expected in &scanned.records {
-        let record = reread_replay_record(file, path, expected)?;
+        let record = reread_replay_record(file, path, expected, network_id)?;
         match record.payload {
             ParsedRecordPayload::LegacyV1 if saw_v2 => {
                 return Err(NodeError::CorruptLog(format!(
                     "record {} became legacy V1 after the V2 chain began",
-                    expected.record_index
+                    expected.ordinal
                 )));
             }
             ParsedRecordPayload::LegacyV1 => {}
@@ -6666,7 +7038,7 @@ fn verify_scanned_replay_log_unchanged(
                 if previous_record_digest != last_record_digest {
                     return Err(NodeError::CorruptLog(format!(
                         "record {} previous-record digest changed after its startup scan",
-                        expected.record_index
+                        expected.ordinal
                     )));
                 }
                 saw_v2 = true;
@@ -6721,6 +7093,29 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove isolated test directory");
         }
+    }
+
+    fn set_indexed_locator(node: &mut Node, block_id: [u8; 32], locator: BlockRecordLocator) {
+        Arc::get_mut(node.index.blocks.get_mut(&block_id).unwrap())
+            .expect("test must not retain another indexed-block Arc")
+            .locator = locator;
+    }
+
+    fn assert_forged_locator_rejected(
+        node: &mut Node,
+        block_id: [u8; 32],
+        forge: impl FnOnce(&mut BlockRecordLocator),
+    ) {
+        let original = node.index.blocks[&block_id].locator;
+        let mut forged = original;
+        forge(&mut forged);
+        set_indexed_locator(node, block_id, forged);
+        assert!(matches!(
+            node.canonical_block(block_id),
+            Err(NodeError::CorruptLog(_))
+        ));
+        set_indexed_locator(node, block_id, original);
+        assert!(node.canonical_block(block_id).unwrap().is_some());
     }
 
     fn split_complete_log_records(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -7277,6 +7672,19 @@ mod tests {
         let a3_cap = node.block_preverifier.preverify(&a3).unwrap();
 
         node.profile.proof = ProofProfile::ProductionV3;
+        let saved_backend = {
+            let mut backend = node.block_preverifier.backend.write().unwrap();
+            std::mem::replace(&mut *backend, ProofVerificationBackend::Unavailable)
+        };
+        assert!(matches!(
+            node.begin_external_block_admission(&b2, t2)
+                .unwrap()
+                .unwrap()
+                .complete(&b2),
+            Err(NodeError::ProductionV3Unavailable)
+        ));
+        *node.block_preverifier.backend.write().unwrap() = saved_backend;
+
         let mut wrong_side_target = b2.clone();
         wrong_side_target.challenge.target[0] ^= 1;
         assert!(matches!(
@@ -7312,7 +7720,10 @@ mod tests {
         node.submit_preverified_block_with_admission(b2.clone(), t2, b2_cap, fresh)
             .unwrap();
         assert!(node.index.contains(b2.block_id()));
-        assert!(node.index.blocks[&b2.block_id()].preverified.is_some());
+        assert_eq!(
+            node.index.blocks[&b2.block_id()].locator.block_id,
+            b2.block_id()
+        );
         assert_eq!(
             node.index.blocks[&b2.block_id()].ancestors.first(),
             Some(&b1.block_id())
@@ -7323,8 +7734,8 @@ mod tests {
     }
 
     #[test]
-    fn production_side_snapshot_rejects_any_missing_external_capability() {
-        let path = test_dir("production-side-missing-capability");
+    fn production_side_snapshot_rejects_a_corrupt_record_locator() {
+        let path = test_dir("production-side-corrupt-locator");
         clean_test_dir(&path);
         let mut node = Node::open(&path).unwrap();
         let genesis = node.params.genesis_hash;
@@ -7339,18 +7750,19 @@ mod tests {
             .unwrap();
         let child = mined_child(&node, side.block_id(), t2, 0x62);
 
+        let original_locator = node.index.blocks[&side.block_id()].locator;
         Arc::get_mut(node.index.blocks.get_mut(&side.block_id()).unwrap())
             .unwrap()
-            .preverified = None;
+            .locator
+            .complete_digest[0] ^= 1;
         node.profile.proof = ProofProfile::ProductionV3;
         assert!(matches!(
             node.begin_external_block_admission(&child, t2),
             Err(NodeError::CorruptLog(_))
         ));
-        let restored_capability = node.block_preverifier.preverify(&side).unwrap();
         Arc::get_mut(node.index.blocks.get_mut(&side.block_id()).unwrap())
             .unwrap()
-            .preverified = Some(restored_capability);
+            .locator = original_locator;
 
         let mut invalid_proof = child;
         let BlockProof::V2Reference(proof) = &mut invalid_proof.proof else {
@@ -7362,7 +7774,7 @@ mod tests {
         assert_eq!(
             error.client_error().code,
             "proof_rejected",
-            "an invalid proof must fail before missing-capability branch replay"
+            "an invalid proof must fail before durable branch replay"
         );
 
         drop(shared);
@@ -7397,7 +7809,17 @@ mod tests {
         miner_seed: u8,
         transactions: Vec<Transaction>,
     ) -> Block {
-        let state = rebuild_state_to(&node.index, node.params, &node.verifier, parent).unwrap();
+        let log_path = node.data_dir.join(BLOCK_LOG_FILE);
+        let state = rebuild_state_to(
+            &node.log,
+            &log_path,
+            &node.index,
+            node.params,
+            &node.verifier,
+            parent,
+            None,
+        )
+        .unwrap();
         let height = state.next_height();
         let destination = insecure_dev_destination(miner_seed);
         let fees = state
@@ -8825,9 +9247,195 @@ mod tests {
         assert_eq!(node.cumulative_work(), work);
         assert_eq!(node.index.blocks.len(), block_count);
         assert!(node.contains_block(side_id));
-        assert!(node.canonical_block(side_id).is_some());
+        assert!(node.canonical_block(side_id).unwrap().is_some());
         assert_eq!(node.status().unwrap().cumulative_work, hex::encode(work.0));
         drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn authenticated_locator_rejects_every_forged_location_and_block_metadata_field() {
+        let path = test_dir("forged-record-locators");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let first_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let second_at = first_at + 60;
+        let first = node
+            .mine_once(
+                default_miner_destination(),
+                first_at,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let second = node
+            .mine_once(
+                default_miner_destination(),
+                second_at,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let first_id = first.block_id();
+        let second_locator = node.index.blocks[&second.block_id()].locator;
+
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.offset = second_locator.offset;
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.length = locator.length.checked_add(1).unwrap();
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.length = locator.length.checked_sub(1).unwrap();
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.complete_digest[0] ^= 1;
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.version = BlockRecordVersion::LegacyV1;
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.accepted_at = locator.accepted_at.checked_add(1).unwrap();
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.block_id[0] ^= 1;
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.parent[0] ^= 1;
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.height = locator.height.checked_add(1).unwrap();
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            locator.target[0] ^= 1;
+        });
+        assert_forged_locator_rejected(&mut node, first_id, |locator| {
+            *locator = second_locator;
+        });
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn positioned_reads_preserve_the_append_cursor_and_restart_offsets_are_exact() {
+        let path = test_dir("positioned-read-append-offsets");
+        clean_test_dir(&path);
+        let first_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let second_at = first_at + 60;
+        let third_at = second_at + 60;
+        let (first_id, second_id, restart_end) = {
+            let mut node = Node::open(&path).unwrap();
+            let first = node
+                .mine_once(
+                    default_miner_destination(),
+                    first_at,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            let second = node
+                .mine_once(
+                    default_miner_destination(),
+                    second_at,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap();
+            let first_locator = node.index.blocks[&first.block_id()].locator;
+            let second_locator = node.index.blocks[&second.block_id()].locator;
+            assert_eq!(first_locator.ordinal, 0);
+            assert_eq!(first_locator.offset, 0);
+            assert_eq!(second_locator.ordinal, 1);
+            assert_eq!(
+                second_locator.offset,
+                first_locator.offset + first_locator.length
+            );
+            assert_eq!(
+                node.block_log_length,
+                second_locator.offset + second_locator.length
+            );
+            (first.block_id(), second.block_id(), node.block_log_length)
+        };
+
+        let mut node = Node::open(&path).unwrap();
+        assert_eq!(node.block_log_length, restart_end);
+        assert_eq!(node.index.blocks[&first_id].locator.ordinal, 0);
+        assert_eq!(node.index.blocks[&second_id].locator.ordinal, 1);
+        node.log.seek(SeekFrom::Start(7)).unwrap();
+        assert!(node.canonical_block(first_id).unwrap().is_some());
+        assert_eq!(node.log.stream_position().unwrap(), 7);
+
+        let third = node
+            .mine_once(
+                default_miner_destination(),
+                third_at,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let third_locator = node.index.blocks[&third.block_id()].locator;
+        assert_eq!(third_locator.ordinal, 2);
+        assert_eq!(third_locator.offset, restart_end);
+        assert_eq!(
+            node.block_log_length,
+            third_locator.offset + third_locator.length
+        );
+        assert_eq!(node.log.metadata().unwrap().len(), node.block_log_length);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn on_demand_locator_rejects_same_length_mutation_and_truncation() {
+        let path = test_dir("on-demand-locator-mutation");
+        clean_test_dir(&path);
+        let params = {
+            let mut node = Node::open(&path).unwrap();
+            node.mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+            node.params
+        };
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let original = fs::read(&log_path).unwrap();
+        let scanned = scan_replay_log(
+            File::open(&log_path).unwrap(),
+            &log_path,
+            params,
+            params.network_id,
+        )
+        .unwrap();
+        let locator = scanned.records[0];
+
+        let mut changed = original.clone();
+        let accepted_at = u64::from_le_bytes(changed[8..16].try_into().unwrap());
+        changed[8..16].copy_from_slice(&accepted_at.checked_add(1).unwrap().to_le_bytes());
+        recompute_fixture_record_checksum(&mut changed);
+        assert_eq!(changed.len(), original.len());
+        fs::write(&log_path, &changed).unwrap();
+        assert!(matches!(
+            read_located_record(
+                &File::open(&log_path).unwrap(),
+                &log_path,
+                &locator,
+                params.network_id,
+                false,
+            ),
+            Err(NodeError::CorruptLog(_))
+        ));
+
+        fs::write(&log_path, &original[..original.len() - 1]).unwrap();
+        assert!(matches!(
+            read_located_record(
+                &File::open(&log_path).unwrap(),
+                &log_path,
+                &locator,
+                params.network_id,
+                false,
+            ),
+            Err(NodeError::CorruptLog(_))
+        ));
+
         clean_test_dir(&path);
     }
 
@@ -8877,8 +9485,8 @@ mod tests {
     }
 
     #[test]
-    fn external_replay_reissues_capabilities_for_active_and_side_blocks() {
-        let path = test_dir("external-capability-replay");
+    fn startup_replay_retains_only_authenticated_locators_for_all_blocks() {
+        let path = test_dir("locator-only-replay");
         clean_test_dir(&path);
         let (params, verifier, expected_tip, expected_blocks) = {
             let mut node = Node::open(&path).unwrap();
@@ -8917,17 +9525,17 @@ mod tests {
 
         assert_eq!(state.tip(), expected_tip);
         assert_eq!(index.blocks.len(), expected_blocks);
-        assert!(
-            index
-                .blocks
-                .values()
-                .all(|entry| entry.preverified.is_some()),
-            "every replayed block must receive fresh process-local proof evidence"
-        );
         for (block_id, entry) in &index.blocks {
-            assert_eq!(*block_id, entry.block_id);
+            let IndexedBlock {
+                locator,
+                cumulative_work: _,
+                successor_header: _,
+                ancestors: _,
+            } = entry.as_ref();
+            assert_eq!(*block_id, locator.block_id);
+            assert_eq!(locator.version, BlockRecordVersion::V2);
             assert!(
-                entry.parent == params.genesis_hash || index.blocks.contains_key(&entry.parent),
+                locator.parent == params.genesis_hash || index.blocks.contains_key(&locator.parent),
                 "every non-genesis parent must remain indexed"
             );
         }
@@ -9000,6 +9608,7 @@ mod tests {
         assert_eq!(node.state.tip(), tip);
         assert_eq!(node.cumulative_work(), work);
         assert_eq!(node.last_record_digest, record_digest);
+        assert_eq!(node.block_log_length, log_len);
         assert!(!node.contains_block(block_id));
         assert_eq!(fs::metadata(log_path).unwrap().len(), log_len);
         assert!(node.storage_faulted);
@@ -9182,9 +9791,10 @@ mod tests {
         assert_eq!(fs::metadata(&log_path).unwrap().len(), scanned.log_length);
 
         let error = verify_scanned_replay_log_unchanged(
-            &mut File::open(&log_path).unwrap(),
+            &File::open(&log_path).unwrap(),
             &log_path,
             &scanned,
+            params.network_id,
         )
         .unwrap_err();
         assert!(matches!(
@@ -10572,6 +11182,8 @@ mod tests {
             DEFAULT_MINING_ATTEMPTS,
         )
         .unwrap();
+        drop(node);
+        let node = Node::open(&path).unwrap();
         let confirmed = node.wallet_snapshot().unwrap();
         let item = confirmed
             .history

@@ -545,7 +545,7 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
     for block_id in &block_ids {
         let canonical = {
             let node = lock_node(&shared)?;
-            node.canonical_block(*block_id).map(|bytes| bytes.to_vec())
+            node.canonical_block(*block_id)?
         }
         .ok_or(P2pError::UnknownRequestedBlock(*block_id))?;
         let block = decode_block(&canonical, network_id)?;
@@ -698,7 +698,7 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::GetBlock { block_id } => {
                 let canonical = {
                     let node = lock_node(&shared)?;
-                    node.canonical_block(block_id).map(|bytes| bytes.to_vec())
+                    node.canonical_block(block_id)?
                 }
                 .ok_or(P2pError::UnknownRequestedBlock(block_id))?;
                 let block = decode_block(&canonical, network_id)?;
@@ -1508,13 +1508,17 @@ mod tests {
     }
 
     #[test]
-    fn initial_sync_and_equal_tip_noop() {
+    fn restarted_source_serves_locator_backed_blocks_and_equal_tip_is_a_noop() {
         let source_path = test_dir("initial-source");
         let target_path = test_dir("initial-target");
         let source = open_shared(&source_path);
         let target = open_shared(&target_path);
         let now = unix_time_seconds().unwrap();
         mine(&source, 3, now);
+        drop(source);
+        let source = Arc::new(Mutex::new(
+            Node::open(&source_path).expect("reopen locator-backed source node"),
+        ));
         let (listener, address) = start_listener(Arc::clone(&source), SOURCE_NONCE);
 
         let first = sync_from_peer_once_inner(

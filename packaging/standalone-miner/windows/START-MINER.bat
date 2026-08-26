@@ -17,6 +17,7 @@ set "BATCH_SIZE=8192"
 rem 0 automatically divides host CPU threads across the selected GPUs (maximum 16 each).
 set "WORKERS_PER_GPU=0"
 set "STATS_SECONDS=5"
+set "PRODUCTION_V3_MAX_ROWS=131072"
 rem ================================================================
 rem GPU_INDEXES examples:
 rem   blank   = use every GPU exposed by the selected backend
@@ -37,6 +38,14 @@ if not defined PAYOUT_ADDRESS (
   echo Right-click START-MINER.bat, choose Edit, and fill in PAYOUT_ADDRESS near the top.
   pause
   exit /b 1
+)
+
+set "PRODUCTION_V3_READY="
+if exist "%~dp0production-v3\MODEL-V2.bank" if exist "%~dp0production-v3\MODEL-V2.manifest.json" if exist "%~dp0production-v3\DORY-V3-MODEL-RECORD-V2.json" (
+  if "%LOCAL_PEER%"=="127.0.0.1:18444" set "LOCAL_PEER=127.0.0.1:21444"
+  if "%BOOTSTRAP_PEER%"=="107.214.187.2:18444" set "BOOTSTRAP_PEER=107.214.187.2:21444"
+  if not exist "%~dp0production-v3\scratch" mkdir "%~dp0production-v3\scratch"
+  set "PRODUCTION_V3_READY=1"
 )
 
 set "PEER_ARGS="
@@ -62,13 +71,28 @@ if defined GPU_INDEXES (
 )
 echo.
 
-"%~dp0cmfd-miner.exe" mine ^
-  !PEER_ARGS! ^
-  !DEVICE_ARGS! ^
-  --miner %PAYOUT_ADDRESS% ^
-  --batch-size %BATCH_SIZE% ^
-  --workers-per-gpu %WORKERS_PER_GPU% ^
-  --stats-seconds %STATS_SECONDS%
+if defined PRODUCTION_V3_READY (
+  "%~dp0cmfd-miner.exe" mine ^
+    !PEER_ARGS! ^
+    !DEVICE_ARGS! ^
+    --miner %PAYOUT_ADDRESS% ^
+    --batch-size %BATCH_SIZE% ^
+    --workers-per-gpu %WORKERS_PER_GPU% ^
+    --stats-seconds %STATS_SECONDS% ^
+    --production-v3-bank "%~dp0production-v3\MODEL-V2.bank" ^
+    --production-v3-manifest "%~dp0production-v3\MODEL-V2.manifest.json" ^
+    --production-v3-record-v2 "%~dp0production-v3\DORY-V3-MODEL-RECORD-V2.json" ^
+    --production-v3-scratch "%~dp0production-v3\scratch" ^
+    --production-v3-max-rows %PRODUCTION_V3_MAX_ROWS%
+) else (
+  "%~dp0cmfd-miner.exe" mine ^
+    !PEER_ARGS! ^
+    !DEVICE_ARGS! ^
+    --miner %PAYOUT_ADDRESS% ^
+    --batch-size %BATCH_SIZE% ^
+    --workers-per-gpu %WORKERS_PER_GPU% ^
+    --stats-seconds %STATS_SECONDS%
+)
 
 echo.
 echo Miner stopped with exit code %ERRORLEVEL%.

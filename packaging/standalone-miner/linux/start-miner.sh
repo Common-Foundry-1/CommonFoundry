@@ -14,11 +14,25 @@ BATCH_SIZE="8192"
 # 0 automatically divides host CPU threads across the selected GPUs (maximum 16 each).
 WORKERS_PER_GPU="0"
 STATS_SECONDS="5"
+PRODUCTION_V3_MAX_ROWS="131072"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 if [[ -z "$PAYOUT_ADDRESS" ]]; then
   echo "ERROR: Set PAYOUT_ADDRESS to the 64-character receive address shown by your wallet." >&2
   exit 1
+fi
+
+PRODUCTION_V3_READY=0
+if [[ -f "$SCRIPT_DIR/production-v3/MODEL-V2.bank" &&
+      -f "$SCRIPT_DIR/production-v3/MODEL-V2.manifest.json" &&
+      -f "$SCRIPT_DIR/production-v3/DORY-V3-MODEL-RECORD-V2.json" ]]; then
+  if [[ "$LOCAL_PEER" == "127.0.0.1:18444" ]]; then
+    LOCAL_PEER="127.0.0.1:21444"
+  fi
+  if [[ "$BOOTSTRAP_PEER" == "107.214.187.2:18444" ]]; then
+    BOOTSTRAP_PEER="107.214.187.2:21444"
+  fi
+  PRODUCTION_V3_READY=1
 fi
 
 ARGS=(mine --miner "$PAYOUT_ADDRESS" --batch-size "$BATCH_SIZE" --workers-per-gpu "$WORKERS_PER_GPU" --stats-seconds "$STATS_SECONDS")
@@ -33,6 +47,16 @@ if [[ -n "$GPU_INDEXES" ]]; then
   for DEVICE in "${DEVICES[@]}"; do
     ARGS+=(--device "$DEVICE")
   done
+fi
+if [[ "$PRODUCTION_V3_READY" == 1 ]]; then
+  mkdir -p "$SCRIPT_DIR/production-v3/scratch"
+  ARGS+=(
+    --production-v3-bank "$SCRIPT_DIR/production-v3/MODEL-V2.bank"
+    --production-v3-manifest "$SCRIPT_DIR/production-v3/MODEL-V2.manifest.json"
+    --production-v3-record-v2 "$SCRIPT_DIR/production-v3/DORY-V3-MODEL-RECORD-V2.json"
+    --production-v3-scratch "$SCRIPT_DIR/production-v3/scratch"
+    --production-v3-max-rows "$PRODUCTION_V3_MAX_ROWS"
+  )
 fi
 export CMFD_GPU_BACKEND="$GPU_BACKEND"
 exec "$SCRIPT_DIR/cmfd-miner" "${ARGS[@]}"

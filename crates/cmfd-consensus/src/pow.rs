@@ -19,8 +19,8 @@ use crate::{
 #[cfg(feature = "dory-v3-consensus-adapter")]
 use crate::{
     dory_bls12_381_candidate::{
-        BlsDoryV3CandidateError, verify_bls_dory_v3_layout_v5_candidate,
-        verify_bls_dory_v3_layout_v5_candidate_relation,
+        BlsDoryV3CandidateError, preflight_bls_dory_v3_layout_v5_candidate,
+        verify_bls_dory_v3_layout_v5_candidate, verify_bls_dory_v3_layout_v5_candidate_relation,
     },
     dory_bls12_381_execution_provider::{
         BlsDoryV3WinningNonceClaim,
@@ -381,6 +381,8 @@ pub enum ConsensusPowVerifier {
 pub struct VerifierInstance<T> {
     verifier: T,
     capability_nonce: u64,
+    #[cfg(test)]
+    relation_dispatches: AtomicU64,
 }
 
 impl<T> VerifierInstance<T> {
@@ -388,7 +390,19 @@ impl<T> VerifierInstance<T> {
         Self {
             verifier,
             capability_nonce: NEXT_VERIFIER_CAPABILITY_NONCE.fetch_add(1, Ordering::Relaxed),
+            #[cfg(test)]
+            relation_dispatches: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn record_relation_dispatch(&self) {
+        self.relation_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn relation_dispatches(&self) -> u64 {
+        self.relation_dispatches.load(Ordering::Relaxed)
     }
 }
 
@@ -845,18 +859,87 @@ impl ConsensusPowVerifier {
     }
 
     pub fn verify(&self, block: &BlockChallenge, proof: &BlockProof) -> Result<(), PowError> {
+        self.preflight(block, proof)?;
         match (self, proof) {
             (Self::V1Legacy(verifier), BlockProof::V1Legacy(proof)) => {
+                #[cfg(test)]
+                verifier.record_relation_dispatch();
                 verifier.verify(block, proof)?;
                 Ok(())
             }
             (Self::V2Reference(reference), BlockProof::V2Reference(proof)) => {
+                #[cfg(test)]
+                reference.record_relation_dispatch();
                 reference.verify_compact(block, proof)?;
                 Ok(())
             }
             #[cfg(feature = "dory-v3-consensus-adapter")]
             (Self::V3Candidate(verifier), BlockProof::V3Candidate(proof)) => {
+                #[cfg(test)]
+                verifier.record_relation_dispatch();
                 verifier.verify(block, proof, true)
+            }
+            _ => Err(PowError::WrongProofType),
+        }
+    }
+
+    /// Reject every verifier-owned, cheaply decidable proof-envelope and
+    /// target failure without parsing or verifying an expensive proof.
+    ///
+    /// `verify` invokes this same method before its authoritative relation
+    /// check. Nodes may therefore use it as an admission optimization without
+    /// creating a consensus rule that the full verifier does not enforce.
+    pub fn preflight(&self, block: &BlockChallenge, proof: &BlockProof) -> Result<(), PowError> {
+        match (self, proof) {
+            (Self::V1Legacy(verifier), BlockProof::V1Legacy(proof)) => {
+                verifier.preflight(block, proof).map_err(PowError::from)
+            }
+            (Self::V2Reference(reference), BlockProof::V2Reference(proof)) => reference
+                .preflight_compact(block, proof)
+                .map_err(PowError::from),
+            #[cfg(feature = "dory-v3-consensus-adapter")]
+            (Self::V3Candidate(verifier), BlockProof::V3Candidate(proof)) => {
+                // These public-envelope checks are common to the production
+                // authority and the bounded relation test authority below.
+                // The production helper repeats them before deriving its
+                // transcript statement, so this early target gate can change
+                // only rejection order, never proof validity.
+                if block.network_id != verifier.parameters.network_id {
+                    return Err(BlsDoryV3CandidateError::WrongNetwork.into());
+                }
+                if proof.algorithm_version != DORY_V3_ALGORITHM_VERSION {
+                    return Err(BlsDoryV3CandidateError::AlgorithmVersion.into());
+                }
+                if proof.proof_version != DORY_V3_PROOF_VERSION {
+                    return Err(BlsDoryV3CandidateError::ProofVersion.into());
+                }
+                if proof.model_manifest_digest != verifier.parameters.model_manifest_digest {
+                    return Err(BlsDoryV3CandidateError::ModelManifestDigest.into());
+                }
+                if proof.structured_proof.is_empty()
+                    || proof.structured_proof.len()
+                        > crate::MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES
+                {
+                    return Err(BlsDoryV3CandidateError::ProofSize.into());
+                }
+                if proof.work_digest > block.target {
+                    return Err(BlsDoryV3CandidateError::HighHash.into());
+                }
+                match &verifier.authority {
+                    ForgeMatrixV3VerifierAuthority::Production {
+                        authenticated,
+                        setup,
+                    } => preflight_bls_dory_v3_layout_v5_candidate(
+                        verifier.parameters.network_id,
+                        authenticated,
+                        block,
+                        proof,
+                        setup,
+                    )
+                    .map_err(PowError::from),
+                    #[cfg(test)]
+                    ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => Ok(()),
+                }
             }
             _ => Err(PowError::WrongProofType),
         }
@@ -1472,6 +1555,130 @@ mod tests {
     }
 
     #[test]
+    fn v1_cheap_preflight_rejects_every_bound_mutation_before_relation_dispatch() {
+        let verifier = ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap();
+        let challenge = block([0x63; 32]);
+        let proof = verifier.mine(&challenge, 0, 1).unwrap();
+        type Mutation = fn(&mut BlockChallenge, &mut ForgeMatrixProof);
+        let mutations: [(&str, Mutation); 11] = [
+            ("network", |block, _| block.network_id[0] ^= 1),
+            ("parent", |block, _| block.previous_block[0] ^= 1),
+            ("transaction_root", |block, _| {
+                block.transaction_root[0] ^= 1
+            }),
+            ("height", |block, _| block.height ^= 1),
+            ("timestamp", |block, _| block.timestamp ^= 1),
+            ("target", |block, _| block.target[0] ^= 1),
+            ("algorithm_version", |_, proof| proof.algorithm_version ^= 1),
+            ("model_version", |_, proof| proof.model_version ^= 1),
+            ("nonce", |_, proof| proof.nonce ^= 1),
+            ("model_root", |_, proof| proof.model_root[0] ^= 1),
+            ("output_digest", |_, proof| proof.output_digest[0] ^= 1),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed_block = challenge;
+            let BlockProof::V1Legacy(mut changed_proof) = proof.clone() else {
+                unreachable!();
+            };
+            mutate(&mut changed_block, &mut changed_proof);
+            assert!(
+                verifier
+                    .verify(&changed_block, &BlockProof::V1Legacy(changed_proof))
+                    .is_err(),
+                "cheap mutation accepted: {name}"
+            );
+            assert_eq!(relation_dispatches(&verifier), 0, "dispatched: {name}");
+        }
+
+        let mut high_block = challenge;
+        high_block.target = [0; 32];
+        let BlockProof::V1Legacy(mut high_proof) = proof.clone() else {
+            unreachable!();
+        };
+        let ConsensusPowVerifier::V1Legacy(inner) = &verifier else {
+            unreachable!();
+        };
+        high_proof.work_digest =
+            inner.claimed_work_digest(&high_block, high_proof.nonce, high_proof.output_digest);
+        assert_ne!(high_proof.work_digest, [0; 32]);
+        assert!(matches!(
+            verifier.verify(&high_block, &BlockProof::V1Legacy(high_proof)),
+            Err(PowError::V1(ForgeMatrixError::HighHash))
+        ));
+        assert_eq!(relation_dispatches(&verifier), 0);
+
+        verifier.verify(&challenge, &proof).unwrap();
+        assert_eq!(relation_dispatches(&verifier), 1);
+    }
+
+    #[test]
+    fn v2_cheap_preflight_rejects_every_bound_mutation_before_relation_dispatch() {
+        let reference = v2_test_reference().unwrap();
+        let challenge = block(reference.descriptor().network_id);
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let proof = verifier.mine(&challenge, 0, 1).unwrap();
+        type Mutation = fn(&mut BlockChallenge, &mut ForgeMatrixV2CompactProof);
+        let mutations: [(&str, Mutation); 13] = [
+            ("network", |block, _| block.network_id[0] ^= 1),
+            ("parent", |block, _| block.previous_block[0] ^= 1),
+            ("transaction_root", |block, _| {
+                block.transaction_root[0] ^= 1
+            }),
+            ("height", |block, _| block.height ^= 1),
+            ("timestamp", |block, _| block.timestamp ^= 1),
+            ("target", |block, _| block.target[0] ^= 1),
+            ("algorithm_version", |_, proof| proof.algorithm_version ^= 1),
+            ("proof_version", |_, proof| proof.proof_version ^= 1),
+            ("nonce", |_, proof| proof.nonce ^= 1),
+            ("manifest", |_, proof| proof.model_manifest_digest[0] ^= 1),
+            ("challenge", |_, proof| proof.challenge_digest[0] ^= 1),
+            ("activation", |_, proof| {
+                proof.final_activation_digest[0] ^= 1
+            }),
+            ("work", |_, proof| proof.work_digest[0] ^= 1),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed_block = challenge;
+            let BlockProof::V2Reference(mut changed_proof) = proof.clone() else {
+                unreachable!();
+            };
+            mutate(&mut changed_block, &mut changed_proof);
+            assert!(
+                verifier
+                    .verify(&changed_block, &BlockProof::V2Reference(changed_proof),)
+                    .is_err(),
+                "cheap mutation accepted: {name}"
+            );
+            assert_eq!(relation_dispatches(&verifier), 0, "dispatched: {name}");
+        }
+
+        let mut high_block = challenge;
+        high_block.target = [0; 32];
+        let BlockProof::V2Reference(mut high_proof) = proof.clone() else {
+            unreachable!();
+        };
+        let ConsensusPowVerifier::V2Reference(inner) = &verifier else {
+            unreachable!();
+        };
+        (high_proof.challenge_digest, high_proof.work_digest) = inner
+            .claimed_compact_digests(
+                &high_block,
+                high_proof.nonce,
+                high_proof.final_activation_digest,
+            )
+            .unwrap();
+        assert_ne!(high_proof.work_digest, [0; 32]);
+        assert!(matches!(
+            verifier.verify(&high_block, &BlockProof::V2Reference(high_proof)),
+            Err(PowError::V2(ForgeMatrixV2Error::HighHash))
+        ));
+        assert_eq!(relation_dispatches(&verifier), 0);
+
+        verifier.verify(&challenge, &proof).unwrap();
+        assert_eq!(relation_dispatches(&verifier), 1);
+    }
+
+    #[test]
     fn preverification_capability_is_bound_to_verifier_challenge_and_proof() {
         let reference = v2_test_reference().unwrap();
         let network_id = reference.descriptor().network_id;
@@ -1655,6 +1862,15 @@ mod tests {
                 },
             },
         )))
+    }
+
+    fn relation_dispatches(verifier: &ConsensusPowVerifier) -> u64 {
+        match verifier {
+            ConsensusPowVerifier::V1Legacy(verifier) => verifier.relation_dispatches(),
+            ConsensusPowVerifier::V2Reference(verifier) => verifier.relation_dispatches(),
+            #[cfg(feature = "dory-v3-consensus-adapter")]
+            ConsensusPowVerifier::V3Candidate(verifier) => verifier.relation_dispatches(),
+        }
     }
 
     #[cfg(feature = "dory-v3-consensus-adapter")]

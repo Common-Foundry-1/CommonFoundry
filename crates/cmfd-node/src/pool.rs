@@ -98,6 +98,8 @@ pub enum PoolError {
     ThreadPanicked,
     #[error("pool shared state is poisoned")]
     SharedStatePoisoned,
+    #[error("pool deadline exceeds the platform monotonic clock range")]
+    DeadlineOverflow,
     #[error("pool bounded session ledger has no inactive record available to prune")]
     LedgerCapacity,
     #[error("operating-system random number generation failed: {0}")]
@@ -795,11 +797,9 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
     let connection = ServerConnection::new(Arc::clone(&shared.tls))
         .map_err(|error| PoolError::Tls(error.to_string()))?;
     let mut stream = StreamOwned::new(connection, stream);
-    let hello: ClientMessage = read_frame_interruptible_until(
-        &mut stream,
-        &shared.stop,
-        Instant::now() + POOL_HANDSHAKE_TIMEOUT,
-    )?;
+    let handshake_deadline = checked_pool_deadline(Instant::now(), POOL_HANDSHAKE_TIMEOUT)?;
+    let hello: ClientMessage =
+        read_frame_interruptible_until(&mut stream, &shared.stop, handshake_deadline)?;
     let (worker, payout) = match hello {
         ClientMessage::Hello {
             protocol_version,
@@ -908,6 +908,10 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
         write_frame(&mut stream, &ServerMessage::ShareResult { result })?;
     }
     Ok(())
+}
+
+fn checked_pool_deadline(now: Instant, duration: Duration) -> Result<Instant, PoolError> {
+    now.checked_add(duration).ok_or(PoolError::DeadlineOverflow)
 }
 
 struct SessionGuard<'a> {
@@ -1913,32 +1917,83 @@ mod tests {
         ));
         assert!(ensure_pool_profile_supported(crate::DEVNET_PROFILE).is_ok());
     }
-    use crate::{Node, default_miner_destination};
 
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    fn test_dir(label: &str) -> PathBuf {
-        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "cmfd-pool-{label}-{}-{sequence}",
-            std::process::id()
+    #[test]
+    fn pool_deadline_overflow_is_controlled() {
+        assert!(matches!(
+            checked_pool_deadline(Instant::now(), Duration::MAX),
+            Err(PoolError::DeadlineOverflow)
         ));
-        fs::create_dir_all(&path).unwrap();
-        path
     }
 
-    fn certificate(label: &str) -> (PathBuf, PathBuf, [u8; 32]) {
-        let dir = test_dir(label);
-        let certificate = dir.join("pool.crt.der");
-        let key = dir.join("pool.key.der");
+    use crate::{Node, default_miner_destination};
+
+    #[derive(Debug)]
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            Self::new_with_ids(label, || {
+                let mut id = [0_u8; 16];
+                getrandom::fill(&mut id).expect("obtain random pool test-root identity");
+                id
+            })
+        }
+
+        fn new_with_ids(label: &str, mut next_id: impl FnMut() -> [u8; 16]) -> Self {
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+                "pool test-root label must be path-safe"
+            );
+            for _ in 0..128 {
+                let path = Self::candidate_path(label, next_id());
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self { path },
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create isolated pool test root {path:?}: {error}"),
+                }
+            }
+            panic!("could not allocate a unique pool test root after 128 random candidates")
+        }
+
+        fn candidate_path(label: &str, id: [u8; 16]) -> PathBuf {
+            std::env::temp_dir().join(format!("cmfd-pool-{label}-{}", hex::encode(id)))
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            for _ in 0..100 {
+                match fs::remove_dir_all(&self.path) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            eprintln!("could not remove isolated pool test root {:?}", self.path);
+        }
+    }
+
+    fn certificate(root: &TestRoot) -> (PathBuf, PathBuf, [u8; 32]) {
+        let certificate = root.path().join("pool.crt.der");
+        let key = root.path().join("pool.key.der");
         let info = generate_pool_certificate(&certificate, &key).unwrap();
         (certificate, key, info.certificate_sha256)
     }
 
-    fn server(label: &str) -> (PoolServerHandle, Arc<Mutex<Node>>, [u8; 32]) {
-        let data = test_dir(&format!("{label}-node"));
+    fn server(label: &str) -> (TestRoot, PoolServerHandle, Arc<Mutex<Node>>, [u8; 32]) {
+        let root = TestRoot::new(label);
+        let data = root.path().join("node");
         let node = Arc::new(Mutex::new(Node::open(data).unwrap()));
-        let (certificate, key, pin) = certificate(&format!("{label}-cert"));
+        let (certificate, key, pin) = certificate(&root);
         let config = PoolServerConfig::devnet(
             "127.0.0.1:0".parse().unwrap(),
             fs::read(certificate).unwrap(),
@@ -1946,7 +2001,87 @@ mod tests {
             default_miner_destination(),
         );
         let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
-        (server, node, pin)
+        (root, server, node, pin)
+    }
+
+    #[test]
+    fn pool_test_root_skips_a_precreated_random_candidate() {
+        let label = "precreated";
+        let occupied_id = [0x11; 16];
+        let selected_id = [0x22; 16];
+        let occupied_path = TestRoot::candidate_path(label, occupied_id);
+        fs::create_dir(&occupied_path).unwrap();
+        let occupied = TestRoot {
+            path: occupied_path.clone(),
+        };
+        let mut candidates = [occupied_id, selected_id].into_iter();
+        let selected = TestRoot::new_with_ids(label, || candidates.next().unwrap());
+        assert_eq!(
+            selected.path(),
+            TestRoot::candidate_path(label, selected_id)
+        );
+        assert!(occupied.path().exists());
+        assert!(selected.path().exists());
+        drop(selected);
+        assert!(!TestRoot::candidate_path(label, selected_id).exists());
+        drop(occupied);
+        assert!(!occupied_path.exists());
+    }
+
+    #[test]
+    fn pool_test_roots_do_not_reuse_pid_scoped_names() {
+        let first = TestRoot::new("pid-reuse");
+        let first_path = first.path().to_owned();
+        let first_name = first_path.file_name().unwrap().to_string_lossy();
+        let suffix = first_name.strip_prefix("cmfd-pool-pid-reuse-").unwrap();
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        drop(first);
+
+        let second = TestRoot::new("pid-reuse");
+        assert_ne!(second.path(), first_path);
+    }
+
+    #[test]
+    fn parallel_pool_test_roots_are_unique_and_raii_cleaned() {
+        const WORKERS: usize = 16;
+        let held = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+        let (paths_tx, paths_rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..WORKERS {
+            let held = Arc::clone(&held);
+            let paths_tx = paths_tx.clone();
+            workers.push(thread::spawn(move || {
+                let root = TestRoot::new("parallel");
+                paths_tx.send(root.path().to_owned()).unwrap();
+                drop(paths_tx);
+                held.wait();
+            }));
+        }
+        drop(paths_tx);
+        let paths: Vec<_> = paths_rx.into_iter().collect();
+        assert_eq!(paths.len(), WORKERS);
+        assert!(paths.iter().all(|path| path.exists()));
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), WORKERS);
+        held.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn pool_test_root_is_removed_during_panic_unwind() {
+        let observed = Arc::new(Mutex::new(None));
+        let panic_observed = Arc::clone(&observed);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let root = TestRoot::new("forced-panic");
+            *panic_observed.lock().unwrap() = Some(root.path().to_owned());
+            panic!("forced pool fixture panic");
+        }));
+        assert!(result.is_err());
+        let path = observed.lock().unwrap().clone().unwrap();
+        assert!(!path.exists());
     }
 
     fn client(address: SocketAddr, pin: [u8; 32], worker: &str) -> PoolClient {
@@ -1982,7 +2117,7 @@ mod tests {
 
     #[test]
     fn tls_pin_mismatch_is_rejected() {
-        let (server, _node, _pin) = server("pin-mismatch");
+        let (_root, server, _node, _pin) = server("pin-mismatch");
         let error = PoolClient::connect(
             PoolClientConfig::devnet(
                 server.local_addr(),
@@ -1999,7 +2134,7 @@ mod tests {
 
     #[test]
     fn stop_interrupts_a_client_stalled_before_tls_handshake() {
-        let (server, _node, _pin) = server("stalled-pre-tls");
+        let (_root, server, _node, _pin) = server("stalled-pre-tls");
         let address = server.local_addr();
         let stream = TcpStream::connect(address).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2022,7 +2157,7 @@ mod tests {
 
     #[test]
     fn protocol_identity_frame_count_and_worker_bounds_are_enforced() {
-        let (server, _node, pin) = server("identity-bounds");
+        let (_root, server, _node, pin) = server("identity-bounds");
         let mut wrong_network = PoolClientConfig::devnet(
             server.local_addr(),
             pin,
@@ -2075,7 +2210,7 @@ mod tests {
 
     #[test]
     fn share_only_credit_duplicate_rejection_and_session_ledger_are_real() {
-        let (server, _node, pin) = server("share-ledger");
+        let (_root, server, _node, pin) = server("share-ledger");
         let mut client = client(server.local_addr(), pin, "worker-a");
         assert!(client.accounting_semantics().contains("nonwithdrawable"));
         assert!(client.persistence().contains("session-only"));
@@ -2100,7 +2235,7 @@ mod tests {
 
     #[test]
     fn stale_jobs_are_rejected_and_chain_valid_shares_submit_blocks() {
-        let (server, node, pin) = server("stale-and-block");
+        let (_root, server, node, pin) = server("stale-and-block");
         let mut stale_client = client(server.local_addr(), pin, "stale-worker");
         let stale_job = stale_client.current_job().clone();
         {
@@ -2139,9 +2274,9 @@ mod tests {
             validate_private_address("8.8.8.8:18445".parse().unwrap()),
             Err(PoolError::PublicAddress(_))
         ));
-        let dir = test_dir("certificate-overwrite");
-        let certificate = dir.join("pool.crt.der");
-        let key = dir.join("pool.key.der");
+        let root = TestRoot::new("certificate-overwrite");
+        let certificate = root.path().join("pool.crt.der");
+        let key = root.path().join("pool.key.der");
         generate_pool_certificate(&certificate, &key).unwrap();
         assert!(matches!(
             generate_pool_certificate(&certificate, &key),
@@ -2169,7 +2304,7 @@ mod tests {
             Err(PoolError::InvalidWorker)
         ));
 
-        let (server, _node, _pin) = server("bounded-state");
+        let (_root, server, _node, _pin) = server("bounded-state");
         let active = Arc::clone(&server.shared.state.lock().unwrap().current);
         {
             let mut seen = active.seen_nonces.lock().unwrap();
@@ -2241,7 +2376,7 @@ mod tests {
 
     #[test]
     fn session_nonce_origins_partition_two_honest_workers() {
-        let (server, _node, pin) = server("nonce-origins");
+        let (_root, server, _node, pin) = server("nonce-origins");
         let mut first = client(server.local_addr(), pin, "worker-1");
         let mut second = client(server.local_addr(), pin, "worker-2");
         assert_eq!(first.current_job().job_id, second.current_job().job_id);
@@ -2275,7 +2410,7 @@ mod tests {
 
     #[test]
     fn full_share_ledger_cannot_block_a_chain_valid_nonce() {
-        let (server, _node, pin) = server("full-ledger-block");
+        let (_root, server, _node, pin) = server("full-ledger-block");
         let mut client = client(server.local_addr(), pin, "block-worker");
         let work = client.current_work().unwrap();
         let nonce = find_share_from(&work, client.current_nonce_origin(), true);

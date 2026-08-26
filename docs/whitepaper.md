@@ -798,10 +798,21 @@ target without a crash, panic, timeout, or sanitizer report and reached nested
 matrix, transition, LogUp, wiring, and field-element parsing. These smoke runs
 establish a repeatable harness, not exhaustive assurance. External block
 admission now uses a one-active/eight-waiter in-process proof queue with a
-five-second admission timeout and panic containment. Verification runs outside
-the global node mutex and returns a nonserializable capability bound to the
-exact verifier, challenge, and proof; atomic chain validation consumes it
-without repeating the expensive proof. External block admission now also has a
+five-second queue timeout and panic containment. Production-profile remote
+proof sessions first enter a separate FIFO capped at eight total active plus
+waiting sessions, with a 60-second wait limit, invalid-session cooldown, and a
+separate two-waiter priority lane for locally found blocks. Verification runs
+outside the global node mutex and returns a nonserializable capability bound to
+the exact verifier, challenge, and proof; atomic chain validation consumes it
+without repeating the expensive proof. P2P block submission has one explicit
+120-second client response contract: server acceptance ends at 110 seconds and
+the server response cutoff is 115 seconds. Disconnect/deadline cancellation
+and durable commit race through one atomic `Active -> Cancelled | Committing`
+transition. Cancellation that wins cannot append; after a post-CAS deadline
+recheck, committing that wins must complete durability and state commit or
+latch a storage fault. The 115-second
+cutoff also covers status-lock acquisition, serialization, and every response
+write. External block admission now also has a
 hash-pinned persistent verifier with canonical statement-bound IPC, killable
 wall-time, bounded output, process-tree termination, and explicit Windows job
 memory or Unix address-space limits. ProductionV3 startup on Linux x86-64
@@ -809,6 +820,15 @@ additionally requires Landlock ABI 3 or newer plus a mandatory default-deny
 seccomp policy before reading/loading model contents or untrusted IPC; Landlock
 ABI 3 is accepted only because seccomp allows only the audited verifier runtime
 surface and denies every unlisted syscall.
+Verifier replacement is supervised single-flight outside a peer request. A
+restarting or unavailable worker and all admission timeouts map to retryable
+`Busy`; cryptographic invalidity maps to `Rejected`. Normal, local-priority,
+and remote admission telemetry separately exposes active, queued, wait,
+rejection, and post-dispatch proof-failure counters.
+The standalone miner treats `Busy` as retention rather than rejection: it
+reconnects with the byte-identical ProductionV3 block and proof while the peer
+tip remains the exact parent. The retry has an interruptible 20-minute total
+budget; a tip change and budget abandonment are logged and counted separately.
 ProductionV3 remains fail-closed on Windows until an atomic AppContainer/LPAC
 launch and inherited-handle artifact loader pass equivalent escape and
 full-worker tests. Per-worker CPU/PID containment also remains open on Linux;

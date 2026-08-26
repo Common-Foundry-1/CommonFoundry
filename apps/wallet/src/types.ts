@@ -21,6 +21,14 @@ export interface PeerSettings {
   max_peers: number;
 }
 
+export interface ProofAdmissionClassTelemetry {
+  active: number;
+  queued: number;
+  wait_events: number;
+  rejections: number;
+  proof_failures: number;
+}
+
 export interface NodeStatus {
   network: string;
   network_short_name: string;
@@ -45,6 +53,19 @@ export interface NodeStatus {
   utxo_count: number;
   mempool_transactions: number;
   mempool_bytes: number;
+  proof_verification_active: number;
+  proof_verification_queued: number;
+  proof_verification_normal_admission: ProofAdmissionClassTelemetry;
+  proof_verification_priority_admission: ProofAdmissionClassTelemetry;
+  proof_verification_remote_admission: ProofAdmissionClassTelemetry;
+  proof_verification_remote_admission_capacity: number;
+  proof_verification_remote_admission_wait_timeout_ms: number;
+  proof_verification_capacity: number;
+  proof_verification_queue_capacity: number;
+  proof_verification_mode: string;
+  proof_verification_timeout_ms: number | null;
+  proof_verification_memory_limit_bytes: number | null;
+  proof_verification_teardown_failures: number | null;
   storage_healthy: boolean;
   public_peer_mode: boolean;
   peers: PeerObservation[];

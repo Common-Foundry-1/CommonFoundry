@@ -6,7 +6,9 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -31,10 +33,32 @@ pub const MAX_BYTES_PER_PEER: u64 = 64 * 1024 * 1024;
 pub const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Authoritative client budget for one `SubmitBlock` response. Proof
+/// admission and verification may legitimately remain silent for longer than
+/// the ordinary peer idle timeout, so mining and relay clients use this
+/// dedicated contract instead of `PeerLimits::idle_timeout`.
+pub const SUBMIT_BLOCK_RESPONSE_BUDGET: Duration = Duration::from_secs(120);
 
 const HELLO_PAYLOAD_BYTES: usize = 200;
 const MIN_SESSION_HANDSHAKE_BYTES: u64 = 2 * (PEER_FRAME_HEADER_BYTES + HELLO_PAYLOAD_BYTES) as u64;
 const PEER_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct WriteDeadlineBarrier {
+    pub(crate) entered: Barrier,
+    pub(crate) release: Barrier,
+}
+
+#[cfg(test)]
+impl WriteDeadlineBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+        }
+    }
+}
 
 pub const HELLO_KIND: u8 = 1;
 pub const GET_HEADERS_KIND: u8 = 2;
@@ -322,8 +346,12 @@ pub enum PeerError {
     TotalTimeout,
     #[error("peer connection exceeded its idle timeout")]
     IdleTimeout,
+    #[error("peer block-submission response exceeded its dedicated timeout")]
+    SubmitBlockResponseTimeout,
     #[error("peer connection was cancelled")]
     Cancelled,
+    #[error("peer closed the connection")]
+    ConnectionClosed,
     #[error("peer I/O failed: {0}")]
     Io(#[source] io::Error),
     #[error("block frame is not canonical")]
@@ -1157,6 +1185,65 @@ pub struct PeerConnection {
     session: PeerSession,
     deadline: Instant,
     cancellation: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    write_deadline_barrier: Option<Arc<WriteDeadlineBarrier>>,
+}
+
+fn connect_stream_cancellable_with<Connect>(
+    address: SocketAddr,
+    connect_timeout: Duration,
+    operation_deadline: Option<Instant>,
+    cancellation: &AtomicBool,
+    mut connect: Connect,
+) -> Result<TcpStream, PeerError>
+where
+    Connect: FnMut(&SocketAddr, Duration) -> io::Result<TcpStream>,
+{
+    let now = Instant::now();
+    let connect_deadline = now
+        .checked_add(connect_timeout)
+        .ok_or(PeerError::InvalidLimits)?;
+    let deadline =
+        operation_deadline.map_or(connect_deadline, |deadline| deadline.min(connect_deadline));
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(PeerError::Cancelled);
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(PeerError::TotalTimeout)?;
+        let attempt_timeout = remaining.min(PEER_CANCEL_POLL_INTERVAL);
+        match connect(&address, attempt_timeout) {
+            Ok(stream) => {
+                if cancellation.load(Ordering::Acquire) {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Err(PeerError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Err(PeerError::TotalTimeout);
+                }
+                return Ok(stream);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if cancellation.load(Ordering::Acquire) {
+                    return Err(PeerError::Cancelled);
+                }
+            }
+            Err(error) => {
+                if cancellation.load(Ordering::Acquire) {
+                    return Err(PeerError::Cancelled);
+                }
+                return Err(PeerError::Io(error));
+            }
+        }
+    }
 }
 
 impl PeerConnection {
@@ -1169,11 +1256,70 @@ impl PeerConnection {
         session: PeerSession,
         address_policy: PeerAddressPolicy,
     ) -> Result<Self, PeerError> {
+        Self::connect_with_policy_deadline(address, session, address_policy, None, None)
+    }
+
+    pub(crate) fn connect_with_policy_before(
+        address: SocketAddr,
+        session: PeerSession,
+        address_policy: PeerAddressPolicy,
+        deadline: Instant,
+    ) -> Result<Self, PeerError> {
+        Self::connect_with_policy_deadline(address, session, address_policy, Some(deadline), None)
+    }
+
+    pub(crate) fn connect_with_policy_before_cancellable(
+        address: SocketAddr,
+        session: PeerSession,
+        address_policy: PeerAddressPolicy,
+        deadline: Instant,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self, PeerError> {
+        Self::connect_with_policy_deadline(
+            address,
+            session,
+            address_policy,
+            Some(deadline),
+            Some(cancellation),
+        )
+    }
+
+    fn connect_with_policy_deadline(
+        address: SocketAddr,
+        session: PeerSession,
+        address_policy: PeerAddressPolicy,
+        deadline: Option<Instant>,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, PeerError> {
         validate_peer_address(address, address_policy)?;
         let limits = session.limits();
-        let stream =
-            TcpStream::connect_timeout(&address, limits.connect_timeout).map_err(PeerError::Io)?;
-        Self::from_stream_with_policy(stream, session, address_policy)
+        let stream = match cancellation.as_deref() {
+            Some(cancellation) => connect_stream_cancellable_with(
+                address,
+                limits.connect_timeout,
+                deadline,
+                cancellation,
+                TcpStream::connect_timeout,
+            )?,
+            None => {
+                let connect_timeout = match deadline {
+                    Some(deadline) => deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                        .map(|remaining| remaining.min(limits.connect_timeout))
+                        .ok_or(PeerError::TotalTimeout)?,
+                    None => limits.connect_timeout,
+                };
+                TcpStream::connect_timeout(&address, connect_timeout).map_err(PeerError::Io)?
+            }
+        };
+        let mut connection =
+            Self::from_stream_with_policy_deadline(stream, session, address_policy, deadline)?;
+        if let Some(cancellation) = cancellation {
+            connection.set_cancellation(cancellation);
+            connection.ensure_not_cancelled()?;
+        }
+        Ok(connection)
     }
 
     pub fn from_stream(stream: TcpStream, session: PeerSession) -> Result<Self, PeerError> {
@@ -1185,15 +1331,35 @@ impl PeerConnection {
         session: PeerSession,
         address_policy: PeerAddressPolicy,
     ) -> Result<Self, PeerError> {
+        Self::from_stream_with_policy_deadline(stream, session, address_policy, None)
+    }
+
+    fn from_stream_with_policy_deadline(
+        stream: TcpStream,
+        session: PeerSession,
+        address_policy: PeerAddressPolicy,
+        operation_deadline: Option<Instant>,
+    ) -> Result<Self, PeerError> {
         validate_peer_address(stream.peer_addr().map_err(PeerError::Io)?, address_policy)?;
         let limits = session.limits();
         limits.validate()?;
         stream.set_nodelay(true).map_err(PeerError::Io)?;
+        let now = Instant::now();
+        let total_deadline = now
+            .checked_add(limits.total_timeout)
+            .ok_or(PeerError::InvalidLimits)?;
+        let deadline =
+            operation_deadline.map_or(total_deadline, |deadline| deadline.min(total_deadline));
+        if deadline <= now {
+            return Err(PeerError::TotalTimeout);
+        }
         Ok(Self {
             stream,
             session,
-            deadline: Instant::now() + limits.total_timeout,
+            deadline,
             cancellation: None,
+            #[cfg(test)]
+            write_deadline_barrier: None,
         })
     }
 
@@ -1209,6 +1375,11 @@ impl PeerConnection {
         self.cancellation = Some(cancellation);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_write_deadline_barrier(&mut self, barrier: Arc<WriteDeadlineBarrier>) {
+        self.write_deadline_barrier = Some(barrier);
+    }
+
     pub fn send_hello(&mut self) -> Result<(), PeerError> {
         let bytes = self.session.encode_hello()?;
         self.write_all_bounded(&bytes)
@@ -1219,8 +1390,31 @@ impl PeerConnection {
         self.write_all_bounded(&bytes)
     }
 
+    pub(crate) fn send_before(
+        &mut self,
+        message: PeerMessage,
+        deadline: Instant,
+    ) -> Result<(), PeerError> {
+        let bytes = self.session.encode_outbound(message)?;
+        self.write_all_before(&bytes, Some(deadline))
+    }
+
     pub fn receive(&mut self) -> Result<PeerMessage, PeerError> {
-        let header = self.read_exact_bounded(PEER_FRAME_HEADER_BYTES)?;
+        self.receive_before(None)
+    }
+
+    pub(crate) fn receive_submit_block_response(&mut self) -> Result<PeerMessage, PeerError> {
+        let deadline = Instant::now()
+            .checked_add(SUBMIT_BLOCK_RESPONSE_BUDGET)
+            .ok_or(PeerError::InvalidLimits)?;
+        self.receive_before(Some(deadline))
+    }
+
+    fn receive_before(
+        &mut self,
+        submit_response_deadline: Option<Instant>,
+    ) -> Result<PeerMessage, PeerError> {
+        let header = self.read_exact_bounded(PEER_FRAME_HEADER_BYTES, submit_response_deadline)?;
         validate_frame_header(&header)?;
         let payload_len =
             u32::from_le_bytes(header[16..20].try_into().expect("fixed frame header")) as usize;
@@ -1239,23 +1433,31 @@ impl PeerConnection {
         self.session.ensure_budget(frame_len)?;
         let mut bytes = Vec::with_capacity(frame_len);
         bytes.extend_from_slice(&header);
-        bytes.extend_from_slice(&self.read_exact_bounded(payload_len)?);
+        bytes.extend_from_slice(&self.read_exact_bounded(payload_len, submit_response_deadline)?);
         self.session.accept_inbound(&bytes)
     }
 
-    fn read_exact_bounded(&mut self, length: usize) -> Result<Vec<u8>, PeerError> {
+    fn read_exact_bounded(
+        &mut self,
+        length: usize,
+        submit_response_deadline: Option<Instant>,
+    ) -> Result<Vec<u8>, PeerError> {
         let mut bytes = vec![0_u8; length];
         let mut offset = 0;
         let mut last_progress = Instant::now();
         while offset < length {
             self.ensure_not_cancelled()?;
-            self.set_read_timeout(last_progress)?;
+            self.set_read_timeout(last_progress, submit_response_deadline)?;
             match self.stream.read(&mut bytes[offset..]) {
                 Ok(0) => {
-                    return Err(PeerError::Truncated {
-                        needed: length,
-                        remaining: offset,
-                    });
+                    return if offset == 0 {
+                        Err(PeerError::ConnectionClosed)
+                    } else {
+                        Err(PeerError::Truncated {
+                            needed: length,
+                            remaining: offset,
+                        })
+                    };
                 }
                 Ok(read) => {
                     offset += read;
@@ -1266,10 +1468,23 @@ impl PeerConnection {
                         || error.kind() == io::ErrorKind::WouldBlock =>
                 {
                     if self.cancellation.is_none() {
-                        return Err(self.timeout_error());
+                        return Err(self.timeout_error(submit_response_deadline));
                     }
                     self.ensure_not_cancelled()?;
-                    self.ensure_io_deadlines(last_progress)?;
+                    self.ensure_io_deadlines(last_progress, submit_response_deadline)?;
+                }
+                Err(error)
+                    if offset == 0
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::NotConnected
+                                | io::ErrorKind::UnexpectedEof
+                        ) =>
+                {
+                    return Err(PeerError::ConnectionClosed);
                 }
                 Err(error) => return Err(PeerError::Io(error)),
             }
@@ -1278,11 +1493,28 @@ impl PeerConnection {
     }
 
     fn write_all_bounded(&mut self, bytes: &[u8]) -> Result<(), PeerError> {
+        self.write_all_before(bytes, None)
+    }
+
+    fn write_all_before(
+        &mut self,
+        bytes: &[u8],
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), PeerError> {
         let mut offset = 0;
         let mut last_progress = Instant::now();
         while offset < bytes.len() {
             self.ensure_not_cancelled()?;
-            self.set_write_timeout(last_progress)?;
+            self.set_write_timeout(last_progress, operation_deadline)?;
+            #[cfg(test)]
+            if let Some(barrier) = self.write_deadline_barrier.take() {
+                barrier.entered.wait();
+                barrier.release.wait();
+            }
+            // Recheck after any scheduling delay and immediately before each
+            // write system call. No later chunk begins after the absolute
+            // SubmitBlock response cutoff.
+            self.ensure_io_deadlines(last_progress, operation_deadline)?;
             match self.stream.write(&bytes[offset..]) {
                 Ok(0) => {
                     return Err(PeerError::Io(io::Error::new(
@@ -1299,10 +1531,10 @@ impl PeerConnection {
                         || error.kind() == io::ErrorKind::WouldBlock =>
                 {
                     if self.cancellation.is_none() {
-                        return Err(self.timeout_error());
+                        return Err(self.timeout_error(operation_deadline));
                     }
                     self.ensure_not_cancelled()?;
-                    self.ensure_io_deadlines(last_progress)?;
+                    self.ensure_io_deadlines(last_progress, operation_deadline)?;
                 }
                 Err(error) => return Err(PeerError::Io(error)),
             }
@@ -1310,30 +1542,48 @@ impl PeerConnection {
         Ok(())
     }
 
-    fn set_read_timeout(&self, last_progress: Instant) -> Result<(), PeerError> {
-        let remaining = self.io_timeout(last_progress)?;
+    fn set_read_timeout(
+        &self,
+        last_progress: Instant,
+        submit_response_deadline: Option<Instant>,
+    ) -> Result<(), PeerError> {
+        let remaining = self.io_timeout(last_progress, submit_response_deadline)?;
         self.stream
             .set_read_timeout(Some(remaining))
             .map_err(PeerError::Io)
     }
 
-    fn set_write_timeout(&self, last_progress: Instant) -> Result<(), PeerError> {
-        let remaining = self.io_timeout(last_progress)?;
+    fn set_write_timeout(
+        &self,
+        last_progress: Instant,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), PeerError> {
+        let remaining = self.io_timeout(last_progress, operation_deadline)?;
         self.stream
             .set_write_timeout(Some(remaining))
             .map_err(PeerError::Io)
     }
 
-    fn io_timeout(&self, last_progress: Instant) -> Result<Duration, PeerError> {
+    fn io_timeout(
+        &self,
+        last_progress: Instant,
+        submit_response_deadline: Option<Instant>,
+    ) -> Result<Duration, PeerError> {
         let total = self.remaining_total()?;
-        let idle = self
-            .session
-            .limits
-            .idle_timeout
-            .checked_sub(last_progress.elapsed())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(PeerError::IdleTimeout)?;
-        let bounded = total.min(idle);
+        let operation = match submit_response_deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(PeerError::SubmitBlockResponseTimeout)?,
+            None => self
+                .session
+                .limits
+                .idle_timeout
+                .checked_sub(last_progress.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(PeerError::IdleTimeout)?,
+        };
+        let bounded = total.min(operation);
         Ok(if self.cancellation.is_some() {
             bounded.min(PEER_CANCEL_POLL_INTERVAL)
         } else {
@@ -1341,9 +1591,17 @@ impl PeerConnection {
         })
     }
 
-    fn ensure_io_deadlines(&self, last_progress: Instant) -> Result<(), PeerError> {
+    fn ensure_io_deadlines(
+        &self,
+        last_progress: Instant,
+        submit_response_deadline: Option<Instant>,
+    ) -> Result<(), PeerError> {
         self.remaining_total()?;
-        if last_progress.elapsed() >= self.session.limits.idle_timeout {
+        if let Some(deadline) = submit_response_deadline {
+            if Instant::now() >= deadline {
+                return Err(PeerError::SubmitBlockResponseTimeout);
+            }
+        } else if last_progress.elapsed() >= self.session.limits.idle_timeout {
             return Err(PeerError::IdleTimeout);
         }
         Ok(())
@@ -1367,9 +1625,11 @@ impl PeerConnection {
             .ok_or(PeerError::TotalTimeout)
     }
 
-    fn timeout_error(&self) -> PeerError {
+    fn timeout_error(&self, operation_deadline: Option<Instant>) -> PeerError {
         if Instant::now() >= self.deadline {
             PeerError::TotalTimeout
+        } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            PeerError::SubmitBlockResponseTimeout
         } else {
             PeerError::IdleTimeout
         }
@@ -1417,6 +1677,7 @@ fn validate_frame_header(header: &[u8]) -> Result<(), PeerError> {
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
+    use std::sync::Barrier;
     use std::thread;
 
     use cmfd_consensus::{
@@ -2002,6 +2263,44 @@ mod tests {
         let second = process_node_nonce();
         assert_ne!(first, [0; 32]);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cancellation_wins_a_connect_attempt_and_closes_the_late_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_cancel = Arc::clone(&cancellation);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker = thread::spawn(move || {
+            connect_stream_cancellable_with(
+                address,
+                Duration::from_secs(5),
+                Instant::now().checked_add(Duration::from_secs(5)),
+                &worker_cancel,
+                |address, timeout| {
+                    worker_entered.wait();
+                    worker_release.wait();
+                    TcpStream::connect_timeout(address, timeout)
+                },
+            )
+        });
+
+        entered.wait();
+        let stopped_at = Instant::now();
+        cancellation.store(true, Ordering::Release);
+        release.wait();
+        let (mut late_socket, _) = listener.accept().unwrap();
+        late_socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(matches!(worker.join().unwrap(), Err(PeerError::Cancelled)));
+        assert!(stopped_at.elapsed() < Duration::from_millis(500));
+        let mut byte = [0_u8; 1];
+        assert_eq!(late_socket.read(&mut byte).unwrap(), 0);
     }
 
     #[test]

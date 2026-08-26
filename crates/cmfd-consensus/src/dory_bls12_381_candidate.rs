@@ -9,6 +9,8 @@
 //! Cargo feature is the current research gate while the production prover,
 //! preprocessing registry, exact n=33 run, review, and audit gates remain open.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::sync::Arc;
 #[cfg(feature = "whir-prototype")]
 use std::{io::Read, path::Path, sync::atomic::AtomicBool};
@@ -90,6 +92,21 @@ pub(crate) const CANDIDATE_PAYLOAD_MAGIC: [u8; 8] = *b"CFV3CP02";
 pub(crate) const CANDIDATE_PAYLOAD_VERSION: u16 = 2;
 pub(crate) const CANDIDATE_PAYLOAD_HEADER_BYTES: usize = 18;
 pub(crate) const CANDIDATE_PAYLOAD_FIELDS: &str = "magic[8],version_u16le,dory_length_u32le,native_blake3_length_u32le,dory_bytes,native_blake3_bytes; exact EOF";
+
+#[cfg(test)]
+thread_local! {
+    static LAYOUT_V5_RELATION_DISPATCHES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_layout_v5_relation_dispatches_for_test() {
+    LAYOUT_V5_RELATION_DISPATCHES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn layout_v5_relation_dispatches_for_test() -> u64 {
+    LAYOUT_V5_RELATION_DISPATCHES.with(Cell::get)
+}
 
 /// Production-shaped verifier for only the algebraic portion of a V3 candidate.
 ///
@@ -972,6 +989,31 @@ fn validate_dory_v3_layout_v5_candidate_statement(
     )
 }
 
+/// Perform the complete cheap, target-enforcing statement preflight used by
+/// the production verifier without decoding or checking the structured proof.
+///
+/// Network admission uses this exact verifier-owned path before reserving an
+/// external worker. The full verifier calls the same underlying function, so
+/// this optimization cannot introduce a second interpretation of validity.
+#[cfg(feature = "dory-v3-consensus-adapter")]
+pub(crate) fn preflight_bls_dory_v3_layout_v5_candidate(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<(), BlsDoryV3CandidateError> {
+    validate_dory_v3_layout_v5_candidate_statement(
+        network_id,
+        authenticated,
+        block,
+        proof,
+        setup,
+        true,
+    )?;
+    Ok(())
+}
+
 #[cfg(feature = "whir-prototype")]
 fn validate_dory_v3_layout_v5_candidate_public_envelope(
     network_id: [u8; 32],
@@ -1168,6 +1210,18 @@ fn verify_bls_dory_v3_layout_v5_candidate_inner(
         setup,
         enforce_target,
     )?;
+    verify_validated_bls_dory_v3_layout_v5_candidate(authenticated, proof, setup, validated)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn verify_validated_bls_dory_v3_layout_v5_candidate(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+    validated: ValidatedBlsDoryV3LayoutV5CandidateStatement,
+) -> Result<VerifiedBlsDoryV3LayoutV5Candidate, BlsDoryV3CandidateError> {
+    #[cfg(test)]
+    LAYOUT_V5_RELATION_DISPATCHES.with(|count| count.set(count.get().saturating_add(1)));
     let context =
         BlsDorySharedLayoutV5Context::from_bank_authenticated_record(authenticated, setup)?;
     let (shared_proof, payload) =
@@ -1211,6 +1265,31 @@ fn verify_bls_dory_v3_layout_v5_candidate_inner(
         native_blake3_proof_digest: *native_hasher.finalize().as_bytes(),
         final_output,
     })
+}
+
+/// Test the actual post-statement Layout V5 relation dispatcher with a small
+/// bank-authenticated record. Only the 25 GiB production-record geometry gate
+/// is replaced; public statement checks and the structured relation path are
+/// the same code used by the production verifier.
+#[cfg(all(test, feature = "whir-prototype"))]
+pub(crate) fn verify_bls_dory_v3_layout_v5_candidate_relation_for_test(
+    network_id: [u8; 32],
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    proof: &ForgeMatrixV3CandidateProof,
+    setup: &DeterministicBlsDorySetup,
+) -> Result<VerifiedBlsDoryV3LayoutV5Candidate, BlsDoryV3CandidateError> {
+    validate_dory_v3_layout_v5_candidate_public_envelope(network_id, block, proof)?;
+    authenticated.record().validate()?;
+    validate_dory_v3_layout_v5_record_setup_binding(authenticated, setup)?;
+    let validated = validate_dory_v3_layout_v5_candidate_statement_after_authority(
+        network_id,
+        authenticated,
+        block,
+        proof,
+        true,
+    )?;
+    verify_validated_bls_dory_v3_layout_v5_candidate(authenticated, proof, setup, validated)
 }
 
 #[cfg(feature = "whir-prototype")]

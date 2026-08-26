@@ -9,19 +9,21 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cmfd_consensus::{Block, Transaction, WireError, decode_block};
 use thiserror::Error;
 
 use crate::peer::{
     BlockSubmissionResult, BlockSubmissionStatus, PeerAddressPolicy, PeerConnection, PeerError,
-    PeerHello, PeerLimits, PeerMessage, PeerSession, StaticPeerConfig,
+    PeerHello, PeerLimits, PeerMessage, PeerSession, SUBMIT_BLOCK_RESPONSE_BUDGET,
+    StaticPeerConfig,
 };
 use crate::{
-    Node, NodeError, PeerDirection, devnet_params, submit_shared_block, unix_time_seconds,
+    Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest, devnet_params,
+    submit_shared_peer_block_cancellable, unix_time_seconds,
 };
 
 /// One request is deliberately small enough that sixteen maximum-size blocks,
@@ -35,6 +37,19 @@ pub const MAX_BLOCKS_PER_SYNC: usize = 16;
 /// farther through an honest peer's inventory.
 pub const MAX_TRANSACTIONS_PER_SYNC: usize = 64;
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PEER_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+// The receiver owns a 120-second response budget. The server stops admission
+// at 110 seconds and reserves five seconds for local response serialization,
+// leaving a final five seconds for transport/scheduling at the client.
+const SUBMIT_BLOCK_SERVER_RESPONSE_MARGIN: Duration = Duration::from_secs(5);
+const SUBMIT_BLOCK_ACCEPTANCE_MARGIN: Duration = Duration::from_secs(5);
+const SUBMIT_BLOCK_SERVER_RESPONSE_BUDGET: Duration = Duration::from_secs(
+    SUBMIT_BLOCK_RESPONSE_BUDGET.as_secs() - SUBMIT_BLOCK_SERVER_RESPONSE_MARGIN.as_secs(),
+);
+const SUBMIT_BLOCK_ACCEPTANCE_BUDGET: Duration = Duration::from_secs(
+    SUBMIT_BLOCK_SERVER_RESPONSE_BUDGET.as_secs() - SUBMIT_BLOCK_ACCEPTANCE_MARGIN.as_secs(),
+);
+static NEXT_REMOTE_PROOF_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub enum P2pError {
@@ -46,6 +61,8 @@ pub enum P2pError {
     Wire(#[from] WireError),
     #[error("peer runtime node mutex is poisoned")]
     PoisonedNode,
+    #[error("SubmitBlock deadline overflowed the monotonic clock")]
+    SubmitBlockDeadlineOverflow,
     #[error("peer runtime stop mutex is poisoned")]
     PoisonedStop,
     #[error("peer runtime active-socket registry is poisoned")]
@@ -90,8 +107,32 @@ pub enum P2pError {
     ZeroPollInterval,
     #[error("peer service thread panicked")]
     ThreadPanicked,
+    #[error("process-local peer admission identity space is exhausted")]
+    PeerAdmissionIdentityExhausted,
     #[error("peer listener I/O failed: {0}")]
     ListenerIo(#[source] io::Error),
+}
+
+impl P2pError {
+    /// Returns true only for loss of transport or an exhausted transport
+    /// deadline. Framing, handshake, message-shape, and identifier failures are
+    /// protocol violations and deliberately remain distinguishable.
+    pub fn is_transport_disconnect(&self) -> bool {
+        matches!(
+            self,
+            Self::Peer(
+                PeerError::ConnectionClosed
+                    | PeerError::TotalTimeout
+                    | PeerError::IdleTimeout
+                    | PeerError::SubmitBlockResponseTimeout
+                    | PeerError::Io(_)
+            )
+        )
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Peer(PeerError::Cancelled))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,13 +219,82 @@ pub fn submit_mined_block_once_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Result<BlockSubmissionResult, P2pError> {
+    submit_mined_block_once_with_policy_deadline(address, block, limits, address_policy, None, None)
+}
+
+/// Same exact-block submission with an additional caller-owned absolute
+/// deadline. This is used by bounded Busy/reconnect retry so connect,
+/// handshake, request, and response cannot overrun the retained candidate's
+/// total retry budget.
+pub fn submit_mined_block_once_with_policy_before(
+    address: SocketAddr,
+    block: Block,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    deadline: Instant,
+) -> Result<BlockSubmissionResult, P2pError> {
+    submit_mined_block_once_with_policy_deadline(
+        address,
+        block,
+        limits,
+        address_policy,
+        Some(deadline),
+        None,
+    )
+}
+
+/// Same exact-block submission as [`submit_mined_block_once_with_policy_before`],
+/// with cancellation threaded through connect, handshake, request write, and
+/// response read. Each connect attempt and every established-socket I/O wait
+/// polls cancellation at a short bounded interval.
+pub fn submit_mined_block_once_with_policy_before_cancellable(
+    address: SocketAddr,
+    block: Block,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    deadline: Instant,
+    cancellation: Arc<AtomicBool>,
+) -> Result<BlockSubmissionResult, P2pError> {
+    submit_mined_block_once_with_policy_deadline(
+        address,
+        block,
+        limits,
+        address_policy,
+        Some(deadline),
+        Some(cancellation),
+    )
+}
+
+fn submit_mined_block_once_with_policy_deadline(
+    address: SocketAddr,
+    block: Block,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    deadline: Option<Instant>,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<BlockSubmissionResult, P2pError> {
     let submitted = block.block_id();
     let session = PeerSession::new(thin_miner_hello()?, limits)?;
-    let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
+    let mut connection = match (deadline, cancellation) {
+        (Some(deadline), Some(cancellation)) => {
+            PeerConnection::connect_with_policy_before_cancellable(
+                address,
+                session,
+                address_policy,
+                deadline,
+                cancellation,
+            )?
+        }
+        (Some(deadline), None) => {
+            PeerConnection::connect_with_policy_before(address, session, address_policy, deadline)?
+        }
+        (None, None) => PeerConnection::connect_with_policy(address, session, address_policy)?,
+        (None, Some(_)) => unreachable!("cancellable submission always has a deadline"),
+    };
     connection.send_hello()?;
     expect_hello(connection.receive()?)?;
     connection.send(PeerMessage::SubmitBlock(block))?;
-    let result = expect_block_submission_result(connection.receive()?)?;
+    let result = expect_block_submission_result(connection.receive_submit_block_response()?)?;
     if result.block_id != submitted {
         return Err(P2pError::WrongBlockSubmission {
             submitted,
@@ -319,6 +429,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
     };
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
+    let proof_peer = next_remote_proof_peer_id()?;
 
     connection.send(PeerMessage::GetHeaders {
         locator,
@@ -377,11 +488,22 @@ fn perform_sync_from_peer_once_inner_with_policy(
         }
 
         let accepted_at = unix_time_seconds()?;
-        let accepted = match submit_shared_block(&shared, block, accepted_at) {
+        let acceptance_deadline =
+            checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
+        let request = RemoteProofRequest::new(acceptance_deadline);
+        let monitor = PeerSubmissionMonitor::start(&connection, request.clone())?;
+        let accepted = match submit_shared_peer_block_cancellable(
+            &shared,
+            block,
+            accepted_at,
+            proof_peer,
+            request,
+        ) {
             Ok(_) => true,
             Err(NodeError::DuplicateBlock(_)) => false,
             Err(error) => return Err(error.into()),
         };
+        drop(monitor);
         if accepted {
             accepted_blocks += 1;
         } else {
@@ -558,7 +680,7 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
         }
 
         connection.send(PeerMessage::SubmitBlock(block))?;
-        let result = expect_block_submission_result(connection.receive()?)?;
+        let result = expect_block_submission_result(connection.receive_submit_block_response()?)?;
         if result.block_id != *block_id {
             return Err(P2pError::WrongBlockSubmission {
                 submitted: *block_id,
@@ -671,6 +793,7 @@ fn perform_respond_to_peer_inner_with_policy(
     }
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
+    let proof_peer = next_remote_proof_peer_id()?;
     record_peer_succeeded(
         &shared,
         PeerDirection::Inbound,
@@ -681,10 +804,7 @@ fn perform_respond_to_peer_inner_with_policy(
     loop {
         let message = match connection.receive() {
             Ok(message) => message,
-            Err(PeerError::Truncated {
-                needed,
-                remaining: 0,
-            }) if needed == crate::peer::PEER_FRAME_HEADER_BYTES => return Ok(()),
+            Err(PeerError::ConnectionClosed) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         match message {
@@ -745,9 +865,22 @@ fn perform_respond_to_peer_inner_with_policy(
                 }))?;
             }
             PeerMessage::SubmitBlock(block) => {
+                let started = Instant::now();
                 let block_id = block.block_id();
                 let accepted_at = unix_time_seconds()?;
-                let status = match submit_shared_block(&shared, block, accepted_at) {
+                let acceptance_deadline =
+                    checked_submit_deadline(started, SUBMIT_BLOCK_ACCEPTANCE_BUDGET)?;
+                let response_deadline =
+                    checked_submit_deadline(started, SUBMIT_BLOCK_SERVER_RESPONSE_BUDGET)?;
+                let request = RemoteProofRequest::new(acceptance_deadline);
+                let monitor = PeerSubmissionMonitor::start(&connection, request.clone())?;
+                let status = match submit_shared_peer_block_cancellable(
+                    &shared,
+                    block,
+                    accepted_at,
+                    proof_peer,
+                    request,
+                ) {
                     Ok(_) => BlockSubmissionStatus::Accepted,
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
                     Err(error) if is_retryable_block_admission(&error) => {
@@ -758,16 +891,14 @@ fn perform_respond_to_peer_inner_with_policy(
                     }
                     Err(error) => return Err(error.into()),
                 };
-                let peer = {
-                    let node = lock_node(&shared)?;
-                    node.peer_hello()
-                };
-                connection.send(PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                drop(monitor);
+                send_block_submission_result_before(
+                    &shared,
+                    &mut connection,
                     block_id,
                     status,
-                    peer_height: peer.height,
-                    peer_tip: peer.tip,
-                }))?;
+                    response_deadline,
+                )?;
             }
             other => {
                 return Err(P2pError::UnexpectedMessage {
@@ -781,6 +912,105 @@ fn perform_respond_to_peer_inner_with_policy(
 
 fn is_retryable_block_admission(error: &NodeError) -> bool {
     error.client_error().retryable
+}
+
+fn checked_submit_deadline(start: Instant, budget: Duration) -> Result<Instant, P2pError> {
+    start
+        .checked_add(budget)
+        .ok_or(P2pError::SubmitBlockDeadlineOverflow)
+}
+
+fn send_block_submission_result_before(
+    shared: &Arc<Mutex<Node>>,
+    connection: &mut PeerConnection,
+    block_id: [u8; 32],
+    status: BlockSubmissionStatus,
+    deadline: Instant,
+) -> Result<(), P2pError> {
+    let peer = lock_node_before(shared, deadline)?.peer_hello();
+    connection.send_before(
+        PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+            block_id,
+            status,
+            peer_height: peer.height,
+            peer_tip: peer.tip,
+        }),
+        deadline,
+    )?;
+    Ok(())
+}
+
+/// Watches the otherwise idle inbound half of a request/response session while
+/// block admission is waiting. Any EOF, socket error, or pipelined input ends
+/// the current submission: honest peers wait for `BlockSubmissionResult`, and
+/// treating unexpected input as cancellation prevents unread bytes from
+/// masking a FIN behind them.
+struct PeerSubmissionMonitor {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PeerSubmissionMonitor {
+    fn start(connection: &PeerConnection, request: RemoteProofRequest) -> Result<Self, P2pError> {
+        let stream = connection.try_clone_stream()?;
+        stream
+            .set_read_timeout(Some(PEER_DISCONNECT_POLL_INTERVAL))
+            .map_err(P2pError::ListenerIo)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher_request = request.clone();
+        let watcher_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("cmfd-peer-submit-monitor".to_owned())
+            .spawn(move || {
+                let mut byte = [0_u8; 1];
+                while !watcher_stop.load(Ordering::Acquire) {
+                    if Instant::now() >= watcher_request.deadline() {
+                        watcher_request.cancel();
+                        break;
+                    }
+                    match stream.peek(&mut byte) {
+                        Ok(_) => {
+                            watcher_request.cancel();
+                            break;
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(_) => {
+                            watcher_request.cancel();
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(P2pError::ListenerIo)?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for PeerSubmissionMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn next_remote_proof_peer_id() -> Result<RemoteProofPeerId, P2pError> {
+    let value = NEXT_REMOTE_PROOF_PEER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| P2pError::PeerAdmissionIdentityExhausted)?;
+    RemoteProofPeerId::new(value).ok_or(P2pError::PeerAdmissionIdentityExhausted)
 }
 
 fn observed_address(direction: PeerDirection, address: SocketAddr) -> String {
@@ -1272,6 +1502,31 @@ fn lock_node(shared: &Arc<Mutex<Node>>) -> Result<MutexGuard<'_, Node>, P2pError
     shared.lock().map_err(|_| P2pError::PoisonedNode)
 }
 
+fn lock_node_before<'a>(
+    shared: &'a Arc<Mutex<Node>>,
+    deadline: Instant,
+) -> Result<MutexGuard<'a, Node>, P2pError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(PeerError::SubmitBlockResponseTimeout)?;
+        match shared.try_lock() {
+            Ok(node) => {
+                if Instant::now() >= deadline {
+                    drop(node);
+                    return Err(PeerError::SubmitBlockResponseTimeout.into());
+                }
+                return Ok(node);
+            }
+            Err(TryLockError::WouldBlock) => {
+                thread::sleep(remaining.min(LISTENER_POLL_INTERVAL));
+            }
+            Err(TryLockError::Poisoned(_)) => return Err(P2pError::PoisonedNode),
+        }
+    }
+}
+
 fn with_nonce(mut hello: PeerHello, nonce_override: Option<[u8; 32]>) -> PeerHello {
     if let Some(nonce) = nonce_override {
         hello.node_nonce = nonce;
@@ -1385,9 +1640,13 @@ mod tests {
         ConsensusPowVerifier, InputWitness, OutPoint, OutputLock, TRANSACTION_VERSION, TxInput,
         TxOutput, v2_test_reference,
     };
+    use cmfd_proof_worker::VerifierWorkerError;
     use k256::schnorr::SigningKey;
 
-    use crate::peer::{PEER_FRAME_HEADER_BYTES, PeerFrame, encode_peer_frame, process_node_nonce};
+    use crate::peer::{
+        PEER_FRAME_HEADER_BYTES, PeerFrame, WriteDeadlineBarrier, encode_peer_frame,
+        process_node_nonce,
+    };
     use crate::{DEFAULT_MINING_ATTEMPTS, default_miner_destination, insecure_dev_destination};
 
     use super::*;
@@ -1421,6 +1680,23 @@ mod tests {
             max_messages_per_peer: 256,
             max_bytes_per_peer: 32 * 1024 * 1024,
         }
+    }
+
+    fn submission_test_block(label: &str) -> Block {
+        let path = test_dir(label);
+        let node = open_shared(&path);
+        let block = node
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        drop(node);
+        clean_test_dir(&path);
+        block
     }
 
     fn mine(node: &Arc<Mutex<Node>>, count: usize, start_time: u64) {
@@ -1505,6 +1781,106 @@ mod tests {
             PeerMessage::Hello(_)
         ));
         connection
+    }
+
+    fn connected_peer_pair() -> (PeerConnection, PeerConnection) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+        let client_hello = with_nonce(thin_miner_hello().unwrap(), Some([0x61; 32]));
+        let server_hello = with_nonce(thin_miner_hello().unwrap(), Some([0x62; 32]));
+        let mut client = PeerConnection::from_stream(
+            client_stream,
+            PeerSession::new(client_hello, test_limits()).unwrap(),
+        )
+        .unwrap();
+        let mut server = PeerConnection::from_stream(
+            server_stream,
+            PeerSession::new(server_hello, test_limits()).unwrap(),
+        )
+        .unwrap();
+        client.send_hello().unwrap();
+        server.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+        assert!(matches!(server.receive().unwrap(), PeerMessage::Hello(_)));
+        (client, server)
+    }
+
+    #[test]
+    fn submit_response_deadline_bounds_peer_hello_lock_without_writing() {
+        let path = test_dir("submit-response-lock-deadline");
+        let shared = open_shared(&path);
+        let (client, server) = connected_peer_pair();
+        let mut raw_client = client.try_clone_stream().unwrap();
+        raw_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let guard = shared.lock().unwrap();
+        let deadline = checked_submit_deadline(Instant::now(), Duration::from_millis(50)).unwrap();
+        let response_node = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            let mut server = server;
+            send_block_submission_result_before(
+                &response_node,
+                &mut server,
+                [0x71; 32],
+                BlockSubmissionStatus::Busy,
+                deadline,
+            )
+        });
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(P2pError::Peer(PeerError::SubmitBlockResponseTimeout))
+        ));
+        drop(guard);
+        let mut byte = [0_u8; 1];
+        assert_eq!(raw_client.read(&mut byte).unwrap(), 0);
+        drop(client);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn submit_response_deadline_rechecks_after_slow_writer_pause() {
+        let (client, mut server) = connected_peer_pair();
+        let mut raw_client = client.try_clone_stream().unwrap();
+        raw_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let barrier = Arc::new(WriteDeadlineBarrier::new());
+        server.set_write_deadline_barrier(Arc::clone(&barrier));
+        let deadline = checked_submit_deadline(Instant::now(), Duration::from_millis(50)).unwrap();
+        let worker = thread::spawn(move || {
+            server.send_before(
+                PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                    block_id: [0x72; 32],
+                    status: BlockSubmissionStatus::Busy,
+                    peer_height: 0,
+                    peer_tip: [0x73; 32],
+                }),
+                deadline,
+            )
+        });
+        barrier.entered.wait();
+        while Instant::now() < deadline {
+            thread::yield_now();
+        }
+        barrier.release.wait();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(PeerError::SubmitBlockResponseTimeout)
+        ));
+        let mut byte = [0_u8; 1];
+        assert_eq!(raw_client.read(&mut byte).unwrap(), 0);
+        drop(client);
+    }
+
+    #[test]
+    fn submit_deadline_overflow_is_a_controlled_error() {
+        assert!(matches!(
+            checked_submit_deadline(Instant::now(), Duration::MAX),
+            Err(P2pError::SubmitBlockDeadlineOverflow)
+        ));
     }
 
     #[test]
@@ -2085,6 +2461,422 @@ mod tests {
         drop(target);
         clean_test_dir(&source_path);
         clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn submit_cancellation_interrupts_handshake_and_closes_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (handshake_waiting, waiting_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut header = [0_u8; PEER_FRAME_HEADER_BYTES];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+            let mut payload = vec![0_u8; payload_len];
+            stream.read_exact(&mut payload).unwrap();
+            handshake_waiting.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancellation);
+        let block = submission_test_block("cancel-handshake-block");
+        let worker = thread::spawn(move || {
+            submit_mined_block_once_with_policy_before_cancellable(
+                address,
+                block,
+                test_limits(),
+                PeerAddressPolicy::PrivateOnly,
+                Instant::now().checked_add(Duration::from_secs(5)).unwrap(),
+                worker_cancel,
+            )
+        });
+
+        waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stopped_at = Instant::now();
+        cancellation.store(true, Ordering::Release);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.is_cancelled());
+        assert!(stopped_at.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn submit_cancellation_interrupts_response_wait_and_closes_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (response_waiting, waiting_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let mut connection = accept_test_peer(listener, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::SubmitBlock(_)
+            ));
+            response_waiting.send(()).unwrap();
+            assert!(matches!(
+                connection.receive(),
+                Err(PeerError::ConnectionClosed)
+            ));
+        });
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancellation);
+        let block = submission_test_block("cancel-response-block");
+        let worker = thread::spawn(move || {
+            submit_mined_block_once_with_policy_before_cancellable(
+                address,
+                block,
+                test_limits(),
+                PeerAddressPolicy::PrivateOnly,
+                Instant::now().checked_add(Duration::from_secs(5)).unwrap(),
+                worker_cancel,
+            )
+        });
+
+        waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stopped_at = Instant::now();
+        cancellation.store(true, Ordering::Release);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.is_cancelled());
+        assert!(stopped_at.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn submission_wrong_id_is_a_protocol_violation_not_a_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let mut connection = accept_test_peer(listener, hello);
+            let PeerMessage::SubmitBlock(block) = connection.receive().unwrap() else {
+                panic!("expected submitted block")
+            };
+            let mut wrong_id = block.block_id();
+            wrong_id[0] ^= 1;
+            connection
+                .send(PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                    block_id: wrong_id,
+                    status: BlockSubmissionStatus::Accepted,
+                    peer_height: block.challenge.height,
+                    peer_tip: wrong_id,
+                }))
+                .unwrap();
+        });
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let error = submit_mined_block_once_with_policy_before_cancellable(
+            address,
+            submission_test_block("wrong-id-block"),
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Instant::now().checked_add(Duration::from_secs(5)).unwrap(),
+            cancellation,
+        )
+        .unwrap_err();
+        assert!(matches!(error, P2pError::WrongBlockSubmission { .. }));
+        assert!(!error.is_transport_disconnect());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_submission_response_is_not_reported_as_a_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let mut connection = accept_test_peer(listener, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::SubmitBlock(_)
+            ));
+            let mut raw = connection.try_clone_stream().unwrap();
+            let mut header = [0_u8; PEER_FRAME_HEADER_BYTES];
+            header[..4].copy_from_slice(b"BAD!");
+            raw.write_all(&header).unwrap();
+        });
+        let error = submit_mined_block_once_with_policy_before_cancellable(
+            address,
+            submission_test_block("malformed-response-block"),
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Instant::now().checked_add(Duration::from_secs(5)).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, P2pError::Peer(PeerError::InvalidMagic)));
+        assert!(!error.is_transport_disconnect());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn closed_submission_response_is_reported_as_a_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let mut connection = accept_test_peer(listener, hello);
+            assert!(matches!(
+                connection.receive().unwrap(),
+                PeerMessage::SubmitBlock(_)
+            ));
+        });
+        let error = submit_mined_block_once_with_policy_before_cancellable(
+            address,
+            submission_test_block("closed-response-block"),
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Instant::now().checked_add(Duration::from_secs(5)).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, P2pError::Peer(PeerError::ConnectionClosed)));
+        assert!(error.is_transport_disconnect());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn honest_submit_longer_than_idle_timeout_is_accepted_within_submit_budget() {
+        let source_path = test_dir("delayed-submit-source");
+        let target_path = test_dir("delayed-submit-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(10_250)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = spawn_inbound_listener_inner(
+            Arc::clone(&target),
+            listener,
+            PeerLimits::default(),
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = submit_mined_block_once_with_policy(
+            address,
+            block,
+            PeerLimits::default(),
+            PeerAddressPolicy::PrivateOnly,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, BlockSubmissionStatus::Accepted);
+        assert!(
+            started.elapsed() > PeerLimits::default().idle_timeout,
+            "test did not cross the ordinary 10-second idle timeout"
+        );
+        assert!(started.elapsed() < SUBMIT_BLOCK_RESPONSE_BUDGET);
+        assert_eq!(target.lock().unwrap().peer_hello().height, 1);
+
+        handle.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn disconnect_during_proof_prevents_durable_acceptance() {
+        let source_path = test_dir("disconnect-submit-source");
+        let target_path = test_dir("disconnect-submit-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let block_id = block.block_id();
+        target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .set_proof_dispatch_delay(Some(Duration::from_millis(500)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = spawn_inbound_listener_inner(
+            Arc::clone(&target),
+            listener,
+            PeerLimits::default(),
+            Some(TARGET_NONCE),
+        )
+        .unwrap();
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let session = PeerSession::new(hello, PeerLimits::default()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+        client.send(PeerMessage::SubmitBlock(block)).unwrap();
+
+        let dispatch_deadline = Instant::now() + Duration::from_secs(2);
+        while target
+            .lock()
+            .unwrap()
+            .block_preverifier
+            .worker_dispatches
+            .load(Ordering::Acquire)
+            == 0
+            && Instant::now() < dispatch_deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(
+            target
+                .lock()
+                .unwrap()
+                .block_preverifier
+                .worker_dispatches
+                .load(Ordering::Acquire),
+            1
+        );
+        drop(client);
+
+        let cancellation_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (height, active) = {
+                let node = target.lock().unwrap();
+                (
+                    node.peer_hello().height,
+                    node.block_preverifier.queue.counts().unwrap().0,
+                )
+            };
+            if active == 0 {
+                assert_eq!(height, 0);
+                break;
+            }
+            assert!(
+                Instant::now() < cancellation_deadline,
+                "disconnected submission did not leave proof admission"
+            );
+            thread::yield_now();
+        }
+        let node = target.lock().unwrap();
+        assert_eq!(node.peer_hello().height, 0);
+        assert!(!node.contains_block(block_id));
+        drop(node);
+
+        handle.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn submit_block_maps_capacity_and_worker_recovery_to_busy_only() {
+        for error in [
+            NodeError::ProofVerificationQueueFull,
+            NodeError::ProofVerificationQueueTimeout,
+            NodeError::ProofVerifierWorker(VerifierWorkerError::Restarting),
+            NodeError::ProofVerifierWorker(VerifierWorkerError::Unavailable),
+            NodeError::ProofVerifierWorker(VerifierWorkerError::RequestDeadlineExpired),
+        ] {
+            assert!(is_retryable_block_admission(&error));
+        }
+
+        let invalid = NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(
+            "invalid proof".to_owned(),
+        ));
+        assert!(!is_retryable_block_admission(&invalid));
+        assert!(invalid.client_error().status < 500);
+    }
+
+    #[test]
+    fn eight_submit_close_sessions_cannot_pin_remote_proof_admission() {
+        let path = test_dir("submit-close-proof-admission");
+        let node = open_shared(&path);
+        let hello = node.lock().unwrap().peer_hello();
+        let remote = Arc::new(crate::RemoteProofAdmissionQueue::new(
+            crate::MAX_REMOTE_PROOF_ADMISSIONS,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        ));
+        let mut clients = Vec::new();
+        let mut connections = Vec::new();
+        let mut monitors = Vec::new();
+        let mut waiters = Vec::new();
+
+        for value in 1..=crate::MAX_REMOTE_PROOF_ADMISSIONS as u64 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let session = PeerSession::new(hello, test_limits()).unwrap();
+            let connection = PeerConnection::from_stream(server, session).unwrap();
+            let acceptance_deadline =
+                checked_submit_deadline(Instant::now(), SUBMIT_BLOCK_ACCEPTANCE_BUDGET).unwrap();
+            let request = crate::RemoteProofRequest::new(acceptance_deadline);
+            let monitor = PeerSubmissionMonitor::start(&connection, request.clone()).unwrap();
+            let waiter_remote = Arc::clone(&remote);
+            waiters.push(thread::spawn(move || {
+                let permit = waiter_remote
+                    .acquire_cancellable(RemoteProofPeerId::new(value).unwrap(), request.clone())?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !request.is_cancelled() && Instant::now() < deadline {
+                    thread::yield_now();
+                }
+                drop(permit);
+                Err::<(), NodeError>(NodeError::ProofVerificationQueueTimeout)
+            }));
+            clients.push(client);
+            connections.push(connection);
+            monitors.push(monitor);
+
+            let expected = value as usize;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while {
+                let telemetry = remote.telemetry().unwrap();
+                telemetry.active + telemetry.queued != expected && Instant::now() < deadline
+            } {
+                thread::yield_now();
+            }
+            let telemetry = remote.telemetry().unwrap();
+            assert_eq!(telemetry.active + telemetry.queued, expected);
+        }
+
+        drop(clients);
+        for waiter in waiters {
+            assert!(matches!(
+                waiter.join().unwrap(),
+                Err(NodeError::ProofVerificationQueueTimeout)
+            ));
+        }
+        let telemetry = remote.telemetry().unwrap();
+        assert_eq!(telemetry.active, 0);
+        assert_eq!(telemetry.queued, 0);
+        assert_eq!(telemetry.proof_failures, 0);
+        drop(
+            remote
+                .acquire(RemoteProofPeerId::new(100).unwrap())
+                .unwrap(),
+        );
+
+        drop(monitors);
+        drop(connections);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

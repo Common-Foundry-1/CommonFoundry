@@ -5,7 +5,7 @@
 //! three authenticated inputs and their trusted parents so downstream type-6
 //! preparation can keep the validated filesystem identities alive.
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 use std::fs::File;
 use std::{
     io::{self, Read, Seek, SeekFrom},
@@ -373,7 +373,7 @@ pub fn load_production_dory_v3_consensus_verifier_from_open_files(
     })
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 struct ValidatedOpenProductionArtifacts {
     authenticated_record: BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     bank_file: FileIdentity,
@@ -381,7 +381,7 @@ struct ValidatedOpenProductionArtifacts {
     record_v2_file: FileIdentity,
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn validate_open_production_dory_v3_model_bank_record_chain(
     mut bank: File,
     mut manifest_input: File,
@@ -771,7 +771,7 @@ fn run_bank_pass<T>(
     Ok((output, identity))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn run_open_bank_pass<T>(
     bank: &mut File,
     expected_bytes: u64,
@@ -799,14 +799,14 @@ fn run_open_bank_pass<T>(
     Ok((output, identity))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OpenFileObjectIdentity {
     volume_serial: u32,
     file_index: u64,
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn open_file_information(
     artifact: &'static str,
     file: &File,
@@ -834,7 +834,7 @@ fn open_file_information(
     Ok(unsafe { information.assume_init() })
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn open_file_object_identity(
     artifact: &'static str,
     file: &File,
@@ -847,7 +847,7 @@ fn open_file_object_identity(
     })
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn ensure_distinct_open_files(
     bank: &File,
     manifest: &File,
@@ -862,7 +862,7 @@ fn ensure_distinct_open_files(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn validate_open_file(
     artifact: &'static str,
     file: &File,
@@ -896,7 +896,7 @@ fn validate_open_file(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn read_open_file_bounded(
     artifact: &'static str,
     file: &mut File,
@@ -927,7 +927,7 @@ fn read_open_file_bounded(
     Ok(bytes)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn require_expected_content_identity(
     artifact: &'static str,
     actual: &FileIdentity,
@@ -941,7 +941,7 @@ fn require_expected_content_identity(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 fn recheck_open_small_files(
     manifest_input: &mut File,
     expected_manifest: &[u8],

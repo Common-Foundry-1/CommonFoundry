@@ -20,7 +20,8 @@ use cmfd_cuda::{CudaDevice, CudaLibrary};
 use cmfd_node::p2p::{
     relay_blocks_to_peer_once_with_policy, request_mining_template_once_with_policy,
     spawn_inbound_listener_with_policy, spawn_static_peer_polling,
-    submit_mined_block_once_with_policy, sync_from_peer_once_with_policy,
+    submit_mined_block_once_with_policy, submit_mined_block_once_with_policy_before_cancellable,
+    sync_from_peer_once_with_policy,
 };
 use cmfd_node::peer::{
     BlockSubmissionStatus, MiningTemplate, PeerAddressPolicy, PeerLimits, StaticPeerConfig,
@@ -49,6 +50,9 @@ const AUTO_WORKERS_PER_GPU: usize = 0;
 const MAX_WORKERS_PER_GPU: usize = 16;
 const DEFAULT_STATS_SECONDS: u64 = 5;
 const PEER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Covers the external verifier's bounded 900-second authenticated restart
+/// while still placing a hard ceiling on retaining one exact candidate.
+const FOUND_BLOCK_RETRY_BUDGET: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -471,6 +475,10 @@ struct SessionStatistics {
     last_totals: BTreeMap<i32, u64>,
     blocks_found: u64,
     stale_jobs: u64,
+    stale_submissions: u64,
+    abandoned_submissions: u64,
+    submission_disconnects: u64,
+    submission_protocol_errors: u64,
     telemetry_warning_printed: bool,
 }
 
@@ -484,6 +492,10 @@ impl SessionStatistics {
             totals,
             blocks_found: 0,
             stale_jobs: 0,
+            stale_submissions: 0,
+            abandoned_submissions: 0,
+            submission_disconnects: 0,
+            submission_protocol_errors: 0,
             telemetry_warning_printed: false,
         }
     }
@@ -544,10 +556,14 @@ impl SessionStatistics {
             .fold(0_u64, |total, attempts| total.saturating_add(*attempts));
 
         println!(
-            "MINER STATS | height {height} | uptime {} | blocks {} | stale jobs {} | attempts {}",
+            "MINER STATS | height {height} | uptime {} | blocks {} | stale jobs {} | stale submissions {} | abandoned submissions {} | submission disconnects {} | protocol errors {} | attempts {}",
             format_duration(self.started_at.elapsed()),
             self.blocks_found,
             self.stale_jobs,
+            self.stale_submissions,
+            self.abandoned_submissions,
+            self.submission_disconnects,
+            self.submission_protocol_errors,
             total_attempts
         );
         println!(
@@ -795,7 +811,11 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                             preferred_peer = Some(peer);
                         }
                         Ok(result)
-                            if block_is_retryable_busy(&result, block.challenge.previous_block) =>
+                            if block_is_retryable_busy(
+                                &result,
+                                block_id,
+                                block.challenge.previous_block,
+                            ) =>
                         {
                             busy_on_parent = true;
                         }
@@ -827,6 +847,7 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                     )?;
                 } else if rejected > 0 {
                     statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                    statistics.stale_submissions = statistics.stale_submissions.saturating_add(1);
                     println!("Block candidate was rejected as stale; rebuilding work.");
                 } else {
                     println!(
@@ -1065,50 +1086,19 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                     ProofRunOutcome::Shutdown => break,
                 };
                 let block = template.into_block(proof);
-                let block_id = block.block_id();
-                let mut acknowledged = 0_usize;
-                let mut rejected = 0_usize;
-                for peer in ordered_peers(&options.peers, preferred_peer) {
-                    match submit_mined_block_once_with_policy(
-                        peer,
-                        block.clone(),
-                        limits,
-                        address_policy,
-                    ) {
-                        Ok(result) if block_is_active_acknowledgement(&result, block_id) => {
-                            acknowledged += 1;
-                            preferred_peer = Some(peer);
-                        }
-                        Ok(_) => rejected += 1,
-                        Err(_) => {}
-                    }
-                }
-                if acknowledged > 0 {
-                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
-                    println!(
-                        "BLOCK ACCEPTED | GPU {device} | height {height} | {} | node acknowledgement {acknowledged}/{} | session blocks {}",
-                        hex::encode(block_id),
-                        options.peers.len(),
-                        statistics.blocks_found
-                    );
-                } else if rejected > 0 {
-                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
-                    println!("Production V3 block was rejected as stale; rebuilding work.");
-                } else {
-                    println!(
-                        "Block proved, but every node disconnected before acceptance; retrying."
-                    );
-                    retry_found_block(
-                        &options.peers,
-                        &mut preferred_peer,
-                        block,
-                        limits,
-                        address_policy,
-                        &shutdown,
-                        &mut statistics,
-                        device,
-                    )?;
-                }
+                println!(
+                    "Production V3 proof completed; submitting and retaining the exact block across Busy or reconnect."
+                );
+                retry_found_block(
+                    &options.peers,
+                    &mut preferred_peer,
+                    block,
+                    limits,
+                    address_policy,
+                    &shutdown,
+                    &mut statistics,
+                    device,
+                )?;
             }
             JobOutcome::Found { .. } => {
                 bail!("Production V3 worker returned a Devnet V2 proof")
@@ -1185,9 +1175,12 @@ fn block_is_active_acknowledgement(
 
 fn block_is_retryable_busy(
     result: &cmfd_node::peer::BlockSubmissionResult,
+    block_id: [u8; 32],
     parent: [u8; 32],
 ) -> bool {
-    result.status == BlockSubmissionStatus::Busy && result.peer_tip == parent
+    result.block_id == block_id
+        && result.status == BlockSubmissionStatus::Busy
+        && result.peer_tip == parent
 }
 
 fn fetch_template_from_any(
@@ -1242,47 +1235,325 @@ fn retry_found_block(
     block: cmfd_consensus::Block,
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
-    shutdown: &AtomicBool,
+    shutdown: &Arc<AtomicBool>,
     statistics: &mut SessionStatistics,
     device: i32,
 ) -> Result<()> {
-    while !shutdown.load(Ordering::Acquire) {
-        let mut busy_on_parent = false;
-        let mut terminal_response = false;
-        for peer in ordered_peers(peers, *preferred) {
-            match submit_mined_block_once_with_policy(peer, block.clone(), limits, address_policy) {
-                Ok(result) if block_is_active_acknowledgement(&result, block.block_id()) => {
-                    *preferred = Some(peer);
-                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
-                    println!(
-                        "BLOCK ACCEPTED | GPU {device} | height {} | {} | node {peer} | session blocks {}",
-                        block.challenge.height,
-                        hex::encode(block.block_id()),
-                        statistics.blocks_found
-                    );
-                    return Ok(());
-                }
-                Ok(result) if block_is_retryable_busy(&result, block.challenge.previous_block) => {
-                    busy_on_parent = true;
-                }
-                Ok(_) => terminal_response = true,
-                Err(_) => {}
+    let deadline = Instant::now()
+        .checked_add(FOUND_BLOCK_RETRY_BUDGET)
+        .ok_or_else(|| anyhow!("found-block retry deadline overflow"))?;
+    let cancellation = Arc::clone(shutdown);
+    let report = retry_exact_block_with(
+        peers,
+        *preferred,
+        &block,
+        deadline,
+        shutdown,
+        |peer, candidate, deadline| match submit_mined_block_once_with_policy_before_cancellable(
+            peer,
+            candidate,
+            limits,
+            address_policy,
+            deadline,
+            Arc::clone(&cancellation),
+        ) {
+            Ok(result) => ExactBlockSubmissionAttempt::Response(result),
+            Err(error) if error.is_cancelled() || error.is_transport_disconnect() => {
+                ExactBlockSubmissionAttempt::Disconnected(error.to_string())
             }
+            Err(error) => ExactBlockSubmissionAttempt::ProtocolViolation(error.to_string()),
+        },
+        interruptible_wait,
+        Instant::now,
+    );
+    record_exact_retry_report(statistics, &report);
+    if let Some((peer, detail)) = &report.last_protocol_violation {
+        println!(
+            "SUBMISSION PROTOCOL ERROR | peer {peer} | {detail} | observed {}",
+            report.protocol_violations
+        );
+    }
+    if let Some((peer, detail)) = &report.last_disconnect {
+        println!(
+            "Submission transport disconnected {} time(s); last peer {peer}: {detail}",
+            report.disconnects
+        );
+    }
+    match report.outcome {
+        ExactBlockRetryOutcome::Accepted(peer) => {
+            *preferred = Some(peer);
+            println!(
+                "BLOCK ACCEPTED | GPU {device} | height {} | {} | node {peer} | session blocks {}",
+                block.challenge.height,
+                hex::encode(block.block_id()),
+                statistics.blocks_found
+            );
         }
-        if terminal_response && !busy_on_parent {
-            statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
-            println!("Block candidate was rejected as stale; rebuilding work.");
-            return Ok(());
+        ExactBlockRetryOutcome::Stale(peer_tip) => {
+            println!(
+                "Exact block retry stopped because the node tip changed to {}; rebuilding work.",
+                hex::encode(peer_tip)
+            );
         }
-        if !interruptible_wait(PEER_RETRY_INTERVAL, shutdown) {
-            return Ok(());
+        ExactBlockRetryOutcome::Rejected => {
+            println!("Exact block candidate was terminally rejected; rebuilding work.");
+        }
+        ExactBlockRetryOutcome::ProtocolViolation { peer, detail } => {
+            println!(
+                "Exact block retry stopped on an incompatible peer response from {peer}: {detail}"
+            );
+        }
+        ExactBlockRetryOutcome::BudgetExhausted => {
+            println!(
+                "Exact block {} was abandoned after the bounded {}-second Busy/reconnect retry budget expired.",
+                hex::encode(block.block_id()),
+                FOUND_BLOCK_RETRY_BUDGET.as_secs()
+            );
+        }
+        ExactBlockRetryOutcome::Stopped => {
+            println!("Exact block retry interrupted by miner shutdown.");
         }
     }
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactBlockRetryOutcome {
+    Accepted(SocketAddr),
+    Stale([u8; 32]),
+    Rejected,
+    ProtocolViolation { peer: SocketAddr, detail: String },
+    BudgetExhausted,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactBlockSubmissionAttempt {
+    Response(cmfd_node::peer::BlockSubmissionResult),
+    Disconnected(String),
+    ProtocolViolation(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactBlockRetryReport {
+    outcome: ExactBlockRetryOutcome,
+    disconnects: u64,
+    protocol_violations: u64,
+    last_disconnect: Option<(SocketAddr, String)>,
+    last_protocol_violation: Option<(SocketAddr, String)>,
+}
+
+fn exact_block_retry_report(
+    outcome: ExactBlockRetryOutcome,
+    disconnects: u64,
+    protocol_violations: u64,
+    last_disconnect: Option<(SocketAddr, String)>,
+    last_protocol_violation: Option<(SocketAddr, String)>,
+) -> ExactBlockRetryReport {
+    ExactBlockRetryReport {
+        outcome,
+        disconnects,
+        protocol_violations,
+        last_disconnect,
+        last_protocol_violation,
+    }
+}
+
+fn record_exact_retry_report(statistics: &mut SessionStatistics, report: &ExactBlockRetryReport) {
+    statistics.submission_disconnects = statistics
+        .submission_disconnects
+        .saturating_add(report.disconnects);
+    statistics.submission_protocol_errors = statistics
+        .submission_protocol_errors
+        .saturating_add(report.protocol_violations);
+    match &report.outcome {
+        ExactBlockRetryOutcome::Accepted(_) => {
+            statistics.blocks_found = statistics.blocks_found.saturating_add(1);
+        }
+        ExactBlockRetryOutcome::Stale(_) | ExactBlockRetryOutcome::Rejected => {
+            statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+            statistics.stale_submissions = statistics.stale_submissions.saturating_add(1);
+        }
+        ExactBlockRetryOutcome::BudgetExhausted => {
+            statistics.abandoned_submissions = statistics.abandoned_submissions.saturating_add(1);
+        }
+        ExactBlockRetryOutcome::ProtocolViolation { .. } | ExactBlockRetryOutcome::Stopped => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retry_exact_block_with<Submit, Wait, Now>(
+    peers: &[SocketAddr],
+    preferred: Option<SocketAddr>,
+    block: &cmfd_consensus::Block,
+    deadline: Instant,
+    shutdown: &AtomicBool,
+    mut submit: Submit,
+    mut wait: Wait,
+    mut now: Now,
+) -> ExactBlockRetryReport
+where
+    Submit: FnMut(SocketAddr, cmfd_consensus::Block, Instant) -> ExactBlockSubmissionAttempt,
+    Wait: FnMut(Duration, &AtomicBool) -> bool,
+    Now: FnMut() -> Instant,
+{
+    let block_id = block.block_id();
+    let parent = block.challenge.previous_block;
+    let mut disconnects = 0_u64;
+    let mut protocol_violations = 0_u64;
+    let mut last_disconnect = None;
+    let mut last_protocol_violation = None;
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return exact_block_retry_report(
+                ExactBlockRetryOutcome::Stopped,
+                disconnects,
+                protocol_violations,
+                last_disconnect,
+                last_protocol_violation,
+            );
+        }
+        if now() >= deadline {
+            return exact_block_retry_report(
+                ExactBlockRetryOutcome::BudgetExhausted,
+                disconnects,
+                protocol_violations,
+                last_disconnect,
+                last_protocol_violation,
+            );
+        }
+        let mut busy_on_parent = false;
+        let mut rejected = false;
+        let mut round_protocol_violation = None;
+        for peer in ordered_peers(peers, preferred) {
+            if shutdown.load(Ordering::Acquire) {
+                return exact_block_retry_report(
+                    ExactBlockRetryOutcome::Stopped,
+                    disconnects,
+                    protocol_violations,
+                    last_disconnect,
+                    last_protocol_violation,
+                );
+            }
+            let attempt = submit(peer, block.clone(), deadline);
+            if shutdown.load(Ordering::Acquire) {
+                return exact_block_retry_report(
+                    ExactBlockRetryOutcome::Stopped,
+                    disconnects,
+                    protocol_violations,
+                    last_disconnect,
+                    last_protocol_violation,
+                );
+            }
+            match attempt {
+                ExactBlockSubmissionAttempt::Response(result)
+                    if block_is_active_acknowledgement(&result, block_id) =>
+                {
+                    return exact_block_retry_report(
+                        ExactBlockRetryOutcome::Accepted(peer),
+                        disconnects,
+                        protocol_violations,
+                        last_disconnect,
+                        last_protocol_violation,
+                    );
+                }
+                ExactBlockSubmissionAttempt::Response(result) if result.block_id != block_id => {
+                    let detail = format!(
+                        "block-submission response ID {} does not match {}",
+                        hex::encode(result.block_id),
+                        hex::encode(block_id)
+                    );
+                    protocol_violations = protocol_violations.saturating_add(1);
+                    last_protocol_violation = Some((peer, detail.clone()));
+                    round_protocol_violation.get_or_insert((peer, detail));
+                }
+                ExactBlockSubmissionAttempt::Response(result) if result.peer_tip != parent => {
+                    return exact_block_retry_report(
+                        ExactBlockRetryOutcome::Stale(result.peer_tip),
+                        disconnects,
+                        protocol_violations,
+                        last_disconnect,
+                        last_protocol_violation,
+                    );
+                }
+                ExactBlockSubmissionAttempt::Response(result)
+                    if block_is_retryable_busy(&result, block_id, parent) =>
+                {
+                    busy_on_parent = true;
+                }
+                ExactBlockSubmissionAttempt::Response(result)
+                    if result.status == BlockSubmissionStatus::Rejected =>
+                {
+                    rejected = true;
+                }
+                ExactBlockSubmissionAttempt::Response(result) => {
+                    let detail = format!(
+                        "incompatible {:?} response for exact block {} on parent {}",
+                        result.status,
+                        hex::encode(block_id),
+                        hex::encode(parent)
+                    );
+                    protocol_violations = protocol_violations.saturating_add(1);
+                    last_protocol_violation = Some((peer, detail.clone()));
+                    round_protocol_violation.get_or_insert((peer, detail));
+                }
+                ExactBlockSubmissionAttempt::Disconnected(detail) => {
+                    disconnects = disconnects.saturating_add(1);
+                    last_disconnect = Some((peer, detail));
+                }
+                ExactBlockSubmissionAttempt::ProtocolViolation(detail) => {
+                    protocol_violations = protocol_violations.saturating_add(1);
+                    last_protocol_violation = Some((peer, detail.clone()));
+                    round_protocol_violation.get_or_insert((peer, detail));
+                }
+            }
+        }
+        if !busy_on_parent {
+            if rejected {
+                return exact_block_retry_report(
+                    ExactBlockRetryOutcome::Rejected,
+                    disconnects,
+                    protocol_violations,
+                    last_disconnect,
+                    last_protocol_violation,
+                );
+            }
+            if let Some((peer, detail)) = round_protocol_violation {
+                return exact_block_retry_report(
+                    ExactBlockRetryOutcome::ProtocolViolation { peer, detail },
+                    disconnects,
+                    protocol_violations,
+                    last_disconnect,
+                    last_protocol_violation,
+                );
+            }
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return exact_block_retry_report(
+                ExactBlockRetryOutcome::BudgetExhausted,
+                disconnects,
+                protocol_violations,
+                last_disconnect,
+                last_protocol_violation,
+            );
+        }
+        if !wait(PEER_RETRY_INTERVAL.min(remaining), shutdown) {
+            return exact_block_retry_report(
+                ExactBlockRetryOutcome::Stopped,
+                disconnects,
+                protocol_violations,
+                last_disconnect,
+                last_protocol_violation,
+            );
+        }
+    }
+}
+
 fn interruptible_wait(duration: Duration, shutdown: &AtomicBool) -> bool {
-    let deadline = Instant::now() + duration;
+    let Some(deadline) = Instant::now().checked_add(duration) else {
+        return false;
+    };
     while Instant::now() < deadline {
         if shutdown.load(Ordering::Acquire) {
             return false;
@@ -2990,7 +3261,47 @@ fn nonce_stride(batch_size: u32, workers: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicU64;
+
     use super::*;
+
+    fn retry_test_block() -> cmfd_consensus::Block {
+        let reference = cmfd_consensus::v2_test_reference().unwrap();
+        let verifier = cmfd_consensus::ConsensusPowVerifier::v2_reference(reference.clone());
+        let challenge = cmfd_consensus::BlockChallenge {
+            network_id: reference.descriptor().network_id,
+            previous_block: [0x41; 32],
+            transaction_root: [0x42; 32],
+            height: 1,
+            timestamp: 60,
+            target: [0xff; 32],
+        };
+        let proof = verifier.mine(&challenge, 0, 1).unwrap();
+        cmfd_consensus::Block {
+            version: cmfd_consensus::BLOCK_VERSION,
+            challenge,
+            proof,
+            coinbase: cmfd_consensus::Coinbase {
+                height: 1,
+                outputs: Vec::new(),
+            },
+            transactions: Vec::new(),
+        }
+    }
+
+    fn retry_result(
+        block: &cmfd_consensus::Block,
+        status: BlockSubmissionStatus,
+        peer_tip: [u8; 32],
+    ) -> cmfd_node::peer::BlockSubmissionResult {
+        cmfd_node::peer::BlockSubmissionResult {
+            block_id: block.block_id(),
+            status,
+            peer_height: block.challenge.height.saturating_sub(1),
+            peer_tip,
+        }
+    }
 
     #[test]
     fn full_node_defaults_follow_the_compiled_network_profile() {
@@ -3219,6 +3530,386 @@ mod tests {
     }
 
     #[test]
+    fn busy_retry_accepts_the_exact_original_block_bytes() {
+        let block = retry_test_block();
+        let canonical = cmfd_consensus::encode_block(&block).unwrap();
+        let block_id = block.block_id();
+        let parent = block.challenge.previous_block;
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let base = Instant::now();
+        let elapsed = AtomicU64::new(0);
+        let mut attempts = Vec::new();
+        let mut calls = 0_u8;
+        let report = retry_exact_block_with(
+            &[peer],
+            Some(peer),
+            &block,
+            base.checked_add(Duration::from_secs(1)).unwrap(),
+            &AtomicBool::new(false),
+            |_, candidate, _| {
+                attempts.push(cmfd_consensus::encode_block(&candidate).unwrap());
+                calls += 1;
+                ExactBlockSubmissionAttempt::Response(if calls == 1 {
+                    retry_result(&candidate, BlockSubmissionStatus::Busy, parent)
+                } else {
+                    retry_result(&candidate, BlockSubmissionStatus::Accepted, block_id)
+                })
+            },
+            |_, _| {
+                elapsed.fetch_add(1, Ordering::AcqRel);
+                true
+            },
+            || {
+                base.checked_add(Duration::from_millis(elapsed.load(Ordering::Acquire)))
+                    .unwrap()
+            },
+        );
+        assert_eq!(report.outcome, ExactBlockRetryOutcome::Accepted(peer));
+        assert_eq!(attempts, vec![canonical.clone(), canonical]);
+    }
+
+    #[test]
+    fn compatible_busy_outranks_another_peers_terminal_response() {
+        let block = retry_test_block();
+        let canonical = cmfd_consensus::encode_block(&block).unwrap();
+        let block_id = block.block_id();
+        let parent = block.challenge.previous_block;
+        let rejecting_peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let busy_peer: SocketAddr = "127.0.0.1:18445".parse().unwrap();
+        let base = Instant::now();
+        let elapsed = AtomicU64::new(0);
+        let mut attempts = Vec::new();
+        let mut busy_peer_calls = 0_u8;
+        let report = retry_exact_block_with(
+            &[rejecting_peer, busy_peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_secs(1)).unwrap(),
+            &AtomicBool::new(false),
+            |peer, candidate, _| {
+                attempts.push(cmfd_consensus::encode_block(&candidate).unwrap());
+                if peer == rejecting_peer {
+                    ExactBlockSubmissionAttempt::Response(retry_result(
+                        &candidate,
+                        BlockSubmissionStatus::Rejected,
+                        parent,
+                    ))
+                } else {
+                    busy_peer_calls += 1;
+                    ExactBlockSubmissionAttempt::Response(if busy_peer_calls == 1 {
+                        retry_result(&candidate, BlockSubmissionStatus::Busy, parent)
+                    } else {
+                        retry_result(&candidate, BlockSubmissionStatus::Accepted, block_id)
+                    })
+                }
+            },
+            |_, _| {
+                elapsed.fetch_add(1, Ordering::AcqRel);
+                true
+            },
+            || {
+                base.checked_add(Duration::from_millis(elapsed.load(Ordering::Acquire)))
+                    .unwrap()
+            },
+        );
+        assert_eq!(report.outcome, ExactBlockRetryOutcome::Accepted(busy_peer));
+        assert_eq!(attempts, vec![canonical; 4]);
+        let mut statistics = SessionStatistics::new(&[]);
+        record_exact_retry_report(&mut statistics, &report);
+        assert_eq!(statistics.blocks_found, 1);
+        assert_eq!(statistics.stale_submissions, 0);
+        assert_eq!(statistics.abandoned_submissions, 0);
+    }
+
+    #[test]
+    fn disconnect_retry_reconnects_and_accepts_the_exact_block() {
+        let block = retry_test_block();
+        let canonical = cmfd_consensus::encode_block(&block).unwrap();
+        let block_id = block.block_id();
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let base = Instant::now();
+        let elapsed = AtomicU64::new(0);
+        let mut attempts = Vec::new();
+        let mut calls = 0_u8;
+        let report = retry_exact_block_with(
+            &[peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_secs(1)).unwrap(),
+            &AtomicBool::new(false),
+            |_, candidate, _| {
+                attempts.push(cmfd_consensus::encode_block(&candidate).unwrap());
+                calls += 1;
+                if calls > 1 {
+                    ExactBlockSubmissionAttempt::Response(retry_result(
+                        &candidate,
+                        BlockSubmissionStatus::Accepted,
+                        block_id,
+                    ))
+                } else {
+                    ExactBlockSubmissionAttempt::Disconnected("test disconnect".to_owned())
+                }
+            },
+            |_, _| {
+                elapsed.fetch_add(1, Ordering::AcqRel);
+                true
+            },
+            || {
+                base.checked_add(Duration::from_millis(elapsed.load(Ordering::Acquire)))
+                    .unwrap()
+            },
+        );
+        assert_eq!(report.outcome, ExactBlockRetryOutcome::Accepted(peer));
+        assert_eq!(report.disconnects, 1);
+        assert_eq!(attempts, vec![canonical.clone(), canonical]);
+    }
+
+    #[test]
+    fn stop_during_reconnect_exits_without_classifying_the_inflight_attempt() {
+        let block = retry_test_block();
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker = thread::spawn(move || {
+            let base = Instant::now();
+            let mut calls = 0_u8;
+            retry_exact_block_with(
+                &[peer],
+                None,
+                &block,
+                base.checked_add(Duration::from_secs(5)).unwrap(),
+                &worker_shutdown,
+                |_, _, _| {
+                    calls += 1;
+                    if calls == 1 {
+                        ExactBlockSubmissionAttempt::Disconnected("initial disconnect".to_owned())
+                    } else {
+                        worker_entered.wait();
+                        worker_release.wait();
+                        ExactBlockSubmissionAttempt::Disconnected(
+                            "reconnect interrupted".to_owned(),
+                        )
+                    }
+                },
+                |_, _| true,
+                Instant::now,
+            )
+        });
+
+        entered.wait();
+        shutdown.store(true, Ordering::Release);
+        release.wait();
+        let report = worker.join().unwrap();
+        assert_eq!(report.outcome, ExactBlockRetryOutcome::Stopped);
+        assert_eq!(report.disconnects, 1);
+        let mut statistics = SessionStatistics::new(&[]);
+        record_exact_retry_report(&mut statistics, &report);
+        assert_eq!(statistics.blocks_found, 0);
+        assert_eq!(statistics.stale_submissions, 0);
+        assert_eq!(statistics.abandoned_submissions, 0);
+        assert_eq!(statistics.submission_disconnects, 1);
+        assert_eq!(statistics.submission_protocol_errors, 0);
+    }
+
+    #[test]
+    fn wrong_response_id_is_protocol_telemetry_not_cryptographic_rejection() {
+        let block = retry_test_block();
+        let parent = block.challenge.previous_block;
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let base = Instant::now();
+        let report = retry_exact_block_with(
+            &[peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_secs(1)).unwrap(),
+            &AtomicBool::new(false),
+            |_, candidate, _| {
+                let mut result = retry_result(&candidate, BlockSubmissionStatus::Accepted, parent);
+                result.block_id[0] ^= 1;
+                ExactBlockSubmissionAttempt::Response(result)
+            },
+            |_, _| panic!("protocol violation must not be retried as Busy"),
+            || base,
+        );
+        assert!(matches!(
+            report.outcome,
+            ExactBlockRetryOutcome::ProtocolViolation { peer: actual, .. } if actual == peer
+        ));
+        assert_eq!(report.protocol_violations, 1);
+        let mut statistics = SessionStatistics::new(&[]);
+        record_exact_retry_report(&mut statistics, &report);
+        assert_eq!(statistics.submission_protocol_errors, 1);
+        assert_eq!(statistics.submission_disconnects, 0);
+        assert_eq!(statistics.stale_jobs, 0);
+        assert_eq!(statistics.stale_submissions, 0);
+        assert_eq!(statistics.abandoned_submissions, 0);
+        assert_eq!(statistics.blocks_found, 0);
+    }
+
+    #[test]
+    fn malformed_response_and_disconnect_remain_distinct_retry_diagnostics() {
+        let block = retry_test_block();
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let base = Instant::now();
+        let malformed = retry_exact_block_with(
+            &[peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_secs(1)).unwrap(),
+            &AtomicBool::new(false),
+            |_, _, _| {
+                ExactBlockSubmissionAttempt::ProtocolViolation(
+                    "peer frame magic is invalid".to_owned(),
+                )
+            },
+            |_, _| panic!("malformed response must not be retried as a disconnect"),
+            || base,
+        );
+        assert_eq!(malformed.protocol_violations, 1);
+        assert_eq!(malformed.disconnects, 0);
+        assert!(matches!(
+            malformed.outcome,
+            ExactBlockRetryOutcome::ProtocolViolation { .. }
+        ));
+
+        let elapsed = AtomicU64::new(0);
+        let disconnected = retry_exact_block_with(
+            &[peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_millis(1)).unwrap(),
+            &AtomicBool::new(false),
+            |_, _, _| ExactBlockSubmissionAttempt::Disconnected("connection closed".to_owned()),
+            |duration, _| {
+                elapsed.fetch_add(duration.as_millis() as u64, Ordering::AcqRel);
+                true
+            },
+            || {
+                base.checked_add(Duration::from_millis(elapsed.load(Ordering::Acquire)))
+                    .unwrap()
+            },
+        );
+        assert_eq!(disconnected.protocol_violations, 0);
+        assert_eq!(disconnected.disconnects, 1);
+        assert_eq!(
+            disconnected.outcome,
+            ExactBlockRetryOutcome::BudgetExhausted
+        );
+    }
+
+    #[test]
+    fn exact_block_retry_aborts_when_the_peer_tip_changes() {
+        let block = retry_test_block();
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let changed_tip = [0x91; 32];
+        let base = Instant::now();
+        let report = retry_exact_block_with(
+            &[peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_secs(1)).unwrap(),
+            &AtomicBool::new(false),
+            |_, candidate, _| {
+                ExactBlockSubmissionAttempt::Response(retry_result(
+                    &candidate,
+                    BlockSubmissionStatus::Busy,
+                    changed_tip,
+                ))
+            },
+            |_, _| panic!("tip change must not wait or retry"),
+            || base,
+        );
+        assert_eq!(report.outcome, ExactBlockRetryOutcome::Stale(changed_tip));
+    }
+
+    #[test]
+    fn exact_block_retry_budget_expires_without_wall_clock_sleep() {
+        let block = retry_test_block();
+        let parent = block.challenge.previous_block;
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let base = Instant::now();
+        let elapsed = AtomicU64::new(0);
+        let mut attempts = 0_u64;
+        let report = retry_exact_block_with(
+            &[peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_millis(5)).unwrap(),
+            &AtomicBool::new(false),
+            |_, candidate, _| {
+                attempts += 1;
+                ExactBlockSubmissionAttempt::Response(retry_result(
+                    &candidate,
+                    BlockSubmissionStatus::Busy,
+                    parent,
+                ))
+            },
+            |duration, _| {
+                elapsed.fetch_add(duration.as_millis() as u64, Ordering::AcqRel);
+                true
+            },
+            || {
+                base.checked_add(Duration::from_millis(elapsed.load(Ordering::Acquire)))
+                    .unwrap()
+            },
+        );
+        assert_eq!(report.outcome, ExactBlockRetryOutcome::BudgetExhausted);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn busy_retry_budget_exhaustion_is_abandonment_not_rejection() {
+        assert_eq!(FOUND_BLOCK_RETRY_BUDGET, Duration::from_secs(20 * 60));
+        let mut statistics = SessionStatistics::new(&[]);
+        let report =
+            exact_block_retry_report(ExactBlockRetryOutcome::BudgetExhausted, 0, 0, None, None);
+        record_exact_retry_report(&mut statistics, &report);
+        assert_eq!(statistics.abandoned_submissions, 1);
+        assert_eq!(statistics.stale_submissions, 0);
+        assert_eq!(statistics.stale_jobs, 0);
+        assert_eq!(statistics.blocks_found, 0);
+    }
+
+    #[test]
+    fn exact_block_retry_wait_is_interruptible_by_stop() {
+        let block = retry_test_block();
+        let parent = block.challenge.previous_block;
+        let peer: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let base = Instant::now();
+        let shutdown = AtomicBool::new(false);
+        let report = retry_exact_block_with(
+            &[peer],
+            None,
+            &block,
+            base.checked_add(Duration::from_secs(1)).unwrap(),
+            &shutdown,
+            |_, candidate, _| {
+                ExactBlockSubmissionAttempt::Response(retry_result(
+                    &candidate,
+                    BlockSubmissionStatus::Busy,
+                    parent,
+                ))
+            },
+            |_, shutdown| {
+                shutdown.store(true, Ordering::Release);
+                false
+            },
+            || base,
+        );
+        assert_eq!(report.outcome, ExactBlockRetryOutcome::Stopped);
+        assert!(shutdown.load(Ordering::Acquire));
+        let mut statistics = SessionStatistics::new(&[]);
+        record_exact_retry_report(&mut statistics, &report);
+        assert_eq!(statistics.blocks_found, 0);
+        assert_eq!(statistics.stale_submissions, 0);
+        assert_eq!(statistics.abandoned_submissions, 0);
+    }
+
+    #[test]
     fn only_an_active_tip_acknowledgement_counts_as_a_mined_block() {
         let block_id = [7; 32];
         let active = cmfd_node::peer::BlockSubmissionResult {
@@ -3246,10 +3937,11 @@ mod tests {
             peer_tip: [6; 32],
             ..active
         };
-        assert!(block_is_retryable_busy(&busy, [6; 32]));
-        assert!(!block_is_retryable_busy(&busy, [5; 32]));
+        assert!(block_is_retryable_busy(&busy, block_id, [6; 32]));
+        assert!(!block_is_retryable_busy(&busy, block_id, [5; 32]));
+        assert!(!block_is_retryable_busy(&busy, [9; 32], [6; 32]));
         assert!(
-            block_is_retryable_busy(&busy, [6; 32])
+            block_is_retryable_busy(&busy, block_id, [6; 32])
                 && !block_is_active_acknowledgement(&rejected, block_id),
             "a busy peer on the exact parent must keep the candidate alive even when another peer rejects it"
         );

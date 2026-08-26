@@ -588,6 +588,58 @@ impl ForgeMatrixV2Reference {
         Ok(())
     }
 
+    /// Rejects every cheaply decidable compact-envelope, transcript-binding,
+    /// and target failure before any matrix replay. Every check is also
+    /// enforced by [`Self::verify_compact`]; the consensus wrapper invokes
+    /// both paths, keeping admission and consensus validity identical.
+    pub(crate) fn preflight_compact(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixV2CompactProof,
+    ) -> Result<(), ForgeMatrixV2Error> {
+        if block.network_id != self.descriptor.network_id {
+            return Err(ForgeMatrixV2Error::WrongNetwork);
+        }
+        if proof.algorithm_version != self.descriptor.algorithm_version {
+            return Err(ForgeMatrixV2Error::AlgorithmVersion);
+        }
+        if proof.proof_version != self.descriptor.proof_version {
+            return Err(ForgeMatrixV2Error::ProofVersion);
+        }
+        if proof.model_manifest_digest != self.descriptor.model.digest()? {
+            return Err(ForgeMatrixV2Error::ModelManifestDigest);
+        }
+
+        let (challenge, work_digest) =
+            self.claimed_compact_digests(block, proof.nonce, proof.final_activation_digest)?;
+        if proof.challenge_digest != challenge {
+            return Err(ForgeMatrixV2Error::ChallengeMismatch);
+        }
+        if proof.work_digest != work_digest {
+            return Err(ForgeMatrixV2Error::WorkDigest);
+        }
+        if proof.work_digest > block.target {
+            return Err(ForgeMatrixV2Error::HighHash);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claimed_compact_digests(
+        &self,
+        block: &BlockChallenge,
+        nonce: u64,
+        final_activation_digest: [u8; 32],
+    ) -> Result<([u8; 32], [u8; 32]), ForgeMatrixV2Error> {
+        let challenge = challenge_digest(&self.descriptor, block, nonce)?;
+        let work_digest = work_digest_from_roots(
+            challenge,
+            self.descriptor.model.raw_blake3_root,
+            self.descriptor.model.pcs_commitment_root,
+            final_activation_digest,
+        );
+        Ok((challenge, work_digest))
+    }
+
     /// Recomputes every matrix layer and committed digest without applying a
     /// target. Consensus callers must still use [`Self::verify_compact`] for
     /// block validation.

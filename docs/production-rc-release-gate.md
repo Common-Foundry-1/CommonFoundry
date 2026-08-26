@@ -150,6 +150,34 @@ the model artifacts once at startup, so this is still not a single global
 artifact load, but ProductionV3 proof verification itself is external-only and
 bounded by the persistent-worker controls.
 
+Remote ProductionV3 submission is additionally bounded by an eight-session
+active-plus-waiting FIFO with a 60-second admission limit. The shared proof
+queue remains one active/eight normal waiters with a five-second queue limit,
+while locally found blocks retain a separate two-waiter priority lane. Cached
+proofs still take their remote FIFO turn. Node status exposes per-class active,
+queued, wait, rejection, and post-dispatch proof-failure counters plus the
+remote capacity and wait limit.
+
+The release protocol fixes one end-to-end `SubmitBlock` contract: mining and
+relay clients wait up to 120 seconds, server acceptance ends at 110 seconds,
+and the server response cutoff is 115 seconds. Disconnect/deadline and commit
+race through one atomic `Active -> Cancelled | Committing` transition at the
+durable append boundary. Cancellation wins without mutation; committing wins
+only after a post-CAS deadline recheck and by completing durability and state
+commit or latching a storage fault.
+The 115-second cutoff covers the status lock, serialization, and every socket
+write. Queue expiry, capacity exhaustion, and worker restart/unavailability
+produce retryable `Busy`; cryptographic invalidity produces `Rejected`. The
+miner retains the identical ProductionV3 block and proof across compatible
+reconnects for one interruptible 20-minute total budget; `Busy` alone never
+causes a fresh template. Tip changes and budget abandonment have separate
+logs and counters. Shutdown interrupts bounded connect attempts, handshake,
+request writes, response reads, and retry waits. Transport disconnect and peer
+protocol-error telemetry are separate from cryptographic rejection. A faulted
+generation is restarted only by the single-flight supervisor outside the
+remote request, cannot resurrect after terminal close, and is not admitted
+until startup authentication has succeeded.
+
 The current 2 GiB worker memory-limit default is a containment setting, not a
 qualified production requirement. The final Windows and Linux package smoke
 must authenticate the real bank under the configured job/address-space limit,

@@ -207,6 +207,49 @@ impl ForgeMatrixVerifier {
         Ok(stats)
     }
 
+    /// Rejects every cheaply decidable envelope, binding, and target failure
+    /// before the matrix relation is evaluated. Every check is also enforced
+    /// by [`Self::verify`]; the consensus wrapper invokes both paths, so using
+    /// this as an admission gate cannot create a second validity rule.
+    pub(crate) fn preflight(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixProof,
+    ) -> Result<(), ForgeMatrixError> {
+        if proof.algorithm_version != self.profile.algorithm_version {
+            return Err(ForgeMatrixError::AlgorithmVersion);
+        }
+        if proof.model_version != self.profile.model_version {
+            return Err(ForgeMatrixError::ModelVersion);
+        }
+        if proof.model_root != self.model_root {
+            return Err(ForgeMatrixError::ModelRoot);
+        }
+
+        let expected_work = self.claimed_work_digest(block, proof.nonce, proof.output_digest);
+        if proof.work_digest != expected_work {
+            return Err(ForgeMatrixError::WorkDigest);
+        }
+        if !meets_target(&proof.work_digest, &block.target) {
+            return Err(ForgeMatrixError::HighHash);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claimed_work_digest(
+        &self,
+        block: &BlockChallenge,
+        nonce: u64,
+        output_digest: [u8; 32],
+    ) -> [u8; 32] {
+        let challenge = challenge_digest(&self.profile, self.model_root, block, nonce);
+        let mut work_hasher = Hasher::new_derive_key(WORK_DOMAIN);
+        work_hasher.update(&challenge);
+        work_hasher.update(&self.model_root);
+        work_hasher.update(&output_digest);
+        *work_hasher.finalize().as_bytes()
+    }
+
     /// Recomputes the complete committed ForgeMatrix relation without
     /// interpreting any proof target. Consensus callers must still use
     /// [`Self::verify`] when deciding whether a block is valid.

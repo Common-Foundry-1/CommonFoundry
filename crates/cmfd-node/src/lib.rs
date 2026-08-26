@@ -10,6 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
+#[cfg(any(test, feature = "production-v3"))]
+use cmfd_consensus::PowParameters;
 use cmfd_consensus::chain::ValidatedBlock;
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, COIN, ChainError,
@@ -38,9 +40,6 @@ use primitive_types::U512;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
-
-#[cfg(test)]
-use cmfd_consensus::PowParameters;
 
 pub mod logging;
 pub mod network_info;
@@ -137,6 +136,29 @@ pub fn compiled_production_v3_worker_sha256() -> Result<[u8; 32], NodeError> {
         ));
     }
     Ok(digest)
+}
+
+fn install_external_proof_verifier(
+    profile: NetworkProfile,
+    block_preverifier: &BlockPreverifier,
+    config: VerifierWorkerConfig,
+) -> Result<(), NodeError> {
+    let configured_for_v3 = config.production_v3_artifacts.is_some();
+    if configured_for_v3 != matches!(profile.proof, ProofProfile::ProductionV3) {
+        return Err(NodeError::ProofVerifierProfileMismatch);
+    }
+    if configured_for_v3 {
+        let expected = compiled_production_v3_worker_sha256()?;
+        if config.worker_sha256 != expected {
+            return Err(NodeError::ProofVerifierWorker(
+                VerifierWorkerError::Process(ProofWorkerError::HashMismatch {
+                    component: "compiled production verifier worker",
+                }),
+            ));
+        }
+    }
+    block_preverifier.use_external_worker(config, profile.network_id)?;
+    Ok(())
 }
 
 const METADATA_FILE: &str = "network.meta";
@@ -1630,6 +1652,10 @@ struct IndexedBlock {
     accepted_at: u64,
     canonical: Vec<u8>,
     cumulative_work: U512,
+    /// Process-local evidence that this exact proof was accepted. Production
+    /// entries always carry it; Devnet entries may use their in-process V2
+    /// verifier instead.
+    preverified: Option<PreverifiedBlockProof>,
 }
 
 #[derive(Debug)]
@@ -1710,6 +1736,7 @@ struct PreparedBlock {
     accepted_at: u64,
     canonical: Vec<u8>,
     cumulative_work: U512,
+    preverified: Option<PreverifiedBlockProof>,
     candidate: ValidatedCandidate,
 }
 
@@ -1718,6 +1745,18 @@ struct BlockPreparationContext<'a> {
     verifier: &'a ConsensusPowVerifier,
     accepted_at: u64,
     preverified: Option<&'a PreverifiedBlockProof>,
+}
+
+fn requires_external_preverification(params: &NetworkParams) -> bool {
+    #[cfg(feature = "production-v3")]
+    {
+        matches!(params.pow, PowParameters::V3Candidate(_))
+    }
+    #[cfg(not(feature = "production-v3"))]
+    {
+        let _ = params;
+        false
+    }
 }
 
 pub(crate) fn network_params_and_verifier_for_profile(
@@ -1844,10 +1883,27 @@ impl Node {
         data_dir: impl AsRef<Path>,
         production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
     ) -> Result<Self, NodeError> {
-        Self::open_with_profile_and_artifacts(
+        Self::open_with_profile_artifacts_and_worker(
             data_dir,
             COMPILED_NETWORK_PROFILE,
             production_v3_artifacts,
+            None,
+        )
+    }
+
+    /// Opens the compiled network with a verifier worker installed before any
+    /// stored block is replayed. ProductionV3 requires this entry point so the
+    /// parent never verifies a production proof in-process.
+    pub fn open_with_artifacts_and_verifier_worker(
+        data_dir: impl AsRef<Path>,
+        production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+        verifier_worker: VerifierWorkerConfig,
+    ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_and_worker(
+            data_dir,
+            COMPILED_NETWORK_PROFILE,
+            production_v3_artifacts,
+            Some(verifier_worker),
         )
     }
 
@@ -1870,8 +1926,29 @@ impl Node {
         profile: NetworkProfile,
         production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
     ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_and_worker(
+            data_dir,
+            profile,
+            production_v3_artifacts,
+            None,
+        )
+    }
+
+    fn open_with_profile_artifacts_and_worker(
+        data_dir: impl AsRef<Path>,
+        profile: NetworkProfile,
+        production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+        verifier_worker: Option<VerifierWorkerConfig>,
+    ) -> Result<Self, NodeError> {
         let (params, verifier) =
             network_params_and_verifier_for_profile(profile, production_v3_artifacts)?;
+        let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
+        let external_replay = verifier_worker.is_some();
+        if let Some(config) = verifier_worker {
+            install_external_proof_verifier(profile, &block_preverifier, config)?;
+        } else if matches!(profile.proof, ProofProfile::ProductionV3) {
+            return Err(NodeError::ProductionV3Unavailable);
+        }
         let data_dir = data_dir.as_ref().to_path_buf();
         let lock = DataDirLock::acquire(&data_dir)?;
         let fingerprint = params.fingerprint()?;
@@ -1879,7 +1956,6 @@ impl Node {
         let (wallet_signing_key, legacy_shared_wallet) =
             load_or_create_wallet_key(&data_dir, metadata)?;
 
-        let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
         let mut state = ChainState::new(params, verifier.clone())?;
         let mut index = BlockIndex::new(params.genesis_hash);
         replay_log(
@@ -1889,6 +1965,7 @@ impl Node {
             &verifier,
             params,
             params.network_id,
+            external_replay.then_some(&block_preverifier),
         )?;
         if metadata != MetadataState::Current {
             write_metadata(&data_dir, fingerprint, metadata)?;
@@ -1971,23 +2048,10 @@ impl Node {
         &mut self,
         config: VerifierWorkerConfig,
     ) -> Result<(), NodeError> {
-        let configured_for_v3 = config.production_v3_artifacts.is_some();
-        if configured_for_v3 != matches!(self.profile.proof, ProofProfile::ProductionV3) {
-            return Err(NodeError::ProofVerifierProfileMismatch);
+        if matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            return Err(NodeError::ProductionV3Unavailable);
         }
-        if configured_for_v3 {
-            let expected = compiled_production_v3_worker_sha256()?;
-            if config.worker_sha256 != expected {
-                return Err(NodeError::ProofVerifierWorker(
-                    VerifierWorkerError::Process(ProofWorkerError::HashMismatch {
-                        component: "compiled production verifier worker",
-                    }),
-                ));
-            }
-        }
-        self.block_preverifier
-            .use_external_worker(config, self.profile.network_id)?;
-        Ok(())
+        install_external_proof_verifier(self.profile, &self.block_preverifier, config)
     }
 
     pub fn wallet_destination(&self) -> [u8; 32] {
@@ -3245,6 +3309,9 @@ fn prepare_block(
         accepted_at,
         preverified,
     } = context;
+    if requires_external_preverification(&params) && preverified.is_none() {
+        return Err(NodeError::ProductionV3Unavailable);
+    }
     let block_id = block.block_id();
     if index.contains(block_id) {
         return Err(NodeError::DuplicateBlock(block_id));
@@ -3287,6 +3354,7 @@ fn prepare_block(
         accepted_at,
         canonical,
         cumulative_work,
+        preverified: preverified.cloned(),
         candidate,
     })
 }
@@ -3313,18 +3381,33 @@ fn rebuild_state_to(
                 "indexed block metadata does not match its canonical frame".to_owned(),
             ));
         }
-        state
-            .validate_and_apply(
-                &block,
-                BlockValidationContext {
-                    now_unix_seconds: entry.accepted_at,
-                },
-            )
-            .map_err(|error| {
+        let context = BlockValidationContext {
+            now_unix_seconds: entry.accepted_at,
+        };
+        let validated = match entry.preverified.as_ref() {
+            Some(preverified) => state
+                .validate_block_preverified(&block, context, preverified)
+                .map_err(|error| {
+                    NodeError::CorruptLog(format!(
+                        "indexed side branch fails preverified consensus replay: {error}"
+                    ))
+                })?,
+            None if requires_external_preverification(&params) => {
+                return Err(NodeError::CorruptLog(
+                    "production side branch is missing external proof evidence".to_owned(),
+                ));
+            }
+            None => state.validate_block(&block, context).map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "indexed side branch fails full consensus replay: {error}"
                 ))
-            })?;
+            })?,
+        };
+        state.commit_validated(validated).map_err(|error| {
+            NodeError::CorruptLog(format!(
+                "indexed side branch cannot commit replayed state: {error}"
+            ))
+        })?;
     }
     Ok(state)
 }
@@ -3372,6 +3455,7 @@ fn commit_prepared(
             accepted_at: prepared.accepted_at,
             canonical: prepared.canonical,
             cumulative_work: prepared.cumulative_work,
+            preverified: prepared.preverified,
         },
     );
     if previous.is_some() {
@@ -4471,6 +4555,7 @@ fn replay_log(
     verifier: &ConsensusPowVerifier,
     params: NetworkParams,
     network_id: [u8; 32],
+    external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<(), NodeError> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -4545,6 +4630,21 @@ fn replay_log(
                 "record {record_index} is not canonical"
             )));
         }
+        let preverified = if let Some(preverifier) = external_preverifier {
+            match preverifier.preverify(&block) {
+                Ok(preverified) => Some(preverified),
+                Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(error))) => {
+                    return Err(NodeError::CorruptLog(format!(
+                        "record {record_index} proof is rejected during external replay: {error}"
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
+        } else if requires_external_preverification(&params) {
+            return Err(NodeError::ProductionV3Unavailable);
+        } else {
+            None
+        };
         let prepared = prepare_block(
             state,
             index,
@@ -4554,7 +4654,7 @@ fn replay_log(
                 params,
                 verifier,
                 accepted_at,
-                preverified: None,
+                preverified: preverified.as_ref(),
             },
         )
         .map_err(|error| {

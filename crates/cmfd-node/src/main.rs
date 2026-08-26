@@ -662,11 +662,22 @@ fn open_node(
     production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
     verifier_worker: Option<&VerifierWorkerConfig>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    let mut node = Node::open_with_artifacts(data_dir, production_v3_artifacts)?;
-    if let Some(config) = verifier_worker {
-        node.use_external_proof_verifier(config.clone())?;
+    match (production_v3_artifacts, verifier_worker) {
+        (Some(artifacts), Some(worker)) => Ok(Node::open_with_artifacts_and_verifier_worker(
+            data_dir,
+            Some(artifacts),
+            worker.clone(),
+        )?),
+        (None, Some(worker)) => {
+            let mut node = Node::open_with_artifacts(data_dir, None)?;
+            node.use_external_proof_verifier(worker.clone())?;
+            Ok(node)
+        }
+        (None, None) => Ok(Node::open_with_artifacts(data_dir, None)?),
+        (Some(_), None) => {
+            Err("ProductionV3 requires its proof-verifier worker before block-log replay".into())
+        }
     }
-    Ok(node)
 }
 
 fn peer_address_policy(allow_public_peers: bool) -> PeerAddressPolicy {

@@ -162,16 +162,18 @@ fn start_embedded_node<R: Runtime>(
     })?;
     let data_dir = wallet_data_dir(&app_data_root, COMPILED_NETWORK_PROFILE);
     let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
-    let mut node = open_with_artifact_gate(
-        &data_dir,
-        COMPILED_NETWORK_PROFILE,
-        &security,
-        |data_dir, artifacts| Node::open_with_artifacts(data_dir, artifacts),
-    )?;
-    if let Some(worker) = security.verifier_worker {
-        node.use_external_proof_verifier(worker)
-            .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
+    let PreparedNodeSecurity {
+        production_v3_artifacts,
+        verifier_worker,
+    } = security;
+    let node = match (production_v3_artifacts.as_ref(), verifier_worker) {
+        (Some(artifacts), Some(worker)) => {
+            Node::open_with_artifacts_and_verifier_worker(&data_dir, Some(artifacts), worker)
+        }
+        (None, None) => Node::open_with_artifacts(&data_dir, None),
+        _ => Err(NodeError::ProofVerifierProfileMismatch),
     }
+    .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
     let shared = Arc::new(Mutex::new(node));
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
         startup_error(
@@ -474,6 +476,7 @@ fn sanitize_worker_configuration_error(
     )
 }
 
+#[cfg(test)]
 fn open_with_artifact_gate<T>(
     data_dir: &Path,
     profile: NetworkProfile,

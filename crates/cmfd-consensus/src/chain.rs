@@ -21,8 +21,8 @@ use crate::{
 mod state_delta;
 
 pub use state_delta::{
-    DecodedReversibleStateDelta, MAX_REVERSIBLE_STATE_DELTA_BYTES, ReversibleStateDeltaError,
-    ValidatedReversibleStateDelta,
+    DecodedReversibleStateDelta, MAX_REVERSIBLE_STATE_DELTA_BYTES, ReversibleStateDeltaCapability,
+    ReversibleStateDeltaError, ValidatedReversibleStateDelta,
 };
 
 const TX_SIGNING_DOMAIN: &str = "CMFD/TRANSACTION/SIGNING/V1";

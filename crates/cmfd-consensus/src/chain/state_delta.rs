@@ -17,6 +17,8 @@ const REVERSIBLE_STATE_DELTA_MAGIC: [u8; 8] = *b"CMFDRSD\0";
 const REVERSIBLE_STATE_DELTA_VERSION: u32 = 1;
 const REVERSIBLE_STATE_DELTA_LOCAL_INTEGRITY_DOMAIN: &str =
     "CMFD/REVERSIBLE-STATE-DELTA/LOCAL-INTEGRITY/V1";
+const REVERSIBLE_STATE_DELTA_CAPABILITY_DOMAIN: &str =
+    "CMFD/REVERSIBLE-STATE-DELTA/VALIDATION-CAPABILITY/V1";
 
 const OUTPOINT_BYTES: usize = 32 + 4;
 const TX_OUTPUT_BYTES: usize = 8 + 1 + 32 + 8;
@@ -94,6 +96,22 @@ pub struct DecodedReversibleStateDelta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedReversibleStateDelta(ReversibleStateDelta);
 
+/// Small process-local evidence binding one fully validated transition to its
+/// exact canonical reversible-delta bytes.
+///
+/// The fields and constructor are private, and this type implements neither
+/// serialization nor `Clone`. It lets a bounded state walker retain only a
+/// validation-issued digest across a descendant traversal, then re-read and
+/// authenticate the full delta immediately before undoing that edge.
+#[derive(Debug)]
+pub struct ReversibleStateDeltaCapability {
+    network_fingerprint: [u8; 32],
+    base_tip: [u8; 32],
+    child_tip: [u8; 32],
+    canonical_len: usize,
+    canonical_digest: [u8; 32],
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ReversibleStateDeltaError {
     #[error("network parameters are invalid: {0}")]
@@ -150,6 +168,22 @@ impl ValidatedBlock {
         Ok(ValidatedReversibleStateDelta(
             ReversibleStateDelta::from_validated(self)?,
         ))
+    }
+
+    /// Issues a compact, non-serializable capability for the exact canonical
+    /// reversible delta derived by this full block validation.
+    pub fn reversible_state_delta_capability(
+        &self,
+    ) -> Result<ReversibleStateDeltaCapability, ReversibleStateDeltaError> {
+        let delta = ReversibleStateDelta::from_validated(self)?;
+        let canonical = delta.encode()?;
+        Ok(ReversibleStateDeltaCapability {
+            network_fingerprint: delta.network_fingerprint,
+            base_tip: delta.base_tip,
+            child_tip: delta.child_tip,
+            canonical_len: canonical.len(),
+            canonical_digest: capability_digest(&canonical),
+        })
     }
 }
 
@@ -298,6 +332,37 @@ impl DecodedReversibleStateDelta {
         }
         Ok(ValidatedReversibleStateDelta(expected))
     }
+
+    /// Promotes re-read canonical bytes using a compact capability previously
+    /// issued by full validation of this exact edge.
+    ///
+    /// This does not replace [`Self::promote_exact`] at initial disk
+    /// authentication. It exists so a DFS state walker can discard the large
+    /// promoted delta while visiting descendants, then re-read it and recover
+    /// the validated undo token without retaining up to one MiB per depth.
+    pub fn promote_capability(
+        self,
+        capability: ReversibleStateDeltaCapability,
+    ) -> Result<ValidatedReversibleStateDelta, ReversibleStateDeltaError> {
+        if self.delta.network_fingerprint != capability.network_fingerprint
+            || self.delta.base_tip != capability.base_tip
+            || self.delta.child_tip != capability.child_tip
+            || self.canonical_bytes.len() != capability.canonical_len
+            || capability_digest(&self.canonical_bytes) != capability.canonical_digest
+        {
+            return Err(ReversibleStateDeltaError::ValidationMismatch);
+        }
+        Ok(ValidatedReversibleStateDelta(self.delta))
+    }
+}
+
+fn capability_digest(canonical: &[u8]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(REVERSIBLE_STATE_DELTA_CAPABILITY_DOMAIN);
+    let canonical_len = u64::try_from(canonical.len())
+        .expect("canonical reversible state deltas are bounded below u64::MAX");
+    hasher.update(&canonical_len.to_le_bytes());
+    hasher.update(canonical);
+    *hasher.finalize().as_bytes()
 }
 
 impl ReversibleStateDelta {
@@ -1124,6 +1189,25 @@ mod tests {
         (base, child)
     }
 
+    fn validated_from_delta(delta: &ReversibleStateDelta) -> ValidatedBlock {
+        ValidatedBlock {
+            params: params(),
+            base_tip: delta.base_tip,
+            base_next_height: delta.base_next_height,
+            base_expected_target: delta.base_expected_target,
+            base_median_time_past: delta.base_median_time_past,
+            base_history_len: usize::try_from(delta.base_history_len).unwrap(),
+            base_timestamp_len: usize::try_from(delta.base_timestamp_len).unwrap(),
+            delta: delta.delta.clone(),
+            fees: delta.fees,
+            timestamp: delta.timestamp,
+            effective_timestamp: delta.effective_timestamp,
+            target: delta.target,
+            next_tip: delta.child_tip,
+            next_height: delta.child_next_height,
+        }
+    }
+
     fn assert_state_eq(left: &ChainState, right: &ChainState) {
         assert_eq!(left.params, right.params);
         assert_eq!(left.utxos.outputs, right.utxos.outputs);
@@ -1155,6 +1239,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.delta, sample_delta(false));
+    }
+
+    #[test]
+    fn validation_capability_binds_exact_bytes_network_and_edge_and_is_consumed() {
+        let delta = sample_delta(false);
+        let validated = validated_from_delta(&delta);
+        let canonical = delta.encode().unwrap();
+        let decoded = DecodedReversibleStateDelta::decode_bound(
+            &canonical,
+            &params(),
+            delta.base_tip,
+            delta.child_tip,
+        )
+        .unwrap();
+        let promoted = decoded
+            .promote_capability(validated.reversible_state_delta_capability().unwrap())
+            .unwrap();
+        let (base, mut child) = child_state(&delta);
+        child.undo_reversible_state_delta(promoted).unwrap();
+        assert_state_eq(&child, &base);
+
+        let mut same_edge_different_transition = delta.clone();
+        same_edge_different_transition.fees += 1;
+        let mismatched_capability = validated_from_delta(&same_edge_different_transition)
+            .reversible_state_delta_capability()
+            .unwrap();
+        let decoded = DecodedReversibleStateDelta::decode_bound(
+            &canonical,
+            &params(),
+            delta.base_tip,
+            delta.child_tip,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.promote_capability(mismatched_capability),
+            Err(ReversibleStateDeltaError::ValidationMismatch)
+        );
+
+        let mut different_edge = delta.clone();
+        different_edge.child_tip = [9; 32];
+        let cross_edge_capability = validated_from_delta(&different_edge)
+            .reversible_state_delta_capability()
+            .unwrap();
+        let decoded = DecodedReversibleStateDelta::decode_bound(
+            &canonical,
+            &params(),
+            delta.base_tip,
+            delta.child_tip,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.promote_capability(cross_edge_capability),
+            Err(ReversibleStateDeltaError::ValidationMismatch)
+        );
     }
 
     #[test]

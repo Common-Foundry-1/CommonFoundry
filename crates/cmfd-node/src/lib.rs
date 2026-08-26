@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use blake3::Hasher;
 #[cfg(any(test, feature = "production-v3"))]
 use cmfd_consensus::PowParameters;
-use cmfd_consensus::chain::ValidatedBlock;
+use cmfd_consensus::chain::{ReversibleStateDeltaCapability, ValidatedBlock};
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, COIN, ChainError,
     ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY,
@@ -186,6 +186,10 @@ const RECORD_CHECKSUM_BYTES: usize = 32;
 const RECORD_V1_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V1";
 const RECORD_V2_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V2";
 const RECORD_CHAIN_DIGEST_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD-CHAIN/V1";
+/// Legacy V1 records do not persist reversible deltas. Devnet startup derives
+/// and retains their canonical bytes only along the current DFS ancestry,
+/// with a temporary hard migration budget. Production V3 rejects V1 records.
+const MAX_LEGACY_REPLAY_UNDO_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// Fixed predecessor for the first V2 record in an empty block log.
 ///
 /// This is only a local corruption/reordering root. It is not a consensus
@@ -246,6 +250,17 @@ pub enum NodeError {
     InvalidWalletKey,
     #[error("block log is corrupt: {0}")]
     CorruptLog(String),
+    #[error(
+        "production V3 refuses legacy V1 block-log record {0}; migrate the log to authenticated V2 before activation"
+    )]
+    ProductionLegacyBlockLog(u64),
+    #[error(
+        "legacy V1 startup reconstruction at record {record_index} exceeds its temporary {maximum}-byte migration budget"
+    )]
+    LegacyReplayResourceLimit {
+        record_index: u64,
+        maximum: usize,
+    },
     #[error("system clock is before the Unix epoch")]
     InvalidSystemTime,
     #[error("no currently valid template timestamp exists; wait for wall clock time to catch up")]
@@ -370,6 +385,8 @@ impl NodeError {
             Self::FingerprintMismatch => ("fingerprint_mismatch", 409, false),
             Self::InvalidWalletKey => ("invalid_wallet_key", 500, false),
             Self::CorruptLog(_) => ("corrupt_block_log", 500, false),
+            Self::ProductionLegacyBlockLog(_) => ("production_legacy_block_log", 500, false),
+            Self::LegacyReplayResourceLimit { .. } => ("legacy_replay_resource_limit", 500, false),
             Self::InvalidSystemTime => ("invalid_system_time", 500, false),
             Self::TemplateTimeUnavailable => ("template_time_unavailable", 503, true),
             Self::InvalidMinerDestination => ("invalid_miner_destination", 400, false),
@@ -2343,21 +2360,6 @@ impl PreparedBlock {
 
     fn encode_reversible_state_delta(&self) -> Result<Vec<u8>, ReversibleStateDeltaError> {
         self.validated_block().encode_reversible_state_delta()
-    }
-
-    fn authenticate_reversible_state_delta(
-        &self,
-        bytes: &[u8],
-        params: &NetworkParams,
-    ) -> Result<(), ReversibleStateDeltaError> {
-        DecodedReversibleStateDelta::decode_bound(bytes, params, self.parent, self.block_id)?
-            .promote_exact(self.validated_block())?;
-        Ok(())
-    }
-
-    fn derive_reversible_state_delta(&self) -> Result<(), ReversibleStateDeltaError> {
-        self.validated_block().validated_reversible_state_delta()?;
-        Ok(())
     }
 }
 
@@ -4566,6 +4568,21 @@ fn rebuild_state_to(
     tip: [u8; 32],
 ) -> Result<ChainState, NodeError> {
     let mut state = ChainState::new(params, verifier.clone())?;
+    replay_indexed_state_to(&mut state, index, params, tip)?;
+    Ok(state)
+}
+
+fn replay_indexed_state_to(
+    state: &mut ChainState,
+    index: &BlockIndex,
+    params: NetworkParams,
+    tip: [u8; 32],
+) -> Result<(), NodeError> {
+    if state.tip() != index.genesis {
+        return Err(NodeError::CorruptLog(
+            "indexed replay must begin at virtual genesis".to_owned(),
+        ));
+    }
     for block_id in index.path_to(tip)? {
         let entry = index.blocks.get(&block_id).ok_or_else(|| {
             NodeError::CorruptLog("fork path refers to an absent block".to_owned())
@@ -4614,12 +4631,11 @@ fn rebuild_state_to(
             ));
         }
     }
-    Ok(state)
+    Ok(())
 }
 
 struct CommitOutcome {
     fees: u64,
-    branch_checkpoint: Option<BranchStateCheckpoint>,
 }
 
 fn commit_prepared(
@@ -4649,11 +4665,11 @@ fn commit_prepared(
         None
     };
 
-    let (fees, successor_header, branch_checkpoint) = match prepared.candidate {
+    let (fees, successor_header) = match prepared.candidate {
         ValidatedCandidate::Active(validated) => {
             let fees = active_state.commit_validated(validated)?;
             let successor_header = active_state.successor_header_preflight()?;
-            (fees, successor_header, None)
+            (fees, successor_header)
         }
         ValidatedCandidate::Branch {
             mut state,
@@ -4663,28 +4679,8 @@ fn commit_prepared(
             let successor_header = state.successor_header_preflight()?;
             if activates {
                 *active_state = *state;
-                (fees, successor_header, None)
-            } else {
-                let path = match externally_prepared_chain.take() {
-                    Some(path) => path,
-                    None => {
-                        let mut path = Vec::new();
-                        path.push(index.genesis);
-                        path.extend(index.path_to(prepared.parent)?);
-                        path.push(prepared.block_id);
-                        path
-                    }
-                };
-                (
-                    fees,
-                    successor_header,
-                    Some(BranchStateCheckpoint {
-                        block_id: prepared.block_id,
-                        state,
-                        path,
-                    }),
-                )
             }
+            (fees, successor_header)
         }
     };
 
@@ -4734,10 +4730,7 @@ fn commit_prepared(
         }
         index.active_work = prepared.cumulative_work;
     }
-    Ok(CommitOutcome {
-        fees,
-        branch_checkpoint,
-    })
+    Ok(CommitOutcome { fees })
 }
 
 #[derive(Debug)]
@@ -5883,6 +5876,55 @@ struct ParsedLogRecord {
     complete_digest: [u8; 32],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayRecordVersion {
+    LegacyV1,
+    V2,
+}
+
+struct ReplayRecordLocator {
+    offset: u64,
+    length: u64,
+    complete_digest: [u8; 32],
+}
+
+struct ReplayRecord {
+    record_index: u64,
+    accepted_at: u64,
+    block_id: [u8; 32],
+    parent: [u8; 32],
+    height: u64,
+    target: [u8; 32],
+    canonical: Arc<[u8]>,
+    version: ReplayRecordVersion,
+    locator: ReplayRecordLocator,
+}
+
+struct ScannedReplayLog {
+    records: Vec<ReplayRecord>,
+    children: HashMap<[u8; 32], Vec<usize>>,
+    last_record_digest: [u8; 32],
+    log_length: u64,
+}
+
+struct ReplayDfsFrame {
+    block_id: [u8; 32],
+    next_child: usize,
+    undo: Option<ReplayUndo>,
+}
+
+enum ReplayUndo {
+    LegacyV1 {
+        record_position: usize,
+        canonical_delta: Box<[u8]>,
+        capability: ReversibleStateDeltaCapability,
+    },
+    V2 {
+        record_position: usize,
+        capability: ReversibleStateDeltaCapability,
+    },
+}
+
 fn read_log_record(
     reader: &mut impl Read,
     path: &Path,
@@ -6020,27 +6062,430 @@ fn replay_log(
     network_id: [u8; 32],
     external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<[u8; 32], NodeError> {
-    let file = match File::open(path) {
+    let mut replayed_state = ChainState::new(params, verifier.clone())?;
+    let mut replayed_index = BlockIndex::new(params.genesis_hash);
+    let last_record_digest = replay_log_into(
+        path,
+        &mut replayed_state,
+        &mut replayed_index,
+        params,
+        network_id,
+        external_preverifier,
+    )?;
+    *state = replayed_state;
+    *index = replayed_index;
+    Ok(last_record_digest)
+}
+
+/// Reconstructs every logged fork with one mutable consensus state and a
+/// compact validation capability per V2 ancestry edge. This bounds expensive
+/// full-state retention; record-count/index and process RSS caps are enforced
+/// by later node resource policy, not by this traversal alone.
+fn replay_log_into(
+    path: &Path,
+    state: &mut ChainState,
+    index: &mut BlockIndex,
+    params: NetworkParams,
+    network_id: [u8; 32],
+    external_preverifier: Option<&BlockPreverifier>,
+) -> Result<[u8; 32], NodeError> {
+    if state.tip() != params.genesis_hash
+        || !index.blocks.is_empty()
+        || index.active_chain != [params.genesis_hash]
+        || index.active_work != U512::zero()
+    {
+        return Err(NodeError::CorruptLog(
+            "startup replay requires an empty genesis state and index".to_owned(),
+        ));
+    }
+
+    let scan_file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             return Ok(EMPTY_RECORD_CHAIN_ROOT);
         }
         Err(source) => return Err(io_error("open block log for replay", path, source)),
     };
+    let scanned = scan_replay_log(scan_file, path, params, network_id)?;
+    if scanned.records.is_empty() {
+        return Ok(scanned.last_record_digest);
+    }
+
+    let mut replay_file = File::open(path)
+        .map_err(|source| io_error("reopen block log for bounded replay", path, source))?;
+    if replay_file
+        .metadata()
+        .map_err(|source| io_error("inspect block log for bounded replay", path, source))?
+        .len()
+        != scanned.log_length
+    {
+        return Err(NodeError::CorruptLog(
+            "block log length changed during startup replay".to_owned(),
+        ));
+    }
+
+    let mut stack = vec![ReplayDfsFrame {
+        block_id: params.genesis_hash,
+        next_child: 0,
+        undo: None,
+    }];
+    let mut winning_tip = params.genesis_hash;
+    let mut winning_work = U512::zero();
+    let mut winning_record_index = u64::MAX;
+    let mut legacy_undo_stack_bytes = 0_usize;
+
+    while let Some(frame) = stack.last_mut() {
+        let next_record = scanned
+            .children
+            .get(&frame.block_id)
+            .and_then(|children| children.get(frame.next_child))
+            .copied();
+        if let Some(record_position) = next_record {
+            frame.next_child = frame.next_child.checked_add(1).ok_or_else(|| {
+                NodeError::CorruptLog("startup replay child counter overflowed".to_owned())
+            })?;
+            let record = scanned.records.get(record_position).ok_or_else(|| {
+                NodeError::CorruptLog("startup replay child locator is invalid".to_owned())
+            })?;
+            if state.tip() != record.parent {
+                return Err(NodeError::CorruptLog(format!(
+                    "record {} DFS parent state is inconsistent",
+                    record.record_index
+                )));
+            }
+            let reread = reread_replay_record(&mut replay_file, path, record)?;
+            let block = decode_block(&reread.block_bytes, network_id).map_err(|error| {
+                NodeError::CorruptLog(format!(
+                    "record {} cannot decode during DFS replay: {error}",
+                    record.record_index
+                ))
+            })?;
+            if block.block_id() != record.block_id
+                || block.challenge.previous_block != record.parent
+                || block.challenge.height != record.height
+                || block.challenge.target != record.target
+            {
+                return Err(NodeError::CorruptLog(format!(
+                    "record {} metadata changed after its startup scan",
+                    record.record_index
+                )));
+            }
+            let preverified = if let Some(preverifier) = external_preverifier {
+                match preverifier.preverify(&block) {
+                    Ok(preverified) => Some(preverified),
+                    Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(
+                        error,
+                    ))) => {
+                        return Err(NodeError::CorruptLog(format!(
+                            "record {} proof is rejected during external replay: {error}",
+                            record.record_index
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if requires_external_preverification(&params) {
+                return Err(NodeError::ProductionV3Unavailable);
+            } else {
+                None
+            };
+            let context = BlockValidationContext {
+                now_unix_seconds: record.accepted_at,
+            };
+            let validated = match preverified.as_ref() {
+                Some(preverified) => state
+                    .validate_block_preverified(&block, context, preverified)
+                    .map_err(|error| {
+                        NodeError::CorruptLog(format!(
+                            "record {} fails preverified DFS replay: {error}",
+                            record.record_index
+                        ))
+                    })?,
+                None if requires_external_preverification(&params) => {
+                    return Err(NodeError::CorruptLog(format!(
+                        "record {} is missing external proof evidence during DFS replay",
+                        record.record_index
+                    )));
+                }
+                None => state.validate_block(&block, context).map_err(|error| {
+                    NodeError::CorruptLog(format!(
+                        "record {} fails full DFS replay: {error}",
+                        record.record_index
+                    ))
+                })?,
+            };
+            let undo = match reread.payload {
+                ParsedRecordPayload::LegacyV1 => {
+                    let canonical_delta =
+                        validated.encode_reversible_state_delta().map_err(|error| {
+                            NodeError::CorruptLog(format!(
+                                "record {} cannot derive canonical legacy undo bytes: {error}",
+                                record.record_index
+                            ))
+                        })?;
+                    legacy_undo_stack_bytes = legacy_undo_stack_bytes
+                        .checked_add(canonical_delta.len())
+                        .filter(|total| *total <= MAX_LEGACY_REPLAY_UNDO_STACK_BYTES)
+                        .ok_or(NodeError::LegacyReplayResourceLimit {
+                            record_index: record.record_index,
+                            maximum: MAX_LEGACY_REPLAY_UNDO_STACK_BYTES,
+                        })?;
+                    let capability =
+                        validated
+                            .reversible_state_delta_capability()
+                            .map_err(|error| {
+                                NodeError::CorruptLog(format!(
+                                    "record {} cannot issue a legacy undo capability: {error}",
+                                    record.record_index
+                                ))
+                            })?;
+                    ReplayUndo::LegacyV1 {
+                        record_position,
+                        canonical_delta: canonical_delta.into_boxed_slice(),
+                        capability,
+                    }
+                }
+                ParsedRecordPayload::V2 { delta_bytes, .. } => {
+                    DecodedReversibleStateDelta::decode_bound(
+                        &delta_bytes,
+                        &params,
+                        record.parent,
+                        record.block_id,
+                    )
+                    .and_then(|decoded| decoded.promote_exact(&validated))
+                    .map_err(|error| {
+                        NodeError::CorruptLog(format!(
+                            "record {} reversible state delta does not match full validation: {error}",
+                            record.record_index
+                        ))
+                    })?;
+                    let capability =
+                        validated
+                            .reversible_state_delta_capability()
+                            .map_err(|error| {
+                                NodeError::CorruptLog(format!(
+                                    "record {} cannot issue a V2 undo capability: {error}",
+                                    record.record_index
+                                ))
+                            })?;
+                    ReplayUndo::V2 {
+                        record_position,
+                        capability,
+                    }
+                }
+            };
+            let parent_work = index.work_at(record.parent).ok_or_else(|| {
+                NodeError::CorruptLog(format!(
+                    "record {} DFS parent is absent from the fork index",
+                    record.record_index
+                ))
+            })?;
+            let cumulative_work = add_chain_work(parent_work, record.target).map_err(|error| {
+                NodeError::CorruptLog(format!(
+                    "record {} cumulative work is invalid: {error}",
+                    record.record_index
+                ))
+            })?;
+            let ancestors = index.ancestor_table(record.parent).map_err(|error| {
+                NodeError::CorruptLog(format!(
+                    "record {} ancestor table cannot be restored: {error}",
+                    record.record_index
+                ))
+            })?;
+            state.commit_validated(validated).map_err(|error| {
+                NodeError::CorruptLog(format!(
+                    "record {} cannot commit DFS state: {error}",
+                    record.record_index
+                ))
+            })?;
+            let successor_header = state.successor_header_preflight().map_err(|error| {
+                NodeError::CorruptLog(format!(
+                    "record {} cannot snapshot its successor header: {error}",
+                    record.record_index
+                ))
+            })?;
+            let block_id = record.block_id;
+            if index
+                .blocks
+                .insert(
+                    block_id,
+                    Arc::new(IndexedBlock {
+                        block_id,
+                        parent: record.parent,
+                        height: record.height,
+                        accepted_at: record.accepted_at,
+                        canonical: Arc::clone(&record.canonical),
+                        cumulative_work,
+                        successor_header,
+                        ancestors,
+                        preverified,
+                    }),
+                )
+                .is_some()
+            {
+                return Err(NodeError::CorruptLog(format!(
+                    "record {} duplicates an indexed block",
+                    record.record_index
+                )));
+            }
+            if cumulative_work > winning_work
+                || (cumulative_work == winning_work && record.record_index < winning_record_index)
+            {
+                winning_tip = block_id;
+                winning_work = cumulative_work;
+                winning_record_index = record.record_index;
+            }
+            stack.push(ReplayDfsFrame {
+                block_id,
+                next_child: 0,
+                undo: Some(undo),
+            });
+            continue;
+        }
+
+        let finished = stack.pop().expect("the nonempty DFS stack has a frame");
+        if let Some(undo) = finished.undo {
+            let (record_position, capability, canonical_delta, legacy_bytes) = match undo {
+                ReplayUndo::LegacyV1 {
+                    record_position,
+                    canonical_delta,
+                    capability,
+                } => {
+                    let length = canonical_delta.len();
+                    (record_position, capability, Some(canonical_delta), length)
+                }
+                ReplayUndo::V2 {
+                    record_position,
+                    capability,
+                } => (record_position, capability, None, 0),
+            };
+            let record = scanned.records.get(record_position).ok_or_else(|| {
+                NodeError::CorruptLog("startup undo locator is invalid".to_owned())
+            })?;
+            let reread = reread_replay_record(&mut replay_file, path, record)?;
+            let delta_bytes = match (reread.payload, canonical_delta) {
+                (ParsedRecordPayload::LegacyV1, Some(canonical_delta)) => canonical_delta,
+                (ParsedRecordPayload::V2 { delta_bytes, .. }, None) => {
+                    delta_bytes.into_boxed_slice()
+                }
+                _ => {
+                    return Err(NodeError::CorruptLog(format!(
+                        "record {} undo payload version changed",
+                        record.record_index
+                    )));
+                }
+            };
+            let validated_undo = DecodedReversibleStateDelta::decode_bound(
+                &delta_bytes,
+                &params,
+                record.parent,
+                record.block_id,
+            )
+            .and_then(|decoded| decoded.promote_capability(capability))
+            .map_err(|error| {
+                NodeError::CorruptLog(format!(
+                    "record {} cannot recover its validation-bound undo delta: {error}",
+                    record.record_index
+                ))
+            })?;
+            state
+                .undo_reversible_state_delta(validated_undo)
+                .map_err(|error| {
+                    NodeError::CorruptLog(format!(
+                        "record {} authenticated reversible state delta cannot restore its parent: {error}",
+                        record.record_index
+                    ))
+                })?;
+            if state.tip() != record.parent {
+                return Err(NodeError::CorruptLog(format!(
+                    "record {} undo did not return to its parent",
+                    record.record_index
+                )));
+            }
+            legacy_undo_stack_bytes = legacy_undo_stack_bytes
+                .checked_sub(legacy_bytes)
+                .ok_or_else(|| {
+                    NodeError::CorruptLog("legacy V1 DFS undo budget underflowed".to_owned())
+                })?;
+        }
+    }
+
+    if legacy_undo_stack_bytes != 0 {
+        return Err(NodeError::CorruptLog(
+            "legacy V1 DFS undo budget did not return to zero".to_owned(),
+        ));
+    }
+
+    if state.tip() != params.genesis_hash || index.blocks.len() != scanned.records.len() {
+        return Err(NodeError::CorruptLog(
+            "startup DFS did not return to genesis after visiting every record".to_owned(),
+        ));
+    }
+    let mut active_chain = Vec::with_capacity(
+        usize::try_from(
+            index
+                .blocks
+                .get(&winning_tip)
+                .map_or(0, |entry| entry.height),
+        )
+        .unwrap_or(0)
+        .saturating_add(1),
+    );
+    active_chain.push(index.genesis);
+    active_chain.extend(index.path_to(winning_tip)?);
+    index.active_chain = active_chain;
+    index.active_work = winning_work;
+    replay_indexed_state_to(state, index, params, winning_tip).map_err(|error| {
+        NodeError::CorruptLog(format!(
+            "selected active branch cannot be fully replayed from genesis: {error}"
+        ))
+    })?;
+
+    verify_scanned_replay_log_unchanged(&mut replay_file, path, &scanned)?;
+    Ok(scanned.last_record_digest)
+}
+
+fn scan_replay_log(
+    file: File,
+    path: &Path,
+    params: NetworkParams,
+    network_id: [u8; 32],
+) -> Result<ScannedReplayLog, NodeError> {
     let mut reader = BufReader::new(file);
     let mut record_index = 0_u64;
-    let mut branch_checkpoint: Option<BranchStateCheckpoint> = None;
     let mut last_record_digest = EMPTY_RECORD_CHAIN_ROOT;
     let mut saw_v2 = false;
+    let mut records = Vec::new();
+    let mut children: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+    let mut known_blocks = HashSet::from([params.genesis_hash]);
     loop {
+        let offset = reader
+            .stream_position()
+            .map_err(|source| io_error("locate block log record", path, source))?;
         let Some(record) = read_log_record(&mut reader, path, record_index)? else {
-            return Ok(last_record_digest);
+            let log_length = reader
+                .stream_position()
+                .map_err(|source| io_error("locate block log end", path, source))?;
+            return Ok(ScannedReplayLog {
+                records,
+                children,
+                last_record_digest,
+                log_length,
+            });
         };
+        let end = reader
+            .stream_position()
+            .map_err(|source| io_error("locate block log record end", path, source))?;
+        let length = end.checked_sub(offset).ok_or_else(|| {
+            NodeError::CorruptLog(format!("record {record_index} has an invalid locator"))
+        })?;
         match &record.payload {
             ParsedRecordPayload::LegacyV1 if saw_v2 => {
                 return Err(NodeError::CorruptLog(format!(
                     "record {record_index} is legacy V1 after the V2 chain began"
                 )));
+            }
+            ParsedRecordPayload::LegacyV1 if requires_external_preverification(&params) => {
+                return Err(NodeError::ProductionLegacyBlockLog(record_index));
             }
             ParsedRecordPayload::LegacyV1 => {}
             ParsedRecordPayload::V2 {
@@ -6072,106 +6517,128 @@ fn replay_log(
                 "record {record_index} is not canonical"
             )));
         }
-        let preverified = if let Some(preverifier) = external_preverifier {
-            match preverifier.preverify(&block) {
-                Ok(preverified) => Some(preverified),
-                Err(NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(error))) => {
-                    return Err(NodeError::CorruptLog(format!(
-                        "record {record_index} proof is rejected during external replay: {error}"
-                    )));
-                }
-                Err(error) => return Err(error),
-            }
-        } else if requires_external_preverification(&params) {
-            return Err(NodeError::ProductionV3Unavailable);
-        } else {
-            None
+        let block_id = block.block_id();
+        let parent = block.challenge.previous_block;
+        if !known_blocks.contains(&parent) {
+            return Err(NodeError::CorruptLog(format!(
+                "record {record_index} names a parent that was not accepted earlier"
+            )));
+        }
+        if !known_blocks.insert(block_id) {
+            return Err(NodeError::CorruptLog(format!(
+                "record {record_index} duplicates an earlier block"
+            )));
+        }
+        let version = match payload {
+            ParsedRecordPayload::LegacyV1 => ReplayRecordVersion::LegacyV1,
+            ParsedRecordPayload::V2 { .. } => ReplayRecordVersion::V2,
         };
-        let external_fork_policy = requires_external_preverification(&params);
-        let (branch_state, branch_path) =
-            if external_fork_policy && block.challenge.previous_block != state.tip() {
-                let (branch_state, branch_path) = loop {
-                    let checkpoint = branch_checkpoint.take();
-                    let plan = index
-                        .branch_state_plan(block.challenge.previous_block, checkpoint)
-                        .map_err(|error| {
-                            NodeError::CorruptLog(format!(
-                                "record {record_index} fork parent cannot be planned: {error}"
-                            ))
-                        })?;
-                    let reaches_target = plan.reaches_target;
-                    let (reconstructed, path) = complete_branch_state_plan(params, verifier, plan)
-                        .map_err(|error| {
-                            NodeError::CorruptLog(format!(
-                                "record {record_index} fork parent cannot be reconstructed: {error}"
-                            ))
-                        })?;
-                    if reaches_target {
-                        break (reconstructed, path);
-                    }
-                    branch_checkpoint = Some(BranchStateCheckpoint {
-                        block_id: reconstructed.tip(),
-                        state: Box::new(reconstructed),
-                        path,
-                    });
-                };
-                (Some(Box::new(branch_state)), Some(branch_path))
-            } else {
-                (None, None)
-            };
-        let activation_chain = branch_path.map(|mut path| {
-            path.push(block.block_id());
-            path
-        });
-        let prepared = prepare_block(
-            state,
-            index,
-            &block,
-            block_bytes,
-            BlockPreparationContext {
-                params,
-                verifier,
-                accepted_at,
-                preverified: preverified.as_ref(),
-                branch_state,
-                activation_chain,
-                allow_index_reconstruction: !external_fork_policy,
+        let position = records.len();
+        children.entry(parent).or_default().push(position);
+        records.push(ReplayRecord {
+            record_index,
+            accepted_at,
+            block_id,
+            parent,
+            height: block.challenge.height,
+            target: block.challenge.target,
+            canonical: Arc::from(block_bytes),
+            version,
+            locator: ReplayRecordLocator {
+                offset,
+                length,
+                complete_digest,
             },
-        )
-        .map_err(|error| {
-            NodeError::CorruptLog(format!("record {record_index} fails fork replay: {error}"))
-        })?;
-        match payload {
-            ParsedRecordPayload::LegacyV1 => {
-                prepared.derive_reversible_state_delta().map_err(|error| {
-                    NodeError::CorruptLog(format!(
-                        "record {record_index} cannot derive a reversible state delta: {error}"
-                    ))
-                })?;
-            }
-            ParsedRecordPayload::V2 { delta_bytes, .. } => {
-                prepared
-                    .authenticate_reversible_state_delta(&delta_bytes, &params)
-                    .map_err(|error| {
-                        NodeError::CorruptLog(format!(
-                            "record {record_index} reversible state delta does not match full validation: {error}"
-                        ))
-                    })?;
-            }
-        }
-        let outcome = commit_prepared(state, index, prepared).map_err(|error| {
-            NodeError::CorruptLog(format!(
-                "record {record_index} cannot restore fork state: {error}"
-            ))
-        })?;
-        if let Some(checkpoint) = outcome.branch_checkpoint {
-            branch_checkpoint = Some(checkpoint);
-        }
+        });
         last_record_digest = complete_digest;
         record_index = record_index
             .checked_add(1)
             .ok_or_else(|| NodeError::CorruptLog("block record count overflowed".to_owned()))?;
     }
+}
+
+fn reread_replay_record(
+    file: &mut File,
+    path: &Path,
+    expected: &ReplayRecord,
+) -> Result<ParsedLogRecord, NodeError> {
+    file.seek(SeekFrom::Start(expected.locator.offset))
+        .map_err(|source| io_error("seek block log for bounded replay", path, source))?;
+    let mut bounded = file.take(expected.locator.length);
+    let record = read_log_record(&mut bounded, path, expected.record_index)?.ok_or_else(|| {
+        NodeError::CorruptLog(format!(
+            "record {} disappeared during startup replay",
+            expected.record_index
+        ))
+    })?;
+    if bounded.limit() != 0
+        || record.accepted_at != expected.accepted_at
+        || record.block_bytes.as_slice() != expected.canonical.as_ref()
+        || record.complete_digest != expected.locator.complete_digest
+    {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} changed after its startup scan",
+            expected.record_index
+        )));
+    }
+    let version_matches = matches!(
+        (&record.payload, expected.version),
+        (ParsedRecordPayload::LegacyV1, ReplayRecordVersion::LegacyV1)
+            | (ParsedRecordPayload::V2 { .. }, ReplayRecordVersion::V2)
+    );
+    if !version_matches {
+        return Err(NodeError::CorruptLog(format!(
+            "record {} changed version after its startup scan",
+            expected.record_index
+        )));
+    }
+    Ok(record)
+}
+
+fn verify_scanned_replay_log_unchanged(
+    file: &mut File,
+    path: &Path,
+    scanned: &ScannedReplayLog,
+) -> Result<(), NodeError> {
+    let mut last_record_digest = EMPTY_RECORD_CHAIN_ROOT;
+    let mut saw_v2 = false;
+    for expected in &scanned.records {
+        let record = reread_replay_record(file, path, expected)?;
+        match record.payload {
+            ParsedRecordPayload::LegacyV1 if saw_v2 => {
+                return Err(NodeError::CorruptLog(format!(
+                    "record {} became legacy V1 after the V2 chain began",
+                    expected.record_index
+                )));
+            }
+            ParsedRecordPayload::LegacyV1 => {}
+            ParsedRecordPayload::V2 {
+                previous_record_digest,
+                ..
+            } => {
+                if previous_record_digest != last_record_digest {
+                    return Err(NodeError::CorruptLog(format!(
+                        "record {} previous-record digest changed after its startup scan",
+                        expected.record_index
+                    )));
+                }
+                saw_v2 = true;
+            }
+        }
+        last_record_digest = record.complete_digest;
+    }
+    if last_record_digest != scanned.last_record_digest
+        || file
+            .metadata()
+            .map_err(|source| io_error("reinspect block log after bounded replay", path, source))?
+            .len()
+            != scanned.log_length
+    {
+        return Err(NodeError::CorruptLog(
+            "block log changed during startup replay".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn log_read_error(path: &Path, source: io::Error, truncated_message: String) -> NodeError {
@@ -6263,6 +6730,49 @@ mod tests {
             _ => panic!("unsupported fixture record version {version}"),
         };
         record[checksum_start..].copy_from_slice(&checksum);
+    }
+
+    fn v2_record_parts(record: &[u8]) -> (u64, [u8; 32], &[u8], &[u8]) {
+        assert_eq!(
+            u16::from_le_bytes(record[4..6].try_into().unwrap()),
+            RECORD_VERSION_V2
+        );
+        let accepted_at = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        let block_len = u32::from_le_bytes(record[16..20].try_into().unwrap()) as usize;
+        let delta_len = u32::from_le_bytes(record[20..24].try_into().unwrap()) as usize;
+        let previous_record_digest = record[24..56].try_into().unwrap();
+        let block_start = RECORD_V2_HEADER_BYTES;
+        let delta_start = block_start + block_len;
+        let delta_end = delta_start + delta_len;
+        (
+            accepted_at,
+            previous_record_digest,
+            &record[block_start..delta_start],
+            &record[delta_start..delta_end],
+        )
+    }
+
+    fn locally_forge_v2_delta(record: &[u8], delta_offset: usize) -> Vec<u8> {
+        const DELTA_LOCAL_INTEGRITY_BYTES: usize = 32;
+        const DELTA_LOCAL_INTEGRITY_DOMAIN: &str = "CMFD/REVERSIBLE-STATE-DELTA/LOCAL-INTEGRITY/V1";
+
+        let (accepted_at, previous_record_digest, block_bytes, delta_bytes) =
+            v2_record_parts(record);
+        let mut forged_delta = delta_bytes.to_vec();
+        assert!(forged_delta.len() > delta_offset + DELTA_LOCAL_INTEGRITY_BYTES);
+        forged_delta[delta_offset] ^= 1;
+        let payload_len = forged_delta.len() - DELTA_LOCAL_INTEGRITY_BYTES;
+        let mut hasher = Hasher::new_derive_key(DELTA_LOCAL_INTEGRITY_DOMAIN);
+        hasher.update(&forged_delta[..payload_len]);
+        let digest = *hasher.finalize().as_bytes();
+        forged_delta[payload_len..].copy_from_slice(&digest);
+        encode_record_v2(
+            accepted_at,
+            block_bytes,
+            &forged_delta,
+            previous_record_digest,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -8067,6 +8577,59 @@ mod tests {
     }
 
     #[test]
+    fn mixed_v1_v2_fork_log_replays_with_dfs_undo_and_reorg() {
+        let path = test_dir("mixed-v1-v2-fork");
+        clean_test_dir(&path);
+        let expected_tip = {
+            let mut node = Node::open(&path).unwrap();
+            let genesis = node.params.genesis_hash;
+            let t1 = DEVNET_GENESIS_TIMESTAMP + 60;
+            let t2 = t1 + 60;
+            let t3 = t2 + 60;
+            let a1 = mined_child(&node, genesis, t1, 0x15);
+            node.submit_block(a1.clone(), t1).unwrap();
+            let a2 = mined_child(&node, a1.block_id(), t2, 0x16);
+            node.submit_block(a2, t2).unwrap();
+            let b1 = mined_child(&node, genesis, t1, 0x17);
+            node.submit_block(b1.clone(), t1).unwrap();
+            let b2 = mined_child(&node, b1.block_id(), t2, 0x18);
+            node.submit_block(b2.clone(), t2).unwrap();
+            let b3 = mined_child(&node, b2.block_id(), t3, 0x19);
+            node.submit_block(b3.clone(), t3).unwrap();
+            b3.block_id()
+        };
+
+        let original = read_complete_log_records(&path);
+        assert_eq!(original.len(), 5);
+        let mut mixed: Vec<Vec<u8>> = Vec::with_capacity(original.len());
+        for (position, record) in original.iter().enumerate() {
+            let (accepted_at, _, block_bytes, delta_bytes) = v2_record_parts(record);
+            let rewritten = if position < 3 {
+                encode_record_v1(accepted_at, block_bytes).unwrap()
+            } else {
+                let previous = complete_record_digest(mixed.last().unwrap());
+                encode_record_v2(accepted_at, block_bytes, delta_bytes, previous).unwrap()
+            };
+            mixed.push(rewritten);
+        }
+        assert!(mixed[..3].iter().all(|record| {
+            u16::from_le_bytes(record[4..6].try_into().unwrap()) == RECORD_VERSION_V1
+        }));
+        assert!(mixed[3..].iter().all(|record| {
+            u16::from_le_bytes(record[4..6].try_into().unwrap()) == RECORD_VERSION_V2
+        }));
+        assert_eq!(&mixed[3][24..56], &complete_record_digest(&mixed[2]));
+        write_complete_log_records(&path, &mixed);
+
+        let node = Node::open(&path).unwrap();
+        assert_eq!(node.state.tip(), expected_tip);
+        assert_eq!(node.state.next_height(), 4);
+        assert_eq!(node.index.blocks.len(), 5);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn mine_restart_and_strict_replay_restore_the_tip() {
         let path = test_dir("replay");
         clean_test_dir(&path);
@@ -8217,6 +8780,51 @@ mod tests {
         assert!(node.contains_block(side_id));
         assert!(node.canonical_block(side_id).is_some());
         assert_eq!(node.status().unwrap().cumulative_work, hex::encode(work.0));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn restart_uses_record_ordinal_for_equal_work_across_dfs_order() {
+        let path = test_dir("fork-restart-equal-work-ordinal");
+        clean_test_dir(&path);
+        let (genesis, a1_id, a2_id, b1_id, b2_id, work) = {
+            let mut node = Node::open(&path).unwrap();
+            let genesis = node.params.genesis_hash;
+            let t1 = DEVNET_GENESIS_TIMESTAMP + 60;
+            let t2 = t1 + 60;
+
+            let a1 = mined_child(&node, genesis, t1, 0x64);
+            node.submit_block(a1.clone(), t1 + 5).unwrap();
+            let b1 = mined_child(&node, genesis, t1, 0x65);
+            node.submit_block(b1.clone(), t1 + 6).unwrap();
+            let b2 = mined_child(&node, b1.block_id(), t2, 0x66);
+            node.submit_block(b2.clone(), t2 + 20).unwrap();
+            let a2 = mined_child(&node, a1.block_id(), t2, 0x67);
+            node.submit_block(a2.clone(), t2 + 10).unwrap();
+
+            assert_eq!(node.state.tip(), b2.block_id());
+            assert_eq!(
+                node.index.blocks[&a2.block_id()].cumulative_work,
+                node.index.blocks[&b2.block_id()].cumulative_work
+            );
+            (
+                genesis,
+                a1.block_id(),
+                a2.block_id(),
+                b1.block_id(),
+                b2.block_id(),
+                node.index.active_work,
+            )
+        };
+
+        let node = Node::open(&path).unwrap();
+        assert_eq!(node.state.tip(), b2_id);
+        assert_ne!(node.state.tip(), a2_id);
+        assert_eq!(node.index.active_chain, vec![genesis, b1_id, b2_id]);
+        assert_eq!(node.index.active_work, work);
+        assert!(node.contains_block(a1_id));
+        assert!(node.contains_block(a2_id));
         drop(node);
         clean_test_dir(&path);
     }
@@ -8458,6 +9066,85 @@ mod tests {
     }
 
     #[test]
+    fn startup_scan_rejects_a_rechained_child_before_its_parent() {
+        let path = test_dir("v2-child-before-parent");
+        clean_test_dir(&path);
+        {
+            let mut node = Node::open(&path).unwrap();
+            let t1 = DEVNET_GENESIS_TIMESTAMP + 60;
+            let t2 = t1 + 60;
+            let first = mined_child(&node, node.params.genesis_hash, t1, 0xba);
+            node.submit_block(first.clone(), t1).unwrap();
+            let second = mined_child(&node, first.block_id(), t2, 0xbb);
+            node.submit_block(second, t2).unwrap();
+        }
+        let records = read_complete_log_records(&path);
+        let (second_at, _, second_block, second_delta) = v2_record_parts(&records[1]);
+        let child_first = encode_record_v2(
+            second_at,
+            second_block,
+            second_delta,
+            EMPTY_RECORD_CHAIN_ROOT,
+        )
+        .unwrap();
+        let (first_at, _, first_block, first_delta) = v2_record_parts(&records[0]);
+        let parent_second = encode_record_v2(
+            first_at,
+            first_block,
+            first_delta,
+            complete_record_digest(&child_first),
+        )
+        .unwrap();
+        write_complete_log_records(&path, &[child_first, parent_second]);
+
+        assert!(matches!(
+            Node::open(&path),
+            Err(NodeError::CorruptLog(message))
+                if message.contains("parent that was not accepted earlier")
+        ));
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn final_replay_snapshot_check_rejects_same_length_post_scan_mutation() {
+        let path = test_dir("v2-post-scan-mutation");
+        clean_test_dir(&path);
+        let params = {
+            let mut node = Node::open(&path).unwrap();
+            let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+            let block = mined_child(&node, node.params.genesis_hash, accepted_at, 0xbc);
+            node.submit_block(block, accepted_at).unwrap();
+            node.params
+        };
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let scanned = scan_replay_log(
+            File::open(&log_path).unwrap(),
+            &log_path,
+            params,
+            params.network_id,
+        )
+        .unwrap();
+        let mut records = read_complete_log_records(&path);
+        let accepted_at = u64::from_le_bytes(records[0][8..16].try_into().unwrap());
+        records[0][8..16].copy_from_slice(&(accepted_at + 1).to_le_bytes());
+        recompute_fixture_record_checksum(&mut records[0]);
+        write_complete_log_records(&path, &records);
+        assert_eq!(fs::metadata(&log_path).unwrap().len(), scanned.log_length);
+
+        let error = verify_scanned_replay_log_unchanged(
+            &mut File::open(&log_path).unwrap(),
+            &log_path,
+            &scanned,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeError::CorruptLog(message) if message.contains("changed after its startup scan")
+        ));
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn locally_rehashed_forged_delta_fails_exact_revalidation_promotion() {
         const DELTA_FEES_OFFSET: usize = 180;
         const DELTA_LOCAL_INTEGRITY_BYTES: usize = 32;
@@ -8512,6 +9199,58 @@ mod tests {
             Err(NodeError::CorruptLog(message))
                 if message.contains("does not exactly match the fully validated block")
         ));
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn forged_side_branch_delta_fails_dfs_replay_without_installing_partial_state() {
+        const DELTA_FEES_OFFSET: usize = 180;
+
+        let path = test_dir("v2-forged-side-delta");
+        clean_test_dir(&path);
+        let (params, verifier) = {
+            let mut node = Node::open(&path).unwrap();
+            let genesis = node.params.genesis_hash;
+            let t1 = DEVNET_GENESIS_TIMESTAMP + 60;
+            let t2 = t1 + 60;
+            let a1 = mined_child(&node, genesis, t1, 0xc2);
+            node.submit_block(a1.clone(), t1).unwrap();
+            let a2 = mined_child(&node, a1.block_id(), t2, 0xc3);
+            node.submit_block(a2, t2).unwrap();
+            let side = mined_child(&node, genesis, t1, 0xc4);
+            node.submit_block(side, t1).unwrap();
+            (node.params, node.verifier.clone())
+        };
+        let mut records = read_complete_log_records(&path);
+        assert_eq!(records.len(), 3);
+        records[2] = locally_forge_v2_delta(&records[2], DELTA_FEES_OFFSET);
+        write_complete_log_records(&path, &records);
+        let forged_log = fs::read(path.join(BLOCK_LOG_FILE)).unwrap();
+
+        let mut state = ChainState::new(params, verifier.clone()).unwrap();
+        let mut index = BlockIndex::new(params.genesis_hash);
+        let error = replay_log(
+            &path.join(BLOCK_LOG_FILE),
+            &mut state,
+            &mut index,
+            &verifier,
+            params,
+            params.network_id,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NodeError::CorruptLog(message)
+                if message.contains("does not exactly match the fully validated block")
+        ));
+        assert_eq!(state.tip(), params.genesis_hash);
+        assert_eq!(state.next_height(), 1);
+        assert!(index.blocks.is_empty());
+        assert_eq!(index.active_chain, vec![params.genesis_hash]);
+        assert_eq!(index.active_work, U512::zero());
+        assert_eq!(fs::read(path.join(BLOCK_LOG_FILE)).unwrap(), forged_log);
+        assert!(matches!(Node::open(&path), Err(NodeError::CorruptLog(_))));
         clean_test_dir(&path);
     }
 

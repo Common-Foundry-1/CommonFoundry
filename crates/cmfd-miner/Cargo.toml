@@ -1,6 +1,6 @@
 [package]
 name = "cmfd-miner"
-version = "0.1.0-devnet.14"
+version = "0.1.0-devnet.15"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

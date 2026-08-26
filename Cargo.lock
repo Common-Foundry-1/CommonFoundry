@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-cuda"
-version = "0.1.0-devnet.14"
+version = "0.1.0-devnet.15"
 dependencies = [
  "blake3",
  "cmfd-consensus",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-miner"
-version = "0.1.0-devnet.14"
+version = "0.1.0-devnet.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-node"
-version = "0.1.0-devnet.14"
+version = "0.1.0-devnet.15"
 dependencies = [
  "blake3",
  "clap",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-proof-accel"
-version = "0.1.0-devnet.14"
+version = "0.1.0-devnet.15"
 dependencies = [
  "blake3",
  "fs2",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-proof-worker"
-version = "0.1.0-devnet.14"
+version = "0.1.0-devnet.15"
 dependencies = [
  "blake3",
  "cmfd-consensus",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "common-foundry-wallet"
-version = "0.1.0-devnet.14"
+version = "0.1.0-devnet.15"
 dependencies = [
  "cmfd-consensus",
  "cmfd-cuda",

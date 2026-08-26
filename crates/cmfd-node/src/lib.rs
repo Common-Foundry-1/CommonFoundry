@@ -2066,6 +2066,52 @@ impl DataDirLock {
     }
 }
 
+fn open_block_log(path: &Path) -> Result<File, NodeError> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options
+        .open(path)
+        .map_err(|source| io_error("open block log", path, source))
+}
+
+#[cfg(unix)]
+fn verify_retained_block_log_path(file: &File, path: &Path) -> Result<(), NodeError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let retained = file
+        .metadata()
+        .map_err(|source| io_error("inspect retained block log", path, source))?;
+    let current = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(NodeError::CorruptLog(
+                "block log path was removed during startup replay".to_owned(),
+            ));
+        }
+        Err(source) => return Err(io_error("inspect block log path", path, source)),
+    };
+    if retained.dev() != current.dev() || retained.ino() != current.ino() {
+        return Err(NodeError::CorruptLog(
+            "block log path no longer identifies the retained startup file".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_retained_block_log_path(_file: &File, _path: &Path) -> Result<(), NodeError> {
+    // `open_block_log` omits write and delete sharing for the retained handle,
+    // so another process cannot mutate, rename, or replace this path.
+    Ok(())
+}
+
 pub struct Node {
     data_dir: PathBuf,
     profile: NetworkProfile,
@@ -2743,32 +2789,27 @@ impl Node {
         }
         let data_dir = data_dir.as_ref().to_path_buf();
         let lock = DataDirLock::acquire(&data_dir)?;
+        let log_path = data_dir.join(BLOCK_LOG_FILE);
+        let log = open_block_log(&log_path)?;
         let fingerprint = params.fingerprint()?;
-        let metadata = load_metadata(&data_dir, fingerprint)?;
+        let metadata = load_metadata(&data_dir, fingerprint, &log, &log_path)?;
         let (wallet_signing_key, legacy_shared_wallet) =
-            load_or_create_wallet_key(&data_dir, metadata)?;
+            load_or_create_wallet_key(&data_dir, metadata, &log, &log_path)?;
 
         let mut state = ChainState::new(params, verifier.clone())?;
         let mut index = BlockIndex::new(params.genesis_hash);
         let last_record_digest = replay_log(
-            &data_dir.join(BLOCK_LOG_FILE),
+            &log,
+            &log_path,
             &mut state,
             &mut index,
             &verifier,
             params,
-            params.network_id,
             external_replay.then_some(&block_preverifier),
         )?;
         if metadata != MetadataState::Current {
             write_metadata(&data_dir, fingerprint, metadata)?;
         }
-        let log_path = data_dir.join(BLOCK_LOG_FILE);
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&log_path)
-            .map_err(|source| io_error("open block log", &log_path, source))?;
         let chain_revision = u64::try_from(index.blocks.len()).map_err(|_| {
             NodeError::CorruptLog("block count exceeds the revision counter".to_owned())
         })?;
@@ -5602,7 +5643,12 @@ fn io_error(operation: &'static str, path: impl AsRef<Path>, source: io::Error) 
     }
 }
 
-fn load_metadata(data_dir: &Path, fingerprint: [u8; 32]) -> Result<MetadataState, NodeError> {
+fn load_metadata(
+    data_dir: &Path,
+    fingerprint: [u8; 32],
+    block_log: &File,
+    block_log_path: &Path,
+) -> Result<MetadataState, NodeError> {
     let path = data_dir.join(METADATA_FILE);
     match OpenOptions::new().read(true).open(&path) {
         Ok(mut file) => {
@@ -5639,14 +5685,13 @@ fn load_metadata(data_dir: &Path, fingerprint: [u8; 32]) -> Result<MetadataState
             }
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            let log_path = data_dir.join(BLOCK_LOG_FILE);
-            match fs::metadata(&log_path) {
-                Ok(metadata) if metadata.len() > 0 => return Err(NodeError::MissingMetadata),
-                Ok(_) => {}
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(io_error("inspect existing block log", &log_path, source));
-                }
+            if block_log
+                .metadata()
+                .map_err(|source| io_error("inspect retained block log", block_log_path, source))?
+                .len()
+                > 0
+            {
+                return Err(NodeError::MissingMetadata);
             }
             Ok(MetadataState::Missing)
         }
@@ -5697,6 +5742,8 @@ fn write_metadata(
 fn load_or_create_wallet_key(
     data_dir: &Path,
     metadata: MetadataState,
+    block_log: &File,
+    block_log_path: &Path,
 ) -> Result<(SigningKey, bool), NodeError> {
     let path = data_dir.join(WALLET_KEY_FILE);
     match OpenOptions::new().read(true).open(&path) {
@@ -5721,7 +5768,14 @@ fn load_or_create_wallet_key(
             if metadata == MetadataState::Current {
                 return Err(NodeError::InvalidWalletKey);
             }
-            let legacy = metadata == MetadataState::Legacy && block_log_is_nonempty(data_dir)?;
+            let legacy = metadata == MetadataState::Legacy
+                && block_log
+                    .metadata()
+                    .map_err(|source| {
+                        io_error("inspect retained block log", block_log_path, source)
+                    })?
+                    .len()
+                    > 0;
             let key = if legacy {
                 insecure_dev_wallet_signing_key()
             } else {
@@ -5731,15 +5785,6 @@ fn load_or_create_wallet_key(
             Ok((key, legacy))
         }
         Err(source) => Err(io_error("open wallet key", &path, source)),
-    }
-}
-
-fn block_log_is_nonempty(data_dir: &Path) -> Result<bool, NodeError> {
-    let path = data_dir.join(BLOCK_LOG_FILE);
-    match fs::metadata(&path) {
-        Ok(metadata) => Ok(metadata.len() > 0),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(io_error("inspect existing block log", &path, source)),
     }
 }
 
@@ -6054,22 +6099,22 @@ fn read_log_record(
 }
 
 fn replay_log(
+    log: &File,
     path: &Path,
     state: &mut ChainState,
     index: &mut BlockIndex,
     verifier: &ConsensusPowVerifier,
     params: NetworkParams,
-    network_id: [u8; 32],
     external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<[u8; 32], NodeError> {
     let mut replayed_state = ChainState::new(params, verifier.clone())?;
     let mut replayed_index = BlockIndex::new(params.genesis_hash);
     let last_record_digest = replay_log_into(
+        log,
         path,
         &mut replayed_state,
         &mut replayed_index,
         params,
-        network_id,
         external_preverifier,
     )?;
     *state = replayed_state;
@@ -6082,11 +6127,11 @@ fn replay_log(
 /// full-state retention; record-count/index and process RSS caps are enforced
 /// by later node resource policy, not by this traversal alone.
 fn replay_log_into(
+    log: &File,
     path: &Path,
     state: &mut ChainState,
     index: &mut BlockIndex,
     params: NetworkParams,
-    network_id: [u8; 32],
     external_preverifier: Option<&BlockPreverifier>,
 ) -> Result<[u8; 32], NodeError> {
     if state.tip() != params.genesis_hash
@@ -6099,20 +6144,16 @@ fn replay_log_into(
         ));
     }
 
-    let scan_file = match File::open(path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(EMPTY_RECORD_CHAIN_ROOT);
-        }
-        Err(source) => return Err(io_error("open block log for replay", path, source)),
-    };
-    let scanned = scan_replay_log(scan_file, path, params, network_id)?;
-    if scanned.records.is_empty() {
-        return Ok(scanned.last_record_digest);
-    }
-
-    let mut replay_file = File::open(path)
-        .map_err(|source| io_error("reopen block log for bounded replay", path, source))?;
+    let mut scan_file = log
+        .try_clone()
+        .map_err(|source| io_error("clone retained block log for startup scan", path, source))?;
+    scan_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("rewind retained block log for startup scan", path, source))?;
+    let scanned = scan_replay_log(scan_file, path, params, params.network_id)?;
+    let mut replay_file = log
+        .try_clone()
+        .map_err(|source| io_error("clone retained block log for bounded replay", path, source))?;
     if replay_file
         .metadata()
         .map_err(|source| io_error("inspect block log for bounded replay", path, source))?
@@ -6122,6 +6163,11 @@ fn replay_log_into(
         return Err(NodeError::CorruptLog(
             "block log length changed during startup replay".to_owned(),
         ));
+    }
+    if scanned.records.is_empty() {
+        verify_scanned_replay_log_unchanged(&mut replay_file, path, &scanned)?;
+        verify_retained_block_log_path(log, path)?;
+        return Ok(scanned.last_record_digest);
     }
 
     let mut stack = vec![ReplayDfsFrame {
@@ -6154,7 +6200,7 @@ fn replay_log_into(
                 )));
             }
             let reread = reread_replay_record(&mut replay_file, path, record)?;
-            let block = decode_block(&reread.block_bytes, network_id).map_err(|error| {
+            let block = decode_block(&reread.block_bytes, params.network_id).map_err(|error| {
                 NodeError::CorruptLog(format!(
                     "record {} cannot decode during DFS replay: {error}",
                     record.record_index
@@ -6441,6 +6487,7 @@ fn replay_log_into(
     })?;
 
     verify_scanned_replay_log_unchanged(&mut replay_file, path, &scanned)?;
+    verify_retained_block_log_path(log, path)?;
     Ok(scanned.last_record_digest)
 }
 
@@ -8855,13 +8902,15 @@ mod tests {
         let mut state = ChainState::new(params, verifier.clone()).unwrap();
         let mut index = BlockIndex::new(params.genesis_hash);
         let preverifier = BlockPreverifier::new(verifier.clone(), ProofProfile::DevnetV2Reference);
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let log = open_block_log(&log_path).unwrap();
         replay_log(
-            &path.join(BLOCK_LOG_FILE),
+            &log,
+            &log_path,
             &mut state,
             &mut index,
             &verifier,
             params,
-            params.network_id,
             Some(&preverifier),
         )
         .unwrap();
@@ -8883,6 +8932,7 @@ mod tests {
             );
         }
 
+        drop(log);
         clean_test_dir(&path);
     }
 
@@ -9145,6 +9195,98 @@ mod tests {
     }
 
     #[test]
+    fn retained_log_handle_prevents_same_length_path_substitution_split_brain() {
+        let path = test_dir("retained-log-path-a");
+        let alternate = test_dir("retained-log-path-b");
+        clean_test_dir(&path);
+        clean_test_dir(&alternate);
+        let (params, verifier, expected_tip) = {
+            let mut node = Node::open(&path).unwrap();
+            let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+            let block = mined_child(&node, node.params.genesis_hash, accepted_at, 0xbd);
+            let expected_tip = block.block_id();
+            node.submit_block(block, accepted_at).unwrap();
+            (node.params, node.verifier.clone(), expected_tip)
+        };
+        {
+            let mut node = Node::open(&alternate).unwrap();
+            let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+            let block = mined_child(&node, node.params.genesis_hash, accepted_at, 0xbe);
+            node.submit_block(block, accepted_at).unwrap();
+        }
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let alternate_bytes = fs::read(alternate.join(BLOCK_LOG_FILE)).unwrap();
+        let original_bytes = fs::read(&log_path).unwrap();
+        assert_eq!(original_bytes.len(), alternate_bytes.len());
+        assert_ne!(original_bytes, alternate_bytes);
+        let retained = open_block_log(&log_path).unwrap();
+
+        #[cfg(unix)]
+        {
+            let detached_path = path.join("blocks-a-detached.log");
+            fs::rename(&log_path, &detached_path).unwrap();
+            fs::write(&log_path, &alternate_bytes).unwrap();
+            let mut state = ChainState::new(params, verifier.clone()).unwrap();
+            let mut index = BlockIndex::new(params.genesis_hash);
+            let error = replay_log(
+                &retained, &log_path, &mut state, &mut index, &verifier, params, None,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                NodeError::CorruptLog(message)
+                    if message.contains("no longer identifies the retained startup file")
+            ));
+            assert_eq!(state.tip(), params.genesis_hash);
+            assert_ne!(state.tip(), expected_tip);
+            assert!(index.blocks.is_empty());
+            assert_eq!(index.active_chain, vec![params.genesis_hash]);
+            assert_eq!(fs::read(&log_path).unwrap(), alternate_bytes);
+
+            let detached_len = fs::metadata(&detached_path).unwrap().len();
+            let mut append = retained.try_clone().unwrap();
+            append.write_all(&[0xa5]).unwrap();
+            append.sync_all().unwrap();
+            assert_eq!(
+                fs::metadata(&detached_path).unwrap().len(),
+                detached_len + 1
+            );
+            assert_eq!(fs::read(&log_path).unwrap(), alternate_bytes);
+        }
+
+        #[cfg(windows)]
+        {
+            let detached_path = path.join("blocks-a-detached.log");
+            let read_only = OpenOptions::new().read(true).open(&log_path).unwrap();
+            drop(read_only);
+            assert!(
+                OpenOptions::new().append(true).open(&log_path).is_err(),
+                "the retained Windows handle must deny a second append writer"
+            );
+            assert!(
+                OpenOptions::new().write(true).open(&log_path).is_err(),
+                "the retained Windows handle must deny in-place mutation"
+            );
+            assert!(
+                fs::rename(&log_path, &detached_path).is_err(),
+                "the retained Windows handle must deny delete/rename sharing"
+            );
+            assert_eq!(fs::read(&log_path).unwrap(), original_bytes);
+            let mut state = ChainState::new(params, verifier.clone()).unwrap();
+            let mut index = BlockIndex::new(params.genesis_hash);
+            replay_log(
+                &retained, &log_path, &mut state, &mut index, &verifier, params, None,
+            )
+            .unwrap();
+            assert_eq!(state.tip(), expected_tip);
+        }
+
+        drop(retained);
+        clean_test_dir(&path);
+        clean_test_dir(&alternate);
+    }
+
+    #[test]
     fn locally_rehashed_forged_delta_fails_exact_revalidation_promotion() {
         const DELTA_FEES_OFFSET: usize = 180;
         const DELTA_LOCAL_INTEGRITY_BYTES: usize = 32;
@@ -9229,14 +9371,10 @@ mod tests {
 
         let mut state = ChainState::new(params, verifier.clone()).unwrap();
         let mut index = BlockIndex::new(params.genesis_hash);
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let log = open_block_log(&log_path).unwrap();
         let error = replay_log(
-            &path.join(BLOCK_LOG_FILE),
-            &mut state,
-            &mut index,
-            &verifier,
-            params,
-            params.network_id,
-            None,
+            &log, &log_path, &mut state, &mut index, &verifier, params, None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -9250,6 +9388,7 @@ mod tests {
         assert_eq!(index.active_chain, vec![params.genesis_hash]);
         assert_eq!(index.active_work, U512::zero());
         assert_eq!(fs::read(path.join(BLOCK_LOG_FILE)).unwrap(), forged_log);
+        drop(log);
         assert!(matches!(Node::open(&path), Err(NodeError::CorruptLog(_))));
         clean_test_dir(&path);
     }

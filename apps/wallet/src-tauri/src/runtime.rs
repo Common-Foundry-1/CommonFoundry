@@ -7,12 +7,11 @@ use std::time::Duration;
 use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
 use cmfd_node::peer::PeerLimits;
 use cmfd_node::{
-    COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError, ProofProfile,
+    COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError,
+    ProductionV3VerifierRecord, ProofProfile, compiled_production_v3_record_identity,
     compiled_production_v3_worker_sha256, production_v3_package_layout,
 };
-use cmfd_proof_worker::{
-    ProductionV3VerifierArtifacts, ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError,
-};
+use cmfd_proof_worker::{ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError};
 use tauri::{App, Manager, Runtime};
 
 use crate::mining::MiningManager;
@@ -47,7 +46,7 @@ struct EmbeddedNode {
 }
 
 struct PreparedNodeSecurity {
-    production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
+    production_v3_record: Option<ProductionV3VerifierRecord>,
     verifier_worker: Option<VerifierWorkerConfig>,
 }
 
@@ -168,14 +167,14 @@ fn start_embedded_node<R: Runtime>(
     let data_dir = wallet_data_dir(&app_data_root, COMPILED_NETWORK_PROFILE);
     let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
     let PreparedNodeSecurity {
-        production_v3_artifacts,
+        production_v3_record,
         verifier_worker,
     } = security;
-    let node = match (production_v3_artifacts.as_ref(), verifier_worker) {
-        (Some(artifacts), Some(worker)) => {
-            Node::open_with_artifacts_and_verifier_worker(&data_dir, Some(artifacts), worker)
+    let node = match (production_v3_record.as_ref(), verifier_worker) {
+        (Some(record), Some(worker)) => {
+            Node::open_with_record_and_verifier_worker(&data_dir, Some(record), worker)
         }
-        (None, None) => Node::open_with_artifacts(&data_dir, None),
+        (None, None) => Node::open_with_record(&data_dir, None),
         _ => Err(NodeError::ProofVerifierProfileMismatch),
     }
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
@@ -281,7 +280,7 @@ fn prepare_node_security_with_package(
                 ));
             }
             Ok(PreparedNodeSecurity {
-                production_v3_artifacts: None,
+                production_v3_record: None,
                 verifier_worker: None,
             })
         }
@@ -311,45 +310,46 @@ fn prepare_node_security_with_package(
                     false,
                 ));
             }
-            let path_override_count = [
-                options.bank.as_ref(),
-                options.manifest.as_ref(),
-                options.record_v2.as_ref(),
-                options.verifier_worker.as_ref(),
-            ]
-            .into_iter()
-            .filter(|value| value.is_some())
-            .count();
-            let (bank, manifest, record_v2, verifier_worker) = if path_override_count == 0 {
+            if options.bank.is_some() || options.manifest.is_some() {
+                return Err(startup_error(
+                    "production_v3_configuration_missing",
+                    format!(
+                        "{} ({}) uses the model bank and manifest only in the standalone miner; wallet verification accepts Record V2 and the proof worker.",
+                        profile.short_name(),
+                        profile.proof.profile_name()
+                    ),
+                    false,
+                ));
+            }
+            let path_override_count =
+                [options.record_v2.as_ref(), options.verifier_worker.as_ref()]
+                    .into_iter()
+                    .filter(|value| value.is_some())
+                    .count();
+            let (mut record, verifier_worker) = if path_override_count == 0 {
                 let layout = production_v3_package_layout(package_executable)
                     .map_err(|error| sanitize_node_startup_error(profile, error))?;
+                (layout.record, layout.worker)
+            } else if path_override_count == 2 {
                 (
-                    layout.artifacts.bank,
-                    layout.artifacts.manifest,
-                    layout.artifacts.record_v2,
-                    layout.worker,
-                )
-            } else if path_override_count == 4 {
-                (
-                    options.bank.clone().expect("all four paths were counted"),
-                    options
-                        .manifest
-                        .clone()
-                        .expect("all four paths were counted"),
-                    options
-                        .record_v2
-                        .clone()
-                        .expect("all four paths were counted"),
+                    ProductionV3VerifierRecord {
+                        record_v2: options
+                            .record_v2
+                            .clone()
+                            .expect("both verifier paths were counted"),
+                        expected_file: compiled_production_v3_record_identity()
+                            .map_err(|error| sanitize_node_startup_error(profile, error))?,
+                    },
                     options
                         .verifier_worker
                         .clone()
-                        .expect("all four paths were counted"),
+                        .expect("both verifier paths were counted"),
                 )
             } else {
                 return Err(startup_error(
                     "production_v3_configuration_missing",
                     format!(
-                        "{} ({}) requires either the complete packaged sidecar layout or all four explicit artifact and worker paths.",
+                        "{} ({}) requires either the packaged Record V2 and proof worker or both explicit verifier paths.",
                         profile.short_name(),
                         profile.proof.profile_name()
                     ),
@@ -357,11 +357,7 @@ fn prepare_node_security_with_package(
                 ));
             };
 
-            let artifacts = ProductionV3VerifierArtifacts {
-                bank: canonical_runtime_file(profile, "model bank", &bank)?,
-                manifest: canonical_runtime_file(profile, "model-bank manifest", &manifest)?,
-                record_v2: canonical_runtime_file(profile, "Record V2", &record_v2)?,
-            };
+            record.record_v2 = canonical_runtime_file(profile, "Record V2", &record.record_v2)?;
             let worker = VerifierWorkerConfig {
                 worker_executable: canonical_runtime_file(
                     profile,
@@ -385,14 +381,14 @@ fn prepare_node_security_with_package(
                 cpu_quota_micros: options.verifier_cpu_quota_us,
                 cpu_period_micros: options.verifier_cpu_period_us,
                 pids_limit: options.verifier_pids_limit,
-                production_v3_artifacts: Some(artifacts.clone()),
+                production_v3_record: Some(record.clone()),
             };
             worker
                 .validate_executable()
                 .map_err(|error| sanitize_worker_configuration_error(profile, error))?;
 
             Ok(PreparedNodeSecurity {
-                production_v3_artifacts: Some(artifacts),
+                production_v3_record: Some(record),
                 verifier_worker: Some(worker),
             })
         }
@@ -485,13 +481,13 @@ fn sanitize_worker_configuration_error(
 }
 
 #[cfg(test)]
-fn open_with_artifact_gate<T>(
+fn open_with_record_gate<T>(
     data_dir: &Path,
     profile: NetworkProfile,
     security: &PreparedNodeSecurity,
-    open: impl FnOnce(&Path, Option<&ProductionV3VerifierArtifacts>) -> Result<T, NodeError>,
+    open: impl FnOnce(&Path, Option<&ProductionV3VerifierRecord>) -> Result<T, NodeError>,
 ) -> Result<T, NodeClientError> {
-    open(data_dir, security.production_v3_artifacts.as_ref())
+    open(data_dir, security.production_v3_record.as_ref())
         .map_err(|error| sanitize_node_startup_error(profile, error))
 }
 
@@ -513,7 +509,7 @@ fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> Nod
         "proof_verifier_configuration" => startup_error(
             client.code,
             format!(
-                "{} ({}) rejected the configured model bank, manifest, Record V2, or proof-verifier identity. Verify the RC package and launch settings.",
+                "{} ({}) rejected the configured Record V2 or proof-verifier identity. Verify the package and launch settings.",
                 profile.short_name(),
                 profile.proof.profile_name()
             ),
@@ -559,8 +555,6 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
             concat!(
                 "ProductionV3 startup uses the fixed packaged sidecars beside the wallet when no paths are supplied.\n",
                 "Explicit overrides must be complete, absolute, and match the compiled pins:\n",
-                "  --production-v3-bank <path>                 Authenticated production model bank\n",
-                "  --production-v3-manifest <path>             Canonical model-bank manifest\n",
                 "  --production-v3-record-v2 <path>            Canonical Dory Record V2\n",
                 "  --proof-verifier-worker <path>               Hash-pinned verifier worker\n",
                 "  --proof-verifier-worker-sha256 <hex>         Exact worker SHA-256\n",
@@ -654,8 +648,8 @@ mod tests {
     fn configured_rc(files: &TestFiles, worker_sha256: [u8; 32]) -> NodeRuntimeConfig {
         let mut config = base_config(RCNET1_PROFILE);
         config.production_v3 = config::ProductionV3RuntimeOptions {
-            bank: Some(files.write("model.bank", b"bounded model bank fixture")),
-            manifest: Some(files.write("model.manifest.json", b"bounded manifest fixture")),
+            bank: None,
+            manifest: None,
             record_v2: Some(files.write("record-v2.json", b"bounded Record V2 fixture")),
             verifier_worker: Some(files.write("cmfd-proof-worker.bin", b"bounded worker fixture")),
             verifier_worker_sha256: Some(worker_sha256),
@@ -732,7 +726,7 @@ mod tests {
         assert!(error.message.contains("RCNet-1 (ProductionV3)"));
 
         let mut partial = base_config(RCNET1_PROFILE);
-        partial.production_v3.bank = Some(files.write("only.bank", b"bank"));
+        partial.production_v3.record_v2 = Some(files.write("only-record.json", b"record"));
         let error = security_error(prepare_for_test(RCNET1_PROFILE, &partial, &files.root));
         assert_eq!(error.code, "production_v3_configuration_missing");
     }
@@ -748,16 +742,6 @@ mod tests {
             &format!("cmfd-proof-worker{}", std::env::consts::EXE_SUFFIX),
             b"bounded worker fixture",
         );
-        fs::write(
-            artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_BANK),
-            b"bounded model bank fixture",
-        )
-        .unwrap();
-        fs::write(
-            artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_MANIFEST),
-            b"bounded manifest fixture",
-        )
-        .unwrap();
         fs::write(
             artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_RECORD_V2),
             b"bounded Record V2 fixture",
@@ -777,10 +761,11 @@ mod tests {
             config
         };
         let security = prepare_for_test(RCNET1_PROFILE, &config, &files.root).unwrap();
-        let artifacts = security.production_v3_artifacts.unwrap();
+        let record = security.production_v3_record.unwrap();
         assert_eq!(
-            artifacts.bank,
-            fs::canonicalize(artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_BANK)).unwrap()
+            record.record_v2,
+            fs::canonicalize(artifact_root.join(cmfd_node::PRODUCTION_V3_PACKAGE_RECORD_V2))
+                .unwrap()
         );
         assert_eq!(
             security.verifier_worker.unwrap().worker_sha256,
@@ -793,8 +778,8 @@ mod tests {
         let files = TestFiles::new();
         let mut config = base_config(RCNET1_PROFILE);
         config.production_v3 = config::ProductionV3RuntimeOptions {
-            bank: Some(PathBuf::from("private/model.bank")),
-            manifest: Some(PathBuf::from("private/manifest.json")),
+            bank: None,
+            manifest: None,
             record_v2: Some(PathBuf::from("private/record-v2.json")),
             verifier_worker: Some(PathBuf::from("private/worker.exe")),
             verifier_worker_sha256: Some(sha256(b"bounded worker fixture")),
@@ -809,7 +794,7 @@ mod tests {
         let error = security_error(prepare_for_test(RCNET1_PROFILE, &config, &files.root));
         assert_eq!(error.code, "production_v3_path_invalid");
         assert!(!error.message.contains("private"));
-        assert!(!error.message.contains("model.bank"));
+        assert!(!error.message.contains("record-v2.json"));
     }
 
     #[test]
@@ -832,25 +817,23 @@ mod tests {
         let worker_bytes = b"bounded worker fixture";
         let config = configured_rc(&files, sha256(worker_bytes));
         let security = prepare_for_test(RCNET1_PROFILE, &config, &files.root).unwrap();
-        let artifacts = security.production_v3_artifacts.as_ref().unwrap();
-        assert!(artifacts.bank.is_absolute());
-        assert!(artifacts.manifest.is_absolute());
-        assert!(artifacts.record_v2.is_absolute());
+        let record = security.production_v3_record.as_ref().unwrap();
+        assert!(record.record_v2.is_absolute());
         let worker = security.verifier_worker.as_ref().unwrap();
         assert!(worker.worker_executable.is_absolute());
-        assert_eq!(worker.production_v3_artifacts.as_ref(), Some(artifacts));
+        assert_eq!(worker.production_v3_record.as_ref(), Some(record));
         assert_eq!(worker.startup_timeout, Duration::from_millis(1_234));
         assert_eq!(worker.timeout, Duration::from_millis(1_234));
         assert_eq!(worker.memory_limit_bytes, 4_096);
 
         let data_dir = files.root.join("rcnet-data");
-        open_with_artifact_gate(
+        open_with_record_gate(
             &data_dir,
             RCNET1_PROFILE,
             &security,
             |received_dir, received| {
                 assert_eq!(received_dir, data_dir);
-                assert_eq!(received, Some(artifacts));
+                assert_eq!(received, Some(record));
                 Ok(())
             },
         )
@@ -858,25 +841,28 @@ mod tests {
     }
 
     #[test]
-    fn production_artifact_gate_failures_are_sanitized_and_fail_closed() {
+    fn production_record_gate_failures_are_sanitized_and_fail_closed() {
         let security = PreparedNodeSecurity {
-            production_v3_artifacts: Some(ProductionV3VerifierArtifacts {
-                bank: PathBuf::from("C:\\private\\model.bank"),
-                manifest: PathBuf::from("C:\\private\\manifest.json"),
+            production_v3_record: Some(ProductionV3VerifierRecord {
                 record_v2: PathBuf::from("C:\\private\\record-v2.json"),
+                expected_file: cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
+                    bytes: 1,
+                    blake3: [1; 32],
+                    sha256: [2; 32],
+                },
             }),
             verifier_worker: None,
         };
         for node_error in [
             NodeError::ProductionV3ArtifactPinsMissing,
-            NodeError::ProductionV3ArtifactIdentityMismatch("bank"),
+            NodeError::ProductionV3ArtifactIdentityMismatch("Record V2"),
         ] {
-            let error = open_with_artifact_gate(
+            let error = open_with_record_gate(
                 Path::new("unused"),
                 RCNET1_PROFILE,
                 &security,
-                |_, artifacts| {
-                    assert!(artifacts.is_some());
+                |_, record| {
+                    assert!(record.is_some());
                     Err::<(), _>(node_error)
                 },
             )
@@ -891,12 +877,12 @@ mod tests {
     fn devnet_runtime_keeps_the_original_no_artifact_startup_path() {
         let config = base_config(DEVNET_PROFILE);
         let security = prepare_for_test(DEVNET_PROFILE, &config, Path::new("unused")).unwrap();
-        assert!(security.production_v3_artifacts.is_none());
+        assert!(security.production_v3_record.is_none());
         assert!(security.verifier_worker.is_none());
         assert!(!command_help_text_for_profile(DEVNET_PROFILE).contains("ProductionV3 startup"));
         assert!(command_help_text_for_profile(RCNET1_PROFILE).contains("ProductionV3 startup"));
 
-        let result = open_with_artifact_gate(
+        let result = open_with_record_gate(
             Path::new("devnet-data"),
             DEVNET_PROFILE,
             &security,

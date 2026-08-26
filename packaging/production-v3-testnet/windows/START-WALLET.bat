@@ -8,4 +8,7 @@ if not exist "%~dp0common-foundry-wallet.exe" (
   exit /b 1
 )
 
-start "" "%~dp0common-foundry-wallet.exe"
+start "" "%~dp0common-foundry-wallet.exe" ^
+  --p2p-bind 0.0.0.0:21444 ^
+  --peer 107.214.187.2:21444 ^
+  --allow-public-peers

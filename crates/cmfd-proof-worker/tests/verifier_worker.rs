@@ -15,12 +15,14 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::PermissionsExt};
 
+#[cfg(any(not(feature = "production-v3"), windows))]
+use cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity;
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, Coinbase, ConsensusPowVerifier, TEST_PROFILE,
     v2_test_reference,
 };
-#[cfg(not(feature = "production-v3"))]
-use cmfd_proof_worker::ProductionV3VerifierArtifacts;
+#[cfg(any(not(feature = "production-v3"), windows))]
+use cmfd_proof_worker::ProductionV3VerifierRecord;
 use cmfd_proof_worker::{
     PersistentVerifierWorker, VerifierWorkerConfig, VerifierWorkerError,
     verify_block_out_of_process,
@@ -75,6 +77,16 @@ fn sha256(path: &Path) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[cfg(any(not(feature = "production-v3"), windows))]
+fn file_identity(path: &Path) -> FileIdentity {
+    let bytes = fs::read(path).unwrap();
+    FileIdentity {
+        bytes: bytes.len() as u64,
+        blake3: *blake3::hash(&bytes).as_bytes(),
+        sha256: Sha256::digest(&bytes).into(),
+    }
+}
+
 fn worker_config() -> VerifierWorkerConfig {
     let worker = PathBuf::from(env!("CARGO_BIN_EXE_cmfd-proof-worker"));
     VerifierWorkerConfig {
@@ -86,7 +98,7 @@ fn worker_config() -> VerifierWorkerConfig {
         cpu_quota_micros: Some(100_000),
         cpu_period_micros: Some(100_000),
         pids_limit: Some(16),
-        production_v3_artifacts: None,
+        production_v3_record: None,
     }
 }
 
@@ -189,20 +201,18 @@ fn linux_production_sandbox_installs_in_a_single_task_worker_image() {
     fs::create_dir_all(&artifact_directory).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&artifact_directory, fs::Permissions::from_mode(0o700)).unwrap();
-    let artifacts = ["bank", "manifest", "record"].map(|name| {
-        let path = artifact_directory.join(name);
-        fs::write(&path, b"artifact").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        path.canonicalize().unwrap()
-    });
+    let record = artifact_directory.join("record-v2.json");
+    fs::write(&record, b"artifact").unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    let record = record.canonicalize().unwrap();
 
     let run_as_nobody = unsafe { libc::geteuid() } == 0;
     if run_as_nobody {
-        for path in artifacts
-            .iter()
-            .map(PathBuf::as_path)
-            .chain([artifact_directory.as_path(), root.as_path()])
-        {
+        for path in [
+            record.as_path(),
+            artifact_directory.as_path(),
+            root.as_path(),
+        ] {
             let path = CString::new(path.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::chown(path.as_ptr(), 65_534, 65_534) }, 0);
         }
@@ -211,7 +221,7 @@ fn linux_production_sandbox_installs_in_a_single_task_worker_image() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cmfd-proof-worker"));
     command
         .arg("--cmfd-internal-linux-sandbox-diagnostic")
-        .args(&artifacts)
+        .arg(&record)
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -341,10 +351,10 @@ fn persistent_worker_rejects_wrong_feature_before_serving_and_redacts_paths() {
     let files = TestArtifacts::create();
     let secret_marker = "secret-customer-model";
     let mut config = worker_config();
-    config.production_v3_artifacts = Some(ProductionV3VerifierArtifacts {
-        bank: files.write(&format!("{secret_marker}.bank"), b"bank"),
-        manifest: files.write("manifest.json", b"manifest"),
-        record_v2: files.write("record-v2.json", b"record"),
+    let record_v2 = files.write(&format!("{secret_marker}.json"), b"record");
+    config.production_v3_record = Some(ProductionV3VerifierRecord {
+        expected_file: file_identity(&record_v2),
+        record_v2,
     });
     let (verifier, block) = candidate_block();
     let error = PersistentVerifierWorker::start(config, verifier, block.challenge.network_id)
@@ -389,10 +399,10 @@ fn production_v3_launches_the_real_worker_with_authenticated_small_artifacts() {
 
     let files = TestArtifacts::create();
     let mut config = worker_config();
-    config.production_v3_artifacts = Some(cmfd_proof_worker::ProductionV3VerifierArtifacts {
-        bank: files.write("small.bank", b"authenticated-small-bank"),
-        manifest: files.write("small-manifest.json", br#"{"version":3}"#),
-        record_v2: files.write("small-record-v2.json", br#"{"records":[]}"#),
+    let record_v2 = files.write("small-record-v2.json", br#"{"records":[]}"#);
+    config.production_v3_record = Some(ProductionV3VerifierRecord {
+        expected_file: file_identity(&record_v2),
+        record_v2,
     });
     let (verifier, block) = candidate_block();
     let error = PersistentVerifierWorker::start(

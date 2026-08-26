@@ -44,7 +44,7 @@ fn worker_config() -> VerifierWorkerConfig {
         cpu_quota_micros: Some(100_000),
         cpu_period_micros: Some(100_000),
         pids_limit: Some(16),
-        production_v3_artifacts: None,
+        production_v3_record: None,
     }
 }
 

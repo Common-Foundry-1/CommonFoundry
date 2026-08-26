@@ -21,10 +21,10 @@ use cmfd_node::rcnet_candidate::{
 };
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node, ProofProfile,
-    canonical_network_info_json_with_artifacts, compiled_production_v3_worker_sha256,
+    canonical_network_info_json_with_record, compiled_production_v3_worker_sha256,
     parse_miner_destination, production_v3_package_layout, spawn_rpc_server, unix_time_seconds,
 };
-use cmfd_proof_worker::{ProductionV3VerifierArtifacts, VerifierWorkerConfig};
+use cmfd_proof_worker::{ProductionV3VerifierRecord, VerifierWorkerConfig};
 use serde_json::json;
 
 const SERVICE_SUPERVISION_POLL: Duration = Duration::from_millis(50);
@@ -236,16 +236,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     validate_production_v3_override_set(&cli)?;
-    let production_v3_artifacts = production_v3_artifacts(&cli)?;
+    let production_v3_record = production_v3_record(&cli)?;
     if matches!(&cli.command, Command::NetworkInfo) {
         io::stdout()
             .lock()
-            .write_all(&canonical_network_info_json_with_artifacts(
-                production_v3_artifacts.as_ref(),
+            .write_all(&canonical_network_info_json_with_record(
+                production_v3_record.as_ref(),
             )?)?;
         return Ok(());
     }
-    let verifier_worker = verifier_worker_config(&cli, production_v3_artifacts.clone())?;
+    let verifier_worker = verifier_worker_config(&cli, production_v3_record.clone())?;
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
@@ -263,7 +263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let address_policy = peer_address_policy(allow_public_peers);
             let mut node = open_node(
                 &cli.data_dir,
-                production_v3_artifacts.as_ref(),
+                production_v3_record.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             node.set_public_peer_mode(allow_public_peers);
@@ -338,7 +338,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             require_bounded_reference_mining("mine-once")?;
             let mut node = open_node(
                 &cli.data_dir,
-                production_v3_artifacts.as_ref(),
+                production_v3_record.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             let miner_destination = match miner.as_deref() {
@@ -363,7 +363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Status => {
             let node = open_node(
                 &cli.data_dir,
-                production_v3_artifacts.as_ref(),
+                production_v3_record.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
@@ -411,7 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let address_policy = peer_address_policy(allow_public_peers);
             let mut node_instance = open_node(
                 &cli.data_dir,
-                production_v3_artifacts.as_ref(),
+                production_v3_record.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
@@ -547,7 +547,7 @@ fn install_shutdown_handler() -> Result<ShutdownSignal, ctrlc::Error> {
 
 fn verifier_worker_config(
     cli: &Cli,
-    production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
+    production_v3_record: Option<ProductionV3VerifierRecord>,
 ) -> Result<Option<VerifierWorkerConfig>, Box<dyn std::error::Error>> {
     let production_v3 = COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV3;
     let worker_executable = match (&cli.proof_verifier_worker, production_v3) {
@@ -582,33 +582,28 @@ fn verifier_worker_config(
         cpu_quota_micros: cli.proof_verifier_cpu_quota_us,
         cpu_period_micros: cli.proof_verifier_cpu_period_us,
         pids_limit: cli.proof_verifier_pids_limit,
-        production_v3_artifacts,
+        production_v3_record,
     }))
 }
 
-fn production_v3_artifacts(
+fn production_v3_record(
     cli: &Cli,
-) -> Result<Option<ProductionV3VerifierArtifacts>, Box<dyn std::error::Error>> {
-    match (
-        cli.production_v3_bank.clone(),
-        cli.production_v3_manifest.clone(),
-        cli.production_v3_record_v2.clone(),
-    ) {
-        (None, None, None)
-            if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV3 =>
-        {
+) -> Result<Option<ProductionV3VerifierRecord>, Box<dyn std::error::Error>> {
+    match cli.production_v3_record_v2.clone() {
+        None if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV3 => {
             let layout = packaged_production_v3_layout()?;
-            Ok(Some(layout.artifacts))
+            Ok(Some(layout.record))
         }
-        (None, None, None) => Ok(None),
-        (Some(bank), Some(manifest), Some(record_v2)) => {
-            Ok(Some(ProductionV3VerifierArtifacts {
-                bank: canonical_regular_file(&bank, "production V3 model bank")?,
-                manifest: canonical_regular_file(&manifest, "production V3 manifest")?,
+        None => Ok(None),
+        Some(record_v2) if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV3 => {
+            Ok(Some(ProductionV3VerifierRecord {
                 record_v2: canonical_regular_file(&record_v2, "production V3 Record V2")?,
+                expected_file: cmfd_node::compiled_production_v3_record_identity()?,
             }))
         }
-        _ => Err("--production-v3-bank, --production-v3-manifest, and --production-v3-record-v2 must be supplied together".into()),
+        Some(_) => {
+            Err("production V3 Record V2 was supplied for a non-ProductionV3 profile".into())
+        }
     }
 }
 
@@ -616,20 +611,20 @@ fn validate_production_v3_override_set(cli: &Cli) -> Result<(), Box<dyn std::err
     if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV3 {
         return Ok(());
     }
-    let count = [
-        cli.proof_verifier_worker.as_ref(),
-        cli.production_v3_bank.as_ref(),
-        cli.production_v3_manifest.as_ref(),
-        cli.production_v3_record_v2.as_ref(),
-    ]
-    .into_iter()
-    .filter(|value| value.is_some())
-    .count();
-    if count == 0 || count == 4 {
-        Ok(())
-    } else {
-        Err("ProductionV3 requires either the complete fixed package layout or all four explicit artifact and worker paths".into())
+    let worker = cli.proof_verifier_worker.is_some();
+    let record = cli.production_v3_record_v2.is_some();
+    let bank = cli.production_v3_bank.is_some();
+    let manifest = cli.production_v3_manifest.is_some();
+    if worker != record {
+        return Err(
+            "ProductionV3 explicit overrides require both the verifier worker and Record V2 paths"
+                .into(),
+        );
     }
+    if bank != manifest || (bank && !record) {
+        return Err("legacy ProductionV3 bank and manifest overrides must be supplied together with the Record V2 override".into());
+    }
+    Ok(())
 }
 
 fn packaged_production_v3_layout()
@@ -638,16 +633,8 @@ fn packaged_production_v3_layout()
         .map_err(|_| "could not resolve the signed package executable directory")?;
     let mut layout = production_v3_package_layout(&executable)?;
     layout.worker = canonical_regular_file(&layout.worker, "packaged proof-verifier worker")?;
-    layout.artifacts.bank =
-        canonical_regular_file(&layout.artifacts.bank, "packaged production V3 model bank")?;
-    layout.artifacts.manifest = canonical_regular_file(
-        &layout.artifacts.manifest,
-        "packaged production V3 manifest",
-    )?;
-    layout.artifacts.record_v2 = canonical_regular_file(
-        &layout.artifacts.record_v2,
-        "packaged production V3 Record V2",
-    )?;
+    layout.record.record_v2 =
+        canonical_regular_file(&layout.record.record_v2, "packaged production V3 Record V2")?;
     Ok(layout)
 }
 
@@ -678,13 +665,13 @@ fn parse_worker_sha256(value: &str) -> Result<[u8; 32], Box<dyn std::error::Erro
 
 fn open_node(
     data_dir: &PathBuf,
-    production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+    production_v3_record: Option<&ProductionV3VerifierRecord>,
     verifier_worker: Option<&VerifierWorkerConfig>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    match (production_v3_artifacts, verifier_worker) {
-        (Some(artifacts), Some(worker)) => Ok(Node::open_with_artifacts_and_verifier_worker(
+    match (production_v3_record, verifier_worker) {
+        (Some(record), Some(worker)) => Ok(Node::open_with_record_and_verifier_worker(
             data_dir,
-            Some(artifacts),
+            Some(record),
             worker.clone(),
         )?),
         (None, Some(worker)) => {

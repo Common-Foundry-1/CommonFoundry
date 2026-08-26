@@ -8,6 +8,7 @@
 #[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
 use std::fs::File;
 use std::{
+    fmt,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -189,6 +190,14 @@ pub enum ProductionDoryV3ModelBankRecordValidationError {
     RecordReproductionMismatch,
     #[error("a final retained small-file reread no longer matches the validated chain")]
     FinalSmallFileMismatch,
+    #[error("the release-pinned Record V2 identity is zero or otherwise invalid")]
+    InvalidReleasePinnedRecordIdentity,
+    #[error("the release-pinned Record V2 content does not match its exact expected identity")]
+    ReleasePinnedRecordIdentityMismatch,
+    #[error("the release-pinned {0} identity is zero, out of bounds, or otherwise invalid")]
+    InvalidReleasePinnedFileIdentity(&'static str),
+    #[error("the release-pinned {0} content does not match its exact expected identity")]
+    ReleasePinnedFileIdentityMismatch(&'static str),
     #[cfg(windows)]
     #[error("inherited {artifact} handle is not an exact regular file: {source}")]
     InheritedHandle {
@@ -218,6 +227,116 @@ pub struct LoadedProductionDoryV3ConsensusVerifier {
     bank_file: FileIdentity,
     manifest_file: FileIdentity,
     record_v2_file: FileIdentity,
+}
+
+/// Verifier-only authority loaded from one exact release-pinned Record V2.
+///
+/// Unlike [`LoadedProductionDoryV3ConsensusVerifier`], this value carries no
+/// model-bank authority. It is sufficient for block-proof verification and is
+/// deliberately rejected by every mining/model-preparation API.
+#[must_use]
+#[cfg(feature = "dory-v3-consensus-adapter")]
+pub struct LoadedReleasePinnedProductionDoryV3ConsensusVerifier {
+    verifier: ConsensusPowVerifier,
+    record_v2_file: FileIdentity,
+}
+
+/// Retained exact bank reader returned only after one complete stream matched
+/// the compiled release identity. The reader starts at byte zero and keeps the
+/// trusted parent and exact file object alive through model preparation.
+#[must_use]
+pub struct RetainedReleasePinnedProductionDoryV3Bank {
+    bank: AuthenticatedInput,
+    bank_parent: TrustedCeremonyParent,
+    expected_file: FileIdentity,
+}
+
+impl RetainedReleasePinnedProductionDoryV3Bank {
+    pub const fn file_identity(&self) -> &FileIdentity {
+        &self.expected_file
+    }
+
+    pub fn recheck(&self) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+        self.bank
+            .recheck(&self.bank_parent, Some(self.expected_file.bytes))
+            .map_err(map_fs)
+    }
+
+    /// Revalidate the retained file object and its trusted pathname, then
+    /// rewind that same object for another complete model-bank read.
+    pub fn rewind_and_recheck(
+        &mut self,
+    ) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+        self.recheck()?;
+        self.bank
+            .file_mut()
+            .seek(SeekFrom::Start(0))
+            .map_err(ProductionDoryV3ModelBankRecordValidationError::BankIo)?;
+        self.recheck()
+    }
+}
+
+impl fmt::Debug for RetainedReleasePinnedProductionDoryV3Bank {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedReleasePinnedProductionDoryV3Bank")
+            .field("expected_file", &self.expected_file)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Read for RetainedReleasePinnedProductionDoryV3Bank {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.bank.file_mut().read(buffer)
+    }
+}
+
+/// Mining verifier plus the retained exact bank reader that must be consumed
+/// by fixed-model preparation. Canonical manifest/Record V2 handles remain
+/// live until the last validation and are never reopened by pathname.
+#[must_use]
+#[cfg(feature = "dory-v3-consensus-adapter")]
+pub struct LoadedReleasePinnedProductionDoryV3MiningVerifier {
+    verifier: ConsensusPowVerifier,
+    bank: RetainedReleasePinnedProductionDoryV3Bank,
+    bank_file: FileIdentity,
+    manifest_file: FileIdentity,
+    record_v2_file: FileIdentity,
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+impl LoadedReleasePinnedProductionDoryV3MiningVerifier {
+    pub const fn bank_file(&self) -> &FileIdentity {
+        &self.bank_file
+    }
+
+    pub const fn manifest_file(&self) -> &FileIdentity {
+        &self.manifest_file
+    }
+
+    pub const fn record_v2_file(&self) -> &FileIdentity {
+        &self.record_v2_file
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConsensusPowVerifier,
+        RetainedReleasePinnedProductionDoryV3Bank,
+    ) {
+        (self.verifier, self.bank)
+    }
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+impl LoadedReleasePinnedProductionDoryV3ConsensusVerifier {
+    pub const fn record_v2_file(&self) -> &FileIdentity {
+        &self.record_v2_file
+    }
+
+    pub fn into_verifier(self) -> ConsensusPowVerifier {
+        self.verifier
+    }
 }
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
@@ -332,6 +451,313 @@ pub fn load_production_dory_v3_consensus_verifier(
         manifest_file,
         record_v2_file,
     })
+}
+
+/// Construct a verifier from the exact canonical Record V2 pinned into a
+/// release profile, without opening or reading the multi-gigabyte model bank.
+///
+/// The complete bank-to-record reproduction remains mandatory for the offline
+/// ceremony and qualification path. Runtime verification may use this narrow
+/// path only when the caller supplies all three immutable file-identity fields
+/// from the compiled release profile. Exact content identity is checked before
+/// any JSON is parsed, and the retained file is reread before authority is
+/// minted.
+#[cfg(feature = "dory-v3-consensus-adapter")]
+pub fn load_release_pinned_production_dory_v3_consensus_verifier(
+    network_id: [u8; 32],
+    record_v2_path: &Path,
+    expected_record_v2_file: FileIdentity,
+) -> Result<
+    LoadedReleasePinnedProductionDoryV3ConsensusVerifier,
+    ProductionDoryV3ModelBankRecordValidationError,
+> {
+    validate_release_pinned_record_identity(&expected_record_v2_file)?;
+    let parent = TrustedCeremonyParent::for_artifact(record_v2_path).map_err(map_fs)?;
+    let mut input =
+        AuthenticatedInput::open(&parent, record_v2_path, Some(expected_record_v2_file.bytes))
+            .map_err(map_fs)?;
+    let bytes = input
+        .read_bounded(MAX_RECORD_V2_JSON_BYTES)
+        .map_err(map_fs)?;
+    let (record, observed, setup) =
+        validate_release_pinned_record_bytes(&bytes, &expected_record_v2_file)?;
+    input
+        .recheck(&parent, Some(expected_record_v2_file.bytes))
+        .map_err(map_fs)?;
+    let final_bytes = input
+        .read_bounded(MAX_RECORD_V2_JSON_BYTES)
+        .map_err(map_fs)?;
+    if final_bytes != bytes || content_identity(&final_bytes) != observed {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::FinalSmallFileMismatch);
+    }
+    input
+        .recheck(&parent, Some(expected_record_v2_file.bytes))
+        .map_err(map_fs)?;
+
+    let authenticated =
+        BankAuthenticatedDoryV3ModelCommitmentRecordV2::from_release_pinned_record(record);
+    let verifier = ConsensusPowVerifier::v3_candidate(network_id, authenticated, setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ConsensusVerifier)?;
+    Ok(LoadedReleasePinnedProductionDoryV3ConsensusVerifier {
+        verifier,
+        record_v2_file: observed,
+    })
+}
+
+/// Windows AppContainer variant of the record-only release loader. The caller
+/// passes the exact read-only file handle selected by the parent; no pathname
+/// is resolved in the worker.
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
+pub fn load_release_pinned_production_dory_v3_consensus_verifier_from_open_file(
+    network_id: [u8; 32],
+    mut record_v2: File,
+    expected_record_v2_file: FileIdentity,
+) -> Result<
+    LoadedReleasePinnedProductionDoryV3ConsensusVerifier,
+    ProductionDoryV3ModelBankRecordValidationError,
+> {
+    validate_release_pinned_record_identity(&expected_record_v2_file)?;
+    validate_open_file("Record V2", &record_v2, Some(expected_record_v2_file.bytes))?;
+    let bytes = read_open_file_bounded("Record V2", &mut record_v2, MAX_RECORD_V2_JSON_BYTES)?;
+    let (record, observed, setup) =
+        validate_release_pinned_record_bytes(&bytes, &expected_record_v2_file)?;
+    validate_open_file("Record V2", &record_v2, Some(expected_record_v2_file.bytes))?;
+    let final_bytes =
+        read_open_file_bounded("Record V2", &mut record_v2, MAX_RECORD_V2_JSON_BYTES)?;
+    if final_bytes != bytes || content_identity(&final_bytes) != observed {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::FinalSmallFileMismatch);
+    }
+    validate_open_file("Record V2", &record_v2, Some(expected_record_v2_file.bytes))?;
+
+    let authenticated =
+        BankAuthenticatedDoryV3ModelCommitmentRecordV2::from_release_pinned_record(record);
+    let verifier = ConsensusPowVerifier::v3_candidate(network_id, authenticated, setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ConsensusVerifier)?;
+    Ok(LoadedReleasePinnedProductionDoryV3ConsensusVerifier {
+        verifier,
+        record_v2_file: observed,
+    })
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+fn validate_release_pinned_record_bytes(
+    bytes: &[u8],
+    expected: &FileIdentity,
+) -> Result<
+    (
+        DoryV3ModelCommitmentRecordV2,
+        FileIdentity,
+        DeterministicBlsDorySetup,
+    ),
+    ProductionDoryV3ModelBankRecordValidationError,
+> {
+    if bytes.len() > MAX_RECORD_V2_JSON_BYTES {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::RecordV2TooLarge);
+    }
+    let observed = content_identity(bytes);
+    if &observed != expected {
+        return Err(
+            ProductionDoryV3ModelBankRecordValidationError::ReleasePinnedRecordIdentityMismatch,
+        );
+    }
+    let record = parse_canonical_record_v2(bytes)?;
+    preflight_production_dory_v3_model_bank_manifest(record.manifest())
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ProductionManifest)?;
+    let setup = pinned_production_setup()?;
+    record
+        .validate_production(&setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::Record)?;
+    Ok((record, observed, setup))
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+fn validate_release_pinned_record_identity(
+    identity: &FileIdentity,
+) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+    if identity.bytes == 0
+        || identity.bytes > MAX_RECORD_V2_JSON_BYTES as u64
+        || identity.blake3 == [0; 32]
+        || identity.sha256 == [0; 32]
+    {
+        return Err(
+            ProductionDoryV3ModelBankRecordValidationError::InvalidReleasePinnedRecordIdentity,
+        );
+    }
+    Ok(())
+}
+
+/// Authenticate the release-pinned mining inputs without repeating the two
+/// ceremony-style commitment derivations. The bank is streamed exactly once
+/// for its compiled length/BLAKE3/SHA-256 identity, then rewound on the same
+/// retained file object. Fixed-model preparation performs the independent
+/// commitment checks while consuming that retained reader.
+#[cfg(feature = "dory-v3-consensus-adapter")]
+#[allow(clippy::too_many_arguments)]
+pub fn load_release_pinned_production_dory_v3_mining_verifier(
+    network_id: [u8; 32],
+    bank_path: &Path,
+    manifest_path: &Path,
+    record_v2_path: &Path,
+    expected_bank_file: FileIdentity,
+    expected_manifest_file: FileIdentity,
+    expected_record_v2_file: FileIdentity,
+) -> Result<
+    LoadedReleasePinnedProductionDoryV3MiningVerifier,
+    ProductionDoryV3ModelBankRecordValidationError,
+> {
+    ensure_distinct_paths(bank_path, manifest_path, record_v2_path)?;
+    validate_release_pinned_file_identity(
+        "bank",
+        &expected_bank_file,
+        PRODUCTION_BANK_BYTES,
+        None,
+    )?;
+    validate_release_pinned_file_identity(
+        "manifest",
+        &expected_manifest_file,
+        expected_manifest_file.bytes,
+        Some(MAX_MANIFEST_JSON_BYTES as u64),
+    )?;
+    validate_release_pinned_record_identity(&expected_record_v2_file)?;
+
+    let bank_parent = TrustedCeremonyParent::for_artifact(bank_path).map_err(map_fs)?;
+    let manifest_parent = TrustedCeremonyParent::for_artifact(manifest_path).map_err(map_fs)?;
+    let record_parent = TrustedCeremonyParent::for_artifact(record_v2_path).map_err(map_fs)?;
+    let mut bank =
+        AuthenticatedInput::open(&bank_parent, bank_path, Some(expected_bank_file.bytes))
+            .map_err(map_fs)?;
+    let mut manifest_input = AuthenticatedInput::open(
+        &manifest_parent,
+        manifest_path,
+        Some(expected_manifest_file.bytes),
+    )
+    .map_err(map_fs)?;
+    let mut record_input = AuthenticatedInput::open(
+        &record_parent,
+        record_v2_path,
+        Some(expected_record_v2_file.bytes),
+    )
+    .map_err(map_fs)?;
+    ensure_distinct_inputs(&bank, &manifest_input, &record_input)?;
+
+    let manifest_bytes = manifest_input
+        .read_bounded(MAX_MANIFEST_JSON_BYTES)
+        .map_err(map_fs)?;
+    require_release_pinned_content_identity(
+        "manifest",
+        &content_identity(&manifest_bytes),
+        &expected_manifest_file,
+    )?;
+    let manifest = parse_canonical_manifest(&manifest_bytes)?;
+    preflight_production_dory_v3_model_bank_manifest(&manifest)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ProductionManifest)?;
+    if manifest
+        .payload_bytes
+        .checked_add(MODEL_BANK_HEADER_BYTES as u64)
+        != Some(PRODUCTION_BANK_BYTES)
+    {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::ManifestBankLength);
+    }
+
+    let record_bytes = record_input
+        .read_bounded(MAX_RECORD_V2_JSON_BYTES)
+        .map_err(map_fs)?;
+    let (record, observed_record_file, setup) =
+        validate_release_pinned_record_bytes(&record_bytes, &expected_record_v2_file)?;
+    if record.manifest() != &manifest {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::EmbeddedManifestMismatch);
+    }
+
+    let (_, observed_bank_file) =
+        run_bank_pass(&mut bank, expected_bank_file.bytes, &mut |reader| {
+            io::copy(reader, &mut io::sink())
+                .map_err(ProductionDoryV3ModelBankRecordValidationError::BankIo)?;
+            Ok(())
+        })?;
+    require_release_pinned_content_identity("bank", &observed_bank_file, &expected_bank_file)?;
+
+    recheck_small_inputs(
+        RetainedInputCheck::new(
+            &manifest_input,
+            &manifest_parent,
+            expected_manifest_file.bytes,
+        ),
+        RetainedInputCheck::new(&record_input, &record_parent, expected_record_v2_file.bytes),
+    )?;
+    bank.recheck(&bank_parent, Some(expected_bank_file.bytes))
+        .map_err(map_fs)?;
+    let final_manifest_bytes = manifest_input
+        .read_bounded(MAX_MANIFEST_JSON_BYTES)
+        .map_err(map_fs)?;
+    let final_record_bytes = record_input
+        .read_bounded(MAX_RECORD_V2_JSON_BYTES)
+        .map_err(map_fs)?;
+    if final_manifest_bytes != manifest_bytes
+        || final_record_bytes != record_bytes
+        || content_identity(&final_manifest_bytes) != expected_manifest_file
+        || content_identity(&final_record_bytes) != observed_record_file
+    {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::FinalSmallFileMismatch);
+    }
+    bank.recheck(&bank_parent, Some(expected_bank_file.bytes))
+        .map_err(map_fs)?;
+    bank.file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::BankIo)?;
+
+    let authenticated =
+        BankAuthenticatedDoryV3ModelCommitmentRecordV2::from_release_pinned_bank_identity(record);
+    let verifier = ConsensusPowVerifier::v3_candidate(network_id, authenticated, setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ConsensusVerifier)?;
+    Ok(LoadedReleasePinnedProductionDoryV3MiningVerifier {
+        verifier,
+        bank: RetainedReleasePinnedProductionDoryV3Bank {
+            bank,
+            bank_parent,
+            expected_file: observed_bank_file.clone(),
+        },
+        bank_file: observed_bank_file,
+        manifest_file: expected_manifest_file,
+        record_v2_file: observed_record_file,
+    })
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+fn validate_release_pinned_file_identity(
+    artifact: &'static str,
+    identity: &FileIdentity,
+    expected_bytes: u64,
+    maximum_bytes: Option<u64>,
+) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+    if identity.bytes == 0
+        || identity.bytes != expected_bytes
+        || maximum_bytes.is_some_and(|maximum| identity.bytes > maximum)
+        || identity.blake3 == [0; 32]
+        || identity.sha256 == [0; 32]
+    {
+        return Err(
+            ProductionDoryV3ModelBankRecordValidationError::InvalidReleasePinnedFileIdentity(
+                artifact,
+            ),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dory-v3-consensus-adapter")]
+fn require_release_pinned_content_identity(
+    artifact: &'static str,
+    observed: &FileIdentity,
+    expected: &FileIdentity,
+) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+    if observed != expected {
+        return Err(
+            ProductionDoryV3ModelBankRecordValidationError::ReleasePinnedFileIdentityMismatch(
+                artifact,
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Construct the production verifier from three already-open Windows files.
@@ -1308,6 +1734,103 @@ mod tests {
             read_canonical_record_v2(&mut input),
             Err(ProductionDoryV3ModelBankRecordValidationError::RecordV2TooLarge)
         ));
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn release_pinned_record_rejects_wrong_identity_before_parsing() {
+        let fixture = complete_fixture();
+        let canonical = canonical_dory_v3_model_record_v2_json(&fixture.record).unwrap();
+        let exact = content_identity(&canonical);
+        let mut mutated = canonical.clone();
+        mutated[0] ^= 1;
+        assert_eq!(mutated.len(), canonical.len());
+        assert!(matches!(
+            validate_release_pinned_record_bytes(&mutated, &exact),
+            Err(
+                ProductionDoryV3ModelBankRecordValidationError::ReleasePinnedRecordIdentityMismatch
+            )
+        ));
+
+        let mut wrong = content_identity(&canonical);
+        wrong.blake3[0] ^= 1;
+        assert!(matches!(
+            validate_release_pinned_record_bytes(&canonical, &wrong),
+            Err(
+                ProductionDoryV3ModelBankRecordValidationError::ReleasePinnedRecordIdentityMismatch
+            )
+        ));
+
+        let mut malformed = canonical;
+        malformed[0] = b'!';
+        let malformed_identity = content_identity(&malformed);
+        assert!(matches!(
+            validate_release_pinned_record_bytes(&malformed, &malformed_identity),
+            Err(ProductionDoryV3ModelBankRecordValidationError::RecordV2Json(_))
+        ));
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn release_pinned_mining_bank_rejects_same_length_content_mutation() {
+        let expected = content_identity(b"bounded-bank");
+        let directory = TestDirectory::new();
+        let path = directory.0.join("model.bank");
+        fs::write(&path, b"changed-bank").unwrap();
+        let parent = TrustedCeremonyParent::for_artifact(&path).unwrap();
+        let mut input = AuthenticatedInput::open(&parent, &path, Some(expected.bytes)).unwrap();
+        let (_, observed) = run_bank_pass(&mut input, expected.bytes, &mut |reader| {
+            io::copy(reader, &mut io::sink())
+                .map_err(ProductionDoryV3ModelBankRecordValidationError::BankIo)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(matches!(
+            require_release_pinned_content_identity("bank", &observed, &expected),
+            Err(
+                ProductionDoryV3ModelBankRecordValidationError::ReleasePinnedFileIdentityMismatch(
+                    "bank"
+                )
+            )
+        ));
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn release_pinned_record_requires_exact_canonical_bytes_before_production_validation() {
+        let fixture = complete_fixture();
+        let compact = serde_json::to_vec(&fixture.record).unwrap();
+        let compact_identity = content_identity(&compact);
+        assert!(matches!(
+            validate_release_pinned_record_bytes(&compact, &compact_identity),
+            Err(ProductionDoryV3ModelBankRecordValidationError::NonCanonicalRecordV2)
+        ));
+
+        for invalid in [
+            FileIdentity {
+                bytes: 0,
+                blake3: [1; 32],
+                sha256: [2; 32],
+            },
+            FileIdentity {
+                bytes: 1,
+                blake3: [0; 32],
+                sha256: [2; 32],
+            },
+            FileIdentity {
+                bytes: 1,
+                blake3: [1; 32],
+                sha256: [0; 32],
+            },
+        ] {
+            assert!(matches!(
+                validate_release_pinned_record_identity(&invalid),
+                Err(
+                    ProductionDoryV3ModelBankRecordValidationError::InvalidReleasePinnedRecordIdentity
+                )
+            ));
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ use cmfd_consensus::{
     POW_TYPE_V2_REFERENCE, PowError, PowParameters, TARGET_SPACING_SECONDS, TRANSACTION_VERSION,
     WIRE_HEADER_BYTES, WIRE_VERSION,
 };
-use cmfd_proof_worker::ProductionV3VerifierArtifacts;
+use cmfd_proof_worker::{ProductionV3VerifierArtifacts, ProductionV3VerifierRecord};
 use serde::Serialize;
 #[cfg(feature = "production-v3")]
 use sha2::{Digest as _, Sha256};
@@ -228,15 +228,25 @@ pub fn canonical_network_info_json() -> Result<Vec<u8>, NodeError> {
 pub fn canonical_network_info_json_with_artifacts(
     production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
 ) -> Result<Vec<u8>, NodeError> {
-    canonical_network_info_json_for_profile(COMPILED_NETWORK_PROFILE, production_v3_artifacts)
+    let production_v3_record =
+        crate::production_v3_record_for_profile(COMPILED_NETWORK_PROFILE, production_v3_artifacts)?;
+    canonical_network_info_json_with_record(production_v3_record.as_ref())
+}
+
+/// Returns the canonical manifest while authenticating only the exact
+/// release-pinned Record V2 needed by a verifier-only node.
+pub fn canonical_network_info_json_with_record(
+    production_v3_record: Option<&ProductionV3VerifierRecord>,
+) -> Result<Vec<u8>, NodeError> {
+    canonical_network_info_json_for_profile(COMPILED_NETWORK_PROFILE, production_v3_record)
 }
 
 fn canonical_network_info_json_for_profile(
     profile: NetworkProfile,
-    production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+    production_v3_record: Option<&ProductionV3VerifierRecord>,
 ) -> Result<Vec<u8>, NodeError> {
     let (params, verifier) =
-        network_params_and_verifier_for_profile(profile, production_v3_artifacts)?;
+        network_params_and_verifier_for_profile(profile, production_v3_record)?;
     let proof_of_work = match verifier.parameters() {
         PowParameters::V2Reference(descriptor) => {
             let model_manifest_digest = descriptor

@@ -1,14 +1,18 @@
-#[cfg(not(feature = "production-v3"))]
+#[cfg(any(not(feature = "production-v3"), target_os = "linux"))]
 use std::fs;
 use std::fs::File;
 use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::process::Stdio;
-#[cfg(not(feature = "production-v3"))]
+#[cfg(any(not(feature = "production-v3"), target_os = "linux"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::PermissionsExt};
 
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, Coinbase, ConsensusPowVerifier,
@@ -22,7 +26,7 @@ use cmfd_proof_worker::{
 };
 use sha2::{Digest, Sha256};
 
-#[cfg(not(feature = "production-v3"))]
+#[cfg(any(not(feature = "production-v3"), target_os = "linux"))]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(not(feature = "production-v3"))]
@@ -142,6 +146,89 @@ fn executable_hash_mismatch_fails_before_spawn() {
 }
 
 #[test]
+fn verifier_worker_rejects_a_nonempty_environment() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cmfd-proof-worker"))
+        .arg("--verify-block-server")
+        .env_clear()
+        .env("CMFD_FORBIDDEN_WORKER_ENVIRONMENT", "sentinel")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        output
+            .stdout
+            .windows(b"verifier worker environment must be empty".len())
+            .any(|window| window == b"verifier worker environment must be empty")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_production_sandbox_installs_in_a_single_task_worker_image() {
+    let root = std::env::temp_dir().join(format!(
+        "cmfd-linux-sandbox-image-{}-{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let artifact_directory = root.join("artifacts");
+    fs::create_dir_all(&artifact_directory).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&artifact_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let artifacts = ["bank", "manifest", "record"].map(|name| {
+        let path = artifact_directory.join(name);
+        fs::write(&path, b"artifact").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path.canonicalize().unwrap()
+    });
+
+    let run_as_nobody = unsafe { libc::geteuid() } == 0;
+    if run_as_nobody {
+        for path in artifacts
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([artifact_directory.as_path(), root.as_path()])
+        {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), 65_534, 65_534) }, 0);
+        }
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cmfd-proof-worker"));
+    command
+        .arg("--cmfd-internal-linux-sandbox-diagnostic")
+        .args(&artifacts)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if run_as_nobody {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::syscall(
+                    libc::SYS_setgroups,
+                    0_usize,
+                    std::ptr::null::<libc::gid_t>(),
+                ) != 0
+                    || libc::syscall(libc::SYS_setresgid, 65_534_u32, 65_534_u32, 65_534_u32) != 0
+                    || libc::syscall(libc::SYS_setresuid, 65_534_u32, 65_534_u32, 65_534_u32) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "single-task sandbox diagnostic failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn persistent_worker_loads_once_for_many_canonical_blocks() {
     let (verifier, block) = candidate_block();
     let worker =
@@ -200,6 +287,30 @@ fn persistent_worker_rejects_wrong_feature_before_serving_and_redacts_paths() {
         .err()
         .expect("a worker compiled without ProductionV3 must fail at startup");
     assert!(!error.to_string().contains(secret_marker));
+}
+
+#[cfg(windows)]
+#[test]
+fn production_v3_fails_before_copy_or_spawn_without_appcontainer() {
+    let mut config = worker_config();
+    config.worker_executable = PathBuf::from(r"C:\cmfd-sandbox-gate\missing-worker.exe");
+    config.production_v3_artifacts = Some(cmfd_proof_worker::ProductionV3VerifierArtifacts {
+        bank: PathBuf::from(r"C:\cmfd-sandbox-gate\bank"),
+        manifest: PathBuf::from(r"C:\cmfd-sandbox-gate\manifest"),
+        record_v2: PathBuf::from(r"C:\cmfd-sandbox-gate\record-v2"),
+    });
+    let (verifier, block) = candidate_block();
+    let error = PersistentVerifierWorker::start(
+        config.clone(),
+        verifier.clone(),
+        block.challenge.network_id,
+    )
+    .err()
+    .expect("Windows ProductionV3 must fail before accessing the missing worker");
+    assert!(matches!(error, VerifierWorkerError::SandboxUnavailable(_)));
+    let error = verify_block_out_of_process(&config, &verifier, &block)
+        .expect_err("one-shot Windows ProductionV3 must fail before accessing the missing worker");
+    assert!(matches!(error, VerifierWorkerError::SandboxUnavailable(_)));
 }
 
 #[test]
@@ -268,7 +379,10 @@ fn shutdown_racing_restart_remains_fail_closed_and_recoverable() {
         let candidate = block.clone();
         let request = std::thread::spawn(move || contender.verify_block(&candidate));
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // ProductionV3 feature builds make the pinned worker materially larger;
+        // hashing the private copy precedes the observable spawn-attempt count.
+        // Give that bounded integrity pass enough time on slow release media.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while worker.process_attempts() == previous_attempts
             && !request.is_finished()
             && Instant::now() < deadline

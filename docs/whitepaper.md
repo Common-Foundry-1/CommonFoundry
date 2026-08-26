@@ -801,15 +801,20 @@ admission now uses a one-active/eight-waiter in-process proof queue with a
 five-second admission timeout and panic containment. Verification runs outside
 the global node mutex and returns a nonserializable capability bound to the
 exact verifier, challenge, and proof; atomic chain validation consumes it
-without repeating the expensive proof. External V2 block admission now also
-has an optional hash-pinned short-lived verifier with canonical
-statement-bound IPC, killable wall-time, bounded output, process-tree
-termination, and explicit Windows job memory or Unix address-space limits. It
-fails closed on crash, timeout, malformed output, identity substitution, or
-executable hash mismatch. This is resource containment rather than an OS
-sandbox, does not cover synchronous side-branch replay, and is not yet the
-production V3 verifier. Sustained independent campaigns and final V3
-parser/verifier integration remain activation work.
+without repeating the expensive proof. External block admission now also has a
+hash-pinned persistent verifier with canonical statement-bound IPC, killable
+wall-time, bounded output, process-tree termination, and explicit Windows job
+memory or Unix address-space limits. ProductionV3 startup on Linux x86-64
+additionally requires Landlock ABI 3 or newer plus a mandatory default-deny
+seccomp policy before reading/loading model contents or untrusted IPC; Landlock
+ABI 3 is accepted only because seccomp allows only the audited verifier runtime
+surface and denies every unlisted syscall.
+ProductionV3 remains fail-closed on Windows until an atomic AppContainer/LPAC
+launch and inherited-handle artifact loader pass equivalent escape and
+full-worker tests. Per-worker CPU/PID containment also remains open on Linux;
+the per-real-UID task limit is not treated as a substitute. Sustained
+independent campaigns, real-bank resource
+measurements, and the Windows sandbox remain activation work.
 
 An optional prover-only CUDA path now implements the exact Goldilocks DFT and coset-LDE semantics used by this STARK and supplies the value-MMCS Poseidon2 first digest layer to actual proof generation. Merkle parent compression, openings, transcript operations, and verification remain on the CPU, and every resulting encoded proof must pass the unchanged CPU verifier. At the 32,768-row checkpoint on an RTX 5090, the same unoptimized Cargo test profile took 348.28 seconds on CPU (64.503 setup, 283.416 prove; 238,698-byte canonical zlib payload) and 76.71 seconds with CUDA DFT plus Poseidon2 (7.700 setup, 68.551 prove; 237,292 bytes), a 4.54x speedup and 78% less wall time. The direct API loads native code in-process and is for trusted development only. The hash-pinned, bounded worker path has been tested with a 64-byte tree proof and terminates its whole process tree on timeout or overflow; this is crash containment, not an operating-system sandbox or a change to consensus.
 
@@ -1127,7 +1132,7 @@ Devnet fork choice is functionally testable, but its tiny CPU-recomputed work pr
 
 ### 12.3 Public-network gaps
 
-Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, bounded proof admission, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened share verifier. External block proof verification no longer holds the global node mutex: one proof runs while at most eight wait, a five-second admission timeout rejects excess work, panics are contained, and an identity-bound process-local capability prevents proof substitution before atomic submission. Operators can move the active V2 verifier into a hash-pinned, killable worker with explicit wall-time, memory, and output limits, but the default remains in process and the worker is not an OS sandbox. Side-branch reconstruction replays from genesis, and non-block RPC dispatch remains single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability remain limited.
+Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, bounded proof admission, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened share verifier. External block proof verification no longer holds the global node mutex: one proof runs while a bounded admission queue separates local and remote callers, panics are contained, and an identity-bound process-local capability prevents proof substitution before atomic submission. Devnet V2 can use the hash-pinned worker with process-tree, wall-time, memory, and output containment. ProductionV3 requires the stronger platform sandbox described above; Linux has a Landlock-plus-seccomp implementation, while Windows remains fail-closed pending AppContainer/LPAC and handle-only artifact loading. Side-branch reconstruction remains a scalability concern, and non-block RPC dispatch remains single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability remain limited.
 
 Release artifacts have SHA-256 checksums, and CI contains checked-in Windows
 and Linux desktop build jobs. The release tag and binaries remain unsigned,

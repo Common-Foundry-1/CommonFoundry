@@ -105,17 +105,20 @@ SHA-256 and adds bounded binary IPC and process-tree termination. That path has
 been tested end to end with a 64-byte tree proof, but it is not an
 operating-system sandbox.
 
-External block admission can also run the active V2 verifier in a short-lived
-child process. The operator supplies an absolute `cmfd-node` or
-`cmfd-proof-worker` path and its SHA-256 pin through
-`--proof-verifier-worker` and `--proof-verifier-worker-sha256`; wall-time and
-memory limits are explicit. The parent accepts a result only after a canonical
-response echoes identities bound to the exact verifier parameters, block
-challenge, proof type, and proof bytes. Timeout, crash, output overflow,
-malformed response, identity substitution, and hash mismatch all fail closed.
-This mode is optional on Devnet and supports only the active V2 verifier. It
-does not activate the reserved V3 proof or replace the required production
-parser, measurements, and audit.
+External block admission can also run the verifier in a hash-pinned persistent
+worker. The operator supplies an absolute `cmfd-proof-worker` path and its
+SHA-256 pin; wall-time and memory limits are explicit. The parent accepts a
+result only after a canonical response echoes identities bound to the exact
+verifier parameters, block challenge, proof type, proof bytes, and required
+sandbox status. Timeout, crash, output overflow, malformed response, identity
+substitution, hash mismatch, and sandbox setup failure all fail closed. Devnet
+V2 uses process-tree crash containment only. ProductionV3 on Linux x86-64 also
+requires Landlock ABI 3 or newer together with a mandatory default-deny seccomp
+filter before reading/loading artifact contents or untrusted IPC. ProductionV3
+on Windows remains unavailable until the AppContainer/LPAC and
+inherited-artifact-handle release gate is implemented and qualified. This
+boundary does not by itself establish production readiness; per-worker CPU/PID
+enforcement is also still a release gate.
 
 At the 32,768-row checkpoint on an RTX 5090, an unoptimized Cargo test-profile
 CPU run took 348.28 seconds (64.503 setup, 283.416 prove; 238,698-byte canonical

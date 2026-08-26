@@ -8,10 +8,11 @@ The worker independently rehashes the CUDA library immediately before loading
 it. A returned proof is never accepted until the parent runs the unchanged
 `verify_structured_blake3` CPU verifier over the exact response bytes.
 
-The same containment layer supports block-proof verification in one persistent
+The same process boundary supports block-proof verification in one persistent
 worker per node. Before P2P starts, the node copies the pinned executable into a
 private random runtime directory, starts it under the memory limit, and requires
-an exact profile, network, verifier-identity, and challenge-response self-test.
+an exact profile, network, verifier-identity, sandbox-status, and
+challenge-response self-test.
 For ProductionV3 the worker authenticates the bank, manifest, and Record V2 once
 at startup. It then handles bounded canonical block requests sequentially; the
 node's admission queue permits one active request and only a bounded number of
@@ -49,8 +50,9 @@ CUDA library selection, its hash pin, and the device index are explicit process
 arguments; there is no environment or default-path selection and no CPU
 fallback after CUDA is selected.
 
-This boundary isolates ordinary worker crashes and many worker OOM failures
-from the parent. It is **not an OS sandbox**. The verifier runtime copy is hashed
+The CUDA prover and Devnet V2 verifier boundaries isolate ordinary crashes and
+many worker OOM failures from the parent. They are **not OS sandboxes**. The
+verifier runtime copy is hashed
 while it is copied, synchronized, made non-writable, and hashed again immediately
 before every execution. Both source metadata and bytes actually copied are
 bounded to 512 MiB. Its random directory is mode `0700` on Unix; Windows inherits
@@ -65,6 +67,60 @@ For proof generation the parent independently verifies returned proof bytes.
 For verifier mode, repeating verification in the parent would defeat the
 isolation, so the pinned worker outcome is explicitly trusted after the exact
 statement-bound protocol checks.
+
+ProductionV3 block verification has a stricter fail-closed boundary. On Linux
+x86_64, the child opens the three trusted paths for setup, then must install the
+following controls before reading/loading artifact contents or an untrusted
+request:
+
+- `PR_SET_NO_NEW_PRIVS` and non-dumpable process state;
+- Landlock ABI 3 or newer, granting file-content read access only to the exact
+  bank, manifest, and Record V2 files. The retained pathname validator also
+  needs directory-open rights on each artifact parent's recursive subtree, so
+  release packaging must use dedicated mode-`0700` parent directories with no
+  unrelated entries. Seccomp denies `getdents`/`getdents64`, so the worker
+  cannot enumerate those directories;
+- a default-deny seccomp allowlist for retained artifact reads, bounded stdio,
+  allocation, clocks, and Rust/Rayon runtime calls. `clone3` is forced to the
+  legacy path, and `clone` accepts only the exact pthread flag mask; network,
+  process execution, filesystem/metadata mutation, cross-process resource or
+  affinity inspection, namespaces, mounts, IPC, io_uring, keyrings, and every
+  unlisted syscall fail. Read-only `stat`-family calls remain available for the
+  retained validator, so guessed host pathname metadata is not hidden;
+- an empty environment, only stdin/stdout/stderr inherited across exec, the
+  address-space limit, an at-most-64-descriptor hard limit, a narrowed
+  per-real-UID task limit, process-group teardown, parent-death signal, wall
+  deadline, and bounded output. Root, set-ID, and capability-bearing worker
+  identities are rejected.
+
+Landlock ABI 3 does not mediate network access. It is sufficient here only in
+combination with the mandatory seccomp socket/network denial. ABI 4 and newer
+also enforce TCP bind/connect denial in Landlock. An older Landlock ABI, a
+sandbox-status mismatch, or any sandbox setup error aborts ProductionV3 startup
+before P2P is enabled. A legitimate runtime syscall omitted from the allowlist
+returns `EPERM`, so real-bank package qualification is mandatory before release.
+
+Windows ProductionV3 remains deliberately unavailable. A Job Object alone does
+not provide least privilege and the current spawn-then-assign sequence is not an
+AppContainer boundary. Activation requires an atomic `STARTUPINFOEX` launch
+with AppContainer/LPAC security capabilities, Job and inherited-handle lists,
+child-process and UI restrictions, and already-open read-only artifact handles.
+The current retained-file validator is pathname based and rejects the DACL
+changes that a path-based AppContainer grant would require, so a pathless
+retained-handle validation entry point is also required. Until both the launch
+and escape tests exist, the Windows ProductionV3 constructor fails closed.
+
+The Linux sandbox is designed to contain a verifier compromised by hostile
+proof input, and its current sentinels cover file-content reads, file and
+metadata mutation, network, process creation, broadened clone flags, unlisted
+syscalls, environment and descriptor inheritance. It does not conceal general
+pathname metadata or protect against an administrator, kernel compromise, or
+another process already running as the wallet user modifying package bytes.
+The per-real-UID task limit is not a per-worker CPU/PID boundary: a compromised
+persistent worker may retain allowed pthreads after responding. Dedicated
+per-worker CPU/PID enforcement remains a production release gate. This is one
+checkpoint, not a claim that the consensus implementation is ready for
+mainnet.
 
 The independent `proof_stream` ABI v1 copies ordered canonical
 physical-bit-reversed source coefficients to the GPU once and then advances a

@@ -95,24 +95,45 @@ hangs, or process compromise. A caller can instead use the short-lived
 hashes, a deadline, output limits, and whole-process-tree termination through a
 Windows Job Object or Unix process group. The hash-pinned worker path has been
 tested with a 64-byte tree proof, and the parent independently verifies the
-returned bytes. This contains ordinary crashes and descendants, but it is not
-an OS sandbox: same-user file replacement between hashing and loading,
-transitive native dependencies, and host-wide resource exhaustion remain
-outside this boundary. No wallet or node path enables either experimental path
-by default.
+returned bytes. This contains ordinary crashes and descendants, but the CUDA
+prover itself is not an OS sandbox: same-user file replacement between hashing
+and loading, transitive native dependencies, and host-wide resource exhaustion
+remain outside this boundary. No wallet or node path enables the prover by
+default.
 
 The node has a separate operator-enabled verifier-worker mode for externally
 submitted blocks. It reuses the hash-pinned executable and process-tree
 containment, adds an explicit wall-time limit and a Windows Job Object memory
 limit or Unix address-space limit, and transports only canonical bounded block
 bytes plus identities for the exact verifier and statement. A successful
-response is accepted only when both identities match. The worker outcome is a
+response is accepted only when both identities and the startup-authenticated
+sandbox status match. The worker outcome is a
 local trust boundary: unlike proof generation, the parent cannot repeat the
 expensive verification without defeating isolation. Operators must therefore
-pin a trusted executable and protect its path and account. This mode is crash
-and resource containment, not a defense against same-user code replacement or
-a compromised host, and it currently supports only Devnet's V2 reference
-verifier. V3 remains fail-closed.
+pin a trusted executable and protect its path and account. Devnet V2 retains
+crash and resource containment only. ProductionV3 on Linux x86_64 additionally
+requires Landlock ABI 3 or newer plus a default-deny seccomp filter before
+reading/loading artifact contents or untrusted IPC. Landlock grants file-content
+read access only to the exact three model artifacts and denies filesystem
+mutation/execute rights. The retained validator also requires directory-open
+rights on their dedicated mode-`0700` parent subtrees; seccomp denies
+directory-enumeration calls, but pathname/stat metadata for guessed host paths
+is not hidden. Seccomp permits only audited artifact-read, bounded-stdio,
+allocation, clock, and runtime syscalls, with an exact pthread clone mask, and
+denies every unlisted call. ABI 3 is accepted only because the seccomp network
+denial is mandatory; ABI 4+ also handles TCP bind/connect in Landlock. Setup
+failure aborts startup before P2P.
+Windows ProductionV3 remains fail-closed until an atomic AppContainer/LPAC
+launch and handle-based artifact validator pass equivalent escape tests. None
+of these controls defend against an administrator, kernel compromise, or a
+separate same-user process replacing package dependencies.
+
+The Linux checkpoint is not complete host-denial-of-service containment.
+`RLIMIT_NPROC` is shared by the worker's real UID, and the exact pthread clone
+rule still permits a compromised persistent worker to retain CPU-consuming
+threads after a response. Production release therefore remains gated on a
+per-worker CPU/PID limit or an equivalently race-bounded watchdog; per-UID
+limits are not represented as a substitute.
 
 The exact Poseidon2 CUDA first-digest layer is now used by proof generation for
 the value MMCS. Merkle parent compression, shorter-matrix injection, openings,

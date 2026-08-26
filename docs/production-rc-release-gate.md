@@ -161,3 +161,48 @@ sidecar layout. A real ProductionV3 package is therefore still blocked until
 the final artifacts exist and packaging compares the staged worker bytes to the
 compiled `NETWORK-INFO.json` pin on both platforms. Unit package-layout fixtures
 do not substitute for that final packaged smoke test.
+
+## Runtime verifier sandbox gate
+
+Process-tree and memory containment alone are not sufficient for a parser that
+handles hostile ProductionV3 proofs. The Linux x86-64 worker must install
+Landlock ABI 3 or newer and the compiled default-deny seccomp policy before it
+reads/loads model artifact contents or any untrusted IPC frame. The worker
+receives an empty environment and only standard protocol pipes across `exec`.
+Landlock grants read access only to the exact bank, manifest, and Record V2 and
+denies handled filesystem mutation and execution rights. The retained validator
+needs directory-open access on dedicated artifact-parent subtrees; directory
+enumeration is denied, but guessed pathname/stat metadata is not hidden. ABI 3
+does not mediate network access, so it is accepted only together with a seccomp
+allowlist limited to artifact reads, bounded stdio, allocation, clocks, and the
+Rust/Rayon runtime.
+The exact pthread clone mask is the only process-creation primitive and every
+unlisted syscall returns `EPERM`. Failure to establish either control aborts
+startup before replay or P2P.
+
+This Linux checkpoint does not yet provide a per-worker CPU/PID budget.
+`RLIMIT_NPROC` is per real UID, and an allowed pthread can outlive a completed
+request inside the persistent worker. Release remains blocked until delegated
+cgroup v2 limits or an equivalently fail-closed, race-bounded watchdog enforce
+the budget for this worker rather than for the operator account as a whole.
+
+Windows ProductionV3 remains an explicit release blocker. The existing Job
+Object is crash, tree, and memory containment, but spawn-then-assign leaves a
+pre-assignment execution window and does not provide filesystem, network, UI,
+clipboard, or token isolation. The Windows gate requires an atomic
+`STARTUPINFOEX` AppContainer/LPAC launch with zero network capabilities, Job
+and exact inherited-handle lists, child-process and Win32k restrictions, and a
+handle-based artifact validator. The existing pathname validator intentionally
+rejects the AppContainer ACL grant that path traversal would require, so the
+trusted parent must instead validate and pass read-only artifact handles.
+
+Neither platform is qualified by unit tests alone. Release evidence must show
+the packaged worker reading the real pinned artifacts, completing the startup
+handshake, accepting one known-valid ProductionV3 block, rejecting corruption,
+and passing file read/write, metadata mutation, network, process-spawn,
+unlisted-handle, environment, and teardown escape sentinels. Linux currently
+has the kernel-policy and sentinel implementation; its real-bank packaged run
+and per-worker CPU/PID containment are still outstanding. Windows has neither
+the AppContainer implementation nor its sentinel/full-worker evidence.
+Therefore this checkpoint must not activate RCNet or be described as
+cross-platform RC-ready.

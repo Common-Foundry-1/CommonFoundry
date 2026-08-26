@@ -3,15 +3,21 @@
 //! The parent hashes an explicitly named worker executable and CUDA library,
 //! sends one bounded canonical request, kills the child on timeout or output
 //! overflow, and verifies every returned proof with the unchanged CPU verifier.
-//! This isolates ordinary worker crashes and many worker OOM failures. It is not
-//! an operating-system sandbox and does not protect against a same-user attacker
-//! replacing the executable, DLL, or their dependencies during a check/load race.
+//! This isolates ordinary worker crashes and many worker OOM failures. The
+//! ProductionV3 block verifier additionally requires a startup-authenticated OS
+//! sandbox: Linux x86_64 installs Landlock plus seccomp before reading/loading
+//! artifact contents or untrusted IPC, while unsupported platforms fail closed.
+//! The CUDA prover and Devnet V2 verifier retain crash containment only. No mode
+//! protects against an administrator or same-user host attacker replacing
+//! dependencies.
 
 pub mod spill {
     pub use cmfd_proof_accel::spill::*;
 }
+mod sandbox;
 mod verifier;
 
+pub use sandbox::VerifierSandboxStatus;
 pub use verifier::{
     MAX_VERIFIER_REQUEST_BYTES, MAX_VERIFIER_RESPONSE_BYTES, PersistentVerifierWorker,
     ProductionV3VerifierArtifacts, VerifierProtocolError, VerifierWorkerConfig,
@@ -648,53 +654,164 @@ impl Drop for WindowsJob {
     }
 }
 
+#[cfg(unix)]
+fn spawn_contained_unix(
+    command: &mut Command,
+    memory_limit_bytes: Option<u64>,
+    require_linux_launch_boundary: bool,
+) -> Result<ContainedChild, ProofWorkerError> {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+    #[cfg(target_os = "linux")]
+    // SAFETY: getpid has no preconditions. Production launches execute this
+    // helper only on the process-lifetime supervisor thread, so the worker's
+    // kernel parent thread cannot disappear when an arbitrary request thread
+    // returns.
+    let expected_parent = unsafe { libc::getpid() };
+    let memory_limit = memory_limit_bytes
+        .map(libc::rlim_t::try_from)
+        .transpose()
+        .map_err(|_| {
+            ProofWorkerError::InvalidConfig(
+                "worker memory limit does not fit the platform resource-limit type",
+            )
+        })?;
+    // SAFETY: this closure calls only raw syscalls and the async-signal-safe
+    // setrlimit operation between fork and exec. Production requires
+    // close_range(CLOEXEC), preserving Rust's internal exec-error descriptor
+    // while guaranteeing that no non-stdio parent descriptor reaches the
+    // worker image. Devnet and the CUDA prover do not claim that stronger
+    // launch boundary and retain their prior process-tree crash containment.
+    unsafe {
+        command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            if require_linux_launch_boundary {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Close the fork-to-prctl race: if the long-lived supervisor
+                // exited first, the child is already reparented and aborts.
+                if libc::getppid() != expected_parent {
+                    return Err(io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+                if libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, CLOSE_RANGE_CLOEXEC) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if let Some(memory_limit) = memory_limit {
+                let limit = libc::rlimit {
+                    rlim_cur: memory_limit,
+                    rlim_max: memory_limit,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(ProofWorkerError::Spawn)?;
+    let process_group = match libc::pid_t::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProofWorkerError::InvalidConfig(
+                "worker PID does not fit the platform process ID type",
+            ));
+        }
+    };
+    Ok(ContainedChild {
+        child,
+        terminator: ProcessTerminator::process_group(process_group),
+        direct_kill_attempted: false,
+        direct_child_reaped: false,
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct ProductionSpawnRequest {
+    command: Command,
+    memory_limit_bytes: Option<u64>,
+    response: mpsc::SyncSender<Result<ContainedChild, ProofWorkerError>>,
+}
+
+#[cfg(target_os = "linux")]
+static PRODUCTION_SPAWN_SUPERVISOR: Mutex<Option<mpsc::Sender<ProductionSpawnRequest>>> =
+    Mutex::new(None);
+
+/// Launches a ProductionV3 verifier from one process-lifetime supervisor
+/// thread. Linux binds `PR_SET_PDEATHSIG` to the thread that performed the
+/// fork, not merely to the process ID; using a transient RPC/restart thread as
+/// the parent would therefore kill a healthy persistent worker when that
+/// thread returned.
+#[cfg(target_os = "linux")]
+fn spawn_contained_production(
+    command: Command,
+    memory_limit_bytes: Option<u64>,
+) -> Result<ContainedChild, ProofWorkerError> {
+    let sender = {
+        let mut supervisor =
+            PRODUCTION_SPAWN_SUPERVISOR
+                .lock()
+                .map_err(|_| ProofWorkerError::Containment {
+                    operation: "locking the ProductionV3 spawn supervisor",
+                    source: io::Error::other("ProductionV3 spawn supervisor state is poisoned"),
+                })?;
+        if supervisor.is_none() {
+            let (sender, receiver) = mpsc::channel::<ProductionSpawnRequest>();
+            thread::Builder::new()
+                .name("cmfd-v3-spawn-supervisor".to_owned())
+                .spawn(move || {
+                    while let Ok(mut request) = receiver.recv() {
+                        let result = spawn_contained_unix(
+                            &mut request.command,
+                            request.memory_limit_bytes,
+                            true,
+                        );
+                        let _ = request.response.send(result);
+                    }
+                })
+                .map_err(ProofWorkerError::Spawn)?;
+            *supervisor = Some(sender);
+        }
+        supervisor
+            .as_ref()
+            .expect("ProductionV3 spawn supervisor was initialized above")
+            .clone()
+    };
+    let (response, result) = mpsc::sync_channel(1);
+    sender
+        .send(ProductionSpawnRequest {
+            command,
+            memory_limit_bytes,
+            response,
+        })
+        .map_err(|_| ProofWorkerError::Containment {
+            operation: "submitting a ProductionV3 worker launch",
+            source: io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ProductionV3 spawn supervisor stopped",
+            ),
+        })?;
+    result.recv().map_err(|_| ProofWorkerError::Containment {
+        operation: "receiving a ProductionV3 worker launch result",
+        source: io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "ProductionV3 spawn supervisor stopped",
+        ),
+    })?
+}
+
 fn spawn_contained(
     command: &mut Command,
     memory_limit_bytes: Option<u64>,
 ) -> Result<ContainedChild, ProofWorkerError> {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-
-        command.process_group(0);
-        if let Some(memory_limit_bytes) = memory_limit_bytes {
-            let memory_limit = libc::rlim_t::try_from(memory_limit_bytes).map_err(|_| {
-                ProofWorkerError::InvalidConfig(
-                    "worker memory limit does not fit the platform resource-limit type",
-                )
-            })?;
-            // SAFETY: this closure calls only the async-signal-safe setrlimit
-            // operation between fork and exec. The limit is copied by value.
-            unsafe {
-                command.pre_exec(move || {
-                    let limit = libc::rlimit {
-                        rlim_cur: memory_limit,
-                        rlim_max: memory_limit,
-                    };
-                    if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        let mut child = command.spawn().map_err(ProofWorkerError::Spawn)?;
-        let process_group = match libc::pid_t::try_from(child.id()) {
-            Ok(process_group) => process_group,
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProofWorkerError::InvalidConfig(
-                    "worker PID does not fit the platform process ID type",
-                ));
-            }
-        };
-        Ok(ContainedChild {
-            child,
-            terminator: ProcessTerminator::process_group(process_group),
-            direct_kill_attempted: false,
-            direct_child_reaped: false,
-        })
+        spawn_contained_unix(command, memory_limit_bytes, false)
     }
 
     #[cfg(windows)]
@@ -1289,6 +1406,9 @@ fn run_worker() -> Result<Vec<u8>, (u16, String)> {
 /// share the audited protocol and hashing implementation with the library.
 #[doc(hidden)]
 pub fn worker_main() -> i32 {
+    if sandbox::diagnostic_mode_requested() {
+        return sandbox::diagnostic_main();
+    }
     if verifier::verifier_mode_requested() {
         return verifier::verifier_worker_main();
     }
@@ -1322,6 +1442,12 @@ mod tests {
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     const TEST_SPILL_DIRECTORY_ENV: &str = "CMFD_PROOF_WORKER_TEST_SPILL_DIRECTORY";
+    #[cfg(target_os = "linux")]
+    const TEST_INHERITED_FD_ENV: &str = "CMFD_PROOF_WORKER_TEST_INHERITED_FD";
+    #[cfg(target_os = "linux")]
+    const TEST_PDEATH_HELPER_ENV: &str = "CMFD_PROOF_WORKER_TEST_PDEATH_HELPER";
+    #[cfg(target_os = "linux")]
+    const TEST_PDEATH_PID_FILE_ENV: &str = "CMFD_PROOF_WORKER_TEST_PDEATH_PID_FILE";
 
     fn statement() -> StructuredBlake3Statement {
         StructuredBlake3Statement {
@@ -1673,6 +1799,48 @@ mod tests {
     #[test]
     fn child_fast_exit_helper() {}
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_parent_death_helper() {
+        if std::env::var_os(TEST_PDEATH_HELPER_ENV).is_none() {
+            return;
+        }
+        let pid_file = PathBuf::from(
+            std::env::var_os(TEST_PDEATH_PID_FILE_ENV).expect("parent-death PID sentinel"),
+        );
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = spawn_contained_production(command, None).unwrap();
+        fs::write(pid_file, child.child.id().to_string()).unwrap();
+        thread::sleep(Duration::from_secs(30));
+        drop(child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_inherited_fd_helper() {
+        let Some(raw_fd) = std::env::var_os(TEST_INHERITED_FD_ENV) else {
+            return;
+        };
+        let raw_fd = raw_fd
+            .to_string_lossy()
+            .parse::<libc::c_int>()
+            .expect("inherited descriptor number");
+        // SAFETY: F_GETFD only queries the numeric descriptor. The test uses a
+        // deliberately high descriptor so runtime startup cannot reuse it.
+        let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        assert_eq!(result, -1, "an unlisted parent descriptor survived exec");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF),
+            "the omitted descriptor failed for an unexpected reason"
+        );
+    }
+
     #[test]
     fn child_crash_helper() {
         if std::env::var_os("CMFD_PROOF_WORKER_CRASH_HELPER").is_some() {
@@ -1761,6 +1929,132 @@ mod tests {
         assert!(!leaf.unwrap().exists());
         assert!(root.is_dir());
         fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_containment_inherits_only_standard_pipes() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let sentinel_path = temporary_file(b"descriptor sentinel");
+        let sentinel = File::open(&sentinel_path).unwrap();
+        // Rust opens files CLOEXEC by default. Duplicate to a high descriptor
+        // and deliberately clear CLOEXEC so this test would fail without the
+        // close_range(CLOEXEC) launch boundary.
+        let inherited = unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_DUPFD, 1_000) };
+        assert!(
+            inherited >= 1_000,
+            "could not duplicate sentinel descriptor"
+        );
+        // SAFETY: F_DUPFD returned a new owned descriptor above.
+        let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
+        let flags = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    inherited.as_raw_fd(),
+                    libc::F_SETFD,
+                    flags & !libc::FD_CLOEXEC,
+                )
+            },
+            0
+        );
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("tests::child_inherited_fd_helper")
+            .arg("--nocapture")
+            .env(TEST_INHERITED_FD_ENV, inherited.as_raw_fd().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_contained_production(command, None).unwrap();
+        exchange_with_child(
+            child,
+            Vec::new(),
+            Duration::from_secs(2),
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+
+        fs::remove_file(sentinel_path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_worker_survives_the_request_thread_that_started_it() {
+        let mut child = thread::spawn(|| {
+            let mut command = Command::new("/bin/sleep");
+            command
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            spawn_contained_production(command, None).unwrap()
+        })
+        .join()
+        .expect("temporary launch caller thread");
+
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "ProductionV3 worker died when its request thread returned"
+        );
+        child.terminate_and_reap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_worker_dies_when_the_host_process_is_killed() {
+        fn live_non_zombie(pid: libc::pid_t) -> bool {
+            let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            stat.rsplit_once(") ")
+                .and_then(|(_, tail)| tail.as_bytes().first().copied())
+                != Some(b'Z')
+        }
+
+        let pid_file = temporary_path("pdeath-pid");
+        let mut host = Command::new(std::env::current_exe().unwrap());
+        host.arg("--exact")
+            .arg("tests::production_parent_death_helper")
+            .arg("--nocapture")
+            .env(TEST_PDEATH_HELPER_ENV, "1")
+            .env(TEST_PDEATH_PID_FILE_ENV, &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut host = host.spawn().expect("launch parent-death host helper");
+        let started = Instant::now();
+        while !pid_file.exists() && started.elapsed() < Duration::from_secs(5) {
+            assert!(
+                host.try_wait().unwrap().is_none(),
+                "parent-death host exited before publishing worker PID"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let worker_pid = fs::read_to_string(&pid_file)
+            .expect("parent-death helper published worker PID")
+            .parse::<libc::pid_t>()
+            .expect("parent-death worker PID");
+        assert!(live_non_zombie(worker_pid));
+
+        host.kill().expect("kill parent-death host process");
+        host.wait().expect("reap parent-death host process");
+        let started = Instant::now();
+        while live_non_zombie(worker_pid) && started.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let survived = live_non_zombie(worker_pid);
+        if survived {
+            unsafe {
+                libc::kill(worker_pid, libc::SIGKILL);
+            }
+        }
+        fs::remove_file(pid_file).unwrap();
+        assert!(!survived, "ProductionV3 worker survived host process death");
     }
 
     #[test]

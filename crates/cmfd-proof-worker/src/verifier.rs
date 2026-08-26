@@ -17,19 +17,21 @@ use thiserror::Error;
 
 use super::{
     ContainedChild, MAX_STDERR_BYTES, PROCESS_REAP_TIMEOUT, ProcessTerminator, ProofWorkerError,
-    exchange_with_child, spawn_contained, verify_file_hash, worker_exit_error,
+    VerifierSandboxStatus, exchange_with_child,
+    sandbox::{install_production, required_production_status},
+    spawn_contained, verify_file_hash, worker_exit_error,
 };
 
 const REQUEST_MAGIC: &[u8; 8] = b"CMFDVWQ1";
 const RESPONSE_MAGIC: &[u8; 8] = b"CMFDVWR1";
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const VERIFY_MODE: &str = "--verify-block";
 const PERSISTENT_VERIFY_MODE: &str = "--verify-block-server";
 const V3_BANK_ARGUMENT: &str = "--production-v3-bank";
 const V3_MANIFEST_ARGUMENT: &str = "--production-v3-manifest";
 const V3_RECORD_ARGUMENT: &str = "--production-v3-record-v2";
 const REQUEST_FIXED_BYTES: usize = 8 + 4 + 32 + 32 + 32 + 4;
-const SUCCESS_RESPONSE_BYTES: usize = 8 + 4 + 1 + 32 + 32;
+const SUCCESS_RESPONSE_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32;
 const ERROR_RESPONSE_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
 const MAX_ERROR_BYTES: usize = 1_024;
 const STATUS_SUCCESS: u8 = 0;
@@ -46,8 +48,8 @@ const HANDSHAKE_STATUS_SUCCESS: u8 = 0;
 const HANDSHAKE_STATUS_FAILURE: u8 = 1;
 const PROFILE_V2_REFERENCE: u8 = 2;
 const PROFILE_PRODUCTION_V3: u8 = 3;
-const HANDSHAKE_REQUEST_BYTES: usize = 8 + 4 + 1 + 32 + 32 + 32;
-const HANDSHAKE_SUCCESS_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32 + 32;
+const HANDSHAKE_REQUEST_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32 + 32;
+const HANDSHAKE_SUCCESS_BYTES: usize = 8 + 4 + 1 + 1 + 1 + 32 + 32 + 32;
 const HANDSHAKE_ERROR_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
 const STARTUP_SELF_TEST_DOMAIN: &[u8] = b"Common Foundry persistent verifier startup self-test v1";
 const PRIVATE_COPY_ATTEMPTS: usize = 128;
@@ -179,6 +181,8 @@ pub enum VerifierWorkerError {
     TransportPoisoned,
     #[error("verifier worker is permanently closed")]
     Closed,
+    #[error("ProductionV3 verifier sandbox is unavailable: {0}")]
+    SandboxUnavailable(&'static str),
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -214,6 +218,7 @@ struct VerifierRequest {
 #[derive(Debug, PartialEq, Eq)]
 enum VerifierResponse {
     Success {
+        sandbox_status: VerifierSandboxStatus,
         verifier_identity: [u8; 32],
         statement_identity: [u8; 32],
     },
@@ -226,6 +231,7 @@ enum VerifierResponse {
 #[derive(Debug, PartialEq, Eq)]
 struct StartupHandshake {
     profile: u8,
+    required_sandbox: VerifierSandboxStatus,
     network_id: [u8; 32],
     verifier_identity: [u8; 32],
     challenge: [u8; 32],
@@ -235,6 +241,7 @@ struct StartupHandshake {
 enum StartupResponse {
     Success {
         profile: u8,
+        sandbox_status: VerifierSandboxStatus,
         network_id: [u8; 32],
         verifier_identity: [u8; 32],
         self_test: [u8; 32],
@@ -265,6 +272,7 @@ struct PersistentVerifierWorkerInner {
     process_starts: AtomicU64,
     shutdown_epoch: AtomicU64,
     terminated_generation: AtomicU64,
+    sandbox_status: std::sync::atomic::AtomicU8,
     /// Set permanently if a contained generation leaves a pipe owner alive
     /// beyond the bounded teardown window. Later generations are forbidden so
     /// hostile descendants cannot accumulate unbounded threads or handles.
@@ -285,6 +293,10 @@ impl PersistentVerifierWorker {
         network_id: [u8; 32],
     ) -> Result<Self, VerifierWorkerError> {
         config.validate()?;
+        // Reject unsupported ProductionV3 isolation before copying or
+        // executing any worker image. Devnet V2 intentionally remains
+        // available with process-tree crash containment only.
+        expected_sandbox_status(&config)?;
         let runtime_copy =
             PrivateRuntimeCopy::create(&config.worker_executable, config.worker_sha256)?;
         let verifier_identity = verifier
@@ -302,6 +314,9 @@ impl PersistentVerifierWorker {
                 process_starts: AtomicU64::new(0),
                 shutdown_epoch: AtomicU64::new(0),
                 terminated_generation: AtomicU64::new(0),
+                sandbox_status: std::sync::atomic::AtomicU8::new(
+                    VerifierSandboxStatus::Unconfined as u8,
+                ),
                 transport_poisoned: Arc::new(AtomicBool::new(false)),
                 closed: AtomicBool::new(false),
                 runtime_copy,
@@ -368,7 +383,11 @@ impl PersistentVerifierWorker {
                 return Err(error);
             }
         };
-        if let Err(error) = require_matching_success(&response, binding) {
+        if let Err(error) = require_matching_success(
+            &response,
+            binding,
+            expected_sandbox_status(&self.inner.config)?,
+        ) {
             // A canonical proof rejection is an expected, statement-local
             // outcome. Protocol, identity, and worker-internal failures poison
             // this process generation and force a complete authenticated
@@ -431,6 +450,13 @@ impl PersistentVerifierWorker {
 
     pub fn memory_limit_bytes(&self) -> u64 {
         self.inner.config.memory_limit_bytes
+    }
+
+    /// Last startup-authenticated isolation state. ProductionV3 construction
+    /// fails before returning unless this is the platform-required sandbox.
+    pub fn sandbox_status(&self) -> VerifierSandboxStatus {
+        VerifierSandboxStatus::from_wire(self.inner.sandbox_status.load(Ordering::Acquire))
+            .unwrap_or(VerifierSandboxStatus::Unconfined)
     }
 
     /// Terminates the current process tree without waiting behind an in-flight
@@ -499,6 +525,7 @@ impl PersistentVerifierWorkerInner {
         if self.transport_poisoned.load(Ordering::Acquire) {
             return Err(VerifierWorkerError::TransportPoisoned);
         }
+        let required_sandbox = expected_sandbox_status(&self.config)?;
         // Recheck the immutable copy immediately before every exec. There is
         // still a residual same-user check/exec race on platforms without an
         // exec-by-retained-handle primitive; the copy lives in a private,
@@ -516,6 +543,8 @@ impl PersistentVerifierWorkerInner {
                 .arg(&artifacts.record_v2);
         }
         command
+            .env_clear()
+            .current_dir(self.runtime_copy.directory())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -523,7 +552,20 @@ impl PersistentVerifierWorkerInner {
         // published. The epoch closes that gap: any overlapping request is
         // observed immediately after publication and kills this generation.
         let shutdown_epoch = self.shutdown_epoch.load(Ordering::Acquire);
-        let child = spawn_contained(&mut command, Some(self.config.memory_limit_bytes))?;
+        let child = if self.config.production_v3_artifacts.is_some() {
+            #[cfg(target_os = "linux")]
+            {
+                super::spawn_contained_production(command, Some(self.config.memory_limit_bytes))?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // `expected_sandbox_status` above fails closed on every
+                // platform without an implemented ProductionV3 launcher.
+                spawn_contained(&mut command, Some(self.config.memory_limit_bytes))?
+            }
+        } else {
+            spawn_contained(&mut command, Some(self.config.memory_limit_bytes))?
+        };
         let generation = self.process_attempts.fetch_add(1, Ordering::AcqRel) + 1;
         let terminator = child.termination_handle();
         let mut process = PersistentVerifierProcess::new(
@@ -556,6 +598,7 @@ impl PersistentVerifierWorkerInner {
             let profile = configured_profile(&self.config);
             let request = encode_startup_handshake(StartupHandshake {
                 profile,
+                required_sandbox,
                 network_id: self.network_id,
                 verifier_identity: self.verifier_identity,
                 challenge,
@@ -565,13 +608,17 @@ impl PersistentVerifierWorkerInner {
                 self.config.startup_timeout,
                 HANDSHAKE_SUCCESS_BYTES.max(HANDSHAKE_ERROR_FIXED_BYTES + MAX_ERROR_BYTES),
             )?;
-            require_startup_success(
+            let sandbox_status = require_startup_success(
                 &response,
                 profile,
+                required_sandbox,
                 self.network_id,
                 self.verifier_identity,
                 challenge,
-            )
+            )?;
+            self.sandbox_status
+                .store(sandbox_status as u8, Ordering::Release);
+            Ok(())
         })();
         if let Err(error) = startup {
             self.clear_terminator(generation)?;
@@ -628,6 +675,16 @@ fn configured_profile(config: &VerifierWorkerConfig) -> u8 {
         PROFILE_PRODUCTION_V3
     } else {
         PROFILE_V2_REFERENCE
+    }
+}
+
+fn expected_sandbox_status(
+    config: &VerifierWorkerConfig,
+) -> Result<VerifierSandboxStatus, VerifierWorkerError> {
+    if config.production_v3_artifacts.is_some() {
+        required_production_status().map_err(VerifierWorkerError::SandboxUnavailable)
+    } else {
+        Ok(VerifierSandboxStatus::Unconfined)
     }
 }
 
@@ -695,6 +752,10 @@ impl PrivateRuntimeCopy {
 
     fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    fn directory(&self) -> &Path {
+        &self.directory
     }
 
     fn verify(&self, expected_sha256: [u8; 32]) -> Result<(), VerifierWorkerError> {
@@ -1140,6 +1201,7 @@ fn encode_startup_handshake(handshake: StartupHandshake) -> Vec<u8> {
     bytes.extend_from_slice(HANDSHAKE_REQUEST_MAGIC);
     bytes.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     bytes.push(handshake.profile);
+    bytes.push(handshake.required_sandbox as u8);
     bytes.extend_from_slice(&handshake.network_id);
     bytes.extend_from_slice(&handshake.verifier_identity);
     bytes.extend_from_slice(&handshake.challenge);
@@ -1164,6 +1226,8 @@ fn decode_startup_handshake(bytes: &[u8]) -> Result<StartupHandshake, VerifierPr
     }
     let handshake = StartupHandshake {
         profile,
+        required_sandbox: VerifierSandboxStatus::from_wire(cursor.read_u8()?)
+            .ok_or(VerifierProtocolError::InvalidStatus)?,
         network_id: cursor.read_array()?,
         verifier_identity: cursor.read_array()?,
         challenge: cursor.read_array()?,
@@ -1174,6 +1238,7 @@ fn decode_startup_handshake(bytes: &[u8]) -> Result<StartupHandshake, VerifierPr
 
 fn startup_self_test(
     profile: u8,
+    sandbox_status: VerifierSandboxStatus,
     network_id: [u8; 32],
     verifier_identity: [u8; 32],
     challenge: [u8; 32],
@@ -1181,22 +1246,28 @@ fn startup_self_test(
     let mut hasher = Sha256::new();
     hasher.update(STARTUP_SELF_TEST_DOMAIN);
     hasher.update([profile]);
+    hasher.update([sandbox_status as u8]);
     hasher.update(network_id);
     hasher.update(verifier_identity);
     hasher.update(challenge);
     hasher.finalize().into()
 }
 
-fn encode_startup_success(handshake: &StartupHandshake) -> Vec<u8> {
+fn encode_startup_success(
+    handshake: &StartupHandshake,
+    sandbox_status: VerifierSandboxStatus,
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(HANDSHAKE_SUCCESS_BYTES);
     bytes.extend_from_slice(HANDSHAKE_RESPONSE_MAGIC);
     bytes.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     bytes.push(HANDSHAKE_STATUS_SUCCESS);
     bytes.push(handshake.profile);
+    bytes.push(sandbox_status as u8);
     bytes.extend_from_slice(&handshake.network_id);
     bytes.extend_from_slice(&handshake.verifier_identity);
     bytes.extend_from_slice(&startup_self_test(
         handshake.profile,
+        sandbox_status,
         handshake.network_id,
         handshake.verifier_identity,
         handshake.challenge,
@@ -1228,6 +1299,8 @@ fn decode_startup_response(bytes: &[u8]) -> Result<StartupResponse, VerifierProt
     let response = match cursor.read_u8()? {
         HANDSHAKE_STATUS_SUCCESS => StartupResponse::Success {
             profile: cursor.read_u8()?,
+            sandbox_status: VerifierSandboxStatus::from_wire(cursor.read_u8()?)
+                .ok_or(VerifierProtocolError::InvalidStatus)?,
             network_id: cursor.read_array()?,
             verifier_identity: cursor.read_array()?,
             self_test: cursor.read_array()?,
@@ -1255,23 +1328,32 @@ fn decode_startup_response(bytes: &[u8]) -> Result<StartupResponse, VerifierProt
 fn require_startup_success(
     response: &[u8],
     profile: u8,
+    required_sandbox: VerifierSandboxStatus,
     network_id: [u8; 32],
     verifier_identity: [u8; 32],
     challenge: [u8; 32],
-) -> Result<(), VerifierWorkerError> {
+) -> Result<VerifierSandboxStatus, VerifierWorkerError> {
     match decode_startup_response(response)? {
         StartupResponse::Success {
             profile: received_profile,
+            sandbox_status,
             network_id: received_network,
             verifier_identity: received_verifier,
             self_test,
         } if received_profile == profile
+            && sandbox_status == required_sandbox
             && received_network == network_id
             && received_verifier == verifier_identity
             && self_test
-                == startup_self_test(profile, network_id, verifier_identity, challenge) =>
+                == startup_self_test(
+                    profile,
+                    required_sandbox,
+                    network_id,
+                    verifier_identity,
+                    challenge,
+                ) =>
         {
-            Ok(())
+            Ok(sandbox_status)
         }
         StartupResponse::Success { .. } => Err(VerifierWorkerError::Startup(
             "worker startup identity or self-test did not match the compiled verifier".to_owned(),
@@ -1290,6 +1372,7 @@ pub fn verify_block_out_of_process(
     verifier: &ConsensusPowVerifier,
     block: &Block,
 ) -> Result<PreverifiedBlockProof, VerifierWorkerError> {
+    let required_sandbox = expected_sandbox_status(config)?;
     config.validate_executable()?;
     let canonical = encode_block(block)
         .map_err(|error| VerifierWorkerError::BlockEncoding(error.to_string()))?;
@@ -1314,13 +1397,32 @@ pub fn verify_block_out_of_process(
             .arg(&artifacts.record_v2);
     }
     command
+        .env_clear()
+        .current_dir(config.worker_executable.parent().ok_or(
+            VerifierWorkerError::InvalidConfig(
+                "verifier worker executable has no parent directory",
+            ),
+        )?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = spawn_contained(&mut command, Some(config.memory_limit_bytes))?;
+    let child = if config.production_v3_artifacts.is_some() {
+        #[cfg(target_os = "linux")]
+        {
+            super::spawn_contained_production(command, Some(config.memory_limit_bytes))?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // `expected_sandbox_status` above fails closed on every platform
+            // without an implemented ProductionV3 launcher.
+            spawn_contained(&mut command, Some(config.memory_limit_bytes))?
+        }
+    } else {
+        spawn_contained(&mut command, Some(config.memory_limit_bytes))?
+    };
     let response =
         exchange_with_child(child, request, config.timeout, MAX_VERIFIER_RESPONSE_BYTES)?;
-    require_matching_success(&response, binding)?;
+    require_matching_success(&response, binding, required_sandbox)?;
 
     // SAFETY: the exact binding was returned by the caller-pinned worker only
     // after a canonical request, successful exit, bounded wall time, bounded
@@ -1333,12 +1435,14 @@ pub fn verify_block_out_of_process(
 fn require_matching_success(
     response: &[u8],
     binding: ExternalPreverificationBinding,
+    required_sandbox: VerifierSandboxStatus,
 ) -> Result<(), VerifierWorkerError> {
-    let (echoed_verifier, echoed_statement) = match decode_response(response)? {
+    let (sandbox_status, echoed_verifier, echoed_statement) = match decode_response(response)? {
         VerifierResponse::Success {
+            sandbox_status,
             verifier_identity,
             statement_identity,
-        } => (verifier_identity, statement_identity),
+        } => (sandbox_status, verifier_identity, statement_identity),
         VerifierResponse::Failure { code, message } if code == ERROR_PROOF_REJECTED => {
             return Err(VerifierWorkerError::ProofRejected(message));
         }
@@ -1346,7 +1450,8 @@ fn require_matching_success(
             return Err(VerifierWorkerError::WorkerReported { code, message });
         }
     };
-    if echoed_verifier != binding.verifier_identity()
+    if sandbox_status != required_sandbox
+        || echoed_verifier != binding.verifier_identity()
         || echoed_statement != binding.statement_identity()
     {
         return Err(VerifierWorkerError::ResponseMismatch);
@@ -1401,11 +1506,15 @@ fn decode_request(bytes: &[u8]) -> Result<VerifierRequest, VerifierProtocolError
     })
 }
 
-fn encode_success_response(binding: ExternalPreverificationBinding) -> Vec<u8> {
+fn encode_success_response(
+    binding: ExternalPreverificationBinding,
+    sandbox_status: VerifierSandboxStatus,
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(SUCCESS_RESPONSE_BYTES);
     output.extend_from_slice(RESPONSE_MAGIC);
     output.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     output.push(STATUS_SUCCESS);
+    output.push(sandbox_status as u8);
     output.extend_from_slice(&binding.verifier_identity());
     output.extend_from_slice(&binding.statement_identity());
     output
@@ -1437,6 +1546,8 @@ fn decode_response(bytes: &[u8]) -> Result<VerifierResponse, VerifierProtocolErr
     }
     let response = match cursor.read_u8()? {
         STATUS_SUCCESS => VerifierResponse::Success {
+            sandbox_status: VerifierSandboxStatus::from_wire(cursor.read_u8()?)
+                .ok_or(VerifierProtocolError::InvalidStatus)?,
             verifier_identity: cursor.read_array()?,
             statement_identity: cursor.read_array()?,
         },
@@ -1460,9 +1571,12 @@ fn decode_response(bytes: &[u8]) -> Result<VerifierResponse, VerifierProtocolErr
     Ok(response)
 }
 
-fn run_verifier_worker() -> Result<ExternalPreverificationBinding, (u16, String)> {
+fn run_verifier_worker()
+-> Result<(ExternalPreverificationBinding, VerifierSandboxStatus), (u16, String)> {
     let artifacts = parse_verifier_worker_arguments(std::env::args_os().skip(1))
         .map_err(|message| (ERROR_REQUEST, message.to_owned()))?;
+    require_empty_worker_environment()?;
+    let sandbox_status = install_worker_sandbox(artifacts.as_ref())?;
     let request_bytes = read_stdin_bounded()
         .map_err(|error| (ERROR_INTERNAL, format!("could not read request: {error}")))?;
     let request =
@@ -1479,6 +1593,27 @@ fn run_verifier_worker() -> Result<ExternalPreverificationBinding, (u16, String)
 
     let verifier = load_worker_verifier(request.network_id, artifacts.as_ref())?;
     verify_request_with_loaded_verifier(&verifier, request, block)
+        .map(|binding| (binding, sandbox_status))
+}
+
+fn install_worker_sandbox(
+    artifacts: Option<&ProductionV3VerifierArtifacts>,
+) -> Result<VerifierSandboxStatus, (u16, String)> {
+    let Some(artifacts) = artifacts else {
+        return Ok(VerifierSandboxStatus::Unconfined);
+    };
+    install_production(&[&artifacts.bank, &artifacts.manifest, &artifacts.record_v2])
+        .map_err(|message| (ERROR_INTERNAL, message))
+}
+
+fn require_empty_worker_environment() -> Result<(), (u16, String)> {
+    if std::env::vars_os().next().is_some() {
+        return Err((
+            ERROR_INTERNAL,
+            "verifier worker environment must be empty".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_request_with_loaded_verifier(
@@ -1532,6 +1667,13 @@ fn persistent_verifier_worker_main() -> i32 {
             return write_single_startup_error(ERROR_REQUEST, message);
         }
     };
+    if let Err((code, message)) = require_empty_worker_environment() {
+        return write_single_startup_error(code, &message);
+    }
+    let sandbox_status = match install_worker_sandbox(artifacts.as_ref()) {
+        Ok(status) => status,
+        Err((code, message)) => return write_single_startup_error(code, &message),
+    };
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = stdin.lock();
@@ -1572,6 +1714,16 @@ fn persistent_verifier_worker_main() -> i32 {
         );
         return 1;
     }
+    if handshake.required_sandbox != sandbox_status {
+        let _ = write_worker_frame(
+            &mut output,
+            &encode_startup_error(
+                ERROR_UNSUPPORTED_VERIFIER,
+                "worker sandbox does not match the required production isolation",
+            ),
+        );
+        return 1;
+    }
     let verifier = match load_worker_verifier(handshake.network_id, artifacts.as_ref()) {
         Ok(verifier) => verifier,
         Err((code, message)) => {
@@ -1602,7 +1754,12 @@ fn persistent_verifier_worker_main() -> i32 {
         );
         return 1;
     }
-    if write_worker_frame(&mut output, &encode_startup_success(&handshake)).is_err() {
+    if write_worker_frame(
+        &mut output,
+        &encode_startup_success(&handshake, sandbox_status),
+    )
+    .is_err()
+    {
         return 1;
     }
 
@@ -1622,7 +1779,7 @@ fn persistent_verifier_worker_main() -> i32 {
                     Ok(block) => match encode_block(&block) {
                         Ok(canonical) if canonical == request.block => {
                             match verify_request_with_loaded_verifier(&verifier, request, block) {
-                                Ok(binding) => encode_success_response(binding),
+                                Ok(binding) => encode_success_response(binding, sandbox_status),
                                 Err((code, message)) => encode_error_response(code, &message),
                             }
                         }
@@ -1784,7 +1941,7 @@ pub(super) fn verifier_worker_main() -> i32 {
         return persistent_verifier_worker_main();
     }
     let response = match run_verifier_worker() {
-        Ok(binding) => encode_success_response(binding),
+        Ok((binding, sandbox_status)) => encode_success_response(binding, sandbox_status),
         Err((code, message)) => encode_error_response(code, &message),
     };
     match io::stdout().write_all(&response) {
@@ -1947,10 +2104,11 @@ mod tests {
         let binding = verifier
             .external_preverification_binding(&block.challenge, &block.proof)
             .unwrap();
-        let encoded = encode_success_response(binding);
+        let encoded = encode_success_response(binding, VerifierSandboxStatus::Unconfined);
         assert_eq!(
             decode_response(&encoded).unwrap(),
             VerifierResponse::Success {
+                sandbox_status: VerifierSandboxStatus::Unconfined,
                 verifier_identity: binding.verifier_identity(),
                 statement_identity: binding.statement_identity(),
             }
@@ -1961,6 +2119,7 @@ mod tests {
         let VerifierResponse::Success {
             verifier_identity,
             statement_identity,
+            ..
         } = decode_response(&substituted).unwrap()
         else {
             unreachable!();
@@ -1970,7 +2129,14 @@ mod tests {
                 || statement_identity != binding.statement_identity()
         );
         assert!(matches!(
-            require_matching_success(&substituted, binding),
+            require_matching_success(&substituted, binding, VerifierSandboxStatus::Unconfined,),
+            Err(VerifierWorkerError::ResponseMismatch)
+        ));
+
+        let mut wrong_sandbox = encoded.clone();
+        wrong_sandbox[13] = VerifierSandboxStatus::LinuxLandlockSeccompV1 as u8;
+        assert!(matches!(
+            require_matching_success(&wrong_sandbox, binding, VerifierSandboxStatus::Unconfined,),
             Err(VerifierWorkerError::ResponseMismatch)
         ));
 
@@ -1986,6 +2152,53 @@ mod tests {
             decode_response(&bad_status),
             Err(VerifierProtocolError::InvalidStatus)
         );
+    }
+
+    #[test]
+    fn startup_handshake_authenticates_required_sandbox_status() {
+        let handshake = StartupHandshake {
+            profile: PROFILE_PRODUCTION_V3,
+            required_sandbox: VerifierSandboxStatus::LinuxLandlockSeccompV1,
+            network_id: [0x11; 32],
+            verifier_identity: [0x22; 32],
+            challenge: [0x33; 32],
+        };
+        assert_eq!(
+            decode_startup_handshake(&encode_startup_handshake(StartupHandshake {
+                profile: handshake.profile,
+                required_sandbox: handshake.required_sandbox,
+                network_id: handshake.network_id,
+                verifier_identity: handshake.verifier_identity,
+                challenge: handshake.challenge,
+            }))
+            .unwrap(),
+            handshake
+        );
+        let success =
+            encode_startup_success(&handshake, VerifierSandboxStatus::LinuxLandlockSeccompV1);
+        assert_eq!(
+            require_startup_success(
+                &success,
+                handshake.profile,
+                handshake.required_sandbox,
+                handshake.network_id,
+                handshake.verifier_identity,
+                handshake.challenge,
+            )
+            .unwrap(),
+            VerifierSandboxStatus::LinuxLandlockSeccompV1
+        );
+        assert!(matches!(
+            require_startup_success(
+                &success,
+                handshake.profile,
+                VerifierSandboxStatus::WindowsAppContainerV1,
+                handshake.network_id,
+                handshake.verifier_identity,
+                handshake.challenge,
+            ),
+            Err(VerifierWorkerError::Startup(_))
+        ));
     }
 
     #[test]

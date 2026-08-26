@@ -9,7 +9,7 @@
 use std::{
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use thiserror::Error;
@@ -118,6 +118,16 @@ impl BlsDoryWordTransposeWriter {
     }
 
     pub fn write_row(&mut self, row: &[u64]) -> Result<(), BlsDoryTransposeError> {
+        let cancel = AtomicBool::new(false);
+        self.write_row_with_cancel(row, &cancel)
+    }
+
+    pub(crate) fn write_row_with_cancel(
+        &mut self,
+        row: &[u64],
+        cancel: &AtomicBool,
+    ) -> Result<(), BlsDoryTransposeError> {
+        check_cancel(cancel)?;
         if row.len() != self.columns
             || self
                 .written_rows
@@ -129,20 +139,30 @@ impl BlsDoryWordTransposeWriter {
         self.row_buffer.extend_from_slice(row);
         self.buffered_rows += 1;
         if self.buffered_rows == self.chunk_rows {
-            self.flush_chunk()?;
+            self.flush_chunk_with_cancel(cancel)?;
         }
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<BlsDoryWordTransposeArtifact, BlsDoryTransposeError> {
-        self.flush_chunk()?;
+    pub fn finish(self) -> Result<BlsDoryWordTransposeArtifact, BlsDoryTransposeError> {
+        let cancel = AtomicBool::new(false);
+        self.finish_with_cancel(&cancel)
+    }
+
+    pub(crate) fn finish_with_cancel(
+        mut self,
+        cancel: &AtomicBool,
+    ) -> Result<BlsDoryWordTransposeArtifact, BlsDoryTransposeError> {
+        check_cancel(cancel)?;
+        self.flush_chunk_with_cancel(cancel)?;
         if self.written_rows != self.rows {
             return Err(BlsDoryTransposeError::Incomplete);
         }
         self.file_mut()?.flush()?;
         let rows = self.rows;
         let columns = self.columns;
-        let snapshot = authenticate_file(self.file_mut()?, rows, columns)?;
+        let snapshot = authenticate_file_with_cancel(self.file_mut()?, rows, columns, cancel)?;
+        check_cancel(cancel)?;
         self.file_mut()?.seek(SeekFrom::Start(DIGEST_OFFSET))?;
         self.file_mut()?.write_all(&snapshot.digest)?;
         self.file_mut()?.flush()?;
@@ -171,7 +191,11 @@ impl BlsDoryWordTransposeWriter {
         })
     }
 
-    fn flush_chunk(&mut self) -> Result<(), BlsDoryTransposeError> {
+    fn flush_chunk_with_cancel(
+        &mut self,
+        cancel: &AtomicBool,
+    ) -> Result<(), BlsDoryTransposeError> {
+        check_cancel(cancel)?;
         if self.buffered_rows == 0 {
             return Ok(());
         }
@@ -184,6 +208,7 @@ impl BlsDoryWordTransposeWriter {
             .try_reserve_exact(encoded_capacity)
             .map_err(|_| BlsDoryTransposeError::InvalidShape)?;
         for column in 0..self.columns {
+            check_cancel(cancel)?;
             encoded.clear();
             for row in 0..self.buffered_rows {
                 let index = row
@@ -207,6 +232,7 @@ impl BlsDoryWordTransposeWriter {
             self.file_mut()?.seek(SeekFrom::Start(offset))?;
             self.file_mut()?.write_all(&encoded)?;
         }
+        check_cancel(cancel)?;
         self.written_rows = self
             .written_rows
             .checked_add(self.buffered_rows)
@@ -563,6 +589,17 @@ fn authenticate_file(
     rows: usize,
     columns: usize,
 ) -> Result<AuthenticationSnapshot, BlsDoryTransposeError> {
+    let cancel = AtomicBool::new(false);
+    authenticate_file_with_cancel(file, rows, columns, &cancel)
+}
+
+fn authenticate_file_with_cancel(
+    file: &mut TrackedScratchFile,
+    rows: usize,
+    columns: usize,
+    cancel: &AtomicBool,
+) -> Result<AuthenticationSnapshot, BlsDoryTransposeError> {
+    check_cancel(cancel)?;
     let expected_data_bytes = data_bytes(rows, columns)?;
     let expected_len = HEADER_BYTES
         .checked_add(expected_data_bytes)
@@ -596,6 +633,7 @@ fn authenticate_file(
         .map_err(|_| BlsDoryTransposeError::InvalidShape)?;
     for column in 0..columns {
         for block in 0..blocks_per_column {
+            check_cancel(cancel)?;
             let start_row = block
                 .checked_mul(AUTHENTICATION_BLOCK_ROWS)
                 .ok_or(BlsDoryTransposeError::InvalidShape)?;
@@ -628,6 +666,13 @@ fn authenticate_file(
         digest: *hasher.finalize().as_bytes(),
         block_digests,
     })
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryTransposeError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryTransposeError::Incomplete);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -14,6 +14,8 @@
 
 #[cfg(feature = "whir-prototype")]
 use std::io::Cursor;
+#[cfg(feature = "whir-prototype")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dory_pcs::primitives::arithmetic::Field as DoryField;
 #[cfg(feature = "whir-prototype")]
@@ -48,7 +50,8 @@ use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryAggregateLayout, BlsDoryCommittedPolynomial, BlsDoryCommittedPolynomialWriter,
         BlsDoryCompactRowSource, BlsDoryDeferredOpeningSet,
-        commit_bls_dory_compact_row_source_with_scratch, source_artifact_spec,
+        commit_bls_dory_compact_row_source_with_scratch,
+        commit_bls_dory_compact_row_source_with_scratch_with_cancel, source_artifact_spec,
     },
     dory_bls12_381_output_bridge::BlsDoryOutputBridgeStatement,
     dory_bls12_381_prototype::{
@@ -66,6 +69,14 @@ use crate::{
         for_each_canonical_preprocessed_trace_row, for_each_main_trace_row, public_values,
     },
 };
+
+#[cfg(feature = "whir-prototype")]
+fn check_native_prover_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryAggregateError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryAggregateError::Cancelled);
+    }
+    Ok(())
+}
 use crate::{
     dory_bls12_381_aggregate::{BlsDoryAggregateError, BlsDoryOpeningClaim},
     dory_bls12_381_compact_artifact::BlsDoryCompactArtifactSpec,
@@ -492,7 +503,7 @@ mod adjacency_round_artifact;
 use adjacency_round_artifact::{
     BlsDoryBlake3AdjacencyRoundArtifact, BlsDoryBlake3AdjacencyRoundArtifactWriter,
     BlsDoryBlake3AdjacencyRoundParent, BlsDoryBlake3AdjacencyRoundRow,
-    fold_native_blake3_adjacency_artifact,
+    fold_native_blake3_adjacency_artifact_with_cancel,
 };
 
 /// Main words, the native accumulator, and post-challenge inverses require
@@ -3873,17 +3884,21 @@ impl BlsDoryBlake3ExecutionAuxiliaryTables {
         Ok(rows)
     }
 
-    fn fold(&mut self, challenge: BlsDoryFr) -> Result<(), BlsDoryAggregateError> {
+    fn fold(
+        &mut self,
+        challenge: BlsDoryFr,
+        cancel: &AtomicBool,
+    ) -> Result<(), BlsDoryAggregateError> {
         let rows = self.active_rows()?;
         if rows < 2 || rows & 1 != 0 {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
-        fold_native_blake3_auxiliary_table(&mut self.equality, challenge);
-        fold_native_blake3_auxiliary_table(&mut self.first, challenge);
-        fold_native_blake3_auxiliary_table(&mut self.last, challenge);
-        fold_native_blake3_auxiliary_table(&mut self.transition, challenge);
+        fold_native_blake3_auxiliary_table(&mut self.equality, challenge, cancel)?;
+        fold_native_blake3_auxiliary_table(&mut self.first, challenge, cancel)?;
+        fold_native_blake3_auxiliary_table(&mut self.last, challenge, cancel)?;
+        fold_native_blake3_auxiliary_table(&mut self.transition, challenge, cancel)?;
         for table in &mut self.byte_coefficients {
-            fold_native_blake3_auxiliary_table(table, challenge);
+            fold_native_blake3_auxiliary_table(table, challenge, cancel)?;
         }
         Ok(())
     }
@@ -3916,20 +3931,27 @@ fn allocate_native_blake3_auxiliary_table(
 }
 
 #[cfg(feature = "whir-prototype")]
-fn fold_native_blake3_auxiliary_table(table: &mut Vec<BlsDoryFr>, challenge: BlsDoryFr) {
+fn fold_native_blake3_auxiliary_table(
+    table: &mut Vec<BlsDoryFr>,
+    challenge: BlsDoryFr,
+    cancel: &AtomicBool,
+) -> Result<(), BlsDoryAggregateError> {
     let folded = table.len() / 2;
     for pair in 0..folded {
+        check_native_prover_cancel(cancel)?;
         let lower = table[2 * pair];
         let upper = table[2 * pair + 1];
         table[pair] = lower + challenge * (upper - lower);
     }
     table.truncate(folded);
+    Ok(())
 }
 
 #[cfg(feature = "whir-prototype")]
 fn for_each_authenticated_execution_root_pair(
     prepared: &mut PreparedBlsDoryBlake3Sources,
     maximum_block_rows: usize,
+    cancel: &AtomicBool,
     mut visitor: impl FnMut(
         usize,
         &BlsDoryBlake3ExecutionRoundRow,
@@ -3944,6 +3966,7 @@ fn for_each_authenticated_execution_root_pair(
     let mut visited = 0usize;
     let mut pair_index = 0usize;
     prepared.for_each_authenticated_execution_row(maximum_block_rows, |row, terminal| {
+        check_native_prover_cancel(cancel)?;
         if row != visited {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
@@ -3965,6 +3988,7 @@ fn for_each_authenticated_execution_root_pair(
 #[cfg(feature = "whir-prototype")]
 fn for_each_authenticated_execution_round_pair(
     artifact: &BlsDoryBlake3ExecutionRoundArtifact,
+    cancel: &AtomicBool,
     mut visitor: impl FnMut(
         usize,
         &BlsDoryBlake3ExecutionRoundRow,
@@ -3974,6 +3998,10 @@ fn for_each_authenticated_execution_round_pair(
     let mut pair_index = 0usize;
     let mut visitor_error = None;
     let traversal = artifact.for_each_row_pair(|lower, upper| {
+        if cancel.load(Ordering::Acquire) {
+            visitor_error = Some(BlsDoryAggregateError::Cancelled);
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
         match visitor(pair_index, lower, upper) {
             Ok(()) => pair_index += 1,
             Err(error) => {
@@ -4046,11 +4074,13 @@ fn evaluate_native_blake3_execution_root_round(
     maximum_block_rows: usize,
     auxiliary: &BlsDoryBlake3ExecutionAuxiliaryTables,
     relation: &BlsDoryBlake3ExecutionRelation<'_>,
+    cancel: &AtomicBool,
 ) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
     let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1];
     for_each_authenticated_execution_root_pair(
         prepared,
         maximum_block_rows,
+        cancel,
         |pair_index, lower, upper| {
             native_blake3_accumulate_execution_pair(
                 pair_index,
@@ -4070,6 +4100,7 @@ fn evaluate_native_blake3_execution_artifact_round(
     artifact: &BlsDoryBlake3ExecutionRoundArtifact,
     auxiliary: &BlsDoryBlake3ExecutionAuxiliaryTables,
     relation: &BlsDoryBlake3ExecutionRelation<'_>,
+    cancel: &AtomicBool,
 ) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
     let artifact_rows = usize::try_from(artifact.active_rows)
         .map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
@@ -4077,7 +4108,7 @@ fn evaluate_native_blake3_execution_artifact_round(
         return Err(BlsDoryAggregateError::InvalidCoefficientCount);
     }
     let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_SUMCHECK_DEGREE + 1];
-    for_each_authenticated_execution_round_pair(artifact, |pair_index, lower, upper| {
+    for_each_authenticated_execution_round_pair(artifact, cancel, |pair_index, lower, upper| {
         native_blake3_accumulate_execution_pair(
             pair_index,
             lower,
@@ -4097,6 +4128,7 @@ fn fold_native_blake3_execution_root(
     scratch_directory: &std::path::Path,
     root_lineage: [u8; 32],
     challenge: BlsDoryFr,
+    cancel: &AtomicBool,
 ) -> Result<BlsDoryBlake3ExecutionRoundArtifact, BlsDoryAggregateError> {
     let active_rows = prepared.binding.trace_rows / 2;
     let active_rows =
@@ -4112,6 +4144,7 @@ fn fold_native_blake3_execution_root(
     for_each_authenticated_execution_root_pair(
         prepared,
         maximum_block_rows,
+        cancel,
         |_pair_index, lower, upper| {
             for column in 0..BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS {
                 folded[column] = lower[column] + challenge * (upper[column] - lower[column]);
@@ -4124,11 +4157,22 @@ fn fold_native_blake3_execution_root(
     writer.finish().map_err(native_blake3_fold_artifact_error)
 }
 
-#[cfg(feature = "whir-prototype")]
+#[cfg(all(feature = "whir-prototype", test))]
 fn fold_native_blake3_execution_artifact(
     parent: &BlsDoryBlake3ExecutionRoundArtifact,
     scratch_directory: &std::path::Path,
     challenge: BlsDoryFr,
+) -> Result<BlsDoryBlake3ExecutionRoundArtifact, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    fold_native_blake3_execution_artifact_with_cancel(parent, scratch_directory, challenge, &cancel)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn fold_native_blake3_execution_artifact_with_cancel(
+    parent: &BlsDoryBlake3ExecutionRoundArtifact,
+    scratch_directory: &std::path::Path,
+    challenge: BlsDoryFr,
+    cancel: &AtomicBool,
 ) -> Result<BlsDoryBlake3ExecutionRoundArtifact, BlsDoryAggregateError> {
     if parent.active_rows < 2 {
         return Err(BlsDoryAggregateError::InvalidCoefficientCount);
@@ -4151,12 +4195,22 @@ fn fold_native_blake3_execution_artifact(
     // therefore drops and deletes the unfinished child before returning.
     parent
         .for_each_row_pair(|lower, upper| {
+            if cancel.load(Ordering::Acquire) {
+                return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+            }
             for column in 0..BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS {
                 folded[column] = lower[column] + challenge * (upper[column] - lower[column]);
             }
             writer.write_row(&folded)
         })
-        .map_err(native_blake3_fold_artifact_error)?;
+        .map_err(|error| {
+            if cancel.load(Ordering::Acquire) {
+                BlsDoryAggregateError::Cancelled
+            } else {
+                native_blake3_fold_artifact_error(error)
+            }
+        })?;
+    check_native_prover_cancel(cancel)?;
     writer.finish().map_err(native_blake3_fold_artifact_error)
 }
 
@@ -4204,6 +4258,25 @@ fn prove_native_blake3_execution_sumcheck_out_of_core(
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
 ) -> Result<BlsDoryBlake3ExecutionSumcheckProof, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prove_native_blake3_execution_sumcheck_out_of_core_with_cancel(
+        prepared,
+        bridge,
+        scratch_directory,
+        maximum_block_rows,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn prove_native_blake3_execution_sumcheck_out_of_core_with_cancel(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryBlake3ExecutionSumcheckProof, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     if maximum_block_rows == 0 || !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
@@ -4249,14 +4322,16 @@ fn prove_native_blake3_execution_sumcheck_out_of_core(
     let mut current_artifact = None;
 
     for round_index in 0..variables {
+        check_native_prover_cancel(cancel)?;
         let evaluations = if let Some(parent) = current_artifact.as_ref() {
-            evaluate_native_blake3_execution_artifact_round(parent, &auxiliary, &relation)?
+            evaluate_native_blake3_execution_artifact_round(parent, &auxiliary, &relation, cancel)?
         } else {
             evaluate_native_blake3_execution_root_round(
                 prepared,
                 maximum_block_rows,
                 &auxiliary,
                 &relation,
+                cancel,
             )?
         };
         if evaluations[0] + evaluations[1] != claim {
@@ -4272,7 +4347,12 @@ fn prove_native_blake3_execution_sumcheck_out_of_core(
         .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
 
         let child = if let Some(parent) = current_artifact.as_ref() {
-            fold_native_blake3_execution_artifact(parent, scratch_directory, challenge)?
+            fold_native_blake3_execution_artifact_with_cancel(
+                parent,
+                scratch_directory,
+                challenge,
+                cancel,
+            )?
         } else {
             fold_native_blake3_execution_root(
                 prepared,
@@ -4280,11 +4360,13 @@ fn prove_native_blake3_execution_sumcheck_out_of_core(
                 scratch_directory,
                 root_lineage,
                 challenge,
+                cancel,
             )?
         };
-        auxiliary.fold(challenge)?;
+        auxiliary.fold(challenge, cancel)?;
         current_artifact = Some(child);
         rounds.push(evaluations.to_vec());
+        check_native_prover_cancel(cancel)?;
     }
 
     let terminal = current_artifact
@@ -4514,14 +4596,18 @@ impl BlsDoryBlake3AdjacencyAuxiliaryTables {
         Ok(rows)
     }
 
-    fn fold(&mut self, challenge: BlsDoryFr) -> Result<(), BlsDoryAggregateError> {
+    fn fold(
+        &mut self,
+        challenge: BlsDoryFr,
+        cancel: &AtomicBool,
+    ) -> Result<(), BlsDoryAggregateError> {
         let rows = self.active_rows()?;
         if rows < 2 || rows & 1 != 0 {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
-        fold_native_blake3_auxiliary_table(&mut self.equality, challenge);
-        fold_native_blake3_auxiliary_table(&mut self.row_index, challenge);
-        fold_native_blake3_auxiliary_table(&mut self.first, challenge);
+        fold_native_blake3_auxiliary_table(&mut self.equality, challenge, cancel)?;
+        fold_native_blake3_auxiliary_table(&mut self.row_index, challenge, cancel)?;
+        fold_native_blake3_auxiliary_table(&mut self.first, challenge, cancel)?;
         Ok(())
     }
 
@@ -4537,6 +4623,7 @@ impl BlsDoryBlake3AdjacencyAuxiliaryTables {
 fn for_each_authenticated_adjacency_root_pair(
     prepared: &mut PreparedBlsDoryBlake3Sources,
     maximum_block_rows: usize,
+    cancel: &AtomicBool,
     mut visitor: impl FnMut(
         usize,
         &[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS],
@@ -4551,6 +4638,7 @@ fn for_each_authenticated_adjacency_root_pair(
     let mut visited = 0usize;
     let mut pair_index = 0usize;
     prepared.for_each_authenticated_adjacency_row(maximum_block_rows, |row, terminal| {
+        check_native_prover_cancel(cancel)?;
         if row != visited {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
@@ -4612,11 +4700,13 @@ fn evaluate_native_blake3_adjacency_root_round(
     maximum_block_rows: usize,
     auxiliary: &BlsDoryBlake3AdjacencyAuxiliaryTables,
     relation: BlsDoryBlake3AdjacencyRelation,
+    cancel: &AtomicBool,
 ) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
     let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1];
     for_each_authenticated_adjacency_root_pair(
         prepared,
         maximum_block_rows,
+        cancel,
         |pair_index, lower, upper| {
             native_blake3_accumulate_adjacency_pair(
                 pair_index,
@@ -4634,6 +4724,7 @@ fn evaluate_native_blake3_adjacency_root_round(
 #[cfg(feature = "whir-prototype")]
 fn for_each_authenticated_adjacency_round_pair(
     artifact: &BlsDoryBlake3AdjacencyRoundArtifact,
+    cancel: &AtomicBool,
     mut visitor: impl FnMut(
         usize,
         &BlsDoryBlake3AdjacencyRoundRow,
@@ -4643,6 +4734,10 @@ fn for_each_authenticated_adjacency_round_pair(
     let mut pair_index = 0usize;
     let mut visitor_error = None;
     let traversal = artifact.for_each_row_pair(|lower, upper| {
+        if cancel.load(Ordering::Acquire) {
+            visitor_error = Some(BlsDoryAggregateError::Cancelled);
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
         match visitor(pair_index, lower, upper) {
             Ok(()) => pair_index += 1,
             Err(error) => {
@@ -4669,6 +4764,7 @@ fn evaluate_native_blake3_adjacency_artifact_round(
     artifact: &BlsDoryBlake3AdjacencyRoundArtifact,
     auxiliary: &BlsDoryBlake3AdjacencyAuxiliaryTables,
     relation: BlsDoryBlake3AdjacencyRelation,
+    cancel: &AtomicBool,
 ) -> Result<[BlsDoryFr; BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1], BlsDoryAggregateError> {
     let artifact_rows = usize::try_from(artifact.active_rows())
         .map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
@@ -4676,7 +4772,7 @@ fn evaluate_native_blake3_adjacency_artifact_round(
         return Err(BlsDoryAggregateError::InvalidCoefficientCount);
     }
     let mut evaluations = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_SUMCHECK_DEGREE + 1];
-    for_each_authenticated_adjacency_round_pair(artifact, |pair_index, lower, upper| {
+    for_each_authenticated_adjacency_round_pair(artifact, cancel, |pair_index, lower, upper| {
         native_blake3_accumulate_adjacency_pair(
             pair_index,
             lower,
@@ -4696,6 +4792,7 @@ fn fold_native_blake3_adjacency_root(
     scratch_directory: &std::path::Path,
     root_lineage: [u8; 32],
     challenge: BlsDoryFr,
+    cancel: &AtomicBool,
 ) -> Result<BlsDoryBlake3AdjacencyRoundArtifact, BlsDoryAggregateError> {
     let active_rows = prepared.binding.trace_rows / 2;
     let active_rows =
@@ -4711,6 +4808,7 @@ fn fold_native_blake3_adjacency_root(
     for_each_authenticated_adjacency_root_pair(
         prepared,
         maximum_block_rows,
+        cancel,
         |_pair_index, lower, upper| {
             for column in 0..BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS {
                 folded[column] = lower[column] + challenge * (upper[column] - lower[column]);
@@ -4756,6 +4854,25 @@ fn prove_native_blake3_adjacency_sumcheck_out_of_core(
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
 ) -> Result<BlsDoryBlake3AdjacencySumcheckProof, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prove_native_blake3_adjacency_sumcheck_out_of_core_with_cancel(
+        prepared,
+        bridge,
+        scratch_directory,
+        maximum_block_rows,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn prove_native_blake3_adjacency_sumcheck_out_of_core_with_cancel(
+    prepared: &mut PreparedBlsDoryBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryBlake3AdjacencySumcheckProof, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     if maximum_block_rows == 0 || !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
@@ -4808,14 +4925,16 @@ fn prove_native_blake3_adjacency_sumcheck_out_of_core(
     let mut current_artifact = None;
 
     for round_index in 0..variables {
+        check_native_prover_cancel(cancel)?;
         let evaluations = if let Some(parent) = current_artifact.as_ref() {
-            evaluate_native_blake3_adjacency_artifact_round(parent, &auxiliary, relation)?
+            evaluate_native_blake3_adjacency_artifact_round(parent, &auxiliary, relation, cancel)?
         } else {
             evaluate_native_blake3_adjacency_root_round(
                 prepared,
                 maximum_block_rows,
                 &auxiliary,
                 relation,
+                cancel,
             )?
         };
         if evaluations[0] + evaluations[1] != claim {
@@ -4831,8 +4950,19 @@ fn prove_native_blake3_adjacency_sumcheck_out_of_core(
         .ok_or(BlsDoryAggregateError::SumcheckFailed)?;
 
         let child = if let Some(parent) = current_artifact.as_ref() {
-            fold_native_blake3_adjacency_artifact(parent, scratch_directory, challenge)
-                .map_err(native_blake3_fold_artifact_error)?
+            fold_native_blake3_adjacency_artifact_with_cancel(
+                parent,
+                scratch_directory,
+                challenge,
+                cancel,
+            )
+            .map_err(|error| {
+                if cancel.load(Ordering::Acquire) {
+                    BlsDoryAggregateError::Cancelled
+                } else {
+                    native_blake3_fold_artifact_error(error)
+                }
+            })?
         } else {
             fold_native_blake3_adjacency_root(
                 prepared,
@@ -4840,11 +4970,13 @@ fn prove_native_blake3_adjacency_sumcheck_out_of_core(
                 scratch_directory,
                 root_lineage,
                 challenge,
+                cancel,
             )?
         };
-        auxiliary.fold(challenge)?;
+        auxiliary.fold(challenge, cancel)?;
         current_artifact = Some(child);
         rounds.push(evaluations.to_vec());
+        check_native_prover_cancel(cancel)?;
     }
 
     let terminal = current_artifact
@@ -5585,34 +5717,64 @@ fn for_each_native_accumulator_pair<E>(
 const BLS_DORY_BLAKE3_ACCUMULATOR_WRITE_CHUNK_SCALARS: usize = 1 << 15;
 
 #[cfg(feature = "whir-prototype")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn write_native_accumulator_pass(
+#[allow(clippy::too_many_arguments)]
+fn write_native_accumulator_pass_with_cancel(
     writer: &mut BlsDoryCommittedPolynomialWriter<'_>,
     air: &NarrowBlake3Air,
     statement: &StructuredBlake3Statement,
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
     bridge: &BlsDoryOutputBridgeStatement,
     write_next: bool,
+    cancel: &AtomicBool,
 ) -> Result<(), BlsDoryAggregateError> {
+    write_native_accumulator_pass_with_cancel_check(
+        writer,
+        air,
+        statement,
+        witness,
+        bridge,
+        write_next,
+        cancel,
+        || check_native_prover_cancel(cancel),
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn write_native_accumulator_pass_with_cancel_check(
+    writer: &mut BlsDoryCommittedPolynomialWriter<'_>,
+    air: &NarrowBlake3Air,
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    write_next: bool,
+    cancel: &AtomicBool,
+    mut check_cancel: impl FnMut() -> Result<(), BlsDoryAggregateError>,
+) -> Result<(), BlsDoryAggregateError> {
+    check_cancel()?;
     let mut scalars = Vec::with_capacity(BLS_DORY_BLAKE3_ACCUMULATOR_WRITE_CHUNK_SCALARS);
     let mut emitted = 0usize;
     let mut last = None;
     for_each_native_accumulator_pair(air, statement, witness, bridge, |row_index, local, next| {
+        check_cancel()?;
         if row_index != emitted {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
         scalars.push(if write_next { next } else { local });
         if scalars.len() == BLS_DORY_BLAKE3_ACCUMULATOR_WRITE_CHUNK_SCALARS {
-            writer.write_scalars(&scalars)?;
+            writer.write_scalars_with_cancel(&scalars, cancel)?;
             scalars.clear();
+            check_cancel()?;
         }
         emitted += 1;
         last = Some((local, next));
         Ok(())
     })?;
+    check_cancel()?;
     if !scalars.is_empty() {
-        writer.write_scalars(&scalars)?;
+        writer.write_scalars_with_cancel(&scalars, cancel)?;
     }
+    check_cancel()?;
     if emitted != air.trace_rows()
         || last != Some((bridge.raw_byte_evaluation(), BlsDoryFr::zero()))
     {
@@ -5652,6 +5814,30 @@ fn commit_native_accumulator_source_with_output_profile(
     scratch_directory: &std::path::Path,
     output_profile: NarrowBlake3OutputProfile,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    commit_native_accumulator_source_with_output_profile_and_cancel(
+        witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+        output_profile,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn commit_native_accumulator_source_with_output_profile_and_cancel(
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    output_profile: NarrowBlake3OutputProfile,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     if witness.digest != bridge.final_activation_digest() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
@@ -5672,31 +5858,62 @@ fn commit_native_accumulator_source_with_output_profile(
         layout.sigma(),
         setup,
     )?;
-    write_native_accumulator_pass(&mut writer, &air, &native_statement, witness, bridge, false)?;
-    write_native_accumulator_pass(&mut writer, &air, &native_statement, witness, bridge, true)?;
-    writer.finish()
+    write_native_accumulator_pass_with_cancel(
+        &mut writer,
+        &air,
+        &native_statement,
+        witness,
+        bridge,
+        false,
+        cancel,
+    )?;
+    write_native_accumulator_pass_with_cancel(
+        &mut writer,
+        &air,
+        &native_statement,
+        witness,
+        bridge,
+        true,
+        cancel,
+    )?;
+    writer.finish_with_cancel(cancel)
 }
 
 #[cfg(feature = "whir-prototype")]
 const BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS: usize = 1 << 15;
 
 #[cfg(feature = "whir-prototype")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn batch_invert_nonzero(values: &mut [BlsDoryFr]) -> Option<()> {
+    let cancel = AtomicBool::new(false);
+    batch_invert_nonzero_with_cancel(values, &cancel).ok()?
+}
+
+#[cfg(feature = "whir-prototype")]
+fn batch_invert_nonzero_with_cancel(
+    values: &mut [BlsDoryFr],
+    cancel: &AtomicBool,
+) -> Result<Option<()>, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     for batch in values.chunks_mut(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
+        check_native_prover_cancel(cancel)?;
         let mut prefixes = Vec::with_capacity(batch.len());
         let mut product = BlsDoryFr::from_u64(1);
         for value in batch.iter().copied() {
             prefixes.push(product);
             product = product * value;
         }
-        let mut suffix = product.inv()?;
+        let Some(mut suffix) = product.inv() else {
+            return Ok(None);
+        };
         for index in (0..batch.len()).rev() {
             let value = batch[index];
             batch[index] = suffix * prefixes[index];
             suffix = suffix * value;
         }
     }
-    Some(())
+    check_native_prover_cancel(cancel)?;
+    Ok(Some(()))
 }
 
 /// Commit the two LogUp inverse tables from authenticated ordinary-main and
@@ -5713,6 +5930,58 @@ fn commit_native_adjacency_inverse_source(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &std::path::Path,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    commit_native_adjacency_inverse_source_with_cancel(
+        ordinary_main,
+        accumulator,
+        compression,
+        alpha,
+        layout,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn commit_native_adjacency_inverse_source_with_cancel(
+    ordinary_main: &mut BlsDoryWordTransposeArtifact,
+    accumulator: &BlsDoryCommittedPolynomial,
+    compression: BlsDoryFr,
+    alpha: BlsDoryFr,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    commit_native_adjacency_inverse_source_with_cancel_check(
+        ordinary_main,
+        accumulator,
+        compression,
+        alpha,
+        layout,
+        setup,
+        scratch_directory,
+        cancel,
+        || check_native_prover_cancel(cancel),
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn commit_native_adjacency_inverse_source_with_cancel_check(
+    ordinary_main: &mut BlsDoryWordTransposeArtifact,
+    accumulator: &BlsDoryCommittedPolynomial,
+    compression: BlsDoryFr,
+    alpha: BlsDoryFr,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    cancel: &AtomicBool,
+    mut check_cancel: impl FnMut() -> Result<(), BlsDoryAggregateError>,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    check_cancel()?;
     let trace_rows = ordinary_main.rows();
     let explicit_scalars = trace_rows
         .checked_mul(BLS_DORY_BLAKE3_INVERSE_SCALAR_TABLES)
@@ -5738,33 +6007,54 @@ fn commit_native_adjacency_inverse_source(
     let trace_rows_u64 =
         u64::try_from(trace_rows).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
     let mut keys = Vec::with_capacity(explicit_scalars);
-    keys.extend((0..trace_rows).map(|row| {
-        BlsDoryFr::from_u64(if row == 0 {
-            trace_rows_u64 - 1
-        } else {
-            row as u64 - 1
-        })
-    }));
-    keys.extend((0..trace_rows).map(|row| BlsDoryFr::from_u64(row as u64)));
+    for chunk_start in (0..trace_rows).step_by(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
+        check_cancel()?;
+        let chunk_end = chunk_start
+            .saturating_add(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS)
+            .min(trace_rows);
+        keys.extend((chunk_start..chunk_end).map(|row| {
+            BlsDoryFr::from_u64(if row == 0 {
+                trace_rows_u64 - 1
+            } else {
+                row as u64 - 1
+            })
+        }));
+    }
+    for chunk_start in (0..trace_rows).step_by(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
+        check_cancel()?;
+        let chunk_end = chunk_start
+            .saturating_add(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS)
+            .min(trace_rows);
+        keys.extend((chunk_start..chunk_end).map(|row| BlsDoryFr::from_u64(row as u64)));
+    }
 
     let mut words = vec![0u64; trace_rows];
     let mut artifact_column = 0usize;
     for native_column in 0..BLS_DORY_BLAKE3_MAIN_WIDTH {
+        check_cancel()?;
         if native_column == NARROW_BLAKE3_EVALUATION_ACCUMULATOR_START {
-            accumulator.for_each_explicit_coefficient(|index, value| {
+            accumulator.for_each_explicit_coefficient_with_cancel(cancel, |index, value| {
                 keys[index] = keys[index] * compression + value;
             })?;
+            check_cancel()?;
             continue;
         }
         ordinary_main
             .read_column(artifact_column, &mut words)
             .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-        for row in 0..trace_rows {
-            let local = BlsDoryFr::from_i64(i64::from_le_bytes(words[row].to_le_bytes()));
-            let next_word = words[(row + 1) % trace_rows];
-            let next = BlsDoryFr::from_i64(i64::from_le_bytes(next_word.to_le_bytes()));
-            keys[row] = keys[row] * compression + local;
-            keys[trace_rows + row] = keys[trace_rows + row] * compression + next;
+        check_cancel()?;
+        for chunk_start in (0..trace_rows).step_by(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
+            check_cancel()?;
+            let chunk_end = chunk_start
+                .saturating_add(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS)
+                .min(trace_rows);
+            for row in chunk_start..chunk_end {
+                let local = BlsDoryFr::from_i64(i64::from_le_bytes(words[row].to_le_bytes()));
+                let next_word = words[(row + 1) % trace_rows];
+                let next = BlsDoryFr::from_i64(i64::from_le_bytes(next_word.to_le_bytes()));
+                keys[row] = keys[row] * compression + local;
+                keys[trace_rows + row] = keys[trace_rows + row] * compression + next;
+            }
         }
         artifact_column += 1;
     }
@@ -5772,10 +6062,15 @@ fn commit_native_adjacency_inverse_source(
         return Err(BlsDoryAggregateError::InvalidCoefficientCount);
     }
 
-    for key in &mut keys {
-        *key = alpha - *key;
+    for batch in keys.chunks_mut(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
+        check_cancel()?;
+        for key in batch {
+            *key = alpha - *key;
+        }
     }
-    batch_invert_nonzero(&mut keys).ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    batch_invert_nonzero_with_cancel(&mut keys, cancel)?
+        .ok_or(BlsDoryAggregateError::InvalidProofShape)?;
+    check_cancel()?;
 
     let row_bytes = physical_columns
         .checked_mul(std::mem::size_of::<BlsDoryFr>())
@@ -5788,8 +6083,11 @@ fn commit_native_adjacency_inverse_source(
         setup,
         row_bytes,
     )?;
-    writer.write_scalars(&keys)?;
-    writer.finish()
+    for batch in keys.chunks(BLS_DORY_BLAKE3_INVERSE_BATCH_SCALARS) {
+        check_cancel()?;
+        writer.write_scalars_with_cancel(batch, cancel)?;
+    }
+    writer.finish_with_cancel(cancel)
 }
 
 #[cfg(feature = "whir-prototype")]
@@ -5863,12 +6161,33 @@ fn validate_native_blake3_source_layout(
 }
 
 #[cfg(feature = "whir-prototype")]
-fn create_native_main_transpose(
+fn create_native_main_transpose_with_cancel(
     air: &NarrowBlake3Air,
     statement: &StructuredBlake3Statement,
     witness: &crate::structured_blake3_tree::Blake3TreeWitness,
     scratch_directory: &std::path::Path,
+    cancel: &AtomicBool,
 ) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
+    create_native_main_transpose_with_cancel_check(
+        air,
+        statement,
+        witness,
+        scratch_directory,
+        cancel,
+        || check_native_prover_cancel(cancel),
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn create_native_main_transpose_with_cancel_check(
+    air: &NarrowBlake3Air,
+    statement: &StructuredBlake3Statement,
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    scratch_directory: &std::path::Path,
+    cancel: &AtomicBool,
+    mut check_cancel: impl FnMut() -> Result<(), BlsDoryAggregateError>,
+) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
+    check_cancel()?;
     let mut writer = BlsDoryWordTransposeWriter::create(
         scratch_directory,
         air.trace_rows(),
@@ -5879,8 +6198,9 @@ fn create_native_main_transpose(
     let mut emitted = 0usize;
     let mut words = Vec::with_capacity(BLS_DORY_BLAKE3_MAIN_WIDTH - 1);
     for_each_main_trace_row(air, statement, witness, |row_index, row| {
+        check_cancel()?;
         if row_index != emitted || row.len() != NARROW_BLAKE3_MAIN_WIDTH {
-            return Err(BlsDoryTransposeError::InvalidShape);
+            return Err(BlsDoryAggregateError::InvalidProofShape);
         }
         words.clear();
         words.extend(
@@ -5893,17 +6213,33 @@ fn create_native_main_transpose(
                 .map(|(_, value)| u64::from_le_bytes(centered_goldilocks(*value).to_le_bytes())),
         );
         if words.len() != BLS_DORY_BLAKE3_MAIN_WIDTH - 1 {
-            return Err(BlsDoryTransposeError::InvalidShape);
+            return Err(BlsDoryAggregateError::InvalidProofShape);
         }
-        writer.write_row(&words)?;
+        writer
+            .write_row_with_cancel(&words, cancel)
+            .map_err(|error| {
+                if cancel.load(Ordering::Acquire) {
+                    BlsDoryAggregateError::Cancelled
+                } else {
+                    blake3_transpose_error(error)
+                }
+            })?;
         emitted += 1;
         Ok(())
-    })
-    .map_err(blake3_transpose_error)?;
+    })?;
+    check_cancel()?;
     if emitted != air.trace_rows() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    writer.finish().map_err(blake3_transpose_error)
+    let artifact = writer.finish_with_cancel(cancel).map_err(|error| {
+        if cancel.load(Ordering::Acquire) {
+            BlsDoryAggregateError::Cancelled
+        } else {
+            blake3_transpose_error(error)
+        }
+    })?;
+    check_cancel()?;
+    Ok(artifact)
 }
 
 #[cfg(feature = "whir-prototype")]
@@ -5911,6 +6247,29 @@ fn create_native_preprocessed_transpose(
     air: &NarrowBlake3Air,
     scratch_directory: &std::path::Path,
 ) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    create_native_preprocessed_transpose_with_cancel(air, scratch_directory, &cancel)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn create_native_preprocessed_transpose_with_cancel(
+    air: &NarrowBlake3Air,
+    scratch_directory: &std::path::Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
+    create_native_preprocessed_transpose_with_cancel_check(air, scratch_directory, cancel, || {
+        check_native_prover_cancel(cancel)
+    })
+}
+
+#[cfg(feature = "whir-prototype")]
+fn create_native_preprocessed_transpose_with_cancel_check(
+    air: &NarrowBlake3Air,
+    scratch_directory: &std::path::Path,
+    cancel: &AtomicBool,
+    mut check_cancel: impl FnMut() -> Result<(), BlsDoryAggregateError>,
+) -> Result<BlsDoryWordTransposeArtifact, BlsDoryAggregateError> {
+    check_cancel()?;
     let mut writer = BlsDoryWordTransposeWriter::create(
         scratch_directory,
         air.trace_rows(),
@@ -5921,20 +6280,37 @@ fn create_native_preprocessed_transpose(
     let mut emitted = 0usize;
     let mut words = Vec::with_capacity(BLS_DORY_BLAKE3_PREPROCESSED_WIDTH);
     for_each_canonical_preprocessed_trace_row(air, |row_index, row| {
+        check_cancel()?;
         if row_index != emitted || row.len() != BLS_DORY_BLAKE3_PREPROCESSED_WIDTH {
-            return Err(BlsDoryTransposeError::InvalidShape);
+            return Err(BlsDoryAggregateError::InvalidProofShape);
         }
         words.clear();
         words.extend(row.iter().map(|value| value.as_canonical_u64()));
-        writer.write_row(&words)?;
+        writer
+            .write_row_with_cancel(&words, cancel)
+            .map_err(|error| {
+                if cancel.load(Ordering::Acquire) {
+                    BlsDoryAggregateError::Cancelled
+                } else {
+                    blake3_transpose_error(error)
+                }
+            })?;
         emitted += 1;
         Ok(())
-    })
-    .map_err(blake3_transpose_error)?;
+    })?;
+    check_cancel()?;
     if emitted != air.trace_rows() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    writer.finish().map_err(blake3_transpose_error)
+    let artifact = writer.finish_with_cancel(cancel).map_err(|error| {
+        if cancel.load(Ordering::Acquire) {
+            BlsDoryAggregateError::Cancelled
+        } else {
+            blake3_transpose_error(error)
+        }
+    })?;
+    check_cancel()?;
+    Ok(artifact)
 }
 
 /// Derive the deterministic production preprocessing commitment without
@@ -6071,6 +6447,30 @@ fn prepare_native_blake3_sources_at_layout_with_output_profile(
     scratch_directory: &std::path::Path,
     output_profile: NarrowBlake3OutputProfile,
 ) -> Result<PreparedBlsDoryBlake3Sources, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prepare_native_blake3_sources_at_layout_with_output_profile_and_cancel(
+        witness,
+        bridge,
+        layout,
+        setup,
+        scratch_directory,
+        output_profile,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_native_blake3_sources_at_layout_with_output_profile_and_cancel(
+    witness: &crate::structured_blake3_tree::Blake3TreeWitness,
+    bridge: &BlsDoryOutputBridgeStatement,
+    layout: BlsDoryAggregateLayout,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    output_profile: NarrowBlake3OutputProfile,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryBlake3Sources, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     if witness.digest != bridge.final_activation_digest() {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
@@ -6079,42 +6479,56 @@ fn prepare_native_blake3_sources_at_layout_with_output_profile(
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
     validate_native_blake3_source_layout(air.trace_rows(), layout, setup)?;
 
-    let mut preprocessed_transpose = create_native_preprocessed_transpose(&air, scratch_directory)?;
+    let mut preprocessed_transpose =
+        create_native_preprocessed_transpose_with_cancel(&air, scratch_directory, cancel)?;
+    check_native_prover_cancel(cancel)?;
     let preprocessing = {
         let mut source =
             TransposedPreprocessedRowSource::new_for_layout(&mut preprocessed_transpose, layout)
                 .map_err(blake3_transpose_error)?;
-        commit_bls_dory_compact_row_source_with_scratch(
+        commit_bls_dory_compact_row_source_with_scratch_with_cancel(
             &mut source,
             layout.nu(),
             layout.sigma(),
             setup,
             scratch_directory,
+            cancel,
         )?
     };
+    check_native_prover_cancel(cancel)?;
 
-    let mut main_transpose =
-        create_native_main_transpose(&air, &native_statement, witness, scratch_directory)?;
+    let mut main_transpose = create_native_main_transpose_with_cancel(
+        &air,
+        &native_statement,
+        witness,
+        scratch_directory,
+        cancel,
+    )?;
+    check_native_prover_cancel(cancel)?;
     let main = {
         let mut source =
             TransposedLocalNextSignedWordRowSource::new_for_layout(&mut main_transpose, layout)
                 .map_err(blake3_transpose_error)?;
-        commit_bls_dory_compact_row_source_with_scratch(
+        commit_bls_dory_compact_row_source_with_scratch_with_cancel(
             &mut source,
             layout.nu(),
             layout.sigma(),
             setup,
             scratch_directory,
+            cancel,
         )?
     };
-    let accumulator = commit_native_accumulator_source_with_output_profile(
+    check_native_prover_cancel(cancel)?;
+    let accumulator = commit_native_accumulator_source_with_output_profile_and_cancel(
         witness,
         bridge,
         layout,
         setup,
         scratch_directory,
         output_profile,
+        cancel,
     )?;
+    check_native_prover_cancel(cancel)?;
     let (compression, alpha) = derive_native_blake3_adjacency_challenges(
         bridge,
         air.trace_rows(),
@@ -6124,7 +6538,8 @@ fn prepare_native_blake3_sources_at_layout_with_output_profile(
             preprocessing: preprocessing.commitment(),
         },
     )?;
-    let inverse = commit_native_adjacency_inverse_source(
+    check_native_prover_cancel(cancel)?;
+    let inverse = commit_native_adjacency_inverse_source_with_cancel(
         &mut main_transpose,
         &accumulator,
         compression,
@@ -6132,7 +6547,9 @@ fn prepare_native_blake3_sources_at_layout_with_output_profile(
         layout,
         setup,
         scratch_directory,
+        cancel,
     )?;
+    check_native_prover_cancel(cancel)?;
 
     let sources = BlsDoryBlake3CommittedSources {
         main,
@@ -6157,11 +6574,30 @@ fn prepare_native_blake3_sources_at_layout_with_output_profile(
 #[cfg(feature = "whir-prototype")]
 #[cfg_attr(not(test), allow(dead_code))]
 fn prove_prepared_native_blake3_sources(
-    mut prepared: PreparedBlsDoryBlake3Sources,
+    prepared: PreparedBlsDoryBlake3Sources,
     bridge: &BlsDoryOutputBridgeStatement,
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
 ) -> Result<ProvenBlsDoryNativeBlake3Sources, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prove_prepared_native_blake3_sources_with_cancel(
+        prepared,
+        bridge,
+        scratch_directory,
+        maximum_block_rows,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn prove_prepared_native_blake3_sources_with_cancel(
+    mut prepared: PreparedBlsDoryBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+    cancel: &AtomicBool,
+) -> Result<ProvenBlsDoryNativeBlake3Sources, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     let trace_rows = prepared.binding.trace_rows;
     if maximum_block_rows == 0
         || !scratch_directory.is_absolute()
@@ -6182,18 +6618,22 @@ fn prove_prepared_native_blake3_sources(
     }
 
     let source_commitments = prepared.commitments();
-    let execution = prove_native_blake3_execution_sumcheck_out_of_core(
+    let execution = prove_native_blake3_execution_sumcheck_out_of_core_with_cancel(
         &mut prepared,
         bridge,
         scratch_directory,
         maximum_block_rows,
+        cancel,
     )?;
-    let adjacency = prove_native_blake3_adjacency_sumcheck_out_of_core(
+    check_native_prover_cancel(cancel)?;
+    let adjacency = prove_native_blake3_adjacency_sumcheck_out_of_core_with_cancel(
         &mut prepared,
         bridge,
         scratch_directory,
         maximum_block_rows,
+        cancel,
     )?;
+    check_native_prover_cancel(cancel)?;
     let output_profile = prepared.binding.output_profile;
     let sources = prepared.into_committed_sources()?;
     if sources.commitments() != source_commitments {
@@ -6220,6 +6660,18 @@ fn finalize_native_blake3_opening(
     bridge: &BlsDoryOutputBridgeStatement,
     verifier: BlsDoryBlake3ReplayVerifier<'_>,
 ) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    finalize_native_blake3_opening_with_cancel(proven, bridge, verifier, &cancel)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn finalize_native_blake3_opening_with_cancel(
+    proven: ProvenBlsDoryNativeBlake3Sources,
+    bridge: &BlsDoryOutputBridgeStatement,
+    verifier: BlsDoryBlake3ReplayVerifier<'_>,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     let ProvenBlsDoryNativeBlake3Sources {
         sources,
         proof,
@@ -6240,6 +6692,7 @@ fn finalize_native_blake3_opening(
         &proof.execution,
         &proof.adjacency,
     )?;
+    check_native_prover_cancel(cancel)?;
     let points = [
         replay.execution_points[0].clone(),
         replay.execution_points[1].clone(),
@@ -6254,6 +6707,7 @@ fn finalize_native_blake3_opening(
         geometry,
     )?;
     let encoded_native_proof = proof.encode_at_trace_variables(geometry.trace_variables)?;
+    check_native_prover_cancel(cancel)?;
     if BlsDoryNativeBlake3Proof::decode_at_trace_variables(
         &encoded_native_proof,
         geometry.trace_variables,
@@ -6267,6 +6721,7 @@ fn finalize_native_blake3_opening(
         geometry.shared_variables,
     )?;
     let opening_set = sources.into_deferred_openings(points)?;
+    check_native_prover_cancel(cancel)?;
     opening_statement.validate_claims(opening_set.claims())?;
 
     Ok(PreparedBlsDoryNativeBlake3Opening {
@@ -6285,6 +6740,7 @@ pub(crate) fn prepare_production_native_blake3_opening(
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
 ) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
     prepare_production_native_blake3_opening_with_output_profile(
         final_activation,
         bridge,
@@ -6292,6 +6748,7 @@ pub(crate) fn prepare_production_native_blake3_opening(
         scratch_directory,
         maximum_block_rows,
         NarrowBlake3OutputProfile::ForgeMatrixV2,
+        &cancel,
     )
 }
 
@@ -6306,6 +6763,27 @@ pub(crate) fn prepare_production_dory_v3_native_blake3_opening(
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
 ) -> Result<PreparedBlsDoryV3NativeBlake3Opening, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prepare_production_dory_v3_native_blake3_opening_with_cancel(
+        final_activation,
+        bridge,
+        setup,
+        scratch_directory,
+        maximum_block_rows,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn prepare_production_dory_v3_native_blake3_opening_with_cancel(
+    final_activation: &[u8],
+    bridge: &BlsDoryOutputBridgeStatement,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &std::path::Path,
+    maximum_block_rows: usize,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryV3NativeBlake3Opening, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     let prepared = prepare_production_native_blake3_opening_with_output_profile(
         final_activation,
         bridge,
@@ -6313,6 +6791,7 @@ pub(crate) fn prepare_production_dory_v3_native_blake3_opening(
         scratch_directory,
         maximum_block_rows,
         NarrowBlake3OutputProfile::DoryV3,
+        cancel,
     )?;
     Ok(PreparedBlsDoryV3NativeBlake3Opening {
         opening_statement: prepared.opening_statement,
@@ -6329,7 +6808,9 @@ fn prepare_production_native_blake3_opening_with_output_profile(
     scratch_directory: &std::path::Path,
     maximum_block_rows: usize,
     output_profile: NarrowBlake3OutputProfile,
+    cancel: &AtomicBool,
 ) -> Result<PreparedBlsDoryNativeBlake3Opening, BlsDoryAggregateError> {
+    check_native_prover_cancel(cancel)?;
     if final_activation.len() != BLS_DORY_BLAKE3_PRODUCTION_ACTIVATION_BYTES
         || bridge.final_activation_len() != final_activation.len()
         || setup.max_log_n() != BLS_DORY_SHARED_PRODUCTION_VARIABLES
@@ -6348,6 +6829,7 @@ fn prepare_production_native_blake3_opening_with_output_profile(
         final_activation,
     )
     .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
+    check_native_prover_cancel(cancel)?;
     let layout = BlsDoryAggregateLayout::new(
         BLS_DORY_BLAKE3_SHARED_DORY_NU,
         BLS_DORY_BLAKE3_SHARED_DORY_SIGMA,
@@ -6356,24 +6838,26 @@ fn prepare_production_native_blake3_opening_with_output_profile(
         BlsDoryBlake3VerifierContext::new_with_output_profile(layout, setup, output_profile)?;
     let preprocessing_pin = native_blake3_production_preprocessing_pin(&verifier_context)
         .map_err(|_| BlsDoryAggregateError::InvalidProofShape)?;
-    let prepared = prepare_native_blake3_sources_at_layout_with_output_profile(
+    let prepared = prepare_native_blake3_sources_at_layout_with_output_profile_and_cancel(
         &witness,
         bridge,
         layout,
         setup,
         scratch_directory,
         output_profile,
+        cancel,
     )?;
-    let proven = prove_prepared_native_blake3_sources(
+    let proven = prove_prepared_native_blake3_sources_with_cancel(
         prepared,
         bridge,
         scratch_directory,
         maximum_block_rows,
+        cancel,
     )?;
     if proven.geometry != BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
-    finalize_native_blake3_opening(
+    finalize_native_blake3_opening_with_cancel(
         proven,
         bridge,
         BlsDoryBlake3ReplayVerifier {
@@ -6381,6 +6865,7 @@ fn prepare_production_native_blake3_opening_with_output_profile(
             preprocessing_pin: &preprocessing_pin,
             geometry: BLS_DORY_BLAKE3_PRODUCTION_REPLAY_GEOMETRY,
         },
+        cancel,
     )
 }
 
@@ -6980,6 +7465,7 @@ mod tests {
     use p3_matrix::Matrix;
     #[cfg(feature = "whir-prototype")]
     use std::{
+        cell::Cell,
         io::{Read, Seek, SeekFrom, Write},
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -7850,6 +8336,85 @@ mod tests {
     impl Drop for Blake3ScratchDirectory {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    struct CancelAfterCompactRows<'a, S> {
+        inner: &'a mut S,
+        cancel: &'a AtomicBool,
+        reads: usize,
+        cancel_after_reads: usize,
+    }
+
+    #[cfg(feature = "whir-prototype")]
+    impl<S: BlsDoryCompactRowSource> BlsDoryCompactRowSource for CancelAfterCompactRows<'_, S> {
+        type Error = S::Error;
+
+        fn rows(&self) -> usize {
+            self.inner.rows()
+        }
+
+        fn columns(&self) -> usize {
+            self.inner.columns()
+        }
+
+        fn explicit_scalar_count(&self) -> usize {
+            self.inner.explicit_scalar_count()
+        }
+
+        fn word_scalar_count(&self) -> usize {
+            self.inner.word_scalar_count()
+        }
+
+        fn word_bytes(&self) -> u8 {
+            self.inner.word_bytes()
+        }
+
+        fn code_bits(&self) -> u8 {
+            self.inner.code_bits()
+        }
+
+        fn word_width_codes(&self) -> u64 {
+            self.inner.word_width_codes()
+        }
+
+        fn word_group_len(&self) -> usize {
+            self.inner.word_group_len()
+        }
+
+        fn signed_word_selectors(&self) -> u64 {
+            self.inner.signed_word_selectors()
+        }
+
+        fn dictionary(&self) -> &[BlsDoryFr] {
+            self.inner.dictionary()
+        }
+
+        fn read_word_row(
+            &mut self,
+            row_index: usize,
+            output: &mut [u64],
+        ) -> Result<usize, Self::Error> {
+            let result = self.inner.read_word_row(row_index, output);
+            self.reads += 1;
+            if self.reads == self.cancel_after_reads {
+                self.cancel.store(true, Ordering::Release);
+            }
+            result
+        }
+
+        fn read_code_row(
+            &mut self,
+            row_index: usize,
+            output: &mut [u8],
+        ) -> Result<usize, Self::Error> {
+            let result = self.inner.read_code_row(row_index, output);
+            self.reads += 1;
+            if self.reads == self.cancel_after_reads {
+                self.cancel.store(true, Ordering::Release);
+            }
+            result
         }
     }
 
@@ -12725,6 +13290,237 @@ mod tests {
             bounded_prepared_source_bundle(&scratch.0, true),
             Err(BlsDoryAggregateError::ProverStorage)
         ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn execution_fold_cancellation_deletes_unpublished_child_artifact() {
+        let scratch = Blake3ScratchDirectory::create();
+        let root_lineage = [7_u8; 32];
+        let mut writer = BlsDoryBlake3ExecutionRoundArtifactWriter::create(
+            &scratch.0,
+            2,
+            0,
+            BlsDoryBlake3ExecutionRoundParent::Root(root_lineage),
+        )
+        .unwrap();
+        let mut lower = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_EXECUTION_TERMINAL_EVALUATIONS];
+        lower[0] = BlsDoryFr::from_u64(1);
+        let mut upper = lower;
+        upper[0] = BlsDoryFr::from_u64(2);
+        writer.write_row(&lower).unwrap();
+        writer.write_row(&upper).unwrap();
+        let parent = writer.finish().unwrap();
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            fold_native_blake3_execution_artifact_with_cancel(
+                &parent,
+                &scratch.0,
+                BlsDoryFr::from_u64(3),
+                &cancel,
+            ),
+            Err(BlsDoryAggregateError::Cancelled)
+        ));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+        drop(parent);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn native_source_transposes_cancel_midstream_and_delete_partial_artifacts() {
+        let fixture = dense_blake3_fixture();
+
+        let main_scratch = Blake3ScratchDirectory::create();
+        let main_cancel = AtomicBool::new(false);
+        let main_checks = Cell::new(0usize);
+        assert!(matches!(
+            create_native_main_transpose_with_cancel_check(
+                &fixture.air,
+                &fixture.statement,
+                &fixture.witness,
+                &main_scratch.0,
+                &main_cancel,
+                || {
+                    let next = main_checks.get() + 1;
+                    main_checks.set(next);
+                    if next == 5 {
+                        main_cancel.store(true, Ordering::Release);
+                    }
+                    check_native_prover_cancel(&main_cancel)
+                },
+            ),
+            Err(BlsDoryAggregateError::Cancelled)
+        ));
+        assert_eq!(main_checks.get(), 5);
+        assert_eq!(std::fs::read_dir(&main_scratch.0).unwrap().count(), 0);
+
+        let preprocessing_scratch = Blake3ScratchDirectory::create();
+        let preprocessing_cancel = AtomicBool::new(false);
+        let preprocessing_checks = Cell::new(0usize);
+        assert!(matches!(
+            create_native_preprocessed_transpose_with_cancel_check(
+                &fixture.air,
+                &preprocessing_scratch.0,
+                &preprocessing_cancel,
+                || {
+                    let next = preprocessing_checks.get() + 1;
+                    preprocessing_checks.set(next);
+                    if next == 5 {
+                        preprocessing_cancel.store(true, Ordering::Release);
+                    }
+                    check_native_prover_cancel(&preprocessing_cancel)
+                },
+            ),
+            Err(BlsDoryAggregateError::Cancelled)
+        ));
+        assert_eq!(preprocessing_checks.get(), 5);
+        assert_eq!(
+            std::fs::read_dir(&preprocessing_scratch.0).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn native_compact_source_commitment_cancels_after_row_read_and_cleans_writer() {
+        let fixture = dense_blake3_fixture();
+        let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+        let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+        let mut transpose = create_native_preprocessed_transpose(&fixture.air, &scratch.0).unwrap();
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+
+        let cancel = AtomicBool::new(false);
+        let result = {
+            let mut source =
+                TransposedPreprocessedRowSource::new_for_layout(&mut transpose, layout).unwrap();
+            let mut cancelling_source = CancelAfterCompactRows {
+                inner: &mut source,
+                cancel: &cancel,
+                reads: 0,
+                cancel_after_reads: 1,
+            };
+            commit_bls_dory_compact_row_source_with_scratch_with_cancel(
+                &mut cancelling_source,
+                layout.nu(),
+                layout.sigma(),
+                &setup,
+                &scratch.0,
+                &cancel,
+            )
+        };
+        assert!(matches!(result, Err(BlsDoryAggregateError::Cancelled)));
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+        drop(transpose);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn native_accumulator_commitment_cancels_mid_pass_and_cleans_writer() {
+        let fixture = dense_blake3_fixture();
+        let layout = BlsDoryAggregateLayout::new(9, 10).unwrap();
+        let setup = deterministic_bls_dory_setup(layout.variables()).unwrap();
+        let scratch = Blake3ScratchDirectory::create();
+        let mut writer = BlsDoryCommittedPolynomialWriter::create(
+            &scratch.0,
+            fixture.air.trace_rows() * BLS_DORY_BLAKE3_ACCUMULATOR_SCALAR_TABLES,
+            layout.nu(),
+            layout.sigma(),
+            &setup,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let checks = Cell::new(0usize);
+        assert!(matches!(
+            write_native_accumulator_pass_with_cancel_check(
+                &mut writer,
+                &fixture.air,
+                &fixture.statement,
+                &fixture.witness,
+                &fixture.bridge,
+                false,
+                &cancel,
+                || {
+                    let next = checks.get() + 1;
+                    checks.set(next);
+                    if next == 6 {
+                        cancel.store(true, Ordering::Release);
+                    }
+                    check_native_prover_cancel(&cancel)
+                },
+            ),
+            Err(BlsDoryAggregateError::Cancelled)
+        ));
+        assert_eq!(checks.get(), 6);
+        drop(writer);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "whir-prototype")]
+    fn native_inverse_commitment_cancels_after_writer_creation_and_cleans_only_child() {
+        let scratch = Blake3ScratchDirectory::create();
+        let BoundedPreparedSourceFixture {
+            prepared,
+            layout,
+            setup,
+            ..
+        } = bounded_prepared_source_bundle(&scratch.0, false).unwrap();
+        let PreparedBlsDoryBlake3Sources {
+            sources,
+            mut main_transpose,
+            preprocessing_transpose,
+            ..
+        } = prepared;
+        let BlsDoryBlake3CommittedSources {
+            main,
+            accumulator,
+            preprocessing,
+            inverse,
+        } = sources;
+        drop((main, preprocessing, inverse, preprocessing_transpose));
+        let baseline_entries = std::fs::read_dir(&scratch.0).unwrap().count();
+        assert_eq!(baseline_entries, 2);
+
+        let compression = BlsDoryFr::from_u64(7);
+        let mut alpha = BlsDoryFr::from_u64(1_000_003);
+        loop {
+            let cancel = AtomicBool::new(false);
+            let result = commit_native_adjacency_inverse_source_with_cancel_check(
+                &mut main_transpose,
+                &accumulator,
+                compression,
+                alpha,
+                layout,
+                &setup,
+                &scratch.0,
+                &cancel,
+                || {
+                    if std::fs::read_dir(&scratch.0).unwrap().count() > baseline_entries {
+                        cancel.store(true, Ordering::Release);
+                    }
+                    check_native_prover_cancel(&cancel)
+                },
+            );
+            match result {
+                Err(BlsDoryAggregateError::InvalidProofShape) => {
+                    alpha = alpha + BlsDoryFr::from_u64(1);
+                }
+                Err(BlsDoryAggregateError::Cancelled) => break,
+                Err(error) => panic!("unexpected inverse cancellation error: {error}"),
+                Ok(_) => panic!("inverse commitment unexpectedly completed"),
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(&scratch.0).unwrap().count(),
+            baseline_entries
+        );
+        drop((main_transpose, accumulator));
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

@@ -8,6 +8,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ark_ff::PrimeField;
 use dory_pcs::primitives::{
@@ -43,6 +44,10 @@ use crate::{
 
 #[cfg(feature = "whir-prototype")]
 use crate::{
+    dory_bls12_381_aggregate::{
+        commit_bls_dory_compact_row_source_with_scratch_with_cancel,
+        commit_bls_dory_row_source_with_scratch_with_cancel,
+    },
     dory_bls12_381_execution_artifact::BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS,
     dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader,
 };
@@ -70,6 +75,13 @@ const MAX_MATRIX_PROOF_BYTES: usize = 262_128;
 const MAX_MATRIX_BINDING_BYTES: usize = 4_096;
 const COMMON_ROUND_DEGREE: usize = 2;
 const LAYER_ROUND_DEGREE: usize = 3;
+
+fn check_matrix_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryMatrixError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BlsDoryAggregateError::Cancelled.into());
+    }
+    Ok(())
+}
 
 /// Witness-free scalar matrix proof plus its canonical Dory opening payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -518,6 +530,33 @@ pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch_and_cancel(
+        binding,
+        weight,
+        reader,
+        bank,
+        padded_variables,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch_and_cancel(
+    binding: &[u8],
+    weight: &BlsDoryCommittedPolynomial,
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    bank: usize,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    check_matrix_cancel(cancel)?;
     reader
         .validate_setup(setup)
         .map_err(|_| BlsDoryMatrixError::ExecutionArtifact)?;
@@ -536,8 +575,8 @@ pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_
     if !weight.matches_layout(aggregate_layout, setup) {
         return Err(BlsDoryMatrixError::InvalidDimensions);
     }
-    let mut tables = DoryV3ExecutionArtifactMatrixTables::new(reader, bank, statement)?;
-    prove_bls_dory_matrix_deferred_from_table_source(
+    let mut tables = DoryV3ExecutionArtifactMatrixTables::new(reader, bank, statement, cancel)?;
+    prove_bls_dory_matrix_deferred_from_table_source_with_cancel(
         binding,
         statement,
         &mut tables,
@@ -545,6 +584,7 @@ pub(crate) fn prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_
         padded_variables,
         setup,
         Some(scratch_directory),
+        cancel,
     )
 }
 
@@ -615,12 +655,25 @@ fn validate_precommitted_matrix_tables(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn accumulate_weight_partials(
     statement: StructuredMatrixStatement,
     source: MatrixWeightProverSource<'_>,
     column_weights: &[BlsDoryFr],
     output: &mut [BlsDoryFr],
 ) -> Result<(), BlsDoryMatrixError> {
+    let cancel = AtomicBool::new(false);
+    accumulate_weight_partials_with_cancel(statement, source, column_weights, output, &cancel)
+}
+
+fn accumulate_weight_partials_with_cancel(
+    statement: StructuredMatrixStatement,
+    source: MatrixWeightProverSource<'_>,
+    column_weights: &[BlsDoryFr],
+    output: &mut [BlsDoryFr],
+    cancel: &AtomicBool,
+) -> Result<(), BlsDoryMatrixError> {
+    check_matrix_cancel(cancel)?;
     let expected = statement
         .layers
         .checked_mul(statement.inner)
@@ -641,11 +694,14 @@ fn accumulate_weight_partials(
     match source {
         MatrixWeightProverSource::Signed(weights) => {
             for (index, weight) in weights.iter().copied().enumerate() {
+                if index.is_multiple_of(8_192) {
+                    check_matrix_cancel(cancel)?;
+                }
                 accumulate(index, BlsDoryFr::from_i64(weight));
             }
         }
         MatrixWeightProverSource::Precommitted(weight) => {
-            weight.for_each_explicit_coefficient(&mut |index, coefficient| {
+            weight.for_each_explicit_coefficient_with_cancel(cancel, |index, coefficient| {
                 if !scalar_within_signed_bound(coefficient, statement.max_abs_weight) {
                     value_out_of_range = true;
                 }
@@ -846,6 +902,31 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
 ) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_matrix_deferred_from_table_source_with_cancel(
+        binding,
+        statement,
+        tables,
+        weight_source,
+        padded_variables,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_matrix_deferred_from_table_source_with_cancel<T: MatrixTableProverSource>(
+    binding: &[u8],
+    statement: StructuredMatrixStatement,
+    tables: &mut T,
+    weight_source: MatrixWeightProverSource<'_>,
+    padded_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryMatrixProof, BlsDoryMatrixError> {
+    check_matrix_cancel(cancel)?;
     if binding.len() > MAX_MATRIX_BINDING_BYTES {
         return Err(BlsDoryMatrixError::PublicBindingTooLarge);
     }
@@ -864,6 +945,7 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
         setup,
         scratch_directory,
     )?;
+    check_matrix_cancel(cancel)?;
     let weight_polynomial = match weight_source {
         MatrixWeightProverSource::Signed(weights) => commit_bounded_signed_table(
             weights,
@@ -889,6 +971,7 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
         setup,
         scratch_directory,
     )?;
+    check_matrix_cancel(cancel)?;
     let activation_commitment = activation_polynomial.commitment();
     let weight_commitment = weight_polynomial.commitment();
     let accumulator_commitment = accumulator_polynomial.commitment();
@@ -921,6 +1004,7 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
     let col_weights = equality_weights(&col_point);
     let accumulator_evaluation =
         tables.evaluate_accumulator(statement, &layer_weights, &row_weights, &col_weights)?;
+    check_matrix_cancel(cancel)?;
     transcript.append_field(b"accumulator-evaluation", &accumulator_evaluation);
     let partial_len = statement
         .layers
@@ -928,11 +1012,18 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
         .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
     let mut layer_selector = Vec::with_capacity(partial_len);
     let mut activation_partial = tables.activation_partials(statement, &row_weights)?;
+    check_matrix_cancel(cancel)?;
     let mut weight_partial = vec![BlsDoryFr::zero(); partial_len];
     for layer_weight in layer_weights.iter().copied() {
         layer_selector.extend(std::iter::repeat_n(layer_weight, statement.inner));
     }
-    accumulate_weight_partials(statement, weight_source, &col_weights, &mut weight_partial)?;
+    accumulate_weight_partials_with_cancel(
+        statement,
+        weight_source,
+        &col_weights,
+        &mut weight_partial,
+        cancel,
+    )?;
 
     let mut claim = accumulator_evaluation;
     let common_rounds = statement.inner.ilog2() as usize;
@@ -941,11 +1032,12 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
     let mut common_sumcheck_point = Vec::with_capacity(common_rounds);
     let mut layer_sumcheck_point = Vec::with_capacity(layer_rounds);
     for round_index in 0..common_rounds {
-        let evaluations = product_round(
+        let evaluations = product_round_with_cancel(
             &layer_selector,
             &activation_partial,
             &weight_partial,
             COMMON_ROUND_DEGREE,
+            cancel,
         )?;
         if evaluations[0] + evaluations[1] != claim {
             return Err(BlsDoryMatrixError::RoundClaim);
@@ -960,11 +1052,12 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
         rounds.push(evaluations);
     }
     for round_index in 0..layer_rounds {
-        let evaluations = product_round(
+        let evaluations = product_round_with_cancel(
             &layer_selector,
             &activation_partial,
             &weight_partial,
             LAYER_ROUND_DEGREE,
+            cancel,
         )?;
         if evaluations[0] + evaluations[1] != claim {
             return Err(BlsDoryMatrixError::RoundClaim);
@@ -1018,6 +1111,7 @@ fn prove_bls_dory_matrix_deferred_from_table_source<T: MatrixTableProverSource>(
         ],
     );
     let openings = BlsDoryDeferredOpeningSet::new(polynomials, vec![0, 1, 2], opening_points)?;
+    check_matrix_cancel(cancel)?;
     if openings.claims() != expected_claims {
         return Err(BlsDoryMatrixError::Opening);
     }
@@ -1969,8 +2063,9 @@ impl MatrixTableProverSource for ExecutionArtifactMatrixTables<'_, '_> {
 }
 
 #[cfg(feature = "whir-prototype")]
-struct DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
+struct DoryV3ExecutionArtifactMatrixTables<'a, 'r, 'c> {
     reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
+    cancel: &'c AtomicBool,
     bank: usize,
     prior_statement: StructuredTransitionStatement,
     prior_mask: StructuredMaskPolynomial,
@@ -1985,12 +2080,14 @@ struct DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
 }
 
 #[cfg(feature = "whir-prototype")]
-impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
+impl<'a, 'r, 'c> DoryV3ExecutionArtifactMatrixTables<'a, 'r, 'c> {
     fn new(
         reader: &'a mut BlsDoryV3ExecutionArtifactReader<'r>,
         bank: usize,
         statement: StructuredMatrixStatement,
+        cancel: &'c AtomicBool,
     ) -> Result<Self, BlsDoryMatrixError> {
+        check_matrix_cancel(cancel)?;
         let rows = reader.canonical_rows();
         let columns = reader.canonical_columns();
         let layers = reader.layers_per_bank();
@@ -2038,6 +2135,7 @@ impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
         Ok(Self {
             io: vec![0; reader.authentication_chunk_cells()],
             reader,
+            cancel,
             bank,
             prior_statement,
             prior_mask,
@@ -2056,6 +2154,7 @@ impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
         column: BlsDoryExecutionAccumulatorColumn,
         cell: usize,
     ) -> Result<(), BlsDoryMatrixError> {
+        check_matrix_cancel(self.cancel)?;
         if cell >= self.cells_per_layer {
             return Err(BlsDoryMatrixError::InvalidDimensions);
         }
@@ -2100,6 +2199,7 @@ impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
         start: usize,
         output: &mut [i64],
     ) -> Result<(), BlsDoryMatrixError> {
+        check_matrix_cancel(self.cancel)?;
         let table_len = self.table_len(table)?;
         let end = start
             .checked_add(output.len())
@@ -2108,6 +2208,7 @@ impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
         let mut cursor = start;
         let mut written = 0usize;
         while cursor < end {
+            check_matrix_cancel(self.cancel)?;
             let matrix_layer = cursor / self.cells_per_layer;
             let cell = cursor % self.cells_per_layer;
             let column = match table {
@@ -2210,7 +2311,7 @@ impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
         rows: usize,
         columns: usize,
         code_maximum: Option<u8>,
-    ) -> Result<DoryV3ExecutionArtifactMatrixRowSource<'s, 'a, 'r>, BlsDoryMatrixError> {
+    ) -> Result<DoryV3ExecutionArtifactMatrixRowSource<'s, 'a, 'r, 'c>, BlsDoryMatrixError> {
         let explicit_scalars = self.table_len(table)?;
         let dictionary = code_maximum
             .and_then(bounded_signed_dictionary)
@@ -2233,8 +2334,8 @@ impl<'a, 'r> DoryV3ExecutionArtifactMatrixTables<'a, 'r> {
 }
 
 #[cfg(feature = "whir-prototype")]
-struct DoryV3ExecutionArtifactMatrixRowSource<'s, 'a, 'r> {
-    tables: &'s mut DoryV3ExecutionArtifactMatrixTables<'a, 'r>,
+struct DoryV3ExecutionArtifactMatrixRowSource<'s, 'a, 'r, 'c> {
+    tables: &'s mut DoryV3ExecutionArtifactMatrixTables<'a, 'r, 'c>,
     table: ExecutionArtifactMatrixTable,
     rows: usize,
     columns: usize,
@@ -2247,7 +2348,7 @@ struct DoryV3ExecutionArtifactMatrixRowSource<'s, 'a, 'r> {
 }
 
 #[cfg(feature = "whir-prototype")]
-impl DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+impl DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_, '_> {
     fn load_row(&mut self, row_index: usize) -> Result<(), BlsDoryMatrixError> {
         if row_index >= self.rows || self.values.len() != self.columns {
             return Err(BlsDoryMatrixError::InvalidDimensions);
@@ -2269,7 +2370,7 @@ impl DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
 }
 
 #[cfg(feature = "whir-prototype")]
-impl BlsDoryRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+impl BlsDoryRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_, '_> {
     type Error = BlsDoryMatrixError;
 
     fn rows(&self) -> usize {
@@ -2301,7 +2402,7 @@ impl BlsDoryRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
 }
 
 #[cfg(feature = "whir-prototype")]
-impl BlsDoryCompactRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_> {
+impl BlsDoryCompactRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, '_, '_> {
     type Error = BlsDoryMatrixError;
 
     fn rows(&self) -> usize {
@@ -2364,7 +2465,7 @@ impl BlsDoryCompactRowSource for DoryV3ExecutionArtifactMatrixRowSource<'_, '_, 
 }
 
 #[cfg(feature = "whir-prototype")]
-impl MatrixTableProverSource for DoryV3ExecutionArtifactMatrixTables<'_, '_> {
+impl MatrixTableProverSource for DoryV3ExecutionArtifactMatrixTables<'_, '_, '_> {
     fn commit_activation(
         &mut self,
         statement: StructuredMatrixStatement,
@@ -2391,6 +2492,7 @@ impl MatrixTableProverSource for DoryV3ExecutionArtifactMatrixTables<'_, '_> {
         let code_maximum = u8::try_from(statement.max_abs_activation)
             .ok()
             .filter(|maximum| *maximum <= 127);
+        let cancel = self.cancel;
         let mut source = self.row_source(
             ExecutionArtifactMatrixTable::Activation,
             rows,
@@ -2398,17 +2500,25 @@ impl MatrixTableProverSource for DoryV3ExecutionArtifactMatrixTables<'_, '_> {
             code_maximum,
         )?;
         if source.code_maximum.is_some() && activation_len.is_multiple_of(columns) {
-            return commit_bls_dory_compact_row_source_with_scratch(
+            return commit_bls_dory_compact_row_source_with_scratch_with_cancel(
                 &mut source,
                 nu,
                 sigma,
                 setup,
                 scratch_directory,
+                cancel,
             )
             .map_err(map_execution_artifact_commit_error);
         }
-        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)
-            .map_err(map_execution_artifact_commit_error)
+        commit_bls_dory_row_source_with_scratch_with_cancel(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+            cancel,
+        )
+        .map_err(map_execution_artifact_commit_error)
     }
 
     fn commit_accumulator(
@@ -2437,14 +2547,22 @@ impl MatrixTableProverSource for DoryV3ExecutionArtifactMatrixTables<'_, '_> {
         let columns = 1usize
             .checked_shl(sigma as u32)
             .ok_or(BlsDoryMatrixError::InvalidDimensions)?;
+        let cancel = self.cancel;
         let mut source = self.row_source(
             ExecutionArtifactMatrixTable::Accumulator,
             rows,
             columns,
             None,
         )?;
-        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)
-            .map_err(map_execution_artifact_commit_error)
+        commit_bls_dory_row_source_with_scratch_with_cancel(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+            cancel,
+        )
+        .map_err(map_execution_artifact_commit_error)
     }
 
     fn evaluate_accumulator(
@@ -2787,12 +2905,25 @@ fn matrix_opening_claims(
         .collect()
 }
 
+#[allow(dead_code)]
 fn product_round(
     selector: &[BlsDoryFr],
     left: &[BlsDoryFr],
     right: &[BlsDoryFr],
     degree: usize,
 ) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {
+    let cancel = AtomicBool::new(false);
+    product_round_with_cancel(selector, left, right, degree, &cancel)
+}
+
+fn product_round_with_cancel(
+    selector: &[BlsDoryFr],
+    left: &[BlsDoryFr],
+    right: &[BlsDoryFr],
+    degree: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<BlsDoryFr>, BlsDoryMatrixError> {
+    check_matrix_cancel(cancel)?;
     if selector.len() != left.len()
         || left.len() != right.len()
         || selector.is_empty()
@@ -2800,20 +2931,28 @@ fn product_round(
     {
         return Err(BlsDoryMatrixError::InvalidDimensions);
     }
-    Ok((0..=degree)
-        .map(|sample| {
-            let point = BlsDoryFr::from_u64(sample as u64);
-            selector
-                .chunks_exact(2)
-                .zip(left.chunks_exact(2))
-                .zip(right.chunks_exact(2))
-                .fold(BlsDoryFr::zero(), |sum, ((selector, left), right)| {
-                    sum + interpolate_pair(selector, point)
-                        * interpolate_pair(left, point)
-                        * interpolate_pair(right, point)
-                })
-        })
-        .collect())
+    let mut evaluations = Vec::with_capacity(degree + 1);
+    for sample in 0..=degree {
+        check_matrix_cancel(cancel)?;
+        let point = BlsDoryFr::from_u64(sample as u64);
+        let mut sum = BlsDoryFr::zero();
+        for (pair_index, ((selector, left), right)) in selector
+            .chunks_exact(2)
+            .zip(left.chunks_exact(2))
+            .zip(right.chunks_exact(2))
+            .enumerate()
+        {
+            if pair_index.is_multiple_of(8_192) {
+                check_matrix_cancel(cancel)?;
+            }
+            sum = sum
+                + interpolate_pair(selector, point)
+                    * interpolate_pair(left, point)
+                    * interpolate_pair(right, point);
+        }
+        evaluations.push(sum);
+    }
+    Ok(evaluations)
 }
 
 fn evaluate_samples(

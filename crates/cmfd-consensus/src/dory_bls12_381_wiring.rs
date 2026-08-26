@@ -8,6 +8,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -41,7 +42,13 @@ use crate::{
 };
 
 #[cfg(feature = "whir-prototype")]
-use crate::dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader;
+use crate::{
+    dory_bls12_381_aggregate::{
+        commit_bls_dory_compact_row_source_with_scratch_with_cancel,
+        commit_bls_dory_row_source_with_scratch_with_cancel,
+    },
+    dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader,
+};
 
 /// Version of the scalar-field wiring transcript.
 pub const BLS_DORY_WIRING_VERSION: u16 = 1;
@@ -64,6 +71,13 @@ pub(crate) const PROOF_MAGIC: [u8; 8] = *b"CFBLSW01";
 const PROOF_HEADER_BYTES: usize = 18;
 const MAX_WIRING_PROOF_BYTES: usize = 262_128;
 const MAX_WIRING_BINDING_BYTES: usize = 4_096;
+
+fn check_wiring_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryWiringError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BlsDoryAggregateError::Cancelled.into());
+    }
+    Ok(())
+}
 
 /// Witness-free scalar wiring proof plus its canonical Dory opening payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -593,6 +607,28 @@ pub(crate) fn prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scrat
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch_and_cancel(
+        binding,
+        reader,
+        packed_variables,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch_and_cancel(
+    binding: &[u8],
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryWiringProof, BlsDoryWiringError> {
+    check_wiring_cancel(cancel)?;
     reader
         .validate_setup(setup)
         .map_err(|_| BlsDoryWiringError::ExecutionArtifact)?;
@@ -606,22 +642,35 @@ pub(crate) fn prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scrat
     let mut source =
         DoryV3WiringExecutionArtifactRowSource::new(descriptor, reader, rows, columns)?;
     let committed = if source.explicit_scalars.is_multiple_of(columns) {
-        commit_bls_dory_compact_row_source_with_scratch(
+        commit_bls_dory_compact_row_source_with_scratch_with_cancel(
             &mut source,
             nu,
             sigma,
             setup,
             scratch_directory,
+            cancel,
         )?
     } else {
-        commit_bls_dory_row_source_with_scratch(&mut source, nu, sigma, setup, scratch_directory)?
+        commit_bls_dory_row_source_with_scratch_with_cancel(
+            &mut source,
+            nu,
+            sigma,
+            setup,
+            scratch_directory,
+            cancel,
+        )?
     };
+    check_wiring_cancel(cancel)?;
     let oracle_commitment = committed.commitment();
 
     let mut transcript = wiring_transcript(binding, statement, &oracle_commitment);
     let points = WiringPoints::derive(statement, &mut transcript);
-    let evaluations =
-        compute_dory_v3_execution_artifact_evaluations(statement, &points, &mut source)?;
+    let evaluations = compute_dory_v3_execution_artifact_evaluations_with_cancel(
+        statement,
+        &points,
+        &mut source,
+        cancel,
+    )?;
     verify_identities(statement, &points, &evaluations)?;
     let flattened = evaluations.flatten(statement)?;
     absorb_evaluations(&mut transcript, &flattened);
@@ -633,6 +682,7 @@ pub(crate) fn prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scrat
         vec![0; opening_points.len()],
         opening_points,
     )?;
+    check_wiring_cancel(cancel)?;
     if openings.claims() != expected_claims {
         return Err(BlsDoryWiringError::Opening);
     }
@@ -2277,12 +2327,24 @@ fn compute_execution_artifact_evaluations(
 }
 
 #[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
 fn compute_dory_v3_execution_artifact_evaluations(
     statement: StructuredWiringStatement,
     points: &WiringPoints,
     source: &mut DoryV3WiringExecutionArtifactRowSource<'_, '_>,
 ) -> Result<WiringEvaluations, BlsDoryWiringError> {
-    compute_execution_source_evaluations(statement, points, source)
+    let cancel = AtomicBool::new(false);
+    compute_dory_v3_execution_artifact_evaluations_with_cancel(statement, points, source, &cancel)
+}
+
+#[cfg(feature = "whir-prototype")]
+fn compute_dory_v3_execution_artifact_evaluations_with_cancel(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    source: &mut DoryV3WiringExecutionArtifactRowSource<'_, '_>,
+    cancel: &AtomicBool,
+) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    compute_execution_source_evaluations_with_cancel(statement, points, source, cancel)
 }
 
 fn compute_execution_source_evaluations(
@@ -2290,6 +2352,17 @@ fn compute_execution_source_evaluations(
     points: &WiringPoints,
     source: &mut impl WiringExecutionActivationSource,
 ) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    let cancel = AtomicBool::new(false);
+    compute_execution_source_evaluations_with_cancel(statement, points, source, &cancel)
+}
+
+fn compute_execution_source_evaluations_with_cancel(
+    statement: StructuredWiringStatement,
+    points: &WiringPoints,
+    source: &mut impl WiringExecutionActivationSource,
+    cancel: &AtomicBool,
+) -> Result<WiringEvaluations, BlsDoryWiringError> {
+    check_wiring_cancel(cancel)?;
     if source.wiring_statement() != statement {
         return Err(BlsDoryWiringError::ExecutionArtifact);
     }
@@ -2316,6 +2389,9 @@ fn compute_execution_source_evaluations(
 
     let mut cell_weights = EqualityWeightIterator::new(&points.cell);
     for cell in 0..cells {
+        if cell.is_multiple_of(8_192) {
+            check_wiring_cancel(cancel)?;
+        }
         let cell_weight = cell_weights
             .next()
             .ok_or(BlsDoryWiringError::InvalidDimensions)?;
@@ -2331,9 +2407,14 @@ fn compute_execution_source_evaluations(
     }
 
     for bank in 0..statement.banks {
+        check_wiring_cancel(cancel)?;
         for (layer, output_layer_weight) in output_layer_weights.iter().copied().enumerate() {
+            check_wiring_cancel(cancel)?;
             let mut cell_weights = EqualityWeightIterator::new(&points.cell);
             for cell in 0..cells {
+                if cell.is_multiple_of(8_192) {
+                    check_wiring_cancel(cancel)?;
+                }
                 let cell_weight = cell_weights
                     .next()
                     .ok_or(BlsDoryWiringError::InvalidDimensions)?;

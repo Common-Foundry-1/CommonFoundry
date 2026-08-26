@@ -15,6 +15,7 @@ use dory_pcs::{
         transcript::Transcript,
     },
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 use crate::dory_bls12_381_prototype::{
@@ -88,6 +89,8 @@ pub fn stream_bls_dory_vector_matrix_product<S: BlsDoryRowSource>(
 pub enum BlsDoryStreamingProofError {
     #[error("precomputed Dory opening geometry is invalid")]
     InvalidGeometry,
+    #[error("Dory opening proof construction was cancelled")]
+    Cancelled,
 }
 
 /// Create the transparent Dory proof from a fallibly precomputed `L^T M`.
@@ -105,6 +108,40 @@ pub fn prove_bls_dory_opening_from_vector_product(
     setup: &DeterministicBlsDorySetup,
     transcript: &mut BlsDoryTranscript,
 ) -> Result<BlsDoryOpeningProof, BlsDoryStreamingProofError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_opening_from_vector_product_with_cancel(
+        point,
+        row_commitments,
+        vector_matrix_product,
+        nu,
+        sigma,
+        setup,
+        transcript,
+        &cancel,
+    )
+}
+
+/// Create the transparent Dory proof while checking cancellation between each
+/// large multiscalar multiplication and every transcript round.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_bls_dory_opening_from_vector_product_with_cancel(
+    point: &[BlsDoryFr],
+    row_commitments: Vec<BlsDoryG1>,
+    vector_matrix_product: Vec<BlsDoryFr>,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    transcript: &mut BlsDoryTranscript,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryOpeningProof, BlsDoryStreamingProofError> {
+    let check_cancel = || {
+        if cancel.load(Ordering::Acquire) {
+            Err(BlsDoryStreamingProofError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check_cancel()?;
     let rows = 1usize
         .checked_shl(u32::try_from(nu).map_err(|_| BlsDoryStreamingProofError::InvalidGeometry)?)
         .ok_or(BlsDoryStreamingProofError::InvalidGeometry)?;
@@ -133,12 +170,15 @@ pub fn prove_bls_dory_opening_from_vector_product(
     }
 
     let g2_final = &prover.g2_vec[0];
+    check_cancel()?;
     let committed_columns = BlsDoryG1Routines::msm(&padded_row_commitments, &vector_matrix_product);
+    check_cancel()?;
     let c = BlsDoryCurve::pair(&committed_columns, g2_final);
     let d2 = BlsDoryCurve::pair(
         &BlsDoryG1Routines::msm(&prover.g1_vec[..columns], &vector_matrix_product),
         g2_final,
     );
+    check_cancel()?;
     let e1 = BlsDoryG1Routines::msm(&row_commitments, &left[..rows]);
     let vmv_message = VMVMessage { c, d2, e1 };
 
@@ -146,7 +186,9 @@ pub fn prove_bls_dory_opening_from_vector_product(
     transcript.append_serde(b"vmv_d2", &vmv_message.d2);
     transcript.append_serde(b"vmv_e1", &vmv_message.e1);
 
+    check_cancel()?;
     let v2 = BlsDoryG2Routines::fixed_base_vector_scalar_mul(g2_final, &vector_matrix_product);
+    check_cancel()?;
     let mut state: DoryProverState<'_, BlsDoryCurve, Transparent> = DoryProverState::new(
         padded_row_commitments,
         v2,
@@ -167,6 +209,7 @@ pub fn prove_bls_dory_opening_from_vector_product(
     let mut first_messages = Vec::with_capacity(rounds);
     let mut second_messages = Vec::with_capacity(rounds);
     for _ in 0..rounds {
+        check_cancel()?;
         let first = state.compute_first_message::<BlsDoryG1Routines, BlsDoryG2Routines>();
         transcript.append_serde(b"d1_left", &first.d1_left);
         transcript.append_serde(b"d1_right", &first.d1_right);
@@ -188,14 +231,17 @@ pub fn prove_bls_dory_opening_from_vector_product(
         let alpha = transcript.challenge_scalar(b"alpha");
         state.apply_second_challenge::<BlsDoryG1Routines, BlsDoryG2Routines>(&alpha);
         second_messages.push(second);
+        check_cancel()?;
     }
 
+    check_cancel()?;
     let gamma = transcript.challenge_scalar(b"gamma");
     state.apply_fold_scalars(&gamma);
     let final_message = state.compute_final_message();
     transcript.append_serde(b"final_e1", &final_message.e1);
     transcript.append_serde(b"final_e2", &final_message.e2);
     let _ = transcript.challenge_scalar(b"d");
+    check_cancel()?;
 
     Ok(BlsDoryOpeningProof {
         vmv_message,
@@ -378,5 +424,27 @@ mod tests {
             &mut BlsDoryTranscript::new(b"stream-equivalence"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn precomputed_dory_proof_honors_cancellation_before_large_msm_work() {
+        let setup = deterministic_bls_dory_setup(2).unwrap();
+        let cancel = AtomicBool::new(true);
+        let mut transcript = BlsDoryTranscript::new(b"cancelled-streaming-proof");
+        let digest_before = transcript.digest();
+        assert_eq!(
+            prove_bls_dory_opening_from_vector_product_with_cancel(
+                &[],
+                Vec::new(),
+                Vec::new(),
+                1,
+                1,
+                &setup,
+                &mut transcript,
+                &cancel,
+            ),
+            Err(BlsDoryStreamingProofError::Cancelled)
+        );
+        assert_eq!(transcript.digest(), digest_before);
     }
 }

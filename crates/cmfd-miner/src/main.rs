@@ -219,6 +219,14 @@ enum WorkStatus {
     Disconnected,
 }
 
+#[cfg(feature = "production-v3")]
+enum ProofRunOutcome<T> {
+    Completed(T),
+    Stale,
+    Disconnected,
+    Shutdown,
+}
+
 enum WorkerCommand {
     Mine {
         job_id: u64,
@@ -381,6 +389,7 @@ struct ProductionWorkerPool {
     commands: Vec<Sender<WorkerCommand>>,
     receiver: Receiver<WorkerMessage>,
     handles: Vec<JoinHandle<()>>,
+    initialization_cancel: Arc<AtomicBool>,
     next_job_id: u64,
 }
 
@@ -392,6 +401,7 @@ struct ProductionWorkerSpec {
     worker_count: usize,
     batch_size: u32,
     factory: ProductionV3MiningWorkFactory,
+    initialization_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -934,6 +944,7 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                 options.batch_size,
                 &work,
                 &factory,
+                Arc::clone(&shutdown),
             )?);
         }
         let mut last_node_check = Instant::now();
@@ -984,7 +995,55 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                 println!(
                     "GPU {device} found a target nonce; CPU replay and Layout V5 proof construction started."
                 );
-                let proof = work.prove_v3_winning_nonce_claim(claim, &shutdown)?;
+                let proof_work = work.clone();
+                let mut last_proof_node_check = Instant::now()
+                    .checked_sub(PEER_RETRY_INTERVAL)
+                    .unwrap_or_else(Instant::now);
+                let proof = match run_production_proof_while_current(
+                    Arc::clone(&shutdown),
+                    &mut || {
+                        if last_proof_node_check.elapsed() < PEER_RETRY_INTERVAL {
+                            return Ok(WorkStatus::Current);
+                        }
+                        last_proof_node_check = Instant::now();
+                        match fetch_template_from_any(
+                            &options.peers,
+                            preferred_peer,
+                            payout,
+                            limits,
+                            address_policy,
+                        ) {
+                            Some((peer, response)) => {
+                                preferred_peer = Some(peer);
+                                if response.template.challenge.previous_block == parent {
+                                    Ok(WorkStatus::Current)
+                                } else {
+                                    Ok(WorkStatus::Stale)
+                                }
+                            }
+                            None => Ok(WorkStatus::Disconnected),
+                        }
+                    },
+                    move |proof_cancel| {
+                        proof_work
+                            .prove_v3_winning_nonce_claim(claim, &proof_cancel)
+                            .map_err(Into::into)
+                    },
+                )? {
+                    ProofRunOutcome::Completed(proof) => proof,
+                    ProofRunOutcome::Stale => {
+                        statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                        println!("Node tip changed during proof construction; rebuilding work.");
+                        continue;
+                    }
+                    ProofRunOutcome::Disconnected => {
+                        println!(
+                            "Node connection was lost during proof construction; rebuilding work."
+                        );
+                        continue;
+                    }
+                    ProofRunOutcome::Shutdown => break,
+                };
                 let block = template.into_block(proof);
                 let block_id = block.block_id();
                 let mut acknowledged = 0_usize;
@@ -1698,6 +1757,7 @@ fn continuous_production_mining(
                 config.batch_size,
                 &work,
                 &factory,
+                Arc::clone(&shutdown),
             )?);
         }
         let outcome = worker_pool
@@ -1736,7 +1796,39 @@ fn continuous_production_mining(
                 println!(
                     "GPU {device} found a target nonce; CPU replay and Layout V5 proof construction started."
                 );
-                let proof = work.prove_v3_winning_nonce_claim(claim, &shutdown)?;
+                let proof_work = work.clone();
+                let proof = match run_production_proof_while_current(
+                    Arc::clone(&shutdown),
+                    &mut || {
+                        let current_tip = node
+                            .lock()
+                            .map_err(|_| anyhow!("node mutex is poisoned"))?
+                            .status()?
+                            .tip;
+                        if current_tip == expected_parent {
+                            Ok(WorkStatus::Current)
+                        } else {
+                            Ok(WorkStatus::Stale)
+                        }
+                    },
+                    move |proof_cancel| {
+                        proof_work
+                            .prove_v3_winning_nonce_claim(claim, &proof_cancel)
+                            .map_err(Into::into)
+                    },
+                )? {
+                    ProofRunOutcome::Completed(proof) => proof,
+                    ProofRunOutcome::Stale => {
+                        statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                        println!("Chain tip changed during proof construction; rebuilding work.");
+                        continue;
+                    }
+                    ProofRunOutcome::Disconnected => {
+                        println!("Embedded node became unavailable during proof construction.");
+                        continue;
+                    }
+                    ProofRunOutcome::Shutdown => break,
+                };
                 let Some(block) = job.build_block_if_chain_valid(&proof)? else {
                     statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
                     println!("Candidate no longer met the chain target; rebuilding work.");
@@ -2223,6 +2315,96 @@ fn monitor_workers(
 }
 
 #[cfg(feature = "production-v3")]
+fn run_production_proof_while_current<T, Prove>(
+    shutdown: Arc<AtomicBool>,
+    check_status: &mut dyn FnMut() -> Result<WorkStatus>,
+    prove: Prove,
+) -> Result<ProofRunOutcome<T>>
+where
+    T: Send + 'static,
+    Prove: FnOnce(Arc<AtomicBool>) -> Result<T> + Send + 'static,
+{
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(ProofRunOutcome::Shutdown);
+    }
+    let proof_cancel = Arc::new(AtomicBool::new(shutdown.load(Ordering::Acquire)));
+    let thread_cancel = Arc::clone(&proof_cancel);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let mut handle = Some(
+        thread::Builder::new()
+            .name("cmfd-v3-proof".to_owned())
+            .spawn(move || {
+                let _ = sender.send(prove(thread_cancel));
+            })
+            .context("spawn Production V3 proof worker")?,
+    );
+
+    let stop_and_join = |handle: &mut Option<JoinHandle<()>>| -> Result<()> {
+        proof_cancel.store(true, Ordering::Release);
+        if handle
+            .take()
+            .expect("Production V3 proof handle is present")
+            .join()
+            .is_err()
+        {
+            bail!("Production V3 proof worker panicked");
+        }
+        Ok(())
+    };
+
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => {
+                if handle
+                    .take()
+                    .expect("Production V3 proof handle is present")
+                    .join()
+                    .is_err()
+                {
+                    bail!("Production V3 proof worker panicked");
+                }
+                if shutdown.load(Ordering::Acquire) {
+                    return Ok(ProofRunOutcome::Shutdown);
+                }
+                return match check_status()? {
+                    WorkStatus::Current => result.map(ProofRunOutcome::Completed),
+                    WorkStatus::Stale => Ok(ProofRunOutcome::Stale),
+                    WorkStatus::Disconnected => Ok(ProofRunOutcome::Disconnected),
+                };
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stop_and_join(&mut handle)?;
+                bail!("Production V3 proof worker exited without a result");
+            }
+        }
+
+        if shutdown.load(Ordering::Acquire) {
+            stop_and_join(&mut handle)?;
+            return Ok(ProofRunOutcome::Shutdown);
+        }
+        let status = match check_status() {
+            Ok(status) => status,
+            Err(error) => {
+                stop_and_join(&mut handle)?;
+                return Err(error);
+            }
+        };
+        match status {
+            WorkStatus::Current => {}
+            WorkStatus::Stale => {
+                stop_and_join(&mut handle)?;
+                return Ok(ProofRunOutcome::Stale);
+            }
+            WorkStatus::Disconnected => {
+                stop_and_join(&mut handle)?;
+                return Ok(ProofRunOutcome::Disconnected);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "production-v3")]
 impl ProductionWorkerPool {
     fn new(
         cuda: CudaLibrary,
@@ -2230,6 +2412,7 @@ impl ProductionWorkerPool {
         batch_size: u32,
         initial_work: &MiningWork,
         factory: &ProductionV3MiningWorkFactory,
+        initialization_cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
         if devices.is_empty() {
             bail!("production GPU pool requires at least one worker");
@@ -2242,42 +2425,60 @@ impl ProductionWorkerPool {
         let parameters = initial_work.v3_candidate_parameters()?;
         let worker_count = devices.len();
         let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(4).max(4));
-        let mut commands = Vec::with_capacity(worker_count);
-        let mut handles = Vec::with_capacity(worker_count);
-        for (ordinal, device) in devices.iter().enumerate() {
+        let mut pool = Self {
+            parameters,
+            devices,
+            commands: Vec::with_capacity(worker_count),
+            receiver,
+            handles: Vec::with_capacity(worker_count),
+            initialization_cancel,
+            next_job_id: 1,
+        };
+        for ordinal in 0..pool.devices.len() {
+            let device = pool.devices[ordinal].clone();
             let (command_sender, command_receiver) = mpsc::channel();
             let spec = ProductionWorkerSpec {
                 cuda: cuda.clone(),
-                device: device.clone(),
+                device,
                 ordinal,
                 worker_count,
                 batch_size,
                 factory: factory.clone(),
+                initialization_cancel: Arc::clone(&pool.initialization_cancel),
             };
-            handles.push(spawn_production_worker(
-                spec,
-                command_receiver,
-                sender.clone(),
-            )?);
-            commands.push(command_sender);
+            let handle = match spawn_production_worker(spec, command_receiver, sender.clone()) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    if let Err(cleanup_error) = pool.stop() {
+                        bail!(
+                            "failed to spawn Production V3 GPU worker: {error}; worker cleanup also failed: {cleanup_error}"
+                        );
+                    }
+                    return Err(error).context("spawn Production V3 GPU worker");
+                }
+            };
+            pool.handles.push(handle);
+            pool.commands.push(command_sender);
         }
         drop(sender);
-        let mut pool = Self {
-            parameters,
-            devices,
-            commands,
-            receiver,
-            handles,
-            next_job_id: 1,
-        };
-        pool.wait_until_initialized(worker_count)?;
+        if let Err(error) = pool.wait_until_initialized(worker_count) {
+            if let Err(cleanup_error) = pool.stop() {
+                bail!(
+                    "Production V3 GPU initialization failed: {error}; worker cleanup also failed: {cleanup_error}"
+                );
+            }
+            return Err(error);
+        }
         Ok(pool)
     }
 
     fn wait_until_initialized(&mut self, worker_count: usize) -> Result<()> {
         let mut initialized = BTreeSet::new();
         while initialized.len() < worker_count {
-            match self.receiver.recv() {
+            if self.initialization_cancel.load(Ordering::Acquire) {
+                bail!("Production V3 GPU initialization was cancelled");
+            }
+            match self.receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(WorkerMessage::Initialized { device, lane }) => {
                     initialized.insert((device, lane));
                     println!(
@@ -2292,7 +2493,10 @@ impl ProductionWorkerPool {
                     ..
                 }) => bail!("GPU {device} Production V3 worker {lane} failed: {error}"),
                 Ok(_) => bail!("Production V3 worker sent job output before initialization"),
-                Err(_) => bail!("Production V3 workers disconnected during initialization"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("Production V3 workers disconnected during initialization")
+                }
             }
         }
         Ok(())
@@ -2397,19 +2601,33 @@ impl ProductionWorkerPool {
     }
 
     fn stop(&mut self) -> Result<()> {
-        for command in &self.commands {
-            let _ = command.send(WorkerCommand::Shutdown);
-        }
-        self.commands.clear();
-        let mut panic_seen = false;
-        for handle in self.handles.drain(..) {
-            panic_seen |= handle.join().is_err();
-        }
-        if panic_seen {
-            bail!("a Production V3 GPU worker thread panicked");
-        }
-        Ok(())
+        stop_production_worker_threads(
+            &self.initialization_cancel,
+            &mut self.commands,
+            &mut self.handles,
+        )
     }
+}
+
+#[cfg(feature = "production-v3")]
+fn stop_production_worker_threads(
+    initialization_cancel: &AtomicBool,
+    commands: &mut Vec<Sender<WorkerCommand>>,
+    handles: &mut Vec<JoinHandle<()>>,
+) -> Result<()> {
+    initialization_cancel.store(true, Ordering::Release);
+    for command in commands.iter() {
+        let _ = command.send(WorkerCommand::Shutdown);
+    }
+    commands.clear();
+    let mut panic_seen = false;
+    for handle in handles.drain(..) {
+        panic_seen |= handle.join().is_err();
+    }
+    if panic_seen {
+        bail!("a Production V3 GPU worker thread panicked");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "production-v3")]
@@ -2458,11 +2676,12 @@ fn run_production_worker(
             })?;
     let mut miner = spec
         .cuda
-        .create_production(
+        .create_production_with_cancel(
             BufReader::new(bank),
             authenticated,
             setup,
             spec.device.index,
+            &spec.initialization_cancel,
         )
         .map_err(|error| WorkerThreadError {
             job_id: None,
@@ -2726,6 +2945,102 @@ mod tests {
         assert_eq!(
             mining_runtime(cmfd_node::RCNET1_PROFILE),
             MiningRuntime::ProductionV3
+        );
+    }
+
+    #[cfg(feature = "production-v3")]
+    #[test]
+    fn production_proof_staleness_cancels_and_joins_prover() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let proof_observed_cancel = Arc::clone(&observed_cancel);
+        let outcome = run_production_proof_while_current(
+            shutdown,
+            &mut || Ok(WorkStatus::Stale),
+            move |cancel| {
+                while !cancel.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                proof_observed_cancel.store(true, Ordering::Release);
+                Ok(7_u8)
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, ProofRunOutcome::Stale));
+        assert!(observed_cancel.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "production-v3")]
+    #[test]
+    fn production_proof_shutdown_cancels_and_joins_prover() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&shutdown);
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let proof_observed_cancel = Arc::clone(&observed_cancel);
+        let trigger_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            trigger.store(true, Ordering::Release);
+        });
+        let outcome = run_production_proof_while_current(
+            shutdown,
+            &mut || Ok(WorkStatus::Current),
+            move |cancel| {
+                while !cancel.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                proof_observed_cancel.store(true, Ordering::Release);
+                Ok(7_u8)
+            },
+        )
+        .unwrap();
+        trigger_handle.join().unwrap();
+        assert!(matches!(outcome, ProofRunOutcome::Shutdown));
+        assert!(observed_cancel.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "production-v3")]
+    #[test]
+    fn production_proof_completion_rechecks_staleness_before_submission() {
+        let outcome = run_production_proof_while_current(
+            Arc::new(AtomicBool::new(false)),
+            &mut || Ok(WorkStatus::Stale),
+            |_| Ok(7_u8),
+        )
+        .unwrap();
+        assert!(matches!(outcome, ProofRunOutcome::Stale));
+    }
+
+    #[cfg(feature = "production-v3")]
+    #[test]
+    fn production_initialization_cleanup_cancels_and_joins_every_started_worker() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observations = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let mut handles = observations
+            .iter()
+            .map(|observation| {
+                let cancel = Arc::clone(&cancel);
+                let observation = Arc::clone(observation);
+                thread::spawn(move || {
+                    while !cancel.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    observation.store(true, Ordering::Release);
+                })
+            })
+            .collect();
+        let mut commands = Vec::new();
+
+        stop_production_worker_threads(&cancel, &mut commands, &mut handles).unwrap();
+
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(handles.is_empty());
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.load(Ordering::Acquire))
         );
     }
 

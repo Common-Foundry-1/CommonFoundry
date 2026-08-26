@@ -8,6 +8,7 @@ use std::fmt;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -41,7 +42,8 @@ use crate::dory_bls12_381_prototype::{
     MAX_BLS_DORY_PROTOTYPE_VARIABLES, MAX_BLS_DORY_SETUP_VARIABLES,
 };
 use crate::dory_bls12_381_streaming::{
-    BlsDoryRowSource, prove_bls_dory_opening_from_vector_product,
+    BlsDoryRowSource, BlsDoryStreamingProofError,
+    prove_bls_dory_opening_from_vector_product_with_cancel,
 };
 
 /// Version of the bounded BLS12-381 aggregate wire grammar.
@@ -686,52 +688,103 @@ impl BlsDoryCommittedPolynomial {
         }
     }
 
+    #[cfg(any(test, feature = "whir-prototype"))]
     pub(crate) fn for_each_explicit_coefficient(
         &self,
+        visitor: impl FnMut(usize, BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        let cancel = AtomicBool::new(false);
+        self.for_each_explicit_coefficient_with_cancel(&cancel, visitor)
+    }
+
+    pub(crate) fn for_each_explicit_coefficient_with_cancel(
+        &self,
+        cancel: &AtomicBool,
         mut visitor: impl FnMut(usize, BlsDoryFr),
     ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         let mut visited = 0usize;
         match &self.coefficients {
             BlsDoryCoefficientStorage::Materialized(polynomial) => {
                 for coefficient in polynomial.coefficients().iter().copied() {
+                    if visited.is_multiple_of(8_192) {
+                        check_prover_cancel(cancel)?;
+                    }
                     visitor(visited, coefficient);
                     visited += 1;
                 }
             }
             BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
+                    if visited.is_multiple_of(8_192) && cancel.load(Ordering::Acquire) {
+                        return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                    }
                     visitor(visited, coefficient);
                     visited += 1;
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             #[cfg(test)]
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
+                    if visited.is_multiple_of(8_192) && cancel.load(Ordering::Acquire) {
+                        return Err(crate::dory_bls12_381_index_artifact::BlsDoryIndexArtifactError::InvalidArtifact);
+                    }
                     visitor(visited, coefficient);
                     visited += 1;
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             BlsDoryCoefficientStorage::CompactArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
+                    if visited.is_multiple_of(8_192) && cancel.load(Ordering::Acquire) {
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
                     visitor(visited, coefficient);
                     visited += 1;
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
+                    if visited.is_multiple_of(8_192) && cancel.load(Ordering::Acquire) {
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
                     visitor(visited, coefficient);
                     visited += 1;
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             BlsDoryCoefficientStorage::ReleasedCompact(_)
             | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
                 return Err(BlsDoryAggregateError::ProverStorage);
             }
         }
+        check_prover_cancel(cancel)?;
         if visited != self.explicit_coefficient_count() {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
@@ -921,41 +974,82 @@ impl BlsDoryCommittedPolynomial {
         }
     }
 
-    fn for_each_coefficient_pair(
+    fn for_each_coefficient_pair_with_cancel(
         &self,
+        cancel: &AtomicBool,
         mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
     ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         match &self.coefficients {
-            BlsDoryCoefficientStorage::Materialized(polynomial) => for_each_memory_pair(
-                polynomial.coefficients(),
-                polynomial.coefficients().len(),
-                &mut visitor,
-            ),
+            BlsDoryCoefficientStorage::Materialized(polynomial) => {
+                for_each_memory_pair_with_cancel(
+                    polynomial.coefficients(),
+                    polynomial.coefficients().len(),
+                    cancel,
+                    &mut visitor,
+                )
+            }
             BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => artifact
                 .for_each_pair(|lower, upper| {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                    }
                     visitor(lower, upper);
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage),
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                }),
             #[cfg(test)]
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => artifact
                 .for_each_pair(|lower, upper| {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(crate::dory_bls12_381_index_artifact::BlsDoryIndexArtifactError::InvalidArtifact);
+                    }
                     visitor(lower, upper);
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage),
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                }),
             BlsDoryCoefficientStorage::CompactArtifact(artifact) => artifact
                 .for_each_pair(|lower, upper| {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
                     visitor(lower, upper);
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage),
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                }),
             BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => artifact
                 .for_each_pair(|lower, upper| {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
                     visitor(lower, upper);
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage),
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                }),
             BlsDoryCoefficientStorage::ReleasedCompact(_)
             | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
                 Err(BlsDoryAggregateError::ProverStorage)
@@ -968,7 +1062,9 @@ impl BlsDoryCommittedPolynomial {
         left: &[BlsDoryFr],
         scale: BlsDoryFr,
         output: &mut [BlsDoryFr],
+        cancel: &AtomicBool,
     ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         let rows = 1usize
             .checked_shl(
                 u32::try_from(self.nu).map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
@@ -989,6 +1085,9 @@ impl BlsDoryCommittedPolynomial {
         let mut column = 0usize;
         let mut visited = 0usize;
         let mut accumulate = |coefficient: BlsDoryFr| {
+            if cancel.load(Ordering::Acquire) {
+                return false;
+            }
             output[column] = output[column] + scale * left[row] * coefficient;
             visited += 1;
             column += 1;
@@ -996,43 +1095,83 @@ impl BlsDoryCommittedPolynomial {
                 column = 0;
                 row += 1;
             }
+            true
         };
         match &self.coefficients {
             BlsDoryCoefficientStorage::Materialized(polynomial) => {
                 for coefficient in polynomial.coefficients().iter().copied() {
-                    accumulate(coefficient);
+                    if !accumulate(coefficient) {
+                        break;
+                    }
                 }
             }
             BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
-                    accumulate(coefficient);
-                    Ok(())
+                    if accumulate(coefficient) {
+                        Ok(())
+                    } else {
+                        Err(BlsDoryFoldArtifactError::InvalidArtifact)
+                    }
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             #[cfg(test)]
             BlsDoryCoefficientStorage::IndexedArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
-                    accumulate(coefficient);
-                    Ok(())
+                    if accumulate(coefficient) {
+                        Ok(())
+                    } else {
+                        Err(crate::dory_bls12_381_index_artifact::BlsDoryIndexArtifactError::InvalidArtifact)
+                    }
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             BlsDoryCoefficientStorage::CompactArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
-                    accumulate(coefficient);
-                    Ok(())
+                    if accumulate(coefficient) {
+                        Ok(())
+                    } else {
+                        Err(BlsDoryCompactArtifactError::InvalidArtifact)
+                    }
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => artifact
                 .for_each_scalar(|coefficient| {
-                    accumulate(coefficient);
-                    Ok(())
+                    if accumulate(coefficient) {
+                        Ok(())
+                    } else {
+                        Err(BlsDoryCompactArtifactError::InvalidArtifact)
+                    }
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                })?,
             BlsDoryCoefficientStorage::ReleasedCompact(_)
             | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
                 return Err(BlsDoryAggregateError::ProverStorage);
             }
         }
+        check_prover_cancel(cancel)?;
         let explicit_count = self.explicit_coefficient_count();
         if visited != explicit_count
             || row != explicit_count / columns
@@ -1323,6 +1462,16 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         &mut self,
         scalars: &[BlsDoryFr],
     ) -> Result<(), BlsDoryAggregateError> {
+        let cancel = AtomicBool::new(false);
+        self.write_scalars_with_cancel(scalars, &cancel)
+    }
+
+    pub(crate) fn write_scalars_with_cancel(
+        &mut self,
+        scalars: &[BlsDoryFr],
+        cancel: &AtomicBool,
+    ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         if scalars.is_empty()
             || self
                 .written
@@ -1337,7 +1486,8 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         writer
             .write_scalars(scalars)
             .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-        self.buffer_commitment_scalars(scalars)
+        check_prover_cancel(cancel)?;
+        self.buffer_commitment_scalars_with_cancel(scalars, cancel)
     }
 
     pub(crate) fn write_signed_values(
@@ -1396,9 +1546,19 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
 
     fn buffer_commitment_scalars(
         &mut self,
+        scalars: &[BlsDoryFr],
+    ) -> Result<(), BlsDoryAggregateError> {
+        let cancel = AtomicBool::new(false);
+        self.buffer_commitment_scalars_with_cancel(scalars, &cancel)
+    }
+
+    fn buffer_commitment_scalars_with_cancel(
+        &mut self,
         mut scalars: &[BlsDoryFr],
+        cancel: &AtomicBool,
     ) -> Result<(), BlsDoryAggregateError> {
         while !scalars.is_empty() {
+            check_prover_cancel(cancel)?;
             let take = scalars
                 .len()
                 .min(self.pending_capacity - self.pending_scalars.len());
@@ -1407,7 +1567,7 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
             self.written += take;
             scalars = &scalars[take..];
             if self.pending_scalars.len() == self.pending_capacity {
-                self.flush_pending_rows(false)?;
+                self.flush_pending_rows_with_cancel(false, cancel)?;
             }
         }
         if self.written == self.explicit_count && self.pending_scalars.is_empty() {
@@ -1416,13 +1576,23 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    pub(crate) fn finish(self) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+        let cancel = AtomicBool::new(false);
+        self.finish_with_cancel(&cancel)
+    }
+
+    pub(crate) fn finish_with_cancel(
+        mut self,
+        cancel: &AtomicBool,
+    ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         if self.written != self.explicit_count {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
         if !self.pending_scalars.is_empty() {
-            self.flush_pending_rows(true)?;
+            self.flush_pending_rows_with_cancel(true, cancel)?;
         }
+        check_prover_cancel(cancel)?;
         if self.committed_rows != self.explicit_count.div_ceil(self.columns) {
             return Err(BlsDoryAggregateError::InvalidCoefficientCount);
         }
@@ -1442,6 +1612,7 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
                 ))
             }
         };
+        check_prover_cancel(cancel)?;
         Ok(BlsDoryCommittedPolynomial {
             coefficients,
             commitment: self.commitment,
@@ -1452,7 +1623,12 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
         })
     }
 
-    fn flush_pending_rows(&mut self, final_chunk: bool) -> Result<(), BlsDoryAggregateError> {
+    fn flush_pending_rows_with_cancel(
+        &mut self,
+        final_chunk: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         if self.pending_scalars.is_empty()
             || (!final_chunk && !self.pending_scalars.len().is_multiple_of(self.columns))
         {
@@ -1474,6 +1650,7 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
             .par_chunks_exact(self.columns)
             .enumerate()
             .map(|(local_row, row)| {
+                check_prover_cancel(cancel)?;
                 let row_index = chunk_start + local_row;
                 let row_commitment = self
                     .setup
@@ -1486,7 +1663,9 @@ impl<'a> BlsDoryCommittedPolynomialWriter<'a> {
                 Ok((row_commitment, paired))
             })
             .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        check_prover_cancel(cancel)?;
         for (local_row, (row_commitment, paired)) in committed.into_iter().enumerate() {
+            check_prover_cancel(cancel)?;
             self.row_commitments[chunk_start + local_row] = row_commitment;
             self.commitment = self.commitment + paired;
         }
@@ -1521,10 +1700,19 @@ pub enum BlsDoryAggregateError {
     SumcheckFailed,
     #[error("authenticated prover scratch storage failed")]
     ProverStorage,
+    #[error("BLS12-381 Dory proof construction was cancelled")]
+    Cancelled,
     #[error("coefficient row source failed")]
     CoefficientSource,
     #[error("Dory operation failed: {0}")]
     Dory(String),
+}
+
+fn check_prover_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryAggregateError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryAggregateError::Cancelled);
+    }
+    Ok(())
 }
 
 /// Fail closed until every documented production blocker is resolved.
@@ -1692,6 +1880,26 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    commit_bls_dory_row_source_with_scratch_with_cancel(
+        source,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+pub(crate) fn commit_bls_dory_row_source_with_scratch_with_cancel<S: BlsDoryRowSource>(
+    source: &mut S,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
@@ -1734,6 +1942,7 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
     let rows_per_chunk = (ROW_COMMIT_CHUNK_BYTES / row_bytes.max(1)).max(1);
     for chunk_start in (0..explicit_rows).step_by(rows_per_chunk) {
+        check_prover_cancel(cancel)?;
         let chunk_end = chunk_start
             .saturating_add(rows_per_chunk)
             .min(explicit_rows);
@@ -1743,6 +1952,7 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
             .ok_or(BlsDoryAggregateError::InvalidDimension)?;
         let mut coefficients = vec![BlsDoryFr::zero(); chunk_scalars];
         for (local_row, row) in coefficients.chunks_exact_mut(columns).enumerate() {
+            check_prover_cancel(cancel)?;
             let row_index = chunk_start + local_row;
             let written = source
                 .read_row(row_index, row)
@@ -1755,10 +1965,12 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
                 .min(columns);
             row[explicit_in_row..].fill(BlsDoryFr::zero());
         }
+        check_prover_cancel(cancel)?;
         let committed_rows = coefficients
             .par_chunks_exact(columns)
             .enumerate()
             .map(|(local_row, row)| {
+                check_prover_cancel(cancel)?;
                 let row_index = chunk_start + local_row;
                 let row_commitment = setup
                     .commit_row_segment(0, row)
@@ -1770,6 +1982,7 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
             })
             .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
         for (local_row, (row_commitment, paired)) in committed_rows.into_iter().enumerate() {
+            check_prover_cancel(cancel)?;
             let row_index = chunk_start + local_row;
             let explicit_in_row = explicit_coefficient_count
                 .saturating_sub(row_index * columns)
@@ -1782,6 +1995,7 @@ pub fn commit_bls_dory_row_source_with_scratch<S: BlsDoryRowSource>(
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
         }
     }
+    check_prover_cancel(cancel)?;
     let artifact = writer
         .finish()
         .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
@@ -2028,6 +2242,28 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    commit_bls_dory_compact_row_source_with_scratch_with_cancel(
+        source,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+pub(crate) fn commit_bls_dory_compact_row_source_with_scratch_with_cancel<
+    S: BlsDoryCompactRowSource,
+>(
+    source: &mut S,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
@@ -2099,6 +2335,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
     let rows_per_chunk = (ROW_COMMIT_CHUNK_BYTES / expanded_row_bytes.max(1)).max(1);
     for chunk_start in (0..word_rows).step_by(rows_per_chunk) {
+        check_prover_cancel(cancel)?;
         let chunk_end = chunk_start.saturating_add(rows_per_chunk).min(word_rows);
         let chunk_rows = chunk_end - chunk_start;
         let chunk_words = chunk_rows
@@ -2106,6 +2343,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
             .ok_or(BlsDoryAggregateError::InvalidDimension)?;
         let mut words = vec![0u64; chunk_words];
         for (local_row, row) in words.chunks_exact_mut(columns).enumerate() {
+            check_prover_cancel(cancel)?;
             let written = source
                 .read_word_row(chunk_start + local_row, row)
                 .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
@@ -2117,6 +2355,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
             .par_chunks_exact(columns)
             .enumerate()
             .map(|(local_row, row)| {
+                check_prover_cancel(cancel)?;
                 let row_index = chunk_start + local_row;
                 let packed_start = row_index
                     .checked_mul(columns)
@@ -2143,7 +2382,9 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
                 Ok((row_commitment, paired))
             })
             .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        check_prover_cancel(cancel)?;
         for (local_row, (row_commitment, paired)) in committed_rows.into_iter().enumerate() {
+            check_prover_cancel(cancel)?;
             let row_index = chunk_start + local_row;
             commitment = commitment + paired;
             row_commitments[row_index] = row_commitment;
@@ -2154,6 +2395,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
         }
     }
     for chunk_start in (word_rows..explicit_rows).step_by(rows_per_chunk) {
+        check_prover_cancel(cancel)?;
         let chunk_end = chunk_start
             .saturating_add(rows_per_chunk)
             .min(explicit_rows);
@@ -2163,6 +2405,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
             .ok_or(BlsDoryAggregateError::InvalidDimension)?;
         let mut codes = vec![0u8; chunk_codes];
         for (local_row, row) in codes.chunks_exact_mut(columns).enumerate() {
+            check_prover_cancel(cancel)?;
             let row_index = chunk_start + local_row;
             let written = source
                 .read_code_row(row_index, row)
@@ -2185,6 +2428,7 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
             .par_chunks_exact(columns)
             .enumerate()
             .map(|(local_row, row)| {
+                check_prover_cancel(cancel)?;
                 let row_index = chunk_start + local_row;
                 let coefficients = row
                     .iter()
@@ -2199,7 +2443,9 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
                 Ok((row_commitment, paired))
             })
             .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        check_prover_cancel(cancel)?;
         for (local_row, (row_commitment, paired)) in committed_rows.into_iter().enumerate() {
+            check_prover_cancel(cancel)?;
             let row_index = chunk_start + local_row;
             let explicit_in_row = explicit_coefficient_count
                 .saturating_sub(row_index * columns)
@@ -2212,9 +2458,11 @@ pub(crate) fn commit_bls_dory_compact_row_source_with_scratch<S: BlsDoryCompactR
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
         }
     }
+    check_prover_cancel(cancel)?;
     let artifact = writer
         .finish()
         .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    check_prover_cancel(cancel)?;
     Ok(BlsDoryCommittedPolynomial {
         coefficients: BlsDoryCoefficientStorage::CompactArtifact(Arc::new(artifact)),
         commitment,
@@ -2236,6 +2484,19 @@ pub(crate) fn commit_bls_dory_existing_compact_artifact(
     sigma: usize,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    commit_bls_dory_existing_compact_artifact_with_cancel(artifact, nu, sigma, setup, &cancel)
+}
+
+#[cfg(any(test, feature = "whir-prototype"))]
+pub(crate) fn commit_bls_dory_existing_compact_artifact_with_cancel(
+    artifact: Arc<BlsDoryCompactArtifact>,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
@@ -2298,6 +2559,7 @@ pub(crate) fn commit_bls_dory_existing_compact_artifact(
     let mut decoded_count = 0usize;
     {
         let mut commit_chunk = |coefficients: &[BlsDoryFr]| -> Result<(), BlsDoryAggregateError> {
+            check_prover_cancel(cancel)?;
             if coefficients.is_empty() || !coefficients.len().is_multiple_of(columns) {
                 return Err(BlsDoryAggregateError::InvalidCoefficientCount);
             }
@@ -2312,6 +2574,7 @@ pub(crate) fn commit_bls_dory_existing_compact_artifact(
                 .par_chunks_exact(columns)
                 .enumerate()
                 .map(|(local_row, row)| {
+                    check_prover_cancel(cancel)?;
                     let row_index = committed_rows
                         .checked_add(local_row)
                         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
@@ -2336,6 +2599,10 @@ pub(crate) fn commit_bls_dory_existing_compact_artifact(
             decoded_count = decoded_count
                 .checked_add(1)
                 .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+            if decoded_count.is_multiple_of(8_192) && cancel.load(Ordering::Acquire) {
+                commit_error = Some(BlsDoryAggregateError::Cancelled);
+                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+            }
             pending.push(coefficient);
             if pending.len() == chunk_scalars {
                 if let Err(error) = commit_chunk(&pending) {
@@ -2369,6 +2636,7 @@ pub(crate) fn commit_bls_dory_existing_compact_artifact(
             commit_chunk(&pending)?;
         }
     }
+    check_prover_cancel(cancel)?;
     if committed_rows != explicit_rows {
         return Err(BlsDoryAggregateError::InvalidCoefficientCount);
     }
@@ -2396,6 +2664,30 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<Arc<BlsDoryCompactArtifact>, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    regenerate_bls_dory_compact_row_source_with_scratch_with_cancel(
+        source,
+        expected,
+        nu,
+        sigma,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch_with_cancel<
+    S: BlsDoryCompactRowSource,
+>(
+    source: &mut S,
+    expected: &BlsDoryReleasedCompactSource,
+    nu: usize,
+    sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<Arc<BlsDoryCompactArtifact>, BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
@@ -2462,6 +2754,7 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
     let explicit_rows = explicit_coefficient_count.div_ceil(columns);
     let mut words = vec![0u64; columns];
     for row_index in 0..word_rows {
+        check_prover_cancel(cancel)?;
         let written = source
             .read_word_row(row_index, &mut words)
             .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
@@ -2474,6 +2767,7 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
     }
     let mut codes = vec![0u8; columns];
     for row_index in word_rows..explicit_rows {
+        check_prover_cancel(cancel)?;
         let written = source
             .read_code_row(row_index, &mut codes)
             .map_err(|_| BlsDoryAggregateError::CoefficientSource)?;
@@ -2494,6 +2788,7 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
             .write_codes(&codes[..explicit_in_row])
             .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
     }
+    check_prover_cancel(cancel)?;
     let artifact = writer
         .finish()
         .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
@@ -2504,12 +2799,31 @@ pub(crate) fn regenerate_bls_dory_compact_row_source_with_scratch<S: BlsDoryComp
 /// Commit a deterministic scalar mapping of an authenticated compact source
 /// while retaining only a shared view of the source file. This is used for the
 /// LogUp inverse, whose codes are exactly the transition's radix-16 digits.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn commit_bls_dory_mapped_compact_polynomial(
     source: &BlsDoryCommittedPolynomial,
     zero_prefix_count: usize,
     mapped_dictionary: Vec<BlsDoryFr>,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    commit_bls_dory_mapped_compact_polynomial_with_cancel(
+        source,
+        zero_prefix_count,
+        mapped_dictionary,
+        setup,
+        &cancel,
+    )
+}
+
+pub(crate) fn commit_bls_dory_mapped_compact_polynomial_with_cancel(
+    source: &BlsDoryCommittedPolynomial,
+    zero_prefix_count: usize,
+    mapped_dictionary: Vec<BlsDoryFr>,
+    setup: &DeterministicBlsDorySetup,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryCommittedPolynomial, BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     setup
         .validate()
         .map_err(|_| BlsDoryAggregateError::InvalidSetup)?;
@@ -2563,6 +2877,7 @@ pub(crate) fn commit_bls_dory_mapped_compact_polynomial(
     let mut commit_error = None;
     let mapping_result = mapped.for_each_chunk(chunk_scalars, |chunk| {
         let result = (|| -> Result<(), BlsDoryAggregateError> {
+            check_prover_cancel(cancel)?;
             let chunk_rows = chunk.len().div_ceil(columns);
             let mut padded = Vec::new();
             let coefficients = if chunk.len().is_multiple_of(columns) {
@@ -2576,6 +2891,7 @@ pub(crate) fn commit_bls_dory_mapped_compact_polynomial(
                 .par_chunks_exact(columns)
                 .enumerate()
                 .map(|(local_row, row)| {
+                    check_prover_cancel(cancel)?;
                     let row_index = committed_rows
                         .checked_add(local_row)
                         .ok_or(BlsDoryAggregateError::InvalidDimension)?;
@@ -2608,6 +2924,7 @@ pub(crate) fn commit_bls_dory_mapped_compact_polynomial(
         return Err(error);
     }
     mapping_result.map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+    check_prover_cancel(cancel)?;
     if committed_rows != explicit_rows {
         return Err(BlsDoryAggregateError::InvalidCoefficientCount);
     }
@@ -2826,6 +3143,31 @@ fn prepare_bls_dory_opening_refs_with_claim_limit(
     scratch_directory: Option<&Path>,
     maximum_claims: usize,
 ) -> Result<PreparedBlsDoryOpeningProof, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prepare_bls_dory_opening_refs_with_claim_limit_and_cancel(
+        public_binding,
+        layout,
+        polynomials,
+        points,
+        setup,
+        scratch_directory,
+        maximum_claims,
+        &cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_bls_dory_opening_refs_with_claim_limit_and_cancel(
+    public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
+    polynomials: &[&BlsDoryCommittedPolynomial],
+    points: &[Vec<BlsDoryFr>],
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: Option<&Path>,
+    maximum_claims: usize,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryOpeningProof, BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     validate_public_inputs_with_claim_limit(public_binding, polynomials.len(), maximum_claims)?;
     setup
         .validate()
@@ -2852,6 +3194,7 @@ fn prepare_bls_dory_opening_refs_with_claim_limit(
         .iter()
         .zip(points)
         .map(|(polynomial, point)| {
+            check_prover_cancel(cancel)?;
             Ok(BlsDoryOpeningClaim {
                 commitment: polynomial.commitment,
                 point: point.clone(),
@@ -2865,12 +3208,13 @@ fn prepare_bls_dory_opening_refs_with_claim_limit(
     let scratch = scratch_directory
         .map(|directory| FoldScratch::new(directory, transcript.digest()))
         .transpose()?;
-    let sumcheck = prove_distinct_point_sumcheck(
+    let sumcheck = prove_distinct_point_sumcheck_with_cancel(
         polynomials,
         &claims,
         &batching,
         &mut transcript,
         scratch.as_ref(),
+        cancel,
     )?;
 
     let SumcheckProverOutput {
@@ -2889,7 +3233,7 @@ fn prepare_bls_dory_opening_refs_with_claim_limit(
         .map(|(rho, equality)| *rho * equality)
         .collect::<Vec<_>>();
     let (combined_rows, combined_commitment, vector_matrix_product) =
-        combine_polynomials_for_opening(polynomials, &lambdas, &random_point, nu, sigma)?;
+        combine_polynomials_for_opening(polynomials, &lambdas, &random_point, nu, sigma, cancel)?;
 
     append_combined_opening(
         &mut transcript,
@@ -2914,6 +3258,16 @@ fn finish_prepared_bls_dory_opening(
     prepared: PreparedBlsDoryOpeningProof,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    finish_prepared_bls_dory_opening_with_cancel(prepared, setup, &cancel)
+}
+
+fn finish_prepared_bls_dory_opening_with_cancel(
+    prepared: PreparedBlsDoryOpeningProof,
+    setup: &DeterministicBlsDorySetup,
+    cancel: &AtomicBool,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     let PreparedBlsDoryOpeningProof {
         claims,
         mut transcript,
@@ -2925,7 +3279,7 @@ fn finish_prepared_bls_dory_opening(
         nu,
         sigma,
     } = prepared;
-    let dory_proof = prove_bls_dory_opening_from_vector_product(
+    let dory_proof = prove_bls_dory_opening_from_vector_product_with_cancel(
         &random_point,
         combined_rows,
         vector_matrix_product,
@@ -2933,9 +3287,14 @@ fn finish_prepared_bls_dory_opening(
         sigma,
         setup,
         &mut transcript,
+        cancel,
     )
-    .map_err(|error| BlsDoryAggregateError::Dory(error.to_string()))?;
+    .map_err(|error| match error {
+        BlsDoryStreamingProofError::Cancelled => BlsDoryAggregateError::Cancelled,
+        error => BlsDoryAggregateError::Dory(error.to_string()),
+    })?;
 
+    check_prover_cancel(cancel)?;
     let encoded = encode_aggregate_proof(
         claims.len(),
         variables,
@@ -2987,6 +3346,7 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming(
     sets: Vec<BlsDoryDeferredOpeningSet>,
     setup: &DeterministicBlsDorySetup,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
     prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
         public_binding,
         layout,
@@ -2994,6 +3354,7 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming(
         setup,
         None,
         MAX_BLS_DORY_AGGREGATE_CLAIMS,
+        &cancel,
     )
 }
 
@@ -3004,6 +3365,7 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
     prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
         public_binding,
         layout,
@@ -3011,6 +3373,7 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_with_scratch(
         setup,
         Some(scratch_directory),
         MAX_BLS_DORY_AGGREGATE_CLAIMS,
+        &cancel,
     )
 }
 
@@ -3024,6 +3387,29 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_composed(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_deferred_opening_sets_consuming_composed_with_cancel(
+        public_binding,
+        layout,
+        sets,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+/// Consume the production composed opening partition while honoring
+/// cancellation throughout scratch folding and the final Dory reduction.
+#[cfg(any(test, feature = "whir-prototype"))]
+pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_composed_with_cancel(
+    public_binding: &[u8],
+    layout: BlsDoryAggregateLayout,
+    sets: Vec<BlsDoryDeferredOpeningSet>,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     let claim_count = sets.iter().try_fold(0usize, |count, set| {
         count
             .checked_add(set.claims().len())
@@ -3039,6 +3425,7 @@ pub(crate) fn prove_bls_dory_deferred_opening_sets_consuming_composed(
         setup,
         Some(scratch_directory),
         BLS_DORY_COMPOSED_AGGREGATE_CLAIMS,
+        cancel,
     )
 }
 
@@ -3049,7 +3436,9 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: Option<&Path>,
     maximum_claims: usize,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<BlsDoryOpeningClaim>, Vec<u8>), BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     if sets.is_empty() {
         return Err(BlsDoryAggregateError::InvalidClaimCount);
     }
@@ -3068,6 +3457,7 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
     let mut points = Vec::with_capacity(claim_count);
     let mut expected_claims = Vec::with_capacity(claim_count);
     for set in sets {
+        check_prover_cancel(cancel)?;
         let BlsDoryDeferredOpeningSet {
             polynomials: set_polynomials,
             polynomial_indices: set_indices,
@@ -3101,7 +3491,7 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
                 .ok_or(BlsDoryAggregateError::InvalidClaimCount)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let prepared = prepare_bls_dory_opening_refs_with_claim_limit(
+    let prepared = prepare_bls_dory_opening_refs_with_claim_limit_and_cancel(
         public_binding,
         layout,
         &polynomial_refs,
@@ -3109,13 +3499,14 @@ fn prove_bls_dory_deferred_opening_sets_consuming_with_optional_scratch(
         setup,
         scratch_directory,
         maximum_claims,
+        cancel,
     )?;
     if prepared.claims != expected_claims {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     drop(polynomial_refs);
     drop(polynomials);
-    finish_prepared_bls_dory_opening(prepared, setup)
+    finish_prepared_bls_dory_opening_with_cancel(prepared, setup, cancel)
 }
 
 fn prove_bls_dory_deferred_opening_sets_with_optional_scratch(
@@ -3505,10 +3896,17 @@ impl AggregateCompactFoldView {
         Ok(())
     }
 
-    fn for_each_scalar(
+    fn for_each_scalar(&self, visitor: impl FnMut(BlsDoryFr)) -> Result<(), BlsDoryAggregateError> {
+        let cancel = AtomicBool::new(false);
+        self.for_each_scalar_with_cancel(&cancel, visitor)
+    }
+
+    fn for_each_scalar_with_cancel(
         &self,
+        cancel: &AtomicBool,
         mut visitor: impl FnMut(BlsDoryFr),
     ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         let spec = self.source.spec();
         if self.challenges.is_empty()
             || self.challenges.len() > AGGREGATE_SOURCE_FOLD_GENERATIONS
@@ -3543,6 +3941,9 @@ impl AggregateCompactFoldView {
         let mut visited = 0usize;
         let mut failed = false;
         let result = self.source.for_each_encoded_scalar(|index, encoded| {
+            if cancel.load(Ordering::Acquire) {
+                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+            }
             block[block_used] = match encoded {
                 CompactEncodedScalar::Word {
                     value,
@@ -3585,6 +3986,7 @@ impl AggregateCompactFoldView {
             }
             Ok(())
         });
+        check_prover_cancel(cancel)?;
         if failed || result.is_err() {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
@@ -3602,12 +4004,13 @@ impl AggregateCompactFoldView {
         Ok(())
     }
 
-    fn for_each_pair(
+    fn for_each_pair_with_cancel(
         &self,
+        cancel: &AtomicBool,
         mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
     ) -> Result<(), BlsDoryAggregateError> {
         let mut pending = None;
-        self.for_each_scalar(|scalar| {
+        self.for_each_scalar_with_cancel(cancel, |scalar| {
             if let Some(lower) = pending.take() {
                 visitor(lower, scalar);
             } else {
@@ -3638,10 +4041,17 @@ impl AggregateWordFoldView {
         Ok(())
     }
 
-    fn for_each_scalar(
+    fn for_each_scalar(&self, visitor: impl FnMut(BlsDoryFr)) -> Result<(), BlsDoryAggregateError> {
+        let cancel = AtomicBool::new(false);
+        self.for_each_scalar_with_cancel(&cancel, visitor)
+    }
+
+    fn for_each_scalar_with_cancel(
         &self,
+        cancel: &AtomicBool,
         mut visitor: impl FnMut(BlsDoryFr),
     ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         if self.challenges.is_empty() || self.challenges.len() > AGGREGATE_SOURCE_FOLD_GENERATIONS {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
@@ -3668,6 +4078,9 @@ impl AggregateWordFoldView {
         let mut visited = 0usize;
         let mut failed = false;
         let read_result = self.source.for_each_encoded_scalar(|index, encoded| {
+            if cancel.load(Ordering::Acquire) {
+                return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+            }
             block[block_used] = match encoded {
                 CompactEncodedScalar::Word { value, signed } => {
                     let Some(selector) = usize::try_from(index)
@@ -3707,6 +4120,7 @@ impl AggregateWordFoldView {
             }
             Ok(())
         });
+        check_prover_cancel(cancel)?;
         if failed || read_result.is_err() {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
@@ -3724,12 +4138,13 @@ impl AggregateWordFoldView {
         Ok(())
     }
 
-    fn for_each_pair(
+    fn for_each_pair_with_cancel(
         &self,
+        cancel: &AtomicBool,
         mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
     ) -> Result<(), BlsDoryAggregateError> {
         let mut pending = None;
-        self.for_each_scalar(|scalar| {
+        self.for_each_scalar_with_cancel(cancel, |scalar| {
             if let Some(lower) = pending.take() {
                 visitor(lower, scalar);
             } else {
@@ -4117,30 +4532,50 @@ impl<'a> FoldedPolynomialTable<'a> {
         Ok(self.explicit_len().div_ceil(2))
     }
 
+    #[cfg(test)]
     fn for_each_pair(
         &self,
+        visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
+    ) -> Result<(), BlsDoryAggregateError> {
+        let cancel = AtomicBool::new(false);
+        self.for_each_pair_with_cancel(&cancel, visitor)
+    }
+
+    fn for_each_pair_with_cancel(
+        &self,
+        cancel: &AtomicBool,
         mut visitor: impl FnMut(BlsDoryFr, BlsDoryFr),
     ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         match &self.storage {
             FoldedPolynomialStorage::Source(polynomial) => {
-                polynomial.for_each_coefficient_pair(&mut visitor)
+                polynomial.for_each_coefficient_pair_with_cancel(cancel, &mut visitor)
             }
             FoldedPolynomialStorage::Owned(values) => {
-                for_each_memory_pair(values, self.logical_len, &mut visitor)
+                for_each_memory_pair_with_cancel(values, self.logical_len, cancel, &mut visitor)
             }
             FoldedPolynomialStorage::Artifact(artifact) => artifact
                 .for_each_pair(|lower, upper| {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                    }
                     visitor(lower, upper);
                     Ok(())
                 })
-                .map_err(|_| BlsDoryAggregateError::ProverStorage),
+                .map_err(|_| {
+                    if cancel.load(Ordering::Acquire) {
+                        BlsDoryAggregateError::Cancelled
+                    } else {
+                        BlsDoryAggregateError::ProverStorage
+                    }
+                }),
             FoldedPolynomialStorage::Compact(view) => {
                 view.validate_lineage(self.lineage_digest)?;
-                view.for_each_pair(visitor)
+                view.for_each_pair_with_cancel(cancel, visitor)
             }
             FoldedPolynomialStorage::WordCompact(view) => {
                 view.validate_lineage(self.lineage_digest)?;
-                view.for_each_pair(visitor)
+                view.for_each_pair_with_cancel(cancel, visitor)
             }
         }
     }
@@ -4150,7 +4585,9 @@ impl<'a> FoldedPolynomialTable<'a> {
         challenge: BlsDoryFr,
         generation: usize,
         scratch: Option<&FoldScratch<'_>>,
+        cancel: &AtomicBool,
     ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
         let child_logical_len = self
             .logical_len
             .checked_div(2)
@@ -4174,7 +4611,7 @@ impl<'a> FoldedPolynomialTable<'a> {
             match &self.storage {
                 FoldedPolynomialStorage::Source(polynomial) => {
                     let mut write_failed = false;
-                    polynomial.for_each_coefficient_pair(|lower, upper| {
+                    polynomial.for_each_coefficient_pair_with_cancel(cancel, |lower, upper| {
                         if !write_failed
                             && writer
                                 .write_scalar(&(lower + challenge * (upper - lower)))
@@ -4188,17 +4625,26 @@ impl<'a> FoldedPolynomialTable<'a> {
                     }
                 }
                 FoldedPolynomialStorage::Owned(values) => {
-                    write_memory_fold(values, self.logical_len, challenge, &mut writer)?
+                    write_memory_fold(values, self.logical_len, challenge, &mut writer, cancel)?
                 }
                 FoldedPolynomialStorage::Artifact(artifact) => artifact
                     .for_each_pair(|lower, upper| {
+                        if cancel.load(Ordering::Acquire) {
+                            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                        }
                         writer.write_scalar(&(lower + challenge * (upper - lower)))
                     })
-                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+                    .map_err(|_| {
+                        if cancel.load(Ordering::Acquire) {
+                            BlsDoryAggregateError::Cancelled
+                        } else {
+                            BlsDoryAggregateError::ProverStorage
+                        }
+                    })?,
                 FoldedPolynomialStorage::Compact(view) => {
                     view.validate_lineage(self.lineage_digest)?;
                     let mut write_failed = false;
-                    view.for_each_pair(|lower, upper| {
+                    view.for_each_pair_with_cancel(cancel, |lower, upper| {
                         if writer
                             .write_scalar(&(lower + challenge * (upper - lower)))
                             .is_err()
@@ -4213,7 +4659,7 @@ impl<'a> FoldedPolynomialTable<'a> {
                 FoldedPolynomialStorage::WordCompact(view) => {
                     view.validate_lineage(self.lineage_digest)?;
                     let mut write_failed = false;
-                    view.for_each_pair(|lower, upper| {
+                    view.for_each_pair_with_cancel(cancel, |lower, upper| {
                         if writer
                             .write_scalar(&(lower + challenge * (upper - lower)))
                             .is_err()
@@ -4226,6 +4672,7 @@ impl<'a> FoldedPolynomialTable<'a> {
                     }
                 }
             }
+            check_prover_cancel(cancel)?;
             let artifact = writer
                 .finish()
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
@@ -4238,16 +4685,21 @@ impl<'a> FoldedPolynomialTable<'a> {
         match &mut self.storage {
             FoldedPolynomialStorage::Source(polynomial) => {
                 let mut folded = Vec::with_capacity(child_explicit_len);
-                polynomial.for_each_coefficient_pair(|lower, upper| {
+                polynomial.for_each_coefficient_pair_with_cancel(cancel, |lower, upper| {
                     folded.push(lower + challenge * (upper - lower));
                 })?;
                 self.storage = FoldedPolynomialStorage::Owned(folded);
             }
             FoldedPolynomialStorage::Owned(values) => {
                 let mut folded = Vec::with_capacity(child_explicit_len);
-                for_each_memory_pair(values, self.logical_len, &mut |lower, upper| {
-                    folded.push(lower + challenge * (upper - lower));
-                })?;
+                for_each_memory_pair_with_cancel(
+                    values,
+                    self.logical_len,
+                    cancel,
+                    &mut |lower, upper| {
+                        folded.push(lower + challenge * (upper - lower));
+                    },
+                )?;
                 *values = folded;
             }
             FoldedPolynomialStorage::Artifact(_) => {
@@ -4260,6 +4712,7 @@ impl<'a> FoldedPolynomialTable<'a> {
                 return Err(BlsDoryAggregateError::ProverStorage);
             }
         }
+        check_prover_cancel(cancel)?;
         self.logical_len = child_logical_len;
         Ok(())
     }
@@ -4297,9 +4750,10 @@ impl<'a> FoldedPolynomialTable<'a> {
     }
 }
 
-fn for_each_memory_pair(
+fn for_each_memory_pair_with_cancel(
     values: &[BlsDoryFr],
     logical_len: usize,
+    cancel: &AtomicBool,
     visitor: &mut impl FnMut(BlsDoryFr, BlsDoryFr),
 ) -> Result<(), BlsDoryAggregateError> {
     if logical_len < 2
@@ -4310,9 +4764,11 @@ fn for_each_memory_pair(
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     for pair in values.chunks_exact(2) {
+        check_prover_cancel(cancel)?;
         visitor(pair[0], pair[1]);
     }
     if !values.len().is_multiple_of(2) {
+        check_prover_cancel(cancel)?;
         visitor(values[values.len() - 1], BlsDoryFr::zero());
     }
     Ok(())
@@ -4323,9 +4779,10 @@ fn write_memory_fold(
     logical_len: usize,
     challenge: BlsDoryFr,
     writer: &mut BlsDoryFoldArtifactWriter,
+    cancel: &AtomicBool,
 ) -> Result<(), BlsDoryAggregateError> {
     let mut failed = false;
-    for_each_memory_pair(values, logical_len, &mut |lower, upper| {
+    for_each_memory_pair_with_cancel(values, logical_len, cancel, &mut |lower, upper| {
         if !failed
             && writer
                 .write_scalar(&(lower + challenge * (upper - lower)))
@@ -4357,6 +4814,7 @@ fn committed_polynomial_fold_parent(
     Ok(*hasher.finalize().as_bytes())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn prove_distinct_point_sumcheck(
     polynomials: &[&BlsDoryCommittedPolynomial],
     claims: &[BlsDoryOpeningClaim],
@@ -4364,6 +4822,26 @@ fn prove_distinct_point_sumcheck(
     transcript: &mut BlsDoryTranscript,
     scratch: Option<&FoldScratch<'_>>,
 ) -> Result<SumcheckProverOutput, BlsDoryAggregateError> {
+    let cancel = AtomicBool::new(false);
+    prove_distinct_point_sumcheck_with_cancel(
+        polynomials,
+        claims,
+        batching,
+        transcript,
+        scratch,
+        &cancel,
+    )
+}
+
+fn prove_distinct_point_sumcheck_with_cancel(
+    polynomials: &[&BlsDoryCommittedPolynomial],
+    claims: &[BlsDoryOpeningClaim],
+    batching: &[BlsDoryFr],
+    transcript: &mut BlsDoryTranscript,
+    scratch: Option<&FoldScratch<'_>>,
+    cancel: &AtomicBool,
+) -> Result<SumcheckProverOutput, BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     let variables = claims[0].point.len();
     let coefficient_count = 1usize
         .checked_shl(u32::try_from(variables).map_err(|_| BlsDoryAggregateError::InvalidDimension)?)
@@ -4421,9 +4899,11 @@ fn prove_distinct_point_sumcheck(
     let mut compressed_pair_folds = 0usize;
 
     for round_index in 0..variables {
+        check_prover_cancel(cancel)?;
         let mut message = [BlsDoryFr::zero(); 3];
         for (table, claim_indices) in polynomial_tables.iter().zip(&table_claim_indices) {
-            accumulate_distinct_point_round(
+            check_prover_cancel(cancel)?;
+            accumulate_distinct_point_round_with_cancel(
                 table,
                 claim_indices,
                 claims,
@@ -4431,6 +4911,7 @@ fn prove_distinct_point_sumcheck(
                 round_index,
                 &equality_prefixes,
                 &mut message,
+                cancel,
             )?;
         }
         if message[0] + message[1] != current_claim {
@@ -4447,6 +4928,7 @@ fn prove_distinct_point_sumcheck(
         }) {
             let mut compressed_tables = vec![false; polynomial_tables.len()];
             for pair in &compact_pairs {
+                check_prover_cancel(cancel)?;
                 let can_compress = generation == 1
                     || polynomial_tables
                         .get(pair.transition_table)
@@ -4474,6 +4956,7 @@ fn prove_distinct_point_sumcheck(
                 }
             }
             for table_index in &word_tables {
+                check_prover_cancel(cancel)?;
                 let table = polynomial_tables
                     .get_mut(*table_index)
                     .ok_or(BlsDoryAggregateError::ProverStorage)?;
@@ -4481,13 +4964,15 @@ fn prove_distinct_point_sumcheck(
                 compressed_tables[*table_index] = true;
             }
             for (table_index, table) in polynomial_tables.iter_mut().enumerate() {
+                check_prover_cancel(cancel)?;
                 if !compressed_tables[table_index] {
-                    table.fold(challenge, generation, Some(scratch))?;
+                    table.fold(challenge, generation, Some(scratch), cancel)?;
                 }
             }
         } else {
             for table in &mut polynomial_tables {
-                table.fold(challenge, generation, scratch)?;
+                check_prover_cancel(cancel)?;
+                table.fold(challenge, generation, scratch, cancel)?;
             }
         }
         for (prefix, claim) in equality_prefixes.iter_mut().zip(claims) {
@@ -4497,6 +4982,7 @@ fn prove_distinct_point_sumcheck(
                     + coordinate * challenge);
         }
         rounds.push(message);
+        check_prover_cancel(cancel)?;
     }
 
     let terminal = claim_table_indices
@@ -4530,7 +5016,8 @@ fn prove_distinct_point_sumcheck(
     })
 }
 
-fn accumulate_distinct_point_round(
+#[allow(clippy::too_many_arguments)]
+fn accumulate_distinct_point_round_with_cancel(
     polynomial: &FoldedPolynomialTable<'_>,
     claim_indices: &[usize],
     claims: &[BlsDoryOpeningClaim],
@@ -4538,7 +5025,9 @@ fn accumulate_distinct_point_round(
     round_index: usize,
     equality_prefixes: &[BlsDoryFr],
     message: &mut [BlsDoryFr; 3],
+    cancel: &AtomicBool,
 ) -> Result<(), BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     let first_claim = claim_indices
         .first()
         .and_then(|index| claims.get(*index))
@@ -4574,7 +5063,7 @@ fn accumulate_distinct_point_round(
         .collect::<Vec<_>>();
     let mut visited = 0usize;
     let mut missing_weight = false;
-    polynomial.for_each_pair(|lower, upper| {
+    polynomial.for_each_pair_with_cancel(cancel, |lower, upper| {
         let value_two = upper + upper - lower;
         for (claim_index, weights) in claim_indices.iter().zip(&mut weights) {
             let claim = &claims[*claim_index];
@@ -4696,7 +5185,9 @@ fn combine_polynomials_for_opening(
     point: &[BlsDoryFr],
     nu: usize,
     sigma: usize,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<BlsDoryG1>, BlsDoryGt, Vec<BlsDoryFr>), BlsDoryAggregateError> {
+    check_prover_cancel(cancel)?;
     let nu = u32::try_from(nu).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
     let sigma = u32::try_from(sigma).map_err(|_| BlsDoryAggregateError::InvalidDimension)?;
     let row_count = 1usize
@@ -4720,6 +5211,7 @@ fn combine_polynomials_for_opening(
 
     let mut grouped = Vec::<(&BlsDoryCommittedPolynomial, BlsDoryFr)>::new();
     for (polynomial, lambda) in polynomials.iter().zip(lambdas) {
+        check_prover_cancel(cancel)?;
         if let Some((_, scale)) = grouped
             .iter_mut()
             .find(|(existing, _)| existing.shares_coefficient_source(polynomial))
@@ -4733,10 +5225,12 @@ fn combine_polynomials_for_opening(
     let mut rows = vec![BlsDoryG1::identity(); row_count];
     let mut commitment = BlsDoryGt::identity();
     for (polynomial, lambda) in &grouped {
+        check_prover_cancel(cancel)?;
         if polynomial.row_commitments.len() != rows.len() {
             return Err(BlsDoryAggregateError::MixedStatement);
         }
         for (combined, row) in rows.iter_mut().zip(&polynomial.row_commitments) {
+            check_prover_cancel(cancel)?;
             *combined = *combined + row.scale(lambda);
         }
         commitment = commitment + polynomial.commitment.scale(lambda);
@@ -4745,7 +5239,8 @@ fn combine_polynomials_for_opening(
     let (left, _) = compute_left_right_vectors(point, nu as usize, sigma as usize);
     let mut product = vec![BlsDoryFr::zero(); column_count];
     for (polynomial, lambda) in grouped {
-        polynomial.accumulate_vector_matrix_product(&left, lambda, &mut product)?;
+        check_prover_cancel(cancel)?;
+        polynomial.accumulate_vector_matrix_product(&left, lambda, &mut product, cancel)?;
     }
     Ok((rows, commitment, product))
 }
@@ -5064,7 +5559,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, BlsDoryAggregateError> {
 #[cfg(test)]
 mod tests {
     use std::io::{Seek, SeekFrom, Write};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::*;
     use crate::dory_bls12_381_prototype::deterministic_bls_dory_setup;
@@ -5228,6 +5723,40 @@ mod tests {
             fail_at: None,
             short_at: None,
             reads: 0,
+        }
+    }
+
+    struct CancellingFixtureRowSource<'a> {
+        inner: FixtureRowSource,
+        cancel: &'a AtomicBool,
+        cancel_after_reads: usize,
+    }
+
+    impl BlsDoryRowSource for CancellingFixtureRowSource<'_> {
+        type Error = FixtureSourceError;
+
+        fn rows(&self) -> usize {
+            self.inner.rows()
+        }
+
+        fn columns(&self) -> usize {
+            self.inner.columns()
+        }
+
+        fn explicit_scalar_count(&self) -> usize {
+            self.inner.explicit_scalar_count()
+        }
+
+        fn read_row(
+            &mut self,
+            row_index: usize,
+            output: &mut [BlsDoryFr],
+        ) -> Result<usize, Self::Error> {
+            let written = self.inner.read_row(row_index, output)?;
+            if self.inner.reads >= self.cancel_after_reads {
+                self.cancel.store(true, Ordering::Release);
+            }
+            Ok(written)
         }
     }
 
@@ -6944,6 +7473,35 @@ mod tests {
         );
         drop(file);
         drop(committed);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn authenticated_row_source_cancels_midstream_and_cleans_partial_artifacts() {
+        let variables = 10;
+        let nu = variables / 2;
+        let sigma = variables - nu;
+        let setup = deterministic_bls_dory_setup(variables).unwrap();
+        let scratch = ScratchDirectory::create();
+        let cancel = AtomicBool::new(false);
+        let mut source = CancellingFixtureRowSource {
+            inner: fixture_row_source(variables),
+            cancel: &cancel,
+            cancel_after_reads: 3,
+        };
+
+        assert!(matches!(
+            commit_bls_dory_row_source_with_scratch_with_cancel(
+                &mut source,
+                nu,
+                sigma,
+                &setup,
+                &scratch.0,
+                &cancel,
+            ),
+            Err(BlsDoryAggregateError::Cancelled)
+        ));
+        assert_eq!(source.inner.reads, 3);
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 

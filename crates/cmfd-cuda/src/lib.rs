@@ -5,6 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cmfd_consensus::{
     ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, GOLDILOCKS_MODULUS,
@@ -483,13 +484,28 @@ impl CudaLibrary {
         setup: &DeterministicBlsDorySetup,
         device_index: i32,
     ) -> Result<ProductionCudaMiner, String> {
-        self.create_production_with_options(
+        let cancel = AtomicBool::new(false);
+        self.create_production_with_cancel(reader, authenticated, setup, device_index, &cancel)
+    }
+
+    /// Streams one canonical production model while honoring cancellation at
+    /// every authenticated field chunk and CUDA upload boundary.
+    pub fn create_production_with_cancel<R: Read>(
+        &self,
+        reader: R,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+        device_index: i32,
+        cancel: &AtomicBool,
+    ) -> Result<ProductionCudaMiner, String> {
+        self.create_production_with_options_and_cancel(
             reader,
             authenticated,
             setup,
             device_index,
             ProductionResidency::Auto,
             ProductionEngine::Auto,
+            cancel,
         )
     }
 
@@ -526,6 +542,34 @@ impl CudaLibrary {
         residency: ProductionResidency,
         engine: ProductionEngine,
     ) -> Result<ProductionCudaMiner, String> {
+        let cancel = AtomicBool::new(false);
+        self.create_production_with_options_and_cancel(
+            reader,
+            authenticated,
+            setup,
+            device_index,
+            residency,
+            engine,
+            &cancel,
+        )
+    }
+
+    /// Construct the authenticated production evaluator while honoring
+    /// cancellation throughout authenticated model streaming and upload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_production_with_options_and_cancel<R: Read>(
+        &self,
+        reader: R,
+        authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: &DeterministicBlsDorySetup,
+        device_index: i32,
+        residency: ProductionResidency,
+        engine: ProductionEngine,
+        cancel: &AtomicBool,
+    ) -> Result<ProductionCudaMiner, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("production model initialization was cancelled".to_owned());
+        }
         if self.backend != GpuBackend::Cuda {
             return Err(
                 "the production ForgeMatrix evaluator requires the CUDA backend".to_owned(),
@@ -546,8 +590,14 @@ impl CudaLibrary {
             ));
         }
 
-        let sink =
-            ProductionModelSink::begin(Arc::clone(&self.api), api, device, residency, engine)?;
+        let sink = ProductionModelSink::begin(
+            Arc::clone(&self.api),
+            api,
+            device,
+            residency,
+            engine,
+            cancel,
+        )?;
         verify_dory_v3_model_bank_into_staged_field_sink(reader, authenticated, setup, sink)
             .map_err(format_dory_model_stream_error)
     }
@@ -846,7 +896,7 @@ impl fmt::Display for ProductionSinkError {
 
 impl std::error::Error for ProductionSinkError {}
 
-struct ProductionModelSink {
+struct ProductionModelSink<'a> {
     context: Option<NonNull<c_void>>,
     api_owner: Arc<CudaApi>,
     production_api: ProductionApi,
@@ -857,16 +907,21 @@ struct ProductionModelSink {
     pending_start: u64,
     next_offset: u64,
     pending: Vec<i8>,
+    cancel: &'a AtomicBool,
 }
 
-impl ProductionModelSink {
+impl<'a> ProductionModelSink<'a> {
     fn begin(
         api_owner: Arc<CudaApi>,
         production_api: ProductionApi,
         device: CudaDevice,
         requested_residency: ProductionResidency,
         requested_engine: ProductionEngine,
+        cancel: &'a AtomicBool,
     ) -> Result<Self, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("production model initialization was cancelled".to_owned());
+        }
         let mut context = std::ptr::null_mut();
         let mut active_residency = ProductionResidency::Auto as u32;
         let mut active_engine = ProductionEngine::Auto as u32;
@@ -888,6 +943,11 @@ impl ProductionModelSink {
         check_result(result, &error)?;
         let context = NonNull::new(context)
             .ok_or_else(|| "CUDA backend returned a null production context".to_owned())?;
+        if cancel.load(Ordering::Acquire) {
+            // SAFETY: this unpublished context came from the same API.
+            unsafe { (production_api.destroy)(context.as_ptr()) };
+            return Err("production model initialization was cancelled".to_owned());
+        }
         let residency = match ProductionResidency::from_active(active_residency) {
             Ok(residency) => residency,
             Err(error) => {
@@ -927,10 +987,21 @@ impl ProductionModelSink {
             pending_start: 0,
             next_offset: 0,
             pending: Vec::with_capacity(PRODUCTION_UPLOAD_BUFFER_BYTES),
+            cancel,
         })
     }
 
+    fn check_cancel(&self) -> Result<(), ProductionSinkError> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(ProductionSinkError(
+                "production model initialization was cancelled".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<(), ProductionSinkError> {
+        self.check_cancel()?;
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -960,17 +1031,19 @@ impl ProductionModelSink {
             )
         };
         check_result(result, &error).map_err(ProductionSinkError)?;
+        self.check_cancel()?;
         self.pending.clear();
         self.pending_start = self.next_offset;
         Ok(())
     }
 }
 
-impl StagedDoryV3ModelFieldSink for ProductionModelSink {
+impl StagedDoryV3ModelFieldSink for ProductionModelSink<'_> {
     type Error = ProductionSinkError;
     type Output = ProductionCudaMiner;
 
     fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        self.check_cancel()?;
         if self.pending_role != Some(chunk.role) {
             self.flush()?;
             self.pending_role = Some(chunk.role);
@@ -995,6 +1068,7 @@ impl StagedDoryV3ModelFieldSink for ProductionModelSink {
         if self.pending.len() >= PRODUCTION_UPLOAD_BUFFER_BYTES {
             self.flush()?;
         }
+        self.check_cancel()?;
         Ok(())
     }
 
@@ -1002,7 +1076,9 @@ impl StagedDoryV3ModelFieldSink for ProductionModelSink {
         mut self,
         receipt: VerifiedBankAuthenticatedDoryV3ModelReceipt,
     ) -> Result<Self::Output, Self::Error> {
+        self.check_cancel()?;
         self.flush()?;
+        self.check_cancel()?;
         let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
         let context = self
             .context
@@ -1013,6 +1089,7 @@ impl StagedDoryV3ModelFieldSink for ProductionModelSink {
             (self.production_api.finalize)(context.as_ptr(), error.as_mut_ptr(), error.len())
         };
         check_result(result, &error).map_err(ProductionSinkError)?;
+        self.check_cancel()?;
         let context = self.context.take().ok_or_else(|| {
             ProductionSinkError("production context was already published".to_owned())
         })?;
@@ -1035,7 +1112,7 @@ impl StagedDoryV3ModelFieldSink for ProductionModelSink {
     }
 }
 
-impl Drop for ProductionModelSink {
+impl Drop for ProductionModelSink<'_> {
     fn drop(&mut self) {
         if let Some(context) = self.context.take() {
             // SAFETY: an unpublished sink uniquely owns its provisional

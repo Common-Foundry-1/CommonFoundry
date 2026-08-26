@@ -109,7 +109,9 @@ use crate::{
 use crate::{
     dory_bls12_381_aggregate::{
         BLS_DORY_AGGREGATE_VERSION, BLS_DORY_COMPOSED_AGGREGATE_CLAIMS,
-        prove_bls_dory_deferred_opening_sets_consuming_composed, verify_bls_dory_composed_openings,
+        prove_bls_dory_deferred_opening_sets_consuming_composed,
+        prove_bls_dory_deferred_opening_sets_consuming_composed_with_cancel,
+        verify_bls_dory_composed_openings,
     },
     dory_bls12_381_blake3::{
         BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, BLS_DORY_BLAKE3_PROJECTION_VERSION,
@@ -4668,19 +4670,42 @@ pub(crate) fn preflight_prepared_bls_dory_shared_layout_v5_composition(
 /// Consume one typed Dory-V3 native opening into the exact 128+6 Layout V5
 /// aggregate. Only the provider-owned atomic execution path calls this seam.
 #[cfg(feature = "whir-prototype")]
+#[allow(dead_code)]
 pub(crate) fn finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening(
     prepared: PreparedBlsDorySharedLayoutV5ProverState,
     native: PreparedBlsDoryV3NativeBlake3Opening,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<(BlsDorySharedLayoutV5Proof, Vec<u8>), BlsDorySharedLayoutError> {
-    preflight_prepared_bls_dory_shared_layout_v5_composition(&prepared, setup)?;
-    let native = BlsDorySharedLayoutV5NativeProverOpenings::from_dory_v3(native)?;
-    prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
+    let cancel = AtomicBool::new(false);
+    finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening_and_cancel(
         prepared,
         native,
         setup,
         scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+pub(crate) fn finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening_and_cancel(
+    prepared: PreparedBlsDorySharedLayoutV5ProverState,
+    native: PreparedBlsDoryV3NativeBlake3Opening,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<(BlsDorySharedLayoutV5Proof, Vec<u8>), BlsDorySharedLayoutError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryAggregateError::Cancelled.into());
+    }
+    preflight_prepared_bls_dory_shared_layout_v5_composition(&prepared, setup)?;
+    let native = BlsDorySharedLayoutV5NativeProverOpenings::from_dory_v3(native)?;
+    prove_prepared_bls_dory_shared_layout_v5_with_native_openings_and_cancel(
+        prepared,
+        native,
+        setup,
+        scratch_directory,
+        cancel,
     )
 }
 
@@ -4692,6 +4717,27 @@ fn prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<(BlsDorySharedLayoutV5Proof, Vec<u8>), BlsDorySharedLayoutError> {
+    let cancel = AtomicBool::new(false);
+    prove_prepared_bls_dory_shared_layout_v5_with_native_openings_and_cancel(
+        prepared,
+        native,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+fn prove_prepared_bls_dory_shared_layout_v5_with_native_openings_and_cancel(
+    prepared: PreparedBlsDorySharedLayoutV5ProverState,
+    native: BlsDorySharedLayoutV5NativeProverOpenings,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<(BlsDorySharedLayoutV5Proof, Vec<u8>), BlsDorySharedLayoutError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryAggregateError::Cancelled.into());
+    }
     let native_opening_binding = native.native.opening_binding();
     let native_claim_count = native.native.opening_claim_count();
     let PreparedBlsDorySharedLayoutV5ProverState {
@@ -4725,13 +4771,15 @@ fn prove_prepared_bls_dory_shared_layout_v5_with_native_openings(
     if expected_claims.len() != BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
     }
-    let (claims, opening_proof) = prove_bls_dory_deferred_opening_sets_consuming_composed(
-        &aggregate_binding,
-        aggregate_layout,
-        opening_sets,
-        setup,
-        scratch_directory,
-    )?;
+    let (claims, opening_proof) =
+        prove_bls_dory_deferred_opening_sets_consuming_composed_with_cancel(
+            &aggregate_binding,
+            aggregate_layout,
+            opening_sets,
+            setup,
+            scratch_directory,
+            cancel,
+        )?;
     if claims != expected_claims {
         return Err(BlsDorySharedLayoutError::OpeningClaims);
     }

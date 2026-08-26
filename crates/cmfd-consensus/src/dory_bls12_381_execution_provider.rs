@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::{
     BlockChallenge, ForgeMatrixV3CandidateProof,
     dory_bls12_381_aggregate::BlsDoryAggregateError,
-    dory_bls12_381_blake3::prepare_production_dory_v3_native_blake3_opening,
+    dory_bls12_381_blake3::prepare_production_dory_v3_native_blake3_opening_with_cancel,
     dory_bls12_381_candidate::{
         BlsDoryV3CandidateError, BlsDoryV3CandidatePayload,
         validate_dory_v3_layout_v5_record_setup_binding,
@@ -33,24 +33,24 @@ use crate::{
         BlsDoryPreparedFixedModelV5, BlsDorySharedLayoutError, BlsDorySharedLayoutV5Context,
         BlsDorySharedLayoutV5Proof, PreparedBlsDorySharedLayoutV5ProverState,
         ValidatedBlsDorySharedLayoutV5ExecutionPreparation,
-        finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening,
+        finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening_and_cancel,
         preflight_bls_dory_shared_layout_v5_execution_preparation,
         preflight_prepared_bls_dory_shared_layout_v5_composition, signed_model_value,
     },
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_TABLE_VALUES,
-        prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch,
+        prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch_and_cancel,
     },
-    dory_bls12_381_matrix::prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch,
+    dory_bls12_381_matrix::prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch_and_cancel,
     dory_bls12_381_output_bridge::{BlsDoryOutputBridgeError, BlsDoryOutputBridgeStatement},
     dory_bls12_381_prototype::DeterministicBlsDorySetup,
     dory_bls12_381_transition::{
         BlsDoryTransitionError, derive_transition_regular_row_from_mask,
-        prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch,
-        prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch,
-        regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch,
+        prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch_and_cancel,
+        prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch_and_cancel,
+        regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch_and_cancel,
     },
-    dory_bls12_381_wiring::prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch,
+    dory_bls12_381_wiring::prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch_and_cancel,
     dory_v3_model_record::BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     dory_v3_suite::{DORY_V3_ALGORITHM_VERSION, DORY_V3_PROOF_VERSION},
     dory_v3_transcript::{DoryV3ChallengeContext, DoryV3TranscriptContext, DoryV3TranscriptError},
@@ -781,14 +781,45 @@ fn algebraic_binding_for_verified_dory_v3_execution(
     Ok(transcript.algebraic_binding(block, &public_fields)?)
 }
 
+fn check_layout_preparation_cancel(
+    cancel: &AtomicBool,
+) -> Result<(), BlsDoryV3LayoutV5PreparationError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryV3WinningNonceReplayError::Cancelled.into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch(
-    mut execution: VerifiedBlsDoryV3WinningNonceExecution,
+    execution: VerifiedBlsDoryV3WinningNonceExecution,
     authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
     preparation: ValidatedBlsDorySharedLayoutV5ExecutionPreparation<'_>,
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5PreparationError> {
+    let cancel = AtomicBool::new(false);
+    prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch_and_cancel(
+        execution,
+        authenticated,
+        preparation,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch_and_cancel(
+    mut execution: VerifiedBlsDoryV3WinningNonceExecution,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    preparation: ValidatedBlsDorySharedLayoutV5ExecutionPreparation<'_>,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5PreparationError> {
+    check_layout_preparation_cancel(cancel)?;
     if !scratch_directory.is_absolute() || !scratch_directory.is_dir() {
         return Err(BlsDoryV3WinningNonceReplayError::ScratchDirectory.into());
     }
@@ -810,12 +841,13 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
         // Authenticate the final-output bytes and both retained digests before
         // any matrix, transition, range, or wiring proof work begins.
         let final_activation = reader.reconstruct_verified_final_activation()?;
+        check_layout_preparation_cancel(cancel)?;
 
         let mut matrices = Vec::with_capacity(preparation.matrix_count());
         for bank in 0..preparation.matrix_count() {
             let weight = preparation.matrix_weight(bank)?;
             let matrix =
-            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch(
+            prove_bls_dory_matrix_deferred_with_precommitted_weight_from_dory_v3_execution_reader_and_scratch_and_cancel(
                 component_binding.as_bytes(),
                 weight,
                 &mut reader,
@@ -823,6 +855,7 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
                 padded_variables,
                 setup,
                 scratch_directory,
+                cancel,
             )
             .map_err(BlsDorySharedLayoutError::from)?;
             if matrix.proof.weight_commitment != weight.commitment() {
@@ -836,13 +869,14 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
         for transition_index in 0..preparation.transition_count() {
             let statement = preparation.transition_statement(transition_index)?;
             let mut arithmetic =
-                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch(
+                prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch_and_cancel(
                     component_binding.as_bytes(),
                     &mut reader,
                     transition_index,
                     padded_variables,
                     setup,
                     scratch_directory,
+                    cancel,
                 )
                 .map_err(BlsDorySharedLayoutError::from)?;
             let committed_transition = arithmetic
@@ -854,17 +888,18 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
                 .map_err(BlsDoryTransitionError::from)
                 .map_err(BlsDorySharedLayoutError::from)?;
             let mut range = if transition_elements >= BLS_DORY_RANGE_LOGUP_TABLE_VALUES {
-                prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch(
+                prove_bls_dory_range_logup_deferred_with_precommitted_compact_transition_and_scratch_and_cancel(
                 component_binding.as_bytes(),
                 statement,
                 committed_transition,
                 padded_variables,
                 setup,
                 scratch_directory,
+                cancel,
             )
             .map_err(BlsDorySharedLayoutError::from)?
             } else {
-                prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch(
+                prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch_and_cancel(
                     component_binding.as_bytes(),
                     &mut reader,
                     transition_index,
@@ -872,6 +907,7 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
                     padded_variables,
                     setup,
                     scratch_directory,
+                    cancel,
                 )
                 .map_err(BlsDorySharedLayoutError::from)?
             };
@@ -895,14 +931,16 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
             released_transition_sources.push(arithmetic_source);
         }
 
-        let wiring = prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch(
-            component_binding.as_bytes(),
-            &mut reader,
-            padded_variables,
-            setup,
-            scratch_directory,
-        )
-        .map_err(BlsDorySharedLayoutError::from)?;
+        let wiring =
+            prove_bls_dory_v3_wiring_deferred_from_execution_reader_with_scratch_and_cancel(
+                component_binding.as_bytes(),
+                &mut reader,
+                padded_variables,
+                setup,
+                scratch_directory,
+                cancel,
+            )
+            .map_err(BlsDorySharedLayoutError::from)?;
 
         for (transition_index, ((arithmetic, range), expected_source)) in transitions
             .iter_mut()
@@ -910,13 +948,14 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
             .enumerate()
         {
             let restored =
-            regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch(
+            regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch_and_cancel(
                 &mut reader,
                 transition_index,
                 padded_variables,
                 expected_source,
                 setup,
                 scratch_directory,
+                cancel,
             )
             .map_err(BlsDorySharedLayoutError::from)?;
             arithmetic
@@ -932,6 +971,7 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
         (final_activation, matrices, transitions, wiring)
     };
     drop(execution);
+    check_layout_preparation_cancel(cancel)?;
     let prepared = preparation.into_prepared(matrices, transitions, wiring, setup)?;
     Ok(PreparedBlsDoryV3LayoutV5Execution {
         prepared,
@@ -952,6 +992,29 @@ pub(crate) fn prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5PreparationError> {
+    let cancel = AtomicBool::new(false);
+    prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch_and_cancel(
+        execution,
+        authenticated,
+        prepared_model,
+        block,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch_and_cancel(
+    execution: VerifiedBlsDoryV3WinningNonceExecution,
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    prepared_model: &BlsDoryPreparedFixedModelV5,
+    block: &BlockChallenge,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5PreparationError> {
+    check_layout_preparation_cancel(cancel)?;
     let binding =
         algebraic_binding_for_verified_dory_v3_execution(&execution, authenticated, block, setup)?;
     let context =
@@ -965,12 +1028,13 @@ pub(crate) fn prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_
         component_binding,
         setup,
     )?;
-    prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch(
+    prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch_and_cancel(
         execution,
         authenticated,
         preparation,
         setup,
         scratch_directory,
+        cancel,
     )
 }
 
@@ -985,29 +1049,54 @@ pub(crate) fn finish_prepared_bls_dory_v3_layout_v5_execution_with_composition(
     scratch_directory: &Path,
     maximum_native_block_rows: usize,
 ) -> Result<ComposedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5CompositionError> {
+    let cancel = AtomicBool::new(false);
+    finish_prepared_bls_dory_v3_layout_v5_execution_with_composition_and_cancel(
+        execution,
+        setup,
+        scratch_directory,
+        maximum_native_block_rows,
+        &cancel,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn finish_prepared_bls_dory_v3_layout_v5_execution_with_composition_and_cancel(
+    execution: PreparedBlsDoryV3LayoutV5Execution,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    maximum_native_block_rows: usize,
+    cancel: &AtomicBool,
+) -> Result<ComposedBlsDoryV3LayoutV5Execution, BlsDoryV3LayoutV5CompositionError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryV3LayoutV5CompositionError::Native(
+            BlsDoryAggregateError::Cancelled,
+        ));
+    }
     validate_dory_v3_layout_v5_composition_configuration(
         scratch_directory,
         maximum_native_block_rows,
     )?;
     preflight_prepared_bls_dory_shared_layout_v5_composition(&execution.prepared, setup)?;
     let bridge = validated_dory_v3_layout_v5_output_bridge(&execution, setup)?;
-    let native = prepare_production_dory_v3_native_blake3_opening(
+    let native = prepare_production_dory_v3_native_blake3_opening_with_cancel(
         execution.final_activation.as_bytes(),
         &bridge,
         setup,
         scratch_directory,
         maximum_native_block_rows,
+        cancel,
     )?;
     let PreparedBlsDoryV3LayoutV5Execution {
         prepared,
         final_activation,
     } = execution;
     let (proof, encoded_native_proof) =
-        finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening(
+        finish_prepared_bls_dory_shared_layout_v5_with_dory_v3_native_opening_and_cancel(
             prepared,
             native,
             setup,
             scratch_directory,
+            cancel,
         )?;
     Ok(ComposedBlsDoryV3LayoutV5Execution {
         challenge: final_activation.context.challenge,
@@ -1141,22 +1230,31 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
     )?;
     check_runtime_prover_cancel(cancel)?;
 
-    let prepared = prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch(
-        execution,
-        authenticated,
-        prepared_model,
-        block,
-        setup,
-        scratch_directory,
-    )
-    .map_err(map_layout_v5_preparation_error)?;
+    let prepared_result =
+        prepare_bls_dory_shared_layout_v5_from_verified_dory_v3_execution_with_scratch_and_cancel(
+            execution,
+            authenticated,
+            prepared_model,
+            block,
+            setup,
+            scratch_directory,
+            cancel,
+        );
+    let prepared = match prepared_result {
+        Ok(prepared) => prepared,
+        Err(_) if cancel.load(Ordering::Acquire) => {
+            return Err(BlsDoryV3WinningNonceReplayError::Cancelled.into());
+        }
+        Err(error) => return Err(map_layout_v5_preparation_error(error)),
+    };
     check_runtime_prover_cancel(cancel)?;
 
-    let composed = finish_prepared_bls_dory_v3_layout_v5_execution_with_composition(
+    let composed = finish_prepared_bls_dory_v3_layout_v5_execution_with_composition_and_cancel(
         prepared,
         setup,
         scratch_directory,
         maximum_native_block_rows,
+        cancel,
     )
     .map_err(map_layout_v5_composition_error)?;
     check_runtime_prover_cancel(cancel)?;

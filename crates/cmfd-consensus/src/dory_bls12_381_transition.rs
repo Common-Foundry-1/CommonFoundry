@@ -9,6 +9,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "whir-prototype"))]
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +51,7 @@ use crate::{
 use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryReleasedCompactSource, commit_bls_dory_existing_compact_artifact,
-        source_artifact_spec,
+        commit_bls_dory_existing_compact_artifact_with_cancel, source_artifact_spec,
     },
     dory_bls12_381_compact_artifact::{
         BlsDoryCompactArtifact, BlsDoryGroupedCompactArtifactWriter,
@@ -66,7 +67,7 @@ use crate::{
     dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader,
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_TABLE_VALUES, BlsDoryRangeLogUpError, PreparedBlsDoryRangeLogUpProof,
-        prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch,
+        prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch_and_cancel,
     },
 };
 
@@ -121,6 +122,13 @@ const TRANSITION_FIXED_WORD_WIDTH_CODES: u64 = (3u64 << (OUTPUT_QUOTIENT * 2))
     | (1u64 << (ACTIVATION * 2));
 pub(crate) const PRODUCTION_TRANSITION_WORD_WIDTH_CODES: u64 =
     TRANSITION_FIXED_WORD_WIDTH_CODES | (2u64 << (MASK * 2));
+
+fn check_transition_cancel(cancel: &AtomicBool) -> Result<(), BlsDoryTransitionError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryAggregateError::Cancelled.into());
+    }
+    Ok(())
+}
 
 fn transition_word_width_codes(max_mask: u64) -> u64 {
     TRANSITION_FIXED_WORD_WIDTH_CODES
@@ -734,6 +742,30 @@ pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_s
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch_and_cancel(
+        binding,
+        reader,
+        transition_index,
+        packed_variables,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_scratch_and_cancel(
+    binding: &[u8],
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    transition_index: usize,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     reader
         .validate_setup(setup)
         .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
@@ -751,24 +783,27 @@ pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_s
         packed_rows,
         packed_columns,
     )?;
-    let grouped = build_grouped_transition_compact_artifact_with_scratch(
+    let grouped = build_grouped_transition_compact_artifact_with_scratch_and_cancel(
         &mut source,
         packed_nu,
         packed_sigma,
         setup,
         scratch_directory,
+        cancel,
     )?;
     if grouped.derived_cells != source.statement.elements()? {
         return Err(transition_storage_error());
     }
     let statement = source.statement;
-    let committed = commit_bls_dory_existing_compact_artifact(
+    check_transition_cancel(cancel)?;
+    let committed = commit_bls_dory_existing_compact_artifact_with_cancel(
         grouped.artifact,
         packed_nu,
         packed_sigma,
         setup,
+        cancel,
     )?;
-    prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch(
+    prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch_and_cancel(
         binding,
         statement,
         &mask_polynomial,
@@ -778,6 +813,7 @@ pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_s
         committed,
         setup,
         scratch_directory,
+        cancel,
     )
 }
 
@@ -794,6 +830,30 @@ pub(crate) fn regenerate_bls_dory_v3_transition_compact_source_from_execution_re
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<Arc<BlsDoryCompactArtifact>, BlsDoryTransitionError> {
+    let cancel = AtomicBool::new(false);
+    regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch_and_cancel(
+        reader,
+        transition_index,
+        packed_variables,
+        expected,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn regenerate_bls_dory_v3_transition_compact_source_from_execution_reader_with_scratch_and_cancel(
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    transition_index: usize,
+    packed_variables: usize,
+    expected: &BlsDoryReleasedCompactSource,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<Arc<BlsDoryCompactArtifact>, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     reader
         .validate_setup(setup)
         .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
@@ -806,17 +866,19 @@ pub(crate) fn regenerate_bls_dory_v3_transition_compact_source_from_execution_re
         packed_rows,
         packed_columns,
     )?;
-    let grouped = build_grouped_transition_compact_artifact_with_scratch(
+    let grouped = build_grouped_transition_compact_artifact_with_scratch_and_cancel(
         &mut source,
         packed_nu,
         packed_sigma,
         setup,
         scratch_directory,
+        cancel,
     )?;
     if grouped.derived_cells != source.statement.elements()? {
         return Err(transition_storage_error());
     }
     drop(source);
+    check_transition_cancel(cancel)?;
     expected.validate_artifact(grouped.artifact.as_ref())?;
     Ok(grouped.artifact)
 }
@@ -837,6 +899,32 @@ pub(crate) fn prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scr
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch_and_cancel(
+        binding,
+        reader,
+        transition_index,
+        transition,
+        packed_variables,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(feature = "whir-prototype")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scratch_and_cancel(
+    binding: &[u8],
+    reader: &mut BlsDoryV3ExecutionArtifactReader<'_>,
+    transition_index: usize,
+    transition: &BlsDoryCommittedPolynomial,
+    packed_variables: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryRangeLogUpProof, BlsDoryRangeLogUpError> {
+    check_transition_cancel(cancel).map_err(BlsDoryRangeLogUpError::from)?;
     reader
         .validate_setup(setup)
         .map_err(|_| BlsDoryTransitionError::ExecutionArtifact)?;
@@ -869,7 +957,7 @@ pub(crate) fn prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scr
         packed_rows,
         packed_columns,
     )?;
-    prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch(
+    prove_bls_dory_range_logup_deferred_with_precommitted_row_source_and_scratch_and_cancel(
         binding,
         statement,
         &source,
@@ -877,6 +965,7 @@ pub(crate) fn prove_bls_dory_v3_small_range_logup_from_execution_reader_with_scr
         packed_variables,
         setup,
         scratch_directory,
+        cancel,
     )
 }
 
@@ -894,17 +983,39 @@ fn build_grouped_transition_compact_artifact_with_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<BuiltGroupedTransitionArtifact, BlsDoryTransitionError> {
-    build_grouped_transition_compact_artifact_with_chunk_cells(
+    let cancel = AtomicBool::new(false);
+    build_grouped_transition_compact_artifact_with_scratch_and_cancel(
+        source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[cfg(any(test, feature = "whir-prototype"))]
+fn build_grouped_transition_compact_artifact_with_scratch_and_cancel(
+    source: &mut BlsDoryTransitionWitnessRowSource<'_>,
+    packed_nu: usize,
+    packed_sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<BuiltGroupedTransitionArtifact, BlsDoryTransitionError> {
+    build_grouped_transition_compact_artifact_with_chunk_cells_and_cancel(
         source,
         packed_nu,
         packed_sigma,
         setup,
         scratch_directory,
         TRANSITION_GROUPED_COMPACT_CHUNK_CELLS,
+        cancel,
     )
 }
 
 #[cfg(any(test, feature = "whir-prototype"))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_grouped_transition_compact_artifact_with_chunk_cells(
     source: &mut BlsDoryTransitionWitnessRowSource<'_>,
     packed_nu: usize,
@@ -913,6 +1024,30 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
     scratch_directory: &Path,
     maximum_chunk_cells: usize,
 ) -> Result<BuiltGroupedTransitionArtifact, BlsDoryTransitionError> {
+    let cancel = AtomicBool::new(false);
+    build_grouped_transition_compact_artifact_with_chunk_cells_and_cancel(
+        source,
+        packed_nu,
+        packed_sigma,
+        setup,
+        scratch_directory,
+        maximum_chunk_cells,
+        &cancel,
+    )
+}
+
+#[cfg(any(test, feature = "whir-prototype"))]
+#[allow(clippy::too_many_arguments)]
+fn build_grouped_transition_compact_artifact_with_chunk_cells_and_cancel(
+    source: &mut BlsDoryTransitionWitnessRowSource<'_>,
+    packed_nu: usize,
+    packed_sigma: usize,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    maximum_chunk_cells: usize,
+    cancel: &AtomicBool,
+) -> Result<BuiltGroupedTransitionArtifact, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     let packed_rows = 1usize
         .checked_shl(packed_nu as u32)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
@@ -1001,6 +1136,7 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
     let range_oracles = source.range_oracles.clone();
     let mut derived_cells = 0usize;
     for cell_start in (0..elements).step_by(chunk_cells) {
+        check_transition_cancel(cancel)?;
         let cell_count = (elements - cell_start).min(chunk_cells);
         selector_words.resize(
             cell_count
@@ -1015,6 +1151,9 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
             0,
         );
         for local_cell in 0..cell_count {
+            if local_cell.is_multiple_of(8_192) {
+                check_transition_cancel(cancel)?;
+            }
             let index = cell_start
                 .checked_add(local_cell)
                 .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
@@ -1060,6 +1199,7 @@ fn build_grouped_transition_compact_artifact_with_chunk_cells(
             )
             .map_err(|_| transition_storage_error())?;
     }
+    check_transition_cancel(cancel)?;
     if derived_cells != elements {
         return Err(transition_storage_error());
     }
@@ -1126,6 +1266,35 @@ fn prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch(
     setup: &DeterministicBlsDorySetup,
     scratch_directory: &Path,
 ) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    let cancel = AtomicBool::new(false);
+    prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch_and_cancel(
+        binding,
+        statement,
+        mask_polynomial,
+        source,
+        packed_variables,
+        cell_variables,
+        committed,
+        setup,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch_and_cancel(
+    binding: &[u8],
+    statement: StructuredTransitionStatement,
+    mask_polynomial: &StructuredMaskPolynomial,
+    source: BlsDoryTransitionWitnessRowSource<'_>,
+    packed_variables: usize,
+    cell_variables: usize,
+    committed: BlsDoryCommittedPolynomial,
+    setup: &DeterministicBlsDorySetup,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedBlsDoryTransitionProof, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     let oracle_commitment = committed.commitment();
 
     let mut transcript = transition_transcript(
@@ -1137,14 +1306,16 @@ fn prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch(
     let mixing = transcript.challenge_scalar(b"constraint-mixing");
     let mixing_powers = powers(mixing, BLS_DORY_TRANSITION_ARITHMETIC_CONSTRAINTS);
     let cell_point = challenge_vector(&mut transcript, b"cell-point", cell_variables);
-    let output = prove_transition_sumcheck_with_scratch(
+    let output = prove_transition_sumcheck_with_scratch_and_cancel(
         statement,
         &source,
         &cell_point,
         &mixing_powers,
         &mut transcript,
         scratch_directory,
+        cancel,
     )?;
+    check_transition_cancel(cancel)?;
     let terminal_evaluations = output.terminal_evaluations;
     if terminal_evaluations[MASK] != evaluate_mask(mask_polynomial, statement, &output.point)? {
         return Err(BlsDoryTransitionError::MaskPolynomial);
@@ -3113,7 +3284,8 @@ fn accumulate_transition_pair(
     Ok(())
 }
 
-fn transition_raw_round(
+#[allow(clippy::too_many_arguments)]
+fn transition_raw_round_with_cancel(
     statement: StructuredTransitionStatement,
     source: &BlsDoryTransitionWitnessRowSource<'_>,
     current_rows: usize,
@@ -3121,7 +3293,9 @@ fn transition_raw_round(
     cell_point: &[BlsDoryFr],
     selector_prefix: BlsDoryFr,
     mixing_powers: &[BlsDoryFr],
+    cancel: &AtomicBool,
 ) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     if current_rows < 2 || !current_rows.is_power_of_two() || round_index >= cell_point.len() {
         return Err(BlsDoryTransitionError::InvalidDimensions);
     }
@@ -3129,6 +3303,9 @@ fn transition_raw_round(
     let mut suffix_weights = TransitionEqualityWeightIterator::new(&cell_point[round_index + 1..]);
     let mut evaluations = vec![BlsDoryFr::zero(); BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1];
     for pair_index in 0..current_rows / 2 {
+        if pair_index.is_multiple_of(8_192) {
+            check_transition_cancel(cancel)?;
+        }
         let suffix = suffix_weights
             .next()
             .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
@@ -3202,14 +3379,16 @@ fn for_each_transition_artifact_pair(
     Ok(())
 }
 
-fn transition_artifact_round(
+fn transition_artifact_round_with_cancel(
     statement: StructuredTransitionStatement,
     artifact: &BlsDoryFoldArtifact,
     round_index: usize,
     cell_point: &[BlsDoryFr],
     selector_prefix: BlsDoryFr,
     mixing_powers: &[BlsDoryFr],
+    cancel: &AtomicBool,
 ) -> Result<Vec<BlsDoryFr>, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     let coordinate = *cell_point
         .get(round_index)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
@@ -3217,6 +3396,9 @@ fn transition_artifact_round(
     let mut evaluations = vec![BlsDoryFr::zero(); BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1];
     let mut visited = 0usize;
     for_each_transition_artifact_pair(artifact, |lower, upper| {
+        if visited.is_multiple_of(8_192) {
+            check_transition_cancel(cancel)?;
+        }
         let suffix = suffix_weights
             .next()
             .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
@@ -3285,7 +3467,7 @@ fn write_transition_fold_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fold_raw_transition_rows(
+fn fold_raw_transition_rows_with_cancel(
     source: &BlsDoryTransitionWitnessRowSource<'_>,
     current_rows: usize,
     challenge: BlsDoryFr,
@@ -3293,7 +3475,9 @@ fn fold_raw_transition_rows(
     generation: usize,
     parent_digest: [u8; 32],
     scratch_directory: &Path,
+    cancel: &AtomicBool,
 ) -> Result<BlsDoryFoldArtifact, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     let child_rows = current_rows
         .checked_div(2)
         .filter(|rows| *rows > 0)
@@ -3302,6 +3486,9 @@ fn fold_raw_transition_rows(
     let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
         .map_err(|_| transition_storage_error())?;
     for pair_index in 0..child_rows {
+        if pair_index.is_multiple_of(8_192) {
+            check_transition_cancel(cancel)?;
+        }
         write_transition_fold_row(
             &mut writer,
             regular_row(source, pair_index * 2)?,
@@ -3309,18 +3496,21 @@ fn fold_raw_transition_rows(
             challenge,
         )?;
     }
+    check_transition_cancel(cancel)?;
     writer.finish().map_err(|_| transition_storage_error())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fold_transition_artifact(
+fn fold_transition_artifact_with_cancel(
     artifact: &BlsDoryFoldArtifact,
     challenge: BlsDoryFr,
     context_digest: [u8; 32],
     generation: usize,
     parent_digest: [u8; 32],
     scratch_directory: &Path,
+    cancel: &AtomicBool,
 ) -> Result<BlsDoryFoldArtifact, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     let current_rows = usize::try_from(artifact.spec().scalar_count)
         .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?
         / TRANSITION_FOLD_SLOTS;
@@ -3331,9 +3521,15 @@ fn fold_transition_artifact(
     let spec = transition_fold_spec(context_digest, generation, child_rows, parent_digest)?;
     let mut writer = BlsDoryFoldArtifactWriter::create(scratch_directory, spec)
         .map_err(|_| transition_storage_error())?;
+    let mut visited = 0usize;
     for_each_transition_artifact_pair(artifact, |lower, upper| {
+        if visited.is_multiple_of(8_192) {
+            check_transition_cancel(cancel)?;
+        }
+        visited += 1;
         write_transition_fold_row(&mut writer, lower, upper, challenge)
     })?;
+    check_transition_cancel(cancel)?;
     writer.finish().map_err(|_| transition_storage_error())
 }
 
@@ -3373,6 +3569,29 @@ fn prove_transition_sumcheck_with_scratch(
     transcript: &mut BlsDoryTranscript,
     scratch_directory: &Path,
 ) -> Result<TransitionScratchSumcheck, BlsDoryTransitionError> {
+    let cancel = AtomicBool::new(false);
+    prove_transition_sumcheck_with_scratch_and_cancel(
+        statement,
+        source,
+        cell_point,
+        mixing_powers,
+        transcript,
+        scratch_directory,
+        &cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_transition_sumcheck_with_scratch_and_cancel(
+    statement: StructuredTransitionStatement,
+    source: &BlsDoryTransitionWitnessRowSource<'_>,
+    cell_point: &[BlsDoryFr],
+    mixing_powers: &[BlsDoryFr],
+    transcript: &mut BlsDoryTranscript,
+    scratch_directory: &Path,
+    cancel: &AtomicBool,
+) -> Result<TransitionScratchSumcheck, BlsDoryTransitionError> {
+    check_transition_cancel(cancel)?;
     let mut claim = BlsDoryFr::zero();
     let mut rounds = Vec::with_capacity(cell_point.len());
     let mut point = Vec::with_capacity(cell_point.len());
@@ -3399,17 +3618,19 @@ fn prove_transition_sumcheck_with_scratch(
     let mut artifact = None;
     let mut current_rows = source.elements;
     for round_index in 0..cell_point.len() {
+        check_transition_cancel(cancel)?;
         let evaluations = if let Some(current) = artifact.as_ref() {
-            transition_artifact_round(
+            transition_artifact_round_with_cancel(
                 statement,
                 current,
                 round_index,
                 cell_point,
                 selector_prefix,
                 mixing_powers,
+                cancel,
             )?
         } else {
-            transition_raw_round(
+            transition_raw_round_with_cancel(
                 statement,
                 source,
                 current_rows,
@@ -3417,6 +3638,7 @@ fn prove_transition_sumcheck_with_scratch(
                 cell_point,
                 selector_prefix,
                 mixing_powers,
+                cancel,
             )?
         };
         if evaluations[0] + evaluations[1] != claim {
@@ -3428,16 +3650,17 @@ fn prove_transition_sumcheck_with_scratch(
         point.push(challenge);
         let generation = round_index + 1;
         let child = if let Some(current) = artifact.as_ref() {
-            fold_transition_artifact(
+            fold_transition_artifact_with_cancel(
                 current,
                 challenge,
                 context_digest,
                 generation,
                 parent_digest,
                 scratch_directory,
+                cancel,
             )?
         } else {
-            fold_raw_transition_rows(
+            fold_raw_transition_rows_with_cancel(
                 source,
                 current_rows,
                 challenge,
@@ -3445,6 +3668,7 @@ fn prove_transition_sumcheck_with_scratch(
                 generation,
                 parent_digest,
                 scratch_directory,
+                cancel,
             )?
         };
         parent_digest = child.digest();
@@ -3456,6 +3680,7 @@ fn prove_transition_sumcheck_with_scratch(
                 + challenge * coordinate);
         rounds.push(evaluations);
     }
+    check_transition_cancel(cancel)?;
     let terminal_evaluations = transition_terminal_row(
         artifact
             .as_ref()

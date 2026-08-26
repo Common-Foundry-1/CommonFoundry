@@ -286,6 +286,20 @@ pub(super) fn fold_native_blake3_adjacency_artifact(
     scratch_directory: &std::path::Path,
     challenge: BlsDoryFr,
 ) -> Result<BlsDoryBlake3AdjacencyRoundArtifact, BlsDoryFoldArtifactError> {
+    let cancel = AtomicBool::new(false);
+    fold_native_blake3_adjacency_artifact_with_cancel(parent, scratch_directory, challenge, &cancel)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn fold_native_blake3_adjacency_artifact_with_cancel(
+    parent: &BlsDoryBlake3AdjacencyRoundArtifact,
+    scratch_directory: &std::path::Path,
+    challenge: BlsDoryFr,
+    cancel: &AtomicBool,
+) -> Result<BlsDoryBlake3AdjacencyRoundArtifact, BlsDoryFoldArtifactError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+    }
     if parent.active_rows < 2 {
         return Err(BlsDoryFoldArtifactError::InvalidArtifact);
     }
@@ -301,6 +315,9 @@ pub(super) fn fold_native_blake3_adjacency_artifact(
     )?;
     let mut folded = [BlsDoryFr::zero(); BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS];
     parent.for_each_row_pair(|lower, upper| {
+        if cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+        }
         for column in 0..BLS_DORY_BLAKE3_ADJACENCY_TERMINAL_EVALUATIONS {
             folded[column] = lower[column] + challenge * (upper[column] - lower[column]);
         }

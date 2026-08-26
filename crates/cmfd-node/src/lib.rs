@@ -4,7 +4,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -83,6 +83,7 @@ pub const MAX_QUEUED_PROOF_VERIFICATIONS: usize = 8;
 /// cannot crowd out a block already found by the wallet, miner, or pool.
 pub const MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS: usize = 2;
 pub const MAX_REJECTED_BLOCK_IDS: usize = 1_024;
+pub const MAX_SUCCESSFUL_PROOF_CAPABILITIES: usize = 1_024;
 pub const MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE: usize = 8;
 pub const PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v3";
 pub const PRODUCTION_V3_PACKAGE_BANK: &str = "MODEL-V2.bank";
@@ -406,6 +407,11 @@ impl NodeError {
             Self::ProofVerifierWorker(_) => ("proof_verifier_unavailable", 503, true),
             Self::Json(_) => ("invalid_json", 400, false),
             Self::Network(_) => ("network_parameters", 500, false),
+            Self::Chain(
+                ChainError::TimestampTooFarInFuture
+                | ChainError::InvalidValidationTime
+                | ChainError::StaleValidatedBlock,
+            ) => ("chain_temporarily_rejected", 409, true),
             Self::Chain(_) => ("chain_rejected", 422, false),
             Self::Wire(_) => ("wire_rejected", 400, false),
             Self::Pow(_) => ("proof_rejected", 422, false),
@@ -487,20 +493,21 @@ impl ProofVerificationQueue {
     }
 
     fn acquire(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
-        self.acquire_class(ProofQueueClass::Normal, self.wait_timeout)
+        self.acquire_class(ProofQueueClass::Normal, Some(self.wait_timeout))
     }
 
-    fn acquire_priority(
-        self: &Arc<Self>,
-        wait_timeout: Duration,
-    ) -> Result<ProofVerificationPermit, NodeError> {
-        self.acquire_class(ProofQueueClass::Priority, wait_timeout)
+    fn acquire_priority(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
+        // A locally found block is already the result of expensive work. Once
+        // admitted to the bounded priority lane, wait until it is served or
+        // terminal shutdown wakes it instead of discarding it behind a slow
+        // remote verification or worker restart.
+        self.acquire_class(ProofQueueClass::Priority, None)
     }
 
     fn acquire_class(
         self: &Arc<Self>,
         class: ProofQueueClass,
-        wait_timeout: Duration,
+        wait_timeout: Option<Duration>,
     ) -> Result<ProofVerificationPermit, NodeError> {
         let mut state = self
             .state
@@ -536,24 +543,34 @@ impl ProofVerificationQueue {
                 ticket
             }
         };
-        let (mut state, wait_result) = self
-            .wake
-            .wait_timeout_while(state, wait_timeout, |state| {
-                !state.closing
-                    && (state.active >= self.max_active
-                        || match class {
-                            ProofQueueClass::Normal => {
-                                state.priority_queued != 0 || state.serving_normal_ticket != ticket
-                            }
-                            ProofQueueClass::Priority => state.serving_priority_ticket != ticket,
-                        })
-            })
-            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        let waiting = |state: &mut ProofVerificationQueueState| {
+            !state.closing
+                && (state.active >= self.max_active
+                    || match class {
+                        ProofQueueClass::Normal => {
+                            state.priority_queued != 0 || state.serving_normal_ticket != ticket
+                        }
+                        ProofQueueClass::Priority => state.serving_priority_ticket != ticket,
+                    })
+        };
+        let (mut state, timed_out) = if let Some(wait_timeout) = wait_timeout {
+            let (state, wait_result) = self
+                .wake
+                .wait_timeout_while(state, wait_timeout, waiting)
+                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+            (state, wait_result.timed_out())
+        } else {
+            let state = self
+                .wake
+                .wait_while(state, waiting)
+                .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+            (state, false)
+        };
         if state.closing {
             cancel_proof_ticket(&mut state, class, ticket);
             return Err(NodeError::ProofVerifierShuttingDown);
         }
-        if wait_result.timed_out()
+        if timed_out
             && (state.active >= self.max_active
                 || match class {
                     ProofQueueClass::Normal => {
@@ -690,6 +707,21 @@ impl BlockPreverificationPermit {
         self.run_guarded(|| self.preverifier.preverify_unqueued(block))
     }
 
+    fn preverify_cached(
+        &self,
+        block: &Block,
+        cache_key: [u8; 32],
+    ) -> Result<PreverifiedBlockProof, NodeError> {
+        if let Some(preverified) = self.preverifier.cached_preverification(cache_key)? {
+            return Ok(preverified);
+        }
+        let generation = self.preverifier.backend_generation.load(Ordering::Acquire);
+        let preverified = self.preverify(block)?;
+        self.preverifier
+            .remember_preverification(cache_key, generation, preverified.clone())?;
+        Ok(preverified)
+    }
+
     fn run_guarded<T>(
         &self,
         operation: impl FnOnce() -> Result<T, NodeError>,
@@ -709,6 +741,31 @@ pub struct BlockPreverifier {
     queue: Arc<ProofVerificationQueue>,
     reconstruction_queue: Arc<ProofVerificationQueue>,
     backend: Arc<RwLock<ProofVerificationBackend>>,
+    backend_generation: Arc<AtomicU64>,
+    successful_proofs: Arc<Mutex<SuccessfulProofCache>>,
+}
+
+#[derive(Debug, Default)]
+struct SuccessfulProofCache {
+    entries: HashMap<[u8; 32], (u64, PreverifiedBlockProof)>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl SuccessfulProofCache {
+    fn insert(&mut self, key: [u8; 32], generation: u64, preverified: PreverifiedBlockProof) {
+        if self
+            .entries
+            .insert(key, (generation, preverified))
+            .is_none()
+        {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_SUCCESSFUL_PROOF_CAPABILITIES {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -766,6 +823,8 @@ impl BlockPreverifier {
             )),
             reconstruction_queue: Arc::new(ProofVerificationQueue::new(1, 2, wait_timeout)),
             backend: Arc::new(RwLock::new(backend)),
+            backend_generation: Arc::new(AtomicU64::new(0)),
+            successful_proofs: Arc::new(Mutex::new(SuccessfulProofCache::default())),
         }
     }
 
@@ -774,12 +833,45 @@ impl BlockPreverifier {
         config: VerifierWorkerConfig,
         network_id: [u8; 32],
     ) -> Result<(), VerifierWorkerError> {
+        {
+            let state = self
+                .queue
+                .state
+                .lock()
+                .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+            if state.closing {
+                return Err(VerifierWorkerError::Closed);
+            }
+        }
         let worker = PersistentVerifierWorker::start(config, self.verifier.clone(), network_id)?;
-        *self
-            .backend
-            .write()
-            .map_err(|_| VerifierWorkerError::StatePoisoned)? =
-            ProofVerificationBackend::External(worker);
+        let queue_state = self
+            .queue
+            .state
+            .lock()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+        if queue_state.closing {
+            worker.close();
+            return Err(VerifierWorkerError::Closed);
+        }
+        let replaced = std::mem::replace(
+            &mut *self
+                .backend
+                .write()
+                .map_err(|_| VerifierWorkerError::StatePoisoned)?,
+            ProofVerificationBackend::External(worker),
+        );
+        self.backend_generation.fetch_add(1, Ordering::AcqRel);
+        let mut successful_proofs = self
+            .successful_proofs
+            .lock()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+        successful_proofs.entries.clear();
+        successful_proofs.order.clear();
+        drop(successful_proofs);
+        drop(queue_state);
+        if let ProofVerificationBackend::External(replaced) = replaced {
+            replaced.close();
+        }
         Ok(())
     }
 
@@ -795,24 +887,9 @@ impl BlockPreverifier {
     }
 
     fn reserve_priority(&self) -> Result<BlockPreverificationPermit, NodeError> {
-        let wait_timeout = match &*self
-            .backend
-            .read()
-            .map_err(|_| VerifierWorkerError::StatePoisoned)?
-        {
-            ProofVerificationBackend::External(worker) => {
-                worker.timeout().saturating_add(Duration::from_secs(5))
-            }
-            ProofVerificationBackend::Unavailable | ProofVerificationBackend::InProcess => {
-                self.queue.wait_timeout
-            }
-            ProofVerificationBackend::Stopped => {
-                return Err(NodeError::ProofVerifierShuttingDown);
-            }
-        };
         Ok(BlockPreverificationPermit {
             preverifier: self.clone(),
-            _queue_permit: self.queue.acquire_priority(wait_timeout)?,
+            _queue_permit: self.queue.acquire_priority()?,
         })
     }
 
@@ -841,6 +918,69 @@ impl BlockPreverifier {
                 worker.verify_block(block).map_err(NodeError::from)
             }
         }
+    }
+
+    fn cached_preverification(
+        &self,
+        cache_key: [u8; 32],
+    ) -> Result<Option<PreverifiedBlockProof>, NodeError> {
+        let queue_state = self
+            .queue
+            .state
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        if queue_state.closing {
+            return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        let backend = self
+            .backend
+            .read()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+        if matches!(*backend, ProofVerificationBackend::Stopped) {
+            return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        let generation = self.backend_generation.load(Ordering::Acquire);
+        let cache = self
+            .successful_proofs
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        Ok(cache
+            .entries
+            .get(&cache_key)
+            .and_then(|(entry_generation, preverified)| {
+                (*entry_generation == generation).then(|| preverified.clone())
+            }))
+    }
+
+    fn remember_preverification(
+        &self,
+        cache_key: [u8; 32],
+        expected_generation: u64,
+        preverified: PreverifiedBlockProof,
+    ) -> Result<(), NodeError> {
+        let queue_state = self
+            .queue
+            .state
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        if queue_state.closing {
+            return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        let backend = self
+            .backend
+            .read()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+        if matches!(*backend, ProofVerificationBackend::Stopped) {
+            return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        if self.backend_generation.load(Ordering::Acquire) != expected_generation {
+            return Ok(());
+        }
+        self.successful_proofs
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?
+            .insert(cache_key, expected_generation, preverified);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -890,8 +1030,13 @@ impl BlockPreverifier {
                 }
             }
         };
+        self.backend_generation.fetch_add(1, Ordering::AcqRel);
         if let Some(worker) = worker {
             worker.close();
+        }
+        if let Ok(mut cache) = self.successful_proofs.lock() {
+            cache.entries.clear();
+            cache.order.clear();
         }
     }
 }
@@ -1913,8 +2058,10 @@ pub struct Node {
     mempool_bytes: usize,
     log: File,
     storage_faulted: bool,
-    rejected_block_ids: HashSet<[u8; 32]>,
-    rejected_block_order: VecDeque<[u8; 32]>,
+    rejected_proof_ids: HashSet<[u8; 32]>,
+    rejected_proof_order: VecDeque<[u8; 32]>,
+    rejected_body_digests: HashSet<[u8; 32]>,
+    rejected_body_order: VecDeque<[u8; 32]>,
     public_peer_mode: bool,
     peer_observations: BTreeMap<PeerObservationKey, PeerObservationRecord>,
     _lock: DataDirLock,
@@ -2599,8 +2746,10 @@ impl Node {
             mempool_bytes: 0,
             log,
             storage_faulted: false,
-            rejected_block_ids: HashSet::new(),
-            rejected_block_order: VecDeque::new(),
+            rejected_proof_ids: HashSet::new(),
+            rejected_proof_order: VecDeque::new(),
+            rejected_body_digests: HashSet::new(),
+            rejected_body_order: VecDeque::new(),
             public_peer_mode: false,
             peer_observations: BTreeMap::new(),
             _lock: lock,
@@ -3680,7 +3829,7 @@ impl Node {
         if self.index.contains(block_id) {
             return Err(NodeError::DuplicateBlock(block_id));
         }
-        if self.rejected_block_ids.contains(&block_id) {
+        if self.rejected_proof_ids.contains(&block_id) {
             return Err(NodeError::CachedInvalidBlock(block_id));
         }
         if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
@@ -3690,7 +3839,10 @@ impl Node {
             return Err(NodeError::StorageFaulted);
         }
         validate_block_resources(block)?;
-        encode_block(block)?;
+        let body_digest = canonical_block_cache_digest(block)?;
+        if self.rejected_body_digests.contains(&body_digest) {
+            return Err(NodeError::CachedInvalidBlock(block_id));
+        }
         validate_block_preamble(block, self.params.network_id)?;
         let parent = block.challenge.previous_block;
         self.index
@@ -3779,15 +3931,20 @@ impl Node {
         }))
     }
 
-    fn remember_rejected_block(&mut self, block_id: [u8; 32]) {
-        if self.rejected_block_ids.insert(block_id) {
-            self.rejected_block_order.push_back(block_id);
-        }
-        while self.rejected_block_order.len() > MAX_REJECTED_BLOCK_IDS {
-            if let Some(expired) = self.rejected_block_order.pop_front() {
-                self.rejected_block_ids.remove(&expired);
-            }
-        }
+    fn remember_rejected_proof(&mut self, block_id: [u8; 32]) {
+        remember_bounded_digest(
+            &mut self.rejected_proof_ids,
+            &mut self.rejected_proof_order,
+            block_id,
+        );
+    }
+
+    fn remember_rejected_body(&mut self, body_digest: [u8; 32]) {
+        remember_bounded_digest(
+            &mut self.rejected_body_digests,
+            &mut self.rejected_body_order,
+            body_digest,
+        );
     }
 
     /// Consumes process-local proof evidence produced outside the node lock.
@@ -4079,39 +4236,44 @@ fn submit_shared_block_with_policy(
         }
         node.preflight_external_block_admission(&block, accepted_at)?;
     }
+    let block_cache_digest = canonical_block_cache_digest(&block)?;
     // The scarce verifier reservation is released immediately after proof verification;
     // side-state replay uses a separate bounded lane so a proof-valid deep fork
     // cannot monopolize proof admission.
-    let permit = match policy {
-        SharedBlockPolicy::AnyBranch => block_preverifier.reserve()?,
-        SharedBlockPolicy::ActiveTipOnly => block_preverifier.reserve_priority()?,
-    };
-    {
-        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
-        if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
-            && block.challenge.previous_block != node.state.tip()
-        {
-            return Err(NodeError::StaleBlockAdmission);
-        }
-        if production_v3 {
-            node.preflight_external_block_admission(&block, accepted_at)?;
-        }
-    }
-    let preverified = match permit.preverify(&block) {
-        Ok(preverified) => preverified,
-        Err(error) => {
-            if production_v3
-                && (is_cacheable_proof_rejection(&error) || is_cacheable_block_rejection(&error))
+    let preverified =
+        if let Some(preverified) = block_preverifier.cached_preverification(block_cache_digest)? {
+            preverified
+        } else {
+            let permit = match policy {
+                SharedBlockPolicy::AnyBranch => block_preverifier.reserve()?,
+                SharedBlockPolicy::ActiveTipOnly => block_preverifier.reserve_priority()?,
+            };
             {
-                shared
-                    .lock()
-                    .map_err(|_| NodeError::SharedNodePoisoned)?
-                    .remember_rejected_block(block_id);
+                let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+                if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+                    && block.challenge.previous_block != node.state.tip()
+                {
+                    return Err(NodeError::StaleBlockAdmission);
+                }
+                if production_v3 {
+                    node.preflight_external_block_admission(&block, accepted_at)?;
+                }
             }
-            return Err(error);
-        }
-    };
-    drop(permit);
+            match permit.preverify_cached(&block, block_cache_digest) {
+                Ok(preverified) => preverified,
+                Err(error) => {
+                    if production_v3 {
+                        let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+                        if is_cacheable_proof_rejection(&error) {
+                            node.remember_rejected_proof(block_id);
+                        } else if is_cacheable_block_rejection(&error) {
+                            node.remember_rejected_body(block_cache_digest);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        };
 
     let admission_work = {
         let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
@@ -4177,9 +4339,35 @@ fn submit_shared_block_with_policy(
         None => node.submit_preverified_block(block, accepted_at, preverified),
     };
     if externally_admitted && result.as_ref().is_err_and(is_cacheable_block_rejection) {
-        node.remember_rejected_block(block_id);
+        node.remember_rejected_body(block_cache_digest);
     }
     result
+}
+
+fn canonical_block_cache_digest(block: &Block) -> Result<[u8; 32], NodeError> {
+    let canonical = encode_block(block)?;
+    let canonical_len =
+        u64::try_from(canonical.len()).map_err(|_| NodeError::Wire(WireError::LengthOverflow))?;
+    let mut hasher = Hasher::new();
+    hasher.update(b"CMFD/NODE/CANONICAL-BLOCK-CACHE/V1");
+    hasher.update(&canonical_len.to_le_bytes());
+    hasher.update(&canonical);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn remember_bounded_digest(
+    entries: &mut HashSet<[u8; 32]>,
+    order: &mut VecDeque<[u8; 32]>,
+    digest: [u8; 32],
+) {
+    if entries.insert(digest) {
+        order.push_back(digest);
+    }
+    while order.len() > MAX_REJECTED_BLOCK_IDS {
+        if let Some(expired) = order.pop_front() {
+            entries.remove(&expired);
+        }
+    }
 }
 
 fn is_cacheable_block_rejection(error: &NodeError) -> bool {
@@ -4191,6 +4379,8 @@ fn is_cacheable_block_rejection(error: &NodeError) -> bool {
                 ChainError::TimestampTooFarInFuture
                     | ChainError::InvalidValidationTime
                     | ChainError::StaleValidatedBlock
+                    | ChainError::PreverifiedProofMismatch
+                    | ChainError::PreverificationUnavailable
             )
     )
 }
@@ -5892,6 +6082,155 @@ mod tests {
             Err(NodeError::ProofVerifierPanicked)
         ));
         assert_eq!(verifier.queue.counts().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn priority_proof_waiters_overtake_normal_work_and_close_wakes_them() {
+        let queue = Arc::new(ProofVerificationQueue::new(1, 2, Duration::from_secs(2)));
+        let active = queue.acquire().unwrap();
+        let (order_tx, order_rx) = mpsc::channel();
+
+        let normal_queue = Arc::clone(&queue);
+        let normal_tx = order_tx.clone();
+        let normal = thread::spawn(move || {
+            let permit = normal_queue.acquire().unwrap();
+            normal_tx.send("normal").unwrap();
+            drop(permit);
+        });
+        while queue.counts().unwrap().1 != 1 {
+            thread::yield_now();
+        }
+
+        let priority_queue = Arc::clone(&queue);
+        let priority = thread::spawn(move || {
+            let permit = priority_queue.acquire_priority().unwrap();
+            order_tx.send("priority").unwrap();
+            drop(permit);
+        });
+        while queue.counts().unwrap().1 != 2 {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(10));
+        assert!(matches!(
+            order_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(active);
+        assert_eq!(
+            order_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "priority"
+        );
+        assert_eq!(
+            order_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "normal"
+        );
+        priority.join().unwrap();
+        normal.join().unwrap();
+
+        let close_queue = Arc::new(ProofVerificationQueue::new(1, 1, Duration::from_millis(1)));
+        let active = close_queue.acquire().unwrap();
+        let waiting_queue = Arc::clone(&close_queue);
+        let waiter = thread::spawn(move || waiting_queue.acquire_priority().map(drop));
+        while close_queue.counts().unwrap().1 != 1 {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(close_queue.counts().unwrap(), (1, 1));
+        close_queue.close();
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(NodeError::ProofVerifierShuttingDown)
+        ));
+        drop(active);
+    }
+
+    #[test]
+    fn proof_capability_cache_is_exact_generation_bound_bounded_and_fail_closed() {
+        let path = test_dir("proof-capability-cache");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let block = mined_candidate(&node, DEVNET_GENESIS_TIMESTAMP + 60);
+        let key = canonical_block_cache_digest(&block).unwrap();
+        let verifier = node.block_preverifier.clone();
+        let capability = verifier.preverify(&block).unwrap();
+        let generation = verifier.backend_generation.load(Ordering::Acquire);
+
+        verifier
+            .remember_preverification(key, generation, capability.clone())
+            .unwrap();
+        assert_eq!(
+            verifier.cached_preverification(key).unwrap(),
+            Some(capability.clone())
+        );
+        let mut changed_proof = block.clone();
+        let BlockProof::V2Reference(proof) = &mut changed_proof.proof else {
+            unreachable!();
+        };
+        proof.work_digest[0] ^= 1;
+        assert_ne!(canonical_block_cache_digest(&changed_proof).unwrap(), key);
+
+        // Model the queue-linearized portion of a backend replacement. An
+        // old in-flight verification cannot repopulate the new generation.
+        let queue_state = verifier.queue.state.lock().unwrap();
+        *verifier.backend.write().unwrap() = ProofVerificationBackend::InProcess;
+        verifier.backend_generation.fetch_add(1, Ordering::AcqRel);
+        let mut cache = verifier.successful_proofs.lock().unwrap();
+        cache.entries.clear();
+        cache.order.clear();
+        drop(cache);
+        drop(queue_state);
+        verifier
+            .remember_preverification(key, generation, capability.clone())
+            .unwrap();
+        assert_eq!(verifier.cached_preverification(key).unwrap(), None);
+
+        let current_generation = verifier.backend_generation.load(Ordering::Acquire);
+        for value in 0..=MAX_SUCCESSFUL_PROOF_CAPABILITIES {
+            let mut cache_key = [0_u8; 32];
+            cache_key[..8].copy_from_slice(&(value as u64).to_le_bytes());
+            verifier
+                .remember_preverification(cache_key, current_generation, capability.clone())
+                .unwrap();
+        }
+        let first = [0_u8; 32];
+        assert_eq!(verifier.cached_preverification(first).unwrap(), None);
+        assert_eq!(
+            verifier.successful_proofs.lock().unwrap().entries.len(),
+            MAX_SUCCESSFUL_PROOF_CAPABILITIES
+        );
+
+        verifier.shutdown();
+        assert!(matches!(
+            verifier.cached_preverification(key),
+            Err(NodeError::ProofVerifierShuttingDown)
+        ));
+        assert!(matches!(
+            verifier.remember_preverification(key, current_generation, capability),
+            Err(NodeError::ProofVerifierShuttingDown)
+        ));
+        assert!(
+            verifier
+                .successful_proofs
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let replacement = VerifierWorkerConfig {
+            worker_executable: PathBuf::from("not-started-after-close"),
+            worker_sha256: [0; 32],
+            startup_timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            memory_limit_bytes: 1,
+            production_v3_artifacts: None,
+        };
+        assert!(matches!(
+            verifier.use_external_worker(replacement, node.params.network_id),
+            Err(VerifierWorkerError::Closed)
+        ));
+        assert_eq!(verifier.backend_status().unwrap().0, "stopped");
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]

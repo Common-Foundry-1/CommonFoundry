@@ -199,7 +199,8 @@ fn map_pow_parameter_error(error: PowError) -> NetworkError {
         PowError::V2(_)
         | PowError::WrongProofType
         | PowError::ParameterMismatch
-        | PowError::PreverificationMismatch => NetworkError::InvalidPowParameters,
+        | PowError::PreverificationMismatch
+        | PowError::PreverificationEntropy => NetworkError::InvalidPowParameters,
         #[cfg(feature = "dory-v3-consensus-adapter")]
         PowError::V3(_) => NetworkError::InvalidPowParameters,
     }

@@ -256,6 +256,8 @@ pub enum ChainError {
     PowParameterMismatch,
     #[error("preverified proof capability does not match this exact block")]
     PreverifiedProofMismatch,
+    #[error("process-local proof capability entropy is unavailable")]
+    PreverificationUnavailable,
     #[error("economics validation failed: {0}")]
     Economics(#[from] EconomicsError),
     #[error("inference channel validation failed: {0}")]
@@ -1214,6 +1216,7 @@ fn map_pow_error(error: PowError) -> ChainError {
         PowError::WrongProofType => ChainError::WrongProofType,
         PowError::ParameterMismatch => ChainError::PowParameterMismatch,
         PowError::PreverificationMismatch => ChainError::PreverifiedProofMismatch,
+        PowError::PreverificationEntropy => ChainError::PreverificationUnavailable,
         PowError::WrongNetwork => ChainError::WrongNetwork,
     }
 }

@@ -74,6 +74,8 @@ pub enum P2pError {
     },
     #[error("peer rejected submitted block {0:?}")]
     RejectedBlockSubmission([u8; 32]),
+    #[error("peer deferred submitted block {0:?} because admission is busy")]
+    BusyBlockSubmission([u8; 32]),
     #[error("peer inventory is not parent-ordered at block {block_id:?}")]
     NonContiguousInventory { block_id: [u8; 32] },
     #[error("peer requested an unknown or body-less block {0:?}")]
@@ -571,6 +573,9 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
             BlockSubmissionStatus::Rejected => {
                 return Err(P2pError::RejectedBlockSubmission(*block_id));
             }
+            BlockSubmissionStatus::Busy => {
+                return Err(P2pError::BusyBlockSubmission(*block_id));
+            }
         }
     }
 
@@ -745,7 +750,13 @@ fn perform_respond_to_peer_inner_with_policy(
                 let status = match submit_shared_block(&shared, block, accepted_at) {
                     Ok(_) => BlockSubmissionStatus::Accepted,
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
-                    Err(_) => BlockSubmissionStatus::Rejected,
+                    Err(error) if is_retryable_block_admission(&error) => {
+                        BlockSubmissionStatus::Busy
+                    }
+                    Err(error) if error.client_error().status < 500 => {
+                        BlockSubmissionStatus::Rejected
+                    }
+                    Err(error) => return Err(error.into()),
                 };
                 let peer = {
                     let node = lock_node(&shared)?;
@@ -766,6 +777,10 @@ fn perform_respond_to_peer_inner_with_policy(
             }
         }
     }
+}
+
+fn is_retryable_block_admission(error: &NodeError) -> bool {
+    error.client_error().retryable
 }
 
 fn observed_address(direction: PeerDirection, address: SocketAddr) -> String {

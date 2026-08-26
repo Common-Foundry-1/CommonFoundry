@@ -782,6 +782,7 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                 let block_id = block.block_id();
                 let mut acknowledged = 0_usize;
                 let mut rejected = 0_usize;
+                let mut busy_on_parent = false;
                 for peer in ordered_peers(&options.peers, preferred_peer) {
                     match submit_mined_block_once_with_policy(
                         peer,
@@ -792,6 +793,11 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                         Ok(result) if block_is_active_acknowledgement(&result, block_id) => {
                             acknowledged += 1;
                             preferred_peer = Some(peer);
+                        }
+                        Ok(result)
+                            if block_is_retryable_busy(&result, block.challenge.previous_block) =>
+                        {
+                            busy_on_parent = true;
                         }
                         Ok(_) => rejected += 1,
                         Err(_) => {}
@@ -805,6 +811,20 @@ fn run_thin_miner_v2(options: ThinMinerOptions) -> Result<()> {
                         options.peers.len(),
                         statistics.blocks_found
                     );
+                } else if busy_on_parent {
+                    println!(
+                        "Block found and a node is still on its parent but busy; retrying the exact candidate."
+                    );
+                    retry_found_block(
+                        &options.peers,
+                        &mut preferred_peer,
+                        block,
+                        limits,
+                        address_policy,
+                        &shutdown,
+                        &mut statistics,
+                        device,
+                    )?;
                 } else if rejected > 0 {
                     statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
                     println!("Block candidate was rejected as stale; rebuilding work.");
@@ -1163,6 +1183,13 @@ fn block_is_active_acknowledgement(
         && result.peer_tip == block_id
 }
 
+fn block_is_retryable_busy(
+    result: &cmfd_node::peer::BlockSubmissionResult,
+    parent: [u8; 32],
+) -> bool {
+    result.status == BlockSubmissionStatus::Busy && result.peer_tip == parent
+}
+
 fn fetch_template_from_any(
     peers: &[SocketAddr],
     preferred: Option<SocketAddr>,
@@ -1220,6 +1247,8 @@ fn retry_found_block(
     device: i32,
 ) -> Result<()> {
     while !shutdown.load(Ordering::Acquire) {
+        let mut busy_on_parent = false;
+        let mut terminal_response = false;
         for peer in ordered_peers(peers, *preferred) {
             match submit_mined_block_once_with_policy(peer, block.clone(), limits, address_policy) {
                 Ok(result) if block_is_active_acknowledgement(&result, block.block_id()) => {
@@ -1233,13 +1262,17 @@ fn retry_found_block(
                     );
                     return Ok(());
                 }
-                Ok(_) => {
-                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
-                    println!("Block candidate was rejected as stale; rebuilding work.");
-                    return Ok(());
+                Ok(result) if block_is_retryable_busy(&result, block.challenge.previous_block) => {
+                    busy_on_parent = true;
                 }
+                Ok(_) => terminal_response = true,
                 Err(_) => {}
             }
+        }
+        if terminal_response && !busy_on_parent {
+            statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+            println!("Block candidate was rejected as stale; rebuilding work.");
+            return Ok(());
         }
         if !interruptible_wait(PEER_RETRY_INTERVAL, shutdown) {
             return Ok(());
@@ -1592,6 +1625,43 @@ fn synchronize_before_mining(
     Ok(false)
 }
 
+fn submit_local_found_block(
+    node: &Arc<Mutex<Node>>,
+    block: &cmfd_consensus::Block,
+    shutdown: &AtomicBool,
+) -> Result<bool> {
+    while !shutdown.load(Ordering::Acquire) {
+        let tip = node
+            .lock()
+            .map_err(|_| anyhow!("node mutex is poisoned"))?
+            .peer_hello()
+            .tip;
+        if tip != block.challenge.previous_block {
+            return Ok(tip == block.block_id());
+        }
+        match submit_shared_tip_block(node, block.clone(), unix_time_seconds()?) {
+            Ok(_) => return Ok(true),
+            Err(NodeError::DuplicateBlock(_)) => {
+                let tip = node
+                    .lock()
+                    .map_err(|_| anyhow!("node mutex is poisoned"))?
+                    .peer_hello()
+                    .tip;
+                return Ok(tip == block.block_id());
+            }
+            Err(NodeError::StaleBlockAdmission | NodeError::UnknownParent(_)) => return Ok(false),
+            Err(NodeError::ProofVerifierShuttingDown) => return Ok(false),
+            Err(error) if error.client_error().retryable => {
+                if !interruptible_wait(Duration::from_millis(100), shutdown) {
+                    return Ok(false);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
 fn continuous_mining(
     node: Arc<Mutex<Node>>,
     cuda: CudaLibrary,
@@ -1668,21 +1738,8 @@ fn continuous_mining(
                     .status()?
                     .tip
                     == expected_parent;
-                let accepted = if !parent_is_current {
-                    false
-                } else {
-                    match submit_shared_tip_block(&node, *block, unix_time_seconds()?) {
-                        Ok(_) => true,
-                        Err(
-                            NodeError::StaleBlockAdmission
-                            | NodeError::DuplicateBlock(_)
-                            | NodeError::UnknownParent(_)
-                            | NodeError::ProofVerificationQueueFull
-                            | NodeError::ProofVerificationQueueTimeout,
-                        ) => false,
-                        Err(error) => return Err(error.into()),
-                    }
-                };
+                let accepted = parent_is_current
+                    && submit_local_found_block(&node, &block, shutdown.as_ref())?;
                 if accepted {
                     statistics.blocks_found = statistics.blocks_found.saturating_add(1);
                     let relayed = config
@@ -3183,6 +3240,19 @@ mod tests {
             ..active
         };
         assert!(!block_is_active_acknowledgement(&rejected, block_id));
+
+        let busy = cmfd_node::peer::BlockSubmissionResult {
+            status: BlockSubmissionStatus::Busy,
+            peer_tip: [6; 32],
+            ..active
+        };
+        assert!(block_is_retryable_busy(&busy, [6; 32]));
+        assert!(!block_is_retryable_busy(&busy, [5; 32]));
+        assert!(
+            block_is_retryable_busy(&busy, [6; 32])
+                && !block_is_active_acknowledgement(&rejected, block_id),
+            "a busy peer on the exact parent must keep the candidate alive even when another peer rejects it"
+        );
     }
 
     #[test]

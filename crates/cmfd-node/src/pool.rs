@@ -973,8 +973,8 @@ fn process_share(
     }
     // Only valid, current shares consume the bounded duplicate set. Unique
     // low-work or stale nonces cannot force a job-capacity denial of service.
-    match reserve_valid_share(&active, nonce)? {
-        NonceReservation::Reserved => {}
+    let nonce_reserved = match reserve_valid_share(&active, nonce)? {
+        NonceReservation::Reserved => true,
         NonceReservation::Duplicate => {
             drop(node);
             return rejected_result(shared, session_id, job_id, nonce, "duplicate_share");
@@ -987,8 +987,9 @@ fn process_share(
                 drop(node);
                 return rejected_result(shared, session_id, job_id, nonce, "job_share_limit");
             }
+            false
         }
-    }
+    };
 
     let Some(block) = block else {
         let session = credit_accepted_share(
@@ -1012,20 +1013,47 @@ fn process_share(
     // Release the shared node before the bounded verifier worker runs; the
     // revision-bound helper rechecks the authoritative chain on commit.
     drop(node);
-    match submit_shared_tip_block(&shared.node, *block, unix_time_seconds()?) {
-        Ok(_) => {}
-        Err(
-            NodeError::StaleBlockAdmission
-            | NodeError::DuplicateBlock(_)
-            | NodeError::UnknownParent(_),
-        ) => {
-            rotate_if_tip_changed(shared)?;
-            return rejected_result(shared, session_id, job_id, nonce, "stale_job");
+    loop {
+        match submit_shared_tip_block(&shared.node, (*block).clone(), unix_time_seconds()?) {
+            Ok(_) => break,
+            Err(
+                NodeError::StaleBlockAdmission
+                | NodeError::DuplicateBlock(_)
+                | NodeError::UnknownParent(_),
+            ) => {
+                rotate_if_tip_changed(shared)?;
+                return rejected_result(shared, session_id, job_id, nonce, "stale_job");
+            }
+            Err(
+                NodeError::ProofVerificationQueueFull | NodeError::ProofVerificationQueueTimeout,
+            ) => {
+                if shared.stop.load(Ordering::Acquire) {
+                    if nonce_reserved {
+                        release_valid_share(&active, nonce)?;
+                    }
+                    return retryable_result(shared, session_id, job_id, nonce, "verifier_busy");
+                }
+                let parent_is_current = shared
+                    .node
+                    .lock()
+                    .map_err(|_| PoolError::SharedStatePoisoned)?
+                    .state
+                    .tip()
+                    == active.wire.challenge.previous_block;
+                if !parent_is_current {
+                    rotate_if_tip_changed(shared)?;
+                    return rejected_result(shared, session_id, job_id, nonce, "stale_job");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.client_error().retryable => {
+                if nonce_reserved {
+                    release_valid_share(&active, nonce)?;
+                }
+                return retryable_result(shared, session_id, job_id, nonce, "verifier_busy");
+            }
+            Err(error) => return Err(PoolError::Node(error)),
         }
-        Err(NodeError::ProofVerificationQueueFull | NodeError::ProofVerificationQueueTimeout) => {
-            return rejected_result(shared, session_id, job_id, nonce, "verifier_busy");
-        }
-        Err(error) => return Err(PoolError::Node(error)),
     }
 
     let session = credit_accepted_share(
@@ -1063,6 +1091,34 @@ fn rejected_result(
     })
 }
 
+fn retryable_result(
+    shared: &SharedServer,
+    session_id: u64,
+    job_id: [u8; 32],
+    nonce: u64,
+    code: &str,
+) -> Result<PoolShareResult, PoolError> {
+    let ledger = shared
+        .ledger
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    let session = session_snapshot(
+        session_id,
+        ledger
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| PoolError::InvalidMessage("unknown session".to_owned()))?,
+    )?;
+    Ok(PoolShareResult {
+        job_id,
+        nonce,
+        accepted: false,
+        block_accepted: false,
+        code: code.to_owned(),
+        session,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonceReservation {
     Reserved,
@@ -1083,6 +1139,15 @@ fn reserve_valid_share(active: &ActiveJob, nonce: u64) -> Result<NonceReservatio
     }
     seen.insert(nonce);
     Ok(NonceReservation::Reserved)
+}
+
+fn release_valid_share(active: &ActiveJob, nonce: u64) -> Result<(), PoolError> {
+    active
+        .seen_nonces
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?
+        .remove(&nonce);
+    Ok(())
 }
 
 fn rotate_if_tip_changed(shared: &Arc<SharedServer>) -> Result<bool, PoolError> {
@@ -2117,6 +2182,12 @@ mod tests {
         assert_eq!(
             reserve_valid_share(&active, POOL_MAX_SHARES_PER_JOB as u64).unwrap(),
             NonceReservation::Full
+        );
+        release_valid_share(&active, 0).unwrap();
+        assert_eq!(
+            reserve_valid_share(&active, 0).unwrap(),
+            NonceReservation::Reserved,
+            "a transient verifier result must make the exact nonce retryable"
         );
 
         let challenge = active.wire.challenge;

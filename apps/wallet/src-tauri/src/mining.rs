@@ -476,20 +476,7 @@ fn mining_loop(
                         if !parent_is_current {
                             return Ok(None);
                         }
-                        match submit_shared_tip_block(&node, *block, unix_time_seconds()) {
-                            Ok(_) => {}
-                            Err(
-                                NodeError::StaleBlockAdmission
-                                | NodeError::DuplicateBlock(_)
-                                | NodeError::UnknownParent(_)
-                                | NodeError::ProofVerificationQueueFull
-                                | NodeError::ProofVerificationQueueTimeout,
-                            ) => return Ok(None),
-                            Err(error) => return Err(error),
-                        }
-                        let node = node.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
-                        let node_status = node.status()?;
-                        Ok((node_status.tip == block_id_hex).then_some(node_status))
+                        submit_solo_candidate(&node, block.as_ref(), stop.as_ref())
                     });
                     match submission {
                         Ok(Some(node_status)) => {
@@ -522,6 +509,42 @@ fn mining_loop(
         current.matrix_attempts_per_second = 0.0;
         current.pool_connected = false;
     }
+}
+
+fn submit_solo_candidate(
+    node: &Arc<Mutex<Node>>,
+    block: &cmfd_consensus::Block,
+    stop: &AtomicBool,
+) -> Result<Option<cmfd_node::NodeStatus>, NodeError> {
+    while !stop.load(Ordering::Acquire) {
+        let node_status = node
+            .lock()
+            .map_err(|_| NodeError::SharedNodePoisoned)?
+            .status()?;
+        let parent = hex::encode(block.challenge.previous_block);
+        let block_id = hex::encode(block.block_id());
+        if node_status.tip != parent {
+            return Ok((node_status.tip == block_id).then_some(node_status));
+        }
+        match submit_shared_tip_block(node, block.clone(), unix_time_seconds()) {
+            Ok(_) | Err(NodeError::DuplicateBlock(_)) => {
+                let node_status = node
+                    .lock()
+                    .map_err(|_| NodeError::SharedNodePoisoned)?
+                    .status()?;
+                return Ok((node_status.tip == block_id).then_some(node_status));
+            }
+            Err(NodeError::StaleBlockAdmission | NodeError::UnknownParent(_)) => return Ok(None),
+            Err(NodeError::ProofVerifierShuttingDown) => return Ok(None),
+            Err(error) if error.client_error().retryable => {
+                if !interruptible_backoff(stop, Duration::from_millis(100)) {
+                    return Ok(None);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 fn initialize_solo_cuda(
@@ -795,7 +818,13 @@ fn mine_pool_connection(
             PoolWorkSearchResult::Cancelled { .. } => return Ok(()),
             PoolWorkSearchResult::Exhausted { .. } => {}
             PoolWorkSearchResult::Found { nonce, .. } => {
-                let submitted = client.submit_share(job.job_id, nonce)?;
+                let mut submitted = client.submit_share(job.job_id, nonce)?;
+                while submitted.code == "verifier_busy" && !stop.load(Ordering::Acquire) {
+                    if !interruptible_backoff(stop, Duration::from_millis(100)) {
+                        return Ok(());
+                    }
+                    submitted = client.submit_share(job.job_id, nonce)?;
+                }
                 let newly_credited = submitted
                     .session
                     .credited_devnet_atoms

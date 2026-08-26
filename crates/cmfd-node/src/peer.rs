@@ -20,7 +20,7 @@ use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 use thiserror::Error;
 
 pub const PEER_MAGIC: [u8; 4] = *b"CMFP";
-pub const PEER_PROTOCOL_VERSION: u16 = 3;
+pub const PEER_PROTOCOL_VERSION: u16 = 4;
 pub const PEER_FRAME_HEADER_BYTES: usize = 20;
 pub const MAX_PEER_PAYLOAD_BYTES: usize = MAX_BLOCK_BYTES;
 pub const MAX_HEADER_LOCATORS: usize = 32;
@@ -76,6 +76,9 @@ pub enum BlockSubmissionStatus {
     Accepted = 0,
     AlreadyKnown = 1,
     Rejected = 2,
+    /// The exact candidate was not judged invalid. The sender may retry it
+    /// while this peer still reports the candidate's parent as its active tip.
+    Busy = 3,
 }
 
 impl BlockSubmissionStatus {
@@ -84,6 +87,7 @@ impl BlockSubmissionStatus {
             0 => Ok(Self::Accepted),
             1 => Ok(Self::AlreadyKnown),
             2 => Ok(Self::Rejected),
+            3 => Ok(Self::Busy),
             other => Err(PeerError::InvalidBlockSubmissionStatus(other)),
         }
     }
@@ -1530,6 +1534,12 @@ mod tests {
                 status: BlockSubmissionStatus::Accepted,
                 peer_height: 1,
                 peer_tip: block_id,
+            }),
+            PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                block_id,
+                status: BlockSubmissionStatus::Busy,
+                peer_height: 0,
+                peer_tip: [0; 32],
             }),
             PeerMessage::GetMempool,
             PeerMessage::TransactionInventory {

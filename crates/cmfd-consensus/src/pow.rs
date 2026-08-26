@@ -1,7 +1,10 @@
-use std::sync::Arc;
+use std::fmt;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
-use std::{fmt, io::Read, path::Path, sync::atomic::AtomicBool};
+use std::{io::Read, path::Path, sync::atomic::AtomicBool};
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
@@ -53,6 +56,9 @@ pub const MAX_PRODUCTION_V3_ACCELERATOR_BATCH: u32 = 64;
 #[cfg(feature = "dory-bls12-381-prototype")]
 pub(crate) const FORGEMATRIX_V3_BLOCK_ID_PROOF_FIELDS: &str = "pow_type_u16le,algorithm_version_u32le,proof_version_u32le,nonce_u64le,model_manifest_digest[32],challenge_digest[32],final_activation_digest[32],work_digest[32],structured_length_u64le,structured_bytes";
 const PREVERIFIED_VERIFIER_DOMAIN: &str = "CMFD/POW/PREVERIFIED-VERIFIER/V1";
+const PREVERIFIED_CAPABILITY_DOMAIN: &str = "CMFD/POW/PREVERIFIED-CAPABILITY/V1";
+static PREVERIFICATION_PROCESS_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+static NEXT_VERIFIER_CAPABILITY_NONCE: AtomicU64 = AtomicU64::new(1);
 const PREVERIFIED_STATEMENT_DOMAIN: &str = "CMFD/POW/PREVERIFIED-STATEMENT/V1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +323,7 @@ pub struct ForgeMatrixV3CandidateProof {
 pub struct PreverifiedBlockProof {
     verifier_identity: [u8; 32],
     statement_identity: [u8; 32],
+    capability_mac: [u8; 32],
 }
 
 /// Exact verifier and statement identities transported across a trusted
@@ -356,16 +363,47 @@ pub enum PowError {
     ParameterMismatch,
     #[error("preverified proof does not match the verifier, challenge, or proof bytes")]
     PreverificationMismatch,
+    #[error("operating-system entropy is unavailable for process-local proof capabilities")]
+    PreverificationEntropy,
     #[error("proof-of-work parameters belong to another network")]
     WrongNetwork,
 }
 
 #[derive(Debug, Clone)]
 pub enum ConsensusPowVerifier {
-    V1Legacy(Arc<ForgeMatrixVerifier>),
-    V2Reference(Arc<ForgeMatrixV2Reference>),
+    V1Legacy(Arc<VerifierInstance<ForgeMatrixVerifier>>),
+    V2Reference(Arc<VerifierInstance<ForgeMatrixV2Reference>>),
     #[cfg(feature = "dory-v3-consensus-adapter")]
-    V3Candidate(Arc<ForgeMatrixV3ConsensusVerifier>),
+    V3Candidate(Arc<VerifierInstance<ForgeMatrixV3ConsensusVerifier>>),
+}
+
+#[doc(hidden)]
+pub struct VerifierInstance<T> {
+    verifier: T,
+    capability_nonce: u64,
+}
+
+impl<T> VerifierInstance<T> {
+    fn new(verifier: T) -> Self {
+        Self {
+            verifier,
+            capability_nonce: NEXT_VERIFIER_CAPABILITY_NONCE.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl<T> Deref for VerifierInstance<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.verifier
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for VerifierInstance<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.verifier.fmt(formatter)
+    }
 }
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
@@ -515,11 +553,13 @@ impl BlockProof {
 
 impl ConsensusPowVerifier {
     pub fn v1_legacy(profile: ForgeMatrixProfile) -> Result<Self, PowError> {
-        Ok(Self::V1Legacy(Arc::new(ForgeMatrixVerifier::new(profile)?)))
+        Ok(Self::V1Legacy(Arc::new(VerifierInstance::new(
+            ForgeMatrixVerifier::new(profile)?,
+        ))))
     }
 
     pub fn v2_reference(reference: ForgeMatrixV2Reference) -> Self {
-        Self::V2Reference(Arc::new(reference))
+        Self::V2Reference(Arc::new(VerifierInstance::new(reference)))
     }
 
     /// Construct the dormant V3 verifier from one authenticated model bank,
@@ -543,7 +583,7 @@ impl ConsensusPowVerifier {
         let parameters =
             ForgeMatrixV3CandidateParameters::from_authenticated(network_id, &authenticated);
         parameters.validate_for_network(network_id)?;
-        Ok(Self::V3Candidate(Arc::new(
+        Ok(Self::V3Candidate(Arc::new(VerifierInstance::new(
             ForgeMatrixV3ConsensusVerifier {
                 parameters,
                 authority: ForgeMatrixV3VerifierAuthority::Production {
@@ -551,7 +591,7 @@ impl ConsensusPowVerifier {
                     setup: Box::new(setup),
                 },
             },
-        )))
+        ))))
     }
 
     /// Reject a Production V3 accelerator claim unless its immutable network
@@ -830,10 +870,7 @@ impl ConsensusPowVerifier {
         proof: &BlockProof,
     ) -> Result<PreverifiedBlockProof, PowError> {
         self.verify(block, proof)?;
-        Ok(PreverifiedBlockProof {
-            verifier_identity: self.preverification_identity(block.network_id)?,
-            statement_identity: preverified_statement_identity(block, proof),
-        })
+        self.issue_preverification_capability(block, proof)
     }
 
     /// Returns the exact identities an external verifier must echo after
@@ -883,10 +920,7 @@ impl ConsensusPowVerifier {
         if binding != expected {
             return Err(PowError::PreverificationMismatch);
         }
-        Ok(PreverifiedBlockProof {
-            verifier_identity: binding.verifier_identity,
-            statement_identity: binding.statement_identity,
-        })
+        self.issue_preverification_capability(block, proof)
     }
 
     pub(crate) fn verify_preverified(
@@ -896,8 +930,12 @@ impl ConsensusPowVerifier {
         preverified: &PreverifiedBlockProof,
     ) -> Result<(), PowError> {
         self.require_matching_proof_type(proof)?;
-        if preverified.verifier_identity != self.preverification_identity(block.network_id)?
-            || preverified.statement_identity != preverified_statement_identity(block, proof)
+        let verifier_identity = self.preverification_identity(block.network_id)?;
+        let statement_identity = preverified_statement_identity(block, proof);
+        if preverified.verifier_identity != verifier_identity
+            || preverified.statement_identity != statement_identity
+            || preverified.capability_mac
+                != self.preverification_capability_mac(verifier_identity, statement_identity)?
         {
             return Err(PowError::PreverificationMismatch);
         }
@@ -922,6 +960,43 @@ impl ConsensusPowVerifier {
     fn preverification_identity(&self, network_id: [u8; 32]) -> Result<[u8; 32], PowError> {
         let mut hasher = Hasher::new_derive_key(PREVERIFIED_VERIFIER_DOMAIN);
         self.parameters().absorb(network_id, &mut hasher)?;
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn issue_preverification_capability(
+        &self,
+        block: &BlockChallenge,
+        proof: &BlockProof,
+    ) -> Result<PreverifiedBlockProof, PowError> {
+        let verifier_identity = self.preverification_identity(block.network_id)?;
+        let statement_identity = preverified_statement_identity(block, proof);
+        Ok(PreverifiedBlockProof {
+            verifier_identity,
+            statement_identity,
+            capability_mac: self
+                .preverification_capability_mac(verifier_identity, statement_identity)?,
+        })
+    }
+
+    fn capability_nonce(&self) -> u64 {
+        match self {
+            Self::V1Legacy(instance) => instance.capability_nonce,
+            Self::V2Reference(instance) => instance.capability_nonce,
+            #[cfg(feature = "dory-v3-consensus-adapter")]
+            Self::V3Candidate(instance) => instance.capability_nonce,
+        }
+    }
+
+    fn preverification_capability_mac(
+        &self,
+        verifier_identity: [u8; 32],
+        statement_identity: [u8; 32],
+    ) -> Result<[u8; 32], PowError> {
+        let mut hasher = Hasher::new_keyed(preverification_process_key()?);
+        hasher.update(PREVERIFIED_CAPABILITY_DOMAIN.as_bytes());
+        hasher.update(&self.capability_nonce().to_le_bytes());
+        hasher.update(&verifier_identity);
+        hasher.update(&statement_identity);
         Ok(*hasher.finalize().as_bytes())
     }
 
@@ -1334,6 +1409,18 @@ fn preverified_statement_identity(block: &BlockChallenge, proof: &BlockProof) ->
     *hasher.finalize().as_bytes()
 }
 
+fn preverification_process_key() -> Result<&'static [u8; 32], PowError> {
+    if let Some(key) = PREVERIFICATION_PROCESS_KEY.get() {
+        return Ok(key);
+    }
+    let mut candidate = [0_u8; 32];
+    getrandom::fill(&mut candidate).map_err(|_| PowError::PreverificationEntropy)?;
+    let _ = PREVERIFICATION_PROCESS_KEY.set(candidate);
+    PREVERIFICATION_PROCESS_KEY
+        .get()
+        .ok_or(PowError::PreverificationEntropy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1417,6 +1504,29 @@ mod tests {
         assert!(matches!(
             legacy.verify_preverified(&challenge, &changed_proof, &preverified),
             Err(PowError::WrongProofType)
+        ));
+    }
+
+    #[test]
+    fn independent_same_parameter_verifier_cannot_mint_a_live_capability() {
+        let reference = v2_test_reference().unwrap();
+        let network_id = reference.descriptor().network_id;
+        let live = ConsensusPowVerifier::v2_reference(reference.clone());
+        let attacker = ConsensusPowVerifier::v2_reference(reference);
+        let challenge = block(network_id);
+        let proof = live.mine(&challenge, 7, 1).unwrap();
+        let binding = attacker
+            .external_preverification_binding(&challenge, &proof)
+            .unwrap();
+        let forged_for_own_instance = unsafe {
+            attacker
+                .issue_external_preverification(&challenge, &proof, binding)
+                .unwrap()
+        };
+
+        assert!(matches!(
+            live.verify_preverified(&challenge, &proof, &forged_for_own_instance),
+            Err(PowError::PreverificationMismatch)
         ));
     }
 
@@ -1537,12 +1647,14 @@ mod tests {
         proof: &ForgeMatrixV3CandidateProof,
     ) -> ConsensusPowVerifier {
         let proof = BlockProof::V3Candidate(Box::new(proof.clone()));
-        ConsensusPowVerifier::V3Candidate(Arc::new(ForgeMatrixV3ConsensusVerifier {
-            parameters,
-            authority: ForgeMatrixV3VerifierAuthority::BoundTestStatement {
-                statement_identity: preverified_statement_identity(challenge, &proof),
+        ConsensusPowVerifier::V3Candidate(Arc::new(VerifierInstance::new(
+            ForgeMatrixV3ConsensusVerifier {
+                parameters,
+                authority: ForgeMatrixV3VerifierAuthority::BoundTestStatement {
+                    statement_identity: preverified_statement_identity(challenge, &proof),
+                },
             },
-        }))
+        )))
     }
 
     #[cfg(feature = "dory-v3-consensus-adapter")]

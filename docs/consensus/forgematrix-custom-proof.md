@@ -1371,10 +1371,18 @@ fail closed. Devnet V2 uses this crash/resource boundary without claiming an OS
 sandbox. ProductionV3 on Linux x86-64 additionally requires Landlock ABI 3 or
 newer plus default-deny seccomp before reading/loading artifact contents or
 untrusted IPC. ABI 3 is accepted only with mandatory seccomp network denial.
-ProductionV3 on Windows remains
-fail-closed until an atomic AppContainer/LPAC launch and inherited-handle
-artifact validator pass equivalent sentinel and real-worker tests. Production
-still requires per-worker CPU/PID containment, production-shape resource/load
+ProductionV3 on Windows now has an atomic zero-capability LPAC launch, exact
+Job/handle lists, a handle-only artifact validator, and a hash/identity-verified
+per-launch private executable pinned through process lifetime with native
+escape sentinels. The child self-attests heap terminate-on-corruption before
+artifact or IPC reads, while the parent checks omitted handles against the
+suspended child without accepting numeric-slot reuse. Profile and private-root
+ownership is panic-safe RAII. Native Job-close evidence additionally requires
+the child's inherited-channel `READY`/`ARMED` barrier, a nonsignaled process,
+one active Job process immediately before close, and exact non-fault exit
+classification with interactive Windows fault UI disabled. Activation remains fail-closed until the packaged worker passes the
+real pinned artifacts and known-valid/corrupt-block qualification. Production
+still requires per-worker CPU containment, production-shape resource/load
 qualification, protected executable deployment, and independent review.
 
 The feature-gated BLS/Dory candidate now has a narrower, explicitly

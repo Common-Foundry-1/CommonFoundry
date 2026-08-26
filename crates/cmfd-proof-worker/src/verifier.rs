@@ -27,8 +27,11 @@ const RESPONSE_MAGIC: &[u8; 8] = b"CMFDVWR1";
 const PROTOCOL_VERSION: u32 = 2;
 const VERIFY_MODE: &str = "--verify-block";
 const PERSISTENT_VERIFY_MODE: &str = "--verify-block-server";
+#[cfg(not(windows))]
 const V3_BANK_ARGUMENT: &str = "--production-v3-bank";
+#[cfg(not(windows))]
 const V3_MANIFEST_ARGUMENT: &str = "--production-v3-manifest";
+#[cfg(not(windows))]
 const V3_RECORD_ARGUMENT: &str = "--production-v3-record-v2";
 const REQUEST_FIXED_BYTES: usize = 8 + 4 + 32 + 32 + 32 + 4;
 const SUCCESS_RESPONSE_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32;
@@ -81,6 +84,14 @@ pub struct ProductionV3VerifierArtifacts {
     pub bank: PathBuf,
     pub manifest: PathBuf,
     pub record_v2: PathBuf,
+}
+
+enum WorkerProductionArtifacts {
+    #[cfg(not(windows))]
+    Paths(ProductionV3VerifierArtifacts),
+    #[cfg(windows)]
+    #[cfg_attr(not(feature = "production-v3"), allow(dead_code))]
+    Handles(crate::windows_artifacts::OwnedWindowsProductionArtifactHandles),
 }
 
 impl ProductionV3VerifierArtifacts {
@@ -179,6 +190,12 @@ pub enum VerifierWorkerError {
     StatePoisoned,
     #[error("verifier worker transport could not be reaped after containment")]
     TransportPoisoned,
+    #[error("verifier worker failed ({worker}); bounded process cleanup also failed: {source}")]
+    CleanupAfterFailure {
+        worker: Box<VerifierWorkerError>,
+        #[source]
+        source: io::Error,
+    },
     #[error("verifier worker is permanently closed")]
     Closed,
     #[error("ProductionV3 verifier sandbox is unavailable: {0}")]
@@ -470,7 +487,7 @@ impl PersistentVerifierWorker {
             self.inner
                 .terminated_generation
                 .store(*generation, Ordering::Release);
-            handle.terminate_tree();
+            terminate_for_shutdown(handle, &self.inner.transport_poisoned);
         }
     }
 
@@ -526,13 +543,14 @@ impl PersistentVerifierWorkerInner {
             return Err(VerifierWorkerError::TransportPoisoned);
         }
         let required_sandbox = expected_sandbox_status(&self.config)?;
-        // Recheck the immutable copy immediately before every exec. There is
-        // still a residual same-user check/exec race on platforms without an
-        // exec-by-retained-handle primitive; the copy lives in a private,
-        // randomly named directory and is non-writable for its lifetime.
+        // Recheck the immutable source copy immediately before every exec. On
+        // Windows the launcher additionally makes a fresh per-generation copy,
+        // pins the source/destination/directory handles, verifies the exact
+        // destination object, and executes only that private path.
         self.runtime_copy.verify(self.config.worker_sha256)?;
         let mut command = Command::new(self.runtime_copy.executable());
         command.arg(PERSISTENT_VERIFY_MODE);
+        #[cfg(not(windows))]
         if let Some(artifacts) = &self.config.production_v3_artifacts {
             command
                 .arg(V3_BANK_ARGUMENT)
@@ -552,16 +570,29 @@ impl PersistentVerifierWorkerInner {
         // published. The epoch closes that gap: any overlapping request is
         // observed immediately after publication and kills this generation.
         let shutdown_epoch = self.shutdown_epoch.load(Ordering::Acquire);
-        let child = if self.config.production_v3_artifacts.is_some() {
+        let child = if let Some(production_artifacts) = &self.config.production_v3_artifacts {
+            let _ = production_artifacts;
             #[cfg(target_os = "linux")]
             {
                 super::spawn_contained_production(command, Some(self.config.memory_limit_bytes))?
             }
             #[cfg(not(target_os = "linux"))]
             {
-                // `expected_sandbox_status` above fails closed on every
-                // platform without an implemented ProductionV3 launcher.
-                spawn_contained(&mut command, Some(self.config.memory_limit_bytes))?
+                #[cfg(windows)]
+                {
+                    crate::windows_launcher::spawn_contained_production_windows(
+                        command,
+                        production_artifacts,
+                        self.config.memory_limit_bytes,
+                        self.config.worker_sha256,
+                    )?
+                }
+                #[cfg(not(windows))]
+                {
+                    // `expected_sandbox_status` above fails closed on every
+                    // platform without an implemented ProductionV3 launcher.
+                    spawn_contained(&mut command, Some(self.config.memory_limit_bytes))?
+                }
             }
         } else {
             spawn_contained(&mut command, Some(self.config.memory_limit_bytes))?
@@ -579,15 +610,23 @@ impl PersistentVerifierWorkerInner {
         {
             self.terminated_generation
                 .store(generation, Ordering::Release);
-            terminator.terminate_tree();
+            let termination = terminator.terminate_tree();
             self.clear_terminator(generation)?;
-            return if self.closed.load(Ordering::Acquire) {
-                Err(VerifierWorkerError::Closed)
+            let primary = if self.closed.load(Ordering::Acquire) {
+                VerifierWorkerError::Closed
             } else {
-                Err(VerifierWorkerError::Startup(
-                    "worker startup was cancelled".to_owned(),
-                ))
+                VerifierWorkerError::Startup("worker startup was cancelled".to_owned())
             };
+            return Err(match termination {
+                Ok(_) => primary,
+                Err(source) => {
+                    self.transport_poisoned.store(true, Ordering::Release);
+                    VerifierWorkerError::CleanupAfterFailure {
+                        worker: Box::new(primary),
+                        source,
+                    }
+                }
+            });
         }
         let startup = (|| {
             let mut challenge = [0_u8; 32];
@@ -670,6 +709,18 @@ impl PersistentVerifierWorkerInner {
     }
 }
 
+impl Drop for PersistentVerifierWorkerInner {
+    fn drop(&mut self) {
+        if let Ok(process) = self.process.get_mut() {
+            process.take();
+        }
+        #[cfg(windows)]
+        if crate::process::shutdown_appcontainer_profile_cleanup().is_err() {
+            self.transport_poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
 fn configured_profile(config: &VerifierWorkerConfig) -> u8 {
     if config.production_v3_artifacts.is_some() {
         PROFILE_PRODUCTION_V3
@@ -688,12 +739,178 @@ fn expected_sandbox_status(
     }
 }
 
+#[cfg(windows)]
+struct WindowsRuntimeCopyCleanup {
+    directory_handle: Option<File>,
+    directory_identity: crate::process::WindowsFileIdentity,
+    executable_handle: Option<File>,
+    executable_identity: Option<crate::process::WindowsFileIdentity>,
+    cleaned: bool,
+}
+
+#[cfg(windows)]
+impl WindowsRuntimeCopyCleanup {
+    fn pin_directory(path: &Path) -> io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+        };
+
+        let directory_handle = OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE | READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let directory_identity = match crate::process::windows_file_identity(&directory_handle) {
+            Ok(identity) => identity,
+            Err(error) => {
+                crate::process::mark_appcontainer_cleanup_unhealthy();
+                std::mem::forget(directory_handle);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            directory_handle: Some(directory_handle),
+            directory_identity,
+            executable_handle: None,
+            executable_identity: None,
+            cleaned: false,
+        })
+    }
+
+    fn attach_executable(&mut self, executable: File) -> io::Result<()> {
+        let identity = match crate::process::windows_file_identity(&executable) {
+            Ok(identity) => identity,
+            Err(error) => {
+                crate::process::mark_appcontainer_cleanup_unhealthy();
+                std::mem::forget(executable);
+                return Err(error);
+            }
+        };
+        self.executable_identity = Some(identity);
+        self.executable_handle = Some(executable);
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        let delays = [0_u64, 10, 20, 40, 80, 160, 320, 500];
+        let mut last_error = None;
+        for delay in delays {
+            if delay != 0 {
+                thread::sleep(Duration::from_millis(delay));
+            }
+            match self.cleanup_with_hook(|| Ok(())) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error().is_some() => last_error = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("the bounded cleanup loop records every native failure"))
+    }
+
+    fn cleanup_with_hook(
+        &mut self,
+        after_executable_disposition: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if let Some(executable) = self.executable_handle.as_ref() {
+            let identity = self.executable_identity.ok_or_else(|| {
+                io::Error::other("private copy executable identity is unavailable")
+            })?;
+            set_runtime_handle_readonly(executable, false)?;
+            crate::process::delete_exact_runtime_handle(executable, false, identity)?;
+            self.executable_handle.take();
+        }
+        after_executable_disposition()?;
+        if let Some(directory) = self.directory_handle.as_ref() {
+            crate::process::delete_exact_runtime_handle(directory, true, self.directory_identity)?;
+            self.directory_handle.take();
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+
+    fn quarantine(&mut self) {
+        if let Some(executable) = self.executable_handle.take() {
+            std::mem::forget(executable);
+        }
+        if let Some(directory) = self.directory_handle.take() {
+            std::mem::forget(directory);
+        }
+        self.cleaned = true;
+    }
+
+    #[cfg(test)]
+    fn release_without_deletion_for_test(&mut self) {
+        self.executable_handle.take();
+        self.directory_handle.take();
+        self.cleaned = true;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsRuntimeCopyCleanup {
+    fn drop(&mut self) {
+        if self.cleanup().is_err() {
+            self.quarantine();
+            crate::process::mark_appcontainer_cleanup_unhealthy();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_runtime_handle_readonly(file: &File, readonly: bool) -> io::Result<()> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        SetFileInformationByHandle,
+    };
+
+    let mut basic = MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut basic = unsafe { basic.assume_init() };
+    if readonly {
+        basic.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+    } else {
+        basic.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
+    }
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw const basic).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 struct PrivateRuntimeCopy {
     directory: PathBuf,
     executable: PathBuf,
+    #[cfg(windows)]
+    cleanup: Option<WindowsRuntimeCopyCleanup>,
 }
 
 impl PrivateRuntimeCopy {
+    #[cfg(not(windows))]
     fn create(source: &Path, expected_sha256: [u8; 32]) -> Result<Self, VerifierWorkerError> {
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random).map_err(|source| VerifierWorkerError::RuntimeCopy {
@@ -750,6 +967,88 @@ impl PrivateRuntimeCopy {
         })
     }
 
+    #[cfg(windows)]
+    fn create(source: &Path, expected_sha256: [u8; 32]) -> Result<Self, VerifierWorkerError> {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|source| VerifierWorkerError::RuntimeCopy {
+            operation: "choosing a private runtime directory",
+            source: io::Error::other(source.to_string()),
+        })?;
+        let extension = source.extension().and_then(OsStr::to_str).unwrap_or("");
+        let sequence = PRIVATE_COPY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        for attempt in 0..PRIVATE_COPY_ATTEMPTS {
+            let directory = std::env::temp_dir().join(format!(
+                "cmfd-verifier-{}-{sequence}-{attempt}",
+                hex::encode(random)
+            ));
+            match fs::create_dir(&directory) {
+                Ok(()) => {
+                    let mut cleanup = WindowsRuntimeCopyCleanup::pin_directory(&directory)
+                        .inspect_err(|_| crate::process::mark_appcontainer_cleanup_unhealthy())
+                        .map_err(|source| VerifierWorkerError::RuntimeCopy {
+                            operation: "identity-binding the private runtime directory",
+                            source,
+                        })?;
+                    crate::windows_launcher::secure_owner_only_handle(
+                        cleanup
+                            .directory_handle
+                            .as_ref()
+                            .expect("new private runtime directory handle is retained"),
+                    )
+                    .map_err(|source| VerifierWorkerError::RuntimeCopy {
+                        operation: "restricting the private runtime directory",
+                        source,
+                    })?;
+                    let filename = if extension.is_empty() {
+                        "verifier-runtime".to_owned()
+                    } else {
+                        format!("verifier-runtime.{extension}")
+                    };
+                    let executable = directory.join(filename);
+                    let executable_handle = copy_and_pin(source, &executable, expected_sha256)?;
+                    cleanup
+                        .attach_executable(executable_handle)
+                        .map_err(|source| VerifierWorkerError::RuntimeCopy {
+                            operation: "identity-binding the private verifier executable",
+                            source,
+                        })?;
+                    let executable_handle = cleanup
+                        .executable_handle
+                        .as_ref()
+                        .expect("new private verifier executable handle is retained");
+                    crate::windows_launcher::secure_owner_only_handle(executable_handle).map_err(
+                        |source| VerifierWorkerError::RuntimeCopy {
+                            operation: "restricting the private verifier executable",
+                            source,
+                        },
+                    )?;
+                    set_runtime_handle_readonly(executable_handle, true).map_err(|source| {
+                        VerifierWorkerError::RuntimeCopy {
+                            operation: "making the private verifier executable read-only",
+                            source,
+                        }
+                    })?;
+                    return Ok(Self {
+                        directory,
+                        executable,
+                        cleanup: Some(cleanup),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(VerifierWorkerError::RuntimeCopy {
+                        operation: "creating a private runtime directory",
+                        source,
+                    });
+                }
+            }
+        }
+        Err(VerifierWorkerError::RuntimeCopy {
+            operation: "allocating a unique private runtime directory",
+            source: io::Error::new(io::ErrorKind::AlreadyExists, "attempt limit reached"),
+        })
+    }
+
     fn executable(&self) -> &Path {
         &self.executable
     }
@@ -770,8 +1069,18 @@ impl PrivateRuntimeCopy {
 
 impl Drop for PrivateRuntimeCopy {
     fn drop(&mut self) {
-        let _ = make_runtime_copy_writable(&self.executable);
-        let _ = fs::remove_dir_all(&self.directory);
+        #[cfg(windows)]
+        if let Some(mut cleanup) = self.cleanup.take()
+            && cleanup.cleanup().is_err()
+        {
+            cleanup.quarantine();
+            crate::process::mark_appcontainer_cleanup_unhealthy();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = make_runtime_copy_writable(&self.executable);
+            let _ = fs::remove_dir_all(&self.directory);
+        }
     }
 }
 
@@ -779,7 +1088,7 @@ fn copy_and_pin(
     source: &Path,
     destination: &Path,
     expected_sha256: [u8; 32],
-) -> Result<(), VerifierWorkerError> {
+) -> Result<File, VerifierWorkerError> {
     copy_and_pin_with_limit(
         source,
         destination,
@@ -793,7 +1102,7 @@ fn copy_and_pin_with_limit(
     destination: &Path,
     expected_sha256: [u8; 32],
     maximum_bytes: u64,
-) -> Result<(), VerifierWorkerError> {
+) -> Result<File, VerifierWorkerError> {
     let mut source_file =
         File::open(source).map_err(|source| VerifierWorkerError::RuntimeCopy {
             operation: "opening the pinned verifier executable",
@@ -811,6 +1120,49 @@ fn copy_and_pin_with_limit(
             "worker executable size is outside the private-copy bound",
         ));
     }
+    #[cfg(windows)]
+    let (mut destination_file, destination_identity) = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Storage::FileSystem::{
+                DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, READ_CONTROL,
+                SYNCHRONIZE, WRITE_DAC,
+            },
+        };
+        let file = OpenOptions::new()
+            .write(true)
+            .access_mode(
+                GENERIC_WRITE
+                    | DELETE
+                    | FILE_READ_ATTRIBUTES
+                    | FILE_WRITE_ATTRIBUTES
+                    | SYNCHRONIZE
+                    | READ_CONTROL
+                    | WRITE_DAC,
+            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(destination)
+            .map_err(|source| VerifierWorkerError::RuntimeCopy {
+                operation: "creating the private verifier executable",
+                source,
+            })?;
+        match crate::process::windows_file_identity(&file) {
+            Ok(identity) => (file, identity),
+            Err(source) => {
+                crate::process::mark_appcontainer_cleanup_unhealthy();
+                std::mem::forget(file);
+                return Err(VerifierWorkerError::RuntimeCopy {
+                    operation: "identity-binding the new private verifier executable",
+                    source,
+                });
+            }
+        }
+    };
+    #[cfg(not(windows))]
     let mut destination_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -819,58 +1171,164 @@ fn copy_and_pin_with_limit(
             operation: "creating the private verifier executable",
             source,
         })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut copied_bytes = 0_u64;
-    loop {
-        let read =
-            source_file
-                .read(&mut buffer)
-                .map_err(|source| VerifierWorkerError::RuntimeCopy {
+
+    let copy_result = (|| {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut copied_bytes = 0_u64;
+        loop {
+            let read = source_file.read(&mut buffer).map_err(|source| {
+                VerifierWorkerError::RuntimeCopy {
                     operation: "reading the pinned verifier executable",
                     source,
-                })?;
-        if read == 0 {
-            break;
-        }
-        copied_bytes =
-            copied_bytes
-                .checked_add(read as u64)
-                .ok_or(VerifierWorkerError::InvalidConfig(
+                }
+            })?;
+            if read == 0 {
+                break;
+            }
+            copied_bytes =
+                copied_bytes
+                    .checked_add(read as u64)
+                    .ok_or(VerifierWorkerError::InvalidConfig(
+                        "worker executable size exceeds the private-copy bound",
+                    ))?;
+            if copied_bytes > maximum_bytes {
+                return Err(VerifierWorkerError::InvalidConfig(
                     "worker executable size exceeds the private-copy bound",
-                ))?;
-        if copied_bytes > maximum_bytes {
-            return Err(VerifierWorkerError::InvalidConfig(
-                "worker executable size exceeds the private-copy bound",
-            ));
+                ));
+            }
+            hasher.update(&buffer[..read]);
+            destination_file
+                .write_all(&buffer[..read])
+                .map_err(|source| VerifierWorkerError::RuntimeCopy {
+                    operation: "writing the private verifier executable",
+                    source,
+                })?;
         }
-        hasher.update(&buffer[..read]);
         destination_file
-            .write_all(&buffer[..read])
+            .sync_all()
             .map_err(|source| VerifierWorkerError::RuntimeCopy {
-                operation: "writing the private verifier executable",
+                operation: "flushing the private verifier executable",
                 source,
             })?;
+        if <[u8; 32]>::from(hasher.finalize()) != expected_sha256 {
+            return Err(VerifierWorkerError::Process(
+                ProofWorkerError::HashMismatch {
+                    component: "verifier worker executable",
+                },
+            ));
+        }
+        if copied_bytes != source_bytes {
+            return Err(VerifierWorkerError::InvalidConfig(
+                "worker executable changed while creating the private copy",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(primary) = copy_result {
+        #[cfg(windows)]
+        if let Err(cleanup) = crate::process::delete_exact_runtime_handle(
+            &destination_file,
+            false,
+            destination_identity,
+        ) {
+            crate::process::mark_appcontainer_cleanup_unhealthy();
+            std::mem::forget(destination_file);
+            return Err(VerifierWorkerError::RuntimeCopy {
+                operation: "cleaning an incomplete identity-bound private verifier executable",
+                source: io::Error::other(format!("{primary}; cleanup failure: {cleanup}")),
+            });
+        }
+        return Err(primary);
     }
-    destination_file
-        .sync_all()
-        .map_err(|source| VerifierWorkerError::RuntimeCopy {
-            operation: "flushing the private verifier executable",
-            source,
-        })?;
-    if <[u8; 32]>::from(hasher.finalize()) != expected_sha256 {
-        return Err(VerifierWorkerError::Process(
-            ProofWorkerError::HashMismatch {
-                component: "verifier worker executable",
-            },
-        ));
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            FILE_WRITE_ATTRIBUTES, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+        };
+
+        // Pin the just-written identity across the only handle transition. The
+        // writer must close before the restrictive DELETE handle is opened,
+        // but a replacement in that interval is detected by the two retained
+        // identities and is never dispositioned.
+        let identity_pin = OpenOptions::new()
+            .read(true)
+            .open(destination)
+            .map_err(|source| VerifierWorkerError::RuntimeCopy {
+                operation: "pinning the completed private verifier executable",
+                source,
+            })?;
+        let pinned_identity =
+            crate::process::windows_file_identity(&identity_pin).map_err(|source| {
+                VerifierWorkerError::RuntimeCopy {
+                    operation: "identity-binding the completed private verifier executable",
+                    source,
+                }
+            })?;
+        if pinned_identity != destination_identity {
+            crate::process::mark_appcontainer_cleanup_unhealthy();
+            std::mem::forget(identity_pin);
+            std::mem::forget(destination_file);
+            return Err(VerifierWorkerError::RuntimeCopy {
+                operation: "pinning the completed private verifier executable",
+                source: io::Error::other("private verifier executable identity changed"),
+            });
+        }
+        drop(destination_file);
+
+        let cleanup_handle = match OpenOptions::new()
+            .access_mode(
+                DELETE
+                    | FILE_READ_ATTRIBUTES
+                    | FILE_WRITE_ATTRIBUTES
+                    | SYNCHRONIZE
+                    | READ_CONTROL
+                    | WRITE_DAC,
+            )
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(destination)
+        {
+            Ok(handle) => handle,
+            Err(source) => {
+                crate::process::mark_appcontainer_cleanup_unhealthy();
+                std::mem::forget(identity_pin);
+                return Err(VerifierWorkerError::RuntimeCopy {
+                    operation: "retaining exact cleanup authority for the private verifier executable",
+                    source,
+                });
+            }
+        };
+        let cleanup_identity = match crate::process::windows_file_identity(&cleanup_handle) {
+            Ok(identity) => identity,
+            Err(source) => {
+                crate::process::mark_appcontainer_cleanup_unhealthy();
+                std::mem::forget(identity_pin);
+                std::mem::forget(cleanup_handle);
+                return Err(VerifierWorkerError::RuntimeCopy {
+                    operation: "identity-binding private verifier cleanup authority",
+                    source,
+                });
+            }
+        };
+        if cleanup_identity != pinned_identity {
+            crate::process::mark_appcontainer_cleanup_unhealthy();
+            std::mem::forget(identity_pin);
+            std::mem::forget(cleanup_handle);
+            return Err(VerifierWorkerError::RuntimeCopy {
+                operation: "retaining exact cleanup authority for the private verifier executable",
+                source: io::Error::other(
+                    "private verifier executable was replaced during cleanup-handle transition",
+                ),
+            });
+        }
+        drop(identity_pin);
+        Ok(cleanup_handle)
     }
-    if copied_bytes != source_bytes {
-        return Err(VerifierWorkerError::InvalidConfig(
-            "worker executable changed while creating the private copy",
-        ));
-    }
-    Ok(())
+    #[cfg(not(windows))]
+    Ok(destination_file)
 }
 
 #[cfg(unix)]
@@ -884,7 +1342,7 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), VerifierWorkerEr
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_private_directory_permissions(_path: &Path) -> Result<(), VerifierWorkerError> {
     Ok(())
 }
@@ -900,21 +1358,6 @@ fn set_immutable_executable_permissions(path: &Path) -> Result<(), VerifierWorke
     })
 }
 
-#[cfg(windows)]
-fn set_immutable_executable_permissions(path: &Path) -> Result<(), VerifierWorkerError> {
-    let mut permissions = fs::metadata(path)
-        .map_err(|source| VerifierWorkerError::RuntimeCopy {
-            operation: "inspecting the private verifier executable",
-            source,
-        })?
-        .permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(path, permissions).map_err(|source| VerifierWorkerError::RuntimeCopy {
-        operation: "making the private verifier executable read-only",
-        source,
-    })
-}
-
 #[cfg(not(any(unix, windows)))]
 fn set_immutable_executable_permissions(_path: &Path) -> Result<(), VerifierWorkerError> {
     Err(VerifierWorkerError::InvalidConfig(
@@ -922,6 +1365,7 @@ fn set_immutable_executable_permissions(_path: &Path) -> Result<(), VerifierWork
     ))
 }
 
+#[cfg(not(windows))]
 fn make_runtime_copy_writable(path: &Path) -> io::Result<()> {
     if !path.exists() {
         return Ok(());
@@ -931,15 +1375,7 @@ fn make_runtime_copy_writable(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
     }
-    #[cfg(windows)]
-    {
-        let mut permissions = fs::metadata(path)?.permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        // Windows toggles FILE_ATTRIBUTE_READONLY.
-        permissions.set_readonly(false);
-        fs::set_permissions(path, permissions)
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         Ok(())
     }
@@ -968,15 +1404,42 @@ impl PersistentVerifierProcess {
         generation: u64,
         transport_poisoned: Arc<AtomicBool>,
     ) -> Result<Self, VerifierWorkerError> {
-        let stdin = child.take_stdin().ok_or(VerifierWorkerError::Process(
-            ProofWorkerError::InvalidConfig("worker stdin pipe was not created"),
-        ))?;
-        let stdout = child.take_stdout().ok_or(VerifierWorkerError::Process(
-            ProofWorkerError::InvalidConfig("worker stdout pipe was not created"),
-        ))?;
-        let stderr = child.take_stderr().ok_or(VerifierWorkerError::Process(
-            ProofWorkerError::InvalidConfig("worker stderr pipe was not created"),
-        ))?;
+        let stdin = match child.take_stdin() {
+            Some(stdin) => stdin,
+            None => {
+                return Err(compose_persistent_cleanup(
+                    &mut child,
+                    &transport_poisoned,
+                    VerifierWorkerError::Process(ProofWorkerError::InvalidConfig(
+                        "worker stdin pipe was not created",
+                    )),
+                ));
+            }
+        };
+        let stdout = match child.take_stdout() {
+            Some(stdout) => stdout,
+            None => {
+                return Err(compose_persistent_cleanup(
+                    &mut child,
+                    &transport_poisoned,
+                    VerifierWorkerError::Process(ProofWorkerError::InvalidConfig(
+                        "worker stdout pipe was not created",
+                    )),
+                ));
+            }
+        };
+        let stderr = match child.take_stderr() {
+            Some(stderr) => stderr,
+            None => {
+                return Err(compose_persistent_cleanup(
+                    &mut child,
+                    &transport_poisoned,
+                    VerifierWorkerError::Process(ProofWorkerError::InvalidConfig(
+                        "worker stderr pipe was not created",
+                    )),
+                ));
+            }
+        };
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let capture = Arc::clone(&stderr_capture);
         let (stderr_done_sender, stderr_done) = mpsc::channel();
@@ -1002,12 +1465,22 @@ impl PersistentVerifierProcess {
         timeout: Duration,
         response_limit: usize,
     ) -> Result<Vec<u8>, VerifierWorkerError> {
-        let stdin = self.stdin.take().ok_or(VerifierWorkerError::Process(
-            ProofWorkerError::InvalidConfig("persistent worker stdin pipe is unavailable"),
-        ))?;
-        let stdout = self.stdout.take().ok_or(VerifierWorkerError::Process(
-            ProofWorkerError::InvalidConfig("persistent worker stdout pipe is unavailable"),
-        ))?;
+        let stdin = match self.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                return Err(self.cleanup_after_failure(VerifierWorkerError::Process(
+                    ProofWorkerError::InvalidConfig("persistent worker stdin pipe is unavailable"),
+                )));
+            }
+        };
+        let stdout = match self.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                return Err(self.cleanup_after_failure(VerifierWorkerError::Process(
+                    ProofWorkerError::InvalidConfig("persistent worker stdout pipe is unavailable"),
+                )));
+            }
+        };
         let (sender, receiver) = mpsc::sync_channel(1);
         let (done_sender, done_receiver) = mpsc::channel();
         let io_thread = thread::spawn(move || {
@@ -1024,49 +1497,66 @@ impl PersistentVerifierProcess {
             Ok((stdin, stdout, result)) => {
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
                     self.transport_poisoned.store(true, Ordering::Release);
-                    self.child.terminate_and_reap();
-                    return Err(VerifierWorkerError::TransportPoisoned);
+                    return Err(self.cleanup_after_failure(VerifierWorkerError::TransportPoisoned));
                 }
                 self.stdin = Some(stdin);
                 self.stdout = Some(stdout);
-                if self.stderr_exceeded()? {
-                    self.child.terminate_and_reap();
-                    return Err(VerifierWorkerError::Process(
-                        ProofWorkerError::StderrTooLarge,
-                    ));
+                match self.stderr_exceeded() {
+                    Ok(true) => {
+                        return Err(self.cleanup_after_failure(VerifierWorkerError::Process(
+                            ProofWorkerError::StderrTooLarge,
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Err(self.cleanup_after_failure(error)),
                 }
-                let response = result.map_err(VerifierWorkerError::Process)?;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return Err(self.cleanup_after_failure(VerifierWorkerError::Process(error)));
+                    }
+                };
                 match self.child.try_wait() {
                     Ok(None) => Ok(response),
-                    Ok(Some(status)) => Err(VerifierWorkerError::Process(worker_exit_error(
-                        status,
-                        &self.stderr_bytes()?,
+                    Ok(Some(status)) => match self.stderr_bytes() {
+                        Ok(stderr) => Err(VerifierWorkerError::Process(worker_exit_error(
+                            status, &stderr,
+                        ))),
+                        Err(error) => Err(self.cleanup_after_failure(error)),
+                    },
+                    Err(source) => Err(self.cleanup_after_failure(VerifierWorkerError::Process(
+                        ProofWorkerError::Pipe {
+                            operation: "waiting for persistent verifier worker",
+                            source,
+                        },
                     ))),
-                    Err(source) => Err(VerifierWorkerError::Process(ProofWorkerError::Pipe {
-                        operation: "waiting for persistent verifier worker",
-                        source,
-                    })),
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.child.terminate_and_reap();
+                let primary = VerifierWorkerError::Process(ProofWorkerError::Timeout {
+                    milliseconds: timeout.as_millis(),
+                });
+                let error = self.cleanup_after_failure(primary);
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
                     self.transport_poisoned.store(true, Ordering::Release);
                 }
-                Err(VerifierWorkerError::Process(ProofWorkerError::Timeout {
-                    milliseconds: timeout.as_millis(),
-                }))
+                Err(error)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.child.terminate_and_reap();
+                let primary = VerifierWorkerError::Process(ProofWorkerError::PipeThread(
+                    "exchanging persistent verifier frames",
+                ));
+                let error = self.cleanup_after_failure(primary);
                 if !finish_pipe_thread_bounded(io_thread, done_receiver) {
                     self.transport_poisoned.store(true, Ordering::Release);
                 }
-                Err(VerifierWorkerError::Process(ProofWorkerError::PipeThread(
-                    "exchanging persistent verifier frames",
-                )))
+                Err(error)
             }
         }
+    }
+
+    fn cleanup_after_failure(&mut self, primary: VerifierWorkerError) -> VerifierWorkerError {
+        compose_persistent_cleanup(&mut self.child, &self.transport_poisoned, primary)
     }
 
     fn stderr_exceeded(&self) -> Result<bool, VerifierWorkerError> {
@@ -1081,6 +1571,38 @@ impl PersistentVerifierProcess {
             .lock()
             .map(|capture| capture.bytes.clone())
             .map_err(|_| VerifierWorkerError::StatePoisoned)
+    }
+}
+
+fn compose_persistent_cleanup(
+    child: &mut ContainedChild,
+    transport_poisoned: &AtomicBool,
+    primary: VerifierWorkerError,
+) -> VerifierWorkerError {
+    let report = child.terminate_and_reap_report();
+    if !report.exit_confirmed {
+        super::PROCESS_CLEANUP_UNHEALTHY.store(true, Ordering::Release);
+    }
+    match report.error {
+        None if report.exit_confirmed => primary,
+        source => {
+            transport_poisoned.store(true, Ordering::Release);
+            VerifierWorkerError::CleanupAfterFailure {
+                worker: Box::new(primary),
+                source: source.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "persistent verifier exit could not be confirmed; resources remain quarantined",
+                    )
+                }),
+            }
+        }
+    }
+}
+
+fn terminate_for_shutdown(terminator: &ProcessTerminator, transport_poisoned: &AtomicBool) {
+    if terminator.terminate_tree().is_err() {
+        transport_poisoned.store(true, Ordering::Release);
     }
 }
 
@@ -1131,7 +1653,13 @@ fn capture_persistent_stderr(mut stderr: impl Read, capture: Arc<Mutex<StderrCap
 
 impl Drop for PersistentVerifierProcess {
     fn drop(&mut self) {
-        self.child.terminate_and_reap();
+        let report = self.child.terminate_and_reap_report();
+        if report.error.is_some() || !report.exit_confirmed {
+            self.transport_poisoned.store(true, Ordering::Release);
+        }
+        if !report.exit_confirmed {
+            super::PROCESS_CLEANUP_UNHEALTHY.store(true, Ordering::Release);
+        }
         self.stdin.take();
         self.stdout.take();
         if let (Some(thread), Some(done)) = (self.stderr_thread.take(), self.stderr_done.take())
@@ -1375,6 +1903,7 @@ pub fn verify_block_out_of_process(
     })?;
     let mut command = Command::new(&config.worker_executable);
     command.arg(VERIFY_MODE);
+    #[cfg(not(windows))]
     if let Some(artifacts) = &config.production_v3_artifacts {
         command
             .arg(V3_BANK_ARGUMENT)
@@ -1394,16 +1923,29 @@ pub fn verify_block_out_of_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = if config.production_v3_artifacts.is_some() {
+    let child = if let Some(production_artifacts) = &config.production_v3_artifacts {
+        let _ = production_artifacts;
         #[cfg(target_os = "linux")]
         {
             super::spawn_contained_production(command, Some(config.memory_limit_bytes))?
         }
         #[cfg(not(target_os = "linux"))]
         {
-            // `expected_sandbox_status` above fails closed on every platform
-            // without an implemented ProductionV3 launcher.
-            spawn_contained(&mut command, Some(config.memory_limit_bytes))?
+            #[cfg(windows)]
+            {
+                crate::windows_launcher::spawn_contained_production_windows(
+                    command,
+                    production_artifacts,
+                    config.memory_limit_bytes,
+                    config.worker_sha256,
+                )?
+            }
+            #[cfg(not(windows))]
+            {
+                // `expected_sandbox_status` above fails closed on every
+                // platform without an implemented ProductionV3 launcher.
+                spawn_contained(&mut command, Some(config.memory_limit_bytes))?
+            }
         }
     } else {
         spawn_contained(&mut command, Some(config.memory_limit_bytes))?
@@ -1563,7 +2105,7 @@ fn run_verifier_worker()
 -> Result<(ExternalPreverificationBinding, VerifierSandboxStatus), (u16, String)> {
     let artifacts = parse_verifier_worker_arguments(std::env::args_os().skip(1))
         .map_err(|message| (ERROR_REQUEST, message.to_owned()))?;
-    require_empty_worker_environment()?;
+    require_worker_environment(artifacts.is_some())?;
     let sandbox_status = install_worker_sandbox(artifacts.as_ref())?;
     let request_bytes = read_stdin_bounded()
         .map_err(|error| (ERROR_INTERNAL, format!("could not read request: {error}")))?;
@@ -1579,22 +2121,37 @@ fn run_verifier_worker()
         ));
     }
 
-    let verifier = load_worker_verifier(request.network_id, artifacts.as_ref())?;
+    let verifier = load_worker_verifier(request.network_id, artifacts)?;
     verify_request_with_loaded_verifier(&verifier, request, block)
         .map(|binding| (binding, sandbox_status))
 }
 
 fn install_worker_sandbox(
-    artifacts: Option<&ProductionV3VerifierArtifacts>,
+    artifacts: Option<&WorkerProductionArtifacts>,
 ) -> Result<VerifierSandboxStatus, (u16, String)> {
     let Some(artifacts) = artifacts else {
         return Ok(VerifierSandboxStatus::Unconfined);
     };
-    install_production(&[&artifacts.bank, &artifacts.manifest, &artifacts.record_v2])
-        .map_err(|message| (ERROR_INTERNAL, message))
+    #[cfg(not(windows))]
+    let paths = match artifacts {
+        WorkerProductionArtifacts::Paths(artifacts) => {
+            [&artifacts.bank, &artifacts.manifest, &artifacts.record_v2]
+        }
+    };
+    #[cfg(windows)]
+    let paths: [&Path; 0] = match artifacts {
+        WorkerProductionArtifacts::Handles(_) => [],
+    };
+    install_production(&paths).map_err(|message| (ERROR_INTERNAL, message))
 }
 
-fn require_empty_worker_environment() -> Result<(), (u16, String)> {
+fn require_worker_environment(production_v3: bool) -> Result<(), (u16, String)> {
+    #[cfg(windows)]
+    if production_v3 {
+        return crate::windows_launcher::validate_current_worker_environment()
+            .map_err(|message| (ERROR_INTERNAL, message));
+    }
+    let _ = production_v3;
     if std::env::vars_os().next().is_some() {
         return Err((
             ERROR_INTERNAL,
@@ -1632,7 +2189,7 @@ fn verify_request_with_loaded_verifier(
 
 fn load_worker_verifier(
     network_id: [u8; 32],
-    artifacts: Option<&ProductionV3VerifierArtifacts>,
+    artifacts: Option<WorkerProductionArtifacts>,
 ) -> Result<ConsensusPowVerifier, (u16, String)> {
     match artifacts {
         Some(artifacts) => load_production_v3_verifier(network_id, artifacts),
@@ -1655,7 +2212,7 @@ fn persistent_verifier_worker_main() -> i32 {
             return write_single_startup_error(ERROR_REQUEST, message);
         }
     };
-    if let Err((code, message)) = require_empty_worker_environment() {
+    if let Err((code, message)) = require_worker_environment(artifacts.is_some()) {
         return write_single_startup_error(code, &message);
     }
     let sandbox_status = match install_worker_sandbox(artifacts.as_ref()) {
@@ -1712,7 +2269,7 @@ fn persistent_verifier_worker_main() -> i32 {
         );
         return 1;
     }
-    let verifier = match load_worker_verifier(handshake.network_id, artifacts.as_ref()) {
+    let verifier = match load_worker_verifier(handshake.network_id, artifacts) {
         Ok(verifier) => verifier,
         Err((code, message)) => {
             let _ = write_worker_frame(&mut output, &encode_startup_error(code, &message));
@@ -1825,72 +2382,102 @@ fn read_optional_worker_frame(reader: &mut impl Read, limit: usize) -> io::Resul
 
 fn parse_verifier_worker_arguments(
     arguments: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<Option<ProductionV3VerifierArtifacts>, &'static str> {
-    let arguments = arguments.into_iter().collect::<Vec<_>>();
-    if arguments.len() == 1 && arguments[0].as_os_str() == OsStr::new(VERIFY_MODE) {
-        return Ok(None);
-    }
-    if arguments.len() != 7
-        || arguments[0].as_os_str() != OsStr::new(VERIFY_MODE)
-        || arguments[1].as_os_str() != OsStr::new(V3_BANK_ARGUMENT)
-        || arguments[3].as_os_str() != OsStr::new(V3_MANIFEST_ARGUMENT)
-        || arguments[5].as_os_str() != OsStr::new(V3_RECORD_ARGUMENT)
-    {
-        return Err(
-            "expected --verify-block alone or with the exact production V3 bank, manifest, and Record V2 arguments",
-        );
-    }
-    let artifacts = ProductionV3VerifierArtifacts {
-        bank: PathBuf::from(&arguments[2]),
-        manifest: PathBuf::from(&arguments[4]),
-        record_v2: PathBuf::from(&arguments[6]),
-    };
-    artifacts
-        .validate()
-        .map_err(|_| "production V3 verifier artifact paths are invalid")?;
-    Ok(Some(artifacts))
+) -> Result<Option<WorkerProductionArtifacts>, &'static str> {
+    parse_verifier_artifact_arguments(VERIFY_MODE, arguments)
 }
 
 fn parse_persistent_verifier_worker_arguments(
     arguments: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<Option<ProductionV3VerifierArtifacts>, &'static str> {
+) -> Result<Option<WorkerProductionArtifacts>, &'static str> {
     parse_verifier_artifact_arguments(PERSISTENT_VERIFY_MODE, arguments)
 }
 
 fn parse_verifier_artifact_arguments(
     mode: &'static str,
     arguments: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<Option<ProductionV3VerifierArtifacts>, &'static str> {
+) -> Result<Option<WorkerProductionArtifacts>, &'static str> {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     if arguments.len() == 1 && arguments[0].as_os_str() == OsStr::new(mode) {
         return Ok(None);
     }
-    if arguments.len() != 7
-        || arguments[0].as_os_str() != OsStr::new(mode)
-        || arguments[1].as_os_str() != OsStr::new(V3_BANK_ARGUMENT)
-        || arguments[3].as_os_str() != OsStr::new(V3_MANIFEST_ARGUMENT)
-        || arguments[5].as_os_str() != OsStr::new(V3_RECORD_ARGUMENT)
+    #[cfg(windows)]
     {
-        return Err(
-            "expected the verifier mode alone or with the exact production V3 bank, manifest, and Record V2 arguments",
-        );
+        if arguments.len() != 5
+            || arguments[0].as_os_str() != OsStr::new(mode)
+            || arguments[1].as_os_str()
+                != OsStr::new(crate::windows_launcher::WINDOWS_ARTIFACT_HANDLES_ARGUMENT)
+        {
+            return Err(
+                "expected the verifier mode alone or with exactly three inherited production V3 artifact handles",
+            );
+        }
+        let mut descriptors = Vec::with_capacity(3);
+        for argument in &arguments[2..] {
+            let argument = argument
+                .to_str()
+                .ok_or("production V3 artifact handle descriptor is not canonical ASCII")?;
+            descriptors.push(
+                crate::windows_artifacts::WindowsArtifactHandleDescriptor::parse_transport_argument(
+                    argument,
+                )
+                .map_err(|_| "production V3 artifact handle descriptor is invalid")?,
+            );
+        }
+        let descriptors: [_; 3] = descriptors
+            .try_into()
+            .map_err(|_| "exactly three production V3 artifact handles are required")?;
+        let handles =
+            crate::windows_artifacts::OwnedWindowsProductionArtifactHandles::from_inherited_descriptors(
+                descriptors,
+            )
+            .map_err(|_| "production V3 artifact handles are invalid")?;
+        Ok(Some(WorkerProductionArtifacts::Handles(handles)))
     }
-    let artifacts = ProductionV3VerifierArtifacts {
-        bank: PathBuf::from(&arguments[2]),
-        manifest: PathBuf::from(&arguments[4]),
-        record_v2: PathBuf::from(&arguments[6]),
-    };
-    artifacts
-        .validate()
-        .map_err(|_| "production V3 verifier artifact paths are invalid")?;
-    Ok(Some(artifacts))
+    #[cfg(not(windows))]
+    {
+        if arguments.len() != 7
+            || arguments[0].as_os_str() != OsStr::new(mode)
+            || arguments[1].as_os_str() != OsStr::new(V3_BANK_ARGUMENT)
+            || arguments[3].as_os_str() != OsStr::new(V3_MANIFEST_ARGUMENT)
+            || arguments[5].as_os_str() != OsStr::new(V3_RECORD_ARGUMENT)
+        {
+            return Err(
+                "expected the verifier mode alone or with the exact production V3 bank, manifest, and Record V2 arguments",
+            );
+        }
+        let artifacts = ProductionV3VerifierArtifacts {
+            bank: PathBuf::from(&arguments[2]),
+            manifest: PathBuf::from(&arguments[4]),
+            record_v2: PathBuf::from(&arguments[6]),
+        };
+        artifacts
+            .validate()
+            .map_err(|_| "production V3 verifier artifact paths are invalid")?;
+        Ok(Some(WorkerProductionArtifacts::Paths(artifacts)))
+    }
 }
 
 #[cfg(feature = "production-v3")]
 fn load_production_v3_verifier(
     network_id: [u8; 32],
-    artifacts: &ProductionV3VerifierArtifacts,
+    artifacts: WorkerProductionArtifacts,
 ) -> Result<ConsensusPowVerifier, (u16, String)> {
+    #[cfg(windows)]
+    {
+        let WorkerProductionArtifacts::Handles(handles) = artifacts;
+        crate::windows_artifacts::load_production_v3_verifier_from_inherited_handles(
+            network_id, handles,
+        )
+        .map_err(|_| {
+            (
+                ERROR_INTERNAL,
+                "could not authenticate the inherited production V3 verifier artifacts".to_owned(),
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    let WorkerProductionArtifacts::Paths(artifacts) = artifacts;
+    #[cfg(not(windows))]
     cmfd_consensus::dory_v3_model_bank_record_validation::load_production_dory_v3_consensus_verifier(
         network_id,
         &artifacts.bank,
@@ -1909,7 +2496,7 @@ fn load_production_v3_verifier(
 #[cfg(not(feature = "production-v3"))]
 fn load_production_v3_verifier(
     _network_id: [u8; 32],
-    _artifacts: &ProductionV3VerifierArtifacts,
+    _artifacts: WorkerProductionArtifacts,
 ) -> Result<ConsensusPowVerifier, (u16, String)> {
     Err((
         ERROR_UNSUPPORTED_VERIFIER,
@@ -2207,42 +2794,75 @@ mod tests {
 
     #[test]
     fn verifier_worker_arguments_never_infer_or_fallback_between_profiles() {
-        assert_eq!(
-            parse_verifier_worker_arguments([std::ffi::OsString::from(VERIFY_MODE)]).unwrap(),
-            None
-        );
-
-        let root = std::env::current_dir().unwrap();
-        let bank = root.join("model.bank");
-        let manifest = root.join("model.manifest.json");
-        let record_v2 = root.join("model.record-v2.json");
-        let parsed = parse_verifier_worker_arguments([
-            std::ffi::OsString::from(VERIFY_MODE),
-            std::ffi::OsString::from(V3_BANK_ARGUMENT),
-            bank.clone().into_os_string(),
-            std::ffi::OsString::from(V3_MANIFEST_ARGUMENT),
-            manifest.clone().into_os_string(),
-            std::ffi::OsString::from(V3_RECORD_ARGUMENT),
-            record_v2.clone().into_os_string(),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            parsed,
-            ProductionV3VerifierArtifacts {
-                bank,
-                manifest,
-                record_v2,
-            }
-        );
-
         assert!(
-            parse_verifier_worker_arguments([
+            parse_verifier_worker_arguments([std::ffi::OsString::from(VERIFY_MODE)])
+                .unwrap()
+                .is_none()
+        );
+
+        #[cfg(not(windows))]
+        {
+            let root = std::env::current_dir().unwrap();
+            let bank = root.join("model.bank");
+            let manifest = root.join("model.manifest.json");
+            let record_v2 = root.join("model.record-v2.json");
+            let parsed = parse_verifier_worker_arguments([
                 std::ffi::OsString::from(VERIFY_MODE),
                 std::ffi::OsString::from(V3_BANK_ARGUMENT),
+                bank.clone().into_os_string(),
+                std::ffi::OsString::from(V3_MANIFEST_ARGUMENT),
+                manifest.clone().into_os_string(),
+                std::ffi::OsString::from(V3_RECORD_ARGUMENT),
+                record_v2.clone().into_os_string(),
             ])
-            .is_err()
-        );
+            .unwrap()
+            .unwrap();
+            let WorkerProductionArtifacts::Paths(parsed) = parsed;
+            assert_eq!(
+                parsed,
+                ProductionV3VerifierArtifacts {
+                    bank,
+                    manifest,
+                    record_v2,
+                }
+            );
+
+            assert!(
+                parse_verifier_worker_arguments([
+                    std::ffi::OsString::from(VERIFY_MODE),
+                    std::ffi::OsString::from(V3_BANK_ARGUMENT),
+                ])
+                .is_err()
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                parse_verifier_worker_arguments([
+                    std::ffi::OsString::from(VERIFY_MODE),
+                    std::ffi::OsString::from("--production-v3-bank"),
+                    std::ffi::OsString::from(r"C:\forbidden-path-fallback.bank"),
+                    std::ffi::OsString::from("--production-v3-manifest"),
+                    std::ffi::OsString::from(r"C:\forbidden-path-fallback.manifest"),
+                    std::ffi::OsString::from("--production-v3-record-v2"),
+                    std::ffi::OsString::from(r"C:\forbidden-path-fallback.record"),
+                ])
+                .is_err(),
+                "Windows ProductionV3 must not retain a pathname fallback"
+            );
+            assert!(
+                parse_verifier_worker_arguments([
+                    std::ffi::OsString::from(VERIFY_MODE),
+                    std::ffi::OsString::from(
+                        crate::windows_launcher::WINDOWS_ARTIFACT_HANDLES_ARGUMENT,
+                    ),
+                    std::ffi::OsString::from("invalid"),
+                    std::ffi::OsString::from("invalid"),
+                    std::ffi::OsString::from("invalid"),
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2301,6 +2921,96 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn private_copy_cleanup_never_deletes_a_path_replacement_after_releasing_identity() {
+        let _ledger = crate::process::isolated_appcontainer_ledger_test();
+        let sequence = PRIVATE_COPY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cmfd-verifier-copy-replacement-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source.exe");
+        fs::write(&source, b"identity-bound outer runtime").unwrap();
+        let expected = <[u8; 32]>::from(Sha256::digest(b"identity-bound outer runtime"));
+        let mut runtime = PrivateRuntimeCopy::create(&source, expected).unwrap();
+        let directory = runtime.directory.clone();
+        let executable = runtime.executable.clone();
+
+        let moved_directory = root.join("moved-runtime");
+        assert!(fs::rename(&directory, &moved_directory).is_err());
+        let replacement_candidate = root.join("replacement.exe");
+        fs::write(&replacement_candidate, b"replacement candidate").unwrap();
+        assert!(fs::rename(&replacement_candidate, &executable).is_err());
+
+        let mut cleanup = runtime
+            .cleanup
+            .take()
+            .expect("Windows private copy owns exact cleanup handles");
+        let error = cleanup
+            .cleanup_with_hook(|| fs::write(&executable, b"replacement after disposition"))
+            .unwrap_err();
+        assert!(
+            error.kind() == io::ErrorKind::DirectoryNotEmpty || error.raw_os_error().is_some(),
+            "unexpected retained-directory cleanup failure: {error}"
+        );
+        assert_eq!(
+            fs::read(&executable).unwrap(),
+            b"replacement after disposition"
+        );
+        cleanup.release_without_deletion_for_test();
+        drop(cleanup);
+        drop(runtime);
+        assert_eq!(
+            fs::read(&executable).unwrap(),
+            b"replacement after disposition",
+            "cleanup deleted a replacement reachable only through the released pathname"
+        );
+
+        fs::remove_file(executable).unwrap();
+        fs::remove_dir(directory).unwrap();
+        fs::remove_file(replacement_candidate).unwrap();
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_copy_cleanup_retries_native_directory_busy_errors_without_reopening_path() {
+        let sequence = PRIVATE_COPY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cmfd-verifier-copy-retry-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source.exe");
+        fs::write(&source, b"identity-bound outer runtime retry").unwrap();
+        let expected = <[u8; 32]>::from(Sha256::digest(b"identity-bound outer runtime retry"));
+        let mut runtime = PrivateRuntimeCopy::create(&source, expected).unwrap();
+        let directory = runtime.directory.clone();
+        let transient = directory.join("transient-loader-pin");
+        fs::write(&transient, b"temporary").unwrap();
+        let remover = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            fs::remove_file(transient).unwrap();
+        });
+
+        runtime
+            .cleanup
+            .as_mut()
+            .expect("Windows private copy owns exact cleanup handles")
+            .cleanup()
+            .unwrap();
+        remover.join().unwrap();
+        assert!(!runtime.executable.exists());
+        assert!(!directory.exists());
+
+        drop(runtime);
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn persistent_stderr_overflow_is_capture_bounded() {
         let capture = Arc::new(Mutex::new(StderrCapture::default()));
@@ -2319,6 +3029,156 @@ mod tests {
         if std::env::var_os("CMFD_PERSISTENT_TEARDOWN_CHILD").is_some() {
             thread::sleep(Duration::from_secs(5));
         }
+    }
+
+    fn forced_cleanup_persistent_process() -> (PersistentVerifierProcess, Arc<AtomicBool>) {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("verifier::tests::persistent_teardown_child_helper")
+            .arg("--nocapture")
+            .env("CMFD_PERSISTENT_TEARDOWN_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_contained(&mut command, None).unwrap();
+        child.force_termination_failures(1);
+        let transport_poisoned = Arc::new(AtomicBool::new(false));
+        let process =
+            PersistentVerifierProcess::new(child, 1, Arc::clone(&transport_poisoned)).unwrap();
+        (process, transport_poisoned)
+    }
+
+    fn assert_persistent_cleanup_wrap(
+        error: VerifierWorkerError,
+        primary: impl FnOnce(&VerifierWorkerError) -> bool,
+    ) {
+        let VerifierWorkerError::CleanupAfterFailure { worker, source } = error else {
+            panic!("cleanup failure was not composed with the primary error: {error}");
+        };
+        assert!(primary(&worker), "wrong primary error: {worker}");
+        assert!(
+            source
+                .to_string()
+                .contains("forced contained-process cleanup failure"),
+            "wrong cleanup error: {source}"
+        );
+    }
+
+    #[test]
+    fn persistent_timeout_composes_forced_cleanup_and_poisons_transport() {
+        let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
+        process.stdin = Some(Box::new(io::sink()));
+        process.stdout = Some(Box::new(SlowReader));
+        let error = process
+            .exchange(Vec::new(), Duration::from_millis(10), 1024)
+            .unwrap_err();
+        assert_persistent_cleanup_wrap(error, |worker| {
+            matches!(
+                worker,
+                VerifierWorkerError::Process(ProofWorkerError::Timeout { .. })
+            )
+        });
+        assert!(transport_poisoned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn persistent_missing_pipe_composes_forced_cleanup_and_poisons_transport() {
+        let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
+        process.stdout.take();
+        let error = process
+            .exchange(Vec::new(), Duration::from_secs(1), 1024)
+            .unwrap_err();
+        assert_persistent_cleanup_wrap(error, |worker| {
+            matches!(
+                worker,
+                VerifierWorkerError::Process(ProofWorkerError::InvalidConfig(message))
+                    if *message == "persistent worker stdout pipe is unavailable"
+            )
+        });
+        assert!(transport_poisoned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn persistent_constructor_missing_pipe_composes_forced_cleanup() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("verifier::tests::persistent_teardown_child_helper")
+            .arg("--nocapture")
+            .env("CMFD_PERSISTENT_TEARDOWN_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_contained(&mut command, None).unwrap();
+        child.force_termination_failures(1);
+        let transport_poisoned = Arc::new(AtomicBool::new(false));
+        let error = PersistentVerifierProcess::new(child, 1, Arc::clone(&transport_poisoned))
+            .err()
+            .expect("missing pipe must fail construction");
+        assert_persistent_cleanup_wrap(error, |worker| {
+            matches!(
+                worker,
+                VerifierWorkerError::Process(ProofWorkerError::InvalidConfig(message))
+                    if *message == "worker stdin pipe was not created"
+            )
+        });
+        assert!(transport_poisoned.load(Ordering::Acquire));
+    }
+
+    struct PanickingWriter;
+
+    struct SlowReader;
+
+    impl Read for SlowReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_millis(100));
+            Ok(0)
+        }
+    }
+
+    impl Write for PanickingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            panic!("forced persistent I/O-thread disconnect");
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn persistent_disconnect_composes_forced_cleanup_and_poisons_transport() {
+        let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
+        process.stdin = Some(Box::new(PanickingWriter));
+        let error = process
+            .exchange(Vec::new(), Duration::from_secs(1), 1024)
+            .unwrap_err();
+        assert_persistent_cleanup_wrap(error, |worker| {
+            matches!(
+                worker,
+                VerifierWorkerError::Process(ProofWorkerError::PipeThread(
+                    "exchanging persistent verifier frames"
+                ))
+            )
+        });
+        assert!(transport_poisoned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_termination_failure_poisons_transport() {
+        let (mut process, transport_poisoned) = forced_cleanup_persistent_process();
+        let terminator = process.child.termination_handle();
+        terminate_for_shutdown(&terminator, &transport_poisoned);
+        assert!(transport_poisoned.load(Ordering::Acquire));
+        process.child.terminate_and_reap().unwrap();
+    }
+
+    #[test]
+    fn persistent_drop_termination_failure_poisons_transport() {
+        let (process, transport_poisoned) = forced_cleanup_persistent_process();
+        drop(process);
+        assert!(transport_poisoned.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2340,7 +3200,7 @@ mod tests {
         // Replace the real stderr reader with a deliberately stuck handle.
         // Reap and join the real reader first so this test does not itself
         // create an untracked pipe thread.
-        process.child.terminate_and_reap();
+        process.child.terminate_and_reap().unwrap();
         process.stdin.take();
         process.stdout.take();
         assert!(finish_pipe_thread_bounded(

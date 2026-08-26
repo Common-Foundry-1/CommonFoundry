@@ -1,4 +1,4 @@
-#[cfg(any(not(feature = "production-v3"), target_os = "linux"))]
+#[cfg(any(not(feature = "production-v3"), windows, target_os = "linux"))]
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(any(windows, target_os = "linux"))]
 use std::process::Stdio;
-#[cfg(any(not(feature = "production-v3"), target_os = "linux"))]
+#[cfg(any(not(feature = "production-v3"), windows, target_os = "linux"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
@@ -26,15 +26,15 @@ use cmfd_proof_worker::{
 };
 use sha2::{Digest, Sha256};
 
-#[cfg(any(not(feature = "production-v3"), target_os = "linux"))]
+#[cfg(any(not(feature = "production-v3"), windows, target_os = "linux"))]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(not(feature = "production-v3"))]
+#[cfg(any(not(feature = "production-v3"), windows))]
 struct TestArtifacts {
     root: PathBuf,
 }
 
-#[cfg(not(feature = "production-v3"))]
+#[cfg(any(not(feature = "production-v3"), windows))]
 impl TestArtifacts {
     fn create() -> Self {
         let root = std::env::temp_dir().join(format!(
@@ -53,7 +53,7 @@ impl TestArtifacts {
     }
 }
 
-#[cfg(not(feature = "production-v3"))]
+#[cfg(any(not(feature = "production-v3"), windows))]
 impl Drop for TestArtifacts {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -289,15 +289,46 @@ fn persistent_worker_rejects_wrong_feature_before_serving_and_redacts_paths() {
     assert!(!error.to_string().contains(secret_marker));
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "production-v3"))]
 #[test]
-fn production_v3_fails_before_copy_or_spawn_without_appcontainer() {
+fn production_v3_launches_the_real_worker_with_authenticated_small_artifacts() {
+    const ISOLATED_CHILD: &str = "CMFD_PRODUCTION_V3_LEDGER_ISOLATED_CHILD";
+    const EXPECT_REAL_LEDGER_QUARANTINE: &str = "CMFD_PRODUCTION_V3_EXPECT_REAL_LEDGER_QUARANTINE";
+    if std::env::var_os(ISOLATED_CHILD).is_none() {
+        let local_app_data = TestArtifacts::create();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("production_v3_launches_the_real_worker_with_authenticated_small_artifacts")
+            .arg("--nocapture")
+            .env(ISOLATED_CHILD, "1")
+            .env("LOCALAPPDATA", &local_app_data.root)
+            .output()
+            .expect("run the ProductionV3 integration in an isolated LOCALAPPDATA process");
+        assert!(
+            output.status.success(),
+            "isolated ProductionV3 integration failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ledger = local_app_data
+            .root
+            .join("CommonFoundry")
+            .join("AppContainerProfileCleanupV1");
+        if ledger.exists() {
+            assert!(
+                fs::read_dir(&ledger).unwrap().next().is_none(),
+                "the isolated ProductionV3 integration left cleanup-ledger sessions behind"
+            );
+        }
+        return;
+    }
+
+    let files = TestArtifacts::create();
     let mut config = worker_config();
-    config.worker_executable = PathBuf::from(r"C:\cmfd-sandbox-gate\missing-worker.exe");
     config.production_v3_artifacts = Some(cmfd_proof_worker::ProductionV3VerifierArtifacts {
-        bank: PathBuf::from(r"C:\cmfd-sandbox-gate\bank"),
-        manifest: PathBuf::from(r"C:\cmfd-sandbox-gate\manifest"),
-        record_v2: PathBuf::from(r"C:\cmfd-sandbox-gate\record-v2"),
+        bank: files.write("small.bank", b"authenticated-small-bank"),
+        manifest: files.write("small-manifest.json", br#"{"version":3}"#),
+        record_v2: files.write("small-record-v2.json", br#"{"records":[]}"#),
     });
     let (verifier, block) = candidate_block();
     let error = PersistentVerifierWorker::start(
@@ -306,11 +337,29 @@ fn production_v3_fails_before_copy_or_spawn_without_appcontainer() {
         block.challenge.network_id,
     )
     .err()
-    .expect("Windows ProductionV3 must fail before accessing the missing worker");
-    assert!(matches!(error, VerifierWorkerError::SandboxUnavailable(_)));
+    .expect("the real worker must reject deliberately non-production small artifacts");
+    if std::env::var_os(EXPECT_REAL_LEDGER_QUARANTINE).is_some() {
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("stale AppContainer cleanup session")
+                && diagnostic.contains("manual remediation is required"),
+            "the real production ledger did not fail closed on its stale session: {error:?}"
+        );
+        eprintln!("REAL_LEDGER_QUARANTINE={diagnostic}");
+        return;
+    }
+    assert!(
+        !matches!(error, VerifierWorkerError::SandboxUnavailable(_)),
+        "the implemented AppContainer launcher must run before artifact parsing: {error:?}"
+    );
+    assert!(!error.to_string().contains("missing-worker"));
     let error = verify_block_out_of_process(&config, &verifier, &block)
-        .expect_err("one-shot Windows ProductionV3 must fail before accessing the missing worker");
-    assert!(matches!(error, VerifierWorkerError::SandboxUnavailable(_)));
+        .expect_err("one-shot real worker must reject deliberately non-production artifacts");
+    assert!(
+        !matches!(error, VerifierWorkerError::SandboxUnavailable(_)),
+        "the one-shot path must reach the implemented AppContainer launcher: {error:?}"
+    );
+    assert!(!error.to_string().contains("missing-worker"));
 }
 
 #[test]

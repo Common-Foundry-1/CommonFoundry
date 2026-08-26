@@ -64,7 +64,7 @@ pub(crate) fn required_production_status() -> Result<VerifierSandboxStatus, &'st
     }
     #[cfg(windows)]
     {
-        Err("Windows AppContainer/LPAC launch with handle-only artifact access is not implemented")
+        Ok(VerifierSandboxStatus::WindowsAppContainerV1)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -84,10 +84,8 @@ pub(crate) fn install_production(artifacts: &[&Path]) -> Result<VerifierSandboxS
     #[cfg(windows)]
     {
         let _ = artifacts;
-        Err(
-            "ProductionV3 is fail-closed on Windows until an AppContainer/LPAC verifier launch is enforced"
-                .to_owned(),
-        )
+        crate::windows_launcher::validate_current_process_sandbox()?;
+        Ok(VerifierSandboxStatus::WindowsAppContainerV1)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -98,21 +96,15 @@ pub(crate) fn install_production(artifacts: &[&Path]) -> Result<VerifierSandboxS
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use std::path::Path;
-
-    use super::{install_production, required_production_status};
+    use super::{VerifierSandboxStatus, install_production, required_production_status};
 
     #[test]
-    fn production_verifier_stays_closed_without_appcontainer_launch() {
-        assert!(required_production_status().is_err());
-        assert!(
-            install_production(&[
-                Path::new(r"C:\bank"),
-                Path::new(r"C:\manifest"),
-                Path::new(r"C:\record"),
-            ])
-            .is_err()
+    fn production_verifier_requires_the_appcontainer_launch_context() {
+        assert_eq!(
+            required_production_status(),
+            Ok(VerifierSandboxStatus::WindowsAppContainerV1)
         );
+        assert!(install_production(&[]).is_err());
     }
 }
 

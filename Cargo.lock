@@ -955,6 +955,9 @@ dependencies = [
  "cmfd-node",
  "ctrlc",
  "hex",
+ "same-file",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

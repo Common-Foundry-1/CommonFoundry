@@ -1,10 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "production-v3")]
 use std::fs::File;
+#[cfg(feature = "production-v3-testnet")]
+use std::fs::{self, OpenOptions};
 #[cfg(feature = "production-v3")]
 use std::io::BufReader;
+#[cfg(feature = "production-v3-testnet")]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "production-v3-testnet")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -15,8 +21,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::ForgeMatrixV3WinningNonceClaim;
+#[cfg(feature = "production-v3-testnet")]
+use cmfd_consensus::dory_v3_qualification::ProductionDoryV3QualificationSeed;
+#[cfg(feature = "production-v3-testnet")]
+use cmfd_consensus::{
+    BlockChallenge, Coinbase, MAX_BLOCK_BYTES, MAX_PROOF_BYTES, Transaction,
+    decode_forgematrix_proof, encode_forgematrix_proof,
+};
 use cmfd_consensus::{BlockProof, ForgeMatrixV2AcceleratorModel};
 use cmfd_cuda::{CudaDevice, CudaLibrary};
+#[cfg(feature = "production-v3-testnet")]
+use cmfd_node::NetworkProfileKind;
 use cmfd_node::p2p::{
     relay_blocks_to_peer_once_with_policy, request_mining_template_once_with_policy,
     spawn_inbound_listener_with_policy, spawn_static_peer_polling,
@@ -39,10 +54,17 @@ use cmfd_node::{
 use cmfd_node::{
     ProductionV3MiningPeerIdentity, ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts,
 };
+#[cfg(feature = "production-v3-testnet")]
+use same_file::Handle as SameFileHandle;
 
 mod telemetry;
 
 use telemetry::{GpuTelemetry, query_nvidia_smi};
+
+#[cfg(feature = "production-v3-testnet")]
+const QUALIFIED_TEMPLATE_FORMAT_VERSION: u16 = 1;
+#[cfg(feature = "production-v3-testnet")]
+static QUALIFIED_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_MINER_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.miner_data_dir_identity();
 const DEFAULT_MINER_P2P_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.miner_p2p_address();
@@ -127,6 +149,48 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_STATS_SECONDS)]
         stats_seconds: u64,
         #[cfg(feature = "production-v3")]
+        #[command(flatten)]
+        production_v3: ProductionV3Cli,
+    },
+    /// Freeze one exact ProductionV3 node template and its qualification seed.
+    #[cfg(feature = "production-v3-testnet")]
+    SnapshotQualifiedTemplate {
+        /// Compiled-network node that provides the immutable template.
+        #[arg(long)]
+        peer: SocketAddr,
+        /// Allow a numeric public peer address for explicitly enabled public testing.
+        #[arg(long)]
+        allow_public_peers: bool,
+        /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
+        #[arg(long)]
+        miner: String,
+        /// Nonce to qualify. The low-difficulty tester network normally uses zero.
+        #[arg(long, default_value_t = 0)]
+        nonce: u64,
+        /// New absolute JSON path for the exact immutable template.
+        #[arg(long)]
+        template_output: PathBuf,
+        /// New absolute JSON path accepted by `cmfd-consensus dory-v3-qualify-request`.
+        #[arg(long)]
+        seed_output: PathBuf,
+        #[command(flatten)]
+        production_v3: ProductionV3Cli,
+    },
+    /// Submit a completed qualification proof against its frozen ProductionV3 template.
+    #[cfg(feature = "production-v3-testnet")]
+    SubmitQualifiedTemplate {
+        /// Compiled-network node that issued the frozen template.
+        #[arg(long)]
+        peer: SocketAddr,
+        /// Allow a numeric public peer address for explicitly enabled public testing.
+        #[arg(long)]
+        allow_public_peers: bool,
+        /// Existing absolute JSON path produced by `snapshot-qualified-template`.
+        #[arg(long)]
+        template: PathBuf,
+        /// Existing absolute canonical proof wire produced by `dory-v3-qualify`.
+        #[arg(long)]
+        proof: PathBuf,
         #[command(flatten)]
         production_v3: ProductionV3Cli,
     },
@@ -298,6 +362,32 @@ fn main() -> Result<()> {
             #[cfg(feature = "production-v3")]
             production_v3,
         }),
+        #[cfg(feature = "production-v3-testnet")]
+        Command::SnapshotQualifiedTemplate {
+            peer,
+            allow_public_peers,
+            miner,
+            nonce,
+            template_output,
+            seed_output,
+            production_v3,
+        } => snapshot_qualified_template(
+            peer,
+            allow_public_peers,
+            &miner,
+            nonce,
+            &template_output,
+            &seed_output,
+            production_v3,
+        ),
+        #[cfg(feature = "production-v3-testnet")]
+        Command::SubmitQualifiedTemplate {
+            peer,
+            allow_public_peers,
+            template,
+            proof,
+            production_v3,
+        } => submit_qualified_template(peer, allow_public_peers, &template, &proof, production_v3),
         Command::FullNode {
             data_dir,
             p2p_bind,
@@ -326,6 +416,419 @@ fn main() -> Result<()> {
             production_v3,
         }),
     }
+}
+
+#[cfg(feature = "production-v3-testnet")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenProductionV3Template {
+    format_version: u16,
+    challenge: BlockChallenge,
+    coinbase: Coinbase,
+    transactions: Vec<Transaction>,
+}
+
+#[cfg(feature = "production-v3-testnet")]
+impl FrozenProductionV3Template {
+    fn from_mining_template(template: MiningTemplate) -> Self {
+        Self {
+            format_version: QUALIFIED_TEMPLATE_FORMAT_VERSION,
+            challenge: template.challenge,
+            coinbase: template.coinbase,
+            transactions: template.transactions,
+        }
+    }
+
+    fn into_mining_template(self) -> Result<MiningTemplate> {
+        if self.format_version != QUALIFIED_TEMPLATE_FORMAT_VERSION {
+            bail!(
+                "unsupported qualified-template format version {}",
+                self.format_version
+            );
+        }
+        Ok(MiningTemplate {
+            challenge: self.challenge,
+            coinbase: self.coinbase,
+            transactions: self.transactions,
+        })
+    }
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn snapshot_qualified_template(
+    peer: SocketAddr,
+    allow_public_peers: bool,
+    miner: &str,
+    nonce: u64,
+    template_output: &Path,
+    seed_output: &Path,
+    production_v3: ProductionV3Cli,
+) -> Result<()> {
+    ensure_production_v3_test_tool()?;
+    ensure_new_absolute_output(template_output, "qualified template")?;
+    ensure_new_absolute_output(seed_output, "qualification seed")?;
+    if template_output == seed_output {
+        bail!("qualified template and qualification seed outputs must be different paths");
+    }
+    let payout = parse_miner_destination(miner).map_err(anyhow::Error::from)?;
+    let address_policy = qualified_template_address_policy(peer, allow_public_peers)?;
+    let limits = PeerLimits::default();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Release))?;
+
+    let runtime = production_v3.into_runtime()?;
+    println!("Authenticating and preparing the pinned Production V3 model...");
+    let factory = ProductionV3MiningWorkFactory::load(
+        runtime.artifacts,
+        runtime.scratch_directory,
+        runtime.maximum_native_block_rows,
+        &shutdown,
+    )?;
+    let response = request_production_v3_mining_template_once_with_policy(
+        peer,
+        payout,
+        factory.peer_identity(),
+        limits,
+        address_policy,
+    )?;
+    factory.work(response.template.challenge)?;
+    let frozen = FrozenProductionV3Template::from_mining_template(response.template);
+    let seed = ProductionDoryV3QualificationSeed {
+        block: frozen.challenge,
+        nonce,
+    };
+    let frozen_json = canonical_json(&frozen, "qualified template")?;
+    let seed_json = canonical_json(&seed, "qualification seed")?;
+    // The template is the completion marker. Publishing the seed first means
+    // an interrupted pair can never look like a complete frozen template.
+    write_new_file(seed_output, &seed_json, "qualification seed")?;
+    write_new_file(template_output, &frozen_json, "qualified template")?;
+    println!(
+        "Frozen Production V3 height {} from {peer}.",
+        frozen.challenge.height
+    );
+    println!("Template: {}", template_output.display());
+    println!("Qualification seed: {}", seed_output.display());
+    Ok(())
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn submit_qualified_template(
+    peer: SocketAddr,
+    allow_public_peers: bool,
+    template_path: &Path,
+    proof_path: &Path,
+    production_v3: ProductionV3Cli,
+) -> Result<()> {
+    ensure_production_v3_test_tool()?;
+    ensure_existing_absolute_file(template_path, "qualified template")?;
+    ensure_existing_absolute_file(proof_path, "qualification proof")?;
+    let address_policy = qualified_template_address_policy(peer, allow_public_peers)?;
+    let frozen_bytes = read_bounded_file(template_path, MAX_BLOCK_BYTES, "qualified template")?;
+    let frozen: FrozenProductionV3Template = serde_json::from_slice(&frozen_bytes)
+        .with_context(|| format!("failed to parse {}", template_path.display()))?;
+    if canonical_json(&frozen, "qualified template")? != frozen_bytes {
+        bail!("qualified template is not canonical JSON");
+    }
+    let template = frozen.into_mining_template()?;
+    let proof_bytes = read_bounded_file(proof_path, MAX_PROOF_BYTES, "qualification proof")?;
+    let proof = decode_forgematrix_proof(&proof_bytes, template.challenge.network_id)
+        .context("failed to decode canonical qualification proof")?;
+    if encode_forgematrix_proof(&proof, template.challenge.network_id)? != proof_bytes {
+        bail!("qualification proof is not canonical");
+    }
+    if !matches!(proof, BlockProof::V3Candidate(_)) {
+        bail!("qualification proof is not a Production V3 candidate");
+    }
+    if proof.work_digest() > template.challenge.target {
+        bail!("qualification proof does not meet the frozen template target");
+    }
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Release))?;
+    let runtime = production_v3.into_runtime()?;
+    println!("Authenticating the pinned Production V3 model before submission...");
+    let factory = ProductionV3MiningWorkFactory::load(
+        runtime.artifacts,
+        runtime.scratch_directory,
+        runtime.maximum_native_block_rows,
+        &shutdown,
+    )?;
+    factory.work(template.challenge)?;
+    let identity = ThinMinerHandshakeIdentity::ProductionV3(factory.peer_identity());
+    let block = template.into_block(proof);
+    let block_id = block.block_id();
+    let deadline = Instant::now()
+        .checked_add(FOUND_BLOCK_RETRY_BUDGET)
+        .ok_or_else(|| anyhow!("qualified-block retry deadline overflow"))?;
+    let cancellation = Arc::clone(&shutdown);
+    let report = retry_exact_block_with(
+        &[peer],
+        Some(peer),
+        &block,
+        deadline,
+        &shutdown,
+        |address, candidate, attempt_deadline| match identity.submit_before_cancellable(
+            address,
+            candidate,
+            PeerLimits::default(),
+            address_policy,
+            attempt_deadline,
+            Arc::clone(&cancellation),
+        ) {
+            Ok(result) => ExactBlockSubmissionAttempt::Response(result),
+            Err(error) if error.is_cancelled() || error.is_transport_disconnect() => {
+                ExactBlockSubmissionAttempt::Disconnected(error.to_string())
+            }
+            Err(error) => ExactBlockSubmissionAttempt::ProtocolViolation(error.to_string()),
+        },
+        interruptible_wait,
+        Instant::now,
+    );
+    match report.outcome {
+        ExactBlockRetryOutcome::Accepted(accepted_peer) => {
+            println!(
+                "QUALIFIED BLOCK ACCEPTED | height {} | {} | node {accepted_peer}",
+                block.challenge.height,
+                hex::encode(block_id)
+            );
+            Ok(())
+        }
+        ExactBlockRetryOutcome::Rejected => bail!("qualified block was rejected by the node"),
+        ExactBlockRetryOutcome::Stale(tip) => bail!(
+            "frozen qualified template is stale; node tip is {}",
+            hex::encode(tip)
+        ),
+        ExactBlockRetryOutcome::ProtocolViolation { peer, detail } => {
+            bail!("incompatible response from {peer}: {detail}")
+        }
+        ExactBlockRetryOutcome::BudgetExhausted => bail!(
+            "qualified block submission exceeded the {}-second retry budget",
+            FOUND_BLOCK_RETRY_BUDGET.as_secs()
+        ),
+        ExactBlockRetryOutcome::Stopped => bail!("qualified block submission was interrupted"),
+    }
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn ensure_production_v3_test_tool() -> Result<()> {
+    if !matches!(
+        COMPILED_NETWORK_PROFILE.kind,
+        NetworkProfileKind::ProductionV3Testnet
+    ) {
+        bail!("qualified-template commands require the Production V3 tester-network build");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn qualified_template_address_policy(
+    peer: SocketAddr,
+    allow_public_peers: bool,
+) -> Result<PeerAddressPolicy> {
+    let address_policy = if allow_public_peers {
+        PeerAddressPolicy::AllowPublic
+    } else {
+        PeerAddressPolicy::PrivateOnly
+    };
+    StaticPeerConfig {
+        listen_address: DEFAULT_MINER_P2P_ADDRESS,
+        peers: vec![peer],
+        limits: PeerLimits::default(),
+        address_policy,
+    }
+    .validate_client_peers()?;
+    Ok(address_policy)
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn ensure_new_absolute_output(path: &Path, label: &str) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("{label} output must be an absolute path");
+    }
+    if path.exists() {
+        bail!("{label} output already exists: {}", path.display());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{label} output has no parent directory"))?;
+    if !parent.is_dir() {
+        bail!("{label} output parent does not exist: {}", parent.display());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn ensure_existing_absolute_file(path: &Path, label: &str) -> Result<()> {
+    if !path.is_absolute() || !path.is_file() {
+        bail!(
+            "{label} must be an existing absolute file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn canonical_json<T>(value: &T, label: &str) -> Result<Vec<u8>>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    let decoded: T = serde_json::from_slice(&bytes)?;
+    if &decoded != value {
+        bail!("{label} failed canonical JSON round trip");
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn write_new_file(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{label} output has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{label} output has no file name"))?
+        .to_string_lossy();
+    let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)
+        .with_context(|| format!("failed to create temporary {label}"))?;
+    let temporary_identity = SameFileHandle::from_file(
+        file.try_clone()
+            .with_context(|| format!("failed to retain {label} output handle"))?,
+    )
+    .with_context(|| format!("failed to identify {label} output"))?;
+    let temporary_output = UnconfirmedOutput::new(temporary_path.clone(), temporary_identity);
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write temporary {label}"))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync temporary {label}"))?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut verified = Vec::with_capacity(bytes.len() + 1);
+    Read::by_ref(&mut file)
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut verified)?;
+    if verified != bytes {
+        bail!("temporary {label} failed retained-handle read-back verification");
+    }
+
+    let published_identity = SameFileHandle::from_file(
+        file.try_clone()
+            .with_context(|| format!("failed to retain publishable {label} handle"))?,
+    )
+    .with_context(|| format!("failed to identify publishable {label}"))?;
+    fs::hard_link(&temporary_path, path)
+        .with_context(|| format!("failed to publish {label} {}", path.display()))?;
+    let mut published_output = UnconfirmedOutput::new(path.to_path_buf(), published_identity);
+
+    let published_file = File::open(path)
+        .with_context(|| format!("failed to reopen published {label} {}", path.display()))?;
+    let reopened_identity = SameFileHandle::from_file(
+        published_file
+            .try_clone()
+            .with_context(|| format!("failed to retain published {label} handle"))?,
+    )
+    .with_context(|| format!("failed to identify published {label}"))?;
+    if reopened_identity != published_output.identity {
+        bail!("{label} output was replaced before publication completed");
+    }
+    let mut reopened_bytes = Vec::with_capacity(bytes.len() + 1);
+    published_file
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut reopened_bytes)?;
+    if reopened_bytes != bytes {
+        bail!("{label} failed published-file read-back verification");
+    }
+    sync_output_parent(parent)?;
+    published_output.confirm();
+    drop(file);
+    if SameFileHandle::from_path(&temporary_path)
+        .is_ok_and(|current| current == temporary_output.identity)
+    {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-v3-testnet")]
+struct UnconfirmedOutput {
+    path: PathBuf,
+    identity: SameFileHandle,
+    confirmed: bool,
+}
+
+#[cfg(feature = "production-v3-testnet")]
+impl UnconfirmedOutput {
+    fn new(path: PathBuf, identity: SameFileHandle) -> Self {
+        Self {
+            path,
+            identity,
+            confirmed: false,
+        }
+    }
+
+    fn confirm(&mut self) {
+        self.confirmed = true;
+    }
+}
+
+#[cfg(feature = "production-v3-testnet")]
+impl Drop for UnconfirmedOutput {
+    fn drop(&mut self) {
+        if !self.confirmed
+            && SameFileHandle::from_path(&self.path).is_ok_and(|current| current == self.identity)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(all(feature = "production-v3-testnet", unix))]
+fn sync_output_parent(parent: &Path) -> Result<()> {
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(all(feature = "production-v3-testnet", not(unix)))]
+fn sync_output_parent(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "production-v3-testnet")]
+fn read_bounded_file(path: &Path, maximum_bytes: usize, label: &str) -> Result<Vec<u8>> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} is not a regular file");
+    }
+    let length = metadata.len();
+    if length > maximum_bytes as u64 {
+        bail!("{label} exceeds its {maximum_bytes}-byte limit");
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(maximum_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    if bytes.len() > maximum_bytes {
+        bail!("{label} exceeds its {maximum_bytes}-byte limit");
+    }
+    Ok(bytes)
 }
 
 fn load_cuda(path: Option<&Path>) -> Result<CudaLibrary> {
@@ -3391,6 +3894,100 @@ mod tests {
             peer_height: block.challenge.height.saturating_sub(1),
             peer_tip,
         }
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    fn frozen_template_fixture() -> FrozenProductionV3Template {
+        let block = retry_test_block();
+        FrozenProductionV3Template {
+            format_version: QUALIFIED_TEMPLATE_FORMAT_VERSION,
+            challenge: block.challenge,
+            coinbase: block.coinbase,
+            transactions: block.transactions,
+        }
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn qualified_template_json_is_canonical_and_strict() {
+        let frozen = frozen_template_fixture();
+        let encoded = canonical_json(&frozen, "qualified template").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<FrozenProductionV3Template>(&encoded).unwrap(),
+            frozen
+        );
+
+        let mut value = serde_json::to_value(&frozen).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<FrozenProductionV3Template>(value).is_err());
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn qualified_template_rejects_unknown_format_version() {
+        let mut frozen = frozen_template_fixture();
+        frozen.format_version = QUALIFIED_TEMPLATE_FORMAT_VERSION + 1;
+        assert!(frozen.into_mining_template().is_err());
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn qualified_template_commands_are_available_in_production_builds() {
+        let snapshot = Cli::try_parse_from([
+            "cmfd-miner",
+            "snapshot-qualified-template",
+            "--peer",
+            "127.0.0.1:21444",
+            "--miner",
+            "11e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+            "--template-output",
+            "D:\\qualified-template.json",
+            "--seed-output",
+            "D:\\qualification-seed.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            snapshot.command,
+            Command::SnapshotQualifiedTemplate { nonce: 0, .. }
+        ));
+
+        let submit = Cli::try_parse_from([
+            "cmfd-miner",
+            "submit-qualified-template",
+            "--peer",
+            "127.0.0.1:21444",
+            "--template",
+            "D:\\qualified-template.json",
+            "--proof",
+            "D:\\qualification-proof.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            submit.command,
+            Command::SubmitQualifiedTemplate { .. }
+        ));
+    }
+
+    #[cfg(feature = "production-v3-testnet")]
+    #[test]
+    fn qualified_output_publication_is_exact_and_never_overwrites() {
+        let sequence = QUALIFIED_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "cmfd-qualified-output-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("template.json");
+        write_new_file(&output, b"first\n", "test output").unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"first\n");
+        assert!(write_new_file(&output, b"second\n", "test output").is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"first\n");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_file(output).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

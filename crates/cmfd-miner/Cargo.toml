@@ -11,7 +11,11 @@ production-v3 = [
     "cmfd-consensus/dory-v3-consensus-adapter",
     "cmfd-node/production-v3",
 ]
-production-v3-testnet = ["production-v3", "cmfd-node/production-v3-testnet"]
+production-v3-testnet = [
+    "production-v3",
+    "cmfd-node/production-v3-testnet",
+    "dep:same-file",
+]
 production-rc = ["production-v3", "cmfd-node/production-rc"]
 
 [dependencies]
@@ -22,6 +26,9 @@ cmfd-consensus = { path = "../cmfd-consensus" }
 cmfd-node = { path = "../cmfd-node" }
 ctrlc.workspace = true
 hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+same-file = { workspace = true, optional = true }
 
 [[bin]]
 name = "cmfd-miner"

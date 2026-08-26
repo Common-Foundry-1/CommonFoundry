@@ -51,7 +51,7 @@ use crate::{
 use crate::{
     dory_bls12_381_aggregate::{
         BlsDoryReleasedCompactSource, commit_bls_dory_existing_compact_artifact,
-        commit_bls_dory_existing_compact_artifact_with_cancel, source_artifact_spec,
+        source_artifact_spec,
     },
     dory_bls12_381_compact_artifact::{
         BlsDoryCompactArtifact, BlsDoryGroupedCompactArtifactWriter,
@@ -64,6 +64,7 @@ use crate::{
 
 #[cfg(feature = "whir-prototype")]
 use crate::{
+    dory_bls12_381_aggregate::commit_bls_dory_existing_compact_artifact_with_cancel,
     dory_bls12_381_execution_provider::BlsDoryV3ExecutionArtifactReader,
     dory_bls12_381_logup::{
         BLS_DORY_RANGE_LOGUP_TABLE_VALUES, BlsDoryRangeLogUpError, PreparedBlsDoryRangeLogUpProof,

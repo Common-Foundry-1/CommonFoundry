@@ -97,6 +97,7 @@ use crate::{
 
 #[cfg(feature = "whir-prototype")]
 use crate::{
+    dory_bls12_381_aggregate::prove_bls_dory_deferred_opening_sets_consuming_composed_with_cancel,
     dory_bls12_381_blake3::{
         PreparedBlsDoryV3NativeBlake3Opening,
         verify_encoded_dory_v3_native_blake3_opening_statement,
@@ -109,9 +110,7 @@ use crate::{
 use crate::{
     dory_bls12_381_aggregate::{
         BLS_DORY_AGGREGATE_VERSION, BLS_DORY_COMPOSED_AGGREGATE_CLAIMS,
-        prove_bls_dory_deferred_opening_sets_consuming_composed,
-        prove_bls_dory_deferred_opening_sets_consuming_composed_with_cancel,
-        verify_bls_dory_composed_openings,
+        prove_bls_dory_deferred_opening_sets_consuming_composed, verify_bls_dory_composed_openings,
     },
     dory_bls12_381_blake3::{
         BLS_DORY_BLAKE3_COMPOSED_OPENING_CLAIMS, BLS_DORY_BLAKE3_PROJECTION_VERSION,

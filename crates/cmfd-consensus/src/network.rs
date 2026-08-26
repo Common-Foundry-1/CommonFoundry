@@ -13,7 +13,7 @@ use crate::wire::{
 
 const NETWORK_PARAMS_DOMAIN: &str = "CMFD/NETWORK/PARAMS/V1";
 
-pub const NETWORK_PROTOCOL_VERSION: u32 = 1;
+pub const NETWORK_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FUTURE_OFFSET_SECS: u64 = 24 * 60 * 60;
 pub const MEDIAN_TIME_WINDOW: usize = 11;
 pub const MAX_BLOCK_TRANSACTIONS: usize = 1_024;
@@ -226,7 +226,7 @@ mod tests {
     fn params() -> NetworkParams {
         NetworkParams {
             network_id: [0x11; 32],
-            protocol_version: 1,
+            protocol_version: NETWORK_PROTOCOL_VERSION,
             genesis_hash: [0x22; 32],
             genesis_timestamp: 1_777_777_777,
             pow_limit: [0xff; 32],
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(candidate.validate(), Err(NetworkError::ZeroNetworkId));
 
         let mut candidate = params();
-        candidate.protocol_version = 0;
+        candidate.protocol_version = NETWORK_PROTOCOL_VERSION - 1;
         assert_eq!(
             candidate.validate(),
             Err(NetworkError::UnsupportedProtocolVersion)

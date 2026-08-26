@@ -6583,10 +6583,10 @@ mod tests {
     }
 
     #[test]
-    fn devnet_fingerprint_remains_compatible_with_v10_and_v11() {
+    fn devnet_fingerprint_commits_transaction_merkle_v2_rules() {
         assert_eq!(
             hex::encode(devnet_params().unwrap().fingerprint().unwrap()),
-            "7ae1b8fadadc6e9316e480968fe2647b3a627df33a1a1c7f7c6c53433a4ff778"
+            "bbbadca69495910a1e6b73fe95db17d5b8b9b056361ce1c9dca9dc183114eddf"
         );
     }
 
@@ -7327,7 +7327,11 @@ mod tests {
         let (block_id, fingerprint) = {
             let mut node = Node::open(&path).unwrap();
             let block = node
-                .mine_once(default_miner_destination(), 1_800_000_000, 100)
+                .mine_once(
+                    default_miner_destination(),
+                    1_800_000_000,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
                 .unwrap();
             assert!(matches!(block.proof, BlockProof::V2Reference(_)));
             assert_eq!(node.status().unwrap().accepted_height, 1);
@@ -7614,8 +7618,12 @@ mod tests {
         clean_test_dir(&path);
         {
             let mut node = Node::open(&path).unwrap();
-            node.mine_once(default_miner_destination(), 1_800_000_000, 100)
-                .unwrap();
+            node.mine_once(
+                default_miner_destination(),
+                1_800_000_000,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
         }
         let log_path = path.join(BLOCK_LOG_FILE);
         let file = OpenOptions::new().write(true).open(&log_path).unwrap();
@@ -7633,8 +7641,12 @@ mod tests {
         clean_test_dir(&path);
         {
             let mut node = Node::open(&path).unwrap();
-            node.mine_once(default_miner_destination(), 1_800_000_000, 100)
-                .unwrap();
+            node.mine_once(
+                default_miner_destination(),
+                1_800_000_000,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
         }
         let log_path = path.join(BLOCK_LOG_FILE);
         let mut file = OpenOptions::new()
@@ -7656,10 +7668,14 @@ mod tests {
     }
 
     #[test]
-    fn wrong_fingerprint_is_refused() {
+    fn previous_protocol_fingerprint_is_refused_before_nonempty_log_replay() {
         let path = test_dir("fingerprint");
         clean_test_dir(&path);
-        drop(Node::open(&path).unwrap());
+        let mut node = Node::open(&path).unwrap();
+        let timestamp = DEVNET_GENESIS_TIMESTAMP + 60;
+        let block = mined_child(&node, node.params.genesis_hash, timestamp, 0x91);
+        node.submit_block(block, timestamp).unwrap();
+        drop(node);
         let metadata_path = path.join(METADATA_FILE);
         let mut metadata = OpenOptions::new()
             .read(true)
@@ -7667,7 +7683,12 @@ mod tests {
             .open(&metadata_path)
             .unwrap();
         metadata.seek(SeekFrom::Start(8)).unwrap();
-        metadata.write_all(&[0; 32]).unwrap();
+        metadata
+            .write_all(
+                &hex::decode("7ae1b8fadadc6e9316e480968fe2647b3a627df33a1a1c7f7c6c53433a4ff778")
+                    .unwrap(),
+            )
+            .unwrap();
         metadata.sync_all().unwrap();
         drop(metadata);
 

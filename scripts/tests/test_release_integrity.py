@@ -488,7 +488,7 @@ class ProductionRcGateTests(unittest.TestCase):
             "community_xonly_public_key": community,
         }
         consensus = {
-            "network_protocol_version": 1,
+            "network_protocol_version": 2,
             "block_version": 1,
             "transaction_version": 1,
             "wire_version": 1,

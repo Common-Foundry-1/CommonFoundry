@@ -23,6 +23,7 @@ const TX_ID_DOMAIN: &str = "CMFD/TRANSACTION/ID/V1";
 const COINBASE_ID_DOMAIN: &str = "CMFD/COINBASE/ID/V1";
 const MERKLE_LEAF_DOMAIN: &str = "CMFD/MERKLE/LEAF/V1";
 const MERKLE_NODE_DOMAIN: &str = "CMFD/MERKLE/NODE/V1";
+const MERKLE_ROOT_DOMAIN: &str = "CMFD/TRANSACTION-MERKLE/ROOT/V2";
 const BLOCK_ID_DOMAIN: &str = "CMFD/BLOCK/ID/V1";
 const COINBASE_OUTPOINT_DOMAIN: &str = "CMFD/COINBASE/OUTPOINT/V1";
 
@@ -1367,11 +1368,6 @@ fn validate_coinbase(
 }
 
 pub fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
-    if txids.is_empty() {
-        return *Hasher::new_derive_key(MERKLE_LEAF_DOMAIN)
-            .finalize()
-            .as_bytes();
-    }
     let mut level: Vec<[u8; 32]> = txids
         .iter()
         .map(|txid| {
@@ -1380,6 +1376,13 @@ pub fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
             *hasher.finalize().as_bytes()
         })
         .collect();
+    if level.is_empty() {
+        level.push(
+            *Hasher::new_derive_key(MERKLE_LEAF_DOMAIN)
+                .finalize()
+                .as_bytes(),
+        );
+    }
     while level.len() > 1 {
         if level.len() % 2 == 1 {
             level.push(*level.last().expect("nonempty Merkle level"));
@@ -1394,7 +1397,11 @@ pub fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
             })
             .collect();
     }
-    level[0]
+
+    let mut hasher = Hasher::new_derive_key(MERKLE_ROOT_DOMAIN);
+    hasher.update(&(txids.len() as u64).to_le_bytes());
+    hasher.update(&level[0]);
+    *hasher.finalize().as_bytes()
 }
 
 fn encode_unsigned_transaction(transaction: &Transaction, hasher: &mut Hasher) {
@@ -1530,7 +1537,7 @@ mod tests {
     fn network_params() -> NetworkParams {
         NetworkParams {
             network_id: [1; 32],
-            protocol_version: 1,
+            protocol_version: crate::NETWORK_PROTOCOL_VERSION,
             genesis_hash: [7; 32],
             genesis_timestamp: 0,
             pow_limit: [0xff; 32],
@@ -1538,6 +1545,52 @@ mod tests {
             monetary_policy: DEFAULT_MONETARY_POLICY,
             rewards: fixed_destinations(),
             max_future_offset_secs: 7_200,
+        }
+    }
+
+    #[test]
+    fn transaction_merkle_root_binds_the_exact_leaf_count() {
+        let coinbase = [0x11; 32];
+        let tx1 = [0x22; 32];
+        let tx2 = [0x33; 32];
+
+        assert_ne!(
+            merkle_root(&[coinbase, tx1, tx2]),
+            merkle_root(&[coinbase, tx1, tx2, tx2])
+        );
+    }
+
+    #[test]
+    fn transaction_merkle_root_v2_known_answer_is_stable() {
+        assert_eq!(
+            merkle_root(&[[0x11; 32], [0x22; 32], [0x33; 32]]),
+            [
+                0x4a, 0x82, 0x02, 0xa7, 0x93, 0xb0, 0x73, 0x29, 0x55, 0x04, 0x58, 0x4a, 0x5d, 0x92,
+                0x3e, 0xe0, 0xff, 0x20, 0xbd, 0xc4, 0xe8, 0xc8, 0x43, 0xac, 0xb9, 0x1b, 0xc0, 0x46,
+                0xba, 0x41, 0xe7, 0x12,
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_merkle_root_rejects_every_bounded_odd_tail_duplication() {
+        for leaf_count in (3..=crate::MAX_BLOCK_TRANSACTIONS + 1).step_by(2) {
+            let leaves = (0..leaf_count)
+                .map(|index| {
+                    let mut leaf = [0_u8; 32];
+                    leaf[..8].copy_from_slice(&(leaf_count as u64).to_le_bytes());
+                    leaf[8..16].copy_from_slice(&(index as u64).to_le_bytes());
+                    leaf
+                })
+                .collect::<Vec<_>>();
+            let mut mutated = leaves.clone();
+            mutated.push(*leaves.last().expect("odd test vector is nonempty"));
+
+            assert_ne!(
+                merkle_root(&leaves),
+                merkle_root(&mutated),
+                "odd-tail duplication was not bound at leaf count {leaf_count}"
+            );
         }
     }
 

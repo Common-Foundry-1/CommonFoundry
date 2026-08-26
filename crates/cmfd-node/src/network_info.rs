@@ -403,9 +403,9 @@ mod tests {
     "virtual_genesis_timestamp_unix_seconds": "1700000000"
   },
   "consensus": {
-    "consensus_fingerprint": "7ae1b8fadadc6e9316e480968fe2647b3a627df33a1a1c7f7c6c53433a4ff778",
+    "consensus_fingerprint": "bbbadca69495910a1e6b73fe95db17d5b8b9b056361ce1c9dca9dc183114eddf",
     "versions": {
-      "network_protocol_version": 1,
+      "network_protocol_version": 2,
       "block_version": 1,
       "transaction_version": 1,
       "wire_version": 1

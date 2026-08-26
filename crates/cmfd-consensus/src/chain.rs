@@ -415,6 +415,16 @@ impl UtxoSet {
         self.validate_delta_with_preverification(block, verifier, params, Some(preverified))
     }
 
+    /// Performs every block-body check except proof verification.
+    ///
+    /// This is an admission-control preflight only. Its candidate delta is
+    /// discarded, and callers must still run either `validate_delta` or
+    /// `validate_delta_preverified` before accepting the block.
+    fn preflight_delta(&self, block: &Block, params: &NetworkParams) -> Result<(), ChainError> {
+        self.validate_delta_preamble(block, params)?;
+        self.validate_delta_body(block, params).map(drop)
+    }
+
     fn validate_delta_with_preverification(
         &self,
         block: &Block,
@@ -422,6 +432,24 @@ impl UtxoSet {
         params: &NetworkParams,
         preverified: Option<&PreverifiedBlockProof>,
     ) -> Result<(u64, UtxoDelta), ChainError> {
+        self.validate_delta_preamble(block, params)?;
+        if let Some(preverified) = preverified {
+            verifier
+                .verify_preverified(&block.challenge, &block.proof, preverified)
+                .map_err(map_pow_error)?;
+        } else {
+            verifier
+                .verify(&block.challenge, &block.proof)
+                .map_err(map_pow_error)?;
+        }
+        self.validate_delta_body(block, params)
+    }
+
+    fn validate_delta_preamble(
+        &self,
+        block: &Block,
+        params: &NetworkParams,
+    ) -> Result<(), ChainError> {
         validate_block_resources(block)?;
         if block.version != BLOCK_VERSION {
             return Err(ChainError::UnsupportedBlockVersion);
@@ -444,16 +472,14 @@ impl UtxoSet {
         if block.transaction_root() != block.challenge.transaction_root {
             return Err(ChainError::MerkleRoot);
         }
-        if let Some(preverified) = preverified {
-            verifier
-                .verify_preverified(&block.challenge, &block.proof, preverified)
-                .map_err(map_pow_error)?;
-        } else {
-            verifier
-                .verify(&block.challenge, &block.proof)
-                .map_err(map_pow_error)?;
-        }
+        Ok(())
+    }
 
+    fn validate_delta_body(
+        &self,
+        block: &Block,
+        params: &NetworkParams,
+    ) -> Result<(u64, UtxoDelta), ChainError> {
         let mut candidate = UtxoOverlay::new(self);
         let mut spent = HashSet::new();
         let mut fees = 0u64;
@@ -986,12 +1012,70 @@ impl ChainState {
         self.validate_block_with_preverification(block, context, Some(preverified))
     }
 
+    /// Runs all inexpensive header and state checks without accepting the
+    /// block or verifying its proof. This is only an admission-control gate;
+    /// callers must still invoke `validate_block` or
+    /// `validate_block_preverified` before committing anything.
+    pub fn preflight_block(
+        &self,
+        block: &Block,
+        context: BlockValidationContext,
+    ) -> Result<(), ChainError> {
+        self.preflight_block_header(block, context)?;
+        self.utxos.preflight_delta(block, &self.params)
+    }
+
     fn validate_block_with_preverification(
         &self,
         block: &Block,
         context: BlockValidationContext,
         preverified: Option<&PreverifiedBlockProof>,
     ) -> Result<ValidatedBlock, ChainError> {
+        let (next_height, expected_target) = self.preflight_block_header(block, context)?;
+
+        let (fees, delta) = if let Some(preverified) = preverified {
+            self.utxos.validate_delta_preverified(
+                block,
+                &self.verifier,
+                &self.params,
+                preverified,
+            )?
+        } else {
+            self.utxos
+                .validate_delta(block, &self.verifier, &self.params)?
+        };
+        let window_start = self
+            .raw_timestamps
+            .len()
+            .saturating_sub(crate::MEDIAN_TIME_WINDOW.saturating_sub(1));
+        let mut timestamp_window = Vec::with_capacity(self.raw_timestamps.len() - window_start + 1);
+        timestamp_window.extend_from_slice(&self.raw_timestamps[window_start..]);
+        timestamp_window.push(block.challenge.timestamp);
+        let effective_timestamp = median_timestamp(&timestamp_window);
+
+        Ok(ValidatedBlock {
+            params: self.params,
+            base_tip: self.tip,
+            base_next_height: self.next_height,
+            base_expected_target: expected_target,
+            base_median_time_past: self.median_time_past(),
+            base_history_len: self.history.len(),
+            base_timestamp_len: self.raw_timestamps.len(),
+            delta,
+            fees,
+            timestamp: block.challenge.timestamp,
+            effective_timestamp,
+            target: block.challenge.target,
+            next_tip: block.block_id(),
+            next_height,
+        })
+    }
+
+    fn preflight_block_header(
+        &self,
+        block: &Block,
+        context: BlockValidationContext,
+    ) -> Result<(u64, [u8; 32]), ChainError> {
         if block.version != BLOCK_VERSION {
             return Err(ChainError::UnsupportedBlockVersion);
         }
@@ -1030,43 +1114,7 @@ impl ChainState {
         if block.challenge.target != expected_target {
             return Err(ChainError::UnexpectedTarget);
         }
-
-        let (fees, delta) = if let Some(preverified) = preverified {
-            self.utxos.validate_delta_preverified(
-                block,
-                &self.verifier,
-                &self.params,
-                preverified,
-            )?
-        } else {
-            self.utxos
-                .validate_delta(block, &self.verifier, &self.params)?
-        };
-        let window_start = self
-            .raw_timestamps
-            .len()
-            .saturating_sub(crate::MEDIAN_TIME_WINDOW.saturating_sub(1));
-        let mut timestamp_window = Vec::with_capacity(self.raw_timestamps.len() - window_start + 1);
-        timestamp_window.extend_from_slice(&self.raw_timestamps[window_start..]);
-        timestamp_window.push(block.challenge.timestamp);
-        let effective_timestamp = median_timestamp(&timestamp_window);
-
-        Ok(ValidatedBlock {
-            params: self.params,
-            base_tip: self.tip,
-            base_next_height: self.next_height,
-            base_expected_target: expected_target,
-            base_median_time_past: self.median_time_past(),
-            base_history_len: self.history.len(),
-            base_timestamp_len: self.raw_timestamps.len(),
-            delta,
-            fees,
-            timestamp: block.challenge.timestamp,
-            effective_timestamp,
-            target: block.challenge.target,
-            next_tip: block.block_id(),
-            next_height,
-        })
+        Ok((next_height, expected_target))
     }
 
     /// Atomically applies a transition returned by [`Self::validate_block`].
@@ -2207,6 +2255,39 @@ mod tests {
         );
         assert_eq!(state.tip(), tip);
         assert_eq!(state.next_height(), 2);
+    }
+
+    #[test]
+    fn proof_free_preflight_rejects_state_failures_but_never_accepts_a_proof() {
+        let reference = v2_test_reference().unwrap();
+        let descriptor = reference.descriptor();
+        let mut params = network_params();
+        params.network_id = descriptor.network_id;
+        params.pow = PowParameters::V2Reference(descriptor);
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let state = ChainState::new(params, verifier).unwrap();
+
+        let mut invalid_proof = block_for_state(&state, 60, miner_destination(), vec![], 0, 7);
+        let BlockProof::V2Reference(proof) = &mut invalid_proof.proof else {
+            panic!("v2 network mined a non-v2 proof")
+        };
+        proof.challenge_digest[0] ^= 1;
+        assert_eq!(
+            state.preflight_block(&invalid_proof, validation_context(60)),
+            Ok(()),
+            "preflight must remain proof-free and cannot become an acceptance path"
+        );
+        assert!(matches!(
+            state.validate_block(&invalid_proof, validation_context(60)),
+            Err(ChainError::InvalidV2Proof)
+        ));
+
+        let mut wrong_target = block_for_state(&state, 60, miner_destination(), vec![], 0, 8);
+        wrong_target.challenge.target[0] ^= 1;
+        assert_eq!(
+            state.preflight_block(&wrong_target, validation_context(60)),
+            Err(ChainError::UnexpectedTarget)
+        );
     }
 
     #[test]

@@ -376,8 +376,12 @@ fn perform_sync_from_peer_once_inner_with_policy(
             });
         }
 
-        let preverified = block_preverifier.preverify(&block)?;
         let accepted_at = unix_time_seconds()?;
+        {
+            let node = lock_node(&shared)?;
+            node.preflight_external_block(&block, accepted_at)?;
+        }
+        let preverified = block_preverifier.preverify(&block)?;
         let accepted = {
             let mut node = lock_node(&shared)?;
             if node.contains_block(*requested) {
@@ -751,14 +755,16 @@ fn perform_respond_to_peer_inner_with_policy(
             }
             PeerMessage::SubmitBlock(block) => {
                 let block_id = block.block_id();
-                let already_known = {
+                let accepted_at = unix_time_seconds()?;
+                let preflight = {
                     let node = lock_node(&shared)?;
-                    node.contains_block(block_id)
+                    node.preflight_external_block(&block, accepted_at)
                 };
-                let status = if already_known {
+                let status = if matches!(preflight, Err(NodeError::DuplicateBlock(_))) {
                     BlockSubmissionStatus::AlreadyKnown
+                } else if preflight.is_err() {
+                    BlockSubmissionStatus::Rejected
                 } else if let Ok(preverified) = block_preverifier.preverify(&block) {
-                    let accepted_at = unix_time_seconds()?;
                     let mut node = lock_node(&shared)?;
                     if node.contains_block(block_id) {
                         BlockSubmissionStatus::AlreadyKnown

@@ -2976,10 +2976,47 @@ impl Node {
 
     pub fn submit_block(&mut self, block: Block, accepted_at: u64) -> Result<u64, NodeError> {
         if matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            self.preflight_external_block(&block, accepted_at)?;
             let preverified = self.block_preverifier.preverify(&block)?;
             return self.submit_block_with_preverification(block, accepted_at, Some(&preverified));
         }
         self.submit_block_with_preverification(block, accepted_at, None)
+    }
+
+    /// Rejects cheap duplicate, ancestry, header, and active-state failures
+    /// before dispatching an expensive external proof verification. This is
+    /// only an admission gate: `submit_block_with_preverification` repeats the
+    /// authoritative consensus checks after the worker returns.
+    pub(crate) fn preflight_external_block(
+        &self,
+        block: &Block,
+        accepted_at: u64,
+    ) -> Result<(), NodeError> {
+        let block_id = block.block_id();
+        if self.index.contains(block_id) {
+            return Err(NodeError::DuplicateBlock(block_id));
+        }
+        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            return Ok(());
+        }
+        if self.storage_faulted {
+            return Err(NodeError::StorageFaulted);
+        }
+        validate_block_resources(block)?;
+        encode_block(block)?;
+        let parent = block.challenge.previous_block;
+        self.index
+            .work_at(parent)
+            .ok_or(NodeError::UnknownParent(parent))?;
+        if parent == self.state.tip() {
+            self.state.preflight_block(
+                block,
+                BlockValidationContext {
+                    now_unix_seconds: accepted_at,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Consumes process-local proof evidence produced outside the node lock.
@@ -3829,20 +3866,21 @@ fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) ->
         Ok(block) => block,
         Err(response) => return response,
     };
-    let block_id = block.block_id();
+    let accepted_at = match unix_time_seconds() {
+        Ok(accepted_at) => accepted_at,
+        Err(error) => return RpcResponse::node_error(error),
+    };
     let block_preverifier = match shared.lock() {
-        Ok(node) if node.contains_block(block_id) => {
-            return RpcResponse::node_error(NodeError::DuplicateBlock(block_id));
+        Ok(node) => {
+            if let Err(error) = node.preflight_external_block(&block, accepted_at) {
+                return RpcResponse::node_error(error);
+            }
+            node.block_preverifier()
         }
-        Ok(node) => node.block_preverifier(),
         Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
     };
     let preverified = match block_preverifier.preverify(&block) {
         Ok(preverified) => preverified,
-        Err(error) => return RpcResponse::node_error(error),
-    };
-    let accepted_at = match unix_time_seconds() {
-        Ok(accepted_at) => accepted_at,
         Err(error) => return RpcResponse::node_error(error),
     };
     let mut node = match shared.lock() {
@@ -4688,6 +4726,44 @@ mod tests {
             "in_process",
             "pre-install clones must observe the atomically installed backend"
         );
+    }
+
+    #[test]
+    fn production_submission_preflights_parent_and_state_before_worker_dispatch() {
+        let path = test_dir("production-preflight-order");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let now = DEVNET_GENESIS_TIMESTAMP + 60;
+        let valid = mined_candidate(&node, now);
+
+        node.profile.proof = ProofProfile::ProductionV3;
+        assert_eq!(
+            node.block_preverifier.backend_status().unwrap().0,
+            "in_process"
+        );
+        *node.block_preverifier.backend.write().unwrap() = ProofVerificationBackend::Unavailable;
+
+        let mut wrong_target = valid.clone();
+        wrong_target.challenge.target[0] ^= 1;
+        assert!(matches!(
+            node.submit_block(wrong_target, now),
+            Err(NodeError::Chain(ChainError::UnexpectedTarget))
+        ));
+
+        let mut orphan = valid.clone();
+        orphan.challenge.previous_block = [0xA5; 32];
+        assert!(matches!(
+            node.submit_block(orphan, now),
+            Err(NodeError::UnknownParent(parent)) if parent == [0xA5; 32]
+        ));
+        assert!(matches!(
+            node.submit_block(valid, now),
+            Err(NodeError::ProductionV3Unavailable)
+        ));
+        assert_eq!(node.state.next_height(), 1);
+        assert_eq!(node.log.metadata().unwrap().len(), 0);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     fn mined_candidate(node: &Node, now: u64) -> Block {

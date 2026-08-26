@@ -33,6 +33,26 @@ pub use verifier::{
     VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
 };
 
+/// Makes a packaged artifact directory private to the operator, matching what
+/// the trusted filesystem gates require of ProductionV3 sidecars: owner-only
+/// (`0700`) on Unix; a protected owner + LocalSystem + Administrators DACL on
+/// Windows. Archive extraction leaves permissive defaults, so packaged
+/// applications call this on their own `production-v3` directory before the
+/// gates inspect it. The gates remain the deciders: any directory this cannot
+/// repair keeps failing closed there.
+pub fn make_packaged_artifact_directory_private(directory: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_launcher::make_operator_private_directory(directory)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+    }
+}
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};

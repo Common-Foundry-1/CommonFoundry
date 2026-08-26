@@ -133,6 +133,15 @@ pub fn production_v3_package_layout(
             "package executable has no parent directory",
         ))?;
     let artifacts = directory.join(PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY);
+    // Archive extraction leaves the sidecar directory with permissive default
+    // permissions that the trusted filesystem gates reject, so a package
+    // launched through its bare executable heals its own directory the same
+    // way the packaged launcher scripts do. Best effort by design: the gates
+    // stay the deciders, and a directory this cannot repair fails closed
+    // there with its own diagnostics.
+    if artifacts.is_dir() {
+        let _ = cmfd_proof_worker::make_packaged_artifact_directory_private(&artifacts);
+    }
     let expected_file = compiled_production_v3_record_identity()?;
     Ok(ProductionV3PackageLayout {
         worker: directory.join(format!("cmfd-proof-worker{}", std::env::consts::EXE_SUFFIX)),

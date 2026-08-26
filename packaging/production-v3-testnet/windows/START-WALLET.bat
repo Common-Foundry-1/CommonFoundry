@@ -17,7 +17,8 @@ if exist "%~dp0production-v3" (
   if errorlevel 1 echo WARNING: could not make production-v3 private; the wallet may refuse to start.
 )
 
+rem The wallet's embedded node keeps its default local P2P bind; inbound
+rem service belongs to the node package. A wildcard --p2p-bind is refused.
 start "" "%~dp0common-foundry-wallet.exe" ^
-  --p2p-bind 0.0.0.0:21444 ^
   --peer 107.214.187.2:21444 ^
   --allow-public-peers

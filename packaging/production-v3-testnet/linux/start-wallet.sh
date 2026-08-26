@@ -9,8 +9,9 @@ if [[ -d "$SCRIPT_DIR/production-v3" ]]; then
   chmod 700 "$SCRIPT_DIR/production-v3"
 fi
 
+# The wallet's embedded node keeps its default local P2P bind; inbound
+# service belongs to the node package. A wildcard --p2p-bind is refused.
 exec "$SCRIPT_DIR/common-foundry-wallet" \
-  --p2p-bind 0.0.0.0:21444 \
   --peer 107.214.187.2:21444 \
   --allow-public-peers \
   --proof-verifier-cpu-quota-us 400000 \

@@ -509,7 +509,7 @@ fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> Nod
         "proof_verifier_configuration" => startup_error(
             client.code,
             format!(
-                "{} ({}) rejected the configured Record V2 or proof-verifier identity. Verify the package and launch settings.",
+                "{} ({}) rejected the configured Record V2 or proof-verifier identity. Re-download the package if any file changed, keep the production-v3 folder beside the wallet private to your account, and retry.",
                 profile.short_name(),
                 profile.proof.profile_name()
             ),

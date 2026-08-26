@@ -1300,6 +1300,143 @@ fn runtime_step(step: &'static str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{step}: {error}"))
 }
 
+fn operator_private_well_known_sid(
+    kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE,
+) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Security::{CreateWellKnownSid, SECURITY_MAX_SID_SIZE};
+
+    let mut size = SECURITY_MAX_SID_SIZE;
+    let mut sid = vec![0_u8; size as usize];
+    // SAFETY: the buffer is writable for the documented maximum SID size.
+    if unsafe { CreateWellKnownSid(kind, ptr::null_mut(), sid.as_mut_ptr().cast(), &mut size) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    sid.truncate(size as usize);
+    Ok(sid)
+}
+
+/// Rewrites `directory`'s DACL to the exact protected operator set the
+/// trusted ceremony filesystem accepts for packaged sidecar directories: the
+/// directory owner, LocalSystem, and Administrators, each with full
+/// inheritable access. This is the packaged launchers' `icacls` step done by
+/// the application itself, so a package started through its bare executable
+/// heals the permissive defaults archive extraction leaves behind. The
+/// consuming identity gates still decide trust afterwards; a directory this
+/// cannot repair simply keeps failing closed there.
+pub(crate) fn make_operator_private_directory(directory: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::{
+        CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+
+    let handle = OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)?;
+    let information = file_information(&handle)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(io::Error::other(
+            "packaged artifact path is not a regular directory",
+        ));
+    }
+
+    let mut owner = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: outputs are writable and the handle grants READ_CONTROL.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_status_error(status));
+    }
+    if descriptor.is_null() || owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
+        return Err(io::Error::other(
+            "packaged artifact directory has no valid owner SID",
+        ));
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let system = operator_private_well_known_sid(WinLocalSystemSid)?;
+    let administrators = operator_private_well_known_sid(WinBuiltinAdministratorsSid)?;
+
+    let inheritable = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    let trustee = |sid: PSID, trustee_type| TRUSTEE_W {
+        pMultipleTrustee: ptr::null_mut(),
+        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: trustee_type,
+        ptstrName: sid.cast(),
+    };
+    let entries = [
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: inheritable,
+            Trustee: trustee(owner, TRUSTEE_IS_USER),
+        },
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: inheritable,
+            Trustee: trustee(system.as_ptr() as PSID, TRUSTEE_IS_UNKNOWN),
+        },
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: inheritable,
+            Trustee: trustee(administrators.as_ptr() as PSID, TRUSTEE_IS_UNKNOWN),
+        },
+    ];
+    let mut operator_dacl = ptr::null_mut();
+    // SAFETY: every trustee SID stays live across this call.
+    let status = unsafe {
+        SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            ptr::null_mut(),
+            &mut operator_dacl,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(win32_status_error(status));
+    }
+    if operator_dacl.is_null() {
+        return Err(io::Error::other(
+            "Windows returned a null operator-private DACL",
+        ));
+    }
+    let operator_dacl = LocalAllocation(operator_dacl.cast());
+    // SAFETY: the handle grants WRITE_DAC and the generated ACL is live.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            operator_dacl.0.cast(),
+            ptr::null(),
+        )
+    };
+    drop(operator_dacl);
+    drop(descriptor);
+    if status != ERROR_SUCCESS {
+        return Err(win32_status_error(status));
+    }
+    Ok(())
+}
+
 impl PrivateLaunchRuntime {
     fn create(source_path: &Path, expected_sha256: [u8; 32], sid: PSID) -> io::Result<Self> {
         let source = OpenOptions::new()

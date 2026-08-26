@@ -37,7 +37,7 @@ use cmfd_node::{
     COMPILED_NETWORK_PROFILE, Node, NodeError, ProductionV3VerifierArtifacts, ProofProfile,
     compiled_production_v3_worker_sha256, submit_shared_block,
 };
-use cmfd_proof_worker::{VerifierWorkerConfig, VerifierWorkerError};
+use cmfd_proof_worker::{ProductionV3VerifierRecord, VerifierWorkerConfig, VerifierWorkerError};
 
 const CP02_MAGIC: &[u8; 8] = b"CFV3CP02";
 const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 900_000;
@@ -161,7 +161,11 @@ fn qualification_worker_config(artifacts: &ProductionV3VerifierArtifacts) -> Ver
         cpu_quota_micros,
         cpu_period_micros,
         pids_limit,
-        production_v3_artifacts: Some(artifacts.clone()),
+        production_v3_record: Some(ProductionV3VerifierRecord {
+            record_v2: artifacts.record_v2.clone(),
+            expected_file: cmfd_node::compiled_production_v3_record_identity()
+                .expect("the test build must contain a ProductionV3 Record V2 pin"),
+        }),
     }
 }
 

@@ -116,6 +116,11 @@ each execution. Source metadata and the streaming copy are both bounded to 512
 MiB so a mismatched package path cannot fill the runtime disk before its digest
 is rejected. This does not close the same-user loader race or pin transitive
 dynamic libraries; package ACLs/signatures remain a release responsibility.
+Request timeouts and process teardown terminate the contained process tree and
+never wait indefinitely for an inherited pipe reader. A pipe owner that somehow
+survives containment is detached and cannot yield a trusted response or
+capability; repeated containment escapes remain an operating-system and package
+trust concern rather than a consensus fallback.
 
 The worker pin is not source-circular with the node profile: the worker does not
 depend on `cmfd-node`, its release-profile constants, or
@@ -126,18 +131,24 @@ those hashes into the node profile; then rebuild both workers from clean target
 directories and require byte-identical hashes before building node/wallet
 packages.
 
-The current node still performs the existing retained-handle, two-pass artifact
-authentication once in the parent to construct its local consensus authority,
-then the persistent worker performs its own authentication once per process
-generation. Startup block-log replay also uses that parent authority before the
-worker handshake. Both happen before P2P and neither reloads the bank per live
-block, but they are not a single global artifact load. Reconstructing a stored
-side branch also replays that branch in-process under the node state lock, so a
-long branch can repeat V3 verification outside the worker limits. Removing
-these boundaries requires an external-only consensus authority and a replay
-protocol (or authenticated persisted validation cache) that establishes exact
-preverification capabilities without first minting local bank-authenticated
-authority; that design is not implemented here.
+The parent still performs retained-handle, two-pass artifact authentication to
+construct the parameter authority used for proof-free consensus checks. It
+does not verify ProductionV3 proofs. The persistent worker starts and completes
+its authenticated handshake before the data-directory lock is acquired and
+before block-log replay. Every replayed ProductionV3 block is sent through that
+worker and receives a fresh, process-local capability bound to its exact
+canonical statement; no capability is trusted from disk.
+
+Live active-chain and side-branch admissions also require the external
+capability. A side-branch request captures an immutable ancestry tip and chain
+revision under the node mutex, reconstructs and preflights the branch outside
+that mutex using only the already issued capabilities, then rechecks the exact
+revision, block, parent, and acceptance time before the authoritative commit.
+Any concurrent block commit makes the admission stale and retryable. Devnet
+keeps its existing in-process V2 path. The parent and worker each authenticate
+the model artifacts once at startup, so this is still not a single global
+artifact load, but ProductionV3 proof verification itself is external-only and
+bounded by the persistent-worker controls.
 
 The current 2 GiB worker memory-limit default is a containment setting, not a
 qualified production requirement. The final Windows and Linux package smoke

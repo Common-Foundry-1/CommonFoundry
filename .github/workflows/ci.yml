@@ -152,6 +152,11 @@ jobs:
         run: cargo test --locked -p cmfd-node --test graceful_shutdown -- --test-threads=1
       - name: Exercise persistent verifier containment and restart
         run: cargo test --locked -p cmfd-proof-worker --test verifier_worker -- --test-threads=1
+      - name: Exercise Windows ProductionV3 proof-worker boundary
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test --locked -p cmfd-proof-worker --features production-v3
+          --lib --test verifier_worker --no-fail-fast -- --test-threads=1
 
   wallet:
     runs-on: ubuntu-latest

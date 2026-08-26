@@ -12,13 +12,11 @@ production-v3 = ["cmfd-consensus/dory-v3-consensus-adapter"]
 [dependencies]
 cmfd-consensus = { path = "../cmfd-consensus", features = ["gpu-proof-prover"] }
 cmfd-proof-accel = { path = "../cmfd-proof-accel" }
+blake3.workspace = true
 getrandom = "0.3"
 hex.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-blake3.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -27,6 +25,7 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }

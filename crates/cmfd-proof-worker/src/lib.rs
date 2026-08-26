@@ -17,6 +17,8 @@ pub mod spill {
 mod process;
 mod sandbox;
 mod verifier;
+#[cfg(windows)]
+mod windows_artifacts;
 
 pub use sandbox::VerifierSandboxStatus;
 pub use verifier::{

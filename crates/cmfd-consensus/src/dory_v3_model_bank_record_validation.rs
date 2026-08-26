@@ -5,6 +5,8 @@
 //! three authenticated inputs and their trusted parents so downstream type-6
 //! preparation can keep the validated filesystem identities alive.
 
+#[cfg(windows)]
+use std::fs::File;
 use std::{
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -187,6 +189,19 @@ pub enum ProductionDoryV3ModelBankRecordValidationError {
     RecordReproductionMismatch,
     #[error("a final retained small-file reread no longer matches the validated chain")]
     FinalSmallFileMismatch,
+    #[cfg(windows)]
+    #[error("inherited {artifact} handle is not an exact regular file: {source}")]
+    InheritedHandle {
+        artifact: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[cfg(windows)]
+    #[error("inherited production artifact handles refer to the same file")]
+    AliasedInheritedHandles,
+    #[cfg(windows)]
+    #[error("inherited {0} handle content differs from its parent-observed identity")]
+    InheritedContentIdentity(&'static str),
     #[cfg(feature = "dory-v3-consensus-adapter")]
     #[error("failed to construct the production V3 consensus verifier: {0}")]
     ConsensusVerifier(#[source] PowError),
@@ -314,6 +329,163 @@ pub fn load_production_dory_v3_consensus_verifier(
     Ok(LoadedProductionDoryV3ConsensusVerifier {
         verifier,
         bank_file,
+        manifest_file,
+        record_v2_file,
+    })
+}
+
+/// Construct the production verifier from three already-open Windows files.
+///
+/// This entry point never resolves or reopens a pathname. The caller must
+/// inherit handles that the parent opened with read/synchronize access only
+/// and sharing that excludes writers and deletion. Stable Win32 APIs do not
+/// expose a handle's granted-access mask, so the later `STARTUPINFOEX` launcher
+/// must enforce that access contract while explicitly selecting the inherited
+/// handle list.
+#[cfg(all(windows, feature = "dory-v3-consensus-adapter"))]
+pub fn load_production_dory_v3_consensus_verifier_from_open_files(
+    network_id: [u8; 32],
+    bank: File,
+    manifest: File,
+    record_v2: File,
+    expected_bank_file: FileIdentity,
+    expected_manifest_file: FileIdentity,
+    expected_record_v2_file: FileIdentity,
+) -> Result<LoadedProductionDoryV3ConsensusVerifier, ProductionDoryV3ModelBankRecordValidationError>
+{
+    let validated = validate_open_production_dory_v3_model_bank_record_chain(
+        bank,
+        manifest,
+        record_v2,
+        &expected_bank_file,
+        &expected_manifest_file,
+        &expected_record_v2_file,
+    )?;
+    let setup = pinned_production_setup()?;
+    let verifier =
+        ConsensusPowVerifier::v3_candidate(network_id, validated.authenticated_record, setup)
+            .map_err(ProductionDoryV3ModelBankRecordValidationError::ConsensusVerifier)?;
+    Ok(LoadedProductionDoryV3ConsensusVerifier {
+        verifier,
+        bank_file: validated.bank_file,
+        manifest_file: validated.manifest_file,
+        record_v2_file: validated.record_v2_file,
+    })
+}
+
+#[cfg(windows)]
+struct ValidatedOpenProductionArtifacts {
+    authenticated_record: BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    bank_file: FileIdentity,
+    manifest_file: FileIdentity,
+    record_v2_file: FileIdentity,
+}
+
+#[cfg(windows)]
+fn validate_open_production_dory_v3_model_bank_record_chain(
+    mut bank: File,
+    mut manifest_input: File,
+    mut record_v2_input: File,
+    expected_bank_file: &FileIdentity,
+    expected_manifest_file: &FileIdentity,
+    expected_record_v2_file: &FileIdentity,
+) -> Result<ValidatedOpenProductionArtifacts, ProductionDoryV3ModelBankRecordValidationError> {
+    ensure_distinct_open_files(&bank, &manifest_input, &record_v2_input)?;
+    validate_open_file("bank", &bank, Some(PRODUCTION_BANK_BYTES))?;
+    validate_open_file(
+        "manifest",
+        &manifest_input,
+        Some(expected_manifest_file.bytes),
+    )?;
+    validate_open_file(
+        "Record V2",
+        &record_v2_input,
+        Some(expected_record_v2_file.bytes),
+    )?;
+
+    let manifest_bytes =
+        read_open_file_bounded("manifest", &mut manifest_input, MAX_MANIFEST_JSON_BYTES)?;
+    let manifest_file = content_identity(&manifest_bytes);
+    require_expected_content_identity("manifest", &manifest_file, expected_manifest_file)?;
+    let manifest = parse_canonical_manifest(&manifest_bytes)?;
+    if manifest
+        .payload_bytes
+        .checked_add(MODEL_BANK_HEADER_BYTES as u64)
+        != Some(PRODUCTION_BANK_BYTES)
+    {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::ManifestBankLength);
+    }
+
+    let record_v2_bytes =
+        read_open_file_bounded("Record V2", &mut record_v2_input, MAX_RECORD_V2_JSON_BYTES)?;
+    let record_v2_file = content_identity(&record_v2_bytes);
+    require_expected_content_identity("Record V2", &record_v2_file, expected_record_v2_file)?;
+    let record = parse_canonical_record_v2(&record_v2_bytes)?;
+    if record.manifest() != &manifest {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::EmbeddedManifestMismatch);
+    }
+
+    preflight_production_dory_v3_model_bank_manifest(&manifest)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ProductionManifest)?;
+    let setup = pinned_production_setup()?;
+    record
+        .validate_production(&setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::Record)?;
+    let structural = record
+        .model_identity()
+        .validate_production_structure(&manifest, &setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ModelIdentity)?;
+
+    let mut derive = |reader: &mut dyn Read| {
+        derive_bank_authenticated_dory_v3_model_commitment_record_v2(reader, &structural, &setup)
+            .map_err(ProductionDoryV3ModelBankRecordValidationError::Record)
+    };
+    let (pass_one, pass_one_file) =
+        run_open_bank_pass(&mut bank, PRODUCTION_BANK_BYTES, &mut derive)?;
+    require_expected_content_identity("bank", &pass_one_file, expected_bank_file)?;
+    recheck_open_small_files(
+        &mut manifest_input,
+        &manifest_bytes,
+        &mut record_v2_input,
+        &record_v2_bytes,
+    )?;
+    validate_open_file("bank", &bank, Some(PRODUCTION_BANK_BYTES))?;
+
+    let (pass_two, pass_two_file) =
+        run_open_bank_pass(&mut bank, PRODUCTION_BANK_BYTES, &mut derive)?;
+    require_expected_content_identity("bank", &pass_two_file, expected_bank_file)?;
+    if pass_one_file != pass_two_file {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::BankPassIdentityMismatch);
+    }
+    recheck_open_small_files(
+        &mut manifest_input,
+        &manifest_bytes,
+        &mut record_v2_input,
+        &record_v2_bytes,
+    )?;
+    validate_open_file("bank", &bank, Some(PRODUCTION_BANK_BYTES))?;
+
+    if pass_one.record() != &record || pass_two.record() != &record {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::RecordReproductionMismatch);
+    }
+    preflight_production_dory_v3_model_bank_manifest(&manifest)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ProductionManifest)?;
+    record
+        .validate_production(&setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::Record)?;
+    let reproduced = record
+        .model_identity()
+        .validate_production_structure(&manifest, &setup)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::ModelIdentity)?;
+    if reproduced != structural {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::Record(
+            DoryV3ModelCommitmentRecordError::StructuralCapabilityMismatch,
+        ));
+    }
+
+    Ok(ValidatedOpenProductionArtifacts {
+        authenticated_record: pass_two,
+        bank_file: pass_two_file,
         manifest_file,
         record_v2_file,
     })
@@ -597,6 +769,201 @@ fn run_bank_pass<T>(
         });
     }
     Ok((output, identity))
+}
+
+#[cfg(windows)]
+fn run_open_bank_pass<T>(
+    bank: &mut File,
+    expected_bytes: u64,
+    derive: &mut impl FnMut(&mut dyn Read) -> Result<T, ProductionDoryV3ModelBankRecordValidationError>,
+) -> Result<(T, FileIdentity), ProductionDoryV3ModelBankRecordValidationError> {
+    bank.seek(SeekFrom::Start(0))
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::BankIo)?;
+    let mut reader = DualHashCountingReader::new(bank);
+    let output = derive(&mut reader)?;
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .map_err(ProductionDoryV3ModelBankRecordValidationError::BankIo)?
+        != 0
+    {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::BankTrailingData);
+    }
+    let identity = reader.finish();
+    if identity.bytes != expected_bytes {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::BankLength {
+            expected: expected_bytes,
+            actual: identity.bytes,
+        });
+    }
+    Ok((output, identity))
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenFileObjectIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
+
+#[cfg(windows)]
+fn open_file_information(
+    artifact: &'static str,
+    file: &File,
+) -> Result<
+    windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION,
+    ProductionDoryV3ModelBankRecordValidationError,
+> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a live handle and the output has the exact Win32
+    // layout. Success initializes the complete structure.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(
+            ProductionDoryV3ModelBankRecordValidationError::InheritedHandle {
+                artifact,
+                source: io::Error::last_os_error(),
+            },
+        );
+    }
+    // SAFETY: the successful API call initialized every field.
+    Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(windows)]
+fn open_file_object_identity(
+    artifact: &'static str,
+    file: &File,
+) -> Result<OpenFileObjectIdentity, ProductionDoryV3ModelBankRecordValidationError> {
+    let information = open_file_information(artifact, file)?;
+    Ok(OpenFileObjectIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(windows)]
+fn ensure_distinct_open_files(
+    bank: &File,
+    manifest: &File,
+    record_v2: &File,
+) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+    let bank = open_file_object_identity("bank", bank)?;
+    let manifest = open_file_object_identity("manifest", manifest)?;
+    let record_v2 = open_file_object_identity("Record V2", record_v2)?;
+    if bank == manifest || bank == record_v2 || manifest == record_v2 {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::AliasedInheritedHandles);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_open_file(
+    artifact: &'static str,
+    file: &File,
+    expected_bytes: Option<u64>,
+) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let metadata = file.metadata().map_err(|source| {
+        ProductionDoryV3ModelBankRecordValidationError::InheritedHandle { artifact, source }
+    })?;
+    let information = open_file_information(artifact, file)?;
+    let information_bytes =
+        (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+    let invalid = !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || information.nNumberOfLinks != 1
+        || metadata.len() != information_bytes
+        || expected_bytes.is_some_and(|expected| expected != information_bytes);
+    if invalid {
+        return Err(
+            ProductionDoryV3ModelBankRecordValidationError::InheritedHandle {
+                artifact,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "handle is not a single-link regular file of the expected length",
+                ),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_open_file_bounded(
+    artifact: &'static str,
+    file: &mut File,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, ProductionDoryV3ModelBankRecordValidationError> {
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        ProductionDoryV3ModelBankRecordValidationError::InheritedHandle { artifact, source }
+    })?;
+    let mut bytes = Vec::with_capacity(maximum_bytes.saturating_add(1));
+    file.take(
+        u64::try_from(maximum_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(
+        |source| ProductionDoryV3ModelBankRecordValidationError::InheritedHandle {
+            artifact,
+            source,
+        },
+    )?;
+    if bytes.len() > maximum_bytes {
+        return Err(match artifact {
+            "manifest" => ProductionDoryV3ModelBankRecordValidationError::ManifestTooLarge,
+            _ => ProductionDoryV3ModelBankRecordValidationError::RecordV2TooLarge,
+        });
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn require_expected_content_identity(
+    artifact: &'static str,
+    actual: &FileIdentity,
+    expected: &FileIdentity,
+) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+    if actual != expected {
+        return Err(
+            ProductionDoryV3ModelBankRecordValidationError::InheritedContentIdentity(artifact),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn recheck_open_small_files(
+    manifest_input: &mut File,
+    expected_manifest: &[u8],
+    record_v2_input: &mut File,
+    expected_record_v2: &[u8],
+) -> Result<(), ProductionDoryV3ModelBankRecordValidationError> {
+    validate_open_file(
+        "manifest",
+        manifest_input,
+        Some(expected_manifest.len() as u64),
+    )?;
+    validate_open_file(
+        "Record V2",
+        record_v2_input,
+        Some(expected_record_v2.len() as u64),
+    )?;
+    let manifest = read_open_file_bounded("manifest", manifest_input, MAX_MANIFEST_JSON_BYTES)?;
+    let record_v2 = read_open_file_bounded("Record V2", record_v2_input, MAX_RECORD_V2_JSON_BYTES)?;
+    if manifest != expected_manifest || record_v2 != expected_record_v2 {
+        return Err(ProductionDoryV3ModelBankRecordValidationError::FinalSmallFileMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

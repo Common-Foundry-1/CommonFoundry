@@ -82,6 +82,9 @@ fn worker_config() -> VerifierWorkerConfig {
         startup_timeout: Duration::from_secs(10),
         timeout: Duration::from_secs(10),
         memory_limit_bytes: 512 * 1024 * 1024,
+        cpu_quota_micros: Some(100_000),
+        cpu_period_micros: Some(100_000),
+        pids_limit: Some(16),
         production_v3_artifacts: None,
     }
 }

@@ -7089,6 +7089,9 @@ mod tests {
             startup_timeout: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             memory_limit_bytes: 1,
+            cpu_quota_micros: None,
+            cpu_period_micros: None,
+            pids_limit: None,
             production_v3_artifacts: None,
         };
         assert!(matches!(

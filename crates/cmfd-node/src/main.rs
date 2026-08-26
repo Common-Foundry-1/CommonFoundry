@@ -75,6 +75,16 @@ struct Cli {
     /// Hard worker address-space/job memory limit in bytes.
     #[arg(long, global = true, default_value_t = 2_147_483_648)]
     proof_verifier_memory_bytes: u64,
+    /// Measured Linux cgroup-v2 worker CPU quota in microseconds. ProductionV3
+    /// requires this together with the period and PID limit.
+    #[arg(long, global = true)]
+    proof_verifier_cpu_quota_us: Option<u64>,
+    /// Measured Linux cgroup-v2 worker CPU period in microseconds.
+    #[arg(long, global = true)]
+    proof_verifier_cpu_period_us: Option<u64>,
+    /// Measured Linux cgroup-v2 maximum verifier task count.
+    #[arg(long, global = true)]
+    proof_verifier_pids_limit: Option<u64>,
     /// Absolute path to the authenticated production V3 model bank.
     #[arg(long, global = true)]
     production_v3_bank: Option<PathBuf>,
@@ -569,6 +579,9 @@ fn verifier_worker_config(
         startup_timeout: Duration::from_millis(cli.proof_verifier_startup_timeout_ms),
         timeout: Duration::from_millis(cli.proof_verifier_timeout_ms),
         memory_limit_bytes: cli.proof_verifier_memory_bytes,
+        cpu_quota_micros: cli.proof_verifier_cpu_quota_us,
+        cpu_period_micros: cli.proof_verifier_cpu_period_us,
+        pids_limit: cli.proof_verifier_pids_limit,
         production_v3_artifacts,
     }))
 }
@@ -733,6 +746,9 @@ mod tests {
     fn cli_defaults_follow_the_compile_time_network_profile() {
         let cli = Cli::try_parse_from(["cmfd-node", "run"]).unwrap();
         assert_eq!(cli.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        assert_eq!(cli.proof_verifier_cpu_quota_us, None);
+        assert_eq!(cli.proof_verifier_cpu_period_us, None);
+        assert_eq!(cli.proof_verifier_pids_limit, None);
         let Command::Run { bind, p2p_bind, .. } = cli.command else {
             unreachable!()
         };

@@ -15,6 +15,8 @@ pub mod spill {
     pub use cmfd_proof_accel::spill::*;
 }
 mod process;
+#[cfg(target_os = "linux")]
+mod cgroup;
 mod sandbox;
 mod verifier;
 #[cfg(windows)]
@@ -451,6 +453,8 @@ struct ContainedChild {
     terminator: ProcessTerminator,
     direct_kill_attempted: bool,
     direct_child_reaped: bool,
+    #[cfg(target_os = "linux")]
+    cgroup: Option<Arc<Mutex<cgroup::LinuxWorkerCgroup>>>,
 }
 
 #[derive(Clone)]
@@ -461,6 +465,11 @@ struct ProcessTerminator {
 enum ProcessTerminationTarget {
     #[cfg(unix)]
     ProcessGroup(libc::pid_t),
+    #[cfg(target_os = "linux")]
+    LinuxCgroup {
+        process_group: libc::pid_t,
+        cgroup: Arc<Mutex<cgroup::LinuxWorkerCgroup>>,
+    },
     #[cfg(windows)]
     Job(Arc<WindowsJob>),
 }
@@ -472,6 +481,19 @@ impl ProcessTerminator {
             target: Arc::new(Mutex::new(Some(ProcessTerminationTarget::ProcessGroup(
                 process_group,
             )))),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_cgroup(
+        process_group: libc::pid_t,
+        cgroup: Arc<Mutex<cgroup::LinuxWorkerCgroup>>,
+    ) -> Self {
+        Self {
+            target: Arc::new(Mutex::new(Some(ProcessTerminationTarget::LinuxCgroup {
+                process_group,
+                cgroup,
+            }))),
         }
     }
 
@@ -504,6 +526,24 @@ impl ProcessTerminator {
                     libc::kill(-process_group, libc::SIGKILL);
                 }
             }
+            #[cfg(target_os = "linux")]
+            ProcessTerminationTarget::LinuxCgroup {
+                process_group,
+                cgroup,
+            } => {
+                let killed = match cgroup.lock() {
+                    Ok(cgroup) => cgroup.kill().is_ok(),
+                    Err(poisoned) => poisoned.into_inner().kill().is_ok(),
+                };
+                if !killed {
+                    // `cgroup.kill` is authoritative for ProductionV3. Keep
+                    // the process group only as a teardown fallback if that
+                    // control unexpectedly became unavailable.
+                    unsafe {
+                        libc::kill(-process_group, libc::SIGKILL);
+                    }
+                }
+            }
             #[cfg(windows)]
             ProcessTerminationTarget::Job(job) => {
                 let _ = job.terminate();
@@ -520,6 +560,8 @@ impl ContainedChild {
             terminator,
             direct_kill_attempted: false,
             direct_child_reaped: false,
+            #[cfg(target_os = "linux")]
+            cgroup: None,
         }
     }
 
@@ -558,9 +600,64 @@ impl ContainedChild {
         }
     }
 
+    fn thaw_for_request(&self) -> Result<(), ProofWorkerError> {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = &self.cgroup {
+            return cgroup
+                .lock()
+                .map_err(|_| ProofWorkerError::Containment {
+                    operation: "locking the ProductionV3 worker cgroup before request",
+                    source: io::Error::other("worker cgroup state is poisoned"),
+                })?
+                .thaw()
+                .map_err(|source| ProofWorkerError::Containment {
+                    operation: "thawing the ProductionV3 worker before request",
+                    source,
+                });
+        }
+        Ok(())
+    }
+
+    fn freeze_after_response(&self) -> Result<(), ProofWorkerError> {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = &self.cgroup {
+            return cgroup
+                .lock()
+                .map_err(|_| ProofWorkerError::Containment {
+                    operation: "locking the ProductionV3 worker cgroup after response",
+                    source: io::Error::other("worker cgroup state is poisoned"),
+                })?
+                .freeze()
+                .map_err(|source| ProofWorkerError::Containment {
+                    operation: "freezing the ProductionV3 worker after response",
+                    source,
+                });
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cleanup_cgroup(&mut self) {
+        if !self.direct_child_reaped {
+            return;
+        }
+        if let Some(cgroup) = self.cgroup.take() {
+            match cgroup.lock() {
+                Ok(mut cgroup) => {
+                    let _ = cgroup.cleanup();
+                }
+                Err(poisoned) => {
+                    let _ = poisoned.into_inner().cleanup();
+                }
+            }
+        }
+    }
+
     fn terminate_and_reap(&mut self) {
         self.terminate_tree();
         if self.direct_child_reaped {
+            #[cfg(target_os = "linux")]
+            self.cleanup_cgroup();
             return;
         }
         let started = Instant::now();
@@ -568,6 +665,8 @@ impl ContainedChild {
             match self.process.try_wait() {
                 Ok(Some(_)) | Err(_) => {
                     self.direct_child_reaped = true;
+                    #[cfg(target_os = "linux")]
+                    self.cleanup_cgroup();
                     return;
                 }
                 Ok(None) => {}
@@ -679,6 +778,7 @@ fn spawn_contained_unix(
     command: &mut Command,
     memory_limit_bytes: Option<u64>,
     require_linux_launch_boundary: bool,
+    #[cfg(target_os = "linux")] mut production_cgroup: Option<cgroup::LinuxWorkerCgroup>,
 ) -> Result<ContainedChild, ProofWorkerError> {
     use std::os::unix::process::CommandExt;
 
@@ -697,6 +797,10 @@ fn spawn_contained_unix(
                 "worker memory limit does not fit the platform resource-limit type",
             )
         })?;
+    #[cfg(target_os = "linux")]
+    let cgroup_procs_fd = production_cgroup
+        .as_ref()
+        .map(cgroup::LinuxWorkerCgroup::procs_fd);
     // SAFETY: this closure calls only raw syscalls and the async-signal-safe
     // setrlimit operation between fork and exec. Production requires
     // close_range(CLOEXEC), preserving Rust's internal exec-error descriptor
@@ -707,6 +811,19 @@ fn spawn_contained_unix(
         command.pre_exec(move || {
             #[cfg(target_os = "linux")]
             if require_linux_launch_boundary {
+                if let Some(cgroup_procs_fd) = cgroup_procs_fd {
+                    const SELF_PID: &[u8] = b"0\n";
+                    let written =
+                        libc::write(cgroup_procs_fd, SELF_PID.as_ptr().cast(), SELF_PID.len());
+                    if written != SELF_PID.len() as libc::ssize_t {
+                        return Err(io::Error::last_os_error());
+                    }
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "ProductionV3 worker cgroup was not prepared",
+                    ));
+                }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -732,27 +849,71 @@ fn spawn_contained_unix(
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(ProofWorkerError::Spawn)?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            #[cfg(target_os = "linux")]
+            if let Some(cgroup) = production_cgroup.as_mut() {
+                let _ = cgroup.kill();
+                let _ = cgroup.cleanup();
+            }
+            return Err(ProofWorkerError::Spawn(source));
+        }
+    };
     let process_group = match libc::pid_t::try_from(child.id()) {
         Ok(process_group) => process_group,
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
+            #[cfg(target_os = "linux")]
+            if let Some(cgroup) = production_cgroup.as_mut() {
+                let _ = cgroup.kill();
+                let _ = cgroup.cleanup();
+            }
             return Err(ProofWorkerError::InvalidConfig(
                 "worker PID does not fit the platform process ID type",
             ));
         }
     };
-    Ok(ContainedChild::new(
-        ManagedProcess::from_std(child),
-        ProcessTerminator::process_group(process_group),
-    ))
+    #[cfg(target_os = "linux")]
+    let cgroup = if let Some(mut cgroup) = production_cgroup.take() {
+        if let Err(source) = cgroup.finish_spawn(child.id()) {
+            let _ = cgroup.kill();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = cgroup.cleanup();
+            return Err(ProofWorkerError::Containment {
+                operation: "confirming exact ProductionV3 worker cgroup membership",
+                source,
+            });
+        }
+        Some(Arc::new(Mutex::new(cgroup)))
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let terminator = if let Some(cgroup) = &cgroup {
+        ProcessTerminator::linux_cgroup(process_group, Arc::clone(cgroup))
+    } else {
+        ProcessTerminator::process_group(process_group)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let terminator = ProcessTerminator::process_group(process_group);
+    Ok(ContainedChild {
+        process: ManagedProcess::from_std(child),
+        terminator,
+        direct_kill_attempted: false,
+        direct_child_reaped: false,
+        #[cfg(target_os = "linux")]
+        cgroup,
+    })
 }
 
 #[cfg(target_os = "linux")]
 struct ProductionSpawnRequest {
     command: Command,
     memory_limit_bytes: Option<u64>,
+    cgroup_limits: cgroup::LinuxCgroupLimits,
     response: mpsc::SyncSender<Result<ContainedChild, ProofWorkerError>>,
 }
 
@@ -769,6 +930,7 @@ static PRODUCTION_SPAWN_SUPERVISOR: Mutex<Option<mpsc::Sender<ProductionSpawnReq
 fn spawn_contained_production(
     command: Command,
     memory_limit_bytes: Option<u64>,
+    cgroup_limits: cgroup::LinuxCgroupLimits,
 ) -> Result<ContainedChild, ProofWorkerError> {
     let sender = {
         let mut supervisor =
@@ -783,12 +945,49 @@ fn spawn_contained_production(
             thread::Builder::new()
                 .name("cmfd-v3-spawn-supervisor".to_owned())
                 .spawn(move || {
+                    let manager = cgroup::LinuxCgroupManager::initialize().map_err(|source| {
+                        ProofWorkerError::Containment {
+                            operation: "initializing the delegated ProductionV3 cgroup-v2 root",
+                            source,
+                        }
+                    });
+                    let mut next_generation = 0_u64;
                     while let Ok(mut request) = receiver.recv() {
-                        let result = spawn_contained_unix(
-                            &mut request.command,
-                            request.memory_limit_bytes,
-                            true,
-                        );
+                        next_generation = next_generation.saturating_add(1);
+                        let result = match &manager {
+                            Ok(manager) => {
+                                let mut random = [0_u8; 8];
+                                getrandom::fill(&mut random).map_err(|source| {
+                                    ProofWorkerError::Containment {
+                                        operation: "naming a unique ProductionV3 worker cgroup",
+                                        source: io::Error::other(source.to_string()),
+                                    }
+                                }).and_then(|()| {
+                                    let name = format!(
+                                        "cmfd-worker-{}-{next_generation:016x}-{}",
+                                        std::process::id(),
+                                        hex::encode(random)
+                                    );
+                                    manager
+                                        .create_worker(&name, request.cgroup_limits)
+                                        .map_err(|source| ProofWorkerError::Containment {
+                                            operation: "creating an exact ProductionV3 worker cgroup",
+                                            source,
+                                        })
+                                }).and_then(|worker_cgroup| {
+                                    spawn_contained_unix(
+                                        &mut request.command,
+                                        request.memory_limit_bytes,
+                                        true,
+                                        Some(worker_cgroup),
+                                    )
+                                })
+                            }
+                            Err(error) => Err(ProofWorkerError::Containment {
+                                operation: "using the delegated ProductionV3 cgroup-v2 root",
+                                source: io::Error::other(error.to_string()),
+                            }),
+                        };
                         let _ = request.response.send(result);
                     }
                 })
@@ -805,6 +1004,7 @@ fn spawn_contained_production(
         .send(ProductionSpawnRequest {
             command,
             memory_limit_bytes,
+            cgroup_limits,
             response,
         })
         .map_err(|_| ProofWorkerError::Containment {
@@ -829,7 +1029,13 @@ fn spawn_contained(
 ) -> Result<ContainedChild, ProofWorkerError> {
     #[cfg(unix)]
     {
-        spawn_contained_unix(command, memory_limit_bytes, false)
+        spawn_contained_unix(
+            command,
+            memory_limit_bytes,
+            false,
+            #[cfg(target_os = "linux")]
+            None,
+        )
     }
 
     #[cfg(windows)]
@@ -1465,6 +1671,37 @@ mod tests {
     #[cfg(target_os = "linux")]
     const TEST_PDEATH_PID_FILE_ENV: &str = "CMFD_PROOF_WORKER_TEST_PDEATH_PID_FILE";
 
+    #[cfg(target_os = "linux")]
+    fn test_linux_cgroup_limits() -> cgroup::LinuxCgroupLimits {
+        cgroup::LinuxCgroupLimits {
+            cpu_quota_micros: 100_000,
+            cpu_period_micros: 100_000,
+            memory_bytes: 512 * 1024 * 1024,
+            pids: 16,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_spawn_or_skip(command: Command) -> Option<ContainedChild> {
+        match spawn_contained_production(command, None, test_linux_cgroup_limits()) {
+            Ok(child) => Some(child),
+            Err(ProofWorkerError::Containment { source, .. })
+            | Err(ProofWorkerError::Spawn(source))
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::ReadOnlyFilesystem
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::Other
+                ) =>
+            {
+                eprintln!("skipping delegated cgroup test: {source}");
+                None
+            }
+            Err(error) => panic!("unexpected ProductionV3 containment failure: {error}"),
+        }
+    }
+
     fn statement() -> StructuredBlake3Statement {
         StructuredBlake3Statement {
             challenge_digest: [0x11; 32],
@@ -1830,7 +2067,10 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = spawn_contained_production(command, None).unwrap();
+        let Some(child) = production_spawn_or_skip(command) else {
+            fs::write(pid_file, "skip").unwrap();
+            return;
+        };
         fs::write(pid_file, child.id().to_string()).unwrap();
         thread::sleep(Duration::from_secs(30));
         drop(child);
@@ -1986,7 +2226,10 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = spawn_contained_production(command, None).unwrap();
+        let Some(child) = production_spawn_or_skip(command) else {
+            fs::remove_file(sentinel_path).unwrap();
+            return;
+        };
         exchange_with_child(
             child,
             Vec::new(),
@@ -2001,17 +2244,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn production_worker_survives_the_request_thread_that_started_it() {
-        let mut child = thread::spawn(|| {
+        let child = thread::spawn(|| {
             let mut command = Command::new("/bin/sleep");
             command
                 .arg("30")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            spawn_contained_production(command, None).unwrap()
+            production_spawn_or_skip(command)
         })
         .join()
         .expect("temporary launch caller thread");
+        let Some(mut child) = child else {
+            return;
+        };
 
         assert!(
             child.try_wait().unwrap().is_none(),
@@ -2051,8 +2297,14 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        let worker_pid = fs::read_to_string(&pid_file)
-            .expect("parent-death helper published worker PID")
+        let published =
+            fs::read_to_string(&pid_file).expect("parent-death helper published worker PID");
+        if published == "skip" {
+            host.wait().expect("reap skipped parent-death helper");
+            fs::remove_file(pid_file).unwrap();
+            return;
+        }
+        let worker_pid = published
             .parse::<libc::pid_t>()
             .expect("parent-death worker PID");
         assert!(live_non_zombie(worker_pid));

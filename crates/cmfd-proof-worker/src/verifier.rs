@@ -24,14 +24,14 @@ use super::{
 
 const REQUEST_MAGIC: &[u8; 8] = b"CMFDVWQ1";
 const RESPONSE_MAGIC: &[u8; 8] = b"CMFDVWR1";
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const VERIFY_MODE: &str = "--verify-block";
 const PERSISTENT_VERIFY_MODE: &str = "--verify-block-server";
 const V3_BANK_ARGUMENT: &str = "--production-v3-bank";
 const V3_MANIFEST_ARGUMENT: &str = "--production-v3-manifest";
 const V3_RECORD_ARGUMENT: &str = "--production-v3-record-v2";
-const REQUEST_FIXED_BYTES: usize = 8 + 4 + 32 + 32 + 32 + 4;
-const SUCCESS_RESPONSE_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32;
+const REQUEST_FIXED_BYTES: usize = 8 + 4 + 32 + 32 + 32 + 32 + 4;
+const SUCCESS_RESPONSE_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32 + 32;
 const ERROR_RESPONSE_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
 const MAX_ERROR_BYTES: usize = 1_024;
 const STATUS_SUCCESS: u8 = 0;
@@ -48,10 +48,13 @@ const HANDSHAKE_STATUS_SUCCESS: u8 = 0;
 const HANDSHAKE_STATUS_FAILURE: u8 = 1;
 const PROFILE_V2_REFERENCE: u8 = 2;
 const PROFILE_PRODUCTION_V3: u8 = 3;
-const HANDSHAKE_REQUEST_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32 + 32;
-const HANDSHAKE_SUCCESS_BYTES: usize = 8 + 4 + 1 + 1 + 1 + 32 + 32 + 32;
+const HANDSHAKE_REQUEST_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32 + 32 + 32;
+const HANDSHAKE_SUCCESS_BYTES: usize = 8 + 4 + 1 + 1 + 1 + 32 + 32 + 32 + 32;
 const HANDSHAKE_ERROR_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
-const STARTUP_SELF_TEST_DOMAIN: &[u8] = b"Common Foundry persistent verifier startup self-test v1";
+const STARTUP_SELF_TEST_DOMAIN: &[u8] = b"Common Foundry persistent verifier startup self-test v2";
+const CONTAINMENT_PROFILE_DOMAIN: &[u8] = b"Common Foundry verifier containment profile v1";
+#[cfg(target_os = "linux")]
+const LINUX_CGROUP_V2_DOMAIN_PROFILE: &[u8] = b"Common Foundry Linux cgroup-v2 domain containment v1: unified; delegated cpu,memory,pids; supervisor child; worker cgroup.type=domain; cpu.max; memory.max; memory.swap.max=0; pids.max; memory.oom.group=1; cgroup.max.depth=0; cgroup.max.descendants=0; exact cgroup.procs membership; cgroup.freeze; cgroup.kill";
 const PRIVATE_COPY_ATTEMPTS: usize = 128;
 const MAX_VERIFIER_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 static PRIVATE_COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +74,13 @@ pub struct VerifierWorkerConfig {
     pub startup_timeout: Duration,
     pub timeout: Duration,
     pub memory_limit_bytes: u64,
+    /// Measured cgroup-v2 CPU quota in microseconds. Linux ProductionV3
+    /// requires this together with `cpu_period_micros`; Devnet does not use it.
+    pub cpu_quota_micros: Option<u64>,
+    /// Measured cgroup-v2 CPU period in microseconds.
+    pub cpu_period_micros: Option<u64>,
+    /// Measured maximum task count for the ProductionV3 verifier cgroup.
+    pub pids_limit: Option<u64>,
     pub production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
 }
 
@@ -130,10 +140,70 @@ impl VerifierWorkerConfig {
                 "worker memory limit does not fit this platform",
             ));
         }
+        match (
+            self.cpu_quota_micros,
+            self.cpu_period_micros,
+            self.pids_limit,
+        ) {
+            (Some(quota), Some(period), Some(pids)) => {
+                if quota < 1_000 {
+                    return Err(VerifierWorkerError::InvalidConfig(
+                        "worker CPU quota must be at least 1000 microseconds",
+                    ));
+                }
+                if !(1_000..=1_000_000).contains(&period) {
+                    return Err(VerifierWorkerError::InvalidConfig(
+                        "worker CPU period must be between 1000 and 1000000 microseconds",
+                    ));
+                }
+                if pids == 0 || pids > i64::MAX as u64 {
+                    return Err(VerifierWorkerError::InvalidConfig(
+                        "worker PID limit must be a nonzero signed 64-bit integer",
+                    ));
+                }
+            }
+            (None, None, None) =>
+            {
+                #[cfg(target_os = "linux")]
+                if self.production_v3_artifacts.is_some() {
+                    return Err(VerifierWorkerError::InvalidConfig(
+                        "Linux ProductionV3 requires measured CPU quota, CPU period, and PID limit",
+                    ));
+                }
+            }
+            _ => {
+                return Err(VerifierWorkerError::InvalidConfig(
+                    "worker CPU quota, CPU period, and PID limit must be configured together",
+                ));
+            }
+        }
         if let Some(artifacts) = &self.production_v3_artifacts {
             artifacts.validate()?;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_cgroup_limits(&self) -> Result<super::cgroup::LinuxCgroupLimits, VerifierWorkerError> {
+        let limits = super::cgroup::LinuxCgroupLimits {
+            cpu_quota_micros: self
+                .cpu_quota_micros
+                .ok_or(VerifierWorkerError::InvalidConfig(
+                    "Linux ProductionV3 CPU quota is not configured",
+                ))?,
+            cpu_period_micros: self
+                .cpu_period_micros
+                .ok_or(VerifierWorkerError::InvalidConfig(
+                    "Linux ProductionV3 CPU period is not configured",
+                ))?,
+            memory_bytes: self.memory_limit_bytes,
+            pids: self.pids_limit.ok_or(VerifierWorkerError::InvalidConfig(
+                "Linux ProductionV3 PID limit is not configured",
+            ))?,
+        };
+        limits
+            .validate()
+            .map_err(|_| VerifierWorkerError::InvalidConfig("invalid Linux cgroup limits"))
     }
 
     /// Validates the shape and caller-supplied executable identity before a
@@ -146,6 +216,37 @@ impl VerifierWorkerConfig {
             self.worker_sha256,
         )?;
         Ok(())
+    }
+
+    fn containment_profile_digest(&self, sandbox: VerifierSandboxStatus) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(CONTAINMENT_PROFILE_DOMAIN);
+        hasher.update([configured_profile(self)]);
+        hasher.update([sandbox as u8]);
+        #[cfg(target_os = "linux")]
+        if self.production_v3_artifacts.is_some() {
+            hasher.update([1]);
+            hasher.update(LINUX_CGROUP_V2_DOMAIN_PROFILE);
+        } else {
+            hasher.update([0]);
+        }
+        #[cfg(not(target_os = "linux"))]
+        hasher.update([0]);
+        hasher.update(self.memory_limit_bytes.to_le_bytes());
+        match (
+            self.cpu_quota_micros,
+            self.cpu_period_micros,
+            self.pids_limit,
+        ) {
+            (Some(quota), Some(period), Some(pids)) => {
+                hasher.update([1]);
+                hasher.update(quota.to_le_bytes());
+                hasher.update(period.to_le_bytes());
+                hasher.update(pids.to_le_bytes());
+            }
+            _ => hasher.update([0]),
+        }
+        hasher.finalize().into()
     }
 }
 
@@ -212,6 +313,7 @@ struct VerifierRequest {
     network_id: [u8; 32],
     verifier_identity: [u8; 32],
     statement_identity: [u8; 32],
+    containment_profile: [u8; 32],
     block: Vec<u8>,
 }
 
@@ -221,6 +323,7 @@ enum VerifierResponse {
         sandbox_status: VerifierSandboxStatus,
         verifier_identity: [u8; 32],
         statement_identity: [u8; 32],
+        containment_profile: [u8; 32],
     },
     Failure {
         code: u16,
@@ -234,6 +337,7 @@ struct StartupHandshake {
     required_sandbox: VerifierSandboxStatus,
     network_id: [u8; 32],
     verifier_identity: [u8; 32],
+    containment_profile: [u8; 32],
     challenge: [u8; 32],
 }
 
@@ -244,6 +348,7 @@ enum StartupResponse {
         sandbox_status: VerifierSandboxStatus,
         network_id: [u8; 32],
         verifier_identity: [u8; 32],
+        containment_profile: [u8; 32],
         self_test: [u8; 32],
     },
     Failure {
@@ -345,10 +450,16 @@ impl PersistentVerifierWorker {
             .verifier
             .external_preverification_binding(&block.challenge, &block.proof)
             .map_err(|error| VerifierWorkerError::Capability(error.to_string()))?;
+        let required_sandbox = expected_sandbox_status(&self.inner.config)?;
+        let containment_profile = self
+            .inner
+            .config
+            .containment_profile_digest(required_sandbox);
         let request = encode_request(VerifierRequest {
             network_id: block.challenge.network_id,
             verifier_identity: binding.verifier_identity(),
             statement_identity: binding.statement_identity(),
+            containment_profile,
             block: canonical,
         })?;
 
@@ -383,11 +494,9 @@ impl PersistentVerifierWorker {
                 return Err(error);
             }
         };
-        if let Err(error) = require_matching_success(
-            &response,
-            binding,
-            expected_sandbox_status(&self.inner.config)?,
-        ) {
+        if let Err(error) =
+            require_matching_success(&response, binding, required_sandbox, containment_profile)
+        {
             // A canonical proof rejection is an expected, statement-local
             // outcome. Protocol, identity, and worker-internal failures poison
             // this process generation and force a complete authenticated
@@ -526,6 +635,7 @@ impl PersistentVerifierWorkerInner {
             return Err(VerifierWorkerError::TransportPoisoned);
         }
         let required_sandbox = expected_sandbox_status(&self.config)?;
+        let containment_profile = self.config.containment_profile_digest(required_sandbox);
         // Recheck the immutable copy immediately before every exec. There is
         // still a residual same-user check/exec race on platforms without an
         // exec-by-retained-handle primitive; the copy lives in a private,
@@ -555,7 +665,11 @@ impl PersistentVerifierWorkerInner {
         let child = if self.config.production_v3_artifacts.is_some() {
             #[cfg(target_os = "linux")]
             {
-                super::spawn_contained_production(command, Some(self.config.memory_limit_bytes))?
+                super::spawn_contained_production(
+                    command,
+                    Some(self.config.memory_limit_bytes),
+                    self.config.linux_cgroup_limits()?,
+                )?
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -601,6 +715,7 @@ impl PersistentVerifierWorkerInner {
                 required_sandbox,
                 network_id: self.network_id,
                 verifier_identity: self.verifier_identity,
+                containment_profile,
                 challenge,
             });
             let response = process.exchange(
@@ -614,6 +729,7 @@ impl PersistentVerifierWorkerInner {
                 required_sandbox,
                 self.network_id,
                 self.verifier_identity,
+                containment_profile,
                 challenge,
             )?;
             self.sandbox_status
@@ -1002,6 +1118,10 @@ impl PersistentVerifierProcess {
         timeout: Duration,
         response_limit: usize,
     ) -> Result<Vec<u8>, VerifierWorkerError> {
+        if let Err(error) = self.child.thaw_for_request() {
+            self.child.terminate_and_reap();
+            return Err(VerifierWorkerError::Process(error));
+        }
         let stdin = self.stdin.take().ok_or(VerifierWorkerError::Process(
             ProofWorkerError::InvalidConfig("persistent worker stdin pipe is unavailable"),
         ))?;
@@ -1029,6 +1149,10 @@ impl PersistentVerifierProcess {
                 }
                 self.stdin = Some(stdin);
                 self.stdout = Some(stdout);
+                if let Err(error) = self.child.freeze_after_response() {
+                    self.child.terminate_and_reap();
+                    return Err(VerifierWorkerError::Process(error));
+                }
                 if self.stderr_exceeded()? {
                     self.child.terminate_and_reap();
                     return Err(VerifierWorkerError::Process(
@@ -1192,6 +1316,7 @@ fn encode_startup_handshake(handshake: StartupHandshake) -> Vec<u8> {
     bytes.push(handshake.required_sandbox as u8);
     bytes.extend_from_slice(&handshake.network_id);
     bytes.extend_from_slice(&handshake.verifier_identity);
+    bytes.extend_from_slice(&handshake.containment_profile);
     bytes.extend_from_slice(&handshake.challenge);
     bytes
 }
@@ -1218,6 +1343,7 @@ fn decode_startup_handshake(bytes: &[u8]) -> Result<StartupHandshake, VerifierPr
             .ok_or(VerifierProtocolError::InvalidStatus)?,
         network_id: cursor.read_array()?,
         verifier_identity: cursor.read_array()?,
+        containment_profile: cursor.read_array()?,
         challenge: cursor.read_array()?,
     };
     cursor.finish()?;
@@ -1229,6 +1355,7 @@ fn startup_self_test(
     sandbox_status: VerifierSandboxStatus,
     network_id: [u8; 32],
     verifier_identity: [u8; 32],
+    containment_profile: [u8; 32],
     challenge: [u8; 32],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1237,6 +1364,7 @@ fn startup_self_test(
     hasher.update([sandbox_status as u8]);
     hasher.update(network_id);
     hasher.update(verifier_identity);
+    hasher.update(containment_profile);
     hasher.update(challenge);
     hasher.finalize().into()
 }
@@ -1253,11 +1381,13 @@ fn encode_startup_success(
     bytes.push(sandbox_status as u8);
     bytes.extend_from_slice(&handshake.network_id);
     bytes.extend_from_slice(&handshake.verifier_identity);
+    bytes.extend_from_slice(&handshake.containment_profile);
     bytes.extend_from_slice(&startup_self_test(
         handshake.profile,
         sandbox_status,
         handshake.network_id,
         handshake.verifier_identity,
+        handshake.containment_profile,
         handshake.challenge,
     ));
     bytes
@@ -1291,6 +1421,7 @@ fn decode_startup_response(bytes: &[u8]) -> Result<StartupResponse, VerifierProt
                 .ok_or(VerifierProtocolError::InvalidStatus)?,
             network_id: cursor.read_array()?,
             verifier_identity: cursor.read_array()?,
+            containment_profile: cursor.read_array()?,
             self_test: cursor.read_array()?,
         },
         HANDSHAKE_STATUS_FAILURE => {
@@ -1319,6 +1450,7 @@ fn require_startup_success(
     required_sandbox: VerifierSandboxStatus,
     network_id: [u8; 32],
     verifier_identity: [u8; 32],
+    containment_profile: [u8; 32],
     challenge: [u8; 32],
 ) -> Result<VerifierSandboxStatus, VerifierWorkerError> {
     match decode_startup_response(response)? {
@@ -1327,17 +1459,20 @@ fn require_startup_success(
             sandbox_status,
             network_id: received_network,
             verifier_identity: received_verifier,
+            containment_profile: received_containment,
             self_test,
         } if received_profile == profile
             && sandbox_status == required_sandbox
             && received_network == network_id
             && received_verifier == verifier_identity
+            && received_containment == containment_profile
             && self_test
                 == startup_self_test(
                     profile,
                     required_sandbox,
                     network_id,
                     verifier_identity,
+                    containment_profile,
                     challenge,
                 ) =>
         {
@@ -1361,6 +1496,7 @@ pub fn verify_block_out_of_process(
     block: &Block,
 ) -> Result<PreverifiedBlockProof, VerifierWorkerError> {
     let required_sandbox = expected_sandbox_status(config)?;
+    let containment_profile = config.containment_profile_digest(required_sandbox);
     config.validate_executable()?;
     let canonical = encode_block(block)
         .map_err(|error| VerifierWorkerError::BlockEncoding(error.to_string()))?;
@@ -1371,6 +1507,7 @@ pub fn verify_block_out_of_process(
         network_id: block.challenge.network_id,
         verifier_identity: binding.verifier_identity(),
         statement_identity: binding.statement_identity(),
+        containment_profile,
         block: canonical,
     })?;
     let mut command = Command::new(&config.worker_executable);
@@ -1397,7 +1534,11 @@ pub fn verify_block_out_of_process(
     let child = if config.production_v3_artifacts.is_some() {
         #[cfg(target_os = "linux")]
         {
-            super::spawn_contained_production(command, Some(config.memory_limit_bytes))?
+            super::spawn_contained_production(
+                command,
+                Some(config.memory_limit_bytes),
+                config.linux_cgroup_limits()?,
+            )?
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1410,7 +1551,7 @@ pub fn verify_block_out_of_process(
     };
     let response =
         exchange_with_child(child, request, config.timeout, MAX_VERIFIER_RESPONSE_BYTES)?;
-    require_matching_success(&response, binding, required_sandbox)?;
+    require_matching_success(&response, binding, required_sandbox, containment_profile)?;
 
     // SAFETY: the exact binding was returned by the caller-pinned worker only
     // after a canonical request, successful exit, bounded wall time, bounded
@@ -1424,23 +1565,32 @@ fn require_matching_success(
     response: &[u8],
     binding: ExternalPreverificationBinding,
     required_sandbox: VerifierSandboxStatus,
+    required_containment_profile: [u8; 32],
 ) -> Result<(), VerifierWorkerError> {
-    let (sandbox_status, echoed_verifier, echoed_statement) = match decode_response(response)? {
-        VerifierResponse::Success {
-            sandbox_status,
-            verifier_identity,
-            statement_identity,
-        } => (sandbox_status, verifier_identity, statement_identity),
-        VerifierResponse::Failure { code, message } if code == ERROR_PROOF_REJECTED => {
-            return Err(VerifierWorkerError::ProofRejected(message));
-        }
-        VerifierResponse::Failure { code, message } => {
-            return Err(VerifierWorkerError::WorkerReported { code, message });
-        }
-    };
+    let (sandbox_status, echoed_verifier, echoed_statement, echoed_containment) =
+        match decode_response(response)? {
+            VerifierResponse::Success {
+                sandbox_status,
+                verifier_identity,
+                statement_identity,
+                containment_profile,
+            } => (
+                sandbox_status,
+                verifier_identity,
+                statement_identity,
+                containment_profile,
+            ),
+            VerifierResponse::Failure { code, message } if code == ERROR_PROOF_REJECTED => {
+                return Err(VerifierWorkerError::ProofRejected(message));
+            }
+            VerifierResponse::Failure { code, message } => {
+                return Err(VerifierWorkerError::WorkerReported { code, message });
+            }
+        };
     if sandbox_status != required_sandbox
         || echoed_verifier != binding.verifier_identity()
         || echoed_statement != binding.statement_identity()
+        || echoed_containment != required_containment_profile
     {
         return Err(VerifierWorkerError::ResponseMismatch);
     }
@@ -1459,6 +1609,7 @@ fn encode_request(request: VerifierRequest) -> Result<Vec<u8>, VerifierProtocolE
     output.extend_from_slice(&request.network_id);
     output.extend_from_slice(&request.verifier_identity);
     output.extend_from_slice(&request.statement_identity);
+    output.extend_from_slice(&request.containment_profile);
     output.extend_from_slice(&block_len.to_le_bytes());
     output.extend_from_slice(&request.block);
     Ok(output)
@@ -1479,6 +1630,7 @@ fn decode_request(bytes: &[u8]) -> Result<VerifierRequest, VerifierProtocolError
     let network_id = cursor.read_array()?;
     let verifier_identity = cursor.read_array()?;
     let statement_identity = cursor.read_array()?;
+    let containment_profile = cursor.read_array()?;
     let block_len =
         usize::try_from(cursor.read_u32()?).map_err(|_| VerifierProtocolError::InvalidLength)?;
     if block_len == 0 || block_len > MAX_BLOCK_BYTES || block_len != cursor.remaining() {
@@ -1490,6 +1642,7 @@ fn decode_request(bytes: &[u8]) -> Result<VerifierRequest, VerifierProtocolError
         network_id,
         verifier_identity,
         statement_identity,
+        containment_profile,
         block,
     })
 }
@@ -1497,6 +1650,7 @@ fn decode_request(bytes: &[u8]) -> Result<VerifierRequest, VerifierProtocolError
 fn encode_success_response(
     binding: ExternalPreverificationBinding,
     sandbox_status: VerifierSandboxStatus,
+    containment_profile: [u8; 32],
 ) -> Vec<u8> {
     let mut output = Vec::with_capacity(SUCCESS_RESPONSE_BYTES);
     output.extend_from_slice(RESPONSE_MAGIC);
@@ -1505,6 +1659,7 @@ fn encode_success_response(
     output.push(sandbox_status as u8);
     output.extend_from_slice(&binding.verifier_identity());
     output.extend_from_slice(&binding.statement_identity());
+    output.extend_from_slice(&containment_profile);
     output
 }
 
@@ -1538,6 +1693,7 @@ fn decode_response(bytes: &[u8]) -> Result<VerifierResponse, VerifierProtocolErr
                 .ok_or(VerifierProtocolError::InvalidStatus)?,
             verifier_identity: cursor.read_array()?,
             statement_identity: cursor.read_array()?,
+            containment_profile: cursor.read_array()?,
         },
         STATUS_FAILURE => {
             let code = cursor.read_u16()?;
@@ -1559,8 +1715,14 @@ fn decode_response(bytes: &[u8]) -> Result<VerifierResponse, VerifierProtocolErr
     Ok(response)
 }
 
-fn run_verifier_worker()
--> Result<(ExternalPreverificationBinding, VerifierSandboxStatus), (u16, String)> {
+fn run_verifier_worker() -> Result<
+    (
+        ExternalPreverificationBinding,
+        VerifierSandboxStatus,
+        [u8; 32],
+    ),
+    (u16, String),
+> {
     let artifacts = parse_verifier_worker_arguments(std::env::args_os().skip(1))
         .map_err(|message| (ERROR_REQUEST, message.to_owned()))?;
     require_empty_worker_environment()?;
@@ -1569,6 +1731,7 @@ fn run_verifier_worker()
         .map_err(|error| (ERROR_INTERNAL, format!("could not read request: {error}")))?;
     let request =
         decode_request(&request_bytes).map_err(|error| (ERROR_REQUEST, error.to_string()))?;
+    let containment_profile = request.containment_profile;
     let block = decode_block(&request.block, request.network_id)
         .map_err(|error| (ERROR_REQUEST, error.to_string()))?;
     let canonical = encode_block(&block).map_err(|error| (ERROR_REQUEST, error.to_string()))?;
@@ -1581,7 +1744,7 @@ fn run_verifier_worker()
 
     let verifier = load_worker_verifier(request.network_id, artifacts.as_ref())?;
     verify_request_with_loaded_verifier(&verifier, request, block)
-        .map(|binding| (binding, sandbox_status))
+        .map(|binding| (binding, sandbox_status, containment_profile))
 }
 
 fn install_worker_sandbox(
@@ -1762,12 +1925,19 @@ fn persistent_verifier_worker_main() -> i32 {
             return 0;
         }
         let response = match decode_request(&request_bytes) {
-            Ok(request) if request.network_id == handshake.network_id => {
+            Ok(request)
+                if request.network_id == handshake.network_id
+                    && request.containment_profile == handshake.containment_profile =>
+            {
                 match decode_block(&request.block, request.network_id) {
                     Ok(block) => match encode_block(&block) {
                         Ok(canonical) if canonical == request.block => {
                             match verify_request_with_loaded_verifier(&verifier, request, block) {
-                                Ok(binding) => encode_success_response(binding, sandbox_status),
+                                Ok(binding) => encode_success_response(
+                                    binding,
+                                    sandbox_status,
+                                    handshake.containment_profile,
+                                ),
                                 Err((code, message)) => encode_error_response(code, &message),
                             }
                         }
@@ -1779,7 +1949,10 @@ fn persistent_verifier_worker_main() -> i32 {
                     Err(error) => encode_error_response(ERROR_REQUEST, &error.to_string()),
                 }
             }
-            Ok(_) => encode_error_response(ERROR_REQUEST, "request belongs to another network"),
+            Ok(_) => encode_error_response(
+                ERROR_REQUEST,
+                "request belongs to another network or containment profile",
+            ),
             Err(error) => encode_error_response(ERROR_REQUEST, &error.to_string()),
         };
         if write_worker_frame(&mut output, &response).is_err() {
@@ -1929,7 +2102,9 @@ pub(super) fn verifier_worker_main() -> i32 {
         return persistent_verifier_worker_main();
     }
     let response = match run_verifier_worker() {
-        Ok((binding, sandbox_status)) => encode_success_response(binding, sandbox_status),
+        Ok((binding, sandbox_status, containment_profile)) => {
+            encode_success_response(binding, sandbox_status, containment_profile)
+        }
         Err((code, message)) => encode_error_response(code, &message),
     };
     match io::stdout().write_all(&response) {
@@ -2059,6 +2234,7 @@ mod tests {
             network_id: block.challenge.network_id,
             verifier_identity: binding.verifier_identity(),
             statement_identity: binding.statement_identity(),
+            containment_profile: [0x44; 32],
             block: canonical,
         };
         let encoded = encode_request(request).unwrap();
@@ -2066,6 +2242,7 @@ mod tests {
         assert_eq!(decoded.network_id, block.challenge.network_id);
         assert_eq!(decoded.verifier_identity, binding.verifier_identity());
         assert_eq!(decoded.statement_identity, binding.statement_identity());
+        assert_eq!(decoded.containment_profile, [0x44; 32]);
         assert_eq!(decoded.block, encode_block(&block).unwrap());
 
         let mut truncated = encoded.clone();
@@ -2087,18 +2264,24 @@ mod tests {
     }
 
     #[test]
-    fn verifier_response_binds_both_identities_and_rejects_malformed_streams() {
+    fn verifier_response_binds_identities_and_containment_and_rejects_malformed_streams() {
         let (verifier, block) = candidate_block();
         let binding = verifier
             .external_preverification_binding(&block.challenge, &block.proof)
             .unwrap();
-        let encoded = encode_success_response(binding, VerifierSandboxStatus::Unconfined);
+        let containment_profile = [0x44; 32];
+        let encoded = encode_success_response(
+            binding,
+            VerifierSandboxStatus::Unconfined,
+            containment_profile,
+        );
         assert_eq!(
             decode_response(&encoded).unwrap(),
             VerifierResponse::Success {
                 sandbox_status: VerifierSandboxStatus::Unconfined,
                 verifier_identity: binding.verifier_identity(),
                 statement_identity: binding.statement_identity(),
+                containment_profile,
             }
         );
 
@@ -2107,6 +2290,7 @@ mod tests {
         let VerifierResponse::Success {
             verifier_identity,
             statement_identity,
+            containment_profile: substituted_containment,
             ..
         } = decode_response(&substituted).unwrap()
         else {
@@ -2115,16 +2299,27 @@ mod tests {
         assert!(
             verifier_identity != binding.verifier_identity()
                 || statement_identity != binding.statement_identity()
+                || substituted_containment != containment_profile
         );
         assert!(matches!(
-            require_matching_success(&substituted, binding, VerifierSandboxStatus::Unconfined,),
+            require_matching_success(
+                &substituted,
+                binding,
+                VerifierSandboxStatus::Unconfined,
+                containment_profile,
+            ),
             Err(VerifierWorkerError::ResponseMismatch)
         ));
 
         let mut wrong_sandbox = encoded.clone();
         wrong_sandbox[13] = VerifierSandboxStatus::LinuxLandlockSeccompV1 as u8;
         assert!(matches!(
-            require_matching_success(&wrong_sandbox, binding, VerifierSandboxStatus::Unconfined,),
+            require_matching_success(
+                &wrong_sandbox,
+                binding,
+                VerifierSandboxStatus::Unconfined,
+                containment_profile,
+            ),
             Err(VerifierWorkerError::ResponseMismatch)
         ));
 
@@ -2149,6 +2344,7 @@ mod tests {
             required_sandbox: VerifierSandboxStatus::LinuxLandlockSeccompV1,
             network_id: [0x11; 32],
             verifier_identity: [0x22; 32],
+            containment_profile: [0x44; 32],
             challenge: [0x33; 32],
         };
         assert_eq!(
@@ -2157,6 +2353,7 @@ mod tests {
                 required_sandbox: handshake.required_sandbox,
                 network_id: handshake.network_id,
                 verifier_identity: handshake.verifier_identity,
+                containment_profile: handshake.containment_profile,
                 challenge: handshake.challenge,
             }))
             .unwrap(),
@@ -2171,6 +2368,7 @@ mod tests {
                 handshake.required_sandbox,
                 handshake.network_id,
                 handshake.verifier_identity,
+                handshake.containment_profile,
                 handshake.challenge,
             )
             .unwrap(),
@@ -2183,6 +2381,19 @@ mod tests {
                 VerifierSandboxStatus::WindowsAppContainerV1,
                 handshake.network_id,
                 handshake.verifier_identity,
+                handshake.containment_profile,
+                handshake.challenge,
+            ),
+            Err(VerifierWorkerError::Startup(_))
+        ));
+        assert!(matches!(
+            require_startup_success(
+                &success,
+                handshake.profile,
+                handshake.required_sandbox,
+                handshake.network_id,
+                handshake.verifier_identity,
+                [0x45; 32],
                 handshake.challenge,
             ),
             Err(VerifierWorkerError::Startup(_))
@@ -2253,6 +2464,9 @@ mod tests {
             startup_timeout: Duration::from_secs(1),
             timeout: Duration::from_secs(1),
             memory_limit_bytes: 1,
+            cpu_quota_micros: None,
+            cpu_period_micros: None,
+            pids_limit: None,
             production_v3_artifacts: None,
         };
         assert!(matches!(
@@ -2272,6 +2486,12 @@ mod tests {
             Err(VerifierWorkerError::InvalidConfig(_))
         ));
         config.memory_limit_bytes = 1;
+        config.cpu_quota_micros = Some(100_000);
+        assert!(matches!(
+            config.validate(),
+            Err(VerifierWorkerError::InvalidConfig(_))
+        ));
+        config.cpu_quota_micros = None;
         config.production_v3_artifacts = Some(ProductionV3VerifierArtifacts {
             bank: PathBuf::from("relative-bank"),
             manifest: PathBuf::from("relative-manifest"),
@@ -2280,6 +2500,89 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(VerifierWorkerError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn containment_profile_digest_commits_every_resource_limit() {
+        let worker = std::env::current_exe().unwrap();
+        let base = VerifierWorkerConfig {
+            worker_executable: worker,
+            worker_sha256: [0; 32],
+            startup_timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            memory_limit_bytes: 1_000_000,
+            cpu_quota_micros: Some(25_000),
+            cpu_period_micros: Some(100_000),
+            pids_limit: Some(8),
+            production_v3_artifacts: None,
+        };
+        let digest = base.containment_profile_digest(VerifierSandboxStatus::Unconfined);
+        for changed in [
+            VerifierWorkerConfig {
+                memory_limit_bytes: base.memory_limit_bytes + 1,
+                ..base.clone()
+            },
+            VerifierWorkerConfig {
+                cpu_quota_micros: Some(25_001),
+                ..base.clone()
+            },
+            VerifierWorkerConfig {
+                cpu_period_micros: Some(100_001),
+                ..base.clone()
+            },
+            VerifierWorkerConfig {
+                pids_limit: Some(9),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                digest,
+                changed.containment_profile_digest(VerifierSandboxStatus::Unconfined)
+            );
+        }
+        assert_ne!(
+            digest,
+            base.containment_profile_digest(VerifierSandboxStatus::LinuxLandlockSeccompV1)
+        );
+        let production = VerifierWorkerConfig {
+            production_v3_artifacts: Some(ProductionV3VerifierArtifacts {
+                bank: std::env::temp_dir().join("containment-profile-bank"),
+                manifest: std::env::temp_dir().join("containment-profile-manifest"),
+                record_v2: std::env::temp_dir().join("containment-profile-record"),
+            }),
+            ..base.clone()
+        };
+        assert_ne!(
+            digest,
+            production.containment_profile_digest(VerifierSandboxStatus::Unconfined)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_production_config_requires_explicit_measured_cgroup_limits() {
+        let root = std::env::temp_dir().join("cmfd-explicit-cgroup-limits");
+        let config = VerifierWorkerConfig {
+            worker_executable: std::env::current_exe().unwrap(),
+            worker_sha256: [0; 32],
+            startup_timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            memory_limit_bytes: 1024,
+            cpu_quota_micros: None,
+            cpu_period_micros: None,
+            pids_limit: None,
+            production_v3_artifacts: Some(ProductionV3VerifierArtifacts {
+                bank: root.join("bank"),
+                manifest: root.join("manifest"),
+                record_v2: root.join("record"),
+            }),
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(VerifierWorkerError::InvalidConfig(
+                "Linux ProductionV3 requires measured CPU quota, CPU period, and PID limit"
+            ))
         ));
     }
 

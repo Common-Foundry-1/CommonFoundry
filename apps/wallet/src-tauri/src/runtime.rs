@@ -382,6 +382,9 @@ fn prepare_node_security_with_package(
                 memory_limit_bytes: options
                     .verifier_memory_bytes
                     .unwrap_or(DEFAULT_PROOF_VERIFIER_MEMORY_BYTES),
+                cpu_quota_micros: options.verifier_cpu_quota_us,
+                cpu_period_micros: options.verifier_cpu_period_us,
+                pids_limit: options.verifier_pids_limit,
                 production_v3_artifacts: Some(artifacts.clone()),
             };
             worker
@@ -564,6 +567,9 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
                 "  --proof-verifier-startup-timeout-ms <integer> Model authentication timeout (default {})\n",
                 "  --proof-verifier-timeout-ms <integer>        Worker timeout (default {})\n",
                 "  --proof-verifier-memory-bytes <integer>      Worker memory cap (default {})\n",
+                "  --proof-verifier-cpu-quota-us <integer>      Measured Linux cgroup CPU quota\n",
+                "  --proof-verifier-cpu-period-us <integer>     Measured Linux cgroup CPU period\n",
+                "  --proof-verifier-pids-limit <integer>        Measured Linux cgroup task limit\n",
             ),
             DEFAULT_PROOF_VERIFIER_STARTUP_TIMEOUT_MS,
             DEFAULT_PROOF_VERIFIER_TIMEOUT_MS,
@@ -656,6 +662,9 @@ mod tests {
             verifier_startup_timeout_ms: Some(1_234),
             verifier_timeout_ms: Some(1_234),
             verifier_memory_bytes: Some(4_096),
+            verifier_cpu_quota_us: Some(100_000),
+            verifier_cpu_period_us: Some(100_000),
+            verifier_pids_limit: Some(16),
         };
         config
     }
@@ -781,6 +790,9 @@ mod tests {
             verifier_startup_timeout_ms: None,
             verifier_timeout_ms: None,
             verifier_memory_bytes: None,
+            verifier_cpu_quota_us: None,
+            verifier_cpu_period_us: None,
+            verifier_pids_limit: None,
         };
 
         let error = security_error(prepare_for_test(RCNET1_PROFILE, &config, &files.root));

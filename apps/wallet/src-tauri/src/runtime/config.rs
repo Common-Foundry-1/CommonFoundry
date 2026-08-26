@@ -39,6 +39,9 @@ pub(super) struct ProductionV3RuntimeOptions {
     pub(super) verifier_startup_timeout_ms: Option<u64>,
     pub(super) verifier_timeout_ms: Option<u64>,
     pub(super) verifier_memory_bytes: Option<u64>,
+    pub(super) verifier_cpu_quota_us: Option<u64>,
+    pub(super) verifier_cpu_period_us: Option<u64>,
+    pub(super) verifier_pids_limit: Option<u64>,
 }
 
 impl ProductionV3RuntimeOptions {
@@ -51,6 +54,9 @@ impl ProductionV3RuntimeOptions {
             || self.verifier_startup_timeout_ms.is_some()
             || self.verifier_timeout_ms.is_some()
             || self.verifier_memory_bytes.is_some()
+            || self.verifier_cpu_quota_us.is_some()
+            || self.verifier_cpu_period_us.is_some()
+            || self.verifier_pids_limit.is_some()
     }
 }
 
@@ -193,6 +199,30 @@ impl NodeRuntimeConfig {
                     set_positive_integer_option(
                         &mut production_v3.verifier_memory_bytes,
                         "--proof-verifier-memory-bytes",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-cpu-quota-us" => {
+                    has_control_arg = true;
+                    set_positive_integer_option(
+                        &mut production_v3.verifier_cpu_quota_us,
+                        "--proof-verifier-cpu-quota-us",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-cpu-period-us" => {
+                    has_control_arg = true;
+                    set_positive_integer_option(
+                        &mut production_v3.verifier_cpu_period_us,
+                        "--proof-verifier-cpu-period-us",
+                        arguments.next(),
+                    )?;
+                }
+                "--proof-verifier-pids-limit" => {
+                    has_control_arg = true;
+                    set_positive_integer_option(
+                        &mut production_v3.verifier_pids_limit,
+                        "--proof-verifier-pids-limit",
                         arguments.next(),
                     )?;
                 }
@@ -600,6 +630,12 @@ mod tests {
             "45000",
             "--proof-verifier-memory-bytes",
             "3221225472",
+            "--proof-verifier-cpu-quota-us",
+            "250000",
+            "--proof-verifier-cpu-period-us",
+            "100000",
+            "--proof-verifier-pids-limit",
+            "16",
         ]);
 
         assert_eq!(
@@ -619,6 +655,9 @@ mod tests {
             config.production_v3.verifier_memory_bytes,
             Some(3_221_225_472)
         );
+        assert_eq!(config.production_v3.verifier_cpu_quota_us, Some(250_000));
+        assert_eq!(config.production_v3.verifier_cpu_period_us, Some(100_000));
+        assert_eq!(config.production_v3.verifier_pids_limit, Some(16));
     }
 
     #[test]

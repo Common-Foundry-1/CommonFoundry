@@ -10,7 +10,7 @@ use cmfd_consensus::{
 };
 use cmfd_node::{
     DEFAULT_MINING_ATTEMPTS, DEVNET_GENESIS_TIMESTAMP, MAX_CONCURRENT_PROOF_VERIFICATIONS,
-    MAX_QUEUED_PROOF_VERIFICATIONS, Node,
+    MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS, MAX_QUEUED_PROOF_VERIFICATIONS, Node,
 };
 use cmfd_proof_worker::VerifierWorkerConfig;
 use sha2::{Digest, Sha256};
@@ -96,7 +96,7 @@ fn node_admission_uses_the_pinned_worker_and_reports_its_limits() {
     );
     assert_eq!(
         status.proof_verification_queue_capacity,
-        MAX_QUEUED_PROOF_VERIFICATIONS
+        MAX_QUEUED_PROOF_VERIFICATIONS + MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS
     );
     assert_eq!(
         status.proof_verification_memory_limit_bytes,

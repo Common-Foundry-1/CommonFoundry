@@ -14,6 +14,7 @@
 pub mod spill {
     pub use cmfd_proof_accel::spill::*;
 }
+mod process;
 mod sandbox;
 mod verifier;
 
@@ -28,7 +29,9 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(windows)]
+use std::process::Child;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +44,8 @@ use cmfd_consensus::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use process::ManagedProcess;
 
 const REQUEST_MAGIC: &[u8; 8] = b"CMFDPWQ1";
 const RESPONSE_MAGIC: &[u8; 8] = b"CMFDPWR1";
@@ -440,7 +445,7 @@ struct Capture {
 }
 
 struct ContainedChild {
-    child: Child,
+    process: ManagedProcess,
     terminator: ProcessTerminator,
     direct_kill_attempted: bool,
     direct_child_reaped: bool,
@@ -507,6 +512,35 @@ impl ProcessTerminator {
 }
 
 impl ContainedChild {
+    fn new(process: ManagedProcess, terminator: ProcessTerminator) -> Self {
+        Self {
+            process,
+            terminator,
+            direct_kill_attempted: false,
+            direct_child_reaped: false,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.process.id()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.process.try_wait()
+    }
+
+    fn take_stdin(&mut self) -> Option<process::BlockingPipeWriter> {
+        self.process.take_stdin()
+    }
+
+    fn take_stdout(&mut self) -> Option<process::BlockingPipeReader> {
+        self.process.take_stdout()
+    }
+
+    fn take_stderr(&mut self) -> Option<process::BlockingPipeReader> {
+        self.process.take_stderr()
+    }
+
     fn termination_handle(&self) -> ProcessTerminator {
         self.terminator.clone()
     }
@@ -518,7 +552,7 @@ impl ContainedChild {
         // process-group/job operation above is what contains descendants.
         if !self.direct_kill_attempted && !self.direct_child_reaped {
             self.direct_kill_attempted = true;
-            let _ = self.child.kill();
+            let _ = self.process.kill();
         }
     }
 
@@ -529,7 +563,7 @@ impl ContainedChild {
         }
         let started = Instant::now();
         loop {
-            match self.child.try_wait() {
+            match self.process.try_wait() {
                 Ok(Some(_)) | Err(_) => {
                     self.direct_child_reaped = true;
                     return;
@@ -552,24 +586,13 @@ impl Drop for ContainedChild {
 
 #[cfg(windows)]
 struct WindowsJob {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    handle: std::os::windows::io::OwnedHandle,
 }
-
-#[cfg(windows)]
-// SAFETY: a Windows Job Object handle is a process-wide kernel handle. This
-// wrapper owns it, never aliases mutable Rust state through the raw value, and
-// closes it exactly once in `Drop`, so transferring ownership between threads
-// is supported by the Win32 handle contract.
-unsafe impl Send for WindowsJob {}
-#[cfg(windows)]
-// SAFETY: Job Object operations accept a process-wide kernel handle and do not
-// expose aliased Rust memory. The shared exactly-once terminator serializes the
-// terminate call, and the final Arc owner closes the handle once.
-unsafe impl Sync for WindowsJob {}
 
 #[cfg(windows)]
 impl WindowsJob {
     fn create(memory_limit_bytes: Option<u64>) -> io::Result<Self> {
+        use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -577,12 +600,15 @@ impl WindowsJob {
         };
 
         // SAFETY: null security/name pointers request an unnamed job with
-        // default security. The returned owned handle is closed in `Drop`.
+        // default security.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let job = Self { handle };
+        // SAFETY: `CreateJobObjectW` returned a fresh owned handle above.
+        let job = Self {
+            handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle.cast()) },
+        };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if let Some(memory_limit_bytes) = memory_limit_bytes {
@@ -601,7 +627,7 @@ impl WindowsJob {
         // duration of this call.
         let configured = unsafe {
             SetInformationJobObject(
-                job.handle,
+                std::os::windows::io::AsRawHandle::as_raw_handle(&job.handle).cast(),
                 JobObjectExtendedLimitInformation,
                 std::ptr::from_ref(&limits).cast(),
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -619,8 +645,12 @@ impl WindowsJob {
 
         // SAFETY: both handles are live. The worker blocks on its protocol
         // stdin, so assignment precedes processing the trusted request.
-        let assigned =
-            unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle().cast()) };
+        let assigned = unsafe {
+            AssignProcessToJobObject(
+                self.handle.as_raw_handle().cast(),
+                child.as_raw_handle().cast(),
+            )
+        };
         if assigned == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -628,28 +658,16 @@ impl WindowsJob {
     }
 
     fn terminate(&self) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
         // SAFETY: the job handle remains owned and live. Closing the handle
         // also has KILL_ON_JOB_CLOSE as a second termination path.
-        let terminated = unsafe { TerminateJobObject(self.handle, 1) };
+        let terminated = unsafe { TerminateJobObject(self.handle.as_raw_handle().cast(), 1) };
         if terminated == 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsJob {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-
-        // SAFETY: this owned handle came from `CreateJobObjectW` and has not
-        // been transferred or closed elsewhere.
-        unsafe {
-            CloseHandle(self.handle);
         }
     }
 }
@@ -723,12 +741,10 @@ fn spawn_contained_unix(
             ));
         }
     };
-    Ok(ContainedChild {
-        child,
-        terminator: ProcessTerminator::process_group(process_group),
-        direct_kill_attempted: false,
-        direct_child_reaped: false,
-    })
+    Ok(ContainedChild::new(
+        ManagedProcess::from_std(child),
+        ProcessTerminator::process_group(process_group),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -831,12 +847,10 @@ fn spawn_contained(
                 source,
             });
         }
-        Ok(ContainedChild {
-            child,
-            terminator: ProcessTerminator::job(job),
-            direct_kill_attempted: false,
-            direct_child_reaped: false,
-        })
+        Ok(ContainedChild::new(
+            ManagedProcess::from_std(child),
+            ProcessTerminator::job(job),
+        ))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -917,19 +931,19 @@ fn exchange_with_child(
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<Vec<u8>, ProofWorkerError> {
-    let Some(mut stdin) = child.child.stdin.take() else {
+    let Some(mut stdin) = child.take_stdin() else {
         terminate_child_bounded(&mut child);
         return Err(ProofWorkerError::InvalidConfig(
             "worker stdin pipe was not created",
         ));
     };
-    let Some(stdout) = child.child.stdout.take() else {
+    let Some(stdout) = child.take_stdout() else {
         terminate_child_bounded(&mut child);
         return Err(ProofWorkerError::InvalidConfig(
             "worker stdout pipe was not created",
         ));
     };
-    let Some(stderr) = child.child.stderr.take() else {
+    let Some(stderr) = child.take_stderr() else {
         terminate_child_bounded(&mut child);
         return Err(ProofWorkerError::InvalidConfig(
             "worker stderr pipe was not created",
@@ -961,7 +975,7 @@ fn exchange_with_child(
     let mut stderr_capture = None;
     loop {
         if exit_status.is_none() {
-            match resources.child_mut().child.try_wait() {
+            match resources.child_mut().try_wait() {
                 Ok(Some(status)) => exit_status = Some(status),
                 Ok(None) => {}
                 Err(source) => {
@@ -1815,7 +1829,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child = spawn_contained_production(command, None).unwrap();
-        fs::write(pid_file, child.child.id().to_string()).unwrap();
+        fs::write(pid_file, child.id().to_string()).unwrap();
         thread::sleep(Duration::from_secs(30));
         drop(child);
     }
@@ -1998,7 +2012,7 @@ mod tests {
         .expect("temporary launch caller thread");
 
         assert!(
-            child.child.try_wait().unwrap().is_none(),
+            child.try_wait().unwrap().is_none(),
             "ProductionV3 worker died when its request thread returned"
         );
         child.terminate_and_reap();

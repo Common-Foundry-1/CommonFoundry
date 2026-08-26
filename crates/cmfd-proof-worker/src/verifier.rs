@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -513,7 +513,7 @@ impl PersistentVerifierWorker {
             .process
             .lock()
             .ok()
-            .and_then(|process| process.as_ref().map(|process| process.child.child.id()))
+            .and_then(|process| process.as_ref().map(|process| process.child.id()))
     }
 }
 
@@ -954,8 +954,8 @@ struct StderrCapture {
 struct PersistentVerifierProcess {
     generation: u64,
     child: ContainedChild,
-    stdin: Option<ChildStdin>,
-    stdout: Option<ChildStdout>,
+    stdin: Option<super::process::BlockingPipeWriter>,
+    stdout: Option<super::process::BlockingPipeReader>,
     stderr_capture: Arc<Mutex<StderrCapture>>,
     transport_poisoned: Arc<AtomicBool>,
     stderr_done: Option<mpsc::Receiver<()>>,
@@ -968,27 +968,15 @@ impl PersistentVerifierProcess {
         generation: u64,
         transport_poisoned: Arc<AtomicBool>,
     ) -> Result<Self, VerifierWorkerError> {
-        let stdin = child
-            .child
-            .stdin
-            .take()
-            .ok_or(VerifierWorkerError::Process(
-                ProofWorkerError::InvalidConfig("worker stdin pipe was not created"),
-            ))?;
-        let stdout = child
-            .child
-            .stdout
-            .take()
-            .ok_or(VerifierWorkerError::Process(
-                ProofWorkerError::InvalidConfig("worker stdout pipe was not created"),
-            ))?;
-        let stderr = child
-            .child
-            .stderr
-            .take()
-            .ok_or(VerifierWorkerError::Process(
-                ProofWorkerError::InvalidConfig("worker stderr pipe was not created"),
-            ))?;
+        let stdin = child.take_stdin().ok_or(VerifierWorkerError::Process(
+            ProofWorkerError::InvalidConfig("worker stdin pipe was not created"),
+        ))?;
+        let stdout = child.take_stdout().ok_or(VerifierWorkerError::Process(
+            ProofWorkerError::InvalidConfig("worker stdout pipe was not created"),
+        ))?;
+        let stderr = child.take_stderr().ok_or(VerifierWorkerError::Process(
+            ProofWorkerError::InvalidConfig("worker stderr pipe was not created"),
+        ))?;
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let capture = Arc::clone(&stderr_capture);
         let (stderr_done_sender, stderr_done) = mpsc::channel();
@@ -1048,7 +1036,7 @@ impl PersistentVerifierProcess {
                     ));
                 }
                 let response = result.map_err(VerifierWorkerError::Process)?;
-                match self.child.child.try_wait() {
+                match self.child.try_wait() {
                     Ok(None) => Ok(response),
                     Ok(Some(status)) => Err(VerifierWorkerError::Process(worker_exit_error(
                         status,

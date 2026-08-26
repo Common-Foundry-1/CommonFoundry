@@ -15,12 +15,13 @@ use cmfd_consensus::PowParameters;
 use cmfd_consensus::chain::ValidatedBlock;
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, COIN, ChainError,
-    ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY, EconomicsError,
-    FixedRewardDestinations, ForgeMatrixError, ForgeMatrixV2AcceleratorBatch,
-    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, InputWitness, MAX_BLOCK_BYTES,
-    MAX_FUTURE_OFFSET_SECS, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS,
-    NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
-    PreverifiedBlockProof, SuccessorHeaderPreflight, TRANSACTION_VERSION, Transaction, TxInput,
+    ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY,
+    DecodedReversibleStateDelta, EconomicsError, FixedRewardDestinations, ForgeMatrixError,
+    ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, InputWitness,
+    MAX_BLOCK_BYTES, MAX_FUTURE_OFFSET_SECS, MAX_REVERSIBLE_STATE_DELTA_BYTES,
+    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS, NETWORK_PROTOCOL_VERSION, NetworkError,
+    NetworkParams, OutPoint, OutputLock, PowError, PreverifiedBlockProof,
+    ReversibleStateDeltaError, SuccessorHeaderPreflight, TRANSACTION_VERSION, Transaction, TxInput,
     TxOutput, WireError, add_chain_work, chain_work_bytes, decode_block, decode_transaction,
     encode_block, encode_transaction, merkle_root, v2_reference_for_network,
     validate_block_preamble, validate_block_resources,
@@ -177,10 +178,21 @@ const METADATA_VERSION: u16 = 1;
 const METADATA_BYTES: usize = 40;
 const METADATA_WALLET_KEY_FLAG: u16 = 1;
 const RECORD_MAGIC: [u8; 4] = *b"CMFR";
-const RECORD_VERSION: u16 = 1;
-const RECORD_HEADER_BYTES: usize = 20;
+const RECORD_VERSION_V1: u16 = 1;
+const RECORD_VERSION_V2: u16 = 2;
+const RECORD_V1_HEADER_BYTES: usize = 20;
+const RECORD_V2_HEADER_BYTES: usize = 56;
 const RECORD_CHECKSUM_BYTES: usize = 32;
-const RECORD_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V1";
+const RECORD_V1_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V1";
+const RECORD_V2_CHECKSUM_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD/V2";
+const RECORD_CHAIN_DIGEST_DOMAIN: &str = "CMFD/NODE/BLOCK-RECORD-CHAIN/V1";
+/// Fixed predecessor for the first V2 record in an empty block log.
+///
+/// This is only a local corruption/reordering root. It is not a consensus
+/// commitment, a state root, or trustless authentication of local storage. A
+/// self-hashed log without an external monotonic anchor also cannot detect
+/// removal of an entire complete suffix; partial records still fail closed.
+const EMPTY_RECORD_CHAIN_ROOT: [u8; 32] = [0; 32];
 const RPC_HEADER_LIMIT: usize = 8 * 1024;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2057,6 +2069,9 @@ pub struct Node {
     mempool: BTreeMap<[u8; 32], MempoolEntry>,
     mempool_bytes: usize,
     log: File,
+    /// Digest of the exact last complete block-log record. V2 appends bind to
+    /// this value; it advances only after the durable record commits in memory.
+    last_record_digest: [u8; 32],
     storage_faulted: bool,
     rejected_proof_ids: HashSet<[u8; 32]>,
     rejected_proof_order: VecDeque<[u8; 32]>,
@@ -2316,6 +2331,34 @@ struct PreparedBlock {
     ancestors: Vec<[u8; 32]>,
     activation_chain: Option<Vec<[u8; 32]>>,
     candidate: ValidatedCandidate,
+}
+
+impl PreparedBlock {
+    fn validated_block(&self) -> &ValidatedBlock {
+        match &self.candidate {
+            ValidatedCandidate::Active(validated)
+            | ValidatedCandidate::Branch { validated, .. } => validated,
+        }
+    }
+
+    fn encode_reversible_state_delta(&self) -> Result<Vec<u8>, ReversibleStateDeltaError> {
+        self.validated_block().encode_reversible_state_delta()
+    }
+
+    fn authenticate_reversible_state_delta(
+        &self,
+        bytes: &[u8],
+        params: &NetworkParams,
+    ) -> Result<(), ReversibleStateDeltaError> {
+        DecodedReversibleStateDelta::decode_bound(bytes, params, self.parent, self.block_id)?
+            .promote_exact(self.validated_block())?;
+        Ok(())
+    }
+
+    fn derive_reversible_state_delta(&self) -> Result<(), ReversibleStateDeltaError> {
+        self.validated_block().validated_reversible_state_delta()?;
+        Ok(())
+    }
 }
 
 struct BlockPreparationContext<'a> {
@@ -2705,7 +2748,7 @@ impl Node {
 
         let mut state = ChainState::new(params, verifier.clone())?;
         let mut index = BlockIndex::new(params.genesis_hash);
-        replay_log(
+        let last_record_digest = replay_log(
             &data_dir.join(BLOCK_LOG_FILE),
             &mut state,
             &mut index,
@@ -2745,6 +2788,7 @@ impl Node {
             mempool: BTreeMap::new(),
             mempool_bytes: 0,
             log,
+            last_record_digest,
             storage_faulted: false,
             rejected_proof_ids: HashSet::new(),
             rejected_proof_order: VecDeque::new(),
@@ -4022,7 +4066,13 @@ impl Node {
                 allow_index_reconstruction: false,
             },
         )?;
-        let record = encode_record(accepted_at, &canonical)?;
+        let delta = prepared.encode_reversible_state_delta().map_err(|error| {
+            NodeError::CorruptLog(format!(
+                "validated block cannot encode its reversible state delta: {error}"
+            ))
+        })?;
+        let record = encode_record_v2(accepted_at, &canonical, &delta, self.last_record_digest)?;
+        let record_digest = complete_record_digest(&record);
         let log_path = self.data_dir.join(BLOCK_LOG_FILE);
         if let Err(source) = self.log.write_all(&record) {
             self.storage_faulted = true;
@@ -4035,6 +4085,7 @@ impl Node {
         match commit_prepared(&mut self.state, &mut self.index, prepared) {
             Ok(outcome) => {
                 self.chain_revision = next_revision;
+                self.last_record_digest = record_digest;
                 if self.state.tip() != previous_tip {
                     self.revalidate_mempool(&confirmed_txids);
                 }
@@ -5732,28 +5783,232 @@ fn write_wallet_key(path: &Path, key: &SigningKey) -> Result<(), NodeError> {
         .map_err(|source| io_error("sync wallet key", path, source))
 }
 
-fn encode_record(accepted_at: u64, block: &[u8]) -> Result<Vec<u8>, NodeError> {
+#[cfg(test)]
+fn encode_record_v1(accepted_at: u64, block: &[u8]) -> Result<Vec<u8>, NodeError> {
     let block_len = u32::try_from(block.len())
         .map_err(|_| NodeError::CorruptLog("block length exceeds u32".to_owned()))?;
     if block.len() > MAX_BLOCK_BYTES {
         return Err(NodeError::CorruptLog("block exceeds wire limit".to_owned()));
     }
-    let mut record = Vec::with_capacity(RECORD_HEADER_BYTES + block.len() + RECORD_CHECKSUM_BYTES);
+    let capacity = checked_record_len(RECORD_V1_HEADER_BYTES, block.len(), 0)?;
+    let mut record = Vec::with_capacity(capacity);
     record.extend_from_slice(&RECORD_MAGIC);
-    record.extend_from_slice(&RECORD_VERSION.to_le_bytes());
+    record.extend_from_slice(&RECORD_VERSION_V1.to_le_bytes());
     record.extend_from_slice(&0_u16.to_le_bytes());
     record.extend_from_slice(&accepted_at.to_le_bytes());
     record.extend_from_slice(&block_len.to_le_bytes());
     record.extend_from_slice(block);
-    let checksum = record_checksum(&record);
+    let checksum = record_checksum_v1(&record);
     record.extend_from_slice(&checksum);
     Ok(record)
 }
 
-fn record_checksum(record_without_checksum: &[u8]) -> [u8; 32] {
-    let mut hasher = Hasher::new_derive_key(RECORD_CHECKSUM_DOMAIN);
+fn encode_record_v2(
+    accepted_at: u64,
+    block: &[u8],
+    delta: &[u8],
+    previous_record_digest: [u8; 32],
+) -> Result<Vec<u8>, NodeError> {
+    if block.len() > MAX_BLOCK_BYTES {
+        return Err(NodeError::CorruptLog("block exceeds wire limit".to_owned()));
+    }
+    if delta.len() > MAX_REVERSIBLE_STATE_DELTA_BYTES {
+        return Err(NodeError::CorruptLog(
+            "reversible state delta exceeds wire limit".to_owned(),
+        ));
+    }
+    let block_len = u32::try_from(block.len())
+        .map_err(|_| NodeError::CorruptLog("block length exceeds u32".to_owned()))?;
+    let delta_len = u32::try_from(delta.len()).map_err(|_| {
+        NodeError::CorruptLog("reversible state delta length exceeds u32".to_owned())
+    })?;
+    let capacity = checked_record_len(RECORD_V2_HEADER_BYTES, block.len(), delta.len())?;
+    let mut record = Vec::with_capacity(capacity);
+    record.extend_from_slice(&RECORD_MAGIC);
+    record.extend_from_slice(&RECORD_VERSION_V2.to_le_bytes());
+    record.extend_from_slice(&0_u16.to_le_bytes());
+    record.extend_from_slice(&accepted_at.to_le_bytes());
+    record.extend_from_slice(&block_len.to_le_bytes());
+    record.extend_from_slice(&delta_len.to_le_bytes());
+    record.extend_from_slice(&previous_record_digest);
+    record.extend_from_slice(block);
+    record.extend_from_slice(delta);
+    let checksum = record_checksum_v2(&record);
+    record.extend_from_slice(&checksum);
+    Ok(record)
+}
+
+fn checked_record_len(
+    header_len: usize,
+    block_len: usize,
+    delta_len: usize,
+) -> Result<usize, NodeError> {
+    header_len
+        .checked_add(block_len)
+        .and_then(|length| length.checked_add(delta_len))
+        .and_then(|length| length.checked_add(RECORD_CHECKSUM_BYTES))
+        .ok_or_else(|| NodeError::CorruptLog("block record length overflowed".to_owned()))
+}
+
+fn record_checksum_v1(record_without_checksum: &[u8]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(RECORD_V1_CHECKSUM_DOMAIN);
     hasher.update(record_without_checksum);
     *hasher.finalize().as_bytes()
+}
+
+fn record_checksum_v2(record_without_checksum: &[u8]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(RECORD_V2_CHECKSUM_DOMAIN);
+    hasher.update(record_without_checksum);
+    *hasher.finalize().as_bytes()
+}
+
+fn complete_record_digest(record: &[u8]) -> [u8; 32] {
+    let mut hasher = Hasher::new_derive_key(RECORD_CHAIN_DIGEST_DOMAIN);
+    hasher.update(record);
+    *hasher.finalize().as_bytes()
+}
+
+enum ParsedRecordPayload {
+    LegacyV1,
+    V2 {
+        delta_bytes: Vec<u8>,
+        previous_record_digest: [u8; 32],
+    },
+}
+
+struct ParsedLogRecord {
+    accepted_at: u64,
+    block_bytes: Vec<u8>,
+    payload: ParsedRecordPayload,
+    complete_digest: [u8; 32],
+}
+
+fn read_log_record(
+    reader: &mut impl Read,
+    path: &Path,
+    record_index: u64,
+) -> Result<Option<ParsedLogRecord>, NodeError> {
+    let mut prefix = [0_u8; 8];
+    match reader.read(&mut prefix[..1]) {
+        Ok(0) => return Ok(None),
+        Ok(1) => {}
+        Ok(_) => unreachable!("one-byte read cannot return more than one byte"),
+        Err(source) => return Err(io_error("read block log", path, source)),
+    }
+    reader.read_exact(&mut prefix[1..]).map_err(|source| {
+        log_read_error(
+            path,
+            source,
+            format!("record {record_index} has a truncated header"),
+        )
+    })?;
+    if prefix[..4] != RECORD_MAGIC || prefix[6..8] != [0, 0] {
+        return Err(NodeError::CorruptLog(format!(
+            "record {record_index} has an invalid header"
+        )));
+    }
+
+    let version = u16::from_le_bytes([prefix[4], prefix[5]]);
+    let header_len = match version {
+        RECORD_VERSION_V1 => RECORD_V1_HEADER_BYTES,
+        RECORD_VERSION_V2 => RECORD_V2_HEADER_BYTES,
+        _ => {
+            return Err(NodeError::CorruptLog(format!(
+                "record {record_index} has unsupported version {version}"
+            )));
+        }
+    };
+    let mut header = Vec::with_capacity(header_len);
+    header.extend_from_slice(&prefix);
+    header.resize(header_len, 0);
+    reader
+        .read_exact(&mut header[prefix.len()..])
+        .map_err(|source| {
+            log_read_error(
+                path,
+                source,
+                format!("record {record_index} has a truncated header"),
+            )
+        })?;
+
+    let accepted_at = u64::from_le_bytes(header[8..16].try_into().expect("fixed slice"));
+    let block_len = u32::from_le_bytes(header[16..20].try_into().expect("fixed slice")) as usize;
+    if block_len > MAX_BLOCK_BYTES {
+        return Err(NodeError::CorruptLog(format!(
+            "record {record_index} block exceeds the wire limit"
+        )));
+    }
+    let (delta_len, previous_record_digest) = if version == RECORD_VERSION_V2 {
+        let delta_len =
+            u32::from_le_bytes(header[20..24].try_into().expect("fixed slice")) as usize;
+        if delta_len > MAX_REVERSIBLE_STATE_DELTA_BYTES {
+            return Err(NodeError::CorruptLog(format!(
+                "record {record_index} reversible state delta exceeds the wire limit"
+            )));
+        }
+        (
+            delta_len,
+            Some(header[24..56].try_into().expect("fixed slice")),
+        )
+    } else {
+        (0, None)
+    };
+    let complete_len = checked_record_len(header_len, block_len, delta_len)?;
+
+    let mut block_bytes = vec![0_u8; block_len];
+    reader.read_exact(&mut block_bytes).map_err(|source| {
+        log_read_error(
+            path,
+            source,
+            format!("record {record_index} has a truncated block"),
+        )
+    })?;
+    let mut delta_bytes = vec![0_u8; delta_len];
+    reader.read_exact(&mut delta_bytes).map_err(|source| {
+        log_read_error(
+            path,
+            source,
+            format!("record {record_index} has a truncated reversible state delta"),
+        )
+    })?;
+    let mut checksum = [0_u8; RECORD_CHECKSUM_BYTES];
+    reader.read_exact(&mut checksum).map_err(|source| {
+        log_read_error(
+            path,
+            source,
+            format!("record {record_index} has a truncated checksum"),
+        )
+    })?;
+
+    let mut complete_record = Vec::with_capacity(complete_len);
+    complete_record.extend_from_slice(&header);
+    complete_record.extend_from_slice(&block_bytes);
+    complete_record.extend_from_slice(&delta_bytes);
+    let expected_checksum = match version {
+        RECORD_VERSION_V1 => record_checksum_v1(&complete_record),
+        RECORD_VERSION_V2 => record_checksum_v2(&complete_record),
+        _ => unreachable!("record version was checked above"),
+    };
+    if checksum != expected_checksum {
+        return Err(NodeError::CorruptLog(format!(
+            "record {record_index} checksum mismatch"
+        )));
+    }
+    complete_record.extend_from_slice(&checksum);
+    let complete_digest = complete_record_digest(&complete_record);
+    let payload = match previous_record_digest {
+        Some(previous_record_digest) => ParsedRecordPayload::V2 {
+            delta_bytes,
+            previous_record_digest,
+        },
+        None => ParsedRecordPayload::LegacyV1,
+    };
+    Ok(Some(ParsedLogRecord {
+        accepted_at,
+        block_bytes,
+        payload,
+        complete_digest,
+    }))
 }
 
 fn replay_log(
@@ -5764,70 +6019,48 @@ fn replay_log(
     params: NetworkParams,
     network_id: [u8; 32],
     external_preverifier: Option<&BlockPreverifier>,
-) -> Result<(), NodeError> {
+) -> Result<[u8; 32], NodeError> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(EMPTY_RECORD_CHAIN_ROOT);
+        }
         Err(source) => return Err(io_error("open block log for replay", path, source)),
     };
     let mut reader = BufReader::new(file);
     let mut record_index = 0_u64;
     let mut branch_checkpoint: Option<BranchStateCheckpoint> = None;
+    let mut last_record_digest = EMPTY_RECORD_CHAIN_ROOT;
+    let mut saw_v2 = false;
     loop {
-        let mut header = [0_u8; RECORD_HEADER_BYTES];
-        match reader.read(&mut header[..1]) {
-            Ok(0) => return Ok(()),
-            Ok(1) => {}
-            Ok(_) => unreachable!("one-byte read cannot return more than one byte"),
-            Err(source) => return Err(io_error("read block log", path, source)),
+        let Some(record) = read_log_record(&mut reader, path, record_index)? else {
+            return Ok(last_record_digest);
+        };
+        match &record.payload {
+            ParsedRecordPayload::LegacyV1 if saw_v2 => {
+                return Err(NodeError::CorruptLog(format!(
+                    "record {record_index} is legacy V1 after the V2 chain began"
+                )));
+            }
+            ParsedRecordPayload::LegacyV1 => {}
+            ParsedRecordPayload::V2 {
+                previous_record_digest,
+                ..
+            } => {
+                if *previous_record_digest != last_record_digest {
+                    return Err(NodeError::CorruptLog(format!(
+                        "record {record_index} previous-record digest mismatch"
+                    )));
+                }
+                saw_v2 = true;
+            }
         }
-        reader.read_exact(&mut header[1..]).map_err(|source| {
-            log_read_error(
-                path,
-                source,
-                format!("record {record_index} has a truncated header"),
-            )
-        })?;
-        if header[..4] != RECORD_MAGIC
-            || u16::from_le_bytes([header[4], header[5]]) != RECORD_VERSION
-            || header[6..8] != [0, 0]
-        {
-            return Err(NodeError::CorruptLog(format!(
-                "record {record_index} has an invalid header"
-            )));
-        }
-        let accepted_at = u64::from_le_bytes(header[8..16].try_into().expect("fixed slice"));
-        let block_len =
-            u32::from_le_bytes(header[16..20].try_into().expect("fixed slice")) as usize;
-        if block_len > MAX_BLOCK_BYTES {
-            return Err(NodeError::CorruptLog(format!(
-                "record {record_index} block exceeds the wire limit"
-            )));
-        }
-        let mut block_bytes = vec![0_u8; block_len];
-        reader.read_exact(&mut block_bytes).map_err(|source| {
-            log_read_error(
-                path,
-                source,
-                format!("record {record_index} has a truncated block"),
-            )
-        })?;
-        let mut checksum = [0_u8; RECORD_CHECKSUM_BYTES];
-        reader.read_exact(&mut checksum).map_err(|source| {
-            log_read_error(
-                path,
-                source,
-                format!("record {record_index} has a truncated checksum"),
-            )
-        })?;
-        let mut checksummed = Vec::with_capacity(RECORD_HEADER_BYTES + block_len);
-        checksummed.extend_from_slice(&header);
-        checksummed.extend_from_slice(&block_bytes);
-        if checksum != record_checksum(&checksummed) {
-            return Err(NodeError::CorruptLog(format!(
-                "record {record_index} checksum mismatch"
-            )));
-        }
+        let ParsedLogRecord {
+            accepted_at,
+            block_bytes,
+            payload,
+            complete_digest,
+        } = record;
         let block = decode_block(&block_bytes, network_id).map_err(|error| {
             NodeError::CorruptLog(format!("record {record_index} cannot decode: {error}"))
         })?;
@@ -5908,6 +6141,24 @@ fn replay_log(
         .map_err(|error| {
             NodeError::CorruptLog(format!("record {record_index} fails fork replay: {error}"))
         })?;
+        match payload {
+            ParsedRecordPayload::LegacyV1 => {
+                prepared.derive_reversible_state_delta().map_err(|error| {
+                    NodeError::CorruptLog(format!(
+                        "record {record_index} cannot derive a reversible state delta: {error}"
+                    ))
+                })?;
+            }
+            ParsedRecordPayload::V2 { delta_bytes, .. } => {
+                prepared
+                    .authenticate_reversible_state_delta(&delta_bytes, &params)
+                    .map_err(|error| {
+                        NodeError::CorruptLog(format!(
+                            "record {record_index} reversible state delta does not match full validation: {error}"
+                        ))
+                    })?;
+            }
+        }
         let outcome = commit_prepared(state, index, prepared).map_err(|error| {
             NodeError::CorruptLog(format!(
                 "record {record_index} cannot restore fork state: {error}"
@@ -5916,7 +6167,10 @@ fn replay_log(
         if let Some(checkpoint) = outcome.branch_checkpoint {
             branch_checkpoint = Some(checkpoint);
         }
-        record_index += 1;
+        last_record_digest = complete_digest;
+        record_index = record_index
+            .checked_add(1)
+            .ok_or_else(|| NodeError::CorruptLog("block record count overflowed".to_owned()))?;
     }
 }
 
@@ -5953,6 +6207,62 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove isolated test directory");
         }
+    }
+
+    fn split_complete_log_records(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut records = Vec::new();
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            assert!(bytes.len() - offset >= 8);
+            assert_eq!(&bytes[offset..offset + 4], &RECORD_MAGIC);
+            let version = u16::from_le_bytes(bytes[offset + 4..offset + 6].try_into().unwrap());
+            let header_len = match version {
+                RECORD_VERSION_V1 => RECORD_V1_HEADER_BYTES,
+                RECORD_VERSION_V2 => RECORD_V2_HEADER_BYTES,
+                _ => panic!("unsupported fixture record version {version}"),
+            };
+            assert!(bytes.len() - offset >= header_len);
+            let block_len =
+                u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap()) as usize;
+            let delta_len = if version == RECORD_VERSION_V2 {
+                u32::from_le_bytes(bytes[offset + 20..offset + 24].try_into().unwrap()) as usize
+            } else {
+                0
+            };
+            let record_len = checked_record_len(header_len, block_len, delta_len).unwrap();
+            let end = offset.checked_add(record_len).unwrap();
+            assert!(end <= bytes.len());
+            records.push(bytes[offset..end].to_vec());
+            offset = end;
+        }
+        records
+    }
+
+    fn read_complete_log_records(path: &Path) -> Vec<Vec<u8>> {
+        split_complete_log_records(&fs::read(path.join(BLOCK_LOG_FILE)).unwrap())
+    }
+
+    fn write_complete_log_records(path: &Path, records: &[Vec<u8>]) {
+        let total = records
+            .iter()
+            .try_fold(0_usize, |total, record| total.checked_add(record.len()))
+            .unwrap();
+        let mut bytes = Vec::with_capacity(total);
+        for record in records {
+            bytes.extend_from_slice(record);
+        }
+        fs::write(path.join(BLOCK_LOG_FILE), bytes).unwrap();
+    }
+
+    fn recompute_fixture_record_checksum(record: &mut [u8]) {
+        let checksum_start = record.len() - RECORD_CHECKSUM_BYTES;
+        let version = u16::from_le_bytes(record[4..6].try_into().unwrap());
+        let checksum = match version {
+            RECORD_VERSION_V1 => record_checksum_v1(&record[..checksum_start]),
+            RECORD_VERSION_V2 => record_checksum_v2(&record[..checksum_start]),
+            _ => panic!("unsupported fixture record version {version}"),
+        };
+        record[checksum_start..].copy_from_slice(&checksum);
     }
 
     #[test]
@@ -7660,6 +7970,103 @@ mod tests {
     }
 
     #[test]
+    fn empty_log_uses_zero_chain_root_and_first_append_is_v2() {
+        let path = test_dir("v2-empty-root");
+        clean_test_dir(&path);
+        let timestamp = DEVNET_GENESIS_TIMESTAMP + 60;
+        let expected_digest = {
+            let mut node = Node::open(&path).unwrap();
+            assert_eq!(node.last_record_digest, EMPTY_RECORD_CHAIN_ROOT);
+            let block = mined_child(&node, node.params.genesis_hash, timestamp, 0x11);
+            node.submit_block(block, timestamp).unwrap();
+            assert_ne!(node.last_record_digest, EMPTY_RECORD_CHAIN_ROOT);
+            node.last_record_digest
+        };
+
+        let records = read_complete_log_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            u16::from_le_bytes(records[0][4..6].try_into().unwrap()),
+            RECORD_VERSION_V2
+        );
+        assert_eq!(&records[0][24..56], &EMPTY_RECORD_CHAIN_ROOT);
+        assert_eq!(complete_record_digest(&records[0]), expected_digest);
+
+        let reopened = Node::open(&path).unwrap();
+        assert_eq!(reopened.last_record_digest, expected_digest);
+        assert_eq!(reopened.state.next_height(), 2);
+        drop(reopened);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn legacy_v1_replays_and_the_first_v2_binds_to_its_exact_record() {
+        let path = test_dir("mixed-v1-v2");
+        clean_test_dir(&path);
+        let first_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let second_at = first_at + 60;
+        let third_at = second_at + 60;
+        let (first, first_record) = {
+            let node = Node::open(&path).unwrap();
+            let first = mined_child(&node, node.params.genesis_hash, first_at, 0x12);
+            let canonical = encode_block(&first).unwrap();
+            let record = encode_record_v1(first_at, &canonical).unwrap();
+            (first, record)
+        };
+        fs::write(path.join(BLOCK_LOG_FILE), &first_record).unwrap();
+
+        let (second, second_record) = {
+            let node = Node::open(&path).unwrap();
+            assert_eq!(node.state.tip(), first.block_id());
+            assert_eq!(
+                node.last_record_digest,
+                complete_record_digest(&first_record)
+            );
+            let second = mined_child(&node, first.block_id(), second_at, 0x13);
+            let record = encode_record_v1(second_at, &encode_block(&second).unwrap()).unwrap();
+            (second, record)
+        };
+        write_complete_log_records(&path, &[first_record, second_record]);
+
+        let third = {
+            let mut node = Node::open(&path).unwrap();
+            assert_eq!(node.state.tip(), second.block_id());
+            let third = mined_child(&node, second.block_id(), third_at, 0x14);
+            node.submit_block(third.clone(), third_at).unwrap();
+            third
+        };
+
+        let records = read_complete_log_records(&path);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            u16::from_le_bytes(records[0][4..6].try_into().unwrap()),
+            RECORD_VERSION_V1
+        );
+        assert_eq!(
+            u16::from_le_bytes(records[1][4..6].try_into().unwrap()),
+            RECORD_VERSION_V1
+        );
+        assert_eq!(
+            u16::from_le_bytes(records[2][4..6].try_into().unwrap()),
+            RECORD_VERSION_V2
+        );
+        assert_eq!(&records[2][24..56], &complete_record_digest(&records[1]));
+        let reopened = Node::open(&path).unwrap();
+        assert_eq!(reopened.state.tip(), third.block_id());
+        assert_eq!(reopened.state.next_height(), 4);
+        drop(reopened);
+
+        let mut downgraded = records;
+        downgraded.push(encode_record_v1(third_at, &encode_block(&third).unwrap()).unwrap());
+        write_complete_log_records(&path, &downgraded);
+        assert!(matches!(
+            Node::open(&path),
+            Err(NodeError::CorruptLog(message)) if message.contains("legacy V1 after the V2 chain")
+        ));
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn mine_restart_and_strict_replay_restore_the_tip() {
         let path = test_dir("replay");
         clean_test_dir(&path);
@@ -7676,6 +8083,13 @@ mod tests {
             assert_eq!(node.status().unwrap().accepted_height, 1);
             (block.block_id(), node.fingerprint)
         };
+
+        let records = read_complete_log_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            u16::from_le_bytes(records[0][4..6].try_into().unwrap()),
+            RECORD_VERSION_V2
+        );
 
         let node = Node::open(&path).unwrap();
         let status = node.status().unwrap();
@@ -7789,6 +8203,12 @@ mod tests {
                 node.index.blocks.len(),
             )
         };
+
+        let records = read_complete_log_records(&path);
+        assert_eq!(records.len(), block_count);
+        assert!(records.iter().all(|record| {
+            u16::from_le_bytes(record[4..6].try_into().unwrap()) == RECORD_VERSION_V2
+        }));
 
         let node = Node::open(&path).unwrap();
         assert_eq!(node.state.tip(), tip);
@@ -7906,6 +8326,7 @@ mod tests {
         let block_id = block.block_id();
         let tip = node.state.tip();
         let work = node.cumulative_work();
+        let record_digest = node.last_record_digest;
         let log_path = path.join(BLOCK_LOG_FILE);
         let log_len = node.log.metadata().unwrap().len();
         let read_only = OpenOptions::new().read(true).open(&log_path).unwrap();
@@ -7920,6 +8341,7 @@ mod tests {
         ));
         assert_eq!(node.state.tip(), tip);
         assert_eq!(node.cumulative_work(), work);
+        assert_eq!(node.last_record_digest, record_digest);
         assert!(!node.contains_block(block_id));
         assert_eq!(fs::metadata(log_path).unwrap().len(), log_len);
         assert!(node.storage_faulted);
@@ -7952,6 +8374,148 @@ mod tests {
     }
 
     #[test]
+    fn v2_lengths_are_rejected_before_payload_allocation() {
+        let path = test_dir("v2-length-limits");
+        clean_test_dir(&path);
+        drop(Node::open(&path).unwrap());
+        assert!(matches!(
+            checked_record_len(usize::MAX, 1, 0),
+            Err(NodeError::CorruptLog(message)) if message.contains("length overflowed")
+        ));
+
+        let header = |block_len: u32, delta_len: u32| {
+            let mut bytes = Vec::with_capacity(RECORD_V2_HEADER_BYTES);
+            bytes.extend_from_slice(&RECORD_MAGIC);
+            bytes.extend_from_slice(&RECORD_VERSION_V2.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            bytes.extend_from_slice(&(DEVNET_GENESIS_TIMESTAMP + 60).to_le_bytes());
+            bytes.extend_from_slice(&block_len.to_le_bytes());
+            bytes.extend_from_slice(&delta_len.to_le_bytes());
+            bytes.extend_from_slice(&EMPTY_RECORD_CHAIN_ROOT);
+            assert_eq!(bytes.len(), RECORD_V2_HEADER_BYTES);
+            bytes
+        };
+
+        let oversized_block = u32::try_from(MAX_BLOCK_BYTES + 1).unwrap();
+        fs::write(path.join(BLOCK_LOG_FILE), header(oversized_block, 0)).unwrap();
+        assert!(matches!(
+            Node::open(&path),
+            Err(NodeError::CorruptLog(message)) if message.contains("block exceeds the wire limit")
+        ));
+
+        let oversized_delta = u32::try_from(MAX_REVERSIBLE_STATE_DELTA_BYTES + 1).unwrap();
+        fs::write(path.join(BLOCK_LOG_FILE), header(0, oversized_delta)).unwrap();
+        assert!(matches!(
+            Node::open(&path),
+            Err(NodeError::CorruptLog(message))
+                if message.contains("reversible state delta exceeds the wire limit")
+        ));
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn v2_chain_rejects_changed_reordered_and_deleted_middle_records() {
+        let path = test_dir("v2-record-chain");
+        clean_test_dir(&path);
+        {
+            let mut node = Node::open(&path).unwrap();
+            let mut parent = node.params.genesis_hash;
+            for (offset, seed) in [(1_u64, 0xb1_u8), (2, 0xb2), (3, 0xb3)] {
+                let accepted_at = DEVNET_GENESIS_TIMESTAMP + offset * 60;
+                let block = mined_child(&node, parent, accepted_at, seed);
+                parent = block.block_id();
+                node.submit_block(block, accepted_at).unwrap();
+            }
+        }
+        let records = read_complete_log_records(&path);
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| {
+            u16::from_le_bytes(record[4..6].try_into().unwrap()) == RECORD_VERSION_V2
+        }));
+
+        let assert_chain_rejected = |candidate: &[Vec<u8>]| {
+            write_complete_log_records(&path, candidate);
+            assert!(matches!(
+                Node::open(&path),
+                Err(NodeError::CorruptLog(message))
+                    if message.contains("previous-record digest mismatch")
+            ));
+        };
+
+        let mut changed = records.clone();
+        let accepted_at = u64::from_le_bytes(changed[1][8..16].try_into().unwrap());
+        changed[1][8..16].copy_from_slice(&accepted_at.checked_add(1).unwrap().to_le_bytes());
+        recompute_fixture_record_checksum(&mut changed[1]);
+        assert_chain_rejected(&changed);
+
+        let mut reordered = records.clone();
+        reordered.swap(1, 2);
+        assert_chain_rejected(&reordered);
+
+        let deleted = vec![records[0].clone(), records[2].clone()];
+        assert_chain_rejected(&deleted);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn locally_rehashed_forged_delta_fails_exact_revalidation_promotion() {
+        const DELTA_FEES_OFFSET: usize = 180;
+        const DELTA_LOCAL_INTEGRITY_BYTES: usize = 32;
+        const DELTA_LOCAL_INTEGRITY_DOMAIN: &str = "CMFD/REVERSIBLE-STATE-DELTA/LOCAL-INTEGRITY/V1";
+
+        let path = test_dir("v2-forged-delta");
+        clean_test_dir(&path);
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let (params, base_tip, child_tip) = {
+            let mut node = Node::open(&path).unwrap();
+            let base_tip = node.params.genesis_hash;
+            let block = mined_child(&node, base_tip, accepted_at, 0xc1);
+            let child_tip = block.block_id();
+            node.submit_block(block, accepted_at).unwrap();
+            (node.params, base_tip, child_tip)
+        };
+        let records = read_complete_log_records(&path);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        let block_len = u32::from_le_bytes(record[16..20].try_into().unwrap()) as usize;
+        let delta_len = u32::from_le_bytes(record[20..24].try_into().unwrap()) as usize;
+        let previous_record_digest: [u8; 32] = record[24..56].try_into().unwrap();
+        let block_start = RECORD_V2_HEADER_BYTES;
+        let delta_start = block_start + block_len;
+        let delta_end = delta_start + delta_len;
+        let block_bytes = &record[block_start..delta_start];
+        let mut forged_delta = record[delta_start..delta_end].to_vec();
+        assert!(forged_delta.len() > DELTA_FEES_OFFSET + DELTA_LOCAL_INTEGRITY_BYTES);
+        forged_delta[DELTA_FEES_OFFSET] ^= 1;
+        let payload_len = forged_delta.len() - DELTA_LOCAL_INTEGRITY_BYTES;
+        let mut hasher = Hasher::new_derive_key(DELTA_LOCAL_INTEGRITY_DOMAIN);
+        hasher.update(&forged_delta[..payload_len]);
+        let digest = *hasher.finalize().as_bytes();
+        forged_delta[payload_len..].copy_from_slice(&digest);
+
+        assert!(
+            DecodedReversibleStateDelta::decode_bound(&forged_delta, &params, base_tip, child_tip,)
+                .is_ok(),
+            "the forged fixture must pass structural decoding and local rehashing"
+        );
+        let forged_record = encode_record_v2(
+            accepted_at,
+            block_bytes,
+            &forged_delta,
+            previous_record_digest,
+        )
+        .unwrap();
+        fs::write(path.join(BLOCK_LOG_FILE), forged_record).unwrap();
+
+        assert!(matches!(
+            Node::open(&path),
+            Err(NodeError::CorruptLog(message))
+                if message.contains("does not exactly match the fully validated block")
+        ));
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn truncated_log_is_refused_instead_of_recovered_silently() {
         let path = test_dir("truncated");
         clean_test_dir(&path);
@@ -7965,11 +8529,17 @@ mod tests {
             .unwrap();
         }
         let log_path = path.join(BLOCK_LOG_FILE);
+        let complete = fs::read(&log_path).unwrap();
         let file = OpenOptions::new().write(true).open(&log_path).unwrap();
         let len = file.metadata().unwrap().len();
         file.set_len(len - 1).unwrap();
         drop(file);
 
+        assert!(matches!(Node::open(&path), Err(NodeError::CorruptLog(_))));
+
+        let mut trailing = complete;
+        trailing.push(0);
+        fs::write(&log_path, trailing).unwrap();
         assert!(matches!(Node::open(&path), Err(NodeError::CorruptLog(_))));
         clean_test_dir(&path);
     }

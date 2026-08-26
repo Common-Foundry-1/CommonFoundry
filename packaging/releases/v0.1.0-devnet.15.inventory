@@ -1,14 +1,12 @@
-BUILDINFO.json
+RCNET1-MODEL-RECORD-V2.json
 RCNET1-MODEL-V2.bank.part01
 RCNET1-MODEL-V2.bank.part02
 RCNET1-MODEL-V2.bank.part03
 RCNET1-MODEL-V2.bank.part04
 RCNET1-MODEL-V2.manifest.json
-RCNET1-MODEL-RECORD-V2.json
 REASSEMBLE-MODEL-BANK.bat
 REASSEMBLE-MODEL-BANK.sh
 RELEASE_NOTES.md
-SHA256SUMS.txt
 commonfoundry-miner-v0.1.0-devnet.15-linux-x86_64-gnu.tar.gz
 commonfoundry-miner-v0.1.0-devnet.15-windows-x86_64.zip
 commonfoundry-node-v0.1.0-devnet.15-linux-x86_64.tar.gz

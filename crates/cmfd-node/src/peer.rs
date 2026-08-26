@@ -248,7 +248,7 @@ pub struct StaticPeerConfig {
 impl StaticPeerConfig {
     pub fn validate(&self) -> Result<(), PeerError> {
         self.limits.validate()?;
-        validate_peer_address(self.listen_address, self.address_policy)?;
+        validate_listen_address(self.listen_address)?;
         self.validate_peer_list(true)
     }
 
@@ -376,6 +376,23 @@ pub fn process_node_nonce() -> [u8; 32] {
         }
         nonce
     })
+}
+
+/// Validates the local listener bind. A bind address is not a peer: the
+/// wildcard is the ordinary way to serve every interface, and the address
+/// policy instead gates each accepted connection's remote address at accept
+/// time. Only a zero port, multicast, or the limited-broadcast address are
+/// nonsensical binds.
+fn validate_listen_address(address: SocketAddr) -> Result<(), PeerError> {
+    let unsafe_address = address.port() == 0
+        || match address.ip() {
+            IpAddr::V4(ip) => ip.is_multicast() || ip.octets() == [255; 4],
+            IpAddr::V6(ip) => ip.is_multicast(),
+        };
+    if unsafe_address {
+        return Err(PeerError::UnsafeAddress(address));
+    }
+    Ok(())
 }
 
 fn validate_peer_address(address: SocketAddr, policy: PeerAddressPolicy) -> Result<(), PeerError> {
@@ -2325,7 +2342,20 @@ mod tests {
         ));
         public.address_policy = PeerAddressPolicy::AllowPublic;
         public.validate().unwrap();
+        // The wildcard is an ordinary LISTENER bind: every packaged public
+        // node serves 0.0.0.0 while the address policy screens each accepted
+        // remote. Only nonsensical binds are refused.
         public.listen_address = "0.0.0.0:19000".parse().unwrap();
+        public.validate().unwrap();
+        public.address_policy = PeerAddressPolicy::PrivateOnly;
+        public.peers = vec!["127.0.0.1:19001".parse().unwrap()];
+        public.validate().unwrap();
+        public.listen_address = "0.0.0.0:0".parse().unwrap();
+        assert!(matches!(
+            public.validate(),
+            Err(PeerError::UnsafeAddress(_))
+        ));
+        public.listen_address = "224.0.0.1:19000".parse().unwrap();
         assert!(matches!(
             public.validate(),
             Err(PeerError::UnsafeAddress(_))

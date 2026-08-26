@@ -285,6 +285,16 @@ impl NodeRuntimeConfig {
             production_v3,
         }
         .with_default_bootstrap();
+        // The desktop wallet keeps its embedded node on a concrete local
+        // address. Serving every interface is the node package's job, so a
+        // wildcard bind stays a wallet configuration error even though the
+        // shared listener validation accepts it for public nodes.
+        if config.p2p_bind.ip().is_unspecified() {
+            return Err(ConfigError::InvalidPeerConfiguration(format!(
+                "peer address is unspecified, multicast, broadcast, or otherwise unsafe: {}",
+                config.p2p_bind
+            )));
+        }
         config.static_peers(PeerLimits::default()).validate()?;
 
         Ok(ProcessCommand::Run(Box::new(config)))

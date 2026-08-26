@@ -18,6 +18,13 @@ use crate::{
     PreverifiedBlockProof, next_work_target,
 };
 
+mod state_delta;
+
+pub use state_delta::{
+    DecodedReversibleStateDelta, MAX_REVERSIBLE_STATE_DELTA_BYTES, ReversibleStateDeltaError,
+    ValidatedReversibleStateDelta,
+};
+
 const TX_SIGNING_DOMAIN: &str = "CMFD/TRANSACTION/SIGNING/V1";
 const TX_ID_DOMAIN: &str = "CMFD/TRANSACTION/ID/V1";
 const COINBASE_ID_DOMAIN: &str = "CMFD/COINBASE/ID/V1";
@@ -101,13 +108,13 @@ pub struct UtxoSet {
     retired_channels: HashSet<[u8; 32]>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OutputChange {
     previous: Option<TxOutput>,
     next: Option<TxOutput>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MembershipChange {
     previous: bool,
     next: bool,
@@ -116,7 +123,7 @@ struct MembershipChange {
 /// A block-local state transition. Each map contains only keys touched while
 /// validating the block, together with the value needed to reject a stale
 /// commit and to support a future undo journal.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UtxoDelta {
     outputs: HashMap<OutPoint, OutputChange>,
     active_channels: HashMap<[u8; 32], MembershipChange>,
@@ -1605,6 +1612,17 @@ mod tests {
         ChainState::new(params, legacy_verifier()).unwrap()
     }
 
+    fn assert_chain_states_equal(left: &ChainState, right: &ChainState) {
+        assert_eq!(left.params, right.params);
+        assert_eq!(left.utxos.outputs, right.utxos.outputs);
+        assert_eq!(left.utxos.active_channels, right.utxos.active_channels);
+        assert_eq!(left.utxos.retired_channels, right.utxos.retired_channels);
+        assert_eq!(left.history, right.history);
+        assert_eq!(left.raw_timestamps, right.raw_timestamps);
+        assert_eq!(left.tip, right.tip);
+        assert_eq!(left.next_height, right.next_height);
+    }
+
     fn validation_context(now_unix_seconds: u64) -> BlockValidationContext {
         BlockValidationContext { now_unix_seconds }
     }
@@ -2974,6 +2992,201 @@ mod tests {
         assert_eq!(state.raw_timestamps, before.raw_timestamps);
         assert_eq!(state.tip, before.tip);
         assert_eq!(state.next_height, before.next_height);
+    }
+
+    #[test]
+    fn reversible_delta_round_trip_covers_chained_spends_and_channel_retirement() {
+        let first_key = signing_key(90);
+        let second_key = signing_key(91);
+        let funding_key = signing_key(92);
+        let customer = signing_key(93);
+        let provider = signing_key(94);
+        let mut terms = channel_terms(&customer, &provider);
+        terms.refund_height = 2;
+
+        let chained_previous = OutPoint {
+            txid: [0xa0; 32],
+            index: 0,
+        };
+        let channel_previous = OutPoint {
+            txid: [0xa1; 32],
+            index: 0,
+        };
+        let mut state = chain_state(network_params());
+        state.utxos.insert_for_testing(
+            chained_previous,
+            TxOutput {
+                value: 10_000,
+                lock: OutputLock::Key(owner(&first_key)),
+                spendable_height: 0,
+            },
+        );
+        state.utxos.insert_for_testing(
+            channel_previous,
+            TxOutput {
+                value: terms.deposit + 500,
+                lock: OutputLock::Key(owner(&funding_key)),
+                spendable_height: 0,
+            },
+        );
+        let initial = state.clone();
+
+        let first = signed_key_spend(chained_previous, &first_key, 9_000, owner(&second_key));
+        let intermediate = OutPoint {
+            txid: first.txid(),
+            index: 0,
+        };
+        let second = signed_key_spend(intermediate, &second_key, 8_000, owner(&signing_key(95)));
+        let mut fund_channel = Transaction {
+            network_id: state.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: channel_previous,
+                witness: InputWitness::Key {
+                    public_key: [0; 32],
+                    signature: vec![],
+                },
+            }],
+            outputs: vec![TxOutput {
+                value: terms.deposit,
+                lock: OutputLock::InferenceChannel {
+                    channel_id: terms.channel_id().unwrap(),
+                },
+                spendable_height: 0,
+            }],
+        };
+        fund_channel.sign_all(&[&funding_key]).unwrap();
+        let funded_channel = OutPoint {
+            txid: fund_channel.txid(),
+            index: 0,
+        };
+
+        let first_block = block_for_state(
+            &state,
+            60,
+            miner_destination(),
+            vec![first, second, fund_channel],
+            2_500,
+            0,
+        );
+        let first_validated = state
+            .validate_block(&first_block, validation_context(60))
+            .unwrap();
+        let first_delta_bytes = first_validated.encode_reversible_state_delta().unwrap();
+        let mut locally_rehashed_forgery = first_delta_bytes.clone();
+        const FEES_OFFSET: usize = 8 + 4 + 3 * 32 + 2 * 8 + 32 + 3 * 8;
+        let forged_fees = u64::from_le_bytes(
+            locally_rehashed_forgery[FEES_OFFSET..FEES_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        )
+        .checked_add(1)
+        .unwrap();
+        locally_rehashed_forgery[FEES_OFFSET..FEES_OFFSET + 8]
+            .copy_from_slice(&forged_fees.to_le_bytes());
+        let payload_len = locally_rehashed_forgery.len() - 32;
+        let mut local_hasher =
+            Hasher::new_derive_key("CMFD/REVERSIBLE-STATE-DELTA/LOCAL-INTEGRITY/V1");
+        local_hasher.update(&locally_rehashed_forgery[..payload_len]);
+        locally_rehashed_forgery[payload_len..].copy_from_slice(local_hasher.finalize().as_bytes());
+        assert_eq!(
+            DecodedReversibleStateDelta::decode_bound(
+                &locally_rehashed_forgery,
+                state.params(),
+                initial.tip(),
+                first_block.block_id(),
+            )
+            .unwrap()
+            .promote_exact(&first_validated),
+            Err(ReversibleStateDeltaError::ValidationMismatch),
+        );
+        let first_delta = DecodedReversibleStateDelta::decode_bound(
+            &first_delta_bytes,
+            state.params(),
+            initial.tip(),
+            first_block.block_id(),
+        )
+        .unwrap()
+        .promote_exact(&first_validated)
+        .unwrap();
+        state.commit_validated(first_validated).unwrap();
+        let after_first = state.clone();
+
+        let refund = Transaction {
+            network_id: state.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: funded_channel,
+                witness: InputWitness::InferenceRefund {
+                    terms: terms.clone(),
+                },
+            }],
+            outputs: channel_outputs(
+                0,
+                terms.provider_key,
+                terms.deposit - terms.close_fee_burn,
+                terms.customer_key,
+                2,
+            ),
+        };
+        let second_block = block_for_state(
+            &state,
+            120,
+            miner_destination(),
+            vec![refund],
+            terms.close_fee_burn,
+            0,
+        );
+        let second_validated = state
+            .validate_block(&second_block, validation_context(120))
+            .unwrap();
+        let second_delta_bytes = second_validated.encode_reversible_state_delta().unwrap();
+        assert_eq!(
+            DecodedReversibleStateDelta::decode_bound(
+                &first_delta_bytes,
+                state.params(),
+                initial.tip(),
+                first_block.block_id(),
+            )
+            .unwrap()
+            .promote_exact(&second_validated),
+            Err(ReversibleStateDeltaError::ValidationMismatch),
+        );
+        let second_delta = DecodedReversibleStateDelta::decode_bound(
+            &second_delta_bytes,
+            state.params(),
+            first_block.block_id(),
+            second_block.block_id(),
+        )
+        .unwrap()
+        .promote_exact(&second_validated)
+        .unwrap();
+        state.commit_validated(second_validated).unwrap();
+        let final_state = state.clone();
+
+        state.undo_reversible_state_delta(second_delta).unwrap();
+        assert_chain_states_equal(&state, &after_first);
+
+        state.undo_reversible_state_delta(first_delta).unwrap();
+        assert_chain_states_equal(&state, &initial);
+
+        let first_replay = state
+            .validate_block(&first_block, validation_context(60))
+            .unwrap();
+        assert_eq!(
+            first_replay.encode_reversible_state_delta().unwrap(),
+            first_delta_bytes
+        );
+        state.commit_validated(first_replay).unwrap();
+        let second_replay = state
+            .validate_block(&second_block, validation_context(120))
+            .unwrap();
+        assert_eq!(
+            second_replay.encode_reversible_state_delta().unwrap(),
+            second_delta_bytes
+        );
+        state.commit_validated(second_replay).unwrap();
+        assert_chain_states_equal(&state, &final_state);
     }
 
     #[test]

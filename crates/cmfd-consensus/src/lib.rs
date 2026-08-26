@@ -120,10 +120,11 @@ pub mod whir_proof;
 pub mod wire;
 
 pub use chain::{
-    BLOCK_VERSION, Block, COINBASE_MATURITY, ChainError, ChainState, Coinbase, InputWitness,
-    OutPoint, OutputLock, SuccessorHeaderPreflight, TRANSACTION_VERSION, Transaction,
-    TransactionSetValidation, TxInput, TxOutput, UtxoSet, merkle_root, validate_block_preamble,
-    validate_block_resources,
+    BLOCK_VERSION, Block, COINBASE_MATURITY, ChainError, ChainState, Coinbase,
+    DecodedReversibleStateDelta, InputWitness, MAX_REVERSIBLE_STATE_DELTA_BYTES, OutPoint,
+    OutputLock, ReversibleStateDeltaError, SuccessorHeaderPreflight, TRANSACTION_VERSION,
+    Transaction, TransactionSetValidation, TxInput, TxOutput, UtxoSet,
+    ValidatedReversibleStateDelta, merkle_root, validate_block_preamble, validate_block_resources,
 };
 pub use difficulty::{
     DGW_WINDOW, DifficultyError, HeaderWork, TARGET_SPACING_SECONDS, add_chain_work, block_work,

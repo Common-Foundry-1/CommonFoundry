@@ -377,17 +377,32 @@ fn perform_sync_from_peer_once_inner_with_policy(
         }
 
         let accepted_at = unix_time_seconds()?;
-        {
+        let admission_work = {
             let node = lock_node(&shared)?;
-            node.preflight_external_block(&block, accepted_at)?;
-        }
+            node.begin_external_block_admission(&block, accepted_at)?
+        };
+        let admission = admission_work
+            .map(|work| work.complete(&block))
+            .transpose()?;
         let preverified = block_preverifier.preverify(&block)?;
         let accepted = {
             let mut node = lock_node(&shared)?;
             if node.contains_block(*requested) {
                 false
             } else {
-                node.submit_preverified_block(block, accepted_at, preverified)?;
+                match admission {
+                    Some(admission) => {
+                        node.submit_preverified_block_with_admission(
+                            block,
+                            accepted_at,
+                            preverified,
+                            admission,
+                        )?;
+                    }
+                    None => {
+                        node.submit_preverified_block(block, accepted_at, preverified)?;
+                    }
+                }
                 true
             }
         };
@@ -756,28 +771,49 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::SubmitBlock(block) => {
                 let block_id = block.block_id();
                 let accepted_at = unix_time_seconds()?;
-                let preflight = {
+                let admission_work = {
                     let node = lock_node(&shared)?;
-                    node.preflight_external_block(&block, accepted_at)
+                    node.begin_external_block_admission(&block, accepted_at)
                 };
-                let status = if matches!(preflight, Err(NodeError::DuplicateBlock(_))) {
-                    BlockSubmissionStatus::AlreadyKnown
-                } else if preflight.is_err() {
-                    BlockSubmissionStatus::Rejected
-                } else if let Ok(preverified) = block_preverifier.preverify(&block) {
-                    let mut node = lock_node(&shared)?;
-                    if node.contains_block(block_id) {
-                        BlockSubmissionStatus::AlreadyKnown
-                    } else if node
-                        .submit_preverified_block(block, accepted_at, preverified)
-                        .is_ok()
-                    {
-                        BlockSubmissionStatus::Accepted
-                    } else {
-                        BlockSubmissionStatus::Rejected
+                let status = match admission_work {
+                    Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
+                    Err(_) => BlockSubmissionStatus::Rejected,
+                    Ok(admission_work) => {
+                        let admission =
+                            admission_work.map(|work| work.complete(&block)).transpose();
+                        match admission {
+                            Ok(admission) => match block_preverifier.preverify(&block) {
+                                Ok(preverified) => {
+                                    let mut node = lock_node(&shared)?;
+                                    if node.contains_block(block_id) {
+                                        BlockSubmissionStatus::AlreadyKnown
+                                    } else {
+                                        let submitted = match admission {
+                                            Some(admission) => node
+                                                .submit_preverified_block_with_admission(
+                                                    block,
+                                                    accepted_at,
+                                                    preverified,
+                                                    admission,
+                                                ),
+                                            None => node.submit_preverified_block(
+                                                block,
+                                                accepted_at,
+                                                preverified,
+                                            ),
+                                        };
+                                        if submitted.is_ok() {
+                                            BlockSubmissionStatus::Accepted
+                                        } else {
+                                            BlockSubmissionStatus::Rejected
+                                        }
+                                    }
+                                }
+                                Err(_) => BlockSubmissionStatus::Rejected,
+                            },
+                            Err(_) => BlockSubmissionStatus::Rejected,
+                        }
                     }
-                } else {
-                    BlockSubmissionStatus::Rejected
                 };
                 let peer = {
                     let node = lock_node(&shared)?;

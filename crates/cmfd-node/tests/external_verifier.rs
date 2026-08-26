@@ -8,7 +8,10 @@ use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, Coinbase, ConsensusPowVerifier,
     v2_test_reference,
 };
-use cmfd_node::{MAX_CONCURRENT_PROOF_VERIFICATIONS, MAX_QUEUED_PROOF_VERIFICATIONS, Node};
+use cmfd_node::{
+    DEFAULT_MINING_ATTEMPTS, DEVNET_GENESIS_TIMESTAMP, MAX_CONCURRENT_PROOF_VERIFICATIONS,
+    MAX_QUEUED_PROOF_VERIFICATIONS, Node,
+};
 use cmfd_proof_worker::VerifierWorkerConfig;
 use sha2::{Digest, Sha256};
 
@@ -110,6 +113,38 @@ fn node_admission_uses_the_pinned_worker_and_reports_its_limits() {
     proof.work_digest[0] ^= 1;
     let error = node.block_preverifier().preverify(&invalid).unwrap_err();
     assert_eq!(error.client_error().code, "proof_rejected");
+
+    drop(node);
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
+fn verifier_worker_starts_before_restart_replay_and_restores_the_chain() {
+    let data_dir = temporary_data_dir();
+    let (tip, height) = {
+        let mut node = Node::open(&data_dir).unwrap();
+        node.mine_once(
+            node.wallet_destination(),
+            DEVNET_GENESIS_TIMESTAMP + 60,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        node.mine_once(
+            node.wallet_destination(),
+            DEVNET_GENESIS_TIMESTAMP + 120,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        let status = node.status().unwrap();
+        (status.tip, status.accepted_height)
+    };
+
+    let node =
+        Node::open_with_artifacts_and_verifier_worker(&data_dir, None, worker_config()).unwrap();
+    let status = node.status().unwrap();
+    assert_eq!(status.tip, tip);
+    assert_eq!(status.accepted_height, height);
+    assert_eq!(status.proof_verification_mode, "external_worker");
 
     drop(node);
     fs::remove_dir_all(data_dir).unwrap();

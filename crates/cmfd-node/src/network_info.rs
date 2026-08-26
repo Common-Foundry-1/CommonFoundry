@@ -302,8 +302,8 @@ fn canonical_network_info_json_for_profile(
                 },
             })
         }
-        PowParameters::V1Legacy(_) => {
-            unreachable!("no compiled network profile selects the legacy V1 proof")
+        _ => {
+            unreachable!("the compiled network profile passed proof selection validation")
         }
     };
 

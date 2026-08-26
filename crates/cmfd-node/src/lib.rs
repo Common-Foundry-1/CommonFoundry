@@ -2362,9 +2362,12 @@ impl BlockIndex {
     }
 
     fn active_position(&self, block_id: [u8; 32]) -> Option<usize> {
-        self.active_chain
-            .iter()
-            .position(|candidate| *candidate == block_id)
+        if block_id == self.genesis {
+            return (self.active_chain.first().copied() == Some(self.genesis)).then_some(0);
+        }
+
+        let position = usize::try_from(self.blocks.get(&block_id)?.height()).ok()?;
+        (self.active_chain.get(position).copied() == Some(block_id)).then_some(position)
     }
 
     fn ancestor_at_height(&self, tip: [u8; 32], target_height: u64) -> Result<[u8; 32], NodeError> {
@@ -10035,6 +10038,21 @@ mod tests {
         );
         assert!(node.inventory_after(&[[0xaa; 32]], [0; 32], 10).is_empty());
         assert!(node.inventory_after(&[genesis], [0; 32], 0).is_empty());
+
+        assert_eq!(node.index.active_position(genesis), Some(0));
+        for (position, block_id) in ids.iter().copied().enumerate() {
+            assert_eq!(node.index.active_position(block_id), Some(position + 1));
+        }
+
+        let side = mined_child(&node, genesis, DEVNET_GENESIS_TIMESTAMP + 61, 0xf0);
+        let side_id = side.block_id();
+        node.submit_block(side, DEVNET_GENESIS_TIMESTAMP + 61)
+            .unwrap();
+        assert_eq!(node.index.active_position(side_id), None);
+        assert_eq!(
+            node.inventory_after(&[side_id, ids[3]], [0; 32], 3),
+            ids[4..7].to_vec()
+        );
         drop(node);
         clean_test_dir(&path);
     }

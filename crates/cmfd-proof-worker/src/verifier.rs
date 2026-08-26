@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -848,6 +848,7 @@ struct PersistentVerifierProcess {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr_capture: Arc<Mutex<StderrCapture>>,
+    stderr_termination_armed: Arc<AtomicBool>,
     stderr_thread: Option<JoinHandle<()>>,
 }
 
@@ -876,9 +877,15 @@ impl PersistentVerifierProcess {
             ))?;
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let capture = Arc::clone(&stderr_capture);
-        let terminator = child.termination_handle();
+        let stderr_termination_armed = Arc::new(AtomicBool::new(true));
+        let armed = Arc::clone(&stderr_termination_armed);
+        let terminator = child.non_owning_termination_handle();
         let stderr_thread = thread::spawn(move || {
-            capture_persistent_stderr(stderr, capture, || terminator.terminate_tree())
+            capture_persistent_stderr(stderr, capture, || {
+                if armed.swap(false, Ordering::AcqRel) {
+                    terminator.terminate_tree();
+                }
+            })
         });
         Ok(Self {
             generation,
@@ -886,6 +893,7 @@ impl PersistentVerifierProcess {
             stdin: Some(stdin),
             stdout: Some(stdout),
             stderr_capture,
+            stderr_termination_armed,
             stderr_thread: Some(stderr_thread),
         })
     }
@@ -914,12 +922,7 @@ impl PersistentVerifierProcess {
         let received = receiver.recv_timeout(timeout);
         match received {
             Ok((stdin, stdout, result)) => {
-                if io_thread.join().is_err() {
-                    self.child.terminate_and_reap();
-                    return Err(VerifierWorkerError::Process(ProofWorkerError::PipeThread(
-                        "exchanging persistent verifier frames",
-                    )));
-                }
+                detach_pipe_thread(io_thread);
                 self.stdin = Some(stdin);
                 self.stdout = Some(stdout);
                 if self.stderr_exceeded()? {
@@ -943,14 +946,14 @@ impl PersistentVerifierProcess {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.child.terminate_and_reap();
-                let _ = io_thread.join();
+                detach_pipe_thread(io_thread);
                 Err(VerifierWorkerError::Process(ProofWorkerError::Timeout {
                     milliseconds: timeout.as_millis(),
                 }))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.child.terminate_and_reap();
-                let _ = io_thread.join();
+                detach_pipe_thread(io_thread);
                 Err(VerifierWorkerError::Process(ProofWorkerError::PipeThread(
                     "exchanging persistent verifier frames",
                 )))
@@ -971,6 +974,13 @@ impl PersistentVerifierProcess {
             .map(|capture| capture.bytes.clone())
             .map_err(|_| VerifierWorkerError::StatePoisoned)
     }
+}
+
+/// Never turn a bounded process deadline into an unbounded caller wait. The
+/// contained process tree is terminated first on failure; a pipe owner that
+/// nevertheless survives is detached and cannot produce a trusted response.
+fn detach_pipe_thread(thread: JoinHandle<()>) {
+    drop(thread);
 }
 
 fn capture_persistent_stderr(
@@ -1007,11 +1017,15 @@ fn capture_persistent_stderr(
 
 impl Drop for PersistentVerifierProcess {
     fn drop(&mut self) {
+        // A detached stderr reader must never target a recycled Unix process
+        // group after this child generation has ended.
+        self.stderr_termination_armed
+            .store(false, Ordering::Release);
         self.child.terminate_and_reap();
         self.stdin.take();
         self.stdout.take();
         if let Some(thread) = self.stderr_thread.take() {
-            let _ = thread.join();
+            detach_pipe_thread(thread);
         }
     }
 }
@@ -1791,8 +1805,6 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-
     use cmfd_consensus::{
         BLOCK_VERSION, BlockChallenge, BlockProof, Coinbase, ForgeMatrixV3CandidateProof,
         v2_test_reference,
@@ -2040,5 +2052,50 @@ mod tests {
         assert!(capture.exceeded);
         assert_eq!(capture.bytes.len(), MAX_STDERR_BYTES);
         assert!(terminated.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn persistent_teardown_child_helper() {
+        if std::env::var_os("CMFD_PERSISTENT_TEARDOWN_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn persistent_process_drop_never_joins_a_stuck_pipe_reader() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("verifier::tests::persistent_teardown_child_helper")
+            .arg("--nocapture")
+            .env("CMFD_PERSISTENT_TEARDOWN_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_contained(&mut command, None).unwrap();
+        let mut process = PersistentVerifierProcess::new(child, 1).unwrap();
+
+        // Replace the real stderr reader with a deliberately stuck handle.
+        // The real reader is safe to detach and exits when `process` kills its
+        // contained child below.
+        detach_pipe_thread(process.stderr_thread.take().unwrap());
+        let (release_sender, release_receiver) = mpsc::channel();
+        process.stderr_thread = Some(thread::spawn(move || {
+            let _ = release_receiver.recv();
+        }));
+
+        let (done_sender, done_receiver) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(process);
+            let _ = done_sender.send(());
+        });
+        let completed =
+            done_receiver.recv_timeout(crate::PROCESS_REAP_TIMEOUT + Duration::from_secs(1));
+        let _ = release_sender.send(());
+        dropper.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "persistent process teardown exceeded its bounded reap window"
+        );
     }
 }

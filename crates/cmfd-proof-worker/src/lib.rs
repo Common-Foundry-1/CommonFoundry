@@ -23,6 +23,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(windows)]
+use std::sync::Weak;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -446,6 +448,14 @@ struct ProcessTerminator {
     job: Arc<WindowsJob>,
 }
 
+#[derive(Clone)]
+struct NonOwningProcessTerminator {
+    #[cfg(unix)]
+    process_group: libc::pid_t,
+    #[cfg(windows)]
+    job: Weak<WindowsJob>,
+}
+
 impl ProcessTerminator {
     fn terminate_tree(&self) {
         #[cfg(unix)]
@@ -458,11 +468,39 @@ impl ProcessTerminator {
         #[cfg(windows)]
         let _ = self.job.terminate();
     }
+
+    fn downgrade(&self) -> NonOwningProcessTerminator {
+        NonOwningProcessTerminator {
+            #[cfg(unix)]
+            process_group: self.process_group,
+            #[cfg(windows)]
+            job: Arc::downgrade(&self.job),
+        }
+    }
+}
+
+impl NonOwningProcessTerminator {
+    fn terminate_tree(&self) {
+        #[cfg(unix)]
+        // SAFETY: this handle is only armed while the owning child is live.
+        // Its process group is the positive child PID selected before spawn.
+        unsafe {
+            libc::kill(-self.process_group, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(job) = self.job.upgrade() {
+            let _ = job.terminate();
+        }
+    }
 }
 
 impl ContainedChild {
     fn termination_handle(&self) -> ProcessTerminator {
         self.terminator.clone()
+    }
+
+    fn non_owning_termination_handle(&self) -> NonOwningProcessTerminator {
+        self.terminator.downgrade()
     }
 
     fn terminate_tree(&mut self) {

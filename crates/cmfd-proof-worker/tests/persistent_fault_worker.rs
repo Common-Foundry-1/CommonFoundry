@@ -134,7 +134,7 @@ fn worker_config(
         cpu_quota_micros: None,
         cpu_period_micros: None,
         pids_limit: None,
-        production_v3_artifacts: None,
+        production_v3_record: None,
     }
 }
 

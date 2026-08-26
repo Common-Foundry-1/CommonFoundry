@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use cmfd_consensus::{
     Block, ConsensusPowVerifier, ExternalPreverificationBinding, MAX_BLOCK_BYTES,
-    PreverifiedBlockProof, decode_block, encode_block, v2_reference_for_network,
+    PreverifiedBlockProof, decode_block, dory_v3_model_ceremony_transcript::FileIdentity,
+    encode_block, v2_reference_for_network,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -28,11 +29,9 @@ const PROTOCOL_VERSION: u32 = 3;
 const VERIFY_MODE: &str = "--verify-block";
 const PERSISTENT_VERIFY_MODE: &str = "--verify-block-server";
 #[cfg(not(windows))]
-const V3_BANK_ARGUMENT: &str = "--production-v3-bank";
-#[cfg(not(windows))]
-const V3_MANIFEST_ARGUMENT: &str = "--production-v3-manifest";
-#[cfg(not(windows))]
 const V3_RECORD_ARGUMENT: &str = "--production-v3-record-v2";
+#[cfg(not(windows))]
+const V3_RECORD_IDENTITY_ARGUMENT: &str = "--production-v3-record-v2-identity";
 const REQUEST_FIXED_BYTES: usize = 8 + 4 + 32 + 32 + 32 + 32 + 4;
 const SUCCESS_RESPONSE_BYTES: usize = 8 + 4 + 1 + 1 + 32 + 32 + 32;
 const ERROR_RESPONSE_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 2;
@@ -88,11 +87,12 @@ pub struct VerifierWorkerConfig {
     pub cpu_period_micros: Option<u64>,
     /// Measured maximum task count for the ProductionV3 verifier cgroup.
     pub pids_limit: Option<u64>,
-    pub production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
+    pub production_v3_record: Option<ProductionV3VerifierRecord>,
 }
 
-/// Local paths to the three authenticated artifacts required by the V3
-/// verifier. Paths are process configuration only and never enter consensus.
+/// Local paths to the three authenticated artifacts required by V3 mining.
+/// Verifier-only workers receive [`ProductionV3VerifierRecord`] instead.
+/// Paths are process configuration only and never enter consensus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionV3VerifierArtifacts {
     pub bank: PathBuf,
@@ -100,31 +100,49 @@ pub struct ProductionV3VerifierArtifacts {
     pub record_v2: PathBuf,
 }
 
-enum WorkerProductionArtifacts {
-    #[cfg(not(windows))]
-    Paths(ProductionV3VerifierArtifacts),
-    #[cfg(windows)]
-    #[cfg_attr(not(feature = "production-v3"), allow(dead_code))]
-    Handles(crate::windows_artifacts::OwnedWindowsProductionArtifactHandles),
+/// Exact release-pinned Record V2 passed to a verifier-only worker. The parent
+/// binds all three identity fields to its compiled release profile before a
+/// worker can start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionV3VerifierRecord {
+    pub record_v2: PathBuf,
+    pub expected_file: FileIdentity,
 }
 
-impl ProductionV3VerifierArtifacts {
+enum WorkerProductionArtifacts {
+    #[cfg(not(windows))]
+    Path(ProductionV3VerifierRecord),
+    #[cfg(windows)]
+    #[cfg_attr(not(feature = "production-v3"), allow(dead_code))]
+    Handle(crate::windows_artifacts::OwnedWindowsProductionRecordHandle),
+}
+
+impl ProductionV3VerifierRecord {
     fn validate(&self) -> Result<(), VerifierWorkerError> {
-        if !self.bank.is_absolute() || !self.manifest.is_absolute() || !self.record_v2.is_absolute()
-        {
+        if !self.record_v2.is_absolute() {
             return Err(VerifierWorkerError::InvalidConfig(
-                "production V3 artifact paths must be absolute",
+                "production V3 Record V2 path must be absolute",
             ));
         }
-        if self.bank == self.manifest
-            || self.bank == self.record_v2
-            || self.manifest == self.record_v2
+        if self.expected_file.bytes == 0
+            || self.expected_file.blake3 == [0; 32]
+            || self.expected_file.sha256 == [0; 32]
         {
             return Err(VerifierWorkerError::InvalidConfig(
-                "production V3 artifact paths must be pairwise distinct",
+                "production V3 Record V2 identity must be complete and nonzero",
             ));
         }
         Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn identity_argument(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.expected_file.bytes,
+            hex::encode(self.expected_file.blake3),
+            hex::encode(self.expected_file.sha256)
+        )
     }
 }
 
@@ -180,7 +198,7 @@ impl VerifierWorkerConfig {
             (None, None, None) =>
             {
                 #[cfg(target_os = "linux")]
-                if self.production_v3_artifacts.is_some() {
+                if self.production_v3_record.is_some() {
                     return Err(VerifierWorkerError::InvalidConfig(
                         "Linux ProductionV3 requires measured CPU quota, CPU period, and PID limit",
                     ));
@@ -192,8 +210,8 @@ impl VerifierWorkerConfig {
                 ));
             }
         }
-        if let Some(artifacts) = &self.production_v3_artifacts {
-            artifacts.validate()?;
+        if let Some(record) = &self.production_v3_record {
+            record.validate()?;
         }
         Ok(())
     }
@@ -239,7 +257,7 @@ impl VerifierWorkerConfig {
         hasher.update([configured_profile(self)]);
         hasher.update([sandbox as u8]);
         #[cfg(target_os = "linux")]
-        if self.production_v3_artifacts.is_some() {
+        if self.production_v3_record.is_some() {
             hasher.update([1]);
             hasher.update(LINUX_CGROUP_V2_DOMAIN_PROFILE);
         } else {
@@ -864,14 +882,12 @@ impl PersistentVerifierWorkerInner {
         let mut command = Command::new(self.runtime_copy.executable());
         command.arg(PERSISTENT_VERIFY_MODE);
         #[cfg(not(windows))]
-        if let Some(artifacts) = &self.config.production_v3_artifacts {
+        if let Some(record) = &self.config.production_v3_record {
             command
-                .arg(V3_BANK_ARGUMENT)
-                .arg(&artifacts.bank)
-                .arg(V3_MANIFEST_ARGUMENT)
-                .arg(&artifacts.manifest)
                 .arg(V3_RECORD_ARGUMENT)
-                .arg(&artifacts.record_v2);
+                .arg(&record.record_v2)
+                .arg(V3_RECORD_IDENTITY_ARGUMENT)
+                .arg(record.identity_argument());
         }
         command
             .env_clear()
@@ -883,8 +899,8 @@ impl PersistentVerifierWorkerInner {
         // published. The epoch closes that gap: any overlapping request is
         // observed immediately after publication and kills this generation.
         let shutdown_epoch = self.shutdown_epoch.load(Ordering::Acquire);
-        let child = if let Some(production_artifacts) = &self.config.production_v3_artifacts {
-            let _ = production_artifacts;
+        let child = if let Some(production_record) = &self.config.production_v3_record {
+            let _ = production_record;
             #[cfg(target_os = "linux")]
             {
                 super::spawn_contained_production(
@@ -899,7 +915,7 @@ impl PersistentVerifierWorkerInner {
                 {
                     crate::windows_launcher::spawn_contained_production_windows(
                         command,
-                        production_artifacts,
+                        production_record,
                         self.config.memory_limit_bytes,
                         self.config.worker_sha256,
                     )?
@@ -1101,7 +1117,7 @@ impl Drop for PersistentVerifierWorkerInner {
 }
 
 fn configured_profile(config: &VerifierWorkerConfig) -> u8 {
-    if config.production_v3_artifacts.is_some() {
+    if config.production_v3_record.is_some() {
         PROFILE_PRODUCTION_V3
     } else {
         PROFILE_V2_REFERENCE
@@ -1111,7 +1127,7 @@ fn configured_profile(config: &VerifierWorkerConfig) -> u8 {
 fn expected_sandbox_status(
     config: &VerifierWorkerConfig,
 ) -> Result<VerifierSandboxStatus, VerifierWorkerError> {
-    if config.production_v3_artifacts.is_some() {
+    if config.production_v3_record.is_some() {
         required_production_status().map_err(VerifierWorkerError::SandboxUnavailable)
     } else {
         Ok(VerifierSandboxStatus::Unconfined)
@@ -2475,14 +2491,12 @@ pub fn verify_block_out_of_process(
     let mut command = Command::new(&config.worker_executable);
     command.arg(VERIFY_MODE);
     #[cfg(not(windows))]
-    if let Some(artifacts) = &config.production_v3_artifacts {
+    if let Some(record) = &config.production_v3_record {
         command
-            .arg(V3_BANK_ARGUMENT)
-            .arg(&artifacts.bank)
-            .arg(V3_MANIFEST_ARGUMENT)
-            .arg(&artifacts.manifest)
             .arg(V3_RECORD_ARGUMENT)
-            .arg(&artifacts.record_v2);
+            .arg(&record.record_v2)
+            .arg(V3_RECORD_IDENTITY_ARGUMENT)
+            .arg(record.identity_argument());
     }
     command
         .env_clear()
@@ -2494,8 +2508,8 @@ pub fn verify_block_out_of_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = if let Some(production_artifacts) = &config.production_v3_artifacts {
-        let _ = production_artifacts;
+    let child = if let Some(production_record) = &config.production_v3_record {
+        let _ = production_record;
         #[cfg(target_os = "linux")]
         {
             super::spawn_contained_production(
@@ -2510,7 +2524,7 @@ pub fn verify_block_out_of_process(
             {
                 crate::windows_launcher::spawn_contained_production_windows(
                     command,
-                    production_artifacts,
+                    production_record,
                     config.memory_limit_bytes,
                     config.worker_sha256,
                 )?
@@ -2731,15 +2745,11 @@ fn install_worker_sandbox(
     };
     #[cfg(not(windows))]
     let paths = match artifacts {
-        WorkerProductionArtifacts::Paths(artifacts) => [
-            artifacts.bank.as_path(),
-            artifacts.manifest.as_path(),
-            artifacts.record_v2.as_path(),
-        ],
+        WorkerProductionArtifacts::Path(record) => [record.record_v2.as_path()],
     };
     #[cfg(windows)]
     let paths: [&Path; 0] = match artifacts {
-        WorkerProductionArtifacts::Handles(_) => [],
+        WorkerProductionArtifacts::Handle(_) => [],
     };
     install_production(&paths).map_err(|message| (ERROR_INTERNAL, message))
 }
@@ -3011,59 +3021,85 @@ fn parse_verifier_artifact_arguments(
     }
     #[cfg(windows)]
     {
-        if arguments.len() != 5
+        if arguments.len() != 3
             || arguments[0].as_os_str() != OsStr::new(mode)
             || arguments[1].as_os_str()
                 != OsStr::new(crate::windows_launcher::WINDOWS_ARTIFACT_HANDLES_ARGUMENT)
         {
             return Err(
-                "expected the verifier mode alone or with exactly three inherited production V3 artifact handles",
+                "expected the verifier mode alone or with exactly one inherited production V3 Record V2 handle",
             );
         }
-        let mut descriptors = Vec::with_capacity(3);
-        for argument in &arguments[2..] {
-            let argument = argument
-                .to_str()
-                .ok_or("production V3 artifact handle descriptor is not canonical ASCII")?;
-            descriptors.push(
-                crate::windows_artifacts::WindowsArtifactHandleDescriptor::parse_transport_argument(
-                    argument,
-                )
-                .map_err(|_| "production V3 artifact handle descriptor is invalid")?,
-            );
-        }
-        let descriptors: [_; 3] = descriptors
-            .try_into()
-            .map_err(|_| "exactly three production V3 artifact handles are required")?;
-        let handles =
-            crate::windows_artifacts::OwnedWindowsProductionArtifactHandles::from_inherited_descriptors(
-                descriptors,
+        let argument = arguments[2]
+            .to_str()
+            .ok_or("production V3 Record V2 handle descriptor is not canonical ASCII")?;
+        let descriptor =
+            crate::windows_artifacts::WindowsArtifactHandleDescriptor::parse_transport_argument(
+                argument,
             )
-            .map_err(|_| "production V3 artifact handles are invalid")?;
-        Ok(Some(WorkerProductionArtifacts::Handles(handles)))
+            .map_err(|_| "production V3 Record V2 handle descriptor is invalid")?;
+        let handle =
+            crate::windows_artifacts::OwnedWindowsProductionRecordHandle::from_inherited_descriptor(
+                descriptor,
+            )
+            .map_err(|_| "production V3 Record V2 handle is invalid")?;
+        Ok(Some(WorkerProductionArtifacts::Handle(handle)))
     }
     #[cfg(not(windows))]
     {
-        if arguments.len() != 7
+        if arguments.len() != 5
             || arguments[0].as_os_str() != OsStr::new(mode)
-            || arguments[1].as_os_str() != OsStr::new(V3_BANK_ARGUMENT)
-            || arguments[3].as_os_str() != OsStr::new(V3_MANIFEST_ARGUMENT)
-            || arguments[5].as_os_str() != OsStr::new(V3_RECORD_ARGUMENT)
+            || arguments[1].as_os_str() != OsStr::new(V3_RECORD_ARGUMENT)
+            || arguments[3].as_os_str() != OsStr::new(V3_RECORD_IDENTITY_ARGUMENT)
         {
             return Err(
-                "expected the verifier mode alone or with the exact production V3 bank, manifest, and Record V2 arguments",
+                "expected the verifier mode alone or with the exact production V3 Record V2 path and identity",
             );
         }
-        let artifacts = ProductionV3VerifierArtifacts {
-            bank: PathBuf::from(&arguments[2]),
-            manifest: PathBuf::from(&arguments[4]),
-            record_v2: PathBuf::from(&arguments[6]),
+        let record = ProductionV3VerifierRecord {
+            record_v2: PathBuf::from(&arguments[2]),
+            expected_file: parse_record_identity(arguments[4].as_os_str())?,
         };
-        artifacts
+        record
             .validate()
-            .map_err(|_| "production V3 verifier artifact paths are invalid")?;
-        Ok(Some(WorkerProductionArtifacts::Paths(artifacts)))
+            .map_err(|_| "production V3 verifier Record V2 is invalid")?;
+        Ok(Some(WorkerProductionArtifacts::Path(record)))
     }
+}
+
+#[cfg(not(windows))]
+fn parse_record_identity(value: &OsStr) -> Result<FileIdentity, &'static str> {
+    let value = value
+        .to_str()
+        .ok_or("production V3 Record V2 identity is not canonical ASCII")?;
+    let fields = value.split(':').collect::<Vec<_>>();
+    if fields.len() != 3 || fields[1].len() != 64 || fields[2].len() != 64 {
+        return Err("production V3 Record V2 identity is malformed");
+    }
+    let bytes = fields[0]
+        .parse::<u64>()
+        .map_err(|_| "production V3 Record V2 length is malformed")?;
+    let mut blake3 = [0_u8; 32];
+    let mut sha256 = [0_u8; 32];
+    hex::decode_to_slice(fields[1], &mut blake3)
+        .map_err(|_| "production V3 Record V2 BLAKE3 is malformed")?;
+    hex::decode_to_slice(fields[2], &mut sha256)
+        .map_err(|_| "production V3 Record V2 SHA-256 is malformed")?;
+    let identity = FileIdentity {
+        bytes,
+        blake3,
+        sha256,
+    };
+    let canonical = format!(
+        "{}:{}:{}",
+        identity.bytes,
+        hex::encode(identity.blake3),
+        hex::encode(identity.sha256)
+    );
+    if canonical != value {
+        return Err("production V3 Record V2 identity is not canonical");
+    }
+    Ok(identity)
 }
 
 #[cfg(feature = "production-v3")]
@@ -3073,31 +3109,30 @@ fn load_production_v3_verifier(
 ) -> Result<ConsensusPowVerifier, (u16, String)> {
     #[cfg(windows)]
     {
-        let WorkerProductionArtifacts::Handles(handles) = artifacts;
-        crate::windows_artifacts::load_production_v3_verifier_from_inherited_handles(
-            network_id, handles,
+        let WorkerProductionArtifacts::Handle(handle) = artifacts;
+        crate::windows_artifacts::load_production_v3_verifier_from_inherited_record_handle(
+            network_id, handle,
         )
         .map_err(|_| {
             (
                 ERROR_INTERNAL,
-                "could not authenticate the inherited production V3 verifier artifacts".to_owned(),
+                "could not authenticate the inherited production V3 Record V2".to_owned(),
             )
         })
     }
     #[cfg(not(windows))]
-    let WorkerProductionArtifacts::Paths(artifacts) = artifacts;
+    let WorkerProductionArtifacts::Path(record) = artifacts;
     #[cfg(not(windows))]
-    cmfd_consensus::dory_v3_model_bank_record_validation::load_production_dory_v3_consensus_verifier(
+    cmfd_consensus::dory_v3_model_bank_record_validation::load_release_pinned_production_dory_v3_consensus_verifier(
         network_id,
-        &artifacts.bank,
-        &artifacts.manifest,
-        &artifacts.record_v2,
+        &record.record_v2,
+        record.expected_file,
     )
     .map(|loaded| loaded.into_verifier())
     .map_err(|_| {
         (
             ERROR_INTERNAL,
-            "could not authenticate the configured production V3 verifier artifacts".to_owned(),
+            "could not authenticate the configured production V3 Record V2".to_owned(),
         )
     })
 }
@@ -3450,34 +3485,39 @@ mod tests {
         #[cfg(not(windows))]
         {
             let root = std::env::current_dir().unwrap();
-            let bank = root.join("model.bank");
-            let manifest = root.join("model.manifest.json");
             let record_v2 = root.join("model.record-v2.json");
+            let expected_file = FileIdentity {
+                bytes: 17,
+                blake3: [0x12; 32],
+                sha256: [0x34; 32],
+            };
             let parsed = parse_verifier_worker_arguments([
                 std::ffi::OsString::from(VERIFY_MODE),
-                std::ffi::OsString::from(V3_BANK_ARGUMENT),
-                bank.clone().into_os_string(),
-                std::ffi::OsString::from(V3_MANIFEST_ARGUMENT),
-                manifest.clone().into_os_string(),
                 std::ffi::OsString::from(V3_RECORD_ARGUMENT),
                 record_v2.clone().into_os_string(),
+                std::ffi::OsString::from(V3_RECORD_IDENTITY_ARGUMENT),
+                std::ffi::OsString::from(format!(
+                    "{}:{}:{}",
+                    expected_file.bytes,
+                    hex::encode(expected_file.blake3),
+                    hex::encode(expected_file.sha256)
+                )),
             ])
             .unwrap()
             .unwrap();
-            let WorkerProductionArtifacts::Paths(parsed) = parsed;
+            let WorkerProductionArtifacts::Path(parsed) = parsed;
             assert_eq!(
                 parsed,
-                ProductionV3VerifierArtifacts {
-                    bank,
-                    manifest,
+                ProductionV3VerifierRecord {
                     record_v2,
+                    expected_file,
                 }
             );
 
             assert!(
                 parse_verifier_worker_arguments([
                     std::ffi::OsString::from(VERIFY_MODE),
-                    std::ffi::OsString::from(V3_BANK_ARGUMENT),
+                    std::ffi::OsString::from(V3_RECORD_ARGUMENT),
                 ])
                 .is_err()
             );
@@ -3504,8 +3544,6 @@ mod tests {
                         crate::windows_launcher::WINDOWS_ARTIFACT_HANDLES_ARGUMENT,
                     ),
                     std::ffi::OsString::from("invalid"),
-                    std::ffi::OsString::from("invalid"),
-                    std::ffi::OsString::from("invalid"),
                 ])
                 .is_err()
             );
@@ -3523,7 +3561,7 @@ mod tests {
             cpu_quota_micros: None,
             cpu_period_micros: None,
             pids_limit: None,
-            production_v3_artifacts: None,
+            production_v3_record: None,
         };
         assert!(matches!(
             config.validate(),
@@ -3548,10 +3586,13 @@ mod tests {
             Err(VerifierWorkerError::InvalidConfig(_))
         ));
         config.cpu_quota_micros = None;
-        config.production_v3_artifacts = Some(ProductionV3VerifierArtifacts {
-            bank: PathBuf::from("relative-bank"),
-            manifest: PathBuf::from("relative-manifest"),
+        config.production_v3_record = Some(ProductionV3VerifierRecord {
             record_v2: PathBuf::from("relative-record"),
+            expected_file: FileIdentity {
+                bytes: 1,
+                blake3: [1; 32],
+                sha256: [2; 32],
+            },
         });
         assert!(matches!(
             config.validate(),
@@ -3571,7 +3612,7 @@ mod tests {
             cpu_quota_micros: Some(25_000),
             cpu_period_micros: Some(100_000),
             pids_limit: Some(8),
-            production_v3_artifacts: None,
+            production_v3_record: None,
         };
         let digest = base.containment_profile_digest(VerifierSandboxStatus::Unconfined);
         for changed in [
@@ -3602,10 +3643,13 @@ mod tests {
             base.containment_profile_digest(VerifierSandboxStatus::LinuxLandlockSeccompV1)
         );
         let production = VerifierWorkerConfig {
-            production_v3_artifacts: Some(ProductionV3VerifierArtifacts {
-                bank: std::env::temp_dir().join("containment-profile-bank"),
-                manifest: std::env::temp_dir().join("containment-profile-manifest"),
+            production_v3_record: Some(ProductionV3VerifierRecord {
                 record_v2: std::env::temp_dir().join("containment-profile-record"),
+                expected_file: FileIdentity {
+                    bytes: 1,
+                    blake3: [3; 32],
+                    sha256: [4; 32],
+                },
             }),
             ..base.clone()
         };
@@ -3628,10 +3672,13 @@ mod tests {
             cpu_quota_micros: None,
             cpu_period_micros: None,
             pids_limit: None,
-            production_v3_artifacts: Some(ProductionV3VerifierArtifacts {
-                bank: root.join("bank"),
-                manifest: root.join("manifest"),
+            production_v3_record: Some(ProductionV3VerifierRecord {
                 record_v2: root.join("record"),
+                expected_file: FileIdentity {
+                    bytes: 1,
+                    blake3: [5; 32],
+                    sha256: [6; 32],
+                },
             }),
         };
         assert!(matches!(

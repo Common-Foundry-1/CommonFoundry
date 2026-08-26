@@ -29,8 +29,8 @@ mod windows_launcher;
 pub use sandbox::VerifierSandboxStatus;
 pub use verifier::{
     MAX_VERIFIER_REQUEST_BYTES, MAX_VERIFIER_RESPONSE_BYTES, PersistentVerifierWorker,
-    ProductionV3VerifierArtifacts, VerifierProtocolError, VerifierWorkerConfig,
-    VerifierWorkerError, verify_block_out_of_process,
+    ProductionV3VerifierArtifacts, ProductionV3VerifierRecord, VerifierProtocolError,
+    VerifierWorkerConfig, VerifierWorkerError, verify_block_out_of_process,
 };
 
 use std::ffi::{OsStr, OsString};

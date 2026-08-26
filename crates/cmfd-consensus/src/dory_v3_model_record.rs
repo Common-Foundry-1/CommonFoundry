@@ -233,6 +233,14 @@ pub fn canonical_dory_v3_model_record_v2_json(
 #[derive(Debug)]
 pub struct BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
     record: DoryV3ModelCommitmentRecordV2,
+    origin: DoryV3ModelCommitmentAuthorityOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoryV3ModelCommitmentAuthorityOrigin {
+    ReproducedFromBank,
+    ReleasePinnedRecord,
+    ReleasePinnedBankIdentity,
 }
 
 impl BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
@@ -242,6 +250,37 @@ impl BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
 
     pub fn into_record(self) -> DoryV3ModelCommitmentRecordV2 {
         self.record
+    }
+
+    /// Mint verifier-only authority after the release loader has matched the
+    /// exact canonical Record V2 length and both compiled content digests.
+    ///
+    /// This is crate-private deliberately. A loose record cannot reach this
+    /// boundary, and the resulting capability is rejected by every API that
+    /// reads or prepares the model bank.
+    pub(crate) fn from_release_pinned_record(record: DoryV3ModelCommitmentRecordV2) -> Self {
+        Self {
+            record,
+            origin: DoryV3ModelCommitmentAuthorityOrigin::ReleasePinnedRecord,
+        }
+    }
+
+    /// Mint mining authority after the release loader has streamed the exact
+    /// retained bank once and matched its compiled length, BLAKE3, and SHA-256
+    /// identity as well as the canonical manifest and Record V2 pins.
+    pub(crate) fn from_release_pinned_bank_identity(record: DoryV3ModelCommitmentRecordV2) -> Self {
+        Self {
+            record,
+            origin: DoryV3ModelCommitmentAuthorityOrigin::ReleasePinnedBankIdentity,
+        }
+    }
+
+    pub(crate) const fn authorizes_bank_reads(&self) -> bool {
+        matches!(
+            self.origin,
+            DoryV3ModelCommitmentAuthorityOrigin::ReproducedFromBank
+                | DoryV3ModelCommitmentAuthorityOrigin::ReleasePinnedBankIdentity
+        )
     }
 }
 
@@ -347,6 +386,7 @@ fn derive_bank_authenticated_record_v2<R: Read>(
 
     Ok(BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
         record: DoryV3ModelCommitmentRecordV2::new(*manifest, identity.clone())?,
+        origin: DoryV3ModelCommitmentAuthorityOrigin::ReproducedFromBank,
     })
 }
 
@@ -678,6 +718,97 @@ mod tests {
         derive_with_reader(fixture, Cursor::new(&fixture.bytes)).unwrap()
     }
 
+    #[test]
+    fn release_record_authority_cannot_authorize_bank_reads() {
+        let fixture = fixture();
+        let reproduced = derive_fixture(&fixture);
+        assert!(reproduced.authorizes_bank_reads());
+
+        let verifier_only =
+            BankAuthenticatedDoryV3ModelCommitmentRecordV2::from_release_pinned_record(
+                reproduced.record().clone(),
+            );
+        assert!(!verifier_only.authorizes_bank_reads());
+
+        let pinned_bank =
+            BankAuthenticatedDoryV3ModelCommitmentRecordV2::from_release_pinned_bank_identity(
+                reproduced.record().clone(),
+            );
+        assert!(pinned_bank.authorizes_bank_reads());
+    }
+
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[test]
+    fn release_record_verifier_rejects_model_preparation_before_any_bank_read() {
+        struct ForbiddenBankRead;
+
+        impl Read for ForbiddenBankRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("verifier-only Record V2 authority reached the model bank")
+            }
+        }
+
+        let fixture = fixture();
+        let reproduced = derive_fixture(&fixture);
+        let verifier_only =
+            BankAuthenticatedDoryV3ModelCommitmentRecordV2::from_release_pinned_record(
+                reproduced.record().clone(),
+            );
+        let verifier = crate::ConsensusPowVerifier::v3_unchecked_for_bank_authority_test(
+            [0x7a; 32],
+            verifier_only,
+            fixture.setup,
+        );
+
+        let Err(authority_error) = verifier.v3_production_authority() else {
+            panic!("verifier-only Record V2 authority reached the model bank boundary")
+        };
+        assert!(matches!(authority_error, crate::PowError::V3(_)));
+        assert!(authority_error.to_string().contains("prover configuration"));
+
+        let parameters = verifier.v3_candidate_parameters().unwrap();
+        let block = crate::BlockChallenge {
+            network_id: parameters.network_id(),
+            previous_block: [0x11; 32],
+            transaction_root: [0x12; 32],
+            height: 13,
+            timestamp: 14,
+            target: [0xff; 32],
+        };
+        let batch_error = verifier
+            .prepare_v3_accelerator_batch(&block, 0, 1)
+            .unwrap_err();
+        assert!(matches!(batch_error, crate::PowError::V3(_)));
+        assert!(batch_error.to_string().contains("prover configuration"));
+        let claim_error = verifier
+            .v3_winning_nonce_claim_from_accelerator_output(
+                &block,
+                parameters.model_record_digest(),
+                parameters.model_identity_digest(),
+                0,
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(claim_error, crate::PowError::V3(_)));
+        assert!(claim_error.to_string().contains("prover configuration"));
+
+        let scratch = std::env::temp_dir().join(format!(
+            "cmfd-record-only-bank-authority-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let prepare_error = verifier
+            .prepare_v3_fixed_model(
+                ForbiddenBankRead,
+                &scratch,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap_err();
+        assert!(matches!(prepare_error, crate::PowError::V3(_)));
+        assert!(prepare_error.to_string().contains("prover configuration"));
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     fn derive_with_reader<R: Read>(
         fixture: &Fixture,
         reader: R,
@@ -936,6 +1067,7 @@ mod tests {
             DoryV3ModelCommitmentRecordV2::new(changed_manifest, changed_identity).unwrap();
         let changed_authenticated = BankAuthenticatedDoryV3ModelCommitmentRecordV2 {
             record: changed_record,
+            origin: DoryV3ModelCommitmentAuthorityOrigin::ReproducedFromBank,
         };
         assert!(matches!(
             BlsDoryV3ExecutionAccumulatorArtifactContext::for_test(

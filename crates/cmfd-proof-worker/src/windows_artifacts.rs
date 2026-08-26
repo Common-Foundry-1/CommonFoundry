@@ -206,6 +206,15 @@ impl WindowsArtifactHandleDescriptor {
             sha256: self.expected_sha256,
         }
     }
+
+    pub(crate) fn matches_file_identity(
+        &self,
+        expected: &cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity,
+    ) -> bool {
+        self.expected_bytes == expected.bytes
+            && self.expected_blake3 == expected.blake3
+            && self.expected_sha256 == expected.sha256
+    }
 }
 
 /// One descriptor bound to a handle whose ownership was established outside
@@ -232,12 +241,32 @@ impl OwnedWindowsArtifactHandle {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct OwnedWindowsProductionArtifactHandles {
     pub(crate) bank: OwnedWindowsArtifactHandle,
     pub(crate) manifest: OwnedWindowsArtifactHandle,
     pub(crate) record_v2: OwnedWindowsArtifactHandle,
 }
 
+/// The verifier-only worker inherits exactly one release-pinned Record V2
+/// handle. Model bank and standalone manifest authority never cross the
+/// AppContainer boundary.
+pub(crate) struct OwnedWindowsProductionRecordHandle {
+    record_v2: OwnedWindowsArtifactHandle,
+}
+
+impl OwnedWindowsProductionRecordHandle {
+    pub(crate) fn from_inherited_descriptor(
+        descriptor: WindowsArtifactHandleDescriptor,
+    ) -> Result<Self, WindowsArtifactHandleError> {
+        let handle = duplicate_borrowed_handle("Record V2", descriptor.raw_handle)?;
+        Ok(Self {
+            record_v2: OwnedWindowsArtifactHandle::bind("Record V2", descriptor, handle)?,
+        })
+    }
+}
+
+#[cfg(test)]
 impl OwnedWindowsProductionArtifactHandles {
     pub(crate) fn from_inherited_descriptors(
         descriptors: [WindowsArtifactHandleDescriptor; 3],
@@ -291,6 +320,8 @@ impl OwnedWindowsProductionArtifactHandles {
 /// Worker entry point selected only by the explicit AppContainer handle-list
 /// launch contract.
 #[cfg(feature = "production-v3")]
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn load_production_v3_verifier_from_inherited_handles(
     network_id: [u8; 32],
     handles: OwnedWindowsProductionArtifactHandles,
@@ -312,12 +343,33 @@ pub(crate) fn load_production_v3_verifier_from_inherited_handles(
     .map_err(WindowsArtifactHandleError::Consensus)
 }
 
+/// Verifier-only worker entry point selected by the one-handle AppContainer
+/// launch contract.
+#[cfg(feature = "production-v3")]
+pub(crate) fn load_production_v3_verifier_from_inherited_record_handle(
+    network_id: [u8; 32],
+    handle: OwnedWindowsProductionRecordHandle,
+) -> Result<ConsensusPowVerifier, WindowsArtifactHandleError> {
+    let verified = handle.record_v2.take_verified_file("Record V2")?;
+    let record_v2_identity = consensus_file_identity(verified.content);
+    cmfd_consensus::dory_v3_model_bank_record_validation::load_release_pinned_production_dory_v3_consensus_verifier_from_open_file(
+        network_id,
+        verified.file,
+        record_v2_identity,
+    )
+    .map(|loaded| loaded.into_verifier())
+    .map_err(WindowsArtifactHandleError::Consensus)
+}
+
 struct VerifiedOpenArtifact {
     file: File,
     content: WindowsArtifactContentIdentity,
+    #[cfg(test)]
     object: WindowsFileObjectIdentity,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 struct VerifiedProductionArtifacts {
     bank: VerifiedOpenArtifact,
     manifest: VerifiedOpenArtifact,
@@ -342,6 +394,7 @@ pub(crate) enum WindowsArtifactHandleError {
     ObjectIdentity { artifact: &'static str },
     #[error("inherited {artifact} handle content does not match its trusted digests")]
     ContentIdentity { artifact: &'static str },
+    #[cfg(test)]
     #[error("inherited production artifact handles are duplicated or refer to the same file")]
     AliasedHandles,
     #[error("inherited {artifact} handle I/O failed while {operation}: {source}")]
@@ -419,6 +472,7 @@ fn verify_claimed_file(
     Ok(VerifiedOpenArtifact {
         file,
         content,
+        #[cfg(test)]
         object,
     })
 }

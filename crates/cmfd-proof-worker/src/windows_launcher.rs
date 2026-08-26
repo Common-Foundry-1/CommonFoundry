@@ -1,7 +1,7 @@
 //! Atomic Windows ProductionV3 worker launch.
 //!
 //! The process is created as a zero-capability LPAC with an explicit Job list
-//! and an explicit six-handle inheritance list. It remains suspended until the
+//! and an explicit four-handle inheritance list. It remains suspended until the
 //! parent has verified the resulting token, mitigations, Job association, and
 //! exact per-launch private executable object.
 
@@ -97,7 +97,7 @@ use crate::{
         delete_exact_runtime_handle, mark_appcontainer_cleanup_unhealthy,
         retry_pending_appcontainer_profile_cleanup, windows_file_identity,
     },
-    verifier::ProductionV3VerifierArtifacts,
+    verifier::ProductionV3VerifierRecord,
     windows_artifacts::{WindowsArtifactHandleDescriptor, WindowsArtifactHandleError},
 };
 
@@ -133,12 +133,12 @@ const MITIGATION_POLICY: u64 = PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE as 
     | MITIGATION_IMAGE_LOAD_PREFER_SYSTEM32;
 
 fn exact_production_child_handles(
-    handles: [HANDLE; 6],
+    handles: [HANDLE; 4],
     additional_handles: &[HANDLE],
-) -> Result<[HANDLE; 6], ProofWorkerError> {
+) -> Result<[HANDLE; 4], ProofWorkerError> {
     if !additional_handles.is_empty() {
         return Err(ProofWorkerError::InvalidConfig(
-            "ProductionV3 inherits exactly stdio and three artifact handles",
+            "ProductionV3 inherits exactly stdio and one Record V2 handle",
         ));
     }
     for (index, handle) in handles.iter().enumerate() {
@@ -228,13 +228,13 @@ fn validate_profile_has_no_loopback_exemption(profile_sid: PSID) -> io::Result<(
 
 pub(crate) fn spawn_contained_production_windows(
     command: Command,
-    artifacts: &ProductionV3VerifierArtifacts,
+    record: &ProductionV3VerifierRecord,
     memory_limit_bytes: u64,
     expected_worker_sha256: [u8; 32],
 ) -> Result<ContainedChild, ProofWorkerError> {
     spawn_contained_production_windows_inner(
         command,
-        artifacts,
+        record,
         memory_limit_bytes,
         expected_worker_sha256,
         true,
@@ -247,13 +247,13 @@ pub(crate) fn spawn_contained_production_windows(
 
 fn spawn_contained_production_windows_inner(
     command: Command,
-    artifacts: &ProductionV3VerifierArtifacts,
+    record: &ProductionV3VerifierRecord,
     memory_limit_bytes: u64,
     expected_worker_sha256: [u8; 32],
     append_artifact_arguments: bool,
     less_privileged_appcontainer: bool,
     #[cfg(test)] mut pre_resume_probe: Option<&mut dyn FnMut(HANDLE) -> io::Result<()>>,
-) -> Result<(ContainedChild, [String; 3]), ProofWorkerError> {
+) -> Result<(ContainedChild, String), ProofWorkerError> {
     #[cfg(test)]
     let _appcontainer_test_lock = crate::process::CrossProcessAppContainerTestLock::acquire();
     ensure_process_cleanup_healthy()?;
@@ -292,24 +292,21 @@ fn spawn_contained_production_windows_inner(
         ));
     }
 
-    let mut parent_artifacts = [
-        open_artifact("bank", &artifacts.bank)?,
-        open_artifact("manifest", &artifacts.manifest)?,
-        open_artifact("Record V2", &artifacts.record_v2)?,
-    ];
-    let mut inherited_artifacts = Vec::with_capacity(3);
-    let mut inherited_descriptors = Vec::with_capacity(3);
-    for (file, descriptor) in &mut parent_artifacts {
-        let inherited = duplicate_inheritable(file.as_raw_handle().cast()).map_err(|source| {
+    let (parent_record, observed_record) = open_artifact("Record V2", &record.record_v2)?;
+    if !observed_record.matches_file_identity(&record.expected_file) {
+        return Err(ProofWorkerError::HashMismatch {
+            component: "production V3 Record V2",
+        });
+    }
+    let inherited_record =
+        duplicate_inheritable(parent_record.as_raw_handle().cast()).map_err(|source| {
             containment(
-                "duplicating a read-only ProductionV3 artifact handle",
+                "duplicating the read-only ProductionV3 Record V2 handle",
                 source,
             )
         })?;
-        let raw_handle = inherited.as_raw_handle() as usize;
-        inherited_descriptors.push(descriptor.for_inherited_handle(raw_handle));
-        inherited_artifacts.push(inherited);
-    }
+    let inherited_descriptor =
+        observed_record.for_inherited_handle(inherited_record.as_raw_handle() as usize);
 
     let stdin = PipePair::child_reads()
         .map_err(|source| containment("creating the bounded worker stdin pipe", source))?;
@@ -324,15 +321,10 @@ fn spawn_contained_production_windows_inner(
     );
 
     let mut arguments = command.get_args().map(OsString::from).collect::<Vec<_>>();
-    let transport_arguments: [String; 3] = inherited_descriptors
-        .iter()
-        .map(WindowsArtifactHandleDescriptor::transport_argument)
-        .collect::<Vec<_>>()
-        .try_into()
-        .expect("the launcher always owns exactly three artifact descriptors");
+    let transport_argument = inherited_descriptor.transport_argument();
     if append_artifact_arguments {
         arguments.push(OsString::from(WINDOWS_ARTIFACT_HANDLES_ARGUMENT));
-        arguments.extend(transport_arguments.iter().map(OsString::from));
+        arguments.push(OsString::from(&transport_argument));
     }
     // The loader requires SystemRoot, but every other ambient entry is
     // deliberately absent. Passing a null pointer would inherit the parent.
@@ -390,9 +382,7 @@ fn spawn_contained_production_windows_inner(
             stdin.child_raw(),
             stdout.child_raw(),
             stderr.child_raw(),
-            inherited_artifacts[0].as_raw_handle().cast(),
-            inherited_artifacts[1].as_raw_handle().cast(),
-            inherited_artifacts[2].as_raw_handle().cast(),
+            inherited_record.as_raw_handle().cast(),
         ],
         &[],
     )?;
@@ -595,7 +585,7 @@ fn spawn_contained_production_windows_inner(
             ManagedProcess::from_win32(child),
             ProcessTerminator::job(job),
         ),
-        transport_arguments,
+        transport_argument,
     ))
 }
 
@@ -2480,7 +2470,8 @@ mod tests {
         WindowsFileIdentity, isolated_appcontainer_ledger_test,
         retry_pending_appcontainer_profile_cleanup, windows_file_identity,
     };
-    use crate::verifier::ProductionV3VerifierArtifacts;
+    use crate::verifier::ProductionV3VerifierRecord;
+    use cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity;
 
     const CHILD_TEST: &str = "windows_launcher::tests::windows_appcontainer_probe_child";
     const INVALID_HANDLE_CHILD_TEST: &str =
@@ -2510,11 +2501,15 @@ mod tests {
     const PARENT_CONNECT_BLOCKED_PREFIX: &str = "NETWORK_PARENT_CONNECT_BLOCKED=";
     const CHILD_ACCEPT_BLOCKED_PREFIX: &str = "NETWORK_CHILD_ACCEPT_BLOCKED=";
     const CHILD_ACCEPT_WOULD_BLOCK_SUFFIX: &str = "|accept-error=10035";
-    const SUPPLIED_CONTENTS: [&[u8]; 3] = [
-        b"bank-handle-sentinel",
-        b"manifest-handle-sentinel",
-        b"record-v2-handle-sentinel",
-    ];
+    const SUPPLIED_CONTENT: &[u8] = b"record-v2-handle-sentinel";
+
+    fn record_identity(bytes: &[u8]) -> FileIdentity {
+        FileIdentity {
+            bytes: bytes.len() as u64,
+            blake3: *blake3::hash(bytes).as_bytes(),
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
 
     fn random_profile_name(label: &str) -> Vec<u16> {
         let mut random = [0_u8; 12];
@@ -2717,14 +2712,14 @@ mod tests {
         assert_ne!(socket, INVALID_SOCKET);
         let socket = unsafe { OwnedSocket::from_raw_socket(socket as u64) };
         let error = super::exact_production_child_handles(
-            [ptr::null_mut(); 6],
+            [ptr::null_mut(); 4],
             &[socket.as_raw_socket() as HANDLE],
         )
         .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("exactly stdio and three artifact"),
+                .contains("exactly stdio and one Record V2"),
             "unexpected inherited-handle attestation error: {error}"
         );
         drop(socket);
@@ -3266,18 +3261,14 @@ mod tests {
         );
         probe_stage("environment");
         let mut request = BufReader::new(std::io::stdin().lock());
-        let descriptors = [line(&mut request), line(&mut request), line(&mut request)];
-        let artifact_paths = [
-            PathBuf::from(line(&mut request)),
-            PathBuf::from(line(&mut request)),
-            PathBuf::from(line(&mut request)),
-        ];
+        let descriptors = [line(&mut request)];
+        let artifact_paths = [PathBuf::from(line(&mut request))];
         let arbitrary_path = PathBuf::from(line(&mut request));
         let child_executable = PathBuf::from(line(&mut request));
 
         for ((descriptor, expected), artifact_path) in descriptors
             .iter()
-            .zip(SUPPLIED_CONTENTS)
+            .zip([SUPPLIED_CONTENT])
             .zip(&artifact_paths)
         {
             // SAFETY: each value came from the launcher's explicit handle list,
@@ -3485,7 +3476,7 @@ mod tests {
     }
 
     fn run_regular_appcontainer_network_sentinel(
-        artifacts: &ProductionV3VerifierArtifacts,
+        record: &ProductionV3VerifierRecord,
         sentinel_executable: &PathBuf,
         sentinel_sha256: [u8; 32],
     ) {
@@ -3537,7 +3528,7 @@ mod tests {
             .stderr(Stdio::piped());
         let (mut child, _) = spawn_contained_production_windows_inner(
             command,
-            artifacts,
+            record,
             1024 * 1024 * 1024,
             sentinel_sha256,
             false,
@@ -3708,11 +3699,7 @@ mod tests {
             .expect("disable inherited interactive fault reporting before CreateProcessW");
         let _ledger = isolated_appcontainer_ledger_test();
         let files = TestDirectory::create();
-        let artifact_paths = [
-            files.write("bank.bin", SUPPLIED_CONTENTS[0]),
-            files.write("manifest.json", SUPPLIED_CONTENTS[1]),
-            files.write("record-v2.json", SUPPLIED_CONTENTS[2]),
-        ];
+        let artifact_paths = [files.write("record-v2.json", SUPPLIED_CONTENT)];
         let arbitrary_path = files.write("arbitrary-secret.txt", b"ambient-secret");
         let omitted_path = files.write("omitted-handle-identity.bin", b"must-not-be-inherited");
         let omitted_source = File::open(&omitted_path).expect("open omitted-handle identity file");
@@ -3745,10 +3732,9 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let artifacts = ProductionV3VerifierArtifacts {
-            bank: artifact_paths[0].clone(),
-            manifest: artifact_paths[1].clone(),
-            record_v2: artifact_paths[2].clone(),
+        let record = ProductionV3VerifierRecord {
+            record_v2: artifact_paths[0].clone(),
+            expected_file: record_identity(SUPPLIED_CONTENT),
         };
         let mut omitted_probe = |process| {
             require_omitted_handle_absent_before_resume(
@@ -3759,7 +3745,7 @@ mod tests {
         };
         let (mut child, descriptors) = spawn_contained_production_windows_inner(
             command,
-            &artifacts,
+            &record,
             1024 * 1024 * 1024,
             sentinel_sha256,
             false,
@@ -3769,22 +3755,20 @@ mod tests {
         .expect("launch the native LPAC sentinel");
         let child_id = child.id();
         let mut stdin = child.take_stdin().expect("sentinel stdin");
-        for descriptor in descriptors {
-            if let Err(source) = writeln!(stdin, "{descriptor}") {
-                let status = child.try_wait().expect("query failed sentinel status");
-                if status.is_none() {
-                    child.terminate_tree().expect("terminate failed sentinel");
-                }
-                let mut stderr = String::new();
-                child
-                    .take_stderr()
-                    .expect("sentinel stderr")
-                    .read_to_string(&mut stderr)
-                    .expect("read failed sentinel stderr");
-                panic!(
-                    "LPAC sentinel closed stdin before its request: source={source}, status={status:?}, stderr={stderr:?}"
-                );
+        if let Err(source) = writeln!(stdin, "{descriptors}") {
+            let status = child.try_wait().expect("query failed sentinel status");
+            if status.is_none() {
+                child.terminate_tree().expect("terminate failed sentinel");
             }
+            let mut stderr = String::new();
+            child
+                .take_stderr()
+                .expect("sentinel stderr")
+                .read_to_string(&mut stderr)
+                .expect("read failed sentinel stderr");
+            panic!(
+                "LPAC sentinel closed stdin before its request: source={source}, status={status:?}, stderr={stderr:?}"
+            );
         }
         for path in &artifact_paths {
             writeln!(stdin, "{}", path.display()).expect("send artifact pathname");
@@ -3950,7 +3934,7 @@ mod tests {
         drop(omitted);
         drop(omitted_source);
 
-        for (path, expected) in artifact_paths.iter().zip(SUPPLIED_CONTENTS) {
+        for (path, expected) in artifact_paths.iter().zip([SUPPLIED_CONTENT]) {
             assert_eq!(
                 fs::read(path).expect("reread immutable artifact"),
                 expected,
@@ -3961,11 +3945,7 @@ mod tests {
             fs::read(arbitrary_path).expect("reread arbitrary file"),
             b"ambient-secret"
         );
-        run_regular_appcontainer_network_sentinel(
-            &artifacts,
-            &sentinel_executable,
-            sentinel_sha256,
-        );
+        run_regular_appcontainer_network_sentinel(&record, &sentinel_executable, sentinel_sha256);
     }
 
     #[test]

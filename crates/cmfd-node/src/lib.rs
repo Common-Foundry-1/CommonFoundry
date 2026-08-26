@@ -34,10 +34,10 @@ use cmfd_consensus::{
     ForgeMatrixV3WinningNonceClaim, MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS,
     PreparedForgeMatrixV3Model,
 };
-pub use cmfd_proof_worker::ProductionV3VerifierArtifacts;
 use cmfd_proof_worker::{
     PersistentVerifierWorker, ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError,
 };
+pub use cmfd_proof_worker::{ProductionV3VerifierArtifacts, ProductionV3VerifierRecord};
 use fs2::FileExt;
 use k256::schnorr::{SigningKey, VerifyingKey};
 use primitive_types::U512;
@@ -58,7 +58,10 @@ pub mod rcnet_candidate;
 #[allow(dead_code)]
 mod release_gate;
 
-pub use network_info::{canonical_network_info_json, canonical_network_info_json_with_artifacts};
+pub use network_info::{
+    canonical_network_info_json, canonical_network_info_json_with_artifacts,
+    canonical_network_info_json_with_record,
+};
 pub use network_profile::{
     COMPILED_NETWORK_PROFILE, DEVNET_PROFILE, NetworkProfile, ProofProfile, RCNET1_PROFILE,
 };
@@ -114,7 +117,7 @@ pub const PRODUCTION_V3_PACKAGE_RECORD_V2: &str = "DORY-V3-MODEL-RECORD-V2.json"
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionV3PackageLayout {
     pub worker: PathBuf,
-    pub artifacts: ProductionV3VerifierArtifacts,
+    pub record: ProductionV3VerifierRecord,
 }
 
 /// Fixed, download-free sidecar layout used when an RC package is launched
@@ -129,14 +132,61 @@ pub fn production_v3_package_layout(
             "package executable has no parent directory",
         ))?;
     let artifacts = directory.join(PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY);
+    let expected_file = compiled_production_v3_record_identity()?;
     Ok(ProductionV3PackageLayout {
         worker: directory.join(format!("cmfd-proof-worker{}", std::env::consts::EXE_SUFFIX)),
-        artifacts: ProductionV3VerifierArtifacts {
-            bank: artifacts.join(PRODUCTION_V3_PACKAGE_BANK),
-            manifest: artifacts.join(PRODUCTION_V3_PACKAGE_MANIFEST),
+        record: ProductionV3VerifierRecord {
             record_v2: artifacts.join(PRODUCTION_V3_PACKAGE_RECORD_V2),
+            expected_file,
         },
     })
+}
+
+pub fn compiled_production_v3_record_identity()
+-> Result<cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity, NodeError> {
+    let pin = release_gate::COMPILED_RELEASE_PROFILE
+        .production_v3_artifacts
+        .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?
+        .record_v2;
+    if pin.bytes == 0 || pin.blake3 == [0; 32] || pin.sha256 == [0; 32] {
+        return Err(NodeError::ProductionV3ArtifactPinsMissing);
+    }
+    Ok(production_v3_file_identity_from_pin(pin))
+}
+
+pub(crate) fn production_v3_record_from_artifacts(
+    artifacts: &ProductionV3VerifierArtifacts,
+) -> Result<ProductionV3VerifierRecord, NodeError> {
+    Ok(ProductionV3VerifierRecord {
+        record_v2: artifacts.record_v2.clone(),
+        expected_file: compiled_production_v3_record_identity()?,
+    })
+}
+
+pub(crate) fn production_v3_record_for_profile(
+    profile: NetworkProfile,
+    artifacts: Option<&ProductionV3VerifierArtifacts>,
+) -> Result<Option<ProductionV3VerifierRecord>, NodeError> {
+    match (profile.proof, artifacts) {
+        (ProofProfile::DevnetV2Reference, Some(_)) => {
+            Err(NodeError::ProductionV3ArtifactsUnexpected)
+        }
+        (ProofProfile::DevnetV2Reference, None) => Ok(None),
+        (ProofProfile::ProductionV3, Some(artifacts)) => {
+            production_v3_record_from_artifacts(artifacts).map(Some)
+        }
+        (ProofProfile::ProductionV3, None) => Ok(None),
+    }
+}
+
+fn production_v3_file_identity_from_pin(
+    pin: release_gate::ProductionV3FileIdentityPin,
+) -> cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
+    cmfd_consensus::dory_v3_model_ceremony_transcript::FileIdentity {
+        bytes: pin.bytes,
+        blake3: pin.blake3,
+        sha256: pin.sha256,
+    }
 }
 
 /// Returns the only verifier-worker executable identity trusted by a compiled
@@ -171,7 +221,7 @@ fn install_external_proof_verifier(
     block_preverifier: &BlockPreverifier,
     config: VerifierWorkerConfig,
 ) -> Result<(), NodeError> {
-    let configured_for_v3 = config.production_v3_artifacts.is_some();
+    let configured_for_v3 = config.production_v3_record.is_some();
     if configured_for_v3 != matches!(profile.proof, ProofProfile::ProductionV3) {
         return Err(NodeError::ProofVerifierProfileMismatch);
     }
@@ -184,6 +234,14 @@ fn install_external_proof_verifier(
                 }),
             ));
         }
+        let record = config
+            .production_v3_record
+            .as_ref()
+            .ok_or(NodeError::ProofVerifierProfileMismatch)?;
+        let pins = release_gate::COMPILED_RELEASE_PROFILE
+            .production_v3_artifacts
+            .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?;
+        require_production_v3_file_identity("Record V2", pins.record_v2, &record.expected_file)?;
     }
     block_preverifier.use_external_worker(config, profile.network_id)?;
     Ok(())
@@ -243,7 +301,7 @@ pub enum NodeError {
         "CommonFoundry RCNet-1 requires the production V3 proof verifier; the tiny Devnet V2 relation is never used as a fallback"
     )]
     ProductionV3Unavailable,
-    #[error("CommonFoundry RCNet-1 requires explicit production V3 bank, manifest, and Record V2 paths")]
+    #[error("CommonFoundry RCNet-1 verification requires an explicit release-pinned production V3 Record V2 path")]
     ProductionV3ArtifactsMissing,
     #[error("production V3 artifacts were supplied for a network that selects the V2 reference proof")]
     ProductionV3ArtifactsUnexpected,
@@ -257,6 +315,8 @@ pub enum NodeError {
         "production V3 mining requires absolute, pairwise-distinct artifact paths, an existing absolute scratch directory, and max rows between 1 and 131072"
     )]
     ProductionV3MiningConfiguration,
+    #[error("production V3 retained mining-bank state is poisoned")]
+    ProductionV3MiningStatePoisoned,
     #[cfg(feature = "production-v3")]
     #[error("production V3 verifier artifacts failed authentication: {0}")]
     ProductionV3Artifacts(
@@ -399,6 +459,7 @@ impl NodeError {
             | Self::ProductionV3ActivationEvidence(_)
             | Self::ProductionV3ArtifactIdentityMismatch(_)
             | Self::ProductionV3MiningConfiguration
+            | Self::ProductionV3MiningStatePoisoned
             | Self::ProofVerifierProfileMismatch => ("proof_verifier_configuration", 500, false),
             #[cfg(feature = "production-v3")]
             Self::ProductionV3Artifacts(_) => ("proof_verifier_configuration", 500, false),
@@ -2097,6 +2158,9 @@ struct ProductionV3MiningContext {
     params: NetworkParams,
     verifier: ConsensusPowVerifier,
     prepared_model: PreparedForgeMatrixV3Model,
+    replay_bank: Mutex<
+        cmfd_consensus::dory_v3_model_bank_record_validation::RetainedReleasePinnedProductionDoryV3Bank,
+    >,
     artifacts: ProductionV3VerifierArtifacts,
     scratch_directory: PathBuf,
     maximum_native_block_rows: usize,
@@ -2503,41 +2567,35 @@ impl ProductionV3MiningWorkFactory {
             &scratch_directory,
             maximum_native_block_rows,
         )?;
-        let (params, verifier) =
-            network_params_and_verifier_for_profile(COMPILED_NETWORK_PROFILE, Some(&artifacts))?;
-        Self::from_authenticated_verifier(
-            params,
-            verifier,
-            artifacts,
-            scratch_directory,
-            maximum_native_block_rows,
-            cancel,
+        let pins = release_gate::COMPILED_RELEASE_PROFILE
+            .production_v3_artifacts
+            .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?;
+        let loaded = cmfd_consensus::dory_v3_model_bank_record_validation::load_release_pinned_production_dory_v3_mining_verifier(
+            COMPILED_NETWORK_PROFILE.network_id,
+            &artifacts.bank,
+            &artifacts.manifest,
+            &artifacts.record_v2,
+            production_v3_file_identity_from_pin(pins.bank),
+            production_v3_file_identity_from_pin(pins.manifest),
+            production_v3_file_identity_from_pin(pins.record_v2),
         )
-    }
-
-    fn from_authenticated_verifier(
-        params: NetworkParams,
-        verifier: ConsensusPowVerifier,
-        artifacts: ProductionV3VerifierArtifacts,
-        scratch_directory: PathBuf,
-        maximum_native_block_rows: usize,
-        cancel: &AtomicBool,
-    ) -> Result<Self, NodeError> {
-        validate_production_v3_mining_configuration(
-            &artifacts,
-            &scratch_directory,
-            maximum_native_block_rows,
-        )?;
-        let bank = File::open(&artifacts.bank).map_err(|source| {
-            io_error("open production V3 mining bank", &artifacts.bank, source)
-        })?;
+        .map_err(NodeError::ProductionV3Artifacts)?;
+        require_production_v3_file_identity("bank", pins.bank, loaded.bank_file())?;
+        require_production_v3_file_identity("manifest", pins.manifest, loaded.manifest_file())?;
+        require_production_v3_file_identity("Record V2", pins.record_v2, loaded.record_v2_file())?;
+        let (verifier, mut retained_bank) = loaded.into_parts();
+        let (params, verifier) = network_params_from_verifier(COMPILED_NETWORK_PROFILE, verifier)?;
         let prepared_model =
-            verifier.prepare_v3_fixed_model(BufReader::new(bank), &scratch_directory, cancel)?;
+            verifier.prepare_v3_fixed_model(&mut retained_bank, &scratch_directory, cancel)?;
+        retained_bank
+            .recheck()
+            .map_err(NodeError::ProductionV3Artifacts)?;
         Ok(Self {
             context: Arc::new(ProductionV3MiningContext {
                 params,
                 verifier,
                 prepared_model,
+                replay_bank: Mutex::new(retained_bank),
                 artifacts,
                 scratch_directory,
                 maximum_native_block_rows,
@@ -2777,24 +2835,28 @@ impl MiningWork {
             .ok_or(NodeError::ProductionV3MiningConfiguration)?;
         self.verifier
             .validate_v3_winning_nonce_claim(&self.challenge, claim)?;
-        let replay_bank = File::open(&context.artifacts.bank).map_err(|source| {
-            io_error(
-                "open production V3 winning-nonce replay bank",
-                &context.artifacts.bank,
-                source,
-            )
-        })?;
-        Ok(self
+        let mut replay_bank = context
+            .replay_bank
+            .lock()
+            .map_err(|_| NodeError::ProductionV3MiningStatePoisoned)?;
+        replay_bank
+            .rewind_and_recheck()
+            .map_err(NodeError::ProductionV3Artifacts)?;
+        let proof = self
             .verifier
             .prove_v3_winning_nonce_claim_with_prepared_model(
                 &self.challenge,
                 claim,
                 &context.prepared_model,
-                BufReader::new(replay_bank),
+                &mut *replay_bank,
                 &context.scratch_directory,
                 context.maximum_native_block_rows,
                 cancel,
-            )?)
+            );
+        replay_bank
+            .recheck()
+            .map_err(NodeError::ProductionV3Artifacts)?;
+        Ok(proof?)
     }
 }
 
@@ -3665,11 +3727,11 @@ fn requires_external_preverification(params: &NetworkParams) -> bool {
 
 pub(crate) fn network_params_and_verifier_for_profile(
     profile: NetworkProfile,
-    production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+    production_v3_record: Option<&ProductionV3VerifierRecord>,
 ) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
     let verifier = match profile.proof {
         ProofProfile::DevnetV2Reference => {
-            if production_v3_artifacts.is_some() {
+            if production_v3_record.is_some() {
                 return Err(NodeError::ProductionV3ArtifactsUnexpected);
             }
             let reference = v2_reference_for_network(profile.network_id).map_err(PowError::from)?;
@@ -3678,24 +3740,21 @@ pub(crate) fn network_params_and_verifier_for_profile(
         ProofProfile::ProductionV3 => {
             #[cfg(feature = "production-v3")]
             {
-                let artifacts =
-                    production_v3_artifacts.ok_or(NodeError::ProductionV3ArtifactsMissing)?;
+                let record = production_v3_record.ok_or(NodeError::ProductionV3ArtifactsMissing)?;
                 let pins = release_gate::COMPILED_RELEASE_PROFILE
                     .production_v3_artifacts
                     .ok_or(NodeError::ProductionV3ArtifactPinsMissing)?;
-                let loaded = cmfd_consensus::dory_v3_model_bank_record_validation::load_production_dory_v3_consensus_verifier(
+                require_production_v3_file_identity(
+                    "Record V2",
+                    pins.record_v2,
+                    &record.expected_file,
+                )?;
+                let loaded = cmfd_consensus::dory_v3_model_bank_record_validation::load_release_pinned_production_dory_v3_consensus_verifier(
                     profile.network_id,
-                    &artifacts.bank,
-                    &artifacts.manifest,
-                    &artifacts.record_v2,
+                    &record.record_v2,
+                    record.expected_file.clone(),
                 )
                 .map_err(NodeError::ProductionV3Artifacts)?;
-                require_production_v3_file_identity("bank", pins.bank, loaded.bank_file())?;
-                require_production_v3_file_identity(
-                    "manifest",
-                    pins.manifest,
-                    loaded.manifest_file(),
-                )?;
                 require_production_v3_file_identity(
                     "Record V2",
                     pins.record_v2,
@@ -3705,11 +3764,18 @@ pub(crate) fn network_params_and_verifier_for_profile(
             }
             #[cfg(not(feature = "production-v3"))]
             {
-                let _ = production_v3_artifacts;
+                let _ = production_v3_record;
                 return Err(NodeError::ProductionV3Unavailable);
             }
         }
     };
+    network_params_from_verifier(profile, verifier)
+}
+
+fn network_params_from_verifier(
+    profile: NetworkProfile,
+    verifier: ConsensusPowVerifier,
+) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
     let pow = verifier.parameters();
     let params = NetworkParams {
         network_id: profile.network_id,
@@ -3729,7 +3795,6 @@ pub(crate) fn network_params_and_verifier_for_profile(
     Ok((params, verifier))
 }
 
-#[cfg(feature = "production-v3")]
 fn require_production_v3_file_identity(
     name: &'static str,
     pin: release_gate::ProductionV3FileIdentityPin,
@@ -3787,10 +3852,28 @@ impl Node {
         data_dir: impl AsRef<Path>,
         production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
     ) -> Result<Self, NodeError> {
+        let record =
+            production_v3_record_for_profile(COMPILED_NETWORK_PROFILE, production_v3_artifacts)?;
         Self::open_with_profile_artifacts_and_worker(
             data_dir,
             COMPILED_NETWORK_PROFILE,
-            production_v3_artifacts,
+            record.as_ref(),
+            production_v3_artifacts.cloned(),
+            None,
+        )
+    }
+
+    /// Open a verifier-only ProductionV3 node from the release-pinned Record
+    /// V2. The model bank and standalone manifest are not node dependencies.
+    pub fn open_with_record(
+        data_dir: impl AsRef<Path>,
+        production_v3_record: Option<&ProductionV3VerifierRecord>,
+    ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_and_worker(
+            data_dir,
+            COMPILED_NETWORK_PROFILE,
+            production_v3_record,
+            None,
             None,
         )
     }
@@ -3803,10 +3886,29 @@ impl Node {
         production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
         verifier_worker: VerifierWorkerConfig,
     ) -> Result<Self, NodeError> {
+        let record =
+            production_v3_record_for_profile(COMPILED_NETWORK_PROFILE, production_v3_artifacts)?;
         Self::open_with_profile_artifacts_and_worker(
             data_dir,
             COMPILED_NETWORK_PROFILE,
-            production_v3_artifacts,
+            record.as_ref(),
+            production_v3_artifacts.cloned(),
+            Some(verifier_worker),
+        )
+    }
+
+    /// Open a verifier-only ProductionV3 node and install its record-only
+    /// worker before replaying any stored block.
+    pub fn open_with_record_and_verifier_worker(
+        data_dir: impl AsRef<Path>,
+        production_v3_record: Option<&ProductionV3VerifierRecord>,
+        verifier_worker: VerifierWorkerConfig,
+    ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_and_worker(
+            data_dir,
+            COMPILED_NETWORK_PROFILE,
+            production_v3_record,
+            None,
             Some(verifier_worker),
         )
     }
@@ -3814,7 +3916,7 @@ impl Node {
     /// Opens the node on an explicit immutable network profile.
     ///
     /// RCNet-1 fails before acquiring a data-directory lock unless its exact
-    /// V3 artifact chain can construct the consensus verifier. This ordering
+    /// release-pinned V3 Record V2 can construct the consensus verifier. This ordering
     /// prevents a failed RC attempt from creating or modifying storage.
     pub fn open_with_profile(
         data_dir: impl AsRef<Path>,
@@ -3830,10 +3932,12 @@ impl Node {
         profile: NetworkProfile,
         production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
     ) -> Result<Self, NodeError> {
+        let record = production_v3_record_for_profile(profile, production_v3_artifacts)?;
         Self::open_with_profile_artifacts_and_worker(
             data_dir,
             profile,
-            production_v3_artifacts,
+            record.as_ref(),
+            production_v3_artifacts.cloned(),
             None,
         )
     }
@@ -3841,11 +3945,12 @@ impl Node {
     fn open_with_profile_artifacts_and_worker(
         data_dir: impl AsRef<Path>,
         profile: NetworkProfile,
-        production_v3_artifacts: Option<&ProductionV3VerifierArtifacts>,
+        production_v3_record: Option<&ProductionV3VerifierRecord>,
+        production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
         verifier_worker: Option<VerifierWorkerConfig>,
     ) -> Result<Self, NodeError> {
         let (params, verifier) =
-            network_params_and_verifier_for_profile(profile, production_v3_artifacts)?;
+            network_params_and_verifier_for_profile(profile, production_v3_record)?;
         let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
         let external_replay = verifier_worker.is_some();
         if let Some(config) = verifier_worker {
@@ -3895,7 +4000,7 @@ impl Node {
             legacy_shared_wallet,
             verifier,
             #[cfg(feature = "production-v3")]
-            production_v3_artifacts: production_v3_artifacts.cloned(),
+            production_v3_artifacts,
             block_preverifier,
             state,
             index,
@@ -3964,9 +4069,10 @@ impl Node {
         self.profile
     }
 
-    /// Prepare process-reusable Production V3 mining state from the verifier
-    /// already authenticated by this node. This avoids authenticating the
-    /// manifest and Record V2 a second time in embedded-node mining mode.
+    /// Prepare process-reusable Production V3 mining state from the compiled
+    /// bank, manifest, and Record V2 identities. The node's verifier-only
+    /// authority cannot authorize model reads, so mining independently uses
+    /// the release-pinned one-pass bank loader.
     #[cfg(feature = "production-v3")]
     pub fn production_v3_mining_work_factory(
         &self,
@@ -3981,9 +4087,7 @@ impl Node {
             .production_v3_artifacts
             .clone()
             .ok_or(NodeError::ProductionV3ArtifactsMissing)?;
-        ProductionV3MiningWorkFactory::from_authenticated_verifier(
-            self.params,
-            self.verifier.clone(),
+        ProductionV3MiningWorkFactory::load(
             artifacts,
             scratch_directory,
             maximum_native_block_rows,
@@ -4004,7 +4108,7 @@ impl Node {
 
     /// Enables hash-pinned, killable proof verification for Devnet testing.
     /// Production must install its worker before startup replay through
-    /// `open_with_artifacts_and_verifier_worker` and cannot switch backends at
+    /// `open_with_record_and_verifier_worker` and cannot switch backends at
     /// runtime.
     pub fn use_external_proof_verifier(
         &mut self,
@@ -9766,7 +9870,7 @@ mod tests {
             cpu_quota_micros: None,
             cpu_period_micros: None,
             pids_limit: None,
-            production_v3_artifacts: None,
+            production_v3_record: None,
         };
         assert!(matches!(
             verifier.use_external_worker(replacement, node.params.network_id),

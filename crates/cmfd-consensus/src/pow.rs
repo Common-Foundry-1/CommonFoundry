@@ -608,6 +608,27 @@ impl ConsensusPowVerifier {
         ))))
     }
 
+    /// Test-only constructor for exercising the bank-read authority boundary
+    /// independently of the production geometry validator.
+    #[cfg(all(test, feature = "dory-v3-consensus-adapter"))]
+    pub(crate) fn v3_unchecked_for_bank_authority_test(
+        network_id: [u8; 32],
+        authenticated: BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+        setup: DeterministicBlsDorySetup,
+    ) -> Self {
+        let parameters =
+            ForgeMatrixV3CandidateParameters::from_authenticated(network_id, &authenticated);
+        Self::V3Candidate(Arc::new(VerifierInstance::new(
+            ForgeMatrixV3ConsensusVerifier {
+                parameters,
+                authority: ForgeMatrixV3VerifierAuthority::Production {
+                    authenticated: Box::new(authenticated),
+                    setup: Box::new(setup),
+                },
+            },
+        )))
+    }
+
     /// Reject a Production V3 accelerator claim unless its immutable network
     /// and model identities match this exact verifier.
     #[cfg(feature = "dory-v3-consensus-adapter")]
@@ -770,16 +791,7 @@ impl ConsensusPowVerifier {
         {
             return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
         }
-        let (authenticated, setup) = match &verifier.authority {
-            ForgeMatrixV3VerifierAuthority::Production {
-                authenticated,
-                setup,
-            } => (authenticated, setup),
-            #[cfg(test)]
-            ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => {
-                return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
-            }
-        };
+        let (authenticated, setup) = verifier.production_authority()?;
         let proof = prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim(
             authenticated,
             block,
@@ -1233,7 +1245,10 @@ impl ForgeMatrixV3ConsensusVerifier {
             ForgeMatrixV3VerifierAuthority::Production {
                 authenticated,
                 setup,
-            } => Ok((authenticated, setup)),
+            } if authenticated.authorizes_bank_reads() => Ok((authenticated, setup)),
+            ForgeMatrixV3VerifierAuthority::Production { .. } => {
+                Err(BlsDoryV3CandidateError::ProverConfiguration.into())
+            }
             #[cfg(test)]
             ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => {
                 Err(BlsDoryV3CandidateError::ProverConfiguration.into())
@@ -1360,13 +1375,7 @@ impl ForgeMatrixV3ConsensusVerifier {
         if accelerator_model_identity_digest != self.parameters.model_identity_digest {
             return Err(BlsDoryV3CandidateError::ModelIdentityDigest.into());
         }
-        let authenticated = match &self.authority {
-            ForgeMatrixV3VerifierAuthority::Production { authenticated, .. } => authenticated,
-            #[cfg(test)]
-            ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => {
-                return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
-            }
-        };
+        let (authenticated, _) = self.production_authority()?;
         let transcript =
             crate::dory_v3_transcript::DoryV3TranscriptContext::from_bank_authenticated_record(
                 block.network_id,

@@ -38,11 +38,11 @@ pub(crate) fn diagnostic_main() -> i32 {
             .skip(2)
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        if artifacts.len() != 3 {
-            eprintln!("the Linux sandbox diagnostic requires exactly three artifact paths");
+        if artifacts.len() != 1 {
+            eprintln!("the Linux sandbox diagnostic requires exactly one Record V2 path");
             return 2;
         }
-        match install_production(&[&artifacts[0], &artifacts[1], &artifacts[2]]) {
+        match install_production(&[&artifacts[0]]) {
             Ok(VerifierSandboxStatus::LinuxLandlockSeccompV1) => 0,
             Ok(_) => 1,
             Err(error) => {
@@ -260,8 +260,11 @@ mod linux {
     }
 
     fn install_inner(artifacts: &[&Path], require_single_task: bool) -> Result<(), String> {
-        if artifacts.len() != 3 {
-            return Err("the ProductionV3 sandbox requires exactly three artifacts".to_owned());
+        if artifacts.len() != 1 {
+            return Err(
+                "the ProductionV3 verifier sandbox requires exactly one Record V2 artifact"
+                    .to_owned(),
+            );
         }
         #[cfg(not(target_arch = "x86_64"))]
         return Err("the ProductionV3 Linux sandbox is qualified only for x86_64".to_owned());
@@ -914,12 +917,10 @@ mod linux {
             if std::env::var_os(PROBE_ENV).is_none() {
                 return;
             }
-            let artifacts = [0, 1, 2].map(|index| {
-                PathBuf::from(
-                    std::env::var_os(format!("{ARTIFACT_ENV_PREFIX}{index}"))
-                        .expect("sandbox probe artifact path"),
-                )
-            });
+            let artifact = PathBuf::from(
+                std::env::var_os(format!("{ARTIFACT_ENV_PREFIX}0"))
+                    .expect("sandbox probe Record V2 path"),
+            );
             let outside =
                 PathBuf::from(std::env::var_os(OUTSIDE_ENV).expect("sandbox probe outside path"));
             let socket = std::env::var(SOCKET_ENV)
@@ -935,12 +936,10 @@ mod linux {
             // unprivileged identity before installing the policy. Otherwise a
             // root-owned CI fixture could turn a DAC denial into a false
             // sandbox pass.
-            for artifact in &artifacts {
-                OpenOptions::new()
-                    .write(true)
-                    .open(artifact)
-                    .expect("artifact is writable before sandbox installation");
-            }
+            OpenOptions::new()
+                .write(true)
+                .open(&artifact)
+                .expect("Record V2 is writable before sandbox installation");
             assert_eq!(fs::read(&outside).unwrap(), b"secret");
             let created = outside.with_extension("control");
             fs::write(&created, b"control").expect("create control file before sandbox");
@@ -1028,7 +1027,7 @@ mod linux {
             let expected_open_files = lower_soft_limit(libc::RLIMIT_NOFILE, 48);
             let expected_user_tasks = lower_soft_limit(libc::RLIMIT_NPROC, 384);
 
-            install_policy_for_multithreaded_test(&[&artifacts[0], &artifacts[1], &artifacts[2]])
+            install_policy_for_multithreaded_test(&[&artifact])
                 .expect("install Linux production verifier sandbox");
 
             let mut limit = libc::rlimit {
@@ -1052,18 +1051,16 @@ mod linux {
             assert!(expected_open_files <= SANDBOX_MAX_OPEN_FILES);
             assert!(expected_user_tasks <= SANDBOX_MAX_USER_TASKS);
 
-            for artifact in &artifacts {
-                let mut bytes = Vec::new();
-                fs::File::open(artifact)
-                    .expect("sandbox keeps exact artifact readable")
-                    .read_to_end(&mut bytes)
-                    .expect("read exact sandbox artifact");
-                assert_eq!(bytes, b"artifact");
-                assert!(
-                    OpenOptions::new().write(true).open(artifact).is_err(),
-                    "sandbox artifact unexpectedly remained writable"
-                );
-            }
+            let mut bytes = Vec::new();
+            fs::File::open(&artifact)
+                .expect("sandbox keeps exact Record V2 readable")
+                .read_to_end(&mut bytes)
+                .expect("read exact sandbox Record V2");
+            assert_eq!(bytes, b"artifact");
+            assert!(
+                OpenOptions::new().write(true).open(&artifact).is_err(),
+                "sandbox Record V2 unexpectedly remained writable"
+            );
             assert!(
                 fs::File::open(&outside).is_err(),
                 "sandbox read an unlisted sentinel"
@@ -1308,21 +1305,21 @@ mod linux {
             fs::set_permissions(&root, Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&artifact_directory, Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&outside_directory, Permissions::from_mode(0o700)).unwrap();
-            let artifacts = ["bank", "manifest", "record"].map(|name| {
-                let path = artifact_directory.join(name);
-                fs::write(&path, b"artifact").unwrap();
-                fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
-                path.canonicalize().unwrap()
-            });
+            let record = artifact_directory.join("record-v2.json");
+            fs::write(&record, b"artifact").unwrap();
+            fs::set_permissions(&record, Permissions::from_mode(0o600)).unwrap();
+            let record = record.canonicalize().unwrap();
             let outside = outside_directory.join("sentinel");
             fs::write(&outside, b"secret").unwrap();
             fs::set_permissions(&outside, Permissions::from_mode(0o600)).unwrap();
             let outside = outside.canonicalize().unwrap();
-            for path in artifacts.iter().chain(std::iter::once(&outside)).chain([
-                &artifact_directory,
-                &outside_directory,
-                &root,
-            ]) {
+            for path in [
+                record.as_path(),
+                outside.as_path(),
+                artifact_directory.as_path(),
+                outside_directory.as_path(),
+                root.as_path(),
+            ] {
                 chown_to_probe_identity(path);
             }
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1339,9 +1336,7 @@ mod linux {
                 .env(SOCKET_ENV, socket.to_string())
                 .env(TARGET_PID_ENV, victim.id().to_string());
             configure_unprivileged_child(&mut command);
-            for (index, artifact) in artifacts.iter().enumerate() {
-                command.env(format!("{ARTIFACT_ENV_PREFIX}{index}"), artifact);
-            }
+            command.env(format!("{ARTIFACT_ENV_PREFIX}0"), &record);
             let status = command.status().expect("launch sandbox probe child");
             let _ = victim.kill();
             let _ = victim.wait();

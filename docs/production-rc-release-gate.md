@@ -14,7 +14,10 @@ SHA-256. A production build must also receive the exact release checkout as
 the trusted `CMFD_BUILD_SOURCE_COMMIT` input. It must also pin the exact byte
 length, BLAKE3 digest, and SHA-256 digest of the production bank, manifest, and
 Record V2, plus distinct Windows x86-64 and Linux x86-64 SHA-256 identities for
-the packaged persistent `cmfd-proof-worker`. The qualification evidence's
+the packaged persistent `cmfd-proof-worker`. The canonical activation-evidence
+bytes include all six artifact/worker identities, so `NETWORK-INFO.json` cannot
+replace those pins without breaking its compiled activation-evidence digest.
+The qualification evidence's
 `fresh_process_verifier_binary_sha256` identifies the `cmfd-consensus`
 qualification harness and must not be reused as the runtime-worker pin. The
 current source selection is Devnet/V2 with no activation evidence, artifact
@@ -186,11 +189,56 @@ must authenticate the real bank under the configured job/address-space limit,
 record peak RSS/commit and startup time, and raise or otherwise qualify the
 default before activation.
 
-The current Tauri/CI finalizer does not yet stage or inspect this runtime
-sidecar layout. A real ProductionV3 package is therefore still blocked until
-the final artifacts exist and packaging compares the staged worker bytes to the
-compiled `NETWORK-INFO.json` pin on both platforms. Unit package-layout fixtures
-do not substitute for that final packaged smoke test.
+Production finalization requires
+`commonfoundry-rc-runtime-windows-x86_64.zip` and
+`commonfoundry-rc-runtime-linux-x86_64.tar.gz`, plus
+`RUNTIME-ATTESTATION-WINDOWS-X86_64.json` and
+`RUNTIME-ATTESTATION-LINUX-X86_64.json`. Each trusted native packaging job must
+create its attestation by running the packaged node itself:
+
+```text
+python scripts/release_integrity.py runtime-attest --platform PLATFORM \
+  --package-directory EXTRACTED-RUNTIME --expected-commit FULL-COMMIT \
+  --output RUNTIME-ATTESTATION-PLATFORM.json
+```
+
+The command validates all three packaged executables as PE32+ AMD64 or ELF64
+x86-64 as appropriate, hashes them through stable handles, runs exactly
+`cmfd-node[.exe] network-info` from the packaged directory, rejects stderr or a
+nonzero/timeout result, and rehashes the executables before create-new
+publication. Finalization verifies that each attested output selects its own
+platform worker and otherwise exactly equals the staged network information,
+and that its node, wallet, and worker hashes equal the corresponding archive
+members. This native-job evidence is required because one finalization host
+cannot execute both platform binaries.
+
+The archives have one exact root directory matching the archive stem:
+`commonfoundry-rc-runtime-windows-x86_64` or
+`commonfoundry-rc-runtime-linux-x86_64`. Alternate, reserved, control-bearing,
+or trailing-dot/space roots are rejected before member contents are read.
+
+The finalizer opens both archives, rejects any prefix, trailing or concatenated
+stream, extra, missing, linked, encrypted, data-descriptor, PAX, unknown-extra,
+commented, or special member, and compares each
+packaged worker and model artifact directly with the identities in the single
+staged `NETWORK-INFO.json`. That file carries both platform worker hashes. The
+model artifacts in both packages must match the same length, BLAKE3, and
+SHA-256 pins. Directories must be empty with canonical modes; files must have
+canonical types and modes; archive inventories are bounded before contents are
+materialized; and ZIP/tar logical endpoints must be exact. Archive publication
+uses atomic create-new semantics and never replaces a racing destination.
+The packaged manifest must equal the manifest embedded in Record V2, while the
+qualification manifest's bank and Record V2 name/size/SHA-256 bindings must
+equal the compiled pins. The existing deterministic ZIP and tar commands stream
+the model bank rather than reading it into memory. Release hosts install the pinned
+dependency in `scripts/requirements-release-integrity.txt` before running the
+ProductionV3 finalizer. CI installs that dependency with its published hashes
+required and runs the parser suite natively on both Linux and Windows.
+
+This gate covers the standalone runtime bundles. The existing NSIS, AppImage, and
+Debian installer builds do not yet install these sidecars beside the wallet and
+therefore remain blocked as ProductionV3 RC packages. Unit fixtures also do not
+substitute for the final real-bank packaged smoke test.
 
 ## Runtime verifier sandbox gate
 

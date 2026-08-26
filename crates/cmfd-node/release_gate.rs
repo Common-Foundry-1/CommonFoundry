@@ -141,6 +141,16 @@ fn valid_binary_identity_pin(value: [u8; 32]) -> bool {
     value != [0; 32] && !is_repeated_byte(value)
 }
 
+fn lower_hex(value: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in value {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 fn is_rfc5737(address: [u8; 4]) -> bool {
     matches!(
         address,
@@ -257,21 +267,45 @@ pub fn canonical_production_v3_activation_evidence_json(
     let evidence = profile
         .activation
         .ok_or("ProductionV3 activation evidence is absent")?;
+    let artifacts = profile
+        .production_v3_artifacts
+        .ok_or("ProductionV3 artifact identity pins are absent")?;
+    let workers = profile
+        .production_v3_verifier_workers
+        .ok_or("ProductionV3 runtime verifier-worker pin is absent")?;
     Ok(format!(
         concat!(
-            "{{\"fresh_process_verifier_binary_sha256\":\"{}\",",
+            "{{\"artifacts\":{{",
+            "\"bank\":{{\"blake3\":\"{}\",\"bytes\":\"{}\",\"sha256\":\"{}\"}},",
+            "\"manifest\":{{\"blake3\":\"{}\",\"bytes\":\"{}\",\"sha256\":\"{}\"}},",
+            "\"record_v2\":{{\"blake3\":\"{}\",\"bytes\":\"{}\",\"sha256\":\"{}\"}}}},",
+            "\"fresh_process_verifier_binary_sha256\":\"{}\",",
             "\"fresh_process_verifier_report_sha256\":\"{}\",",
             "\"network_profile\":\"RCNet-1\",",
             "\"proof_selection\":\"ProductionV3\",",
             "\"qualification_manifest_sha256\":\"{}\",",
             "\"qualification_source_commit\":\"{}\",",
+            "\"runtime_verifier_workers\":{{",
+            "\"linux_x86_64_sha256\":\"{}\",",
+            "\"windows_x86_64_sha256\":\"{}\"}},",
             "\"schema\":\"{}\",",
             "\"source_commit\":\"{}\"}}\n"
         ),
+        lower_hex(artifacts.bank.blake3),
+        artifacts.bank.bytes,
+        lower_hex(artifacts.bank.sha256),
+        lower_hex(artifacts.manifest.blake3),
+        artifacts.manifest.bytes,
+        lower_hex(artifacts.manifest.sha256),
+        lower_hex(artifacts.record_v2.blake3),
+        artifacts.record_v2.bytes,
+        lower_hex(artifacts.record_v2.sha256),
         evidence.fresh_process_verifier_binary_sha256,
         evidence.fresh_process_verifier_report_sha256,
         evidence.qualification_manifest_sha256,
         evidence.qualification_source_commit,
+        lower_hex(workers.linux_x86_64_sha256),
+        lower_hex(workers.windows_x86_64_sha256),
         evidence.schema,
         build_source_commit,
     )
@@ -511,11 +545,19 @@ mod tests {
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
             concat!(
-                "{\"fresh_process_verifier_binary_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
+                "{\"artifacts\":{\"bank\":{\"blake3\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+                "\"bytes\":\"1\",\"sha256\":\"4545454545454545454545454545454545454545454545454545454545454545\"},",
+                "\"manifest\":{\"blake3\":\"4646464646464646464646464646464646464646464646464646464646464646\",",
+                "\"bytes\":\"2\",\"sha256\":\"4747474747474747474747474747474747474747474747474747474747474747\"},",
+                "\"record_v2\":{\"blake3\":\"4848484848484848484848484848484848484848484848484848484848484848\",",
+                "\"bytes\":\"3\",\"sha256\":\"4949494949494949494949494949494949494949494949494949494949494949\"}},",
+                "\"fresh_process_verifier_binary_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
                 "\"fresh_process_verifier_report_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
                 "\"network_profile\":\"RCNet-1\",\"proof_selection\":\"ProductionV3\",",
                 "\"qualification_manifest_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
                 "\"qualification_source_commit\":\"1111111111111111111111111111111111111111\",",
+                "\"runtime_verifier_workers\":{\"linux_x86_64_sha256\":\"9a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9\",",
+                "\"windows_x86_64_sha256\":\"5a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70717273747576777879\"},",
                 "\"schema\":\"CMFD_PRODUCTION_V3_ACTIVATION_V1\",",
                 "\"source_commit\":\"5555555555555555555555555555555555555555\"}\n"
             )

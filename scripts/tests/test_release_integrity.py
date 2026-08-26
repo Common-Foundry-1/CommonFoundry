@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import copy
 import gzip
 import io
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -13,11 +16,55 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 import release_integrity as integrity
+
+
+def pe_x86_64_fixture(
+    label: bytes, machine: int = 0x8664, characteristics: int = 0x0022
+) -> bytes:
+    pe_offset = 0x80
+    optional_size = 0xF0
+    encoded = bytearray(0x400)
+    encoded[0:2] = b"MZ"
+    struct.pack_into("<I", encoded, 0x3C, pe_offset)
+    encoded[pe_offset : pe_offset + 4] = b"PE\0\0"
+    struct.pack_into("<HH", encoded, pe_offset + 4, machine, 1)
+    struct.pack_into("<HH", encoded, pe_offset + 20, optional_size, characteristics)
+    optional = pe_offset + 24
+    struct.pack_into("<H", encoded, optional, 0x020B)
+    struct.pack_into("<I", encoded, optional + 4, 0x200)
+    struct.pack_into("<I", encoded, optional + 16, 0x1000)
+    struct.pack_into("<I", encoded, optional + 20, 0x1000)
+    struct.pack_into("<Q", encoded, optional + 24, 0x140000000)
+    struct.pack_into("<II", encoded, optional + 32, 0x1000, 0x200)
+    struct.pack_into("<II", encoded, optional + 56, 0x2000, 0x200)
+    struct.pack_into("<H", encoded, optional + 68, 3)
+    struct.pack_into("<I", encoded, optional + 108, 16)
+    section = optional + optional_size
+    encoded[section : section + 8] = b".text\0\0\0"
+    struct.pack_into("<IIII", encoded, section + 8, 0x100, 0x1000, 0x200, 0x200)
+    struct.pack_into("<I", encoded, section + 36, 0x60000020)
+    encoded[0x200 : 0x200 + len(label)] = label
+    return bytes(encoded)
+
+
+def elf_x86_64_fixture(label: bytes, machine: int = 0x003E) -> bytes:
+    encoded = bytearray(64 + 56 + len(label))
+    encoded[0:4] = b"\x7fELF"
+    encoded[4:7] = bytes((2, 1, 1))
+    struct.pack_into("<HHI", encoded, 16, 3, machine, 1)
+    struct.pack_into("<Q", encoded, 24, 0x400078)
+    struct.pack_into("<Q", encoded, 32, 64)
+    struct.pack_into("<HHH", encoded, 52, 64, 56, 1)
+    struct.pack_into("<II", encoded, 64, 1, 5)
+    struct.pack_into("<QQQQQQ", encoded, 72, 0, 0x400000, 0x400000, len(encoded), len(encoded), 0x1000)
+    encoded[120:] = label
+    return bytes(encoded)
 
 
 class GitFixture:
@@ -184,6 +231,32 @@ class DeterministicArchiveTests(unittest.TestCase):
         os.utime(readme, (second_mtime, second_mtime))
         return stage
 
+    def rewrite_first_tar_header(
+        self,
+        archive: Path,
+        *,
+        name: bytes | None = None,
+        size: int | None = None,
+        member_type: bytes | None = None,
+    ) -> None:
+        payload = bytearray(gzip.decompress(archive.read_bytes()))
+        header = bytearray(payload[: integrity.TAR_BLOCK_BYTES])
+        if name is not None:
+            self.assertLessEqual(len(name), 100)
+            header[:100] = name.ljust(100, b"\0")
+        if size is not None:
+            header[124:136] = tarfile.itn(size, 12, tarfile.GNU_FORMAT)
+        if member_type is not None:
+            self.assertEqual(len(member_type), 1)
+            header[156:157] = member_type
+        header[148:156] = b" " * 8
+        header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+        payload[: integrity.TAR_BLOCK_BYTES] = header
+        with archive.open("wb") as raw, gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=self.epoch
+        ) as zipped:
+            zipped.write(payload)
+
     def test_zip_and_tar_gz_are_independent_of_source_mtimes(self) -> None:
         stage_a = self.stage("one", int(time.time()) - 100, int(time.time()) - 50)
         stage_b = self.stage("two", int(time.time()) + 50, int(time.time()) + 100)
@@ -197,6 +270,351 @@ class DeterministicArchiveTests(unittest.TestCase):
         integrity.create_deterministic_tar_gz(stage_b, tar_b, self.epoch)
         self.assertEqual(zip_a.read_bytes(), zip_b.read_bytes())
         self.assertEqual(tar_a.read_bytes(), tar_b.read_bytes())
+
+    def test_zip_rejects_prefix_and_trailer_bytes(self) -> None:
+        for kind in ("prefix", "trailer"):
+            with self.subTest(kind=kind):
+                stage = self.stage(kind, 1, 2)
+                archive = self.root / f"{kind}.zip"
+                integrity.create_deterministic_zip(stage, archive, self.epoch)
+                original = archive.read_bytes()
+                archive.write_bytes(
+                    b"prefix" + original if kind == "prefix" else original + b"trailer"
+                )
+                with self.assertRaisesRegex(
+                    integrity.IntegrityError, "prefix|trailer|endpoint"
+                ):
+                    integrity.verify_deterministic_zip(stage, archive, self.epoch)
+
+    def test_tar_rejects_a_trailing_or_concatenated_stream(self) -> None:
+        stage = self.stage("tar-trailer", 1, 2)
+        archive = self.root / "trailer.tar.gz"
+        integrity.create_deterministic_tar_gz(stage, archive, self.epoch)
+        archive.write_bytes(archive.read_bytes() + gzip.compress(b"second stream"))
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "concatenated|trailer|endpoint"
+        ):
+            integrity.verify_deterministic_tar_gz(stage, archive, self.epoch)
+
+    def test_tar_rejects_a_noncanonical_gzip_os_byte_before_tarfile(self) -> None:
+        stage = self.stage("tar-gzip-os", 1, 2)
+        archive = self.root / "gzip-os.tar.gz"
+        integrity.create_deterministic_tar_gz(stage, archive, self.epoch)
+        encoded = bytearray(archive.read_bytes())
+        self.assertEqual(encoded[9], 255)
+        encoded[9] = 3
+        archive.write_bytes(encoded)
+        with (
+            mock.patch.object(
+                integrity.tarfile,
+                "open",
+                side_effect=AssertionError(
+                    "tarfile.open called before gzip header rejection"
+                ),
+            ) as tar_open,
+            self.assertRaisesRegex(integrity.IntegrityError, "gzip header"),
+        ):
+            integrity.verify_deterministic_tar_gz(stage, archive, self.epoch)
+        tar_open.assert_not_called()
+
+    def test_tar_decompression_is_bounded_by_expected_output(self) -> None:
+        archive = self.root / "large-logical-output.tar.gz"
+        with (
+            archive.open("wb") as raw,
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=self.epoch) as zipped,
+        ):
+            zipped.write(b"\0" * integrity.TAR_RECORD_BYTES)
+
+        decoder = integrity.zlib.decompressobj(16 + integrity.zlib.MAX_WBITS)
+
+        class RecordingDecoder:
+            def __init__(self) -> None:
+                self.maximum_lengths: list[int] = []
+
+            def decompress(self, data: bytes, maximum_length: int = 0) -> bytes:
+                self.maximum_lengths.append(maximum_length)
+                return decoder.decompress(data, maximum_length)
+
+            def flush(self, maximum_length: int = integrity.zlib.DEF_BUF_SIZE) -> bytes:
+                self.maximum_lengths.append(maximum_length)
+                return decoder.flush(maximum_length)
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(decoder, name)
+
+        recording = RecordingDecoder()
+        with (
+            archive.open("rb") as raw,
+            mock.patch.object(integrity.zlib, "decompressobj", return_value=recording),
+            self.assertRaisesRegex(integrity.IntegrityError, "output|endpoint"),
+        ):
+            integrity._validate_gzip_tar_framing(
+                raw,
+                members=[],
+                logical_end=16 * 1024 * 1024 * 1024,
+                label="bounded tar",
+                expected_epoch=self.epoch,
+            )
+        self.assertTrue(recording.maximum_lengths)
+        self.assertNotIn(0, recording.maximum_lengths)
+        self.assertLessEqual(
+            max(recording.maximum_lengths), integrity.MAX_GZIP_OUTPUT_CHUNK_BYTES
+        )
+
+    def test_tar_oversized_first_member_fails_before_seekable_enumeration(self) -> None:
+        stage = self.stage("tar-oversized-first", 1, 2)
+        archive = self.root / "oversized-first.tar.gz"
+        integrity.create_deterministic_tar_gz(stage, archive, self.epoch)
+        self.rewrite_first_tar_header(
+            archive, size=integrity.MAX_ARCHIVE_MEMBER_BYTES + 1
+        )
+        real_open = integrity.tarfile.open
+        with mock.patch.object(
+            integrity.tarfile, "open", wraps=real_open
+        ) as recorded, self.assertRaisesRegex(
+            integrity.IntegrityError, "numeric field|wrong size"
+        ):
+            integrity.verify_deterministic_tar_gz(stage, archive, self.epoch)
+        recorded.assert_not_called()
+
+    def test_tar_wrong_first_member_fails_before_seekable_enumeration(self) -> None:
+        stage = self.stage("tar-wrong-first", 1, 2)
+        archive = self.root / "wrong-first.tar.gz"
+        integrity.create_deterministic_tar_gz(stage, archive, self.epoch)
+        self.rewrite_first_tar_header(archive, name=b"wrong-package")
+        real_open = integrity.tarfile.open
+        with mock.patch.object(
+            integrity.tarfile, "open", wraps=real_open
+        ) as recorded, self.assertRaisesRegex(
+            integrity.IntegrityError, "missing, reordered, or unexpected"
+        ):
+            integrity.verify_deterministic_tar_gz(stage, archive, self.epoch)
+        recorded.assert_not_called()
+
+    def test_tar_rejects_an_alternate_name_prefix_split_before_tarfile(self) -> None:
+        stage = self.stage("tar-name-prefix", 1, 2)
+        archive = self.root / "alternate-name-prefix.tar.gz"
+        integrity.create_deterministic_tar_gz(stage, archive, self.epoch)
+        with tarfile.open(archive, "r:gz") as parsed:
+            member = next(
+                item for item in parsed if item.name.endswith("/README.txt")
+            )
+        payload = bytearray(gzip.decompress(archive.read_bytes()))
+        header = bytearray(
+            payload[member.offset : member.offset + integrity.TAR_BLOCK_BYTES]
+        )
+        header[:100] = b"README.txt".ljust(100, b"\0")
+        header[345:500] = stage.name.encode("ascii").ljust(155, b"\0")
+        header[148:156] = b" " * 8
+        header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+        payload[member.offset : member.offset + integrity.TAR_BLOCK_BYTES] = header
+        with archive.open("wb") as raw, gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=self.epoch
+        ) as zipped:
+            zipped.write(payload)
+        with (
+            mock.patch.object(
+                integrity.tarfile,
+                "open",
+                side_effect=AssertionError(
+                    "tarfile.open called before name/prefix rejection"
+                ),
+            ) as tar_open,
+            self.assertRaisesRegex(integrity.IntegrityError, "name/prefix split"),
+        ):
+            integrity.verify_deterministic_tar_gz(stage, archive, self.epoch)
+        tar_open.assert_not_called()
+
+    def test_tar_extension_headers_fail_before_payload_or_tarfile(self) -> None:
+        for member_type in (
+            tarfile.XHDTYPE,
+            tarfile.XGLTYPE,
+            tarfile.GNUTYPE_LONGNAME,
+        ):
+            with self.subTest(member_type=member_type):
+                stage = self.stage(f"tar-extension-{member_type.hex()}", 1, 2)
+                archive = self.root / f"extension-{member_type.hex()}.tar.gz"
+                integrity.create_deterministic_tar_gz(stage, archive, self.epoch)
+                self.rewrite_first_tar_header(
+                    archive,
+                    size=integrity.MAX_ARCHIVE_MEMBER_BYTES + 1,
+                    member_type=member_type,
+                )
+                decoder = integrity.zlib.decompressobj(
+                    16 + integrity.zlib.MAX_WBITS
+                )
+
+                class RecordingDecoder:
+                    def __init__(self) -> None:
+                        self.maximum_lengths: list[int] = []
+
+                    def decompress(
+                        self, data: bytes, maximum_length: int = 0
+                    ) -> bytes:
+                        self.maximum_lengths.append(maximum_length)
+                        return decoder.decompress(data, maximum_length)
+
+                    def __getattr__(self, name: str) -> object:
+                        return getattr(decoder, name)
+
+                recording = RecordingDecoder()
+                with (
+                    mock.patch.object(
+                        integrity.zlib, "decompressobj", return_value=recording
+                    ),
+                    mock.patch.object(
+                        integrity.tarfile,
+                        "open",
+                        side_effect=AssertionError(
+                            "tarfile.open called before extension rejection"
+                        ),
+                    ) as tar_open,
+                    self.assertRaisesRegex(integrity.IntegrityError, "wrong type"),
+                ):
+                    integrity.verify_deterministic_tar_gz(
+                        stage, archive, self.epoch
+                    )
+                tar_open.assert_not_called()
+                self.assertTrue(recording.maximum_lengths)
+                self.assertLessEqual(
+                    max(recording.maximum_lengths), integrity.TAR_BLOCK_BYTES
+                )
+
+    def test_tar_nonzero_file_padding_is_rejected(self) -> None:
+        stage = self.stage("tar-padding", 1, 2)
+        archive = self.root / "padding.tar.gz"
+        integrity.create_deterministic_tar_gz(stage, archive, self.epoch)
+        with tarfile.open(archive, "r:gz") as parsed:
+            member = next(item for item in parsed if item.name.endswith("README.txt"))
+        payload = bytearray(gzip.decompress(archive.read_bytes()))
+        payload[member.offset_data + member.size] = 1
+        with archive.open("wb") as raw, gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=self.epoch
+        ) as zipped:
+            zipped.write(payload)
+        with self.assertRaisesRegex(integrity.IntegrityError, "nonzero tar padding"):
+            integrity.verify_deterministic_tar_gz(stage, archive, self.epoch)
+
+    def test_archive_publication_does_not_replace_a_racing_destination(self) -> None:
+        stage = self.stage("publish-race", 1, 2)
+        output = self.root / "raced.zip"
+        original_link = os.link
+
+        def race(source: object, destination: object, **kwargs: object) -> None:
+            Path(destination).write_bytes(b"racer-owned")
+            original_link(source, destination, **kwargs)
+
+        with mock.patch.object(os, "link", side_effect=race), self.assertRaisesRegex(
+            integrity.IntegrityError, "already exists"
+        ):
+            integrity.create_deterministic_zip(stage, output, self.epoch)
+        self.assertEqual(output.read_bytes(), b"racer-owned")
+
+    def test_staging_inventory_is_bounded_before_archiving(self) -> None:
+        stage = self.stage("bounded", 1, 2)
+        with mock.patch.object(integrity, "MAX_ARCHIVE_MEMBERS", 2), self.assertRaisesRegex(
+            integrity.IntegrityError, "too many members"
+        ):
+            integrity._archive_entries(stage)
+
+    def test_zip_unknown_extra_field_is_rejected(self) -> None:
+        stage = self.stage("zip-extra", 1, 2)
+        archive_path = self.root / "extra.zip"
+        timestamp = integrity._zip_datetime(self.epoch)
+        with zipfile.ZipFile(
+            archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as archive:
+            for path, name, is_directory in integrity._archive_entries(stage):
+                info = zipfile.ZipInfo(name, timestamp)
+                info.create_system = 3
+                info.compress_type = zipfile.ZIP_DEFLATED
+                mode = 0o755 if is_directory else integrity._canonical_file_mode(path)
+                kind = stat.S_IFDIR if is_directory else stat.S_IFREG
+                info.external_attr = ((kind | mode) & 0xFFFF) << 16
+                if is_directory:
+                    info.external_attr |= 0x10
+                if name.endswith("README.txt"):
+                    info.extra = b"\xfe\xca\x00\x00"
+                archive.writestr(info, b"" if is_directory else path.read_bytes())
+        with self.assertRaisesRegex(integrity.IntegrityError, "metadata"):
+            integrity.verify_deterministic_zip(stage, archive_path, self.epoch)
+
+    def test_zip_directory_content_and_flags_are_rejected(self) -> None:
+        stage = self.stage("zip-directory", 1, 2)
+        timestamp = integrity._zip_datetime(self.epoch)
+        archive_path = self.root / "directory-content.zip"
+        with zipfile.ZipFile(
+            archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as archive:
+            for path, name, is_directory in integrity._archive_entries(stage):
+                info = zipfile.ZipInfo(name, timestamp)
+                info.create_system = 3
+                info.compress_type = zipfile.ZIP_DEFLATED
+                mode = 0o755 if is_directory else integrity._canonical_file_mode(path)
+                kind = stat.S_IFDIR if is_directory else stat.S_IFREG
+                info.external_attr = ((kind | mode) & 0xFFFF) << 16
+                if is_directory:
+                    info.external_attr |= 0x10
+                content = b"not empty" if name == "commonfoundry-package/" else (
+                    b"" if is_directory else path.read_bytes()
+                )
+                archive.writestr(info, content)
+        with self.assertRaisesRegex(integrity.IntegrityError, "directory content"):
+            integrity.verify_deterministic_zip(stage, archive_path, self.epoch)
+
+        archive_path = self.root / "flags.zip"
+        integrity.create_deterministic_zip(stage, archive_path, self.epoch)
+        encoded = bytearray(archive_path.read_bytes())
+        local = encoded.find(b"PK\x03\x04")
+        central = encoded.find(b"PK\x01\x02")
+        struct.pack_into("<H", encoded, local + 6, 0x0008)
+        struct.pack_into("<H", encoded, central + 8, 0x0008)
+        archive_path.write_bytes(encoded)
+        with self.assertRaisesRegex(integrity.IntegrityError, "metadata"):
+            integrity.verify_deterministic_zip(stage, archive_path, self.epoch)
+
+    def test_tar_pax_metadata_is_rejected(self) -> None:
+        stage = self.stage("tar-pax", 1, 2)
+        archive_path = self.root / "pax.tar.gz"
+        with (
+            archive_path.open("wb") as raw,
+            gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=self.epoch
+            ) as zipped,
+            tarfile.open(
+                fileobj=zipped,
+                mode="w",
+                format=tarfile.PAX_FORMAT,
+                pax_headers={"comment": "noncanonical"},
+            ) as archive,
+        ):
+            for path, name, is_directory in integrity._archive_entries(stage):
+                member = tarfile.TarInfo(name.rstrip("/") if is_directory else name)
+                member.mtime = self.epoch
+                member.uid = member.gid = 0
+                member.mode = 0o755 if is_directory else integrity._canonical_file_mode(path)
+                if is_directory:
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                else:
+                    member.type = tarfile.REGTYPE
+                    member.size = path.stat().st_size
+                    with path.open("rb") as source:
+                        archive.addfile(member, source)
+        with self.assertRaisesRegex(integrity.IntegrityError, "PAX"):
+            integrity.verify_deterministic_tar_gz(stage, archive_path, self.epoch)
+
+    def test_zip64_metadata_is_canonical_for_streamed_large_members(self) -> None:
+        stage = self.stage("zip64", 1, 2)
+        archive_path = self.root / "zip64.zip"
+        original_limit = zipfile.ZIP64_LIMIT
+        try:
+            zipfile.ZIP64_LIMIT = 8
+            integrity.create_deterministic_zip(stage, archive_path, self.epoch)
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                self.assertTrue(any(member.extra for member in archive.infolist()))
+        finally:
+            zipfile.ZIP64_LIMIT = original_limit
 
     def test_symlinked_stage_root_is_rejected(self) -> None:
         stage = self.stage("real", 1, 2)
@@ -443,6 +861,38 @@ class DebianPackageInspectionTests(unittest.TestCase):
 
 
 class ProductionRcGateTests(unittest.TestCase):
+    MODEL_MANIFEST = {"format_version": 2, "bank_count": 1, "layers_per_bank": 4}
+    RECORD_V2 = {
+        "record_version": 2,
+        "suite_digest": "44" * 32,
+        "manifest": MODEL_MANIFEST,
+        "manifest_digest": "22" * 32,
+        "model_identity": {"identity_version": 1},
+        "model_identity_digest": "33" * 32,
+        "setup_identity": "55" * 32,
+        "padded_variables": 33,
+        "commitment_root": "66" * 32,
+        "record_digest": "11" * 32,
+    }
+    RUNTIME_ARTIFACTS = {
+        integrity.PRODUCTION_V3_PACKAGE_BANK: b"bounded production model bank fixture",
+        integrity.PRODUCTION_V3_PACKAGE_MANIFEST: (
+            json.dumps(MODEL_MANIFEST, indent=2) + "\n"
+        ).encode("utf-8"),
+        integrity.PRODUCTION_V3_PACKAGE_RECORD_V2: (
+            json.dumps(RECORD_V2, indent=2) + "\n"
+        ).encode("utf-8"),
+    }
+    WINDOWS_WORKER = pe_x86_64_fixture(b"Windows production proof worker")
+    LINUX_WORKER = elf_x86_64_fixture(b"Linux production proof worker")
+
+    @staticmethod
+    def runtime_binary(platform: str, role: str) -> bytes:
+        label = f"{platform} {role}".encode("ascii")
+        if platform == "windows-x86_64":
+            return pe_x86_64_fixture(label)
+        return elf_x86_64_fixture(label)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -460,6 +910,137 @@ class ProductionRcGateTests(unittest.TestCase):
         )
         return path
 
+    def write_runtime_package(
+        self,
+        *,
+        platform: str,
+        worker: bytes,
+        runtime_artifacts: dict[str, bytes],
+        runtime_binaries: dict[str, bytes] | None = None,
+    ) -> Path:
+        container = self.root / f"runtime-{platform}-{time.time_ns()}"
+        stage = container / integrity._runtime_package_root(platform)
+        stage.mkdir(parents=True)
+        executable_suffix = ".exe" if platform == "windows-x86_64" else ""
+        for name in (
+            f"cmfd-node{executable_suffix}",
+            f"common-foundry-wallet{executable_suffix}",
+        ):
+            path = stage / name
+            role = "node" if name.startswith("cmfd-node") else "wallet"
+            path.write_bytes(
+                (runtime_binaries or {}).get(
+                    role, self.runtime_binary(platform, role)
+                )
+            )
+            path.chmod(0o755)
+        worker_path = stage / f"cmfd-proof-worker{executable_suffix}"
+        worker_path.write_bytes(worker)
+        worker_path.chmod(0o755)
+        artifact_directory = stage / integrity.PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY
+        artifact_directory.mkdir()
+        for name, data in runtime_artifacts.items():
+            (artifact_directory / name).write_bytes(data)
+
+        if platform == "windows-x86_64":
+            package = self.root / integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME
+            package.unlink(missing_ok=True)
+            integrity.create_deterministic_zip(stage, package, 1_700_000_000)
+        else:
+            package = self.root / integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME
+            package.unlink(missing_ok=True)
+            integrity.create_deterministic_tar_gz(stage, package, 1_700_000_000)
+        return package
+
+    def refresh_activation_chain(self, stage_files: dict[str, Path]) -> None:
+        qualification = stage_files[integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME]
+        evidence_path = stage_files[integrity.PRODUCTION_V3_ACTIVATION_NAME]
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["qualification_manifest_sha256"] = integrity._sha256_file(qualification)
+        self.write_json(integrity.PRODUCTION_V3_ACTIVATION_NAME, evidence)
+        network_path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(network_path.read_text(encoding="utf-8"))
+        network["proof_of_work"]["activation_evidence_sha256"] = integrity._sha256_file(
+            evidence_path
+        )
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+
+    def rewrite_windows_runtime_root(self, package: Path, replacement_root: str) -> None:
+        rewritten = self.root / f"rewritten-{time.time_ns()}.zip"
+        with (
+            zipfile.ZipFile(package, "r") as source,
+            zipfile.ZipFile(
+                rewritten,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+                strict_timestamps=True,
+            ) as destination,
+        ):
+            members = source.infolist()
+            original_root = members[0].filename.rstrip("/")
+            for member in members:
+                info = copy.copy(member)
+                info.filename = replacement_root + member.filename[len(original_root) :]
+                if member.is_dir():
+                    destination.writestr(info, b"")
+                else:
+                    with destination.open(info, "w", force_zip64=True) as output:
+                        output.write(source.read(member))
+        rewritten.replace(package)
+
+    def rewrite_linux_tar_header(
+        self, package: Path, member_suffix: str, mutate: object
+    ) -> None:
+        compressed = package.read_bytes()
+        epoch = struct.unpack_from("<I", compressed, 4)[0]
+        decoded = bytearray(gzip.decompress(compressed))
+        with tarfile.open(fileobj=io.BytesIO(decoded), mode="r:") as archive:
+            member = next(item for item in archive if item.name.endswith(member_suffix))
+        header = bytearray(decoded[member.offset : member.offset + integrity.TAR_BLOCK_BYTES])
+        mutate(header)
+        header[148:156] = b"        "
+        header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+        decoded[member.offset : member.offset + integrity.TAR_BLOCK_BYTES] = header
+        with (
+            package.open("wb") as raw,
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch) as zipped,
+        ):
+            zipped.write(decoded)
+
+    def write_runtime_attestation(
+        self,
+        *,
+        platform: str,
+        network_info: dict[str, object],
+        worker: bytes,
+    ) -> Path:
+        network_bytes = (
+            json.dumps(network_info, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        name = (
+            integrity.PRODUCTION_RC_WINDOWS_ATTESTATION_NAME
+            if platform == "windows-x86_64"
+            else integrity.PRODUCTION_RC_LINUX_ATTESTATION_NAME
+        )
+        return self.write_json(
+            name,
+            {
+                "schema": integrity.PRODUCTION_RC_RUNTIME_ATTESTATION_SCHEMA,
+                "platform": platform,
+                "source_commit": self.commit,
+                "node_sha256": integrity._sha256_bytes(
+                    self.runtime_binary(platform, "node")
+                ),
+                "wallet_sha256": integrity._sha256_bytes(
+                    self.runtime_binary(platform, "wallet")
+                ),
+                "worker_sha256": integrity._sha256_bytes(worker),
+                "network_info_sha256": integrity._sha256_bytes(network_bytes),
+                "network_info_base64": base64.b64encode(network_bytes).decode("ascii"),
+            },
+        )
+
     def valid_stage_files(self) -> dict[str, Path]:
         launch_root = bytes(range(1, 33)).hex()
         network_id = bytes(range(33, 65)).hex()
@@ -467,15 +1048,33 @@ class ProductionRcGateTests(unittest.TestCase):
         pow_limit = "00" + "ff" * 31
         steward = bytes(range(97, 129)).hex()
         community = bytes(range(129, 161)).hex()
+        runtime_artifacts = self.RUNTIME_ARTIFACTS
+        artifact_identities = {
+            role: {
+                "bytes": str(len(runtime_artifacts[name])),
+                "blake3": integrity._blake3_bytes(runtime_artifacts[name]),
+                "sha256": integrity._sha256_bytes(runtime_artifacts[name]),
+            }
+            for role, name in (
+                ("bank", integrity.PRODUCTION_V3_PACKAGE_BANK),
+                ("manifest", integrity.PRODUCTION_V3_PACKAGE_MANIFEST),
+                ("record_v2", integrity.PRODUCTION_V3_PACKAGE_RECORD_V2),
+            )
+        }
+        windows_worker = self.WINDOWS_WORKER
+        linux_worker = self.LINUX_WORKER
         record = {
-            "record_version": 2,
-            "record_digest": "11" * 32,
-            "manifest_digest": "22" * 32,
-            "model_identity_digest": "33" * 32,
-            "suite_digest": "44" * 32,
-            "setup_identity": "55" * 32,
-            "padded_variables": 33,
-            "commitment_root": "66" * 32,
+            field: self.RECORD_V2[field]
+            for field in (
+                "record_version",
+                "record_digest",
+                "manifest_digest",
+                "model_identity_digest",
+                "suite_digest",
+                "setup_identity",
+                "padded_variables",
+                "commitment_root",
+            )
         }
         services = {
             "bootstrap_ipv4": "8.8.8.8",
@@ -575,6 +1174,15 @@ class ProductionRcGateTests(unittest.TestCase):
                 "rustc",
             )
         }
+        for role, name in (
+            ("bank", integrity.PRODUCTION_V3_PACKAGE_BANK),
+            ("record_v2", integrity.PRODUCTION_V3_PACKAGE_RECORD_V2),
+        ):
+            artifact_rows[role] = {
+                "bytes": len(runtime_artifacts[name]),
+                "file_name": name,
+                "sha256": integrity._sha256_bytes(runtime_artifacts[name]),
+            }
         artifact_rows["fresh_process_verifier_binary"] = {
             "bytes": verifier_binary.stat().st_size,
             "file_name": integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME,
@@ -639,6 +1247,7 @@ class ProductionRcGateTests(unittest.TestCase):
         evidence = self.write_json(
             integrity.PRODUCTION_V3_ACTIVATION_NAME,
             {
+                "artifacts": artifact_identities,
                 "fresh_process_verifier_binary_sha256": integrity._sha256_file(
                     verifier_binary
                 ),
@@ -651,13 +1260,15 @@ class ProductionRcGateTests(unittest.TestCase):
                     qualification_manifest
                 ),
                 "qualification_source_commit": "9" * 40,
+                "runtime_verifier_workers": {
+                    "windows_x86_64_sha256": integrity._sha256_bytes(windows_worker),
+                    "linux_x86_64_sha256": integrity._sha256_bytes(linux_worker),
+                },
                 "schema": "CMFD_PRODUCTION_V3_ACTIVATION_V1",
                 "source_commit": self.commit,
             },
         )
-        network_info = self.write_json(
-            integrity.PRODUCTION_RC_NETWORK_INFO_NAME,
-            {
+        network_info_value = {
                 "network": {
                     "name": "CommonFoundry RCNet-1",
                     "network_id": network_id,
@@ -674,7 +1285,18 @@ class ProductionRcGateTests(unittest.TestCase):
                     "banks": 1,
                     "layers_per_bank": 4,
                     "maximum_structured_proof_bytes": "262144",
+                    "runtime_verifier_worker_sha256": integrity._sha256_bytes(
+                        windows_worker
+                    ),
+                    "runtime_verifier_workers": {
+                        "windows_x86_64_sha256": integrity._sha256_bytes(
+                            windows_worker
+                        ),
+                        "linux_x86_64_sha256": integrity._sha256_bytes(linux_worker),
+                    },
+                    "artifacts": artifact_identities,
                     "model": {
+                        "record_version": record["record_version"],
                         "record_digest": record["record_digest"],
                         "manifest_digest": record["manifest_digest"],
                         "model_identity_digest": record["model_identity_digest"],
@@ -716,7 +1338,33 @@ class ProductionRcGateTests(unittest.TestCase):
                     field: value if field.endswith("_percent") else str(value)
                     for field, value in monetary_policy.items()
                 },
-            },
+            }
+        network_info = self.write_json(
+            integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network_info_value
+        )
+        windows_package = self.write_runtime_package(
+            platform="windows-x86_64",
+            worker=windows_worker,
+            runtime_artifacts=runtime_artifacts,
+        )
+        linux_package = self.write_runtime_package(
+            platform="linux-x86_64",
+            worker=linux_worker,
+            runtime_artifacts=runtime_artifacts,
+        )
+        windows_attestation = self.write_runtime_attestation(
+            platform="windows-x86_64",
+            network_info=network_info_value,
+            worker=windows_worker,
+        )
+        linux_network_info = json.loads(json.dumps(network_info_value))
+        linux_network_info["proof_of_work"]["runtime_verifier_worker_sha256"] = (
+            integrity._sha256_bytes(linux_worker)
+        )
+        linux_attestation = self.write_runtime_attestation(
+            platform="linux-x86_64",
+            network_info=linux_network_info,
+            worker=linux_worker,
         )
         return {
             integrity.PRODUCTION_RC_NETWORK_INFO_NAME: network_info,
@@ -725,6 +1373,10 @@ class ProductionRcGateTests(unittest.TestCase):
             integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME: qualification_manifest,
             integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_BINARY_NAME: verifier_binary,
             integrity.PRODUCTION_V3_FRESH_PROCESS_VERIFIER_REPORT_NAME: verifier_report,
+            integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME: windows_package,
+            integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME: linux_package,
+            integrity.PRODUCTION_RC_WINDOWS_ATTESTATION_NAME: windows_attestation,
+            integrity.PRODUCTION_RC_LINUX_ATTESTATION_NAME: linux_attestation,
         }
 
     def test_production_rc_labels_exclude_devnet_candidates(self) -> None:
@@ -768,6 +1420,448 @@ class ProductionRcGateTests(unittest.TestCase):
             commit=self.commit,
             stage_files=self.valid_stage_files(),
         )
+
+    def test_every_required_qualification_artifact_has_a_bounded_identity(self) -> None:
+        cases = (("request", "sha256", "not-a-digest"), ("journal", "bytes", 0))
+        for role, field, replacement in cases:
+            with self.subTest(role=role, field=field):
+                stage_files = self.valid_stage_files()
+                path = stage_files[integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME]
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+                manifest["artifacts"][role][field] = replacement
+                self.write_json(integrity.PRODUCTION_V3_QUALIFICATION_MANIFEST_NAME, manifest)
+                self.refresh_activation_chain(stage_files)
+                with self.assertRaisesRegex(
+                    integrity.IntegrityError, f"invalid {role} binding"
+                ):
+                    integrity.validate_production_rc_artifacts(
+                        version="production-rc1",
+                        commit=self.commit,
+                        stage_files=stage_files,
+                    )
+
+    def test_runtime_executables_must_match_the_platform_architecture(self) -> None:
+        cases = (
+            (
+                "windows-x86_64",
+                "node",
+                pe_x86_64_fixture(b"wrong Windows architecture", machine=0x014C),
+                "x86-64 PE",
+            ),
+            (
+                "linux-x86_64",
+                "wallet",
+                elf_x86_64_fixture(b"wrong Linux architecture", machine=0x00B7),
+                "x86-64 ELF",
+            ),
+            (
+                "windows-x86_64",
+                "wallet",
+                pe_x86_64_fixture(
+                    b"DLL masquerading as a wallet", characteristics=0x2022
+                ),
+                "DLL",
+            ),
+            (
+                "windows-x86_64",
+                "node",
+                pe_x86_64_fixture(b"truncated optional header")[:0x98],
+                r"PE32\+ executable header",
+            ),
+        )
+        for platform, role, binary, message in cases:
+            with self.subTest(platform=platform, role=role):
+                stage_files = self.valid_stage_files()
+                package = self.write_runtime_package(
+                    platform=platform,
+                    worker=(
+                        self.WINDOWS_WORKER
+                        if platform == "windows-x86_64"
+                        else self.LINUX_WORKER
+                    ),
+                    runtime_artifacts=self.RUNTIME_ARTIFACTS,
+                    runtime_binaries={role: binary},
+                )
+                name = (
+                    integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME
+                    if platform == "windows-x86_64"
+                    else integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME
+                )
+                stage_files[name] = package
+                with self.assertRaisesRegex(integrity.IntegrityError, message):
+                    integrity.validate_production_rc_artifacts(
+                        version="production-rc1",
+                        commit=self.commit,
+                        stage_files=stage_files,
+                    )
+
+    def test_runtime_archive_trailer_and_extra_member_are_rejected(self) -> None:
+        stage_files = self.valid_stage_files()
+        windows = stage_files[integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME]
+        windows.write_bytes(windows.read_bytes() + b"trailer")
+        with self.assertRaisesRegex(integrity.IntegrityError, "trailer|endpoint"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+        stage_files = self.valid_stage_files()
+        windows = stage_files[integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME]
+        with zipfile.ZipFile(windows, "a") as archive:
+            archive.writestr("unexpected-source.rs", b"source")
+        with self.assertRaisesRegex(integrity.IntegrityError, "too many|unexpected"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_runtime_zip_limits_are_checked_before_zipfile_materialization(self) -> None:
+        stage_files = self.valid_stage_files()
+        package = stage_files[integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME]
+        encoded = bytearray(package.read_bytes())
+        endpoint = len(encoded) - 22
+        struct.pack_into("<HH", encoded, endpoint + 8, 9, 9)
+        package.write_bytes(encoded)
+        with (
+            mock.patch.object(
+                integrity.zipfile,
+                "ZipFile",
+                side_effect=AssertionError("ZipFile opened before entry bound"),
+            ),
+            self.assertRaisesRegex(integrity.IntegrityError, "too many entries"),
+        ):
+            integrity._inspect_runtime_package_archive(package, "windows-x86_64")
+
+        stage_files = self.valid_stage_files()
+        package = stage_files[integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME]
+        with (
+            mock.patch.object(
+                integrity, "MAX_RUNTIME_ZIP_CENTRAL_DIRECTORY_BYTES", 1
+            ),
+            mock.patch.object(
+                integrity.zipfile,
+                "ZipFile",
+                side_effect=AssertionError("ZipFile opened before directory bound"),
+            ),
+            self.assertRaisesRegex(integrity.IntegrityError, "central directory"),
+        ):
+            integrity._inspect_runtime_package_archive(package, "windows-x86_64")
+
+    def test_runtime_root_name_is_exact_and_windows_safe(self) -> None:
+        for invalid_root in ("CON", "runtime.", "runtime ", "bad\x01root"):
+            with self.subTest(root=repr(invalid_root)):
+                stage_files = self.valid_stage_files()
+                package = stage_files[integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME]
+                self.rewrite_windows_runtime_root(package, invalid_root)
+                with self.assertRaisesRegex(
+                    integrity.IntegrityError, "root directory|unsafe member"
+                ):
+                    integrity.validate_production_rc_artifacts(
+                        version="production-rc1",
+                        commit=self.commit,
+                        stage_files=stage_files,
+                    )
+
+    def test_runtime_tar_rejects_oversized_members_before_stream_advance(self) -> None:
+        stage_files = self.valid_stage_files()
+        package = stage_files[integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME]
+
+        def oversize(header: bytearray) -> None:
+            header[124:136] = f"{integrity.MAX_RUNTIME_BINARY_BYTES + 1:011o}\0".encode(
+                "ascii"
+            )
+
+        self.rewrite_linux_tar_header(package, "/cmfd-node", oversize)
+        with (
+            mock.patch.object(
+                integrity.tarfile,
+                "open",
+                side_effect=AssertionError(
+                    "tarfile.open called before oversized binary rejection"
+                ),
+            ) as tar_open,
+            self.assertRaisesRegex(integrity.IntegrityError, "size limit"),
+        ):
+            integrity._inspect_runtime_package_archive(package, "linux-x86_64")
+        tar_open.assert_not_called()
+
+    def test_runtime_tar_rejects_contiguous_file_type(self) -> None:
+        stage_files = self.valid_stage_files()
+        package = stage_files[integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME]
+
+        def contiguous(header: bytearray) -> None:
+            header[156:157] = tarfile.CONTTYPE
+
+        self.rewrite_linux_tar_header(package, "/cmfd-node", contiguous)
+        with self.assertRaisesRegex(integrity.IntegrityError, "type"):
+            integrity._inspect_runtime_package_archive(package, "linux-x86_64")
+
+    def test_runtime_tar_extensions_fail_before_payload_or_tarfile(self) -> None:
+        root = integrity.PRODUCTION_RC_RUNTIME_ROOTS["linux-x86_64"]
+        for member_type in (
+            tarfile.XHDTYPE,
+            tarfile.XGLTYPE,
+            tarfile.GNUTYPE_LONGNAME,
+        ):
+            with self.subTest(member_type=member_type):
+                stage_files = self.valid_stage_files()
+                package = stage_files[
+                    integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME
+                ]
+
+                def extension(header: bytearray) -> None:
+                    header[124:136] = tarfile.itn(
+                        integrity.MAX_ARCHIVE_MEMBER_BYTES + 1,
+                        12,
+                        tarfile.GNU_FORMAT,
+                    )
+                    header[156:157] = member_type
+
+                self.rewrite_linux_tar_header(package, root, extension)
+                with (
+                    mock.patch.object(
+                        integrity.tarfile,
+                        "open",
+                        side_effect=AssertionError(
+                            "tarfile.open called before extension rejection"
+                        ),
+                    ) as tar_open,
+                    self.assertRaisesRegex(integrity.IntegrityError, "wrong type"),
+                ):
+                    integrity._inspect_runtime_package_archive(
+                        package, "linux-x86_64"
+                    )
+                tar_open.assert_not_called()
+
+    def test_runtime_directory_metadata_must_be_canonical(self) -> None:
+        stage_files = self.valid_stage_files()
+        original = stage_files[integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME]
+        rows: list[tuple[tarfile.TarInfo, bytes | None]] = []
+        with tarfile.open(original, "r:gz") as source:
+            for member in source:
+                extracted = source.extractfile(member) if member.isreg() else None
+                rows.append((copy.copy(member), extracted.read() if extracted else None))
+        replacement = self.root / "noncanonical-runtime.tar.gz"
+        with (
+            replacement.open("wb") as raw,
+            gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=1_700_000_000
+            ) as zipped,
+            tarfile.open(fileobj=zipped, mode="w", format=tarfile.USTAR_FORMAT) as archive,
+        ):
+            for member, content in rows:
+                if member.isdir() and member.name.endswith("/production-v3"):
+                    member.mode = 0o700
+                archive.addfile(member, io.BytesIO(content) if content is not None else None)
+        stage_files[integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME] = replacement
+        with self.assertRaisesRegex(integrity.IntegrityError, "metadata"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_replacement_pins_cannot_bypass_qualification_binding(self) -> None:
+        stage_files = self.valid_stage_files()
+        network_path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        evidence_path = stage_files[integrity.PRODUCTION_V3_ACTIVATION_NAME]
+        network = json.loads(network_path.read_text(encoding="utf-8"))
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        replacement = integrity._sha256_bytes(b"replacement bank")
+        network["proof_of_work"]["artifacts"]["bank"]["sha256"] = replacement
+        evidence["artifacts"]["bank"]["sha256"] = replacement
+        self.write_json(integrity.PRODUCTION_V3_ACTIVATION_NAME, evidence)
+        network["proof_of_work"]["activation_evidence_sha256"] = (
+            integrity._sha256_file(evidence_path)
+        )
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(integrity.IntegrityError, "qualification evidence"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_packaged_node_attestation_is_required_and_cross_bound(self) -> None:
+        stage_files = self.valid_stage_files()
+        del stage_files[integrity.PRODUCTION_RC_LINUX_ATTESTATION_NAME]
+        with self.assertRaisesRegex(integrity.IntegrityError, "runtime package"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+        stage_files = self.valid_stage_files()
+        attestation_path = stage_files[integrity.PRODUCTION_RC_WINDOWS_ATTESTATION_NAME]
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        attestation["node_sha256"] = "ab" * 32
+        self.write_json(integrity.PRODUCTION_RC_WINDOWS_ATTESTATION_NAME, attestation)
+        with self.assertRaisesRegex(integrity.IntegrityError, "node_sha256"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+        stage_files = self.valid_stage_files()
+        attestation_path = stage_files[integrity.PRODUCTION_RC_LINUX_ATTESTATION_NAME]
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        network_bytes = base64.b64decode(attestation["network_info_base64"])
+        attested_network = json.loads(network_bytes)
+        attested_network["services"]["p2p_port"] += 1
+        network_bytes = (
+            json.dumps(attested_network, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        attestation["network_info_base64"] = base64.b64encode(network_bytes).decode(
+            "ascii"
+        )
+        attestation["network_info_sha256"] = integrity._sha256_bytes(network_bytes)
+        self.write_json(integrity.PRODUCTION_RC_LINUX_ATTESTATION_NAME, attestation)
+        with self.assertRaisesRegex(integrity.IntegrityError, "staged network identity"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_attestation_writer_runs_the_packaged_node(self) -> None:
+        package = self.root / "attested-package"
+        package.mkdir()
+        node = package / "cmfd-node.exe"
+        wallet = package / "common-foundry-wallet.exe"
+        worker = package / "cmfd-proof-worker.exe"
+        node.write_bytes(self.runtime_binary("windows-x86_64", "node"))
+        wallet.write_bytes(self.runtime_binary("windows-x86_64", "wallet"))
+        worker.write_bytes(self.WINDOWS_WORKER)
+        network_bytes = (
+            json.dumps(
+                {
+                    "proof_of_work": {
+                        "build_source_commit": self.commit,
+                        "runtime_verifier_worker_sha256": integrity._sha256_file(worker),
+                        "selection": "ProductionV3",
+                    }
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        output = self.root / integrity.PRODUCTION_RC_WINDOWS_ATTESTATION_NAME
+        completed = subprocess.CompletedProcess(
+            [str(node), "network-info"], 0, stdout=network_bytes, stderr=b""
+        )
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            attestation = integrity.create_runtime_network_info_attestation(
+                platform="windows-x86_64",
+                package_directory=package,
+                commit=self.commit,
+                output=output,
+            )
+        run.assert_called_once()
+        self.assertEqual(attestation["node_sha256"], integrity._sha256_file(node))
+        self.assertEqual(base64.b64decode(attestation["network_info_base64"]), network_bytes)
+
+    def test_runtime_packages_are_required_on_both_platforms(self) -> None:
+        for missing in (
+            integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME,
+            integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME,
+        ):
+            stage_files = self.valid_stage_files()
+            del stage_files[missing]
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                integrity.IntegrityError, "runtime package"
+            ):
+                integrity.validate_production_rc_artifacts(
+                    version="production-rc1",
+                    commit=self.commit,
+                    stage_files=stage_files,
+                )
+
+    def test_runtime_package_requires_the_exact_sidecar_layout(self) -> None:
+        stage_files = self.valid_stage_files()
+        replacement = self.write_runtime_package(
+            platform="linux-x86_64",
+            worker=self.LINUX_WORKER,
+            runtime_artifacts={
+                name: data
+                for name, data in self.RUNTIME_ARTIFACTS.items()
+                if name != integrity.PRODUCTION_V3_PACKAGE_RECORD_V2
+            },
+        )
+        stage_files[integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME] = replacement
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "layout mismatch|missing, reordered"
+        ):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_packaged_worker_must_match_staged_network_info(self) -> None:
+        stage_files = self.valid_stage_files()
+        replacement = self.write_runtime_package(
+            platform="windows-x86_64",
+            worker=pe_x86_64_fixture(b"different Windows proof worker"),
+            runtime_artifacts=self.RUNTIME_ARTIFACTS,
+        )
+        stage_files[integrity.PRODUCTION_RC_WINDOWS_RUNTIME_PACKAGE_NAME] = replacement
+        with self.assertRaisesRegex(integrity.IntegrityError, "proof worker"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_staged_platform_worker_pins_must_be_distinct(self) -> None:
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(path.read_text(encoding="utf-8"))
+        network["proof_of_work"]["runtime_verifier_workers"][
+            "linux_x86_64_sha256"
+        ] = network["proof_of_work"]["runtime_verifier_workers"][
+            "windows_x86_64_sha256"
+        ]
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "runtime_verifier_workers"
+        ):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_selected_worker_must_be_one_of_the_platform_pins(self) -> None:
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(path.read_text(encoding="utf-8"))
+        network["proof_of_work"]["runtime_verifier_worker_sha256"] = (
+            integrity._sha256_bytes(b"uncompiled proof worker")
+        )
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(integrity.IntegrityError, "not a compiled platform pin"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_packaged_artifact_blake3_must_match_staged_network_info(self) -> None:
+        stage_files = self.valid_stage_files()
+        path = stage_files[integrity.PRODUCTION_RC_NETWORK_INFO_NAME]
+        network = json.loads(path.read_text(encoding="utf-8"))
+        network["proof_of_work"]["artifacts"]["bank"]["blake3"] = "ab" * 32
+        self.write_json(integrity.PRODUCTION_RC_NETWORK_INFO_NAME, network)
+        with self.assertRaisesRegex(integrity.IntegrityError, "artifacts"):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
+
+    def test_packaged_artifact_must_match_staged_network_info(self) -> None:
+        stage_files = self.valid_stage_files()
+        replacement = self.write_runtime_package(
+            platform="linux-x86_64",
+            worker=self.LINUX_WORKER,
+            runtime_artifacts={
+                integrity.PRODUCTION_V3_PACKAGE_BANK: b"tampered production model bank",
+                integrity.PRODUCTION_V3_PACKAGE_MANIFEST: self.RUNTIME_ARTIFACTS[
+                    integrity.PRODUCTION_V3_PACKAGE_MANIFEST
+                ],
+                integrity.PRODUCTION_V3_PACKAGE_RECORD_V2: self.RUNTIME_ARTIFACTS[
+                    integrity.PRODUCTION_V3_PACKAGE_RECORD_V2
+                ],
+            },
+        )
+        stage_files[integrity.PRODUCTION_RC_LINUX_RUNTIME_PACKAGE_NAME] = replacement
+        with self.assertRaisesRegex(
+            integrity.IntegrityError, "model bank|MODEL-V2.bank"
+        ):
+            integrity.validate_production_rc_artifacts(
+                version="production-rc1", commit=self.commit, stage_files=stage_files
+            )
 
     def test_launch_candidate_unknown_fields_are_rejected(self) -> None:
         stage_files = self.valid_stage_files()

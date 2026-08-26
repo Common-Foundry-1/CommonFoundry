@@ -36,7 +36,7 @@ use thiserror::Error;
 
 use crate::{
     COMPILED_NETWORK_PROFILE, MAX_MINING_SEARCH_ATTEMPTS, MiningJob, NetworkProfile, Node,
-    NodeError, ProofProfile, devnet_params, unix_time_seconds,
+    NodeError, ProofProfile, devnet_params, submit_shared_tip_block, unix_time_seconds,
 };
 
 pub const POOL_PROTOCOL_VERSION: u16 = 1;
@@ -962,7 +962,7 @@ fn process_share(
     // Evaluation is intentionally outside the node lock. Recheck the active
     // parent afterwards, then keep the node lock through duplicate reservation
     // and ledger credit so P2P cannot advance the tip between those steps.
-    let mut node = shared
+    let node = shared
         .node
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
@@ -990,33 +990,57 @@ fn process_share(
         }
     }
 
-    let block_accepted = if let Some(block) = block {
-        node.submit_block(*block, unix_time_seconds()?)?;
-        true
-    } else {
-        false
+    let Some(block) = block else {
+        let session = credit_accepted_share(
+            &shared.ledger,
+            session_id,
+            false,
+            shared.test_credit_atoms_per_share,
+        )?;
+        drop(node);
+        return Ok(PoolShareResult {
+            job_id,
+            nonce,
+            accepted: true,
+            block_accepted: false,
+            code: "share_accepted".to_owned(),
+            session,
+        });
     };
+
+    // A ProductionV3 proof and side-branch reconstruction can take seconds.
+    // Release the shared node before the bounded verifier worker runs; the
+    // revision-bound helper rechecks the authoritative chain on commit.
+    drop(node);
+    match submit_shared_tip_block(&shared.node, *block, unix_time_seconds()?) {
+        Ok(_) => {}
+        Err(
+            NodeError::StaleBlockAdmission
+            | NodeError::DuplicateBlock(_)
+            | NodeError::UnknownParent(_),
+        ) => {
+            rotate_if_tip_changed(shared)?;
+            return rejected_result(shared, session_id, job_id, nonce, "stale_job");
+        }
+        Err(NodeError::ProofVerificationQueueFull | NodeError::ProofVerificationQueueTimeout) => {
+            return rejected_result(shared, session_id, job_id, nonce, "verifier_busy");
+        }
+        Err(error) => return Err(PoolError::Node(error)),
+    }
 
     let session = credit_accepted_share(
         &shared.ledger,
         session_id,
-        block_accepted,
+        true,
         shared.test_credit_atoms_per_share,
     )?;
-    drop(node);
-    if block_accepted {
-        rotate_if_tip_changed(shared)?;
-    }
+    rotate_if_tip_changed(shared)?;
     Ok(PoolShareResult {
         job_id,
         nonce,
         accepted: true,
-        block_accepted,
-        code: if block_accepted {
-            "block_accepted".to_owned()
-        } else {
-            "share_accepted".to_owned()
-        },
+        block_accepted: true,
+        code: "block_accepted".to_owned(),
         session,
     })
 }

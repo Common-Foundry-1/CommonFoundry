@@ -120,6 +120,11 @@ impl RuntimeState {
     }
 
     pub fn stop_services(&self) {
+        if let NodeAvailability::Ready(node) = &self.node
+            && let Ok(node) = node.lock()
+        {
+            node.shutdown_proof_verifier();
+        }
         if let Some(mining) = &self.mining {
             mining.stop_for_shutdown();
         }

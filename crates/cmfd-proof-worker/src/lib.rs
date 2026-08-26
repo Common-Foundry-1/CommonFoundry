@@ -23,9 +23,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-#[cfg(windows)]
-use std::sync::Weak;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -438,59 +436,67 @@ struct Capture {
 struct ContainedChild {
     child: Child,
     terminator: ProcessTerminator,
+    direct_kill_attempted: bool,
+    direct_child_reaped: bool,
 }
 
 #[derive(Clone)]
 struct ProcessTerminator {
-    #[cfg(unix)]
-    process_group: libc::pid_t,
-    #[cfg(windows)]
-    job: Arc<WindowsJob>,
+    target: Arc<Mutex<Option<ProcessTerminationTarget>>>,
 }
 
-#[derive(Clone)]
-struct NonOwningProcessTerminator {
+enum ProcessTerminationTarget {
     #[cfg(unix)]
-    process_group: libc::pid_t,
+    ProcessGroup(libc::pid_t),
     #[cfg(windows)]
-    job: Weak<WindowsJob>,
+    Job(Arc<WindowsJob>),
 }
 
 impl ProcessTerminator {
-    fn terminate_tree(&self) {
-        #[cfg(unix)]
-        // SAFETY: `process_group` is the positive child PID assigned as its
-        // new process-group ID before spawn. Negating it targets that group,
-        // never the parent process group.
-        unsafe {
-            libc::kill(-self.process_group, libc::SIGKILL);
+    #[cfg(unix)]
+    fn process_group(process_group: libc::pid_t) -> Self {
+        Self {
+            target: Arc::new(Mutex::new(Some(ProcessTerminationTarget::ProcessGroup(
+                process_group,
+            )))),
         }
-        #[cfg(windows)]
-        let _ = self.job.terminate();
     }
 
-    fn downgrade(&self) -> NonOwningProcessTerminator {
-        NonOwningProcessTerminator {
+    #[cfg(windows)]
+    fn job(job: Arc<WindowsJob>) -> Self {
+        Self {
+            target: Arc::new(Mutex::new(Some(ProcessTerminationTarget::Job(job)))),
+        }
+    }
+
+    /// Atomically disarms the process identity before using it. All cloned
+    /// handles share this slot, so shutdown, timeout, and Drop can never signal
+    /// a PID/process group after the direct child has been reaped and its ID
+    /// potentially reused.
+    fn terminate_tree(&self) -> bool {
+        let target = match self.target.lock() {
+            Ok(mut target) => target.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        match target {
             #[cfg(unix)]
-            process_group: self.process_group,
+            ProcessTerminationTarget::ProcessGroup(process_group) => {
+                // SAFETY: `process_group` is the positive child PID assigned
+                // as its new process-group ID before spawn. It was atomically
+                // disarmed above, so no later teardown can signal a reused ID.
+                unsafe {
+                    libc::kill(-process_group, libc::SIGKILL);
+                }
+            }
             #[cfg(windows)]
-            job: Arc::downgrade(&self.job),
+            ProcessTerminationTarget::Job(job) => {
+                let _ = job.terminate();
+            }
         }
-    }
-}
-
-impl NonOwningProcessTerminator {
-    fn terminate_tree(&self) {
-        #[cfg(unix)]
-        // SAFETY: this handle is only armed while the owning child is live.
-        // Its process group is the positive child PID selected before spawn.
-        unsafe {
-            libc::kill(-self.process_group, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        if let Some(job) = self.job.upgrade() {
-            let _ = job.terminate();
-        }
+        true
     }
 }
 
@@ -499,40 +505,30 @@ impl ContainedChild {
         self.terminator.clone()
     }
 
-    fn non_owning_termination_handle(&self) -> NonOwningProcessTerminator {
-        self.terminator.downgrade()
-    }
-
     fn terminate_tree(&mut self) {
         self.terminator.terminate_tree();
 
         // Retain a direct-child fallback for setup/platform edge cases. The
         // process-group/job operation above is what contains descendants.
-        let _ = self.child.kill();
+        if !self.direct_kill_attempted && !self.direct_child_reaped {
+            self.direct_kill_attempted = true;
+            let _ = self.child.kill();
+        }
     }
 
     fn terminate_and_reap(&mut self) {
         self.terminate_tree();
+        if self.direct_child_reaped {
+            return;
+        }
         let started = Instant::now();
-        let mut direct_child_reaped = false;
         loop {
-            if !direct_child_reaped {
-                match self.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => direct_child_reaped = true,
-                    Ok(None) => {}
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    self.direct_child_reaped = true;
+                    return;
                 }
-            }
-            #[cfg(windows)]
-            let process_tree_reaped = self
-                .terminator
-                .job
-                .active_processes()
-                .is_ok_and(|active| active == 0);
-            #[cfg(not(windows))]
-            let process_tree_reaped = direct_child_reaped;
-
-            if direct_child_reaped && process_tree_reaped {
-                return;
+                Ok(None) => {}
             }
             if started.elapsed() >= PROCESS_REAP_TIMEOUT {
                 return;
@@ -561,8 +557,8 @@ struct WindowsJob {
 unsafe impl Send for WindowsJob {}
 #[cfg(windows)]
 // SAFETY: Job Object operations accept a process-wide kernel handle and do not
-// expose aliased Rust memory. Concurrent terminate/query calls are supported by
-// the Win32 object contract, and the final Arc owner closes the handle once.
+// expose aliased Rust memory. The shared exactly-once terminator serializes the
+// terminate call, and the final Arc owner closes the handle once.
 unsafe impl Sync for WindowsJob {}
 
 #[cfg(windows)]
@@ -637,31 +633,6 @@ impl WindowsJob {
             Ok(())
         }
     }
-
-    fn active_processes(&self) -> io::Result<u32> {
-        use windows_sys::Win32::System::JobObjects::{
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-            QueryInformationJobObject,
-        };
-
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: `accounting` has the requested Win32 layout and remains live
-        // for the duration of the query. The return-length pointer is optional.
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.handle,
-                JobObjectBasicAccountingInformation,
-                std::ptr::from_mut(&mut accounting).cast(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if queried == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(accounting.ActiveProcesses)
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -720,7 +691,9 @@ fn spawn_contained(
         };
         Ok(ContainedChild {
             child,
-            terminator: ProcessTerminator { process_group },
+            terminator: ProcessTerminator::process_group(process_group),
+            direct_kill_attempted: false,
+            direct_child_reaped: false,
         })
     }
 
@@ -743,7 +716,9 @@ fn spawn_contained(
         }
         Ok(ContainedChild {
             child,
-            terminator: ProcessTerminator { job },
+            terminator: ProcessTerminator::job(job),
+            direct_kill_attempted: false,
+            direct_child_reaped: false,
         })
     }
 

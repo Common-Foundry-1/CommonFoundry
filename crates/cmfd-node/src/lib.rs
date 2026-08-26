@@ -5,7 +5,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,9 +20,10 @@ use cmfd_consensus::{
     ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, InputWitness, MAX_BLOCK_BYTES,
     MAX_FUTURE_OFFSET_SECS, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS,
     NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
-    PreverifiedBlockProof, TRANSACTION_VERSION, Transaction, TxInput, TxOutput, WireError,
-    add_chain_work, chain_work_bytes, decode_block, decode_transaction, encode_block,
-    encode_transaction, merkle_root, v2_reference_for_network, validate_block_resources,
+    PreverifiedBlockProof, SuccessorHeaderPreflight, TRANSACTION_VERSION, Transaction, TxInput,
+    TxOutput, WireError, add_chain_work, chain_work_bytes, decode_block, decode_transaction,
+    encode_block, encode_transaction, merkle_root, v2_reference_for_network,
+    validate_block_preamble, validate_block_resources,
 };
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::{
@@ -78,6 +79,11 @@ pub const MAX_OBSERVED_PEERS: usize = 64;
 pub const MAX_CONCURRENT_PROOF_VERIFICATIONS: usize = 1;
 /// Bounded waiters prevent peer floods from creating unbounded verifier work.
 pub const MAX_QUEUED_PROOF_VERIFICATIONS: usize = 8;
+/// Local tip submissions have a separate bounded lane so a full remote queue
+/// cannot crowd out a block already found by the wallet, miner, or pool.
+pub const MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS: usize = 2;
+pub const MAX_REJECTED_BLOCK_IDS: usize = 1_024;
+pub const MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE: usize = 8;
 pub const PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v3";
 pub const PRODUCTION_V3_PACKAGE_BANK: &str = "MODEL-V2.bank";
 pub const PRODUCTION_V3_PACKAGE_MANIFEST: &str = "MODEL-V2.manifest.json";
@@ -249,6 +255,10 @@ pub enum NodeError {
     UnknownParent([u8; 32]),
     #[error("block admission snapshot became stale while proof verification was in progress")]
     StaleBlockAdmission,
+    #[error("block was already rejected by deterministic consensus validation: {0:?}")]
+    CachedInvalidBlock([u8; 32]),
+    #[error("fork state reconstruction exceeded its bounded work slice; retry the candidate")]
+    ForkReconstructionDeferred,
     #[error("transaction is already in the mempool: {0:?}")]
     DuplicateMempoolTransaction([u8; 32]),
     #[error("transaction input conflicts with the first mempool spend: {0:?}")]
@@ -297,6 +307,8 @@ pub enum NodeError {
     ProofVerificationQueueTimeout,
     #[error("proof verification queue state is poisoned")]
     ProofVerificationQueuePoisoned,
+    #[error("proof verifier is shutting down")]
+    ProofVerifierShuttingDown,
     #[error("proof verifier panicked; the candidate was rejected")]
     ProofVerifierPanicked,
     #[error("external proof-verifier profile does not match the node consensus profile")]
@@ -355,6 +367,8 @@ impl NodeError {
             Self::DuplicateBlock(_) => ("duplicate_block", 409, false),
             Self::UnknownParent(_) => ("unknown_parent", 422, true),
             Self::StaleBlockAdmission => ("stale_block_admission", 409, true),
+            Self::CachedInvalidBlock(_) => ("cached_invalid_block", 422, false),
+            Self::ForkReconstructionDeferred => ("fork_reconstruction_deferred", 503, true),
             Self::DuplicateMempoolTransaction(_) => ("duplicate_mempool_transaction", 409, false),
             Self::MempoolInputConflict(_) => ("mempool_input_conflict", 409, false),
             Self::MempoolUnconfirmedInput(_) => ("mempool_unconfirmed_input", 422, true),
@@ -377,6 +391,7 @@ impl NodeError {
             Self::ProofVerificationQueueFull => ("proof_queue_full", 503, true),
             Self::ProofVerificationQueueTimeout => ("proof_queue_timeout", 503, true),
             Self::ProofVerificationQueuePoisoned => ("proof_queue_poisoned", 500, false),
+            Self::ProofVerifierShuttingDown => ("proof_verifier_shutting_down", 503, true),
             Self::ProofVerifierPanicked => ("proof_verifier_panicked", 500, false),
             Self::ProofVerifierWorker(VerifierWorkerError::ProofRejected(_)) => {
                 ("proof_rejected", 422, false)
@@ -422,7 +437,21 @@ impl NodeError {
 #[derive(Debug)]
 struct ProofVerificationQueueState {
     active: usize,
-    queued: usize,
+    closing: bool,
+    normal_queued: usize,
+    priority_queued: usize,
+    next_normal_ticket: u64,
+    serving_normal_ticket: u64,
+    cancelled_normal_tickets: HashSet<u64>,
+    next_priority_ticket: u64,
+    serving_priority_ticket: u64,
+    cancelled_priority_tickets: HashSet<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum ProofQueueClass {
+    Normal,
+    Priority,
 }
 
 #[derive(Debug)]
@@ -440,7 +469,15 @@ impl ProofVerificationQueue {
         Self {
             state: Mutex::new(ProofVerificationQueueState {
                 active: 0,
-                queued: 0,
+                closing: false,
+                normal_queued: 0,
+                priority_queued: 0,
+                next_normal_ticket: 0,
+                serving_normal_ticket: 0,
+                cancelled_normal_tickets: HashSet::new(),
+                next_priority_ticket: 0,
+                serving_priority_ticket: 0,
+                cancelled_priority_tickets: HashSet::new(),
             }),
             wake: Condvar::new(),
             max_active,
@@ -449,51 +486,217 @@ impl ProofVerificationQueue {
         }
     }
 
-    fn acquire(&self) -> Result<ProofVerificationPermit<'_>, NodeError> {
+    fn acquire(self: &Arc<Self>) -> Result<ProofVerificationPermit, NodeError> {
+        self.acquire_class(ProofQueueClass::Normal, self.wait_timeout)
+    }
+
+    fn acquire_priority(
+        self: &Arc<Self>,
+        wait_timeout: Duration,
+    ) -> Result<ProofVerificationPermit, NodeError> {
+        self.acquire_class(ProofQueueClass::Priority, wait_timeout)
+    }
+
+    fn acquire_class(
+        self: &Arc<Self>,
+        class: ProofQueueClass,
+        wait_timeout: Duration,
+    ) -> Result<ProofVerificationPermit, NodeError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
-        if state.active < self.max_active {
+        if state.closing {
+            return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        if state.active < self.max_active && state.normal_queued == 0 && state.priority_queued == 0
+        {
             state.active += 1;
-            return Ok(ProofVerificationPermit { queue: self });
+            return Ok(ProofVerificationPermit {
+                queue: Arc::clone(self),
+            });
         }
-        if state.queued >= self.max_queued {
-            return Err(NodeError::ProofVerificationQueueFull);
-        }
-
-        state.queued += 1;
+        let ticket = match class {
+            ProofQueueClass::Normal => {
+                if state.normal_queued >= self.max_queued {
+                    return Err(NodeError::ProofVerificationQueueFull);
+                }
+                let ticket = state.next_normal_ticket;
+                state.next_normal_ticket = state.next_normal_ticket.wrapping_add(1);
+                state.normal_queued += 1;
+                ticket
+            }
+            ProofQueueClass::Priority => {
+                if state.priority_queued >= MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS {
+                    return Err(NodeError::ProofVerificationQueueFull);
+                }
+                let ticket = state.next_priority_ticket;
+                state.next_priority_ticket = state.next_priority_ticket.wrapping_add(1);
+                state.priority_queued += 1;
+                ticket
+            }
+        };
         let (mut state, wait_result) = self
             .wake
-            .wait_timeout_while(state, self.wait_timeout, |state| {
-                state.active >= self.max_active
+            .wait_timeout_while(state, wait_timeout, |state| {
+                !state.closing
+                    && (state.active >= self.max_active
+                        || match class {
+                            ProofQueueClass::Normal => {
+                                state.priority_queued != 0 || state.serving_normal_ticket != ticket
+                            }
+                            ProofQueueClass::Priority => state.serving_priority_ticket != ticket,
+                        })
             })
             .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
-        state.queued -= 1;
-        if wait_result.timed_out() && state.active >= self.max_active {
+        if state.closing {
+            cancel_proof_ticket(&mut state, class, ticket);
+            return Err(NodeError::ProofVerifierShuttingDown);
+        }
+        if wait_result.timed_out()
+            && (state.active >= self.max_active
+                || match class {
+                    ProofQueueClass::Normal => {
+                        state.priority_queued != 0 || state.serving_normal_ticket != ticket
+                    }
+                    ProofQueueClass::Priority => state.serving_priority_ticket != ticket,
+                })
+        {
+            cancel_proof_ticket(&mut state, class, ticket);
+            self.wake.notify_all();
             return Err(NodeError::ProofVerificationQueueTimeout);
         }
+        serve_proof_ticket(&mut state, class);
         state.active += 1;
-        Ok(ProofVerificationPermit { queue: self })
+        self.wake.notify_all();
+        Ok(ProofVerificationPermit {
+            queue: Arc::clone(self),
+        })
     }
 
     fn counts(&self) -> Result<(usize, usize), NodeError> {
         self.state
             .lock()
-            .map(|state| (state.active, state.queued))
+            .map(|state| {
+                (
+                    state.active,
+                    state.normal_queued.saturating_add(state.priority_queued),
+                )
+            })
             .map_err(|_| NodeError::ProofVerificationQueuePoisoned)
+    }
+
+    fn close(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closing = true;
+        self.wake.notify_all();
+    }
+
+    fn ensure_open(&self) -> Result<(), NodeError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| NodeError::ProofVerificationQueuePoisoned)?;
+        if state.closing {
+            Err(NodeError::ProofVerifierShuttingDown)
+        } else {
+            Ok(())
+        }
     }
 }
 
-struct ProofVerificationPermit<'a> {
-    queue: &'a ProofVerificationQueue,
+fn cancel_proof_ticket(
+    state: &mut ProofVerificationQueueState,
+    class: ProofQueueClass,
+    ticket: u64,
+) {
+    match class {
+        ProofQueueClass::Normal => {
+            state.normal_queued = state.normal_queued.saturating_sub(1);
+            state.cancelled_normal_tickets.insert(ticket);
+            while state
+                .cancelled_normal_tickets
+                .remove(&state.serving_normal_ticket)
+            {
+                state.serving_normal_ticket = state.serving_normal_ticket.wrapping_add(1);
+            }
+        }
+        ProofQueueClass::Priority => {
+            state.priority_queued = state.priority_queued.saturating_sub(1);
+            state.cancelled_priority_tickets.insert(ticket);
+            while state
+                .cancelled_priority_tickets
+                .remove(&state.serving_priority_ticket)
+            {
+                state.serving_priority_ticket = state.serving_priority_ticket.wrapping_add(1);
+            }
+        }
+    }
 }
 
-impl Drop for ProofVerificationPermit<'_> {
+fn serve_proof_ticket(state: &mut ProofVerificationQueueState, class: ProofQueueClass) {
+    match class {
+        ProofQueueClass::Normal => {
+            state.normal_queued = state.normal_queued.saturating_sub(1);
+            state.serving_normal_ticket = state.serving_normal_ticket.wrapping_add(1);
+            while state
+                .cancelled_normal_tickets
+                .remove(&state.serving_normal_ticket)
+            {
+                state.serving_normal_ticket = state.serving_normal_ticket.wrapping_add(1);
+            }
+        }
+        ProofQueueClass::Priority => {
+            state.priority_queued = state.priority_queued.saturating_sub(1);
+            state.serving_priority_ticket = state.serving_priority_ticket.wrapping_add(1);
+            while state
+                .cancelled_priority_tickets
+                .remove(&state.serving_priority_ticket)
+            {
+                state.serving_priority_ticket = state.serving_priority_ticket.wrapping_add(1);
+            }
+        }
+    }
+}
+
+struct ProofVerificationPermit {
+    queue: Arc<ProofVerificationQueue>,
+}
+
+impl Drop for ProofVerificationPermit {
     fn drop(&mut self) {
         if let Ok(mut state) = self.queue.state.lock() {
             state.active = state.active.saturating_sub(1);
-            self.queue.wake.notify_one();
+            self.queue.wake.notify_all();
+        }
+    }
+}
+
+/// An owned queue reservation. Shared-node admission captures its revision
+/// only after this reservation is acquired and keeps it until commit, so
+/// queued candidates cannot all verify against one stale revision.
+struct BlockPreverificationPermit {
+    preverifier: BlockPreverifier,
+    _queue_permit: ProofVerificationPermit,
+}
+
+impl BlockPreverificationPermit {
+    fn preverify(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
+        validate_block_resources(block)?;
+        encode_block(block)?;
+        self.run_guarded(|| self.preverifier.preverify_unqueued(block))
+    }
+
+    fn run_guarded<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, NodeError>,
+    ) -> Result<T, NodeError> {
+        match catch_unwind(AssertUnwindSafe(operation)) {
+            Ok(result) => result,
+            Err(_) => Err(NodeError::ProofVerifierPanicked),
         }
     }
 }
@@ -504,6 +707,7 @@ impl Drop for ProofVerificationPermit<'_> {
 pub struct BlockPreverifier {
     verifier: ConsensusPowVerifier,
     queue: Arc<ProofVerificationQueue>,
+    reconstruction_queue: Arc<ProofVerificationQueue>,
     backend: Arc<RwLock<ProofVerificationBackend>>,
 }
 
@@ -512,6 +716,7 @@ enum ProofVerificationBackend {
     Unavailable,
     InProcess,
     External(PersistentVerifierWorker),
+    Stopped,
 }
 
 impl BlockPreverifier {
@@ -559,6 +764,7 @@ impl BlockPreverifier {
                 max_queued,
                 wait_timeout,
             )),
+            reconstruction_queue: Arc::new(ProofVerificationQueue::new(1, 2, wait_timeout)),
             backend: Arc::new(RwLock::new(backend)),
         }
     }
@@ -578,27 +784,44 @@ impl BlockPreverifier {
     }
 
     pub fn preverify(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
-        validate_block_resources(block)?;
-        encode_block(block)?;
-        self.run_guarded(|| self.preverify_unqueued(block))
+        self.reserve()?.preverify(block)
     }
 
-    /// Completes a ProductionV3 branch snapshot and verifies its exact proof
-    /// under one bounded admission permit. Side-branch replay therefore stays
-    /// outside the node mutex without escaping the verifier concurrency and
-    /// queue limits.
-    fn complete_admission_and_preverify(
-        &self,
-        block: &Block,
-        admission: ExternalBlockAdmissionWork,
-    ) -> Result<(ExternalBlockAdmission, PreverifiedBlockProof), NodeError> {
-        validate_block_resources(block)?;
-        encode_block(block)?;
-        self.run_guarded(|| {
-            let admission = admission.complete(block)?;
-            let preverified = self.preverify_unqueued(block)?;
-            Ok((admission, preverified))
+    fn reserve(&self) -> Result<BlockPreverificationPermit, NodeError> {
+        Ok(BlockPreverificationPermit {
+            preverifier: self.clone(),
+            _queue_permit: self.queue.acquire()?,
         })
+    }
+
+    fn reserve_priority(&self) -> Result<BlockPreverificationPermit, NodeError> {
+        let wait_timeout = match &*self
+            .backend
+            .read()
+            .map_err(|_| VerifierWorkerError::StatePoisoned)?
+        {
+            ProofVerificationBackend::External(worker) => {
+                worker.timeout().saturating_add(Duration::from_secs(5))
+            }
+            ProofVerificationBackend::Unavailable | ProofVerificationBackend::InProcess => {
+                self.queue.wait_timeout
+            }
+            ProofVerificationBackend::Stopped => {
+                return Err(NodeError::ProofVerifierShuttingDown);
+            }
+        };
+        Ok(BlockPreverificationPermit {
+            preverifier: self.clone(),
+            _queue_permit: self.queue.acquire_priority(wait_timeout)?,
+        })
+    }
+
+    fn reserve_reconstruction(&self) -> Result<ProofVerificationPermit, NodeError> {
+        self.reconstruction_queue.acquire()
+    }
+
+    fn ensure_reconstruction_open(&self) -> Result<(), NodeError> {
+        self.reconstruction_queue.ensure_open()
     }
 
     fn preverify_unqueued(&self, block: &Block) -> Result<PreverifiedBlockProof, NodeError> {
@@ -609,6 +832,7 @@ impl BlockPreverifier {
             .clone();
         match backend {
             ProofVerificationBackend::Unavailable => Err(NodeError::ProductionV3Unavailable),
+            ProofVerificationBackend::Stopped => Err(NodeError::ProofVerifierShuttingDown),
             ProofVerificationBackend::InProcess => self
                 .verifier
                 .preverify(&block.challenge, &block.proof)
@@ -619,15 +843,12 @@ impl BlockPreverifier {
         }
     }
 
+    #[cfg(test)]
     fn run_guarded<T>(
         &self,
         operation: impl FnOnce() -> Result<T, NodeError>,
     ) -> Result<T, NodeError> {
-        let _permit = self.queue.acquire()?;
-        match catch_unwind(AssertUnwindSafe(operation)) {
-            Ok(result) => result,
-            Err(_) => Err(NodeError::ProofVerifierPanicked),
-        }
+        self.reserve()?.run_guarded(operation)
     }
 
     fn backend_status(&self) -> Result<(&'static str, Option<u64>, Option<u64>), NodeError> {
@@ -637,6 +858,7 @@ impl BlockPreverifier {
             .map_err(|_| VerifierWorkerError::StatePoisoned)?;
         Ok(match &*backend {
             ProofVerificationBackend::Unavailable => ("unavailable", None, None),
+            ProofVerificationBackend::Stopped => ("stopped", None, None),
             ProofVerificationBackend::InProcess => ("in_process", None, None),
             ProofVerificationBackend::External(worker) => (
                 "external_worker",
@@ -644,6 +866,33 @@ impl BlockPreverifier {
                 Some(worker.memory_limit_bytes()),
             ),
         })
+    }
+
+    fn shutdown(&self) {
+        self.queue.close();
+        self.reconstruction_queue.close();
+        let worker = match self.backend.write() {
+            Ok(mut backend) => {
+                match std::mem::replace(&mut *backend, ProofVerificationBackend::Stopped) {
+                    ProofVerificationBackend::External(worker) => Some(worker),
+                    ProofVerificationBackend::Unavailable
+                    | ProofVerificationBackend::InProcess
+                    | ProofVerificationBackend::Stopped => None,
+                }
+            }
+            Err(poisoned) => {
+                let mut backend = poisoned.into_inner();
+                match std::mem::replace(&mut *backend, ProofVerificationBackend::Stopped) {
+                    ProofVerificationBackend::External(worker) => Some(worker),
+                    ProofVerificationBackend::Unavailable
+                    | ProofVerificationBackend::InProcess
+                    | ProofVerificationBackend::Stopped => None,
+                }
+            }
+        };
+        if let Some(worker) = worker {
+            worker.close();
+        }
     }
 }
 
@@ -1664,6 +1913,8 @@ pub struct Node {
     mempool_bytes: usize,
     log: File,
     storage_faulted: bool,
+    rejected_block_ids: HashSet<[u8; 32]>,
+    rejected_block_order: VecDeque<[u8; 32]>,
     public_peer_mode: bool,
     peer_observations: BTreeMap<PeerObservationKey, PeerObservationRecord>,
     _lock: DataDirLock,
@@ -1682,14 +1933,15 @@ struct IndexedBlock {
     accepted_at: u64,
     canonical: Arc<[u8]>,
     cumulative_work: U512,
+    successor_header: SuccessorHeaderPreflight,
+    /// Binary-lifting ancestors. Entry `k` is the `2^k`-th ancestor, allowing
+    /// bounded checkpoint slices to be selected without a height-linear walk
+    /// under the node mutex.
+    ancestors: Vec<[u8; 32]>,
     /// Process-local evidence that this exact proof was accepted. Production
     /// entries always carry it; Devnet entries may use their in-process V2
     /// verifier instead.
     preverified: Option<PreverifiedBlockProof>,
-    /// Immutable ancestry used to snapshot a side branch in O(1) while the
-    /// shared node mutex is held. Traversal and state reconstruction happen
-    /// after releasing that mutex.
-    previous: Option<Weak<IndexedBlock>>,
 }
 
 #[derive(Debug)]
@@ -1700,6 +1952,23 @@ struct BlockIndex {
     /// index zero.
     active_chain: Vec<[u8; 32]>,
     active_work: U512,
+}
+
+#[derive(Debug)]
+struct BranchStateCheckpoint {
+    block_id: [u8; 32],
+    state: Box<ChainState>,
+    path: Vec<[u8; 32]>,
+}
+
+#[derive(Debug)]
+struct BranchStatePlan {
+    /// `None` denotes virtual genesis, which is cheap to reconstruct.
+    base: Option<Box<ChainState>>,
+    path: Vec<[u8; 32]>,
+    replay: Vec<Arc<IndexedBlock>>,
+    target_parent: [u8; 32],
+    reaches_target: bool,
 }
 
 impl BlockIndex {
@@ -1753,6 +2022,132 @@ impl BlockIndex {
             .iter()
             .position(|candidate| *candidate == block_id)
     }
+
+    fn ancestor_at_height(&self, tip: [u8; 32], target_height: u64) -> Result<[u8; 32], NodeError> {
+        if tip == self.genesis {
+            return (target_height == 0)
+                .then_some(self.genesis)
+                .ok_or_else(|| NodeError::CorruptLog("genesis has no descendants".to_owned()));
+        }
+        let mut cursor = tip;
+        let tip_height = self
+            .blocks
+            .get(&tip)
+            .ok_or(NodeError::UnknownParent(tip))?
+            .height;
+        let mut distance = tip_height.checked_sub(target_height).ok_or_else(|| {
+            NodeError::CorruptLog("ancestor height is above the indexed tip".to_owned())
+        })?;
+        let mut bit = 0_usize;
+        while distance != 0 {
+            if distance & 1 != 0 {
+                let entry = self.blocks.get(&cursor).ok_or_else(|| {
+                    NodeError::CorruptLog("ancestor table refers to an absent block".to_owned())
+                })?;
+                cursor = *entry.ancestors.get(bit).ok_or_else(|| {
+                    NodeError::CorruptLog("ancestor table is shorter than its height".to_owned())
+                })?;
+            }
+            distance >>= 1;
+            bit = bit.saturating_add(1);
+        }
+        Ok(cursor)
+    }
+
+    fn ancestor_table(&self, parent: [u8; 32]) -> Result<Vec<[u8; 32]>, NodeError> {
+        let mut ancestors = vec![parent];
+        let mut level = 1_usize;
+        while let Some(previous) = ancestors.get(level - 1).copied() {
+            if previous == self.genesis {
+                break;
+            }
+            let previous_entry = self
+                .blocks
+                .get(&previous)
+                .ok_or(NodeError::UnknownParent(previous))?;
+            let Some(ancestor) = previous_entry.ancestors.get(level - 1).copied() else {
+                break;
+            };
+            ancestors.push(ancestor);
+            level = level.saturating_add(1);
+        }
+        Ok(ancestors)
+    }
+
+    /// Captures one bounded, resumable slice toward `parent`. The optional
+    /// work-local checkpoint is moved, never cloned. It must describe the
+    /// exact ancestry already reconstructed by this admission.
+    fn branch_state_plan(
+        &self,
+        parent: [u8; 32],
+        checkpoint: Option<BranchStateCheckpoint>,
+    ) -> Result<BranchStatePlan, NodeError> {
+        if parent == self.genesis {
+            if checkpoint.is_some() {
+                return Err(NodeError::StaleBlockAdmission);
+            }
+            return Ok(BranchStatePlan {
+                base: None,
+                path: vec![self.genesis],
+                replay: Vec::new(),
+                target_parent: parent,
+                reaches_target: true,
+            });
+        }
+
+        let parent_height = self
+            .blocks
+            .get(&parent)
+            .ok_or(NodeError::UnknownParent(parent))?
+            .height;
+        let (base_height, base, path) = match checkpoint {
+            Some(checkpoint) => {
+                let usable = checkpoint.state.tip() == checkpoint.block_id
+                    && checkpoint.path.last() == Some(&checkpoint.block_id)
+                    && checkpoint.path.first() == Some(&self.genesis)
+                    && self.blocks.get(&checkpoint.block_id).is_some_and(|entry| {
+                        entry.preverified.is_some()
+                            && entry.height <= parent_height
+                            && usize::try_from(entry.height)
+                                .ok()
+                                .and_then(|height| height.checked_add(1))
+                                == Some(checkpoint.path.len())
+                    })
+                    && self.blocks.get(&checkpoint.block_id).is_some_and(|entry| {
+                        self.ancestor_at_height(parent, entry.height)
+                            .is_ok_and(|ancestor| ancestor == checkpoint.block_id)
+                    });
+                if usable {
+                    let height = self.blocks[&checkpoint.block_id].height;
+                    (height, Some(checkpoint.state), checkpoint.path)
+                } else {
+                    (0, None, vec![self.genesis])
+                }
+            }
+            None => (0, None, vec![self.genesis]),
+        };
+        let end_height = parent_height
+            .min(base_height.saturating_add(MAX_EXTERNAL_RECONSTRUCTION_BLOCKS_PER_SLICE as u64));
+        let mut replay = Vec::with_capacity(
+            usize::try_from(end_height.saturating_sub(base_height)).unwrap_or(0),
+        );
+        for height in base_height.saturating_add(1)..=end_height {
+            let block_id = self.ancestor_at_height(parent, height)?;
+            replay.push(
+                self.blocks
+                    .get(&block_id)
+                    .cloned()
+                    .ok_or(NodeError::UnknownParent(block_id))?,
+            );
+        }
+        Ok(BranchStatePlan {
+            base,
+            path,
+            replay,
+            target_parent: parent,
+            reaches_target: end_height == parent_height,
+        })
+    }
 }
 
 enum ValidatedCandidate {
@@ -1771,6 +2166,7 @@ struct PreparedBlock {
     canonical: Vec<u8>,
     cumulative_work: U512,
     preverified: Option<PreverifiedBlockProof>,
+    ancestors: Vec<[u8; 32]>,
     activation_chain: Option<Vec<[u8; 32]>>,
     candidate: ValidatedCandidate,
 }
@@ -1788,8 +2184,7 @@ struct BlockPreparationContext<'a> {
 #[derive(Debug)]
 enum AdmissionStateSnapshot {
     Active,
-    BranchGenesis,
-    Branch(Arc<IndexedBlock>),
+    Branch(BranchStatePlan),
 }
 
 /// Immutable, revision-bound work captured while holding the shared node
@@ -1818,30 +2213,52 @@ pub(crate) struct ExternalBlockAdmission {
     activation_chain: Option<Vec<[u8; 32]>>,
 }
 
+enum ExternalBlockAdmissionProgress {
+    Ready(ExternalBlockAdmission),
+    Checkpoint { checkpoint: BranchStateCheckpoint },
+}
+
+#[cfg(test)]
+impl ExternalBlockAdmissionProgress {
+    fn into_ready(self) -> ExternalBlockAdmission {
+        match self {
+            Self::Ready(admission) => admission,
+            Self::Checkpoint { .. } => panic!("test admission unexpectedly required another slice"),
+        }
+    }
+}
+
 impl ExternalBlockAdmissionWork {
-    pub(crate) fn complete(self, block: &Block) -> Result<ExternalBlockAdmission, NodeError> {
+    fn requires_reconstruction(&self) -> bool {
+        matches!(&self.state_snapshot, AdmissionStateSnapshot::Branch(_))
+    }
+
+    pub(crate) fn complete(
+        self,
+        block: &Block,
+    ) -> Result<ExternalBlockAdmissionProgress, NodeError> {
         if block.block_id() != self.block_id || block.challenge.previous_block != self.parent {
             return Err(NodeError::StaleBlockAdmission);
         }
-        let (branch_state, activation_chain) = match self.state_snapshot {
-            AdmissionStateSnapshot::Active => (None, None),
-            AdmissionStateSnapshot::BranchGenesis => {
-                let state = ChainState::new(self.params, self.verifier)?;
-                state.preflight_block(
-                    block,
-                    BlockValidationContext {
-                        now_unix_seconds: self.accepted_at,
-                    },
-                )?;
-                let chain = vec![self.params.genesis_hash, self.block_id];
-                (Some(Box::new(state)), Some(chain))
-            }
-            AdmissionStateSnapshot::Branch(tip) => {
-                let (state, path) =
-                    rebuild_state_from_snapshot(self.params, &self.verifier, Arc::clone(&tip))?;
+        let (branch_state, reconstructed_path) = match self.state_snapshot {
+            AdmissionStateSnapshot::Active => (None, Vec::new()),
+            AdmissionStateSnapshot::Branch(plan) => {
+                let target_parent = plan.target_parent;
+                let reaches_target = plan.reaches_target;
+                let (state, path) = complete_branch_state_plan(self.params, &self.verifier, plan)?;
+                if !reaches_target {
+                    let block_id = state.tip();
+                    return Ok(ExternalBlockAdmissionProgress::Checkpoint {
+                        checkpoint: BranchStateCheckpoint {
+                            block_id,
+                            state: Box::new(state),
+                            path,
+                        },
+                    });
+                }
                 if state.tip() != self.parent {
                     return Err(NodeError::CorruptLog(
-                        "captured fork snapshot does not end at the requested parent".to_owned(),
+                        "captured fork state does not end at the requested parent".to_owned(),
                     ));
                 }
                 state.preflight_block(
@@ -1850,22 +2267,84 @@ impl ExternalBlockAdmissionWork {
                         now_unix_seconds: self.accepted_at,
                     },
                 )?;
-                let mut chain = Vec::with_capacity(path.len().saturating_add(2));
-                chain.push(self.params.genesis_hash);
-                chain.extend(path);
-                chain.push(self.block_id);
-                (Some(Box::new(state)), Some(chain))
+                if target_parent != self.parent {
+                    return Err(NodeError::CorruptLog(
+                        "captured fork plan targets another parent".to_owned(),
+                    ));
+                }
+                (Some(Box::new(state)), path)
             }
         };
-        Ok(ExternalBlockAdmission {
-            revision: self.revision,
-            block_id: self.block_id,
-            parent: self.parent,
-            accepted_at: self.accepted_at,
-            branch_state,
-            activation_chain,
-        })
+        let activation_chain = branch_state.as_ref().map(|_| {
+            let mut chain = reconstructed_path;
+            let expected = usize::try_from(block.challenge.height)
+                .unwrap_or(0)
+                .saturating_add(1);
+            chain.reserve(expected.saturating_sub(chain.len()));
+            chain.push(self.block_id);
+            chain
+        });
+        Ok(ExternalBlockAdmissionProgress::Ready(
+            ExternalBlockAdmission {
+                revision: self.revision,
+                block_id: self.block_id,
+                parent: self.parent,
+                accepted_at: self.accepted_at,
+                branch_state,
+                activation_chain,
+            },
+        ))
     }
+}
+
+fn complete_branch_state_plan(
+    params: NetworkParams,
+    verifier: &ConsensusPowVerifier,
+    plan: BranchStatePlan,
+) -> Result<(ChainState, Vec<[u8; 32]>), NodeError> {
+    let mut state = match plan.base {
+        Some(base) => *base,
+        None => ChainState::new(params, verifier.clone())?,
+    };
+    let mut path = plan.path;
+    for entry in plan.replay {
+        if state.tip() != entry.parent {
+            return Err(NodeError::CorruptLog(
+                "bounded fork reconstruction has inconsistent ancestry".to_owned(),
+            ));
+        }
+        let block = decode_block(entry.canonical.as_ref(), params.network_id).map_err(|error| {
+            NodeError::CorruptLog(format!("captured indexed block cannot decode: {error}"))
+        })?;
+        if block.block_id() != entry.block_id
+            || block.challenge.previous_block != entry.parent
+            || block.challenge.height != entry.height
+        {
+            return Err(NodeError::CorruptLog(
+                "captured indexed block metadata does not match its canonical frame".to_owned(),
+            ));
+        }
+        let preverified = entry.preverified.as_ref().ok_or_else(|| {
+            NodeError::CorruptLog(
+                "production fork reconstruction is missing external proof evidence".to_owned(),
+            )
+        })?;
+        let validated = state.validate_block_preverified(
+            &block,
+            BlockValidationContext {
+                now_unix_seconds: entry.accepted_at,
+            },
+            preverified,
+        )?;
+        state.commit_validated(validated)?;
+        if state.successor_header_preflight()? != entry.successor_header {
+            return Err(NodeError::CorruptLog(
+                "captured production fork header snapshot does not match replayed state".to_owned(),
+            ));
+        }
+        path.push(entry.block_id);
+    }
+    Ok((state, path))
 }
 
 fn requires_external_preverification(params: &NetworkParams) -> bool {
@@ -2120,6 +2599,8 @@ impl Node {
             mempool_bytes: 0,
             log,
             storage_faulted: false,
+            rejected_block_ids: HashSet::new(),
+            rejected_block_order: VecDeque::new(),
             public_peer_mode: false,
             peer_observations: BTreeMap::new(),
             _lock: lock,
@@ -2163,6 +2644,13 @@ impl Node {
 
     pub fn block_preverifier(&self) -> BlockPreverifier {
         self.block_preverifier.clone()
+    }
+
+    /// Permanently closes proof admission and terminates the current external
+    /// verifier generation. Service owners call this before joining RPC/P2P
+    /// threads so queued requests cannot restart a worker during shutdown.
+    pub fn shutdown_proof_verifier(&self) {
+        self.block_preverifier.shutdown();
     }
 
     /// Enables hash-pinned, killable proof verification for Devnet testing.
@@ -2230,7 +2718,11 @@ impl Node {
             proof_verification_active,
             proof_verification_queued,
             proof_verification_capacity: self.block_preverifier.queue.max_active,
-            proof_verification_queue_capacity: self.block_preverifier.queue.max_queued,
+            proof_verification_queue_capacity: self
+                .block_preverifier
+                .queue
+                .max_queued
+                .saturating_add(MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS),
             proof_verification_mode,
             proof_verification_timeout_ms,
             proof_verification_memory_limit_bytes,
@@ -3165,64 +3657,116 @@ impl Node {
 
     pub fn submit_block(&mut self, block: Block, accepted_at: u64) -> Result<u64, NodeError> {
         if matches!(self.profile.proof, ProofProfile::ProductionV3) {
-            let admission_work = self
-                .begin_external_block_admission(&block, accepted_at)?
-                .ok_or(NodeError::ProductionV3Unavailable)?;
-            let (admission, preverified) = self
-                .block_preverifier
-                .complete_admission_and_preverify(&block, admission_work)?;
-            return self.submit_preverified_block_with_admission(
-                block,
-                accepted_at,
-                preverified,
-                admission,
-            );
+            // A caller may already hold an Arc<Mutex<Node>> guard. Acquiring
+            // the proof permit here would invert the canonical permit->node
+            // lock order and can deadlock another shared submission. Live
+            // ProductionV3 callers must use `submit_shared_block`.
+            return Err(NodeError::ProductionV3Unavailable);
         }
         self.submit_block_with_preverification(block, accepted_at, None, None, None)
     }
 
-    /// Rejects cheap duplicate, ancestry, header, and active-state failures
-    /// before dispatching an expensive external proof verification. This is
-    /// only an admission gate: `submit_block_with_preverification` repeats the
-    /// authoritative consensus checks after the worker returns.
-    pub(crate) fn begin_external_block_admission(
+    /// Rejects cheap duplicate, ancestry, and successor-header failures before
+    /// dispatching an expensive external proof verification. This is only an
+    /// admission gate: stateful validation happens outside the node mutex after
+    /// the worker accepts the proof, and `submit_block_with_preverification`
+    /// repeats every authoritative consensus check when committing.
+    pub(crate) fn preflight_external_block_admission(
         &self,
         block: &Block,
         accepted_at: u64,
-    ) -> Result<Option<ExternalBlockAdmissionWork>, NodeError> {
+    ) -> Result<(), NodeError> {
         let block_id = block.block_id();
         if self.index.contains(block_id) {
             return Err(NodeError::DuplicateBlock(block_id));
         }
+        if self.rejected_block_ids.contains(&block_id) {
+            return Err(NodeError::CachedInvalidBlock(block_id));
+        }
         if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
-            return Ok(None);
+            return Ok(());
         }
         if self.storage_faulted {
             return Err(NodeError::StorageFaulted);
         }
         validate_block_resources(block)?;
         encode_block(block)?;
+        validate_block_preamble(block, self.params.network_id)?;
         let parent = block.challenge.previous_block;
         self.index
             .work_at(parent)
             .ok_or(NodeError::UnknownParent(parent))?;
-        let state_snapshot = if parent == self.state.tip() {
-            self.state.preflight_block(
-                block,
-                BlockValidationContext {
-                    now_unix_seconds: accepted_at,
-                },
-            )?;
-            AdmissionStateSnapshot::Active
-        } else if parent == self.index.genesis {
-            AdmissionStateSnapshot::BranchGenesis
+        let validation_context = BlockValidationContext {
+            now_unix_seconds: accepted_at,
+        };
+        if parent == self.state.tip() {
+            self.state
+                .successor_header_preflight()?
+                .preflight_block(block, validation_context)?;
         } else {
-            AdmissionStateSnapshot::Branch(Arc::clone(
-                self.index
+            if parent == self.index.genesis {
+                ChainState::new(self.params, self.verifier.clone())?
+                    .successor_header_preflight()?
+                    .preflight_block(block, validation_context)?;
+            } else {
+                let parent_entry = self
+                    .index
                     .blocks
                     .get(&parent)
-                    .ok_or(NodeError::UnknownParent(parent))?,
-            ))
+                    .ok_or(NodeError::UnknownParent(parent))?;
+                if parent_entry.preverified.is_none() {
+                    return Err(NodeError::CorruptLog(
+                        "production fork parent is missing external proof evidence".to_owned(),
+                    ));
+                }
+                parent_entry
+                    .successor_header
+                    .preflight_block(block, validation_context)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_external_block_admission(
+        &self,
+        block: &Block,
+        accepted_at: u64,
+    ) -> Result<Option<ExternalBlockAdmissionWork>, NodeError> {
+        self.begin_external_block_admission_from_checkpoint(block, accepted_at, None)
+    }
+
+    fn continue_external_block_admission(
+        &self,
+        block: &Block,
+        accepted_at: u64,
+        checkpoint: BranchStateCheckpoint,
+    ) -> Result<ExternalBlockAdmissionWork, NodeError> {
+        self.begin_external_block_admission_from_checkpoint(block, accepted_at, Some(checkpoint))?
+            .ok_or(NodeError::ProofVerifierProfileMismatch)
+    }
+
+    fn begin_external_block_admission_from_checkpoint(
+        &self,
+        block: &Block,
+        accepted_at: u64,
+        checkpoint: Option<BranchStateCheckpoint>,
+    ) -> Result<Option<ExternalBlockAdmissionWork>, NodeError> {
+        self.preflight_external_block_admission(block, accepted_at)?;
+        if !matches!(self.profile.proof, ProofProfile::ProductionV3) {
+            if checkpoint.is_some() {
+                return Err(NodeError::ProofVerifierProfileMismatch);
+            }
+            return Ok(None);
+        }
+        let block_id = block.block_id();
+        let parent = block.challenge.previous_block;
+        let state_snapshot = if parent == self.state.tip() {
+            if checkpoint.is_some() {
+                return Err(NodeError::StaleBlockAdmission);
+            }
+            AdmissionStateSnapshot::Active
+        } else {
+            AdmissionStateSnapshot::Branch(self.index.branch_state_plan(parent, checkpoint)?)
         };
         Ok(Some(ExternalBlockAdmissionWork {
             revision: self.chain_revision,
@@ -3233,6 +3777,17 @@ impl Node {
             verifier: self.verifier.clone(),
             state_snapshot,
         }))
+    }
+
+    fn remember_rejected_block(&mut self, block_id: [u8; 32]) {
+        if self.rejected_block_ids.insert(block_id) {
+            self.rejected_block_order.push_back(block_id);
+        }
+        while self.rejected_block_order.len() > MAX_REJECTED_BLOCK_IDS {
+            if let Some(expired) = self.rejected_block_order.pop_front() {
+                self.rejected_block_ids.remove(&expired);
+            }
+        }
     }
 
     /// Consumes process-local proof evidence produced outside the node lock.
@@ -3321,12 +3876,12 @@ impl Node {
             return Err(io_error("sync block record", &log_path, source));
         }
         match commit_prepared(&mut self.state, &mut self.index, prepared) {
-            Ok(fees) => {
+            Ok(outcome) => {
                 self.chain_revision = next_revision;
                 if self.state.tip() != previous_tip {
                     self.revalidate_mempool(&confirmed_txids);
                 }
-                Ok(fees)
+                Ok(outcome.fees)
             }
             Err(error) => {
                 // The record is already durable. Refuse further work so a
@@ -3465,6 +4020,188 @@ fn select_send_utxos(
     })
 }
 
+/// Submits a block to a mutex-shared node without holding the node mutex while
+/// proof verification or ProductionV3 side-branch reconstruction runs.
+///
+/// Callers must not retain another guard for `shared` while invoking this
+/// function. Production admission is revision-bound and all consensus checks
+/// are repeated after the mutex is reacquired, so a concurrent chain update
+/// fails closed instead of committing against stale state.
+pub fn submit_shared_block(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    accepted_at: u64,
+) -> Result<u64, NodeError> {
+    submit_shared_block_with_policy(shared, block, accepted_at, SharedBlockPolicy::AnyBranch)
+}
+
+/// Submits only if the candidate extends the active tip observed after it
+/// acquires the proof permit. Mining callers use this policy so a concurrent
+/// winning block cannot turn their candidate into a credited side branch.
+pub fn submit_shared_tip_block(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    accepted_at: u64,
+) -> Result<u64, NodeError> {
+    submit_shared_block_with_policy(shared, block, accepted_at, SharedBlockPolicy::ActiveTipOnly)
+}
+
+#[derive(Clone, Copy)]
+enum SharedBlockPolicy {
+    AnyBranch,
+    ActiveTipOnly,
+}
+
+fn submit_shared_block_with_policy(
+    shared: &Arc<Mutex<Node>>,
+    block: Block,
+    accepted_at: u64,
+    policy: SharedBlockPolicy,
+) -> Result<u64, NodeError> {
+    let block_id = block.block_id();
+    let (block_preverifier, production_v3) = {
+        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        (
+            node.block_preverifier(),
+            matches!(node.profile.proof, ProofProfile::ProductionV3),
+        )
+    };
+    if production_v3 {
+        // Keep trivial duplicates, cached deterministic rejects, unknown
+        // parents, malformed bodies, and impossible headers out of the scarce
+        // proof queue. This snapshot is deliberately discarded and repeated
+        // authoritatively after the permit is acquired.
+        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+            && block.challenge.previous_block != node.state.tip()
+        {
+            return Err(NodeError::StaleBlockAdmission);
+        }
+        node.preflight_external_block_admission(&block, accepted_at)?;
+    }
+    // The scarce verifier reservation is released immediately after proof verification;
+    // side-state replay uses a separate bounded lane so a proof-valid deep fork
+    // cannot monopolize proof admission.
+    let permit = match policy {
+        SharedBlockPolicy::AnyBranch => block_preverifier.reserve()?,
+        SharedBlockPolicy::ActiveTipOnly => block_preverifier.reserve_priority()?,
+    };
+    {
+        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+            && block.challenge.previous_block != node.state.tip()
+        {
+            return Err(NodeError::StaleBlockAdmission);
+        }
+        if production_v3 {
+            node.preflight_external_block_admission(&block, accepted_at)?;
+        }
+    }
+    let preverified = match permit.preverify(&block) {
+        Ok(preverified) => preverified,
+        Err(error) => {
+            if production_v3
+                && (is_cacheable_proof_rejection(&error) || is_cacheable_block_rejection(&error))
+            {
+                shared
+                    .lock()
+                    .map_err(|_| NodeError::SharedNodePoisoned)?
+                    .remember_rejected_block(block_id);
+            }
+            return Err(error);
+        }
+    };
+    drop(permit);
+
+    let admission_work = {
+        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+            && block.challenge.previous_block != node.state.tip()
+        {
+            return Err(NodeError::StaleBlockAdmission);
+        }
+        node.begin_external_block_admission(&block, accepted_at)?
+    };
+
+    let admission = match admission_work {
+        Some(mut work) => {
+            let _reconstruction_permit = work
+                .requires_reconstruction()
+                .then(|| block_preverifier.reserve_reconstruction())
+                .transpose()?;
+            loop {
+                let progress = match catch_unwind(AssertUnwindSafe(|| work.complete(&block))) {
+                    Ok(result) => result?,
+                    Err(_) => return Err(NodeError::ProofVerifierPanicked),
+                };
+                match progress {
+                    ExternalBlockAdmissionProgress::Ready(admission) => break Some(admission),
+                    ExternalBlockAdmissionProgress::Checkpoint { checkpoint } => {
+                        block_preverifier.ensure_reconstruction_open()?;
+                        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+                        if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+                            && block.challenge.previous_block != node.state.tip()
+                        {
+                            return Err(NodeError::StaleBlockAdmission);
+                        }
+                        work = node.continue_external_block_admission(
+                            &block,
+                            accepted_at,
+                            checkpoint,
+                        )?;
+                    }
+                }
+            }
+        }
+        None => None,
+    };
+    let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+    if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
+        && block.challenge.previous_block != node.state.tip()
+    {
+        return Err(NodeError::StaleBlockAdmission);
+    }
+    let externally_admitted = admission.is_some();
+    let result = match admission {
+        Some(mut admission) => {
+            if admission.branch_state.is_some() {
+                node.preflight_external_block_admission(&block, accepted_at)?;
+                admission.revision = node.chain_revision;
+                if block.challenge.previous_block == node.state.tip() {
+                    admission.branch_state = None;
+                    admission.activation_chain = None;
+                }
+            }
+            node.submit_preverified_block_with_admission(block, accepted_at, preverified, admission)
+        }
+        None => node.submit_preverified_block(block, accepted_at, preverified),
+    };
+    if externally_admitted && result.as_ref().is_err_and(is_cacheable_block_rejection) {
+        node.remember_rejected_block(block_id);
+    }
+    result
+}
+
+fn is_cacheable_block_rejection(error: &NodeError) -> bool {
+    matches!(
+        error,
+        NodeError::Chain(chain_error)
+            if !matches!(
+                chain_error,
+                ChainError::TimestampTooFarInFuture
+                    | ChainError::InvalidValidationTime
+                    | ChainError::StaleValidatedBlock
+            )
+    )
+}
+
+fn is_cacheable_proof_rejection(error: &NodeError) -> bool {
+    matches!(
+        error,
+        NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(_))
+    )
+}
+
 fn signed_wallet_delta(credits: u64, debits: u64) -> String {
     if credits >= debits {
         (credits - debits).to_string()
@@ -3517,8 +4254,9 @@ fn prepare_block(
     let context = BlockValidationContext {
         now_unix_seconds: accepted_at,
     };
-    let candidate = if parent == active_state.tip() {
-        if branch_state.is_some() || activation_chain.is_some() {
+    let active_candidate = parent == active_state.tip();
+    let candidate = if active_candidate {
+        if branch_state.is_some() {
             return Err(NodeError::StaleBlockAdmission);
         }
         let validated = if let Some(preverified) = preverified {
@@ -3555,6 +4293,17 @@ fn prepare_block(
     };
     let cumulative_work =
         add_chain_work(parent_work, block.challenge.target).map_err(ChainError::from)?;
+    let ancestors = index.ancestor_table(parent)?;
+    if active_candidate && activation_chain.is_some() {
+        return Err(NodeError::StaleBlockAdmission);
+    }
+    if !active_candidate
+        && cumulative_work > index.active_work
+        && requires_external_preverification(&params)
+        && activation_chain.is_none()
+    {
+        return Err(NodeError::ProductionV3Unavailable);
+    }
     Ok(PreparedBlock {
         block_id,
         parent,
@@ -3563,6 +4312,7 @@ fn prepare_block(
         canonical,
         cumulative_work,
         preverified: preverified.cloned(),
+        ancestors,
         activation_chain,
         candidate,
     })
@@ -3617,81 +4367,25 @@ fn rebuild_state_to(
                 "indexed side branch cannot commit replayed state: {error}"
             ))
         })?;
+        if state.successor_header_preflight()? != entry.successor_header {
+            return Err(NodeError::CorruptLog(
+                "indexed side branch header snapshot does not match replayed state".to_owned(),
+            ));
+        }
     }
     Ok(state)
 }
 
-fn rebuild_state_from_snapshot(
-    params: NetworkParams,
-    verifier: &ConsensusPowVerifier,
-    tip: Arc<IndexedBlock>,
-) -> Result<(ChainState, Vec<[u8; 32]>), NodeError> {
-    let mut reversed = Vec::new();
-    let mut cursor = Some(tip);
-    while let Some(entry) = cursor {
-        cursor = match entry.previous.as_ref() {
-            Some(previous) => Some(previous.upgrade().ok_or_else(|| {
-                NodeError::CorruptLog("captured fork snapshot lost an indexed ancestor".to_owned())
-            })?),
-            None => None,
-        };
-        reversed.push(entry);
-    }
-    reversed.reverse();
-
-    let mut state = ChainState::new(params, verifier.clone())?;
-    let mut path = Vec::with_capacity(reversed.len());
-    for entry in reversed {
-        let expected_parent = path.last().copied().unwrap_or(params.genesis_hash);
-        if entry.parent != expected_parent {
-            return Err(NodeError::CorruptLog(
-                "captured fork snapshot has inconsistent ancestry".to_owned(),
-            ));
-        }
-        let block = decode_block(entry.canonical.as_ref(), params.network_id).map_err(|error| {
-            NodeError::CorruptLog(format!("captured indexed block cannot decode: {error}"))
-        })?;
-        if block.block_id() != entry.block_id
-            || block.challenge.previous_block != entry.parent
-            || block.challenge.height != entry.height
-        {
-            return Err(NodeError::CorruptLog(
-                "captured indexed block metadata does not match its canonical frame".to_owned(),
-            ));
-        }
-        let preverified = entry.preverified.as_ref().ok_or_else(|| {
-            NodeError::CorruptLog(
-                "production fork snapshot is missing external proof evidence".to_owned(),
-            )
-        })?;
-        let validated = state
-            .validate_block_preverified(
-                &block,
-                BlockValidationContext {
-                    now_unix_seconds: entry.accepted_at,
-                },
-                preverified,
-            )
-            .map_err(|error| {
-                NodeError::CorruptLog(format!(
-                    "captured production fork fails preverified replay: {error}"
-                ))
-            })?;
-        state.commit_validated(validated).map_err(|error| {
-            NodeError::CorruptLog(format!(
-                "captured production fork cannot commit replayed state: {error}"
-            ))
-        })?;
-        path.push(entry.block_id);
-    }
-    Ok((state, path))
+struct CommitOutcome {
+    fees: u64,
+    branch_checkpoint: Option<BranchStateCheckpoint>,
 }
 
 fn commit_prepared(
     active_state: &mut ChainState,
     index: &mut BlockIndex,
-    prepared: PreparedBlock,
-) -> Result<u64, NodeError> {
+    mut prepared: PreparedBlock,
+) -> Result<CommitOutcome, NodeError> {
     let activates = prepared.cumulative_work > index.active_work;
     if matches!(prepared.candidate, ValidatedCandidate::Active(_)) && !activates {
         return Err(NodeError::CorruptLog(
@@ -3699,45 +4393,60 @@ fn commit_prepared(
         ));
     }
     let was_active = matches!(prepared.candidate, ValidatedCandidate::Active(_));
+    let mut externally_prepared_chain = prepared.activation_chain.take();
     let next_active_chain = if activates && !was_active {
-        match prepared.activation_chain {
-            Some(chain) => Some(chain),
-            None => {
-                let mut chain = Vec::new();
-                chain.push(index.genesis);
-                chain.extend(index.path_to(prepared.parent)?);
-                chain.push(prepared.block_id);
-                Some(chain)
-            }
+        if let Some(chain) = externally_prepared_chain.take() {
+            Some(chain)
+        } else {
+            let mut chain = Vec::new();
+            chain.push(index.genesis);
+            chain.extend(index.path_to(prepared.parent)?);
+            chain.push(prepared.block_id);
+            Some(chain)
         }
     } else {
         None
     };
 
-    let fees = match prepared.candidate {
-        ValidatedCandidate::Active(validated) => active_state.commit_validated(validated)?,
+    let (fees, successor_header, branch_checkpoint) = match prepared.candidate {
+        ValidatedCandidate::Active(validated) => {
+            let fees = active_state.commit_validated(validated)?;
+            let successor_header = active_state.successor_header_preflight()?;
+            (fees, successor_header, None)
+        }
         ValidatedCandidate::Branch {
             mut state,
             validated,
         } => {
             let fees = state.commit_validated(validated)?;
+            let successor_header = state.successor_header_preflight()?;
             if activates {
                 *active_state = *state;
+                (fees, successor_header, None)
+            } else {
+                let path = match externally_prepared_chain.take() {
+                    Some(path) => path,
+                    None => {
+                        let mut path = Vec::new();
+                        path.push(index.genesis);
+                        path.extend(index.path_to(prepared.parent)?);
+                        path.push(prepared.block_id);
+                        path
+                    }
+                };
+                (
+                    fees,
+                    successor_header,
+                    Some(BranchStateCheckpoint {
+                        block_id: prepared.block_id,
+                        state,
+                        path,
+                    }),
+                )
             }
-            fees
         }
     };
 
-    let previous_link = if prepared.parent == index.genesis {
-        None
-    } else {
-        Some(Arc::downgrade(
-            index
-                .blocks
-                .get(&prepared.parent)
-                .ok_or(NodeError::UnknownParent(prepared.parent))?,
-        ))
-    };
     let previous = index.blocks.insert(
         prepared.block_id,
         Arc::new(IndexedBlock {
@@ -3747,8 +4456,9 @@ fn commit_prepared(
             accepted_at: prepared.accepted_at,
             canonical: Arc::from(prepared.canonical),
             cumulative_work: prepared.cumulative_work,
+            successor_header,
+            ancestors: prepared.ancestors,
             preverified: prepared.preverified,
-            previous: previous_link,
         }),
     );
     if previous.is_some() {
@@ -3758,6 +4468,23 @@ fn commit_prepared(
         if was_active {
             index.active_chain.push(prepared.block_id);
         } else if let Some(active_chain) = next_active_chain {
+            let expected_len = usize::try_from(prepared.height)
+                .ok()
+                .and_then(|height| height.checked_add(1))
+                .ok_or_else(|| {
+                    NodeError::CorruptLog(
+                        "active chain height does not fit this platform".to_owned(),
+                    )
+                })?;
+            if active_chain.len() != expected_len
+                || active_chain.first() != Some(&index.genesis)
+                || active_chain.last() != Some(&prepared.block_id)
+                || active_chain.get(active_chain.len().saturating_sub(2)) != Some(&prepared.parent)
+            {
+                return Err(NodeError::CorruptLog(
+                    "externally prepared active chain has invalid endpoints".to_owned(),
+                ));
+            }
             index.active_chain = active_chain;
         } else {
             return Err(NodeError::CorruptLog(
@@ -3766,7 +4493,10 @@ fn commit_prepared(
         }
         index.active_work = prepared.cumulative_work;
     }
-    Ok(fees)
+    Ok(CommitOutcome {
+        fees,
+        branch_checkpoint,
+    })
 }
 
 #[derive(Debug)]
@@ -4255,41 +4985,13 @@ fn route_shared_block_request(request: RpcRequest, shared: &Arc<Mutex<Node>>) ->
         Ok(accepted_at) => accepted_at,
         Err(error) => return RpcResponse::node_error(error),
     };
-    let (block_preverifier, admission_work) = match shared.lock() {
-        Ok(node) => {
-            let admission_work = match node.begin_external_block_admission(&block, accepted_at) {
-                Ok(admission_work) => admission_work,
-                Err(error) => return RpcResponse::node_error(error),
-            };
-            (node.block_preverifier(), admission_work)
-        }
-        Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
-    };
-    let admission_and_preverified = match admission_work {
-        Some(work) => block_preverifier
-            .complete_admission_and_preverify(&block, work)
-            .map(|(admission, preverified)| (Some(admission), preverified)),
-        None => block_preverifier
-            .preverify(&block)
-            .map(|preverified| (None, preverified)),
-    };
-    let (admission, preverified) = match admission_and_preverified {
-        Ok(result) => result,
+    let fees_burned = match submit_shared_block(shared, block, accepted_at) {
+        Ok(fees_burned) => fees_burned,
         Err(error) => return RpcResponse::node_error(error),
     };
-    let mut node = match shared.lock() {
-        Ok(node) => node,
-        Err(_) => return RpcResponse::node_error(NodeError::SharedNodePoisoned),
-    };
-    let result = match admission {
-        Some(admission) => {
-            node.submit_preverified_block_with_admission(block, accepted_at, preverified, admission)
-        }
-        None => node.submit_preverified_block(block, accepted_at, preverified),
-    };
-    match result {
-        Ok(fees_burned) => accepted_block_rpc_response(&node, fees_burned),
-        Err(error) => RpcResponse::node_error(error),
+    match shared.lock() {
+        Ok(node) => accepted_block_rpc_response(&node, fees_burned),
+        Err(_) => RpcResponse::node_error(NodeError::SharedNodePoisoned),
     }
 }
 
@@ -4880,6 +5582,7 @@ fn replay_log(
     };
     let mut reader = BufReader::new(file);
     let mut record_index = 0_u64;
+    let mut branch_checkpoint: Option<BranchStateCheckpoint> = None;
     loop {
         let mut header = [0_u8; RECORD_HEADER_BYTES];
         match reader.read(&mut header[..1]) {
@@ -4961,6 +5664,42 @@ fn replay_log(
         } else {
             None
         };
+        let external_fork_policy = requires_external_preverification(&params);
+        let (branch_state, branch_path) =
+            if external_fork_policy && block.challenge.previous_block != state.tip() {
+                let (branch_state, branch_path) = loop {
+                    let checkpoint = branch_checkpoint.take();
+                    let plan = index
+                        .branch_state_plan(block.challenge.previous_block, checkpoint)
+                        .map_err(|error| {
+                            NodeError::CorruptLog(format!(
+                                "record {record_index} fork parent cannot be planned: {error}"
+                            ))
+                        })?;
+                    let reaches_target = plan.reaches_target;
+                    let (reconstructed, path) = complete_branch_state_plan(params, verifier, plan)
+                        .map_err(|error| {
+                            NodeError::CorruptLog(format!(
+                                "record {record_index} fork parent cannot be reconstructed: {error}"
+                            ))
+                        })?;
+                    if reaches_target {
+                        break (reconstructed, path);
+                    }
+                    branch_checkpoint = Some(BranchStateCheckpoint {
+                        block_id: reconstructed.tip(),
+                        state: Box::new(reconstructed),
+                        path,
+                    });
+                };
+                (Some(Box::new(branch_state)), Some(branch_path))
+            } else {
+                (None, None)
+            };
+        let activation_chain = branch_path.map(|mut path| {
+            path.push(block.block_id());
+            path
+        });
         let prepared = prepare_block(
             state,
             index,
@@ -4971,19 +5710,22 @@ fn replay_log(
                 verifier,
                 accepted_at,
                 preverified: preverified.as_ref(),
-                branch_state: None,
-                activation_chain: None,
-                allow_index_reconstruction: true,
+                branch_state,
+                activation_chain,
+                allow_index_reconstruction: !external_fork_policy,
             },
         )
         .map_err(|error| {
             NodeError::CorruptLog(format!("record {record_index} fails fork replay: {error}"))
         })?;
-        commit_prepared(state, index, prepared).map_err(|error| {
+        let outcome = commit_prepared(state, index, prepared).map_err(|error| {
             NodeError::CorruptLog(format!(
                 "record {record_index} cannot restore fork state: {error}"
             ))
         })?;
+        if let Some(checkpoint) = outcome.branch_checkpoint {
+            branch_checkpoint = Some(checkpoint);
+        }
         record_index += 1;
     }
 }
@@ -5101,7 +5843,7 @@ mod tests {
         waiter.join().unwrap().unwrap();
         assert_eq!(queue.counts().unwrap(), (0, 0));
 
-        let timeout_queue = ProofVerificationQueue::new(1, 1, Duration::from_millis(1));
+        let timeout_queue = Arc::new(ProofVerificationQueue::new(1, 1, Duration::from_millis(1)));
         let active = timeout_queue.acquire().unwrap();
         assert!(matches!(
             timeout_queue.acquire(),
@@ -5109,6 +5851,35 @@ mod tests {
         ));
         drop(active);
         assert_eq!(timeout_queue.counts().unwrap(), (0, 0));
+
+        let fifo_queue = Arc::new(ProofVerificationQueue::new(1, 2, Duration::from_secs(2)));
+        let active = fifo_queue.acquire().unwrap();
+        let (order_tx, order_rx) = mpsc::channel();
+        let first_queue = Arc::clone(&fifo_queue);
+        let first_tx = order_tx.clone();
+        let first = thread::spawn(move || {
+            let permit = first_queue.acquire().unwrap();
+            first_tx.send(1).unwrap();
+            drop(permit);
+        });
+        while fifo_queue.counts().unwrap().1 != 1 {
+            thread::yield_now();
+        }
+        let second_queue = Arc::clone(&fifo_queue);
+        let second = thread::spawn(move || {
+            let permit = second_queue.acquire().unwrap();
+            order_tx.send(2).unwrap();
+            drop(permit);
+        });
+        while fifo_queue.counts().unwrap().1 != 2 {
+            thread::yield_now();
+        }
+        drop(active);
+        assert_eq!(order_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        assert_eq!(order_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(fifo_queue.counts().unwrap(), (0, 0));
 
         let verifier = BlockPreverifier::with_limits(
             ConsensusPowVerifier::v2_reference(v2_test_reference().unwrap()),
@@ -5121,6 +5892,90 @@ mod tests {
             Err(NodeError::ProofVerifierPanicked)
         ));
         assert_eq!(verifier.queue.counts().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn shared_submission_queues_before_snapshot_and_never_holds_node_mutex() {
+        let path = test_dir("shared-submission-order");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let genesis = node.params.genesis_hash;
+        let accepted_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let candidate = mined_child(&node, genesis, accepted_at, 0x71);
+        let competing = mined_child(&node, genesis, accepted_at, 0x72);
+        let competing_cap = node.block_preverifier.preverify(&competing).unwrap();
+        node.profile.proof = ProofProfile::ProductionV3;
+        let queue = Arc::clone(&node.block_preverifier.queue);
+        let held_permit = queue.acquire().unwrap();
+        let shared = Arc::new(Mutex::new(node));
+
+        let submit_node = Arc::clone(&shared);
+        let submitter =
+            thread::spawn(move || submit_shared_block(&submit_node, candidate, accepted_at));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while queue.counts().unwrap() != (1, 1) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(queue.counts().unwrap(), (1, 1));
+
+        // The waiter has cloned its verifier but cannot capture a revision
+        // until it owns the sole proof permit. The node mutex remains usable.
+        {
+            let mut node = shared.try_lock().expect("proof waiter held node mutex");
+            node.profile.proof = ProofProfile::DevnetV2Reference;
+            node.submit_preverified_block(competing.clone(), accepted_at, competing_cap)
+                .unwrap();
+            node.profile.proof = ProofProfile::ProductionV3;
+        }
+        drop(held_permit);
+
+        submitter.join().unwrap().unwrap();
+        let node = shared.lock().unwrap();
+        assert!(node.index.contains(competing.block_id()));
+        assert_eq!(node.index.blocks.len(), 2);
+        drop(node);
+
+        let second_at = accepted_at + 60;
+        let (tip_candidate, tip_candidate_id, competing_tip, competing_tip_cap) = {
+            let node = shared.lock().unwrap();
+            let parent = node.state.tip();
+            let tip_candidate = mined_child(&node, parent, second_at, 0x73);
+            let competing_tip = mined_child(&node, parent, second_at, 0x74);
+            let competing_tip_cap = node.block_preverifier.preverify(&competing_tip).unwrap();
+            (
+                tip_candidate.clone(),
+                tip_candidate.block_id(),
+                competing_tip,
+                competing_tip_cap,
+            )
+        };
+        let held_permit = queue.acquire().unwrap();
+        let submit_node = Arc::clone(&shared);
+        let tip_submitter =
+            thread::spawn(move || submit_shared_tip_block(&submit_node, tip_candidate, second_at));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while queue.counts().unwrap() != (1, 1) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(queue.counts().unwrap(), (1, 1));
+        {
+            let mut node = shared.lock().unwrap();
+            node.profile.proof = ProofProfile::DevnetV2Reference;
+            node.submit_preverified_block(competing_tip.clone(), second_at, competing_tip_cap)
+                .unwrap();
+            node.profile.proof = ProofProfile::ProductionV3;
+        }
+        drop(held_permit);
+        assert!(matches!(
+            tip_submitter.join().unwrap(),
+            Err(NodeError::StaleBlockAdmission)
+        ));
+        let node = shared.lock().unwrap();
+        assert!(node.index.contains(competing_tip.block_id()));
+        assert!(!node.index.contains(tip_candidate_id));
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
     }
 
     #[test]
@@ -5161,27 +6016,30 @@ mod tests {
             "in_process"
         );
         *node.block_preverifier.backend.write().unwrap() = ProofVerificationBackend::Unavailable;
+        let shared = Arc::new(Mutex::new(node));
 
         let mut wrong_target = valid.clone();
         wrong_target.challenge.target[0] ^= 1;
         assert!(matches!(
-            node.submit_block(wrong_target, now),
+            submit_shared_block(&shared, wrong_target, now),
             Err(NodeError::Chain(ChainError::UnexpectedTarget))
         ));
 
         let mut orphan = valid.clone();
         orphan.challenge.previous_block = [0xA5; 32];
         assert!(matches!(
-            node.submit_block(orphan, now),
+            submit_shared_block(&shared, orphan, now),
             Err(NodeError::UnknownParent(parent)) if parent == [0xA5; 32]
         ));
         assert!(matches!(
-            node.submit_block(valid, now),
+            submit_shared_block(&shared, valid, now),
             Err(NodeError::ProductionV3Unavailable)
         ));
+        let node = shared.lock().unwrap();
         assert_eq!(node.state.next_height(), 1);
         assert_eq!(node.log.metadata().unwrap().len(), 0);
         drop(node);
+        drop(shared);
         clean_test_dir(&path);
     }
 
@@ -5213,12 +6071,19 @@ mod tests {
         let a3_cap = node.block_preverifier.preverify(&a3).unwrap();
 
         node.profile.proof = ProofProfile::ProductionV3;
+        let mut wrong_side_target = b2.clone();
+        wrong_side_target.challenge.target[0] ^= 1;
+        assert!(matches!(
+            node.begin_external_block_admission(&wrong_side_target, t2),
+            Err(NodeError::Chain(ChainError::UnexpectedTarget))
+        ));
         let admission = node
             .begin_external_block_admission(&b2, t2)
             .unwrap()
             .unwrap()
             .complete(&b2)
-            .unwrap();
+            .unwrap()
+            .into_ready();
 
         // A successful concurrent block changes the revision after all
         // expensive side reconstruction has completed. The old admission can
@@ -5236,20 +6101,15 @@ mod tests {
             .unwrap()
             .unwrap()
             .complete(&b2)
-            .unwrap();
+            .unwrap()
+            .into_ready();
         node.submit_preverified_block_with_admission(b2.clone(), t2, b2_cap, fresh)
             .unwrap();
         assert!(node.index.contains(b2.block_id()));
         assert!(node.index.blocks[&b2.block_id()].preverified.is_some());
         assert_eq!(
-            node.index.blocks[&b2.block_id()]
-                .previous
-                .as_ref()
-                .unwrap()
-                .upgrade()
-                .unwrap()
-                .block_id,
-            b1.block_id()
+            node.index.blocks[&b2.block_id()].ancestors.first(),
+            Some(&b1.block_id())
         );
 
         drop(node);
@@ -5277,16 +6137,29 @@ mod tests {
             .unwrap()
             .preverified = None;
         node.profile.proof = ProofProfile::ProductionV3;
-        let work = node
-            .begin_external_block_admission(&child, t2)
-            .unwrap()
-            .unwrap();
         assert!(matches!(
-            work.complete(&child),
+            node.begin_external_block_admission(&child, t2),
             Err(NodeError::CorruptLog(_))
         ));
+        let restored_capability = node.block_preverifier.preverify(&side).unwrap();
+        Arc::get_mut(node.index.blocks.get_mut(&side.block_id()).unwrap())
+            .unwrap()
+            .preverified = Some(restored_capability);
 
-        drop(node);
+        let mut invalid_proof = child;
+        let BlockProof::V2Reference(proof) = &mut invalid_proof.proof else {
+            unreachable!();
+        };
+        proof.work_digest[0] ^= 1;
+        let shared = Arc::new(Mutex::new(node));
+        let error = submit_shared_block(&shared, invalid_proof, t2).unwrap_err();
+        assert_eq!(
+            error.client_error().code,
+            "proof_rejected",
+            "an invalid proof must fail before missing-capability branch replay"
+        );
+
+        drop(shared);
         clean_test_dir(&path);
     }
 
@@ -5994,7 +6867,7 @@ mod tests {
         );
         assert_eq!(
             status.proof_verification_queue_capacity,
-            MAX_QUEUED_PROOF_VERIFICATIONS
+            MAX_QUEUED_PROOF_VERIFICATIONS + MAX_PRIORITY_QUEUED_PROOF_VERIFICATIONS
         );
         node.set_public_peer_mode(true);
         assert!(node.status().unwrap().public_peer_mode);
@@ -6631,19 +7504,12 @@ mod tests {
                 .all(|entry| entry.preverified.is_some()),
             "every replayed block must receive fresh process-local proof evidence"
         );
-        for entry in index.blocks.values() {
-            if entry.parent == params.genesis_hash {
-                assert!(entry.previous.is_none());
-            } else {
-                assert_eq!(
-                    entry
-                        .previous
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .map(|parent| parent.block_id),
-                    Some(entry.parent)
-                );
-            }
+        for (block_id, entry) in &index.blocks {
+            assert_eq!(*block_id, entry.block_id);
+            assert!(
+                entry.parent == params.genesis_hash || index.blocks.contains_key(&entry.parent),
+                "every non-genesis parent must remain indexed"
+            );
         }
 
         clean_test_dir(&path);

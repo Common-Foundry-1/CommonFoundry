@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
-    ContainedChild, MAX_STDERR_BYTES, ProcessTerminator, ProofWorkerError, exchange_with_child,
-    spawn_contained, verify_file_hash, worker_exit_error,
+    ContainedChild, MAX_STDERR_BYTES, PROCESS_REAP_TIMEOUT, ProcessTerminator, ProofWorkerError,
+    exchange_with_child, spawn_contained, verify_file_hash, worker_exit_error,
 };
 
 const REQUEST_MAGIC: &[u8; 8] = b"CMFDVWQ1";
@@ -175,6 +175,10 @@ pub enum VerifierWorkerError {
     Startup(String),
     #[error("verifier worker state is poisoned")]
     StatePoisoned,
+    #[error("verifier worker transport could not be reaped after containment")]
+    TransportPoisoned,
+    #[error("verifier worker is permanently closed")]
+    Closed,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -261,6 +265,11 @@ struct PersistentVerifierWorkerInner {
     process_starts: AtomicU64,
     shutdown_epoch: AtomicU64,
     terminated_generation: AtomicU64,
+    /// Set permanently if a contained generation leaves a pipe owner alive
+    /// beyond the bounded teardown window. Later generations are forbidden so
+    /// hostile descendants cannot accumulate unbounded threads or handles.
+    transport_poisoned: Arc<AtomicBool>,
+    closed: AtomicBool,
     // Declared last so the process and its pipes are dropped before its private
     // executable copy is made writable for cleanup.
     runtime_copy: PrivateRuntimeCopy,
@@ -293,6 +302,8 @@ impl PersistentVerifierWorker {
                 process_starts: AtomicU64::new(0),
                 shutdown_epoch: AtomicU64::new(0),
                 terminated_generation: AtomicU64::new(0),
+                transport_poisoned: Arc::new(AtomicBool::new(false)),
+                closed: AtomicBool::new(false),
                 runtime_copy,
             }),
         };
@@ -304,6 +315,9 @@ impl PersistentVerifierWorker {
         &self,
         block: &Block,
     ) -> Result<PreverifiedBlockProof, VerifierWorkerError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(VerifierWorkerError::Closed);
+        }
         if block.challenge.network_id != self.inner.network_id {
             return Err(VerifierWorkerError::Startup(
                 "candidate belongs to another network".to_owned(),
@@ -328,6 +342,9 @@ impl PersistentVerifierWorker {
             .process
             .lock()
             .map_err(|_| VerifierWorkerError::StatePoisoned)?;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(VerifierWorkerError::Closed);
+        }
         let request_shutdown_epoch = self.inner.shutdown_epoch.load(Ordering::Acquire);
         self.inner.discard_terminated_generation(&mut process)?;
         if process.is_none() {
@@ -374,6 +391,14 @@ impl PersistentVerifierWorker {
             return Err(VerifierWorkerError::Startup(
                 "worker request was cancelled".to_owned(),
             ));
+        }
+        if self.inner.closed.load(Ordering::Acquire) {
+            let generation = process.as_ref().map(|process| process.generation);
+            if let Some(generation) = generation {
+                self.inner.clear_terminator(generation)?;
+            }
+            process.take();
+            return Err(VerifierWorkerError::Closed);
         }
 
         // SAFETY: the exact binding was returned by the private-copy, pinned,
@@ -423,6 +448,13 @@ impl PersistentVerifierWorker {
         }
     }
 
+    /// Permanently prevents new generations, then terminates the current one.
+    /// Unlike `shutdown`, this is the terminal service-teardown operation.
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.shutdown();
+    }
+
     fn ensure_started(&self) -> Result<(), VerifierWorkerError> {
         let mut process = self
             .inner
@@ -461,6 +493,12 @@ impl PersistentVerifierWorker {
 
 impl PersistentVerifierWorkerInner {
     fn start_process(&self) -> Result<PersistentVerifierProcess, VerifierWorkerError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(VerifierWorkerError::Closed);
+        }
+        if self.transport_poisoned.load(Ordering::Acquire) {
+            return Err(VerifierWorkerError::TransportPoisoned);
+        }
         // Recheck the immutable copy immediately before every exec. There is
         // still a residual same-user check/exec race on platforms without an
         // exec-by-retained-handle primitive; the copy lives in a private,
@@ -488,16 +526,26 @@ impl PersistentVerifierWorkerInner {
         let child = spawn_contained(&mut command, Some(self.config.memory_limit_bytes))?;
         let generation = self.process_attempts.fetch_add(1, Ordering::AcqRel) + 1;
         let terminator = child.termination_handle();
-        let mut process = PersistentVerifierProcess::new(child, generation)?;
+        let mut process = PersistentVerifierProcess::new(
+            child,
+            generation,
+            Arc::clone(&self.transport_poisoned),
+        )?;
         self.set_terminator(generation, terminator.clone())?;
-        if self.shutdown_epoch.load(Ordering::Acquire) != shutdown_epoch {
+        if self.closed.load(Ordering::Acquire)
+            || self.shutdown_epoch.load(Ordering::Acquire) != shutdown_epoch
+        {
             self.terminated_generation
                 .store(generation, Ordering::Release);
             terminator.terminate_tree();
             self.clear_terminator(generation)?;
-            return Err(VerifierWorkerError::Startup(
-                "worker startup was cancelled".to_owned(),
-            ));
+            return if self.closed.load(Ordering::Acquire) {
+                Err(VerifierWorkerError::Closed)
+            } else {
+                Err(VerifierWorkerError::Startup(
+                    "worker startup was cancelled".to_owned(),
+                ))
+            };
         }
         let startup = (|| {
             let mut challenge = [0_u8; 32];
@@ -848,12 +896,17 @@ struct PersistentVerifierProcess {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr_capture: Arc<Mutex<StderrCapture>>,
-    stderr_termination_armed: Arc<AtomicBool>,
+    transport_poisoned: Arc<AtomicBool>,
+    stderr_done: Option<mpsc::Receiver<()>>,
     stderr_thread: Option<JoinHandle<()>>,
 }
 
 impl PersistentVerifierProcess {
-    fn new(mut child: ContainedChild, generation: u64) -> Result<Self, VerifierWorkerError> {
+    fn new(
+        mut child: ContainedChild,
+        generation: u64,
+        transport_poisoned: Arc<AtomicBool>,
+    ) -> Result<Self, VerifierWorkerError> {
         let stdin = child
             .child
             .stdin
@@ -877,15 +930,10 @@ impl PersistentVerifierProcess {
             ))?;
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let capture = Arc::clone(&stderr_capture);
-        let stderr_termination_armed = Arc::new(AtomicBool::new(true));
-        let armed = Arc::clone(&stderr_termination_armed);
-        let terminator = child.non_owning_termination_handle();
+        let (stderr_done_sender, stderr_done) = mpsc::channel();
         let stderr_thread = thread::spawn(move || {
-            capture_persistent_stderr(stderr, capture, || {
-                if armed.swap(false, Ordering::AcqRel) {
-                    terminator.terminate_tree();
-                }
-            })
+            capture_persistent_stderr(stderr, capture);
+            let _ = stderr_done_sender.send(());
         });
         Ok(Self {
             generation,
@@ -893,7 +941,8 @@ impl PersistentVerifierProcess {
             stdin: Some(stdin),
             stdout: Some(stdout),
             stderr_capture,
-            stderr_termination_armed,
+            transport_poisoned,
+            stderr_done: Some(stderr_done),
             stderr_thread: Some(stderr_thread),
         })
     }
@@ -911,18 +960,24 @@ impl PersistentVerifierProcess {
             ProofWorkerError::InvalidConfig("persistent worker stdout pipe is unavailable"),
         ))?;
         let (sender, receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::channel();
         let io_thread = thread::spawn(move || {
             let mut stdin = stdin;
             let mut stdout = stdout;
             let result = write_frame(&mut stdin, &request)
                 .and_then(|()| read_required_frame(&mut stdout, response_limit));
             let _ = sender.send((stdin, stdout, result));
+            let _ = done_sender.send(());
         });
 
         let received = receiver.recv_timeout(timeout);
         match received {
             Ok((stdin, stdout, result)) => {
-                detach_pipe_thread(io_thread);
+                if !finish_pipe_thread_bounded(io_thread, done_receiver) {
+                    self.transport_poisoned.store(true, Ordering::Release);
+                    self.child.terminate_and_reap();
+                    return Err(VerifierWorkerError::TransportPoisoned);
+                }
                 self.stdin = Some(stdin);
                 self.stdout = Some(stdout);
                 if self.stderr_exceeded()? {
@@ -946,14 +1001,18 @@ impl PersistentVerifierProcess {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.child.terminate_and_reap();
-                detach_pipe_thread(io_thread);
+                if !finish_pipe_thread_bounded(io_thread, done_receiver) {
+                    self.transport_poisoned.store(true, Ordering::Release);
+                }
                 Err(VerifierWorkerError::Process(ProofWorkerError::Timeout {
                     milliseconds: timeout.as_millis(),
                 }))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.child.terminate_and_reap();
-                detach_pipe_thread(io_thread);
+                if !finish_pipe_thread_bounded(io_thread, done_receiver) {
+                    self.transport_poisoned.store(true, Ordering::Release);
+                }
                 Err(VerifierWorkerError::Process(ProofWorkerError::PipeThread(
                     "exchanging persistent verifier frames",
                 )))
@@ -976,19 +1035,24 @@ impl PersistentVerifierProcess {
     }
 }
 
-/// Never turn a bounded process deadline into an unbounded caller wait. The
-/// contained process tree is terminated first on failure; a pipe owner that
-/// nevertheless survives is detached and cannot produce a trusted response.
-fn detach_pipe_thread(thread: JoinHandle<()>) {
-    drop(thread);
+/// Joins only after the thread explicitly reports completion. A caller that
+/// observes `false` must permanently poison the transport before detaching the
+/// handle, preventing a hostile inherited pipe from leaking one thread per
+/// restarted process generation.
+fn finish_pipe_thread_bounded(thread: JoinHandle<()>, done: mpsc::Receiver<()>) -> bool {
+    match done.recv_timeout(PROCESS_REAP_TIMEOUT) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = thread.join();
+            true
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            drop(thread);
+            false
+        }
+    }
 }
 
-fn capture_persistent_stderr(
-    mut stderr: impl Read,
-    capture: Arc<Mutex<StderrCapture>>,
-    on_exceeded: impl FnOnce(),
-) {
-    let mut on_exceeded = Some(on_exceeded);
+fn capture_persistent_stderr(mut stderr: impl Read, capture: Arc<Mutex<StderrCapture>>) {
     let mut buffer = [0_u8; 8 * 1024];
     while let Ok(read) = stderr.read(&mut buffer) {
         if read == 0 {
@@ -1007,9 +1071,10 @@ fn capture_persistent_stderr(
             true
         };
         if exceeded {
-            if let Some(on_exceeded) = on_exceeded.take() {
-                on_exceeded();
-            }
+            // Dropping the read end forces an honest worker to observe a
+            // closed pipe. A hostile inherited writer is still bounded by the
+            // request deadline and permanently poisons restart if teardown
+            // cannot reap this reader.
             break;
         }
     }
@@ -1017,15 +1082,13 @@ fn capture_persistent_stderr(
 
 impl Drop for PersistentVerifierProcess {
     fn drop(&mut self) {
-        // A detached stderr reader must never target a recycled Unix process
-        // group after this child generation has ended.
-        self.stderr_termination_armed
-            .store(false, Ordering::Release);
         self.child.terminate_and_reap();
         self.stdin.take();
         self.stdout.take();
-        if let Some(thread) = self.stderr_thread.take() {
-            detach_pipe_thread(thread);
+        if let (Some(thread), Some(done)) = (self.stderr_thread.take(), self.stderr_done.take())
+            && !finish_pipe_thread_bounded(thread, done)
+        {
+            self.transport_poisoned.store(true, Ordering::Release);
         }
     }
 }
@@ -2038,20 +2101,16 @@ mod tests {
     }
 
     #[test]
-    fn persistent_stderr_overflow_triggers_immediate_termination_signal() {
+    fn persistent_stderr_overflow_is_capture_bounded() {
         let capture = Arc::new(Mutex::new(StderrCapture::default()));
-        let terminated = Arc::new(AtomicBool::new(false));
-        let signal = Arc::clone(&terminated);
         capture_persistent_stderr(
             io::Cursor::new(vec![b'x'; MAX_STDERR_BYTES + 1]),
             Arc::clone(&capture),
-            move || signal.store(true, Ordering::Release),
         );
 
         let capture = capture.lock().unwrap();
         assert!(capture.exceeded);
         assert_eq!(capture.bytes.len(), MAX_STDERR_BYTES);
-        assert!(terminated.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2062,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_process_drop_never_joins_a_stuck_pipe_reader() {
+    fn persistent_process_drop_bounds_and_poisons_a_stuck_pipe_reader() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
@@ -2073,16 +2132,27 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = spawn_contained(&mut command, None).unwrap();
-        let mut process = PersistentVerifierProcess::new(child, 1).unwrap();
+        let transport_poisoned = Arc::new(AtomicBool::new(false));
+        let mut process =
+            PersistentVerifierProcess::new(child, 1, Arc::clone(&transport_poisoned)).unwrap();
 
         // Replace the real stderr reader with a deliberately stuck handle.
-        // The real reader is safe to detach and exits when `process` kills its
-        // contained child below.
-        detach_pipe_thread(process.stderr_thread.take().unwrap());
+        // Reap and join the real reader first so this test does not itself
+        // create an untracked pipe thread.
+        process.child.terminate_and_reap();
+        process.stdin.take();
+        process.stdout.take();
+        assert!(finish_pipe_thread_bounded(
+            process.stderr_thread.take().unwrap(),
+            process.stderr_done.take().unwrap(),
+        ));
         let (release_sender, release_receiver) = mpsc::channel();
+        let (stuck_done_sender, stuck_done_receiver) = mpsc::channel();
         process.stderr_thread = Some(thread::spawn(move || {
             let _ = release_receiver.recv();
+            let _ = stuck_done_sender.send(());
         }));
+        process.stderr_done = Some(stuck_done_receiver);
 
         let (done_sender, done_receiver) = mpsc::channel();
         let dropper = thread::spawn(move || {
@@ -2097,5 +2167,6 @@ mod tests {
             completed.is_ok(),
             "persistent process teardown exceeded its bounded reap window"
         );
+        assert!(transport_poisoned.load(Ordering::Acquire));
     }
 }

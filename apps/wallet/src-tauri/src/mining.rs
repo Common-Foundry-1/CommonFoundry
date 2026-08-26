@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cmfd_node::pool::{PoolClient, PoolClientConfig, PoolError, PoolWorkSearchResult};
 use cmfd_node::{
     MiningSearchResult, MiningShareSearchResult, Node, NodeClientError, NodeError,
-    parse_miner_destination,
+    parse_miner_destination, submit_shared_tip_block,
 };
 use serde::{Deserialize, Serialize};
 
@@ -468,17 +468,29 @@ fn mining_loop(
                     let block_id_hex = hex::encode(block_id);
                     let block_height = block.challenge.height;
                     let expected_parent = hex::encode(job.challenge().previous_block);
-                    let submission = node
+                    let parent_is_current = node
                         .lock()
                         .map_err(|_| NodeError::SharedNodePoisoned)
-                        .and_then(|mut node| {
-                            if node.status()?.tip != expected_parent {
-                                return Ok(None);
-                            }
-                            node.submit_block(*block, unix_time_seconds())?;
-                            let node_status = node.status()?;
-                            Ok((node_status.tip == block_id_hex).then_some(node_status))
-                        });
+                        .and_then(|node| Ok(node.status()?.tip == expected_parent));
+                    let submission = parent_is_current.and_then(|parent_is_current| {
+                        if !parent_is_current {
+                            return Ok(None);
+                        }
+                        match submit_shared_tip_block(&node, *block, unix_time_seconds()) {
+                            Ok(_) => {}
+                            Err(
+                                NodeError::StaleBlockAdmission
+                                | NodeError::DuplicateBlock(_)
+                                | NodeError::UnknownParent(_)
+                                | NodeError::ProofVerificationQueueFull
+                                | NodeError::ProofVerificationQueueTimeout,
+                            ) => return Ok(None),
+                            Err(error) => return Err(error),
+                        }
+                        let node = node.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+                        let node_status = node.status()?;
+                        Ok((node_status.tip == block_id_hex).then_some(node_status))
+                    });
                     match submission {
                         Ok(Some(node_status)) => {
                             if let Ok(mut current) = status.lock() {

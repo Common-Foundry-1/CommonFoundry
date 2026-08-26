@@ -20,7 +20,9 @@ use crate::peer::{
     BlockSubmissionResult, BlockSubmissionStatus, PeerAddressPolicy, PeerConnection, PeerError,
     PeerHello, PeerLimits, PeerMessage, PeerSession, StaticPeerConfig,
 };
-use crate::{Node, NodeError, PeerDirection, devnet_params, unix_time_seconds};
+use crate::{
+    Node, NodeError, PeerDirection, devnet_params, submit_shared_block, unix_time_seconds,
+};
 
 /// One request is deliberately small enough that sixteen maximum-size blocks,
 /// sixty-four maximum-size transactions, their outer peer frames, and
@@ -298,13 +300,9 @@ fn perform_sync_from_peer_once_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<SyncReport, P2pError> {
-    let (hello, locator, block_preverifier) = {
+    let (hello, locator) = {
         let node = lock_node(&shared)?;
-        (
-            node.peer_hello(),
-            node.block_locator(MAX_BLOCKS_PER_SYNC),
-            node.block_preverifier(),
-        )
+        (node.peer_hello(), node.block_locator(MAX_BLOCKS_PER_SYNC))
     };
     let hello = with_nonce(hello, nonce_override);
 
@@ -377,38 +375,10 @@ fn perform_sync_from_peer_once_inner_with_policy(
         }
 
         let accepted_at = unix_time_seconds()?;
-        let admission_work = {
-            let node = lock_node(&shared)?;
-            node.begin_external_block_admission(&block, accepted_at)?
-        };
-        let (admission, preverified) = match admission_work {
-            Some(work) => {
-                let (admission, preverified) =
-                    block_preverifier.complete_admission_and_preverify(&block, work)?;
-                (Some(admission), preverified)
-            }
-            None => (None, block_preverifier.preverify(&block)?),
-        };
-        let accepted = {
-            let mut node = lock_node(&shared)?;
-            if node.contains_block(*requested) {
-                false
-            } else {
-                match admission {
-                    Some(admission) => {
-                        node.submit_preverified_block_with_admission(
-                            block,
-                            accepted_at,
-                            preverified,
-                            admission,
-                        )?;
-                    }
-                    None => {
-                        node.submit_preverified_block(block, accepted_at, preverified)?;
-                    }
-                }
-                true
-            }
+        let accepted = match submit_shared_block(&shared, block, accepted_at) {
+            Ok(_) => true,
+            Err(NodeError::DuplicateBlock(_)) => false,
+            Err(error) => return Err(error.into()),
         };
         if accepted {
             accepted_blocks += 1;
@@ -684,12 +654,9 @@ fn perform_respond_to_peer_inner_with_policy(
     observation_address: String,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<(), P2pError> {
-    let (hello, block_preverifier) = {
-        let (hello, block_preverifier) = {
-            let node = lock_node(&shared)?;
-            (node.peer_hello(), node.block_preverifier())
-        };
-        (with_nonce(hello, nonce_override), block_preverifier)
+    let hello = {
+        let node = lock_node(&shared)?;
+        with_nonce(node.peer_hello(), nonce_override)
     };
     let network_id = hello.network_id;
     let session = PeerSession::new(hello, limits)?;
@@ -775,52 +742,10 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::SubmitBlock(block) => {
                 let block_id = block.block_id();
                 let accepted_at = unix_time_seconds()?;
-                let admission_work = {
-                    let node = lock_node(&shared)?;
-                    node.begin_external_block_admission(&block, accepted_at)
-                };
-                let status = match admission_work {
+                let status = match submit_shared_block(&shared, block, accepted_at) {
+                    Ok(_) => BlockSubmissionStatus::Accepted,
                     Err(NodeError::DuplicateBlock(_)) => BlockSubmissionStatus::AlreadyKnown,
                     Err(_) => BlockSubmissionStatus::Rejected,
-                    Ok(admission_work) => {
-                        let admission_and_preverified = match admission_work {
-                            Some(work) => block_preverifier
-                                .complete_admission_and_preverify(&block, work)
-                                .map(|(admission, preverified)| (Some(admission), preverified)),
-                            None => block_preverifier
-                                .preverify(&block)
-                                .map(|preverified| (None, preverified)),
-                        };
-                        match admission_and_preverified {
-                            Ok((admission, preverified)) => {
-                                let mut node = lock_node(&shared)?;
-                                if node.contains_block(block_id) {
-                                    BlockSubmissionStatus::AlreadyKnown
-                                } else {
-                                    let submitted = match admission {
-                                        Some(admission) => node
-                                            .submit_preverified_block_with_admission(
-                                                block,
-                                                accepted_at,
-                                                preverified,
-                                                admission,
-                                            ),
-                                        None => node.submit_preverified_block(
-                                            block,
-                                            accepted_at,
-                                            preverified,
-                                        ),
-                                    };
-                                    if submitted.is_ok() {
-                                        BlockSubmissionStatus::Accepted
-                                    } else {
-                                        BlockSubmissionStatus::Rejected
-                                    }
-                                }
-                            }
-                            Err(_) => BlockSubmissionStatus::Rejected,
-                        }
-                    }
                 };
                 let peer = {
                     let node = lock_node(&shared)?;

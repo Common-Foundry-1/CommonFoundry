@@ -306,6 +306,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             })?;
+            if let Ok(node) = shared.lock() {
+                node.shutdown_proof_verifier();
+            }
             let rpc_result = rpc.stop();
             let poll_result = match poller {
                 Some(poller) => poller.stop(),
@@ -438,7 +441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config =
                 PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
             config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
-            let pool = spawn_pool_server(node, config)?;
+            let pool = spawn_pool_server(Arc::clone(&node), config)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -470,6 +473,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             })?;
+            if let Ok(node) = node.lock() {
+                node.shutdown_proof_verifier();
+            }
             let pool_result = pool.stop();
             let poll_result = match poller {
                 Some(poller) => poller.stop(),

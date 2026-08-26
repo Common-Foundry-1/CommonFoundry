@@ -171,6 +171,73 @@ pub struct TransactionSetValidation {
     pub signature_checks: usize,
 }
 
+/// Compact consensus state needed to reject an impossible successor header
+/// without replaying the owning branch. The fields stay private so callers
+/// cannot manufacture or reinterpret this snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuccessorHeaderPreflight {
+    params: NetworkParams,
+    tip: [u8; 32],
+    next_height: u64,
+    median_time_past: u64,
+    expected_target: [u8; 32],
+}
+
+impl SuccessorHeaderPreflight {
+    pub fn preflight_block(
+        self,
+        block: &Block,
+        context: BlockValidationContext,
+    ) -> Result<(), ChainError> {
+        self.preflight_block_values(block, context).map(drop)
+    }
+
+    fn preflight_block_values(
+        self,
+        block: &Block,
+        context: BlockValidationContext,
+    ) -> Result<(u64, [u8; 32]), ChainError> {
+        if block.version != BLOCK_VERSION {
+            return Err(ChainError::UnsupportedBlockVersion);
+        }
+        if block.challenge.network_id != self.params.network_id {
+            return Err(ChainError::WrongNetwork);
+        }
+        if block.challenge.height != self.next_height {
+            return Err(ChainError::UnexpectedHeight {
+                expected: self.next_height,
+                actual: block.challenge.height,
+            });
+        }
+        let next_height = self
+            .next_height
+            .checked_add(1)
+            .ok_or(ChainError::HeightExhausted)?;
+        block
+            .challenge
+            .height
+            .checked_add(COINBASE_MATURITY)
+            .ok_or(ChainError::HeightExhausted)?;
+        if block.challenge.previous_block != self.tip {
+            return Err(ChainError::PreviousBlock);
+        }
+        if block.challenge.timestamp <= self.median_time_past {
+            return Err(ChainError::TimestampNotAfterMedian);
+        }
+        let maximum_timestamp = context
+            .now_unix_seconds
+            .checked_add(self.params.max_future_offset_secs)
+            .ok_or(ChainError::InvalidValidationTime)?;
+        if block.challenge.timestamp > maximum_timestamp {
+            return Err(ChainError::TimestampTooFarInFuture);
+        }
+        if block.challenge.target != self.expected_target {
+            return Err(ChainError::UnexpectedTarget);
+        }
+        Ok((next_height, self.expected_target))
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ChainError {
     #[error("network parameters are invalid: {0}")]
@@ -450,29 +517,7 @@ impl UtxoSet {
         block: &Block,
         params: &NetworkParams,
     ) -> Result<(), ChainError> {
-        validate_block_resources(block)?;
-        if block.version != BLOCK_VERSION {
-            return Err(ChainError::UnsupportedBlockVersion);
-        }
-        if block.challenge.network_id != params.network_id {
-            return Err(ChainError::WrongNetwork);
-        }
-        for transaction in &block.transactions {
-            if transaction.network_id != params.network_id {
-                return Err(ChainError::WrongNetwork);
-            }
-            if transaction.version != TRANSACTION_VERSION {
-                return Err(ChainError::UnsupportedTransactionVersion);
-            }
-        }
-        crate::wire::encode_block(block).map_err(|_| ChainError::BlockEncoding)?;
-        if block.challenge.height != block.coinbase.height {
-            return Err(ChainError::HeightMismatch);
-        }
-        if block.transaction_root() != block.challenge.transaction_root {
-            return Err(ChainError::MerkleRoot);
-        }
-        Ok(())
+        validate_block_preamble(block, params.network_id)
     }
 
     fn validate_delta_body(
@@ -945,6 +990,18 @@ impl ChainState {
         median_timestamp(&self.raw_timestamps)
     }
 
+    /// Captures only the immutable consensus values required to preflight the
+    /// next header. It contains no UTXO state and cannot authorize a commit.
+    pub fn successor_header_preflight(&self) -> Result<SuccessorHeaderPreflight, ChainError> {
+        Ok(SuccessorHeaderPreflight {
+            params: self.params,
+            tip: self.tip,
+            next_height: self.next_height,
+            median_time_past: self.median_time_past(),
+            expected_target: self.expected_target()?,
+        })
+    }
+
     /// Validates a transaction set against the current UTXO state at the next
     /// block height without mutating the chain or exposing a committable delta.
     pub fn validate_transactions_for_next_block(
@@ -1076,45 +1133,8 @@ impl ChainState {
         block: &Block,
         context: BlockValidationContext,
     ) -> Result<(u64, [u8; 32]), ChainError> {
-        if block.version != BLOCK_VERSION {
-            return Err(ChainError::UnsupportedBlockVersion);
-        }
-        if block.challenge.network_id != self.params.network_id {
-            return Err(ChainError::WrongNetwork);
-        }
-        if block.challenge.height != self.next_height {
-            return Err(ChainError::UnexpectedHeight {
-                expected: self.next_height,
-                actual: block.challenge.height,
-            });
-        }
-        let next_height = self
-            .next_height
-            .checked_add(1)
-            .ok_or(ChainError::HeightExhausted)?;
-        block
-            .challenge
-            .height
-            .checked_add(COINBASE_MATURITY)
-            .ok_or(ChainError::HeightExhausted)?;
-        if block.challenge.previous_block != self.tip {
-            return Err(ChainError::PreviousBlock);
-        }
-        if block.challenge.timestamp <= self.median_time_past() {
-            return Err(ChainError::TimestampNotAfterMedian);
-        }
-        let maximum_timestamp = context
-            .now_unix_seconds
-            .checked_add(self.params.max_future_offset_secs)
-            .ok_or(ChainError::InvalidValidationTime)?;
-        if block.challenge.timestamp > maximum_timestamp {
-            return Err(ChainError::TimestampTooFarInFuture);
-        }
-        let expected_target = self.expected_target()?;
-        if block.challenge.target != expected_target {
-            return Err(ChainError::UnexpectedTarget);
-        }
-        Ok((next_height, expected_target))
+        self.successor_header_preflight()?
+            .preflight_block_values(block, context)
     }
 
     /// Atomically applies a transition returned by [`Self::validate_block`].
@@ -1212,6 +1232,35 @@ pub fn validate_block_resources(block: &Block) -> Result<(), ChainError> {
         return Err(ChainError::CoinbaseOutputLimit);
     }
     validate_transaction_resources(&block.transactions).map(drop)
+}
+
+/// Performs the canonical, state-independent body checks that bind the full
+/// transaction and coinbase payload to the proof-of-work header. This is safe
+/// to run before expensive proof verification and does not authorize a block.
+pub fn validate_block_preamble(block: &Block, network_id: [u8; 32]) -> Result<(), ChainError> {
+    validate_block_resources(block)?;
+    if block.version != BLOCK_VERSION {
+        return Err(ChainError::UnsupportedBlockVersion);
+    }
+    if block.challenge.network_id != network_id {
+        return Err(ChainError::WrongNetwork);
+    }
+    for transaction in &block.transactions {
+        if transaction.network_id != network_id {
+            return Err(ChainError::WrongNetwork);
+        }
+        if transaction.version != TRANSACTION_VERSION {
+            return Err(ChainError::UnsupportedTransactionVersion);
+        }
+    }
+    crate::wire::encode_block(block).map_err(|_| ChainError::BlockEncoding)?;
+    if block.challenge.height != block.coinbase.height {
+        return Err(ChainError::HeightMismatch);
+    }
+    if block.transaction_root() != block.challenge.transaction_root {
+        return Err(ChainError::MerkleRoot);
+    }
+    Ok(())
 }
 
 fn validate_transaction_set_resources(
@@ -2286,6 +2335,33 @@ mod tests {
         wrong_target.challenge.target[0] ^= 1;
         assert_eq!(
             state.preflight_block(&wrong_target, validation_context(60)),
+            Err(ChainError::UnexpectedTarget)
+        );
+    }
+
+    #[test]
+    fn successor_header_snapshot_matches_live_header_preflight() {
+        let state = chain_state(network_params());
+        let block = block_for_state(&state, 60, miner_destination(), vec![], 0, 7);
+        let context = validation_context(60);
+        let snapshot = state.successor_header_preflight().unwrap();
+
+        assert_eq!(snapshot.preflight_block(&block, context), Ok(()));
+        assert_eq!(
+            state.preflight_block_header(&block, context).map(drop),
+            Ok(())
+        );
+
+        let mut wrong_target = block;
+        wrong_target.challenge.target[0] ^= 1;
+        assert_eq!(
+            snapshot.preflight_block(&wrong_target, context),
+            Err(ChainError::UnexpectedTarget)
+        );
+        assert_eq!(
+            state
+                .preflight_block_header(&wrong_target, context)
+                .map(drop),
             Err(ChainError::UnexpectedTarget)
         );
     }

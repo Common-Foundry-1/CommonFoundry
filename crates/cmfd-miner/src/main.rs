@@ -26,8 +26,8 @@ use cmfd_node::peer::{
     BlockSubmissionStatus, MiningTemplate, PeerAddressPolicy, PeerLimits, StaticPeerConfig,
 };
 use cmfd_node::{
-    COMPILED_NETWORK_PROFILE, MiningShareSearchResult, MiningWork, Node, ProofProfile,
-    parse_miner_destination, unix_time_seconds,
+    COMPILED_NETWORK_PROFILE, MiningShareSearchResult, MiningWork, Node, NodeError, ProofProfile,
+    parse_miner_destination, submit_shared_tip_block, unix_time_seconds,
 };
 #[cfg(feature = "production-v3")]
 use cmfd_node::{ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts};
@@ -1662,13 +1662,25 @@ fn continuous_mining(
                 let block_id = block.block_id();
                 let height = block.challenge.height;
                 let expected_parent = hex::encode(block.challenge.previous_block);
-                let accepted = {
-                    let mut node = node.lock().map_err(|_| anyhow!("node mutex is poisoned"))?;
-                    if node.status()?.tip != expected_parent {
-                        false
-                    } else {
-                        node.submit_block(*block, unix_time_seconds()?)?;
-                        true
+                let parent_is_current = node
+                    .lock()
+                    .map_err(|_| anyhow!("node mutex is poisoned"))?
+                    .status()?
+                    .tip
+                    == expected_parent;
+                let accepted = if !parent_is_current {
+                    false
+                } else {
+                    match submit_shared_tip_block(&node, *block, unix_time_seconds()?) {
+                        Ok(_) => true,
+                        Err(
+                            NodeError::StaleBlockAdmission
+                            | NodeError::DuplicateBlock(_)
+                            | NodeError::UnknownParent(_)
+                            | NodeError::ProofVerificationQueueFull
+                            | NodeError::ProofVerificationQueueTimeout,
+                        ) => false,
+                        Err(error) => return Err(error.into()),
                     }
                 };
                 if accepted {

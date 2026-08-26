@@ -544,7 +544,7 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
 
     for block_id in &block_ids {
         let canonical = {
-            let node = lock_node(&shared)?;
+            let mut node = lock_node(&shared)?;
             node.canonical_block(*block_id)?
         }
         .ok_or(P2pError::UnknownRequestedBlock(*block_id))?;
@@ -697,7 +697,7 @@ fn perform_respond_to_peer_inner_with_policy(
             }
             PeerMessage::GetBlock { block_id } => {
                 let canonical = {
-                    let node = lock_node(&shared)?;
+                    let mut node = lock_node(&shared)?;
                     node.canonical_block(block_id)?
                 }
                 .ok_or(P2pError::UnknownRequestedBlock(block_id))?;

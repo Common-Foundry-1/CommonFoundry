@@ -173,6 +173,7 @@ const METADATA_FILE: &str = "network.meta";
 const BLOCK_LOG_FILE: &str = "blocks.log";
 const LOCK_FILE: &str = "node.lock";
 const WALLET_KEY_FILE: &str = "wallet.key";
+static NEXT_NODE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const METADATA_MAGIC: [u8; 4] = *b"CMFM";
 const METADATA_VERSION: u16 = 1;
 const METADATA_BYTES: usize = 40;
@@ -2106,13 +2107,94 @@ fn verify_retained_block_log_path(file: &File, path: &Path) -> Result<(), NodeEr
 }
 
 #[cfg(windows)]
-fn verify_retained_block_log_path(_file: &File, _path: &Path) -> Result<(), NodeError> {
-    // `open_block_log` omits write and delete sharing for the retained handle,
-    // so another process cannot mutate, rename, or replace this path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsFileIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn windows_file_identity(
+    file: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<WindowsFileIdentity, NodeError> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: `file` owns a valid handle for the duration of the call and the
+    // output pointer names a correctly sized writable FILE_ID_INFO value.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(io_error(operation, path, io::Error::last_os_error()));
+    }
+    Ok(WindowsFileIdentity {
+        volume_serial_number: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+    })
+}
+
+#[cfg(windows)]
+fn verify_retained_block_log_path(file: &File, path: &Path) -> Result<(), NodeError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    let retained = windows_file_identity(file, path, "identify retained block log handle")?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        // The transient identity handle must coexist with the retained append
+        // handle. The retained handle itself still grants FILE_SHARE_READ only
+        // and therefore continues to deny external write and delete access.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    let current = match options.open(path) {
+        Ok(current) => current,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(NodeError::CorruptLog(
+                "block log path was removed or retargeted after startup".to_owned(),
+            ));
+        }
+        Err(source) => {
+            return Err(io_error(
+                "open block log path for identity check",
+                path,
+                source,
+            ));
+        }
+    };
+    let current = windows_file_identity(&current, path, "identify current block log path")?;
+    if retained != current {
+        return Err(NodeError::CorruptLog(
+            "block log path no longer identifies the retained startup file".to_owned(),
+        ));
+    }
     Ok(())
 }
 
+fn next_node_instance_id() -> Result<u64, NodeError> {
+    NEXT_NODE_INSTANCE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| NodeError::CorruptLog("node instance identity counter exhausted".to_owned()))
+}
+
 pub struct Node {
+    /// Process-local identity used to bind off-lock admissions to this exact
+    /// live node value, even if the value inside a shared mutex is replaced.
+    instance_id: u64,
     data_dir: PathBuf,
     profile: NetworkProfile,
     params: NetworkParams,
@@ -2476,6 +2558,7 @@ enum AdmissionStateSnapshot {
 /// Immutable, revision-bound work captured while holding the shared node
 /// mutex. Completing this value never touches live node state.
 pub(crate) struct ExternalBlockAdmissionWork {
+    node_instance_id: u64,
     revision: u64,
     block_id: [u8; 32],
     parent: [u8; 32],
@@ -2630,9 +2713,24 @@ fn complete_branch_state_plan(
             }
             Err(error) => return Err(error),
         };
-        let validated = state.validate_block_preverified(&block, context, &preverified)?;
-        state.commit_validated(validated)?;
-        if state.successor_header_preflight()? != entry.successor_header {
+        let validated = state
+            .validate_block_preverified(&block, context, &preverified)
+            .map_err(|error| {
+                NodeError::CorruptLog(format!(
+                    "captured production fork block fails freshly preverified replay: {error}"
+                ))
+            })?;
+        state.commit_validated(validated).map_err(|error| {
+            NodeError::CorruptLog(format!(
+                "captured production fork block cannot commit during replay: {error}"
+            ))
+        })?;
+        let successor_header = state.successor_header_preflight().map_err(|error| {
+            NodeError::CorruptLog(format!(
+                "captured production fork successor state is invalid: {error}"
+            ))
+        })?;
+        if successor_header != entry.successor_header {
             return Err(NodeError::CorruptLog(
                 "captured production fork header snapshot does not match replayed state".to_owned(),
             ));
@@ -2877,6 +2975,7 @@ impl Node {
         }
 
         Ok(Self {
+            instance_id: next_node_instance_id()?,
             data_dir,
             profile,
             params,
@@ -2908,6 +3007,30 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    fn latch_authenticated_storage_failure<T>(
+        &mut self,
+        result: Result<T, NodeError>,
+    ) -> Result<T, NodeError> {
+        if result.as_ref().is_err_and(is_authenticated_storage_failure) {
+            self.storage_faulted = true;
+        }
+        result
+    }
+
+    fn latch_external_completion_failure(
+        &mut self,
+        node_instance_id: u64,
+        chain_revision: u64,
+        error: &NodeError,
+    ) {
+        if self.instance_id == node_instance_id
+            && self.chain_revision == chain_revision
+            && is_authenticated_storage_failure(error)
+        {
+            self.storage_faulted = true;
+        }
     }
 
     pub fn network_profile(&self) -> NetworkProfile {
@@ -3164,7 +3287,12 @@ impl Node {
     /// is reconstructed from the active branch on every call, while balances
     /// come from the active UTXO set with the volatile mempool applied as a
     /// reservation/pending-output overlay.
-    pub fn wallet_snapshot(&self) -> Result<WalletSnapshot, NodeError> {
+    pub fn wallet_snapshot(&mut self) -> Result<WalletSnapshot, NodeError> {
+        let result = self.wallet_snapshot_unlatched();
+        self.latch_authenticated_storage_failure(result)
+    }
+
+    fn wallet_snapshot_unlatched(&mut self) -> Result<WalletSnapshot, NodeError> {
         let destination = self.wallet_destination();
         let reserved = mempool_spent_inputs(&self.mempool);
         let mut spendable = 0_u64;
@@ -3507,23 +3635,24 @@ impl Node {
     }
 
     fn confirmed_wallet_history(
-        &self,
+        &mut self,
         destination: [u8; 32],
         accepted_height: u64,
         history_limit: usize,
     ) -> Result<Vec<WalletHistoryEntry>, NodeError> {
         let mut outputs = HashMap::<OutPoint, TxOutput>::new();
         let mut history = VecDeque::with_capacity(history_limit);
-        for block_id in self.index.active_chain.iter().skip(1) {
-            let indexed = self.index.blocks.get(block_id).ok_or_else(|| {
+        for position in 1..self.index.active_chain.len() {
+            let block_id = self.index.active_chain[position];
+            let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
                 NodeError::CorruptLog("active wallet history refers to an absent block".to_owned())
             })?;
             let log_path = self.data_dir.join(BLOCK_LOG_FILE);
             let block = read_indexed_block(
                 &self.log,
                 &log_path,
-                indexed,
-                *block_id,
+                &indexed,
+                block_id,
                 self.params.network_id,
                 matches!(self.profile.proof, ProofProfile::ProductionV3),
             )?;
@@ -3675,24 +3804,27 @@ impl Node {
     /// Reads and authenticates the exact canonical frame for a validated block.
     /// Virtual genesis and unknown identifiers have no frame and return
     /// `None`; retained-log corruption and I/O failures are never hidden.
-    pub fn canonical_block(&self, block_id: [u8; 32]) -> Result<Option<Vec<u8>>, NodeError> {
-        let Some(indexed) = self.index.blocks.get(&block_id) else {
+    pub fn canonical_block(&mut self, block_id: [u8; 32]) -> Result<Option<Vec<u8>>, NodeError> {
+        let Some(indexed) = self.index.blocks.get(&block_id).cloned() else {
             return Ok(None);
         };
-        if indexed.block_id() != block_id {
-            return Err(NodeError::CorruptLog(
-                "fork index key does not match its durable record locator".to_owned(),
-            ));
-        }
-        let path = self.data_dir.join(BLOCK_LOG_FILE);
-        let (record, _) = read_located_record(
-            &self.log,
-            &path,
-            &indexed.locator,
-            self.params.network_id,
-            matches!(self.profile.proof, ProofProfile::ProductionV3),
-        )?;
-        Ok(Some(record.block_bytes))
+        let result = (|| {
+            if indexed.block_id() != block_id {
+                return Err(NodeError::CorruptLog(
+                    "fork index key does not match its durable record locator".to_owned(),
+                ));
+            }
+            let path = self.data_dir.join(BLOCK_LOG_FILE);
+            let (record, _) = read_located_record(
+                &self.log,
+                &path,
+                &indexed.locator,
+                self.params.network_id,
+                matches!(self.profile.proof, ProofProfile::ProductionV3),
+            )?;
+            Ok(Some(record.block_bytes))
+        })();
+        self.latch_authenticated_storage_failure(result)
     }
 
     /// Builds a bounded, newest-first active-chain locator. For every nonzero
@@ -4044,7 +4176,7 @@ impl Node {
     }
 
     pub(crate) fn begin_external_block_admission(
-        &self,
+        &mut self,
         block: &Block,
         accepted_at: u64,
     ) -> Result<Option<ExternalBlockAdmissionWork>, NodeError> {
@@ -4052,7 +4184,7 @@ impl Node {
     }
 
     fn continue_external_block_admission(
-        &self,
+        &mut self,
         block: &Block,
         accepted_at: u64,
         checkpoint: BranchStateCheckpoint,
@@ -4062,7 +4194,7 @@ impl Node {
     }
 
     fn begin_external_block_admission_from_checkpoint(
-        &self,
+        &mut self,
         block: &Block,
         accepted_at: u64,
         checkpoint: Option<BranchStateCheckpoint>,
@@ -4083,16 +4215,18 @@ impl Node {
             AdmissionStateSnapshot::Active
         } else {
             let log_path = self.data_dir.join(BLOCK_LOG_FILE);
-            AdmissionStateSnapshot::Branch(self.index.branch_state_plan(
+            let plan = self.index.branch_state_plan(
                 parent,
                 checkpoint,
                 &self.log,
                 &log_path,
                 self.params.network_id,
                 true,
-            )?)
+            );
+            AdmissionStateSnapshot::Branch(self.latch_authenticated_storage_failure(plan)?)
         };
         Ok(Some(ExternalBlockAdmissionWork {
+            node_instance_id: self.instance_id,
             revision: self.chain_revision,
             block_id,
             parent,
@@ -4196,7 +4330,8 @@ impl Node {
                 activation_chain,
                 allow_index_reconstruction: false,
             },
-        )?;
+        );
+        let prepared = self.latch_authenticated_storage_failure(prepared)?;
         let delta = prepared.encode_reversible_state_delta().map_err(|error| {
             NodeError::CorruptLog(format!(
                 "validated block cannot encode its reversible state delta: {error}"
@@ -4204,12 +4339,21 @@ impl Node {
         })?;
         let record = encode_record_v2(accepted_at, &canonical, &delta, self.last_record_digest)?;
         let record_digest = complete_record_digest(&record);
-        verify_retained_block_log_path(&self.log, &log_path)?;
-        let observed_length = self
-            .log
-            .metadata()
-            .map_err(|source| io_error("inspect block log before append", &log_path, source))?
-            .len();
+        if let Err(error) = verify_retained_block_log_path(&self.log, &log_path) {
+            self.storage_faulted = true;
+            return Err(error);
+        }
+        let observed_length = match self.log.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(source) => {
+                self.storage_faulted = true;
+                return Err(io_error(
+                    "inspect block log before append",
+                    &log_path,
+                    source,
+                ));
+            }
+        };
         if observed_length != self.block_log_length {
             self.storage_faulted = true;
             return Err(NodeError::CorruptLog(
@@ -4509,7 +4653,7 @@ fn submit_shared_block_with_policy(
         };
 
     let admission_work = {
-        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+        let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
         if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
             && block.challenge.previous_block != node.state.tip()
         {
@@ -4525,15 +4669,29 @@ fn submit_shared_block_with_policy(
                 .then(|| block_preverifier.reserve_reconstruction())
                 .transpose()?;
             loop {
+                let work_node_instance_id = work.node_instance_id;
+                let work_revision = work.revision;
                 let progress = match catch_unwind(AssertUnwindSafe(|| work.complete(&block))) {
-                    Ok(result) => result?,
+                    Ok(Ok(progress)) => progress,
+                    Ok(Err(error)) => {
+                        if is_authenticated_storage_failure(&error) {
+                            let mut node =
+                                shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+                            node.latch_external_completion_failure(
+                                work_node_instance_id,
+                                work_revision,
+                                &error,
+                            );
+                        }
+                        return Err(error);
+                    }
                     Err(_) => return Err(NodeError::ProofVerifierPanicked),
                 };
                 match progress {
                     ExternalBlockAdmissionProgress::Ready(admission) => break Some(admission),
                     ExternalBlockAdmissionProgress::Checkpoint { checkpoint } => {
                         block_preverifier.ensure_reconstruction_open()?;
-                        let node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
+                        let mut node = shared.lock().map_err(|_| NodeError::SharedNodePoisoned)?;
                         if matches!(policy, SharedBlockPolicy::ActiveTipOnly)
                             && block.challenge.previous_block != node.state.tip()
                         {
@@ -4622,6 +4780,13 @@ fn is_cacheable_proof_rejection(error: &NodeError) -> bool {
     matches!(
         error,
         NodeError::ProofVerifierWorker(VerifierWorkerError::ProofRejected(_))
+    )
+}
+
+fn is_authenticated_storage_failure(error: &NodeError) -> bool {
+    matches!(
+        error,
+        NodeError::Io { .. } | NodeError::CorruptLog(_) | NodeError::ProductionLegacyBlockLog(_)
     )
 }
 
@@ -7071,6 +7236,8 @@ fn log_read_error(path: &Path, source: io::Error, truncated_message: String) -> 
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
+    #[cfg(windows)]
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
@@ -7114,8 +7281,25 @@ mod tests {
             node.canonical_block(block_id),
             Err(NodeError::CorruptLog(_))
         ));
+        assert!(node.storage_faulted);
         set_indexed_locator(node, block_id, original);
         assert!(node.canonical_block(block_id).unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    fn create_directory_junction(target: &Path, junction: &Path) {
+        let output = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(junction)
+            .arg(target)
+            .output()
+            .expect("launch mklink for isolated junction fixture");
+        assert!(
+            output.status.success(),
+            "mklink failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn split_complete_log_records(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -7763,15 +7947,19 @@ mod tests {
             node.begin_external_block_admission(&child, t2),
             Err(NodeError::CorruptLog(_))
         ));
+        assert!(node.storage_faulted);
         Arc::get_mut(node.index.blocks.get_mut(&side.block_id()).unwrap())
             .unwrap()
             .locator = original_locator;
+        drop(node);
 
         let mut invalid_proof = child;
         let BlockProof::V2Reference(proof) = &mut invalid_proof.proof else {
             unreachable!();
         };
         proof.work_digest[0] ^= 1;
+        let mut node = Node::open(&path).unwrap();
+        node.profile.proof = ProofProfile::ProductionV3;
         let shared = Arc::new(Mutex::new(node));
         let error = submit_shared_block(&shared, invalid_proof, t2).unwrap_err();
         assert_eq!(
@@ -7782,6 +7970,128 @@ mod tests {
 
         drop(shared);
         clean_test_dir(&path);
+    }
+
+    #[test]
+    fn production_side_completion_corruption_latches_storage_and_blocks_append() {
+        let path = test_dir("production-side-completion-corruption");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let genesis = node.params.genesis_hash;
+        let t1 = DEVNET_GENESIS_TIMESTAMP + 60;
+        let t2 = t1 + 60;
+
+        let active = mined_child(&node, genesis, t1, 0x71);
+        node.submit_block(active, t1).unwrap();
+        let side = mined_child(&node, genesis, t1, 0x72);
+        let side_cap = node.block_preverifier.preverify(&side).unwrap();
+        node.submit_preverified_block(side.clone(), t1, side_cap)
+            .unwrap();
+        let child = mined_child(&node, side.block_id(), t2, 0x73);
+
+        // Preserve every field used by cheap successor preflight while making
+        // the retained index snapshot unequal to the freshly replayed state.
+        let mut alternate_params = node.params;
+        alternate_params.max_future_offset_secs -= 1;
+        let mut alternate_state = ChainState::new(alternate_params, node.verifier.clone()).unwrap();
+        let alternate_validated = alternate_state
+            .validate_block(
+                &side,
+                BlockValidationContext {
+                    now_unix_seconds: t1,
+                },
+            )
+            .unwrap();
+        alternate_state
+            .commit_validated(alternate_validated)
+            .unwrap();
+        let forged_header = alternate_state.successor_header_preflight().unwrap();
+        assert!(
+            forged_header
+                .preflight_block(
+                    &child,
+                    BlockValidationContext {
+                        now_unix_seconds: t2
+                    }
+                )
+                .is_ok()
+        );
+        let side_entry =
+            Arc::get_mut(node.index.blocks.get_mut(&side.block_id()).unwrap()).unwrap();
+        assert_ne!(side_entry.successor_header, forged_header);
+        side_entry.successor_header = forged_header;
+
+        let original_tip = node.state.tip();
+        let original_revision = node.chain_revision;
+        let original_log_length = node.log.metadata().unwrap().len();
+        node.profile.proof = ProofProfile::ProductionV3;
+        let shared = Arc::new(Mutex::new(node));
+        assert!(matches!(
+            submit_shared_block(&shared, child.clone(), t2),
+            Err(NodeError::CorruptLog(message))
+                if message.contains("header snapshot does not match replayed state")
+        ));
+
+        let mut node = shared.lock().unwrap();
+        assert!(node.storage_faulted);
+        assert_eq!(node.state.tip(), original_tip);
+        assert_eq!(node.chain_revision, original_revision);
+        assert_eq!(node.log.metadata().unwrap().len(), original_log_length);
+        node.profile.proof = ProofProfile::DevnetV2Reference;
+        assert!(matches!(
+            node.submit_block(child, t2),
+            Err(NodeError::StorageFaulted)
+        ));
+
+        drop(node);
+        drop(shared);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn completion_fault_latch_is_instance_revision_and_error_bound() {
+        let first_path = test_dir("completion-latch-first");
+        let replacement_path = test_dir("completion-latch-replacement");
+        clean_test_dir(&first_path);
+        clean_test_dir(&replacement_path);
+        let mut first = Node::open(&first_path).unwrap();
+        let original_instance = first.instance_id;
+        let stale_revision = first.chain_revision;
+        first
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let corruption = NodeError::CorruptLog("captured replay corruption".to_owned());
+        first.latch_external_completion_failure(original_instance, stale_revision, &corruption);
+        assert!(!first.storage_faulted, "a stale completion cannot poison");
+
+        let mut replacement = Node::open(&replacement_path).unwrap();
+        replacement.latch_external_completion_failure(
+            original_instance,
+            replacement.chain_revision,
+            &corruption,
+        );
+        assert!(
+            !replacement.storage_faulted,
+            "another node instance cannot be poisoned"
+        );
+        replacement.latch_external_completion_failure(
+            replacement.instance_id,
+            replacement.chain_revision,
+            &NodeError::UnknownParent([0x5a; 32]),
+        );
+        assert!(
+            !replacement.storage_faulted,
+            "ordinary client failures are not storage faults"
+        );
+
+        drop(first);
+        drop(replacement);
+        clean_test_dir(&first_path);
+        clean_test_dir(&replacement_path);
     }
 
     fn mined_candidate(node: &Node, now: u64) -> Block {
@@ -9245,7 +9555,7 @@ mod tests {
             u16::from_le_bytes(record[4..6].try_into().unwrap()) == RECORD_VERSION_V2
         }));
 
-        let node = Node::open(&path).unwrap();
+        let mut node = Node::open(&path).unwrap();
         assert_eq!(node.state.tip(), tip);
         assert_eq!(node.cumulative_work(), work);
         assert_eq!(node.index.blocks.len(), block_count);
@@ -9381,6 +9691,150 @@ mod tests {
         );
         assert_eq!(node.log.metadata().unwrap().len(), node.block_log_length);
 
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ancestor_junction_retarget_cannot_split_the_retained_log_from_its_path() {
+        let root = test_dir("retained-log-junction-retarget");
+        clean_test_dir(&root);
+        let target_a = root.join("target-a");
+        let target_b = root.join("target-b");
+        let junction = root.join("current");
+        fs::create_dir_all(&target_a).unwrap();
+        fs::create_dir_all(&target_b).unwrap();
+        create_directory_junction(&target_a, &junction);
+
+        let data_dir = junction.join("node");
+        let first_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let second_at = first_at + 60;
+        let mut node = Node::open(&data_dir).unwrap();
+        let first = node
+            .mine_once(
+                default_miner_destination(),
+                first_at,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let second = mined_child(&node, first.block_id(), second_at, 0x5a);
+        let original_tip = node.state.tip();
+        let retained_log = target_a.join("node").join(BLOCK_LOG_FILE);
+        let retained_length = fs::metadata(&retained_log).unwrap().len();
+
+        let replacement_data_dir = target_b.join("node");
+        fs::create_dir_all(&replacement_data_dir).unwrap();
+        let replacement_log = replacement_data_dir.join(BLOCK_LOG_FILE);
+        fs::write(&replacement_log, []).unwrap();
+        fs::remove_dir(&junction).unwrap();
+        create_directory_junction(&target_b, &junction);
+
+        assert!(matches!(
+            node.submit_block(second.clone(), second_at),
+            Err(NodeError::CorruptLog(message))
+                if message.contains("no longer identifies the retained startup file")
+        ));
+        assert!(node.storage_faulted);
+        assert_eq!(node.state.tip(), original_tip);
+        assert_eq!(fs::metadata(&retained_log).unwrap().len(), retained_length);
+        assert_eq!(fs::metadata(&replacement_log).unwrap().len(), 0);
+        assert!(matches!(
+            node.submit_block(second, second_at),
+            Err(NodeError::StorageFaulted)
+        ));
+
+        drop(node);
+        fs::remove_dir(&junction).unwrap();
+        clean_test_dir(&root);
+    }
+
+    #[test]
+    fn wallet_locator_corruption_latches_storage_and_blocks_the_next_append() {
+        let path = test_dir("wallet-latches-locator-corruption");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        assert!(node.canonical_block([0xa5; 32]).unwrap().is_none());
+        assert!(
+            !node.storage_faulted,
+            "unknown blocks are not storage faults"
+        );
+
+        let first_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let second_at = first_at + 60;
+        let first = node
+            .mine_once(
+                default_miner_destination(),
+                first_at,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let second = mined_child(&node, first.block_id(), second_at, 0x5b);
+        let log_length = node.block_log_length;
+        let mut forged = node.index.blocks[&first.block_id()].locator;
+        forged.complete_digest[0] ^= 1;
+        set_indexed_locator(&mut node, first.block_id(), forged);
+
+        assert!(matches!(
+            node.wallet_snapshot(),
+            Err(NodeError::CorruptLog(_))
+        ));
+        assert!(node.storage_faulted);
+        assert!(matches!(
+            node.submit_block(second, second_at),
+            Err(NodeError::StorageFaulted)
+        ));
+        assert_eq!(node.log.metadata().unwrap().len(), log_length);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_length_log_mutation_read_latches_storage_and_blocks_the_next_append() {
+        let path = test_dir("read-latches-same-length-log-mutation");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let first_at = DEVNET_GENESIS_TIMESTAMP + 60;
+        let second_at = first_at + 60;
+        let first = node
+            .mine_once(
+                default_miner_destination(),
+                first_at,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let second = mined_child(&node, first.block_id(), second_at, 0x5c);
+        let original_tip = node.state.tip();
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let mut changed = fs::read(&log_path).unwrap();
+        let original_length = changed.len();
+        let accepted_at = u64::from_le_bytes(changed[8..16].try_into().unwrap());
+        changed[8..16].copy_from_slice(&accepted_at.checked_add(1).unwrap().to_le_bytes());
+        recompute_fixture_record_checksum(&mut changed);
+        assert_eq!(changed.len(), original_length);
+        let mut writer = OpenOptions::new().write(true).open(&log_path).unwrap();
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.write_all(&changed).unwrap();
+        writer.sync_all().unwrap();
+
+        assert!(matches!(
+            node.canonical_block(first.block_id()),
+            Err(NodeError::CorruptLog(_))
+        ));
+        assert!(node.storage_faulted);
+        assert!(matches!(
+            node.submit_block(second, second_at),
+            Err(NodeError::StorageFaulted)
+        ));
+        assert_eq!(node.state.tip(), original_tip);
+        assert_eq!(
+            fs::metadata(&log_path).unwrap().len(),
+            original_length as u64
+        );
+
+        drop(writer);
         drop(node);
         clean_test_dir(&path);
     }
@@ -11042,7 +11496,7 @@ mod tests {
         assert_eq!(tx_history.fee_burned_atoms, "1");
         drop(node);
 
-        let replayed = Node::open(&path).unwrap();
+        let mut replayed = Node::open(&path).unwrap();
         assert_eq!(replayed.wallet_snapshot().unwrap(), confirmed);
         drop(replayed);
         for entry in fs::read_dir(&path).unwrap() {
@@ -11186,7 +11640,7 @@ mod tests {
         )
         .unwrap();
         drop(node);
-        let node = Node::open(&path).unwrap();
+        let mut node = Node::open(&path).unwrap();
         let confirmed = node.wallet_snapshot().unwrap();
         let item = confirmed
             .history

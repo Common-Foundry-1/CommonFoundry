@@ -91,6 +91,7 @@ pub mod dory_v3_transcript;
 pub mod economics;
 pub mod forgematrix;
 pub mod forgematrix_v2;
+pub mod forgematrix_v4;
 pub mod model_bank;
 #[cfg(feature = "gpu-proof-prover")]
 pub mod model_whir_sources;
@@ -153,6 +154,15 @@ pub use forgematrix_v2::{
     V2_REFERENCE_MAX_BATCH, V2_REFERENCE_MAX_DIMENSION, V2_REFERENCE_MAX_LAYERS, V2_TEST_BATCH,
     V2_TEST_DIMENSION, V2_TEST_LAYERS, V2_TRANSITION_MODULUS, v2_reference_for_network,
     v2_test_reference,
+};
+pub use forgematrix_v4::{
+    FORGEMATRIX_V4_BASEFOLD_LOG_BLOWUP, FORGEMATRIX_V4_BASEFOLD_POW_BITS,
+    FORGEMATRIX_V4_BASEFOLD_QUERIES, FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES,
+    FORGEMATRIX_V4_BASEFOLD_ROWS, FORGEMATRIX_V4_DYNAMIC_AXIS_ORDER,
+    FORGEMATRIX_V4_DYNAMIC_COLUMNS, FORGEMATRIX_V4_EXTENSION_DEGREE, FORGEMATRIX_V4_FIELD_MODULUS,
+    FORGEMATRIX_V4_FIXED_COLUMNS, FORGEMATRIX_V4_RELATION_REPETITIONS,
+    FORGEMATRIX_V4_WEIGHT_AXIS_ORDER, ForgeMatrixV4DynamicTraceKind, forgematrix_v4_dynamic_index,
+    forgematrix_v4_weight_index,
 };
 pub use model_bank::{
     BuiltModelBankFixture, MAX_MODEL_BYTE, MAX_MODEL_PCS_WEIGHT_BANKS,

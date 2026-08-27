@@ -26,12 +26,13 @@ const BATCH_VARIABLES: usize = 7;
 const DIMENSION_VARIABLES: usize = 12;
 const FIXED_COLUMN_VARIABLES: usize = 8;
 const DYNAMIC_COLUMN_VARIABLES: usize = 4;
+const COMMITMENTS_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/Commitments/v1";
 const MATRIX_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/MatrixPoint/v1";
 const MATRIX_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/MatrixProof/v1";
 const SHIFT_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/ShiftProof/v1";
 const CUBIC_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/CubicPoint/v1";
 const CUBIC_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/CubicProof/v1";
-const BOUNDARY_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/BoundaryPoint/v1";
+const FINAL_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/FinalPoint/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForgeMatrixV4MatrixPoint {
@@ -95,6 +96,18 @@ pub enum ForgeMatrixV4RelationError {
     Terminal,
 }
 
+pub fn bind_forgematrix_v4_commitments(
+    challenger: &mut ForgeMatrixV4Challenger,
+    fixed_commitments: &[crate::forgematrix_v4_basefold::ForgeMatrixV4Digest; 3],
+    dynamic_commitments: &[crate::forgematrix_v4_basefold::ForgeMatrixV4Digest; 3],
+) {
+    observe_bytes(challenger, COMMITMENTS_DOMAIN);
+    for bank in 0..PRODUCTION_V2_BANKS as usize {
+        challenger.observe(fixed_commitments[bank]);
+        challenger.observe(dynamic_commitments[bank]);
+    }
+}
+
 pub fn sample_forgematrix_v4_matrix_point(
     challenger: &mut ForgeMatrixV4Challenger,
     bank: usize,
@@ -121,12 +134,16 @@ pub fn sample_forgematrix_v4_cubic_point(
     })
 }
 
-pub fn sample_forgematrix_v4_boundary_point(
+pub fn sample_forgematrix_v4_final_point(
     challenger: &mut ForgeMatrixV4Challenger,
-    bank: usize,
     repetition: usize,
 ) -> Result<ForgeMatrixV4BoundaryPoint, ForgeMatrixV4RelationError> {
-    observe_relation_index(challenger, BOUNDARY_POINT_DOMAIN, bank, repetition)?;
+    observe_relation_index(
+        challenger,
+        FINAL_POINT_DOMAIN,
+        PRODUCTION_V2_BANKS as usize - 1,
+        repetition,
+    )?;
     Ok(ForgeMatrixV4BoundaryPoint {
         batch: sample_point(challenger, BATCH_VARIABLES),
         output: sample_point(challenger, DIMENSION_VARIABLES),
@@ -326,6 +343,17 @@ pub fn forgematrix_v4_matrix_opening_claims(
     ])
 }
 
+pub fn forgematrix_v4_matrix_terminal_layer(
+    proof: &ForgeMatrixV4MatrixRelationProof,
+) -> Result<Point<ForgeMatrixV4Extension>, ForgeMatrixV4RelationError> {
+    validate_sumcheck_shape(
+        &proof.sumcheck,
+        FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES,
+        FORGEMATRIX_V4_MATRIX_SUMCHECK_DEGREE,
+    )?;
+    point_range(&proof.sumcheck.point_and_eval.0, 0..LAYER_VARIABLES)
+}
+
 pub fn forgematrix_v4_shift_opening_claim(
     matrix_point: &ForgeMatrixV4MatrixPoint,
     matrix_proof: &ForgeMatrixV4MatrixRelationProof,
@@ -403,7 +431,47 @@ pub fn forgematrix_v4_cubic_opening_claims(
     ])
 }
 
-pub fn forgematrix_v4_boundary_opening_claim(
+pub fn forgematrix_v4_shift_boundary_point(
+    matrix_point: &ForgeMatrixV4MatrixPoint,
+    matrix_proof: &ForgeMatrixV4MatrixRelationProof,
+) -> Result<ForgeMatrixV4BoundaryPoint, ForgeMatrixV4RelationError> {
+    validate_matrix_point(matrix_point)?;
+    validate_sumcheck_shape(
+        &matrix_proof.sumcheck,
+        FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES,
+        FORGEMATRIX_V4_MATRIX_SUMCHECK_DEGREE,
+    )?;
+    Ok(ForgeMatrixV4BoundaryPoint {
+        batch: matrix_point.batch.clone(),
+        output: point_range(
+            &matrix_proof.sumcheck.point_and_eval.0,
+            LAYER_VARIABLES..FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES,
+        )?,
+    })
+}
+
+pub fn forgematrix_v4_shift_boundary_opening_claim(
+    matrix_point: &ForgeMatrixV4MatrixPoint,
+    matrix_proof: &ForgeMatrixV4MatrixRelationProof,
+    shift_proof: &ForgeMatrixV4ShiftRelationProof,
+) -> Result<ForgeMatrixV4OpeningClaim, ForgeMatrixV4RelationError> {
+    validate_sumcheck_shape(
+        &shift_proof.sumcheck,
+        FORGEMATRIX_V4_SHIFT_SUMCHECK_VARIABLES,
+        FORGEMATRIX_V4_SHIFT_SUMCHECK_DEGREE,
+    )?;
+    let point = forgematrix_v4_shift_boundary_point(matrix_point, matrix_proof)?;
+    forgematrix_v4_last_activation_opening_claim(&point, shift_proof.boundary_evaluation)
+}
+
+pub fn forgematrix_v4_final_opening_claim(
+    point: &ForgeMatrixV4BoundaryPoint,
+    value: ForgeMatrixV4Extension,
+) -> Result<ForgeMatrixV4OpeningClaim, ForgeMatrixV4RelationError> {
+    forgematrix_v4_last_activation_opening_claim(point, value)
+}
+
+fn forgematrix_v4_last_activation_opening_claim(
     point: &ForgeMatrixV4BoundaryPoint,
     value: ForgeMatrixV4Extension,
 ) -> Result<ForgeMatrixV4OpeningClaim, ForgeMatrixV4RelationError> {
@@ -770,7 +838,9 @@ mod tests {
 
     #[test]
     fn zero_relations_replay_one_shared_transcript_and_reject_mutations() {
+        let commitments = [[crate::forgematrix_v4_basefold::ForgeMatrixV4Field::zero(); 8]; 3];
         let mut prover_challenger = forgematrix_v4_transcript(statement());
+        bind_forgematrix_v4_commitments(&mut prover_challenger, &commitments, &commitments);
         let matrix_point =
             sample_forgematrix_v4_matrix_point(&mut prover_challenger, 0, 0).unwrap();
         observe_bytes(&mut prover_challenger, MATRIX_PROOF_DOMAIN);
@@ -818,10 +888,10 @@ mod tests {
         };
         prover_challenger.observe_ext_element(cubic.preactivation_evaluation);
         prover_challenger.observe_ext_element(cubic.next_activation_evaluation);
-        let boundary_point =
-            sample_forgematrix_v4_boundary_point(&mut prover_challenger, 0, 0).unwrap();
+        let final_point = sample_forgematrix_v4_final_point(&mut prover_challenger, 0).unwrap();
 
         let mut verifier_challenger = forgematrix_v4_transcript(statement());
+        bind_forgematrix_v4_commitments(&mut verifier_challenger, &commitments, &commitments);
         assert_eq!(
             sample_forgematrix_v4_matrix_point(&mut verifier_challenger, 0, 0).unwrap(),
             matrix_point
@@ -847,13 +917,14 @@ mod tests {
         verify_forgematrix_v4_cubic_relation(&cubic_point, &cubic, &mut verifier_challenger)
             .unwrap();
         assert_eq!(
-            sample_forgematrix_v4_boundary_point(&mut verifier_challenger, 0, 0).unwrap(),
-            boundary_point
+            sample_forgematrix_v4_final_point(&mut verifier_challenger, 0).unwrap(),
+            final_point
         );
 
         let mut bad_matrix = matrix.clone();
         bad_matrix.preactivation_evaluation = ForgeMatrixV4Extension::one();
         let mut challenger = forgematrix_v4_transcript(statement());
+        bind_forgematrix_v4_commitments(&mut challenger, &commitments, &commitments);
         let point = sample_forgematrix_v4_matrix_point(&mut challenger, 0, 0).unwrap();
         assert_eq!(
             verify_forgematrix_v4_matrix_relation(
@@ -887,5 +958,61 @@ mod tests {
                 .iter()
                 .all(|claim| claim.value == padding)
         );
+    }
+
+    #[test]
+    fn shift_boundary_is_the_previous_bank_tail_at_the_matrix_input_coordinates() {
+        let mut challenger = forgematrix_v4_transcript(statement());
+        let matrix_point = sample_forgematrix_v4_matrix_point(&mut challenger, 1, 0).unwrap();
+        observe_bytes(&mut challenger, MATRIX_PROOF_DOMAIN);
+        challenger.observe_ext_element(ForgeMatrixV4Extension::zero());
+        challenger.observe_ext_element(ForgeMatrixV4Extension::zero());
+        let matrix = ForgeMatrixV4MatrixRelationProof {
+            sumcheck: zero_sumcheck(
+                &mut challenger,
+                FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES,
+                FORGEMATRIX_V4_MATRIX_SUMCHECK_DEGREE,
+            ),
+            preactivation_evaluation: ForgeMatrixV4Extension::zero(),
+            weight_evaluation: ForgeMatrixV4Extension::zero(),
+            input_evaluation: ForgeMatrixV4Extension::zero(),
+        };
+        challenger.observe_ext_element(matrix.weight_evaluation);
+        challenger.observe_ext_element(matrix.input_evaluation);
+        observe_bytes(&mut challenger, SHIFT_PROOF_DOMAIN);
+        challenger.observe_ext_element(matrix.input_evaluation);
+        challenger.observe_ext_element(ForgeMatrixV4Extension::from_canonical_usize(17));
+        let shift = ForgeMatrixV4ShiftRelationProof {
+            sumcheck: zero_sumcheck(
+                &mut challenger,
+                FORGEMATRIX_V4_SHIFT_SUMCHECK_VARIABLES,
+                FORGEMATRIX_V4_SHIFT_SUMCHECK_DEGREE,
+            ),
+            boundary_evaluation: ForgeMatrixV4Extension::from_canonical_usize(17),
+            next_activation_evaluation: ForgeMatrixV4Extension::zero(),
+        };
+        let boundary = forgematrix_v4_shift_boundary_point(&matrix_point, &matrix).unwrap();
+        assert_eq!(boundary.batch, matrix_point.batch);
+        assert_eq!(
+            boundary.output,
+            point_range(
+                &matrix.sumcheck.point_and_eval.0,
+                LAYER_VARIABLES..FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES,
+            )
+            .unwrap()
+        );
+        let claim =
+            forgematrix_v4_shift_boundary_opening_claim(&matrix_point, &matrix, &shift).unwrap();
+        assert_eq!(claim.commitment, ForgeMatrixV4OpeningCommitment::Dynamic);
+        assert_eq!(claim.value, shift.boundary_evaluation);
+        let expected = forgematrix_v4_dynamic_pcs_point(
+            ForgeMatrixV4DynamicTraceKind::NextActivation,
+            &Point::from(vec![ForgeMatrixV4Extension::one(); LAYER_VARIABLES]),
+            &boundary.batch,
+            &boundary.output,
+        )
+        .unwrap();
+        assert_eq!(claim.column_point, expected.column);
+        assert_eq!(claim.row_point, expected.row);
     }
 }

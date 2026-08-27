@@ -350,7 +350,7 @@ mod tests {
         let expected = baseline.digest();
         assert_eq!(
             hex::encode(expected),
-            "2e2206f74a9ec0e81ceb91541fd27a57f523b876bb31062b3945d7084c94b93b"
+            "ace9c12f5b4183f64961421ab1489482c6ed0063f0b8c062843cca6e05afb4d3"
         );
 
         let mutations: [fn(&mut ForgeMatrixV4TranscriptStatement); 14] = [

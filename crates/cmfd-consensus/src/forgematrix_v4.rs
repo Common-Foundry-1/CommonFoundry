@@ -16,11 +16,13 @@ pub const FORGEMATRIX_V4_BASEFOLD_SOURCE_REVISION: &str =
     "92b8eabaea9ab7306da5826caa700adabf7445ba";
 pub const FORGEMATRIX_V4_POSEIDON_SUITE: &str =
     "slop-koala-bear/KoalaBearDegree4Duplex/Poseidon2-width16-digest8";
-pub const FORGEMATRIX_V4_PROOF_CODEC: &str =
-    "cmfd-v4-basefold-v1/fixed-shape/canonical-u32/little-endian/reject-trailing";
+pub const FORGEMATRIX_V4_PROOF_CODEC: &str = "cmfd-v4-transparent-v1/final-fields;three-banks(dynamic-commitment,two-relations,basefold-opening);fixed-shape;canonical-u32;little-endian;reject-trailing";
 pub const FORGEMATRIX_V4_TRACE_RELATIONS: &str =
     "preactivation=matrix-accumulator+challenge-coordinate-mask;next-activation=preactivation^3";
-pub const FORGEMATRIX_V4_RELATION_TRANSCRIPT: &str = "matrix-point-v1;matrix-proof-v1;shift-proof-v1;cubic-point-v1;cubic-proof-v1;boundary-point-v1";
+pub const FORGEMATRIX_V4_EXECUTION_SEMANTICS: &str = "model-byte x maps to x-125;initial-activation=(base-input+CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,u32::MAX))^3;layer-mask=CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,global-layer);all arithmetic canonical KoalaBear";
+pub const FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/V4/FinalActivation/v1";
+pub const FORGEMATRIX_V4_RELATION_TRANSCRIPT: &str = "commitments-v1;matrix-point-v1;matrix-proof-v1;shift-proof-v1;cubic-point-v1;cubic-proof-v1;final-point-v1";
 
 pub const FORGEMATRIX_V4_ALGORITHM_VERSION: u32 = 4;
 pub const FORGEMATRIX_V4_PROOF_VERSION: u32 = 1;
@@ -92,6 +94,8 @@ pub fn forgematrix_v4_proof_system_digest() -> [u8; 32] {
     update_text(&mut hasher, FORGEMATRIX_V4_WEIGHT_AXIS_ORDER);
     update_text(&mut hasher, FORGEMATRIX_V4_DYNAMIC_AXIS_ORDER);
     update_text(&mut hasher, FORGEMATRIX_V4_TRACE_RELATIONS);
+    update_text(&mut hasher, FORGEMATRIX_V4_EXECUTION_SEMANTICS);
+    update_text(&mut hasher, FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN);
     update_text(&mut hasher, FORGEMATRIX_V4_RELATION_TRANSCRIPT);
     update_text(&mut hasher, FORGEMATRIX_V4_TRANSCRIPT_DOMAIN);
     update_text(&mut hasher, FORGEMATRIX_V4_POSEIDON_SUITE);
@@ -256,7 +260,7 @@ mod tests {
         assert_ne!(digest, [0; 32]);
         assert_eq!(
             hex::encode(digest),
-            "2316bd7a7f9aa57507acf2ee49d5cd5e7a6a09d1f0c5532e41daab2c7fef8bf5"
+            "26a6a69d1c5386333c108e575cd75af62257802c7c8d27a5666c1b7f0fd351b6"
         );
     }
 }

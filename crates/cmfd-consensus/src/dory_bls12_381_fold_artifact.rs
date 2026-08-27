@@ -141,6 +141,7 @@ impl BlsDoryFoldArtifactWriter {
     }
 
     pub fn write_scalars(&mut self, scalars: &[BlsDoryFr]) -> Result<(), BlsDoryFoldArtifactError> {
+        const ENCODE_BATCH_SCALARS: usize = 1 << 16;
         let scalar_count =
             u64::try_from(scalars.len()).map_err(|_| BlsDoryFoldArtifactError::InvalidArtifact)?;
         let next_written = self
@@ -150,11 +151,20 @@ impl BlsDoryFoldArtifactWriter {
         if next_written > self.spec.explicit_scalar_count {
             return Err(BlsDoryFoldArtifactError::InvalidArtifact);
         }
-        for scalar in scalars {
-            let encoded = encode_scalar(scalar)?;
-            self.file_mut()?.write_all(&encoded)?;
-            self.hasher.update(&encoded);
-            self.written += 1;
+        // Encode a batch at a time so the digest and file advance in one
+        // update per batch instead of one per scalar. The byte stream is
+        // exactly the per-scalar stream, so artifact authentication is
+        // unchanged.
+        let mut encoded_batch =
+            Vec::with_capacity(scalars.len().min(ENCODE_BATCH_SCALARS) * ARTIFACT_SCALAR_BYTES);
+        for batch in scalars.chunks(ENCODE_BATCH_SCALARS) {
+            encoded_batch.clear();
+            for scalar in batch {
+                encoded_batch.extend_from_slice(&encode_scalar(scalar)?);
+            }
+            self.file_mut()?.write_all(&encoded_batch)?;
+            self.hasher.update(&encoded_batch);
+            self.written += batch.len() as u64;
         }
         Ok(())
     }

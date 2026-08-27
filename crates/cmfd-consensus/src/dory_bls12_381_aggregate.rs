@@ -4367,6 +4367,8 @@ impl AggregateCompactFoldView {
         Ok(())
     }
 
+    /// Serial reference for the chunked streams, retained for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn for_each_pair_with_cancel(
         &self,
         cancel: &AtomicBool,
@@ -4384,6 +4386,78 @@ impl AggregateCompactFoldView {
             visitor(lower, BlsDoryFr::zero());
         }
         Ok(())
+    }
+
+    /// The view's folded scalars as parallel-computed, index-ordered chunks;
+    /// exactly `for_each_scalar_with_cancel`'s values and validation.
+    fn for_each_output_chunk_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+        on_outputs: &mut ViewOutputChunkVisitor<'_>,
+    ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
+        let spec = self.source.spec();
+        if self.challenges.is_empty()
+            || self.challenges.len() > AGGREGATE_SOURCE_FOLD_GENERATIONS
+            || self.source.dictionary().len() != 16
+            || self
+                .source
+                .dictionary()
+                .iter()
+                .enumerate()
+                .any(|(digit, scalar)| *scalar != BlsDoryFr::from_u64(digit as u64))
+            || self.mapped_dictionary.len() != 16
+            || spec.signed_word_selectors != 0
+            || spec.word_scalar_count == 0
+            || spec.word_scalar_count >= spec.explicit_scalar_count
+        {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let block_len = 1usize
+            .checked_shl(
+                u32::try_from(self.challenges.len())
+                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            )
+            .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        let expected = usize::try_from(spec.explicit_scalar_count)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?
+            .div_ceil(block_len);
+        if expected != self.explicit_len || block_len > 1 << AGGREGATE_SOURCE_FOLD_GENERATIONS {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        stream_view_folded_chunks_with_cancel(
+            &self.source,
+            &self.challenges,
+            expected,
+            cancel,
+            |index, encoded| match encoded {
+                CompactEncodedScalar::Word {
+                    value,
+                    signed: false,
+                } if index < spec.word_scalar_count => Ok(match self.role {
+                    AggregateCompactFoldRole::Transition => BlsDoryFr::from_u64(value),
+                    AggregateCompactFoldRole::Mapped => BlsDoryFr::zero(),
+                }),
+                CompactEncodedScalar::Code(code) if index >= spec.word_scalar_count => {
+                    let digit = usize::from(code);
+                    match self.role {
+                        AggregateCompactFoldRole::Transition => self
+                            .source
+                            .dictionary()
+                            .get(digit)
+                            .copied()
+                            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact),
+                        AggregateCompactFoldRole::Mapped => self
+                            .mapped_dictionary
+                            .get(digit)
+                            .copied()
+                            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact),
+                    }
+                }
+                _ => Err(BlsDoryCompactArtifactError::InvalidArtifact),
+            },
+            on_outputs,
+        )
     }
 }
 
@@ -4501,6 +4575,8 @@ impl AggregateWordFoldView {
         Ok(())
     }
 
+    /// Serial reference for the chunked streams, retained for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn for_each_pair_with_cancel(
         &self,
         cancel: &AtomicBool,
@@ -4518,6 +4594,66 @@ impl AggregateWordFoldView {
             visitor(lower, BlsDoryFr::zero());
         }
         Ok(())
+    }
+
+    /// The view's folded scalars as parallel-computed, index-ordered chunks;
+    /// exactly `for_each_scalar_with_cancel`'s values and validation.
+    fn for_each_output_chunk_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+        on_outputs: &mut ViewOutputChunkVisitor<'_>,
+    ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
+        if self.challenges.is_empty() || self.challenges.len() > AGGREGATE_SOURCE_FOLD_GENERATIONS {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let spec = self.source.spec();
+        if !aggregate_word_source_supported(&self.source) {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        let word_group_len = usize::try_from(spec.word_group_len)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+        let block_len = 1usize
+            .checked_shl(
+                u32::try_from(self.challenges.len())
+                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+            )
+            .ok_or(BlsDoryAggregateError::ProverStorage)?;
+        let expected = usize::try_from(spec.explicit_scalar_count)
+            .map_err(|_| BlsDoryAggregateError::ProverStorage)?
+            .div_ceil(block_len);
+        if expected != self.explicit_len || block_len > 1 << AGGREGATE_SOURCE_FOLD_GENERATIONS {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        stream_view_folded_chunks_with_cancel(
+            &self.source,
+            &self.challenges,
+            expected,
+            cancel,
+            |index, encoded| match encoded {
+                CompactEncodedScalar::Word { value, signed } => {
+                    let selector = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| index.checked_div(word_group_len))
+                        .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
+                    if signed != compact_selector_is_signed(selector, spec.signed_word_selectors) {
+                        return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+                    }
+                    Ok(if signed {
+                        BlsDoryFr::from_i64(i64::from_le_bytes(value.to_le_bytes()))
+                    } else {
+                        BlsDoryFr::from_u64(value)
+                    })
+                }
+                CompactEncodedScalar::Code(code) => self
+                    .source
+                    .dictionary()
+                    .get(usize::from(code))
+                    .copied()
+                    .ok_or(BlsDoryCompactArtifactError::InvalidArtifact),
+            },
+            on_outputs,
+        )
     }
 }
 
@@ -4546,6 +4682,96 @@ fn fold_aggregate_word_block(
     }
     debug_assert_eq!(width, 1);
     block[0]
+}
+
+/// One folded-output chunk consumer for the parallel view streams. The `u64`
+/// is the global output index of the first scalar.
+type ViewOutputChunkVisitor<'a> =
+    dyn FnMut(u64, &[BlsDoryFr]) -> Result<(), BlsDoryAggregateError> + 'a;
+
+/// Stream a compact-source fold view as parallel-folded output chunks. The
+/// base source is decoded in exactly the serial visitors' order (so artifact
+/// authentication is unchanged), buffered, and challenge-folded one block per
+/// worker; every emitted scalar equals the serial view's because the per-block
+/// fold is the same `fold_aggregate_word_block` over the same zero-padded
+/// block contents.
+fn stream_view_folded_chunks_with_cancel(
+    source: &BlsDoryCompactArtifact,
+    challenges: &[BlsDoryFr],
+    expected_outputs: usize,
+    cancel: &AtomicBool,
+    mut decode: impl FnMut(u64, CompactEncodedScalar) -> Result<BlsDoryFr, BlsDoryCompactArtifactError>,
+    on_outputs: &mut ViewOutputChunkVisitor<'_>,
+) -> Result<(), BlsDoryAggregateError> {
+    let block_len = 1usize
+        .checked_shl(
+            u32::try_from(challenges.len()).map_err(|_| BlsDoryAggregateError::ProverStorage)?,
+        )
+        .filter(|block_len| *block_len <= 1 << AGGREGATE_SOURCE_FOLD_GENERATIONS)
+        .ok_or(BlsDoryAggregateError::ProverStorage)?;
+    let base_capacity = STREAM_CHUNK_SCALARS.max(block_len);
+    let mut raw: Vec<BlsDoryFr> = Vec::with_capacity(base_capacity);
+    let mut outputs_emitted = 0u64;
+    let mut inner_error: Option<BlsDoryAggregateError> = None;
+    let flush = |raw: &mut Vec<BlsDoryFr>,
+                 outputs_emitted: &mut u64,
+                 inner_error: &mut Option<BlsDoryAggregateError>,
+                 on_outputs: &mut ViewOutputChunkVisitor<'_>|
+     -> bool {
+        if raw.is_empty() {
+            return true;
+        }
+        let remainder = raw.len() % block_len;
+        if remainder != 0 {
+            raw.resize(raw.len() + (block_len - remainder), BlsDoryFr::zero());
+        }
+        let outputs = raw
+            .par_chunks(block_len)
+            .map(|block| {
+                let mut buffer = [BlsDoryFr::zero(); 1 << AGGREGATE_SOURCE_FOLD_GENERATIONS];
+                buffer[..block.len()].copy_from_slice(block);
+                fold_aggregate_word_block(&mut buffer, block_len, challenges)
+            })
+            .collect::<Vec<_>>();
+        raw.clear();
+        let start = *outputs_emitted;
+        *outputs_emitted += outputs.len() as u64;
+        match on_outputs(start, &outputs) {
+            Ok(()) => true,
+            Err(error) => {
+                *inner_error = Some(error);
+                false
+            }
+        }
+    };
+    let read_result = source.for_each_encoded_scalar(|index, encoded| {
+        if cancel.load(Ordering::Acquire) {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        raw.push(decode(index, encoded)?);
+        if raw.len() == base_capacity
+            && !flush(&mut raw, &mut outputs_emitted, &mut inner_error, on_outputs)
+        {
+            return Err(BlsDoryCompactArtifactError::InvalidArtifact);
+        }
+        Ok(())
+    });
+    check_prover_cancel(cancel)?;
+    if let Some(error) = inner_error {
+        return Err(error);
+    }
+    if read_result.is_err() {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    if !flush(&mut raw, &mut outputs_emitted, &mut inner_error, on_outputs) {
+        return Err(inner_error.unwrap_or(BlsDoryAggregateError::ProverStorage));
+    }
+    if outputs_emitted
+        != u64::try_from(expected_outputs).map_err(|_| BlsDoryAggregateError::ProverStorage)?
+    {
+        return Err(BlsDoryAggregateError::ProverStorage);
+    }
+    Ok(())
 }
 
 struct AggregateCompactPair {
@@ -4904,6 +5130,8 @@ impl<'a> FoldedPolynomialTable<'a> {
         self.for_each_pair_with_cancel(&cancel, visitor)
     }
 
+    /// Serial reference for the chunked streams, retained for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn for_each_pair_with_cancel(
         &self,
         cancel: &AtomicBool,
@@ -4971,68 +5199,86 @@ impl<'a> FoldedPolynomialTable<'a> {
             };
             let mut writer = BlsDoryFoldArtifactWriter::create(scratch.directory, spec)
                 .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
+            // Each source streams in even, index-ordered chunks; child scalars
+            // are computed in parallel per chunk and written in order, so the
+            // child artifact's bytes are exactly the serial fold's.
+            let fold_chunk_pairs = |scalars: &[BlsDoryFr]| -> Vec<BlsDoryFr> {
+                (0..scalars.len().div_ceil(2))
+                    .into_par_iter()
+                    .map(|pair| {
+                        let lower = scalars[pair * 2];
+                        let upper = scalars
+                            .get(pair * 2 + 1)
+                            .copied()
+                            .unwrap_or_else(BlsDoryFr::zero);
+                        lower + challenge * (upper - lower)
+                    })
+                    .collect()
+            };
             match &self.storage {
                 FoldedPolynomialStorage::Source(polynomial) => {
-                    let mut write_failed = false;
-                    polynomial.for_each_coefficient_pair_with_cancel(cancel, |lower, upper| {
-                        if !write_failed
-                            && writer
-                                .write_scalar(&(lower + challenge * (upper - lower)))
-                                .is_err()
-                        {
-                            write_failed = true;
-                        }
-                    })?;
-                    if write_failed {
-                        return Err(BlsDoryAggregateError::ProverStorage);
-                    }
+                    polynomial.for_each_explicit_chunk_with_cancel(
+                        STREAM_CHUNK_SCALARS,
+                        cancel,
+                        &mut |_, scalars| {
+                            writer
+                                .write_scalars(&fold_chunk_pairs(scalars))
+                                .map_err(|_| BlsDoryAggregateError::ProverStorage)
+                        },
+                    )?;
                 }
                 FoldedPolynomialStorage::Owned(values) => {
                     write_memory_fold(values, self.logical_len, challenge, &mut writer, cancel)?
                 }
-                FoldedPolynomialStorage::Artifact(artifact) => artifact
-                    .for_each_pair(|lower, upper| {
-                        if cancel.load(Ordering::Acquire) {
-                            return Err(BlsDoryFoldArtifactError::InvalidArtifact);
-                        }
-                        writer.write_scalar(&(lower + challenge * (upper - lower)))
-                    })
-                    .map_err(|_| {
+                FoldedPolynomialStorage::Artifact(artifact) => {
+                    let mut inner_error = None;
+                    let stream =
+                        artifact.for_each_encoded_chunk(STREAM_CHUNK_SCALARS, |_, bytes| {
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                            }
+                            let decoded = bytes
+                                .par_chunks_exact(32)
+                                .map(|encoded| {
+                                    let mut exact = [0u8; 32];
+                                    exact.copy_from_slice(encoded);
+                                    crate::dory_bls12_381_fold_artifact::decode_scalar(exact)
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            match writer.write_scalars(&fold_chunk_pairs(&decoded)) {
+                                Ok(()) => Ok(()),
+                                Err(_) => {
+                                    inner_error = Some(BlsDoryAggregateError::ProverStorage);
+                                    Err(BlsDoryFoldArtifactError::InvalidArtifact)
+                                }
+                            }
+                        });
+                    if let Some(error) = inner_error {
+                        return Err(error);
+                    }
+                    stream.map_err(|_| {
                         if cancel.load(Ordering::Acquire) {
                             BlsDoryAggregateError::Cancelled
                         } else {
                             BlsDoryAggregateError::ProverStorage
                         }
-                    })?,
+                    })?;
+                }
                 FoldedPolynomialStorage::Compact(view) => {
                     view.validate_lineage(self.lineage_digest)?;
-                    let mut write_failed = false;
-                    view.for_each_pair_with_cancel(cancel, |lower, upper| {
-                        if writer
-                            .write_scalar(&(lower + challenge * (upper - lower)))
-                            .is_err()
-                        {
-                            write_failed = true;
-                        }
+                    view.for_each_output_chunk_with_cancel(cancel, &mut |_, outputs| {
+                        writer
+                            .write_scalars(&fold_chunk_pairs(outputs))
+                            .map_err(|_| BlsDoryAggregateError::ProverStorage)
                     })?;
-                    if write_failed {
-                        return Err(BlsDoryAggregateError::ProverStorage);
-                    }
                 }
                 FoldedPolynomialStorage::WordCompact(view) => {
                     view.validate_lineage(self.lineage_digest)?;
-                    let mut write_failed = false;
-                    view.for_each_pair_with_cancel(cancel, |lower, upper| {
-                        if writer
-                            .write_scalar(&(lower + challenge * (upper - lower)))
-                            .is_err()
-                        {
-                            write_failed = true;
-                        }
+                    view.for_each_output_chunk_with_cancel(cancel, &mut |_, outputs| {
+                        writer
+                            .write_scalars(&fold_chunk_pairs(outputs))
+                            .map_err(|_| BlsDoryAggregateError::ProverStorage)
                     })?;
-                    if write_failed {
-                        return Err(BlsDoryAggregateError::ProverStorage);
-                    }
                 }
             }
             check_prover_cancel(cancel)?;
@@ -5420,33 +5666,155 @@ fn accumulate_distinct_point_round_with_cancel(
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
 
-    let mut weights = claim_indices
+    // Per-claim terms that are constant across the round. The per-pair math
+    // below is exactly the serial accumulator's; pairs are processed in
+    // parallel tasks whose partial sums recombine with exact field addition,
+    // so the round message is identical.
+    let claim_terms = claim_indices
         .iter()
-        .map(|index| EqualityWeightIterator::new(&claims[*index].point[round_index + 1..]))
+        .map(|index| {
+            (
+                &claims[*index].point[round_index + 1..],
+                claims[*index].point[round_index],
+                equality_prefixes[*index],
+                batching[*index],
+            )
+        })
         .collect::<Vec<_>>();
-    let mut visited = 0usize;
-    let mut missing_weight = false;
-    polynomial.for_each_pair_with_cancel(cancel, |lower, upper| {
-        let value_two = upper + upper - lower;
-        for (claim_index, weights) in claim_indices.iter().zip(&mut weights) {
-            let claim = &claims[*claim_index];
-            let Some(suffix_weight) = weights.next() else {
-                missing_weight = true;
-                continue;
-            };
-            let coordinate = claim.point[round_index];
-            let equality_scale = equality_prefixes[*claim_index] * suffix_weight;
-            let equality_zero = equality_scale * (BlsDoryFr::one() - coordinate);
-            let equality_one = equality_scale * coordinate;
-            let equality_two = equality_one + equality_one - equality_zero;
-            let rho = batching[*claim_index];
-            message[0] = message[0] + rho * lower * equality_zero;
-            message[1] = message[1] + rho * upper * equality_one;
-            message[2] = message[2] + rho * value_two * equality_two;
+    let mut visited_pairs = 0u64;
+    let process_pair_scalars = |start_pair: u64,
+                                scalars: &[BlsDoryFr],
+                                message: &mut [BlsDoryFr; 3]|
+     -> Result<(), BlsDoryAggregateError> {
+        const TASK_PAIRS: usize = 1 << 15;
+        let pair_count = scalars.len().div_ceil(2);
+        let partials = (0..pair_count.div_ceil(TASK_PAIRS))
+            .into_par_iter()
+            .map(|task| {
+                let first_pair = task * TASK_PAIRS;
+                let last_pair = ((task + 1) * TASK_PAIRS).min(pair_count);
+                let mut cursors = claim_terms
+                    .iter()
+                    .map(|(suffix, ..)| {
+                        EqualityWeightIterator::seeded(suffix, start_pair + first_pair as u64)
+                    })
+                    .collect::<Vec<_>>();
+                let mut local = [BlsDoryFr::zero(); 3];
+                for pair_index in first_pair..last_pair {
+                    let lower = scalars[pair_index * 2];
+                    let upper = scalars
+                        .get(pair_index * 2 + 1)
+                        .copied()
+                        .unwrap_or_else(BlsDoryFr::zero);
+                    let value_two = upper + upper - lower;
+                    for ((_, coordinate, prefix, rho), cursor) in
+                        claim_terms.iter().zip(&mut cursors)
+                    {
+                        let Some(suffix_weight) = cursor.next() else {
+                            return Err(BlsDoryAggregateError::InvalidProofShape);
+                        };
+                        let equality_scale = *prefix * suffix_weight;
+                        let equality_zero = equality_scale * (BlsDoryFr::one() - *coordinate);
+                        let equality_one = equality_scale * *coordinate;
+                        let equality_two = equality_one + equality_one - equality_zero;
+                        local[0] = local[0] + *rho * lower * equality_zero;
+                        local[1] = local[1] + *rho * upper * equality_one;
+                        local[2] = local[2] + *rho * value_two * equality_two;
+                    }
+                }
+                Ok(local)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for local in partials {
+            message[0] = message[0] + local[0];
+            message[1] = message[1] + local[1];
+            message[2] = message[2] + local[2];
         }
-        visited += 1;
-    })?;
-    if missing_weight || visited != explicit_pairs {
+        Ok(())
+    };
+    match &polynomial.storage {
+        FoldedPolynomialStorage::Source(committed) => {
+            committed.for_each_explicit_chunk_with_cancel(
+                STREAM_CHUNK_SCALARS,
+                cancel,
+                &mut |start, scalars| {
+                    if start % 2 != 0 {
+                        return Err(BlsDoryAggregateError::InvalidProofShape);
+                    }
+                    visited_pairs += scalars.len().div_ceil(2) as u64;
+                    process_pair_scalars(start / 2, scalars, message)
+                },
+            )?;
+        }
+        FoldedPolynomialStorage::Owned(values) => {
+            let mut start = 0usize;
+            while start < values.len() {
+                check_prover_cancel(cancel)?;
+                let end = start.saturating_add(STREAM_CHUNK_SCALARS).min(values.len());
+                visited_pairs += (end - start).div_ceil(2) as u64;
+                process_pair_scalars((start / 2) as u64, &values[start..end], message)?;
+                start = end;
+            }
+        }
+        FoldedPolynomialStorage::Artifact(artifact) => {
+            let mut inner_error = None;
+            let stream = artifact.for_each_encoded_chunk(STREAM_CHUNK_SCALARS, |start, bytes| {
+                let decoded = bytes
+                    .par_chunks_exact(32)
+                    .map(|encoded| {
+                        let mut exact = [0u8; 32];
+                        exact.copy_from_slice(encoded);
+                        crate::dory_bls12_381_fold_artifact::decode_scalar(exact)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if start % 2 != 0 {
+                    inner_error = Some(BlsDoryAggregateError::InvalidProofShape);
+                    return Err(BlsDoryFoldArtifactError::InvalidArtifact);
+                }
+                visited_pairs += decoded.len().div_ceil(2) as u64;
+                match process_pair_scalars(start / 2, &decoded, message) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        inner_error = Some(error);
+                        Err(BlsDoryFoldArtifactError::InvalidArtifact)
+                    }
+                }
+            });
+            if let Some(error) = inner_error {
+                return Err(error);
+            }
+            stream.map_err(|_| {
+                if cancel.load(Ordering::Acquire) {
+                    BlsDoryAggregateError::Cancelled
+                } else {
+                    BlsDoryAggregateError::ProverStorage
+                }
+            })?;
+        }
+        FoldedPolynomialStorage::Compact(view) => {
+            view.validate_lineage(polynomial.lineage_digest)?;
+            view.for_each_output_chunk_with_cancel(cancel, &mut |start, outputs| {
+                if start % 2 != 0 {
+                    return Err(BlsDoryAggregateError::InvalidProofShape);
+                }
+                visited_pairs += outputs.len().div_ceil(2) as u64;
+                process_pair_scalars(start / 2, outputs, message)
+            })?;
+        }
+        FoldedPolynomialStorage::WordCompact(view) => {
+            view.validate_lineage(polynomial.lineage_digest)?;
+            view.for_each_output_chunk_with_cancel(cancel, &mut |start, outputs| {
+                if start % 2 != 0 {
+                    return Err(BlsDoryAggregateError::InvalidProofShape);
+                }
+                visited_pairs += outputs.len().div_ceil(2) as u64;
+                process_pair_scalars(start / 2, outputs, message)
+            })?;
+        }
+    }
+    if visited_pairs
+        != u64::try_from(explicit_pairs).map_err(|_| BlsDoryAggregateError::InvalidProofShape)?
+    {
         return Err(BlsDoryAggregateError::InvalidProofShape);
     }
     Ok(())

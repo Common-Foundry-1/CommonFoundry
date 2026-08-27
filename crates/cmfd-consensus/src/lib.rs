@@ -97,6 +97,8 @@ pub mod forgematrix_v4_basefold;
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_basefold_codec;
 #[cfg(feature = "forgematrix-v4-verifier")]
+pub mod forgematrix_v4_fixed_artifact;
+#[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_proof;
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_proof_codec;
@@ -184,6 +186,17 @@ pub use forgematrix_v4::{
     FORGEMATRIX_V4_TRACE_RELATIONS, FORGEMATRIX_V4_TRANSCRIPT_DOMAIN,
     FORGEMATRIX_V4_WEIGHT_AXIS_ORDER, ForgeMatrixV4DynamicTraceKind, forgematrix_v4_dynamic_index,
     forgematrix_v4_proof_system_digest, forgematrix_v4_weight_index,
+};
+#[cfg(feature = "forgematrix-v4-verifier")]
+pub use forgematrix_v4_fixed_artifact::{
+    FORGEMATRIX_V4_FIXED_ARTIFACT_FORMAT, FORGEMATRIX_V4_FIXED_ARTIFACT_FORMAT_DOMAIN,
+    FORGEMATRIX_V4_FIXED_ARTIFACT_RECORD_DOMAIN, FORGEMATRIX_V4_FIXED_ARTIFACT_RECORD_VERSION,
+    FORGEMATRIX_V4_FIXED_CODEWORD_BYTES, FORGEMATRIX_V4_FIXED_CODEWORD_ROWS,
+    FORGEMATRIX_V4_FIXED_TREE_BYTES, FORGEMATRIX_V4_FIXED_TREE_HEIGHT,
+    FORGEMATRIX_V4_FIXED_TREE_NODES, ForgeMatrixV4FixedArtifactRecordError,
+    ForgeMatrixV4FixedArtifactRecordV1, ForgeMatrixV4FixedBankArtifactV1,
+    canonical_forgematrix_v4_fixed_artifact_record_json,
+    forgematrix_v4_fixed_artifact_format_digest,
 };
 pub use model_bank::{
     BuiltModelBankFixture, MAX_MODEL_BYTE, MAX_MODEL_PCS_WEIGHT_BANKS,

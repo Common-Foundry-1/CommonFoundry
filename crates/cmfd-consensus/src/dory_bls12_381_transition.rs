@@ -785,6 +785,7 @@ pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_s
         packed_rows,
         packed_columns,
     )?;
+    let mut phase_started = std::time::Instant::now();
     let grouped = build_grouped_transition_compact_artifact_with_scratch_and_cancel(
         &mut source,
         packed_nu,
@@ -793,6 +794,7 @@ pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_s
         scratch_directory,
         cancel,
     )?;
+    phase_started = report_transition_phase("transition_grouped_artifact", phase_started);
     if grouped.derived_cells != source.statement.elements()? {
         return Err(transition_storage_error());
     }
@@ -805,6 +807,7 @@ pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_s
         setup,
         cancel,
     )?;
+    let _ = report_transition_phase("transition_commit", phase_started);
     prove_bls_dory_transition_deferred_from_committed_row_source_with_scratch_and_cancel(
         binding,
         statement,
@@ -817,6 +820,17 @@ pub(crate) fn prove_bls_dory_v3_transition_deferred_from_execution_reader_with_s
         scratch_directory,
         cancel,
     )
+}
+
+/// Report one transition-prover phase to standard error in the proof-stage
+/// shape. Best effort by design: reporting must never fail or reorder
+/// proving.
+fn report_transition_phase(phase: &str, started: std::time::Instant) -> std::time::Instant {
+    let elapsed = started.elapsed().as_micros();
+    eprintln!(
+        "CMFD_V3_PROOF_SUBSTAGE {{\"stage\":\"{phase}\",\"scalars\":0,\"elapsed_micros\":{elapsed}}}"
+    );
+    std::time::Instant::now()
 }
 
 /// Rebuild a released V3 transition source from the same opaque execution
@@ -3348,48 +3362,74 @@ fn transition_raw_round_with_cancel(
     {
         return Err(BlsDoryTransitionError::InvalidProofShape);
     }
-    // Score pair chunks in parallel; each task reseeds the suffix-weight
-    // iterator at its first pair and computes a partial degree-2 evaluation.
-    // The row derivations are read-only and the source is shared read-only,
-    // exactly as in the parallel LogUp round. Partial sums recombine with
-    // exact field addition, so the round message equals the serial walk's.
-    const TASK_PAIRS: usize = 1 << 14;
+    // Materialize row pairs sequentially — the source is chunk-cached and
+    // must be walked in order to stay amplification-free — then score each
+    // buffered chunk across all cores: every task reseeds the suffix-weight
+    // iterator at its first pair and repeats the serial per-pair math, and
+    // partial sums recombine with exact field addition, so the round message
+    // equals the serial walk's.
+    const CHUNK_PAIRS: usize = 1 << 17;
+    const TASK_PAIRS: usize = 1 << 13;
     let degree = BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1;
-    let partials = (0..pair_count.div_ceil(TASK_PAIRS))
-        .into_par_iter()
-        .map(|task| {
-            let first_pair = task * TASK_PAIRS;
-            let last_pair = ((task + 1) * TASK_PAIRS).min(pair_count);
-            let mut suffix_weights =
-                TransitionEqualityWeightIterator::seeded(suffix_point, first_pair as u64);
-            let mut evaluations = vec![BlsDoryFr::zero(); degree];
-            for pair_index in first_pair..last_pair {
-                if pair_index.is_multiple_of(8_192) {
-                    check_transition_cancel(cancel)?;
-                }
-                let suffix = suffix_weights
-                    .next()
-                    .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
-                let equality_scale = selector_prefix * suffix;
-                accumulate_transition_pair(
-                    statement,
-                    regular_row(source, pair_index * 2)?,
-                    regular_row(source, pair_index * 2 + 1)?,
-                    equality_scale * (BlsDoryFr::one() - coordinate),
-                    equality_scale * coordinate,
-                    mixing_powers,
-                    &mut evaluations,
-                )?;
-            }
-            Ok(evaluations)
-        })
-        .collect::<Result<Vec<_>, BlsDoryTransitionError>>()?;
     let mut evaluations = vec![BlsDoryFr::zero(); degree];
-    for partial in partials {
-        for (evaluation, value) in evaluations.iter_mut().zip(partial) {
-            *evaluation = *evaluation + value;
+    let flush = |chunk_first_pair: usize,
+                 buffered: &[(TransitionRegularRow, TransitionRegularRow)],
+                 evaluations: &mut Vec<BlsDoryFr>|
+     -> Result<(), BlsDoryTransitionError> {
+        if buffered.is_empty() {
+            return Ok(());
+        }
+        let partials = buffered
+            .par_chunks(TASK_PAIRS)
+            .enumerate()
+            .map(|(task, task_pairs)| {
+                let first_pair = chunk_first_pair + task * TASK_PAIRS;
+                let mut suffix_weights =
+                    TransitionEqualityWeightIterator::seeded(suffix_point, first_pair as u64);
+                let mut partial = vec![BlsDoryFr::zero(); degree];
+                for (lower, upper) in task_pairs {
+                    let suffix = suffix_weights
+                        .next()
+                        .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+                    let equality_scale = selector_prefix * suffix;
+                    accumulate_transition_pair(
+                        statement,
+                        *lower,
+                        *upper,
+                        equality_scale * (BlsDoryFr::one() - coordinate),
+                        equality_scale * coordinate,
+                        mixing_powers,
+                        &mut partial,
+                    )?;
+                }
+                Ok(partial)
+            })
+            .collect::<Result<Vec<_>, BlsDoryTransitionError>>()?;
+        for partial in partials {
+            for (evaluation, value) in evaluations.iter_mut().zip(partial) {
+                *evaluation = *evaluation + value;
+            }
+        }
+        Ok(())
+    };
+    let mut buffered: Vec<(TransitionRegularRow, TransitionRegularRow)> =
+        Vec::with_capacity(CHUNK_PAIRS.min(pair_count));
+    let mut chunk_first_pair = 0usize;
+    for pair_index in 0..pair_count {
+        if pair_index.is_multiple_of(8_192) {
+            check_transition_cancel(cancel)?;
+        }
+        buffered.push((
+            regular_row(source, pair_index * 2)?,
+            regular_row(source, pair_index * 2 + 1)?,
+        ));
+        if buffered.len() == CHUNK_PAIRS {
+            flush(chunk_first_pair, &buffered, &mut evaluations)?;
+            chunk_first_pair = pair_index + 1;
+            buffered.clear();
         }
     }
+    flush(chunk_first_pair, &buffered, &mut evaluations)?;
     Ok(evaluations)
 }
 
@@ -3738,6 +3778,7 @@ fn prove_transition_sumcheck_with_scratch_and_cancel(
     let mut current_rows = source.elements;
     for round_index in 0..cell_point.len() {
         check_transition_cancel(cancel)?;
+        let round_started = std::time::Instant::now();
         let evaluations = if let Some(current) = artifact.as_ref() {
             transition_artifact_round_with_cancel(
                 statement,
@@ -3798,6 +3839,10 @@ fn prove_transition_sumcheck_with_scratch_and_cancel(
             * ((BlsDoryFr::one() - challenge) * (BlsDoryFr::one() - coordinate)
                 + challenge * coordinate);
         rounds.push(evaluations);
+        let _ = report_transition_phase(
+            &format!("transition_arith_round_{round_index}"),
+            round_started,
+        );
     }
     check_transition_cancel(cancel)?;
     let terminal_evaluations = transition_terminal_row(

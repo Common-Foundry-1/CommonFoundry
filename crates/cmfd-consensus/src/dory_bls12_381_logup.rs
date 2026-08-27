@@ -1031,6 +1031,17 @@ impl<'a> CompactLogUpTransitionSource<'a> {
     }
 }
 
+/// Report one range-LogUp prover phase to standard error in the proof-stage
+/// shape. Best effort by design: reporting must never fail or reorder
+/// proving.
+fn report_logup_phase(phase: &str, started: std::time::Instant) -> std::time::Instant {
+    let elapsed = started.elapsed().as_micros();
+    eprintln!(
+        "CMFD_V3_PROOF_SUBSTAGE {{\"stage\":\"{phase}\",\"scalars\":0,\"elapsed_micros\":{elapsed}}}"
+    );
+    std::time::Instant::now()
+}
+
 fn compact_encoded_transition_scalar(
     selector: usize,
     encoded: CompactEncodedScalar,
@@ -1262,11 +1273,13 @@ fn prove_from_source_deferred_with_cancel(
             }
         }
         LogUpProverSource::PrecommittedCompact(_) => {
+            let phase_started = std::time::Instant::now();
             counts = count_compact_range_digits(
                 compact_source
                     .as_mut()
                     .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?,
             )?;
+            let _ = report_logup_phase("logup_counts_scan", phase_started);
         }
     }
     check_logup_cancel(cancel)?;
@@ -1317,6 +1330,7 @@ fn prove_from_source_deferred_with_cancel(
             (None, None, None, None)
         };
     let inverse = if scratch_directory.is_some() {
+        let phase_started = std::time::Instant::now();
         let mapped_dictionary = (0..TABLE_VALUES)
             .map(|digit| {
                 (alpha - BlsDoryFr::from_u64(digit as u64))
@@ -1327,13 +1341,15 @@ fn prove_from_source_deferred_with_cancel(
         let zero_prefix_count = elements
             .checked_mul(STRUCTURED_TRANSITION_REGULAR_ORACLES)
             .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-        commit_bls_dory_mapped_compact_polynomial_with_cancel(
+        let committed = commit_bls_dory_mapped_compact_polynomial_with_cancel(
             &transition,
             zero_prefix_count,
             mapped_dictionary,
             setup,
             cancel,
-        )?
+        )?;
+        let _ = report_logup_phase("logup_inverse_commit", phase_started);
+        committed
     } else {
         let transition_explicit_len = elements
             .checked_mul(STRUCTURED_TRANSITION_ORACLES)
@@ -4047,6 +4063,7 @@ fn prove_logup_sumcheck_with_artifacts_and_cancel(
 
     for round_index in 0..cell_variables {
         check_logup_cancel(cancel)?;
+        let round_started = std::time::Instant::now();
         let round_expected = artifact.as_ref().map(|_| LogUpLineageReadSpec {
             context_digest,
             generation: round_index,
@@ -4180,6 +4197,7 @@ fn prove_logup_sumcheck_with_artifacts_and_cancel(
             * ((BlsDoryFr::one() - challenge) * (BlsDoryFr::one() - coordinate)
                 + challenge * coordinate);
         rounds.push(evaluations);
+        let _ = report_logup_phase(&format!("logup_round_{round_index}"), round_started);
     }
 
     check_logup_cancel(cancel)?;

@@ -53,6 +53,12 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 shared-types = { git = "https://github.com/worldcoin/Remainder_CE", rev = "5687fe7f3a077c75c374422ef79f22e3860de9c1", optional = true }
+slop-algebra = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
+slop-basefold = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
+slop-challenger = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
+slop-koala-bear = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
+slop-multilinear = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
+slop-sumcheck = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
 thiserror.workspace = true
 
 [features]
@@ -73,6 +79,15 @@ dory-bls12-381-prototype = [
 dory-v3-consensus-adapter = ["dory-bls12-381-prototype", "whir-prototype"]
 dory-opening-prototype = ["dep:ark-serialize", "dep:dory-pcs"]
 gpu-proof-prover = ["whir-prototype", "dep:cmfd-proof-accel", "dep:fs2"]
+forgematrix-v4-verifier = [
+    "dep:bincode",
+    "dep:slop-algebra",
+    "dep:slop-basefold",
+    "dep:slop-challenger",
+    "dep:slop-koala-bear",
+    "dep:slop-multilinear",
+    "dep:slop-sumcheck",
+]
 production-whir-candidate = ["whir-prototype"]
 remainder-prototype = [
     "dep:bincode",

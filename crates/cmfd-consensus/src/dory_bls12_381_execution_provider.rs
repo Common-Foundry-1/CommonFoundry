@@ -11,6 +11,7 @@ use std::{
     io::Read,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
 };
 
 use rayon::prelude::*;
@@ -1138,6 +1139,17 @@ pub(crate) fn seal_composed_bls_dory_v3_layout_v5_candidate(
 /// and execution replay must each authenticate the complete bank against the
 /// same non-serializable Record V2 authority. The scratch directory and native
 /// row limit are explicit process resources, never consensus parameters.
+/// Emits one machine-readable prover-stage line to standard error, matching
+/// the ceremony progress convention, so operators can attribute Layout V5
+/// proof wall time to its pipeline stages without a profiler. Best effort by
+/// design: stage reporting must never fail or reorder proving.
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
+fn report_prover_stage(stage: &str, started: Instant) -> Instant {
+    let elapsed = started.elapsed().as_micros();
+    eprintln!("CMFD_V3_PROOF_STAGE {{\"stage\":\"{stage}\",\"elapsed_micros\":{elapsed}}}");
+    Instant::now()
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(any(feature = "dory-v3-consensus-adapter", test))]
 pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
@@ -1162,9 +1174,11 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
     }
     check_runtime_prover_cancel(cancel)?;
 
+    let stage_started = Instant::now();
     let transcript =
         DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
     let _ = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
+    let stage_started = report_prover_stage("claim_validation", stage_started);
 
     let prepared_model =
         prepare_bls_dory_v3_fixed_model_from_bank_authenticated_record_with_scratch_and_cancel(
@@ -1174,6 +1188,7 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim<
             scratch_directory,
             cancel,
         )?;
+    let _ = report_prover_stage("fixed_model_preparation", stage_started);
     check_runtime_prover_cancel(cancel)?;
 
     prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model(
@@ -1215,6 +1230,8 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
     }
     check_runtime_prover_cancel(cancel)?;
 
+    let proof_started = Instant::now();
+    let stage_started = proof_started;
     let transcript =
         DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
     let _ = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
@@ -1228,6 +1245,7 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
         scratch_directory,
         cancel,
     )?;
+    let stage_started = report_prover_stage("winning_nonce_replay", stage_started);
     check_runtime_prover_cancel(cancel)?;
 
     let prepared_result =
@@ -1247,6 +1265,7 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
         }
         Err(error) => return Err(map_layout_v5_preparation_error(error)),
     };
+    let stage_started = report_prover_stage("layout_preparation", stage_started);
     check_runtime_prover_cancel(cancel)?;
 
     let composed = finish_prepared_bls_dory_v3_layout_v5_execution_with_composition_and_cancel(
@@ -1257,10 +1276,12 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
         cancel,
     )
     .map_err(map_layout_v5_composition_error)?;
+    let stage_started = report_prover_stage("native_composition", stage_started);
     check_runtime_prover_cancel(cancel)?;
 
     let candidate =
         seal_composed_bls_dory_v3_layout_v5_candidate(composed, authenticated, block, setup)?;
+    let stage_started = report_prover_stage("candidate_seal", stage_started);
     let _verified = verify_bls_dory_v3_layout_v5_candidate(
         block.network_id,
         authenticated,
@@ -1268,6 +1289,8 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
         &candidate,
         setup,
     )?;
+    let _ = report_prover_stage("self_verification", stage_started);
+    let _ = report_prover_stage("proof_total", proof_started);
     Ok(candidate)
 }
 

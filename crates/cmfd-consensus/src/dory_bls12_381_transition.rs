@@ -19,6 +19,7 @@ use dory_pcs::primitives::{
     serialization::{Compress, Validate},
     transcript::Transcript,
 };
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::{
@@ -3227,11 +3228,45 @@ struct TransitionEqualityWeightIterator<'a> {
 }
 
 impl<'a> TransitionEqualityWeightIterator<'a> {
+    /// Serial reference for `seeded`.
+    #[allow(dead_code)]
     fn new(point: &'a [BlsDoryFr]) -> Self {
         Self {
             point,
             stack: vec![(point.len(), BlsDoryFr::one())],
         }
+    }
+
+    /// An iterator positioned as if `start` weights were already consumed, so
+    /// a chunk of pairs can be scored in parallel. Weight `i` multiplies
+    /// `point[b]` for each set bit `b` of `i` and `1 - point[b]` for each
+    /// clear bit; the pending-sibling stack at leaf `start` is reconstructed
+    /// in one pass over the coordinates, matching the fresh iterator's suffix.
+    fn seeded(point: &'a [BlsDoryFr], start: u64) -> Self {
+        let variables = point.len();
+        if u32::try_from(variables)
+            .ok()
+            .and_then(|variables| 1u64.checked_shl(variables))
+            .is_some_and(|total| start >= total)
+        {
+            return Self {
+                point,
+                stack: Vec::new(),
+            };
+        }
+        let mut stack = Vec::with_capacity(variables + 1);
+        let mut prefix = BlsDoryFr::one();
+        for bit in (0..variables).rev() {
+            let coordinate = point[bit];
+            if (start >> bit) & 1 == 1 {
+                prefix = prefix * coordinate;
+            } else {
+                stack.push((bit, prefix * coordinate));
+                prefix = prefix * (BlsDoryFr::one() - coordinate);
+            }
+        }
+        stack.push((0, prefix));
+        Self { point, stack }
     }
 }
 
@@ -3301,28 +3336,59 @@ fn transition_raw_round_with_cancel(
         return Err(BlsDoryTransitionError::InvalidDimensions);
     }
     let coordinate = cell_point[round_index];
-    let mut suffix_weights = TransitionEqualityWeightIterator::new(&cell_point[round_index + 1..]);
-    let mut evaluations = vec![BlsDoryFr::zero(); BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1];
-    for pair_index in 0..current_rows / 2 {
-        if pair_index.is_multiple_of(8_192) {
-            check_transition_cancel(cancel)?;
-        }
-        let suffix = suffix_weights
-            .next()
-            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
-        let equality_scale = selector_prefix * suffix;
-        accumulate_transition_pair(
-            statement,
-            regular_row(source, pair_index * 2)?,
-            regular_row(source, pair_index * 2 + 1)?,
-            equality_scale * (BlsDoryFr::one() - coordinate),
-            equality_scale * coordinate,
-            mixing_powers,
-            &mut evaluations,
-        )?;
-    }
-    if suffix_weights.next().is_some() {
+    let suffix_point = &cell_point[round_index + 1..];
+    let pair_count = current_rows / 2;
+    if 1usize
+        .checked_shl(
+            u32::try_from(suffix_point.len())
+                .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?,
+        )
+        .filter(|weights| *weights == pair_count)
+        .is_none()
+    {
         return Err(BlsDoryTransitionError::InvalidProofShape);
+    }
+    // Score pair chunks in parallel; each task reseeds the suffix-weight
+    // iterator at its first pair and computes a partial degree-2 evaluation.
+    // The row derivations are read-only and the source is shared read-only,
+    // exactly as in the parallel LogUp round. Partial sums recombine with
+    // exact field addition, so the round message equals the serial walk's.
+    const TASK_PAIRS: usize = 1 << 14;
+    let degree = BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1;
+    let partials = (0..pair_count.div_ceil(TASK_PAIRS))
+        .into_par_iter()
+        .map(|task| {
+            let first_pair = task * TASK_PAIRS;
+            let last_pair = ((task + 1) * TASK_PAIRS).min(pair_count);
+            let mut suffix_weights =
+                TransitionEqualityWeightIterator::seeded(suffix_point, first_pair as u64);
+            let mut evaluations = vec![BlsDoryFr::zero(); degree];
+            for pair_index in first_pair..last_pair {
+                if pair_index.is_multiple_of(8_192) {
+                    check_transition_cancel(cancel)?;
+                }
+                let suffix = suffix_weights
+                    .next()
+                    .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+                let equality_scale = selector_prefix * suffix;
+                accumulate_transition_pair(
+                    statement,
+                    regular_row(source, pair_index * 2)?,
+                    regular_row(source, pair_index * 2 + 1)?,
+                    equality_scale * (BlsDoryFr::one() - coordinate),
+                    equality_scale * coordinate,
+                    mixing_powers,
+                    &mut evaluations,
+                )?;
+            }
+            Ok(evaluations)
+        })
+        .collect::<Result<Vec<_>, BlsDoryTransitionError>>()?;
+    let mut evaluations = vec![BlsDoryFr::zero(); degree];
+    for partial in partials {
+        for (evaluation, value) in evaluations.iter_mut().zip(partial) {
+            *evaluation = *evaluation + value;
+        }
     }
     Ok(evaluations)
 }
@@ -3393,34 +3459,86 @@ fn transition_artifact_round_with_cancel(
     let coordinate = *cell_point
         .get(round_index)
         .ok_or(BlsDoryTransitionError::InvalidDimensions)?;
-    let mut suffix_weights = TransitionEqualityWeightIterator::new(&cell_point[round_index + 1..]);
-    let mut evaluations = vec![BlsDoryFr::zero(); BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1];
+    let suffix_point = &cell_point[round_index + 1..];
+    let degree = BLS_DORY_TRANSITION_SUMCHECK_DEGREE + 1;
+    // Buffer streamed row pairs and score chunks in parallel: each task
+    // reseeds the suffix-weight iterator at its first pair index and repeats
+    // the serial per-pair math; partial sums recombine with exact field
+    // addition, so the round message equals the serial walk's.
+    const CHUNK_PAIRS: usize = 1 << 17;
+    const TASK_PAIRS: usize = 1 << 13;
+    let mut buffered: Vec<(TransitionRegularRow, TransitionRegularRow)> =
+        Vec::with_capacity(CHUNK_PAIRS);
+    let mut evaluations = vec![BlsDoryFr::zero(); degree];
     let mut visited = 0usize;
-    for_each_transition_artifact_pair(artifact, |lower, upper| {
+    let flush = |chunk_first_pair: usize,
+                 buffered: &[(TransitionRegularRow, TransitionRegularRow)],
+                 evaluations: &mut Vec<BlsDoryFr>|
+     -> Result<(), BlsDoryTransitionError> {
+        if buffered.is_empty() {
+            return Ok(());
+        }
+        let partials = buffered
+            .par_chunks(TASK_PAIRS)
+            .enumerate()
+            .map(|(task, task_pairs)| {
+                let first_pair = chunk_first_pair + task * TASK_PAIRS;
+                let mut suffix_weights =
+                    TransitionEqualityWeightIterator::seeded(suffix_point, first_pair as u64);
+                let mut partial = vec![BlsDoryFr::zero(); degree];
+                for (lower, upper) in task_pairs {
+                    let suffix = suffix_weights
+                        .next()
+                        .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
+                    let equality_scale = selector_prefix * suffix;
+                    accumulate_transition_pair(
+                        statement,
+                        *lower,
+                        *upper,
+                        equality_scale * (BlsDoryFr::one() - coordinate),
+                        equality_scale * coordinate,
+                        mixing_powers,
+                        &mut partial,
+                    )?;
+                }
+                Ok(partial)
+            })
+            .collect::<Result<Vec<_>, BlsDoryTransitionError>>()?;
+        for partial in partials {
+            for (evaluation, value) in evaluations.iter_mut().zip(partial) {
+                *evaluation = *evaluation + value;
+            }
+        }
+        Ok(())
+    };
+    let mut chunk_first_pair = 0usize;
+    let mut flush_error = None;
+    let stream_result = for_each_transition_artifact_pair(artifact, |lower, upper| {
         if visited.is_multiple_of(8_192) {
             check_transition_cancel(cancel)?;
         }
-        let suffix = suffix_weights
-            .next()
-            .ok_or(BlsDoryTransitionError::InvalidProofShape)?;
-        let equality_scale = selector_prefix * suffix;
-        accumulate_transition_pair(
-            statement,
-            lower,
-            upper,
-            equality_scale * (BlsDoryFr::one() - coordinate),
-            equality_scale * coordinate,
-            mixing_powers,
-            &mut evaluations,
-        )?;
+        buffered.push((lower, upper));
         visited += 1;
+        if buffered.len() == CHUNK_PAIRS {
+            if let Err(error) = flush(chunk_first_pair, &buffered, &mut evaluations) {
+                flush_error = Some(error);
+                return Err(transition_storage_error());
+            }
+            chunk_first_pair = visited;
+            buffered.clear();
+        }
         Ok(())
-    })?;
+    });
+    if let Some(error) = flush_error {
+        return Err(error);
+    }
+    stream_result?;
+    flush(chunk_first_pair, &buffered, &mut evaluations)?;
     let expected_pairs = usize::try_from(artifact.spec().scalar_count)
         .map_err(|_| BlsDoryTransitionError::InvalidDimensions)?
         / TRANSITION_FOLD_SLOTS
         / 2;
-    if suffix_weights.next().is_some() || visited != expected_pairs {
+    if visited != expected_pairs {
         return Err(BlsDoryTransitionError::InvalidProofShape);
     }
     Ok(evaluations)

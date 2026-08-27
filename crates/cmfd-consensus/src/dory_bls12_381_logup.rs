@@ -3153,6 +3153,38 @@ impl<'a> LogUpEqualityWeightIterator<'a> {
             stack: vec![(point.len(), BlsDoryFr::one())],
         }
     }
+
+    /// An iterator positioned as if `start` weights were already consumed, so
+    /// a chunk of pairs can be scored in parallel. Weight `i` multiplies
+    /// `point[b]` for each set bit `b` of `i` and `1 - point[b]` for each
+    /// clear bit; the pending-sibling stack at leaf `start` is reconstructed
+    /// in one pass over the coordinates, matching the fresh iterator's suffix.
+    fn seeded(point: &'a [BlsDoryFr], start: u64) -> Self {
+        let variables = point.len();
+        if u32::try_from(variables)
+            .ok()
+            .and_then(|variables| 1u64.checked_shl(variables))
+            .is_some_and(|total| start >= total)
+        {
+            return Self {
+                point,
+                stack: Vec::new(),
+            };
+        }
+        let mut stack = Vec::with_capacity(variables + 1);
+        let mut prefix = BlsDoryFr::one();
+        for bit in (0..variables).rev() {
+            let coordinate = point[bit];
+            if (start >> bit) & 1 == 1 {
+                prefix = prefix * coordinate;
+            } else {
+                stack.push((bit, prefix * coordinate));
+                prefix = prefix * (BlsDoryFr::one() - coordinate);
+            }
+        }
+        stack.push((0, prefix));
+        Self { point, stack }
+    }
 }
 
 impl Iterator for LogUpEqualityWeightIterator<'_> {
@@ -3374,61 +3406,113 @@ fn compact_raw_logup_artifact_round(
     let expected_values = elements
         .checked_mul(STRUCTURED_TRANSITION_ORACLES)
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-    let mut current_selector = 0usize;
-    let mut selector_weight = logup_equality_weight_at(selector_point, 0)?;
-    let mut cell_weights = LogUpEqualityWeightIterator::new(cell_suffix_point);
-    let mut lower = None;
+    // Buffer even-aligned chunks of encoded scalars and score their pairs in
+    // parallel. Each task derives (selector, cell) arithmetically from the
+    // global index and reseeds the suffix-weight iterator at its first pair
+    // of every selector run, so the per-pair math is exactly the serial
+    // walk's; partial sums recombine with exact field addition. Chunks and
+    // `elements` are even, so no pair splits across a chunk or task.
+    const CHUNK_SCALARS: usize = 1 << 21;
+    const TASK_PAIRS: usize = 1 << 14;
+    let mut buffered: Vec<CompactEncodedScalar> = Vec::with_capacity(CHUNK_SCALARS);
+    let mut chunk_start = 0usize;
     let mut visited = 0usize;
     let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
-    source.for_each_encoded_scalar(|index, encoded| {
+    let flush = |chunk_start: usize,
+                 buffered: &[CompactEncodedScalar],
+                 evaluations: &mut [BlsDoryFr; LOGUP_ROUND_VALUES]|
+     -> Result<(), BlsDoryRangeLogUpError> {
+        if buffered.is_empty() {
+            return Ok(());
+        }
+        if !chunk_start.is_multiple_of(2) || !buffered.len().is_multiple_of(2) {
+            return Err(logup_storage_error());
+        }
+        let pair_count = buffered.len() / 2;
+        let partials = (0..pair_count.div_ceil(TASK_PAIRS))
+            .into_par_iter()
+            .map(|task| {
+                let first_pair = task * TASK_PAIRS;
+                let last_pair = ((task + 1) * TASK_PAIRS).min(pair_count);
+                let mut run: Option<(usize, BlsDoryFr, LogUpEqualityWeightIterator)> = None;
+                let mut partial = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+                for pair in first_pair..last_pair {
+                    let global_lower = chunk_start + pair * 2;
+                    let selector = global_lower / elements;
+                    let cell = global_lower % elements;
+                    if run.as_ref().map(|(active, ..)| *active) != Some(selector) {
+                        run = Some((
+                            selector,
+                            logup_equality_weight_at(selector_point, selector)?,
+                            LogUpEqualityWeightIterator::seeded(
+                                cell_suffix_point,
+                                (cell / 2) as u64,
+                            ),
+                        ));
+                    }
+                    let (_, selector_weight, cell_weights) =
+                        run.as_mut().ok_or_else(logup_storage_error)?;
+                    let lower_values = logup_core_from_fold(
+                        compact_logup_fold_values(selector, buffered[pair * 2], &digits)?,
+                        selector,
+                        cell,
+                        sparse,
+                    );
+                    let upper_values = logup_core_from_fold(
+                        compact_logup_fold_values(selector, buffered[pair * 2 + 1], &digits)?,
+                        selector,
+                        cell + 1,
+                        sparse,
+                    );
+                    let suffix =
+                        cell_weights.next().ok_or_else(logup_storage_error)? * *selector_weight;
+                    let equality_scale = equality_prefix * suffix;
+                    accumulate_logup_pair(
+                        lower_values,
+                        upper_values,
+                        equality_scale * (BlsDoryFr::one() - coordinate),
+                        equality_scale * coordinate,
+                        alpha,
+                        local_mixing,
+                        rational_mixing,
+                        count_mixing,
+                        &mut partial,
+                    );
+                }
+                Ok(partial)
+            })
+            .collect::<Result<Vec<_>, BlsDoryRangeLogUpError>>()?;
+        for partial in partials {
+            for (evaluation, value) in evaluations.iter_mut().zip(partial) {
+                *evaluation = *evaluation + value;
+            }
+        }
+        Ok(())
+    };
+    let mut flush_error = None;
+    let stream_result = source.for_each_encoded_scalar(|index, encoded| {
         let index = usize::try_from(index).map_err(|_| logup_storage_error())?;
         if index != visited {
             return Err(logup_storage_error());
         }
-        let selector = index / elements;
-        let cell = index % elements;
-        if selector != current_selector {
-            if selector != current_selector + 1
-                || lower.is_some()
-                || cell != 0
-                || cell_weights.next().is_some()
-            {
-                return Err(logup_storage_error());
-            }
-            current_selector = selector;
-            selector_weight = logup_equality_weight_at(selector_point, selector)?;
-            cell_weights = LogUpEqualityWeightIterator::new(cell_suffix_point);
-        }
-        let values = logup_core_from_fold(
-            compact_logup_fold_values(selector, encoded, &digits)?,
-            selector,
-            cell,
-            sparse,
-        );
-        if cell.is_multiple_of(2) {
-            if lower.replace(values).is_some() {
-                return Err(logup_storage_error());
-            }
-        } else {
-            let lower = lower.take().ok_or_else(logup_storage_error)?;
-            let suffix = cell_weights.next().ok_or_else(logup_storage_error)? * selector_weight;
-            let equality_scale = equality_prefix * suffix;
-            accumulate_logup_pair(
-                lower,
-                values,
-                equality_scale * (BlsDoryFr::one() - coordinate),
-                equality_scale * coordinate,
-                alpha,
-                local_mixing,
-                rational_mixing,
-                count_mixing,
-                &mut evaluations,
-            );
-        }
+        buffered.push(encoded);
         visited += 1;
+        if buffered.len() == CHUNK_SCALARS {
+            if let Err(error) = flush(chunk_start, &buffered, &mut evaluations) {
+                flush_error = Some(error);
+                return Err(logup_storage_error());
+            }
+            chunk_start = visited;
+            buffered.clear();
+        }
         Ok(())
-    })?;
-    if visited != expected_values || lower.is_some() || cell_weights.next().is_some() {
+    });
+    if let Some(error) = flush_error {
+        return Err(error);
+    }
+    stream_result?;
+    flush(chunk_start, &buffered, &mut evaluations)?;
+    if visited != expected_values {
         return Err(logup_storage_error());
     }
     Ok(evaluations)
@@ -3547,36 +3631,89 @@ fn logup_artifact_round_with_cancel(
         .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
     validate_logup_suffix_pairs(equality_point, round_index, total_pairs)?;
     let coordinate = equality_point[round_index];
-    let mut suffix_weights = LogUpEqualityWeightIterator::new(&equality_point[round_index + 1..]);
+    let suffix_point = &equality_point[round_index + 1..];
+    // Buffer streamed pairs and score chunks in parallel: each task reseeds
+    // the suffix-weight iterator at its first pair index and repeats the
+    // serial per-pair math; partial sums recombine with exact field addition,
+    // so the round message equals the serial walk's.
+    const CHUNK_PAIRS: usize = 1 << 19;
+    const TASK_PAIRS: usize = 1 << 14;
+    let mut buffered: Vec<(usize, LogUpFoldValues, LogUpFoldValues)> =
+        Vec::with_capacity(CHUNK_PAIRS);
     let mut evaluations = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
     let mut visited = 0usize;
-    for_each_logup_lineage_pair(artifact, expected, |pair_index, lower, upper| {
-        if pair_index.is_multiple_of(8_192) {
-            check_logup_cancel(cancel)?;
+    let flush = |buffered: &[(usize, LogUpFoldValues, LogUpFoldValues)],
+                 evaluations: &mut [BlsDoryFr; LOGUP_ROUND_VALUES]|
+     -> Result<(), BlsDoryRangeLogUpError> {
+        if buffered.is_empty() {
+            return Ok(());
         }
-        let suffix = suffix_weights
-            .next()
-            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-        let equality_scale = equality_prefix * suffix;
-        let lower_index = pair_index
-            .checked_mul(2)
-            .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
-        let selector = lower_index / expected.current_cells;
-        let lower_cell = lower_index % expected.current_cells;
-        accumulate_logup_pair(
-            logup_core_from_fold(lower, selector, lower_cell, sparse),
-            logup_core_from_fold(upper, selector, lower_cell + 1, sparse),
-            equality_scale * (BlsDoryFr::one() - coordinate),
-            equality_scale * coordinate,
-            expected.alpha,
-            local_mixing,
-            rational_mixing,
-            count_mixing,
-            &mut evaluations,
-        );
-        visited += 1;
+        let partials = buffered
+            .par_chunks(TASK_PAIRS)
+            .map(|task_pairs| {
+                let first = task_pairs
+                    .first()
+                    .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+                let mut suffix_weights =
+                    LogUpEqualityWeightIterator::seeded(suffix_point, first.0 as u64);
+                let mut partial = [BlsDoryFr::zero(); LOGUP_ROUND_VALUES];
+                for (pair_index, lower, upper) in task_pairs {
+                    let suffix = suffix_weights
+                        .next()
+                        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+                    let equality_scale = equality_prefix * suffix;
+                    let lower_index = pair_index
+                        .checked_mul(2)
+                        .ok_or(BlsDoryRangeLogUpError::InvalidDimensions)?;
+                    let selector = lower_index / expected.current_cells;
+                    let lower_cell = lower_index % expected.current_cells;
+                    accumulate_logup_pair(
+                        logup_core_from_fold(*lower, selector, lower_cell, sparse),
+                        logup_core_from_fold(*upper, selector, lower_cell + 1, sparse),
+                        equality_scale * (BlsDoryFr::one() - coordinate),
+                        equality_scale * coordinate,
+                        expected.alpha,
+                        local_mixing,
+                        rational_mixing,
+                        count_mixing,
+                        &mut partial,
+                    );
+                }
+                Ok(partial)
+            })
+            .collect::<Result<Vec<_>, BlsDoryRangeLogUpError>>()?;
+        for partial in partials {
+            for (evaluation, value) in evaluations.iter_mut().zip(partial) {
+                *evaluation = *evaluation + value;
+            }
+        }
         Ok(())
-    })?;
+    };
+    let mut flush_error = None;
+    let stream_result =
+        for_each_logup_lineage_pair(artifact, expected, |pair_index, lower, upper| {
+            if pair_index.is_multiple_of(8_192) {
+                check_logup_cancel(cancel)?;
+            }
+            if pair_index != visited {
+                return Err(BlsDoryRangeLogUpError::InvalidDimensions);
+            }
+            buffered.push((pair_index, lower, upper));
+            visited += 1;
+            if buffered.len() == CHUNK_PAIRS {
+                if let Err(error) = flush(&buffered, &mut evaluations) {
+                    flush_error = Some(error);
+                    return Err(logup_storage_error());
+                }
+                buffered.clear();
+            }
+            Ok(())
+        });
+    if let Some(error) = flush_error {
+        return Err(error);
+    }
+    stream_result?;
+    flush(&buffered, &mut evaluations)?;
     if visited > total_pairs {
         return Err(BlsDoryRangeLogUpError::InvalidDimensions);
     }

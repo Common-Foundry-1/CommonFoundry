@@ -909,90 +909,15 @@ impl BlsDoryCommittedPolynomial {
         if point.len() != self.variables() {
             return Err(BlsDoryAggregateError::InvalidDimension);
         }
-        match &self.coefficients {
-            BlsDoryCoefficientStorage::Materialized(polynomial) => Ok(polynomial.evaluate(point)),
-            BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => {
-                let mut weights = EqualityWeightIterator::new(point);
-                let mut evaluation = BlsDoryFr::zero();
-                let mut visited = 0usize;
-                artifact
-                    .for_each_scalar(|coefficient| {
-                        let weight = weights
-                            .next()
-                            .ok_or(BlsDoryFoldArtifactError::InvalidArtifact)?;
-                        evaluation = evaluation + coefficient * weight;
-                        visited += 1;
-                        Ok(())
-                    })
-                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-                if visited != self.explicit_coefficient_count() {
-                    return Err(BlsDoryAggregateError::ProverStorage);
-                }
-                Ok(evaluation)
-            }
-            #[cfg(test)]
-            BlsDoryCoefficientStorage::IndexedArtifact(artifact) => {
-                let mut weights = EqualityWeightIterator::new(point);
-                let mut evaluation = BlsDoryFr::zero();
-                let mut visited = 0usize;
-                artifact
-                    .for_each_scalar(|coefficient| {
-                        let weight = weights.next().ok_or(
-                            crate::dory_bls12_381_index_artifact::BlsDoryIndexArtifactError::InvalidArtifact,
-                        )?;
-                        evaluation = evaluation + coefficient * weight;
-                        visited += 1;
-                        Ok(())
-                    })
-                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-                if visited != self.explicit_coefficient_count() {
-                    return Err(BlsDoryAggregateError::ProverStorage);
-                }
-                Ok(evaluation)
-            }
-            BlsDoryCoefficientStorage::CompactArtifact(artifact) => {
-                let mut weights = EqualityWeightIterator::new(point);
-                let mut evaluation = BlsDoryFr::zero();
-                let mut visited = 0usize;
-                artifact
-                    .for_each_scalar(|coefficient| {
-                        let weight = weights
-                            .next()
-                            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
-                        evaluation = evaluation + coefficient * weight;
-                        visited += 1;
-                        Ok(())
-                    })
-                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-                if visited != self.explicit_coefficient_count() {
-                    return Err(BlsDoryAggregateError::ProverStorage);
-                }
-                Ok(evaluation)
-            }
-            BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => {
-                let mut weights = EqualityWeightIterator::new(point);
-                let mut evaluation = BlsDoryFr::zero();
-                let mut visited = 0usize;
-                artifact
-                    .for_each_scalar(|coefficient| {
-                        let weight = weights
-                            .next()
-                            .ok_or(BlsDoryCompactArtifactError::InvalidArtifact)?;
-                        evaluation = evaluation + coefficient * weight;
-                        visited += 1;
-                        Ok(())
-                    })
-                    .map_err(|_| BlsDoryAggregateError::ProverStorage)?;
-                if visited != self.explicit_coefficient_count() {
-                    return Err(BlsDoryAggregateError::ProverStorage);
-                }
-                Ok(evaluation)
-            }
-            BlsDoryCoefficientStorage::ReleasedCompact(_)
-            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
-                Err(BlsDoryAggregateError::ProverStorage)
-            }
-        }
+        // Every storage kind evaluates through the parallel authenticated
+        // chunk stream; per-index terms recombine with exact field addition,
+        // so the value matches the retired one-scalar-at-a-time walk.
+        let cancel = AtomicBool::new(false);
+        let evaluations = self.evaluate_many_parallel(&[point], &cancel)?;
+        evaluations
+            .into_iter()
+            .next()
+            .ok_or(BlsDoryAggregateError::InvalidDimension)
     }
 
     fn for_each_coefficient_pair_with_cancel(
@@ -5826,6 +5751,8 @@ struct EqualityWeightIterator<'a> {
 }
 
 impl<'a> EqualityWeightIterator<'a> {
+    /// Serial reference for `seeded`, retained for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(point: &'a [BlsDoryFr]) -> Self {
         Self {
             point,

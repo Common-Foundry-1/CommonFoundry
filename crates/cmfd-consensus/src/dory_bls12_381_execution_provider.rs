@@ -811,6 +811,18 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
     )
 }
 
+/// Report one layout-preparation component to standard error in the same
+/// machine-readable shape as the proof stage lines, so operators can see
+/// where layout wall time goes. Best effort by design: reporting must never
+/// fail or reorder proving.
+fn report_layout_component(component: &str, started: std::time::Instant) -> std::time::Instant {
+    let elapsed = started.elapsed().as_micros();
+    eprintln!(
+        "CMFD_V3_PROOF_SUBSTAGE {{\"stage\":\"{component}\",\"scalars\":0,\"elapsed_micros\":{elapsed}}}"
+    );
+    std::time::Instant::now()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_scratch_and_cancel(
     mut execution: VerifiedBlsDoryV3WinningNonceExecution,
@@ -841,7 +853,9 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
 
         // Authenticate the final-output bytes and both retained digests before
         // any matrix, transition, range, or wiring proof work begins.
+        let mut component_started = std::time::Instant::now();
         let final_activation = reader.reconstruct_verified_final_activation()?;
+        component_started = report_layout_component("layout_final_activation", component_started);
         check_layout_preparation_cancel(cancel)?;
 
         let mut matrices = Vec::with_capacity(preparation.matrix_count());
@@ -863,6 +877,8 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
                 return Err(BlsDorySharedLayoutError::FixedModelCommitment.into());
             }
             matrices.push(matrix);
+            component_started =
+                report_layout_component(&format!("layout_matrix_bank_{bank}"), component_started);
         }
 
         let mut transitions = Vec::with_capacity(preparation.transition_count());
@@ -930,6 +946,10 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
             }
             transitions.push((arithmetic, range));
             released_transition_sources.push(arithmetic_source);
+            component_started = report_layout_component(
+                &format!("layout_transition_{transition_index}"),
+                component_started,
+            );
         }
 
         let wiring =
@@ -942,6 +962,7 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
                 cancel,
             )
             .map_err(BlsDorySharedLayoutError::from)?;
+        component_started = report_layout_component("layout_wiring", component_started);
 
         for (transition_index, ((arithmetic, range), expected_source)) in transitions
             .iter_mut()
@@ -967,13 +988,19 @@ fn prepare_bls_dory_shared_layout_v5_from_validated_execution_preparation_with_s
                 .openings
                 .restore_compact_source(&restored)
                 .map_err(BlsDorySharedLayoutError::from)?;
+            component_started = report_layout_component(
+                &format!("layout_transition_source_restore_{transition_index}"),
+                component_started,
+            );
         }
 
         (final_activation, matrices, transitions, wiring)
     };
     drop(execution);
     check_layout_preparation_cancel(cancel)?;
+    let assembly_started = std::time::Instant::now();
     let prepared = preparation.into_prepared(matrices, transitions, wiring, setup)?;
+    let _ = report_layout_component("layout_shared_assembly", assembly_started);
     Ok(PreparedBlsDoryV3LayoutV5Execution {
         prepared,
         final_activation,

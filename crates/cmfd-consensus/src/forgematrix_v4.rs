@@ -30,7 +30,8 @@ const ROW_MASK: usize = FORGEMATRIX_V4_BASEFOLD_ROWS - 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum ForgeMatrixV4DynamicTraceKind {
-    Accumulator = 0,
+    /// Matrix accumulator plus the challenge-derived coordinate mask.
+    Preactivation = 0,
     NextActivation = 1,
 }
 
@@ -137,7 +138,12 @@ mod tests {
         );
 
         assert_eq!(
-            forgematrix_v4_dynamic_index(ForgeMatrixV4DynamicTraceKind::Accumulator, 15, 127, 4095,),
+            forgematrix_v4_dynamic_index(
+                ForgeMatrixV4DynamicTraceKind::Preactivation,
+                15,
+                127,
+                4095,
+            ),
             Some((
                 FORGEMATRIX_V4_BASEFOLD_ROWS - 1,
                 0,
@@ -145,7 +151,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            forgematrix_v4_dynamic_index(ForgeMatrixV4DynamicTraceKind::Accumulator, 16, 0, 0,),
+            forgematrix_v4_dynamic_index(ForgeMatrixV4DynamicTraceKind::Preactivation, 16, 0, 0,),
             Some((FORGEMATRIX_V4_BASEFOLD_ROWS, 1, 0))
         );
         assert_eq!(
@@ -166,7 +172,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            forgematrix_v4_dynamic_index(ForgeMatrixV4DynamicTraceKind::Accumulator, 0, 128, 0,),
+            forgematrix_v4_dynamic_index(ForgeMatrixV4DynamicTraceKind::Preactivation, 0, 128, 0,),
             None
         );
     }

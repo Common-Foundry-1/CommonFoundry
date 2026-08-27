@@ -945,8 +945,10 @@ dependencies = [
  "slop-basefold",
  "slop-challenger",
  "slop-koala-bear",
+ "slop-merkle-tree",
  "slop-multilinear",
  "slop-sumcheck",
+ "slop-tensor",
  "thiserror 2.0.20",
  "windows-sys 0.61.2",
 ]

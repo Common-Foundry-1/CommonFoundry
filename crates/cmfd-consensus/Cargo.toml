@@ -57,8 +57,10 @@ slop-algebra = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eab
 slop-basefold = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
 slop-challenger = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
 slop-koala-bear = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
+slop-merkle-tree = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
 slop-multilinear = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
 slop-sumcheck = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
+slop-tensor = { git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba", optional = true }
 thiserror.workspace = true
 
 [features]
@@ -80,13 +82,14 @@ dory-v3-consensus-adapter = ["dory-bls12-381-prototype", "whir-prototype"]
 dory-opening-prototype = ["dep:ark-serialize", "dep:dory-pcs"]
 gpu-proof-prover = ["whir-prototype", "dep:cmfd-proof-accel", "dep:fs2"]
 forgematrix-v4-verifier = [
-    "dep:bincode",
     "dep:slop-algebra",
     "dep:slop-basefold",
     "dep:slop-challenger",
     "dep:slop-koala-bear",
+    "dep:slop-merkle-tree",
     "dep:slop-multilinear",
     "dep:slop-sumcheck",
+    "dep:slop-tensor",
 ]
 production-whir-candidate = ["whir-prototype"]
 remainder-prototype = [

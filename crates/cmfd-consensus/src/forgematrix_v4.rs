@@ -16,7 +16,8 @@ pub const FORGEMATRIX_V4_BASEFOLD_SOURCE_REVISION: &str =
     "92b8eabaea9ab7306da5826caa700adabf7445ba";
 pub const FORGEMATRIX_V4_POSEIDON_SUITE: &str =
     "slop-koala-bear/KoalaBearDegree4Duplex/Poseidon2-width16-digest8";
-pub const FORGEMATRIX_V4_PROOF_CODEC: &str = "bincode-1.3.3/fixint/little-endian/reject-trailing";
+pub const FORGEMATRIX_V4_PROOF_CODEC: &str =
+    "cmfd-v4-basefold-v1/fixed-shape/canonical-u32/little-endian/reject-trailing";
 pub const FORGEMATRIX_V4_TRACE_RELATIONS: &str =
     "preactivation=matrix-accumulator+challenge-coordinate-mask;next-activation=preactivation^3";
 
@@ -237,7 +238,7 @@ mod tests {
         assert_ne!(digest, [0; 32]);
         assert_eq!(
             hex::encode(digest),
-            "0abd5e8f1b1028d6a8e11b7a8245964415b271f37a2181a94f8b144c4def00d0"
+            "be00d978ba336af0d31fa987b3f32f8a1c5993fa346ea9cf0dfa4e7c606c9083"
         );
     }
 }

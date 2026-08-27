@@ -94,6 +94,8 @@ pub mod forgematrix_v2;
 pub mod forgematrix_v4;
 #[cfg(feature = "forgematrix-v4-verifier")]
 pub mod forgematrix_v4_basefold;
+#[cfg(feature = "forgematrix-v4-verifier")]
+pub mod forgematrix_v4_basefold_codec;
 pub mod model_bank;
 #[cfg(feature = "gpu-proof-prover")]
 pub mod model_whir_sources;

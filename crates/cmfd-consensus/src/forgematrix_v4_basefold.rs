@@ -3,7 +3,6 @@
 //! This module deliberately contains no CUDA dependency. The GPU prover must
 //! produce exactly the transcript accepted by these CPU-owned routines.
 
-use serde::{Deserialize, Serialize};
 use slop_algebra::{AbstractField, extension::BinomialExtensionField};
 use slop_basefold::{BasefoldProof, BasefoldVerifier, FriConfig};
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx};
@@ -89,7 +88,7 @@ impl ForgeMatrixV4TranscriptStatement {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ForgeMatrixV4OpeningCommitment {
     Fixed = 0,
@@ -104,7 +103,7 @@ pub struct ForgeMatrixV4OpeningClaim {
     pub value: ForgeMatrixV4Extension,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone)]
 pub struct ForgeMatrixV4OpeningReductionProof {
     pub sumcheck: PartialSumcheckProof<ForgeMatrixV4Extension>,
     pub fixed_column_evaluations: Vec<ForgeMatrixV4Extension>,
@@ -351,7 +350,7 @@ mod tests {
         let expected = baseline.digest();
         assert_eq!(
             hex::encode(expected),
-            "ffab0795635f749bb1e8b48a01ebd4c24f907f624bb8ae6f2de827e2e22501a7"
+            "8867f1741dd68d15010e191cd9719ff657cb5512d972de0ceee554c0bf281ab5"
         );
 
         let mutations: [fn(&mut ForgeMatrixV4TranscriptStatement); 14] = [

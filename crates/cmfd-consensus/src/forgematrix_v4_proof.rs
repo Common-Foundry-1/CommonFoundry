@@ -175,6 +175,19 @@ pub fn verify_forgematrix_v4_transparent_proof(
             verify_forgematrix_v4_cubic_relation(&cubic_point, &relation.cubic, &mut challenger)?;
             claims[bank].extend(forgematrix_v4_cubic_opening_claims(&relation.cubic)?);
         }
+        if bank > 0 {
+            let completed_bank = bank - 1;
+            finalize_forgematrix_v4_bank_opening_claims(&mut claims[completed_bank])?;
+            verify_forgematrix_v4_opening_reduction(
+                [
+                    fixed_commitments[completed_bank],
+                    dynamic_commitments[completed_bank],
+                ],
+                &claims[completed_bank],
+                &proof.banks[completed_bank].opening,
+                &mut challenger,
+            )?;
+        }
     }
 
     let last_bank = PRODUCTION_V2_BANKS as usize - 1;
@@ -188,15 +201,13 @@ pub fn verify_forgematrix_v4_transparent_proof(
         claims[last_bank].push(forgematrix_v4_final_opening_claim(&point, value)?);
     }
 
-    for bank in 0..PRODUCTION_V2_BANKS as usize {
-        finalize_forgematrix_v4_bank_opening_claims(&mut claims[bank])?;
-        verify_forgematrix_v4_opening_reduction(
-            [fixed_commitments[bank], dynamic_commitments[bank]],
-            &claims[bank],
-            &proof.banks[bank].opening,
-            &mut challenger,
-        )?;
-    }
+    finalize_forgematrix_v4_bank_opening_claims(&mut claims[last_bank])?;
+    verify_forgematrix_v4_opening_reduction(
+        [fixed_commitments[last_bank], dynamic_commitments[last_bank]],
+        &claims[last_bank],
+        &proof.banks[last_bank].opening,
+        &mut challenger,
+    )?;
     Ok(())
 }
 

@@ -22,7 +22,7 @@ pub const FORGEMATRIX_V4_TRACE_RELATIONS: &str =
 pub const FORGEMATRIX_V4_EXECUTION_SEMANTICS: &str = "model-byte x maps to x-125;initial-activation=(base-input+CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,u32::MAX))^3;layer-mask=CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,global-layer);all arithmetic canonical KoalaBear";
 pub const FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/V4/FinalActivation/v1";
-pub const FORGEMATRIX_V4_RELATION_TRANSCRIPT: &str = "commitments-v1;matrix-point-v1;matrix-proof-v1;shift-proof-v1;cubic-point-v1;cubic-proof-v1;final-point-v1";
+pub const FORGEMATRIX_V4_RELATION_TRANSCRIPT: &str = "commitments-v1;bank0-relations;bank1-relations;bank0-opening;bank2-relations;bank1-opening;final-point-v1;bank2-opening";
 
 pub const FORGEMATRIX_V4_ALGORITHM_VERSION: u32 = 4;
 pub const FORGEMATRIX_V4_PROOF_VERSION: u32 = 1;
@@ -260,7 +260,7 @@ mod tests {
         assert_ne!(digest, [0; 32]);
         assert_eq!(
             hex::encode(digest),
-            "e93bbac0a67541cf446448179c03adf6edbcc538ee9b17ef9c8fbefdee2b3c82"
+            "7878c407708c39439658f91bb6e6fc95cadb80742032dff21a98df04162ffb72"
         );
     }
 }

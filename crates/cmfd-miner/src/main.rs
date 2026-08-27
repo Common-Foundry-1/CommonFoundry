@@ -1079,6 +1079,13 @@ impl SessionStatistics {
         *total = total.saturating_add(attempts);
     }
 
+    /// Total completed nonce evaluations across every GPU this session.
+    fn total_attempts(&self) -> u64 {
+        self.totals
+            .values()
+            .fold(0_u64, |total, attempts| total.saturating_add(*attempts))
+    }
+
     fn report_if_due(&mut self, devices: &[CudaDevice], height: u64, interval: Duration) {
         if self.last_report.elapsed() < interval {
             return;
@@ -1569,6 +1576,8 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
             )?);
         }
         let mut last_node_check = Instant::now();
+        let search_started = Instant::now();
+        let search_attempt_base = statistics.total_attempts();
         let outcome = worker_pool
             .as_mut()
             .expect("Production V3 worker pool is initialized")
@@ -1614,9 +1623,16 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                 println!("Node connection lost; GPU work paused until a node is reachable.");
             }
             JobOutcome::FoundV3 { device, claim } => {
+                let search_seconds = search_started.elapsed().as_secs_f64().max(f64::EPSILON);
+                let search_evaluations = statistics
+                    .total_attempts()
+                    .saturating_sub(search_attempt_base);
                 println!(
-                    "GPU {device} found a target nonce; CPU replay and Layout V5 proof construction started."
+                    "GPU {device} found a target nonce after {search_evaluations} evaluations in {search_seconds:.1}s ({:.2} H/s); CPU replay and Layout V5 proof construction started.",
+                    search_evaluations as f64 / search_seconds
                 );
+                let proof_stats_height = work.challenge().height;
+                let proof_stats_interval = Duration::from_secs(options.stats_seconds);
                 let proof_work = work.clone();
                 let mut last_proof_node_check = Instant::now()
                     .checked_sub(PEER_RETRY_INTERVAL)
@@ -1646,6 +1662,13 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                             }
                             None => Ok(WorkStatus::Disconnected),
                         }
+                    },
+                    &mut || {
+                        statistics.report_if_due(
+                            &devices,
+                            proof_stats_height,
+                            proof_stats_interval,
+                        );
                     },
                     move |proof_cancel| {
                         proof_work
@@ -2693,6 +2716,8 @@ fn continuous_production_mining(
                 Arc::clone(&shutdown),
             )?);
         }
+        let search_started = Instant::now();
+        let search_attempt_base = statistics.total_attempts();
         let outcome = worker_pool
             .as_mut()
             .expect("Production V3 worker pool is initialized")
@@ -2726,9 +2751,15 @@ fn continuous_production_mining(
                 println!("New chain tip received; rebuilding Production V3 work.");
             }
             JobOutcome::FoundV3 { device, claim } => {
+                let search_seconds = search_started.elapsed().as_secs_f64().max(f64::EPSILON);
+                let search_evaluations = statistics
+                    .total_attempts()
+                    .saturating_sub(search_attempt_base);
                 println!(
-                    "GPU {device} found a target nonce; CPU replay and Layout V5 proof construction started."
+                    "GPU {device} found a target nonce after {search_evaluations} evaluations in {search_seconds:.1}s ({:.2} H/s); CPU replay and Layout V5 proof construction started.",
+                    search_evaluations as f64 / search_seconds
                 );
+                let proof_stats_height = work.challenge().height;
                 let proof_work = work.clone();
                 let proof = match run_production_proof_while_current(
                     Arc::clone(&shutdown),
@@ -2743,6 +2774,13 @@ fn continuous_production_mining(
                         } else {
                             Ok(WorkStatus::Stale)
                         }
+                    },
+                    &mut || {
+                        statistics.report_if_due(
+                            &devices,
+                            proof_stats_height,
+                            config.stats_interval,
+                        );
                     },
                     move |proof_cancel| {
                         proof_work
@@ -3251,6 +3289,7 @@ fn monitor_workers(
 fn run_production_proof_while_current<T, Prove>(
     shutdown: Arc<AtomicBool>,
     check_status: &mut dyn FnMut() -> Result<WorkStatus>,
+    on_poll: &mut dyn FnMut(),
     prove: Prove,
 ) -> Result<ProofRunOutcome<T>>
 where
@@ -3334,6 +3373,7 @@ where
                 return Ok(ProofRunOutcome::Disconnected);
             }
         }
+        on_poll();
     }
 }
 
@@ -4054,6 +4094,7 @@ mod tests {
         let outcome = run_production_proof_while_current(
             shutdown,
             &mut || Ok(WorkStatus::Stale),
+            &mut || {},
             move |cancel| {
                 while !cancel.load(Ordering::Acquire) {
                     thread::yield_now();
@@ -4081,6 +4122,7 @@ mod tests {
         let outcome = run_production_proof_while_current(
             shutdown,
             &mut || Ok(WorkStatus::Current),
+            &mut || {},
             move |cancel| {
                 while !cancel.load(Ordering::Acquire) {
                     thread::yield_now();
@@ -4101,6 +4143,7 @@ mod tests {
         let outcome = run_production_proof_while_current(
             Arc::new(AtomicBool::new(false)),
             &mut || Ok(WorkStatus::Stale),
+            &mut || {},
             |_| Ok(7_u8),
         )
         .unwrap();

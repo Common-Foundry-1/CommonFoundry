@@ -20,6 +20,7 @@ pub const FORGEMATRIX_V4_PROOF_CODEC: &str =
     "cmfd-v4-basefold-v1/fixed-shape/canonical-u32/little-endian/reject-trailing";
 pub const FORGEMATRIX_V4_TRACE_RELATIONS: &str =
     "preactivation=matrix-accumulator+challenge-coordinate-mask;next-activation=preactivation^3";
+pub const FORGEMATRIX_V4_RELATION_TRANSCRIPT: &str = "matrix-point-v1;matrix-proof-v1;shift-proof-v1;cubic-point-v1;cubic-proof-v1;boundary-point-v1";
 
 pub const FORGEMATRIX_V4_ALGORITHM_VERSION: u32 = 4;
 pub const FORGEMATRIX_V4_PROOF_VERSION: u32 = 1;
@@ -34,6 +35,14 @@ pub const FORGEMATRIX_V4_BASEFOLD_QUERIES: u32 = 270;
 pub const FORGEMATRIX_V4_BASEFOLD_POW_BITS: u32 = 16;
 pub const FORGEMATRIX_V4_RELATION_REPETITIONS: u32 = 2;
 pub const FORGEMATRIX_V4_MAX_OPENING_CLAIMS: usize = 16;
+pub const FORGEMATRIX_V4_RELATION_OPENING_CLAIMS_PER_BANK: usize = 12;
+pub const FORGEMATRIX_V4_OPENING_CLAIMS_PER_BANK: usize = 16;
+pub const FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES: usize = 19;
+pub const FORGEMATRIX_V4_MATRIX_SUMCHECK_DEGREE: usize = 3;
+pub const FORGEMATRIX_V4_SHIFT_SUMCHECK_VARIABLES: usize = 7;
+pub const FORGEMATRIX_V4_SHIFT_SUMCHECK_DEGREE: usize = 2;
+pub const FORGEMATRIX_V4_CUBIC_SUMCHECK_VARIABLES: usize = 26;
+pub const FORGEMATRIX_V4_CUBIC_SUMCHECK_DEGREE: usize = 4;
 pub const FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES: usize =
     PRODUCTION_V2_BATCH as usize * PRODUCTION_V2_DIMENSION as usize * std::mem::size_of::<u32>();
 
@@ -71,10 +80,19 @@ pub fn forgematrix_v4_proof_system_digest() -> [u8; 32] {
     hasher.update(&FORGEMATRIX_V4_BASEFOLD_POW_BITS.to_le_bytes());
     hasher.update(&FORGEMATRIX_V4_RELATION_REPETITIONS.to_le_bytes());
     hasher.update(&(FORGEMATRIX_V4_MAX_OPENING_CLAIMS as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_RELATION_OPENING_CLAIMS_PER_BANK as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_OPENING_CLAIMS_PER_BANK as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_MATRIX_SUMCHECK_DEGREE as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_SHIFT_SUMCHECK_VARIABLES as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_SHIFT_SUMCHECK_DEGREE as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_CUBIC_SUMCHECK_VARIABLES as u64).to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_CUBIC_SUMCHECK_DEGREE as u64).to_le_bytes());
     hasher.update(&(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES as u64).to_le_bytes());
     update_text(&mut hasher, FORGEMATRIX_V4_WEIGHT_AXIS_ORDER);
     update_text(&mut hasher, FORGEMATRIX_V4_DYNAMIC_AXIS_ORDER);
     update_text(&mut hasher, FORGEMATRIX_V4_TRACE_RELATIONS);
+    update_text(&mut hasher, FORGEMATRIX_V4_RELATION_TRANSCRIPT);
     update_text(&mut hasher, FORGEMATRIX_V4_TRANSCRIPT_DOMAIN);
     update_text(&mut hasher, FORGEMATRIX_V4_POSEIDON_SUITE);
     update_text(&mut hasher, FORGEMATRIX_V4_PROOF_CODEC);
@@ -238,7 +256,7 @@ mod tests {
         assert_ne!(digest, [0; 32]);
         assert_eq!(
             hex::encode(digest),
-            "be00d978ba336af0d31fa987b3f32f8a1c5993fa346ea9cf0dfa4e7c606c9083"
+            "2316bd7a7f9aa57507acf2ee49d5cd5e7a6a09d1f0c5532e41daab2c7fef8bf5"
         );
     }
 }

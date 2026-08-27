@@ -32,10 +32,11 @@ const SUMCHECK_DEGREE: usize = 2;
 const COMPONENT_LOG_HEIGHT: usize = FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize + 1;
 const QUERY_WIDTH: usize = 8;
 
-/// Exact bytes for one opening reduction with one claim.
+/// Exact bytes for one opening reduction at any pinned claim count.
 pub const FORGEMATRIX_V4_OPENING_REDUCTION_MIN_BYTES: usize = 3_300_008;
-/// Exact maximum bytes for one opening reduction with sixteen claims.
-pub const FORGEMATRIX_V4_OPENING_REDUCTION_MAX_BYTES: usize = 3_300_264;
+/// Exact maximum bytes for one opening reduction at any pinned claim count.
+pub const FORGEMATRIX_V4_OPENING_REDUCTION_MAX_BYTES: usize =
+    FORGEMATRIX_V4_OPENING_REDUCTION_MIN_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ForgeMatrixV4ProofCodecError {
@@ -57,8 +58,7 @@ pub fn forgematrix_v4_opening_reduction_encoded_len(
     claim_count: usize,
 ) -> Result<usize, ForgeMatrixV4ProofCodecError> {
     validate_claim_count(claim_count)?;
-    let selector_variables = claim_count.ilog2() as usize;
-    Ok(FORGEMATRIX_V4_OPENING_REDUCTION_MIN_BYTES + selector_variables * 64)
+    Ok(FORGEMATRIX_V4_OPENING_REDUCTION_MIN_BYTES)
 }
 
 pub fn encode_forgematrix_v4_opening_reduction(
@@ -222,8 +222,8 @@ fn validate_claim_count(claim_count: usize) -> Result<(), ForgeMatrixV4ProofCode
     Ok(())
 }
 
-fn sumcheck_rounds(claim_count: usize) -> usize {
-    FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize + claim_count.ilog2() as usize
+fn sumcheck_rounds(_claim_count: usize) -> usize {
+    FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize
 }
 
 fn validate_shape(

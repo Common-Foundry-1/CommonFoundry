@@ -16,7 +16,7 @@ pub const FORGEMATRIX_V4_BASEFOLD_SOURCE_REVISION: &str =
     "92b8eabaea9ab7306da5826caa700adabf7445ba";
 pub const FORGEMATRIX_V4_POSEIDON_SUITE: &str =
     "slop-koala-bear/KoalaBearDegree4Duplex/Poseidon2-width16-digest8";
-pub const FORGEMATRIX_V4_PROOF_CODEC: &str = "cmfd-v4-transparent-v1/final-fields;three-banks(dynamic-commitment,two-relations,basefold-opening);fixed-shape;canonical-u32;little-endian;reject-trailing";
+pub const FORGEMATRIX_V4_PROOF_CODEC: &str = "cmfd-v4-transparent-v1/final-fields;three-banks(dynamic-commitment,two-relations,direct-row-rlc-basefold-opening);fixed-shape;canonical-u32;little-endian;reject-trailing";
 pub const FORGEMATRIX_V4_TRACE_RELATIONS: &str =
     "preactivation=matrix-accumulator+challenge-coordinate-mask;next-activation=preactivation^3";
 pub const FORGEMATRIX_V4_EXECUTION_SEMANTICS: &str = "model-byte x maps to x-125;initial-activation=(base-input+CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,u32::MAX))^3;layer-mask=CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,global-layer);all arithmetic canonical KoalaBear";
@@ -260,7 +260,7 @@ mod tests {
         assert_ne!(digest, [0; 32]);
         assert_eq!(
             hex::encode(digest),
-            "26a6a69d1c5386333c108e575cd75af62257802c7c8d27a5666c1b7f0fd351b6"
+            "e93bbac0a67541cf446448179c03adf6edbcc538ee9b17ef9c8fbefdee2b3c82"
         );
     }
 }

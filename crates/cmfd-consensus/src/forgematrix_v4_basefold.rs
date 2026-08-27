@@ -21,7 +21,7 @@ use crate::{
 };
 
 const TRANSCRIPT_STATEMENT_DOMAIN: &str = "CommonFoundry/ForgeMatrix/V4/TranscriptStatement/v1";
-const OPENING_REDUCTION_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/OpeningReduction/v1";
+const OPENING_REDUCTION_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/OpeningReduction/v2";
 
 pub type ForgeMatrixV4Field = KoalaBear;
 pub type ForgeMatrixV4Extension = BinomialExtensionField<ForgeMatrixV4Field, 4>;
@@ -201,42 +201,30 @@ pub fn verify_forgematrix_v4_opening_reduction(
         return Err(ForgeMatrixV4VerifierError::OpeningClaim);
     }
 
-    let selector_variables = claims.len().ilog2() as usize;
     partially_verify_sumcheck_proof(
         &proof.sumcheck,
         challenger,
-        selector_variables + FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize,
+        FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize,
         2,
     )
     .map_err(|_| ForgeMatrixV4VerifierError::OpeningSumcheck)?;
 
-    let (selector_point, opening_point) =
-        proof.sumcheck.point_and_eval.0.split_at(selector_variables);
-    let per_claim_trace = claims
-        .iter()
-        .zip(&powers)
-        .map(|(claim, &power)| {
-            let evaluations = match claim.commitment {
-                ForgeMatrixV4OpeningCommitment::Fixed => &proof.fixed_column_evaluations,
-                ForgeMatrixV4OpeningCommitment::Dynamic => &proof.dynamic_column_evaluations,
-            };
-            power * evaluate_columns(evaluations, &claim.column_point)
-        })
-        .collect::<Vec<_>>();
-    let expected_trace = combine(&per_claim_trace, &selector_point)?;
-    let per_claim_equality = claims
-        .iter()
-        .map(|claim| equality_evaluation(&claim.row_point, &opening_point))
-        .collect::<Result<Vec<_>, _>>()?;
-    let expected_equality = combine(&per_claim_equality, &selector_point)?;
-    if proof.sumcheck.point_and_eval.1 != expected_trace * expected_equality {
+    let opening_point = &proof.sumcheck.point_and_eval.0;
+    let expected_terminal = opening_terminal_evaluation(
+        claims,
+        &powers,
+        &proof.fixed_column_evaluations,
+        &proof.dynamic_column_evaluations,
+        opening_point,
+    )?;
+    if proof.sumcheck.point_and_eval.1 != expected_terminal {
         return Err(ForgeMatrixV4VerifierError::OpeningTerminal);
     }
 
     forgematrix_v4_basefold_verifier()
         .verify_mle_evaluations(
             &commitments,
-            opening_point,
+            opening_point.clone(),
             &[
                 MleEval::from(proof.fixed_column_evaluations.clone()),
                 MleEval::from(proof.dynamic_column_evaluations.clone()),
@@ -291,17 +279,29 @@ fn equality_evaluation(
     ))
 }
 
-fn combine(
-    values: &[ForgeMatrixV4Extension],
-    point: &Point<ForgeMatrixV4Extension>,
+fn opening_terminal_evaluation(
+    claims: &[ForgeMatrixV4OpeningClaim],
+    powers: &[ForgeMatrixV4Extension],
+    fixed_evaluations: &[ForgeMatrixV4Extension],
+    dynamic_evaluations: &[ForgeMatrixV4Extension],
+    opening_point: &Point<ForgeMatrixV4Extension>,
 ) -> Result<ForgeMatrixV4Extension, ForgeMatrixV4VerifierError> {
-    let expected = 1_usize
-        .checked_shl(point.dimension() as u32)
-        .ok_or(ForgeMatrixV4VerifierError::OpeningShape)?;
-    if values.len() != expected {
+    if claims.len() != powers.len() {
         return Err(ForgeMatrixV4VerifierError::OpeningShape);
     }
-    Ok(evaluate_columns(values, point))
+    claims
+        .iter()
+        .zip(powers)
+        .map(|(claim, &power)| {
+            let evaluations = match claim.commitment {
+                ForgeMatrixV4OpeningCommitment::Fixed => fixed_evaluations,
+                ForgeMatrixV4OpeningCommitment::Dynamic => dynamic_evaluations,
+            };
+            Ok(power
+                * evaluate_columns(evaluations, &claim.column_point)
+                * equality_evaluation(&claim.row_point, opening_point)?)
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -350,7 +350,7 @@ mod tests {
         let expected = baseline.digest();
         assert_eq!(
             hex::encode(expected),
-            "ace9c12f5b4183f64961421ab1489482c6ed0063f0b8c062843cca6e05afb4d3"
+            "d900d23ff3a773021c1c4654cb7eb65d8e31171f7f5b481f754533e881c46429"
         );
 
         let mutations: [fn(&mut ForgeMatrixV4TranscriptStatement); 14] = [
@@ -487,6 +487,50 @@ mod tests {
                 &mut challenger,
             ),
             Err(ForgeMatrixV4VerifierError::OpeningShape)
+        );
+    }
+
+    #[test]
+    fn direct_row_rlc_terminal_sums_each_claim_without_selector_variables() {
+        let row_zero = Point::from(vec![
+            ForgeMatrixV4Extension::zero();
+            FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize
+        ]);
+        let row_one = Point::from(vec![
+            ForgeMatrixV4Extension::one();
+            FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize
+        ]);
+        let claims = [
+            ForgeMatrixV4OpeningClaim {
+                commitment: ForgeMatrixV4OpeningCommitment::Fixed,
+                column_point: Point::from(vec![
+                    ForgeMatrixV4Extension::zero();
+                    FORGEMATRIX_V4_FIXED_COLUMNS.ilog2() as usize
+                ]),
+                row_point: row_zero.clone(),
+                value: ForgeMatrixV4Extension::zero(),
+            },
+            ForgeMatrixV4OpeningClaim {
+                commitment: ForgeMatrixV4OpeningCommitment::Dynamic,
+                column_point: Point::from(vec![
+                    ForgeMatrixV4Extension::zero();
+                    FORGEMATRIX_V4_DYNAMIC_COLUMNS.ilog2() as usize
+                ]),
+                row_point: row_one,
+                value: ForgeMatrixV4Extension::zero(),
+            },
+        ];
+        let fixed =
+            vec![ForgeMatrixV4Extension::from_canonical_u8(2); FORGEMATRIX_V4_FIXED_COLUMNS];
+        let dynamic =
+            vec![ForgeMatrixV4Extension::from_canonical_u8(3); FORGEMATRIX_V4_DYNAMIC_COLUMNS];
+        let powers = [
+            ForgeMatrixV4Extension::from_canonical_u8(5),
+            ForgeMatrixV4Extension::from_canonical_u8(7),
+        ];
+        assert_eq!(
+            opening_terminal_evaluation(&claims, &powers, &fixed, &dynamic, &row_zero).unwrap(),
+            ForgeMatrixV4Extension::from_canonical_u8(10)
         );
     }
 }

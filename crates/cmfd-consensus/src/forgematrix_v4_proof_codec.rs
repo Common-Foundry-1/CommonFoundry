@@ -403,7 +403,7 @@ const _: () = assert!(MATRIX_PROOF_BYTES == 1_600);
 const _: () = assert!(SHIFT_PROOF_BYTES == 512);
 const _: () = assert!(CUBIC_PROOF_BYTES == 2_560);
 const _: () = assert!(RELATION_REPETITION_BYTES == 4_672);
-const _: () = assert!(FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES == 12_026_088);
+const _: () = assert!(FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES == 12_025_320);
 
 #[cfg(test)]
 mod tests {
@@ -468,8 +468,7 @@ mod tests {
     }
 
     fn structural_opening() -> ForgeMatrixV4OpeningReductionProof {
-        let variables = FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize
-            + FORGEMATRIX_V4_OPENING_CLAIMS_PER_BANK.ilog2() as usize;
+        let variables = FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize;
         let mut query_openings = Vec::with_capacity(FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize);
         for index in 0..FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES as usize {
             query_openings.push(zero_opening(

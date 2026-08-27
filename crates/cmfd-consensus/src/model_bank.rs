@@ -50,7 +50,10 @@ pub(crate) const LAYER_ROOTS_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/LAYER-ROOTS";
 pub(crate) const MANIFEST_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MANIFEST";
 const MODEL_PCS_COMMITMENT_ROOT_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-PCS-COMMITMENTS/V1";
 const MODEL_PCS_IDENTITY_DOMAIN: &str = "CMFD/FORGEMATRIX/V2/MODEL-PCS-IDENTITY/V1";
-const VERIFY_CHUNK_BYTES: usize = 64 * 1024;
+// Large enough that the multithreaded BLAKE3 tree hasher reaches full rate;
+// section boundaries still bound every chunk, and the digest is identical to
+// any other chunking of the same byte stream.
+const VERIFY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Consensus-significant partition of the model layers into ordered PCS roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -875,16 +878,16 @@ where
 {
     let mut remaining = bytes;
     let mut section_offset = 0_u64;
-    let mut buffer = [0_u8; VERIFY_CHUNK_BYTES];
+    let mut buffer = vec![0_u8; VERIFY_CHUNK_BYTES];
     while remaining != 0 {
         let take = usize::try_from(remaining.min(VERIFY_CHUNK_BYTES as u64))
             .map_err(|_| ModelBankConsumerError::ModelBank(ModelBankError::SizeOverflow))?;
         read_exact(reader, &mut buffer[..take]).map_err(ModelBankConsumerError::ModelBank)?;
         validate_values(&buffer[..take], *payload_offset)
             .map_err(ModelBankConsumerError::ModelBank)?;
-        raw_hasher.update(&buffer[..take]);
+        raw_hasher.update_rayon(&buffer[..take]);
         if let Some(hasher) = section_hasher.as_deref_mut() {
-            hasher.update(&buffer[..take]);
+            hasher.update_rayon(&buffer[..take]);
         }
         consume(ModelBankByteChunk {
             section,
@@ -919,15 +922,15 @@ pub(crate) fn centered_model_field_element(value: u8) -> u64 {
 }
 
 fn validate_values(bytes: &[u8], start_offset: u64) -> Result<(), ModelBankError> {
-    for (index, value) in bytes.iter().copied().enumerate() {
-        if value > MAX_MODEL_BYTE {
-            return Err(ModelBankError::OutOfRange {
-                offset: start_offset + index as u64,
-                value,
-            });
-        }
+    // `position` lets the scan vectorize; the reported offset is still the
+    // first out-of-range byte exactly as in the indexed walk.
+    match bytes.iter().position(|value| *value > MAX_MODEL_BYTE) {
+        None => Ok(()),
+        Some(index) => Err(ModelBankError::OutOfRange {
+            offset: start_offset + index as u64,
+            value: bytes[index],
+        }),
     }
-    Ok(())
 }
 
 pub(crate) fn start_layer_aggregate(layers: u32) -> Hasher {

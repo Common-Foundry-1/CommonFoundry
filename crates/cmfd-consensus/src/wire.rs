@@ -30,7 +30,7 @@ pub const MAX_TRANSACTION_BYTES: usize = 64 * 1024;
 pub const MAX_PROOF_BYTES: usize = 256 * 1024;
 /// All networks before V4 retain this complete-frame limit.
 pub const MAX_BLOCK_BYTES: usize = 1024 * 1024;
-pub const PRODUCTION_V4_MAX_PROOF_BYTES: usize = 10 * 1024 * 1024;
+pub const PRODUCTION_V4_MAX_PROOF_BYTES: usize = 13 * 1024 * 1024;
 pub const PRODUCTION_V4_MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 
 /// SHA-256("CMFD/PRODUCTION-V4-TESTNET/V1/NETWORK-ID").
@@ -1705,19 +1705,21 @@ mod tests {
     }
 
     #[test]
-    fn v4_candidate_accepts_the_measured_raw_proof_and_rejects_oversize_before_copy() {
+    fn v4_candidate_accepts_measured_pcs_and_public_output_then_rejects_oversize() {
         const MEASURED_THREE_BANK_BASEFOLD_BYTES: usize = 3 * 3_296_168;
+        const MEASURED_PCS_PLUS_PUBLIC_OUTPUT_BYTES: usize = MEASURED_THREE_BANK_BASEFOLD_BYTES
+            + crate::FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES;
         const {
             assert!(MEASURED_THREE_BANK_BASEFOLD_BYTES > MAX_PROOF_BYTES);
             assert!(
-                MEASURED_THREE_BANK_BASEFOLD_BYTES < MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES
+                MEASURED_PCS_PLUS_PUBLIC_OUTPUT_BYTES < MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES
             );
         }
 
         let BlockProof::V4Candidate(mut proof) = v4_proof() else {
             unreachable!();
         };
-        proof.transparent_proof = vec![0x5a; MEASURED_THREE_BANK_BASEFOLD_BYTES];
+        proof.transparent_proof = vec![0x5a; MEASURED_PCS_PLUS_PUBLIC_OUTPUT_BYTES];
         let candidate = BlockProof::V4Candidate(proof.clone());
         let encoded =
             encode_forgematrix_proof(&candidate, PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap();

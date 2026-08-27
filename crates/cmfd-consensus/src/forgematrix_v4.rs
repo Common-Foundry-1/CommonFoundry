@@ -17,6 +17,8 @@ pub const FORGEMATRIX_V4_BASEFOLD_LOG_BLOWUP: u32 = 1;
 pub const FORGEMATRIX_V4_BASEFOLD_QUERIES: u32 = 270;
 pub const FORGEMATRIX_V4_BASEFOLD_POW_BITS: u32 = 16;
 pub const FORGEMATRIX_V4_RELATION_REPETITIONS: u32 = 2;
+pub const FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES: usize =
+    PRODUCTION_V2_BATCH as usize * PRODUCTION_V2_DIMENSION as usize * std::mem::size_of::<u32>();
 
 pub const FORGEMATRIX_V4_WEIGHT_AXIS_ORDER: &str =
     "[column,common,layer-within-bank] least-significant/fastest-changing first";
@@ -128,6 +130,10 @@ mod tests {
         assert_eq!(
             2 * layers * batch * dimension,
             FORGEMATRIX_V4_DYNAMIC_COLUMNS * FORGEMATRIX_V4_BASEFOLD_ROWS
+        );
+        assert_eq!(
+            FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
+            2 * 1024 * 1024
         );
 
         assert_eq!(

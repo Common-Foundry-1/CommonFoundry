@@ -426,7 +426,7 @@ mod tests {
 
         assert_eq!(max_proof_bytes_for_network(legacy.network_id), 256 * 1024);
         assert_eq!(max_block_bytes_for_network(legacy.network_id), 1024 * 1024);
-        assert_eq!(max_proof_bytes_for_network(v4.network_id), 10 * 1024 * 1024);
+        assert_eq!(max_proof_bytes_for_network(v4.network_id), 13 * 1024 * 1024);
         assert_eq!(max_block_bytes_for_network(v4.network_id), 16 * 1024 * 1024);
         assert_ne!(legacy.fingerprint().unwrap(), v4.fingerprint().unwrap());
     }

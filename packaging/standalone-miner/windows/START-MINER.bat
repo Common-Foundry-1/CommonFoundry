@@ -44,6 +44,9 @@ set "PRODUCTION_V3_READY="
 if exist "%~dp0production-v3\MODEL-V2.bank" if exist "%~dp0production-v3\MODEL-V2.manifest.json" if exist "%~dp0production-v3\DORY-V3-MODEL-RECORD-V2.json" (
   if "%LOCAL_PEER%"=="127.0.0.1:18444" set "LOCAL_PEER=127.0.0.1:21444"
   if "%BOOTSTRAP_PEER%"=="107.214.187.2:18444" set "BOOTSTRAP_PEER=107.214.187.2:21444"
+  rem ProductionV3 accepts --batch-size 1-64 (per-worker nonce stride; proof
+  rem time dominates). Correct the reference-profile default automatically.
+  if "%BATCH_SIZE%"=="8192" set "BATCH_SIZE=64"
   if not exist "%~dp0production-v3\scratch" mkdir "%~dp0production-v3\scratch"
   rem ProductionV3 refuses to load model artifacts from a directory other
   rem accounts can reach, and extracting a ZIP leaves inherited permissions in

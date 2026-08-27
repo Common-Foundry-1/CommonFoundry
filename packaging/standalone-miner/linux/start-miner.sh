@@ -32,6 +32,11 @@ if [[ -f "$SCRIPT_DIR/production-v3/MODEL-V2.bank" &&
   if [[ "$BOOTSTRAP_PEER" == "107.214.187.2:18444" ]]; then
     BOOTSTRAP_PEER="107.214.187.2:21444"
   fi
+  # ProductionV3 accepts --batch-size 1-64 (per-worker nonce stride; proof
+  # time dominates). Correct the reference-profile default automatically.
+  if [[ "$BATCH_SIZE" == "8192" ]]; then
+    BATCH_SIZE="64"
+  fi
   PRODUCTION_V3_READY=1
 fi
 

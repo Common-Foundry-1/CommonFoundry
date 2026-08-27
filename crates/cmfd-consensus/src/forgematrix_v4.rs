@@ -20,6 +20,8 @@ pub const FORGEMATRIX_V4_PROOF_CODEC: &str = "bincode-1.3.3/fixint/little-endian
 pub const FORGEMATRIX_V4_TRACE_RELATIONS: &str =
     "preactivation=matrix-accumulator+challenge-coordinate-mask;next-activation=preactivation^3";
 
+pub const FORGEMATRIX_V4_ALGORITHM_VERSION: u32 = 4;
+pub const FORGEMATRIX_V4_PROOF_VERSION: u32 = 1;
 pub const FORGEMATRIX_V4_FIELD_MODULUS: u32 = 0x7f00_0001;
 pub const FORGEMATRIX_V4_EXTENSION_DEGREE: u32 = 4;
 pub const FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES: u32 = 23;
@@ -30,6 +32,7 @@ pub const FORGEMATRIX_V4_BASEFOLD_LOG_BLOWUP: u32 = 1;
 pub const FORGEMATRIX_V4_BASEFOLD_QUERIES: u32 = 270;
 pub const FORGEMATRIX_V4_BASEFOLD_POW_BITS: u32 = 16;
 pub const FORGEMATRIX_V4_RELATION_REPETITIONS: u32 = 2;
+pub const FORGEMATRIX_V4_MAX_OPENING_CLAIMS: usize = 16;
 pub const FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES: usize =
     PRODUCTION_V2_BATCH as usize * PRODUCTION_V2_DIMENSION as usize * std::mem::size_of::<u32>();
 
@@ -50,6 +53,8 @@ pub fn forgematrix_v4_proof_system_digest() -> [u8; 32] {
 
     let mut hasher = blake3::Hasher::new_derive_key(FORGEMATRIX_V4_PROOF_SYSTEM_DIGEST_DOMAIN);
     hasher.update(&1_u32.to_le_bytes());
+    hasher.update(&FORGEMATRIX_V4_ALGORITHM_VERSION.to_le_bytes());
+    hasher.update(&FORGEMATRIX_V4_PROOF_VERSION.to_le_bytes());
     hasher.update(&FORGEMATRIX_V4_FIELD_MODULUS.to_le_bytes());
     hasher.update(&FORGEMATRIX_V4_EXTENSION_DEGREE.to_le_bytes());
     hasher.update(&PRODUCTION_V2_BATCH.to_le_bytes());
@@ -64,6 +69,7 @@ pub fn forgematrix_v4_proof_system_digest() -> [u8; 32] {
     hasher.update(&FORGEMATRIX_V4_BASEFOLD_QUERIES.to_le_bytes());
     hasher.update(&FORGEMATRIX_V4_BASEFOLD_POW_BITS.to_le_bytes());
     hasher.update(&FORGEMATRIX_V4_RELATION_REPETITIONS.to_le_bytes());
+    hasher.update(&(FORGEMATRIX_V4_MAX_OPENING_CLAIMS as u64).to_le_bytes());
     hasher.update(&(FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES as u64).to_le_bytes());
     update_text(&mut hasher, FORGEMATRIX_V4_WEIGHT_AXIS_ORDER);
     update_text(&mut hasher, FORGEMATRIX_V4_DYNAMIC_AXIS_ORDER);
@@ -231,7 +237,7 @@ mod tests {
         assert_ne!(digest, [0; 32]);
         assert_eq!(
             hex::encode(digest),
-            "4331ff6e5b3a38e540acf540054977b4f426c85b0d28fe939f6fd897c17389b6"
+            "0abd5e8f1b1028d6a8e11b7a8245964415b271f37a2181a94f8b144c4def00d0"
         );
     }
 }

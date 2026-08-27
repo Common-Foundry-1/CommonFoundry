@@ -1083,6 +1083,42 @@ impl BlsDoryCompactArtifact {
         Ok(())
     }
 
+    /// Visit the authenticated scalar stream as decoded chunks so the caller
+    /// can process many scalars per call (typically in parallel). Byte order,
+    /// hashing, and decoding are exactly `for_each_scalar`'s; only the
+    /// per-scalar visitor round trip is amortized.
+    pub fn for_each_chunk(
+        &self,
+        chunk_scalars: usize,
+        mut visitor: impl FnMut(u64, &[BlsDoryFr]) -> Result<(), BlsDoryCompactArtifactError>,
+    ) -> Result<(), BlsDoryCompactArtifactError> {
+        if chunk_scalars == 0 {
+            return Err(BlsDoryCompactArtifactError::InvalidSpec);
+        }
+        let capacity = chunk_scalars.min(
+            usize::try_from(self.spec.explicit_scalar_count)
+                .map_err(|_| BlsDoryCompactArtifactError::InvalidSpec)?
+                .max(1),
+        );
+        let mut chunk = Vec::with_capacity(capacity);
+        let mut start = 0u64;
+        self.for_each_scalar(|scalar| {
+            chunk.push(scalar);
+            if chunk.len() == chunk_scalars {
+                visitor(start, &chunk)?;
+                start = start
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(BlsDoryCompactArtifactError::InvalidSpec)?;
+                chunk.clear();
+            }
+            Ok(())
+        })?;
+        if !chunk.is_empty() {
+            visitor(start, &chunk)?;
+        }
+        Ok(())
+    }
+
     fn validate_live_file(
         &self,
         consume: impl FnOnce(

@@ -9,6 +9,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use dory_pcs::primitives::{
     DoryDeserialize, DorySerialize,
@@ -71,9 +72,29 @@ pub(crate) const WIRE_MAGIC: [u8; 8] = *b"CFDBLS01";
 const WIRE_HEADER_BYTES: usize = 18;
 const MAX_PUBLIC_BINDING_BYTES: usize = 4_096;
 const ROW_COMMIT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+/// Decoded scalars per producer chunk for the parallel opening streams
+/// (4 Mi scalars = 128 MiB), balancing rayon batch overhead against memory.
+const STREAM_CHUNK_SCALARS: usize = 1 << 22;
 const AGGREGATE_SOURCE_FOLD_GENERATIONS: usize = 8;
 #[cfg_attr(not(test), allow(dead_code))]
 const MAX_AUTHENTICATED_COEFFICIENT_RANGE_SCALARS: usize = 1 << 20;
+
+/// One decoded, index-ordered chunk consumer for the parallel opening
+/// streams.
+type ExplicitChunkVisitor<'a> =
+    dyn FnMut(u64, &[BlsDoryFr]) -> Result<(), BlsDoryAggregateError> + 'a;
+
+/// Report one aggregate-opening substage to standard error in the same
+/// machine-readable shape as the Layout V5 stage lines, so operators can see
+/// where opening wall time goes. Best effort by design: reporting must never
+/// fail or reorder proving.
+fn report_opening_substage(stage: &str, scalars: u64, started: Instant) -> Instant {
+    let elapsed = started.elapsed().as_micros();
+    eprintln!(
+        "CMFD_V3_PROOF_SUBSTAGE {{\"stage\":\"{stage}\",\"scalars\":{scalars},\"elapsed_micros\":{elapsed}}}"
+    );
+    Instant::now()
+}
 
 pub(crate) fn bounded_signed_dictionary(maximum: u8) -> Option<Vec<BlsDoryFr>> {
     if maximum == 0 || maximum > 127 {
@@ -1057,6 +1078,9 @@ impl BlsDoryCommittedPolynomial {
         }
     }
 
+    /// Serial reference for `accumulate_vector_matrix_product_parallel`,
+    /// retained as the equivalence-test oracle.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn accumulate_vector_matrix_product(
         &self,
         left: &[BlsDoryFr],
@@ -1180,6 +1204,309 @@ impl BlsDoryCommittedPolynomial {
             return Err(BlsDoryAggregateError::ProverStorage);
         }
         Ok(())
+    }
+
+    /// Stream this table's explicit coefficients as decoded, index-ordered
+    /// chunks. Chunks arrive serially on the calling thread with their global
+    /// starting index; parallelism belongs inside `on_chunk`. Authentication
+    /// is byte-identical to the per-scalar visitors. Returns the number of
+    /// explicit coefficients visited.
+    fn for_each_explicit_chunk_with_cancel(
+        &self,
+        chunk_scalars: usize,
+        cancel: &AtomicBool,
+        on_chunk: &mut ExplicitChunkVisitor<'_>,
+    ) -> Result<u64, BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
+        if chunk_scalars == 0 {
+            return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+        }
+        let mut visited = 0u64;
+        let mut inner_error = None;
+        let mut deliver = |start: u64,
+                           scalars: &[BlsDoryFr],
+                           inner_error: &mut Option<BlsDoryAggregateError>|
+         -> bool {
+            if cancel.load(Ordering::Acquire) {
+                *inner_error = Some(BlsDoryAggregateError::Cancelled);
+                return false;
+            }
+            match on_chunk(start, scalars) {
+                Ok(()) => {
+                    visited += scalars.len() as u64;
+                    true
+                }
+                Err(error) => {
+                    *inner_error = Some(error);
+                    false
+                }
+            }
+        };
+        let stream_result: Result<(), BlsDoryAggregateError> = match &self.coefficients {
+            BlsDoryCoefficientStorage::Materialized(polynomial) => {
+                let coefficients = polynomial.coefficients();
+                let mut start = 0usize;
+                while start < coefficients.len() {
+                    let end = start.saturating_add(chunk_scalars).min(coefficients.len());
+                    if !deliver(start as u64, &coefficients[start..end], &mut inner_error) {
+                        break;
+                    }
+                    start = end;
+                }
+                Ok(())
+            }
+            BlsDoryCoefficientStorage::AuthenticatedArtifact(artifact) => {
+                let mut decoded = Vec::new();
+                artifact
+                    .for_each_encoded_chunk(chunk_scalars, |start, bytes| {
+                        decoded.clear();
+                        let decode_result = bytes
+                            .par_chunks_exact(32)
+                            .map(|encoded| {
+                                let mut exact = [0u8; 32];
+                                exact.copy_from_slice(encoded);
+                                crate::dory_bls12_381_fold_artifact::decode_scalar(exact)
+                            })
+                            .collect::<Result<Vec<_>, _>>();
+                        match decode_result {
+                            Ok(scalars) => decoded = scalars,
+                            Err(error) => return Err(error),
+                        }
+                        if deliver(start, &decoded, &mut inner_error) {
+                            Ok(())
+                        } else {
+                            Err(BlsDoryFoldArtifactError::InvalidArtifact)
+                        }
+                    })
+                    .map(|_| ())
+                    .or_else(|error| {
+                        if inner_error.is_some() {
+                            Ok(())
+                        } else {
+                            let _ = error;
+                            Err(BlsDoryAggregateError::ProverStorage)
+                        }
+                    })
+            }
+            #[cfg(test)]
+            BlsDoryCoefficientStorage::IndexedArtifact(artifact) => {
+                let mut chunk = Vec::with_capacity(chunk_scalars);
+                let mut start = 0u64;
+                let mut aborted = false;
+                let stream = artifact.for_each_scalar(|scalar| {
+                    chunk.push(scalar);
+                    if chunk.len() == chunk_scalars {
+                        if !deliver(start, &chunk, &mut inner_error) {
+                            aborted = true;
+                            return Err(
+                                crate::dory_bls12_381_index_artifact::BlsDoryIndexArtifactError::InvalidArtifact,
+                            );
+                        }
+                        start += chunk.len() as u64;
+                        chunk.clear();
+                    }
+                    Ok(())
+                });
+                match stream {
+                    Ok(()) => {
+                        if !chunk.is_empty() {
+                            let _ = deliver(start, &chunk, &mut inner_error);
+                        }
+                        Ok(())
+                    }
+                    Err(_) if aborted => Ok(()),
+                    Err(_) => Err(BlsDoryAggregateError::ProverStorage),
+                }
+            }
+            BlsDoryCoefficientStorage::CompactArtifact(artifact) => artifact
+                .for_each_chunk(chunk_scalars, |start, scalars| {
+                    if deliver(start, scalars, &mut inner_error) {
+                        Ok(())
+                    } else {
+                        Err(BlsDoryCompactArtifactError::InvalidArtifact)
+                    }
+                })
+                .map(|_| ())
+                .or_else(|error| {
+                    if inner_error.is_some() {
+                        Ok(())
+                    } else {
+                        let _ = error;
+                        Err(BlsDoryAggregateError::ProverStorage)
+                    }
+                }),
+            BlsDoryCoefficientStorage::MappedCompactArtifact(artifact) => {
+                let mut start = 0u64;
+                artifact
+                    .for_each_chunk(chunk_scalars, |scalars| {
+                        if deliver(start, scalars, &mut inner_error) {
+                            start += scalars.len() as u64;
+                            Ok(())
+                        } else {
+                            Err(BlsDoryCompactArtifactError::InvalidArtifact)
+                        }
+                    })
+                    .map(|_| ())
+                    .or_else(|error| {
+                        if inner_error.is_some() {
+                            Ok(())
+                        } else {
+                            let _ = error;
+                            Err(BlsDoryAggregateError::ProverStorage)
+                        }
+                    })
+            }
+            BlsDoryCoefficientStorage::ReleasedCompact(_)
+            | BlsDoryCoefficientStorage::ReleasedMappedCompact(_) => {
+                Err(BlsDoryAggregateError::ProverStorage)
+            }
+        };
+        if let Some(error) = inner_error {
+            return Err(error);
+        }
+        stream_result?;
+        check_prover_cancel(cancel)?;
+        Ok(visited)
+    }
+
+    /// Parallel replacement for `accumulate_vector_matrix_product` on the
+    /// production opening path. Chunks are row-aligned; within a chunk every
+    /// worker owns a disjoint block of output columns, so each `output` slot
+    /// receives exactly the additions of the serial loop in the same row
+    /// order. Field addition is exact, so the result and every downstream
+    /// transcript byte are identical to the serial path.
+    fn accumulate_vector_matrix_product_parallel(
+        &self,
+        left: &[BlsDoryFr],
+        scale: BlsDoryFr,
+        output: &mut [BlsDoryFr],
+        cancel: &AtomicBool,
+    ) -> Result<(), BlsDoryAggregateError> {
+        check_prover_cancel(cancel)?;
+        let rows = 1usize
+            .checked_shl(
+                u32::try_from(self.nu).map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+            )
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let columns = 1usize
+            .checked_shl(
+                u32::try_from(self.sigma).map_err(|_| BlsDoryAggregateError::InvalidDimension)?,
+            )
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        if left.len() != rows
+            || output.len() != columns
+            || self.coefficient_count() != rows * columns
+        {
+            return Err(BlsDoryAggregateError::MixedStatement);
+        }
+        let rows_per_chunk = (STREAM_CHUNK_SCALARS / columns).max(1);
+        let chunk_scalars = rows_per_chunk
+            .checked_mul(columns)
+            .ok_or(BlsDoryAggregateError::InvalidDimension)?;
+        let visited = self.for_each_explicit_chunk_with_cancel(
+            chunk_scalars,
+            cancel,
+            &mut |start, scalars| {
+                let start = usize::try_from(start)
+                    .map_err(|_| BlsDoryAggregateError::InvalidCoefficientCount)?;
+                if !start.is_multiple_of(columns) {
+                    return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+                }
+                let base_row = start / columns;
+                let chunk_rows = scalars.len().div_ceil(columns);
+                let mut weights = Vec::with_capacity(chunk_rows);
+                for local_row in 0..chunk_rows {
+                    let row_weight = left
+                        .get(base_row + local_row)
+                        .ok_or(BlsDoryAggregateError::InvalidCoefficientCount)?;
+                    weights.push(scale * *row_weight);
+                }
+                let block = (columns / rayon::current_num_threads().max(1).saturating_mul(4))
+                    .clamp(1, columns)
+                    .max(1024.min(columns));
+                output
+                    .par_chunks_mut(block)
+                    .enumerate()
+                    .for_each(|(block_index, output_block)| {
+                        let first_column = block_index * block;
+                        for (local_row, weight) in weights.iter().enumerate() {
+                            let row_offset = local_row * columns;
+                            let row_len = scalars.len().saturating_sub(row_offset).min(columns);
+                            if first_column >= row_len {
+                                continue;
+                            }
+                            let take = (row_len - first_column).min(output_block.len());
+                            let row_slice = &scalars
+                                [row_offset + first_column..row_offset + first_column + take];
+                            for (slot, coefficient) in
+                                output_block[..take].iter_mut().zip(row_slice)
+                            {
+                                *slot = *slot + *weight * *coefficient;
+                            }
+                        }
+                    });
+                Ok(())
+            },
+        )?;
+        if visited != self.explicit_coefficient_count() as u64 {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(())
+    }
+
+    /// Evaluate this table at several points in one authenticated pass over
+    /// its coefficients, in parallel. Returns one evaluation per point, equal
+    /// to `evaluate` at that point: per-index terms are grouped into partial
+    /// sums which field addition recombines exactly.
+    fn evaluate_many_parallel(
+        &self,
+        points: &[&[BlsDoryFr]],
+        cancel: &AtomicBool,
+    ) -> Result<Vec<BlsDoryFr>, BlsDoryAggregateError> {
+        if points.is_empty() {
+            return Ok(Vec::new());
+        }
+        if points.iter().any(|point| point.len() != self.variables()) {
+            return Err(BlsDoryAggregateError::InvalidDimension);
+        }
+        let mut evaluations = vec![BlsDoryFr::zero(); points.len()];
+        let visited = self.for_each_explicit_chunk_with_cancel(
+            STREAM_CHUNK_SCALARS,
+            cancel,
+            &mut |start, scalars| {
+                const TASK_SCALARS: usize = 1 << 16;
+                let partials = scalars
+                    .par_chunks(TASK_SCALARS)
+                    .enumerate()
+                    .map(|(task_index, task_scalars)| {
+                        let task_start = start + (task_index * TASK_SCALARS) as u64;
+                        let mut sums = vec![BlsDoryFr::zero(); points.len()];
+                        for (point_index, point) in points.iter().enumerate() {
+                            let mut weights = EqualityWeightIterator::seeded(point, task_start);
+                            let mut sum = BlsDoryFr::zero();
+                            for coefficient in task_scalars {
+                                let Some(weight) = weights.next() else {
+                                    return Err(BlsDoryAggregateError::InvalidCoefficientCount);
+                                };
+                                sum = sum + *coefficient * weight;
+                            }
+                            sums[point_index] = sum;
+                        }
+                        Ok(sums)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                for sums in partials {
+                    for (evaluation, sum) in evaluations.iter_mut().zip(sums) {
+                        *evaluation = *evaluation + sum;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if visited != self.explicit_coefficient_count() as u64 {
+            return Err(BlsDoryAggregateError::ProverStorage);
+        }
+        Ok(evaluations)
     }
 
     #[cfg(test)]
@@ -3190,18 +3517,51 @@ fn prepare_bls_dory_opening_refs_with_claim_limit_and_cancel(
         return Err(BlsDoryAggregateError::InvalidDimension);
     }
 
+    let stage_started = Instant::now();
+    let mut group_heads: Vec<usize> = Vec::new();
+    let mut group_members: Vec<Vec<usize>> = Vec::new();
+    for (claim_index, polynomial) in polynomials.iter().enumerate() {
+        match group_heads
+            .iter()
+            .position(|head| polynomials[*head].shares_coefficient_source(polynomial))
+        {
+            Some(group) => group_members[group].push(claim_index),
+            None => {
+                group_heads.push(claim_index);
+                group_members.push(vec![claim_index]);
+            }
+        }
+    }
+    let mut evaluations = vec![BlsDoryFr::zero(); polynomials.len()];
+    let mut evaluated_scalars = 0u64;
+    for (head, members) in group_heads.iter().zip(&group_members) {
+        check_prover_cancel(cancel)?;
+        let member_points = members
+            .iter()
+            .map(|member| points[*member].as_slice())
+            .collect::<Vec<_>>();
+        let group_evaluations =
+            polynomials[*head].evaluate_many_parallel(&member_points, cancel)?;
+        if group_evaluations.len() != members.len() {
+            return Err(BlsDoryAggregateError::InvalidClaimCount);
+        }
+        for (member, evaluation) in members.iter().zip(group_evaluations) {
+            evaluations[*member] = evaluation;
+        }
+        evaluated_scalars = evaluated_scalars
+            .saturating_add(polynomials[*head].explicit_coefficient_count() as u64);
+    }
     let claims = polynomials
         .iter()
         .zip(points)
-        .map(|(polynomial, point)| {
-            check_prover_cancel(cancel)?;
-            Ok(BlsDoryOpeningClaim {
-                commitment: polynomial.commitment,
-                point: point.clone(),
-                evaluation: polynomial.evaluate(point)?,
-            })
+        .zip(evaluations)
+        .map(|((polynomial, point), evaluation)| BlsDoryOpeningClaim {
+            commitment: polynomial.commitment,
+            point: point.clone(),
+            evaluation,
         })
-        .collect::<Result<Vec<_>, BlsDoryAggregateError>>()?;
+        .collect::<Vec<_>>();
+    let stage_started = report_opening_substage("opening_claims", evaluated_scalars, stage_started);
     let mut transcript =
         statement_transcript(public_binding, &setup.identity(), &claims, nu, sigma)?;
     let batching = batching_challenges(&mut transcript, claims.len());
@@ -3216,6 +3576,7 @@ fn prepare_bls_dory_opening_refs_with_claim_limit_and_cancel(
         scratch.as_ref(),
         cancel,
     )?;
+    let _ = report_opening_substage("opening_sumcheck", 0, stage_started);
 
     let SumcheckProverOutput {
         rounds: sumcheck_rounds,
@@ -3279,6 +3640,7 @@ fn finish_prepared_bls_dory_opening_with_cancel(
         nu,
         sigma,
     } = prepared;
+    let stage_started = Instant::now();
     let dory_proof = prove_bls_dory_opening_from_vector_product_with_cancel(
         &random_point,
         combined_rows,
@@ -3293,6 +3655,7 @@ fn finish_prepared_bls_dory_opening_with_cancel(
         BlsDoryStreamingProofError::Cancelled => BlsDoryAggregateError::Cancelled,
         error => BlsDoryAggregateError::Dory(error.to_string()),
     })?;
+    let _ = report_opening_substage("opening_dory_reduce", 0, stage_started);
 
     check_prover_cancel(cancel)?;
     let encoded = encode_aggregate_proof(
@@ -5101,6 +5464,37 @@ impl<'a> EqualityWeightIterator<'a> {
             stack: vec![(point.len(), BlsDoryFr::one())],
         }
     }
+
+    /// An iterator positioned as if `start` weights were already consumed.
+    /// Weight `i` multiplies `point[b]` for every set bit `b` of `i` and
+    /// `1 - point[b]` for every clear bit, so the pending-sibling stack at
+    /// leaf `start` is reconstructed in one pass over the coordinates.
+    fn seeded(point: &'a [BlsDoryFr], start: u64) -> Self {
+        let variables = point.len();
+        if u32::try_from(variables)
+            .ok()
+            .and_then(|variables| 1u64.checked_shl(variables))
+            .is_some_and(|total| start >= total)
+        {
+            return Self {
+                point,
+                stack: Vec::new(),
+            };
+        }
+        let mut stack = Vec::with_capacity(variables + 1);
+        let mut prefix = BlsDoryFr::one();
+        for bit in (0..variables).rev() {
+            let coordinate = point[bit];
+            if (start >> bit) & 1 == 1 {
+                prefix = prefix * coordinate;
+            } else {
+                stack.push((bit, prefix * coordinate));
+                prefix = prefix * (BlsDoryFr::one() - coordinate);
+            }
+        }
+        stack.push((0, prefix));
+        Self { point, stack }
+    }
 }
 
 impl Iterator for EqualityWeightIterator<'_> {
@@ -5229,10 +5623,11 @@ fn combine_polynomials_for_opening(
         if polynomial.row_commitments.len() != rows.len() {
             return Err(BlsDoryAggregateError::MixedStatement);
         }
-        for (combined, row) in rows.iter_mut().zip(&polynomial.row_commitments) {
-            check_prover_cancel(cancel)?;
-            *combined = *combined + row.scale(lambda);
-        }
+        rows.par_iter_mut()
+            .zip(polynomial.row_commitments.par_iter())
+            .for_each(|(combined, row)| {
+                *combined = *combined + row.scale(lambda);
+            });
         commitment = commitment + polynomial.commitment.scale(lambda);
     }
 
@@ -5240,7 +5635,18 @@ fn combine_polynomials_for_opening(
     let mut product = vec![BlsDoryFr::zero(); column_count];
     for (polynomial, lambda) in grouped {
         check_prover_cancel(cancel)?;
-        polynomial.accumulate_vector_matrix_product(&left, lambda, &mut product, cancel)?;
+        let source_started = Instant::now();
+        polynomial.accumulate_vector_matrix_product_parallel(
+            &left,
+            lambda,
+            &mut product,
+            cancel,
+        )?;
+        report_opening_substage(
+            "combine_vector_matrix_product",
+            polynomial.explicit_coefficient_count() as u64,
+            source_started,
+        );
     }
     Ok((rows, commitment, product))
 }
@@ -5651,6 +6057,81 @@ mod tests {
             nu,
             sigma,
         }
+    }
+
+    #[test]
+    fn seeded_equality_weights_match_the_fresh_iterator_at_every_start() {
+        for variables in 0..=8usize {
+            let point = (0..variables)
+                .map(|index| BlsDoryFr::from_u64((index as u64) * 23 + 5))
+                .collect::<Vec<_>>();
+            let expected = EqualityWeightIterator::new(&point).collect::<Vec<_>>();
+            assert_eq!(expected.len(), 1 << variables);
+            for start in 0..=(1u64 << variables) {
+                let seeded = EqualityWeightIterator::seeded(&point, start).collect::<Vec<_>>();
+                assert_eq!(
+                    seeded.as_slice(),
+                    &expected[usize::try_from(start).unwrap()..],
+                    "variables {variables} start {start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_vector_matrix_product_matches_the_serial_accumulator() {
+        let scratch = ScratchDirectory::create();
+        let (nu, sigma) = (4usize, 5usize);
+        let setup = deterministic_bls_dory_setup(nu + sigma).unwrap();
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        // A partial final row plus an implicit zero suffix.
+        let explicit_count = rows * columns - columns - 3;
+        let polynomial =
+            serial_model_writer_reference(&scratch.0, explicit_count, nu, sigma, &setup);
+        let left = (0..rows)
+            .map(|index| BlsDoryFr::from_u64((index as u64) * 31 + 2))
+            .collect::<Vec<_>>();
+        let scale = BlsDoryFr::from_u64(917);
+        let cancel = AtomicBool::new(false);
+        let mut serial = vec![BlsDoryFr::from_u64(11); columns];
+        let mut parallel = serial.clone();
+        polynomial
+            .accumulate_vector_matrix_product(&left, scale, &mut serial, &cancel)
+            .unwrap();
+        polynomial
+            .accumulate_vector_matrix_product_parallel(&left, scale, &mut parallel, &cancel)
+            .unwrap();
+        assert_eq!(serial, parallel);
+    }
+
+    #[test]
+    fn parallel_many_point_evaluation_matches_the_serial_evaluator() {
+        let scratch = ScratchDirectory::create();
+        let (nu, sigma) = (4usize, 5usize);
+        let setup = deterministic_bls_dory_setup(nu + sigma).unwrap();
+        let rows = 1usize << nu;
+        let columns = 1usize << sigma;
+        let explicit_count = rows * columns - columns - 3;
+        let polynomial =
+            serial_model_writer_reference(&scratch.0, explicit_count, nu, sigma, &setup);
+        let points = (0..3usize)
+            .map(|point_index| {
+                (0..nu + sigma)
+                    .map(|index| BlsDoryFr::from_u64((index as u64) * 7 + point_index as u64 + 3))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let point_refs = points.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let cancel = AtomicBool::new(false);
+        let parallel = polynomial
+            .evaluate_many_parallel(&point_refs, &cancel)
+            .unwrap();
+        let serial = points
+            .iter()
+            .map(|point| polynomial.evaluate(point).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(parallel, serial);
     }
 
     struct Fixture {

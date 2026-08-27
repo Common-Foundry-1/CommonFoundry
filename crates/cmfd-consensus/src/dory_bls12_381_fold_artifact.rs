@@ -263,6 +263,48 @@ impl BlsDoryFoldArtifact {
         Ok(())
     }
 
+    /// Visit the authenticated scalar stream as encoded 32-byte slabs so the
+    /// caller can decode a whole chunk at once (typically in parallel). The
+    /// bytes are hashed into the artifact digest in exactly the order
+    /// `for_each_scalar` hashes them, so authentication is unchanged; only the
+    /// per-scalar read, hash, and visitor round trips are amortized.
+    pub fn for_each_encoded_chunk(
+        &self,
+        chunk_scalars: usize,
+        mut visitor: impl FnMut(u64, &[u8]) -> Result<(), BlsDoryFoldArtifactError>,
+    ) -> Result<(), BlsDoryFoldArtifactError> {
+        if chunk_scalars == 0 {
+            return Err(BlsDoryFoldArtifactError::InvalidSpec);
+        }
+        self.validate_live_file(|reader, hasher| {
+            let capacity = u64::try_from(chunk_scalars)
+                .map_err(|_| BlsDoryFoldArtifactError::InvalidSpec)?
+                .min(self.spec.explicit_scalar_count);
+            let capacity_bytes = usize::try_from(capacity)
+                .ok()
+                .and_then(|scalars| scalars.checked_mul(ARTIFACT_SCALAR_BYTES))
+                .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+            let mut slab = vec![0u8; capacity_bytes];
+            let mut start = 0u64;
+            let mut remaining = self.spec.explicit_scalar_count;
+            while remaining > 0 {
+                let take = remaining.min(capacity);
+                let bytes = usize::try_from(take)
+                    .ok()
+                    .and_then(|scalars| scalars.checked_mul(ARTIFACT_SCALAR_BYTES))
+                    .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+                reader.read_exact(&mut slab[..bytes])?;
+                hasher.update(&slab[..bytes]);
+                visitor(start, &slab[..bytes])?;
+                start = start
+                    .checked_add(take)
+                    .ok_or(BlsDoryFoldArtifactError::InvalidSpec)?;
+                remaining -= take;
+            }
+            Ok(())
+        })
+    }
+
     fn validate_live_file(
         &self,
         consume: impl FnOnce(
@@ -330,7 +372,7 @@ fn encode_scalar(scalar: &BlsDoryFr) -> Result<[u8; 32], BlsDoryFoldArtifactErro
     Ok(encoded)
 }
 
-fn decode_scalar(encoded: [u8; 32]) -> Result<BlsDoryFr, BlsDoryFoldArtifactError> {
+pub(crate) fn decode_scalar(encoded: [u8; 32]) -> Result<BlsDoryFr, BlsDoryFoldArtifactError> {
     let mut reader = Cursor::new(encoded.as_slice());
     let scalar = BlsDoryFr::deserialize_with_mode(&mut reader, Compress::Yes, Validate::Yes)
         .map_err(|_| BlsDoryFoldArtifactError::InvalidScalar)?;

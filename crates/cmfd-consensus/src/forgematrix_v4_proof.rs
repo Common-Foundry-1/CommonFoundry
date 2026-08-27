@@ -85,6 +85,19 @@ pub fn forgematrix_v4_final_activation_digest(
     *hasher.finalize().as_bytes()
 }
 
+/// Returns the exact coordinate-mask coefficients consumed by a V4 replay.
+/// `global_layer == u32::MAX` selects the public initial-activation mask.
+pub fn forgematrix_v4_mask_coefficients(challenge_digest: [u8; 32], global_layer: u32) -> [u8; 20] {
+    mask_coefficients(
+        &challenge_digest,
+        global_layer,
+        PRODUCTION_V2_BATCH as usize,
+        PRODUCTION_V2_DIMENSION as usize,
+    )
+    .try_into()
+    .expect("the production V4 mask has exactly 20 coefficients")
+}
+
 pub fn verify_forgematrix_v4_transparent_proof(
     statement: ForgeMatrixV4TranscriptStatement,
     fixed_commitments: [ForgeMatrixV4Digest; PRODUCTION_V2_BANKS as usize],
@@ -233,12 +246,7 @@ pub fn forgematrix_v4_mask_evaluation(
             .and_then(|offset| offset.checked_add(local_layer))
             .and_then(|index| u32::try_from(index).ok())
             .ok_or(ForgeMatrixV4ProofError::Shape)?;
-        let coefficients = mask_coefficients(
-            &challenge_digest,
-            global_layer,
-            PRODUCTION_V2_BATCH as usize,
-            PRODUCTION_V2_DIMENSION as usize,
-        );
+        let coefficients = forgematrix_v4_mask_coefficients(challenge_digest, global_layer);
         let value = affine_mask_evaluation(&coefficients, batch, output)?;
         result += layer_weights.guts().as_slice()[local_layer] * value;
     }
@@ -261,12 +269,7 @@ pub fn forgematrix_v4_initial_activation_evaluation(
     if base_input.iter().any(|value| *value > 250) {
         return Err(ForgeMatrixV4ProofError::Value);
     }
-    let coefficients = mask_coefficients(
-        &challenge_digest,
-        u32::MAX,
-        PRODUCTION_V2_BATCH as usize,
-        PRODUCTION_V2_DIMENSION as usize,
-    );
+    let coefficients = forgematrix_v4_mask_coefficients(challenge_digest, u32::MAX);
     let point = concatenate_points(batch, output);
     let weights = Mle::<ForgeMatrixV4Extension>::partial_lagrange(&point);
     let mut result = ForgeMatrixV4Extension::zero();
@@ -418,6 +421,10 @@ mod tests {
                 global as u32,
                 PRODUCTION_V2_BATCH as usize,
                 PRODUCTION_V2_DIMENSION as usize,
+            );
+            assert_eq!(
+                forgematrix_v4_mask_coefficients(challenge, global as u32).as_slice(),
+                coefficients
             );
             assert_eq!(
                 forgematrix_v4_mask_evaluation(

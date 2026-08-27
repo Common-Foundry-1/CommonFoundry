@@ -1221,6 +1221,41 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
     maximum_native_block_rows: usize,
     cancel: &AtomicBool,
 ) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
+    prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model_with_accelerated_replay(
+        authenticated,
+        block,
+        claim,
+        setup,
+        prepared_model,
+        replay_bank,
+        scratch_directory,
+        maximum_native_block_rows,
+        None,
+        cancel,
+    )
+}
+
+/// The prepared-fixed-model prover with an optional accelerator-proposed
+/// replay accumulator bundle. `None` executes the unchanged CPU replay;
+/// `Some` still authenticates the complete bank on this path's own reader and
+/// re-derives every published digest on the CPU, so accepting the bundle only
+/// removes the redundant matrix re-execution, never any validation.
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "dory-v3-consensus-adapter", test))]
+pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model_with_accelerated_replay<
+    ReplayBank: Read,
+>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    block: &BlockChallenge,
+    claim: BlsDoryV3WinningNonceClaim,
+    setup: &DeterministicBlsDorySetup,
+    prepared_model: &BlsDoryPreparedFixedModelV5,
+    replay_bank: ReplayBank,
+    scratch_directory: &Path,
+    maximum_native_block_rows: usize,
+    accelerated_replay: Option<BlsDoryV3AcceleratedReplayAccumulators>,
+    cancel: &AtomicBool,
+) -> Result<ForgeMatrixV3CandidateProof, BlsDoryV3CandidateError> {
     if maximum_native_block_rows == 0
         || !scratch_directory.is_absolute()
         || !scratch_directory.is_dir()
@@ -1235,16 +1270,31 @@ pub(crate) fn prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model<Re
     let transcript =
         DoryV3TranscriptContext::from_bank_authenticated_record(block.network_id, authenticated)?;
     let _ = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
-    let execution = replay_dory_v3_winning_nonce_from_bank_authenticated_record(
-        authenticated,
-        transcript,
-        block,
-        claim,
-        setup,
-        replay_bank,
-        scratch_directory,
-        cancel,
-    )?;
+    let execution = match accelerated_replay {
+        Some(accelerated) => {
+            replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated(
+                authenticated,
+                transcript,
+                block,
+                claim,
+                setup,
+                replay_bank,
+                scratch_directory,
+                accelerated,
+                cancel,
+            )?
+        }
+        None => replay_dory_v3_winning_nonce_from_bank_authenticated_record(
+            authenticated,
+            transcript,
+            block,
+            claim,
+            setup,
+            replay_bank,
+            scratch_directory,
+            cancel,
+        )?,
+    };
     let stage_started = report_prover_stage("winning_nonce_replay", stage_started);
     check_runtime_prover_cancel(cancel)?;
 
@@ -2795,6 +2845,510 @@ fn reserved_dory_v3_vector<T>(capacity: usize) -> Result<Vec<T>, BlsDoryV3Winnin
         .try_reserve_exact(capacity)
         .map_err(|_| BlsDoryV3WinningNonceReplayError::Resource)?;
     Ok(values)
+}
+
+/// Accelerator-computed replay accumulator columns for one winning nonce, in
+/// canonical bank-major layer order (`banks * layers_per_bank` columns of
+/// `rows * columns` raw int32 accumulators each).
+///
+/// Accepting this bundle never extends trust to the accelerator: the replay
+/// that consumes it still authenticates the complete model bank on its own
+/// reader, validates the initialization transition per cell, bound-checks
+/// every surfaced accumulator, re-derives the final activation and both
+/// digests on the CPU from the last column, and writes the canonical
+/// execution artifact. Downstream, the matrix sumcheck proves every column
+/// against the CPU-committed fixed-model weights and the finished candidate
+/// is self-verified, so a wrong accelerator value costs the candidate and
+/// can never produce a valid proof.
+pub struct BlsDoryV3AcceleratedReplayAccumulators {
+    layer_accumulators: Vec<i32>,
+}
+
+impl BlsDoryV3AcceleratedReplayAccumulators {
+    pub fn new(layer_accumulators: Vec<i32>) -> Self {
+        Self { layer_accumulators }
+    }
+
+    fn layer_column(&self, global_layer: usize, cells: usize) -> Option<&[i32]> {
+        let start = global_layer.checked_mul(cells)?;
+        let end = start.checked_add(cells)?;
+        self.layer_accumulators.get(start..end)
+    }
+}
+
+/// Replay one winning nonce using accelerator-proposed accumulator columns in
+/// place of the CPU matrix executions. The claimed work and target are checked
+/// before the model-bank reader is touched, the complete bank authenticates on
+/// this path's own reader exactly as in the CPU replay, and the artifact
+/// remains provisional until everything has authenticated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated<R: Read>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    transcript: DoryV3TranscriptContext,
+    block: &BlockChallenge,
+    claim: BlsDoryV3WinningNonceClaim,
+    setup: &DeterministicBlsDorySetup,
+    model_bank: R,
+    scratch_directory: &Path,
+    accelerated: BlsDoryV3AcceleratedReplayAccumulators,
+    cancel: &AtomicBool,
+) -> Result<VerifiedBlsDoryV3WinningNonceExecution, BlsDoryV3WinningNonceReplayError> {
+    let challenge = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
+    let context = BlsDoryV3ExecutionAccumulatorArtifactContext::from_challenge(
+        challenge,
+        authenticated,
+        setup,
+    )?;
+    execute_dory_v3_accelerated_with_context(
+        authenticated,
+        context,
+        BlsDoryV3WinningNonceExpectation::Verify(claim),
+        model_bank,
+        scratch_directory,
+        accelerated,
+        cancel,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated_for_test<R: Read>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    transcript: DoryV3TranscriptContext,
+    block: &BlockChallenge,
+    claim: BlsDoryV3WinningNonceClaim,
+    setup: &DeterministicBlsDorySetup,
+    model_bank: R,
+    scratch_directory: &Path,
+    accelerated: BlsDoryV3AcceleratedReplayAccumulators,
+    cancel: &AtomicBool,
+) -> Result<VerifiedBlsDoryV3WinningNonceExecution, BlsDoryV3WinningNonceReplayError> {
+    let challenge = validate_dory_v3_replay_claim(authenticated, transcript, block, claim, cancel)?;
+    let context =
+        BlsDoryV3ExecutionAccumulatorArtifactContext::for_test(challenge, authenticated, setup)?;
+    execute_dory_v3_accelerated_with_context(
+        authenticated,
+        context,
+        BlsDoryV3WinningNonceExpectation::Verify(claim),
+        model_bank,
+        scratch_directory,
+        accelerated,
+        cancel,
+    )
+}
+
+fn execute_dory_v3_accelerated_with_context<R: Read>(
+    authenticated: &BankAuthenticatedDoryV3ModelCommitmentRecordV2,
+    context: BlsDoryV3ExecutionAccumulatorArtifactContext,
+    expectation: BlsDoryV3WinningNonceExpectation,
+    model_bank: R,
+    scratch_directory: &Path,
+    accelerated: BlsDoryV3AcceleratedReplayAccumulators,
+    cancel: &AtomicBool,
+) -> Result<VerifiedBlsDoryV3WinningNonceExecution, BlsDoryV3WinningNonceReplayError> {
+    let record = authenticated.record();
+    let identity = record.model_identity();
+    let bank_count = identity
+        .weight_bank_count()
+        .map_err(|_| BlsDoryV3WinningNonceReplayError::ModelShape)?;
+    validate_dory_v3_replay_geometry(context, authenticated, bank_count)?;
+    preflight_dory_v3_execution_artifact(context, scratch_directory)?;
+    let sink = DoryV3AcceleratedWinningNonceReplaySink::new(
+        context,
+        *record.manifest(),
+        expectation,
+        scratch_directory,
+        accelerated,
+        cancel,
+    )?;
+    verify_model_bank_into_staged_field_layout_sink(
+        model_bank,
+        record.manifest(),
+        identity.layers_per_bank(),
+        bank_count,
+        sink,
+    )
+    .map_err(|error| match error {
+        ModelBankFieldStreamError::ModelBank(error) => error.into(),
+        ModelBankFieldStreamError::Sink(error) => error,
+    })
+}
+
+/// Replay sink that authenticates the model stream exactly like
+/// `DoryV3WinningNonceReplaySink` but consumes accelerator-proposed
+/// accumulator columns instead of executing the matrix layers, so the weight
+/// bytes only advance authentication bookkeeping. Validation posture is
+/// unchanged where it feeds the artifact or the claim: the initialization
+/// transition is still derived and range-checked per cell, every accumulator
+/// is bound-checked before it is written, and the final activation is derived
+/// on the CPU from the last accepted column.
+struct DoryV3AcceleratedWinningNonceReplaySink<'a> {
+    context: BlsDoryV3ExecutionAccumulatorArtifactContext,
+    expected_manifest: ModelBankManifest,
+    expectation: BlsDoryV3WinningNonceExpectation,
+    cancel: &'a AtomicBool,
+    writer: Option<BlsDoryExecutionAccumulatorArtifactWriter>,
+    initialization_statement: StructuredTransitionStatement,
+    transition_statement: StructuredTransitionStatement,
+    initialization_mask: StructuredMaskPolynomial,
+    transition_masks: Vec<StructuredMaskPolynomial>,
+    cells: usize,
+    layer_cells: usize,
+    bank_elements: u64,
+    base_offset: usize,
+    current_bank: usize,
+    bank_offset: usize,
+    accelerated: BlsDoryV3AcceleratedReplayAccumulators,
+    final_activations: Vec<i8>,
+    pending_initial_accumulators: Vec<i32>,
+}
+
+impl<'a> DoryV3AcceleratedWinningNonceReplaySink<'a> {
+    fn new(
+        context: BlsDoryV3ExecutionAccumulatorArtifactContext,
+        expected_manifest: ModelBankManifest,
+        expectation: BlsDoryV3WinningNonceExpectation,
+        scratch_directory: &Path,
+        accelerated: BlsDoryV3AcceleratedReplayAccumulators,
+        cancel: &'a AtomicBool,
+    ) -> Result<Self, BlsDoryV3WinningNonceReplayError> {
+        let raw = *context.raw();
+        let rows = raw.canonical_rows();
+        let columns = raw.canonical_columns();
+        let cells = rows
+            .checked_mul(columns)
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        let layer_cells = columns
+            .checked_mul(columns)
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        let bank_elements = u64::try_from(layer_cells)
+            .ok()
+            .and_then(|elements| elements.checked_mul(raw.layers_per_bank() as u64))
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        let total_layers = raw
+            .banks()
+            .checked_mul(raw.layers_per_bank())
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        if total_layers
+            .checked_mul(cells)
+            .is_none_or(|expected| accelerated.layer_accumulators.len() != expected)
+        {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        let initialization_statement = StructuredTransitionStatement {
+            layers: 1,
+            rows,
+            cols: columns,
+            max_abs_accumulator: u64::from(V2_MODEL_VALUE_CENTER.unsigned_abs()),
+            max_mask: MAX_TRANSITION_MASK,
+        };
+        let transition_statement = StructuredTransitionStatement {
+            layers: raw.layers_per_bank(),
+            rows,
+            cols: columns,
+            max_abs_accumulator: u64::from(BLS_DORY_EXECUTION_ACCUMULATOR_MAX_ABS),
+            max_mask: MAX_TRANSITION_MASK,
+        };
+        let initialization_mask = StructuredMaskPolynomial::from_dory_v3_virtual_challenge(
+            &raw.challenge_identity(),
+            rows,
+            columns,
+        )?;
+        initialization_mask.validate(initialization_statement)?;
+        let mut transition_masks = Vec::new();
+        transition_masks
+            .try_reserve_exact(raw.banks())
+            .map_err(|_| BlsDoryV3WinningNonceReplayError::Resource)?;
+        for bank in 0..raw.banks() {
+            let first_layer = bank
+                .checked_mul(raw.layers_per_bank())
+                .and_then(|layer| u32::try_from(layer).ok())
+                .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+            let mask = StructuredMaskPolynomial::from_dory_v3_challenge_at_layer_offset(
+                &raw.challenge_identity(),
+                first_layer,
+                raw.layers_per_bank(),
+                rows,
+                columns,
+            )?;
+            mask.validate(transition_statement)?;
+            transition_masks.push(mask);
+        }
+
+        Ok(Self {
+            context,
+            expected_manifest,
+            expectation,
+            cancel,
+            writer: Some(BlsDoryExecutionAccumulatorArtifactWriter::create_new(
+                scratch_directory,
+                raw,
+            )?),
+            initialization_statement,
+            transition_statement,
+            initialization_mask,
+            transition_masks,
+            cells,
+            layer_cells,
+            bank_elements,
+            base_offset: 0,
+            current_bank: 0,
+            bank_offset: 0,
+            accelerated,
+            final_activations: zeroed_dory_v3_vector(cells)?,
+            pending_initial_accumulators: reserved_dory_v3_vector(
+                raw.authentication_chunk_cells(),
+            )?,
+        })
+    }
+
+    fn writer_mut(
+        &mut self,
+    ) -> Result<&mut BlsDoryExecutionAccumulatorArtifactWriter, BlsDoryV3WinningNonceReplayError>
+    {
+        self.writer
+            .as_mut()
+            .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)
+    }
+
+    fn write_base_chunk(
+        &mut self,
+        chunk: ModelFieldChunk<'_>,
+    ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
+        if chunk.role != ModelPcsRole::BaseInput
+            || chunk.role_offset != self.base_offset as u64
+            || chunk.role_elements != self.cells as u64
+            || chunk.elements.len() > self.cells.saturating_sub(self.base_offset)
+        {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        for &element in chunk.elements {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(BlsDoryV3WinningNonceReplayError::Cancelled);
+            }
+            let index = self.base_offset;
+            let accumulator = i64::from(decode_dory_v3_model_field(element)?);
+            let mask = self
+                .initialization_mask
+                .value_at_boolean_index_prevalidated(self.initialization_statement, index)?;
+            let transition = derive_transition_regular_row_from_mask(
+                self.initialization_statement,
+                index,
+                accumulator,
+                mask,
+            )?;
+            let _ = i8::try_from(transition.activation)
+                .map_err(|_| BlsDoryV3WinningNonceReplayError::ModelShape)?;
+            self.pending_initial_accumulators.push(
+                i32::try_from(accumulator)
+                    .map_err(|_| BlsDoryV3WinningNonceReplayError::ModelShape)?,
+            );
+            self.base_offset += 1;
+
+            if self.pending_initial_accumulators.len()
+                == self.context.raw().authentication_chunk_cells()
+            {
+                let values = std::mem::take(&mut self.pending_initial_accumulators);
+                self.writer_mut()?.write_column_chunk(
+                    BlsDoryExecutionAccumulatorColumn::Initialization,
+                    &values,
+                )?;
+                self.pending_initial_accumulators =
+                    reserved_dory_v3_vector(self.context.raw().authentication_chunk_cells())?;
+            }
+        }
+        if self.base_offset == self.cells && !self.pending_initial_accumulators.is_empty() {
+            let values = std::mem::take(&mut self.pending_initial_accumulators);
+            self.writer_mut()?
+                .write_column_chunk(BlsDoryExecutionAccumulatorColumn::Initialization, &values)?;
+            self.pending_initial_accumulators =
+                reserved_dory_v3_vector(self.context.raw().authentication_chunk_cells())?;
+        }
+        Ok(())
+    }
+
+    fn write_weight_chunk(
+        &mut self,
+        chunk: ModelFieldChunk<'_>,
+    ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
+        if self.current_bank >= self.context.raw().banks()
+            || chunk.role
+                != (ModelPcsRole::WeightBank {
+                    index: self.current_bank as u32,
+                })
+            || chunk.role_offset != self.bank_offset as u64
+            || chunk.role_elements != self.bank_elements
+            || chunk.elements.len()
+                > usize::try_from(self.bank_elements)
+                    .ok()
+                    .and_then(|total| total.checked_sub(self.bank_offset))
+                    .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?
+        {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(BlsDoryV3WinningNonceReplayError::Cancelled);
+        }
+
+        let mut consumed = 0usize;
+        while consumed < chunk.elements.len() {
+            let layer_offset = self.bank_offset % self.layer_cells;
+            let take = (self.layer_cells - layer_offset).min(chunk.elements.len() - consumed);
+            self.bank_offset = self
+                .bank_offset
+                .checked_add(take)
+                .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+            consumed += take;
+
+            if self.bank_offset.is_multiple_of(self.layer_cells) {
+                let layer = self
+                    .bank_offset
+                    .checked_div(self.layer_cells)
+                    .and_then(|completed| completed.checked_sub(1))
+                    .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?;
+                self.accept_accelerated_layer(self.current_bank, layer)?;
+            }
+        }
+
+        if self.bank_offset as u64 == self.bank_elements {
+            self.current_bank += 1;
+            self.bank_offset = 0;
+        }
+        Ok(())
+    }
+
+    /// Bound-check and write one accelerator column once the corresponding
+    /// authenticated weight layer has fully streamed; derive the final
+    /// activations on the CPU when the last layer's column is accepted.
+    fn accept_accelerated_layer(
+        &mut self,
+        bank: usize,
+        layer: usize,
+    ) -> Result<(), BlsDoryV3WinningNonceReplayError> {
+        if bank >= self.context.raw().banks() || layer >= self.context.raw().layers_per_bank() {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        let global_layer = bank
+            .checked_mul(self.context.raw().layers_per_bank())
+            .and_then(|base| base.checked_add(layer))
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        let total_layers = self
+            .context
+            .raw()
+            .banks()
+            .checked_mul(self.context.raw().layers_per_bank())
+            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+        let is_final_layer = global_layer + 1 == total_layers;
+        let cells = self.cells;
+        let chunk_cells = self.context.raw().authentication_chunk_cells();
+        let column = self
+            .accelerated
+            .layer_column(global_layer, cells)
+            .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?
+            .to_vec();
+        let mask = &self.transition_masks[bank];
+
+        for start in (0..cells).step_by(chunk_cells) {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(BlsDoryV3WinningNonceReplayError::Cancelled);
+            }
+            let len = chunk_cells.min(cells - start);
+            let encoded = &column[start..start + len];
+            encoded.par_iter().try_for_each(|accumulator| {
+                validate_dory_v3_accumulator_bound(std::slice::from_ref(&i64::from(*accumulator)))
+            })?;
+            if is_final_layer {
+                let transition_statement = self.transition_statement;
+                self.final_activations[start..start + len]
+                    .par_iter_mut()
+                    .zip(encoded.par_iter())
+                    .enumerate()
+                    .try_for_each(|(offset, (activation, accumulator))| {
+                        let index = layer
+                            .checked_mul(cells)
+                            .and_then(|base| base.checked_add(start + offset))
+                            .ok_or(BlsDoryV3WinningNonceReplayError::Resource)?;
+                        let mask_value =
+                            mask.value_at_boolean_index_prevalidated(transition_statement, index)?;
+                        let transition = derive_transition_regular_row_from_mask(
+                            transition_statement,
+                            index,
+                            i64::from(*accumulator),
+                            mask_value,
+                        )?;
+                        *activation = i8::try_from(transition.activation)
+                            .map_err(|_| BlsDoryV3WinningNonceReplayError::ModelShape)?;
+                        Ok::<(), BlsDoryV3WinningNonceReplayError>(())
+                    })?;
+            }
+            self.writer
+                .as_mut()
+                .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?
+                .write_column_chunk(
+                    BlsDoryExecutionAccumulatorColumn::BankLayer { bank, layer },
+                    encoded,
+                )?;
+        }
+        Ok(())
+    }
+}
+
+impl StagedModelFieldLayoutSink for DoryV3AcceleratedWinningNonceReplaySink<'_> {
+    type Error = BlsDoryV3WinningNonceReplayError;
+    type Output = VerifiedBlsDoryV3WinningNonceExecution;
+
+    fn write_chunk(&mut self, chunk: ModelFieldChunk<'_>) -> Result<(), Self::Error> {
+        if chunk.elements.is_empty() {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+        if self.base_offset < self.cells {
+            self.write_base_chunk(chunk)
+        } else {
+            self.write_weight_chunk(chunk)
+        }
+    }
+
+    fn finish_verified(
+        mut self,
+        receipt: VerifiedModelBankLayoutReceipt,
+    ) -> Result<Self::Output, Self::Error> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(BlsDoryV3WinningNonceReplayError::Cancelled);
+        }
+        if receipt.manifest() != &self.expected_manifest
+            || receipt.layout().weight_bank_count() as usize != self.context.raw().banks()
+            || receipt.layout().layers_per_bank() as usize != self.context.raw().layers_per_bank()
+            || self.base_offset != self.cells
+            || self.current_bank != self.context.raw().banks()
+            || self.bank_offset != 0
+            || !self.pending_initial_accumulators.is_empty()
+        {
+            return Err(BlsDoryV3WinningNonceReplayError::ModelShape);
+        }
+
+        let mut final_activation = reserved_dory_v3_vector(self.cells)?;
+        for activation in &self.final_activations {
+            final_activation.push(encode_dory_v3_activation(i64::from(*activation))?);
+        }
+        let final_activation_digest = self.context.output_digest(&final_activation)?;
+        let work_digest = self.context.work_digest(final_activation_digest);
+        let claim = self
+            .expectation
+            .resolve(final_activation_digest, work_digest)?;
+
+        let writer = self
+            .writer
+            .take()
+            .ok_or(BlsDoryV3WinningNonceReplayError::ModelShape)?;
+        finish_verified_dory_v3_execution(
+            writer,
+            self.context,
+            claim,
+            final_activation_digest,
+            work_digest,
+            self.cancel,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -5621,6 +6175,149 @@ mod tests {
         );
         assert_eq!(execution.work_digest(), claim.work_digest);
         drop(execution);
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_accelerated_replay_matches_the_cpu_replay() {
+        let fixture = dory_v3_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let cancel = AtomicBool::new(false);
+        let cpu = replay_dory_v3_winning_nonce_from_bank_authenticated_record_for_test(
+            &fixture.authenticated,
+            fixture.transcript,
+            &fixture.block,
+            fixture.claim,
+            &fixture.setup,
+            Cursor::new(&fixture.bank.bytes),
+            scratch.path(),
+            &cancel,
+        )
+        .unwrap();
+
+        let layers = DORY_V3_TEST_LAYERS
+            .into_iter()
+            .map(Vec::from)
+            .collect::<Vec<_>>();
+        let (_, _, layer_accumulators) = evaluate_dory_v3_test_reference(
+            &fixture.base,
+            &layers,
+            fixture.transcript,
+            &fixture.block,
+            fixture.claim.nonce,
+        );
+        let flat = layer_accumulators
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let accelerated =
+            replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated_for_test(
+                &fixture.authenticated,
+                fixture.transcript,
+                &fixture.block,
+                fixture.claim,
+                &fixture.setup,
+                Cursor::new(&fixture.bank.bytes),
+                scratch.path(),
+                BlsDoryV3AcceleratedReplayAccumulators::new(flat),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(accelerated.nonce(), cpu.nonce());
+        assert_eq!(
+            accelerated.final_activation_digest(),
+            cpu.final_activation_digest()
+        );
+        assert_eq!(accelerated.work_digest(), cpu.work_digest());
+        drop(cpu);
+        drop(accelerated);
+        assert_eq!(scratch.entry_count(), 0);
+    }
+
+    #[test]
+    fn dory_v3_accelerated_replay_rejects_wrong_or_misshapen_accumulators() {
+        let fixture = dory_v3_replay_fixture(0);
+        let scratch = ScratchDirectory::create();
+        let cancel = AtomicBool::new(false);
+        let layers = DORY_V3_TEST_LAYERS
+            .into_iter()
+            .map(Vec::from)
+            .collect::<Vec<_>>();
+        let (_, _, layer_accumulators) = evaluate_dory_v3_test_reference(
+            &fixture.base,
+            &layers,
+            fixture.transcript,
+            &fixture.block,
+            fixture.claim.nonce,
+        );
+        let flat = layer_accumulators
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+
+        // A wrong final-layer accumulator changes the derived activation, so
+        // the CPU-recomputed digest refuses the claim.
+        let mut tampered_final = flat.clone();
+        let last = tampered_final.len() - 1;
+        tampered_final[last] += 1;
+        assert!(
+            replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated_for_test(
+                &fixture.authenticated,
+                fixture.transcript,
+                &fixture.block,
+                fixture.claim,
+                &fixture.setup,
+                Cursor::new(&fixture.bank.bytes),
+                scratch.path(),
+                BlsDoryV3AcceleratedReplayAccumulators::new(tampered_final),
+                &cancel,
+            )
+            .is_err()
+        );
+        assert_eq!(scratch.entry_count(), 0);
+
+        // An out-of-bound accumulator is refused before it reaches the
+        // artifact.
+        let mut out_of_bound = flat.clone();
+        out_of_bound[0] = i32::MAX;
+        assert!(
+            replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated_for_test(
+                &fixture.authenticated,
+                fixture.transcript,
+                &fixture.block,
+                fixture.claim,
+                &fixture.setup,
+                Cursor::new(&fixture.bank.bytes),
+                scratch.path(),
+                BlsDoryV3AcceleratedReplayAccumulators::new(out_of_bound),
+                &cancel,
+            )
+            .is_err()
+        );
+        assert_eq!(scratch.entry_count(), 0);
+
+        // A wrong column count is refused before the bank is read.
+        let mut truncated = flat;
+        truncated.pop();
+        let shape_error =
+            replay_dory_v3_winning_nonce_from_bank_authenticated_record_accelerated_for_test(
+                &fixture.authenticated,
+                fixture.transcript,
+                &fixture.block,
+                fixture.claim,
+                &fixture.setup,
+                Cursor::new(&fixture.bank.bytes),
+                scratch.path(),
+                BlsDoryV3AcceleratedReplayAccumulators::new(truncated),
+                &cancel,
+            )
+            .err();
+        assert!(matches!(
+            shape_error,
+            Some(BlsDoryV3WinningNonceReplayError::ModelShape)
+        ));
         assert_eq!(scratch.entry_count(), 0);
     }
 

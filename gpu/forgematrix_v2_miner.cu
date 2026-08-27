@@ -932,6 +932,92 @@ CMFD_CUDA_EXPORT void cmfd_cuda_production_destroy(void* opaque_context) {
     delete static_cast<ProductionContext*>(opaque_context);
 }
 
+// Replay seam: evaluate exactly one nonce's coefficient schedule and surface
+// every layer's raw int32 accumulator column plus the final encoded
+// activation. It runs the same initialization, matrix, and transition
+// routines as the production evaluator on the same finalized context; the
+// consensus replay that calls it still authenticates the model stream itself,
+// bound-checks every surfaced accumulator, writes the canonical execution
+// artifact, and proves the accumulators against the CPU-committed weights, so
+// a wrong device result cannot survive to a candidate proof.
+CMFD_CUDA_EXPORT int32_t cmfd_cuda_production_replay_v1(
+    void* opaque_context, const uint8_t* coefficients, size_t coefficients_len,
+    int32_t* accumulators, size_t accumulators_len, uint8_t* final_activation,
+    size_t final_activation_len, char* error, size_t error_len) {
+    try {
+        if (opaque_context == nullptr) throw std::runtime_error("production context is null");
+        auto& context = *static_cast<ProductionContext*>(opaque_context);
+        if (!context.finalized) throw std::runtime_error("production model is not authenticated");
+        const size_t expected_coefficients =
+            size_t(PRODUCTION_STAGES) * PRODUCTION_COEFFICIENTS;
+        const size_t expected_accumulators =
+            size_t(PRODUCTION_LAYERS) * PRODUCTION_ACTIVATION_VALUES;
+        if (coefficients == nullptr || coefficients_len != expected_coefficients ||
+            accumulators == nullptr || accumulators_len != expected_accumulators ||
+            final_activation == nullptr ||
+            final_activation_len != PRODUCTION_ACTIVATION_VALUES) {
+            throw std::runtime_error("production replay buffer length mismatch");
+        }
+        validate_canonical(coefficients, coefficients_len, "production mask coefficients");
+        cuda_check(cudaSetDevice(context.device_index), "select CUDA device");
+        ensure_production_coefficient_capacity(context, expected_coefficients);
+        cuda_check(cudaMemcpy(context.device_coefficients, coefficients, coefficients_len,
+                              cudaMemcpyHostToDevice),
+                   "copy production mask coefficients");
+
+        const uint32_t blocks = static_cast<uint32_t>(
+            (PRODUCTION_ACTIVATION_VALUES + THREADS - 1) / THREADS);
+        initialize_production_activation<<<blocks, THREADS>>>(
+            context.device_base, context.device_coefficients, context.device_activation_a,
+            PRODUCTION_ROWS, PRODUCTION_WIDTH);
+        cuda_check(cudaGetLastError(), "launch production input transition");
+
+        int8_t* current = context.device_activation_a;
+        int8_t* next = context.device_activation_b;
+        for (uint32_t layer = 0; layer < PRODUCTION_LAYERS; ++layer) {
+            const int8_t* weights = nullptr;
+            if (context.residency == PRODUCTION_RESIDENCY_FULL) {
+                weights = context.device_weights + size_t(layer) * PRODUCTION_LAYER_BYTES;
+            } else if (context.residency == PRODUCTION_RESIDENCY_HOST) {
+                const int8_t* host_layer =
+                    context.host_weights.get() + size_t(layer) * PRODUCTION_LAYER_BYTES;
+                cuda_check(cudaMemcpy(context.device_stream_layer, host_layer,
+                                      PRODUCTION_LAYER_BYTES, cudaMemcpyHostToDevice),
+                           "stream authenticated production weight layer");
+                transpose_layer(context.device_stream_layer, context.device_transpose_layer,
+                                PRODUCTION_WIDTH);
+                weights = context.device_transpose_layer;
+            } else {
+                throw std::runtime_error("production residency mode is invalid");
+            }
+            launch_production_matrix_layer(context.engine, current, weights,
+                                           context.device_accumulators, PRODUCTION_ROWS,
+                                           PRODUCTION_WIDTH);
+            cuda_check(cudaMemcpy(accumulators + size_t(layer) * PRODUCTION_ACTIVATION_VALUES,
+                                  context.device_accumulators,
+                                  PRODUCTION_ACTIVATION_VALUES * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost),
+                       "copy production replay accumulators");
+            reduce_production_layer<<<blocks, THREADS>>>(
+                context.device_accumulators,
+                context.device_coefficients + size_t(layer + 1) * PRODUCTION_COEFFICIENTS,
+                next, PRODUCTION_ROWS, PRODUCTION_WIDTH);
+            cuda_check(cudaGetLastError(), "launch production layer transition");
+            std::swap(current, next);
+        }
+        encode_production_activation<<<blocks, THREADS>>>(
+            current, context.device_encoded_output, PRODUCTION_ACTIVATION_VALUES);
+        cuda_check(cudaGetLastError(), "launch production output encoding");
+        cuda_check(cudaMemcpy(final_activation, context.device_encoded_output,
+                              PRODUCTION_ACTIVATION_VALUES, cudaMemcpyDeviceToHost),
+                   "copy production replay output");
+        return 0;
+    } catch (const std::exception& exception) {
+        write_error(error, error_len, exception.what());
+        return 1;
+    }
+}
+
 // Qualification seam: execute one exact matrix/transition layer at any valid
 // power-of-two research or production shape. It shares the same DP4A and
 // reduction routines as the production evaluator and is never called by the

@@ -258,6 +258,11 @@ enum WorkerMessage {
         device: i32,
         claim: ForgeMatrixV3WinningNonceClaim,
         attempts: u64,
+        /// Untrusted GPU-computed replay accumulator columns for the claim,
+        /// when the backend exports the replay seam and its final activation
+        /// matched the search output. The consensus replay revalidates
+        /// everything; `None` falls back to the CPU matrix replay.
+        replay_accumulators: Option<Vec<i32>>,
     },
     Idle {
         job_id: u64,
@@ -281,6 +286,7 @@ enum JobOutcome {
     FoundV3 {
         device: i32,
         claim: ForgeMatrixV3WinningNonceClaim,
+        replay_accumulators: Option<Vec<i32>>,
     },
     Stale,
     Disconnected,
@@ -1622,15 +1628,26 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
             JobOutcome::Disconnected => {
                 println!("Node connection lost; GPU work paused until a node is reachable.");
             }
-            JobOutcome::FoundV3 { device, claim } => {
+            JobOutcome::FoundV3 {
+                device,
+                claim,
+                replay_accumulators,
+            } => {
                 let search_seconds = search_started.elapsed().as_secs_f64().max(f64::EPSILON);
                 let search_evaluations = statistics
                     .total_attempts()
                     .saturating_sub(search_attempt_base);
+                let replay_mode = if replay_accumulators.is_some() {
+                    "GPU-accelerated replay"
+                } else {
+                    "CPU replay"
+                };
                 println!(
-                    "GPU {device} found a target nonce after {search_evaluations} evaluations in {search_seconds:.1}s ({:.2} H/s); CPU replay and Layout V5 proof construction started.",
+                    "GPU {device} found a target nonce after {search_evaluations} evaluations in {search_seconds:.1}s ({:.2} H/s); {replay_mode} and Layout V5 proof construction started.",
                     search_evaluations as f64 / search_seconds
                 );
+                let accelerated_replay = replay_accumulators
+                    .map(cmfd_consensus::BlsDoryV3AcceleratedReplayAccumulators::new);
                 let proof_stats_height = work.challenge().height;
                 let proof_stats_interval = Duration::from_secs(options.stats_seconds);
                 let proof_work = work.clone();
@@ -1672,7 +1689,11 @@ fn run_thin_miner_v3(options: ThinMinerOptions) -> Result<()> {
                     },
                     move |proof_cancel| {
                         proof_work
-                            .prove_v3_winning_nonce_claim(claim, &proof_cancel)
+                            .prove_v3_winning_nonce_claim_with_accelerated_replay(
+                                claim,
+                                accelerated_replay,
+                                &proof_cancel,
+                            )
                             .map_err(Into::into)
                     },
                 )? {
@@ -2750,15 +2771,26 @@ fn continuous_production_mining(
                 statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
                 println!("New chain tip received; rebuilding Production V3 work.");
             }
-            JobOutcome::FoundV3 { device, claim } => {
+            JobOutcome::FoundV3 {
+                device,
+                claim,
+                replay_accumulators,
+            } => {
                 let search_seconds = search_started.elapsed().as_secs_f64().max(f64::EPSILON);
                 let search_evaluations = statistics
                     .total_attempts()
                     .saturating_sub(search_attempt_base);
+                let replay_mode = if replay_accumulators.is_some() {
+                    "GPU-accelerated replay"
+                } else {
+                    "CPU replay"
+                };
                 println!(
-                    "GPU {device} found a target nonce after {search_evaluations} evaluations in {search_seconds:.1}s ({:.2} H/s); CPU replay and Layout V5 proof construction started.",
+                    "GPU {device} found a target nonce after {search_evaluations} evaluations in {search_seconds:.1}s ({:.2} H/s); {replay_mode} and Layout V5 proof construction started.",
                     search_evaluations as f64 / search_seconds
                 );
+                let accelerated_replay = replay_accumulators
+                    .map(cmfd_consensus::BlsDoryV3AcceleratedReplayAccumulators::new);
                 let proof_stats_height = work.challenge().height;
                 let proof_work = work.clone();
                 let proof = match run_production_proof_while_current(
@@ -2784,7 +2816,11 @@ fn continuous_production_mining(
                     },
                     move |proof_cancel| {
                         proof_work
-                            .prove_v3_winning_nonce_claim(claim, &proof_cancel)
+                            .prove_v3_winning_nonce_claim_with_accelerated_replay(
+                                claim,
+                                accelerated_replay,
+                                &proof_cancel,
+                            )
                             .map_err(Into::into)
                     },
                 )? {
@@ -3742,12 +3778,15 @@ fn run_production_worker_job(
                 .v3_winning_nonce_claim_from_accelerator_batch_output(&batch, index, output)
                 .map_err(|error| error.client_error().message)?
             {
+                let replay_accumulators =
+                    gpu_replay_accumulators_for_found_nonce(miner, &batch, index, output);
                 sender
                     .send(WorkerMessage::FoundV3 {
                         job_id,
                         device: spec.device.index,
                         claim,
                         attempts: pending_attempts,
+                        replay_accumulators,
                     })
                     .map_err(|_| {
                         "miner coordinator closed before Production V3 proof replay".to_owned()
@@ -3776,6 +3815,56 @@ fn run_production_worker_job(
         });
     }
     Ok(())
+}
+
+/// Re-evaluate the found nonce on the worker's authenticated GPU context and
+/// surface its raw accumulator columns for the consensus replay, or `None` to
+/// fall back to the CPU matrix replay. The columns are untrusted here and
+/// everywhere: the consensus replay reauthenticates the complete bank on its
+/// own reader, bound-checks every value, re-derives the digests, proves the
+/// columns against the CPU-committed weights, and self-verifies the
+/// candidate. As a cheap consistency gate, the replay's final activation must
+/// reproduce the search output byte for byte or the bundle is discarded.
+#[cfg(feature = "production-v3")]
+fn gpu_replay_accumulators_for_found_nonce(
+    miner: &mut cmfd_cuda::ProductionCudaMiner,
+    batch: &cmfd_consensus::ForgeMatrixV3AcceleratorBatch,
+    index: usize,
+    search_activation: &[u8],
+) -> Option<Vec<i32>> {
+    if !miner.supports_replay() {
+        eprintln!(
+            "GPU replay unavailable (backend lacks the replay seam); using the CPU matrix replay."
+        );
+        return None;
+    }
+    let count = batch.count() as usize;
+    let coefficients = batch.coefficients();
+    if count == 0 || !coefficients.len().is_multiple_of(count) {
+        return None;
+    }
+    let per_nonce = coefficients.len() / count;
+    let nonce_coefficients = coefficients.get(index * per_nonce..(index + 1) * per_nonce)?;
+    let replay_started = Instant::now();
+    match miner.replay_winning_nonce(nonce_coefficients) {
+        Ok(output) => {
+            if output.final_activation != search_activation {
+                eprintln!(
+                    "GPU replay final activation diverged from the search output; discarding the GPU replay and using the CPU matrix replay."
+                );
+                return None;
+            }
+            eprintln!(
+                "GPU replay surfaced the execution table in {:.1}s; the CPU authenticates the bank and proves against its own commitments.",
+                replay_started.elapsed().as_secs_f64()
+            );
+            Some(output.layer_accumulators)
+        }
+        Err(error) => {
+            eprintln!("GPU replay failed ({error}); using the CPU matrix replay.");
+            None
+        }
+    }
 }
 
 #[cfg(feature = "production-v3")]
@@ -3808,10 +3897,15 @@ fn monitor_production_workers(
                 device,
                 claim,
                 attempts,
+                replay_accumulators,
             }) if message_job == job_id => {
                 statistics.record_attempts(device, attempts);
                 control.worker_cancel.store(true, Ordering::Release);
-                return Ok(JobOutcome::FoundV3 { device, claim });
+                return Ok(JobOutcome::FoundV3 {
+                    device,
+                    claim,
+                    replay_accumulators,
+                });
             }
             Ok(WorkerMessage::Failed {
                 job_id: failed_job,

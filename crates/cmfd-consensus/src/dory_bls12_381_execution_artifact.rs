@@ -428,12 +428,21 @@ impl BlsDoryExecutionAccumulatorArtifactWriter {
             self.next_cell,
             values.len(),
         )?;
+        // Encode the whole chunk so the digest and file advance in one update
+        // each instead of one per cell; the byte stream is exactly the
+        // per-value stream, so chunk digests are unchanged.
         let result = (|| {
+            let mut encoded = Vec::new();
+            encoded.try_reserve_exact(values.len() * 4).map_err(|_| {
+                BlsDoryExecutionAccumulatorArtifactError::Io(std::io::Error::from(
+                    std::io::ErrorKind::OutOfMemory,
+                ))
+            })?;
             for value in values {
-                let encoded = value.to_le_bytes();
-                self.file_mut()?.write_all(&encoded)?;
-                hasher.update(&encoded);
+                encoded.extend_from_slice(&value.to_le_bytes());
             }
+            self.file_mut()?.write_all(&encoded)?;
+            hasher.update(&encoded);
             Ok(())
         })();
         if result.is_err() {

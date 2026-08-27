@@ -133,7 +133,8 @@ pub use difficulty::{
 };
 #[cfg(all(feature = "dory-bls12-381-prototype", feature = "whir-prototype"))]
 pub use dory_bls12_381_execution_provider::{
-    BlsDoryWinningNonceClaim, BlsDoryWinningNonceReplayError, VerifiedBlsDoryWinningNonceExecution,
+    BlsDoryV3AcceleratedReplayAccumulators, BlsDoryWinningNonceClaim,
+    BlsDoryWinningNonceReplayError, VerifiedBlsDoryWinningNonceExecution,
 };
 pub use economics::{
     Allocation, BLOCKS_PER_365_DAY_YEAR, COIN, CoinbaseClaim, DEFAULT_MONETARY_POLICY,

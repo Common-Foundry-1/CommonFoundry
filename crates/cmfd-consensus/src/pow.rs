@@ -23,8 +23,9 @@ use crate::{
         verify_bls_dory_v3_layout_v5_candidate, verify_bls_dory_v3_layout_v5_candidate_relation,
     },
     dory_bls12_381_execution_provider::{
-        BlsDoryV3WinningNonceClaim,
+        BlsDoryV3AcceleratedReplayAccumulators, BlsDoryV3WinningNonceClaim,
         prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model,
+        prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model_with_accelerated_replay,
         prove_bls_dory_v3_layout_v5_candidate_from_winning_nonce_claim,
         validate_dory_v3_replay_claim,
     },
@@ -848,6 +849,58 @@ impl ConsensusPowVerifier {
             replay_bank,
             scratch_directory,
             maximum_native_block_rows,
+            cancel,
+        )?;
+        Ok(BlockProof::V3Candidate(Box::new(proof)))
+    }
+
+    /// Prove one winning claim with process-reusable fixed-model state and an
+    /// optional accelerator-proposed replay accumulator bundle. `None` is the
+    /// unchanged CPU replay. `Some` never extends trust to the accelerator:
+    /// the complete bank still authenticates on this call's replay reader,
+    /// every accumulator is bound-checked, the published digests are
+    /// re-derived on the CPU, the matrix sumcheck proves the accumulators
+    /// against the CPU-committed weights, and the candidate self-verifies.
+    #[cfg(feature = "dory-v3-consensus-adapter")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_v3_winning_nonce_claim_with_prepared_model_and_accelerated_replay<
+        ReplayBank: Read,
+    >(
+        &self,
+        block: &BlockChallenge,
+        claim: ForgeMatrixV3WinningNonceClaim,
+        prepared_model: &PreparedForgeMatrixV3Model,
+        replay_bank: ReplayBank,
+        scratch_directory: &Path,
+        maximum_native_block_rows: usize,
+        accelerated_replay: Option<BlsDoryV3AcceleratedReplayAccumulators>,
+        cancel: &AtomicBool,
+    ) -> Result<BlockProof, PowError> {
+        let Self::V3Candidate(verifier) = self else {
+            return Err(PowError::WrongProofType);
+        };
+        verifier.validate_winning_nonce_claim(block, claim, cancel)?;
+        if prepared_model.parameters != verifier.parameters
+            || maximum_native_block_rows == 0
+            || maximum_native_block_rows > MAX_PRODUCTION_V3_NATIVE_BLOCK_ROWS
+        {
+            return Err(BlsDoryV3CandidateError::ProverConfiguration.into());
+        }
+        let (authenticated, setup) = verifier.production_authority()?;
+        let proof = prove_bls_dory_v3_layout_v5_candidate_from_prepared_fixed_model_with_accelerated_replay(
+            authenticated,
+            block,
+            BlsDoryV3WinningNonceClaim {
+                nonce: claim.nonce,
+                final_activation_digest: claim.final_activation_digest,
+                work_digest: claim.work_digest,
+            },
+            setup,
+            prepared_model.prepared.as_ref(),
+            replay_bank,
+            scratch_directory,
+            maximum_native_block_rows,
+            accelerated_replay,
             cancel,
         )?;
         Ok(BlockProof::V3Candidate(Box::new(proof)))

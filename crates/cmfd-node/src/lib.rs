@@ -2965,6 +2965,48 @@ impl MiningWork {
             .map_err(NodeError::ProductionV3Artifacts)?;
         Ok(proof?)
     }
+
+    /// Replay and prove a Production V3 winning claim with an optional
+    /// accelerator-proposed replay accumulator bundle. `None` is the unchanged
+    /// CPU replay; `Some` still authenticates the complete bank on this call's
+    /// replay reader and revalidates everything the accelerator surfaced.
+    #[cfg(feature = "production-v3")]
+    pub fn prove_v3_winning_nonce_claim_with_accelerated_replay(
+        &self,
+        claim: ForgeMatrixV3WinningNonceClaim,
+        accelerated_replay: Option<cmfd_consensus::BlsDoryV3AcceleratedReplayAccumulators>,
+        cancel: &AtomicBool,
+    ) -> Result<BlockProof, NodeError> {
+        let context = self
+            .production_v3
+            .as_ref()
+            .ok_or(NodeError::ProductionV3MiningConfiguration)?;
+        self.verifier
+            .validate_v3_winning_nonce_claim(&self.challenge, claim)?;
+        let mut replay_bank = context
+            .replay_bank
+            .lock()
+            .map_err(|_| NodeError::ProductionV3MiningStatePoisoned)?;
+        replay_bank
+            .rewind_and_recheck()
+            .map_err(NodeError::ProductionV3Artifacts)?;
+        let proof = self
+            .verifier
+            .prove_v3_winning_nonce_claim_with_prepared_model_and_accelerated_replay(
+                &self.challenge,
+                claim,
+                &context.prepared_model,
+                &mut *replay_bank,
+                &context.scratch_directory,
+                context.maximum_native_block_rows,
+                accelerated_replay,
+                cancel,
+            );
+        replay_bank
+            .recheck()
+            .map_err(NodeError::ProductionV3Artifacts)?;
+        Ok(proof?)
+    }
 }
 
 #[derive(Debug, Clone)]

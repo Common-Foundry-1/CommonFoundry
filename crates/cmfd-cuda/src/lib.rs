@@ -84,6 +84,17 @@ type ProductionEvaluateFn = unsafe extern "C" fn(
     usize,
 ) -> i32;
 type ProductionDestroyFn = unsafe extern "C" fn(*mut c_void);
+type ProductionReplayV1Fn = unsafe extern "C" fn(
+    *mut c_void,
+    *const u8,
+    usize,
+    *mut i32,
+    usize,
+    *mut u8,
+    usize,
+    *mut c_char,
+    usize,
+) -> i32;
 type DifferentialLayerV3Fn = unsafe extern "C" fn(
     i32,
     u32,
@@ -134,6 +145,7 @@ struct CudaApi {
     evaluate: EvaluateFn,
     destroy: DestroyFn,
     production: Option<ProductionApi>,
+    production_replay_v1: Option<ProductionReplayV1Fn>,
     differential_layer_v3: Option<DifferentialLayerV3Fn>,
     _library: Library,
 }
@@ -162,6 +174,12 @@ impl CudaApi {
                 evaluate: load_symbol(&library, b"cmfd_cuda_evaluate\0")?,
                 destroy: load_symbol(&library, b"cmfd_cuda_destroy\0")?,
                 production: load_production_api(&library),
+                // Optional separately from the production API so an older
+                // backend without the replay seam keeps full mining support.
+                production_replay_v1: load_optional_symbol(
+                    &library,
+                    b"cmfd_cuda_production_replay_v1\0",
+                ),
                 differential_layer_v3: load_optional_symbol(
                     &library,
                     b"cmfd_cuda_differential_layer_v3\0",
@@ -875,6 +893,72 @@ impl ProductionCudaMiner {
         check_result(result, &error)?;
         Ok(outputs)
     }
+
+    /// True when the loaded backend exports the production replay seam.
+    pub fn supports_replay(&self) -> bool {
+        self._api_owner.production_replay_v1.is_some()
+    }
+
+    /// Re-evaluate one nonce's 385-stage coefficient schedule and surface
+    /// every layer's raw int32 accumulator column plus the final encoded
+    /// activation. The caller is expected to treat everything surfaced here
+    /// as untrusted accelerator output: the consensus replay re-authenticates
+    /// the bank, bound-checks every accumulator, re-derives the digests, and
+    /// the proof pipeline proves the columns against CPU-committed weights.
+    pub fn replay_winning_nonce(
+        &mut self,
+        coefficients: &[u8],
+    ) -> Result<ProductionReplayOutput, String> {
+        let replay = self
+            ._api_owner
+            .production_replay_v1
+            .ok_or_else(|| "CUDA backend does not export the production replay ABI".to_owned())?;
+        if coefficients.len() != PRODUCTION_COEFFICIENTS_PER_NONCE
+            || coefficients.iter().any(|byte| *byte > 250)
+        {
+            return Err(
+                "production replay coefficients are noncanonical or have the wrong length"
+                    .to_owned(),
+            );
+        }
+        let accumulator_count = (PRODUCTION_V2_LAYERS as usize)
+            .checked_mul(PRODUCTION_ACTIVATION_VALUES)
+            .ok_or_else(|| "production replay accumulator length overflow".to_owned())?;
+        let mut layer_accumulators = Vec::new();
+        layer_accumulators
+            .try_reserve_exact(accumulator_count)
+            .map_err(|_| "production replay accumulator allocation failed".to_owned())?;
+        layer_accumulators.resize(accumulator_count, 0_i32);
+        let mut final_activation = vec![0_u8; PRODUCTION_ACTIVATION_VALUES];
+        let mut error = [0 as c_char; ERROR_BUFFER_BYTES];
+        // SAFETY: this context was finalized by the matching production API;
+        // all slices remain live and their exact lengths are supplied.
+        let result = unsafe {
+            replay(
+                self.context.as_ptr(),
+                coefficients.as_ptr(),
+                coefficients.len(),
+                layer_accumulators.as_mut_ptr(),
+                layer_accumulators.len(),
+                final_activation.as_mut_ptr(),
+                final_activation.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        check_result(result, &error)?;
+        Ok(ProductionReplayOutput {
+            layer_accumulators,
+            final_activation,
+        })
+    }
+}
+
+/// Raw accelerator replay output for one nonce: 384 layer columns of int32
+/// accumulators in canonical order plus the final encoded activation.
+pub struct ProductionReplayOutput {
+    pub layer_accumulators: Vec<i32>,
+    pub final_activation: Vec<u8>,
 }
 
 impl Drop for ProductionCudaMiner {

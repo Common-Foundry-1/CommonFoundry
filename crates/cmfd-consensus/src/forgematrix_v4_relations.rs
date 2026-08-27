@@ -162,10 +162,12 @@ pub fn verify_forgematrix_v4_matrix_relation(
         FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES,
         FORGEMATRIX_V4_MATRIX_SUMCHECK_DEGREE,
     )?;
-    observe_bytes(challenger, MATRIX_PROOF_DOMAIN);
-    challenger.observe_ext_element(proof.preactivation_evaluation);
-    challenger.observe_ext_element(mask_evaluation);
-    if proof.sumcheck.claimed_sum != proof.preactivation_evaluation - mask_evaluation {
+    let expected_claim = begin_forgematrix_v4_matrix_sumcheck(
+        challenger,
+        proof.preactivation_evaluation,
+        mask_evaluation,
+    );
+    if proof.sumcheck.claimed_sum != expected_claim {
         return Err(ForgeMatrixV4RelationError::Claim);
     }
     partially_verify_sumcheck_proof(
@@ -202,13 +204,13 @@ pub fn verify_forgematrix_v4_shift_relation(
         FORGEMATRIX_V4_SHIFT_SUMCHECK_VARIABLES,
         FORGEMATRIX_V4_SHIFT_SUMCHECK_DEGREE,
     )?;
-    observe_bytes(challenger, SHIFT_PROOF_DOMAIN);
-    challenger.observe_ext_element(input_evaluation);
-    challenger.observe_ext_element(proof.boundary_evaluation);
-    let boundary_coefficient = equality_at_boolean(source_layer_point, 0)?;
-    if proof.sumcheck.claimed_sum
-        != input_evaluation - boundary_coefficient * proof.boundary_evaluation
-    {
+    let expected_claim = begin_forgematrix_v4_shift_sumcheck(
+        challenger,
+        source_layer_point,
+        input_evaluation,
+        proof.boundary_evaluation,
+    )?;
+    if proof.sumcheck.claimed_sum != expected_claim {
         return Err(ForgeMatrixV4RelationError::Claim);
     }
     partially_verify_sumcheck_proof(
@@ -238,7 +240,7 @@ pub fn verify_forgematrix_v4_cubic_relation(
         FORGEMATRIX_V4_CUBIC_SUMCHECK_VARIABLES,
         FORGEMATRIX_V4_CUBIC_SUMCHECK_DEGREE,
     )?;
-    observe_bytes(challenger, CUBIC_PROOF_DOMAIN);
+    begin_forgematrix_v4_cubic_sumcheck(challenger);
     if proof.sumcheck.claimed_sum != ForgeMatrixV4Extension::zero() {
         return Err(ForgeMatrixV4RelationError::Claim);
     }
@@ -263,6 +265,41 @@ pub fn verify_forgematrix_v4_cubic_relation(
     challenger.observe_ext_element(proof.preactivation_evaluation);
     challenger.observe_ext_element(proof.next_activation_evaluation);
     Ok(())
+}
+
+/// Advances the canonical transcript to the matrix sumcheck and returns its
+/// public reduced claim for use by a prover.
+pub fn begin_forgematrix_v4_matrix_sumcheck(
+    challenger: &mut ForgeMatrixV4Challenger,
+    preactivation_evaluation: ForgeMatrixV4Extension,
+    mask_evaluation: ForgeMatrixV4Extension,
+) -> ForgeMatrixV4Extension {
+    observe_bytes(challenger, MATRIX_PROOF_DOMAIN);
+    challenger.observe_ext_element(preactivation_evaluation);
+    challenger.observe_ext_element(mask_evaluation);
+    preactivation_evaluation - mask_evaluation
+}
+
+/// Advances the canonical transcript to the shift sumcheck and returns its
+/// public reduced claim for use by a prover.
+pub fn begin_forgematrix_v4_shift_sumcheck(
+    challenger: &mut ForgeMatrixV4Challenger,
+    source_layer_point: &Point<ForgeMatrixV4Extension>,
+    input_evaluation: ForgeMatrixV4Extension,
+    boundary_evaluation: ForgeMatrixV4Extension,
+) -> Result<ForgeMatrixV4Extension, ForgeMatrixV4RelationError> {
+    if source_layer_point.dimension() != LAYER_VARIABLES {
+        return Err(ForgeMatrixV4RelationError::Shape);
+    }
+    observe_bytes(challenger, SHIFT_PROOF_DOMAIN);
+    challenger.observe_ext_element(input_evaluation);
+    challenger.observe_ext_element(boundary_evaluation);
+    Ok(input_evaluation - equality_at_boolean(source_layer_point, 0)? * boundary_evaluation)
+}
+
+/// Advances the canonical transcript to the cubic-transition sumcheck.
+pub fn begin_forgematrix_v4_cubic_sumcheck(challenger: &mut ForgeMatrixV4Challenger) {
+    observe_bytes(challenger, CUBIC_PROOF_DOMAIN);
 }
 
 pub fn forgematrix_v4_weight_pcs_point(

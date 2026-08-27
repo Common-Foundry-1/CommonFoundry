@@ -4,10 +4,11 @@ use thiserror::Error;
 
 use crate::{
     Block, BlockChallenge, BlockProof, CONSENSUS_SIGNATURE_BYTES, Coinbase, ForgeMatrixProof,
-    ForgeMatrixV2CompactProof, ForgeMatrixV3CandidateProof, InputWitness,
-    MAX_BLOCK_AGGREGATE_INPUTS, MAX_BLOCK_AGGREGATE_OUTPUTS, MAX_BLOCK_SIGNATURE_CHECKS,
-    MAX_BLOCK_TRANSACTIONS, MAX_COINBASE_OUTPUTS, MAX_TRANSACTION_INPUTS, MAX_TRANSACTION_OUTPUTS,
-    OutPoint, OutputLock, Transaction, TxInput, TxOutput,
+    ForgeMatrixV2CompactProof, ForgeMatrixV3CandidateProof, ForgeMatrixV4CandidateProof,
+    InputWitness, MAX_BLOCK_AGGREGATE_INPUTS, MAX_BLOCK_AGGREGATE_OUTPUTS,
+    MAX_BLOCK_SIGNATURE_CHECKS, MAX_BLOCK_TRANSACTIONS, MAX_COINBASE_OUTPUTS,
+    MAX_TRANSACTION_INPUTS, MAX_TRANSACTION_OUTPUTS, OutPoint, OutputLock, Transaction, TxInput,
+    TxOutput,
 };
 
 pub const WIRE_HEADER_BYTES: usize = 16;
@@ -21,10 +22,22 @@ pub const FORGEMATRIX_V1_PROOF_TAG: u8 = 1;
 pub const FORGEMATRIX_V2_PROOF_TAG: u8 = 2;
 /// Reserved, fail-closed production-candidate proof tag.
 pub const FORGEMATRIX_V3_CANDIDATE_PROOF_TAG: u8 = 3;
+/// Reserved exclusively for the isolated ProductionV4 latency testnet.
+pub const FORGEMATRIX_V4_CANDIDATE_PROOF_TAG: u8 = 4;
 
 pub const MAX_TRANSACTION_BYTES: usize = 64 * 1024;
+/// All proof tags before V4 retain this complete-frame limit.
 pub const MAX_PROOF_BYTES: usize = 256 * 1024;
+/// All networks before V4 retain this complete-frame limit.
 pub const MAX_BLOCK_BYTES: usize = 1024 * 1024;
+pub const PRODUCTION_V4_MAX_PROOF_BYTES: usize = 10 * 1024 * 1024;
+pub const PRODUCTION_V4_MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+
+/// SHA-256("CMFD/PRODUCTION-V4-TESTNET/V1/NETWORK-ID").
+pub const PRODUCTION_V4_TESTNET_NETWORK_ID: [u8; 32] = [
+    0xb9, 0xe5, 0x5d, 0x5a, 0x5e, 0x80, 0xc8, 0xe3, 0xd7, 0x3b, 0xf8, 0x1b, 0x19, 0x9b, 0xc6, 0x43,
+    0xac, 0x93, 0x67, 0x43, 0x69, 0x62, 0xc2, 0x8b, 0x6a, 0xac, 0xdc, 0x37, 0xf3, 0x80, 0x99, 0x62,
+];
 
 pub(crate) const FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES: usize = 1 + 32 + 4 + 4 + 8 + 4 * 32;
 pub(crate) const FORGEMATRIX_V3_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
@@ -38,6 +51,12 @@ pub const MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES: usize = MAX_PROOF_BYTES
     - WIRE_HEADER_BYTES
     - FORGEMATRIX_V3_PUBLIC_PREFIX_BYTES
     - FORGEMATRIX_V3_LENGTH_BYTES;
+pub(crate) const FORGEMATRIX_V4_PUBLIC_PREFIX_BYTES: usize = 1 + 32 + 4 + 4 + 8 + 5 * 32;
+pub(crate) const FORGEMATRIX_V4_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+pub const MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES: usize = PRODUCTION_V4_MAX_PROOF_BYTES
+    - WIRE_HEADER_BYTES
+    - FORGEMATRIX_V4_PUBLIC_PREFIX_BYTES
+    - FORGEMATRIX_V4_LENGTH_BYTES;
 
 pub(crate) const FRAME_MAGIC: [u8; 4] = *b"CMFD";
 pub(crate) const NETWORK_MAGIC_DOMAIN: &str = "CMFD/WIRE/NETWORK-MAGIC/V1";
@@ -80,6 +99,33 @@ pub enum WireError {
     LengthOverflow,
     #[error("{field} must not be empty")]
     EmptyField { field: &'static str },
+    #[error("proof tag {tag} is not valid for this network")]
+    ProofTagNetworkMismatch { tag: u8 },
+}
+
+pub fn max_proof_bytes_for_network(network_id: [u8; 32]) -> usize {
+    if network_id == PRODUCTION_V4_TESTNET_NETWORK_ID {
+        PRODUCTION_V4_MAX_PROOF_BYTES
+    } else {
+        MAX_PROOF_BYTES
+    }
+}
+
+pub fn max_block_bytes_for_network(network_id: [u8; 32]) -> usize {
+    if network_id == PRODUCTION_V4_TESTNET_NETWORK_ID {
+        PRODUCTION_V4_MAX_BLOCK_BYTES
+    } else {
+        MAX_BLOCK_BYTES
+    }
+}
+
+fn ensure_proof_tag_for_network(tag: u8, network_id: [u8; 32]) -> Result<(), WireError> {
+    let is_v4_tag = tag == FORGEMATRIX_V4_CANDIDATE_PROOF_TAG;
+    let is_v4_network = network_id == PRODUCTION_V4_TESTNET_NETWORK_ID;
+    if is_v4_tag != is_v4_network {
+        return Err(WireError::ProofTagNetworkMismatch { tag });
+    }
+    Ok(())
 }
 
 /// Derives the four-byte frame discriminator from all 32 bytes of a network ID.
@@ -126,7 +172,7 @@ pub fn encode_forgematrix_proof(
         FORGEMATRIX_PROOF_KIND,
         network_id,
         &payload,
-        MAX_PROOF_BYTES,
+        max_proof_bytes_for_network(network_id),
         "ForgeMatrix proof",
     )
 }
@@ -139,7 +185,7 @@ pub fn decode_forgematrix_proof(
         bytes,
         expected_network_id,
         FORGEMATRIX_PROOF_KIND,
-        MAX_PROOF_BYTES,
+        max_proof_bytes_for_network(expected_network_id),
         "ForgeMatrix proof",
     )?;
     decode_forgematrix_proof_payload(payload, expected_network_id)
@@ -148,12 +194,14 @@ pub fn decode_forgematrix_proof(
 pub fn encode_block(block: &Block) -> Result<Vec<u8>, WireError> {
     validate_block_shape(block)?;
     let network_id = block.challenge.network_id;
-    let mut writer = Writer::new(payload_limit(MAX_BLOCK_BYTES), "block");
+    let max_block_bytes = max_block_bytes_for_network(network_id);
+    let max_proof_bytes = max_proof_bytes_for_network(network_id);
+    let mut writer = Writer::new(payload_limit(max_block_bytes), "block");
     writer.u32(block.version)?;
     encode_challenge(&block.challenge, &mut writer)?;
 
     let proof = encode_forgematrix_proof_payload(&block.proof, network_id)?;
-    writer.sized_bytes(&proof, MAX_PROOF_BYTES, "ForgeMatrix proof")?;
+    writer.sized_bytes(&proof, max_proof_bytes, "ForgeMatrix proof")?;
     encode_coinbase(&block.coinbase, &mut writer)?;
 
     writer.count(
@@ -167,22 +215,24 @@ pub fn encode_block(block: &Block) -> Result<Vec<u8>, WireError> {
     }
 
     let payload = writer.finish();
-    encode_frame(BLOCK_KIND, network_id, &payload, MAX_BLOCK_BYTES, "block")
+    encode_frame(BLOCK_KIND, network_id, &payload, max_block_bytes, "block")
 }
 
 pub fn decode_block(bytes: &[u8], expected_network_id: [u8; 32]) -> Result<Block, WireError> {
+    let max_block_bytes = max_block_bytes_for_network(expected_network_id);
+    let max_proof_bytes = max_proof_bytes_for_network(expected_network_id);
     let payload = decode_frame(
         bytes,
         expected_network_id,
         BLOCK_KIND,
-        MAX_BLOCK_BYTES,
+        max_block_bytes,
         "block",
     )?;
     let mut reader = Reader::new(payload);
     let version = reader.u32()?;
     let challenge = decode_challenge(&mut reader, expected_network_id)?;
 
-    let proof_payload = reader.sized_bytes(MAX_PROOF_BYTES, "ForgeMatrix proof")?;
+    let proof_payload = reader.sized_bytes(max_proof_bytes, "ForgeMatrix proof")?;
     let proof = decode_forgematrix_proof_payload(proof_payload, challenge.network_id)?;
     let coinbase = decode_coinbase(&mut reader)?;
 
@@ -273,9 +323,13 @@ fn encode_forgematrix_proof_payload(
     proof: &BlockProof,
     network_id: [u8; 32],
 ) -> Result<Vec<u8>, WireError> {
-    let mut writer = Writer::new(payload_limit(MAX_PROOF_BYTES), "ForgeMatrix proof");
+    let mut writer = Writer::new(
+        payload_limit(max_proof_bytes_for_network(network_id)),
+        "ForgeMatrix proof",
+    );
     match proof {
         BlockProof::V1Legacy(proof) => {
+            ensure_proof_tag_for_network(FORGEMATRIX_V1_PROOF_TAG, network_id)?;
             writer.u8(FORGEMATRIX_V1_PROOF_TAG)?;
             writer.bytes(&network_id)?;
             writer.u32(proof.algorithm_version)?;
@@ -286,6 +340,7 @@ fn encode_forgematrix_proof_payload(
             writer.bytes(&proof.work_digest)?;
         }
         BlockProof::V2Reference(proof) => {
+            ensure_proof_tag_for_network(FORGEMATRIX_V2_PROOF_TAG, network_id)?;
             writer.u8(FORGEMATRIX_V2_PROOF_TAG)?;
             writer.bytes(&network_id)?;
             writer.u32(proof.algorithm_version)?;
@@ -297,6 +352,7 @@ fn encode_forgematrix_proof_payload(
             writer.bytes(&proof.work_digest)?;
         }
         BlockProof::V3Candidate(proof) => {
+            ensure_proof_tag_for_network(FORGEMATRIX_V3_CANDIDATE_PROOF_TAG, network_id)?;
             if proof.structured_proof.is_empty() {
                 return Err(WireError::EmptyField {
                     field: "structured production proof",
@@ -321,6 +377,33 @@ fn encode_forgematrix_proof_payload(
             writer.u32(structured_length)?;
             writer.bytes(&proof.structured_proof)?;
         }
+        BlockProof::V4Candidate(proof) => {
+            ensure_proof_tag_for_network(FORGEMATRIX_V4_CANDIDATE_PROOF_TAG, network_id)?;
+            if proof.transparent_proof.is_empty() {
+                return Err(WireError::EmptyField {
+                    field: "transparent production proof",
+                });
+            }
+            writer.u8(FORGEMATRIX_V4_CANDIDATE_PROOF_TAG)?;
+            writer.bytes(&network_id)?;
+            writer.u32(proof.algorithm_version)?;
+            writer.u32(proof.proof_version)?;
+            writer.u64(proof.nonce)?;
+            writer.bytes(&proof.proof_system_digest)?;
+            writer.bytes(&proof.model_manifest_digest)?;
+            writer.bytes(&proof.challenge_digest)?;
+            writer.bytes(&proof.final_activation_digest)?;
+            writer.bytes(&proof.work_digest)?;
+            check_byte_length(
+                proof.transparent_proof.len(),
+                MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+                "transparent production proof",
+            )?;
+            let proof_length = u32::try_from(proof.transparent_proof.len())
+                .map_err(|_| WireError::LengthOverflow)?;
+            writer.u32(proof_length)?;
+            writer.bytes(&proof.transparent_proof)?;
+        }
     }
     Ok(writer.finish())
 }
@@ -329,7 +412,11 @@ fn decode_forgematrix_proof_payload(
     payload: &[u8],
     expected_network_id: [u8; 32],
 ) -> Result<BlockProof, WireError> {
-    ensure_payload_size(payload.len(), MAX_PROOF_BYTES, "ForgeMatrix proof")?;
+    ensure_payload_size(
+        payload.len(),
+        max_proof_bytes_for_network(expected_network_id),
+        "ForgeMatrix proof",
+    )?;
     let mut reader = Reader::new(payload);
     let tag = reader.u8()?;
     let network_id = reader.array()?;
@@ -338,6 +425,7 @@ fn decode_forgematrix_proof_payload(
             field: "ForgeMatrix proof",
         });
     }
+    ensure_proof_tag_for_network(tag, expected_network_id)?;
     let proof = match tag {
         FORGEMATRIX_V1_PROOF_TAG => BlockProof::V1Legacy(ForgeMatrixProof {
             algorithm_version: reader.u32()?,
@@ -386,6 +474,40 @@ fn decode_forgematrix_proof_payload(
                 final_activation_digest,
                 work_digest,
                 structured_proof,
+            }))
+        }
+        FORGEMATRIX_V4_CANDIDATE_PROOF_TAG => {
+            let algorithm_version = reader.u32()?;
+            let proof_version = reader.u32()?;
+            let nonce = reader.u64()?;
+            let proof_system_digest = reader.array()?;
+            let model_manifest_digest = reader.array()?;
+            let challenge_digest = reader.array()?;
+            let final_activation_digest = reader.array()?;
+            let work_digest = reader.array()?;
+            let proof_length =
+                usize::try_from(reader.u32()?).map_err(|_| WireError::LengthOverflow)?;
+            check_byte_length(
+                proof_length,
+                MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+                "transparent production proof",
+            )?;
+            let transparent_proof = reader.bytes(proof_length)?.to_vec();
+            if transparent_proof.is_empty() {
+                return Err(WireError::EmptyField {
+                    field: "transparent production proof",
+                });
+            }
+            BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
+                algorithm_version,
+                proof_version,
+                nonce,
+                proof_system_digest,
+                model_manifest_digest,
+                challenge_digest,
+                final_activation_digest,
+                work_digest,
+                transparent_proof,
             }))
         }
         tag => {
@@ -1178,6 +1300,20 @@ mod tests {
         }))
     }
 
+    fn v4_proof() -> BlockProof {
+        BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
+            algorithm_version: 61,
+            proof_version: 62,
+            nonce: 63,
+            proof_system_digest: [64; 32],
+            model_manifest_digest: [65; 32],
+            challenge_digest: [66; 32],
+            final_activation_digest: [67; 32],
+            work_digest: [68; 32],
+            transparent_proof: b"CMFDV4-transparent-candidate".to_vec(),
+        }))
+    }
+
     fn block() -> Block {
         Block {
             version: 37,
@@ -1512,6 +1648,160 @@ mod tests {
             ),
             Err(crate::PowError::WrongProofType)
         ));
+    }
+
+    #[test]
+    fn v4_candidate_uses_only_its_isolated_network_and_exact_larger_cap() {
+        assert_eq!(max_proof_bytes_for_network(NETWORK_ID), MAX_PROOF_BYTES);
+        assert_eq!(max_block_bytes_for_network(NETWORK_ID), MAX_BLOCK_BYTES);
+        assert_eq!(
+            max_proof_bytes_for_network(PRODUCTION_V4_TESTNET_NETWORK_ID),
+            PRODUCTION_V4_MAX_PROOF_BYTES
+        );
+        assert_eq!(
+            max_block_bytes_for_network(PRODUCTION_V4_TESTNET_NETWORK_ID),
+            PRODUCTION_V4_MAX_BLOCK_BYTES
+        );
+        assert_eq!(
+            WIRE_HEADER_BYTES
+                + FORGEMATRIX_V4_PUBLIC_PREFIX_BYTES
+                + FORGEMATRIX_V4_LENGTH_BYTES
+                + MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+            PRODUCTION_V4_MAX_PROOF_BYTES
+        );
+
+        let proof = v4_proof();
+        let encoded = encode_forgematrix_proof(&proof, PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap();
+        assert_eq!(
+            encoded[WIRE_HEADER_BYTES],
+            FORGEMATRIX_V4_CANDIDATE_PROOF_TAG
+        );
+        assert_eq!(
+            decode_forgematrix_proof(&encoded, PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap(),
+            proof
+        );
+
+        assert_eq!(
+            encode_forgematrix_proof(&v4_proof(), NETWORK_ID),
+            Err(WireError::ProofTagNetworkMismatch {
+                tag: FORGEMATRIX_V4_CANDIDATE_PROOF_TAG,
+            })
+        );
+        assert_eq!(
+            encode_forgematrix_proof(&v3_proof(), PRODUCTION_V4_TESTNET_NETWORK_ID),
+            Err(WireError::ProofTagNetworkMismatch {
+                tag: FORGEMATRIX_V3_CANDIDATE_PROOF_TAG,
+            })
+        );
+
+        let mut wrong_tag = encoded;
+        wrong_tag[WIRE_HEADER_BYTES] = FORGEMATRIX_V3_CANDIDATE_PROOF_TAG;
+        assert_eq!(
+            decode_forgematrix_proof(&wrong_tag, PRODUCTION_V4_TESTNET_NETWORK_ID),
+            Err(WireError::ProofTagNetworkMismatch {
+                tag: FORGEMATRIX_V3_CANDIDATE_PROOF_TAG,
+            })
+        );
+    }
+
+    #[test]
+    fn v4_candidate_accepts_the_measured_raw_proof_and_rejects_oversize_before_copy() {
+        const MEASURED_THREE_BANK_BASEFOLD_BYTES: usize = 3 * 3_296_168;
+        const {
+            assert!(MEASURED_THREE_BANK_BASEFOLD_BYTES > MAX_PROOF_BYTES);
+            assert!(
+                MEASURED_THREE_BANK_BASEFOLD_BYTES < MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES
+            );
+        }
+
+        let BlockProof::V4Candidate(mut proof) = v4_proof() else {
+            unreachable!();
+        };
+        proof.transparent_proof = vec![0x5a; MEASURED_THREE_BANK_BASEFOLD_BYTES];
+        let candidate = BlockProof::V4Candidate(proof.clone());
+        let encoded =
+            encode_forgematrix_proof(&candidate, PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap();
+        assert!(encoded.len() > MAX_PROOF_BYTES);
+        assert!(encoded.len() < PRODUCTION_V4_MAX_PROOF_BYTES);
+        assert_eq!(
+            decode_forgematrix_proof(&encoded, PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap(),
+            BlockProof::V4Candidate(proof)
+        );
+
+        let mut block = block();
+        block.challenge.network_id = PRODUCTION_V4_TESTNET_NETWORK_ID;
+        block.proof = candidate;
+        block.transactions.clear();
+        let encoded_block = encode_block(&block).unwrap();
+        assert!(encoded_block.len() > MAX_BLOCK_BYTES);
+        assert!(encoded_block.len() < PRODUCTION_V4_MAX_BLOCK_BYTES);
+        assert_eq!(
+            decode_block(&encoded_block, PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap(),
+            block
+        );
+
+        let BlockProof::V4Candidate(mut oversize) = v4_proof() else {
+            unreachable!();
+        };
+        oversize.transparent_proof = vec![0; MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES + 1];
+        assert_eq!(
+            encode_forgematrix_proof(
+                &BlockProof::V4Candidate(oversize),
+                PRODUCTION_V4_TESTNET_NETWORK_ID,
+            ),
+            Err(WireError::SizeLimit {
+                object: "transparent production proof",
+                actual: MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES + 1,
+                max: MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+            })
+        );
+
+        let mut declared_oversize =
+            encode_forgematrix_proof(&v4_proof(), PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap();
+        let proof_length_offset = WIRE_HEADER_BYTES + FORGEMATRIX_V4_PUBLIC_PREFIX_BYTES;
+        declared_oversize[proof_length_offset..proof_length_offset + FORGEMATRIX_V4_LENGTH_BYTES]
+            .copy_from_slice(
+                &u32::try_from(MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES + 1)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+        assert_eq!(
+            decode_forgematrix_proof(&declared_oversize, PRODUCTION_V4_TESTNET_NETWORK_ID,),
+            Err(WireError::SizeLimit {
+                object: "transparent production proof",
+                actual: MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES + 1,
+                max: MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+            })
+        );
+
+        let BlockProof::V4Candidate(mut empty) = v4_proof() else {
+            unreachable!();
+        };
+        empty.transparent_proof.clear();
+        assert_eq!(
+            encode_forgematrix_proof(
+                &BlockProof::V4Candidate(empty),
+                PRODUCTION_V4_TESTNET_NETWORK_ID,
+            ),
+            Err(WireError::EmptyField {
+                field: "transparent production proof",
+            })
+        );
+
+        let mut declared_empty =
+            encode_forgematrix_proof(&v4_proof(), PRODUCTION_V4_TESTNET_NETWORK_ID).unwrap();
+        declared_empty[proof_length_offset..proof_length_offset + FORGEMATRIX_V4_LENGTH_BYTES]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        declared_empty.truncate(proof_length_offset + FORGEMATRIX_V4_LENGTH_BYTES);
+        let payload_length = declared_empty.len() - WIRE_HEADER_BYTES;
+        declared_empty[12..16]
+            .copy_from_slice(&u32::try_from(payload_length).unwrap().to_le_bytes());
+        assert_eq!(
+            decode_forgematrix_proof(&declared_empty, PRODUCTION_V4_TESTNET_NETWORK_ID),
+            Err(WireError::EmptyField {
+                field: "transparent production proof",
+            })
+        );
     }
 
     #[test]

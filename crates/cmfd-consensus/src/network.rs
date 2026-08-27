@@ -8,7 +8,8 @@ use crate::economics::{EconomicsError, MonetaryPolicy};
 use crate::forgematrix::ForgeMatrixError;
 use crate::pow::{PowError, PowParameters};
 use crate::wire::{
-    MAX_BLOCK_BYTES, MAX_PROOF_BYTES, MAX_TRANSACTION_BYTES, WIRE_HEADER_BYTES, WIRE_VERSION,
+    MAX_TRANSACTION_BYTES, WIRE_HEADER_BYTES, WIRE_VERSION, max_block_bytes_for_network,
+    max_proof_bytes_for_network,
 };
 
 const NETWORK_PARAMS_DOMAIN: &str = "CMFD/NETWORK/PARAMS/V1";
@@ -126,8 +127,8 @@ impl NetworkParams {
             DGW_WINDOW,
             WIRE_HEADER_BYTES,
             MAX_TRANSACTION_BYTES,
-            MAX_PROOF_BYTES,
-            MAX_BLOCK_BYTES,
+            max_proof_bytes_for_network(self.network_id),
+            max_block_bytes_for_network(self.network_id),
         ] {
             hasher.update(&(cap as u64).to_le_bytes());
         }
@@ -415,5 +416,18 @@ mod tests {
         for candidate in variants {
             assert_ne!(candidate.fingerprint().unwrap(), fingerprint);
         }
+    }
+
+    #[test]
+    fn v4_network_fingerprint_commits_the_larger_isolated_wire_limits() {
+        let legacy = params();
+        let mut v4 = legacy;
+        v4.network_id = crate::PRODUCTION_V4_TESTNET_NETWORK_ID;
+
+        assert_eq!(max_proof_bytes_for_network(legacy.network_id), 256 * 1024);
+        assert_eq!(max_block_bytes_for_network(legacy.network_id), 1024 * 1024);
+        assert_eq!(max_proof_bytes_for_network(v4.network_id), 10 * 1024 * 1024);
+        assert_eq!(max_block_bytes_for_network(v4.network_id), 16 * 1024 * 1024);
+        assert_ne!(legacy.fingerprint().unwrap(), v4.fingerprint().unwrap());
     }
 }

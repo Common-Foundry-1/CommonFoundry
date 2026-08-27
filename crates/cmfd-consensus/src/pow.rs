@@ -46,6 +46,8 @@ pub const POW_TYPE_V1_LEGACY: u16 = 1;
 pub const POW_TYPE_V2_REFERENCE: u16 = 2;
 /// Reserved wire identity for the fail-closed structured production candidate.
 pub const POW_TYPE_V3_CANDIDATE: u16 = 3;
+/// Reserved wire identity for the isolated ProductionV4 latency testnet.
+pub const POW_TYPE_V4_CANDIDATE: u16 = 4;
 /// Largest native BLAKE3 block-row batch accepted by the runtime V3 prover.
 ///
 /// This is an operational memory bound, not a consensus parameter. Callers
@@ -296,6 +298,10 @@ pub enum BlockProof {
     /// Length-bounded production candidate. No consensus verifier can select
     /// this variant until the final model and proof parameters are pinned.
     V3Candidate(Box<ForgeMatrixV3CandidateProof>),
+    /// Length-bounded transparent-proof candidate for the isolated V4 testnet.
+    /// Existing verifiers deliberately reject this variant until the complete
+    /// V4 relation and verifier parameters are pinned.
+    V4Candidate(Box<ForgeMatrixV4CandidateProof>),
 }
 
 /// Existing V2 public fields plus one canonical structured aggregate encoding.
@@ -312,6 +318,24 @@ pub struct ForgeMatrixV3CandidateProof {
     pub final_activation_digest: [u8; 32],
     pub work_digest: [u8; 32],
     pub structured_proof: Vec<u8>,
+}
+
+/// Public V4 statement fields plus one canonical transparent proof encoding.
+///
+/// The proof-system digest binds the exact field, PCS, transcript, query, and
+/// soundness parameters. The proof bytes remain opaque to block framing so the
+/// future verifier can parse them behind its own strict resource bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeMatrixV4CandidateProof {
+    pub algorithm_version: u32,
+    pub proof_version: u32,
+    pub nonce: u64,
+    pub proof_system_digest: [u8; 32],
+    pub model_manifest_digest: [u8; 32],
+    pub challenge_digest: [u8; 32],
+    pub final_activation_digest: [u8; 32],
+    pub work_digest: [u8; 32],
+    pub transparent_proof: Vec<u8>,
 }
 
 /// Process-local evidence that the configured verifier accepted one exact
@@ -518,6 +542,7 @@ impl BlockProof {
             Self::V1Legacy(_) => POW_TYPE_V1_LEGACY,
             Self::V2Reference(_) => POW_TYPE_V2_REFERENCE,
             Self::V3Candidate(_) => POW_TYPE_V3_CANDIDATE,
+            Self::V4Candidate(_) => POW_TYPE_V4_CANDIDATE,
         }
     }
 
@@ -528,6 +553,7 @@ impl BlockProof {
             Self::V1Legacy(proof) => proof.work_digest,
             Self::V2Reference(proof) => proof.work_digest,
             Self::V3Candidate(proof) => proof.work_digest,
+            Self::V4Candidate(proof) => proof.work_digest,
         }
     }
 
@@ -561,6 +587,18 @@ impl BlockProof {
                 hasher.update(&proof.work_digest);
                 hasher.update(&(proof.structured_proof.len() as u64).to_le_bytes());
                 hasher.update(&proof.structured_proof);
+            }
+            Self::V4Candidate(proof) => {
+                hasher.update(&proof.algorithm_version.to_le_bytes());
+                hasher.update(&proof.proof_version.to_le_bytes());
+                hasher.update(&proof.nonce.to_le_bytes());
+                hasher.update(&proof.proof_system_digest);
+                hasher.update(&proof.model_manifest_digest);
+                hasher.update(&proof.challenge_digest);
+                hasher.update(&proof.final_activation_digest);
+                hasher.update(&proof.work_digest);
+                hasher.update(&(proof.transparent_proof.len() as u64).to_le_bytes());
+                hasher.update(&proof.transparent_proof);
             }
         }
     }
@@ -1604,6 +1642,90 @@ mod tests {
             v1.verify(&block(v2_network), &v2_proof),
             Err(PowError::WrongProofType)
         ));
+
+        let v4_proof = BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
+            algorithm_version: 4,
+            proof_version: 1,
+            nonce: 0,
+            proof_system_digest: [1; 32],
+            model_manifest_digest: [2; 32],
+            challenge_digest: [3; 32],
+            final_activation_digest: [4; 32],
+            work_digest: [5; 32],
+            transparent_proof: vec![6],
+        }));
+        assert_eq!(v4_proof.proof_type(), POW_TYPE_V4_CANDIDATE);
+        assert_eq!(v4_proof.work_digest(), [5; 32]);
+        assert!(matches!(
+            v1.verify(&block(crate::PRODUCTION_V4_TESTNET_NETWORK_ID), &v4_proof),
+            Err(PowError::WrongProofType)
+        ));
+    }
+
+    #[test]
+    fn v4_statement_identity_binds_every_challenge_and_proof_byte() {
+        let challenge = block(crate::PRODUCTION_V4_TESTNET_NETWORK_ID);
+        let candidate = ForgeMatrixV4CandidateProof {
+            algorithm_version: 4,
+            proof_version: 1,
+            nonce: 7,
+            proof_system_digest: [1; 32],
+            model_manifest_digest: [2; 32],
+            challenge_digest: [3; 32],
+            final_activation_digest: [4; 32],
+            work_digest: [5; 32],
+            transparent_proof: vec![6, 7],
+        };
+        let proof = BlockProof::V4Candidate(Box::new(candidate.clone()));
+        let expected = preverified_statement_identity(&challenge, &proof);
+
+        type Mutation = fn(&mut BlockChallenge, &mut ForgeMatrixV4CandidateProof);
+        let mutations: [(&str, Mutation); 16] = [
+            ("network_id", |challenge, _| challenge.network_id[0] ^= 1),
+            ("previous_block", |challenge, _| {
+                challenge.previous_block[0] ^= 1
+            }),
+            ("transaction_root", |challenge, _| {
+                challenge.transaction_root[0] ^= 1
+            }),
+            ("height", |challenge, _| challenge.height ^= 1),
+            ("timestamp", |challenge, _| challenge.timestamp ^= 1),
+            ("target", |challenge, _| challenge.target[0] ^= 1),
+            ("algorithm_version", |_, proof| proof.algorithm_version ^= 1),
+            ("proof_version", |_, proof| proof.proof_version ^= 1),
+            ("nonce", |_, proof| proof.nonce ^= 1),
+            ("proof_system_digest", |_, proof| {
+                proof.proof_system_digest[0] ^= 1
+            }),
+            ("model_manifest_digest", |_, proof| {
+                proof.model_manifest_digest[0] ^= 1
+            }),
+            ("challenge_digest", |_, proof| {
+                proof.challenge_digest[0] ^= 1
+            }),
+            ("final_activation_digest", |_, proof| {
+                proof.final_activation_digest[0] ^= 1
+            }),
+            ("work_digest", |_, proof| proof.work_digest[0] ^= 1),
+            ("transparent_proof_byte", |_, proof| {
+                proof.transparent_proof[0] ^= 1
+            }),
+            ("transparent_proof_length", |_, proof| {
+                proof.transparent_proof.push(8)
+            }),
+        ];
+
+        for (name, mutate) in mutations {
+            let mut changed_challenge = challenge;
+            let mut changed_candidate = candidate.clone();
+            mutate(&mut changed_challenge, &mut changed_candidate);
+            let changed_proof = BlockProof::V4Candidate(Box::new(changed_candidate));
+            assert_ne!(
+                preverified_statement_identity(&changed_challenge, &changed_proof),
+                expected,
+                "statement mutation not absorbed: {name}"
+            );
+        }
     }
 
     #[test]

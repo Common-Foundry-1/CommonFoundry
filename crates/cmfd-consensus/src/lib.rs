@@ -180,8 +180,8 @@ pub use network::{
 };
 pub use pow::{
     BlockProof, ConsensusPowVerifier, ExternalPreverificationBinding, ForgeMatrixV3CandidateProof,
-    POW_TYPE_V1_LEGACY, POW_TYPE_V2_REFERENCE, POW_TYPE_V3_CANDIDATE, PowError, PowParameters,
-    PreverifiedBlockProof,
+    ForgeMatrixV4CandidateProof, POW_TYPE_V1_LEGACY, POW_TYPE_V2_REFERENCE, POW_TYPE_V3_CANDIDATE,
+    POW_TYPE_V4_CANDIDATE, PowError, PowParameters, PreverifiedBlockProof,
 };
 #[cfg(feature = "dory-v3-consensus-adapter")]
 pub use pow::{
@@ -351,8 +351,11 @@ pub use whir_proof::{
 };
 pub use wire::{
     BLOCK_KIND, FORGEMATRIX_PROOF_KIND, FORGEMATRIX_V1_PROOF_TAG, FORGEMATRIX_V2_PROOF_TAG,
-    FORGEMATRIX_V3_CANDIDATE_PROOF_TAG, MAX_BLOCK_BYTES, MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES,
-    MAX_PROOF_BYTES, MAX_TRANSACTION_BYTES, TRANSACTION_KIND, WIRE_HEADER_BYTES, WIRE_VERSION,
-    WireError, decode_block, decode_forgematrix_proof, decode_transaction, encode_block,
-    encode_forgematrix_proof, encode_transaction, network_magic,
+    FORGEMATRIX_V3_CANDIDATE_PROOF_TAG, FORGEMATRIX_V4_CANDIDATE_PROOF_TAG, MAX_BLOCK_BYTES,
+    MAX_FORGEMATRIX_V3_STRUCTURED_PROOF_BYTES, MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+    MAX_PROOF_BYTES, MAX_TRANSACTION_BYTES, PRODUCTION_V4_MAX_BLOCK_BYTES,
+    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_TESTNET_NETWORK_ID, TRANSACTION_KIND,
+    WIRE_HEADER_BYTES, WIRE_VERSION, WireError, decode_block, decode_forgematrix_proof,
+    decode_transaction, encode_block, encode_forgematrix_proof, encode_transaction,
+    max_block_bytes_for_network, max_proof_bytes_for_network, network_magic,
 };

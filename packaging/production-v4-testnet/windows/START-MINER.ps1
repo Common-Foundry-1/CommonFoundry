@@ -1,8 +1,6 @@
 #requires -Version 5.1
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [ValidatePattern('^[0-9a-fA-F]{64}$')]
     [string]$Miner,
     [string]$Peer = '107.214.187.2:22444',
     [ValidateRange(0, [int]::MaxValue)]
@@ -11,6 +9,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Miner)) {
+    Write-Host 'Paste the 64-character receive address shown by your Devnet-16 wallet.'
+    $Miner = (Read-Host 'Mining address').Trim()
+}
+if ($Miner -cnotmatch '^[0-9a-fA-F]{64}$') {
+    throw 'Mining address must be exactly 64 hexadecimal characters.'
+}
 & (Join-Path $PSScriptRoot 'PREPARE-V4-INPUTS.ps1') -Role Miner
 $inputs = Join-Path $PSScriptRoot 'inputs'
 $work = Join-Path $PSScriptRoot 'work'

@@ -11,13 +11,11 @@ if not exist "%~dp0START-MINER.ps1" (
   exit /b 1
 )
 
-set "MINER_ADDRESS=%~1"
-if not defined MINER_ADDRESS (
-  echo Paste the 64-character receive address shown by your Devnet-16 wallet.
-  set /p "MINER_ADDRESS=Mining address: "
+if "%~1"=="" (
+  "%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0START-MINER.ps1"
+) else (
+  "%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0START-MINER.ps1" -Miner "%~1"
 )
-
-"%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0START-MINER.ps1" -Miner "%MINER_ADDRESS%"
 set "MINER_EXIT=%ERRORLEVEL%"
 if not "%MINER_EXIT%"=="0" echo ERROR: Miner stopped with exit code %MINER_EXIT%.
 pause

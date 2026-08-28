@@ -24,8 +24,14 @@ The online proving path is:
 5. run `real_bank0_relations` to create and CPU-self-verify the exact proof; and
 6. submit the unchanged template and proof with `cmfd-miner submit-v4-template`.
 
-The block-1-qualified prover authenticates and maps three canonical fixed codewords, maps three
-row-major fixed codewords for fast reads, and authenticates three Merkle trees. This current cache
-occupies about 105 GiB. Reducing the release bundle to the row-major codewords and trees (about
-54 GiB) requires a separately qualified cache-authentication change. Nodes need only the 6.4 GB
-model bank and the 6,973-byte fixed record; they do not need the proving cache.
+Fast proving requires the fixed record, three row-major fixed codewords, and three authenticated
+Merkle trees, occupying about 54 GiB. The row-major files are untrusted caches: every queried row
+is opened against the record-pinned tree, and the finished proof is CPU-self-verified. The three
+canonical codewords are needed to generate the row-major caches but not to mine. Block 1 was
+re-proved successfully with all canonical codewords absent. Nodes need only the 6.4 GB model bank
+and the 6,973-byte fixed record; they do not need the proving cache.
+
+On Windows, `scripts/run-production-v4-miner.ps1` performs the complete template, replay,
+commitment, proof, CPU-verification, and submission sequence. Its `Blocks` value defaults to zero,
+which continues until interrupted. The current qualified binaries target compute capability 12.0
+and the launcher enforces at least 15,000 MiB of reported GPU memory.

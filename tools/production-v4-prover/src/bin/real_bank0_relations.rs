@@ -504,7 +504,7 @@ fn prove_bank_relations(
     Vec<CpuOpeningClaim>,
 )> {
     let upload_started = Instant::now();
-    let encoded_device = DeviceBuffer::from_host_slice(&encoded_bank, scope)?;
+    let encoded_device = DeviceBuffer::from_host_slice(encoded_bank, scope)?;
     let dynamic =
         DeviceTensor::from_raw(
             Tensor::from(DeviceBuffer::from_host_slice(dynamic_values, scope)?.into_inner())
@@ -787,9 +787,11 @@ fn read_final_activation(path: &Path) -> Result<Vec<CpuFelt>> {
     let bytes = std::fs::read(path)?;
     ensure!(bytes.len() == CELLS * 4, "wrong final activation length");
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|bytes| {
-            let value = u32::from_le_bytes(bytes.try_into().unwrap());
+            let value = u32::from_le_bytes(*bytes);
             ensure!(value < MODULUS, "noncanonical final activation");
             Ok(CpuFelt::from_canonical_u32(value))
         })

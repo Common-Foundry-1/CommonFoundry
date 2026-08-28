@@ -417,28 +417,37 @@ fn add_ext_in_place(
 impl FixedArtifactMaps {
     pub fn open(artifact_dir: &Path, artifact: ForgeMatrixV4FixedBankArtifactV1) -> Result<Self> {
         let bank = artifact.bank();
-        let codeword_file =
-            File::open(artifact_dir.join(format!("FORGEMATRIX-V4-FIXED-BANK-{bank}.codeword")))?;
+        let canonical_path =
+            artifact_dir.join(format!("FORGEMATRIX-V4-FIXED-BANK-{bank}.codeword"));
+        let row_major_path = artifact_dir.join(format!(
+            "FORGEMATRIX-V4-FIXED-BANK-{bank}.row-major.codeword"
+        ));
         let tree_file =
             File::open(artifact_dir.join(format!("FORGEMATRIX-V4-FIXED-BANK-{bank}.tree")))?;
-        ensure!(
-            codeword_file.metadata()?.len() == artifact.codeword_bytes(),
-            "fixed codeword length mismatch"
-        );
         ensure!(
             tree_file.metadata()?.len() == artifact.tree_bytes(),
             "fixed tree length mismatch"
         );
-        let canonical_codeword = unsafe { MmapOptions::new().map(&codeword_file)? };
+        let canonical_codeword = if canonical_path.is_file() {
+            let codeword_file = File::open(&canonical_path)?;
+            ensure!(
+                codeword_file.metadata()?.len() == artifact.codeword_bytes(),
+                "fixed codeword length mismatch"
+            );
+            let codeword = unsafe { MmapOptions::new().map(&codeword_file)? };
+            ensure!(
+                blake3::Hasher::new()
+                    .update_rayon(&codeword)
+                    .finalize()
+                    .as_bytes()
+                    == &artifact.codeword_blake3(),
+                "fixed codeword digest mismatch"
+            );
+            Some(codeword)
+        } else {
+            None
+        };
         let tree = unsafe { MmapOptions::new().map(&tree_file)? };
-        ensure!(
-            blake3::Hasher::new()
-                .update_rayon(&canonical_codeword)
-                .finalize()
-                .as_bytes()
-                == &artifact.codeword_blake3(),
-            "fixed codeword digest mismatch"
-        );
         ensure!(
             blake3::Hasher::new()
                 .update_rayon(&tree)
@@ -452,9 +461,8 @@ impl FixedArtifactMaps {
             root.map(|value| value.as_canonical_u32()) == artifact.merkle_root_words(),
             "fixed tree root mismatch"
         );
-        let row_major_path = artifact_dir.join(format!(
-            "FORGEMATRIX-V4-FIXED-BANK-{bank}.row-major.codeword"
-        ));
+        // The row-major file is an untrusted read cache. Every value used from it is opened
+        // against the digest-pinned Merkle tree, and the finished proof is CPU-self-verified.
         let (codeword, row_major) = if row_major_path.is_file() {
             let row_major_file = File::open(row_major_path)?;
             ensure!(
@@ -463,7 +471,11 @@ impl FixedArtifactMaps {
             );
             (unsafe { MmapOptions::new().map(&row_major_file)? }, true)
         } else {
-            (canonical_codeword, false)
+            (
+                canonical_codeword
+                    .context("missing both canonical and row-major fixed codeword artifacts")?,
+                false,
+            )
         };
         let commitment = artifact.commitment_words().map(Felt::from_canonical_u32);
         Ok(Self {

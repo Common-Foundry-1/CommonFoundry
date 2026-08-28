@@ -24,11 +24,13 @@ use cmfd_consensus::ForgeMatrixV3WinningNonceClaim;
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::dory_v3_qualification::ProductionDoryV3QualificationSeed;
 #[cfg(feature = "production-v4-testnet")]
+use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_mask_coefficients;
+#[cfg(feature = "production-v4-testnet")]
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
 #[cfg(feature = "production-v4-testnet")]
 use cmfd_consensus::{
     BlockChallenge, Coinbase, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_PROOF_VERSION,
-    ForgeMatrixV4CandidateProof, ForgeMatrixV4FixedArtifactRecordV1,
+    ForgeMatrixV4CandidateProof, ForgeMatrixV4FixedArtifactRecordV1, PRODUCTION_V2_LAYERS,
     PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MAX_BLOCK_BYTES,
     PRODUCTION_V4_MAX_PROOF_BYTES, Transaction, forgematrix_v4_challenge_digest,
     forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
@@ -216,6 +218,12 @@ enum Command {
         miner: String,
         #[arg(long, default_value_t = 0)]
         nonce: u64,
+        /// Existing compiled ProductionV4 fixed artifact record.
+        #[arg(long)]
+        fixed_record: PathBuf,
+        /// New replay-coefficient file bound to the frozen template.
+        #[arg(long)]
+        coefficients_output: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
@@ -439,8 +447,18 @@ fn main() -> Result<()> {
             allow_public_peers,
             miner,
             nonce,
+            fixed_record,
+            coefficients_output,
             output,
-        } => snapshot_v4_template(peer, allow_public_peers, &miner, nonce, &output),
+        } => snapshot_v4_template(
+            peer,
+            allow_public_peers,
+            &miner,
+            nonce,
+            &fixed_record,
+            &coefficients_output,
+            &output,
+        ),
         #[cfg(feature = "production-v4-testnet")]
         Command::SubmitV4Template {
             peer,
@@ -568,10 +586,28 @@ fn snapshot_v4_template(
     allow_public_peers: bool,
     miner: &str,
     nonce: u64,
+    fixed_record_path: &Path,
+    coefficients_output: &Path,
     output: &Path,
 ) -> Result<()> {
     ensure_production_v4_test_tool()?;
+    ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
+    ensure_new_absolute_output(coefficients_output, "ProductionV4 replay coefficients")?;
     ensure_new_absolute_output(output, "ProductionV4 template")?;
+    if coefficients_output == output {
+        bail!("ProductionV4 template and replay coefficient outputs must be different paths");
+    }
+    let fixed_record_bytes = read_bounded_file(
+        fixed_record_path,
+        64 * 1024,
+        "ProductionV4 fixed artifact record",
+    )?;
+    let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 =
+        serde_json::from_slice(&fixed_record_bytes)?;
+    fixed_record.validate()?;
+    if fixed_record.record_digest() != PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST {
+        bail!("ProductionV4 fixed artifact record is not the compiled testnet record");
+    }
     let payout = parse_miner_destination(miner).map_err(anyhow::Error::from)?;
     let address_policy = qualified_template_address_policy(peer, allow_public_peers)?;
     let response = request_mining_template_once_with_policy(
@@ -581,15 +617,41 @@ fn snapshot_v4_template(
         address_policy,
     )?;
     let frozen = FrozenProductionV4Template::from_mining_template(response.template, nonce);
+    let challenge_digest = forgematrix_v4_challenge_digest(
+        &frozen.challenge,
+        frozen.nonce,
+        fixed_record.manifest_digest(),
+    );
+    let coefficients = production_v4_replay_coefficients(challenge_digest);
     let bytes = canonical_json(&frozen, "ProductionV4 template")?;
+    // The template is the completion marker for this bound output pair.
+    write_new_file(
+        coefficients_output,
+        &coefficients,
+        "ProductionV4 replay coefficients",
+    )?;
     write_new_file(output, &bytes, "ProductionV4 template")?;
     println!(
-        "Frozen ProductionV4 height {} nonce {} from {peer}: {}",
+        "Frozen ProductionV4 height {} nonce {} from {peer}: {} (coefficients: {})",
         frozen.challenge.height,
         frozen.nonce,
-        output.display()
+        output.display(),
+        coefficients_output.display()
     );
     Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn production_v4_replay_coefficients(challenge_digest: [u8; 32]) -> Vec<u8> {
+    let mut coefficients = Vec::with_capacity((PRODUCTION_V2_LAYERS as usize + 1) * 20);
+    coefficients.extend_from_slice(&forgematrix_v4_mask_coefficients(
+        challenge_digest,
+        u32::MAX,
+    ));
+    for layer in 0..PRODUCTION_V2_LAYERS {
+        coefficients.extend_from_slice(&forgematrix_v4_mask_coefficients(challenge_digest, layer));
+    }
+    coefficients
 }
 
 #[cfg(feature = "production-v4-testnet")]
@@ -4283,6 +4345,51 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use super::*;
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn production_v4_snapshot_requires_bound_replay_outputs() {
+        let snapshot = Cli::try_parse_from([
+            "cmfd-miner",
+            "snapshot-v4-template",
+            "--peer",
+            "127.0.0.1:22444",
+            "--miner",
+            "11e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+            "--fixed-record",
+            "D:\\fixed-record.json",
+            "--coefficients-output",
+            "D:\\replay-coefficients.bin",
+            "--output",
+            "D:\\v4-template.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            snapshot.command,
+            Command::SnapshotV4Template { nonce: 0, .. }
+        ));
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn production_v4_replay_coefficients_cover_every_layer() {
+        let challenge_digest = [0x42; 32];
+        let coefficients = production_v4_replay_coefficients(challenge_digest);
+        assert_eq!(coefficients.len(), (PRODUCTION_V2_LAYERS as usize + 1) * 20);
+        assert_eq!(
+            &coefficients[..20],
+            &forgematrix_v4_mask_coefficients(challenge_digest, u32::MAX)
+        );
+        assert_eq!(
+            &coefficients[20..40],
+            &forgematrix_v4_mask_coefficients(challenge_digest, 0)
+        );
+        let last = PRODUCTION_V2_LAYERS as usize * 20;
+        assert_eq!(
+            &coefficients[last..last + 20],
+            &forgematrix_v4_mask_coefficients(challenge_digest, PRODUCTION_V2_LAYERS - 1)
+        );
+    }
 
     fn retry_test_block() -> cmfd_consensus::Block {
         let reference = cmfd_consensus::v2_test_reference().unwrap();

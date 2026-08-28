@@ -1,0 +1,1181 @@
+diff --git a/sp1-gpu/crates/basefold/src/fri.rs b/sp1-gpu/crates/basefold/src/fri.rs
+index 31ef533..72d813c 100644
+--- a/sp1-gpu/crates/basefold/src/fri.rs
++++ b/sp1-gpu/crates/basefold/src/fri.rs
+@@ -61,6 +61,13 @@ pub struct FriCudaProver<GC, P, F> {
+     _marker: PhantomData<GC>,
+ }
+ 
++pub type TrustedMleBatchBuilder<'a, GC> = Box<
++    dyn FnOnce(&Tensor<<GC as IopCtx>::EF>, &TaskScope) -> Mle<<GC as IopCtx>::EF, TaskScope> + 'a,
++>;
++
++pub type TrustedComponentOpeningBuilder<'a, GC> =
++    Box<dyn FnOnce(&[usize]) -> Option<MerkleTreeOpeningAndProof<GC>> + 'a>;
++
+ impl<GC: IopCtx<F = Felt, EF = Ext>, P> FriCudaProver<GC, P, GC::F>
+ where
+     GC::F: TwoAdicField,
+@@ -316,25 +323,95 @@ where
+         )
+     }
+ 
++    fn encode_batched_mle(&self, batch_mle: &Mle<GC::EF, TaskScope>) -> Tensor<GC::F, TaskScope> {
++        let scope = batch_mle.backend().clone();
++        let height = 1 << self.log_height;
++        let mut flattened = Tensor::<GC::F, TaskScope>::with_sizes_in(
++            [<GC::EF as AbstractExtensionField<GC::F>>::D, height],
++            scope.clone(),
++        );
++        let mut codeword = Tensor::<GC::F, TaskScope>::with_sizes_in(
++            [<GC::EF as AbstractExtensionField<GC::F>>::D, height << self.config.log_blowup()],
++            scope.clone(),
++        );
++        let block_dim = 256;
++        let grid_dim = height.div_ceil(block_dim);
++        unsafe {
++            let args = args!(batch_mle.guts().as_ptr(), flattened.as_mut_ptr(), height);
++            flattened.assume_init();
++            codeword.assume_init();
++            scope
++                .launch_kernel(TaskScope::flatten_to_base_kernel(), grid_dim, block_dim, &args, 0)
++                .unwrap();
++        }
++        encode_batch(
++            SpparkDftKoalaBear::default(),
++            self.config.log_blowup as u32,
++            flattened.as_view(),
++            &mut codeword,
++        )
++        .unwrap();
++        codeword
++    }
++
+     #[inline]
+     pub fn prove_trusted_evaluations_basefold(
++        &self,
++        eval_point: Point<GC::EF>,
++        evaluation_claims: Vec<GC::EF>,
++        mles: Option<JaggedTraceMle<GC::F, TaskScope>>,
++        batch_mle_builder: Option<TrustedMleBatchBuilder<'_, GC>>,
++        prover_data: Rounds<&CudaStackedPcsProverData<GC>>,
++        challenger: &mut GC::Challenger,
++    ) -> Result<BasefoldProof<GC>, BasefoldProverError<SingleLayerMerkleTreeProverError>>
++    where
++        GC::Challenger: DeviceGrindingChallenger<Witness = GC::F>,
++    {
++        self.prove_trusted_evaluations_basefold_with_component_openings(
++            eval_point,
++            evaluation_claims,
++            mles,
++            batch_mle_builder,
++            prover_data,
++            None,
++            challenger,
++        )
++    }
++
++    #[inline]
++    pub fn prove_trusted_evaluations_basefold_with_component_openings(
+         &self,
+         mut eval_point: Point<GC::EF>,
+         evaluation_claims: Vec<GC::EF>,
+-        mles: &JaggedTraceMle<GC::F, TaskScope>,
++        mles: Option<JaggedTraceMle<GC::F, TaskScope>>,
++        batch_mle_builder: Option<TrustedMleBatchBuilder<'_, GC>>,
+         prover_data: Rounds<&CudaStackedPcsProverData<GC>>,
++        component_opening_builders: Option<Vec<Option<TrustedComponentOpeningBuilder<'_, GC>>>>,
+         challenger: &mut GC::Challenger,
+     ) -> Result<BasefoldProof<GC>, BasefoldProverError<SingleLayerMerkleTreeProverError>>
+     where
+         GC::Challenger: DeviceGrindingChallenger<Witness = GC::F>,
+     {
+-        let scope = mles.dense().dense.backend().clone();
+-        let mut codewords: Vec<Arc<Tensor<Felt, TaskScope>>> = Vec::new();
+-        for data in prover_data.iter() {
++        if mles.is_some() == batch_mle_builder.is_some() {
++            return Err(BasefoldProverError::IncorrectShape);
++        }
++        let component_opening_builders = component_opening_builders
++            .unwrap_or_else(|| std::iter::repeat_with(|| None).take(prover_data.len()).collect());
++        if component_opening_builders.len() != prover_data.len() {
++            return Err(BasefoldProverError::IncorrectShape);
++        }
++        let mut codewords: Vec<Option<Arc<Tensor<Felt, TaskScope>>>> = Vec::new();
++        for (data, opening_builder) in prover_data.iter().zip(component_opening_builders.iter()) {
++            if opening_builder.is_some() {
++                codewords.push(None);
++                continue;
++            }
+             if let Some(ref codeword) = data.codeword_mle {
+-                codewords.push(codeword.clone());
++                codewords.push(Some(codeword.clone()));
+             } else {
+                 // Codeword was dropped - this is always a main trace.
++                let mles = mles.as_ref().ok_or(BasefoldProverError::IncorrectShape)?;
++                let scope = mles.dense().dense.backend().clone();
+                 let mut dst = Tensor::<Felt, TaskScope>::with_sizes_in(
+                     [
+                         mles.dense().main_size() >> self.log_height,
+@@ -355,14 +432,21 @@ where
+                 )
+                 .unwrap();
+ 
+-                codewords.push(Arc::new(dst));
++                codewords.push(Some(Arc::new(dst)));
+             }
+         }
+ 
+-        let total_num_polynomials = codewords.iter().map(|c| c.sizes()[0]).sum::<usize>();
+-        let num_batching_variables = total_num_polynomials.next_power_of_two().ilog2();
++        let scope = codewords
++            .iter()
++            .flatten()
++            .next()
++            .ok_or(BasefoldProverError::IncorrectShape)?
++            .backend()
++            .clone();
+ 
+-        let encoded_messages: Message<_> = codewords.iter().cloned().collect();
++        let total_num_polynomials =
++            prover_data.iter().map(|data| data.merkle_tree_tcs_data.3).sum::<usize>();
++        let num_batching_variables = total_num_polynomials.next_power_of_two().ilog2();
+ 
+         // Grind for batch randomness.
+         let batch_grinding_witness =
+@@ -371,9 +455,36 @@ where
+         let batching_point = challenger.sample_point::<GC::EF>(num_batching_variables);
+         let batching_coefficients = partial_lagrange_blocking(&batching_point);
+ 
+-        // Batch the mles and codewords.
+-        let (mle_batch, codeword_batch, batched_eval_claim) =
+-            self.batch(&batching_coefficients, mles.dense(), encoded_messages, evaluation_claims);
++        // Batch the MLEs. Production-width callers may provide a challenge-
++        // weighted builder so the original multi-gigabyte trace can be
++        // released before the BaseFold folding trees are allocated.
++        let (mle_batch, codeword_batch, batched_eval_claim) = if let Some(mles) = mles.as_ref() {
++            let encoded_messages: Message<_> = codewords
++                .iter()
++                .map(|codeword| {
++                    codeword.as_ref().cloned().ok_or(BasefoldProverError::IncorrectShape)
++                })
++                .collect::<Result<_, _>>()?;
++            self.batch(&batching_coefficients, mles.dense(), encoded_messages, evaluation_claims)
++        } else {
++            let builder = batch_mle_builder.ok_or(BasefoldProverError::IncorrectShape)?;
++            let mle_batch = builder(&batching_coefficients, &scope);
++            if mle_batch.num_variables() != self.log_height || mle_batch.num_polynomials() != 1 {
++                return Err(BasefoldProverError::IncorrectShape);
++            }
++            let codeword_batch = self.encode_batched_mle(&mle_batch);
++            let batched_eval_claim = evaluation_claims
++                .into_iter()
++                .zip(batching_coefficients.as_slice())
++                .map(|(evaluation, coefficient)| evaluation * *coefficient)
++                .sum::<GC::EF>();
++            (mle_batch, codeword_batch, batched_eval_claim)
++        };
++        // The original trace is not used after batching. Releasing it here is
++        // required for production-width commitments to leave enough VRAM for
++        // the first BaseFold folding tree.
++        drop(mles);
++        scope.synchronize_blocking().unwrap();
+         // From this point on, run the BaseFold protocol on the random linear combination codeword,
+         // the random linear combination multilinear, and the random linear combination of the
+         // evaluation claims.
+@@ -438,13 +549,20 @@ where
+ 
+         // Open the original polynomials at the query indices.
+         let mut component_polynomials_query_openings_and_proofs = vec![];
+-        for (data, codeword) in prover_data.iter().zip(codewords.iter()) {
+-            let values = self.tcs_prover.compute_openings_at_indices(codeword, &query_indices);
+-            let proof = self
+-                .tcs_prover
+-                .prove_openings_at_indices(&data.merkle_tree_tcs_data, codeword, &query_indices)
+-                .map_err(BasefoldProverError::TcsCommitError)?;
+-            let opening = MerkleTreeOpeningAndProof::<GC> { values, proof };
++        for ((data, codeword), opening_builder) in
++            prover_data.iter().zip(codewords.iter()).zip(component_opening_builders)
++        {
++            let opening = if let Some(opening_builder) = opening_builder {
++                opening_builder(&query_indices).ok_or(BasefoldProverError::IncorrectShape)?
++            } else {
++                let codeword = codeword.as_ref().ok_or(BasefoldProverError::IncorrectShape)?;
++                let values = self.tcs_prover.compute_openings_at_indices(codeword, &query_indices);
++                let proof = self
++                    .tcs_prover
++                    .prove_openings_at_indices(&data.merkle_tree_tcs_data, codeword, &query_indices)
++                    .map_err(BasefoldProverError::TcsCommitError)?;
++                MerkleTreeOpeningAndProof::<GC> { values, proof }
++            };
+             component_polynomials_query_openings_and_proofs.push(opening);
+         }
+ 
+diff --git a/sp1-gpu/crates/jagged_sumcheck/src/hadamard.rs b/sp1-gpu/crates/jagged_sumcheck/src/hadamard.rs
+index 6507904..fd674f8 100644
+--- a/sp1-gpu/crates/jagged_sumcheck/src/hadamard.rs
++++ b/sp1-gpu/crates/jagged_sumcheck/src/hadamard.rs
+@@ -3,18 +3,22 @@ use num_bigint::BigUint;
+ use slop_algebra::{interpolate_univariate_polynomial, AbstractField, Field};
+ use slop_algebra::{AbstractExtensionField, UnivariatePolynomial};
+ use slop_challenger::FieldChallenger;
+-use slop_multilinear::Mle;
+ use slop_multilinear::MleBaseBackend;
++use slop_multilinear::{Mle, Point};
++use sp1_gpu_cudart::sys::kernels::cubic_transition_fix_last_variable_and_sum_as_poly_ext_kernel;
++use sp1_gpu_cudart::sys::kernels::cubic_transition_sum_as_poly_ext_kernel;
+ use sp1_gpu_cudart::sys::kernels::hadamard_fix_last_variable_and_sum_as_poly_base_ext_kernel;
+ use sp1_gpu_cudart::sys::kernels::hadamard_fix_last_variable_and_sum_as_poly_ext_ext_kernel;
+ use sp1_gpu_cudart::sys::kernels::hadamard_sum_as_poly_base_ext_kernel;
+ use sp1_gpu_cudart::sys::kernels::hadamard_sum_as_poly_ext_ext_kernel;
+ use sp1_gpu_cudart::sys::kernels::mle_fix_last_variable_koala_bear_ext_ext_zero_padding;
+ use sp1_gpu_cudart::sys::kernels::padded_hadamard_fix_and_sum;
++use sp1_gpu_cudart::sys::kernels::triple_hadamard_fix_last_variable_and_sum_as_poly_ext_kernel;
++use sp1_gpu_cudart::sys::kernels::triple_hadamard_sum_as_poly_ext_kernel;
+ use sp1_gpu_cudart::sys::runtime::Dim3;
+ use sp1_gpu_cudart::sys::runtime::KernelPtr;
+-use sp1_gpu_cudart::TaskScope;
+ use sp1_gpu_cudart::{args, DeviceTensor};
++use sp1_gpu_cudart::{DevicePoint, TaskScope};
+ use sp1_gpu_utils::{Ext, Felt};
+ 
+ use slop_sumcheck::PartialSumcheckProof;
+@@ -330,6 +334,508 @@ where
+     }
+ }
+ 
++fn sum_round_polynomials(polynomials: &[UnivariatePolynomial<Ext>]) -> UnivariatePolynomial<Ext> {
++    let mut coefficients = vec![Ext::zero(); 3];
++    for polynomial in polynomials {
++        assert_eq!(polynomial.coefficients.len(), coefficients.len());
++        for (sum, &coefficient) in coefficients.iter_mut().zip(&polynomial.coefficients) {
++            *sum += coefficient;
++        }
++    }
++    UnivariatePolynomial::new(coefficients)
++}
++
++fn observe_round_polynomial<C>(challenger: &mut C, polynomial: &UnivariatePolynomial<Ext>)
++where
++    C: FieldChallenger<Felt>,
++{
++    challenger.observe_slice(
++        &polynomial
++            .coefficients
++            .iter()
++            .flat_map(|value| value.as_base_slice())
++            .copied()
++            .collect_vec(),
++    );
++}
++
++/// Proves a random-linear combination of multilinear evaluations at distinct
++/// points without materializing a selector-expanded equality table.
++///
++/// Each trace is already scaled by its random-linear-combination coefficient.
++/// `component_claims[i]` is the claimed sum of `traces[i] * eq(points[i], ·)`.
++pub fn multi_hadamard_sumcheck_at_points<C>(
++    mut traces: Vec<Mle<Ext, TaskScope>>,
++    equality_points: &[Point<Ext>],
++    mut component_claims: Vec<Ext>,
++    mut challenger: C,
++    initial_claim: Ext,
++) -> (PartialSumcheckProof<Ext>, Vec<Ext>)
++where
++    C: FieldChallenger<Felt>,
++{
++    assert!(!traces.is_empty());
++    assert_eq!(traces.len(), equality_points.len());
++    assert_eq!(traces.len(), component_claims.len());
++    assert_eq!(component_claims.iter().copied().sum::<Ext>(), initial_claim);
++    let num_variables = traces[0].num_variables() as usize;
++    assert!(num_variables > 0);
++    assert!(traces.iter().all(|trace| trace.num_variables() as usize == num_variables));
++    assert!(equality_points.iter().all(|point| point.dimension() == num_variables));
++
++    let scope = traces[0].backend().clone();
++    let mut equalities: Vec<Mle<Ext, TaskScope>> = Vec::new();
++    let mut univariate_polys = Vec::with_capacity(num_variables);
++    let mut point = Vec::with_capacity(num_variables);
++
++    for round in 0..num_variables {
++        let component_polynomials = if round == 0 {
++            traces
++                .iter()
++                .zip(equality_points)
++                .zip(&component_claims)
++                .map(|((trace, equality_point), &claim)| {
++                    let device_point = DevicePoint::from_host(equality_point, &scope).unwrap();
++                    let equality: Mle<Ext, TaskScope> = device_point.partial_lagrange().into();
++                    sum_in_last_variable(
++                        trace,
++                        &equality,
++                        claim,
++                        hadamard_sum_as_poly_ext_ext_kernel,
++                    )
++                })
++                .collect::<Vec<_>>()
++        } else {
++            traces
++                .iter()
++                .zip(&equalities)
++                .zip(&component_claims)
++                .map(|((trace, equality), &claim)| {
++                    sum_in_last_variable(
++                        trace,
++                        equality,
++                        claim,
++                        hadamard_sum_as_poly_ext_ext_kernel,
++                    )
++                })
++                .collect::<Vec<_>>()
++        };
++        let polynomial = sum_round_polynomials(&component_polynomials);
++        observe_round_polynomial(&mut challenger, &polynomial);
++        let alpha = challenger.sample_ext_element();
++        point.insert(0, alpha);
++        component_claims =
++            component_polynomials.iter().map(|component| component.eval_at_point(alpha)).collect();
++        univariate_polys.push(polynomial);
++
++        let current_equalities = if round == 0 {
++            equality_points
++                .iter()
++                .map(|equality_point| {
++                    Mle::from(
++                        DevicePoint::from_host(equality_point, &scope).unwrap().partial_lagrange(),
++                    )
++                })
++                .collect()
++        } else {
++            equalities
++        };
++        let mut next_traces = Vec::with_capacity(traces.len());
++        let mut next_equalities = Vec::with_capacity(traces.len());
++        for (trace, equality) in traces.into_iter().zip(current_equalities) {
++            let (trace, equality) = fix_last_variable(
++                trace,
++                equality,
++                alpha,
++                mle_fix_last_variable_koala_bear_ext_ext_zero_padding,
++            );
++            next_traces.push(trace);
++            next_equalities.push(equality);
++        }
++        traces = next_traces;
++        equalities = next_equalities;
++    }
++
++    let trace_evaluations = traces
++        .iter()
++        .map(|trace| DeviceTensor::copy_to_host(trace.guts()).unwrap().as_slice()[0])
++        .collect();
++    let terminal = component_claims.iter().copied().sum();
++    (
++        PartialSumcheckProof {
++            univariate_polys,
++            claimed_sum: initial_claim,
++            point_and_eval: (point.into(), terminal),
++        },
++        trace_evaluations,
++    )
++}
++
++fn triple_interpolate_round(
++    univariate_evals: Tensor<Ext, TaskScope>,
++    claim: Ext,
++) -> UnivariatePolynomial<Ext> {
++    let host_evals = DeviceTensor::from_raw(univariate_evals).sum_dim(1).to_host().unwrap();
++    let [eval_zero, eval_two, eval_three] = host_evals.as_slice().try_into().unwrap();
++    let eval_one = claim - eval_zero;
++    interpolate_univariate_polynomial(
++        &[
++            Ext::from_canonical_u16(0),
++            Ext::from_canonical_u16(1),
++            Ext::from_canonical_u16(2),
++            Ext::from_canonical_u16(3),
++        ],
++        &[eval_zero, eval_one, eval_two, eval_three],
++    )
++}
++
++fn triple_sum_as_poly(
++    first: &Mle<Ext, TaskScope>,
++    second: &Mle<Ext, TaskScope>,
++    third: &Mle<Ext, TaskScope>,
++    claim: Ext,
++) -> UnivariatePolynomial<Ext> {
++    assert_eq!(first.guts().sizes(), second.guts().sizes());
++    assert_eq!(first.guts().sizes(), third.guts().sizes());
++    let num_variables = first.num_variables() as usize;
++    let height = 1usize << (num_variables - 1);
++    const BLOCK_SIZE: usize = 256;
++    let grid_size = height.div_ceil(BLOCK_SIZE);
++    let mut evaluations =
++        Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_size], first.backend().clone());
++    let shared_mem = BLOCK_SIZE.checked_div(32).unwrap_or(1) * std::mem::size_of::<Ext>();
++    unsafe {
++        let args = args!(
++            evaluations.as_mut_ptr(),
++            first.guts().as_ptr(),
++            second.guts().as_ptr(),
++            third.guts().as_ptr(),
++            num_variables - 1
++        );
++        evaluations.assume_init();
++        first
++            .backend()
++            .launch_kernel(
++                triple_hadamard_sum_as_poly_ext_kernel(),
++                grid_size,
++                BLOCK_SIZE,
++                &args,
++                shared_mem,
++            )
++            .unwrap();
++    }
++    triple_interpolate_round(evaluations, claim)
++}
++
++fn triple_fix_and_sum_as_poly(
++    first: Mle<Ext, TaskScope>,
++    second: Mle<Ext, TaskScope>,
++    third: Mle<Ext, TaskScope>,
++    alpha: Ext,
++    claim: Ext,
++) -> (Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, UnivariatePolynomial<Ext>) {
++    assert_eq!(first.guts().sizes(), second.guts().sizes());
++    assert_eq!(first.guts().sizes(), third.guts().sizes());
++    let input_height = first.guts().sizes()[1];
++    let output_height = input_height >> 1;
++    let backend = first.backend();
++    let mut first_output = backend.uninit_mle(1, output_height);
++    let mut second_output = backend.uninit_mle(1, output_height);
++    let mut third_output = backend.uninit_mle(1, output_height);
++    const BLOCK_SIZE: usize = 256;
++    let grid_size = output_height.div_ceil(BLOCK_SIZE);
++    let mut evaluations = Tensor::<Ext, TaskScope>::with_sizes_in([3, grid_size], backend.clone());
++    let shared_mem = BLOCK_SIZE.checked_div(32).unwrap_or(1) * std::mem::size_of::<Ext>();
++    unsafe {
++        let args = args!(
++            first.guts().as_ptr(),
++            second.guts().as_ptr(),
++            third.guts().as_ptr(),
++            first_output.as_mut_ptr(),
++            second_output.as_mut_ptr(),
++            third_output.as_mut_ptr(),
++            alpha,
++            evaluations.as_mut_ptr(),
++            input_height
++        );
++        first_output.assume_init();
++        second_output.assume_init();
++        third_output.assume_init();
++        evaluations.assume_init();
++        backend
++            .launch_kernel(
++                triple_hadamard_fix_last_variable_and_sum_as_poly_ext_kernel(),
++                grid_size,
++                BLOCK_SIZE,
++                &args,
++                shared_mem,
++            )
++            .unwrap();
++    }
++    (
++        Mle::new(first_output),
++        Mle::new(second_output),
++        Mle::new(third_output),
++        triple_interpolate_round(evaluations, claim),
++    )
++}
++
++/// Proves a sum of pointwise products of three extension-field multilinears.
++pub fn triple_hadamard_sumcheck<C>(
++    mut first: Mle<Ext, TaskScope>,
++    mut second: Mle<Ext, TaskScope>,
++    mut third: Mle<Ext, TaskScope>,
++    mut challenger: C,
++    initial_claim: Ext,
++) -> (PartialSumcheckProof<Ext>, [Ext; 3])
++where
++    C: FieldChallenger<Felt>,
++{
++    assert_eq!(first.guts().sizes(), second.guts().sizes());
++    assert_eq!(first.guts().sizes(), third.guts().sizes());
++    let num_variables = first.num_variables() as usize;
++    assert!(num_variables > 0);
++    let mut univariate_polys = Vec::with_capacity(num_variables);
++    univariate_polys.push(triple_sum_as_poly(&first, &second, &third, initial_claim));
++    let mut point = Vec::with_capacity(num_variables);
++
++    loop {
++        let polynomial = univariate_polys.last().unwrap();
++        challenger.observe_slice(
++            &polynomial
++                .coefficients
++                .iter()
++                .flat_map(|value| value.as_base_slice())
++                .copied()
++                .collect_vec(),
++        );
++        let alpha = challenger.sample_ext_element();
++        point.insert(0, alpha);
++        let next_claim = polynomial.eval_at_point(alpha);
++        if univariate_polys.len() == num_variables {
++            first = fix_last_variable_inner(
++                &first,
++                alpha,
++                mle_fix_last_variable_koala_bear_ext_ext_zero_padding,
++            );
++            second = fix_last_variable_inner(
++                &second,
++                alpha,
++                mle_fix_last_variable_koala_bear_ext_ext_zero_padding,
++            );
++            third = fix_last_variable_inner(
++                &third,
++                alpha,
++                mle_fix_last_variable_koala_bear_ext_ext_zero_padding,
++            );
++            let endpoints = [
++                DeviceTensor::copy_to_host(first.guts()).unwrap().as_slice()[0],
++                DeviceTensor::copy_to_host(second.guts()).unwrap().as_slice()[0],
++                DeviceTensor::copy_to_host(third.guts()).unwrap().as_slice()[0],
++            ];
++            return (
++                PartialSumcheckProof {
++                    univariate_polys,
++                    claimed_sum: initial_claim,
++                    point_and_eval: (point.into(), next_claim),
++                },
++                endpoints,
++            );
++        }
++        let (next_first, next_second, next_third, next_polynomial) =
++            triple_fix_and_sum_as_poly(first, second, third, alpha, next_claim);
++        first = next_first;
++        second = next_second;
++        third = next_third;
++        univariate_polys.push(next_polynomial);
++    }
++}
++
++fn cubic_transition_interpolate_round(
++    univariate_evals: Tensor<Ext, TaskScope>,
++    claim: Ext,
++) -> UnivariatePolynomial<Ext> {
++    let host_evals = DeviceTensor::from_raw(univariate_evals).sum_dim(1).to_host().unwrap();
++    let [eval_zero, eval_two, eval_three, eval_four] = host_evals.as_slice().try_into().unwrap();
++    let eval_one = claim - eval_zero;
++    interpolate_univariate_polynomial(
++        &[
++            Ext::from_canonical_u16(0),
++            Ext::from_canonical_u16(1),
++            Ext::from_canonical_u16(2),
++            Ext::from_canonical_u16(3),
++            Ext::from_canonical_u16(4),
++        ],
++        &[eval_zero, eval_one, eval_two, eval_three, eval_four],
++    )
++}
++
++fn cubic_transition_sum_as_poly(
++    preactivation: &Mle<Ext, TaskScope>,
++    next_activation: &Mle<Ext, TaskScope>,
++    equality: &Mle<Ext, TaskScope>,
++    claim: Ext,
++) -> UnivariatePolynomial<Ext> {
++    assert_eq!(preactivation.guts().sizes(), next_activation.guts().sizes());
++    assert_eq!(preactivation.guts().sizes(), equality.guts().sizes());
++    let num_variables = preactivation.num_variables() as usize;
++    let height = 1usize << (num_variables - 1);
++    const BLOCK_SIZE: usize = 256;
++    let grid_size = height.div_ceil(BLOCK_SIZE);
++    let mut evaluations =
++        Tensor::<Ext, TaskScope>::with_sizes_in([4, grid_size], preactivation.backend().clone());
++    let shared_mem = BLOCK_SIZE.checked_div(32).unwrap_or(1) * std::mem::size_of::<Ext>();
++    unsafe {
++        let args = args!(
++            evaluations.as_mut_ptr(),
++            preactivation.guts().as_ptr(),
++            next_activation.guts().as_ptr(),
++            equality.guts().as_ptr(),
++            num_variables - 1
++        );
++        evaluations.assume_init();
++        preactivation
++            .backend()
++            .launch_kernel(
++                cubic_transition_sum_as_poly_ext_kernel(),
++                grid_size,
++                BLOCK_SIZE,
++                &args,
++                shared_mem,
++            )
++            .unwrap();
++    }
++    cubic_transition_interpolate_round(evaluations, claim)
++}
++
++fn cubic_transition_fix_and_sum_as_poly(
++    preactivation: Mle<Ext, TaskScope>,
++    next_activation: Mle<Ext, TaskScope>,
++    equality: Mle<Ext, TaskScope>,
++    alpha: Ext,
++    claim: Ext,
++) -> (Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, Mle<Ext, TaskScope>, UnivariatePolynomial<Ext>) {
++    assert_eq!(preactivation.guts().sizes(), next_activation.guts().sizes());
++    assert_eq!(preactivation.guts().sizes(), equality.guts().sizes());
++    let input_height = preactivation.guts().sizes()[1];
++    let output_height = input_height >> 1;
++    let backend = preactivation.backend();
++    let mut preactivation_output = backend.uninit_mle(1, output_height);
++    let mut next_activation_output = backend.uninit_mle(1, output_height);
++    let mut equality_output = backend.uninit_mle(1, output_height);
++    const BLOCK_SIZE: usize = 256;
++    let grid_size = output_height.div_ceil(BLOCK_SIZE);
++    let mut evaluations = Tensor::<Ext, TaskScope>::with_sizes_in([4, grid_size], backend.clone());
++    let shared_mem = BLOCK_SIZE.checked_div(32).unwrap_or(1) * std::mem::size_of::<Ext>();
++    unsafe {
++        let args = args!(
++            preactivation.guts().as_ptr(),
++            next_activation.guts().as_ptr(),
++            equality.guts().as_ptr(),
++            preactivation_output.as_mut_ptr(),
++            next_activation_output.as_mut_ptr(),
++            equality_output.as_mut_ptr(),
++            alpha,
++            evaluations.as_mut_ptr(),
++            input_height
++        );
++        preactivation_output.assume_init();
++        next_activation_output.assume_init();
++        equality_output.assume_init();
++        evaluations.assume_init();
++        backend
++            .launch_kernel(
++                cubic_transition_fix_last_variable_and_sum_as_poly_ext_kernel(),
++                grid_size,
++                BLOCK_SIZE,
++                &args,
++                shared_mem,
++            )
++            .unwrap();
++    }
++    (
++        Mle::new(preactivation_output),
++        Mle::new(next_activation_output),
++        Mle::new(equality_output),
++        cubic_transition_interpolate_round(evaluations, claim),
++    )
++}
++
++/// Proves `sum equality * (next_activation - preactivation^3)`.
++pub fn cubic_transition_sumcheck<C>(
++    mut preactivation: Mle<Ext, TaskScope>,
++    mut next_activation: Mle<Ext, TaskScope>,
++    mut equality: Mle<Ext, TaskScope>,
++    mut challenger: C,
++    initial_claim: Ext,
++) -> (PartialSumcheckProof<Ext>, [Ext; 3])
++where
++    C: FieldChallenger<Felt>,
++{
++    assert_eq!(preactivation.guts().sizes(), next_activation.guts().sizes());
++    assert_eq!(preactivation.guts().sizes(), equality.guts().sizes());
++    let num_variables = preactivation.num_variables() as usize;
++    assert!(num_variables > 0);
++    let mut univariate_polys = Vec::with_capacity(num_variables);
++    univariate_polys.push(cubic_transition_sum_as_poly(
++        &preactivation,
++        &next_activation,
++        &equality,
++        initial_claim,
++    ));
++    let mut point = Vec::with_capacity(num_variables);
++
++    loop {
++        let polynomial = univariate_polys.last().unwrap();
++        observe_round_polynomial(&mut challenger, polynomial);
++        let alpha = challenger.sample_ext_element();
++        point.insert(0, alpha);
++        let next_claim = polynomial.eval_at_point(alpha);
++        if univariate_polys.len() == num_variables {
++            preactivation = fix_last_variable_inner(
++                &preactivation,
++                alpha,
++                mle_fix_last_variable_koala_bear_ext_ext_zero_padding,
++            );
++            next_activation = fix_last_variable_inner(
++                &next_activation,
++                alpha,
++                mle_fix_last_variable_koala_bear_ext_ext_zero_padding,
++            );
++            equality = fix_last_variable_inner(
++                &equality,
++                alpha,
++                mle_fix_last_variable_koala_bear_ext_ext_zero_padding,
++            );
++            let endpoints = [
++                DeviceTensor::copy_to_host(preactivation.guts()).unwrap().as_slice()[0],
++                DeviceTensor::copy_to_host(next_activation.guts()).unwrap().as_slice()[0],
++                DeviceTensor::copy_to_host(equality.guts()).unwrap().as_slice()[0],
++            ];
++            return (
++                PartialSumcheckProof {
++                    univariate_polys,
++                    claimed_sum: initial_claim,
++                    point_and_eval: (point.into(), next_claim),
++                },
++                endpoints,
++            );
++        }
++        let (next_preactivation, next_activation_value, next_equality, next_polynomial) =
++            cubic_transition_fix_and_sum_as_poly(
++                preactivation,
++                next_activation,
++                equality,
++                alpha,
++                next_claim,
++            );
++        preactivation = next_preactivation;
++        next_activation = next_activation_value;
++        equality = next_equality;
++        univariate_polys.push(next_polynomial);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     /// Compares our simple hadamard sumcheck implementation with the slop implementation, which is more complicated and supports batching.
+diff --git a/sp1-gpu/crates/merkle_tree/src/single_layer.rs b/sp1-gpu/crates/merkle_tree/src/single_layer.rs
+index e99b5d7..7d6311f 100644
+--- a/sp1-gpu/crates/merkle_tree/src/single_layer.rs
++++ b/sp1-gpu/crates/merkle_tree/src/single_layer.rs
+@@ -148,7 +148,8 @@ where
+ 
+         // Keep only the top levels; the bottom ones are rehashed from `tensor` per query.
+         // The full tree lives only for the duration of this commit.
+-        if height >= MIN_TRUNCATED_HEIGHT {
++        let keep_full_tree = std::env::var_os("CMFD_BASEFOLD_FULL_TREE").is_some();
++        if height >= MIN_TRUNCATED_HEIGHT && !keep_full_tree {
+             let stored_height = height - MERKLE_TRUNCATED_LEVELS;
+             let stored_len = (1usize << (stored_height + 1)) - 1;
+             let mut digests = Buffer::with_capacity_in(stored_len, scope.clone());
+diff --git a/sp1-gpu/crates/sys/include/jagged_sumcheck/hadamard.cuh b/sp1-gpu/crates/sys/include/jagged_sumcheck/hadamard.cuh
+index 9945a67..b2255ef 100644
+--- a/sp1-gpu/crates/sys/include/jagged_sumcheck/hadamard.cuh
++++ b/sp1-gpu/crates/sys/include/jagged_sumcheck/hadamard.cuh
+@@ -4,3 +4,11 @@ extern "C" void* hadamard_sum_as_poly_base_ext_kernel();
+ extern "C" void* hadamard_sum_as_poly_base_kernel();
+ extern "C" void* hadamard_fix_last_variable_and_sum_as_poly_base_ext_kernel();
+ extern "C" void* hadamard_fix_last_variable_and_sum_as_poly_ext_ext_kernel();
++extern "C" void* triple_hadamard_sum_as_poly_ext_kernel();
++extern "C" void* triple_hadamard_fix_last_variable_and_sum_as_poly_ext_kernel();
++extern "C" void* cubic_transition_sum_as_poly_ext_kernel();
++extern "C" void* cubic_transition_fix_last_variable_and_sum_as_poly_ext_kernel();
++extern "C" void* cmfd_fixed_bank_rlc_kernel();
++extern "C" void* cmfd_fixed_bank_evaluate_columns_kernel();
++extern "C" void* cmfd_weight_output_reduction_kernel();
++extern "C" void* cmfd_ext_add_in_place_kernel();
+diff --git a/sp1-gpu/crates/sys/lib/jagged_sumcheck/hadamard.cu b/sp1-gpu/crates/sys/lib/jagged_sumcheck/hadamard.cu
+index 7e3ea72..8b716ad 100644
+--- a/sp1-gpu/crates/sys/lib/jagged_sumcheck/hadamard.cu
++++ b/sp1-gpu/crates/sys/lib/jagged_sumcheck/hadamard.cu
+@@ -151,3 +151,376 @@ extern "C" void* hadamard_fix_last_variable_and_sum_as_poly_base_ext_kernel() {
+ extern "C" void* hadamard_fix_last_variable_and_sum_as_poly_ext_ext_kernel() {
+     return (void*)hadamardFixLastVariableAndSumAsPoly<ext_t, ext_t>;
+ }
++
++__global__ void cmfdFixedBankRlc(
++    const uint8_t* __restrict__ encoded,
++    const ext_t* __restrict__ coefficients,
++    ext_t* __restrict__ output,
++    size_t rows,
++    size_t columns) {
++    const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row >= rows) {
++        return;
++    }
++    ext_t accumulator = ext_t::zero();
++    for (size_t column = 0; column < columns; ++column) {
++        const int centered = static_cast<int>(encoded[column * rows + row]) - 125;
++        const kb31_t value = centered >= 0
++                                 ? kb31_t::from_canonical_u32(static_cast<uint32_t>(centered))
++                                 : kb31_t::zero() - kb31_t::from_canonical_u32(
++                                                        static_cast<uint32_t>(-centered));
++        accumulator += ext_t::load(coefficients, column) * value;
++    }
++    ext_t::store(output, row, accumulator);
++}
++
++__global__ void cmfdFixedBankEvaluateColumns(
++    const uint8_t* __restrict__ encoded,
++    const ext_t* __restrict__ equality,
++    ext_t* __restrict__ output,
++    size_t rows) {
++    const size_t column = blockIdx.x;
++    ext_t accumulator = ext_t::zero();
++    const size_t base = column * rows;
++    for (size_t row = threadIdx.x; row < rows; row += blockDim.x) {
++        const int centered = static_cast<int>(encoded[base + row]) - 125;
++        const kb31_t value = centered >= 0
++                                 ? kb31_t::from_canonical_u32(static_cast<uint32_t>(centered))
++                                 : kb31_t::zero() - kb31_t::from_canonical_u32(
++                                                        static_cast<uint32_t>(-centered));
++        accumulator += ext_t::load(equality, row) * value;
++    }
++    __shared__ ext_t partials[256];
++    partials[threadIdx.x] = accumulator;
++    __syncthreads();
++    for (unsigned stride = blockDim.x / 2; stride != 0; stride >>= 1) {
++        if (threadIdx.x < stride) {
++            partials[threadIdx.x] += partials[threadIdx.x + stride];
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        ext_t::store(output, column, partials[0]);
++    }
++}
++
++extern "C" void* cmfd_fixed_bank_rlc_kernel() {
++    return (void*)cmfdFixedBankRlc;
++}
++
++extern "C" void* cmfd_fixed_bank_evaluate_columns_kernel() {
++    return (void*)cmfdFixedBankEvaluateColumns;
++}
++
++__global__ void cmfdWeightOutputReduction(
++    const uint8_t* __restrict__ encoded,
++    const ext_t* __restrict__ output_coefficients,
++    ext_t* __restrict__ reduced,
++    size_t rows,
++    size_t outputs) {
++    const size_t row = static_cast<size_t>(blockIdx.x);
++    if (row >= rows) {
++        return;
++    }
++    ext_t accumulator = ext_t::zero();
++    const size_t base = row * outputs;
++    for (size_t output = threadIdx.x; output < outputs; output += blockDim.x) {
++        const int centered = static_cast<int>(encoded[base + output]) - 125;
++        const kb31_t value = centered >= 0
++                                 ? kb31_t::from_canonical_u32(static_cast<uint32_t>(centered))
++                                 : kb31_t::zero() - kb31_t::from_canonical_u32(
++                                                        static_cast<uint32_t>(-centered));
++        accumulator += ext_t::load(output_coefficients, output) * value;
++    }
++    __shared__ ext_t partials[256];
++    partials[threadIdx.x] = accumulator;
++    __syncthreads();
++    for (unsigned stride = blockDim.x / 2; stride != 0; stride >>= 1) {
++        if (threadIdx.x < stride) {
++            partials[threadIdx.x] += partials[threadIdx.x + stride];
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        ext_t::store(reduced, row, partials[0]);
++    }
++}
++
++extern "C" void* cmfd_weight_output_reduction_kernel() {
++    return (void*)cmfdWeightOutputReduction;
++}
++
++__global__ void cmfdExtAddInPlace(
++    ext_t* __restrict__ destination,
++    const ext_t* __restrict__ source,
++    size_t count) {
++    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++         index < count; index += static_cast<size_t>(blockDim.x) * gridDim.x) {
++        ext_t::store(destination, index,
++                     ext_t::load(destination, index) + ext_t::load(source, index));
++    }
++}
++
++extern "C" void* cmfd_ext_add_in_place_kernel() {
++    return (void*)cmfdExtAddInPlace;
++}
++
++__global__ void tripleHadamardSumAsPoly(
++    ext_t* __restrict__ result,
++    const ext_t* __restrict__ first_mle,
++    const ext_t* __restrict__ second_mle,
++    const ext_t* __restrict__ third_mle,
++    size_t numVariablesMinusOne) {
++    size_t height = 1 << numVariablesMinusOne;
++    ext_t evalZero = ext_t::zero();
++    ext_t evalTwo = ext_t::zero();
++    ext_t evalThree = ext_t::zero();
++    for (size_t i = blockDim.x * blockIdx.x + threadIdx.x; i < height;
++         i += blockDim.x * gridDim.x) {
++        size_t evenIdx = i << 1;
++        size_t oddIdx = evenIdx + 1;
++        ext_t firstZero = ext_t::load(first_mle, evenIdx);
++        ext_t firstOne = ext_t::load(first_mle, oddIdx);
++        ext_t secondZero = ext_t::load(second_mle, evenIdx);
++        ext_t secondOne = ext_t::load(second_mle, oddIdx);
++        ext_t thirdZero = ext_t::load(third_mle, evenIdx);
++        ext_t thirdOne = ext_t::load(third_mle, oddIdx);
++        ext_t firstTwo = firstOne + firstOne - firstZero;
++        ext_t secondTwo = secondOne + secondOne - secondZero;
++        ext_t thirdTwo = thirdOne + thirdOne - thirdZero;
++        ext_t firstThree = firstTwo + firstOne - firstZero;
++        ext_t secondThree = secondTwo + secondOne - secondZero;
++        ext_t thirdThree = thirdTwo + thirdOne - thirdZero;
++        evalZero += firstZero * secondZero * thirdZero;
++        evalTwo += firstTwo * secondTwo * thirdTwo;
++        evalThree += firstThree * secondThree * thirdThree;
++    }
++
++    extern __shared__ unsigned char memory[];
++    ext_t* shared = reinterpret_cast<ext_t*>(memory);
++    auto block = cg::this_thread_block();
++    auto tile = cg::tiled_partition<32>(block);
++    ext_t zeroBlockSum = partialBlockReduce(block, tile, evalZero, shared);
++    ext_t twoBlockSum = partialBlockReduce(block, tile, evalTwo, shared);
++    ext_t threeBlockSum = partialBlockReduce(block, tile, evalThree, shared);
++    if (threadIdx.x == 0) {
++        ext_t::store(result, blockIdx.x, zeroBlockSum);
++        ext_t::store(result, gridDim.x + blockIdx.x, twoBlockSum);
++        ext_t::store(result, 2 * gridDim.x + blockIdx.x, threeBlockSum);
++    }
++}
++
++__global__ void tripleHadamardFixLastVariableAndSumAsPoly(
++    const ext_t* first_input,
++    const ext_t* second_input,
++    const ext_t* third_input,
++    ext_t* __restrict__ first_output,
++    ext_t* __restrict__ second_output,
++    ext_t* __restrict__ third_output,
++    ext_t alpha,
++    ext_t* univariate_result,
++    size_t inputHeight) {
++    size_t outputHeight = inputHeight >> 1;
++    ext_t evalZero = ext_t::zero();
++    ext_t evalTwo = ext_t::zero();
++    ext_t evalThree = ext_t::zero();
++    auto block = cg::this_thread_block();
++    auto pair = cg::tiled_partition<2>(block);
++
++    for (size_t i = blockDim.x * blockIdx.x + threadIdx.x; i < outputHeight;
++         i += blockDim.x * gridDim.x) {
++        size_t startingIdx = i << 1;
++        ext_t firstZero = ext_t::load(first_input, startingIdx);
++        ext_t firstOne = ext_t::load(first_input, startingIdx + 1);
++        ext_t secondZero = ext_t::load(second_input, startingIdx);
++        ext_t secondOne = ext_t::load(second_input, startingIdx + 1);
++        ext_t thirdZero = ext_t::load(third_input, startingIdx);
++        ext_t thirdOne = ext_t::load(third_input, startingIdx + 1);
++        ext_t firstValue = alpha * firstOne + (ext_t::one() - alpha) * firstZero;
++        ext_t secondValue = alpha * secondOne + (ext_t::one() - alpha) * secondZero;
++        ext_t thirdValue = alpha * thirdOne + (ext_t::one() - alpha) * thirdZero;
++        ext_t::store(first_output, i, firstValue);
++        ext_t::store(second_output, i, secondValue);
++        ext_t::store(third_output, i, thirdValue);
++
++        ext_t previousFirst = pair.shfl(firstValue, 0);
++        ext_t previousSecond = pair.shfl(secondValue, 0);
++        ext_t previousThird = pair.shfl(thirdValue, 0);
++        if ((pair.thread_rank() & 1) == 0) {
++            evalZero += firstValue * secondValue * thirdValue;
++        } else {
++            ext_t firstTwo = firstValue + firstValue - previousFirst;
++            ext_t secondTwo = secondValue + secondValue - previousSecond;
++            ext_t thirdTwo = thirdValue + thirdValue - previousThird;
++            ext_t firstThree = firstTwo + firstValue - previousFirst;
++            ext_t secondThree = secondTwo + secondValue - previousSecond;
++            ext_t thirdThree = thirdTwo + thirdValue - previousThird;
++            evalTwo += firstTwo * secondTwo * thirdTwo;
++            evalThree += firstThree * secondThree * thirdThree;
++        }
++    }
++
++    extern __shared__ unsigned char memory[];
++    ext_t* shared = reinterpret_cast<ext_t*>(memory);
++    auto reduceTile = cg::tiled_partition<32>(block);
++    ext_t zeroBlockSum = partialBlockReduce(block, reduceTile, evalZero, shared);
++    ext_t twoBlockSum = partialBlockReduce(block, reduceTile, evalTwo, shared);
++    ext_t threeBlockSum = partialBlockReduce(block, reduceTile, evalThree, shared);
++    if (threadIdx.x == 0) {
++        ext_t::store(univariate_result, blockIdx.x, zeroBlockSum);
++        ext_t::store(univariate_result, gridDim.x + blockIdx.x, twoBlockSum);
++        ext_t::store(univariate_result, 2 * gridDim.x + blockIdx.x, threeBlockSum);
++    }
++}
++
++extern "C" void* triple_hadamard_sum_as_poly_ext_kernel() {
++    return (void*)tripleHadamardSumAsPoly;
++}
++
++extern "C" void* triple_hadamard_fix_last_variable_and_sum_as_poly_ext_kernel() {
++    return (void*)tripleHadamardFixLastVariableAndSumAsPoly;
++}
++
++__device__ __forceinline__ ext_t cubicTransitionRelation(
++    ext_t preactivation,
++    ext_t nextActivation,
++    ext_t equality) {
++    return equality *
++           (nextActivation - preactivation * preactivation * preactivation);
++}
++
++__global__ void cubicTransitionSumAsPoly(
++    ext_t* __restrict__ result,
++    const ext_t* __restrict__ preactivation_mle,
++    const ext_t* __restrict__ next_activation_mle,
++    const ext_t* __restrict__ equality_mle,
++    size_t numVariablesMinusOne) {
++    size_t height = 1 << numVariablesMinusOne;
++    ext_t evalZero = ext_t::zero();
++    ext_t evalTwo = ext_t::zero();
++    ext_t evalThree = ext_t::zero();
++    ext_t evalFour = ext_t::zero();
++    for (size_t i = blockDim.x * blockIdx.x + threadIdx.x; i < height;
++         i += blockDim.x * gridDim.x) {
++        size_t evenIdx = i << 1;
++        size_t oddIdx = evenIdx + 1;
++        ext_t preZero = ext_t::load(preactivation_mle, evenIdx);
++        ext_t preOne = ext_t::load(preactivation_mle, oddIdx);
++        ext_t nextZero = ext_t::load(next_activation_mle, evenIdx);
++        ext_t nextOne = ext_t::load(next_activation_mle, oddIdx);
++        ext_t eqZero = ext_t::load(equality_mle, evenIdx);
++        ext_t eqOne = ext_t::load(equality_mle, oddIdx);
++        ext_t preStep = preOne - preZero;
++        ext_t nextStep = nextOne - nextZero;
++        ext_t eqStep = eqOne - eqZero;
++        ext_t preTwo = preOne + preStep;
++        ext_t nextTwo = nextOne + nextStep;
++        ext_t eqTwo = eqOne + eqStep;
++        ext_t preThree = preTwo + preStep;
++        ext_t nextThree = nextTwo + nextStep;
++        ext_t eqThree = eqTwo + eqStep;
++        ext_t preFour = preThree + preStep;
++        ext_t nextFour = nextThree + nextStep;
++        ext_t eqFour = eqThree + eqStep;
++        evalZero += cubicTransitionRelation(preZero, nextZero, eqZero);
++        evalTwo += cubicTransitionRelation(preTwo, nextTwo, eqTwo);
++        evalThree += cubicTransitionRelation(preThree, nextThree, eqThree);
++        evalFour += cubicTransitionRelation(preFour, nextFour, eqFour);
++    }
++
++    extern __shared__ unsigned char memory[];
++    ext_t* shared = reinterpret_cast<ext_t*>(memory);
++    auto block = cg::this_thread_block();
++    auto tile = cg::tiled_partition<32>(block);
++    ext_t zeroBlockSum = partialBlockReduce(block, tile, evalZero, shared);
++    ext_t twoBlockSum = partialBlockReduce(block, tile, evalTwo, shared);
++    ext_t threeBlockSum = partialBlockReduce(block, tile, evalThree, shared);
++    ext_t fourBlockSum = partialBlockReduce(block, tile, evalFour, shared);
++    if (threadIdx.x == 0) {
++        ext_t::store(result, blockIdx.x, zeroBlockSum);
++        ext_t::store(result, gridDim.x + blockIdx.x, twoBlockSum);
++        ext_t::store(result, 2 * gridDim.x + blockIdx.x, threeBlockSum);
++        ext_t::store(result, 3 * gridDim.x + blockIdx.x, fourBlockSum);
++    }
++}
++
++__global__ void cubicTransitionFixLastVariableAndSumAsPoly(
++    const ext_t* preactivation_input,
++    const ext_t* next_activation_input,
++    const ext_t* equality_input,
++    ext_t* __restrict__ preactivation_output,
++    ext_t* __restrict__ next_activation_output,
++    ext_t* __restrict__ equality_output,
++    ext_t alpha,
++    ext_t* univariate_result,
++    size_t inputHeight) {
++    size_t outputHeight = inputHeight >> 1;
++    ext_t evalZero = ext_t::zero();
++    ext_t evalTwo = ext_t::zero();
++    ext_t evalThree = ext_t::zero();
++    ext_t evalFour = ext_t::zero();
++    auto block = cg::this_thread_block();
++    auto pair = cg::tiled_partition<2>(block);
++
++    for (size_t i = blockDim.x * blockIdx.x + threadIdx.x; i < outputHeight;
++         i += blockDim.x * gridDim.x) {
++        size_t startingIdx = i << 1;
++        ext_t preZero = ext_t::load(preactivation_input, startingIdx);
++        ext_t preOne = ext_t::load(preactivation_input, startingIdx + 1);
++        ext_t nextZero = ext_t::load(next_activation_input, startingIdx);
++        ext_t nextOne = ext_t::load(next_activation_input, startingIdx + 1);
++        ext_t eqZero = ext_t::load(equality_input, startingIdx);
++        ext_t eqOne = ext_t::load(equality_input, startingIdx + 1);
++        ext_t preValue = alpha * preOne + (ext_t::one() - alpha) * preZero;
++        ext_t nextValue = alpha * nextOne + (ext_t::one() - alpha) * nextZero;
++        ext_t eqValue = alpha * eqOne + (ext_t::one() - alpha) * eqZero;
++        ext_t::store(preactivation_output, i, preValue);
++        ext_t::store(next_activation_output, i, nextValue);
++        ext_t::store(equality_output, i, eqValue);
++
++        ext_t previousPre = pair.shfl(preValue, 0);
++        ext_t previousNext = pair.shfl(nextValue, 0);
++        ext_t previousEq = pair.shfl(eqValue, 0);
++        if ((pair.thread_rank() & 1) == 0) {
++            evalZero += cubicTransitionRelation(preValue, nextValue, eqValue);
++        } else {
++            ext_t preStep = preValue - previousPre;
++            ext_t nextStep = nextValue - previousNext;
++            ext_t eqStep = eqValue - previousEq;
++            ext_t preTwo = preValue + preStep;
++            ext_t nextTwo = nextValue + nextStep;
++            ext_t eqTwo = eqValue + eqStep;
++            ext_t preThree = preTwo + preStep;
++            ext_t nextThree = nextTwo + nextStep;
++            ext_t eqThree = eqTwo + eqStep;
++            ext_t preFour = preThree + preStep;
++            ext_t nextFour = nextThree + nextStep;
++            ext_t eqFour = eqThree + eqStep;
++            evalTwo += cubicTransitionRelation(preTwo, nextTwo, eqTwo);
++            evalThree += cubicTransitionRelation(preThree, nextThree, eqThree);
++            evalFour += cubicTransitionRelation(preFour, nextFour, eqFour);
++        }
++    }
++
++    extern __shared__ unsigned char memory[];
++    ext_t* shared = reinterpret_cast<ext_t*>(memory);
++    auto reduceTile = cg::tiled_partition<32>(block);
++    ext_t zeroBlockSum = partialBlockReduce(block, reduceTile, evalZero, shared);
++    ext_t twoBlockSum = partialBlockReduce(block, reduceTile, evalTwo, shared);
++    ext_t threeBlockSum = partialBlockReduce(block, reduceTile, evalThree, shared);
++    ext_t fourBlockSum = partialBlockReduce(block, reduceTile, evalFour, shared);
++    if (threadIdx.x == 0) {
++        ext_t::store(univariate_result, blockIdx.x, zeroBlockSum);
++        ext_t::store(univariate_result, gridDim.x + blockIdx.x, twoBlockSum);
++        ext_t::store(univariate_result, 2 * gridDim.x + blockIdx.x, threeBlockSum);
++        ext_t::store(univariate_result, 3 * gridDim.x + blockIdx.x, fourBlockSum);
++    }
++}
++
++extern "C" void* cubic_transition_sum_as_poly_ext_kernel() {
++    return (void*)cubicTransitionSumAsPoly;
++}
++
++extern "C" void* cubic_transition_fix_last_variable_and_sum_as_poly_ext_kernel() {
++    return (void*)cubicTransitionFixLastVariableAndSumAsPoly;
++}
+diff --git a/sp1-gpu/crates/sys/src/kernels.rs b/sp1-gpu/crates/sys/src/kernels.rs
+index 413a5b7..3a98288 100644
+--- a/sp1-gpu/crates/sys/src/kernels.rs
++++ b/sp1-gpu/crates/sys/src/kernels.rs
+@@ -157,6 +157,14 @@ extern "C" {
+ 
+     pub fn hadamard_fix_last_variable_and_sum_as_poly_base_ext_kernel() -> KernelPtr;
+     pub fn hadamard_fix_last_variable_and_sum_as_poly_ext_ext_kernel() -> KernelPtr;
++    pub fn triple_hadamard_sum_as_poly_ext_kernel() -> KernelPtr;
++    pub fn triple_hadamard_fix_last_variable_and_sum_as_poly_ext_kernel() -> KernelPtr;
++    pub fn cubic_transition_sum_as_poly_ext_kernel() -> KernelPtr;
++    pub fn cubic_transition_fix_last_variable_and_sum_as_poly_ext_kernel() -> KernelPtr;
++    pub fn cmfd_fixed_bank_rlc_kernel() -> KernelPtr;
++    pub fn cmfd_fixed_bank_evaluate_columns_kernel() -> KernelPtr;
++    pub fn cmfd_weight_output_reduction_kernel() -> KernelPtr;
++    pub fn cmfd_ext_add_in_place_kernel() -> KernelPtr;
+ 
+     pub fn fix_last_variable_felt_ext_kernel() -> KernelPtr;
+     pub fn fix_last_variable_ext_ext_kernel() -> KernelPtr;

@@ -1,0 +1,49 @@
+[package]
+name = "cmfd-production-v4-prover"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+rand = "0.8"
+bincode = "1.3"
+blake3 = { version = "1", features = ["rayon"] }
+hex = "0.4"
+memmap2 = "0.9"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+slop-algebra = { path = "/root/sp1-basefold-eval/slop/crates/algebra" }
+slop-alloc = { path = "/root/sp1-basefold-eval/slop/crates/alloc" }
+slop-basefold = { path = "/root/sp1-basefold-eval/slop/crates/basefold" }
+slop-challenger = { path = "/root/sp1-basefold-eval/slop/crates/challenger" }
+slop-commit = { path = "/root/sp1-basefold-eval/slop/crates/commit" }
+sp1-core-machine = { path = "/root/sp1-basefold-eval/crates/core/machine" }
+sp1-gpu-basefold = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/basefold" }
+sp1-gpu-commit = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/commit" }
+sp1-gpu-cudart = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/cuda" }
+sp1-gpu-jagged-tracegen = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/jagged_tracegen", features = ["test-utils"] }
+sp1-gpu-merkle-tree = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/merkle_tree" }
+sp1-gpu-sys = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/sys" }
+sp1-gpu-utils = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/utils" }
+sp1-hypercube = { path = "/root/sp1-basefold-eval/crates/hypercube" }
+slop-jagged = { path = "/root/sp1-basefold-eval/slop/crates/jagged" }
+slop-multilinear = { path = "/root/sp1-basefold-eval/slop/crates/multilinear" }
+itertools = "0.14"
+slop-air = { path = "/root/sp1-basefold-eval/slop/crates/air" }
+slop-matrix = { path = "/root/sp1-basefold-eval/slop/crates/matrix" }
+slop-merkle-tree = { path = "/root/sp1-basefold-eval/slop/crates/merkle-tree" }
+slop-sumcheck = { path = "/root/sp1-basefold-eval/slop/crates/sumcheck" }
+slop-tensor = { path = "/root/sp1-basefold-eval/slop/crates/tensor" }
+sp1-core-executor = { path = "/root/sp1-basefold-eval/crates/core/executor" }
+sp1-gpu-air = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/air" }
+sp1-gpu-zerocheck = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/zerocheck" }
+sp1-gpu-jagged-sumcheck = { path = "/root/sp1-basefold-eval/sp1-gpu/crates/jagged_sumcheck" }
+sp1-primitives = { path = "/root/sp1-basefold-eval/crates/primitives" }
+cmfd-consensus = { path = "../../crates/cmfd-consensus", features = ["forgematrix-v4-verifier"] }
+cpu-slop-algebra = { package = "slop-algebra", git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+cpu-slop-challenger = { package = "slop-challenger", git = "https://github.com/succinctlabs/sp1.git", rev = "92b8eabaea9ab7306da5826caa700adabf7445ba" }
+
+[workspace]

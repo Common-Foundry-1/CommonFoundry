@@ -89,6 +89,25 @@ function Convert-ToWslPath {
     return [string]$converted[0]
 }
 
+function Invoke-NativeLogged {
+    param(
+        [string]$Program,
+        [string[]]$Arguments,
+        [string]$LogPath
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell promotes native stderr to NativeCommandError. The
+        # V4 tools intentionally write telemetry there, so process exit status
+        # - not stderr output - determines success.
+        $ErrorActionPreference = 'Continue'
+        & $Program @Arguments >> $LogPath 2>&1
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 function Invoke-Checked {
     param(
         [string]$Program,
@@ -96,8 +115,7 @@ function Invoke-Checked {
         [string]$Label,
         [string]$LogPath
     )
-    & $Program @Arguments >> $LogPath 2>&1
-    $exitCode = $LASTEXITCODE
+    $exitCode = Invoke-NativeLogged $Program $Arguments $LogPath
     if ($exitCode -ne 0) {
         throw "$Label exited with code $exitCode"
     }
@@ -399,8 +417,7 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         if ($AllowPublicPeer) {
             $submitArguments += '--allow-public-peers'
         }
-        & $cmfdMinerPath @submitArguments >> $attemptLog 2>&1
-        $submitExitCode = $LASTEXITCODE
+        $submitExitCode = Invoke-NativeLogged $cmfdMinerPath $submitArguments $attemptLog
         if ($submitExitCode -eq 0) {
             $accepted++
             $outcome = 'accepted'

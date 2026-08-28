@@ -33,5 +33,6 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
     -WorkDirectory $work `
     -WslDistribution $WslDistribution `
     -Blocks $Blocks `
+    -InputsPrepared `
     -AllowPublicPeer
 exit $LASTEXITCODE

@@ -9,6 +9,7 @@ CUDA_DEVICE=0
 NONCE=0
 KEEP_ACCEPTED_WORK=0
 VALIDATE_ONLY=0
+INPUTS_PREPARED=0
 sampler_pid=""
 
 usage() {
@@ -24,6 +25,7 @@ while (($#)); do
     --nonce) NONCE="${2:-}"; shift 2 ;;
     --keep-accepted-work) KEEP_ACCEPTED_WORK=1; shift ;;
     --validate-only) VALIDATE_ONLY=1; shift ;;
+    --inputs-prepared) INPUTS_PREPARED=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -62,13 +64,18 @@ for path in "$CMFD_MINER" "$REPLAY_BINARY" "$DYNAMIC_BINARY" "$PROOF_BINARY"; do
   fi
 done
 
-python3 "$SCRIPT_DIR/production-v4-inputs.py" \
-  --chunk-manifest "$SCRIPT_DIR/V4-INPUT-CHUNKS.json" \
-  --input-manifest "$INPUT_MANIFEST" \
-  --fixed-record "$SCRIPT_DIR/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json" \
-  --destination "$SCRIPT_DIR/inputs" \
-  --release-base "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16" \
+input_validation=(
+  --chunk-manifest "$SCRIPT_DIR/V4-INPUT-CHUNKS.json"
+  --input-manifest "$INPUT_MANIFEST"
+  --fixed-record "$SCRIPT_DIR/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+  --destination "$SCRIPT_DIR/inputs"
+  --release-base "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16"
   --validate-only
+)
+if ((INPUTS_PREPARED != 0)); then
+  input_validation+=(--prepared-inputs)
+fi
+python3 "$SCRIPT_DIR/production-v4-inputs.py" "${input_validation[@]}"
 
 gpu_line="$(nvidia-smi --id="$CUDA_DEVICE" --query-gpu=name,memory.total,compute_cap --format=csv,noheader,nounits)"
 IFS=',' read -r gpu_name gpu_memory gpu_compute <<<"$gpu_line"

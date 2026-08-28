@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+
+SCRIPT = Path(__file__).parents[1] / "production-v4-inputs.py"
+SPEC = importlib.util.spec_from_file_location("production_v4_inputs", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+INPUTS = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(INPUTS)
+
+
+def sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+class ProductionV4InputTests(unittest.TestCase):
+    def test_prepare_authenticates_parts_while_assembling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "inputs"
+            parts = destination / ".parts"
+            parts.mkdir(parents=True)
+            fixed_record = root / "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+            fixed_record.write_bytes(b"fixed-record")
+
+            files = []
+            input_entries = []
+            names = ["MODEL-V2.bank"]
+            for bank in range(3):
+                names.extend(
+                    [
+                        f"FORGEMATRIX-V4-FIXED-BANK-{bank}.row-major.codeword",
+                        f"FORGEMATRIX-V4-FIXED-BANK-{bank}.tree",
+                    ]
+                )
+            for index, name in enumerate(names):
+                content = f"left-{index}|right-{index}".encode()
+                midpoint = len(content) // 2
+                left, right = content[:midpoint], content[midpoint:]
+                part_entries = []
+                for part_index, value in enumerate((left, right)):
+                    part_name = f"part-{index}-{part_index}"
+                    (parts / part_name).write_bytes(value)
+                    part_entries.append(
+                        {"name": part_name, "bytes": len(value), "sha256": sha256(value)}
+                    )
+                relative = name if name == "MODEL-V2.bank" else f"fixed/{name}"
+                identity = {"name": name, "bytes": len(content), "sha256": sha256(content)}
+                files.append(
+                    {
+                        **identity,
+                        "relative_path": relative,
+                        "roles": ["miner"],
+                        "parts": part_entries,
+                    }
+                )
+                input_entries.append(identity)
+
+            input_entries.append(
+                {
+                    "name": fixed_record.name,
+                    "bytes": fixed_record.stat().st_size,
+                    "sha256": sha256(fixed_record.read_bytes()),
+                }
+            )
+            chunk_manifest = root / "chunks.json"
+            chunk_manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "release": INPUTS.EXPECTED_RELEASE,
+                        "files": files,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            input_manifest = root / "inputs.json"
+            input_manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "network": INPUTS.EXPECTED_NETWORK,
+                        "total_bytes": sum(entry["bytes"] for entry in input_entries),
+                        "files": input_entries,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                chunk_manifest=chunk_manifest,
+                input_manifest=input_manifest,
+                fixed_record=fixed_record,
+                destination=destination,
+                release_base="https://invalid.example",
+                download_concurrency=16,
+                validate_only=False,
+            )
+
+            authenticated = INPUTS.prepare_inputs(args)
+            INPUTS.validate_inputs(destination, input_manifest, authenticated)
+            self.assertEqual(authenticated, set(names))
+            for entry in files:
+                path = destination / Path(entry["relative_path"])
+                index = names.index(entry["name"])
+                self.assertEqual(path.read_bytes(), f"left-{index}|right-{index}".encode())
+
+    def test_validation_treats_only_row_major_files_as_untrusted_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "inputs"
+            fixed = destination / "fixed"
+            fixed.mkdir(parents=True)
+            values = {
+                "MODEL-V2.bank": b"model",
+                "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json": b"record",
+            }
+            for bank in range(3):
+                values[f"FORGEMATRIX-V4-FIXED-BANK-{bank}.row-major.codeword"] = b"cache"
+                values[f"FORGEMATRIX-V4-FIXED-BANK-{bank}.tree"] = b"tree"
+            entries = []
+            for name, value in values.items():
+                path = INPUTS.final_input_path(destination, name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(value)
+                entries.append({"name": name, "bytes": len(value), "sha256": sha256(value)})
+            manifest = root / "inputs.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "network": INPUTS.EXPECTED_NETWORK,
+                        "total_bytes": sum(entry["bytes"] for entry in entries),
+                        "files": entries,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            (fixed / "FORGEMATRIX-V4-FIXED-BANK-0.row-major.codeword").write_bytes(b"wrong")
+            INPUTS.validate_inputs(destination, manifest)
+            (fixed / "FORGEMATRIX-V4-FIXED-BANK-0.tree").write_bytes(b"fail")
+            with self.assertRaisesRegex(ValueError, "input identity mismatch"):
+                INPUTS.validate_inputs(destination, manifest)
+
+            INPUTS.validate_inputs(destination, manifest, prepared=True)
+            (fixed / "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json").write_bytes(b"badbad")
+            with self.assertRaisesRegex(ValueError, "input identity mismatch"):
+                INPUTS.validate_inputs(destination, manifest, prepared=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

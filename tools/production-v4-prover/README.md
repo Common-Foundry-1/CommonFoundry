@@ -34,6 +34,7 @@ and the 6,973-byte fixed record; they do not need the proving cache.
 On Windows, `scripts/run-production-v4-miner.ps1` performs the complete template, replay,
 commitment, proof, CPU-verification, and submission sequence. Its `Blocks` value defaults to zero,
 which continues until interrupted. The current qualified binaries target compute capability 12.0
-and the launcher enforces at least 15,000 MiB of reported GPU memory. It authenticates all eight
-required inputs once at startup against `production-v4-testnet-1-inputs.json` before requesting a
-node template.
+and the launcher enforces at least 15,000 MiB of reported GPU memory. Before requesting a node
+template, the launcher authenticates the model bank, fixed record, and Merkle trees against
+`production-v4-testnet-1-inputs.json`. The row-major proving files are length-checked and reused as
+untrusted caches; their opened rows and the complete candidate proof remain independently checked.

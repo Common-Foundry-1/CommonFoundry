@@ -51,6 +51,7 @@ param(
 
     [switch]$AllowPublicPeer,
     [switch]$KeepAcceptedWork,
+    [switch]$InputsPrepared,
     [switch]$ValidateOnly
 )
 
@@ -79,14 +80,14 @@ function Resolve-ExistingDirectory {
     return $resolved
 }
 
-function Convert-ToWslPath {
-    param([string]$Path)
-    $portablePath = $Path.Replace('\', '/')
-    $converted = @(& wsl.exe -d $WslDistribution -- wslpath -a -u $portablePath)
-    if ($LASTEXITCODE -ne 0 -or $converted.Count -ne 1) {
-        throw "failed to convert Windows path for $WslDistribution`: $Path"
+function Convert-ToWslPaths {
+    param([string[]]$Paths)
+    $command = 'for value in "$@"; do wslpath -a -u "$value"; done'
+    $converted = @(& wsl.exe -d $WslDistribution --exec bash -c $command cmfd-wslpath @Paths)
+    if ($LASTEXITCODE -ne 0 -or $converted.Count -ne $Paths.Count) {
+        throw "failed to convert Windows paths for $WslDistribution"
     }
-    return [string]$converted[0]
+    return $converted
 }
 
 function Invoke-NativeLogged {
@@ -236,7 +237,11 @@ function Remove-AttemptDirectory {
 }
 
 function Assert-InputManifest {
-    param([string]$ManifestPath, [hashtable]$ExpectedInputs)
+    param(
+        [string]$ManifestPath,
+        [hashtable]$ExpectedInputs,
+        [switch]$Prepared
+    )
     $manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
     if ($manifest.schema_version -ne 1) {
         throw "unsupported ProductionV4 input manifest version: $($manifest.schema_version)"
@@ -261,9 +266,13 @@ function Assert-InputManifest {
         if ([uint64]$item.Length -ne [uint64]$entry.bytes) {
             throw "input length mismatch for $name"
         }
-        $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
-        if ($sha256 -cne [string]$entry.sha256) {
-            throw "input SHA-256 mismatch for $name"
+        $reusableCache = $name.EndsWith('.row-major.codeword', [StringComparison]::Ordinal)
+        $fixedRecord = $name -ceq 'FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json'
+        if ((-not $reusableCache) -and ((-not $Prepared) -or $fixedRecord)) {
+            $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            if ($sha256 -cne [string]$entry.sha256) {
+                throw "input SHA-256 mismatch for $name"
+            }
         }
         $totalBytes += [uint64]$item.Length
     }
@@ -325,13 +334,17 @@ $expectedInputs = @{
         $artifactDirectoryPath
     ) "FORGEMATRIX-V4-FIXED-BANK-$_.tree"
 }
-Assert-InputManifest $inputManifestPath $expectedInputs
+Assert-InputManifest $inputManifestPath $expectedInputs -Prepared:$InputsPrepared
 
-$modelBankWsl = Convert-ToWslPath $modelBankPath
-$artifactDirectoryWsl = Convert-ToWslPath $artifactDirectoryPath
-$replayBinaryWsl = Convert-ToWslPath $replayBinaryPath
-$dynamicCommitmentBinaryWsl = Convert-ToWslPath $dynamicCommitmentBinaryPath
-$proofBinaryWsl = Convert-ToWslPath $proofBinaryPath
+$modelBankWsl, $artifactDirectoryWsl, $replayBinaryWsl, $dynamicCommitmentBinaryWsl, $proofBinaryWsl = @(
+    Convert-ToWslPaths @(
+        $modelBankPath,
+        $artifactDirectoryPath,
+        $replayBinaryPath,
+        $dynamicCommitmentBinaryPath,
+        $proofBinaryPath
+    )
+)
 
 if ($ValidateOnly) {
     Write-Host 'ProductionV4 miner launcher validation passed.'
@@ -384,12 +397,16 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         $sampler = Start-GpuSampler $gpuSamples
         Invoke-Checked $cmfdMinerPath $snapshotArguments 'ProductionV4 template snapshot' $attemptLog
 
-        $templateWsl = Convert-ToWslPath $template
-        $coefficientsWsl = Convert-ToWslPath $coefficients
-        $tracePrefixWsl = Convert-ToWslPath $tracePrefix
-        $dynamicCommitmentsWsl = Convert-ToWslPath $dynamicCommitments
-        $finalActivationWsl = Convert-ToWslPath $finalActivation
-        $proofWsl = Convert-ToWslPath $proof
+        $templateWsl, $coefficientsWsl, $tracePrefixWsl, $dynamicCommitmentsWsl, $finalActivationWsl, $proofWsl = @(
+            Convert-ToWslPaths @(
+                $template,
+                $coefficients,
+                $tracePrefix,
+                $dynamicCommitments,
+                $finalActivation,
+                $proof
+            )
+        )
 
         Invoke-WslChecked $replayBinaryWsl @(
             $modelBankWsl, $coefficientsWsl, $tracePrefixWsl

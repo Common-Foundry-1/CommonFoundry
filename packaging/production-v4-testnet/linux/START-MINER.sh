@@ -9,4 +9,4 @@ if [[ -z "$MINER_ADDRESS" ]]; then
 fi
 
 "$SCRIPT_DIR/PREPARE-V4-INPUTS.sh"
-exec "$SCRIPT_DIR/run-production-v4-miner.sh" --miner "$MINER_ADDRESS"
+exec "$SCRIPT_DIR/run-production-v4-miner.sh" --miner "$MINER_ADDRESS" --inputs-prepared

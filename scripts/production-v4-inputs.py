@@ -39,6 +39,14 @@ def identity_matches(path: Path, size: int, sha256: str) -> bool:
     return path.is_file() and path.stat().st_size == size and sha256_file(path) == sha256
 
 
+def length_matches(path: Path, size: int) -> bool:
+    return path.is_file() and path.stat().st_size == size
+
+
+def is_reusable_cache(name: str) -> bool:
+    return name.endswith(".row-major.codeword")
+
+
 def safe_relative_path(value: str) -> Path:
     relative = PurePosixPath(value)
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
@@ -104,7 +112,7 @@ def prepare_part(part: dict, part_directory: Path, release_base: str) -> Path:
     return part_path
 
 
-def prepare_inputs(args: argparse.Namespace) -> None:
+def prepare_inputs(args: argparse.Namespace) -> set[str]:
     manifest = load_json(args.chunk_manifest)
     if manifest.get("schema_version") != 1 or manifest.get("release") != EXPECTED_RELEASE:
         raise ValueError("unsupported ProductionV4 input chunk manifest")
@@ -116,14 +124,25 @@ def prepare_inputs(args: argparse.Namespace) -> None:
     part_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     part_directory.chmod(0o700)
 
+    authenticated: set[str] = set()
     for entry in manifest.get("files", []):
         if "miner" not in entry.get("roles", []):
             continue
+        name = str(entry["name"])
         output = destination / safe_relative_path(str(entry["relative_path"]))
         expected_size = int(entry["bytes"])
         expected_sha256 = str(entry["sha256"])
-        if identity_matches(output, expected_size, expected_sha256):
-            print(f"Authenticated existing {entry['name']}", flush=True)
+        reusable_cache = is_reusable_cache(name)
+        ready = (
+            length_matches(output, expected_size)
+            if reusable_cache
+            else identity_matches(output, expected_size, expected_sha256)
+        )
+        if ready:
+            if not reusable_cache:
+                authenticated.add(name)
+            status = "Reusing" if reusable_cache else "Authenticated existing"
+            print(f"{status} {name}", flush=True)
             continue
 
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -138,23 +157,30 @@ def prepare_inputs(args: argparse.Namespace) -> None:
 
         partial = output.with_name(f"{output.name}.partial")
         partial.unlink(missing_ok=True)
+        digest = hashlib.sha256()
+        written = 0
         with partial.open("xb") as target:
             for part_path in part_paths:
                 with part_path.open("rb") as source:
-                    shutil.copyfileobj(source, target, BUFFER_BYTES)
+                    while chunk := source.read(BUFFER_BYTES):
+                        target.write(chunk)
+                        digest.update(chunk)
+                        written += len(chunk)
             target.flush()
             os.fsync(target.fileno())
-        if not identity_matches(partial, expected_size, expected_sha256):
+        if written != expected_size or digest.hexdigest() != expected_sha256:
             partial.unlink(missing_ok=True)
-            raise ValueError(f"assembled file failed authentication: {entry['name']}")
+            raise ValueError(f"assembled file failed authentication: {name}")
         os.replace(partial, output)
+        authenticated.add(name)
         for part_path in part_paths:
             part_path.unlink()
-        print(f"Prepared {entry['name']}", flush=True)
+        print(f"Prepared {name}", flush=True)
 
     fixed_target = destination / "fixed" / args.fixed_record.name
     fixed_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.fixed_record, fixed_target)
+    return authenticated
 
 
 def final_input_path(destination: Path, name: str) -> Path:
@@ -165,7 +191,12 @@ def final_input_path(destination: Path, name: str) -> Path:
     return destination / "fixed" / name
 
 
-def validate_inputs(destination: Path, manifest_path: Path) -> None:
+def validate_inputs(
+    destination: Path,
+    manifest_path: Path,
+    authenticated: set[str] | None = None,
+    prepared: bool = False,
+) -> None:
     manifest = load_json(manifest_path)
     if manifest.get("schema_version") != 1 or manifest.get("network") != EXPECTED_NETWORK:
         raise ValueError("unsupported ProductionV4 prover input manifest")
@@ -183,10 +214,21 @@ def validate_inputs(destination: Path, manifest_path: Path) -> None:
         path = final_input_path(destination, name)
         size = int(entry["bytes"])
         sha256 = str(entry["sha256"])
-        if not identity_matches(path, size, sha256):
+        fixed_record = name == "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+        already_authenticated = (authenticated is not None and name in authenticated) or (
+            prepared and not fixed_record
+        )
+        reusable_cache = is_reusable_cache(name)
+        valid = (
+            length_matches(path, size)
+            if already_authenticated or reusable_cache
+            else identity_matches(path, size, sha256)
+        )
+        if not valid:
             raise ValueError(f"input identity mismatch for {name}: {path}")
         total += size
-        print(f"Authenticated {name} ({size} bytes)", flush=True)
+        status = "Validated reusable cache" if reusable_cache else "Authenticated"
+        print(f"{status} {name} ({size} bytes)", flush=True)
     if total != int(manifest.get("total_bytes", -1)):
         raise ValueError(f"input manifest total is invalid: authenticated {total} bytes")
     print(f"Authenticated ProductionV4 input manifest: {total} bytes", flush=True)
@@ -199,8 +241,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-record", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--release-base", required=True)
-    parser.add_argument("--download-concurrency", type=int, choices=range(1, 17), default=8)
+    parser.add_argument("--download-concurrency", type=int, choices=range(1, 17), default=16)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--prepared-inputs", action="store_true")
     return parser.parse_args()
 
 
@@ -209,9 +252,17 @@ def main() -> int:
     for path in (args.chunk_manifest, args.input_manifest, args.fixed_record):
         if not path.is_file():
             raise ValueError(f"required package file is missing: {path}")
+    if args.prepared_inputs and not args.validate_only:
+        raise ValueError("--prepared-inputs requires --validate-only")
+    authenticated = None
     if not args.validate_only:
-        prepare_inputs(args)
-    validate_inputs(args.destination.resolve(), args.input_manifest)
+        authenticated = prepare_inputs(args)
+    validate_inputs(
+        args.destination.resolve(),
+        args.input_manifest,
+        authenticated,
+        prepared=args.prepared_inputs,
+    )
     return 0
 
 

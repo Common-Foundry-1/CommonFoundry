@@ -6,7 +6,7 @@ param(
     [string]$Destination = (Join-Path $PSScriptRoot 'inputs'),
     [string]$ReleaseBase = 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16',
     [ValidateRange(1, 16)]
-    [int]$DownloadConcurrency = 8
+    [int]$DownloadConcurrency = 16
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,6 +17,17 @@ function Test-Identity {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     if ([uint64](Get-Item -LiteralPath $Path).Length -ne $Bytes) { return $false }
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() -ceq $Sha256
+}
+
+function Test-Length {
+    param([string]$Path, [uint64]$Bytes)
+    return (Test-Path -LiteralPath $Path -PathType Leaf) -and
+        [uint64](Get-Item -LiteralPath $Path).Length -eq $Bytes
+}
+
+function Test-ReusableCacheName {
+    param([string]$Name)
+    return $Name.EndsWith('.row-major.codeword', [StringComparison]::Ordinal)
 }
 
 function Get-MissingPart {
@@ -108,6 +119,28 @@ $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
 if ($manifest.schema_version -ne 1 -or $manifest.release -ne 'v0.1.0-devnet.16') {
     throw 'Unsupported ProductionV4 input chunk manifest.'
 }
+$inputManifestPath = Join-Path $PSScriptRoot 'production-v4-testnet-1-inputs.json'
+$inputManifest = Get-Content -Raw -LiteralPath $inputManifestPath | ConvertFrom-Json
+if ($inputManifest.schema_version -ne 1 -or
+    $inputManifest.network -cne 'CommonFoundry ProductionV4 Testnet-1') {
+    throw 'Unsupported ProductionV4 input manifest.'
+}
+$inputEntries = @{}
+foreach ($entry in @($inputManifest.files)) {
+    $name = [string]$entry.name
+    if ($inputEntries.ContainsKey($name)) {
+        throw "ProductionV4 input manifest repeats $name"
+    }
+    $inputEntries[$name] = $entry
+}
+foreach ($file in @($manifest.files)) {
+    $name = [string]$file.name
+    if (-not $inputEntries.ContainsKey($name) -or
+        [uint64]$inputEntries[$name].bytes -ne [uint64]$file.bytes -or
+        [string]$inputEntries[$name].sha256 -cne [string]$file.sha256) {
+        throw "ProductionV4 input manifests disagree about $name"
+    }
+}
 $destinationPath = [IO.Path]::GetFullPath($Destination)
 $partDirectory = Join-Path $destinationPath '.parts'
 New-Item -ItemType Directory -Force -Path $destinationPath, $partDirectory | Out-Null
@@ -115,8 +148,15 @@ New-Item -ItemType Directory -Force -Path $destinationPath, $partDirectory | Out
 foreach ($file in $manifest.files) {
     if (@($file.roles) -notcontains $Role.ToLowerInvariant()) { continue }
     $output = Join-Path $destinationPath ([string]$file.relative_path)
-    if (Test-Identity $output ([uint64]$file.bytes) ([string]$file.sha256)) {
-        Write-Host "Authenticated existing $($file.name)"
+    $reusableCache = Test-ReusableCacheName ([string]$file.name)
+    $ready = if ($reusableCache) {
+        Test-Length $output ([uint64]$file.bytes)
+    } else {
+        Test-Identity $output ([uint64]$file.bytes) ([string]$file.sha256)
+    }
+    if ($ready) {
+        $status = if ($reusableCache) { 'Reusing' } else { 'Authenticated existing' }
+        Write-Host "$status $($file.name)"
         continue
     }
     $parent = Split-Path -Parent $output
@@ -125,15 +165,30 @@ foreach ($file in $manifest.files) {
     $partial = "$output.partial"
     Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
     $target = [IO.File]::Open($partial, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $sha256 = [Security.Cryptography.IncrementalHash]::CreateHash(
+        [Security.Cryptography.HashAlgorithmName]::SHA256
+    )
     try {
+        $buffer = New-Object byte[] (8 * 1024 * 1024)
         foreach ($partPath in $partPaths) {
             $source = [IO.File]::OpenRead($partPath)
-            try { $source.CopyTo($target, 8 * 1024 * 1024) } finally { $source.Dispose() }
+            try {
+                while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $target.Write($buffer, 0, $read)
+                    $sha256.AppendData($buffer, 0, $read)
+                }
+            } finally {
+                $source.Dispose()
+            }
         }
     } finally {
         $target.Dispose()
     }
-    if (-not (Test-Identity $partial ([uint64]$file.bytes) ([string]$file.sha256))) {
+    $assembledHash = [BitConverter]::ToString($sha256.GetHashAndReset()).Replace('-', '').ToLowerInvariant()
+    $sha256.Dispose()
+    if (-not (Test-Length $partial ([uint64]$file.bytes)) -or
+        $assembledHash -cne [string]$file.sha256) {
+        Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
         throw "Assembled file failed authentication: $($file.name)"
     }
     Move-Item -LiteralPath $partial -Destination $output -Force

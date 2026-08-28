@@ -19,4 +19,4 @@ if errorlevel 1 (
   exit /b 1
 )
 
-start "" "%WALLET_RUNTIME%\common-foundry-wallet.exe" --p2p-bind 127.0.0.1:22445
+start "" "%WALLET_RUNTIME%\common-foundry-wallet.exe" --peer 107.214.187.2:22444 --allow-public-peers --p2p-bind 127.0.0.1:22445

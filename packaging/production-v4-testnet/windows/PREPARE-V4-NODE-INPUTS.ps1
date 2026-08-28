@@ -1,4 +1,4 @@
-#requires -Version 7.0
+#requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$Destination = (Join-Path $PSScriptRoot 'production-v4'),
@@ -36,7 +36,7 @@ if (-not (Test-Identity $output ([uint64]$file.bytes) ([string]$file.sha256))) {
             $download = "$partPath.download"
             Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
             Write-Host "Downloading $($part.name)"
-            Invoke-WebRequest -Uri "$ReleaseBase/$($part.name)" -OutFile $download
+            Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$($part.name)" -OutFile $download
             if (-not (Test-Identity $download ([uint64]$part.bytes) ([string]$part.sha256))) {
                 Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
                 throw "Downloaded part failed authentication: $($part.name)"

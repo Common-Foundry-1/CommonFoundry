@@ -1,4 +1,4 @@
-#requires -Version 7.0
+#requires -Version 5.1
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -57,7 +57,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-if (-not $IsWindows) {
+if ($env:OS -cne 'Windows_NT') {
     throw 'The ProductionV4 miner launcher must run on Windows.'
 }
 

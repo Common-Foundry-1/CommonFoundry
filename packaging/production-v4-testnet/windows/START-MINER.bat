@@ -2,12 +2,9 @@
 setlocal
 title Common Foundry ProductionV4 Testnet Miner
 
+set "POWERSHELL_EXE=powershell.exe"
 where pwsh.exe >nul 2>&1
-if errorlevel 1 (
-  echo ERROR: PowerShell 7 is required. Install it, then run START-MINER.bat again.
-  pause
-  exit /b 1
-)
+if not errorlevel 1 set "POWERSHELL_EXE=pwsh.exe"
 if not exist "%~dp0START-MINER.ps1" (
   echo ERROR: START-MINER.ps1 is missing from this package.
   pause
@@ -20,7 +17,7 @@ if not defined MINER_ADDRESS (
   set /p "MINER_ADDRESS=Mining address: "
 )
 
-pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0START-MINER.ps1" -Miner "%MINER_ADDRESS%"
+"%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0START-MINER.ps1" -Miner "%MINER_ADDRESS%"
 set "MINER_EXIT=%ERRORLEVEL%"
 if not "%MINER_EXIT%"=="0" echo ERROR: Miner stopped with exit code %MINER_EXIT%.
 pause

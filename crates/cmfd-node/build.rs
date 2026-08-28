@@ -13,6 +13,7 @@ fn main() {
         "GITHUB_REF_NAME",
         "CARGO_FEATURE_PRODUCTION_RC",
         "CARGO_FEATURE_PRODUCTION_V3_TESTNET",
+        "CARGO_FEATURE_PRODUCTION_V4_TESTNET",
         "CMFD_BUILD_SOURCE_COMMIT",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
@@ -20,10 +21,16 @@ fn main() {
     println!("cargo:rerun-if-changed=release_gate.rs");
     println!("cargo:rerun-if-changed=src/network_profile.rs");
 
-    if env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some()
-        && env::var_os("CARGO_FEATURE_PRODUCTION_V3_TESTNET").is_some()
-    {
-        panic!("production-rc and production-v3-testnet are mutually exclusive");
+    let mutually_exclusive_profiles = [
+        env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some(),
+        env::var_os("CARGO_FEATURE_PRODUCTION_V3_TESTNET").is_some(),
+        env::var_os("CARGO_FEATURE_PRODUCTION_V4_TESTNET").is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    if mutually_exclusive_profiles > 1 {
+        panic!("production-rc and production testnet profiles are mutually exclusive");
     }
 
     let requested = env::var_os("CARGO_FEATURE_PRODUCTION_RC").is_some()

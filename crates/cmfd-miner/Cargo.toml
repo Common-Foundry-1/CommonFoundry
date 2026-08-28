@@ -16,6 +16,11 @@ production-v3-testnet = [
     "cmfd-node/production-v3-testnet",
     "dep:same-file",
 ]
+production-v4-testnet = [
+    "cmfd-consensus/forgematrix-v4-verifier",
+    "cmfd-node/production-v4-testnet",
+    "dep:same-file",
+]
 production-rc = ["production-v3", "cmfd-node/production-rc"]
 
 [dependencies]

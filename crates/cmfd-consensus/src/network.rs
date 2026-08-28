@@ -204,6 +204,8 @@ fn map_pow_parameter_error(error: PowError) -> NetworkError {
         | PowError::PreverificationEntropy => NetworkError::InvalidPowParameters,
         #[cfg(feature = "dory-v3-consensus-adapter")]
         PowError::V3(_) => NetworkError::InvalidPowParameters,
+        #[cfg(feature = "forgematrix-v4-verifier")]
+        PowError::V4(_) => NetworkError::InvalidPowParameters,
     }
 }
 

@@ -152,3 +152,15 @@ path = "src/lib.rs"
 [[bin]]
 name = "cmfd-consensus"
 path = "src/main.rs"
+
+[[example]]
+name = "forgematrix_v4_fixed_record"
+required-features = ["forgematrix-v4-verifier"]
+
+[[example]]
+name = "forgematrix_v4_replay_coefficients"
+required-features = ["forgematrix-v4-verifier"]
+
+[[example]]
+name = "forgematrix_v4_verify_candidate"
+required-features = ["forgematrix-v4-verifier"]

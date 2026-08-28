@@ -3,9 +3,12 @@
 //! This module defines only the field, BaseFold, and trace-index parameters.
 //! It does not activate ProductionV4 or provide a verifier.
 
-use crate::forgematrix_v2::{
-    PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
-    PRODUCTION_V2_LAYERS_PER_BANK,
+use crate::{
+    BlockChallenge,
+    forgematrix_v2::{
+        PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
+        PRODUCTION_V2_LAYERS_PER_BANK,
+    },
 };
 
 pub const FORGEMATRIX_V4_PROOF_SYSTEM_DIGEST_DOMAIN: &str =
@@ -22,6 +25,18 @@ pub const FORGEMATRIX_V4_TRACE_RELATIONS: &str =
 pub const FORGEMATRIX_V4_EXECUTION_SEMANTICS: &str = "model-byte x maps to x-125;initial-activation=(base-input+CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,u32::MAX))^3;layer-mask=CMFD/FORGEMATRIX/MASKCOEFF/V2(challenge,global-layer);all arithmetic canonical KoalaBear";
 pub const FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN: &str =
     "CommonFoundry/ForgeMatrix/V4/FinalActivation/v1";
+pub const FORGEMATRIX_V4_CHALLENGE_DIGEST_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/V4/Challenge/v1";
+pub const FORGEMATRIX_V4_WORK_DIGEST_DOMAIN: &str = "CommonFoundry/ForgeMatrix/V4/Work/v1";
+/// Authenticated fixed-bank record selected by ProductionV4 Testnet-1.
+pub const PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST: [u8; 32] = [
+    0x2e, 0xfd, 0x2c, 0x42, 0x44, 0xbb, 0xd7, 0x80, 0x85, 0x47, 0xb8, 0x52, 0x66, 0x98, 0x75, 0x44,
+    0x23, 0x3f, 0xbe, 0x33, 0x9f, 0x44, 0x51, 0x35, 0xb0, 0x78, 0x43, 0xaa, 0x88, 0x93, 0xd4, 0x5e,
+];
+pub const PRODUCTION_V4_MODEL_MANIFEST_DIGEST: [u8; 32] = [
+    0x68, 0xf6, 0xfe, 0x67, 0x4f, 0x75, 0xa3, 0x63, 0xc6, 0x2c, 0x27, 0x5e, 0xbb, 0x11, 0xfa, 0x74,
+    0xaa, 0x08, 0x9e, 0x9b, 0xbd, 0xe5, 0xbc, 0xb9, 0x52, 0xec, 0x35, 0xb8, 0x89, 0x0b, 0x57, 0x5c,
+];
 pub const FORGEMATRIX_V4_RELATION_TRANSCRIPT: &str = "commitments-v1;bank0-relations;bank1-relations;bank0-opening;bank2-relations;bank1-opening;final-point-v1;bank2-opening";
 
 pub const FORGEMATRIX_V4_ALGORITHM_VERSION: u32 = 4;
@@ -96,11 +111,50 @@ pub fn forgematrix_v4_proof_system_digest() -> [u8; 32] {
     update_text(&mut hasher, FORGEMATRIX_V4_TRACE_RELATIONS);
     update_text(&mut hasher, FORGEMATRIX_V4_EXECUTION_SEMANTICS);
     update_text(&mut hasher, FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN);
+    update_text(&mut hasher, FORGEMATRIX_V4_CHALLENGE_DIGEST_DOMAIN);
+    update_text(&mut hasher, FORGEMATRIX_V4_WORK_DIGEST_DOMAIN);
     update_text(&mut hasher, FORGEMATRIX_V4_RELATION_TRANSCRIPT);
     update_text(&mut hasher, FORGEMATRIX_V4_TRANSCRIPT_DOMAIN);
     update_text(&mut hasher, FORGEMATRIX_V4_POSEIDON_SUITE);
     update_text(&mut hasher, FORGEMATRIX_V4_PROOF_CODEC);
     update_text(&mut hasher, FORGEMATRIX_V4_BASEFOLD_SOURCE_REVISION);
+    *hasher.finalize().as_bytes()
+}
+
+pub fn forgematrix_v4_challenge_digest(
+    block: &BlockChallenge,
+    nonce: u64,
+    model_manifest_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(FORGEMATRIX_V4_CHALLENGE_DIGEST_DOMAIN);
+    hasher.update(&1_u32.to_le_bytes());
+    hasher.update(&block.network_id);
+    hasher.update(&block.previous_block);
+    hasher.update(&block.transaction_root);
+    hasher.update(&block.height.to_le_bytes());
+    hasher.update(&block.timestamp.to_le_bytes());
+    hasher.update(&block.target);
+    hasher.update(&FORGEMATRIX_V4_ALGORITHM_VERSION.to_le_bytes());
+    hasher.update(&FORGEMATRIX_V4_PROOF_VERSION.to_le_bytes());
+    hasher.update(&forgematrix_v4_proof_system_digest());
+    hasher.update(&model_manifest_digest);
+    hasher.update(&nonce.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+pub fn forgematrix_v4_work_digest(
+    model_manifest_digest: [u8; 32],
+    challenge_digest: [u8; 32],
+    final_activation_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(FORGEMATRIX_V4_WORK_DIGEST_DOMAIN);
+    hasher.update(&1_u32.to_le_bytes());
+    hasher.update(&FORGEMATRIX_V4_ALGORITHM_VERSION.to_le_bytes());
+    hasher.update(&FORGEMATRIX_V4_PROOF_VERSION.to_le_bytes());
+    hasher.update(&forgematrix_v4_proof_system_digest());
+    hasher.update(&model_manifest_digest);
+    hasher.update(&challenge_digest);
+    hasher.update(&final_activation_digest);
     *hasher.finalize().as_bytes()
 }
 
@@ -260,7 +314,40 @@ mod tests {
         assert_ne!(digest, [0; 32]);
         assert_eq!(
             hex::encode(digest),
-            "7878c407708c39439658f91bb6e6fc95cadb80742032dff21a98df04162ffb72"
+            "e849e3bfc83f8f8dd0f1fc1100879417718ba2bffb92af5cd649b61c720675a3"
+        );
+    }
+
+    #[test]
+    fn challenge_and_work_bind_every_public_input() {
+        let block = BlockChallenge {
+            network_id: [1; 32],
+            previous_block: [2; 32],
+            transaction_root: [3; 32],
+            height: 4,
+            timestamp: 5,
+            target: [6; 32],
+        };
+        let challenge = forgematrix_v4_challenge_digest(&block, 7, [8; 32]);
+        let work = forgematrix_v4_work_digest([8; 32], challenge, [9; 32]);
+
+        let mut changed = block;
+        changed.target[0] ^= 1;
+        assert_ne!(
+            forgematrix_v4_challenge_digest(&changed, 7, [8; 32]),
+            challenge
+        );
+        assert_ne!(
+            forgematrix_v4_challenge_digest(&block, 8, [8; 32]),
+            challenge
+        );
+        assert_ne!(
+            forgematrix_v4_challenge_digest(&block, 7, [9; 32]),
+            challenge
+        );
+        assert_ne!(
+            forgematrix_v4_work_digest([8; 32], challenge, [10; 32]),
+            work
         );
     }
 }

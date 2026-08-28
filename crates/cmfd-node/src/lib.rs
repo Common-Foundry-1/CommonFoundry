@@ -12,7 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-#[cfg(any(test, feature = "production-v3"))]
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_consensus::ForgeMatrixV4FixedArtifactRecordV1;
+#[cfg(any(test, feature = "production-v3", feature = "production-v4-testnet"))]
 use cmfd_consensus::PowParameters;
 use cmfd_consensus::chain::{ReversibleStateDeltaCapability, ValidatedBlock};
 use cmfd_consensus::{
@@ -25,8 +27,8 @@ use cmfd_consensus::{
     NetworkParams, OutPoint, OutputLock, PowError, PreverifiedBlockProof,
     ReversibleStateDeltaError, SuccessorHeaderPreflight, TRANSACTION_VERSION, Transaction, TxInput,
     TxOutput, WireError, add_chain_work, chain_work_bytes, decode_block, decode_transaction,
-    encode_block, encode_transaction, merkle_root, v2_reference_for_network,
-    validate_block_preamble, validate_block_resources,
+    encode_block, encode_transaction, max_block_bytes_for_network, merkle_root,
+    v2_reference_for_network, validate_block_preamble, validate_block_resources,
 };
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::{
@@ -43,6 +45,7 @@ use k256::schnorr::{SigningKey, VerifyingKey};
 use primitive_types::U512;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 pub mod logging;
@@ -60,11 +63,11 @@ mod release_gate;
 
 pub use network_info::{
     canonical_network_info_json, canonical_network_info_json_with_artifacts,
-    canonical_network_info_json_with_record,
+    canonical_network_info_json_with_record, canonical_network_info_json_with_v4_artifacts,
 };
 pub use network_profile::{
     COMPILED_NETWORK_PROFILE, DEVNET_PROFILE, NetworkProfile, NetworkProfileKind,
-    PRODUCTION_V3_TESTNET_PROFILE, ProofProfile, RCNET1_PROFILE,
+    PRODUCTION_V3_TESTNET_PROFILE, PRODUCTION_V4_TESTNET_PROFILE, ProofProfile, RCNET1_PROFILE,
 };
 
 pub const DEVNET_NETWORK_ID: [u8; 32] = COMPILED_NETWORK_PROFILE.network_id;
@@ -114,6 +117,28 @@ pub const PRODUCTION_V3_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v3";
 pub const PRODUCTION_V3_PACKAGE_BANK: &str = "MODEL-V2.bank";
 pub const PRODUCTION_V3_PACKAGE_MANIFEST: &str = "MODEL-V2.manifest.json";
 pub const PRODUCTION_V3_PACKAGE_RECORD_V2: &str = "DORY-V3-MODEL-RECORD-V2.json";
+pub const PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY: &str = "production-v4";
+pub const PRODUCTION_V4_PACKAGE_BANK: &str = "MODEL-V2.bank";
+pub const PRODUCTION_V4_PACKAGE_FIXED_RECORD: &str = "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionV4VerifierArtifacts {
+    pub bank: PathBuf,
+    pub fixed_record: PathBuf,
+}
+
+pub fn production_v4_package_artifacts(
+    executable: &Path,
+) -> Result<ProductionV4VerifierArtifacts, NodeError> {
+    let directory = executable
+        .parent()
+        .ok_or(NodeError::ProductionV4ArtifactsMissing)?;
+    let artifacts = directory.join(PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY);
+    Ok(ProductionV4VerifierArtifacts {
+        bank: artifacts.join(PRODUCTION_V4_PACKAGE_BANK),
+        fixed_record: artifacts.join(PRODUCTION_V4_PACKAGE_FIXED_RECORD),
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionV3PackageLayout {
@@ -224,6 +249,8 @@ pub(crate) fn production_v3_record_for_profile(
             production_v3_record_from_artifacts(artifacts).map(Some)
         }
         (ProofProfile::ProductionV3, None) => Ok(None),
+        (ProofProfile::ProductionV4, Some(_)) => Err(NodeError::ProductionV3ArtifactsUnexpected),
+        (ProofProfile::ProductionV4, None) => Ok(None),
     }
 }
 
@@ -373,6 +400,16 @@ pub enum NodeError {
         #[source]
         cmfd_consensus::dory_v3_model_bank_record_validation::ProductionDoryV3ModelBankRecordValidationError,
     ),
+    #[error("the compiled ProductionV4 network requires its in-process verifier authority")]
+    ProductionV4Unavailable,
+    #[error("ProductionV4 requires the release-pinned model bank and fixed artifact record")]
+    ProductionV4ArtifactsMissing,
+    #[error("ProductionV4 verifier artifacts were supplied for another proof profile")]
+    ProductionV4ArtifactsUnexpected,
+    #[error("the compiled ProductionV4 artifact identity pins are absent or invalid")]
+    ProductionV4ArtifactPinsMissing,
+    #[error("the authenticated ProductionV4 {0} does not match its compiled identity pin")]
+    ProductionV4ArtifactIdentityMismatch(&'static str),
     #[error("network metadata is missing while a nonempty block log already exists")]
     MissingMetadata,
     #[error("data directory belongs to a different immutable network fingerprint")]
@@ -513,6 +550,13 @@ impl NodeError {
             | Self::ProofVerifierProfileMismatch => ("proof_verifier_configuration", 500, false),
             #[cfg(feature = "production-v3")]
             Self::ProductionV3Artifacts(_) => ("proof_verifier_configuration", 500, false),
+            Self::ProductionV4Unavailable => ("production_v4_unavailable", 503, false),
+            Self::ProductionV4ArtifactsMissing
+            | Self::ProductionV4ArtifactsUnexpected
+            | Self::ProductionV4ArtifactPinsMissing
+            | Self::ProductionV4ArtifactIdentityMismatch(_) => {
+                ("proof_verifier_configuration", 500, false)
+            }
             Self::MissingMetadata => ("missing_metadata", 500, false),
             Self::FingerprintMismatch => ("fingerprint_mismatch", 409, false),
             Self::InvalidWalletKey => ("invalid_wallet_key", 500, false),
@@ -676,7 +720,10 @@ struct DeadlineWakeBarrier {
 
 #[cfg(test)]
 impl DeadlineWakeBarrier {
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     fn new() -> Self {
         Self {
             entered: Barrier::new(2),
@@ -702,7 +749,10 @@ struct CommitRaceBarrier {
 
 #[cfg(test)]
 impl CommitRaceBarrier {
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     fn new(point: CommitPausePoint) -> Self {
         Self {
             point,
@@ -721,7 +771,10 @@ struct CompletionFaultBarrier {
 
 #[cfg(test)]
 impl CompletionFaultBarrier {
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     fn new() -> Self {
         Self {
             entered: Barrier::new(2),
@@ -1739,6 +1792,7 @@ impl BlockPreverifier {
         let backend = match proof_profile {
             ProofProfile::DevnetV2Reference => ProofVerificationBackend::InProcess,
             ProofProfile::ProductionV3 => ProofVerificationBackend::Unavailable,
+            ProofProfile::ProductionV4 => ProofVerificationBackend::InProcess,
         };
         Self::with_limits_and_backend(
             verifier,
@@ -1750,7 +1804,10 @@ impl BlockPreverifier {
     }
 
     #[cfg(test)]
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     fn with_limits(
         verifier: ConsensusPowVerifier,
         max_active: usize,
@@ -1999,7 +2056,10 @@ impl BlockPreverifier {
     }
 
     #[cfg(test)]
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     fn run_guarded<T>(
         &self,
         operation: impl FnOnce() -> Result<T, NodeError>,
@@ -3703,7 +3763,10 @@ enum ExternalBlockAdmissionProgress {
 
 #[cfg(test)]
 impl ExternalBlockAdmissionProgress {
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     fn into_ready(self) -> ExternalBlockAdmission {
         match self {
             Self::Ready(admission) => admission,
@@ -3878,16 +3941,20 @@ fn requires_external_preverification(params: &NetworkParams) -> bool {
 pub(crate) fn network_params_and_verifier_for_profile(
     profile: NetworkProfile,
     production_v3_record: Option<&ProductionV3VerifierRecord>,
+    production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
 ) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
     let verifier = match profile.proof {
         ProofProfile::DevnetV2Reference => {
-            if production_v3_record.is_some() {
-                return Err(NodeError::ProductionV3ArtifactsUnexpected);
+            if production_v3_record.is_some() || production_v4_artifacts.is_some() {
+                return Err(NodeError::ProductionV4ArtifactsUnexpected);
             }
             let reference = v2_reference_for_network(profile.network_id).map_err(PowError::from)?;
             ConsensusPowVerifier::v2_reference(reference)
         }
         ProofProfile::ProductionV3 => {
+            if production_v4_artifacts.is_some() {
+                return Err(NodeError::ProductionV4ArtifactsUnexpected);
+            }
             #[cfg(feature = "production-v3")]
             {
                 let record = production_v3_record.ok_or(NodeError::ProductionV3ArtifactsMissing)?;
@@ -3918,8 +3985,76 @@ pub(crate) fn network_params_and_verifier_for_profile(
                 return Err(NodeError::ProductionV3Unavailable);
             }
         }
+        ProofProfile::ProductionV4 => {
+            if production_v3_record.is_some() {
+                return Err(NodeError::ProductionV3ArtifactsUnexpected);
+            }
+            #[cfg(feature = "production-v4-testnet")]
+            {
+                let artifacts =
+                    production_v4_artifacts.ok_or(NodeError::ProductionV4ArtifactsMissing)?;
+                let pins = release_gate::PRODUCTION_V4_TESTNET_ARTIFACT_PINS;
+                let fixed_record_file = require_production_v4_file_identity(
+                    &artifacts.fixed_record,
+                    pins.fixed_record,
+                    "fixed artifact record",
+                )?;
+                let record: ForgeMatrixV4FixedArtifactRecordV1 =
+                    serde_json::from_reader(BufReader::new(fixed_record_file))?;
+                let bank_file =
+                    require_production_v4_file_identity(&artifacts.bank, pins.bank, "model bank")?;
+                ConsensusPowVerifier::v4_candidate(
+                    record,
+                    BufReader::with_capacity(64 * 1024 * 1024, bank_file),
+                )?
+            }
+            #[cfg(not(feature = "production-v4-testnet"))]
+            {
+                let _ = production_v4_artifacts;
+                return Err(NodeError::ProductionV4Unavailable);
+            }
+        }
     };
     network_params_from_verifier(profile, verifier)
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn require_production_v4_file_identity(
+    path: &Path,
+    pin: release_gate::ProductionV3FileIdentityPin,
+    name: &'static str,
+) -> Result<File, NodeError> {
+    if pin.bytes == 0 || pin.blake3 == [0; 32] || pin.sha256 == [0; 32] {
+        return Err(NodeError::ProductionV4ArtifactPinsMissing);
+    }
+    let mut file =
+        File::open(path).map_err(|source| io_error("open ProductionV4 artifact", path, source))?;
+    let bytes = file
+        .metadata()
+        .map_err(|source| io_error("inspect ProductionV4 artifact", path, source))?
+        .len();
+    if bytes != pin.bytes {
+        return Err(NodeError::ProductionV4ArtifactIdentityMismatch(name));
+    }
+    let mut blake3 = blake3::Hasher::new();
+    let mut sha256 = Sha256::new();
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| io_error("hash ProductionV4 artifact", path, source))?;
+        if read == 0 {
+            break;
+        }
+        blake3.update(&buffer[..read]);
+        sha256.update(&buffer[..read]);
+    }
+    let actual_blake3 = *blake3.finalize().as_bytes();
+    let actual_sha256: [u8; 32] = sha256.finalize().into();
+    if actual_blake3 != pin.blake3 || actual_sha256 != pin.sha256 {
+        return Err(NodeError::ProductionV4ArtifactIdentityMismatch(name));
+    }
+    File::open(path).map_err(|source| io_error("reopen ProductionV4 artifact", path, source))
 }
 
 fn network_params_from_verifier(
@@ -3927,6 +4062,14 @@ fn network_params_from_verifier(
     verifier: ConsensusPowVerifier,
 ) -> Result<(NetworkParams, ConsensusPowVerifier), NodeError> {
     let pow = verifier.parameters();
+    let params = network_params_from_pow(profile, pow)?;
+    Ok((params, verifier))
+}
+
+fn network_params_from_pow(
+    profile: NetworkProfile,
+    pow: PowParameters,
+) -> Result<NetworkParams, NodeError> {
     let params = NetworkParams {
         network_id: profile.network_id,
         protocol_version: NETWORK_PROTOCOL_VERSION,
@@ -3942,7 +4085,7 @@ fn network_params_from_verifier(
         max_future_offset_secs: MAX_FUTURE_OFFSET_SECS,
     };
     params.validate()?;
-    Ok((params, verifier))
+    Ok(params)
 }
 
 fn require_production_v3_file_identity(
@@ -3957,7 +4100,29 @@ fn require_production_v3_file_identity(
 }
 
 fn network_params_for_profile(profile: NetworkProfile) -> Result<NetworkParams, NodeError> {
-    network_params_and_verifier_for_profile(profile, None).map(|(params, _)| params)
+    network_params_and_verifier_for_profile(profile, None, None).map(|(params, _)| params)
+}
+
+pub(crate) fn thin_miner_network_params() -> Result<NetworkParams, NodeError> {
+    match COMPILED_NETWORK_PROFILE.proof {
+        ProofProfile::DevnetV2Reference => network_params_for_profile(COMPILED_NETWORK_PROFILE),
+        ProofProfile::ProductionV3 => Err(NodeError::ProductionV3Unavailable),
+        ProofProfile::ProductionV4 => {
+            #[cfg(feature = "production-v4-testnet")]
+            {
+                network_params_from_pow(
+                    COMPILED_NETWORK_PROFILE,
+                    PowParameters::V4Candidate(
+                        cmfd_consensus::ForgeMatrixV4CandidateParameters::production_testnet(),
+                    ),
+                )
+            }
+            #[cfg(not(feature = "production-v4-testnet"))]
+            {
+                Err(NodeError::ProductionV4Unavailable)
+            }
+        }
+    }
 }
 
 pub fn devnet_params() -> Result<NetworkParams, NodeError> {
@@ -4010,6 +4175,23 @@ impl Node {
             record.as_ref(),
             production_v3_artifacts.cloned(),
             None,
+            None,
+        )
+    }
+
+    /// Opens the isolated ProductionV4 testnet only after authenticating its
+    /// release-pinned fixed record and complete model bank.
+    pub fn open_with_v4_artifacts(
+        data_dir: impl AsRef<Path>,
+        production_v4_artifacts: &ProductionV4VerifierArtifacts,
+    ) -> Result<Self, NodeError> {
+        Self::open_with_profile_artifacts_and_worker(
+            data_dir,
+            COMPILED_NETWORK_PROFILE,
+            None,
+            None,
+            Some(production_v4_artifacts),
+            None,
         )
     }
 
@@ -4023,6 +4205,7 @@ impl Node {
             data_dir,
             COMPILED_NETWORK_PROFILE,
             production_v3_record,
+            None,
             None,
             None,
         )
@@ -4043,6 +4226,7 @@ impl Node {
             COMPILED_NETWORK_PROFILE,
             record.as_ref(),
             production_v3_artifacts.cloned(),
+            None,
             Some(verifier_worker),
         )
     }
@@ -4058,6 +4242,7 @@ impl Node {
             data_dir,
             COMPILED_NETWORK_PROFILE,
             production_v3_record,
+            None,
             None,
             Some(verifier_worker),
         )
@@ -4089,6 +4274,7 @@ impl Node {
             record.as_ref(),
             production_v3_artifacts.cloned(),
             None,
+            None,
         )
     }
 
@@ -4097,10 +4283,14 @@ impl Node {
         profile: NetworkProfile,
         production_v3_record: Option<&ProductionV3VerifierRecord>,
         production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
+        production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
         verifier_worker: Option<VerifierWorkerConfig>,
     ) -> Result<Self, NodeError> {
-        let (params, verifier) =
-            network_params_and_verifier_for_profile(profile, production_v3_record)?;
+        let (params, verifier) = network_params_and_verifier_for_profile(
+            profile,
+            production_v3_record,
+            production_v4_artifacts,
+        )?;
         let block_preverifier = BlockPreverifier::new(verifier.clone(), profile.proof);
         let external_replay = verifier_worker.is_some();
         if let Some(config) = verifier_worker {
@@ -4139,6 +4329,9 @@ impl Node {
                 "startup record count does not match the fork index".to_owned(),
             ));
         }
+
+        #[cfg(not(feature = "production-v3"))]
+        let _ = production_v3_artifacts;
 
         Ok(Self {
             instance_id: next_node_instance_id()?,
@@ -4264,8 +4457,12 @@ impl Node {
         &mut self,
         config: VerifierWorkerConfig,
     ) -> Result<(), NodeError> {
-        if matches!(self.profile.proof, ProofProfile::ProductionV3) {
-            return Err(NodeError::ProductionV3Unavailable);
+        if !matches!(self.profile.proof, ProofProfile::DevnetV2Reference) {
+            return Err(match self.profile.proof {
+                ProofProfile::ProductionV3 => NodeError::ProductionV3Unavailable,
+                ProofProfile::ProductionV4 => NodeError::ProductionV4Unavailable,
+                ProofProfile::DevnetV2Reference => unreachable!(),
+            });
         }
         install_external_proof_verifier(self.profile, &self.block_preverifier, config)
     }
@@ -5466,7 +5663,10 @@ impl Node {
     /// Every state-dependent consensus and durability check remains identical
     /// to [`Self::submit_block`].
     #[cfg(test)]
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     pub(crate) fn submit_preverified_block(
         &mut self,
         block: Block,
@@ -5507,7 +5707,10 @@ impl Node {
     }
 
     #[cfg(test)]
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     pub(crate) fn submit_preverified_block_with_admission(
         &mut self,
         block: Block,
@@ -5607,7 +5810,13 @@ impl Node {
                 "validated block cannot encode its reversible state delta: {error}"
             ))
         })?;
-        let record = encode_record_v2(accepted_at, &canonical, &delta, self.last_record_digest)?;
+        let record = encode_record_v2(
+            accepted_at,
+            &canonical,
+            &delta,
+            self.last_record_digest,
+            self.params.network_id,
+        )?;
         let record_digest = complete_record_digest(&record);
         if let Err(error) = verify_retained_block_log_path(&self.log, &log_path) {
             self.storage_faulted = true;
@@ -6722,7 +6931,10 @@ pub struct RpcServerHandle {
     local_address: SocketAddr,
     stop: Arc<(Mutex<bool>, Condvar)>,
     #[cfg(test)]
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     active_request: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<(), NodeError>>>,
 }
@@ -6900,7 +7112,12 @@ fn handle_rpc_connection_shared(
         .map_err(NodeError::RpcIo)?;
     let mut deadline_reader =
         DeadlineReader::new(stream, RPC_TOTAL_READ_TIMEOUT).map_err(NodeError::RpcIo)?;
-    let request = match read_rpc_request(&mut deadline_reader) {
+    let network_id = shared
+        .lock()
+        .map_err(|_| NodeError::SharedNodePoisoned)?
+        .params
+        .network_id;
+    let request = match read_rpc_request(&mut deadline_reader, network_id) {
         Ok(request) => request,
         Err(error) => {
             return write_rpc_response(stream, RpcResponse::node_error(error));
@@ -7340,7 +7557,7 @@ fn template_json(template: &BlockTemplate, profile: NetworkProfile) -> serde_jso
     })
 }
 
-fn read_rpc_request(reader: &mut impl Read) -> Result<RpcRequest, NodeError> {
+fn read_rpc_request(reader: &mut impl Read, network_id: [u8; 32]) -> Result<RpcRequest, NodeError> {
     let mut bytes = Vec::new();
     let header_end = loop {
         if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -7382,7 +7599,7 @@ fn read_rpc_request(reader: &mut impl Read) -> Result<RpcRequest, NodeError> {
 
     let mut content_length = None;
     let mut content_type = None;
-    let body_limit = rpc_body_limit(request_parts[0], request_parts[1]);
+    let body_limit = rpc_body_limit(request_parts[0], request_parts[1], network_id);
     for line in lines {
         let (name, value) = line
             .split_once(':')
@@ -7452,11 +7669,11 @@ fn read_rpc_request(reader: &mut impl Read) -> Result<RpcRequest, NodeError> {
     })
 }
 
-fn rpc_body_limit(method: &str, target: &str) -> usize {
+fn rpc_body_limit(method: &str, target: &str, network_id: [u8; 32]) -> usize {
     match (method, target) {
         ("POST", "/v1/transaction") => MAX_TRANSACTION_BYTES,
         ("POST", "/v1/wallet/send" | "/v1/wallet/consolidate") => WALLET_JSON_BODY_LIMIT,
-        ("POST", "/v1/block") => MAX_BLOCK_BYTES,
+        ("POST", "/v1/block") => max_block_bytes_for_network(network_id),
         ("POST", target) if target.starts_with("/v1/mine?") => 0,
         ("GET", _) => 0,
         _ => MAX_BLOCK_BYTES,
@@ -7684,7 +7901,10 @@ fn write_wallet_key(path: &Path, key: &SigningKey) -> Result<(), NodeError> {
 }
 
 #[cfg(test)]
-#[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+#[cfg_attr(
+    any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+    allow(dead_code)
+)]
 fn encode_record_v1(accepted_at: u64, block: &[u8]) -> Result<Vec<u8>, NodeError> {
     let block_len = u32::try_from(block.len())
         .map_err(|_| NodeError::CorruptLog("block length exceeds u32".to_owned()))?;
@@ -7709,8 +7929,9 @@ fn encode_record_v2(
     block: &[u8],
     delta: &[u8],
     previous_record_digest: [u8; 32],
+    network_id: [u8; 32],
 ) -> Result<Vec<u8>, NodeError> {
-    if block.len() > MAX_BLOCK_BYTES {
+    if block.len() > max_block_bytes_for_network(network_id) {
         return Err(NodeError::CorruptLog("block exceeds wire limit".to_owned()));
     }
     if delta.len() > MAX_REVERSIBLE_STATE_DELTA_BYTES {
@@ -7826,6 +8047,7 @@ fn read_log_record(
     reader: &mut impl Read,
     path: &Path,
     record_index: u64,
+    network_id: [u8; 32],
 ) -> Result<Option<ParsedLogRecord>, NodeError> {
     let mut prefix = [0_u8; 8];
     match reader.read(&mut prefix[..1]) {
@@ -7872,7 +8094,7 @@ fn read_log_record(
 
     let accepted_at = u64::from_le_bytes(header[8..16].try_into().expect("fixed slice"));
     let block_len = u32::from_le_bytes(header[16..20].try_into().expect("fixed slice")) as usize;
-    if block_len > MAX_BLOCK_BYTES {
+    if block_len > max_block_bytes_for_network(network_id) {
         return Err(NodeError::CorruptLog(format!(
             "record {record_index} block exceeds the wire limit"
         )));
@@ -8021,16 +8243,17 @@ fn read_located_record(
     network_id: [u8; 32],
     require_v2: bool,
 ) -> Result<(ParsedLogRecord, Block), NodeError> {
+    let max_block_bytes = max_block_bytes_for_network(network_id);
     let (minimum_length, maximum_length) = match locator.version {
         BlockRecordVersion::LegacyV1 => (
             RECORD_V1_HEADER_BYTES + RECORD_CHECKSUM_BYTES,
-            checked_record_len(RECORD_V1_HEADER_BYTES, MAX_BLOCK_BYTES, 0)?,
+            checked_record_len(RECORD_V1_HEADER_BYTES, max_block_bytes, 0)?,
         ),
         BlockRecordVersion::V2 => (
             RECORD_V2_HEADER_BYTES + RECORD_CHECKSUM_BYTES,
             checked_record_len(
                 RECORD_V2_HEADER_BYTES,
-                MAX_BLOCK_BYTES,
+                max_block_bytes,
                 MAX_REVERSIBLE_STATE_DELTA_BYTES,
             )?,
         ),
@@ -8082,12 +8305,13 @@ fn read_located_record(
         )
     })?;
     let mut reader = Cursor::new(bytes.as_slice());
-    let record = read_log_record(&mut reader, path, locator.ordinal)?.ok_or_else(|| {
-        NodeError::CorruptLog(format!(
-            "record {} disappeared at its authenticated locator",
-            locator.ordinal
-        ))
-    })?;
+    let record =
+        read_log_record(&mut reader, path, locator.ordinal, network_id)?.ok_or_else(|| {
+            NodeError::CorruptLog(format!(
+                "record {} disappeared at its authenticated locator",
+                locator.ordinal
+            ))
+        })?;
     if reader.position() != locator.length {
         return Err(NodeError::CorruptLog(format!(
             "record {} locator does not contain exactly one record",
@@ -8585,7 +8809,7 @@ fn scan_replay_log(
         let offset = reader
             .stream_position()
             .map_err(|source| io_error("locate block log record", path, source))?;
-        let Some(record) = read_log_record(&mut reader, path, record_index)? else {
+        let Some(record) = read_log_record(&mut reader, path, record_index, network_id)? else {
             let log_length = reader
                 .stream_position()
                 .map_err(|source| io_error("locate block log end", path, source))?;
@@ -8751,7 +8975,10 @@ fn log_read_error(path: &Path, source: io::Error, truncated_message: String) -> 
     }
 }
 
-#[cfg(all(test, not(feature = "production-v3-testnet")))]
+#[cfg(all(
+    test,
+    not(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))
+))]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     #[cfg(windows)]
@@ -8964,6 +9191,7 @@ mod tests {
             block_bytes,
             &forged_delta,
             previous_record_digest,
+            DEVNET_NETWORK_ID,
         )
         .unwrap()
     }
@@ -11491,6 +11719,7 @@ mod tests {
             BlockProof::V1Legacy(proof) => proof.nonce,
             BlockProof::V2Reference(proof) => proof.nonce,
             BlockProof::V3Candidate(proof) => proof.nonce,
+            BlockProof::V4Candidate(proof) => proof.nonce,
         };
         assert_eq!(attempts_completed, proof_nonce.wrapping_add(1));
         assert_eq!(next_nonce, proof_nonce.wrapping_add(1));
@@ -11689,6 +11918,7 @@ mod tests {
             BlockProof::V1Legacy(proof) => proof.work_digest[0] ^= 1,
             BlockProof::V2Reference(proof) => proof.work_digest[0] ^= 1,
             BlockProof::V3Candidate(proof) => proof.work_digest[0] ^= 1,
+            BlockProof::V4Candidate(proof) => proof.work_digest[0] ^= 1,
         }
         assert!(job.build_block_if_chain_valid(&mutated_work).is_err());
 
@@ -11697,6 +11927,7 @@ mod tests {
             BlockProof::V1Legacy(proof) => proof.nonce = proof.nonce.wrapping_add(1),
             BlockProof::V2Reference(proof) => proof.nonce = proof.nonce.wrapping_add(1),
             BlockProof::V3Candidate(proof) => proof.nonce = proof.nonce.wrapping_add(1),
+            BlockProof::V4Candidate(proof) => proof.nonce = proof.nonce.wrapping_add(1),
         }
         assert!(job.build_block_if_chain_valid(&mutated_nonce).is_err());
 
@@ -11960,7 +12191,14 @@ mod tests {
                 encode_record_v1(accepted_at, block_bytes).unwrap()
             } else {
                 let previous = complete_record_digest(mixed.last().unwrap());
-                encode_record_v2(accepted_at, block_bytes, delta_bytes, previous).unwrap()
+                encode_record_v2(
+                    accepted_at,
+                    block_bytes,
+                    delta_bytes,
+                    previous,
+                    DEVNET_NETWORK_ID,
+                )
+                .unwrap()
             };
             mixed.push(rewritten);
         }
@@ -12786,6 +13024,7 @@ mod tests {
             second_block,
             second_delta,
             EMPTY_RECORD_CHAIN_ROOT,
+            DEVNET_NETWORK_ID,
         )
         .unwrap();
         let (first_at, _, first_block, first_delta) = v2_record_parts(&records[0]);
@@ -12794,6 +13033,7 @@ mod tests {
             first_block,
             first_delta,
             complete_record_digest(&child_first),
+            DEVNET_NETWORK_ID,
         )
         .unwrap();
         write_complete_log_records(&path, &[child_first, parent_second]);
@@ -12984,6 +13224,7 @@ mod tests {
             block_bytes,
             &forged_delta,
             previous_record_digest,
+            DEVNET_NETWORK_ID,
         )
         .unwrap();
         fs::write(path.join(BLOCK_LOG_FILE), forged_record).unwrap();
@@ -13316,10 +13557,47 @@ mod tests {
     #[test]
     fn rpc_parser_accepts_a_bounded_binary_post() {
         let request = b"POST /v1/block HTTP/1.1\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\n\r\nabc";
-        let parsed = read_rpc_request(&mut &request[..]).unwrap();
+        let parsed = read_rpc_request(&mut &request[..], DEVNET_PROFILE.network_id).unwrap();
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.target, "/v1/block");
         assert_eq!(parsed.body, b"abc");
+    }
+
+    #[test]
+    fn production_v4_storage_and_rpc_bounds_do_not_raise_legacy_limits() {
+        let block = vec![0_u8; MAX_BLOCK_BYTES + 1];
+        assert!(
+            encode_record_v2(
+                1,
+                &block,
+                &[],
+                EMPTY_RECORD_CHAIN_ROOT,
+                cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID,
+            )
+            .is_ok()
+        );
+        assert!(
+            encode_record_v2(
+                1,
+                &block,
+                &[],
+                EMPTY_RECORD_CHAIN_ROOT,
+                DEVNET_PROFILE.network_id,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            rpc_body_limit(
+                "POST",
+                "/v1/block",
+                cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID,
+            ),
+            cmfd_consensus::PRODUCTION_V4_MAX_BLOCK_BYTES
+        );
+        assert_eq!(
+            rpc_body_limit("POST", "/v1/block", DEVNET_PROFILE.network_id),
+            MAX_BLOCK_BYTES
+        );
     }
 
     #[test]
@@ -13329,7 +13607,7 @@ mod tests {
             "a".repeat(RPC_HEADER_LIMIT)
         );
         assert!(matches!(
-            read_rpc_request(&mut oversized_header.as_bytes()),
+            read_rpc_request(&mut oversized_header.as_bytes(), DEVNET_PROFILE.network_id),
             Err(NodeError::InvalidRpcRequest(_))
         ));
 
@@ -13338,7 +13616,7 @@ mod tests {
             MAX_BLOCK_BYTES + 1
         );
         assert!(matches!(
-            read_rpc_request(&mut oversized_body.as_bytes()),
+            read_rpc_request(&mut oversized_body.as_bytes(), DEVNET_PROFILE.network_id),
             Err(NodeError::InvalidRpcRequest(_))
         ));
 
@@ -13347,7 +13625,10 @@ mod tests {
             MAX_TRANSACTION_BYTES + 1
         );
         assert!(matches!(
-            read_rpc_request(&mut oversized_transaction.as_bytes()),
+            read_rpc_request(
+                &mut oversized_transaction.as_bytes(),
+                DEVNET_PROFILE.network_id,
+            ),
             Err(NodeError::InvalidRpcRequest(_))
         ));
 
@@ -13357,7 +13638,10 @@ mod tests {
                 WALLET_JSON_BODY_LIMIT + 1
             );
             assert!(matches!(
-                read_rpc_request(&mut oversized_wallet_request.as_bytes()),
+                read_rpc_request(
+                    &mut oversized_wallet_request.as_bytes(),
+                    DEVNET_PROFILE.network_id,
+                ),
                 Err(NodeError::InvalidRpcRequest(_))
             ));
         }
@@ -13367,7 +13651,7 @@ mod tests {
             hex::encode(default_miner_destination())
         );
         assert!(matches!(
-            read_rpc_request(&mut mine_with_body.as_bytes()),
+            read_rpc_request(&mut mine_with_body.as_bytes(), DEVNET_PROFILE.network_id),
             Err(NodeError::InvalidRpcRequest(_))
         ));
     }
@@ -13616,13 +13900,13 @@ mod tests {
     fn rpc_parser_rejects_truncation_and_transfer_encoding() {
         let truncated = b"POST /v1/block HTTP/1.1\r\nContent-Length: 4\r\n\r\nabc";
         assert!(matches!(
-            read_rpc_request(&mut &truncated[..]),
+            read_rpc_request(&mut &truncated[..], DEVNET_PROFILE.network_id),
             Err(NodeError::InvalidRpcRequest(_))
         ));
 
         let chunked = b"POST /v1/block HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert!(matches!(
-            read_rpc_request(&mut &chunked[..]),
+            read_rpc_request(&mut &chunked[..], DEVNET_PROFILE.network_id),
             Err(NodeError::InvalidRpcRequest(_))
         ));
     }
@@ -13680,7 +13964,7 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
         let mut reader = DeadlineReader::new(&mut server, Duration::ZERO).unwrap();
-        let error = read_rpc_request(&mut reader).unwrap_err();
+        let error = read_rpc_request(&mut reader, DEVNET_PROFILE.network_id).unwrap_err();
         assert!(matches!(
             error,
             NodeError::RpcIo(ref source) if source.kind() == io::ErrorKind::TimedOut

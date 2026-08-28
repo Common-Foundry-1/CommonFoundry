@@ -1,4 +1,4 @@
-#![cfg(not(feature = "production-v3-testnet"))]
+#![cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
 
 use std::fs;
 use std::process::Command;

@@ -3,8 +3,13 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(any(
+    feature = "dory-v3-consensus-adapter",
+    feature = "forgematrix-v4-verifier"
+))]
+use std::io::Read;
 #[cfg(feature = "dory-v3-consensus-adapter")]
-use std::{io::Read, path::Path, sync::atomic::AtomicBool};
+use std::{path::Path, sync::atomic::AtomicBool};
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
@@ -14,6 +19,21 @@ use crate::{
     BlockChallenge, ForgeMatrixError, ForgeMatrixProfile, ForgeMatrixProof,
     ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, ForgeMatrixV2CompactProof,
     ForgeMatrixV2Descriptor, ForgeMatrixV2Error, ForgeMatrixV2Reference, ForgeMatrixVerifier,
+};
+
+#[cfg(feature = "forgematrix-v4-verifier")]
+use crate::{
+    FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_PROOF_VERSION,
+    ForgeMatrixV4FixedArtifactRecordError, ForgeMatrixV4FixedArtifactRecordV1, ModelBankError,
+    forgematrix_v4_basefold::{ForgeMatrixV4Digest, ForgeMatrixV4TranscriptStatement},
+    forgematrix_v4_challenge_digest,
+    forgematrix_v4_proof::{ForgeMatrixV4ProofError, verify_forgematrix_v4_transparent_proof},
+    forgematrix_v4_proof_codec::{
+        FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES, ForgeMatrixV4TransparentCodecError,
+        decode_forgematrix_v4_transparent_proof,
+    },
+    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
+    verify_model_bank_and_retain_base_input,
 };
 
 #[cfg(feature = "dory-v3-consensus-adapter")]
@@ -70,6 +90,8 @@ pub enum PowParameters {
     V2Reference(ForgeMatrixV2Descriptor),
     #[cfg(feature = "dory-v3-consensus-adapter")]
     V3Candidate(ForgeMatrixV3CandidateParameters),
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    V4Candidate(ForgeMatrixV4CandidateParameters),
 }
 
 /// Immutable identities committed by the dormant Dory V3 consensus adapter.
@@ -304,6 +326,87 @@ pub enum BlockProof {
     V4Candidate(Box<ForgeMatrixV4CandidateProof>),
 }
 
+#[cfg(feature = "forgematrix-v4-verifier")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeMatrixV4CandidateParameters {
+    network_id: [u8; 32],
+    algorithm_version: u32,
+    proof_version: u32,
+    proof_system_digest: [u8; 32],
+    model_manifest_digest: [u8; 32],
+    fixed_artifact_record_digest: [u8; 32],
+}
+
+#[cfg(feature = "forgematrix-v4-verifier")]
+impl ForgeMatrixV4CandidateParameters {
+    pub fn production_testnet() -> Self {
+        Self {
+            network_id: crate::PRODUCTION_V4_TESTNET_NETWORK_ID,
+            algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
+            proof_version: FORGEMATRIX_V4_PROOF_VERSION,
+            proof_system_digest: forgematrix_v4_proof_system_digest(),
+            model_manifest_digest: crate::forgematrix_v4::PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            fixed_artifact_record_digest:
+                crate::forgematrix_v4::PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
+        }
+    }
+
+    fn from_record(record: &ForgeMatrixV4FixedArtifactRecordV1) -> Self {
+        let parameters = Self::production_testnet();
+        debug_assert_eq!(parameters.model_manifest_digest, record.manifest_digest());
+        debug_assert_eq!(
+            parameters.fixed_artifact_record_digest,
+            record.record_digest()
+        );
+        parameters
+    }
+
+    fn validate_for_network(self, network_id: [u8; 32]) -> Result<(), PowError> {
+        if network_id != crate::PRODUCTION_V4_TESTNET_NETWORK_ID || self.network_id != network_id {
+            return Err(ForgeMatrixV4ConsensusError::WrongNetwork.into());
+        }
+        if self.algorithm_version != FORGEMATRIX_V4_ALGORITHM_VERSION
+            || self.proof_version != FORGEMATRIX_V4_PROOF_VERSION
+            || self.proof_system_digest != forgematrix_v4_proof_system_digest()
+            || self.model_manifest_digest == [0; 32]
+            || self.fixed_artifact_record_digest == [0; 32]
+        {
+            return Err(ForgeMatrixV4ConsensusError::ParameterMismatch.into());
+        }
+        Ok(())
+    }
+
+    fn absorb(self, hasher: &mut Hasher) {
+        hasher.update(&POW_TYPE_V4_CANDIDATE.to_le_bytes());
+        hasher.update(&self.network_id);
+        hasher.update(&self.algorithm_version.to_le_bytes());
+        hasher.update(&self.proof_version.to_le_bytes());
+        hasher.update(&self.proof_system_digest);
+        hasher.update(&self.model_manifest_digest);
+        hasher.update(&self.fixed_artifact_record_digest);
+    }
+
+    pub const fn algorithm_version(self) -> u32 {
+        self.algorithm_version
+    }
+
+    pub const fn proof_version(self) -> u32 {
+        self.proof_version
+    }
+
+    pub const fn proof_system_digest(self) -> [u8; 32] {
+        self.proof_system_digest
+    }
+
+    pub const fn model_manifest_digest(self) -> [u8; 32] {
+        self.model_manifest_digest
+    }
+
+    pub const fn fixed_artifact_record_digest(self) -> [u8; 32] {
+        self.fixed_artifact_record_digest
+    }
+}
+
 /// Existing V2 public fields plus one canonical structured aggregate encoding.
 ///
 /// The aggregate stays opaque at the block framing layer so expensive parsing
@@ -363,6 +466,31 @@ pub struct ExternalPreverificationBinding {
     statement_identity: [u8; 32],
 }
 
+#[cfg(feature = "forgematrix-v4-verifier")]
+#[derive(Debug, Error)]
+pub enum ForgeMatrixV4ConsensusError {
+    #[error("ProductionV4 proof belongs to another network")]
+    WrongNetwork,
+    #[error("ProductionV4 proof parameters do not match the configured verifier")]
+    ParameterMismatch,
+    #[error("ProductionV4 proof envelope has the wrong exact length")]
+    ProofSize,
+    #[error("ProductionV4 challenge digest is incorrect")]
+    ChallengeDigest,
+    #[error("ProductionV4 work digest is incorrect")]
+    WorkDigest,
+    #[error("ProductionV4 proof does not meet the block target")]
+    HighHash,
+    #[error("ProductionV4 fixed artifact record is invalid: {0}")]
+    FixedArtifact(#[from] ForgeMatrixV4FixedArtifactRecordError),
+    #[error("ProductionV4 model bank is invalid: {0}")]
+    ModelBank(#[from] ModelBankError),
+    #[error("ProductionV4 proof codec rejected the frame: {0}")]
+    Codec(#[from] ForgeMatrixV4TransparentCodecError),
+    #[error("ProductionV4 proof verification failed: {0}")]
+    Proof(#[from] ForgeMatrixV4ProofError),
+}
+
 impl ExternalPreverificationBinding {
     pub fn verifier_identity(self) -> [u8; 32] {
         self.verifier_identity
@@ -382,6 +510,9 @@ pub enum PowError {
     #[cfg(feature = "dory-v3-consensus-adapter")]
     #[error("ForgeMatrix Dory v3 candidate verification failed: {0}")]
     V3(#[from] BlsDoryV3CandidateError),
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    #[error("ForgeMatrix v4 candidate verification failed: {0}")]
+    V4(#[from] ForgeMatrixV4ConsensusError),
     #[error("block proof type does not match the network proof parameters")]
     WrongProofType,
     #[error("proof verifier identity does not match the network parameters")]
@@ -400,6 +531,8 @@ pub enum ConsensusPowVerifier {
     V2Reference(Arc<VerifierInstance<ForgeMatrixV2Reference>>),
     #[cfg(feature = "dory-v3-consensus-adapter")]
     V3Candidate(Arc<VerifierInstance<ForgeMatrixV3ConsensusVerifier>>),
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    V4Candidate(Arc<VerifierInstance<ForgeMatrixV4ConsensusVerifier>>),
 }
 
 #[doc(hidden)]
@@ -466,6 +599,92 @@ pub struct ForgeMatrixV3ConsensusVerifier {
     authority: ForgeMatrixV3VerifierAuthority,
 }
 
+#[cfg(feature = "forgematrix-v4-verifier")]
+pub struct ForgeMatrixV4ConsensusVerifier {
+    parameters: ForgeMatrixV4CandidateParameters,
+    fixed_commitments: [ForgeMatrixV4Digest; 3],
+    base_input: Arc<[u8]>,
+}
+
+#[cfg(feature = "forgematrix-v4-verifier")]
+impl fmt::Debug for ForgeMatrixV4ConsensusVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ForgeMatrixV4ConsensusVerifier")
+            .field("parameters", &self.parameters)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "forgematrix-v4-verifier")]
+impl ForgeMatrixV4ConsensusVerifier {
+    fn preflight(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixV4CandidateProof,
+        enforce_target: bool,
+    ) -> Result<(), ForgeMatrixV4ConsensusError> {
+        if block.network_id != self.parameters.network_id {
+            return Err(ForgeMatrixV4ConsensusError::WrongNetwork);
+        }
+        if proof.algorithm_version != self.parameters.algorithm_version
+            || proof.proof_version != self.parameters.proof_version
+            || proof.proof_system_digest != self.parameters.proof_system_digest
+            || proof.model_manifest_digest != self.parameters.model_manifest_digest
+        {
+            return Err(ForgeMatrixV4ConsensusError::ParameterMismatch);
+        }
+        if proof.transparent_proof.len() != FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES {
+            return Err(ForgeMatrixV4ConsensusError::ProofSize);
+        }
+        let challenge =
+            forgematrix_v4_challenge_digest(block, proof.nonce, proof.model_manifest_digest);
+        if proof.challenge_digest != challenge {
+            return Err(ForgeMatrixV4ConsensusError::ChallengeDigest);
+        }
+        let work = forgematrix_v4_work_digest(
+            proof.model_manifest_digest,
+            challenge,
+            proof.final_activation_digest,
+        );
+        if proof.work_digest != work {
+            return Err(ForgeMatrixV4ConsensusError::WorkDigest);
+        }
+        if enforce_target && proof.work_digest > block.target {
+            return Err(ForgeMatrixV4ConsensusError::HighHash);
+        }
+        Ok(())
+    }
+
+    fn verify(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixV4CandidateProof,
+        enforce_target: bool,
+    ) -> Result<(), ForgeMatrixV4ConsensusError> {
+        self.preflight(block, proof, enforce_target)?;
+        let transparent = decode_forgematrix_v4_transparent_proof(&proof.transparent_proof)?;
+        let statement = ForgeMatrixV4TranscriptStatement {
+            block: *block,
+            algorithm_version: proof.algorithm_version,
+            proof_version: proof.proof_version,
+            nonce: proof.nonce,
+            proof_system_digest: proof.proof_system_digest,
+            model_manifest_digest: proof.model_manifest_digest,
+            challenge_digest: proof.challenge_digest,
+            final_activation_digest: proof.final_activation_digest,
+            work_digest: proof.work_digest,
+        };
+        verify_forgematrix_v4_transparent_proof(
+            statement,
+            self.fixed_commitments,
+            &self.base_input,
+            &transparent,
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "dory-v3-consensus-adapter")]
 impl fmt::Debug for ForgeMatrixV3ConsensusVerifier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -490,6 +709,10 @@ impl PowParameters {
             }
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(parameters) => {
+                parameters.validate_for_network(network_id)?;
+            }
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(parameters) => {
                 parameters.validate_for_network(network_id)?;
             }
         }
@@ -528,6 +751,11 @@ impl PowParameters {
             }
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(parameters) => {
+                parameters.validate_for_network(network_id)?;
+                parameters.absorb(hasher);
+            }
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(parameters) => {
                 parameters.validate_for_network(network_id)?;
                 parameters.absorb(hasher);
             }
@@ -643,6 +871,38 @@ impl ConsensusPowVerifier {
                     authenticated: Box::new(authenticated),
                     setup: Box::new(setup),
                 },
+            },
+        ))))
+    }
+
+    /// Construct the isolated ProductionV4 verifier only after one reader has
+    /// authenticated the complete model bank against the fixed-artifact
+    /// record's manifest. The retained base input is published only after EOF.
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    pub fn v4_candidate<ModelBank: Read>(
+        fixed_record: ForgeMatrixV4FixedArtifactRecordV1,
+        model_bank: ModelBank,
+    ) -> Result<Self, PowError> {
+        fixed_record
+            .validate()
+            .map_err(ForgeMatrixV4ConsensusError::from)?;
+        if fixed_record.record_digest()
+            != crate::forgematrix_v4::PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST
+            || fixed_record.manifest_digest()
+                != crate::forgematrix_v4::PRODUCTION_V4_MODEL_MANIFEST_DIGEST
+        {
+            return Err(ForgeMatrixV4ConsensusError::ParameterMismatch.into());
+        }
+        let base_input =
+            verify_model_bank_and_retain_base_input(model_bank, fixed_record.manifest())
+                .map_err(ForgeMatrixV4ConsensusError::from)?;
+        let parameters = ForgeMatrixV4CandidateParameters::from_record(&fixed_record);
+        parameters.validate_for_network(crate::PRODUCTION_V4_TESTNET_NETWORK_ID)?;
+        Ok(Self::V4Candidate(Arc::new(VerifierInstance::new(
+            ForgeMatrixV4ConsensusVerifier {
+                parameters,
+                fixed_commitments: fixed_record.fixed_commitments(),
+                base_input: Arc::from(base_input),
             },
         ))))
     }
@@ -950,6 +1210,8 @@ impl ConsensusPowVerifier {
             Self::V2Reference(reference) => PowParameters::V2Reference(reference.descriptor()),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(verifier) => PowParameters::V3Candidate(verifier.parameters),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(verifier) => PowParameters::V4Candidate(verifier.parameters),
         }
     }
 
@@ -981,6 +1243,12 @@ impl ConsensusPowVerifier {
                 #[cfg(test)]
                 verifier.record_relation_dispatch();
                 verifier.verify(block, proof, true)
+            }
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            (Self::V4Candidate(verifier), BlockProof::V4Candidate(proof)) => {
+                #[cfg(test)]
+                verifier.record_relation_dispatch();
+                verifier.verify(block, proof, true).map_err(PowError::from)
             }
             _ => Err(PowError::WrongProofType),
         }
@@ -1044,6 +1312,10 @@ impl ConsensusPowVerifier {
                     ForgeMatrixV3VerifierAuthority::BoundTestStatement { .. } => Ok(()),
                 }
             }
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            (Self::V4Candidate(verifier), BlockProof::V4Candidate(proof)) => verifier
+                .preflight(block, proof, true)
+                .map_err(PowError::from),
             _ => Err(PowError::WrongProofType),
         }
     }
@@ -1134,6 +1406,8 @@ impl ConsensusPowVerifier {
             | (Self::V2Reference(_), BlockProof::V2Reference(_)) => true,
             #[cfg(feature = "dory-v3-consensus-adapter")]
             (Self::V3Candidate(_), BlockProof::V3Candidate(_)) => true,
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            (Self::V4Candidate(_), BlockProof::V4Candidate(_)) => true,
             _ => false,
         };
         if matches {
@@ -1170,6 +1444,8 @@ impl ConsensusPowVerifier {
             Self::V2Reference(instance) => instance.capability_nonce,
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(instance) => instance.capability_nonce,
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(instance) => instance.capability_nonce,
         }
     }
 
@@ -1197,6 +1473,8 @@ impl ConsensusPowVerifier {
             )),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 
@@ -1208,6 +1486,8 @@ impl ConsensusPowVerifier {
             Self::V1Legacy(_) => Err(PowError::WrongProofType),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 
@@ -1219,6 +1499,8 @@ impl ConsensusPowVerifier {
             Self::V1Legacy(_) => Err(PowError::WrongProofType),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 
@@ -1235,6 +1517,8 @@ impl ConsensusPowVerifier {
             Self::V1Legacy(_) => Err(PowError::WrongProofType),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 
@@ -1252,6 +1536,8 @@ impl ConsensusPowVerifier {
             Self::V1Legacy(_) => Err(PowError::WrongProofType),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 
@@ -1270,6 +1556,8 @@ impl ConsensusPowVerifier {
             Self::V1Legacy(_) => Err(PowError::WrongProofType),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 
@@ -1294,6 +1582,10 @@ impl ConsensusPowVerifier {
             (Self::V3Candidate(verifier), BlockProof::V3Candidate(proof)) => {
                 verifier.verify(block, proof, false)
             }
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            (Self::V4Candidate(verifier), BlockProof::V4Candidate(proof)) => {
+                verifier.verify(block, proof, false).map_err(PowError::from)
+            }
             _ => Err(PowError::WrongProofType),
         }
     }
@@ -1317,6 +1609,8 @@ impl ConsensusPowVerifier {
             )?)),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             Self::V3Candidate(_) => Err(PowError::WrongProofType),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            Self::V4Candidate(_) => Err(PowError::WrongProofType),
         }
     }
 }
@@ -2054,6 +2348,8 @@ mod tests {
             ConsensusPowVerifier::V2Reference(verifier) => verifier.relation_dispatches(),
             #[cfg(feature = "dory-v3-consensus-adapter")]
             ConsensusPowVerifier::V3Candidate(verifier) => verifier.relation_dispatches(),
+            #[cfg(feature = "forgematrix-v4-verifier")]
+            ConsensusPowVerifier::V4Candidate(verifier) => verifier.relation_dispatches(),
         }
     }
 

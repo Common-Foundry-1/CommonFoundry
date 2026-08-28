@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use cmfd_consensus::{
     Block, BlockChallenge, BlockProof, Coinbase, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSACTIONS,
     MAX_COINBASE_OUTPUTS, MAX_TRANSACTION_BYTES, OutputLock, Transaction, TxOutput, WireError,
-    decode_block, decode_transaction, encode_block, encode_transaction, merkle_root,
+    decode_block, decode_transaction, encode_block, encode_transaction,
+    max_block_bytes_for_network, merkle_root,
 };
 use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 use thiserror::Error;
@@ -415,16 +416,31 @@ fn validate_peer_address(address: SocketAddr, policy: PeerAddressPolicy) -> Resu
 }
 
 pub fn encode_peer_frame(frame: &PeerFrame) -> Result<Vec<u8>, PeerError> {
+    let network_id = match &frame.message {
+        PeerMessage::Hello(hello) => hello.network_id,
+        PeerMessage::Block(block) | PeerMessage::SubmitBlock(block) => block.challenge.network_id,
+        PeerMessage::Transaction(transaction) => transaction.network_id,
+        PeerMessage::MiningTemplate(template) => template.challenge.network_id,
+        _ => [0_u8; 32],
+    };
+    encode_peer_frame_for_network(frame, network_id)
+}
+
+fn encode_peer_frame_for_network(
+    frame: &PeerFrame,
+    expected_network_id: [u8; 32],
+) -> Result<Vec<u8>, PeerError> {
     let (kind, payload) = encode_message(&frame.message)?;
-    if payload.len() > MAX_PEER_PAYLOAD_BYTES {
+    let payload_limit = peer_payload_limit(kind, expected_network_id);
+    if payload.len() > payload_limit {
         return Err(PeerError::PayloadTooLarge {
             actual: payload.len(),
-            max: MAX_PEER_PAYLOAD_BYTES,
+            max: payload_limit,
         });
     }
     let payload_len = u32::try_from(payload.len()).map_err(|_| PeerError::PayloadTooLarge {
         actual: payload.len(),
-        max: MAX_PEER_PAYLOAD_BYTES,
+        max: payload_limit,
     })?;
     let mut encoded = Vec::with_capacity(PEER_FRAME_HEADER_BYTES + payload.len());
     encoded.extend_from_slice(&PEER_MAGIC);
@@ -461,11 +477,7 @@ pub fn decode_peer_frame(
     let sequence = u64::from_le_bytes(bytes[8..16].try_into().expect("fixed frame header"));
     let payload_len =
         u32::from_le_bytes(bytes[16..20].try_into().expect("fixed frame header")) as usize;
-    let payload_limit = if kind == TRANSACTION_KIND {
-        MAX_TRANSACTION_BYTES
-    } else {
-        MAX_PEER_PAYLOAD_BYTES
-    };
+    let payload_limit = peer_payload_limit(kind, expected_network_id);
     if payload_len > payload_limit {
         return Err(PeerError::PayloadTooLarge {
             actual: payload_len,
@@ -490,6 +502,14 @@ pub fn decode_peer_frame(
     }
     let message = decode_message(kind, &bytes[PEER_FRAME_HEADER_BYTES..], expected_network_id)?;
     Ok(PeerFrame { sequence, message })
+}
+
+fn peer_payload_limit(kind: u8, network_id: [u8; 32]) -> usize {
+    match kind {
+        TRANSACTION_KIND => MAX_TRANSACTION_BYTES,
+        BLOCK_KIND | SUBMIT_BLOCK_KIND => max_block_bytes_for_network(network_id),
+        _ => MAX_PEER_PAYLOAD_BYTES,
+    }
 }
 
 fn encode_message(message: &PeerMessage) -> Result<(u8, Vec<u8>), PeerError> {
@@ -1059,7 +1079,10 @@ impl PeerSession {
         let next_sequence = sequence
             .checked_add(1)
             .ok_or(PeerError::SequenceExhausted)?;
-        let encoded = encode_peer_frame(&PeerFrame { sequence, message })?;
+        let encoded = encode_peer_frame_for_network(
+            &PeerFrame { sequence, message },
+            self.local_hello.network_id,
+        )?;
         self.ensure_budget(encoded.len())?;
         self.charge(encoded.len());
         self.next_outbound_sequence = next_sequence;
@@ -1435,11 +1458,7 @@ impl PeerConnection {
         validate_frame_header(&header)?;
         let payload_len =
             u32::from_le_bytes(header[16..20].try_into().expect("fixed frame header")) as usize;
-        let payload_limit = if header[6] == TRANSACTION_KIND {
-            MAX_TRANSACTION_BYTES
-        } else {
-            MAX_PEER_PAYLOAD_BYTES
-        };
+        let payload_limit = peer_payload_limit(header[6], self.session.local_hello.network_id);
         if payload_len > payload_limit {
             return Err(PeerError::PayloadTooLarge {
                 actual: payload_len,
@@ -1726,7 +1745,8 @@ mod tests {
 
     fn sample_block() -> Block {
         let (params, _) =
-            crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None).unwrap();
+            crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None, None)
+                .unwrap();
         let reference = v2_test_reference().unwrap();
         let verifier = ConsensusPowVerifier::v2_reference(reference);
         let state = ChainState::new(params, verifier.clone()).unwrap();
@@ -1933,6 +1953,29 @@ mod tests {
             ),
             Err(PeerError::InvalidBlockSubmissionStatus(0xff))
         ));
+    }
+
+    #[test]
+    fn production_v4_block_frames_use_only_the_v4_block_limit() {
+        assert_eq!(
+            peer_payload_limit(BLOCK_KIND, cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID,),
+            cmfd_consensus::PRODUCTION_V4_MAX_BLOCK_BYTES
+        );
+        assert_eq!(
+            peer_payload_limit(
+                SUBMIT_BLOCK_KIND,
+                cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID,
+            ),
+            cmfd_consensus::PRODUCTION_V4_MAX_BLOCK_BYTES
+        );
+        assert_eq!(peer_payload_limit(BLOCK_KIND, NETWORK_ID), MAX_BLOCK_BYTES);
+        assert_eq!(
+            peer_payload_limit(
+                TRANSACTION_KIND,
+                cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID
+            ),
+            MAX_TRANSACTION_BYTES
+        );
     }
 
     #[test]

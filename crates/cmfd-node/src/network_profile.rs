@@ -32,6 +32,7 @@ pub struct NetworkProfile {
 pub enum NetworkProfileKind {
     Devnet,
     ProductionV3Testnet,
+    ProductionV4Testnet,
     Rcnet,
 }
 
@@ -51,6 +52,7 @@ pub struct RewardDestinations {
 pub enum ProofProfile {
     DevnetV2Reference,
     ProductionV3,
+    ProductionV4,
 }
 
 impl NetworkProfile {
@@ -58,6 +60,7 @@ impl NetworkProfile {
         match self.kind {
             NetworkProfileKind::Devnet => "Devnet-0",
             NetworkProfileKind::ProductionV3Testnet => "ProductionV3 Testnet-1",
+            NetworkProfileKind::ProductionV4Testnet => "ProductionV4 Testnet-1",
             NetworkProfileKind::Rcnet => "RCNet-1",
         }
     }
@@ -68,6 +71,9 @@ impl NetworkProfile {
             NetworkProfileKind::ProductionV3Testnet => {
                 "Private ProductionV3 test network · Not RCNet or mainnet"
             }
+            NetworkProfileKind::ProductionV4Testnet => {
+                "Private ProductionV4 latency test network · Not RCNet or mainnet"
+            }
             NetworkProfileKind::Rcnet => "Release-candidate rehearsal network · Not mainnet",
         }
     }
@@ -76,6 +82,7 @@ impl NetworkProfile {
         match self.kind {
             NetworkProfileKind::Devnet => "Community testing",
             NetworkProfileKind::ProductionV3Testnet => "ProductionV3 end-to-end testing",
+            NetworkProfileKind::ProductionV4Testnet => "ProductionV4 latency and admission testing",
             NetworkProfileKind::Rcnet => "Launch rehearsal",
         }
     }
@@ -89,6 +96,9 @@ impl NetworkProfile {
             NetworkProfileKind::Devnet => "Common Foundry Wallet — Devnet-0",
             NetworkProfileKind::ProductionV3Testnet => {
                 "Common Foundry Wallet — ProductionV3 Testnet-1"
+            }
+            NetworkProfileKind::ProductionV4Testnet => {
+                "Common Foundry Wallet — ProductionV4 Testnet-1"
             }
             NetworkProfileKind::Rcnet => "Common Foundry Wallet — RCNet-1",
         }
@@ -108,6 +118,12 @@ impl NetworkProfile {
             (NetworkProfileKind::ProductionV3Testnet, false) => {
                 "ProductionV3 Testnet-1 wallet: back up wallet.key before testing recovery. This is not RCNet or mainnet."
             }
+            (NetworkProfileKind::ProductionV4Testnet, true) => {
+                "ProductionV4 Testnet-1 wallet uses a known development key. Create a fresh testnet wallet before testing."
+            }
+            (NetworkProfileKind::ProductionV4Testnet, false) => {
+                "ProductionV4 Testnet-1 wallet: back up wallet.key before testing recovery. This is not RCNet or mainnet."
+            }
             (NetworkProfileKind::Rcnet, true) => {
                 "RCNet-1 wallet uses a known development key. Create a fresh RCNet wallet before testing."
             }
@@ -121,6 +137,7 @@ impl NetworkProfile {
         match self.kind {
             NetworkProfileKind::Devnet => "commonfoundry-miner-devnet0",
             NetworkProfileKind::ProductionV3Testnet => "commonfoundry-miner-production-v3-testnet1",
+            NetworkProfileKind::ProductionV4Testnet => "commonfoundry-miner-production-v4-testnet1",
             NetworkProfileKind::Rcnet => "commonfoundry-miner-rcnet1",
         }
     }
@@ -139,6 +156,7 @@ impl NetworkProfile {
         match self.proof {
             ProofProfile::DevnetV2Reference => "ForgeMatrix-v2 tiny full-recompute reference",
             ProofProfile::ProductionV3 => "ForgeMatrix-v3 production Dory",
+            ProofProfile::ProductionV4 => "ForgeMatrix-v4 transparent BaseFold",
         }
     }
 
@@ -164,6 +182,7 @@ impl ProofProfile {
         match self {
             Self::DevnetV2Reference => "DevnetV2",
             Self::ProductionV3 => "ProductionV3",
+            Self::ProductionV4 => "ProductionV4",
         }
     }
 
@@ -253,6 +272,51 @@ pub const PRODUCTION_V3_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
     wallet_data_dir_identity: "production-v3-testnet-1",
 };
 
+/// Isolated, low-difficulty network for the ProductionV4 latency proof.
+///
+/// The network id exactly matches the V4-only wire allowance in consensus.
+/// Its ports and storage are disjoint from Devnet-0, ProductionV3 Testnet-1,
+/// and RCNet-1, so its larger proof and block bounds cannot leak elsewhere.
+pub const PRODUCTION_V4_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
+    kind: NetworkProfileKind::ProductionV4Testnet,
+    proof: ProofProfile::ProductionV4,
+    name: "CommonFoundry ProductionV4 Testnet-1",
+    // SHA-256("CMFD/PRODUCTION-V4-TESTNET/V1/NETWORK-ID").
+    network_id: [
+        0xb9, 0xe5, 0x5d, 0x5a, 0x5e, 0x80, 0xc8, 0xe3, 0xd7, 0x3b, 0xf8, 0x1b, 0x19, 0x9b, 0xc6,
+        0x43, 0xac, 0x93, 0x67, 0x43, 0x69, 0x62, 0xc2, 0x8b, 0x6a, 0xac, 0xdc, 0x37, 0xf3, 0x80,
+        0x99, 0x62,
+    ],
+    // SHA-256("CMFD/PRODUCTION-V4-TESTNET/V1/VIRTUAL-GENESIS/2026-08-27").
+    virtual_genesis_hash: [
+        0x2b, 0xda, 0x6e, 0x00, 0xa7, 0xd1, 0x86, 0xe5, 0x8b, 0x39, 0x20, 0xa1, 0x2d, 0x55, 0x21,
+        0xd9, 0x78, 0xe6, 0x37, 0x64, 0x1f, 0xff, 0x97, 0xc8, 0xef, 0x0e, 0x10, 0xf9, 0x45, 0x00,
+        0xbb, 0xa6,
+    ],
+    virtual_genesis_timestamp: 1_787_788_800, // 2026-08-27T00:00:00Z
+    pow_limit: [0xff; 32],
+    rewards: RewardDestinations {
+        // Deterministic test-only x-only public keys derived from the V4
+        // testnet STEWARD and COMMUNITY labels.
+        steward: [
+            0xb3, 0x62, 0xd0, 0x9f, 0xd1, 0x1d, 0x50, 0x15, 0x8c, 0x4c, 0xe1, 0xed, 0xad, 0x99,
+            0xbd, 0xe8, 0x55, 0x14, 0xd2, 0x51, 0xc5, 0x45, 0xe0, 0x7a, 0xc1, 0x37, 0x02, 0xaa,
+            0x4d, 0x5f, 0x2d, 0xde,
+        ],
+        community: [
+            0x9a, 0xf8, 0x35, 0x9c, 0x02, 0x4c, 0xd0, 0xaf, 0xb4, 0xf3, 0x54, 0xe4, 0x49, 0x31,
+            0x77, 0x3b, 0x8a, 0xfa, 0xc2, 0xe6, 0xaf, 0x3d, 0xfe, 0xc8, 0x0a, 0xff, 0xcc, 0x80,
+            0xb0, 0x85, 0x7c, 0x52,
+        ],
+    },
+    rpc_port: 22_443,
+    p2p_port: 22_444,
+    pool_port: 22_445,
+    bootstrap_ipv4: Ipv4Addr::new(107, 214, 187, 2),
+    default_data_dir_identity: "commonfoundry-production-v4-testnet1",
+    wallet_data_dir_identity: "production-v4-testnet-1",
+};
+
 /// Isolated rehearsal identity for the first launch-candidate network.
 ///
 /// RCNet-1 is not mainnet and cannot currently start. Its identity, service
@@ -289,6 +353,9 @@ pub const COMPILED_NETWORK_PROFILE: NetworkProfile = match (
     (CompiledNetworkProfile::Devnet, ConsensusProofSelection::DevnetV2Reference) => DEVNET_PROFILE,
     (CompiledNetworkProfile::ProductionV3Testnet, ConsensusProofSelection::ProductionV3) => {
         PRODUCTION_V3_TESTNET_PROFILE
+    }
+    (CompiledNetworkProfile::ProductionV4Testnet, ConsensusProofSelection::ProductionV4) => {
+        PRODUCTION_V4_TESTNET_PROFILE
     }
     (CompiledNetworkProfile::Rcnet, ConsensusProofSelection::ProductionV3) => RCNET1_PROFILE,
     _ => panic!("compiled network and consensus proof selections are inconsistent"),
@@ -391,7 +458,7 @@ mod tests {
 
     #[test]
     fn compiled_profile_matches_the_release_gate_selection() {
-        #[cfg(not(feature = "production-v3-testnet"))]
+        #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
         {
             assert_eq!(COMPILED_NETWORK_PROFILE, DEVNET_PROFILE);
             assert_eq!(
@@ -404,5 +471,51 @@ mod tests {
             assert_eq!(COMPILED_NETWORK_PROFILE, PRODUCTION_V3_TESTNET_PROFILE);
             assert_eq!(COMPILED_NETWORK_PROFILE.proof, ProofProfile::ProductionV3);
         }
+        #[cfg(feature = "production-v4-testnet")]
+        {
+            assert_eq!(COMPILED_NETWORK_PROFILE, PRODUCTION_V4_TESTNET_PROFILE);
+            assert_eq!(COMPILED_NETWORK_PROFILE.proof, ProofProfile::ProductionV4);
+            assert_eq!(
+                COMPILED_NETWORK_PROFILE.network_id,
+                cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID
+            );
+        }
+    }
+
+    #[test]
+    fn production_v4_testnet_is_fully_isolated() {
+        let testnet = PRODUCTION_V4_TESTNET_PROFILE;
+        for other in [
+            DEVNET_PROFILE,
+            PRODUCTION_V3_TESTNET_PROFILE,
+            RCNET1_PROFILE,
+        ] {
+            assert_ne!(testnet.network_id, other.network_id);
+            assert_ne!(testnet.virtual_genesis_hash, other.virtual_genesis_hash);
+            assert_ne!(
+                testnet.virtual_genesis_timestamp,
+                other.virtual_genesis_timestamp
+            );
+            assert_ne!(testnet.rpc_port, other.rpc_port);
+            assert_ne!(testnet.p2p_port, other.p2p_port);
+            assert_ne!(testnet.pool_port, other.pool_port);
+            assert_ne!(
+                testnet.default_data_dir_identity,
+                other.default_data_dir_identity
+            );
+            assert_ne!(
+                testnet.wallet_data_dir_identity,
+                other.wallet_data_dir_identity
+            );
+        }
+        assert_eq!(testnet.proof, ProofProfile::ProductionV4);
+        assert_eq!(
+            testnet.network_id,
+            cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID
+        );
+        assert_eq!(testnet.bootstrap_peer().to_string(), "107.214.187.2:22444");
+        assert_eq!(testnet.miner_p2p_address().to_string(), "127.0.0.1:23444");
+        assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.steward).is_ok());
+        assert!(k256::schnorr::VerifyingKey::from_bytes(&testnet.rewards.community).is_ok());
     }
 }

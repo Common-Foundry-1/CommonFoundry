@@ -20,9 +20,11 @@ use cmfd_node::rcnet_candidate::{
     RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
 };
 use cmfd_node::{
-    COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node, ProofProfile,
-    canonical_network_info_json_with_record, compiled_production_v3_worker_sha256,
-    parse_miner_destination, production_v3_package_layout, spawn_rpc_server, unix_time_seconds,
+    COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
+    ProductionV4VerifierArtifacts, ProofProfile, canonical_network_info_json_with_record,
+    canonical_network_info_json_with_v4_artifacts, compiled_production_v3_worker_sha256,
+    parse_miner_destination, production_v3_package_layout, production_v4_package_artifacts,
+    spawn_rpc_server, unix_time_seconds,
 };
 use cmfd_proof_worker::{ProductionV3VerifierRecord, VerifierWorkerConfig};
 use serde_json::json;
@@ -94,6 +96,12 @@ struct Cli {
     /// Absolute path to the canonical production V3 Record V2.
     #[arg(long, global = true)]
     production_v3_record_v2: Option<PathBuf>,
+    /// Absolute path to the authenticated ProductionV4 model bank.
+    #[arg(long, global = true)]
+    production_v4_bank: Option<PathBuf>,
+    /// Absolute path to the pinned ProductionV4 fixed artifact record.
+    #[arg(long, global = true)]
+    production_v4_fixed_record: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -237,12 +245,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     validate_production_v3_override_set(&cli)?;
     let production_v3_record = production_v3_record(&cli)?;
+    let production_v4_artifacts = production_v4_artifacts(&cli)?;
     if matches!(&cli.command, Command::NetworkInfo) {
-        io::stdout()
-            .lock()
-            .write_all(&canonical_network_info_json_with_record(
-                production_v3_record.as_ref(),
-            )?)?;
+        let bytes = match production_v4_artifacts.as_ref() {
+            Some(artifacts) => canonical_network_info_json_with_v4_artifacts(artifacts)?,
+            None => canonical_network_info_json_with_record(production_v3_record.as_ref())?,
+        };
+        io::stdout().lock().write_all(&bytes)?;
         return Ok(());
     }
     let verifier_worker = verifier_worker_config(&cli, production_v3_record.clone())?;
@@ -264,6 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut node = open_node(
                 &cli.data_dir,
                 production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             node.set_public_peer_mode(allow_public_peers);
@@ -339,6 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut node = open_node(
                 &cli.data_dir,
                 production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             let miner_destination = match miner.as_deref() {
@@ -364,6 +375,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let node = open_node(
                 &cli.data_dir,
                 production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
@@ -412,6 +424,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut node_instance = open_node(
                 &cli.data_dir,
                 production_v3_record.as_ref(),
+                production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
@@ -627,6 +640,45 @@ fn validate_production_v3_override_set(cli: &Cli) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+fn production_v4_artifacts(
+    cli: &Cli,
+) -> Result<Option<ProductionV4VerifierArtifacts>, Box<dyn std::error::Error>> {
+    let is_v4 = COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4;
+    match (
+        cli.production_v4_bank.as_ref(),
+        cli.production_v4_fixed_record.as_ref(),
+        is_v4,
+    ) {
+        (Some(_), None, _) | (None, Some(_), _) => Err(
+            "ProductionV4 overrides require both the model bank and fixed artifact record paths"
+                .into(),
+        ),
+        (Some(_), Some(_), false) => {
+            Err("ProductionV4 artifacts were supplied for a non-ProductionV4 profile".into())
+        }
+        (None, None, false) => Ok(None),
+        (Some(bank), Some(fixed_record), true) => Ok(Some(ProductionV4VerifierArtifacts {
+            bank: canonical_regular_file(bank, "ProductionV4 model bank")?,
+            fixed_record: canonical_regular_file(
+                fixed_record,
+                "ProductionV4 fixed artifact record",
+            )?,
+        })),
+        (None, None, true) => {
+            let executable = std::env::current_exe()
+                .map_err(|_| "could not resolve the signed package executable directory")?;
+            let packaged = production_v4_package_artifacts(&executable)?;
+            Ok(Some(ProductionV4VerifierArtifacts {
+                bank: canonical_regular_file(&packaged.bank, "packaged ProductionV4 model bank")?,
+                fixed_record: canonical_regular_file(
+                    &packaged.fixed_record,
+                    "packaged ProductionV4 fixed artifact record",
+                )?,
+            }))
+        }
+    }
+}
+
 fn packaged_production_v3_layout()
 -> Result<cmfd_node::ProductionV3PackageLayout, Box<dyn std::error::Error>> {
     let executable = std::env::current_exe()
@@ -668,8 +720,15 @@ fn parse_worker_sha256(value: &str) -> Result<[u8; 32], Box<dyn std::error::Erro
 fn open_node(
     data_dir: &PathBuf,
     production_v3_record: Option<&ProductionV3VerifierRecord>,
+    production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
     verifier_worker: Option<&VerifierWorkerConfig>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
+    if let Some(artifacts) = production_v4_artifacts {
+        if production_v3_record.is_some() || verifier_worker.is_some() {
+            return Err("ProductionV4 does not accept a ProductionV3 verifier worker".into());
+        }
+        return Ok(Node::open_with_v4_artifacts(data_dir, artifacts)?);
+    }
     match (production_v3_record, verifier_worker) {
         (Some(record), Some(worker)) => Ok(Node::open_with_record_and_verifier_worker(
             data_dir,

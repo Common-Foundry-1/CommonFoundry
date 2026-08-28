@@ -2,18 +2,27 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompiledNetworkProfile {
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     Devnet,
     #[cfg_attr(not(feature = "production-v3-testnet"), allow(dead_code))]
     ProductionV3Testnet,
+    #[cfg_attr(not(feature = "production-v4-testnet"), allow(dead_code))]
+    ProductionV4Testnet,
     Rcnet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusProofSelection {
-    #[cfg_attr(feature = "production-v3-testnet", allow(dead_code))]
+    #[cfg_attr(
+        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        allow(dead_code)
+    )]
     DevnetV2Reference,
     ProductionV3,
+    ProductionV4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +46,13 @@ pub struct ProductionV3ArtifactIdentityPins {
     pub bank: ProductionV3FileIdentityPin,
     pub manifest: ProductionV3FileIdentityPin,
     pub record_v2: ProductionV3FileIdentityPin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // build.rs includes this module without using runtime artifact pins.
+pub struct ProductionV4ArtifactIdentityPins {
+    pub bank: ProductionV3FileIdentityPin,
+    pub fixed_record: ProductionV3FileIdentityPin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +178,51 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     production_network_identity: None,
 };
 
+/// Exact verifier inputs accepted by the isolated ProductionV4 latency
+/// testnet. The fixed record binds all three fixed commitments; the complete
+/// model bank is authenticated before its base-input prefix is retained.
+#[cfg(feature = "production-v4-testnet")]
+#[allow(dead_code)] // build.rs includes this module without loading verifier artifacts.
+pub const PRODUCTION_V4_TESTNET_ARTIFACT_PINS: ProductionV4ArtifactIdentityPins =
+    ProductionV4ArtifactIdentityPins {
+        bank: ProductionV3FileIdentityPin {
+            bytes: 6_442_975_416,
+            blake3: [
+                0xb8, 0xbe, 0x84, 0x50, 0xb9, 0x33, 0xdc, 0x75, 0x9a, 0xa3, 0x4f, 0x2d, 0x60, 0xe7,
+                0x3c, 0xf4, 0xea, 0xc3, 0x06, 0x44, 0x07, 0xc6, 0xa9, 0xf4, 0x83, 0x72, 0x17, 0x5a,
+                0xbe, 0x87, 0xb6, 0xac,
+            ],
+            sha256: [
+                0x5f, 0x9b, 0x21, 0x3c, 0x3b, 0xda, 0x51, 0xb7, 0x4e, 0x4e, 0xba, 0xbb, 0x26, 0x60,
+                0x7b, 0x67, 0x38, 0x5d, 0x61, 0x3a, 0xa8, 0xd9, 0x9a, 0xf9, 0x15, 0xa4, 0x8a, 0xb0,
+                0x63, 0xe1, 0x7d, 0x4e,
+            ],
+        },
+        fixed_record: ProductionV3FileIdentityPin {
+            bytes: 6_973,
+            blake3: [
+                0x3c, 0x95, 0x87, 0xfb, 0x83, 0x32, 0x34, 0xcd, 0xfa, 0x88, 0xb9, 0x75, 0x02, 0xa8,
+                0x9a, 0xbb, 0xa6, 0x13, 0xb9, 0x00, 0x2c, 0x16, 0xbb, 0x64, 0x83, 0xb3, 0x4d, 0x53,
+                0x99, 0xde, 0xeb, 0xd0,
+            ],
+            sha256: [
+                0xea, 0x21, 0x88, 0x31, 0xaa, 0x56, 0x7e, 0x48, 0x64, 0x26, 0xde, 0xd7, 0x7c, 0x84,
+                0xa5, 0x75, 0x2a, 0x81, 0x73, 0x29, 0xc4, 0x96, 0xe3, 0x55, 0x7c, 0x6d, 0x43, 0x57,
+                0x7f, 0x0a, 0xfe, 0x79,
+            ],
+        },
+    };
+
+#[cfg(feature = "production-v4-testnet")]
+pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
+    network: CompiledNetworkProfile::ProductionV4Testnet,
+    proof: ConsensusProofSelection::ProductionV4,
+    activation: None,
+    production_v3_artifacts: None,
+    production_v3_verifier_workers: None,
+    production_network_identity: None,
+};
+
 /// The identity selected by an ordinary source-tree build.
 ///
 /// A production RC build may change these values only together with the real
@@ -169,7 +230,7 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
 /// checkout commit is deliberately not a source constant: trusted CI supplies
 /// it to the build gate so the finalizer can compare it with the exact checkout
 /// without a self-reference.
-#[cfg(not(feature = "production-v3-testnet"))]
+#[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
     network: CompiledNetworkProfile::Devnet,
     proof: ConsensusProofSelection::DevnetV2Reference,

@@ -590,6 +590,33 @@ pub fn verify_model_bank<R: Read>(
     )
 }
 
+/// Authenticates the complete model bank and retains its canonical base-input
+/// prefix only after the same reader has passed every payload and EOF check.
+pub fn verify_model_bank_and_retain_base_input<R: Read>(
+    reader: R,
+    expected: &ModelBankManifest,
+) -> Result<Vec<u8>, ModelBankError> {
+    let capacity =
+        usize::try_from(expected.base_input_bytes).map_err(|_| ModelBankError::SizeOverflow)?;
+    let mut base_input = Vec::with_capacity(capacity);
+    verify_model_bank_with_consumer(reader, expected, |chunk| {
+        if matches!(chunk.section, ModelBankByteSection::BaseInput) {
+            if u64::try_from(base_input.len()).ok() != Some(chunk.section_offset) {
+                return Err(ModelBankError::NonCanonicalLengths);
+            }
+            base_input.extend_from_slice(chunk.bytes);
+        }
+        Ok(())
+    })
+    .map_err(|error| match error {
+        ModelBankConsumerError::ModelBank(error) | ModelBankConsumerError::Consumer(error) => error,
+    })?;
+    if base_input.len() != capacity {
+        return Err(ModelBankError::BaseInputLength);
+    }
+    Ok(base_input)
+}
+
 /// Verifies and field-encodes one canonical bank on a single reader while
 /// feeding an owned, provisional sink in exact PCS role order.
 ///
@@ -2094,6 +2121,23 @@ mod tests {
             &(6_u8..=23).collect::<Vec<_>>()
         );
         assert_ne!(built.manifest.digest().unwrap(), [0; 32]);
+    }
+
+    #[test]
+    fn retained_base_input_is_published_only_after_full_bank_authentication() {
+        let built = fixture();
+        assert_eq!(
+            verify_model_bank_and_retain_base_input(Cursor::new(&built.bytes), &built.manifest)
+                .unwrap(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+
+        let mut mutated = built.bytes.clone();
+        *mutated.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            verify_model_bank_and_retain_base_input(Cursor::new(mutated), &built.manifest),
+            Err(ModelBankError::RawRootMismatch)
+        ));
     }
 
     #[test]

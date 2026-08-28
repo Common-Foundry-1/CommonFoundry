@@ -425,7 +425,7 @@ impl PoolMiningWork {
 }
 
 fn devnet_pool_params() -> Result<cmfd_consensus::NetworkParams, PoolError> {
-    crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None)
+    crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None, None)
         .map(|(params, _)| params)
         .map_err(PoolError::from)
 }

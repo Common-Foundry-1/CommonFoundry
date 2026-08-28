@@ -10,11 +10,15 @@ use cmfd_consensus::dory_v3_suite::{
 };
 use cmfd_consensus::{
     BLOCK_VERSION, COIN, COINBASE_MATURITY, CONSENSUS_SIGNATURE_BYTES, DGW_WINDOW,
-    ForgeMatrixV2Error, MAX_BLOCK_AGGREGATE_INPUTS, MAX_BLOCK_AGGREGATE_OUTPUTS, MAX_BLOCK_BYTES,
-    MAX_BLOCK_SIGNATURE_CHECKS, MAX_BLOCK_TRANSACTIONS, MAX_COINBASE_OUTPUTS, MAX_PROOF_BYTES,
+    ForgeMatrixV2Error, MAX_BLOCK_AGGREGATE_INPUTS, MAX_BLOCK_AGGREGATE_OUTPUTS,
+    MAX_BLOCK_SIGNATURE_CHECKS, MAX_BLOCK_TRANSACTIONS, MAX_COINBASE_OUTPUTS,
     MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS, MAX_TRANSACTION_OUTPUTS, MEDIAN_TIME_WINDOW,
     POW_TYPE_V2_REFERENCE, PowError, PowParameters, TARGET_SPACING_SECONDS, TRANSACTION_VERSION,
-    WIRE_HEADER_BYTES, WIRE_VERSION,
+    WIRE_HEADER_BYTES, WIRE_VERSION, max_block_bytes_for_network, max_proof_bytes_for_network,
+};
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_consensus::{
+    POW_TYPE_V4_CANDIDATE, forgematrix_v4_proof_codec::FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
 };
 use cmfd_proof_worker::{ProductionV3VerifierArtifacts, ProductionV3VerifierRecord};
 use serde::Serialize;
@@ -22,7 +26,8 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    COMPILED_NETWORK_PROFILE, NetworkProfile, NodeError, network_params_and_verifier_for_profile,
+    COMPILED_NETWORK_PROFILE, NetworkProfile, NodeError, ProductionV4VerifierArtifacts,
+    network_params_and_verifier_for_profile,
 };
 
 const NETWORK_INFO_FORMAT: &str = "commonfoundry-network-info";
@@ -92,6 +97,39 @@ enum ProofOfWorkIdentity {
     V2Reference(V2ProofOfWorkIdentity),
     #[cfg(feature = "production-v3")]
     ProductionV3(ProductionV3ProofOfWorkIdentity),
+    #[cfg(feature = "production-v4-testnet")]
+    ProductionV4(ProductionV4ProofOfWorkIdentity),
+}
+
+#[cfg(feature = "production-v4-testnet")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV4ProofOfWorkIdentity {
+    selection: &'static str,
+    profile: &'static str,
+    wire_type: u16,
+    pow_limit: String,
+    algorithm_version: u32,
+    proof_version: u32,
+    proof_system_digest: String,
+    model_manifest_digest: String,
+    fixed_artifact_record_digest: String,
+    exact_transparent_proof_bytes: String,
+    artifacts: ProductionV4ArtifactIdentities,
+}
+
+#[cfg(feature = "production-v4-testnet")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV4ArtifactIdentities {
+    bank: ProductionV4FileIdentity,
+    fixed_record: ProductionV4FileIdentity,
+}
+
+#[cfg(feature = "production-v4-testnet")]
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProductionV4FileIdentity {
+    bytes: String,
+    blake3: String,
+    sha256: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -238,15 +276,31 @@ pub fn canonical_network_info_json_with_artifacts(
 pub fn canonical_network_info_json_with_record(
     production_v3_record: Option<&ProductionV3VerifierRecord>,
 ) -> Result<Vec<u8>, NodeError> {
-    canonical_network_info_json_for_profile(COMPILED_NETWORK_PROFILE, production_v3_record)
+    canonical_network_info_json_for_profile(COMPILED_NETWORK_PROFILE, production_v3_record, None)
+}
+
+/// Returns the canonical V4 network manifest after authenticating the pinned
+/// fixed record and complete model bank used to construct verifier authority.
+pub fn canonical_network_info_json_with_v4_artifacts(
+    production_v4_artifacts: &ProductionV4VerifierArtifacts,
+) -> Result<Vec<u8>, NodeError> {
+    canonical_network_info_json_for_profile(
+        COMPILED_NETWORK_PROFILE,
+        None,
+        Some(production_v4_artifacts),
+    )
 }
 
 fn canonical_network_info_json_for_profile(
     profile: NetworkProfile,
     production_v3_record: Option<&ProductionV3VerifierRecord>,
+    production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
 ) -> Result<Vec<u8>, NodeError> {
-    let (params, verifier) =
-        network_params_and_verifier_for_profile(profile, production_v3_record)?;
+    let (params, verifier) = network_params_and_verifier_for_profile(
+        profile,
+        production_v3_record,
+        production_v4_artifacts,
+    )?;
     let proof_of_work = match verifier.parameters() {
         PowParameters::V2Reference(descriptor) => {
             let model_manifest_digest = descriptor
@@ -352,6 +406,28 @@ fn canonical_network_info_json_for_profile(
                 },
             })
         }
+        #[cfg(feature = "production-v4-testnet")]
+        PowParameters::V4Candidate(parameters) => {
+            let pins = crate::release_gate::PRODUCTION_V4_TESTNET_ARTIFACT_PINS;
+            ProofOfWorkIdentity::ProductionV4(ProductionV4ProofOfWorkIdentity {
+                selection: "ProductionV4",
+                profile: profile.proof_name(),
+                wire_type: POW_TYPE_V4_CANDIDATE,
+                pow_limit: hex::encode(params.pow_limit),
+                algorithm_version: parameters.algorithm_version(),
+                proof_version: parameters.proof_version(),
+                proof_system_digest: hex::encode(parameters.proof_system_digest()),
+                model_manifest_digest: hex::encode(parameters.model_manifest_digest()),
+                fixed_artifact_record_digest: hex::encode(
+                    parameters.fixed_artifact_record_digest(),
+                ),
+                exact_transparent_proof_bytes: FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES.to_string(),
+                artifacts: ProductionV4ArtifactIdentities {
+                    bank: production_v4_file_identity(pins.bank),
+                    fixed_record: production_v4_file_identity(pins.fixed_record),
+                },
+            })
+        }
         _ => {
             unreachable!("the compiled network profile passed proof selection validation")
         }
@@ -390,8 +466,8 @@ fn canonical_network_info_json_for_profile(
                 dgw_window: DGW_WINDOW.to_string(),
                 wire_header_bytes: WIRE_HEADER_BYTES.to_string(),
                 max_transaction_bytes: MAX_TRANSACTION_BYTES.to_string(),
-                max_proof_bytes: MAX_PROOF_BYTES.to_string(),
-                max_block_bytes: MAX_BLOCK_BYTES.to_string(),
+                max_proof_bytes: max_proof_bytes_for_network(profile.network_id).to_string(),
+                max_block_bytes: max_block_bytes_for_network(profile.network_id).to_string(),
             },
         },
         proof_of_work,
@@ -435,11 +511,22 @@ fn production_v3_file_identity(
     }
 }
 
+#[cfg(feature = "production-v4-testnet")]
+fn production_v4_file_identity(
+    pin: crate::release_gate::ProductionV3FileIdentityPin,
+) -> ProductionV4FileIdentity {
+    ProductionV4FileIdentity {
+        bytes: pin.bytes.to_string(),
+        blake3: hex::encode(pin.blake3),
+        sha256: hex::encode(pin.sha256),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     const EXPECTED_DEVNET_NETWORK_INFO: &str = r#"{
   "format": "commonfoundry-network-info",
   "format_version": 1,
@@ -525,7 +612,7 @@ mod tests {
 }
 "#;
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     #[test]
     fn current_network_info_bytes_are_exact() {
         assert_eq!(
@@ -549,7 +636,7 @@ mod tests {
 
     #[test]
     fn rcnet_network_info_never_falls_back_to_the_devnet_manifest() {
-        let result = canonical_network_info_json_for_profile(crate::RCNET1_PROFILE, None);
+        let result = canonical_network_info_json_for_profile(crate::RCNET1_PROFILE, None, None);
         #[cfg(feature = "production-v3")]
         assert!(matches!(
             result,

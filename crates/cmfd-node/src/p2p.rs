@@ -397,7 +397,7 @@ fn submit_mined_block_once_with_policy_deadline(
 }
 
 fn thin_miner_hello() -> Result<PeerHello, P2pError> {
-    let (params, _) = crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None)?;
+    let params = crate::thin_miner_network_params()?;
     Ok(PeerHello {
         network_id: params.network_id,
         consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
@@ -1767,6 +1767,71 @@ mod tests {
         ))
     }
 
+    fn test_thin_miner_hello() -> PeerHello {
+        let (params, _) =
+            crate::network_params_and_verifier_for_profile(crate::DEVNET_PROFILE, None, None)
+                .unwrap();
+        PeerHello {
+            network_id: params.network_id,
+            consensus_fingerprint: params.fingerprint().unwrap(),
+            node_nonce: process_node_nonce(),
+            tip: params.genesis_hash,
+            height: 0,
+            cumulative_work: crate::peer::ChainWork::ZERO,
+        }
+    }
+
+    fn test_request_mining_template_once_with_policy(
+        address: SocketAddr,
+        payout: [u8; 32],
+        limits: PeerLimits,
+        address_policy: PeerAddressPolicy,
+    ) -> Result<MiningTemplateResponse, P2pError> {
+        request_mining_template_once_with_hello_and_policy(
+            address,
+            payout,
+            test_thin_miner_hello(),
+            limits,
+            address_policy,
+        )
+    }
+
+    fn test_submit_mined_block_once_with_policy(
+        address: SocketAddr,
+        block: Block,
+        limits: PeerLimits,
+        address_policy: PeerAddressPolicy,
+    ) -> Result<BlockSubmissionResult, P2pError> {
+        submit_mined_block_once_with_policy_deadline(
+            address,
+            block,
+            test_thin_miner_hello(),
+            limits,
+            address_policy,
+            None,
+            None,
+        )
+    }
+
+    fn test_submit_mined_block_once_with_policy_before_cancellable(
+        address: SocketAddr,
+        block: Block,
+        limits: PeerLimits,
+        address_policy: PeerAddressPolicy,
+        deadline: Instant,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<BlockSubmissionResult, P2pError> {
+        submit_mined_block_once_with_policy_deadline(
+            address,
+            block,
+            test_thin_miner_hello(),
+            limits,
+            address_policy,
+            Some(deadline),
+            Some(cancellation),
+        )
+    }
+
     fn test_limits() -> PeerLimits {
         PeerLimits {
             connect_timeout: Duration::from_secs(1),
@@ -1883,8 +1948,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server_stream, _) = listener.accept().unwrap();
-        let client_hello = with_nonce(thin_miner_hello().unwrap(), Some([0x61; 32]));
-        let server_hello = with_nonce(thin_miner_hello().unwrap(), Some([0x62; 32]));
+        let client_hello = with_nonce(test_thin_miner_hello(), Some([0x61; 32]));
+        let server_hello = with_nonce(test_thin_miner_hello(), Some([0x62; 32]));
         let mut client = PeerConnection::from_stream(
             client_stream,
             PeerSession::new(client_hello, test_limits()).unwrap(),
@@ -2583,7 +2648,7 @@ mod tests {
         let worker_cancel = Arc::clone(&cancellation);
         let block = submission_test_block("cancel-handshake-block");
         let worker = thread::spawn(move || {
-            submit_mined_block_once_with_policy_before_cancellable(
+            test_submit_mined_block_once_with_policy_before_cancellable(
                 address,
                 block,
                 test_limits(),
@@ -2608,7 +2673,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (response_waiting, waiting_rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let hello = with_nonce(test_thin_miner_hello(), Some(TARGET_NONCE));
             let mut connection = accept_test_peer(listener, hello);
             assert!(matches!(
                 connection.receive().unwrap(),
@@ -2624,7 +2689,7 @@ mod tests {
         let worker_cancel = Arc::clone(&cancellation);
         let block = submission_test_block("cancel-response-block");
         let worker = thread::spawn(move || {
-            submit_mined_block_once_with_policy_before_cancellable(
+            test_submit_mined_block_once_with_policy_before_cancellable(
                 address,
                 block,
                 test_limits(),
@@ -2648,7 +2713,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let hello = with_nonce(test_thin_miner_hello(), Some(TARGET_NONCE));
             let mut connection = accept_test_peer(listener, hello);
             let PeerMessage::SubmitBlock(block) = connection.receive().unwrap() else {
                 panic!("expected submitted block")
@@ -2665,7 +2730,7 @@ mod tests {
                 .unwrap();
         });
         let cancellation = Arc::new(AtomicBool::new(false));
-        let error = submit_mined_block_once_with_policy_before_cancellable(
+        let error = test_submit_mined_block_once_with_policy_before_cancellable(
             address,
             submission_test_block("wrong-id-block"),
             test_limits(),
@@ -2684,7 +2749,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let hello = with_nonce(test_thin_miner_hello(), Some(TARGET_NONCE));
             let mut connection = accept_test_peer(listener, hello);
             assert!(matches!(
                 connection.receive().unwrap(),
@@ -2695,7 +2760,7 @@ mod tests {
             header[..4].copy_from_slice(b"BAD!");
             raw.write_all(&header).unwrap();
         });
-        let error = submit_mined_block_once_with_policy_before_cancellable(
+        let error = test_submit_mined_block_once_with_policy_before_cancellable(
             address,
             submission_test_block("malformed-response-block"),
             test_limits(),
@@ -2714,14 +2779,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let hello = with_nonce(thin_miner_hello().unwrap(), Some(TARGET_NONCE));
+            let hello = with_nonce(test_thin_miner_hello(), Some(TARGET_NONCE));
             let mut connection = accept_test_peer(listener, hello);
             assert!(matches!(
                 connection.receive().unwrap(),
                 PeerMessage::SubmitBlock(_)
             ));
         });
-        let error = submit_mined_block_once_with_policy_before_cancellable(
+        let error = test_submit_mined_block_once_with_policy_before_cancellable(
             address,
             submission_test_block("closed-response-block"),
             test_limits(),
@@ -2766,7 +2831,7 @@ mod tests {
         )
         .unwrap();
         let started = Instant::now();
-        let result = submit_mined_block_once_with_policy(
+        let result = test_submit_mined_block_once_with_policy(
             address,
             block,
             PeerLimits::default(),
@@ -2983,7 +3048,7 @@ mod tests {
         let payout = insecure_dev_destination(0x7a);
         let (listener, address) = start_listener(Arc::clone(&node), TARGET_NONCE);
 
-        let response = request_mining_template_once_with_policy(
+        let response = test_request_mining_template_once_with_policy(
             address,
             payout,
             test_limits(),
@@ -3006,7 +3071,7 @@ mod tests {
             .unwrap();
         let block = response.template.into_block(proof);
         let block_id = block.block_id();
-        let result = submit_mined_block_once_with_policy(
+        let result = test_submit_mined_block_once_with_policy(
             address,
             block,
             test_limits(),
@@ -3158,7 +3223,7 @@ mod tests {
         let payout = insecure_dev_destination(0x7b);
         let (listener, address) = start_listener(Arc::clone(&node), TARGET_NONCE);
 
-        let stale = request_mining_template_once_with_policy(
+        let stale = test_request_mining_template_once_with_policy(
             address,
             payout,
             test_limits(),
@@ -3173,7 +3238,7 @@ mod tests {
         let proof = verifier
             .mine(&stale.challenge, 0, DEFAULT_MINING_ATTEMPTS)
             .unwrap();
-        let result = submit_mined_block_once_with_policy(
+        let result = test_submit_mined_block_once_with_policy(
             address,
             stale.into_block(proof),
             test_limits(),

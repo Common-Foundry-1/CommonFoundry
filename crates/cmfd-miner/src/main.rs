@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "production-v3")]
+#[cfg(any(feature = "production-v3", feature = "production-v4-testnet"))]
 use std::fs::File;
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 use std::fs::{self, OpenOptions};
 #[cfg(feature = "production-v3")]
 use std::io::BufReader;
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -23,6 +23,16 @@ use clap::{Parser, Subcommand};
 use cmfd_consensus::ForgeMatrixV3WinningNonceClaim;
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::dory_v3_qualification::ProductionDoryV3QualificationSeed;
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_consensus::{
+    BlockChallenge, Coinbase, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_PROOF_VERSION,
+    ForgeMatrixV4CandidateProof, ForgeMatrixV4FixedArtifactRecordV1,
+    PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MAX_BLOCK_BYTES,
+    PRODUCTION_V4_MAX_PROOF_BYTES, Transaction, forgematrix_v4_challenge_digest,
+    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
+};
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::{
     BlockChallenge, Coinbase, MAX_BLOCK_BYTES, MAX_PROOF_BYTES, Transaction,
@@ -54,16 +64,16 @@ use cmfd_node::{
 use cmfd_node::{
     ProductionV3MiningPeerIdentity, ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts,
 };
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 use same_file::Handle as SameFileHandle;
 
 mod telemetry;
 
 use telemetry::{GpuTelemetry, query_nvidia_smi};
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 const QUALIFIED_TEMPLATE_FORMAT_VERSION: u16 = 1;
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 static QUALIFIED_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_MINER_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.miner_data_dir_identity();
@@ -71,6 +81,7 @@ const DEFAULT_MINER_P2P_ADDRESS: SocketAddr = COMPILED_NETWORK_PROFILE.miner_p2p
 const DEFAULT_BATCH_SIZE: u32 = match COMPILED_NETWORK_PROFILE.proof {
     ProofProfile::DevnetV2Reference => 8_192,
     ProofProfile::ProductionV3 => 64,
+    ProofProfile::ProductionV4 => 1,
 };
 const MAX_BATCH_SIZE: u32 = 65_536;
 #[cfg(feature = "production-v3")]
@@ -193,6 +204,34 @@ enum Command {
         proof: PathBuf,
         #[command(flatten)]
         production_v3: ProductionV3Cli,
+    },
+    /// Freeze one exact ProductionV4 node template for the GPU prover.
+    #[cfg(feature = "production-v4-testnet")]
+    SnapshotV4Template {
+        #[arg(long)]
+        peer: SocketAddr,
+        #[arg(long)]
+        allow_public_peers: bool,
+        #[arg(long)]
+        miner: String,
+        #[arg(long, default_value_t = 0)]
+        nonce: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Wrap and submit a CPU-self-verified ProductionV4 transparent proof.
+    #[cfg(feature = "production-v4-testnet")]
+    SubmitV4Template {
+        #[arg(long)]
+        peer: SocketAddr,
+        #[arg(long)]
+        allow_public_peers: bool,
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        transparent_proof: PathBuf,
+        #[arg(long)]
+        fixed_record: PathBuf,
     },
     /// Mine with an embedded full node and local chain database.
     FullNode {
@@ -394,6 +433,28 @@ fn main() -> Result<()> {
             proof,
             production_v3,
         } => submit_qualified_template(peer, allow_public_peers, &template, &proof, production_v3),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::SnapshotV4Template {
+            peer,
+            allow_public_peers,
+            miner,
+            nonce,
+            output,
+        } => snapshot_v4_template(peer, allow_public_peers, &miner, nonce, &output),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::SubmitV4Template {
+            peer,
+            allow_public_peers,
+            template,
+            transparent_proof,
+            fixed_record,
+        } => submit_v4_template(
+            peer,
+            allow_public_peers,
+            &template,
+            &transparent_proof,
+            &fixed_record,
+        ),
         Command::FullNode {
             data_dir,
             p2p_bind,
@@ -458,6 +519,215 @@ impl FrozenProductionV3Template {
             transactions: self.transactions,
         })
     }
+}
+
+#[cfg(feature = "production-v4-testnet")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenProductionV4Template {
+    format_version: u16,
+    challenge: BlockChallenge,
+    coinbase: Coinbase,
+    transactions: Vec<Transaction>,
+    nonce: u64,
+}
+
+#[cfg(feature = "production-v4-testnet")]
+impl FrozenProductionV4Template {
+    fn from_mining_template(template: MiningTemplate, nonce: u64) -> Self {
+        Self {
+            format_version: QUALIFIED_TEMPLATE_FORMAT_VERSION,
+            challenge: template.challenge,
+            coinbase: template.coinbase,
+            transactions: template.transactions,
+            nonce,
+        }
+    }
+
+    fn into_mining_template(self) -> Result<(MiningTemplate, u64)> {
+        if self.format_version != QUALIFIED_TEMPLATE_FORMAT_VERSION {
+            bail!(
+                "unsupported ProductionV4 template format version {}",
+                self.format_version
+            );
+        }
+        Ok((
+            MiningTemplate {
+                challenge: self.challenge,
+                coinbase: self.coinbase,
+                transactions: self.transactions,
+            },
+            self.nonce,
+        ))
+    }
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn snapshot_v4_template(
+    peer: SocketAddr,
+    allow_public_peers: bool,
+    miner: &str,
+    nonce: u64,
+    output: &Path,
+) -> Result<()> {
+    ensure_production_v4_test_tool()?;
+    ensure_new_absolute_output(output, "ProductionV4 template")?;
+    let payout = parse_miner_destination(miner).map_err(anyhow::Error::from)?;
+    let address_policy = qualified_template_address_policy(peer, allow_public_peers)?;
+    let response = request_mining_template_once_with_policy(
+        peer,
+        payout,
+        PeerLimits::default(),
+        address_policy,
+    )?;
+    let frozen = FrozenProductionV4Template::from_mining_template(response.template, nonce);
+    let bytes = canonical_json(&frozen, "ProductionV4 template")?;
+    write_new_file(output, &bytes, "ProductionV4 template")?;
+    println!(
+        "Frozen ProductionV4 height {} nonce {} from {peer}: {}",
+        frozen.challenge.height,
+        frozen.nonce,
+        output.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn submit_v4_template(
+    peer: SocketAddr,
+    allow_public_peers: bool,
+    template_path: &Path,
+    transparent_proof_path: &Path,
+    fixed_record_path: &Path,
+) -> Result<()> {
+    ensure_production_v4_test_tool()?;
+    ensure_existing_absolute_file(template_path, "ProductionV4 template")?;
+    ensure_existing_absolute_file(transparent_proof_path, "ProductionV4 transparent proof")?;
+    ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
+    let address_policy = qualified_template_address_policy(peer, allow_public_peers)?;
+
+    let template_bytes = read_bounded_file(
+        template_path,
+        PRODUCTION_V4_MAX_BLOCK_BYTES,
+        "ProductionV4 template",
+    )?;
+    let frozen: FrozenProductionV4Template = serde_json::from_slice(&template_bytes)
+        .with_context(|| format!("failed to parse {}", template_path.display()))?;
+    if canonical_json(&frozen, "ProductionV4 template")? != template_bytes {
+        bail!("ProductionV4 template is not canonical JSON");
+    }
+    let (template, nonce) = frozen.into_mining_template()?;
+
+    let fixed_record_bytes = read_bounded_file(
+        fixed_record_path,
+        64 * 1024,
+        "ProductionV4 fixed artifact record",
+    )?;
+    let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 =
+        serde_json::from_slice(&fixed_record_bytes)?;
+    if fixed_record.record_digest() != PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST {
+        bail!("ProductionV4 fixed artifact record is not the compiled testnet record");
+    }
+
+    let transparent_proof = read_bounded_file(
+        transparent_proof_path,
+        PRODUCTION_V4_MAX_PROOF_BYTES,
+        "ProductionV4 transparent proof",
+    )?;
+    let decoded = decode_forgematrix_v4_transparent_proof(&transparent_proof)?;
+    let challenge_digest =
+        forgematrix_v4_challenge_digest(&template.challenge, nonce, fixed_record.manifest_digest());
+    let final_activation_digest =
+        cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_final_activation_digest(
+            challenge_digest,
+            &decoded.final_activation,
+        );
+    let work_digest = forgematrix_v4_work_digest(
+        fixed_record.manifest_digest(),
+        challenge_digest,
+        final_activation_digest,
+    );
+    if work_digest > template.challenge.target {
+        bail!("ProductionV4 proof does not meet the frozen template target");
+    }
+    let proof = BlockProof::V4Candidate(Box::new(ForgeMatrixV4CandidateProof {
+        algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
+        proof_version: FORGEMATRIX_V4_PROOF_VERSION,
+        nonce,
+        proof_system_digest: forgematrix_v4_proof_system_digest(),
+        model_manifest_digest: fixed_record.manifest_digest(),
+        challenge_digest,
+        final_activation_digest,
+        work_digest,
+        transparent_proof,
+    }));
+    let block = template.into_block(proof);
+    let block_id = block.block_id();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Release))?;
+    let deadline = Instant::now()
+        .checked_add(FOUND_BLOCK_RETRY_BUDGET)
+        .ok_or_else(|| anyhow!("ProductionV4 block retry deadline overflow"))?;
+    let cancellation = Arc::clone(&shutdown);
+    let report = retry_exact_block_with(
+        &[peer],
+        Some(peer),
+        &block,
+        deadline,
+        &shutdown,
+        |address, candidate, attempt_deadline| {
+            match submit_mined_block_once_with_policy_before_cancellable(
+                address,
+                candidate,
+                PeerLimits::default(),
+                address_policy,
+                attempt_deadline,
+                Arc::clone(&cancellation),
+            ) {
+                Ok(result) => ExactBlockSubmissionAttempt::Response(result),
+                Err(error) if error.is_cancelled() || error.is_transport_disconnect() => {
+                    ExactBlockSubmissionAttempt::Disconnected(error.to_string())
+                }
+                Err(error) => ExactBlockSubmissionAttempt::ProtocolViolation(error.to_string()),
+            }
+        },
+        interruptible_wait,
+        Instant::now,
+    );
+    match report.outcome {
+        ExactBlockRetryOutcome::Accepted(accepted_peer) => {
+            println!(
+                "PRODUCTION V4 BLOCK ACCEPTED | height {} | {} | node {accepted_peer}",
+                block.challenge.height,
+                hex::encode(block_id)
+            );
+            Ok(())
+        }
+        ExactBlockRetryOutcome::Rejected => bail!("ProductionV4 block was rejected by the node"),
+        ExactBlockRetryOutcome::Stale(tip) => bail!(
+            "frozen ProductionV4 template is stale; node tip is {}",
+            hex::encode(tip)
+        ),
+        ExactBlockRetryOutcome::ProtocolViolation { peer, detail } => {
+            bail!("incompatible response from {peer}: {detail}")
+        }
+        ExactBlockRetryOutcome::BudgetExhausted => {
+            bail!("ProductionV4 block submission exceeded its retry budget")
+        }
+        ExactBlockRetryOutcome::Stopped => bail!("ProductionV4 block submission was interrupted"),
+    }
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn ensure_production_v4_test_tool() -> Result<()> {
+    if !matches!(
+        COMPILED_NETWORK_PROFILE.kind,
+        cmfd_node::NetworkProfileKind::ProductionV4Testnet
+    ) {
+        bail!("ProductionV4 template commands require the ProductionV4 testnet build");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "production-v3-testnet")]
@@ -629,7 +899,7 @@ fn ensure_production_v3_test_tool() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 fn qualified_template_address_policy(
     peer: SocketAddr,
     allow_public_peers: bool,
@@ -649,7 +919,7 @@ fn qualified_template_address_policy(
     Ok(address_policy)
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 fn ensure_new_absolute_output(path: &Path, label: &str) -> Result<()> {
     if !path.is_absolute() {
         bail!("{label} output must be an absolute path");
@@ -666,7 +936,7 @@ fn ensure_new_absolute_output(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 fn ensure_existing_absolute_file(path: &Path, label: &str) -> Result<()> {
     if !path.is_absolute() || !path.is_file() {
         bail!(
@@ -677,7 +947,7 @@ fn ensure_existing_absolute_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 fn canonical_json<T>(value: &T, label: &str) -> Result<Vec<u8>>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + PartialEq,
@@ -691,7 +961,7 @@ where
     Ok(bytes)
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 fn write_new_file(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     let parent = path
         .parent()
@@ -769,14 +1039,14 @@ fn write_new_file(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 struct UnconfirmedOutput {
     path: PathBuf,
     identity: SameFileHandle,
     confirmed: bool,
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 impl UnconfirmedOutput {
     fn new(path: PathBuf, identity: SameFileHandle) -> Self {
         Self {
@@ -791,7 +1061,7 @@ impl UnconfirmedOutput {
     }
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 impl Drop for UnconfirmedOutput {
     fn drop(&mut self) {
         if !self.confirmed
@@ -802,18 +1072,24 @@ impl Drop for UnconfirmedOutput {
     }
 }
 
-#[cfg(all(feature = "production-v3-testnet", unix))]
+#[cfg(all(
+    any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+    unix
+))]
 fn sync_output_parent(parent: &Path) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
 
-#[cfg(all(feature = "production-v3-testnet", not(unix)))]
+#[cfg(all(
+    any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+    not(unix)
+))]
 fn sync_output_parent(_parent: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "production-v3-testnet")]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
 fn read_bounded_file(path: &Path, maximum_bytes: usize, label: &str) -> Result<Vec<u8>> {
     let file =
         File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
@@ -928,6 +1204,7 @@ struct ProductionWorkerSpec {
 enum MiningRuntime {
     DevnetV2,
     ProductionV3,
+    ProductionV4,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -998,6 +1275,7 @@ const fn mining_runtime(profile: cmfd_node::NetworkProfile) -> MiningRuntime {
     match profile.proof {
         ProofProfile::DevnetV2Reference => MiningRuntime::DevnetV2,
         ProofProfile::ProductionV3 => MiningRuntime::ProductionV3,
+        ProofProfile::ProductionV4 => MiningRuntime::ProductionV4,
     }
 }
 
@@ -1086,6 +1364,7 @@ impl SessionStatistics {
     }
 
     /// Total completed nonce evaluations across every GPU this session.
+    #[cfg_attr(feature = "production-v4-testnet", allow(dead_code))]
     fn total_attempts(&self) -> u64 {
         self.totals
             .values()
@@ -1231,6 +1510,12 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
                     "this binary selects Production V3 but was built without the production-v3 feature"
                 )
             }
+        }
+        MiningRuntime::ProductionV4 => {
+            let _ = options;
+            bail!(
+                "ProductionV4 continuous mining is not yet installed; use snapshot-v4-template, the GPU prover, and submit-v4-template"
+            )
         }
     }
 }
@@ -2215,6 +2500,12 @@ fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
                     "this binary selects Production V3 but was built without the production-v3 feature"
                 )
             }
+        }
+        MiningRuntime::ProductionV4 => {
+            let _ = options;
+            bail!(
+                "ProductionV4 embedded mining is not supported; run a V4 node and use the template/prover submission flow"
+            )
         }
     }
 }

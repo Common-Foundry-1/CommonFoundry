@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
@@ -53,6 +53,22 @@ const MAX_PEER_CACHE_BYTES: u64 = 16 * 1024;
 const MAX_DYNAMIC_TARGETS_PER_ROUND: usize = 2;
 const MAX_UNVERIFIED_PEER_FAILURES: u8 = 3;
 const MAX_DISCOVERED_PEERS_PER_IP: usize = 8;
+// Keep source-tracking memory fixed, prevent one address from consuming the
+// default 16-peer listener, and leave ample reconnect headroom for several
+// honest nodes behind one NAT. Bans are deliberately temporary so operator
+// mistakes and rolling-upgrade incompatibilities recover without intervention.
+const MAX_PEER_REPUTATIONS: usize = 1_024;
+const MAX_INBOUND_CONNECTIONS_PER_IP: usize = 4;
+const MAX_INBOUND_ATTEMPTS_PER_WINDOW: u16 = 64;
+const INBOUND_ATTEMPT_WINDOW: Duration = Duration::from_secs(10);
+const PEER_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
+const PEER_BAN_SCORE: u16 = 100;
+const CLEAN_SESSION_CREDIT: u16 = 10;
+const TRANSIENT_FAILURE_PENALTY: u16 = 5;
+const UNKNOWN_REQUEST_PENALTY: u16 = 10;
+const INVALID_BLOCK_PENALTY: u16 = 25;
+const PROTOCOL_VIOLATION_PENALTY: u16 = 50;
+const RESOURCE_ABUSE_PENALTY: u16 = PEER_BAN_SCORE;
 const DYNAMIC_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_DYNAMIC_PEER_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -101,6 +117,10 @@ pub enum P2pError {
     PoisonedActiveSockets,
     #[error("peer discovery registry is poisoned")]
     PoisonedPeerDiscovery,
+    #[error("peer reputation registry is poisoned")]
+    PoisonedPeerReputation,
+    #[error("peer {0} is temporarily banned")]
+    PeerTemporarilyBanned(IpAddr),
     #[error("peer service is stopping")]
     ServiceStopping,
     #[error("unexpected peer message: expected {expected}, received {actual}")]
@@ -212,6 +232,253 @@ struct DiscoveredPeer {
     next_sync: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PeerReputationKey {
+    V4([u8; 4]),
+    V6([u8; 8]),
+}
+
+impl PeerReputationKey {
+    fn from_ip(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(ip) => Self::V4(ip.octets()),
+            IpAddr::V6(ip) => {
+                if let Some(ip) = ip.to_ipv4_mapped() {
+                    Self::V4(ip.octets())
+                } else {
+                    let octets = ip.octets();
+                    Self::V6(octets[..8].try_into().expect("fixed IPv6 /64 prefix"))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PeerReputationEntry {
+    score: u16,
+    banned_until: Option<Instant>,
+    active_connections: usize,
+    attempt_window_started: Instant,
+    connection_attempts: u16,
+    last_updated: Instant,
+}
+
+impl PeerReputationEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            score: 0,
+            banned_until: None,
+            active_connections: 0,
+            attempt_window_started: now,
+            connection_attempts: 0,
+            last_updated: now,
+        }
+    }
+
+    fn refresh(&mut self, now: Instant) {
+        if self.banned_until.is_some_and(|until| until <= now) {
+            self.score = 0;
+            self.banned_until = None;
+            self.attempt_window_started = now;
+            self.connection_attempts = 0;
+        }
+        if now.saturating_duration_since(self.attempt_window_started) >= INBOUND_ATTEMPT_WINDOW {
+            self.attempt_window_started = now;
+            self.connection_attempts = 0;
+        }
+        self.last_updated = now;
+    }
+}
+
+#[derive(Debug, Default)]
+struct PeerSecurityState {
+    reputations: BTreeMap<PeerReputationKey, PeerReputationEntry>,
+}
+
+#[derive(Debug, Default)]
+struct PeerSecurity {
+    state: Mutex<PeerSecurityState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerAdmissionRejection {
+    Banned,
+    PerIpLimit,
+    RateLimit,
+    Capacity,
+}
+
+enum PeerAdmission {
+    Accepted(PeerAdmissionGuard),
+    Rejected(PeerAdmissionRejection),
+}
+
+struct PeerAdmissionGuard {
+    security: Arc<PeerSecurity>,
+    key: PeerReputationKey,
+}
+
+impl Drop for PeerAdmissionGuard {
+    fn drop(&mut self) {
+        self.security.release(self.key);
+    }
+}
+
+impl PeerSecurity {
+    fn reserve_inbound(self: &Arc<Self>, ip: IpAddr) -> Result<PeerAdmission, P2pError> {
+        self.reserve_inbound_at(ip, Instant::now())
+    }
+
+    fn reserve_inbound_at(
+        self: &Arc<Self>,
+        ip: IpAddr,
+        now: Instant,
+    ) -> Result<PeerAdmission, P2pError> {
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        let Some(entry) = peer_reputation_entry(&mut state, key, now) else {
+            return Ok(PeerAdmission::Rejected(PeerAdmissionRejection::Capacity));
+        };
+        entry.refresh(now);
+        if entry.banned_until.is_some_and(|until| until > now) {
+            return Ok(PeerAdmission::Rejected(PeerAdmissionRejection::Banned));
+        }
+        if entry.connection_attempts >= MAX_INBOUND_ATTEMPTS_PER_WINDOW {
+            entry.score = PEER_BAN_SCORE;
+            entry.banned_until = Some(now + PEER_BAN_DURATION);
+            tracing::warn!(peer = %ip, "temporarily banned peer after excessive connection churn");
+            return Ok(PeerAdmission::Rejected(PeerAdmissionRejection::RateLimit));
+        }
+        entry.connection_attempts = entry.connection_attempts.saturating_add(1);
+        if entry.active_connections >= MAX_INBOUND_CONNECTIONS_PER_IP {
+            return Ok(PeerAdmission::Rejected(PeerAdmissionRejection::PerIpLimit));
+        }
+        entry.active_connections = entry.active_connections.saturating_add(1);
+        Ok(PeerAdmission::Accepted(PeerAdmissionGuard {
+            security: Arc::clone(self),
+            key,
+        }))
+    }
+
+    fn record_success(&self, ip: IpAddr) -> Result<(), P2pError> {
+        let now = Instant::now();
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        let Some(entry) = state.reputations.get_mut(&key) else {
+            return Ok(());
+        };
+        entry.refresh(now);
+        if entry.banned_until.is_none() {
+            entry.score = entry.score.saturating_sub(CLEAN_SESSION_CREDIT);
+        }
+        Ok(())
+    }
+
+    fn record_failure(
+        &self,
+        ip: IpAddr,
+        penalty: u16,
+        reason: &'static str,
+    ) -> Result<bool, P2pError> {
+        self.record_failure_at(ip, penalty, Instant::now(), reason)
+    }
+
+    fn record_failure_at(
+        &self,
+        ip: IpAddr,
+        penalty: u16,
+        now: Instant,
+        reason: &'static str,
+    ) -> Result<bool, P2pError> {
+        if penalty == 0 {
+            return Ok(false);
+        }
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        let Some(entry) = peer_reputation_entry(&mut state, key, now) else {
+            return Ok(false);
+        };
+        entry.refresh(now);
+        if entry.banned_until.is_some_and(|until| until > now) {
+            return Ok(true);
+        }
+        entry.score = entry.score.saturating_add(penalty).min(PEER_BAN_SCORE);
+        let banned = entry.score >= PEER_BAN_SCORE;
+        if banned {
+            entry.banned_until = Some(now + PEER_BAN_DURATION);
+            tracing::warn!(peer = %ip, score = entry.score, %reason, "temporarily banned misbehaving peer");
+        } else {
+            tracing::debug!(peer = %ip, score = entry.score, %reason, "recorded peer misbehavior");
+        }
+        Ok(banned)
+    }
+
+    fn is_banned(&self, ip: IpAddr) -> Result<bool, P2pError> {
+        self.is_banned_at(ip, Instant::now())
+    }
+
+    fn is_banned_at(&self, ip: IpAddr, now: Instant) -> Result<bool, P2pError> {
+        let key = PeerReputationKey::from_ip(ip);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerReputation)?;
+        let Some(entry) = state.reputations.get_mut(&key) else {
+            return Ok(false);
+        };
+        entry.refresh(now);
+        Ok(entry.banned_until.is_some_and(|until| until > now))
+    }
+
+    fn release(&self, key: PeerReputationKey) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(entry) = state.reputations.get_mut(&key)
+        {
+            entry.active_connections = entry.active_connections.saturating_sub(1);
+            entry.last_updated = Instant::now();
+        }
+    }
+}
+
+fn peer_reputation_entry(
+    state: &mut PeerSecurityState,
+    key: PeerReputationKey,
+    now: Instant,
+) -> Option<&mut PeerReputationEntry> {
+    if !state.reputations.contains_key(&key) && state.reputations.len() >= MAX_PEER_REPUTATIONS {
+        let eviction = state
+            .reputations
+            .iter()
+            .filter(|(_, entry)| {
+                entry.active_connections == 0 && entry.banned_until.is_none_or(|until| until <= now)
+            })
+            .min_by_key(|(_, entry)| entry.last_updated)
+            .map(|(key, _)| *key);
+        if let Some(eviction) = eviction {
+            state.reputations.remove(&eviction);
+        }
+    }
+    if !state.reputations.contains_key(&key) && state.reputations.len() >= MAX_PEER_REPUTATIONS {
+        return None;
+    }
+    Some(
+        state
+            .reputations
+            .entry(key)
+            .or_insert_with(|| PeerReputationEntry::new(now)),
+    )
+}
+
 #[derive(Debug, Default)]
 struct PeerDiscoveryState {
     peers: BTreeMap<SocketAddr, DiscoveredPeer>,
@@ -228,6 +495,7 @@ pub struct PeerDiscovery {
     consensus_fingerprint: [u8; 32],
     listen_address: SocketAddr,
     address_policy: PeerAddressPolicy,
+    security: Arc<PeerSecurity>,
     state: Mutex<PeerDiscoveryState>,
 }
 
@@ -270,6 +538,7 @@ impl PeerDiscovery {
             consensus_fingerprint: local_hello.consensus_fingerprint,
             listen_address,
             address_policy,
+            security: Arc::new(PeerSecurity::default()),
             state: Mutex::new(state),
         }
     }
@@ -1232,6 +1501,10 @@ fn respond_to_peer_inner_with_policy(
     cancellation: Option<Arc<AtomicBool>>,
     discovery: Option<Arc<PeerDiscovery>>,
 ) -> Result<(), P2pError> {
+    let security = discovery.as_ref().map_or_else(
+        || Arc::new(PeerSecurity::default()),
+        |discovery| Arc::clone(&discovery.security),
+    );
     respond_to_peer_inner_with_options(
         shared,
         stream,
@@ -1241,6 +1514,7 @@ fn respond_to_peer_inner_with_policy(
             nonce_override,
             cancellation,
             discovery,
+            security,
         },
     )
 }
@@ -1251,6 +1525,7 @@ struct InboundPeerOptions {
     nonce_override: Option<[u8; 32]>,
     cancellation: Option<Arc<AtomicBool>>,
     discovery: Option<Arc<PeerDiscovery>>,
+    security: Arc<PeerSecurity>,
 }
 
 fn respond_to_peer_inner_with_options(
@@ -1265,6 +1540,7 @@ fn respond_to_peer_inner_with_options(
     let _entered = span.enter();
     let observation_address = observed_address(PeerDirection::Inbound, remote_address);
     record_peer_started(&shared, PeerDirection::Inbound, observation_address.clone());
+    let security = Arc::clone(&options.security);
     let result = perform_respond_to_peer_inner_with_policy(
         Arc::clone(&shared),
         stream,
@@ -1273,6 +1549,21 @@ fn respond_to_peer_inner_with_options(
         observation_address.clone(),
         options,
     );
+    match &result {
+        Ok(()) => {
+            if let Err(error) = security.record_success(remote_address.ip()) {
+                tracing::warn!(%error, "failed to update peer reputation after successful session");
+            }
+        }
+        Err(error) => {
+            let (penalty, reason) = inbound_reputation_penalty(error);
+            if let Err(reputation_error) =
+                security.record_failure(remote_address.ip(), penalty, reason)
+            {
+                tracing::warn!(%reputation_error, "failed to update peer reputation after failed session");
+            }
+        }
+    }
     if let Err(error) = &result {
         tracing::warn!(%error, "inbound peer session ended with error");
     }
@@ -1413,6 +1704,15 @@ fn perform_respond_to_peer_inner_with_policy(
                     status,
                     response_deadline,
                 )?;
+                if status == BlockSubmissionStatus::Rejected
+                    && options.security.record_failure(
+                        remote_address.ip(),
+                        INVALID_BLOCK_PENALTY,
+                        "deterministically rejected block",
+                    )?
+                {
+                    return Err(P2pError::PeerTemporarilyBanned(remote_address.ip()));
+                }
             }
             PeerMessage::GetPeers { listen_port } => {
                 let Some(discovery) = options.discovery.as_ref() else {
@@ -1438,6 +1738,64 @@ fn perform_respond_to_peer_inner_with_policy(
 
 fn is_retryable_block_admission(error: &NodeError) -> bool {
     error.client_error().retryable
+}
+
+fn inbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
+    match error {
+        P2pError::Peer(
+            PeerError::PayloadTooLarge { .. }
+            | PeerError::CountLimit { .. }
+            | PeerError::PeerBudgetExceeded,
+        ) => (RESOURCE_ABUSE_PENALTY, "peer resource limit violation"),
+        P2pError::Peer(PeerError::Cancelled) | P2pError::PeerTemporarilyBanned(_) => {
+            (0, "no peer fault")
+        }
+        P2pError::Peer(
+            PeerError::ConnectionClosed
+            | PeerError::TotalTimeout
+            | PeerError::IdleTimeout
+            | PeerError::SubmitBlockResponseTimeout
+            | PeerError::Io(_),
+        ) => (TRANSIENT_FAILURE_PENALTY, "inbound transport churn"),
+        P2pError::Peer(_) | P2pError::UnexpectedMessage { .. } => {
+            (PROTOCOL_VIOLATION_PENALTY, "peer protocol violation")
+        }
+        P2pError::UnknownRequestedBlock(_) | P2pError::UnknownRequestedTransaction(_) => {
+            (UNKNOWN_REQUEST_PENALTY, "peer requested unknown data")
+        }
+        _ => (0, "no peer fault"),
+    }
+}
+
+fn outbound_reputation_penalty(error: &P2pError) -> (u16, &'static str) {
+    match error {
+        P2pError::Peer(
+            PeerError::PayloadTooLarge { .. }
+            | PeerError::CountLimit { .. }
+            | PeerError::PeerBudgetExceeded,
+        ) => (RESOURCE_ABUSE_PENALTY, "remote resource limit violation"),
+        P2pError::Peer(
+            PeerError::ConnectionClosed
+            | PeerError::TotalTimeout
+            | PeerError::IdleTimeout
+            | PeerError::SubmitBlockResponseTimeout
+            | PeerError::Cancelled
+            | PeerError::Io(_),
+        )
+        | P2pError::RejectedBlockSubmission(_)
+        | P2pError::BusyBlockSubmission(_) => (0, "no remote peer fault"),
+        P2pError::Peer(_)
+        | P2pError::UnexpectedMessage { .. }
+        | P2pError::WrongBlock { .. }
+        | P2pError::WrongTransaction { .. }
+        | P2pError::WrongBlockSubmission { .. }
+        | P2pError::NonContiguousInventory { .. }
+        | P2pError::UnexpectedMiningTemplate
+        | P2pError::UnexpectedMiningPayout => {
+            (PROTOCOL_VIOLATION_PENALTY, "remote peer protocol violation")
+        }
+        _ => (0, "no remote peer fault"),
+    }
 }
 
 fn checked_submit_deadline(start: Instant, budget: Duration) -> Result<Instant, P2pError> {
@@ -1592,6 +1950,7 @@ fn record_peer_ended(
 pub struct InboundPeerHandle {
     stop: Arc<AtomicBool>,
     active_sockets: Arc<ActiveSocketRegistry>,
+    security: Arc<PeerSecurity>,
     local_address: SocketAddr,
     thread: Option<JoinHandle<Result<(), P2pError>>>,
 }
@@ -1603,6 +1962,10 @@ impl InboundPeerHandle {
 
     pub fn is_finished(&self) -> bool {
         self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    pub fn peer_is_temporarily_banned(&self, ip: IpAddr) -> Result<bool, P2pError> {
+        self.security.is_banned(ip)
     }
 
     pub fn stop(mut self) -> Result<(), P2pError> {
@@ -1694,6 +2057,10 @@ fn spawn_inbound_listener_inner_with_policy(
 
     let stop = Arc::new(AtomicBool::new(false));
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
+    let security = discovery.as_ref().map_or_else(
+        || Arc::new(PeerSecurity::default()),
+        |discovery| Arc::clone(&discovery.security),
+    );
     let thread_stop = Arc::clone(&stop);
     let thread_active_sockets = Arc::clone(&active_sockets);
     let options = InboundPeerOptions {
@@ -1701,6 +2068,7 @@ fn spawn_inbound_listener_inner_with_policy(
         nonce_override,
         cancellation: Some(Arc::clone(&thread_stop)),
         discovery,
+        security: Arc::clone(&security),
     };
     let thread = thread::Builder::new()
         .name("cmfd-peer-listener".to_owned())
@@ -1718,6 +2086,7 @@ fn spawn_inbound_listener_inner_with_policy(
     Ok(InboundPeerHandle {
         stop,
         active_sockets,
+        security,
         local_address,
         thread: Some(thread),
     })
@@ -1736,7 +2105,7 @@ fn listener_loop(
 
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, remote_address)) => {
                 // Accepted sockets can inherit the listener's nonblocking mode
                 // on some platforms. PeerConnection supplies its own bounded
                 // blocking read/write deadlines.
@@ -1745,6 +2114,14 @@ fn listener_loop(
                     continue;
                 }
                 reap_workers(&mut workers);
+                let admission = match options.security.reserve_inbound(remote_address.ip())? {
+                    PeerAdmission::Accepted(guard) => guard,
+                    PeerAdmission::Rejected(reason) => {
+                        tracing::debug!(peer = %remote_address, ?reason, "rejected inbound peer admission");
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                };
                 if !reserve_connection(&active, limits.max_peers) {
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
@@ -1775,6 +2152,7 @@ fn listener_loop(
                 let worker_stop = Arc::clone(&stop);
                 let worker_options = options.clone();
                 workers.push(thread::spawn(move || {
+                    let _admission = admission;
                     let _guard = ActiveConnectionGuard {
                         active: worker_active,
                         _socket: socket_guard,
@@ -1909,6 +2287,12 @@ pub struct StaticPeerPollHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+struct PeerPollOptions {
+    nonce_override: Option<[u8; 32]>,
+    discovery: Option<Arc<PeerDiscovery>>,
+    security: Arc<PeerSecurity>,
+}
+
 impl StaticPeerPollHandle {
     pub fn is_finished(&self) -> bool {
         self.thread.as_ref().is_some_and(JoinHandle::is_finished)
@@ -1976,10 +2360,19 @@ fn spawn_peer_polling_inner(
     if poll_interval.is_zero() {
         return Err(P2pError::ZeroPollInterval);
     }
+    let security = discovery.as_ref().map_or_else(
+        || Arc::new(PeerSecurity::default()),
+        |discovery| Arc::clone(&discovery.security),
+    );
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
     let thread_active_sockets = Arc::clone(&active_sockets);
+    let options = PeerPollOptions {
+        nonce_override,
+        discovery,
+        security,
+    };
     let thread = thread::Builder::new()
         .name("cmfd-static-peer-poll".to_owned())
         .spawn(move || {
@@ -1989,8 +2382,7 @@ fn spawn_peer_polling_inner(
                 poll_interval,
                 thread_stop,
                 thread_active_sockets,
-                nonce_override,
-                discovery,
+                options,
             )
         })
         .map_err(P2pError::ListenerIo)?;
@@ -2007,15 +2399,14 @@ fn static_peer_poll_loop(
     poll_interval: Duration,
     stop: Arc<(Mutex<bool>, Condvar)>,
     active_sockets: Arc<ActiveSocketRegistry>,
-    nonce_override: Option<[u8; 32]>,
-    discovery: Option<Arc<PeerDiscovery>>,
+    options: PeerPollOptions,
 ) {
     loop {
         if poll_stopped(&stop) {
             return;
         }
         let mut targets = config.peers.clone();
-        if let Some(discovery) = discovery.as_ref() {
+        if let Some(discovery) = options.discovery.as_ref() {
             match discovery.poll_targets(MAX_DYNAMIC_TARGETS_PER_ROUND) {
                 Ok(dynamic) => {
                     for address in dynamic {
@@ -2031,6 +2422,17 @@ fn static_peer_poll_loop(
             if poll_stopped(&stop) {
                 return;
             }
+            match options.security.is_banned(peer.ip()) {
+                Ok(true) => {
+                    tracing::debug!(%peer, "skipping temporarily banned outbound peer");
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, %peer, "failed to consult outbound peer reputation");
+                    continue;
+                }
+            }
             // Errors are already logged via tracing inside these calls;
             // a failure with one peer must not stop later peers or rounds.
             let sync_result = sync_from_peer_once_inner_with_policy(
@@ -2038,10 +2440,21 @@ fn static_peer_poll_loop(
                 peer,
                 config.limits,
                 config.address_policy,
-                nonce_override,
+                options.nonce_override,
                 Some(&active_sockets),
             );
-            if let Some(discovery) = discovery.as_ref() {
+            let mut round_succeeded = sync_result.is_ok();
+            let sync_banned = sync_result.as_ref().err().is_some_and(|error| {
+                let (penalty, reason) = outbound_reputation_penalty(error);
+                options
+                    .security
+                    .record_failure(peer.ip(), penalty, reason)
+                    .unwrap_or_else(|reputation_error| {
+                        tracing::warn!(%reputation_error, %peer, "failed to update outbound peer reputation");
+                        false
+                    })
+            });
+            if let Some(discovery) = options.discovery.as_ref() {
                 let discovery_result = if sync_result.is_ok() {
                     discovery.mark_verified(peer)
                 } else {
@@ -2051,18 +2464,38 @@ fn static_peer_poll_loop(
                     tracing::warn!(%error, peer = %peer, "failed to update peer discovery state");
                 }
             }
+            if sync_banned {
+                continue;
+            }
             if poll_stopped(&stop) {
                 return;
             }
-            let _ = relay_blocks_to_peer_once_inner_with_policy(
+            let relay_result = relay_blocks_to_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 peer,
                 config.limits,
                 config.address_policy,
-                nonce_override,
+                options.nonce_override,
                 Some(&active_sockets),
             );
-            if let Some(discovery) = discovery.as_ref()
+            round_succeeded &= relay_result.is_ok();
+            let relay_banned = relay_result.as_ref().err().is_some_and(|error| {
+                let (penalty, reason) = outbound_reputation_penalty(error);
+                options
+                    .security
+                    .record_failure(peer.ip(), penalty, reason)
+                    .unwrap_or_else(|reputation_error| {
+                        tracing::warn!(%reputation_error, %peer, "failed to update outbound peer reputation");
+                        false
+                    })
+            });
+            if relay_banned {
+                continue;
+            }
+            if round_succeeded && let Err(error) = options.security.record_success(peer.ip()) {
+                tracing::warn!(%error, %peer, "failed to update outbound peer reputation after successful round");
+            }
+            if let Some(discovery) = options.discovery.as_ref()
                 && sync_result.is_ok()
             {
                 match discovery.discovery_due(peer) {
@@ -2073,7 +2506,7 @@ fn static_peer_poll_loop(
                             config.limits,
                             config.address_policy,
                             discovery,
-                            nonce_override,
+                            options.nonce_override,
                             Some(&active_sockets),
                         ) {
                             let _ = discovery.defer_discovery(peer);
@@ -2398,6 +2831,120 @@ mod tests {
         let v4_maximum_block_bytes = max_block_bytes_for_network(v4_network_id) as u64;
         assert!(v4_maximum_block_bytes <= v4_block_budget);
         assert!(v4_maximum_block_bytes.saturating_mul(2) > v4_block_budget);
+    }
+
+    #[test]
+    fn peer_reputation_bans_protocol_violations_and_recovers() {
+        let security = Arc::new(PeerSecurity::default());
+        let ip = "127.0.0.1".parse().unwrap();
+        let started = Instant::now();
+
+        for offset in 0..2 {
+            security
+                .record_failure_at(
+                    ip,
+                    PROTOCOL_VIOLATION_PENALTY,
+                    started + Duration::from_millis(offset),
+                    "test protocol violation",
+                )
+                .unwrap();
+        }
+        assert!(security.is_banned_at(ip, started).unwrap());
+        assert!(matches!(
+            security.reserve_inbound_at(ip, started).unwrap(),
+            PeerAdmission::Rejected(PeerAdmissionRejection::Banned)
+        ));
+
+        let recovered_at = started + PEER_BAN_DURATION + Duration::from_millis(1);
+        let guard = match security.reserve_inbound_at(ip, recovered_at).unwrap() {
+            PeerAdmission::Accepted(guard) => guard,
+            PeerAdmission::Rejected(reason) => panic!("recovered peer was rejected: {reason:?}"),
+        };
+        assert!(!security.is_banned_at(ip, recovered_at).unwrap());
+        drop(guard);
+    }
+
+    #[test]
+    fn peer_reputation_reserves_only_a_fair_per_ip_share() {
+        let security = Arc::new(PeerSecurity::default());
+        let ip = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut guards = Vec::new();
+
+        for _ in 0..MAX_INBOUND_CONNECTIONS_PER_IP {
+            match security.reserve_inbound_at(ip, now).unwrap() {
+                PeerAdmission::Accepted(guard) => guards.push(guard),
+                PeerAdmission::Rejected(reason) => {
+                    panic!("connection inside per-IP allowance was rejected: {reason:?}")
+                }
+            }
+        }
+        assert!(matches!(
+            security.reserve_inbound_at(ip, now).unwrap(),
+            PeerAdmission::Rejected(PeerAdmissionRejection::PerIpLimit)
+        ));
+
+        drop(guards.pop());
+        assert!(matches!(
+            security.reserve_inbound_at(ip, now).unwrap(),
+            PeerAdmission::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn peer_reputation_rate_limits_reconnect_churn() {
+        let security = Arc::new(PeerSecurity::default());
+        let ip = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+
+        for _ in 0..MAX_INBOUND_ATTEMPTS_PER_WINDOW {
+            let guard = match security.reserve_inbound_at(ip, now).unwrap() {
+                PeerAdmission::Accepted(guard) => guard,
+                PeerAdmission::Rejected(reason) => {
+                    panic!("connection inside rate allowance was rejected: {reason:?}")
+                }
+            };
+            drop(guard);
+        }
+        assert!(matches!(
+            security.reserve_inbound_at(ip, now).unwrap(),
+            PeerAdmission::Rejected(PeerAdmissionRejection::RateLimit)
+        ));
+        assert!(security.is_banned_at(ip, now).unwrap());
+    }
+
+    #[test]
+    fn peer_reputation_groups_ipv6_addresses_by_prefix() {
+        let first = PeerReputationKey::from_ip("2001:db8:1234:5678::1".parse().unwrap());
+        let second = PeerReputationKey::from_ip("2001:db8:1234:5678::ffff".parse().unwrap());
+        let other = PeerReputationKey::from_ip("2001:db8:1234:5679::1".parse().unwrap());
+        let ipv4 = PeerReputationKey::from_ip("192.0.2.1".parse().unwrap());
+        let ipv4_mapped = PeerReputationKey::from_ip("::ffff:192.0.2.1".parse().unwrap());
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(ipv4, ipv4_mapped);
+    }
+
+    #[test]
+    fn peer_reputation_does_not_ban_outbound_transport_outages() {
+        let transport = P2pError::Peer(PeerError::ConnectionClosed);
+        let malformed = P2pError::Peer(PeerError::InvalidMagic);
+        let oversized = P2pError::Peer(PeerError::PayloadTooLarge { actual: 2, max: 1 });
+
+        assert_eq!(outbound_reputation_penalty(&transport).0, 0);
+        assert_eq!(
+            inbound_reputation_penalty(&transport).0,
+            TRANSIENT_FAILURE_PENALTY
+        );
+        assert_eq!(
+            outbound_reputation_penalty(&malformed).0,
+            PROTOCOL_VIOLATION_PENALTY
+        );
+        assert_eq!(
+            outbound_reputation_penalty(&oversized).0,
+            RESOURCE_ABUSE_PENALTY
+        );
     }
 
     #[test]
@@ -4205,6 +4752,62 @@ mod tests {
 
         drop(first);
         drop(second);
+        service.stop().unwrap();
+        drop(node);
+        clean_test_dir(&node_path);
+    }
+
+    #[test]
+    fn listener_temporarily_bans_repeated_malformed_handshakes() {
+        let node_path = test_dir("malformed-handshake-ban");
+        let node = open_shared(&node_path);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = spawn_inbound_listener_inner(
+            Arc::clone(&node),
+            listener,
+            test_limits(),
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut hello_header = [0_u8; PEER_FRAME_HEADER_BYTES];
+            stream.read_exact(&mut hello_header).unwrap();
+            let hello_bytes = u32::from_le_bytes(hello_header[16..20].try_into().unwrap()) as usize;
+            let mut hello_payload = vec![0_u8; hello_bytes];
+            stream.read_exact(&mut hello_payload).unwrap();
+
+            let mut invalid_header = [0_u8; PEER_FRAME_HEADER_BYTES];
+            invalid_header[..4].copy_from_slice(b"BAD!");
+            stream.write_all(&invalid_header).unwrap();
+            drop(stream);
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !service.active_sockets.sockets.lock().unwrap().is_empty()
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        assert!(
+            service
+                .peer_is_temporarily_banned("127.0.0.1".parse().unwrap())
+                .unwrap()
+        );
+        let mut rejected = TcpStream::connect(address).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(matches!(rejected.read(&mut byte), Ok(0) | Err(_)));
+
+        drop(rejected);
         service.stop().unwrap();
         drop(node);
         clean_test_dir(&node_path);

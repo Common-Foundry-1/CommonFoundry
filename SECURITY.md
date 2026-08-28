@@ -467,20 +467,24 @@ CMFD-specific pool test protocol. Those features
 make it a multi-node test harness; they do not make it safe for valuable funds.
 Loopback/private addresses remain the default. An explicit
 `--allow-public-peers` flag permits numeric public P2P addresses for bounded,
-valueless testing, but does not add authentication, encryption, reputation,
-automatic bans, NAT traversal, or DDoS resistance. RPC remains loopback-only,
-`0.0.0.0` remains invalid, and operators should expose only TCP P2P port 18444.
+valueless testing. The P2P runtime adds connect-back-verified peer discovery,
+per-source connection fairness, bounded reputation scoring, reconnect-rate
+limits, and temporary automatic bans for objective protocol and resource-limit
+violations. RPC remains loopback-only, `0.0.0.0` remains invalid, and operators
+should expose only the active profile's TCP P2P port.
 
 Before any public-value or broadly advertised public testnet, the networking and storage design needs
-explicit abuse, latency, and crash-recovery bounds. Peers are statically
-configured and compatibility-checked by network ID and consensus fingerprint,
-but are not identity-authenticated; P2P transport is unencrypted, with no peer
-discovery, NAT traversal, reputation/ban system, or demonstrated DDoS
-resilience. Extending a side branch currently reconstructs that branch from
-genesis, which is deliberately Devnet-only and not scalable. The mempool is
-volatile and intentionally excludes unconfirmed-parent packages. There is no
-production wallet/key custody, durable pool payout system, or optimized GPU
-miner.
+explicit abuse, latency, and crash-recovery bounds. Static and discovered peers
+are compatibility-checked by network ID and consensus fingerprint, and the
+in-memory reputation layer limits single-IP slot exhaustion, reconnect churn,
+malformed framing, resource-limit violations, and repeated invalid block
+submission. Peers are not identity-authenticated and P2P transport remains
+unencrypted; NAT traversal, Sybil resistance, and demonstrated volumetric DDoS
+resilience remain future work. Extending a side branch currently reconstructs
+that branch from genesis, which is deliberately Devnet-only and not scalable.
+The mempool is volatile and intentionally excludes unconfirmed-parent
+packages. There is no production wallet/key custody or durable pool payout
+system.
 
 New local Devnet data directories generate distinct Schnorr test keys and store
 the raw 32-byte secret in `wallet.key`. The node does not return that secret

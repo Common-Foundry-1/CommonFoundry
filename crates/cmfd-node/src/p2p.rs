@@ -521,16 +521,12 @@ fn perform_sync_from_peer_once_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<SyncReport, P2pError> {
-    let (hello, locator, block_batch_limit) = {
+    let (hello, locator) = {
         let node = lock_node(&shared)?;
         let hello = node.peer_hello();
-        let block_batch_limit = block_sync_batch_limit(hello.network_id, limits);
-        (
-            hello,
-            node.block_locator(block_batch_limit),
-            block_batch_limit,
-        )
+        (hello, node.block_locator(MAX_BLOCKS_PER_SYNC))
     };
+    let block_batch_limit = block_sync_batch_limit(hello.network_id, limits);
     let hello = with_nonce(hello, nonce_override);
 
     let session = PeerSession::new(hello, limits)?;

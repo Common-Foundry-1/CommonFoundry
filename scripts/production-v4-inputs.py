@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -57,17 +58,50 @@ def download(url: str, output: Path) -> None:
             "curl",
             "--location",
             "--fail",
+            "--silent",
             "--show-error",
             "--retry",
-            "3",
-            "--retry-delay",
             "5",
+            "--retry-delay",
+            "3",
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "30",
+            "--continue-at",
+            "-",
             "--output",
             str(output),
             url,
         ],
         check=True,
     )
+
+
+def prepare_part(part: dict, part_directory: Path, release_base: str) -> Path:
+    name = safe_part_name(str(part["name"]))
+    part_path = part_directory / name
+    size = int(part["bytes"])
+    sha256 = str(part["sha256"])
+    if identity_matches(part_path, size, sha256):
+        return part_path
+
+    temporary = part_path.with_name(f"{part_path.name}.download")
+    if temporary.is_file():
+        downloaded = temporary.stat().st_size
+        if downloaded > size or (downloaded == size and not identity_matches(temporary, size, sha256)):
+            temporary.unlink()
+    downloaded = temporary.stat().st_size if temporary.is_file() else 0
+    print(f"Downloading {name} ({downloaded} of {size} bytes already present)", flush=True)
+    download(f"{release_base.rstrip('/')}/{name}", temporary)
+    if not identity_matches(temporary, size, sha256):
+        temporary.unlink(missing_ok=True)
+        raise ValueError(f"downloaded part failed authentication: {name}")
+    os.replace(temporary, part_path)
+    print(f"Authenticated {name}", flush=True)
+    return part_path
 
 
 def prepare_inputs(args: argparse.Namespace) -> None:
@@ -93,22 +127,14 @@ def prepare_inputs(args: argparse.Namespace) -> None:
             continue
 
         output.parent.mkdir(parents=True, exist_ok=True)
-        part_paths: list[Path] = []
-        for part in entry.get("parts", []):
-            name = safe_part_name(str(part["name"]))
-            part_path = part_directory / name
-            size = int(part["bytes"])
-            sha256 = str(part["sha256"])
-            if not identity_matches(part_path, size, sha256):
-                temporary = part_path.with_name(f"{part_path.name}.download")
-                temporary.unlink(missing_ok=True)
-                print(f"Downloading {name}", flush=True)
-                download(f"{args.release_base.rstrip('/')}/{name}", temporary)
-                if not identity_matches(temporary, size, sha256):
-                    temporary.unlink(missing_ok=True)
-                    raise ValueError(f"downloaded part failed authentication: {name}")
-                os.replace(temporary, part_path)
-            part_paths.append(part_path)
+        parts = list(entry.get("parts", []))
+        with ThreadPoolExecutor(max_workers=args.download_concurrency) as executor:
+            part_paths = list(
+                executor.map(
+                    lambda part: prepare_part(part, part_directory, args.release_base),
+                    parts,
+                )
+            )
 
         partial = output.with_name(f"{output.name}.partial")
         partial.unlink(missing_ok=True)
@@ -173,6 +199,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-record", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--release-base", required=True)
+    parser.add_argument("--download-concurrency", type=int, choices=range(1, 17), default=8)
     parser.add_argument("--validate-only", action="store_true")
     return parser.parse_args()
 

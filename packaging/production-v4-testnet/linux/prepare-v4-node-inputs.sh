@@ -13,6 +13,12 @@ PART_NAMES=(
   V4-MODEL-V2.bank.part03
   V4-MODEL-V2.bank.part04
 )
+PART_BYTES=(
+  1610743854
+  1610743854
+  1610743854
+  1610743854
+)
 PART_HASHES=(
   3af0fd15bf0377bab42f2c59d8337f4f82e87e32c5f8c4f27ebfc21681450254
   9d4f2547dc632c1c5f74ace84d26ca2ce38be50bea01ed93542fc5ab56aed6cf
@@ -29,20 +35,49 @@ verify() {
   printf '%s  %s\n' "$hash" "$path" | sha256sum --check --status
 }
 
+download_part() {
+  local index="$1" name part download bytes downloaded
+  name="${PART_NAMES[$index]}"
+  part="$PART_DIRECTORY/$name"
+  bytes="${PART_BYTES[$index]}"
+  if verify "$part" "$bytes" "${PART_HASHES[$index]}"; then
+    return 0
+  fi
+  download="$part.download"
+  if [[ -f "$download" ]]; then
+    downloaded="$(wc -c < "$download")"
+    if [[ "$downloaded" -gt "$bytes" ]] ||
+       { [[ "$downloaded" -eq "$bytes" ]] && ! verify "$download" "$bytes" "${PART_HASHES[$index]}"; }; then
+      rm -f -- "$download"
+    fi
+  fi
+  downloaded=0
+  [[ ! -f "$download" ]] || downloaded="$(wc -c < "$download")"
+  echo "Downloading $name ($downloaded of $bytes bytes already present)"
+  curl --fail --location --silent --show-error --retry 5 --retry-delay 3 --connect-timeout 30 \
+    --speed-limit 1024 --speed-time 30 --continue-at - --output "$download" "$RELEASE_BASE/$name"
+  verify "$download" "$bytes" "${PART_HASHES[$index]}"
+  mv -f -- "$download" "$part"
+  echo "Authenticated $name"
+}
+
 mkdir -p -- "$PART_DIRECTORY"
 if ! verify "$OUTPUT" "$OUTPUT_BYTES" "$OUTPUT_HASH"; then
+  pids=()
   for index in "${!PART_NAMES[@]}"; do
-    name="${PART_NAMES[$index]}"
-    part="$PART_DIRECTORY/$name"
-    if ! printf '%s  %s\n' "${PART_HASHES[$index]}" "$part" | sha256sum --check --status 2>/dev/null; then
-      download="$part.download"
-      rm -f -- "$download"
-      echo "Downloading $name"
-      curl --fail --location --retry 3 --output "$download" "$RELEASE_BASE/$name"
-      printf '%s  %s\n' "${PART_HASHES[$index]}" "$download" | sha256sum --check --status
-      mv -f -- "$download" "$part"
+    download_part "$index" &
+    pids+=("$!")
+  done
+  download_failed=0
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      download_failed=1
     fi
   done
+  if [[ "$download_failed" -ne 0 ]]; then
+    echo "ERROR: one or more ProductionV4 model-bank parts failed to download." >&2
+    exit 1
+  fi
 
   partial="$OUTPUT.partial"
   rm -f -- "$partial"

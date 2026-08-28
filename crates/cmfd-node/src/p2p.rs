@@ -5,9 +5,11 @@
 //! defaults to loopback/private addresses; public peers require an explicit
 //! unsafe Devnet opt-in enforced by `peer`.
 
-use std::collections::{HashMap, HashSet};
-use std::io;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
@@ -21,9 +23,9 @@ use thiserror::Error;
 #[cfg(feature = "production-v3")]
 use crate::ProductionV3MiningPeerIdentity;
 use crate::peer::{
-    BlockSubmissionResult, BlockSubmissionStatus, PeerAddressPolicy, PeerConnection, PeerError,
-    PeerHello, PeerLimits, PeerMessage, PeerSession, SUBMIT_BLOCK_RESPONSE_BUDGET,
-    StaticPeerConfig,
+    BlockSubmissionResult, BlockSubmissionStatus, MAX_GOSSIP_PEERS, PeerAddressPolicy,
+    PeerConnection, PeerError, PeerHello, PeerLimits, PeerMessage, PeerSession,
+    SUBMIT_BLOCK_RESPONSE_BUDGET, StaticPeerConfig, validate_peer_address,
 };
 use crate::{
     Node, NodeError, PeerDirection, RemoteProofPeerId, RemoteProofRequest,
@@ -44,6 +46,17 @@ pub const MAX_TRANSACTIONS_PER_SYNC: usize = 64;
 const SYNC_CONTROL_RESERVE_BYTES: u64 = 1024 * 1024;
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PEER_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PEER_CACHE_FILE: &str = "peers-v1.txt";
+const PEER_CACHE_MAGIC: &str = "CMFD_PEERS_V1";
+const MAX_DISCOVERED_PEERS: usize = 64;
+const MAX_PEER_CACHE_BYTES: u64 = 16 * 1024;
+const MAX_DYNAMIC_TARGETS_PER_ROUND: usize = 2;
+const MAX_UNVERIFIED_PEER_FAILURES: u8 = 3;
+const MAX_DISCOVERED_PEERS_PER_IP: usize = 8;
+const DYNAMIC_PEER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_DYNAMIC_PEER_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DISCOVERY_UNSUPPORTED_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 // The receiver owns a 120-second response budget. The server stops admission
 // at 110 seconds and reserves five seconds for local response serialization,
 // leaving a final five seconds for transport/scheduling at the client.
@@ -86,6 +99,8 @@ pub enum P2pError {
     PoisonedStop,
     #[error("peer runtime active-socket registry is poisoned")]
     PoisonedActiveSockets,
+    #[error("peer discovery registry is poisoned")]
+    PoisonedPeerDiscovery,
     #[error("peer service is stopping")]
     ServiceStopping,
     #[error("unexpected peer message: expected {expected}, received {actual}")]
@@ -184,6 +199,332 @@ pub struct MiningTemplateResponse {
     pub template: crate::peer::MiningTemplate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerDiscoveryReport {
+    pub remote_hello: PeerHello,
+    pub addresses: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiscoveredPeer {
+    verified: bool,
+    failures: u8,
+    next_sync: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PeerDiscoveryState {
+    peers: BTreeMap<SocketAddr, DiscoveredPeer>,
+    next_discovery: HashMap<SocketAddr, Instant>,
+}
+
+/// Bounded process-local discovery state backed by a small cache of peers that
+/// this node has successfully handshaken with. Advertised and gossiped
+/// addresses remain unverified candidates until an outbound sync succeeds.
+#[derive(Debug)]
+pub struct PeerDiscovery {
+    cache_path: PathBuf,
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    listen_address: SocketAddr,
+    address_policy: PeerAddressPolicy,
+    state: Mutex<PeerDiscoveryState>,
+}
+
+impl PeerDiscovery {
+    pub fn open(
+        data_dir: &Path,
+        local_hello: PeerHello,
+        listen_address: SocketAddr,
+        address_policy: PeerAddressPolicy,
+    ) -> Self {
+        let cache_path = data_dir.join(PEER_CACHE_FILE);
+        let mut state = PeerDiscoveryState::default();
+        match load_peer_cache(
+            &cache_path,
+            local_hello.network_id,
+            local_hello.consensus_fingerprint,
+            listen_address,
+            address_policy,
+        ) {
+            Ok(addresses) => {
+                let now = Instant::now();
+                for address in addresses {
+                    state.peers.insert(
+                        address,
+                        DiscoveredPeer {
+                            verified: true,
+                            failures: 0,
+                            next_sync: now,
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(path = %cache_path.display(), %error, "ignoring invalid peer cache");
+            }
+        }
+        Self {
+            cache_path,
+            network_id: local_hello.network_id,
+            consensus_fingerprint: local_hello.consensus_fingerprint,
+            listen_address,
+            address_policy,
+            state: Mutex::new(state),
+        }
+    }
+
+    fn add_candidate(&self, address: SocketAddr) -> Result<(), P2pError> {
+        validate_peer_address(address, self.address_policy)?;
+        if address == self.listen_address {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+        if state.peers.contains_key(&address)
+            || state.peers.len() >= MAX_DISCOVERED_PEERS
+            || state
+                .peers
+                .keys()
+                .filter(|known| known.ip() == address.ip())
+                .count()
+                >= MAX_DISCOVERED_PEERS_PER_IP
+        {
+            return Ok(());
+        }
+        state.peers.insert(
+            address,
+            DiscoveredPeer {
+                verified: false,
+                failures: 0,
+                next_sync: Instant::now(),
+            },
+        );
+        Ok(())
+    }
+
+    fn add_candidates(&self, addresses: &[SocketAddr]) -> Result<(), P2pError> {
+        for address in addresses {
+            self.add_candidate(*address)?;
+        }
+        Ok(())
+    }
+
+    fn poll_targets(&self, limit: usize) -> Result<Vec<SocketAddr>, P2pError> {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+        let targets: Vec<_> = state
+            .peers
+            .iter()
+            .filter_map(|(address, peer)| (peer.next_sync <= now).then_some(*address))
+            .take(limit)
+            .collect();
+        for address in &targets {
+            if let Some(peer) = state.peers.get_mut(address) {
+                peer.next_sync = now + DYNAMIC_PEER_RETRY_INTERVAL;
+            }
+        }
+        Ok(targets)
+    }
+
+    fn mark_verified(&self, address: SocketAddr) -> Result<(), P2pError> {
+        validate_peer_address(address, self.address_policy)?;
+        if address == self.listen_address {
+            return Ok(());
+        }
+        let verified_addresses = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+            let was_verified = state.peers.get(&address).is_some_and(|peer| peer.verified);
+            if !state.peers.contains_key(&address) && state.peers.len() >= MAX_DISCOVERED_PEERS {
+                let Some(unverified) = state
+                    .peers
+                    .iter()
+                    .find_map(|(address, peer)| (!peer.verified).then_some(*address))
+                else {
+                    return Ok(());
+                };
+                state.peers.remove(&unverified);
+                state.next_discovery.remove(&unverified);
+            }
+            state.peers.insert(
+                address,
+                DiscoveredPeer {
+                    verified: true,
+                    failures: 0,
+                    next_sync: Instant::now() + DYNAMIC_PEER_RETRY_INTERVAL,
+                },
+            );
+            if was_verified {
+                return Ok(());
+            }
+            state
+                .peers
+                .iter()
+                .filter_map(|(address, peer)| peer.verified.then_some(*address))
+                .collect::<Vec<_>>()
+        };
+        if let Err(error) = write_peer_cache(
+            &self.cache_path,
+            self.network_id,
+            self.consensus_fingerprint,
+            &verified_addresses,
+        ) {
+            tracing::warn!(path = %self.cache_path.display(), %error, "failed to persist peer cache");
+        }
+        Ok(())
+    }
+
+    fn mark_failed(&self, address: SocketAddr) -> Result<(), P2pError> {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+        let remove = match state.peers.get_mut(&address) {
+            Some(peer) => {
+                peer.failures = peer.failures.saturating_add(1);
+                let remove = !peer.verified && peer.failures >= MAX_UNVERIFIED_PEER_FAILURES;
+                if !remove {
+                    let multiplier = 1_u32 << u32::from(peer.failures.min(5));
+                    peer.next_sync = now
+                        + DYNAMIC_PEER_RETRY_INTERVAL
+                            .saturating_mul(multiplier)
+                            .min(MAX_DYNAMIC_PEER_BACKOFF);
+                }
+                remove
+            }
+            None => return Ok(()),
+        };
+        if remove {
+            state.peers.remove(&address);
+            state.next_discovery.remove(&address);
+        }
+        Ok(())
+    }
+
+    fn gossip_addresses(&self, exclude: SocketAddr) -> Result<Vec<SocketAddr>, P2pError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+        Ok(state
+            .peers
+            .iter()
+            .filter_map(|(address, peer)| {
+                (peer.verified && *address != exclude).then_some(*address)
+            })
+            .take(MAX_GOSSIP_PEERS)
+            .collect())
+    }
+
+    fn discovery_due(&self, address: SocketAddr) -> Result<bool, P2pError> {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?;
+        if state
+            .next_discovery
+            .get(&address)
+            .is_some_and(|deadline| *deadline > now)
+        {
+            return Ok(false);
+        }
+        state
+            .next_discovery
+            .insert(address, now + DISCOVERY_REFRESH_INTERVAL);
+        Ok(true)
+    }
+
+    fn defer_discovery(&self, address: SocketAddr) -> Result<(), P2pError> {
+        self.state
+            .lock()
+            .map_err(|_| P2pError::PoisonedPeerDiscovery)?
+            .next_discovery
+            .insert(
+                address,
+                Instant::now() + DISCOVERY_UNSUPPORTED_RETRY_INTERVAL,
+            );
+        Ok(())
+    }
+}
+
+fn load_peer_cache(
+    path: &Path,
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    listen_address: SocketAddr,
+    address_policy: PeerAddressPolicy,
+) -> Result<Vec<SocketAddr>, io::Error> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() > MAX_PEER_CACHE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer cache exceeds its byte limit",
+        ));
+    }
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines();
+    let expected_network_id = hex::encode(network_id);
+    let expected_consensus_fingerprint = hex::encode(consensus_fingerprint);
+    if lines.next() != Some(PEER_CACHE_MAGIC)
+        || lines.next() != Some(expected_network_id.as_str())
+        || lines.next() != Some(expected_consensus_fingerprint.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer cache identity does not match this network",
+        ));
+    }
+    let mut addresses = Vec::new();
+    for line in lines {
+        let address: SocketAddr = line.parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "peer cache address is invalid")
+        })?;
+        validate_peer_address(address, address_policy)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if address != listen_address && !addresses.contains(&address) {
+            addresses.push(address);
+        }
+        if addresses.len() >= MAX_DISCOVERED_PEERS {
+            break;
+        }
+    }
+    Ok(addresses)
+}
+
+fn write_peer_cache(
+    path: &Path,
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    addresses: &[SocketAddr],
+) -> Result<(), io::Error> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    writeln!(file, "{PEER_CACHE_MAGIC}")?;
+    writeln!(file, "{}", hex::encode(network_id))?;
+    writeln!(file, "{}", hex::encode(consensus_fingerprint))?;
+    for address in addresses.iter().take(MAX_DISCOVERED_PEERS) {
+        writeln!(file, "{address}")?;
+    }
+    file.sync_all()
+}
+
 impl SyncReport {
     pub fn up_to_date(&self) -> bool {
         self.inventory_items == 0
@@ -192,6 +533,38 @@ impl SyncReport {
                 .saturating_sub(self.already_known_transactions)
                 <= self.requested_transactions
     }
+}
+
+fn discover_peers_from_peer_once_with_policy(
+    shared: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    discovery: &Arc<PeerDiscovery>,
+    nonce_override: Option<[u8; 32]>,
+    active_sockets: Option<&Arc<ActiveSocketRegistry>>,
+) -> Result<PeerDiscoveryReport, P2pError> {
+    let hello = with_nonce(lock_node(&shared)?.peer_hello(), nonce_override);
+    let session = PeerSession::new(hello, limits)?;
+    let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
+    if let Some(registry) = active_sockets {
+        connection.set_cancellation(Arc::clone(&registry.stopping));
+    }
+    let _active_socket = match active_sockets {
+        Some(registry) => Some(registry.register(connection.try_clone_stream()?)?),
+        None => None,
+    };
+    connection.send_hello()?;
+    let remote_hello = expect_hello(connection.receive()?)?;
+    connection.send(PeerMessage::GetPeers {
+        listen_port: discovery.listen_address.port(),
+    })?;
+    let addresses = expect_peers(connection.receive()?)?;
+    discovery.add_candidates(&addresses)?;
+    Ok(PeerDiscoveryReport {
+        remote_hello,
+        addresses,
+    })
 }
 
 /// Fetches one complete immutable mining template without downloading or
@@ -846,6 +1219,7 @@ fn respond_to_peer_inner(
         PeerAddressPolicy::PrivateOnly,
         nonce_override,
         None,
+        None,
     )
 }
 
@@ -856,6 +1230,34 @@ fn respond_to_peer_inner_with_policy(
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
     cancellation: Option<Arc<AtomicBool>>,
+    discovery: Option<Arc<PeerDiscovery>>,
+) -> Result<(), P2pError> {
+    respond_to_peer_inner_with_options(
+        shared,
+        stream,
+        limits,
+        InboundPeerOptions {
+            address_policy,
+            nonce_override,
+            cancellation,
+            discovery,
+        },
+    )
+}
+
+#[derive(Clone)]
+struct InboundPeerOptions {
+    address_policy: PeerAddressPolicy,
+    nonce_override: Option<[u8; 32]>,
+    cancellation: Option<Arc<AtomicBool>>,
+    discovery: Option<Arc<PeerDiscovery>>,
+}
+
+fn respond_to_peer_inner_with_options(
+    shared: Arc<Mutex<Node>>,
+    stream: TcpStream,
+    limits: PeerLimits,
+    options: InboundPeerOptions,
 ) -> Result<(), P2pError> {
     let remote_address = stream.peer_addr().map_err(P2pError::ListenerIo)?;
     let span =
@@ -867,10 +1269,9 @@ fn respond_to_peer_inner_with_policy(
         Arc::clone(&shared),
         stream,
         limits,
-        address_policy,
-        nonce_override,
+        remote_address,
         observation_address.clone(),
-        cancellation,
+        options,
     );
     if let Err(error) = &result {
         tracing::warn!(%error, "inbound peer session ended with error");
@@ -888,20 +1289,20 @@ fn perform_respond_to_peer_inner_with_policy(
     shared: Arc<Mutex<Node>>,
     stream: TcpStream,
     limits: PeerLimits,
-    address_policy: PeerAddressPolicy,
-    nonce_override: Option<[u8; 32]>,
+    remote_address: SocketAddr,
     observation_address: String,
-    cancellation: Option<Arc<AtomicBool>>,
+    options: InboundPeerOptions,
 ) -> Result<(), P2pError> {
     let hello = {
         let node = lock_node(&shared)?;
-        with_nonce(node.peer_hello(), nonce_override)
+        with_nonce(node.peer_hello(), options.nonce_override)
     };
     let network_id = hello.network_id;
     let block_batch_limit = block_sync_batch_limit(network_id, limits);
     let session = PeerSession::new(hello, limits)?;
-    let mut connection = PeerConnection::from_stream_with_policy(stream, session, address_policy)?;
-    if let Some(cancellation) = cancellation {
+    let mut connection =
+        PeerConnection::from_stream_with_policy(stream, session, options.address_policy)?;
+    if let Some(cancellation) = options.cancellation {
         connection.set_cancellation(cancellation);
     }
     connection.send_hello()?;
@@ -1013,9 +1414,21 @@ fn perform_respond_to_peer_inner_with_policy(
                     response_deadline,
                 )?;
             }
+            PeerMessage::GetPeers { listen_port } => {
+                let Some(discovery) = options.discovery.as_ref() else {
+                    return Err(P2pError::UnexpectedMessage {
+                        expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, GetMiningTemplate, or SubmitBlock",
+                        actual: "GetPeers",
+                    });
+                };
+                let advertised = SocketAddr::new(remote_address.ip(), listen_port);
+                discovery.add_candidate(advertised)?;
+                let addresses = discovery.gossip_addresses(advertised)?;
+                connection.send(PeerMessage::Peers { addresses })?;
+            }
             other => {
                 return Err(P2pError::UnexpectedMessage {
-                    expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, GetMiningTemplate, or SubmitBlock",
+                    expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, GetMiningTemplate, SubmitBlock, or GetPeers",
                     actual: message_name(&other),
                 });
             }
@@ -1222,7 +1635,24 @@ pub fn spawn_inbound_listener_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
 ) -> Result<InboundPeerHandle, P2pError> {
-    spawn_inbound_listener_inner_with_policy(shared, listener, limits, address_policy, None)
+    spawn_inbound_listener_inner_with_policy(shared, listener, limits, address_policy, None, None)
+}
+
+pub fn spawn_inbound_listener_with_discovery(
+    shared: Arc<Mutex<Node>>,
+    listener: TcpListener,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    discovery: Arc<PeerDiscovery>,
+) -> Result<InboundPeerHandle, P2pError> {
+    spawn_inbound_listener_inner_with_policy(
+        shared,
+        listener,
+        limits,
+        address_policy,
+        None,
+        Some(discovery),
+    )
 }
 
 fn spawn_inbound_listener_inner(
@@ -1237,6 +1667,7 @@ fn spawn_inbound_listener_inner(
         limits,
         PeerAddressPolicy::PrivateOnly,
         nonce_override,
+        None,
     )
 }
 
@@ -1246,6 +1677,7 @@ fn spawn_inbound_listener_inner_with_policy(
     limits: PeerLimits,
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
+    discovery: Option<Arc<PeerDiscovery>>,
 ) -> Result<InboundPeerHandle, P2pError> {
     limits.validate()?;
     let local_address = listener.local_addr().map_err(P2pError::ListenerIo)?;
@@ -1264,6 +1696,12 @@ fn spawn_inbound_listener_inner_with_policy(
     let active_sockets = Arc::new(ActiveSocketRegistry::default());
     let thread_stop = Arc::clone(&stop);
     let thread_active_sockets = Arc::clone(&active_sockets);
+    let options = InboundPeerOptions {
+        address_policy,
+        nonce_override,
+        cancellation: Some(Arc::clone(&thread_stop)),
+        discovery,
+    };
     let thread = thread::Builder::new()
         .name("cmfd-peer-listener".to_owned())
         .spawn(move || {
@@ -1271,10 +1709,9 @@ fn spawn_inbound_listener_inner_with_policy(
                 shared,
                 listener,
                 limits,
-                address_policy,
                 thread_stop,
                 thread_active_sockets,
-                nonce_override,
+                options,
             )
         })
         .map_err(P2pError::ListenerIo)?;
@@ -1290,10 +1727,9 @@ fn listener_loop(
     shared: Arc<Mutex<Node>>,
     listener: TcpListener,
     limits: PeerLimits,
-    address_policy: PeerAddressPolicy,
     stop: Arc<AtomicBool>,
     active_sockets: Arc<ActiveSocketRegistry>,
-    nonce_override: Option<[u8; 32]>,
+    options: InboundPeerOptions,
 ) -> Result<(), P2pError> {
     let active = Arc::new(AtomicUsize::new(0));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
@@ -1337,6 +1773,7 @@ fn listener_loop(
                 let worker_node = Arc::clone(&shared);
                 let worker_active = Arc::clone(&active);
                 let worker_stop = Arc::clone(&stop);
+                let worker_options = options.clone();
                 workers.push(thread::spawn(move || {
                     let _guard = ActiveConnectionGuard {
                         active: worker_active,
@@ -1350,13 +1787,11 @@ fn listener_loop(
                     // connection; it must not stop the listener. The error is
                     // already logged via tracing inside
                     // respond_to_peer_inner_with_policy.
-                    let _ = respond_to_peer_inner_with_policy(
+                    let _ = respond_to_peer_inner_with_options(
                         worker_node,
                         stream,
                         limits,
-                        address_policy,
-                        nonce_override,
-                        Some(worker_stop),
+                        worker_options,
                     );
                 }));
             }
@@ -1512,11 +1947,30 @@ pub fn spawn_static_peer_polling(
     spawn_static_peer_polling_inner(shared, config, poll_interval, None)
 }
 
+pub fn spawn_peer_polling_with_discovery(
+    shared: Arc<Mutex<Node>>,
+    config: StaticPeerConfig,
+    poll_interval: Duration,
+    discovery: Arc<PeerDiscovery>,
+) -> Result<StaticPeerPollHandle, P2pError> {
+    spawn_peer_polling_inner(shared, config, poll_interval, None, Some(discovery))
+}
+
 fn spawn_static_peer_polling_inner(
     shared: Arc<Mutex<Node>>,
     config: StaticPeerConfig,
     poll_interval: Duration,
     nonce_override: Option<[u8; 32]>,
+) -> Result<StaticPeerPollHandle, P2pError> {
+    spawn_peer_polling_inner(shared, config, poll_interval, nonce_override, None)
+}
+
+fn spawn_peer_polling_inner(
+    shared: Arc<Mutex<Node>>,
+    config: StaticPeerConfig,
+    poll_interval: Duration,
+    nonce_override: Option<[u8; 32]>,
+    discovery: Option<Arc<PeerDiscovery>>,
 ) -> Result<StaticPeerPollHandle, P2pError> {
     config.validate()?;
     if poll_interval.is_zero() {
@@ -1536,6 +1990,7 @@ fn spawn_static_peer_polling_inner(
                 thread_stop,
                 thread_active_sockets,
                 nonce_override,
+                discovery,
             )
         })
         .map_err(P2pError::ListenerIo)?;
@@ -1553,36 +2008,84 @@ fn static_peer_poll_loop(
     stop: Arc<(Mutex<bool>, Condvar)>,
     active_sockets: Arc<ActiveSocketRegistry>,
     nonce_override: Option<[u8; 32]>,
+    discovery: Option<Arc<PeerDiscovery>>,
 ) {
     loop {
         if poll_stopped(&stop) {
             return;
         }
-        for peer in &config.peers {
+        let mut targets = config.peers.clone();
+        if let Some(discovery) = discovery.as_ref() {
+            match discovery.poll_targets(MAX_DYNAMIC_TARGETS_PER_ROUND) {
+                Ok(dynamic) => {
+                    for address in dynamic {
+                        if !targets.contains(&address) {
+                            targets.push(address);
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "peer discovery target selection failed"),
+            }
+        }
+        for peer in targets {
             if poll_stopped(&stop) {
                 return;
             }
             // Errors are already logged via tracing inside these calls;
             // a failure with one peer must not stop later peers or rounds.
-            let _ = sync_from_peer_once_inner_with_policy(
+            let sync_result = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
-                *peer,
+                peer,
                 config.limits,
                 config.address_policy,
                 nonce_override,
                 Some(&active_sockets),
             );
+            if let Some(discovery) = discovery.as_ref() {
+                let discovery_result = if sync_result.is_ok() {
+                    discovery.mark_verified(peer)
+                } else {
+                    discovery.mark_failed(peer)
+                };
+                if let Err(error) = discovery_result {
+                    tracing::warn!(%error, peer = %peer, "failed to update peer discovery state");
+                }
+            }
             if poll_stopped(&stop) {
                 return;
             }
             let _ = relay_blocks_to_peer_once_inner_with_policy(
                 Arc::clone(&shared),
-                *peer,
+                peer,
                 config.limits,
                 config.address_policy,
                 nonce_override,
                 Some(&active_sockets),
             );
+            if let Some(discovery) = discovery.as_ref()
+                && sync_result.is_ok()
+            {
+                match discovery.discovery_due(peer) {
+                    Ok(true) => {
+                        if let Err(error) = discover_peers_from_peer_once_with_policy(
+                            Arc::clone(&shared),
+                            peer,
+                            config.limits,
+                            config.address_policy,
+                            discovery,
+                            nonce_override,
+                            Some(&active_sockets),
+                        ) {
+                            let _ = discovery.defer_discovery(peer);
+                            tracing::debug!(%error, peer = %peer, "peer discovery extension unavailable");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, peer = %peer, "failed to schedule peer discovery")
+                    }
+                }
+            }
         }
 
         let (mutex, wake) = &*stop;
@@ -1717,6 +2220,16 @@ fn expect_mining_template(message: PeerMessage) -> Result<crate::peer::MiningTem
     }
 }
 
+fn expect_peers(message: PeerMessage) -> Result<Vec<SocketAddr>, P2pError> {
+    match message {
+        PeerMessage::Peers { addresses } => Ok(addresses),
+        other => Err(P2pError::UnexpectedMessage {
+            expected: "Peers",
+            actual: message_name(&other),
+        }),
+    }
+}
+
 fn message_name(message: &PeerMessage) -> &'static str {
     match message {
         PeerMessage::Hello(_) => "Hello",
@@ -1732,6 +2245,8 @@ fn message_name(message: &PeerMessage) -> &'static str {
         PeerMessage::Transaction(_) => "Transaction",
         PeerMessage::GetMiningTemplate { .. } => "GetMiningTemplate",
         PeerMessage::MiningTemplate(_) => "MiningTemplate",
+        PeerMessage::GetPeers { .. } => "GetPeers",
+        PeerMessage::Peers { .. } => "Peers",
     }
 }
 
@@ -1883,6 +2398,204 @@ mod tests {
         let v4_maximum_block_bytes = max_block_bytes_for_network(v4_network_id) as u64;
         assert!(v4_maximum_block_bytes <= v4_block_budget);
         assert!(v4_maximum_block_bytes.saturating_mul(2) > v4_block_budget);
+    }
+
+    #[test]
+    fn peer_discovery_persists_only_successfully_verified_addresses() {
+        let path = test_dir("discovery-cache");
+        let node = open_shared(&path);
+        let hello = node.lock().unwrap().peer_hello();
+        let listen_address: SocketAddr = "127.0.0.1:22444".parse().unwrap();
+        let candidate: SocketAddr = "127.0.0.1:22445".parse().unwrap();
+
+        let discovery =
+            PeerDiscovery::open(&path, hello, listen_address, PeerAddressPolicy::PrivateOnly);
+        discovery.add_candidate(candidate).unwrap();
+        for port in 22500..22516 {
+            discovery
+                .add_candidate(SocketAddr::new(candidate.ip(), port))
+                .unwrap();
+        }
+        assert_eq!(
+            discovery.state.lock().unwrap().peers.len(),
+            MAX_DISCOVERED_PEERS_PER_IP
+        );
+        let rejected_candidate = SocketAddr::new(candidate.ip(), 22500);
+        for _ in 0..MAX_UNVERIFIED_PEER_FAILURES {
+            discovery.mark_failed(rejected_candidate).unwrap();
+        }
+        assert!(
+            !discovery
+                .state
+                .lock()
+                .unwrap()
+                .peers
+                .contains_key(&rejected_candidate)
+        );
+        assert!(
+            discovery
+                .gossip_addresses(listen_address)
+                .unwrap()
+                .is_empty()
+        );
+        drop(discovery);
+
+        let discovery =
+            PeerDiscovery::open(&path, hello, listen_address, PeerAddressPolicy::PrivateOnly);
+        assert!(
+            discovery
+                .gossip_addresses(listen_address)
+                .unwrap()
+                .is_empty()
+        );
+        discovery.mark_verified(candidate).unwrap();
+        drop(discovery);
+
+        let discovery =
+            PeerDiscovery::open(&path, hello, listen_address, PeerAddressPolicy::PrivateOnly);
+        assert_eq!(
+            discovery.gossip_addresses(listen_address).unwrap(),
+            vec![candidate]
+        );
+
+        drop(discovery);
+        let mut wrong_network = hello;
+        wrong_network.network_id[0] ^= 1;
+        let discovery = PeerDiscovery::open(
+            &path,
+            wrong_network,
+            listen_address,
+            PeerAddressPolicy::PrivateOnly,
+        );
+        assert!(
+            discovery
+                .gossip_addresses(listen_address)
+                .unwrap()
+                .is_empty()
+        );
+        drop(discovery);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn peer_discovery_gossips_an_address_only_after_connect_back_verification() {
+        const CLIENT_NONCE: [u8; 32] = [0x53; 32];
+        let seed_path = test_dir("discovery-seed");
+        let advertised_path = test_dir("discovery-advertised");
+        let client_path = test_dir("discovery-client");
+        let seed = open_shared(&seed_path);
+        let advertised = open_shared(&advertised_path);
+        let client = open_shared(&client_path);
+
+        let seed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let seed_address = seed_listener.local_addr().unwrap();
+        let seed_discovery = Arc::new(PeerDiscovery::open(
+            &seed_path,
+            seed.lock().unwrap().peer_hello(),
+            seed_address,
+            PeerAddressPolicy::PrivateOnly,
+        ));
+        let seed_handle = spawn_inbound_listener_inner_with_policy(
+            Arc::clone(&seed),
+            seed_listener,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            Some(SOURCE_NONCE),
+            Some(Arc::clone(&seed_discovery)),
+        )
+        .unwrap();
+
+        let (advertised_handle, advertised_address) =
+            start_listener(Arc::clone(&advertised), TARGET_NONCE);
+        let advertised_discovery = Arc::new(PeerDiscovery::open(
+            &advertised_path,
+            advertised.lock().unwrap().peer_hello(),
+            advertised_address,
+            PeerAddressPolicy::PrivateOnly,
+        ));
+
+        let first = discover_peers_from_peer_once_with_policy(
+            Arc::clone(&advertised),
+            seed_address,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            &advertised_discovery,
+            Some(TARGET_NONCE),
+            None,
+        )
+        .unwrap();
+        assert!(first.addresses.is_empty());
+        assert!(
+            seed_discovery
+                .gossip_addresses(seed_address)
+                .unwrap()
+                .is_empty()
+        );
+
+        let seed_poller = spawn_peer_polling_inner(
+            Arc::clone(&seed),
+            StaticPeerConfig {
+                listen_address: seed_address,
+                peers: Vec::new(),
+                limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_millis(10),
+            Some(SOURCE_NONCE),
+            Some(Arc::clone(&seed_discovery)),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && seed_discovery
+                .gossip_addresses(seed_address)
+                .unwrap()
+                .is_empty()
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            seed_discovery.gossip_addresses(seed_address).unwrap(),
+            vec![advertised_address]
+        );
+
+        let client_discovery = Arc::new(PeerDiscovery::open(
+            &client_path,
+            client.lock().unwrap().peer_hello(),
+            "127.0.0.1:22446".parse().unwrap(),
+            PeerAddressPolicy::PrivateOnly,
+        ));
+        let second = discover_peers_from_peer_once_with_policy(
+            Arc::clone(&client),
+            seed_address,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+            &client_discovery,
+            Some(CLIENT_NONCE),
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.addresses, vec![advertised_address]);
+        assert_eq!(
+            client_discovery
+                .poll_targets(MAX_DYNAMIC_TARGETS_PER_ROUND)
+                .unwrap(),
+            vec![advertised_address]
+        );
+
+        seed_poller.stop().unwrap();
+        seed_handle.stop().unwrap();
+        advertised_handle.stop().unwrap();
+        drop(client_discovery);
+        drop(advertised_discovery);
+        drop(seed_discovery);
+        drop(client);
+        drop(advertised);
+        drop(seed);
+        clean_test_dir(&client_path);
+        clean_test_dir(&advertised_path);
+        clean_test_dir(&seed_path);
     }
 
     fn submission_test_block(label: &str) -> Block {

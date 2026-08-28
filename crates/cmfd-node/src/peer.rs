@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
 #[cfg(test)]
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +28,7 @@ pub const PEER_FRAME_HEADER_BYTES: usize = 20;
 pub const MAX_PEER_PAYLOAD_BYTES: usize = MAX_BLOCK_BYTES;
 pub const MAX_HEADER_LOCATORS: usize = 32;
 pub const MAX_INVENTORY_ITEMS: usize = 1_024;
+pub const MAX_GOSSIP_PEERS: usize = 32;
 pub const MAX_CONFIGURED_PEERS: usize = 64;
 pub const MAX_MESSAGES_PER_PEER: u64 = 4_096;
 pub const MAX_BYTES_PER_PEER: u64 = 64 * 1024 * 1024;
@@ -74,6 +75,11 @@ pub const SUBMIT_BLOCK_KIND: u8 = 10;
 pub const BLOCK_SUBMISSION_RESULT_KIND: u8 = 11;
 pub const GET_MINING_TEMPLATE_KIND: u8 = 12;
 pub const MINING_TEMPLATE_KIND: u8 = 13;
+// Discovery is an optional, separate post-handshake exchange. A v4 peer that
+// does not recognize these kinds closes only that short-lived connection, so
+// ordinary synchronization remains compatible during a rolling upgrade.
+pub const GET_PEERS_KIND: u8 = 14;
+pub const PEERS_KIND: u8 = 15;
 
 const BLOCK_CHALLENGE_BYTES: usize = 32 + 32 + 32 + 8 + 8 + 32;
 
@@ -180,6 +186,16 @@ pub enum PeerMessage {
         payout: [u8; 32],
     },
     MiningTemplate(MiningTemplate),
+    /// Requests bounded peer discovery and advertises only the sender's
+    /// listening port. The receiver derives the IP from the established TCP
+    /// connection, preventing third-party address injection through this
+    /// field.
+    GetPeers {
+        listen_port: u16,
+    },
+    Peers {
+        addresses: Vec<SocketAddr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +307,10 @@ pub enum PeerError {
     NonZeroFlags,
     #[error("unknown peer message kind {0}")]
     UnknownKind(u8),
+    #[error("peer address family or canonical encoding is invalid")]
+    InvalidPeerAddressEncoding,
+    #[error("peer discovery listening port must be nonzero")]
+    ZeroDiscoveryPort,
     #[error("invalid block-submission status {0}")]
     InvalidBlockSubmissionStatus(u8),
     #[error("peer payload is {actual} bytes, exceeding the {max}-byte limit")]
@@ -396,7 +416,10 @@ fn validate_listen_address(address: SocketAddr) -> Result<(), PeerError> {
     Ok(())
 }
 
-fn validate_peer_address(address: SocketAddr, policy: PeerAddressPolicy) -> Result<(), PeerError> {
+pub(crate) fn validate_peer_address(
+    address: SocketAddr,
+    policy: PeerAddressPolicy,
+) -> Result<(), PeerError> {
     let private = match address.ip() {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
@@ -582,6 +605,21 @@ fn encode_message(message: &PeerMessage) -> Result<(u8, Vec<u8>), PeerError> {
         PeerMessage::MiningTemplate(template) => {
             Ok((MINING_TEMPLATE_KIND, encode_mining_template(template)?))
         }
+        PeerMessage::GetPeers { listen_port } => {
+            if *listen_port == 0 {
+                return Err(PeerError::ZeroDiscoveryPort);
+            }
+            Ok((GET_PEERS_KIND, listen_port.to_le_bytes().to_vec()))
+        }
+        PeerMessage::Peers { addresses } => {
+            validate_peer_addresses(addresses)?;
+            let mut payload = Vec::with_capacity(2 + addresses.len() * 19);
+            payload.extend_from_slice(&(addresses.len() as u16).to_le_bytes());
+            for address in addresses {
+                encode_peer_address(*address, &mut payload);
+            }
+            Ok((PEERS_KIND, payload))
+        }
     }
 }
 
@@ -730,8 +768,85 @@ fn decode_message(
             payload,
             expected_network_id,
         )?)),
+        GET_PEERS_KIND => {
+            let mut reader = PayloadReader::new(payload);
+            let listen_port = reader.u16()?;
+            reader.finish()?;
+            if listen_port == 0 {
+                return Err(PeerError::ZeroDiscoveryPort);
+            }
+            Ok(PeerMessage::GetPeers { listen_port })
+        }
+        PEERS_KIND => {
+            let mut reader = PayloadReader::new(payload);
+            let count = reader.u16()? as usize;
+            if count > MAX_GOSSIP_PEERS {
+                return Err(PeerError::CountLimit {
+                    field: "peer address inventory",
+                    actual: count,
+                    max: MAX_GOSSIP_PEERS,
+                });
+            }
+            let mut addresses = Vec::with_capacity(count);
+            for _ in 0..count {
+                addresses.push(decode_peer_address(&mut reader)?);
+            }
+            reader.finish()?;
+            validate_peer_addresses(&addresses)?;
+            Ok(PeerMessage::Peers { addresses })
+        }
         other => Err(PeerError::UnknownKind(other)),
     }
+}
+
+fn encode_peer_address(address: SocketAddr, payload: &mut Vec<u8>) {
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            payload.push(4);
+            payload.extend_from_slice(&[0; 12]);
+            payload.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            payload.push(6);
+            payload.extend_from_slice(&ip.octets());
+        }
+    }
+    payload.extend_from_slice(&address.port().to_le_bytes());
+}
+
+fn decode_peer_address(reader: &mut PayloadReader<'_>) -> Result<SocketAddr, PeerError> {
+    let family = reader.u8()?;
+    let encoded_ip: [u8; 16] = reader.array()?;
+    let port = reader.u16()?;
+    let ip = match family {
+        4 if encoded_ip[..12] == [0; 12] => IpAddr::V4(Ipv4Addr::new(
+            encoded_ip[12],
+            encoded_ip[13],
+            encoded_ip[14],
+            encoded_ip[15],
+        )),
+        6 => IpAddr::V6(Ipv6Addr::from(encoded_ip)),
+        _ => return Err(PeerError::InvalidPeerAddressEncoding),
+    };
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn validate_peer_addresses(addresses: &[SocketAddr]) -> Result<(), PeerError> {
+    if addresses.len() > MAX_GOSSIP_PEERS {
+        return Err(PeerError::CountLimit {
+            field: "peer address inventory",
+            actual: addresses.len(),
+            max: MAX_GOSSIP_PEERS,
+        });
+    }
+    let mut unique = HashSet::with_capacity(addresses.len());
+    for address in addresses {
+        validate_peer_address(*address, PeerAddressPolicy::AllowPublic)?;
+        if !unique.insert(*address) {
+            return Err(PeerError::DuplicatePeer(*address));
+        }
+    }
+    Ok(())
 }
 
 fn encode_mining_template(template: &MiningTemplate) -> Result<Vec<u8>, PeerError> {
@@ -1701,6 +1816,8 @@ fn validate_frame_header(header: &[u8]) -> Result<(), PeerError> {
             | BLOCK_SUBMISSION_RESULT_KIND
             | GET_MINING_TEMPLATE_KIND
             | MINING_TEMPLATE_KIND
+            | GET_PEERS_KIND
+            | PEERS_KIND
     ) {
         return Err(PeerError::UnknownKind(header[6]));
     }
@@ -1850,6 +1967,13 @@ mod tests {
                 payout: crate::default_miner_destination(),
             },
             PeerMessage::MiningTemplate(template),
+            PeerMessage::GetPeers { listen_port: 22444 },
+            PeerMessage::Peers {
+                addresses: vec![
+                    "127.0.0.1:22444".parse().unwrap(),
+                    "[fd00::1]:22444".parse().unwrap(),
+                ],
+            },
         ]
     }
 
@@ -2101,6 +2225,51 @@ mod tests {
                 NETWORK_ID
             ),
             Err(PeerError::DuplicateIdentifier("transaction inventory"))
+        ));
+    }
+
+    #[test]
+    fn peer_discovery_addresses_are_canonical_bounded_and_unique() {
+        assert!(matches!(
+            encode_peer_frame(&PeerFrame {
+                sequence: 1,
+                message: PeerMessage::GetPeers { listen_port: 0 },
+            }),
+            Err(PeerError::ZeroDiscoveryPort)
+        ));
+        assert!(matches!(
+            decode_peer_frame(&raw_frame(GET_PEERS_KIND, 1, &[0, 0]), NETWORK_ID),
+            Err(PeerError::ZeroDiscoveryPort)
+        ));
+
+        let duplicate: SocketAddr = "127.0.0.1:22444".parse().unwrap();
+        assert!(matches!(
+            encode_peer_frame(&PeerFrame {
+                sequence: 1,
+                message: PeerMessage::Peers {
+                    addresses: vec![duplicate, duplicate],
+                },
+            }),
+            Err(PeerError::DuplicatePeer(address)) if address == duplicate
+        ));
+
+        let oversized_count = ((MAX_GOSSIP_PEERS as u16) + 1).to_le_bytes();
+        assert!(matches!(
+            decode_peer_frame(&raw_frame(PEERS_KIND, 1, &oversized_count), NETWORK_ID),
+            Err(PeerError::CountLimit {
+                field: "peer address inventory",
+                ..
+            })
+        ));
+
+        let mut noncanonical_ipv4 = Vec::with_capacity(21);
+        noncanonical_ipv4.extend_from_slice(&1_u16.to_le_bytes());
+        noncanonical_ipv4.push(4);
+        noncanonical_ipv4.extend_from_slice(&[1; 16]);
+        noncanonical_ipv4.extend_from_slice(&22444_u16.to_le_bytes());
+        assert!(matches!(
+            decode_peer_frame(&raw_frame(PEERS_KIND, 1, &noncanonical_ipv4), NETWORK_ID),
+            Err(PeerError::InvalidPeerAddressEncoding)
         ));
     }
 

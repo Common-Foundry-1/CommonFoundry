@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
-use cmfd_node::p2p::{spawn_inbound_listener_with_policy, spawn_static_peer_polling};
+use cmfd_node::p2p::{
+    PeerDiscovery, spawn_inbound_listener_with_discovery, spawn_peer_polling_with_discovery,
+};
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
     DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolServerConfig,
@@ -278,30 +280,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             node.set_public_peer_mode(allow_public_peers);
             let status = node.status()?;
+            let discovery_hello = node.peer_hello();
             let shared = Arc::new(Mutex::new(node));
             let limits = PeerLimits::default();
             let p2p_socket = TcpListener::bind(p2p_bind)?;
             let p2p_address = p2p_socket.local_addr()?;
-            let inbound = spawn_inbound_listener_with_policy(
+            let discovery = Arc::new(PeerDiscovery::open(
+                &cli.data_dir,
+                discovery_hello,
+                p2p_address,
+                address_policy,
+            ));
+            let inbound = spawn_inbound_listener_with_discovery(
                 Arc::clone(&shared),
                 p2p_socket,
                 limits,
                 address_policy,
+                Arc::clone(&discovery),
             )?;
-            let poller = if peers.is_empty() {
-                None
-            } else {
-                Some(spawn_static_peer_polling(
-                    Arc::clone(&shared),
-                    StaticPeerConfig {
-                        listen_address: p2p_address,
-                        peers: peers.clone(),
-                        limits,
-                        address_policy,
-                    },
-                    Duration::from_secs(2),
-                )?)
-            };
+            let poller = Some(spawn_peer_polling_with_discovery(
+                Arc::clone(&shared),
+                StaticPeerConfig {
+                    listen_address: p2p_address,
+                    peers: peers.clone(),
+                    limits,
+                    address_policy,
+                },
+                Duration::from_secs(2),
+                discovery,
+            )?);
             let rpc = spawn_rpc_server(Arc::clone(&shared), bind)?;
             let rpc_address = rpc.local_addr();
             println!(
@@ -428,6 +435,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 verifier_worker.as_ref(),
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
+            let discovery_hello = node_instance.peer_hello();
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
                 None => node_instance.wallet_destination(),
@@ -441,26 +449,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let limits = PeerLimits::default();
             let p2p_socket = TcpListener::bind(p2p_bind)?;
             let p2p_address = p2p_socket.local_addr()?;
-            let inbound = spawn_inbound_listener_with_policy(
+            let discovery = Arc::new(PeerDiscovery::open(
+                &cli.data_dir,
+                discovery_hello,
+                p2p_address,
+                address_policy,
+            ));
+            let inbound = spawn_inbound_listener_with_discovery(
                 Arc::clone(&node),
                 p2p_socket,
                 limits,
                 address_policy,
+                Arc::clone(&discovery),
             )?;
-            let poller = if peers.is_empty() {
-                None
-            } else {
-                Some(spawn_static_peer_polling(
-                    Arc::clone(&node),
-                    StaticPeerConfig {
-                        listen_address: p2p_address,
-                        peers: peers.clone(),
-                        limits,
-                        address_policy,
-                    },
-                    Duration::from_secs(2),
-                )?)
-            };
+            let poller = Some(spawn_peer_polling_with_discovery(
+                Arc::clone(&node),
+                StaticPeerConfig {
+                    listen_address: p2p_address,
+                    peers: peers.clone(),
+                    limits,
+                    address_policy,
+                },
+                Duration::from_secs(2),
+                discovery,
+            )?);
             let mut config =
                 PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
             config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);

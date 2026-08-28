@@ -42,19 +42,20 @@ describe("investor website", () => {
     expect(screen.getByText(/Block 2,628,001 · 5 CMFD per block/)).toBeVisible();
 
     const gate = screen.getByRole("button", {
-      name: /Freeze the specification and canonical vectors/i,
+      name: /Full-shape ProductionV4 proof/i,
     });
     gate.focus();
     fireEvent.click(gate);
     expect(gate).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(/Pin every field, arithmetic rule/i)).toBeVisible();
+    expect(screen.getByText(/384-layer ForgeMatrix proof is measured/i)).toBeVisible();
   });
 
-  it("discloses gated work and links bundled source documents", () => {
+  it("presents ProductionV4 milestones and links bundled source documents", () => {
     render(<App />);
 
-    expect(screen.getByText("External security review")).toBeVisible();
-    expect(screen.getByText(/founder-controlled pre-tail allocation/i)).toBeVisible();
+    expect(screen.getByText("Independent implementations and review")).toBeVisible();
+    expect(screen.getByText(/permanent 5 CMFD tail goes only to miners/i)).toBeVisible();
+    expect(screen.getByText("v0.1.0-devnet.16")).toBeVisible();
     const rejectedAuditCount = ["two", "external", "audits"].join(" ");
     expect(screen.queryByText(new RegExp(rejectedAuditCount, "i"))).not.toBeInTheDocument();
 

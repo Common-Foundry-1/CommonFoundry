@@ -26,8 +26,8 @@ export function Roadmap() {
       />
       <div className="roadmap__content section-shell">
         <div className="section-heading">
-          <h2 id="roadmap-heading">From research protocol to public infrastructure.</h2>
-          <p>Every step toward public value is gated by evidence, not dates.</p>
+          <h2 id="roadmap-heading">From working testnet to broader public infrastructure.</h2>
+          <p>Each milestone builds on measured ProductionV4 results.</p>
         </div>
 
         <ol className="roadmap__rail">
@@ -53,9 +53,9 @@ export function Roadmap() {
 
         <div className="conversion-band">
           <div>
-            <h3>Run the research.<br />Challenge the assumptions.</h3>
+            <h3>Run ProductionV4.<br />Help shape the next milestone.</h3>
             <p>
-              Join Devnet-0 and help produce the reproducible evidence that moves
+              Join Devnet-16 and help produce the reproducible evidence that moves
               Common Foundry forward.
             </p>
           </div>
@@ -79,7 +79,7 @@ export function Roadmap() {
             </div>
             <p className="trust-note">
               <ShieldIcon />
-              <span>Experimental software. Valueless Devnet balances. No token sale.</span>
+              <span>Full-shape proof. Consumer-GPU testing. No token sale.</span>
             </p>
           </div>
         </div>

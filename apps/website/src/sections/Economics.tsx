@@ -102,7 +102,7 @@ export function Economics() {
         </div>
 
         <div className="allocation">
-          <h3>Before the tail</h3>
+          <h3>Bootstrap allocation</h3>
           <div className="allocation__bar">
             <button
               className={allocation === "miners" ? "is-active" : ""}
@@ -139,8 +139,8 @@ export function Economics() {
 
         <aside className="economics__disclosures" aria-label="Economic disclosures">
           <p><FlameIcon /><span>All transaction and channel-close fees are burned.</span></p>
-          <p><ShieldIcon /><span>The steward and community streams are a disclosed 30% founder-controlled pre-tail allocation while they remain under founder control.</span></p>
-          <p className="economics__plain"><span>No premine. No token sale. No hidden fee diversion.</span></p>
+          <p><ShieldIcon /><span>The 25% stewardship and 5% community allocations end with the bootstrap; the permanent 5 CMFD tail goes only to miners.</span></p>
+          <p className="economics__plain"><span>No premine. No token sale. All usage fees burned.</span></p>
           <a href={EMISSION_URL} target="_blank" rel="noopener noreferrer">
             <span>Inspect the emission rules</span>
             <ArrowIcon />

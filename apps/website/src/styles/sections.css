@@ -380,8 +380,8 @@
   opacity: var(--implemented-opacity);
 }
 
-.progress__group--gated {
-  opacity: var(--gated-opacity);
+.progress__group--next {
+  opacity: var(--next-opacity);
 }
 
 .progress__group h3 {
@@ -391,7 +391,7 @@
   text-transform: uppercase;
 }
 
-.progress__group--gated h3 {
+.progress__group--next h3 {
   color: var(--mineral-500);
 }
 
@@ -434,13 +434,13 @@
   transform: rotate(45deg);
 }
 
-.progress-list--gated .progress-list__icon,
-.progress-list--gated li > i {
+.progress-list--next .progress-list__icon,
+.progress-list--next li > i {
   color: var(--mineral-500);
   border-color: var(--white-line);
 }
 
-.progress-list--gated li > i {
+.progress-list--next li > i {
   background: var(--mineral-500);
 }
 

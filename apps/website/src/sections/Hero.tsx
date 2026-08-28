@@ -28,9 +28,9 @@ export function Hero() {
           Open GPU infrastructure for work, settlement, and inference.
         </h1>
         <p>
-          Common Foundry is a research-first proof-of-work protocol aligning GPU
-          operators with direct inference markets—without pretending mining is
-          customer inference.
+          ProductionV4 turns the full 384-layer ForgeMatrix workload into a
+          transparent GPU proof, with independent CPU and node verification and
+          a separate market path for customer inference.
         </p>
 
         <div className="hero__actions">
@@ -48,7 +48,7 @@ export function Hero() {
 
         <div className="trust-note">
           <ShieldIcon />
-          <span>Devnet-0 is experimental, private, and valueless. No token sale.</span>
+          <span>ProductionV4 Testnet-1 is live for open research and testing. No token sale.</span>
         </div>
       </div>
 

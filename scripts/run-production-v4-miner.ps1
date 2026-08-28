@@ -90,15 +90,26 @@ function Convert-ToWslPath {
 }
 
 function Invoke-Checked {
-    param([string]$Program, [string[]]$Arguments, [string]$Label)
-    & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Label exited with code $LASTEXITCODE"
+    param(
+        [string]$Program,
+        [string[]]$Arguments,
+        [string]$Label,
+        [string]$LogPath
+    )
+    & $Program @Arguments >> $LogPath 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Label exited with code $exitCode"
     }
 }
 
 function Invoke-WslChecked {
-    param([string]$Program, [string[]]$Arguments, [string]$Label)
+    param(
+        [string]$Program,
+        [string[]]$Arguments,
+        [string]$Label,
+        [string]$LogPath
+    )
     $environment = @(
         "CUDA_VISIBLE_DEVICES=$CudaDevice",
         'CUDA_HOME=/usr/local/cuda-12.8',
@@ -106,7 +117,104 @@ function Invoke-WslChecked {
         'CUDAToolkit_ROOT=/usr/local/cuda-12.8',
         'LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64'
     )
-    Invoke-Checked wsl.exe (@('-d', $WslDistribution, '--', 'env') + $environment + @($Program) + $Arguments) $Label
+    Invoke-Checked wsl.exe `
+        (@('-d', $WslDistribution, '--', 'env') + $environment + @($Program) + $Arguments) `
+        $Label `
+        $LogPath
+}
+
+function Start-GpuSampler {
+    param([string]$OutputPath)
+    Start-Job -ArgumentList $WslDistribution, $CudaDevice, $OutputPath -ScriptBlock {
+        param($Distribution, $Device, $Path)
+        while ($true) {
+            $sample = @(& wsl.exe -d $Distribution -- nvidia-smi "--id=$Device" `
+                '--query-gpu=power.draw,temperature.gpu' '--format=csv,noheader,nounits' 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $sample.Count -eq 1) {
+                Add-Content -LiteralPath $Path -Value ([string]$sample[0]) -Encoding Ascii
+            }
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
+function Stop-GpuSampler {
+    param($Job)
+    if ($null -eq $Job) {
+        return
+    }
+    Stop-Job -Job $Job -ErrorAction SilentlyContinue
+    Wait-Job -Job $Job -ErrorAction SilentlyContinue | Out-Null
+    Receive-Job -Job $Job -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+}
+
+function Read-GpuStats {
+    param([string]$Path)
+    $powerTotal = 0.0
+    $temperatureMaximum = [double]::NaN
+    $sampleCount = 0
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        foreach ($line in Get-Content -LiteralPath $Path) {
+            $fields = ([string]$line).Split(',').ForEach({ $_.Trim() })
+            if ($fields.Count -ne 2) {
+                continue
+            }
+            $power = 0.0
+            $temperature = 0.0
+            if (-not [double]::TryParse(
+                $fields[0],
+                [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$power
+            )) {
+                continue
+            }
+            if (-not [double]::TryParse(
+                $fields[1],
+                [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$temperature
+            )) {
+                continue
+            }
+            $powerTotal += $power
+            if ([double]::IsNaN($temperatureMaximum) -or $temperature -gt $temperatureMaximum) {
+                $temperatureMaximum = $temperature
+            }
+            $sampleCount++
+        }
+    }
+    [pscustomobject]@{
+        AveragePower = if ($sampleCount -eq 0) { [double]::NaN } else { $powerTotal / $sampleCount }
+        MaximumTemperature = $temperatureMaximum
+        SampleCount = $sampleCount
+    }
+}
+
+function Write-MinerStats {
+    param(
+        [int]$Accepted,
+        [int]$Rejected,
+        [double]$AveragePower,
+        [double]$MaximumTemperature,
+        [double]$SessionEnergyKwh,
+        [double]$ElapsedSeconds
+    )
+    $powerText = if ([double]::IsNaN($AveragePower)) { 'N/A' } else { $AveragePower.ToString('F1', [Globalization.CultureInfo]::InvariantCulture) }
+    $temperatureText = if ([double]::IsNaN($MaximumTemperature)) { 'N/A' } else { $MaximumTemperature.ToString('F0', [Globalization.CultureInfo]::InvariantCulture) }
+    $efficiencyText = if ($SessionEnergyKwh -le 0.0) { 'N/A' } else { ($Accepted / $SessionEnergyKwh).ToString('F2', [Globalization.CultureInfo]::InvariantCulture) }
+    $elapsedText = if ([double]::IsNaN($ElapsedSeconds)) { 'N/A' } else { $ElapsedSeconds.ToString('F1', [Globalization.CultureInfo]::InvariantCulture) }
+    Write-Host "MINER STATS | accepted $Accepted | rejected $Rejected | avg $powerText W | efficiency $efficiencyText accepted/kWh | temp $temperatureText C | last $elapsedText s"
+}
+
+function Remove-AttemptDirectory {
+    param([string]$Path)
+    $resolvedAttempt = (Resolve-Path -LiteralPath $Path).Path
+    if ((Split-Path -Parent $resolvedAttempt) -ne $workDirectoryPath) {
+        throw "refusing to remove an attempt outside the work directory: $resolvedAttempt"
+    }
+    Remove-Item -LiteralPath $resolvedAttempt -Recurse -Force
 }
 
 function Assert-InputManifest {
@@ -140,12 +248,10 @@ function Assert-InputManifest {
             throw "input SHA-256 mismatch for $name"
         }
         $totalBytes += [uint64]$item.Length
-        Write-Host "Authenticated $name ($($item.Length) bytes)"
     }
     if ($totalBytes -ne [uint64]$manifest.total_bytes) {
         throw "input manifest total is $($manifest.total_bytes); authenticated $totalBytes bytes"
     }
-    Write-Host "Authenticated ProductionV4 input manifest: $totalBytes bytes"
 }
 
 $modelBankPath = Resolve-ExistingFile $ModelBank 'model bank'
@@ -189,8 +295,6 @@ if ($gpuMemoryMiB -lt $MinimumGpuMemoryMiB) {
 if ($gpuFields[2] -ne $RequiredComputeCapability) {
     throw "GPU $($gpuFields[0]) has compute capability $($gpuFields[2]); this build requires $RequiredComputeCapability"
 }
-Write-Host "ProductionV4 GPU: $($gpuFields[0]), $gpuMemoryMiB MiB, compute $($gpuFields[2])"
-
 $expectedInputs = @{
     'MODEL-V2.bank' = $modelBankPath
     'FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json' = $fixedRecordPath
@@ -217,13 +321,23 @@ if ($ValidateOnly) {
 }
 
 $accepted = 0
+$rejected = 0
+$attempts = 0
+$sessionEnergyKwh = 0.0
+$logDirectory = Join-Path $workDirectoryPath 'logs'
+New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+Write-MinerStats $accepted $rejected ([double]::NaN) ([double]::NaN) $sessionEnergyKwh ([double]::NaN)
 while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
-    $attemptName = 'attempt-{0:D8}-{1}' -f ($accepted + 1), ([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))
+    $attempts++
+    $attemptName = 'attempt-{0:D8}-{1}' -f $attempts, ([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))
     $attemptDirectory = Join-Path $workDirectoryPath $attemptName
     if (Test-Path -LiteralPath $attemptDirectory) {
         throw "attempt directory already exists: $attemptDirectory"
     }
     New-Item -ItemType Directory -Path $attemptDirectory | Out-Null
+    $attemptLog = Join-Path $logDirectory "$attemptName.log"
+    $gpuSamples = Join-Path $attemptDirectory 'gpu-samples.csv'
+    New-Item -ItemType File -Path $attemptLog | Out-Null
 
     $template = Join-Path $attemptDirectory 'template.json'
     $coefficients = Join-Path $attemptDirectory 'replay-coefficients.bin'
@@ -244,50 +358,88 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
     if ($AllowPublicPeer) {
         $snapshotArguments += '--allow-public-peers'
     }
-    Invoke-Checked $cmfdMinerPath $snapshotArguments 'ProductionV4 template snapshot'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $sampler = $null
+    $outcome = $null
+    $failure = $null
+    try {
+        $sampler = Start-GpuSampler $gpuSamples
+        Invoke-Checked $cmfdMinerPath $snapshotArguments 'ProductionV4 template snapshot' $attemptLog
 
-    $templateWsl = Convert-ToWslPath $template
-    $coefficientsWsl = Convert-ToWslPath $coefficients
-    $tracePrefixWsl = Convert-ToWslPath $tracePrefix
-    $dynamicCommitmentsWsl = Convert-ToWslPath $dynamicCommitments
-    $finalActivationWsl = Convert-ToWslPath $finalActivation
-    $proofWsl = Convert-ToWslPath $proof
+        $templateWsl = Convert-ToWslPath $template
+        $coefficientsWsl = Convert-ToWslPath $coefficients
+        $tracePrefixWsl = Convert-ToWslPath $tracePrefix
+        $dynamicCommitmentsWsl = Convert-ToWslPath $dynamicCommitments
+        $finalActivationWsl = Convert-ToWslPath $finalActivation
+        $proofWsl = Convert-ToWslPath $proof
 
-    Invoke-WslChecked $replayBinaryWsl @(
-        $modelBankWsl, $coefficientsWsl, $tracePrefixWsl
-    ) 'ProductionV4 replay'
-    Invoke-WslChecked $dynamicCommitmentBinaryWsl @(
-        $tracePrefixWsl, $dynamicCommitmentsWsl
-    ) 'ProductionV4 dynamic commitments'
-    Invoke-WslChecked $proofBinaryWsl @(
-        $modelBankWsl,
-        $artifactDirectoryWsl,
-        $templateWsl,
-        $tracePrefixWsl,
-        $dynamicCommitmentsWsl,
-        $finalActivationWsl,
-        $proofWsl
-    ) 'ProductionV4 proof'
+        Invoke-WslChecked $replayBinaryWsl @(
+            $modelBankWsl, $coefficientsWsl, $tracePrefixWsl
+        ) 'ProductionV4 replay' $attemptLog
+        Invoke-WslChecked $dynamicCommitmentBinaryWsl @(
+            $tracePrefixWsl, $dynamicCommitmentsWsl
+        ) 'ProductionV4 dynamic commitments' $attemptLog
+        Invoke-WslChecked $proofBinaryWsl @(
+            $modelBankWsl,
+            $artifactDirectoryWsl,
+            $templateWsl,
+            $tracePrefixWsl,
+            $dynamicCommitmentsWsl,
+            $finalActivationWsl,
+            $proofWsl
+        ) 'ProductionV4 proof' $attemptLog
 
-    $submitArguments = @(
-        'submit-v4-template',
-        '--peer', $Peer,
-        '--template', $template,
-        '--transparent-proof', $proof,
-        '--fixed-record', $fixedRecordPath
-    )
-    if ($AllowPublicPeer) {
-        $submitArguments += '--allow-public-peers'
-    }
-    Invoke-Checked $cmfdMinerPath $submitArguments 'ProductionV4 block submission'
-    $accepted++
-    Write-Host "Accepted ProductionV4 block $accepted for this launcher session."
-
-    if (-not $KeepAcceptedWork) {
-        $resolvedAttempt = (Resolve-Path -LiteralPath $attemptDirectory).Path
-        if ((Split-Path -Parent $resolvedAttempt) -ne $workDirectoryPath) {
-            throw "refusing to remove an attempt outside the work directory: $resolvedAttempt"
+        $submitArguments = @(
+            'submit-v4-template',
+            '--peer', $Peer,
+            '--template', $template,
+            '--transparent-proof', $proof,
+            '--fixed-record', $fixedRecordPath
+        )
+        if ($AllowPublicPeer) {
+            $submitArguments += '--allow-public-peers'
         }
-        Remove-Item -LiteralPath $resolvedAttempt -Recurse -Force
+        & $cmfdMinerPath @submitArguments >> $attemptLog 2>&1
+        $submitExitCode = $LASTEXITCODE
+        if ($submitExitCode -eq 0) {
+            $accepted++
+            $outcome = 'accepted'
+        } elseif (
+            (Select-String -LiteralPath $attemptLog -SimpleMatch 'ProductionV4 block was rejected by the node' -Quiet) -or
+            (Select-String -LiteralPath $attemptLog -SimpleMatch 'frozen ProductionV4 template is stale' -Quiet)
+        ) {
+            $rejected++
+            $outcome = 'rejected'
+        } else {
+            throw "ProductionV4 block submission exited with code $submitExitCode"
+        }
+    } catch {
+        $failure = $_
+    } finally {
+        Stop-GpuSampler $sampler
+        $timer.Stop()
+    }
+
+    $gpu = Read-GpuStats $gpuSamples
+    if (-not [double]::IsNaN($gpu.AveragePower)) {
+        $sessionEnergyKwh += $gpu.AveragePower * $timer.Elapsed.TotalSeconds / 3600000.0
+    }
+
+    if ($null -ne $failure) {
+        Write-Host "MINER ERROR | $($failure.Exception.Message) | log $attemptLog" -ForegroundColor Red
+        Get-Content -LiteralPath $attemptLog -Tail 40
+        throw $failure
+    }
+
+    Write-MinerStats `
+        $accepted `
+        $rejected `
+        $gpu.AveragePower `
+        $gpu.MaximumTemperature `
+        $sessionEnergyKwh `
+        $timer.Elapsed.TotalSeconds
+
+    if ($outcome -eq 'rejected' -or -not $KeepAcceptedWork) {
+        Remove-AttemptDirectory $attemptDirectory
     }
 }

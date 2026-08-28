@@ -13,7 +13,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cmfd_consensus::{Block, Transaction, WireError, decode_block};
+use cmfd_consensus::{
+    Block, MAX_TRANSACTION_BYTES, Transaction, WireError, decode_block, max_block_bytes_for_network,
+};
 use thiserror::Error;
 
 #[cfg(feature = "production-v3")]
@@ -28,16 +30,18 @@ use crate::{
     submit_shared_peer_block_cancellable, unix_time_seconds,
 };
 
-/// One request is deliberately small enough that sixteen maximum-size blocks,
-/// sixty-four maximum-size transactions, their outer peer frames, and
-/// request/handshake traffic remain below the default 32 MiB per-connection
-/// budget. Static polling advances longer chains in multiple independently
-/// bounded calls.
+/// Absolute item-count cap for one block synchronization request. The active
+/// byte-size cap is derived from the network's maximum block frame below.
 pub const MAX_BLOCKS_PER_SYNC: usize = 16;
 /// A single poll downloads only a small prefix of an advertised mempool.
 /// Accepted candidates become locally known, allowing later polls to proceed
 /// farther through an honest peer's inventory.
 pub const MAX_TRANSACTIONS_PER_SYNC: usize = 64;
+// Leave room in the shared session budget for a full transaction batch plus
+// peer frames, inventories, requests, and the handshake. This keeps the V4
+// 16 MiB block frame inside the existing 32 MiB anti-abuse boundary without
+// reducing the legacy network's 16-block batch.
+const SYNC_CONTROL_RESERVE_BYTES: u64 = 1024 * 1024;
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PEER_DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 // The receiver owns a 120-second response budget. The server stops admission
@@ -52,6 +56,19 @@ const SUBMIT_BLOCK_ACCEPTANCE_BUDGET: Duration = Duration::from_secs(
     SUBMIT_BLOCK_SERVER_RESPONSE_BUDGET.as_secs() - SUBMIT_BLOCK_ACCEPTANCE_MARGIN.as_secs(),
 );
 static NEXT_REMOTE_PROOF_PEER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn block_sync_batch_limit(network_id: [u8; 32], limits: PeerLimits) -> usize {
+    let transaction_reserve =
+        (MAX_TRANSACTIONS_PER_SYNC as u64).saturating_mul(MAX_TRANSACTION_BYTES as u64);
+    let block_budget = limits
+        .max_bytes_per_peer
+        .saturating_sub(transaction_reserve)
+        .saturating_sub(SYNC_CONTROL_RESERVE_BYTES);
+    let maximum_block_bytes = max_block_bytes_for_network(network_id) as u64;
+    usize::try_from(block_budget / maximum_block_bytes)
+        .unwrap_or(usize::MAX)
+        .min(MAX_BLOCKS_PER_SYNC)
+}
 
 #[derive(Debug, Error)]
 pub enum P2pError {
@@ -504,9 +521,15 @@ fn perform_sync_from_peer_once_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
     active_sockets: Option<&Arc<ActiveSocketRegistry>>,
 ) -> Result<SyncReport, P2pError> {
-    let (hello, locator) = {
+    let (hello, locator, block_batch_limit) = {
         let node = lock_node(&shared)?;
-        (node.peer_hello(), node.block_locator(MAX_BLOCKS_PER_SYNC))
+        let hello = node.peer_hello();
+        let block_batch_limit = block_sync_batch_limit(hello.network_id, limits);
+        (
+            hello,
+            node.block_locator(block_batch_limit),
+            block_batch_limit,
+        )
     };
     let hello = with_nonce(hello, nonce_override);
 
@@ -528,11 +551,11 @@ fn perform_sync_from_peer_once_inner_with_policy(
         stop: remote_hello.tip,
     })?;
     let inventory = expect_inventory(connection.receive()?)?;
-    if inventory.len() > MAX_BLOCKS_PER_SYNC {
+    if inventory.len() > block_batch_limit {
         return Err(PeerError::CountLimit {
             field: "sync inventory",
             actual: inventory.len(),
-            max: MAX_BLOCKS_PER_SYNC,
+            max: block_batch_limit,
         }
         .into());
     }
@@ -663,7 +686,7 @@ fn perform_sync_from_peer_once_inner_with_policy(
     })
 }
 
-/// Offers up to `MAX_BLOCKS_PER_SYNC` locally active blocks that follow the
+/// Offers a byte-budgeted prefix of locally active blocks that follows the
 /// peer's advertised tip. Each block is acknowledged only after the peer has
 /// passed it through its normal durable consensus path. A later poll continues
 /// from the peer's new tip, so temporary disconnects recover in bounded steps.
@@ -735,6 +758,7 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
         nonce_override,
     );
     let network_id = hello.network_id;
+    let block_batch_limit = block_sync_batch_limit(network_id, limits);
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
     if let Some(registry) = active_sockets {
@@ -749,7 +773,7 @@ fn perform_relay_blocks_to_peer_once_inner_with_policy(
 
     let block_ids = {
         let node = lock_node(&shared)?;
-        node.relay_inventory_after(remote_hello.tip, MAX_BLOCKS_PER_SYNC)
+        node.relay_inventory_after(remote_hello.tip, block_batch_limit)
     };
     let mut accepted_blocks = 0;
     let mut already_known = 0;
@@ -878,6 +902,7 @@ fn perform_respond_to_peer_inner_with_policy(
         with_nonce(node.peer_hello(), nonce_override)
     };
     let network_id = hello.network_id;
+    let block_batch_limit = block_sync_batch_limit(network_id, limits);
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::from_stream_with_policy(stream, session, address_policy)?;
     if let Some(cancellation) = cancellation {
@@ -903,7 +928,7 @@ fn perform_respond_to_peer_inner_with_policy(
             PeerMessage::GetHeaders { locator, stop } => {
                 let block_ids = {
                     let node = lock_node(&shared)?;
-                    node.inventory_after(&locator, stop, MAX_BLOCKS_PER_SYNC)
+                    node.inventory_after(&locator, stop, block_batch_limit)
                 };
                 connection.send(PeerMessage::Inventory { block_ids })?;
             }
@@ -1841,6 +1866,27 @@ mod tests {
             max_messages_per_peer: 256,
             max_bytes_per_peer: 32 * 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn block_sync_batch_limit_tracks_the_network_frame_size() {
+        let limits = test_limits();
+        let legacy_network_id = crate::DEVNET_PROFILE.network_id;
+        let v4_network_id = cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID;
+
+        assert_eq!(
+            block_sync_batch_limit(legacy_network_id, limits),
+            MAX_BLOCKS_PER_SYNC
+        );
+        assert_eq!(block_sync_batch_limit(v4_network_id, limits), 1);
+
+        let v4_block_budget = limits
+            .max_bytes_per_peer
+            .saturating_sub((MAX_TRANSACTIONS_PER_SYNC * MAX_TRANSACTION_BYTES) as u64)
+            .saturating_sub(SYNC_CONTROL_RESERVE_BYTES);
+        let v4_maximum_block_bytes = max_block_bytes_for_network(v4_network_id) as u64;
+        assert!(v4_maximum_block_bytes <= v4_block_budget);
+        assert!(v4_maximum_block_bytes.saturating_mul(2) > v4_block_budget);
     }
 
     fn submission_test_block(label: &str) -> Block {

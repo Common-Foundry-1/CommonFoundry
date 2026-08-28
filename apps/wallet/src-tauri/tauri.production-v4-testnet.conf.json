@@ -1,0 +1,8 @@
+{
+  "productName": "Common Foundry Wallet ProductionV4 Testnet",
+  "identifier": "org.commonfoundry.wallet.productionv4testnet1",
+  "bundle": {
+    "shortDescription": "Common Foundry ProductionV4 testnet wallet",
+    "longDescription": "Native desktop wallet and embedded node for the Common Foundry ProductionV4 transparent-proof test network."
+  }
+}

@@ -25,6 +25,7 @@ production-v3 = [
     "cmfd-proof-worker/production-v3",
 ]
 production-v3-testnet = ["production-v3", "cmfd-node/production-v3-testnet"]
+production-v4-testnet = ["cmfd-node/production-v4-testnet"]
 production-rc = ["production-v3", "cmfd-node/production-rc"]
 
 [build-dependencies]

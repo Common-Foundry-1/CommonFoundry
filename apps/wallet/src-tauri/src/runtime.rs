@@ -8,8 +8,9 @@ use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
 use cmfd_node::peer::PeerLimits;
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError,
-    ProductionV3VerifierRecord, ProofProfile, compiled_production_v3_record_identity,
-    compiled_production_v3_worker_sha256, production_v3_package_layout,
+    ProductionV3VerifierRecord, ProductionV4VerifierArtifacts, ProofProfile,
+    compiled_production_v3_record_identity, compiled_production_v3_worker_sha256,
+    production_v3_package_layout, production_v4_package_artifacts,
 };
 use cmfd_proof_worker::{ProofWorkerError, VerifierWorkerConfig, VerifierWorkerError};
 use tauri::{App, Manager, Runtime};
@@ -47,6 +48,7 @@ struct EmbeddedNode {
 
 struct PreparedNodeSecurity {
     production_v3_record: Option<ProductionV3VerifierRecord>,
+    production_v4_artifacts: Option<ProductionV4VerifierArtifacts>,
     verifier_worker: Option<VerifierWorkerConfig>,
 }
 
@@ -168,13 +170,19 @@ fn start_embedded_node<R: Runtime>(
     let log_guard = cmfd_node::logging::init_tracing(&data_dir, config.verbose);
     let PreparedNodeSecurity {
         production_v3_record,
+        production_v4_artifacts,
         verifier_worker,
     } = security;
-    let node = match (production_v3_record.as_ref(), verifier_worker) {
-        (Some(record), Some(worker)) => {
+    let node = match (
+        production_v3_record.as_ref(),
+        production_v4_artifacts.as_ref(),
+        verifier_worker,
+    ) {
+        (Some(record), None, Some(worker)) => {
             Node::open_with_record_and_verifier_worker(&data_dir, Some(record), worker)
         }
-        (None, None) => Node::open_with_record(&data_dir, None),
+        (None, Some(artifacts), None) => Node::open_with_v4_artifacts(&data_dir, artifacts),
+        (None, None, None) => Node::open_with_record(&data_dir, None),
         _ => Err(NodeError::ProofVerifierProfileMismatch),
     }
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
@@ -242,20 +250,24 @@ fn prepare_node_security(
     profile: NetworkProfile,
     config: &NodeRuntimeConfig,
 ) -> Result<PreparedNodeSecurity, NodeClientError> {
-    if profile.proof != ProofProfile::ProductionV3 {
+    if profile.proof == ProofProfile::DevnetV2Reference {
         return prepare_node_security_with_package(profile, config, Path::new("."), None);
     }
     let package_executable = std::env::current_exe().map_err(|_| {
         startup_error(
-            "production_v3_package_unavailable",
+            "production_package_unavailable",
             "The wallet could not resolve its signed package directory.",
             false,
         )
     })?;
-    let expected_worker_sha256 = Some(
-        compiled_production_v3_worker_sha256()
-            .map_err(|error| sanitize_node_startup_error(profile, error))?,
-    );
+    let expected_worker_sha256 = if profile.proof == ProofProfile::ProductionV3 {
+        Some(
+            compiled_production_v3_worker_sha256()
+                .map_err(|error| sanitize_node_startup_error(profile, error))?,
+        )
+    } else {
+        None
+    };
     prepare_node_security_with_package(profile, config, &package_executable, expected_worker_sha256)
 }
 
@@ -281,6 +293,7 @@ fn prepare_node_security_with_package(
             }
             Ok(PreparedNodeSecurity {
                 production_v3_record: None,
+                production_v4_artifacts: None,
                 verifier_worker: None,
             })
         }
@@ -389,7 +402,28 @@ fn prepare_node_security_with_package(
 
             Ok(PreparedNodeSecurity {
                 production_v3_record: Some(record),
+                production_v4_artifacts: None,
                 verifier_worker: Some(worker),
+            })
+        }
+        ProofProfile::ProductionV4 => {
+            if options.is_configured() {
+                return Err(startup_error(
+                    "production_v4_configuration_unexpected",
+                    format!(
+                        "{} ({}) does not accept ProductionV3 artifacts or proof-verifier settings.",
+                        profile.short_name(),
+                        profile.proof.profile_name()
+                    ),
+                    false,
+                ));
+            }
+            let artifacts = production_v4_package_artifacts(package_executable)
+                .map_err(|error| sanitize_node_startup_error(profile, error))?;
+            Ok(PreparedNodeSecurity {
+                production_v3_record: None,
+                production_v4_artifacts: Some(artifacts),
+                verifier_worker: None,
             })
         }
     }
@@ -717,6 +751,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "production-v4-testnet"))]
     #[test]
     fn production_v3_no_argument_package_missing_and_partial_overrides_fail_closed() {
         let files = TestFiles::new();
@@ -731,6 +766,7 @@ mod tests {
         assert_eq!(error.code, "production_v3_configuration_missing");
     }
 
+    #[cfg(not(feature = "production-v4-testnet"))]
     #[test]
     fn production_v3_no_argument_package_layout_resolves_fixed_sidecars() {
         let files = TestFiles::new();
@@ -778,6 +814,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "production-v4-testnet"))]
     #[test]
     fn production_v3_rejects_relative_paths_without_echoing_them() {
         let files = TestFiles::new();
@@ -816,6 +853,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "production-v4-testnet"))]
     #[test]
     fn production_v3_happy_path_is_canonical_and_passed_to_the_node_gate() {
         let files = TestFiles::new();
@@ -856,6 +894,7 @@ mod tests {
                     sha256: [2; 32],
                 },
             }),
+            production_v4_artifacts: None,
             verifier_worker: None,
         };
         for node_error in [
@@ -883,6 +922,7 @@ mod tests {
         let config = base_config(DEVNET_PROFILE);
         let security = prepare_for_test(DEVNET_PROFILE, &config, Path::new("unused")).unwrap();
         assert!(security.production_v3_record.is_none());
+        assert!(security.production_v4_artifacts.is_none());
         assert!(security.verifier_worker.is_none());
         assert!(!command_help_text_for_profile(DEVNET_PROFILE).contains("ProductionV3 startup"));
         assert!(command_help_text_for_profile(RCNET1_PROFILE).contains("ProductionV3 startup"));
@@ -906,5 +946,29 @@ mod tests {
         let config = configured_rc(&files, sha256(b"bounded worker fixture"));
         let error = security_error(prepare_for_test(DEVNET_PROFILE, &config, &files.root));
         assert_eq!(error.code, "production_v3_configuration_unexpected");
+    }
+
+    #[test]
+    fn production_v4_package_layout_is_distinct_and_rejects_v3_options() {
+        let files = TestFiles::new();
+        let profile = cmfd_node::PRODUCTION_V4_TESTNET_PROFILE;
+        let config = base_config(profile);
+        let security = prepare_for_test(profile, &config, &files.root).unwrap();
+        let artifacts = security.production_v4_artifacts.unwrap();
+        let expected_root = files
+            .root
+            .join(cmfd_node::PRODUCTION_V4_PACKAGE_ARTIFACT_DIRECTORY);
+        assert_eq!(
+            artifacts.bank,
+            expected_root.join(cmfd_node::PRODUCTION_V4_PACKAGE_BANK)
+        );
+        assert_eq!(
+            artifacts.fixed_record,
+            expected_root.join(cmfd_node::PRODUCTION_V4_PACKAGE_FIXED_RECORD)
+        );
+
+        let configured = configured_rc(&files, sha256(b"bounded worker fixture"));
+        let error = security_error(prepare_for_test(profile, &configured, &files.root));
+        assert_eq!(error.code, "production_v4_configuration_unexpected");
     }
 }

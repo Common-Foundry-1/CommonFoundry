@@ -1105,21 +1105,21 @@ fn pool_client_error(code: &'static str, error: PoolError, retryable: bool) -> N
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     use std::fs;
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     use std::path::PathBuf;
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     use std::sync::Barrier;
     use std::time::Duration;
 
     use cmfd_node::default_miner_destination;
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     use cmfd_node::pool::{PoolServerConfig, generate_pool_certificate, spawn_pool_server};
 
     use super::*;
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     fn test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cmfd-desktop-mining-{name}-{}-{}",
@@ -1131,7 +1131,7 @@ mod tests {
         ))
     }
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     fn request(mode: MiningMode) -> MiningStartRequest {
         MiningStartRequest {
             mode,
@@ -1141,7 +1141,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     fn pool_request(pool_url: String, worker: &str) -> MiningStartRequest {
         MiningStartRequest {
             mode: MiningMode::Pool,
@@ -1151,7 +1151,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     #[test]
     fn continuous_solo_mining_starts_finds_work_and_stops() {
         let path = test_dir("solo");
@@ -1184,7 +1184,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     #[test]
     fn invalid_pool_configuration_and_duplicate_start_are_rejected() {
         let path = test_dir("guards");
@@ -1257,7 +1257,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     #[test]
     fn pool_mining_uses_pinned_tls_tracks_real_shares_and_never_mines_local_node() {
         let wallet_path = test_dir("pool-wallet-node");
@@ -1369,7 +1369,7 @@ mod tests {
         interrupter.join().unwrap();
     }
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     #[test]
     fn concurrent_start_and_stop_leave_worker_and_status_consistent() {
         let path = test_dir("concurrent-control");
@@ -1420,7 +1420,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
-    #[cfg(not(feature = "production-v3-testnet"))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
     #[test]
     fn shutdown_permanently_rejects_starts_and_drains_the_worker() {
         let path = test_dir("shutdown-control");

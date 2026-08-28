@@ -15,6 +15,9 @@ param(
     [string]$FixedArtifactDirectory,
 
     [Parameter(Mandatory)]
+    [string]$InputManifest,
+
+    [Parameter(Mandatory)]
     [string]$CmfdMiner,
 
     [Parameter(Mandatory)]
@@ -106,8 +109,48 @@ function Invoke-WslChecked {
     Invoke-Checked wsl.exe (@('-d', $WslDistribution, '--', 'env') + $environment + @($Program) + $Arguments) $Label
 }
 
+function Assert-InputManifest {
+    param([string]$ManifestPath, [hashtable]$ExpectedInputs)
+    $manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
+    if ($manifest.schema_version -ne 1) {
+        throw "unsupported ProductionV4 input manifest version: $($manifest.schema_version)"
+    }
+    $entries = @($manifest.files)
+    if ($entries.Count -ne $ExpectedInputs.Count) {
+        throw "input manifest contains $($entries.Count) files; expected $($ExpectedInputs.Count)"
+    }
+    $seen = @{}
+    [uint64]$totalBytes = 0
+    foreach ($entry in $entries) {
+        $name = [string]$entry.name
+        if ($seen.ContainsKey($name)) {
+            throw "input manifest repeats $name"
+        }
+        $seen[$name] = $true
+        if (-not $ExpectedInputs.ContainsKey($name)) {
+            throw "input manifest contains unexpected file $name"
+        }
+        $path = [string]$ExpectedInputs[$name]
+        $item = Get-Item -LiteralPath $path
+        if ([uint64]$item.Length -ne [uint64]$entry.bytes) {
+            throw "input length mismatch for $name"
+        }
+        $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+        if ($sha256 -cne [string]$entry.sha256) {
+            throw "input SHA-256 mismatch for $name"
+        }
+        $totalBytes += [uint64]$item.Length
+        Write-Host "Authenticated $name ($($item.Length) bytes)"
+    }
+    if ($totalBytes -ne [uint64]$manifest.total_bytes) {
+        throw "input manifest total is $($manifest.total_bytes); authenticated $totalBytes bytes"
+    }
+    Write-Host "Authenticated ProductionV4 input manifest: $totalBytes bytes"
+}
+
 $modelBankPath = Resolve-ExistingFile $ModelBank 'model bank'
 $artifactDirectoryPath = Resolve-ExistingDirectory $FixedArtifactDirectory 'fixed artifact directory'
+$inputManifestPath = Resolve-ExistingFile $InputManifest 'ProductionV4 input manifest'
 $cmfdMinerPath = Resolve-ExistingFile $CmfdMiner 'cmfd-miner'
 $replayBinaryPath = Resolve-ExistingFile $ReplayBinary 'V4 replay binary'
 $dynamicCommitmentBinaryPath = Resolve-ExistingFile $DynamicCommitmentBinary 'V4 dynamic commitment binary'
@@ -147,6 +190,20 @@ if ($gpuFields[2] -ne $RequiredComputeCapability) {
     throw "GPU $($gpuFields[0]) has compute capability $($gpuFields[2]); this build requires $RequiredComputeCapability"
 }
 Write-Host "ProductionV4 GPU: $($gpuFields[0]), $gpuMemoryMiB MiB, compute $($gpuFields[2])"
+
+$expectedInputs = @{
+    'MODEL-V2.bank' = $modelBankPath
+    'FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json' = $fixedRecordPath
+}
+0..2 | ForEach-Object {
+    $expectedInputs["FORGEMATRIX-V4-FIXED-BANK-$_.row-major.codeword"] = Join-Path (
+        $artifactDirectoryPath
+    ) "FORGEMATRIX-V4-FIXED-BANK-$_.row-major.codeword"
+    $expectedInputs["FORGEMATRIX-V4-FIXED-BANK-$_.tree"] = Join-Path (
+        $artifactDirectoryPath
+    ) "FORGEMATRIX-V4-FIXED-BANK-$_.tree"
+}
+Assert-InputManifest $inputManifestPath $expectedInputs
 
 $modelBankWsl = Convert-ToWslPath $modelBankPath
 $artifactDirectoryWsl = Convert-ToWslPath $artifactDirectoryPath

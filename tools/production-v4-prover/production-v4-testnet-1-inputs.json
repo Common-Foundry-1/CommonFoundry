@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "network": "CommonFoundry ProductionV4 Testnet-1",
+  "network_id": "b9e55d5a5e80c8e3d73bf81b199bc643ac9367436962c28b6aacdc37f3809962",
+  "source_commit": "1dd8b90bfea8242cd6bb638cf62ccf66732c2479",
+  "total_bytes": 61203815317,
+  "files": [
+    {
+      "name": "MODEL-V2.bank",
+      "bytes": 6442975416,
+      "sha256": "5f9b213c3bda51b74e4ebabb26607b67385d613aa8d99af915a48ab063e17d4e"
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json",
+      "bytes": 6973,
+      "sha256": "ea218831aa567e486426ded77c84a5752a817329c496e3557c6d43577f0afe79"
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-0.row-major.codeword",
+      "bytes": 17179869184,
+      "sha256": "f21c9e146f03ac0cc7633048401370707d47bc02d9b662c5650b16b894514eb3"
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-0.tree",
+      "bytes": 1073741792,
+      "sha256": "6f55b1ddc9bc15426dbf23a662ab205e2f5396d92c7298c34885a22e34380085"
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-1.row-major.codeword",
+      "bytes": 17179869184,
+      "sha256": "29620f6804611dd800e3e105d8ee18b7b9caa7c38a3ff0e20c610cd2650c1ab6"
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-1.tree",
+      "bytes": 1073741792,
+      "sha256": "33bf29037d913b83c32bd7a88ca07c787ce4c9d92d8fe11d8c53c591af31b687"
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-2.row-major.codeword",
+      "bytes": 17179869184,
+      "sha256": "57f4d72ac2009553c245bb2081dec19508ec9a171cab8075e0aad95d0714cc76"
+    },
+    {
+      "name": "FORGEMATRIX-V4-FIXED-BANK-2.tree",
+      "bytes": 1073741792,
+      "sha256": "ce6e1083c99ed4f2379d3ca0ee4886dfee14e8b5072270d39f70337ce652d6e1"
+    }
+  ]
+}

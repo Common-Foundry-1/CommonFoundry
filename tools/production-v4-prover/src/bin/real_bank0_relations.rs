@@ -61,7 +61,7 @@ use sp1_gpu_jagged_sumcheck::{
     cubic_transition_sumcheck, simple_hadamard_sumcheck, triple_hadamard_sumcheck,
 };
 use sp1_gpu_sys::kernels::cmfd_weight_output_reduction_kernel;
-use sp1_gpu_utils::{Ext, Felt, TestGC};
+use sp1_gpu_utils::{AbstractChipLayoutWithHeights, Ext, Felt, JaggedTraceMle, TestGC};
 
 #[path = "../real_v4_opening.rs"]
 mod real_v4_opening;
@@ -69,6 +69,9 @@ mod real_v4_opening;
 const LAYERS: usize = 128;
 const BATCH: usize = 128;
 const WIDTH: usize = 4096;
+const LOG_ROWS: u32 = 23;
+const ROWS: usize = 1 << LOG_ROWS;
+const DYNAMIC_COLUMNS: usize = 16;
 const CELLS: usize = BATCH * WIDTH;
 const BANK_VALUES: usize = LAYERS * CELLS;
 const BANK_BYTES: usize = LAYERS * WIDTH * WIDTH;
@@ -265,7 +268,7 @@ fn prove_complete_proof(
             if let Ok((free, _)) = cuda_memory_info() {
                 sampler_minimum.fetch_min(free, Ordering::Relaxed);
             }
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(50));
         }
     });
     let online_started = Instant::now();
@@ -283,7 +286,13 @@ fn prove_complete_proof(
     let mut openings = Vec::with_capacity(3);
 
     let [encoded, next_encoded, final_encoded] = encoded_banks;
-    let (bank_relations, bank_claims, boundary_claims, encoded_device) = prove_bank_relations(
+    let (
+        bank_relations,
+        bank_claims,
+        boundary_claims,
+        encoded_device,
+        dynamic_device,
+    ) = prove_bank_relations(
         0,
         statement,
         &base_input,
@@ -303,7 +312,13 @@ fn prove_complete_proof(
     claims.push(bank_claims);
 
     let boundary = last_activation_layer(dynamic_values[0]);
-    let (bank_relations, bank_claims, boundary_claims, next_encoded_device) = prove_bank_relations(
+    let (
+        bank_relations,
+        bank_claims,
+        boundary_claims,
+        next_encoded_device,
+        next_dynamic_device,
+    ) = prove_bank_relations(
         1,
         statement,
         &base_input,
@@ -323,7 +338,7 @@ fn prove_complete_proof(
         0,
         fixed_maps.remove(0),
         encoded_device,
-        dynamic_values[0],
+        dynamic_device,
         gpu_fixed[0],
         gpu_dynamic[0],
         &claims[0],
@@ -332,7 +347,13 @@ fn prove_complete_proof(
         &scope,
     )?);
     let boundary = last_activation_layer(dynamic_values[1]);
-    let (bank_relations, bank_claims, boundary_claims, final_encoded_device) =
+    let (
+        bank_relations,
+        bank_claims,
+        boundary_claims,
+        final_encoded_device,
+        final_dynamic_device,
+    ) =
         prove_bank_relations(
             2,
             statement,
@@ -353,7 +374,7 @@ fn prove_complete_proof(
         1,
         fixed_maps.remove(0),
         next_encoded_device,
-        dynamic_values[1],
+        next_dynamic_device,
         gpu_fixed[1],
         gpu_dynamic[1],
         &claims[1],
@@ -386,7 +407,7 @@ fn prove_complete_proof(
         2,
         fixed_maps.remove(0),
         final_encoded_device,
-        dynamic_values[2],
+        final_dynamic_device,
         gpu_fixed[2],
         gpu_dynamic[2],
         &claims[2],
@@ -503,14 +524,25 @@ fn prove_bank_relations(
     Vec<CpuOpeningClaim>,
     Vec<CpuOpeningClaim>,
     DeviceBuffer<u8>,
+    JaggedTraceMle<Felt, TaskScope>,
 )> {
     let upload_started = Instant::now();
     let encoded_device = DeviceBuffer::from_host_slice(encoded_bank, scope)?;
-    let dynamic =
-        DeviceTensor::from_raw(
-            Tensor::from(DeviceBuffer::from_host_slice(dynamic_values, scope)?.into_inner())
-                .reshape([2 * LAYERS, BATCH, WIDTH]),
-        );
+    let mut dynamic_dense = Vec::with_capacity((DYNAMIC_COLUMNS + 1) * ROWS);
+    dynamic_dense.resize(ROWS, Felt::zero());
+    dynamic_dense.extend_from_slice(dynamic_values);
+    let dynamic_layout = AbstractChipLayoutWithHeights::new(vec![(
+        format!("v4-bank-{bank}-dynamic"),
+        1,
+        DYNAMIC_COLUMNS,
+        ROWS,
+    )]);
+    let dynamic = JaggedTraceMle::from_chip_layout(
+        Buffer::from(dynamic_dense),
+        &dynamic_layout,
+        LOG_ROWS,
+    )
+    .into_device(scope);
     scope.synchronize_blocking()?;
     eprintln!(
         "bank={bank} relation_upload_seconds={:.6}",
@@ -542,8 +574,11 @@ fn prove_bank_relations(
             "matrix output point diverged"
         );
 
-        let preactivation_reduced = reduce_batches(&dynamic, 0, &gpu_matrix_point.1, scope)?;
-        let next_reduced = reduce_batches(&dynamic, BANK_VALUES, &gpu_matrix_point.1, scope)?;
+        let dynamic_tensor = dynamic.main_virtual_tensor(LOG_ROWS);
+        let preactivation_reduced =
+            reduce_batches(&dynamic_tensor, 0, &gpu_matrix_point.1, scope)?;
+        let next_reduced =
+            reduce_batches(&dynamic_tensor, BANK_VALUES, &gpu_matrix_point.1, scope)?;
         let preactivation_evaluation = evaluate_matrix(
             &preactivation_reduced,
             &gpu_matrix_point.0,
@@ -755,6 +790,7 @@ fn prove_bank_relations(
         opening_claims,
         boundary_claims,
         encoded_device,
+        dynamic,
     ))
 }
 
@@ -849,7 +885,7 @@ fn build_initial_activation(challenge: [u8; 32], base: &[u8]) -> Vec<Felt> {
 }
 
 fn reduce_batches(
-    dynamic: &DeviceTensor<Felt>,
+    dynamic: &TensorView<'_, Felt, TaskScope>,
     offset: usize,
     batch_point: &Point<Ext>,
     scope: &TaskScope,

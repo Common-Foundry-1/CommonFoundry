@@ -30,7 +30,7 @@ use sp1_gpu_sys::kernels::{
     cmfd_ext_add_in_place_kernel, cmfd_fixed_bank_evaluate_columns_kernel,
     cmfd_fixed_bank_rlc_kernel,
 };
-use sp1_gpu_utils::{AbstractChipLayoutWithHeights, Ext, Felt, JaggedTraceMle, TestGC};
+use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle, TestGC};
 
 const LOG_ROWS: u32 = 23;
 const ROWS: usize = 1 << LOG_ROWS;
@@ -68,7 +68,7 @@ pub fn prove_real_bank_opening(
     bank: usize,
     maps: FixedArtifactMaps,
     encoded_bank: DeviceBuffer<u8>,
-    dynamic_values: &[Felt],
+    dynamic_trace: JaggedTraceMle<Felt, TaskScope>,
     fixed_commitment: GpuDigest,
     dynamic_commitment: GpuDigest,
     claims: &[CpuClaim],
@@ -86,27 +86,10 @@ pub fn prove_real_bank_opening(
         "wrong encoded bank length"
     );
     ensure!(
-        dynamic_values.len() == DYNAMIC_COLUMNS * ROWS,
+        dynamic_trace.main_size() == DYNAMIC_COLUMNS * ROWS,
         "wrong dynamic trace length"
     );
-
-    let upload_started = Instant::now();
-    let mut dense = Vec::with_capacity((DYNAMIC_COLUMNS + 1) * ROWS);
-    dense.resize(ROWS, Felt::zero());
-    dense.extend_from_slice(dynamic_values);
-    let layout = AbstractChipLayoutWithHeights::new(vec![(
-        format!("v4-bank-{bank}-dynamic"),
-        1,
-        DYNAMIC_COLUMNS,
-        ROWS,
-    )]);
-    let host_trace = JaggedTraceMle::from_chip_layout(Buffer::from(dense), &layout, LOG_ROWS);
-    let dynamic_trace = host_trace.into_device(scope);
-    scope.synchronize_blocking()?;
-    eprintln!(
-        "bank={bank} opening_upload_seconds={:.6}",
-        upload_started.elapsed().as_secs_f64()
-    );
+    eprintln!("bank={bank} opening_upload_seconds=0.000000");
 
     let prover = FriCudaProver::<TestGC, _, Felt>::new(
         Poseidon2SP1Field16CudaProver::new(scope),

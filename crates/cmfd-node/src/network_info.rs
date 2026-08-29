@@ -1,4 +1,4 @@
-#[cfg(feature = "production-v3")]
+#[cfg(any(feature = "production-v3", feature = "production-v4"))]
 use crate::NetworkProfileKind;
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::POW_TYPE_V3_CANDIDATE;
@@ -16,13 +16,13 @@ use cmfd_consensus::{
     POW_TYPE_V2_REFERENCE, PowError, PowParameters, TARGET_SPACING_SECONDS, TRANSACTION_VERSION,
     WIRE_HEADER_BYTES, WIRE_VERSION, max_block_bytes_for_network, max_proof_bytes_for_network,
 };
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use cmfd_consensus::{
     POW_TYPE_V4_CANDIDATE, forgematrix_v4_proof_codec::FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
 };
 use cmfd_proof_worker::{ProductionV3VerifierArtifacts, ProductionV3VerifierRecord};
 use serde::Serialize;
-#[cfg(feature = "production-v3")]
+#[cfg(any(feature = "production-v3", feature = "production-v4"))]
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -97,15 +97,19 @@ enum ProofOfWorkIdentity {
     V2Reference(V2ProofOfWorkIdentity),
     #[cfg(feature = "production-v3")]
     ProductionV3(ProductionV3ProofOfWorkIdentity),
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     ProductionV4(ProductionV4ProofOfWorkIdentity),
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ProductionV4ProofOfWorkIdentity {
     selection: &'static str,
     profile: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_source_commit: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_evidence_sha256: Option<String>,
     wire_type: u16,
     pow_limit: String,
     algorithm_version: u32,
@@ -117,14 +121,14 @@ struct ProductionV4ProofOfWorkIdentity {
     artifacts: ProductionV4ArtifactIdentities,
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ProductionV4ArtifactIdentities {
     bank: ProductionV4FileIdentity,
     fixed_record: ProductionV4FileIdentity,
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ProductionV4FileIdentity {
     bytes: String,
@@ -362,8 +366,8 @@ fn canonical_network_info_json_for_profile(
                     )
                 }
                 NetworkProfileKind::ProductionV3Testnet => (None, None),
-                NetworkProfileKind::Devnet => {
-                    unreachable!("the Devnet network profile cannot select ProductionV3 parameters")
+                NetworkProfileKind::Devnet | NetworkProfileKind::ProductionV4Testnet => {
+                    unreachable!("only ProductionV3 profiles can select ProductionV3 parameters")
                 }
             };
             ProofOfWorkIdentity::ProductionV3(ProductionV3ProofOfWorkIdentity {
@@ -406,12 +410,40 @@ fn canonical_network_info_json_for_profile(
                 },
             })
         }
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         PowParameters::V4Candidate(parameters) => {
-            let pins = crate::release_gate::PRODUCTION_V4_TESTNET_ARTIFACT_PINS;
+            let release_profile = crate::release_gate::COMPILED_RELEASE_PROFILE;
+            let pins = release_profile
+                .production_v4_artifacts
+                .ok_or(NodeError::ProductionV4ArtifactPinsMissing)?;
+            let (build_source_commit, activation_evidence_sha256) = match profile.kind {
+                NetworkProfileKind::Rcnet => {
+                    let build_source_commit = option_env!("CMFD_BUILD_SOURCE_COMMIT").ok_or(
+                        NodeError::ProductionV4ActivationEvidence(
+                            "trusted build source commit is absent",
+                        ),
+                    )?;
+                    let activation_evidence =
+                        crate::release_gate::canonical_production_v4_activation_evidence_json(
+                            release_profile,
+                            build_source_commit,
+                        )
+                        .map_err(NodeError::ProductionV4ActivationEvidence)?;
+                    (
+                        Some(build_source_commit),
+                        Some(hex::encode(Sha256::digest(&activation_evidence))),
+                    )
+                }
+                NetworkProfileKind::ProductionV4Testnet => (None, None),
+                NetworkProfileKind::Devnet | NetworkProfileKind::ProductionV3Testnet => {
+                    unreachable!("only ProductionV4 profiles can select ProductionV4 parameters")
+                }
+            };
             ProofOfWorkIdentity::ProductionV4(ProductionV4ProofOfWorkIdentity {
                 selection: "ProductionV4",
                 profile: profile.proof_name(),
+                build_source_commit,
+                activation_evidence_sha256,
                 wire_type: POW_TYPE_V4_CANDIDATE,
                 pow_limit: hex::encode(params.pow_limit),
                 algorithm_version: parameters.algorithm_version(),
@@ -511,7 +543,7 @@ fn production_v3_file_identity(
     }
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn production_v4_file_identity(
     pin: crate::release_gate::ProductionV3FileIdentityPin,
 ) -> ProductionV4FileIdentity {
@@ -637,12 +669,12 @@ mod tests {
     #[test]
     fn rcnet_network_info_never_falls_back_to_the_devnet_manifest() {
         let result = canonical_network_info_json_for_profile(crate::RCNET1_PROFILE, None, None);
-        #[cfg(feature = "production-v3")]
+        #[cfg(feature = "production-v4")]
         assert!(matches!(
             result,
-            Err(NodeError::ProductionV3ArtifactsMissing)
+            Err(NodeError::ProductionV4ArtifactsMissing)
         ));
-        #[cfg(not(feature = "production-v3"))]
-        assert!(matches!(result, Err(NodeError::ProductionV3Unavailable)));
+        #[cfg(not(feature = "production-v4"))]
+        assert!(matches!(result, Err(NodeError::ProductionV4Unavailable)));
     }
 }

@@ -16,12 +16,13 @@ production-v3-testnet = [
     "cmfd-node/production-v3-testnet",
     "dep:same-file",
 ]
-production-v4-testnet = [
+production-v4 = [
     "cmfd-consensus/forgematrix-v4-verifier",
-    "cmfd-node/production-v4-testnet",
+    "cmfd-node/production-v4",
     "dep:same-file",
 ]
-production-rc = ["production-v3", "cmfd-node/production-rc"]
+production-v4-testnet = ["production-v4", "cmfd-node/production-v4-testnet"]
+production-rc = ["production-v4", "cmfd-node/production-rc"]
 
 [dependencies]
 anyhow.workspace = true

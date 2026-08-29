@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(any(feature = "production-v3", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3", feature = "production-v4"))]
 use std::fs::File;
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use std::fs::{self, OpenOptions};
 #[cfg(feature = "production-v3")]
 use std::io::BufReader;
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -17,26 +17,27 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+#[cfg(feature = "production-v4")]
+use anyhow::ensure;
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "production-v3")]
 use cmfd_consensus::ForgeMatrixV3WinningNonceClaim;
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::dory_v3_qualification::ProductionDoryV3QualificationSeed;
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_mask_coefficients;
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use cmfd_consensus::{
     BlockChallenge, Coinbase, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_FIELD_MODULUS,
     FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN, FORGEMATRIX_V4_PROOF_VERSION,
     FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
     ForgeMatrixV4FixedArtifactRecordV1, PRODUCTION_V2_LAYERS,
     PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MAX_BLOCK_BYTES,
-    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_TESTNET_NETWORK_ID, Transaction,
-    forgematrix_v4_challenge_digest, forgematrix_v4_proof_system_digest,
-    forgematrix_v4_work_digest,
+    PRODUCTION_V4_MAX_PROOF_BYTES, Transaction, forgematrix_v4_challenge_digest,
+    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
 };
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::{
@@ -69,16 +70,16 @@ use cmfd_node::{
 use cmfd_node::{
     ProductionV3MiningPeerIdentity, ProductionV3MiningWorkFactory, ProductionV3VerifierArtifacts,
 };
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 use same_file::Handle as SameFileHandle;
 
 mod telemetry;
 
 use telemetry::{GpuTelemetry, query_nvidia_smi};
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 const QUALIFIED_TEMPLATE_FORMAT_VERSION: u16 = 1;
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 static QUALIFIED_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_MINER_DATA_DIR: &str = COMPILED_NETWORK_PROFILE.miner_data_dir_identity();
@@ -211,7 +212,7 @@ enum Command {
         production_v3: ProductionV3Cli,
     },
     /// Freeze one exact ProductionV4 node template for the GPU prover.
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     SnapshotV4Template {
         #[arg(long)]
         peer: SocketAddr,
@@ -231,7 +232,7 @@ enum Command {
         output: PathBuf,
     },
     /// Bind another nonce to an already-frozen ProductionV4 block challenge.
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     BindV4Nonce {
         /// Existing canonical template whose block challenge remains unchanged.
         #[arg(long)]
@@ -246,7 +247,7 @@ enum Command {
         output: PathBuf,
     },
     /// Prepare replay coefficients for a contiguous ProductionV4 nonce batch.
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     PrepareV4SearchBatch {
         /// Existing canonical template whose block challenge remains unchanged.
         #[arg(long)]
@@ -261,7 +262,7 @@ enum Command {
         coefficients_output: PathBuf,
     },
     /// Inspect an ordered ProductionV4 nonce batch and retain its first winner.
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     InspectV4SearchBatch {
         /// Existing canonical template whose block challenge remains unchanged.
         #[arg(long)]
@@ -278,7 +279,7 @@ enum Command {
         winner_final_output: PathBuf,
     },
     /// Report whether a replay's final activation meets a frozen V4 target.
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     InspectV4Work {
         #[arg(long)]
         template: PathBuf,
@@ -288,7 +289,7 @@ enum Command {
         fixed_record: PathBuf,
     },
     /// Wrap and submit a CPU-self-verified ProductionV4 transparent proof.
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     SubmitV4Template {
         #[arg(long)]
         peer: SocketAddr,
@@ -501,7 +502,7 @@ fn main() -> Result<()> {
             proof,
             production_v3,
         } => submit_qualified_template(peer, allow_public_peers, &template, &proof, production_v3),
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         Command::SnapshotV4Template {
             peer,
             allow_public_peers,
@@ -519,7 +520,7 @@ fn main() -> Result<()> {
             &coefficients_output,
             &output,
         ),
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         Command::BindV4Nonce {
             template,
             nonce,
@@ -533,7 +534,7 @@ fn main() -> Result<()> {
             &coefficients_output,
             &output,
         ),
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         Command::PrepareV4SearchBatch {
             template,
             start_nonce,
@@ -547,7 +548,7 @@ fn main() -> Result<()> {
             &fixed_record,
             &coefficients_output,
         ),
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         Command::InspectV4SearchBatch {
             template,
             start_nonce,
@@ -563,13 +564,13 @@ fn main() -> Result<()> {
             &fixed_record,
             &winner_final_output,
         ),
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         Command::InspectV4Work {
             template,
             final_activation,
             fixed_record,
         } => inspect_v4_work(&template, &final_activation, &fixed_record),
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         Command::SubmitV4Template {
             peer,
             allow_public_peers,
@@ -649,7 +650,7 @@ impl FrozenProductionV3Template {
     }
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FrozenProductionV4Template {
@@ -660,7 +661,7 @@ struct FrozenProductionV4Template {
     nonce: u64,
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 impl FrozenProductionV4Template {
     fn from_mining_template(template: MiningTemplate, nonce: u64) -> Self {
         Self {
@@ -690,7 +691,7 @@ impl FrozenProductionV4Template {
     }
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn snapshot_v4_template(
     peer: SocketAddr,
     allow_public_peers: bool,
@@ -700,7 +701,7 @@ fn snapshot_v4_template(
     coefficients_output: &Path,
     output: &Path,
 ) -> Result<()> {
-    ensure_production_v4_test_tool()?;
+    ensure_production_v4_tool()?;
     ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
     ensure_new_absolute_output(coefficients_output, "ProductionV4 replay coefficients")?;
     ensure_new_absolute_output(output, "ProductionV4 template")?;
@@ -751,7 +752,7 @@ fn snapshot_v4_template(
     Ok(())
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn bind_v4_nonce(
     template_path: &Path,
     nonce: u64,
@@ -759,7 +760,7 @@ fn bind_v4_nonce(
     coefficients_output: &Path,
     output: &Path,
 ) -> Result<()> {
-    ensure_production_v4_test_tool()?;
+    ensure_production_v4_tool()?;
     ensure_existing_absolute_file(template_path, "ProductionV4 source template")?;
     ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
     ensure_new_absolute_output(coefficients_output, "ProductionV4 replay coefficients")?;
@@ -779,7 +780,7 @@ fn bind_v4_nonce(
         bail!("ProductionV4 source template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
         bail!("ProductionV4 source template belongs to another network");
     }
 
@@ -819,7 +820,7 @@ fn bind_v4_nonce(
     Ok(())
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn prepare_v4_search_batch(
     template_path: &Path,
     start_nonce: u64,
@@ -827,7 +828,7 @@ fn prepare_v4_search_batch(
     fixed_record_path: &Path,
     coefficients_output: &Path,
 ) -> Result<()> {
-    ensure_production_v4_test_tool()?;
+    ensure_production_v4_tool()?;
     validate_v4_search_batch_range(start_nonce, count)?;
     ensure_existing_absolute_file(template_path, "ProductionV4 source template")?;
     ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
@@ -847,7 +848,7 @@ fn prepare_v4_search_batch(
         bail!("ProductionV4 source template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
         bail!("ProductionV4 source template belongs to another network");
     }
 
@@ -886,7 +887,7 @@ fn prepare_v4_search_batch(
     Ok(())
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn inspect_v4_search_batch(
     template_path: &Path,
     start_nonce: u64,
@@ -895,7 +896,7 @@ fn inspect_v4_search_batch(
     fixed_record_path: &Path,
     winner_final_output: &Path,
 ) -> Result<()> {
-    ensure_production_v4_test_tool()?;
+    ensure_production_v4_tool()?;
     validate_v4_search_batch_range(start_nonce, count)?;
 
     ensure_existing_absolute_file(template_path, "ProductionV4 source template")?;
@@ -917,7 +918,7 @@ fn inspect_v4_search_batch(
         bail!("ProductionV4 source template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
         bail!("ProductionV4 source template belongs to another network");
     }
 
@@ -985,7 +986,7 @@ fn inspect_v4_search_batch(
     Ok(())
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn validate_v4_search_batch_range(start_nonce: u64, count: u32) -> Result<()> {
     ensure!(
         (1..=64).contains(&count),
@@ -997,13 +998,13 @@ fn validate_v4_search_batch_range(start_nonce: u64, count: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn inspect_v4_work(
     template_path: &Path,
     final_activation_path: &Path,
     fixed_record_path: &Path,
 ) -> Result<()> {
-    ensure_production_v4_test_tool()?;
+    ensure_production_v4_tool()?;
     ensure_existing_absolute_file(template_path, "ProductionV4 template")?;
     ensure_existing_absolute_file(final_activation_path, "ProductionV4 final activation")?;
     ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
@@ -1019,7 +1020,7 @@ fn inspect_v4_work(
         bail!("ProductionV4 template is not canonical JSON");
     }
     frozen.clone().into_mining_template()?;
-    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+    if frozen.challenge.network_id != COMPILED_NETWORK_PROFILE.network_id {
         bail!("ProductionV4 template belongs to another network");
     }
 
@@ -1065,7 +1066,7 @@ fn inspect_v4_work(
     Ok(())
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn v4_final_activation_digest_from_bytes(
     challenge_digest: [u8; 32],
     final_activation: &[u8],
@@ -1086,7 +1087,7 @@ fn v4_final_activation_digest_from_bytes(
     Ok(*hasher.finalize().as_bytes())
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn production_v4_replay_coefficients(challenge_digest: [u8; 32]) -> Vec<u8> {
     let mut coefficients = Vec::with_capacity((PRODUCTION_V2_LAYERS as usize + 1) * 20);
     coefficients.extend_from_slice(&forgematrix_v4_mask_coefficients(
@@ -1099,7 +1100,7 @@ fn production_v4_replay_coefficients(challenge_digest: [u8; 32]) -> Vec<u8> {
     coefficients
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn submit_v4_template(
     peer: SocketAddr,
     allow_public_peers: bool,
@@ -1107,7 +1108,7 @@ fn submit_v4_template(
     transparent_proof_path: &Path,
     fixed_record_path: &Path,
 ) -> Result<()> {
-    ensure_production_v4_test_tool()?;
+    ensure_production_v4_tool()?;
     ensure_existing_absolute_file(template_path, "ProductionV4 template")?;
     ensure_existing_absolute_file(transparent_proof_path, "ProductionV4 transparent proof")?;
     ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
@@ -1226,13 +1227,10 @@ fn submit_v4_template(
     }
 }
 
-#[cfg(feature = "production-v4-testnet")]
-fn ensure_production_v4_test_tool() -> Result<()> {
-    if !matches!(
-        COMPILED_NETWORK_PROFILE.kind,
-        cmfd_node::NetworkProfileKind::ProductionV4Testnet
-    ) {
-        bail!("ProductionV4 template commands require the ProductionV4 testnet build");
+#[cfg(feature = "production-v4")]
+fn ensure_production_v4_tool() -> Result<()> {
+    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+        bail!("ProductionV4 template commands require a ProductionV4 network build");
     }
     Ok(())
 }
@@ -1406,7 +1404,7 @@ fn ensure_production_v3_test_tool() -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 fn qualified_template_address_policy(
     peer: SocketAddr,
     allow_public_peers: bool,
@@ -1426,7 +1424,7 @@ fn qualified_template_address_policy(
     Ok(address_policy)
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 fn ensure_new_absolute_output(path: &Path, label: &str) -> Result<()> {
     if !path.is_absolute() {
         bail!("{label} output must be an absolute path");
@@ -1443,7 +1441,7 @@ fn ensure_new_absolute_output(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 fn ensure_existing_absolute_file(path: &Path, label: &str) -> Result<()> {
     if !path.is_absolute() || !path.is_file() {
         bail!(
@@ -1454,7 +1452,7 @@ fn ensure_existing_absolute_file(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 fn canonical_json<T>(value: &T, label: &str) -> Result<Vec<u8>>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + PartialEq,
@@ -1468,7 +1466,7 @@ where
     Ok(bytes)
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 fn write_new_file(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     let parent = path
         .parent()
@@ -1546,14 +1544,14 @@ fn write_new_file(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 struct UnconfirmedOutput {
     path: PathBuf,
     identity: SameFileHandle,
     confirmed: bool,
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 impl UnconfirmedOutput {
     fn new(path: PathBuf, identity: SameFileHandle) -> Self {
         Self {
@@ -1568,7 +1566,7 @@ impl UnconfirmedOutput {
     }
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 impl Drop for UnconfirmedOutput {
     fn drop(&mut self) {
         if !self.confirmed
@@ -1580,7 +1578,7 @@ impl Drop for UnconfirmedOutput {
 }
 
 #[cfg(all(
-    any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+    any(feature = "production-v3-testnet", feature = "production-v4"),
     unix
 ))]
 fn sync_output_parent(parent: &Path) -> Result<()> {
@@ -1589,14 +1587,14 @@ fn sync_output_parent(parent: &Path) -> Result<()> {
 }
 
 #[cfg(all(
-    any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+    any(feature = "production-v3-testnet", feature = "production-v4"),
     not(unix)
 ))]
 fn sync_output_parent(_parent: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "production-v3-testnet", feature = "production-v4-testnet"))]
+#[cfg(any(feature = "production-v3-testnet", feature = "production-v4"))]
 fn read_bounded_file(path: &Path, maximum_bytes: usize, label: &str) -> Result<Vec<u8>> {
     let file =
         File::open(path).with_context(|| format!("failed to open {label} {}", path.display()))?;
@@ -1871,7 +1869,7 @@ impl SessionStatistics {
     }
 
     /// Total completed nonce evaluations across every GPU this session.
-    #[cfg_attr(feature = "production-v4-testnet", allow(dead_code))]
+    #[cfg_attr(feature = "production-v4", allow(dead_code))]
     fn total_attempts(&self) -> u64 {
         self.totals
             .values()
@@ -4791,7 +4789,7 @@ mod tests {
 
     use super::*;
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     #[test]
     fn production_v4_snapshot_requires_bound_replay_outputs() {
         let snapshot = Cli::try_parse_from([
@@ -4815,7 +4813,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     #[test]
     fn production_v4_replay_coefficients_cover_every_layer() {
         let challenge_digest = [0x42; 32];
@@ -4836,7 +4834,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     #[test]
     fn production_v4_raw_final_digest_has_a_pinned_vector() {
         let challenge_digest = [0x6b; 32];
@@ -4854,7 +4852,7 @@ mod tests {
         assert!(v4_final_activation_digest_from_bytes(challenge_digest, &noncanonical).is_err());
     }
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     #[test]
     fn production_v4_continuous_search_commands_require_bound_inputs() {
         for command in [
@@ -4867,7 +4865,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     #[test]
     fn production_v4_search_batch_range_is_bounded() {
         assert!(validate_v4_search_batch_range(0, 1).is_ok());
@@ -5059,7 +5057,7 @@ mod tests {
         );
         assert_eq!(
             mining_runtime(cmfd_node::RCNET1_PROFILE),
-            MiningRuntime::ProductionV3
+            MiningRuntime::ProductionV4
         );
     }
 

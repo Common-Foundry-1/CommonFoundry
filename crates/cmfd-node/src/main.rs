@@ -23,7 +23,7 @@ use cmfd_node::pool::{
 use cmfd_node::pool_dashboard::{
     DEFAULT_POOL_DASHBOARD_ADDRESS, PoolDashboardConfig, spawn_pool_dashboard,
 };
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use cmfd_node::production_v4_pool::{
     ProductionV4PersistentPoolVerifier, ProductionV4PoolVerifierConfig,
     ProductionV4PoolWorkerCommand,
@@ -846,7 +846,7 @@ fn configure_production_v4_pool_verifier(
         return Err("ProductionV4 pool-serve requires replay-worker, proof-worker, and scratch-directory options".into());
     };
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     {
         let replay_worker =
             canonical_regular_file(replay_worker, "ProductionV4 pool replay worker")?;
@@ -896,7 +896,7 @@ fn configure_production_v4_pool_verifier(
         config.production_v4_share_verifier = Some(Arc::new(verifier));
         Ok(())
     }
-    #[cfg(not(feature = "production-v4-testnet"))]
+    #[cfg(not(feature = "production-v4"))]
     {
         let _ = (
             config,
@@ -909,7 +909,7 @@ fn configure_production_v4_pool_verifier(
     }
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn production_v4_wsl_pool_workers(
     distribution: &str,
     replay_worker: &Path,
@@ -996,7 +996,7 @@ fn production_v4_wsl_pool_workers(
     }
 }
 
-#[cfg(all(feature = "production-v4-testnet", windows))]
+#[cfg(all(feature = "production-v4", windows))]
 fn production_v4_wsl_path(
     wsl: &Path,
     distribution: &str,

@@ -13,11 +13,12 @@ production-v3 = [
     "cmfd-proof-worker/production-v3",
 ]
 production-v3-testnet = ["production-v3"]
-production-v4-testnet = [
+production-v4 = [
     "cmfd-consensus/forgematrix-v4-verifier",
     "cmfd-proof-worker/production-v3",
 ]
-production-rc = ["production-v3"]
+production-v4-testnet = ["production-v4"]
+production-rc = ["production-v4"]
 
 [dependencies]
 blake3.workspace = true

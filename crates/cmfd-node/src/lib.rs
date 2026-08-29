@@ -12,9 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use cmfd_consensus::ForgeMatrixV4FixedArtifactRecordV1;
-#[cfg(any(test, feature = "production-v3", feature = "production-v4-testnet"))]
+#[cfg(any(test, feature = "production-v3", feature = "production-v4"))]
 use cmfd_consensus::PowParameters;
 use cmfd_consensus::chain::{ReversibleStateDeltaCapability, ValidatedBlock};
 use cmfd_consensus::{
@@ -45,6 +45,7 @@ use k256::schnorr::{SigningKey, VerifyingKey};
 use primitive_types::U512;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(feature = "production-v4")]
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -55,7 +56,7 @@ pub mod p2p;
 pub mod peer;
 pub mod pool;
 pub mod pool_dashboard;
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 pub mod production_v4_pool;
 #[cfg(feature = "production-v3")]
 pub mod rcnet_candidate;
@@ -411,6 +412,8 @@ pub enum NodeError {
     ProductionV4ArtifactsUnexpected,
     #[error("the compiled ProductionV4 artifact identity pins are absent or invalid")]
     ProductionV4ArtifactPinsMissing,
+    #[error("compiled ProductionV4 activation evidence is invalid: {0}")]
+    ProductionV4ActivationEvidence(&'static str),
     #[error("the authenticated ProductionV4 {0} does not match its compiled identity pin")]
     ProductionV4ArtifactIdentityMismatch(&'static str),
     #[error("network metadata is missing while a nonempty block log already exists")]
@@ -557,6 +560,7 @@ impl NodeError {
             Self::ProductionV4ArtifactsMissing
             | Self::ProductionV4ArtifactsUnexpected
             | Self::ProductionV4ArtifactPinsMissing
+            | Self::ProductionV4ActivationEvidence(_)
             | Self::ProductionV4ArtifactIdentityMismatch(_) => {
                 ("proof_verifier_configuration", 500, false)
             }
@@ -3992,11 +3996,13 @@ pub(crate) fn network_params_and_verifier_for_profile(
             if production_v3_record.is_some() {
                 return Err(NodeError::ProductionV3ArtifactsUnexpected);
             }
-            #[cfg(feature = "production-v4-testnet")]
+            #[cfg(feature = "production-v4")]
             {
                 let artifacts =
                     production_v4_artifacts.ok_or(NodeError::ProductionV4ArtifactsMissing)?;
-                let pins = release_gate::PRODUCTION_V4_TESTNET_ARTIFACT_PINS;
+                let pins = release_gate::COMPILED_RELEASE_PROFILE
+                    .production_v4_artifacts
+                    .ok_or(NodeError::ProductionV4ArtifactPinsMissing)?;
                 let fixed_record_file = require_production_v4_file_identity(
                     &artifacts.fixed_record,
                     pins.fixed_record,
@@ -4011,7 +4017,7 @@ pub(crate) fn network_params_and_verifier_for_profile(
                     BufReader::with_capacity(64 * 1024 * 1024, bank_file),
                 )?
             }
-            #[cfg(not(feature = "production-v4-testnet"))]
+            #[cfg(not(feature = "production-v4"))]
             {
                 let _ = production_v4_artifacts;
                 return Err(NodeError::ProductionV4Unavailable);
@@ -4021,7 +4027,7 @@ pub(crate) fn network_params_and_verifier_for_profile(
     network_params_from_verifier(profile, verifier)
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn require_production_v4_file_identity(
     path: &Path,
     pin: release_gate::ProductionV3FileIdentityPin,
@@ -4111,7 +4117,7 @@ pub(crate) fn thin_miner_network_params() -> Result<NetworkParams, NodeError> {
         ProofProfile::DevnetV2Reference => network_params_for_profile(COMPILED_NETWORK_PROFILE),
         ProofProfile::ProductionV3 => Err(NodeError::ProductionV3Unavailable),
         ProofProfile::ProductionV4 => {
-            #[cfg(feature = "production-v4-testnet")]
+            #[cfg(feature = "production-v4")]
             {
                 network_params_from_pow(
                     COMPILED_NETWORK_PROFILE,
@@ -4120,7 +4126,7 @@ pub(crate) fn thin_miner_network_params() -> Result<NetworkParams, NodeError> {
                     ),
                 )
             }
-            #[cfg(not(feature = "production-v4-testnet"))]
+            #[cfg(not(feature = "production-v4"))]
             {
                 Err(NodeError::ProductionV4Unavailable)
             }
@@ -11439,28 +11445,28 @@ mod tests {
 
     #[test]
     fn rcnet_profile_fails_closed_without_touching_storage() {
-        let path = test_dir("rcnet-production-v3-gate");
+        let path = test_dir("rcnet-production-v4-gate");
         clean_test_dir(&path);
 
-        #[cfg(not(feature = "production-v3"))]
+        #[cfg(not(feature = "production-v4"))]
         assert!(matches!(
             network_params_for_profile(RCNET1_PROFILE),
-            Err(NodeError::ProductionV3Unavailable)
+            Err(NodeError::ProductionV4Unavailable)
         ));
-        #[cfg(feature = "production-v3")]
+        #[cfg(feature = "production-v4")]
         assert!(matches!(
             network_params_for_profile(RCNET1_PROFILE),
-            Err(NodeError::ProductionV3ArtifactsMissing)
+            Err(NodeError::ProductionV4ArtifactsMissing)
         ));
-        #[cfg(not(feature = "production-v3"))]
+        #[cfg(not(feature = "production-v4"))]
         assert!(matches!(
             Node::open_with_profile(&path, RCNET1_PROFILE),
-            Err(NodeError::ProductionV3Unavailable)
+            Err(NodeError::ProductionV4Unavailable)
         ));
-        #[cfg(feature = "production-v3")]
+        #[cfg(feature = "production-v4")]
         assert!(matches!(
             Node::open_with_profile(&path, RCNET1_PROFILE),
-            Err(NodeError::ProductionV3ArtifactsMissing)
+            Err(NodeError::ProductionV4ArtifactsMissing)
         ));
         assert!(!path.exists());
     }

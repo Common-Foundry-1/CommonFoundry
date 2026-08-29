@@ -44,10 +44,9 @@ pub struct RewardDestinations {
 
 /// Consensus proof relation selected by a network profile.
 ///
-/// The launch-candidate value deliberately has no fallback to the tiny Devnet
-/// relation. Until a production V3 verifier is wired into `PowParameters` and
-/// `ConsensusPowVerifier`, selecting that profile must fail before node storage
-/// is opened.
+/// Production selections deliberately have no fallback to the tiny Devnet
+/// relation. A profile without its matching verifier authority must fail
+/// before node storage is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofProfile {
     DevnetV2Reference,
@@ -321,12 +320,12 @@ pub const PRODUCTION_V4_TESTNET_PROFILE: NetworkProfile = NetworkProfile {
 ///
 /// RCNet-1 is not mainnet and cannot currently start. Its identity, service
 /// ports, and storage paths are intentionally disjoint from Devnet-0 so a
-/// future production-V3 integration cannot accidentally reuse Devnet state.
+/// future ProductionV4 integration cannot accidentally reuse Devnet state.
 /// The production proof selector is the hard gate: code must never substitute
 /// the tiny V2 reference relation for this profile.
 pub const RCNET1_PROFILE: NetworkProfile = NetworkProfile {
     kind: NetworkProfileKind::Rcnet,
-    proof: ProofProfile::ProductionV3,
+    proof: ProofProfile::ProductionV4,
     name: "CommonFoundry RCNet-1",
     network_id: [0x72; 32],
     virtual_genesis_hash: [0x52; 32],
@@ -357,7 +356,7 @@ pub const COMPILED_NETWORK_PROFILE: NetworkProfile = match (
     (CompiledNetworkProfile::ProductionV4Testnet, ConsensusProofSelection::ProductionV4) => {
         PRODUCTION_V4_TESTNET_PROFILE
     }
-    (CompiledNetworkProfile::Rcnet, ConsensusProofSelection::ProductionV3) => RCNET1_PROFILE,
+    (CompiledNetworkProfile::Rcnet, ConsensusProofSelection::ProductionV4) => RCNET1_PROFILE,
     _ => panic!("compiled network and consensus proof selections are inconsistent"),
 };
 
@@ -383,12 +382,12 @@ mod tests {
             RCNET1_PROFILE.wallet_data_dir_identity,
             DEVNET_PROFILE.wallet_data_dir_identity
         );
-        assert_eq!(RCNET1_PROFILE.proof, ProofProfile::ProductionV3);
+        assert_eq!(RCNET1_PROFILE.proof, ProofProfile::ProductionV4);
         assert_eq!(DEVNET_PROFILE.proof, ProofProfile::DevnetV2Reference);
         assert_eq!(DEVNET_PROFILE.short_name(), "Devnet-0");
         assert_eq!(DEVNET_PROFILE.proof.profile_name(), "DevnetV2");
         assert_eq!(RCNET1_PROFILE.short_name(), "RCNet-1");
-        assert_eq!(RCNET1_PROFILE.proof.profile_name(), "ProductionV3");
+        assert_eq!(RCNET1_PROFILE.proof.profile_name(), "ProductionV4");
         assert_eq!(RCNET1_PROFILE.rpc_address().to_string(), "127.0.0.1:19443");
         assert_eq!(RCNET1_PROFILE.p2p_address().to_string(), "127.0.0.1:19444");
         assert_eq!(RCNET1_PROFILE.pool_address().to_string(), "127.0.0.1:19445");
@@ -458,7 +457,11 @@ mod tests {
 
     #[test]
     fn compiled_profile_matches_the_release_gate_selection() {
-        #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+        #[cfg(not(any(
+            feature = "production-v3-testnet",
+            feature = "production-v4-testnet",
+            feature = "production-rc"
+        )))]
         {
             assert_eq!(COMPILED_NETWORK_PROFILE, DEVNET_PROFILE);
             assert_eq!(
@@ -479,6 +482,11 @@ mod tests {
                 COMPILED_NETWORK_PROFILE.network_id,
                 cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID
             );
+        }
+        #[cfg(feature = "production-rc")]
+        {
+            assert_eq!(COMPILED_NETWORK_PROFILE, RCNET1_PROFILE);
+            assert_eq!(COMPILED_NETWORK_PROFILE.proof, ProofProfile::ProductionV4);
         }
     }
 

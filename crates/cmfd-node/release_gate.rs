@@ -3,7 +3,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompiledNetworkProfile {
     #[cfg_attr(
-        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        any(
+            feature = "production-v3-testnet",
+            feature = "production-v4-testnet",
+            feature = "production-rc"
+        ),
         allow(dead_code)
     )]
     Devnet,
@@ -17,7 +21,11 @@ pub enum CompiledNetworkProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusProofSelection {
     #[cfg_attr(
-        any(feature = "production-v3-testnet", feature = "production-v4-testnet"),
+        any(
+            feature = "production-v3-testnet",
+            feature = "production-v4-testnet",
+            feature = "production-rc"
+        ),
         allow(dead_code)
     )]
     DevnetV2Reference,
@@ -46,6 +54,18 @@ pub struct ProductionV3ArtifactIdentityPins {
     pub bank: ProductionV3FileIdentityPin,
     pub manifest: ProductionV3FileIdentityPin,
     pub record_v2: ProductionV3FileIdentityPin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionV4ActivationEvidence {
+    pub schema: &'static str,
+    pub qualification_source_commit: &'static str,
+    pub qualification_manifest_sha256: &'static str,
+    pub fresh_process_verifier_binary_sha256: &'static str,
+    pub fresh_process_verifier_report_sha256: &'static str,
+    pub core_spec_sha256: &'static str,
+    pub core_vector_sha256: &'static str,
+    pub proof_algebra_sha256: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +114,8 @@ pub struct CompiledReleaseProfile {
     /// identifies the qualification harness executable rather than the runtime
     /// sidecar shipped to nodes and wallets.
     pub production_v3_verifier_workers: Option<ProductionV3VerifierWorkerIdentityPins>,
+    pub production_v4_activation: Option<ProductionV4ActivationEvidence>,
+    pub production_v4_artifacts: Option<ProductionV4ArtifactIdentityPins>,
     pub production_network_identity: Option<ProductionRcNetworkIdentityPin>,
 }
 
@@ -175,6 +197,8 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     activation: None,
     production_v3_artifacts: PRODUCTION_V3_TESTNET_ARTIFACT_PINS,
     production_v3_verifier_workers: PRODUCTION_V3_TESTNET_WORKER_PINS,
+    production_v4_activation: None,
+    production_v4_artifacts: None,
     production_network_identity: None,
 };
 
@@ -220,6 +244,24 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
     activation: None,
     production_v3_artifacts: None,
     production_v3_verifier_workers: None,
+    production_v4_activation: None,
+    production_v4_artifacts: Some(PRODUCTION_V4_TESTNET_ARTIFACT_PINS),
+    production_network_identity: None,
+};
+
+/// ProductionV4 release-candidate shape. Every launch-specific identity is
+/// intentionally absent until it is independently reproduced and approved.
+/// Selecting `production-rc` therefore chooses the correct proof system but
+/// still fails closed in the build gate.
+#[cfg(feature = "production-rc")]
+pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
+    network: CompiledNetworkProfile::Rcnet,
+    proof: ConsensusProofSelection::ProductionV4,
+    activation: None,
+    production_v3_artifacts: None,
+    production_v3_verifier_workers: None,
+    production_v4_activation: None,
+    production_v4_artifacts: None,
     production_network_identity: None,
 };
 
@@ -230,13 +272,19 @@ pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProf
 /// checkout commit is deliberately not a source constant: trusted CI supplies
 /// it to the build gate so the finalizer can compare it with the exact checkout
 /// without a self-reference.
-#[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+#[cfg(not(any(
+    feature = "production-v3-testnet",
+    feature = "production-v4-testnet",
+    feature = "production-rc"
+)))]
 pub const COMPILED_RELEASE_PROFILE: CompiledReleaseProfile = CompiledReleaseProfile {
     network: CompiledNetworkProfile::Devnet,
     proof: ConsensusProofSelection::DevnetV2Reference,
     activation: None,
     production_v3_artifacts: None,
     production_v3_verifier_workers: None,
+    production_v4_activation: None,
+    production_v4_artifacts: None,
     production_network_identity: None,
 };
 
@@ -339,7 +387,7 @@ fn validate_production_network_identity(
     Ok(())
 }
 
-pub fn validate_production_rc(
+fn validate_legacy_production_v3_rc(
     profile: CompiledReleaseProfile,
     build_source_commit: &str,
 ) -> Result<(), &'static str> {
@@ -400,6 +448,77 @@ pub fn validate_production_rc(
     Ok(())
 }
 
+pub fn validate_production_rc(
+    profile: CompiledReleaseProfile,
+    build_source_commit: &str,
+) -> Result<(), &'static str> {
+    if profile.network != CompiledNetworkProfile::Rcnet {
+        return Err("compiled network profile is not RCNet");
+    }
+    if profile.proof != ConsensusProofSelection::ProductionV4 {
+        return Err("compiled consensus proof selection is not ProductionV4");
+    }
+    validate_production_network_identity(
+        profile
+            .production_network_identity
+            .ok_or("production RC network identity pin is absent")?,
+    )?;
+    let evidence = profile
+        .production_v4_activation
+        .ok_or("ProductionV4 activation evidence is absent")?;
+    if evidence.schema != "CMFD_PRODUCTION_V4_ACTIVATION_V1" {
+        return Err("ProductionV4 activation evidence schema is unsupported");
+    }
+    if !is_nonzero_lower_hex(build_source_commit, 20)
+        && !is_nonzero_lower_hex(build_source_commit, 32)
+    {
+        return Err("trusted production RC build source commit is invalid");
+    }
+    if !is_nonzero_lower_hex(evidence.qualification_source_commit, 20)
+        && !is_nonzero_lower_hex(evidence.qualification_source_commit, 32)
+    {
+        return Err("ProductionV4 qualification source commit is invalid");
+    }
+    for (digest, error) in [
+        (
+            evidence.qualification_manifest_sha256,
+            "ProductionV4 qualification manifest digest is invalid",
+        ),
+        (
+            evidence.fresh_process_verifier_binary_sha256,
+            "ProductionV4 fresh-process verifier binary digest is invalid",
+        ),
+        (
+            evidence.fresh_process_verifier_report_sha256,
+            "ProductionV4 fresh-process verifier report digest is invalid",
+        ),
+        (
+            evidence.core_spec_sha256,
+            "ProductionV4 core specification digest is invalid",
+        ),
+        (
+            evidence.core_vector_sha256,
+            "ProductionV4 core vector digest is invalid",
+        ),
+        (
+            evidence.proof_algebra_sha256,
+            "ProductionV4 proof algebra digest is invalid",
+        ),
+    ] {
+        if !is_nonzero_lower_hex(digest, 32) {
+            return Err(error);
+        }
+    }
+    let artifacts = profile
+        .production_v4_artifacts
+        .ok_or("ProductionV4 artifact identity pins are absent")?;
+    if !valid_file_identity_pin(artifacts.bank) || !valid_file_identity_pin(artifacts.fixed_record)
+    {
+        return Err("ProductionV4 artifact identity pins are invalid");
+    }
+    Ok(())
+}
+
 /// Exact activation-evidence bytes hashed into the compiled ProductionV3
 /// network manifest and staged by the release finalizer.
 ///
@@ -410,7 +529,7 @@ pub fn canonical_production_v3_activation_evidence_json(
     profile: CompiledReleaseProfile,
     build_source_commit: &str,
 ) -> Result<Vec<u8>, &'static str> {
-    validate_production_rc(profile, build_source_commit)?;
+    validate_legacy_production_v3_rc(profile, build_source_commit)?;
     let evidence = profile
         .activation
         .ok_or("ProductionV3 activation evidence is absent")?;
@@ -459,6 +578,57 @@ pub fn canonical_production_v3_activation_evidence_json(
     .into_bytes())
 }
 
+/// Exact activation-evidence bytes hashed into a ProductionV4 RC network
+/// manifest. The source commit remains a trusted build input so the source
+/// tree never attempts to hash a value that contains itself.
+#[allow(dead_code)] // build.rs validates evidence but does not serialize it.
+pub fn canonical_production_v4_activation_evidence_json(
+    profile: CompiledReleaseProfile,
+    build_source_commit: &str,
+) -> Result<Vec<u8>, &'static str> {
+    validate_production_rc(profile, build_source_commit)?;
+    let evidence = profile
+        .production_v4_activation
+        .ok_or("ProductionV4 activation evidence is absent")?;
+    let artifacts = profile
+        .production_v4_artifacts
+        .ok_or("ProductionV4 artifact identity pins are absent")?;
+    Ok(format!(
+        concat!(
+            "{{\"artifacts\":{{",
+            "\"bank\":{{\"blake3\":\"{}\",\"bytes\":\"{}\",\"sha256\":\"{}\"}},",
+            "\"fixed_record\":{{\"blake3\":\"{}\",\"bytes\":\"{}\",\"sha256\":\"{}\"}}}},",
+            "\"core_spec_sha256\":\"{}\",",
+            "\"core_vector_sha256\":\"{}\",",
+            "\"fresh_process_verifier_binary_sha256\":\"{}\",",
+            "\"fresh_process_verifier_report_sha256\":\"{}\",",
+            "\"network_profile\":\"RCNet-1\",",
+            "\"proof_algebra_sha256\":\"{}\",",
+            "\"proof_selection\":\"ProductionV4\",",
+            "\"qualification_manifest_sha256\":\"{}\",",
+            "\"qualification_source_commit\":\"{}\",",
+            "\"schema\":\"{}\",",
+            "\"source_commit\":\"{}\"}}\n"
+        ),
+        lower_hex(artifacts.bank.blake3),
+        artifacts.bank.bytes,
+        lower_hex(artifacts.bank.sha256),
+        lower_hex(artifacts.fixed_record.blake3),
+        artifacts.fixed_record.bytes,
+        lower_hex(artifacts.fixed_record.sha256),
+        evidence.core_spec_sha256,
+        evidence.core_vector_sha256,
+        evidence.fresh_process_verifier_binary_sha256,
+        evidence.fresh_process_verifier_report_sha256,
+        evidence.proof_algebra_sha256,
+        evidence.qualification_manifest_sha256,
+        evidence.qualification_source_commit,
+        evidence.schema,
+        build_source_commit,
+    )
+    .into_bytes())
+}
+
 pub fn validate_production_rc_for_network(
     profile: CompiledReleaseProfile,
     build_source_commit: &str,
@@ -501,6 +671,28 @@ mod tests {
             sha256: [0x49; 32],
         },
     };
+    const V4_EVIDENCE: ProductionV4ActivationEvidence = ProductionV4ActivationEvidence {
+        schema: "CMFD_PRODUCTION_V4_ACTIVATION_V1",
+        qualification_source_commit: "1111111111111111111111111111111111111111",
+        qualification_manifest_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+        fresh_process_verifier_binary_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+        fresh_process_verifier_report_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
+        core_spec_sha256: "6666666666666666666666666666666666666666666666666666666666666666",
+        core_vector_sha256: "7777777777777777777777777777777777777777777777777777777777777777",
+        proof_algebra_sha256: "8888888888888888888888888888888888888888888888888888888888888888",
+    };
+    const V4_ARTIFACTS: ProductionV4ArtifactIdentityPins = ProductionV4ArtifactIdentityPins {
+        bank: ProductionV3FileIdentityPin {
+            bytes: 1,
+            blake3: [0x44; 32],
+            sha256: [0x45; 32],
+        },
+        fixed_record: ProductionV3FileIdentityPin {
+            bytes: 2,
+            blake3: [0x46; 32],
+            sha256: [0x47; 32],
+        },
+    };
     const BUILD_SOURCE_COMMIT: &str = "5555555555555555555555555555555555555555";
     const fn varied(seed: u8) -> [u8; 32] {
         let mut value = [0_u8; 32];
@@ -528,6 +720,19 @@ mod tests {
         community_reward_destination: varied(193),
     };
 
+    fn v4_profile() -> CompiledReleaseProfile {
+        CompiledReleaseProfile {
+            network: CompiledNetworkProfile::Rcnet,
+            proof: ConsensusProofSelection::ProductionV4,
+            activation: None,
+            production_v3_artifacts: None,
+            production_v3_verifier_workers: None,
+            production_v4_activation: Some(V4_EVIDENCE),
+            production_v4_artifacts: Some(V4_ARTIFACTS),
+            production_network_identity: Some(NETWORK_IDENTITY),
+        }
+    }
+
     #[test]
     fn production_rc_labels_are_distinct_from_devnet_rc_labels() {
         for label in ["production-rc1", "mainnet-rc.2", "v1.0.0-rc1"] {
@@ -547,17 +752,19 @@ mod tests {
     }
 
     #[test]
-    fn gate_requires_production_v3_activation_and_artifact_pins() {
+    fn legacy_v3_gate_requires_activation_artifacts_and_workers() {
         let no_v3 = CompiledReleaseProfile {
             network: CompiledNetworkProfile::Rcnet,
             proof: ConsensusProofSelection::DevnetV2Reference,
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
             production_v3_verifier_workers: Some(VERIFIER_WORKERS),
+            production_v4_activation: None,
+            production_v4_artifacts: None,
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
-            validate_production_rc(no_v3, BUILD_SOURCE_COMMIT),
+            validate_legacy_production_v3_rc(no_v3, BUILD_SOURCE_COMMIT),
             Err("compiled consensus proof selection is not ProductionV3")
         );
 
@@ -567,10 +774,12 @@ mod tests {
             activation: None,
             production_v3_artifacts: Some(ARTIFACTS),
             production_v3_verifier_workers: Some(VERIFIER_WORKERS),
+            production_v4_activation: None,
+            production_v4_artifacts: None,
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
-            validate_production_rc(no_evidence, BUILD_SOURCE_COMMIT),
+            validate_legacy_production_v3_rc(no_evidence, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 activation evidence is absent")
         );
 
@@ -580,10 +789,12 @@ mod tests {
             activation: Some(EVIDENCE),
             production_v3_artifacts: None,
             production_v3_verifier_workers: Some(VERIFIER_WORKERS),
+            production_v4_activation: None,
+            production_v4_artifacts: None,
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
-            validate_production_rc(no_artifacts, BUILD_SOURCE_COMMIT),
+            validate_legacy_production_v3_rc(no_artifacts, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 artifact identity pins are absent")
         );
 
@@ -593,10 +804,12 @@ mod tests {
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
             production_v3_verifier_workers: None,
+            production_v4_activation: None,
+            production_v4_artifacts: None,
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         assert_eq!(
-            validate_production_rc(no_runtime_worker, BUILD_SOURCE_COMMIT),
+            validate_legacy_production_v3_rc(no_runtime_worker, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 runtime verifier-worker pin is absent")
         );
 
@@ -608,7 +821,7 @@ mod tests {
             ..no_runtime_worker
         };
         assert_eq!(
-            validate_production_rc(zero_runtime_worker, BUILD_SOURCE_COMMIT),
+            validate_legacy_production_v3_rc(zero_runtime_worker, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 runtime verifier-worker pin is invalid")
         );
 
@@ -620,7 +833,7 @@ mod tests {
             ..no_runtime_worker
         };
         assert_eq!(
-            validate_production_rc(placeholder_runtime_worker, BUILD_SOURCE_COMMIT),
+            validate_legacy_production_v3_rc(placeholder_runtime_worker, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 runtime verifier-worker pin is invalid")
         );
 
@@ -632,7 +845,7 @@ mod tests {
             ..no_runtime_worker
         };
         assert_eq!(
-            validate_production_rc(identical_runtime_workers, BUILD_SOURCE_COMMIT),
+            validate_legacy_production_v3_rc(identical_runtime_workers, BUILD_SOURCE_COMMIT),
             Err("ProductionV3 runtime verifier-worker pin is invalid")
         );
     }
@@ -651,15 +864,53 @@ mod tests {
     }
 
     #[test]
-    fn gate_accepts_only_a_complete_rcnet_v3_profile() {
-        let profile = CompiledReleaseProfile {
-            network: CompiledNetworkProfile::Rcnet,
+    fn production_rc_gate_requires_v4_evidence_and_artifact_pins() {
+        let wrong_proof = CompiledReleaseProfile {
             proof: ConsensusProofSelection::ProductionV3,
-            activation: Some(EVIDENCE),
-            production_v3_artifacts: Some(ARTIFACTS),
-            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
-            production_network_identity: Some(NETWORK_IDENTITY),
+            ..v4_profile()
         };
+        assert_eq!(
+            validate_production_rc(wrong_proof, BUILD_SOURCE_COMMIT),
+            Err("compiled consensus proof selection is not ProductionV4")
+        );
+
+        let no_evidence = CompiledReleaseProfile {
+            production_v4_activation: None,
+            ..v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(no_evidence, BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 activation evidence is absent")
+        );
+
+        let no_artifacts = CompiledReleaseProfile {
+            production_v4_artifacts: None,
+            ..v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(no_artifacts, BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 artifact identity pins are absent")
+        );
+
+        let invalid_artifacts = CompiledReleaseProfile {
+            production_v4_artifacts: Some(ProductionV4ArtifactIdentityPins {
+                fixed_record: ProductionV3FileIdentityPin {
+                    bytes: 0,
+                    ..V4_ARTIFACTS.fixed_record
+                },
+                ..V4_ARTIFACTS
+            }),
+            ..v4_profile()
+        };
+        assert_eq!(
+            validate_production_rc(invalid_artifacts, BUILD_SOURCE_COMMIT),
+            Err("ProductionV4 artifact identity pins are invalid")
+        );
+    }
+
+    #[test]
+    fn production_rc_gate_accepts_only_a_complete_rcnet_v4_profile() {
+        let profile = v4_profile();
         assert_eq!(validate_production_rc(profile, BUILD_SOURCE_COMMIT), Ok(()));
         assert_eq!(
             validate_production_rc_for_network(profile, BUILD_SOURCE_COMMIT, NETWORK_IDENTITY),
@@ -678,6 +929,55 @@ mod tests {
     }
 
     #[test]
+    fn v4_activation_evidence_encoding_is_canonical() {
+        let encoded =
+            canonical_production_v4_activation_evidence_json(v4_profile(), BUILD_SOURCE_COMMIT)
+                .unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            concat!(
+                "{\"artifacts\":{\"bank\":{\"blake3\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+                "\"bytes\":\"1\",\"sha256\":\"4545454545454545454545454545454545454545454545454545454545454545\"},",
+                "\"fixed_record\":{\"blake3\":\"4646464646464646464646464646464646464646464646464646464646464646\",",
+                "\"bytes\":\"2\",\"sha256\":\"4747474747474747474747474747474747474747474747474747474747474747\"}},",
+                "\"core_spec_sha256\":\"6666666666666666666666666666666666666666666666666666666666666666\",",
+                "\"core_vector_sha256\":\"7777777777777777777777777777777777777777777777777777777777777777\",",
+                "\"fresh_process_verifier_binary_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
+                "\"fresh_process_verifier_report_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
+                "\"network_profile\":\"RCNet-1\",",
+                "\"proof_algebra_sha256\":\"8888888888888888888888888888888888888888888888888888888888888888\",",
+                "\"proof_selection\":\"ProductionV4\",",
+                "\"qualification_manifest_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+                "\"qualification_source_commit\":\"1111111111111111111111111111111111111111\",",
+                "\"schema\":\"CMFD_PRODUCTION_V4_ACTIVATION_V1\",",
+                "\"source_commit\":\"5555555555555555555555555555555555555555\"}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_v3_gate_accepts_a_complete_v3_profile() {
+        let profile = CompiledReleaseProfile {
+            network: CompiledNetworkProfile::Rcnet,
+            proof: ConsensusProofSelection::ProductionV3,
+            activation: Some(EVIDENCE),
+            production_v3_artifacts: Some(ARTIFACTS),
+            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
+            production_v4_activation: None,
+            production_v4_artifacts: None,
+            production_network_identity: Some(NETWORK_IDENTITY),
+        };
+        assert_eq!(
+            validate_legacy_production_v3_rc(profile, BUILD_SOURCE_COMMIT),
+            Ok(())
+        );
+        assert_eq!(
+            validate_legacy_production_v3_rc(profile, ""),
+            Err("trusted production RC build source commit is invalid")
+        );
+    }
+
+    #[test]
     fn activation_evidence_encoding_is_canonical_and_uses_dynamic_build_commit() {
         let profile = CompiledReleaseProfile {
             network: CompiledNetworkProfile::Rcnet,
@@ -685,6 +985,8 @@ mod tests {
             activation: Some(EVIDENCE),
             production_v3_artifacts: Some(ARTIFACTS),
             production_v3_verifier_workers: Some(VERIFIER_WORKERS),
+            production_v4_activation: None,
+            production_v4_artifacts: None,
             production_network_identity: Some(NETWORK_IDENTITY),
         };
         let encoded =
@@ -715,10 +1017,12 @@ mod tests {
     fn gate_rejects_placeholder_and_unsafe_network_identity_values() {
         let profile = |identity| CompiledReleaseProfile {
             network: CompiledNetworkProfile::Rcnet,
-            proof: ConsensusProofSelection::ProductionV3,
-            activation: Some(EVIDENCE),
-            production_v3_artifacts: Some(ARTIFACTS),
-            production_v3_verifier_workers: Some(VERIFIER_WORKERS),
+            proof: ConsensusProofSelection::ProductionV4,
+            activation: None,
+            production_v3_artifacts: None,
+            production_v3_verifier_workers: None,
+            production_v4_activation: Some(V4_EVIDENCE),
+            production_v4_artifacts: Some(V4_ARTIFACTS),
             production_network_identity: identity,
         };
         assert_eq!(

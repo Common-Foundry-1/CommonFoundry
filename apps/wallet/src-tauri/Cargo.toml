@@ -25,8 +25,9 @@ production-v3 = [
     "cmfd-proof-worker/production-v3",
 ]
 production-v3-testnet = ["production-v3", "cmfd-node/production-v3-testnet"]
-production-v4-testnet = ["cmfd-node/production-v4-testnet"]
-production-rc = ["production-v3", "cmfd-node/production-rc"]
+production-v4 = ["cmfd-node/production-v4"]
+production-v4-testnet = ["production-v4", "cmfd-node/production-v4-testnet"]
+production-rc = ["production-v4", "cmfd-node/production-rc"]
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }

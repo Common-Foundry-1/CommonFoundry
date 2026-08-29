@@ -1,5 +1,5 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cmfd_node::pool::{PoolClient, PoolClientConfig, PoolError, PoolWorkSearchResult};
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use cmfd_node::production_v4_pool::{
     ProductionV4PersistentPoolSearcher, production_v4_pool_searcher_config,
 };
@@ -23,7 +23,7 @@ const SEARCH_BATCH_ATTEMPTS: u64 = 4_096;
 const POOL_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
 const POOL_RECONNECT_MAX: Duration = Duration::from_secs(4);
 const POOL_RECONNECT_POLL: Duration = Duration::from_millis(25);
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 const PRODUCTION_V4_POOL_SEARCH_BATCH_SIZE: u32 = 32;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -99,11 +99,11 @@ pub struct MiningManager {
     node: Arc<Mutex<Node>>,
     status: Arc<Mutex<MiningStatus>>,
     control: Mutex<MinerControl>,
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     production_v4_pool_search: Option<ProductionV4PoolSearchAssets>,
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 #[derive(Clone)]
 pub(crate) struct ProductionV4PoolSearchAssets {
     pub replay_worker: PathBuf,
@@ -112,7 +112,7 @@ pub(crate) struct ProductionV4PoolSearchAssets {
     pub wsl_distribution: Option<String>,
 }
 
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 fn start_production_v4_pool_searcher(
     assets: ProductionV4PoolSearchAssets,
 ) -> Result<ProductionV4PersistentPoolSearcher, PoolError> {
@@ -158,12 +158,12 @@ impl MiningManager {
                 worker: None,
                 shutting_down: false,
             }),
-            #[cfg(feature = "production-v4-testnet")]
+            #[cfg(feature = "production-v4")]
             production_v4_pool_search: None,
         }
     }
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     pub(crate) fn new_with_production_v4_pool_search(
         node: Arc<Mutex<Node>>,
         assets: ProductionV4PoolSearchAssets,
@@ -337,7 +337,7 @@ impl MiningManager {
         let thread_stop = Arc::clone(&stop);
         let node = Arc::clone(&self.node);
         let status = Arc::clone(&self.status);
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         let production_v4_pool_search = self.production_v4_pool_search.clone();
         let worker_name = match request.mode {
             MiningMode::Solo => "cmfd-solo-miner",
@@ -350,7 +350,7 @@ impl MiningManager {
                     status,
                     thread_stop,
                     config,
-                    #[cfg(feature = "production-v4-testnet")]
+                    #[cfg(feature = "production-v4")]
                     production_v4_pool_search,
                 ),
                 None => mining_loop(node, status, thread_stop, payout),
@@ -743,11 +743,11 @@ fn pool_mining_loop(
     status: Arc<Mutex<MiningStatus>>,
     stop: Arc<AtomicBool>,
     config: PoolClientConfig,
-    #[cfg(feature = "production-v4-testnet")] production_v4_pool_search: Option<
+    #[cfg(feature = "production-v4")] production_v4_pool_search: Option<
         ProductionV4PoolSearchAssets,
     >,
 ) {
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     let production_v4_pool_searcher =
         if COMPILED_NETWORK_PROFILE.proof == ProofProfile::ProductionV4 {
             match production_v4_pool_search {
@@ -816,7 +816,7 @@ fn pool_mining_loop(
             &mut credited_atoms,
             &mut cuda,
             &mut cuda_initialized,
-            #[cfg(feature = "production-v4-testnet")]
+            #[cfg(feature = "production-v4")]
             production_v4_pool_searcher.as_ref(),
         ) {
             Ok(()) => break,
@@ -854,7 +854,7 @@ fn mine_pool_connection(
     credited_atoms: &mut u64,
     cuda: &mut Option<CudaMiner>,
     cuda_initialized: &mut bool,
-    #[cfg(feature = "production-v4-testnet")] production_v4_pool_searcher: Option<
+    #[cfg(feature = "production-v4")] production_v4_pool_searcher: Option<
         &ProductionV4PersistentPoolSearcher,
     >,
 ) -> Result<(), PoolError> {
@@ -864,7 +864,7 @@ fn mine_pool_connection(
             status,
             stop,
             credited_atoms,
-            #[cfg(feature = "production-v4-testnet")]
+            #[cfg(feature = "production-v4")]
             production_v4_pool_searcher,
         );
     }
@@ -983,7 +983,7 @@ fn mine_production_v4_pool_connection(
     status: &Mutex<MiningStatus>,
     stop: &AtomicBool,
     credited_atoms: &mut u64,
-    #[cfg(feature = "production-v4-testnet")] production_v4_pool_searcher: Option<
+    #[cfg(feature = "production-v4")] production_v4_pool_searcher: Option<
         &ProductionV4PersistentPoolSearcher,
     >,
 ) -> Result<(), PoolError> {
@@ -998,14 +998,14 @@ fn mine_production_v4_pool_connection(
         }
         if let Ok(mut current) = status.lock() {
             current.current_height = job.challenge.height.saturating_sub(1);
-            #[cfg(feature = "production-v4-testnet")]
+            #[cfg(feature = "production-v4")]
             if production_v4_pool_searcher.is_some() {
                 current.engine = MiningEngine::Cuda;
                 current.device = Some("Persistent ProductionV4 CUDA batch search".to_owned());
             } else {
                 current.device = Some("Pool-owned ProductionV4 replay verifier".to_owned());
             }
-            #[cfg(not(feature = "production-v4-testnet"))]
+            #[cfg(not(feature = "production-v4"))]
             {
                 current.device = Some("Pool-owned ProductionV4 replay verifier".to_owned());
             }
@@ -1016,7 +1016,7 @@ fn mine_production_v4_pool_connection(
             &job,
             cursor.next_nonce,
             stop,
-            #[cfg(feature = "production-v4-testnet")]
+            #[cfg(feature = "production-v4")]
             production_v4_pool_searcher,
         )?;
         let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
@@ -1108,11 +1108,11 @@ fn production_v4_pool_search_batch(
     job: &cmfd_node::pool::PoolJob,
     start_nonce: u64,
     stop: &AtomicBool,
-    #[cfg(feature = "production-v4-testnet")] production_v4_pool_searcher: Option<
+    #[cfg(feature = "production-v4")] production_v4_pool_searcher: Option<
         &ProductionV4PersistentPoolSearcher,
     >,
 ) -> Result<PoolWorkSearchResult, PoolError> {
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     if let Some(searcher) = production_v4_pool_searcher {
         return searcher.search(job, start_nonce, stop);
     }
@@ -1377,21 +1377,21 @@ fn pool_client_error(code: &'static str, error: PoolError, retryable: bool) -> N
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     use std::fs;
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     use std::path::PathBuf;
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     use std::sync::Barrier;
     use std::time::Duration;
 
     use cmfd_node::default_miner_destination;
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     use cmfd_node::pool::{PoolServerConfig, generate_pool_certificate, spawn_pool_server};
 
     use super::*;
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     fn test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "cmfd-desktop-mining-{name}-{}-{}",
@@ -1403,7 +1403,7 @@ mod tests {
         ))
     }
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     fn request(mode: MiningMode) -> MiningStartRequest {
         MiningStartRequest {
             mode,
@@ -1413,7 +1413,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     fn pool_request(pool_url: String, worker: &str) -> MiningStartRequest {
         MiningStartRequest {
             mode: MiningMode::Pool,
@@ -1423,7 +1423,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     #[test]
     fn continuous_solo_mining_starts_finds_work_and_stops() {
         let path = test_dir("solo");
@@ -1456,7 +1456,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     #[test]
     fn invalid_pool_configuration_and_duplicate_start_are_rejected() {
         let path = test_dir("guards");
@@ -1530,7 +1530,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     #[test]
     fn production_v4_pool_search_requires_cuda_for_nontrivial_targets() {
         let mut job = cmfd_node::pool::PoolJob {
@@ -1564,7 +1564,7 @@ mod tests {
         ));
     }
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     #[test]
     fn pool_mining_uses_pinned_tls_tracks_real_shares_and_never_mines_local_node() {
         let wallet_path = test_dir("pool-wallet-node");
@@ -1676,7 +1676,7 @@ mod tests {
         interrupter.join().unwrap();
     }
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     #[test]
     fn concurrent_start_and_stop_leave_worker_and_status_consistent() {
         let path = test_dir("concurrent-control");
@@ -1727,7 +1727,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
-    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4-testnet")))]
+    #[cfg(not(any(feature = "production-v3-testnet", feature = "production-v4")))]
     #[test]
     fn shutdown_permanently_rejects_starts_and_drains_the_worker() {
         let path = test_dir("shutdown-control");

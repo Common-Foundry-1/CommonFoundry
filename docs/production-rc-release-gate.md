@@ -1,359 +1,152 @@
-# Production RC release gate
+# ProductionV4 release-candidate gate
 
-Production release-candidate labels are fail-closed. A build is treated as a
-production RC when `cmfd-node` is built with the `production-rc` feature, when
-`CMFD_RELEASE_LABEL` names a production/mainnet RC, when the package version is
-a non-Devnet RC, or when GitHub builds a matching production-RC ref. Devnet and
-testnet RC labels are deliberately excluded.
+This is the work order and fail-closed contract for the first Common Foundry
+release-candidate network. RCNet-1 is a launch rehearsal, not mainnet.
 
-The build proceeds only when the source-selected profile is RCNet, its consensus
-proof selector is `ProductionV3`, and the compiled profile contains complete
-activation evidence: the qualification source commit, qualification-manifest
-SHA-256, fresh-process verifier binary SHA-256, and fresh-process verifier report
-SHA-256. A production build must also receive the exact release checkout as
-the trusted `CMFD_BUILD_SOURCE_COMMIT` input. It must also pin the exact byte
-length, BLAKE3 digest, and SHA-256 digest of the production bank, manifest, and
-Record V2, plus distinct Windows x86-64 and Linux x86-64 SHA-256 identities for
-the packaged persistent `cmfd-proof-worker`. The canonical activation-evidence
-bytes include all six artifact/worker identities, so `NETWORK-INFO.json` cannot
-replace those pins without breaking its compiled activation-evidence digest.
-The qualification evidence's
-`fresh_process_verifier_binary_sha256` identifies the `cmfd-consensus`
-qualification harness and must not be reused as the runtime-worker pin. The
-current source selection is Devnet/V2 with no activation evidence, artifact
-pins, runtime-worker pins, or final production-network identity pin, so this
-command must fail:
+## Current status
+
+The source tree now gives RCNet-1 the correct proof shape:
+
+- network profile: `RCNet-1`
+- consensus proof selector: `ProductionV4`
+- verifier: the in-process ProductionV4 verifier
+- proof and block envelopes: the ProductionV4 network-specific limits
+- node, miner, wallet, and pool runtime: shared ProductionV4 feature
+
+The `production-rc` feature deliberately does not contain launch identities.
+It stops in `cmfd-node/build.rs` before a runnable binary is produced. At the
+time of this revision the first blocker is:
 
 ```text
-cargo check --locked -p cmfd-node --features production-rc
+production RC build gate: production RC network identity pin is absent
 ```
 
-Release finalization applies a second, artifact-level check. Any production-RC
-stage must inventory `NETWORK-INFO.json`, `RCNET-LAUNCH-CANDIDATE.json`,
-`PRODUCTION-V3-ACTIVATION.json`, the actual
-`PRODUCTION-V3-QUALIFICATION-MANIFEST.json`, the exact
-`PRODUCTION-V3-FRESH-PROCESS-VERIFIER.bin`, and its
-`PRODUCTION-V3-FRESH-PROCESS-VERIFIER-REPORT.json`. The compiled manifest must
-identify RCNet-1, select `ProductionV3`, bind the checked-out release commit
-provided by the trusted build job, and bind the exact activation-evidence bytes
-by SHA-256.
+This is expected. Real launch values may enter source only after the decisions
+and reproduction checks below are complete.
 
-`cmfd-node rcnet-candidate` creates the launch-candidate file without
-overwriting an existing path. It accepts the canonical final Record V2 and
-explicit timestamp, bootstrap, port, proof-of-work limit, and reward
-destinations. Its launch root binds those values, every compiled consensus and
-economic parameter, and the Record V2/model identities. The network ID and
-virtual genesis are independently derived from that root under distinct
-BLAKE3 domains; neither derived value is an input to the root.
+## Frozen ProductionV4 proof surface
 
-The finalizer recomputes SHA-256 over the staged qualification manifest,
-fresh-process verifier binary, and fresh-process verifier report and requires
-exact matches in the activation evidence. It also checks that the qualification
-manifest binds the staged verifier artifacts, the pinned Cargo and rustc
-binaries, the generated Cargo configuration, production n=33/134-claim
-geometry, an RCNet-1 qualification identity, and a successful fresh-process
-same-build verifier report. This is process isolation, not an independently
-built verifier claim. Arbitrary well-formed nonzero digest strings cannot pass.
-These files then become ordinary hashed release artifacts in `BUILDINFO.json`
-and `SHA256SUMS.txt`.
+The following version-1 documents are the compatibility authority for the
+proof system. Their current SHA-256 values are included here so an activation
+record cannot silently substitute another document.
 
-Both build and finalization gates reject zero or repeated-byte network/genesis
-identities, RFC 5737 documentation bootstraps, and the known deterministic
-Devnet reward keys. Finalization additionally requires the compiled network
-manifest to match the candidate's identity, timestamp, services, difficulty
-limit, rewards, and Record V2 identity. The current RCNet constants remain
-placeholders and therefore cannot pass these checks.
+| Authority | SHA-256 |
+|---|---|
+| `docs/consensus/production-v4-core-spec-v1.md` | `507075fb6d22b7ac0968508b18c48a09a017806e7d4e0454b71f8ae88440df84` |
+| `docs/consensus/production-v4-core-vector-v1.json` | `c885ae499a65c5bb965e08f4894a0d2768d823b0e23979958f00e3db73e0b168` |
+| `docs/consensus/production-v4-proof-algebra-v1.md` | `5a686ad518a7d957b8af908fb52cd58056e63da4dab578a40d4ef097654aaf33` |
 
-For the binary-only RC, finalization also pins the service allocation to RPC
-`19443`, P2P `19444`, and pool `19445`; rejects source-like top-level release
-assets; and requires the wallet JavaScript package, Tauri package/config, node,
-miner, and proof-worker manifests that produce shipped applications to carry
-the exact same non-Devnet RC version supplied to the finalizer. Internal
-library crates retain independent semantic versions. Runtime policy keeps RPC
-loopback-only. Release launchers and firewall instructions must expose only TCP
-`19444`; they must not start or expose the pool service on `19445`.
+The frozen core vector binds:
 
-These checks do not sign binaries or `SHA256SUMS.txt`, generate an SBOM, inspect
-the contents of GitHub's automatically generated source archives, or distribute
-the multi-gigabyte model bank. Those are separate release gates. A public
-binary repository must contain only reviewed binary-release metadata, and the
-model bank must be delivered through a create-new partial download that checks
-the compiled byte length, BLAKE3, and SHA-256 pins before atomic publication.
-The node then authenticates the bank, manifest, and Record V2 again before
-opening chain storage.
+- algorithm version `4` and proof version `1`
+- proof-system digest
+  `e849e3bfc83f8f8dd0f1fc1100879417718ba2bffb92af5cd649b61c720675a3`
+- model-manifest digest
+  `68f6fe674f75a363c62c275ebb11fa74aa089e9bbde5bcb952ec35b8890b575c`
+- fixed-record digest
+  `2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e`
+- exact transparent proof size `12,025,320` bytes
+- maximum transparent payload `13,631,259` bytes
+- maximum proof frame `13,631,488` bytes
+- maximum block frame `16,777,216` bytes
 
-The qualification manifest records the older exact commit used to build and
-run the qualifying verifier. The final activation evidence separately records
-the release checkout commit supplied as trusted CI input. This avoids the
-impossible requirement for a committed source constant to contain its own
-future commit hash; the release finalizer matches the dynamic build identity to
-the checked-out commit.
+Changing any of these is a new proof-system revision, not an RC packaging
+change.
 
-Changing a label, branch name, archive name, or package name cannot satisfy
-these checks. Activation requires the real profile/proof integration and the
-committed qualification evidence; no override or fallback flag exists.
+## Launch identities that remain to be selected
 
-## Runtime sidecar contract
+RCNet-1 cannot be enabled until each item below has a reviewed, final value:
 
-An activated RC node or wallet launched without artifact arguments resolves one
-fixed layout relative to its own executable directory:
+1. Network ID.
+2. Virtual-genesis hash and timestamp.
+3. Proof-of-work limit and initial difficulty policy.
+4. Steward and community reward destinations with documented custody.
+5. Public bootstrap address and final RC ports.
+6. Exact model-bank and fixed-record byte length, BLAKE3, and SHA-256 pins.
+7. Qualification source commit and qualification manifest.
+8. Fresh-process verifier executable and report identities.
 
-```text
-cmfd-node[.exe] or common-foundry-wallet[.exe]
-cmfd-proof-worker[.exe]
-production-v3/MODEL-V2.bank
-production-v3/MODEL-V2.manifest.json
-production-v3/DORY-V3-MODEL-RECORD-V2.json
+The current repeated-byte identifiers, development reward destinations,
+development proof-of-work limit, and RFC 5737 bootstrap address are explicit
+placeholders. The build gate rejects them.
+
+## Canonical activation evidence
+
+`CMFD_PRODUCTION_V4_ACTIVATION_V1` is the canonical evidence schema. Its JSON
+encoding is produced only by
+`canonical_production_v4_activation_evidence_json` and binds:
+
+- exact bank and fixed-record identities
+- qualification source commit
+- qualification manifest SHA-256
+- fresh-process verifier executable SHA-256
+- fresh-process verifier report SHA-256
+- all three normative specification SHA-256 values
+- trusted build source commit
+- `RCNet-1` and `ProductionV4`
+
+The trusted build commit is supplied by release automation through
+`CMFD_BUILD_SOURCE_COMMIT`; it is not embedded as a self-referential source
+constant.
+
+## Independent reproduction gate
+
+Before launch pins are inserted, a second clean environment must reproduce:
+
+1. The model bank and fixed artifact record from the documented inputs.
+2. All byte counts, BLAKE3 digests, and SHA-256 digests.
+3. The proof-system, model-manifest, and fixed-record digests.
+4. Every expected value and rejection case in the canonical core vector.
+5. One fresh-process known-valid proof verification and the required mutation
+   rejection set.
+6. The exact qualification manifest and verifier report.
+
+The reproducer records OS, architecture, compiler versions, source commit,
+commands, inputs, outputs, and hashes. The original producer and independent
+reproducer sign the resulting manifest separately.
+
+## Build and test gates
+
+Safe local validation uses bounded build concurrency:
+
+```powershell
+$env:CARGO_BUILD_JOBS = '4'
+cargo test -p cmfd-node --lib --features production-v4
+cargo test -p cmfd-node --lib --features production-v4-testnet
+cargo test -p cmfd-miner --features production-v4-testnet
+cargo test -p common-foundry-wallet --lib --features production-v4-testnet
+cargo clippy -p cmfd-node --features production-v4-testnet --all-targets
+cargo clippy -p cmfd-miner --features production-v4-testnet --all-targets
+cargo clippy -p common-foundry-wallet --features production-v4-testnet --all-targets
 ```
 
-Every path is canonicalized and must be a regular file. The existing compiled
-byte-length/BLAKE3/SHA-256 artifact gates authenticate the three model files.
-The selected platform's compiled worker SHA-256 authenticates the sidecar.
-Explicit paths are accepted only as one complete set and still must match those
-compiled identities. Startup never downloads, discovers, or invents a missing
-artifact.
+The negative RC gate is also mandatory:
 
-The worker hashes while copying the sidecar into a private runtime directory,
-synchronizes and makes that copy non-writable, then rehashes immediately before
-each execution. Source metadata and the streaming copy are both bounded to 512
-MiB so a mismatched package path cannot fill the runtime disk before its digest
-is rejected. Retained exact-object handles prevent same-user replacement of the
-configured worker and private image through mapping and process lifetime. They
-do not pin transitive dynamic libraries; package ACLs/signatures remain a
-release responsibility.
-Request timeouts and process teardown terminate the contained process tree and
-never wait indefinitely for an inherited pipe reader. A pipe owner that somehow
-survives containment is detached and cannot yield a trusted response or
-capability; repeated containment escapes remain an operating-system and package
-trust concern rather than a consensus fallback.
-
-The worker pin is not source-circular with the node profile: the worker does not
-depend on `cmfd-node`, its release-profile constants, or
-`CMFD_BUILD_SOURCE_COMMIT`. The ceremony must nevertheless freeze its source,
-dependencies, features, versions, toolchain, target, and compiler flags; build
-and hash the ProductionV3 worker independently on Windows and Linux; insert only
-those hashes into the node profile; then rebuild both workers from clean target
-directories and require byte-identical hashes before building node/wallet
-packages.
-
-The parent still performs retained-handle, two-pass artifact authentication to
-construct the parameter authority used for proof-free consensus checks. It
-does not verify ProductionV3 proofs. The persistent worker starts and completes
-its authenticated handshake before the data-directory lock is acquired and
-before block-log replay. Every replayed ProductionV3 block is sent through that
-worker and receives a fresh, process-local capability bound to its exact
-canonical statement; no capability is trusted from disk.
-
-Live active-chain and side-branch admissions also require the external
-capability. A side-branch request captures an immutable ancestry tip and chain
-revision under the node mutex, reconstructs and preflights the branch outside
-that mutex using only the already issued capabilities, then rechecks the exact
-revision, block, parent, and acceptance time before the authoritative commit.
-Any concurrent block commit makes the admission stale and retryable. Devnet
-keeps its existing in-process V2 path. The parent and worker each authenticate
-the model artifacts once at startup, so this is still not a single global
-artifact load, but ProductionV3 proof verification itself is external-only and
-bounded by the persistent-worker controls.
-
-Remote ProductionV3 submission is additionally bounded by an eight-session
-active-plus-waiting FIFO with a 60-second admission limit. The shared proof
-queue remains one active/eight normal waiters with a five-second queue limit,
-while locally found blocks retain a separate two-waiter priority lane. Cached
-proofs still take their remote FIFO turn. Node status exposes per-class active,
-queued, wait, rejection, and post-dispatch proof-failure counters plus the
-remote capacity and wait limit.
-
-The release protocol fixes one end-to-end `SubmitBlock` contract: mining and
-relay clients wait up to 120 seconds, server acceptance ends at 110 seconds,
-and the server response cutoff is 115 seconds. Disconnect/deadline and commit
-race through one atomic `Active -> Cancelled | Committing` transition at the
-durable append boundary. Cancellation wins without mutation; committing wins
-only after a post-CAS deadline recheck and by completing durability and state
-commit or latching a storage fault.
-The 115-second cutoff covers the status lock, serialization, and every socket
-write. Queue expiry, capacity exhaustion, and worker restart/unavailability
-produce retryable `Busy`; cryptographic invalidity produces `Rejected`. The
-miner retains the identical ProductionV3 block and proof across compatible
-reconnects for one interruptible 20-minute total budget; `Busy` alone never
-causes a fresh template. Tip changes and budget abandonment have separate
-logs and counters. Shutdown interrupts bounded connect attempts, handshake,
-request writes, response reads, and retry waits. Transport disconnect and peer
-protocol-error telemetry are separate from cryptographic rejection. A faulted
-generation is restarted only by the single-flight supervisor outside the
-remote request, cannot resurrect after terminal close, and is not admitted
-until startup authentication has succeeded.
-
-The current 2 GiB worker memory-limit default is a containment setting, not a
-qualified production requirement. The final Windows and Linux package smoke
-must authenticate the real bank under the configured job/address-space limit,
-record peak RSS/commit and startup time, and raise or otherwise qualify the
-default before activation.
-
-Production finalization requires
-`commonfoundry-rc-runtime-windows-x86_64.zip` and
-`commonfoundry-rc-runtime-linux-x86_64.tar.gz`, plus
-`RUNTIME-ATTESTATION-WINDOWS-X86_64.json` and
-`RUNTIME-ATTESTATION-LINUX-X86_64.json`. Each trusted native packaging job must
-create its attestation by running the packaged node itself:
-
-```text
-python scripts/release_integrity.py runtime-attest --platform PLATFORM \
-  --package-directory EXTRACTED-RUNTIME --expected-commit FULL-COMMIT \
-  --output RUNTIME-ATTESTATION-PLATFORM.json
+```powershell
+$env:CARGO_BUILD_JOBS = '4'
+$env:CMFD_BUILD_SOURCE_COMMIT = '<trusted lowercase source commit>'
+cargo check -p cmfd-node --features production-rc
 ```
 
-The command validates all three packaged executables as PE32+ AMD64 or ELF64
-x86-64 as appropriate, hashes them through stable handles, runs exactly
-`cmfd-node[.exe] network-info` from the packaged directory, rejects stderr or a
-nonzero/timeout result, and rehashes the executables before create-new
-publication. Finalization verifies that each attested output selects its own
-platform worker and otherwise exactly equals the staged network information,
-and that its node, wallet, and worker hashes equal the corresponding archive
-members. This native-job evidence is required because one finalization host
-cannot execute both platform binaries.
+Until every approved identity is present, that command must fail before a node
+can open storage.
 
-The archives have one exact root directory matching the archive stem:
-`commonfoundry-rc-runtime-windows-x86_64` or
-`commonfoundry-rc-runtime-linux-x86_64`. Alternate, reserved, control-bearing,
-or trailing-dot/space roots are rejected before member contents are read.
+## RCNet-1 rehearsal acceptance
 
-The finalizer opens both archives, rejects any prefix, trailing or concatenated
-stream, extra, missing, linked, encrypted, data-descriptor, PAX, unknown-extra,
-commented, or special member, and compares each
-packaged worker and model artifact directly with the identities in the single
-staged `NETWORK-INFO.json`. That file carries both platform worker hashes. The
-model artifacts in both packages must match the same length, BLAKE3, and
-SHA-256 pins. Directories must be empty with canonical modes; files must have
-canonical types and modes; archive inventories are bounded before contents are
-materialized; and ZIP/tar logical endpoints must be exact. Archive publication
-uses atomic create-new semantics and never replaces a racing destination.
-The packaged manifest must equal the manifest embedded in Record V2, while the
-qualification manifest's bank and Record V2 name/size/SHA-256 bindings must
-equal the compiled pins. The existing deterministic ZIP and tar commands stream
-the model bank rather than reading it into memory. Release hosts install the pinned
-dependency in `scripts/requirements-release-integrity.txt` before running the
-ProductionV3 finalizer. CI installs that dependency with its published hashes
-required and runs the parser suite natively on both Linux and Windows.
+After the identity and reproduction gates pass, RCNet-1 must demonstrate:
 
-This gate covers the standalone runtime bundles. The existing NSIS, AppImage, and
-Debian installer builds do not yet install these sidecars beside the wallet and
-therefore remain blocked as ProductionV3 RC packages. Unit fixtures also do not
-substitute for the final real-bank packaged smoke test.
+- independently operated bootstrap and secondary nodes
+- clean Windows and Linux node and wallet installation
+- clean Windows and Linux miner installation
+- peer discovery, catch-up, restart, and reorganization recovery
+- pool share accounting, block submission, maturity, payout, and reorg recovery
+- sustained load at the ProductionV4 resource envelope
+- malformed and oversized network traffic rejection
+- deterministic fresh-process verification of known-valid and mutated proofs
+- signed, reproducible binary-only release artifacts with checksums, SBOM, and
+  provenance
+- documented backup, restore, update, rollback, incident, and key-rotation
+  procedures
 
-## Runtime verifier sandbox gate
-
-Process-tree and memory containment alone are not sufficient for a parser that
-handles hostile ProductionV3 proofs. The Linux x86-64 worker must install
-Landlock ABI 3 or newer and the compiled default-deny seccomp policy before it
-reads/loads model artifact contents or any untrusted IPC frame. The worker
-receives an empty environment and only standard protocol pipes across `exec`.
-Landlock grants read access only to the exact bank, manifest, and Record V2 and
-denies handled filesystem mutation and execution rights. The retained validator
-needs directory-open access on dedicated artifact-parent subtrees; directory
-enumeration is denied, but guessed pathname/stat metadata is not hidden. ABI 3
-does not mediate network access, so it is accepted only together with a seccomp
-allowlist limited to artifact reads, bounded stdio, allocation, clocks, and the
-Rust/Rayon runtime.
-The exact pthread clone mask is the only process-creation primitive and every
-unlisted syscall returns `EPERM`. Failure to establish either control aborts
-startup before replay or P2P.
-
-This Linux checkpoint does not yet provide a per-worker CPU/PID budget.
-`RLIMIT_NPROC` is per real UID, and an allowed pthread can outlive a completed
-request inside the persistent worker. Release remains blocked until delegated
-cgroup v2 limits or an equivalently fail-closed, race-bounded watchdog enforce
-the budget for this worker rather than for the operator account as a whole.
-
-The Windows isolation implementation now creates the verifier suspended in a
-zero-capability LPAC through one `STARTUPINFOEX` call. Its attribute list
-contains the documented LPAC opt-out, the preconfigured kill-on-close Job,
-exactly six inherited handles, child-process restriction, and Win32k and other
-process mitigations. Only bounded stdio and three parent-owned read-only
-artifact handles cross the boundary; the Windows worker has no artifact
-pathname fallback. The parent validates the resulting token, capability count,
-SID, DEP, ASLR, dynamic-code, image-load, Win32k, child-process, SEHOP,
-strict-handle-check, and extension-point mitigations, Job membership, and exact
-limits before resuming the primary thread. It also fails closed if the exact
-new profile SID appears in the system loopback-exemption table. It never
-mutates the shared configured executable or directory ACL. Every launch gets a
-fresh private
-directory and regular executable copy; no-write/no-delete-share handles pin the
-source, exact hash/length-verified destination, and directory through image
-mapping and process lifetime. Reparse or hardlink ambiguity fails closed, only
-the private objects receive the unique SID, and the worker executes only that
-verified path. After confirmed process-tree exit, the exact private file and
-directory are marked for deletion through their retained `DELETE` handles,
-bound by full 128-bit `FILE_ID_INFO`. An added alias, replacement, unconfirmed
-exit, or uncertain cleanup retains or quarantines all relevant pins and latches
-worker health.
-
-A protected owner-only ledger records a durable ownership intent before
-`CreateAppContainerProfile`. Only its live same-process guard can delete the
-registration. Deletion uses bounded delays of `0, 10, 20, 40, 80, 160, 320,
-500 ms`; exhausted deletion or marker cleanup is surfaced and remains
-retryable on that guard. Initialization failures retain quarantine evidence.
-No later process deletes a profile from a persisted name; any stale session,
-including an empty partial session, blocks launch for manual remediation.
-Successful creation is wrapped in that RAII guard before SID validation or
-another fallible step, and forced-panic subprocess regressions require exact
-before/after profile-mapping and temporary-root `FILE_ID_INFO` sets. A fresh
-allowlisted UTF-16 environment replaces ambient inheritance. The native
-sentinel covers supplied-handle reads, artifact and arbitrary-file data and
-metadata denial, exact `WSAStartup` failure 10107, and denial of a real
-`WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP)` request. No socket handle is
-inherited, so the production LPAC never reaches a genuine `connect`, `bind`, or
-`listen` call. A second, explicitly less-restricted regular AppContainer probe
-uses the same zero-capability, non-loopback-exempt profile but initializes
-Winsock and creates its own valid sockets. On the qualification host, a bounded
-outbound connection to the parent's concrete non-loopback listener never
-completes and the parent accepts nothing. Although local `bind` and `listen`
-setup succeed, a parent connection to that listener times out, the child accepts
-nothing, and the endpoint is reusable after teardown. This is measured
-same-host evidence, not production-token evidence and not a substitute for the
-packaged external-host network gate. Neither path grants a registry or network
-capability.
-
-The external-host gate must run the packaged binary on the qualification host
-against a separately routed fleet peer. The packaged production LPAC must
-repeat its exact Winsock-init/socket-creation denial. Its zero-capability
-regular AppContainer companion must attempt an outbound connection to a
-peer-owned listener while the peer records no accept or traffic, then create a
-concrete non-loopback listener while the peer attempts to connect and the child
-records no accept or traffic. Both directions require bounded poll/`SO_ERROR`
-results, the exact profile SID and no-loopback-exemption attestation, and proof
-that the endpoint is reusable after child teardown. Any connection, accept,
-payload, ambiguous timeout, or missing capture fails the gate. The external
-harness and signed evidence do not yet exist; this is an explicit release
-blocker, not a completed qualification claim.
-
-Sockets created outside an AppContainer can retain authority when inherited.
-The exact six-handle list is therefore an enforced boundary: production and
-both sentinels reject any extra handle before creation, and the regression uses
-a real socket as the forbidden seventh handle. The native sentinel also covers
-child creation and ambient environment. Kill-on-last-Job-handle evidence uses
-an inherited-stdio `READY`/`ARMED` barrier; immediately before close, the
-parent requires a nonsignaled process and exact Job accounting of one active
-process. Only the measured zero Job-close exit status passes.
-`STATUS_INVALID_HANDLE`, an arbitrary exception, and any pre-close exit fail.
-Process error mode and WER no-UI flags suppress interactive crash dialogs while
-retaining exact status diagnostics. No `TerminateJobObject` call is used in
-this sentinel path. Its omitted-file check is a trusted parent-side
-`DuplicateHandle` probe while the child is suspended: only
-`ERROR_INVALID_HANDLE` passes, and numeric-slot reuse is an explicit failure.
-The child also queries its own process heap before artifact/IPC reads and
-requires the exact enabled terminate-on-corruption state.
-
-Neither platform is qualified by unit tests alone. Release evidence must show
-the packaged worker reading the real pinned artifacts, completing the startup
-handshake, accepting one known-valid ProductionV3 block, rejecting corruption,
-and passing file read/write, metadata mutation, network, process-spawn,
-unlisted-handle, environment, and teardown escape sentinels. Linux currently
-has the kernel-policy and sentinel implementation; its real-bank packaged run
-and per-worker CPU/PID containment are still outstanding. Windows now has the
-launcher, native escape sentinel, and a real-worker integration that passes
-authenticated deliberately small artifacts through the launcher and reaches
-their expected format rejection. It does not yet have the packaged real-bank,
-known-valid/corrupt-block replay, external-peer bidirectional network-isolation
-run, or independent release evidence. Therefore
-this checkpoint must not activate RCNet or be described as cross-platform
-RC-ready.
+Mainnet activation is a separate decision after the full rehearsal evidence,
+independent audits, and launch operations review are complete.

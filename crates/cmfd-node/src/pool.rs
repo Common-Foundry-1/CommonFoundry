@@ -4026,7 +4026,7 @@ mod tests {
     fn production_pool_profiles_fail_closed_without_share_verifiers() {
         assert!(matches!(
             ensure_pool_profile_supported(crate::RCNET1_PROFILE, false),
-            Err(PoolError::ProductionV3Unsupported)
+            Err(PoolError::ProductionV4Unsupported)
         ));
         assert!(matches!(
             ensure_pool_profile_supported(crate::PRODUCTION_V4_TESTNET_PROFILE, false),

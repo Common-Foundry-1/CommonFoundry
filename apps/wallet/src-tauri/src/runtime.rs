@@ -16,7 +16,7 @@ use cmfd_proof_worker::{ProofWorkerError, VerifierWorkerConfig, VerifierWorkerEr
 use tauri::{App, Manager, Runtime};
 
 use crate::mining::MiningManager;
-#[cfg(feature = "production-v4-testnet")]
+#[cfg(feature = "production-v4")]
 use crate::mining::ProductionV4PoolSearchAssets;
 
 mod config;
@@ -46,7 +46,7 @@ struct EmbeddedNode {
     peers: Arc<PeerManager>,
     services: ServiceHandles,
     log_guard: cmfd_node::logging::WorkerGuard,
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     production_v4_pool_search: Option<ProductionV4PoolSearchAssets>,
 }
 
@@ -79,7 +79,7 @@ impl RuntimeState {
         );
         match start_embedded_node(app, config) {
             Ok(started) => {
-                #[cfg(feature = "production-v4-testnet")]
+                #[cfg(feature = "production-v4")]
                 let mining = match started.production_v4_pool_search.clone() {
                     Some(assets) => MiningManager::new_with_production_v4_pool_search(
                         Arc::clone(&started.node),
@@ -87,7 +87,7 @@ impl RuntimeState {
                     ),
                     None => MiningManager::new(Arc::clone(&started.node)),
                 };
-                #[cfg(not(feature = "production-v4-testnet"))]
+                #[cfg(not(feature = "production-v4"))]
                 let mining = MiningManager::new(Arc::clone(&started.node));
                 Self {
                     mining: Some(Arc::new(mining)),
@@ -202,7 +202,7 @@ fn start_embedded_node<R: Runtime>(
         _ => Err(NodeError::ProofVerifierProfileMismatch),
     }
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
-    #[cfg(feature = "production-v4-testnet")]
+    #[cfg(feature = "production-v4")]
     let production_v4_pool_search =
         production_v4_artifacts
             .as_ref()
@@ -277,7 +277,7 @@ fn start_embedded_node<R: Runtime>(
         peers,
         services: ServiceHandles { inbound },
         log_guard,
-        #[cfg(feature = "production-v4-testnet")]
+        #[cfg(feature = "production-v4")]
         production_v4_pool_search,
     })
 }
@@ -563,11 +563,8 @@ fn open_with_record_gate<T>(
 
 fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> NodeClientError {
     let client = error.client_error();
-    if profile.proof != ProofProfile::ProductionV3 {
-        return client;
-    }
-    match client.code {
-        "production_v3_unavailable" => startup_error(
+    match (profile.proof, client.code) {
+        (ProofProfile::ProductionV3, "production_v3_unavailable") => startup_error(
             client.code,
             format!(
                 "{} ({}) cannot start because this wallet build does not include the ProductionV3 verifier.",
@@ -576,10 +573,28 @@ fn sanitize_node_startup_error(profile: NetworkProfile, error: NodeError) -> Nod
             ),
             false,
         ),
-        "proof_verifier_configuration" => startup_error(
+        (ProofProfile::ProductionV3, "proof_verifier_configuration") => startup_error(
             client.code,
             format!(
                 "{} ({}) rejected the configured Record V2 or proof-verifier identity. Re-download the package if any file changed, keep the production-v3 folder beside the wallet private to your account, and retry.",
+                profile.short_name(),
+                profile.proof.profile_name()
+            ),
+            false,
+        ),
+        (ProofProfile::ProductionV4, "production_v4_unavailable") => startup_error(
+            client.code,
+            format!(
+                "{} ({}) cannot start because this wallet build does not include the ProductionV4 verifier.",
+                profile.short_name(),
+                profile.proof.profile_name()
+            ),
+            false,
+        ),
+        (ProofProfile::ProductionV4, "proof_verifier_configuration") => startup_error(
+            client.code,
+            format!(
+                "{} ({}) rejected the packaged model bank or fixed artifact record. Re-download the package and retry.",
                 profile.short_name(),
                 profile.proof.profile_name()
             ),
@@ -639,6 +654,10 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
             DEFAULT_PROOF_VERIFIER_TIMEOUT_MS,
             DEFAULT_PROOF_VERIFIER_MEMORY_BYTES
         ));
+    } else if profile.proof == ProofProfile::ProductionV4 {
+        help.push_str(
+            "ProductionV4 startup authenticates the packaged model bank and fixed artifact record before opening node storage.\n",
+        );
     }
     help
 }
@@ -659,7 +678,7 @@ pub fn startup_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cmfd_node::{DEVNET_PROFILE, RCNET1_PROFILE};
+    use cmfd_node::{DEVNET_PROFILE, PRODUCTION_V3_TESTNET_PROFILE, RCNET1_PROFILE};
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -716,7 +735,7 @@ mod tests {
     }
 
     fn configured_rc(files: &TestFiles, worker_sha256: [u8; 32]) -> NodeRuntimeConfig {
-        let mut config = base_config(RCNET1_PROFILE);
+        let mut config = base_config(PRODUCTION_V3_TESTNET_PROFILE);
         config.production_v3 = config::ProductionV3RuntimeOptions {
             bank: None,
             manifest: None,
@@ -787,22 +806,34 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "production-v4-testnet"))]
+    #[cfg(not(feature = "production-v4"))]
     #[test]
     fn production_v3_no_argument_package_missing_and_partial_overrides_fail_closed() {
         let files = TestFiles::new();
-        let empty = base_config(RCNET1_PROFILE);
-        let error = security_error(prepare_for_test(RCNET1_PROFILE, &empty, &files.root));
+        let empty = base_config(PRODUCTION_V3_TESTNET_PROFILE);
+        let error = security_error(prepare_for_test(
+            PRODUCTION_V3_TESTNET_PROFILE,
+            &empty,
+            &files.root,
+        ));
         assert_eq!(error.code, "production_v3_file_unavailable");
-        assert!(error.message.contains("RCNet-1 (ProductionV3)"));
+        assert!(
+            error
+                .message
+                .contains("ProductionV3 Testnet-1 (ProductionV3)")
+        );
 
-        let mut partial = base_config(RCNET1_PROFILE);
+        let mut partial = base_config(PRODUCTION_V3_TESTNET_PROFILE);
         partial.production_v3.record_v2 = Some(files.write("only-record.json", b"record"));
-        let error = security_error(prepare_for_test(RCNET1_PROFILE, &partial, &files.root));
+        let error = security_error(prepare_for_test(
+            PRODUCTION_V3_TESTNET_PROFILE,
+            &partial,
+            &files.root,
+        ));
         assert_eq!(error.code, "production_v3_configuration_missing");
     }
 
-    #[cfg(not(feature = "production-v4-testnet"))]
+    #[cfg(not(feature = "production-v4"))]
     #[test]
     fn production_v3_no_argument_package_layout_resolves_fixed_sidecars() {
         let files = TestFiles::new();
@@ -820,7 +851,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = base_config(RCNET1_PROFILE);
+        let config = base_config(PRODUCTION_V3_TESTNET_PROFILE);
         #[cfg(target_os = "linux")]
         let config = {
             // Linux ProductionV3 deliberately has no packaged cgroup defaults;
@@ -832,7 +863,8 @@ mod tests {
             config.production_v3.verifier_pids_limit = Some(16);
             config
         };
-        let security = prepare_for_test(RCNET1_PROFILE, &config, &files.root).unwrap();
+        let security =
+            prepare_for_test(PRODUCTION_V3_TESTNET_PROFILE, &config, &files.root).unwrap();
         let record = security.production_v3_record.unwrap();
         // The resolved path must be the plain form: the trusted ceremony
         // filesystem rejects the `\\?\` verbatim syntax `fs::canonicalize`
@@ -850,11 +882,11 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "production-v4-testnet"))]
+    #[cfg(not(feature = "production-v4"))]
     #[test]
     fn production_v3_rejects_relative_paths_without_echoing_them() {
         let files = TestFiles::new();
-        let mut config = base_config(RCNET1_PROFILE);
+        let mut config = base_config(PRODUCTION_V3_TESTNET_PROFILE);
         config.production_v3 = config::ProductionV3RuntimeOptions {
             bank: None,
             manifest: None,
@@ -869,18 +901,27 @@ mod tests {
             verifier_pids_limit: None,
         };
 
-        let error = security_error(prepare_for_test(RCNET1_PROFILE, &config, &files.root));
+        let error = security_error(prepare_for_test(
+            PRODUCTION_V3_TESTNET_PROFILE,
+            &config,
+            &files.root,
+        ));
         assert_eq!(error.code, "production_v3_path_invalid");
         assert!(!error.message.contains("private"));
         assert!(!error.message.contains("record-v2.json"));
     }
 
+    #[cfg(not(feature = "production-v4"))]
     #[test]
     fn production_v3_rejects_a_worker_hash_mismatch_without_leaking_its_path() {
         let files = TestFiles::new();
         let config = configured_rc(&files, [0; 32]);
 
-        let error = security_error(prepare_for_test(RCNET1_PROFILE, &config, &files.root));
+        let error = security_error(prepare_for_test(
+            PRODUCTION_V3_TESTNET_PROFILE,
+            &config,
+            &files.root,
+        ));
         assert_eq!(error.code, "proof_verifier_identity_mismatch");
         assert!(
             !error
@@ -889,13 +930,14 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "production-v4-testnet"))]
+    #[cfg(not(feature = "production-v4"))]
     #[test]
     fn production_v3_happy_path_is_canonical_and_passed_to_the_node_gate() {
         let files = TestFiles::new();
         let worker_bytes = b"bounded worker fixture";
         let config = configured_rc(&files, sha256(worker_bytes));
-        let security = prepare_for_test(RCNET1_PROFILE, &config, &files.root).unwrap();
+        let security =
+            prepare_for_test(PRODUCTION_V3_TESTNET_PROFILE, &config, &files.root).unwrap();
         let record = security.production_v3_record.as_ref().unwrap();
         assert!(record.record_v2.is_absolute());
         let worker = security.verifier_worker.as_ref().unwrap();
@@ -908,7 +950,7 @@ mod tests {
         let data_dir = files.root.join("rcnet-data");
         open_with_record_gate(
             &data_dir,
-            RCNET1_PROFILE,
+            PRODUCTION_V3_TESTNET_PROFILE,
             &security,
             |received_dir, received| {
                 assert_eq!(received_dir, data_dir);
@@ -919,6 +961,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(not(feature = "production-v4"))]
     #[test]
     fn production_record_gate_failures_are_sanitized_and_fail_closed() {
         let security = PreparedNodeSecurity {
@@ -939,7 +982,7 @@ mod tests {
         ] {
             let error = open_with_record_gate(
                 Path::new("unused"),
-                RCNET1_PROFILE,
+                PRODUCTION_V3_TESTNET_PROFILE,
                 &security,
                 |_, record| {
                     assert!(record.is_some());
@@ -948,7 +991,11 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.code, "proof_verifier_configuration");
-            assert!(error.message.contains("RCNet-1 (ProductionV3)"));
+            assert!(
+                error
+                    .message
+                    .contains("ProductionV3 Testnet-1 (ProductionV3)")
+            );
             assert!(!error.message.contains("C:\\private"));
         }
     }
@@ -961,7 +1008,7 @@ mod tests {
         assert!(security.production_v4_artifacts.is_none());
         assert!(security.verifier_worker.is_none());
         assert!(!command_help_text_for_profile(DEVNET_PROFILE).contains("ProductionV3 startup"));
-        assert!(command_help_text_for_profile(RCNET1_PROFILE).contains("ProductionV3 startup"));
+        assert!(command_help_text_for_profile(RCNET1_PROFILE).contains("ProductionV4 startup"));
 
         let result = open_with_record_gate(
             Path::new("devnet-data"),

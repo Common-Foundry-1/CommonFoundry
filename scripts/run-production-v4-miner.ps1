@@ -82,12 +82,59 @@ function Resolve-ExistingDirectory {
 
 function Convert-ToWslPaths {
     param([string[]]$Paths)
-    $command = 'for value in "$@"; do wslpath -a -u "$value"; done'
-    $converted = @(& wsl.exe -d $WslDistribution --exec bash -c $command cmfd-wslpath @Paths)
-    if ($LASTEXITCODE -ne 0 -or $converted.Count -ne $Paths.Count) {
-        throw "failed to convert Windows paths for $WslDistribution"
+
+    $wslRoots = @{}
+    foreach ($path in $Paths) {
+        $root = [IO.Path]::GetPathRoot($path)
+        if ([string]::IsNullOrWhiteSpace($root) -or $root.StartsWith('\\')) {
+            throw "cannot convert non-drive path for $WslDistribution`: $path"
+        }
+        if (-not $wslRoots.ContainsKey($root)) {
+            $wslRoot = $null
+            $wslExitCode = -1
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                $previousErrorActionPreference = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    $rawOutput = @(& wsl.exe -d $WslDistribution --exec wslpath -a -u $root 2>&1)
+                    $wslExitCode = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $previousErrorActionPreference
+                }
+                $convertedRoots = @(
+                    foreach ($line in $rawOutput) {
+                        $text = [string]$line
+                        if ($text.StartsWith('/', [StringComparison]::Ordinal)) {
+                            $text.TrimEnd('/')
+                        }
+                    }
+                )
+                if ($wslExitCode -eq 0 -and $convertedRoots.Count -eq 1) {
+                    $wslRoot = $convertedRoots[0]
+                    break
+                }
+                if ($attempt -lt 3) {
+                    Start-Sleep -Seconds (2 * $attempt)
+                }
+            }
+            if ($null -eq $wslRoot) {
+                throw "failed to convert drive $root for $WslDistribution after 3 attempts (WSL exit code $wslExitCode)"
+            }
+            $wslRoots[$root] = $wslRoot
+        }
     }
-    return $converted
+
+    return @(
+        foreach ($path in $Paths) {
+            $root = [IO.Path]::GetPathRoot($path)
+            $relative = $path.Substring($root.Length).Replace('\', '/')
+            if ($relative.Length -eq 0) {
+                "$($wslRoots[$root])/"
+            } else {
+                "$($wslRoots[$root])/$relative"
+            }
+        }
+    )
 }
 
 function Invoke-NativeLogged {

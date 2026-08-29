@@ -188,7 +188,7 @@ pub struct ProductionV4PoolShareEvaluation {
 pub trait ProductionV4PoolShareVerifier: fmt::Debug + Send + Sync {
     fn evaluate(
         &self,
-        challenge: &BlockChallenge,
+        template: &crate::BlockTemplate,
         nonce: u64,
         share_target: [u8; 32],
     ) -> Result<ProductionV4PoolShareEvaluation, PoolError>;
@@ -1454,7 +1454,7 @@ fn evaluate_pool_share(
         ProofProfile::ProductionV3 => Err(PoolError::ProductionV3Unsupported),
         ProofProfile::ProductionV4 => evaluate_production_v4_pool_share(
             shared.production_v4_share_verifier.as_deref(),
-            &active.wire.challenge,
+            &active.mining.template,
             nonce,
             active.wire.share_target,
         ),
@@ -1463,13 +1463,13 @@ fn evaluate_pool_share(
 
 fn evaluate_production_v4_pool_share(
     verifier: Option<&dyn ProductionV4PoolShareVerifier>,
-    challenge: &BlockChallenge,
+    template: &crate::BlockTemplate,
     nonce: u64,
     share_target: [u8; 32],
 ) -> Result<VerifiedPoolShare, PoolError> {
     let verifier = verifier.ok_or(PoolError::ProductionV4Unsupported)?;
-    let evaluation = verifier.evaluate(challenge, nonce, share_target)?;
-    let meets_chain_target = evaluation.work_digest <= challenge.target;
+    let evaluation = verifier.evaluate(template, nonce, share_target)?;
+    let meets_chain_target = evaluation.work_digest <= template.challenge.target;
     match (meets_chain_target, evaluation.chain_proof) {
         (true, Some(proof)) if proof.work_digest() == evaluation.work_digest => {
             Ok(VerifiedPoolShare {
@@ -2026,7 +2026,7 @@ mod tests {
     impl ProductionV4PoolShareVerifier for FixedProductionV4ShareVerifier {
         fn evaluate(
             &self,
-            _challenge: &BlockChallenge,
+            _template: &crate::BlockTemplate,
             _nonce: u64,
             _share_target: [u8; 32],
         ) -> Result<ProductionV4PoolShareEvaluation, PoolError> {
@@ -2034,14 +2034,22 @@ mod tests {
         }
     }
 
-    fn production_v4_share_challenge() -> BlockChallenge {
-        BlockChallenge {
-            network_id: [1; 32],
-            previous_block: [2; 32],
-            transaction_root: [3; 32],
-            height: 4,
-            timestamp: 5,
-            target: [0x80; 32],
+    fn production_v4_share_template() -> crate::BlockTemplate {
+        crate::BlockTemplate {
+            challenge: BlockChallenge {
+                network_id: [1; 32],
+                previous_block: [2; 32],
+                transaction_root: [3; 32],
+                height: 4,
+                timestamp: 5,
+                target: [0x80; 32],
+            },
+            coinbase: cmfd_consensus::Coinbase {
+                height: 4,
+                outputs: Vec::new(),
+            },
+            transactions: Vec::new(),
+            total_fees_burned: 0,
         }
     }
 
@@ -2072,9 +2080,9 @@ mod tests {
 
     #[test]
     fn production_v4_share_replay_boundary_is_fail_closed() {
-        let challenge = production_v4_share_challenge();
+        let template = production_v4_share_template();
         assert!(matches!(
-            evaluate_production_v4_pool_share(None, &challenge, 7, [0xff; 32]),
+            evaluate_production_v4_pool_share(None, &template, 7, [0xff; 32]),
             Err(PoolError::ProductionV4Unsupported)
         ));
 
@@ -2085,7 +2093,7 @@ mod tests {
             },
         };
         let ordinary =
-            evaluate_production_v4_pool_share(Some(&ordinary), &challenge, 7, [0xff; 32]).unwrap();
+            evaluate_production_v4_pool_share(Some(&ordinary), &template, 7, [0xff; 32]).unwrap();
         assert_eq!(ordinary.work_digest, [0xff; 32]);
         assert!(ordinary.chain_proof.is_none());
 
@@ -2096,7 +2104,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            evaluate_production_v4_pool_share(Some(&missing), &challenge, 7, [0xff; 32]),
+            evaluate_production_v4_pool_share(Some(&missing), &template, 7, [0xff; 32]),
             Err(PoolError::ProductionV4ChainProofMissing)
         ));
 
@@ -2107,7 +2115,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            evaluate_production_v4_pool_share(Some(&mismatched), &challenge, 7, [0xff; 32]),
+            evaluate_production_v4_pool_share(Some(&mismatched), &template, 7, [0xff; 32]),
             Err(PoolError::ProductionV4ProofMismatch)
         ));
 
@@ -2118,7 +2126,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            evaluate_production_v4_pool_share(Some(&unexpected), &challenge, 7, [0xff; 32]),
+            evaluate_production_v4_pool_share(Some(&unexpected), &template, 7, [0xff; 32]),
             Err(PoolError::ProductionV4UnexpectedChainProof)
         ));
 
@@ -2129,7 +2137,7 @@ mod tests {
             },
         };
         let winning =
-            evaluate_production_v4_pool_share(Some(&winning), &challenge, 7, [0xff; 32]).unwrap();
+            evaluate_production_v4_pool_share(Some(&winning), &template, 7, [0xff; 32]).unwrap();
         assert_eq!(winning.work_digest, [0; 32]);
         assert_eq!(winning.chain_proof.unwrap().work_digest(), [0; 32]);
     }

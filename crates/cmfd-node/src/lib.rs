@@ -54,6 +54,8 @@ pub mod network_profile;
 pub mod p2p;
 pub mod peer;
 pub mod pool;
+#[cfg(feature = "production-v4-testnet")]
+pub mod production_v4_pool;
 #[cfg(feature = "production-v3")]
 pub mod rcnet_candidate;
 

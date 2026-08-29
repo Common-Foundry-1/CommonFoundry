@@ -17,6 +17,11 @@ use cmfd_node::pool::{
     DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolServerConfig,
     certificate_sha256, generate_pool_certificate, spawn_pool_server,
 };
+#[cfg(feature = "production-v4-testnet")]
+use cmfd_node::production_v4_pool::{
+    ProductionV4PersistentPoolVerifier, ProductionV4PoolVerifierConfig,
+    ProductionV4PoolWorkerCommand,
+};
 #[cfg(feature = "production-v3")]
 use cmfd_node::rcnet_candidate::{
     RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
@@ -168,7 +173,7 @@ enum Command {
         #[arg(long)]
         private_key: PathBuf,
     },
-    /// Run the authenticated Devnet-0 pool; Production V3 fails closed as unsupported.
+    /// Run the authenticated pool for the compiled network profile.
     PoolServe {
         #[arg(long, default_value_t = DEFAULT_POOL_SOCKET_ADDRESS)]
         bind: SocketAddr,
@@ -192,6 +197,15 @@ enum Command {
         /// Easier reference-pool share target; chain work starts at 8 leading zero bits.
         #[arg(long, default_value_t = DEFAULT_SHARE_LEADING_ZERO_BITS)]
         share_leading_zero_bits: u16,
+        /// Absolute native path to the persistent ProductionV4 CUDA replay worker.
+        #[arg(long)]
+        production_v4_pool_replay_worker: Option<PathBuf>,
+        /// Absolute native path to the persistent ProductionV4 proof worker.
+        #[arg(long)]
+        production_v4_pool_proof_worker: Option<PathBuf>,
+        /// Absolute native scratch directory shared by the V4 pool workers.
+        #[arg(long)]
+        production_v4_pool_scratch: Option<PathBuf>,
     },
 }
 
@@ -417,8 +431,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             private_key,
             miner,
             share_leading_zero_bits,
+            production_v4_pool_replay_worker,
+            production_v4_pool_proof_worker,
+            production_v4_pool_scratch,
         } => {
-            require_bounded_reference_mining("pool-serve")?;
+            require_pool_mining_profile()?;
             let shutdown = install_shutdown_handler()?;
             if share_leading_zero_bits >= 8 {
                 return Err(format!(
@@ -476,6 +493,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config =
                 PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
             config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
+            configure_production_v4_pool_verifier(
+                &mut config,
+                production_v4_artifacts.as_ref(),
+                production_v4_pool_replay_worker.as_ref(),
+                production_v4_pool_proof_worker.as_ref(),
+                production_v4_pool_scratch.as_ref(),
+            )?;
             let pool = spawn_pool_server(Arc::clone(&node), config)?;
             println!(
                 "{}",
@@ -691,6 +715,78 @@ fn production_v4_artifacts(
     }
 }
 
+fn configure_production_v4_pool_verifier(
+    config: &mut PoolServerConfig,
+    artifacts: Option<&ProductionV4VerifierArtifacts>,
+    replay_worker: Option<&PathBuf>,
+    proof_worker: Option<&PathBuf>,
+    scratch_directory: Option<&PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supplied = replay_worker.is_some() || proof_worker.is_some() || scratch_directory.is_some();
+    if COMPILED_NETWORK_PROFILE.proof != ProofProfile::ProductionV4 {
+        if supplied {
+            return Err(
+                "ProductionV4 pool worker options were supplied for a non-ProductionV4 profile"
+                    .into(),
+            );
+        }
+        return Ok(());
+    }
+    let (Some(replay_worker), Some(proof_worker), Some(scratch_directory), Some(artifacts)) =
+        (replay_worker, proof_worker, scratch_directory, artifacts)
+    else {
+        return Err("ProductionV4 pool-serve requires replay-worker, proof-worker, and scratch-directory options".into());
+    };
+
+    #[cfg(feature = "production-v4-testnet")]
+    {
+        let replay_worker =
+            canonical_regular_file(replay_worker, "ProductionV4 pool replay worker")?;
+        let proof_worker = canonical_regular_file(proof_worker, "ProductionV4 pool proof worker")?;
+        if !scratch_directory.is_absolute() {
+            return Err("ProductionV4 pool scratch directory must be absolute".into());
+        }
+        let scratch_directory = cmfd_node::plain_package_path(scratch_directory.clone());
+        let worker_scratch_directory = scratch_directory
+            .to_str()
+            .ok_or("ProductionV4 pool scratch directory is not UTF-8")?
+            .to_owned();
+        let fixed_artifact_directory = artifacts
+            .fixed_record
+            .parent()
+            .ok_or("ProductionV4 fixed artifact record has no parent directory")?;
+        let verifier = ProductionV4PersistentPoolVerifier::start(ProductionV4PoolVerifierConfig {
+            replay: ProductionV4PoolWorkerCommand {
+                program: replay_worker,
+                arguments: vec!["--server".into(), artifacts.bank.as_os_str().to_owned()],
+            },
+            proof: ProductionV4PoolWorkerCommand {
+                program: proof_worker,
+                arguments: vec![
+                    "--server".into(),
+                    artifacts.bank.as_os_str().to_owned(),
+                    fixed_artifact_directory.as_os_str().to_owned(),
+                ],
+            },
+            scratch_directory,
+            worker_scratch_directory,
+        })?;
+        config.production_v4_share_verifier = Some(Arc::new(verifier));
+        Ok(())
+    }
+    #[cfg(not(feature = "production-v4-testnet"))]
+    {
+        let _ = (
+            config,
+            replay_worker,
+            proof_worker,
+            scratch_directory,
+            artifacts,
+        );
+        Err("ProductionV4 pool support is not compiled into this binary".into())
+    }
+}
+
 fn packaged_production_v3_layout()
 -> Result<cmfd_node::ProductionV3PackageLayout, Box<dyn std::error::Error>> {
     let executable = std::env::current_exe()
@@ -780,6 +876,18 @@ fn require_bounded_reference_mining(command: &str) -> Result<(), Box<dyn std::er
             COMPILED_NETWORK_PROFILE.proof.profile_name()
         )
         .into())
+    }
+}
+
+fn require_pool_mining_profile() -> Result<(), Box<dyn std::error::Error>> {
+    match COMPILED_NETWORK_PROFILE.proof {
+        ProofProfile::DevnetV2Reference | ProofProfile::ProductionV4 => Ok(()),
+        ProofProfile::ProductionV3 => Err(format!(
+            "pool-serve is unavailable for {} ({}); no DevnetV2 fallback is permitted",
+            COMPILED_NETWORK_PROFILE.short_name(),
+            COMPILED_NETWORK_PROFILE.proof.profile_name()
+        )
+        .into()),
     }
 }
 

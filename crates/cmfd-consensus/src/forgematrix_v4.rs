@@ -318,6 +318,128 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    #[test]
+    fn production_v4_core_vector_is_canonical() {
+        use slop_algebra::AbstractField;
+
+        use crate::{
+            MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES, PRODUCTION_V4_MAX_BLOCK_BYTES,
+            PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            PRODUCTION_V4_TESTNET_NETWORK_ID,
+            forgematrix_v4_basefold::{ForgeMatrixV4Field, ForgeMatrixV4TranscriptStatement},
+            forgematrix_v4_proof::forgematrix_v4_final_activation_digest,
+            forgematrix_v4_proof_codec::FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+        };
+
+        fn hex32(value: &serde_json::Value) -> [u8; 32] {
+            hex::decode(value.as_str().expect("vector field is a string"))
+                .expect("vector field is valid hex")
+                .try_into()
+                .expect("vector digest has 32 bytes")
+        }
+
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/consensus/production-v4-core-vector-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            vector["schema"],
+            "CommonFoundry/ForgeMatrix/V4/CoreCanonicalVector/v1"
+        );
+        assert_eq!(
+            vector["algorithm_version"],
+            FORGEMATRIX_V4_ALGORITHM_VERSION
+        );
+        assert_eq!(vector["proof_version"], FORGEMATRIX_V4_PROOF_VERSION);
+        let proof_system_digest = forgematrix_v4_proof_system_digest();
+        assert_eq!(hex32(&vector["proof_system_digest"]), proof_system_digest);
+        assert_eq!(
+            hex32(&vector["model_manifest_digest"]),
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST
+        );
+        assert_eq!(
+            hex32(&vector["fixed_artifact_record_digest"]),
+            PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST
+        );
+
+        let block_vector = &vector["block"];
+        let block = BlockChallenge {
+            network_id: hex32(&block_vector["network_id"]),
+            previous_block: hex32(&block_vector["previous_block"]),
+            transaction_root: hex32(&block_vector["transaction_root"]),
+            height: block_vector["height"].as_u64().unwrap(),
+            timestamp: block_vector["timestamp"].as_u64().unwrap(),
+            target: hex32(&block_vector["target"]),
+        };
+        assert_eq!(block.network_id, PRODUCTION_V4_TESTNET_NETWORK_ID);
+        let nonce = vector["nonce"].as_u64().unwrap();
+        let challenge_digest =
+            forgematrix_v4_challenge_digest(&block, nonce, PRODUCTION_V4_MODEL_MANIFEST_DIGEST);
+        let expected = &vector["expected"];
+        assert_eq!(challenge_digest, hex32(&expected["challenge_digest"]));
+        let activation_vector = &vector["final_activation"];
+        let field_count = activation_vector["field_count"].as_u64().unwrap() as usize;
+        assert_eq!(
+            field_count,
+            FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES / 4
+        );
+        assert_eq!(
+            activation_vector["encoding"],
+            "524288 canonical KoalaBear u32 little-endian values, all zero"
+        );
+        assert_eq!(activation_vector["fill_value"], 0);
+        let final_activation = vec![ForgeMatrixV4Field::zero(); field_count];
+        let final_activation_digest =
+            forgematrix_v4_final_activation_digest(challenge_digest, &final_activation);
+        assert_eq!(
+            final_activation_digest,
+            hex32(&expected["final_activation_digest"])
+        );
+        let work_digest = forgematrix_v4_work_digest(
+            PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest,
+        );
+        assert_eq!(work_digest, hex32(&expected["work_digest"]));
+        let transcript_statement_digest = ForgeMatrixV4TranscriptStatement {
+            block,
+            algorithm_version: FORGEMATRIX_V4_ALGORITHM_VERSION,
+            proof_version: FORGEMATRIX_V4_PROOF_VERSION,
+            nonce,
+            proof_system_digest,
+            model_manifest_digest: PRODUCTION_V4_MODEL_MANIFEST_DIGEST,
+            challenge_digest,
+            final_activation_digest,
+            work_digest,
+        }
+        .digest();
+        assert_eq!(
+            transcript_statement_digest,
+            hex32(&expected["transcript_statement_digest"])
+        );
+
+        let wire = &vector["wire"];
+        assert_eq!(
+            wire["transparent_proof_exact_bytes"],
+            FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES
+        );
+        assert_eq!(
+            wire["transparent_proof_max_bytes"],
+            MAX_FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES
+        );
+        assert_eq!(wire["proof_frame_max_bytes"], PRODUCTION_V4_MAX_PROOF_BYTES);
+        assert_eq!(wire["block_frame_max_bytes"], PRODUCTION_V4_MAX_BLOCK_BYTES);
+
+        let rejections = vector["rejections"].as_array().unwrap();
+        assert_eq!(rejections.len(), 5);
+        assert_eq!(rejections[0][2], FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES - 1);
+        assert_eq!(rejections[1][2], FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES + 1);
+        assert_eq!(rejections[2][2], FORGEMATRIX_V4_FIELD_MODULUS);
+        assert_eq!(rejections[3][2], PRODUCTION_V4_MAX_PROOF_BYTES + 1);
+        assert_eq!(rejections[4][2], PRODUCTION_V4_MAX_BLOCK_BYTES + 1);
+    }
+
     #[test]
     fn challenge_and_work_bind_every_public_input() {
         let block = BlockChallenge {

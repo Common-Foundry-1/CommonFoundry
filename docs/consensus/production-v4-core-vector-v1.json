@@ -1,0 +1,42 @@
+{
+  "schema": "CommonFoundry/ForgeMatrix/V4/CoreCanonicalVector/v1",
+  "purpose": "Canonical core binding and boundary vector; not a mined-proof fixture",
+  "algorithm_version": 4,
+  "proof_version": 1,
+  "proof_system_digest": "e849e3bfc83f8f8dd0f1fc1100879417718ba2bffb92af5cd649b61c720675a3",
+  "model_manifest_digest": "68f6fe674f75a363c62c275ebb11fa74aa089e9bbde5bcb952ec35b8890b575c",
+  "fixed_artifact_record_digest": "2efd2c4244bbd7808547b85266987544233fbe339f445135b07843aa8893d45e",
+  "block": {
+    "network_id": "b9e55d5a5e80c8e3d73bf81b199bc643ac9367436962c28b6aacdc37f3809962",
+    "previous_block": "0101010101010101010101010101010101010101010101010101010101010101",
+    "transaction_root": "0202020202020202020202020202020202020202020202020202020202020202",
+    "height": 3,
+    "timestamp": 4,
+    "target": "0505050505050505050505050505050505050505050505050505050505050505"
+  },
+  "nonce": 6,
+  "final_activation": {
+    "encoding": "524288 canonical KoalaBear u32 little-endian values, all zero",
+    "field_count": 524288,
+    "fill_value": 0
+  },
+  "expected": {
+    "challenge_digest": "523a47eb90c07299243a1aa8fa7ca07a67b0527dfbd6b367bb14a3ea8dbb6a23",
+    "final_activation_digest": "c9802d97d27707d05cf38db9286866c4fbd40a5a5a76809cb654b4d3f221844b",
+    "work_digest": "e9c3ec2fd53ab08340e58a642733a6d528e476ce19a9247e0983d6f71ee2606a",
+    "transcript_statement_digest": "9c3e50fa124dbb2df551ec893c44d1a9813b6245d0f981e1a4e10884e4bd0387"
+  },
+  "wire": {
+    "transparent_proof_exact_bytes": 12025320,
+    "transparent_proof_max_bytes": 13631259,
+    "proof_frame_max_bytes": 13631488,
+    "block_frame_max_bytes": 16777216
+  },
+  "rejections": [
+    ["transparent-proof-truncated", "bytes", 12025319, "Length"],
+    ["transparent-proof-trailing-byte", "bytes", 12025321, "Length"],
+    ["transparent-proof-noncanonical-field", "field_value", 2130706433, "Field"],
+    ["proof-frame-over-limit", "bytes", 13631489, "SizeLimit"],
+    ["block-frame-over-limit", "bytes", 16777217, "SizeLimit"]
+  ]
+}

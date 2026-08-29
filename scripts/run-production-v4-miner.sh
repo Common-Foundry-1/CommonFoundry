@@ -234,11 +234,17 @@ write_stats() {
   local maximum_temperature="$2"
   local elapsed_seconds="$3"
   local efficiency="N/A"
+  local hashrate="N/A"
+  local compute="N/A"
   if [[ "$session_energy_kwh" != "0" && "$session_energy_kwh" != "0.000000000" ]]; then
     efficiency="$(awk -v accepted="$accepted" -v energy="$session_energy_kwh" 'BEGIN { printf "%.2f", accepted / energy }')"
   fi
-  printf 'MINER STATS | accepted %d | rejected %d | avg %s W | efficiency %s accepted/kWh | temp %s C | last %s s\n' \
-    "$accepted" "$rejected" "$average_power" "$efficiency" "$maximum_temperature" "$elapsed_seconds"
+  if ((session_forge_work_count > 0)) && [[ "$session_search_seconds" != "0" && "$session_search_seconds" != "0.000000000" ]]; then
+    read -r hashrate compute < <(awk -v work="$session_forge_work_count" -v seconds="$session_search_seconds" \
+      'BEGIN { rate = work / seconds; printf "%.2f %.2f\n", rate, rate * 0.824633720832 }')
+  fi
+  printf 'MINER STATS | Hashrate %s FW/s | Compute %s TMAC/s | accepted %d | rejected %d | avg %s W | efficiency %s accepted/kWh | temp %s C | last %s s\n' \
+    "$hashrate" "$compute" "$accepted" "$rejected" "$average_power" "$efficiency" "$maximum_temperature" "$elapsed_seconds"
 }
 
 trap cleanup EXIT
@@ -248,6 +254,8 @@ accepted=0
 rejected=0
 attempts=0
 session_energy_kwh="0"
+session_forge_work_count=0
+session_search_seconds="0"
 log_directory="$WORK_DIRECTORY/logs"
 mkdir -p -- "$log_directory"
 session_log="$log_directory/session-$(date -u +%Y%m%dT%H%M%S%NZ).log"
@@ -306,6 +314,7 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
   candidate_template="$template"
   candidate_coefficients="$coefficients"
   candidate_nonce="$NONCE"
+  attempt_forge_work_count=0
   search_start_ns="$(date +%s%N)"
   outcome=""
   while :; do
@@ -322,6 +331,7 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
     if [[ "$(grep -c '^CMFD_V4_WORK ' <<<"$work_output")" -ne 1 ]]; then
       attempt_failure "ProductionV4 work inspection returned a noncanonical result"
     fi
+    attempt_forge_work_count=$((attempt_forge_work_count + 1))
     if grep -q '^CMFD_V4_WORK qualified=true ' <<<"$work_output"; then
       break
     fi
@@ -341,6 +351,11 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
       --coefficients-output "$candidate_coefficients" --output "$candidate_template"
   done
   search_end_ns="$(date +%s%N)"
+  search_elapsed_seconds="$(awk -v start="$search_start_ns" -v end="$search_end_ns" \
+    'BEGIN { printf "%.9f", (end - start) / 1000000000 }')"
+  session_forge_work_count=$((session_forge_work_count + attempt_forge_work_count))
+  session_search_seconds="$(awk -v total="$session_search_seconds" -v elapsed="$search_elapsed_seconds" \
+    'BEGIN { printf "%.9f", total + elapsed }')"
   printf 'CMFD_V4_MINER_PHASE phase=search elapsed_micros=%d\n' \
     "$(((search_end_ns - search_start_ns) / 1000))" >>"$attempt_log"
 

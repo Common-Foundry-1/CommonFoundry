@@ -501,13 +501,18 @@ function Write-MinerStats {
         [double]$AveragePower,
         [double]$MaximumTemperature,
         [double]$SessionEnergyKwh,
-        [double]$ElapsedSeconds
+        [double]$ElapsedSeconds,
+        [uint64]$ForgeWorkCount,
+        [double]$SearchSeconds
     )
     $powerText = if ([double]::IsNaN($AveragePower)) { 'N/A' } else { $AveragePower.ToString('F1', [Globalization.CultureInfo]::InvariantCulture) }
     $temperatureText = if ([double]::IsNaN($MaximumTemperature)) { 'N/A' } else { $MaximumTemperature.ToString('F0', [Globalization.CultureInfo]::InvariantCulture) }
     $efficiencyText = if ($SessionEnergyKwh -le 0.0) { 'N/A' } else { ($Accepted / $SessionEnergyKwh).ToString('F2', [Globalization.CultureInfo]::InvariantCulture) }
     $elapsedText = if ([double]::IsNaN($ElapsedSeconds)) { 'N/A' } else { $ElapsedSeconds.ToString('F1', [Globalization.CultureInfo]::InvariantCulture) }
-    Write-Host "MINER STATS | accepted $Accepted | rejected $Rejected | avg $powerText W | efficiency $efficiencyText accepted/kWh | temp $temperatureText C | last $elapsedText s"
+    $forgeWorkRate = if ($ForgeWorkCount -eq 0 -or $SearchSeconds -le 0.0) { [double]::NaN } else { $ForgeWorkCount / $SearchSeconds }
+    $hashrateText = if ([double]::IsNaN($forgeWorkRate)) { 'N/A' } else { $forgeWorkRate.ToString('F2', [Globalization.CultureInfo]::InvariantCulture) }
+    $computeText = if ([double]::IsNaN($forgeWorkRate)) { 'N/A' } else { ($forgeWorkRate * 0.824633720832).ToString('F2', [Globalization.CultureInfo]::InvariantCulture) }
+    Write-Host "MINER STATS | Hashrate $hashrateText FW/s | Compute $computeText TMAC/s | accepted $Accepted | rejected $Rejected | avg $powerText W | efficiency $efficiencyText accepted/kWh | temp $temperatureText C | last $elapsedText s"
 }
 
 function Remove-AttemptDirectory {
@@ -725,6 +730,8 @@ $accepted = 0
 $rejected = 0
 $attempts = 0
 $sessionEnergyKwh = 0.0
+$sessionForgeWorkCount = [uint64]0
+$sessionSearchSeconds = 0.0
 $logDirectory = Join-Path $workDirectoryPath 'logs'
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
 $sessionLog = Join-Path $logDirectory (
@@ -734,7 +741,7 @@ New-Item -ItemType File -Path $sessionLog | Out-Null
 $proofWorker = $null
 $replayWorker = $null
 $keepReplayResident = $gpuMemoryMiB -ge 20000
-Write-MinerStats $accepted $rejected ([double]::NaN) ([double]::NaN) $sessionEnergyKwh ([double]::NaN)
+Write-MinerStats $accepted $rejected ([double]::NaN) ([double]::NaN) $sessionEnergyKwh ([double]::NaN) $sessionForgeWorkCount $sessionSearchSeconds
 try {
 $proofWorker = Start-PersistentWslWorker `
     $persistentProofWsl `
@@ -810,6 +817,7 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         $candidateTemplateWsl = $templateWindowsWsl
         $candidateCoefficientsWsl = $coefficientsWindowsWsl
         $candidateNonce = $Nonce
+        $attemptForgeWorkCount = [uint64]0
         $searchTimer = [Diagnostics.Stopwatch]::StartNew()
         try {
             while ($true) {
@@ -838,6 +846,7 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
                 if ($null -eq $workMatch -or -not $workMatch.Success) {
                     throw 'ProductionV4 work inspection did not return one canonical result'
                 }
+                $attemptForgeWorkCount++
                 if ($workMatch.Groups[1].Value -ceq 'true') {
                     break
                 }
@@ -869,6 +878,8 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
             }
         } finally {
             $searchTimer.Stop()
+            $sessionForgeWorkCount += $attemptForgeWorkCount
+            $sessionSearchSeconds += $searchTimer.Elapsed.TotalSeconds
             Write-PhaseTelemetry $attemptLog 'search' $searchTimer
         }
         if ($outcome -ne 'refresh') {
@@ -957,7 +968,9 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         $gpu.AveragePower `
         $gpu.MaximumTemperature `
         $sessionEnergyKwh `
-        $timer.Elapsed.TotalSeconds
+        $timer.Elapsed.TotalSeconds `
+        $sessionForgeWorkCount `
+        $sessionSearchSeconds
 
     if ($outcome -eq 'accepted' -and $KeepAcceptedWork) {
         $attemptDirectoryWsl = @(Convert-ToWslPaths @($attemptDirectory))[0]

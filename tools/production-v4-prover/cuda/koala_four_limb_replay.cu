@@ -239,6 +239,12 @@ void launch_gemm(const int8_t* activation, const int8_t* weights,
     cutlass_check(operation(arguments), "launch Tensor Core GEMM");
 }
 
+void launch_stacked_limb_gemm(const int8_t* limbs, const int8_t* weights,
+                              int32_t* limb_accumulators, uint32_t rows,
+                              uint32_t width) {
+    launch_gemm(limbs, weights, limb_accumulators, 4 * rows, width);
+}
+
 std::vector<uint32_t> make_coefficients(uint32_t layers) {
     std::vector<uint32_t> coefficients(size_t(layers + 1) * MASK_COEFFICIENTS);
     for (size_t index = 0; index < coefficients.size(); ++index) {
@@ -372,11 +378,9 @@ void run_small_differential() {
                                           device_activation_trace,
                                           device_coefficients, rows, width);
     for (uint32_t layer = 0; layer < layers; ++layer) {
-        for (uint32_t limb = 0; limb < 4; ++limb) {
-            launch_gemm(device_limbs + size_t(limb) * cells,
-                        device_weights + size_t(layer) * layer_cells,
-                        device_accumulators + size_t(limb) * cells, rows, width);
-        }
+        launch_stacked_limb_gemm(device_limbs,
+                                 device_weights + size_t(layer) * layer_cells,
+                                 device_accumulators, rows, width);
         reduce_layer<<<1, THREADS>>>(
             device_accumulators, device_limbs,
             device_preactivation_trace + size_t(layer) * cells,
@@ -603,12 +607,9 @@ void run_production_replay(ProductionModel& model, const char* coefficient_path,
                                                device_coefficients, PRODUCTION_ROWS,
                                                PRODUCTION_WIDTH);
     for (uint32_t layer = 0; layer < PRODUCTION_LAYERS; ++layer) {
-        for (uint32_t limb = 0; limb < 4; ++limb) {
-            launch_gemm(limbs + size_t(limb) * cells,
-                        model.weights() + size_t(layer) * layer_cells,
-                        limb_accumulators + size_t(limb) * cells,
-                        PRODUCTION_ROWS, PRODUCTION_WIDTH);
-        }
+        launch_stacked_limb_gemm(
+            limbs, model.weights() + size_t(layer) * layer_cells,
+            limb_accumulators, PRODUCTION_ROWS, PRODUCTION_WIDTH);
         uint32_t* layer_preactivation = full_trace
                                             ? preactivation_trace + size_t(layer) * cells
                                             : preactivation_trace;

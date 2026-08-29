@@ -20,8 +20,10 @@ use crate::{
     forgematrix_v4_proof_system_digest,
 };
 
-const TRANSCRIPT_STATEMENT_DOMAIN: &str = "CommonFoundry/ForgeMatrix/V4/TranscriptStatement/v1";
-const OPENING_REDUCTION_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/OpeningReduction/v2";
+pub(crate) const TRANSCRIPT_STATEMENT_DOMAIN: &str =
+    "CommonFoundry/ForgeMatrix/V4/TranscriptStatement/v1";
+pub(crate) const OPENING_REDUCTION_DOMAIN: &[u8] =
+    b"CommonFoundry/ForgeMatrix/V4/OpeningReduction/v2";
 
 pub type ForgeMatrixV4Field = KoalaBear;
 pub type ForgeMatrixV4Extension = BinomialExtensionField<ForgeMatrixV4Field, 4>;

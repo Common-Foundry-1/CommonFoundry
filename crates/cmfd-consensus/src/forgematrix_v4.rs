@@ -320,6 +320,237 @@ mod tests {
 
     #[cfg(feature = "forgematrix-v4-verifier")]
     #[test]
+    fn production_v4_message_order_manifest_matches_consensus() {
+        use crate::{
+            forgematrix_v4_basefold::{OPENING_REDUCTION_DOMAIN, TRANSCRIPT_STATEMENT_DOMAIN},
+            forgematrix_v4_basefold_codec::FORGEMATRIX_V4_OPENING_REDUCTION_MAX_BYTES,
+            forgematrix_v4_proof_codec::FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES,
+            forgematrix_v4_relations::{
+                COMMITMENTS_DOMAIN, CUBIC_POINT_DOMAIN, CUBIC_PROOF_DOMAIN, FINAL_POINT_DOMAIN,
+                MATRIX_POINT_DOMAIN, MATRIX_PROOF_DOMAIN, SHIFT_PROOF_DOMAIN,
+            },
+        };
+
+        fn text(bytes: &[u8]) -> &str {
+            std::str::from_utf8(bytes).expect("consensus domain is UTF-8")
+        }
+
+        fn strings(value: &serde_json::Value) -> Vec<&str> {
+            value
+                .as_array()
+                .expect("manifest value is an array")
+                .iter()
+                .map(|value| value.as_str().expect("manifest array contains strings"))
+                .collect()
+        }
+
+        fn sumcheck_bytes(variables: usize, degree: usize) -> usize {
+            const EXTENSION_BYTES: usize = FORGEMATRIX_V4_EXTENSION_DEGREE as usize * 4;
+            variables * (degree + 1) * EXTENSION_BYTES
+                + EXTENSION_BYTES
+                + variables * EXTENSION_BYTES
+                + EXTENSION_BYTES
+        }
+
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/consensus/production-v4-message-order-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            manifest["schema"],
+            "CommonFoundry/ForgeMatrix/V4/MessageOrder/v1"
+        );
+        assert_eq!(manifest["consensus_change"], false);
+        assert_eq!(manifest["field"]["modulus"], FORGEMATRIX_V4_FIELD_MODULUS);
+        assert_eq!(
+            manifest["field"]["extension_degree"],
+            FORGEMATRIX_V4_EXTENSION_DEGREE
+        );
+        assert_eq!(manifest["field"]["extension_polynomial"], "X^4 - 3");
+        assert_eq!(
+            strings(&manifest["field"]["extension_coefficient_order"]),
+            ["1", "X", "X^2", "X^3"]
+        );
+        assert_eq!(
+            manifest["challenger"]["suite"],
+            FORGEMATRIX_V4_POSEIDON_SUITE
+        );
+        assert_eq!(
+            manifest["challenger"]["statement_domain"],
+            TRANSCRIPT_STATEMENT_DOMAIN
+        );
+
+        let domains = &manifest["domains"];
+        assert_eq!(domains["commitments"], text(COMMITMENTS_DOMAIN));
+        assert_eq!(domains["matrix_point"], text(MATRIX_POINT_DOMAIN));
+        assert_eq!(domains["matrix_proof"], text(MATRIX_PROOF_DOMAIN));
+        assert_eq!(domains["shift_proof"], text(SHIFT_PROOF_DOMAIN));
+        assert_eq!(domains["cubic_point"], text(CUBIC_POINT_DOMAIN));
+        assert_eq!(domains["cubic_proof"], text(CUBIC_PROOF_DOMAIN));
+        assert_eq!(domains["final_point"], text(FINAL_POINT_DOMAIN));
+        assert_eq!(domains["opening_reduction"], text(OPENING_REDUCTION_DOMAIN));
+
+        assert_eq!(
+            strings(&manifest["top_level_sequence"]),
+            [
+                "transcript-statement-digest",
+                "commitments",
+                "bank-0/repetition-0/relations",
+                "bank-0/repetition-1/relations",
+                "bank-1/repetition-0/relations",
+                "bank-1/repetition-1/relations",
+                "bank-0/opening",
+                "bank-2/repetition-0/relations",
+                "bank-2/repetition-1/relations",
+                "bank-1/opening",
+                "final-point/repetition-0",
+                "final-point/repetition-1",
+                "bank-2/opening",
+            ]
+        );
+        assert_eq!(
+            FORGEMATRIX_V4_RELATION_TRANSCRIPT,
+            "commitments-v1;bank0-relations;bank1-relations;bank0-opening;bank2-relations;bank1-opening;final-point-v1;bank2-opening"
+        );
+        assert_eq!(
+            strings(&manifest["relation_repetition_sequence"]),
+            [
+                "matrix-point: observe domain, bank, repetition; sample layer-7, batch-7, output-12",
+                "matrix-proof: observe preactivation, mask; verify 19-variable degree-3 sumcheck; observe weight, input",
+                "shift-proof: observe input, boundary; verify 7-variable degree-2 sumcheck; observe next-activation",
+                "route matrix, shift, and preceding-bank boundary opening claims",
+                "cubic-point: observe domain, bank, repetition; sample layer-7, batch-7, output-12",
+                "cubic-proof: verify zero-claim 26-variable degree-4 sumcheck; observe preactivation, next-activation",
+            ]
+        );
+        assert_eq!(
+            strings(&manifest["sumcheck_sequence"]),
+            [
+                "observe first polynomial coefficients",
+                "for each later polynomial: sample extension challenge, then observe coefficients",
+                "sample final extension challenge",
+                "check encoded terminal point and terminal evaluation",
+            ]
+        );
+
+        let opening = &manifest["opening_reduction"];
+        assert_eq!(
+            opening["claims_before_padding"],
+            FORGEMATRIX_V4_RELATION_OPENING_CLAIMS_PER_BANK
+        );
+        assert_eq!(
+            opening["claims_after_padding"],
+            FORGEMATRIX_V4_OPENING_CLAIMS_PER_BANK
+        );
+        assert_eq!(
+            opening["row_variables"],
+            FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES
+        );
+        assert_eq!(opening["sumcheck_degree"], 2);
+        assert_eq!(
+            strings(&opening["sequence"]),
+            [
+                "observe domain",
+                "observe fixed commitment",
+                "observe dynamic commitment",
+                "observe claim count",
+                "observe each claim tag, column point, row point, value",
+                "sample reverse-power RLC lambda",
+                "verify opening sumcheck",
+                "verify BaseFold evaluation claims",
+            ]
+        );
+
+        let basefold = &manifest["basefold"];
+        assert_eq!(
+            basefold["source_revision"],
+            FORGEMATRIX_V4_BASEFOLD_SOURCE_REVISION
+        );
+        assert_eq!(basefold["fixed_columns"], FORGEMATRIX_V4_FIXED_COLUMNS);
+        assert_eq!(basefold["dynamic_columns"], FORGEMATRIX_V4_DYNAMIC_COLUMNS);
+        assert_eq!(basefold["batching_variables"], 9);
+        assert_eq!(
+            basefold["fri_rounds"],
+            FORGEMATRIX_V4_BASEFOLD_ROW_VARIABLES
+        );
+        assert_eq!(basefold["log_blowup"], FORGEMATRIX_V4_BASEFOLD_LOG_BLOWUP);
+        assert_eq!(basefold["queries"], FORGEMATRIX_V4_BASEFOLD_QUERIES);
+        assert_eq!(basefold["pow_bits"], FORGEMATRIX_V4_BASEFOLD_POW_BITS);
+        assert_eq!(basefold["batch_grinding_bits"], 5);
+        assert_eq!(
+            strings(&basefold["sequence"]),
+            [
+                "observe batch-grinding witness and sample 5 zero bits",
+                "sample 9-element polynomial-batching point",
+                "reverse 23-element evaluation point",
+                "observe FRI round count 23",
+                "for each round: observe two-element univariate message, observe FRI commitment, sample beta",
+                "observe final polynomial",
+                "observe proof-of-work witness and sample 16 zero bits",
+                "sample 270 query indices of 24 bits",
+                "verify component Merkle openings, FRI query openings, folds, and final consistency",
+            ]
+        );
+
+        let extension_bytes = FORGEMATRIX_V4_EXTENSION_DEGREE as usize * 4;
+        let relation_bytes = sumcheck_bytes(
+            FORGEMATRIX_V4_MATRIX_SUMCHECK_VARIABLES,
+            FORGEMATRIX_V4_MATRIX_SUMCHECK_DEGREE,
+        ) + 3 * extension_bytes
+            + sumcheck_bytes(
+                FORGEMATRIX_V4_SHIFT_SUMCHECK_VARIABLES,
+                FORGEMATRIX_V4_SHIFT_SUMCHECK_DEGREE,
+            )
+            + 2 * extension_bytes
+            + sumcheck_bytes(
+                FORGEMATRIX_V4_CUBIC_SUMCHECK_VARIABLES,
+                FORGEMATRIX_V4_CUBIC_SUMCHECK_DEGREE,
+            )
+            + 2 * extension_bytes;
+        let bank_bytes = 32
+            + FORGEMATRIX_V4_RELATION_REPETITIONS as usize * relation_bytes
+            + FORGEMATRIX_V4_OPENING_REDUCTION_MAX_BYTES;
+        let first_bank = 16 + FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES;
+        let wire = &manifest["wire"];
+        assert_eq!(wire["outer_magic"], "CMV4PF01");
+        assert_eq!(wire["outer_version"], 1);
+        assert_eq!(wire["banks"], PRODUCTION_V2_BANKS);
+        assert_eq!(wire["opening_magic"], "CMV4BF01");
+        assert_eq!(wire["opening_version"], 1);
+        assert_eq!(
+            wire["transparent_proof_bytes"],
+            FORGEMATRIX_V4_TRANSPARENT_PROOF_BYTES
+        );
+        assert_eq!(
+            wire["final_activation_bytes"],
+            FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES
+        );
+        assert_eq!(wire["relation_repetition_bytes"], relation_bytes);
+        assert_eq!(wire["bank_bytes"], bank_bytes);
+        assert_eq!(
+            wire["opening_bytes"],
+            FORGEMATRIX_V4_OPENING_REDUCTION_MAX_BYTES
+        );
+        assert_eq!(
+            wire["bank_offsets"],
+            serde_json::json!([
+                first_bank,
+                first_bank + bank_bytes,
+                first_bank + 2 * bank_bytes
+            ])
+        );
+        assert_eq!(
+            wire["opening_offsets"],
+            serde_json::json!([
+                first_bank + 32 + 2 * relation_bytes,
+                first_bank + bank_bytes + 32 + 2 * relation_bytes,
+                first_bank + 2 * bank_bytes + 32 + 2 * relation_bytes,
+            ])
+        );
+    }
+
+    #[cfg(feature = "forgematrix-v4-verifier")]
+    #[test]
     fn production_v4_core_vector_is_canonical() {
         use slop_algebra::AbstractField;
 

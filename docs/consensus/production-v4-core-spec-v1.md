@@ -7,8 +7,10 @@ independent implementation a compact starting point for compatibility work.
 
 This first specification slice covers block-to-proof binding, public-output
 binding, work derivation, the transcript statement, artifact identities, and
-wire boundaries. The complete proof-algebra and BaseFold message-order
-specification remains a separate mainnet milestone.
+wire boundaries. The companion
+[proof-algebra and message-order specification](production-v4-proof-algebra-v1.md)
+covers the relation equations, transcript sequence, claim routing, BaseFold
+order, and exact proof layout.
 
 ## Encoding conventions
 

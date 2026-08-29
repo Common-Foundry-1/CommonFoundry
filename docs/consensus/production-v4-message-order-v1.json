@@ -1,0 +1,109 @@
+{
+  "schema": "CommonFoundry/ForgeMatrix/V4/MessageOrder/v1",
+  "scope": "Existing consensus algebra, Fiat-Shamir order, BaseFold source pin, and transparent-proof layout",
+  "consensus_change": false,
+  "field": {
+    "name": "KoalaBear",
+    "modulus": 2130706433,
+    "extension_degree": 4,
+    "extension_polynomial": "X^4 - 3",
+    "extension_coefficient_order": ["1", "X", "X^2", "X^3"]
+  },
+  "challenger": {
+    "suite": "slop-koala-bear/KoalaBearDegree4Duplex/Poseidon2-width16-digest8",
+    "byte_observation": "observe field(len), then one field(byte) per byte",
+    "statement_domain": "CommonFoundry/ForgeMatrix/V4/TranscriptStatement/v1"
+  },
+  "domains": {
+    "commitments": "CommonFoundry/ForgeMatrix/V4/Commitments/v1",
+    "matrix_point": "CommonFoundry/ForgeMatrix/V4/MatrixPoint/v1",
+    "matrix_proof": "CommonFoundry/ForgeMatrix/V4/MatrixProof/v1",
+    "shift_proof": "CommonFoundry/ForgeMatrix/V4/ShiftProof/v1",
+    "cubic_point": "CommonFoundry/ForgeMatrix/V4/CubicPoint/v1",
+    "cubic_proof": "CommonFoundry/ForgeMatrix/V4/CubicProof/v1",
+    "final_point": "CommonFoundry/ForgeMatrix/V4/FinalPoint/v1",
+    "opening_reduction": "CommonFoundry/ForgeMatrix/V4/OpeningReduction/v2"
+  },
+  "top_level_sequence": [
+    "transcript-statement-digest",
+    "commitments",
+    "bank-0/repetition-0/relations",
+    "bank-0/repetition-1/relations",
+    "bank-1/repetition-0/relations",
+    "bank-1/repetition-1/relations",
+    "bank-0/opening",
+    "bank-2/repetition-0/relations",
+    "bank-2/repetition-1/relations",
+    "bank-1/opening",
+    "final-point/repetition-0",
+    "final-point/repetition-1",
+    "bank-2/opening"
+  ],
+  "relation_repetition_sequence": [
+    "matrix-point: observe domain, bank, repetition; sample layer-7, batch-7, output-12",
+    "matrix-proof: observe preactivation, mask; verify 19-variable degree-3 sumcheck; observe weight, input",
+    "shift-proof: observe input, boundary; verify 7-variable degree-2 sumcheck; observe next-activation",
+    "route matrix, shift, and preceding-bank boundary opening claims",
+    "cubic-point: observe domain, bank, repetition; sample layer-7, batch-7, output-12",
+    "cubic-proof: verify zero-claim 26-variable degree-4 sumcheck; observe preactivation, next-activation"
+  ],
+  "sumcheck_sequence": [
+    "observe first polynomial coefficients",
+    "for each later polynomial: sample extension challenge, then observe coefficients",
+    "sample final extension challenge",
+    "check encoded terminal point and terminal evaluation"
+  ],
+  "opening_reduction": {
+    "claims_before_padding": 12,
+    "claims_after_padding": 16,
+    "row_variables": 23,
+    "sumcheck_degree": 2,
+    "sequence": [
+      "observe domain",
+      "observe fixed commitment",
+      "observe dynamic commitment",
+      "observe claim count",
+      "observe each claim tag, column point, row point, value",
+      "sample reverse-power RLC lambda",
+      "verify opening sumcheck",
+      "verify BaseFold evaluation claims"
+    ]
+  },
+  "basefold": {
+    "source_revision": "92b8eabaea9ab7306da5826caa700adabf7445ba",
+    "source_path": "slop/crates/basefold/src/verifier.rs::verify_mle_evaluations",
+    "fixed_columns": 256,
+    "dynamic_columns": 16,
+    "batching_variables": 9,
+    "fri_rounds": 23,
+    "log_blowup": 1,
+    "queries": 270,
+    "pow_bits": 16,
+    "batch_grinding_bits": 5,
+    "sequence": [
+      "observe batch-grinding witness and sample 5 zero bits",
+      "sample 9-element polynomial-batching point",
+      "reverse 23-element evaluation point",
+      "observe FRI round count 23",
+      "for each round: observe two-element univariate message, observe FRI commitment, sample beta",
+      "observe final polynomial",
+      "observe proof-of-work witness and sample 16 zero bits",
+      "sample 270 query indices of 24 bits",
+      "verify component Merkle openings, FRI query openings, folds, and final consistency"
+    ]
+  },
+  "wire": {
+    "outer_magic": "CMV4PF01",
+    "outer_version": 1,
+    "banks": 3,
+    "opening_magic": "CMV4BF01",
+    "opening_version": 1,
+    "transparent_proof_bytes": 12025320,
+    "final_activation_bytes": 2097152,
+    "relation_repetition_bytes": 4672,
+    "bank_bytes": 3309384,
+    "opening_bytes": 3300008,
+    "bank_offsets": [2097168, 5406552, 8715936],
+    "opening_offsets": [2106544, 5415928, 8725312]
+  }
+}

@@ -14,7 +14,9 @@ use cmfd_node::p2p::{
 };
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
-    DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_PAYOUT_FEE_ATOMS, DEFAULT_POOL_SOCKET_ADDRESS,
+    DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS, DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
+    DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_PAYOUT_FEE_ATOMS,
+    DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS, DEFAULT_POOL_SOCKET_ADDRESS,
     DEFAULT_SHARE_LEADING_ZERO_BITS, PoolPayoutPolicy, PoolServerConfig, certificate_sha256,
     generate_pool_certificate, spawn_pool_server,
 };
@@ -217,6 +219,15 @@ enum Command {
         /// Burned fee, in atoms, for each pool payout transaction.
         #[arg(long, default_value_t = DEFAULT_POOL_PAYOUT_FEE_ATOMS)]
         pool_payout_fee_atoms: u64,
+        /// Maximum simultaneous pool connections accepted from one source IP.
+        #[arg(long, default_value_t = DEFAULT_POOL_CONNECTIONS_PER_SOURCE)]
+        pool_max_connections_per_source: usize,
+        /// Maximum share replays evaluated concurrently by the pool verifier.
+        #[arg(long, default_value_t = DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS)]
+        pool_max_concurrent_share_verifications: usize,
+        /// Maximum authenticated shares waiting for a pool verifier slot.
+        #[arg(long, default_value_t = DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS)]
+        pool_max_queued_share_verifications: usize,
     },
 }
 
@@ -448,6 +459,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_testnet_payouts,
             pool_minimum_payout_atoms,
             pool_payout_fee_atoms,
+            pool_max_connections_per_source,
+            pool_max_concurrent_share_verifications,
+            pool_max_queued_share_verifications,
         } => {
             require_pool_mining_profile()?;
             let shutdown = install_shutdown_handler()?;
@@ -508,6 +522,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
             config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
             config.ledger_directory = Some(cli.data_dir.join("pool-ledger"));
+            config.max_connections_per_source = pool_max_connections_per_source;
+            config.max_concurrent_share_verifications = pool_max_concurrent_share_verifications;
+            config.max_queued_share_verifications = pool_max_queued_share_verifications;
             if enable_testnet_payouts {
                 config.payout_policy = Some(PoolPayoutPolicy {
                     minimum_payout_atoms: pool_minimum_payout_atoms,
@@ -539,10 +556,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "automatic_testnet_payouts": enable_testnet_payouts,
                     "minimum_payout_atoms": pool_minimum_payout_atoms,
                     "payout_fee_atoms": pool_payout_fee_atoms,
+                    "max_connections_per_source": pool_max_connections_per_source,
+                    "max_concurrent_share_verifications": pool_max_concurrent_share_verifications,
+                    "max_queued_share_verifications": pool_max_queued_share_verifications,
                     "used_insecure_default_miner": used_insecure_default_miner,
                     "public_peer_mode": allow_public_peers,
                     "p2p_warning": peer_warning(allow_public_peers),
-                    "accounting": "durable network-bound test accounting; nonwithdrawable; not funds; not an on-chain balance or payout"
+                    "accounting": cmfd_node::pool::POOL_ACCOUNTING_SEMANTICS
                 }))?
             );
             let service_exit = shutdown.wait_for_service_exit(|| {

@@ -466,6 +466,11 @@ The default fixed-price test policy credits one Devnet atom per accepted share.
 When the operator enables testnet payouts, the pool journals each exact signed
 transaction before broadcast, confirms it against the active chain, and safely
 releases its credit after a reorganization invalidates the transaction.
+Pool work admission is bounded independently of socket admission: one replay is
+active by default, eight authenticated shares may wait, and additional shares
+receive a retryable busy result. Per-session pacing, per-source connection caps,
+and temporary backoff for repeated protocol/authentication failures keep the
+GPU verifier available to well-behaved miners.
 
 Generate a test certificate and start a local pool from the repository root:
 

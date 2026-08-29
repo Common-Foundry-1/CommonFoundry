@@ -60,3 +60,10 @@ path = "fuzz_targets/production_v4_peer_block_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "pool_frame_decode"
+path = "fuzz_targets/pool_frame_decode.rs"
+test = false
+doc = false
+bench = false

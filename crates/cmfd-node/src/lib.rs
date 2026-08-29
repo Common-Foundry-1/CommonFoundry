@@ -5228,12 +5228,16 @@ impl Node {
         self.mempool.contains_key(&txid)
     }
 
-    pub(crate) fn active_transaction_confirmations(
+    pub(crate) fn active_transaction_confirmations_for(
         &mut self,
-        txid: [u8; 32],
-    ) -> Result<Option<u64>, NodeError> {
+        txids: &HashSet<[u8; 32]>,
+    ) -> Result<HashMap<[u8; 32], u64>, NodeError> {
         let result = (|| {
-            for position in 1..self.index.active_chain.len() {
+            let mut confirmations = HashMap::new();
+            if txids.is_empty() {
+                return Ok(confirmations);
+            }
+            for position in (1..self.index.active_chain.len()).rev() {
                 let block_id = self.index.active_chain[position];
                 let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
                     NodeError::CorruptLog(
@@ -5248,15 +5252,23 @@ impl Node {
                     self.params.network_id,
                     matches!(self.profile.proof, ProofProfile::ProductionV3),
                 )?;
-                if block
-                    .transactions
-                    .iter()
-                    .any(|transaction| transaction.txid() == txid)
-                {
-                    return Ok(u64::try_from(self.index.active_chain.len() - position).ok());
+                let depth =
+                    u64::try_from(self.index.active_chain.len() - position).map_err(|_| {
+                        NodeError::CorruptLog(
+                            "active transaction depth does not fit u64".to_owned(),
+                        )
+                    })?;
+                for transaction in &block.transactions {
+                    let txid = transaction.txid();
+                    if txids.contains(&txid) {
+                        confirmations.insert(txid, depth);
+                    }
+                }
+                if confirmations.len() == txids.len() {
+                    break;
                 }
             }
-            Ok(None)
+            Ok(confirmations)
         })();
         self.latch_authenticated_storage_failure(result)
     }

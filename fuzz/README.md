@@ -12,6 +12,7 @@ cargo +nightly fuzz run bls_v3_candidate_decode -- "-dict=fuzz/dictionaries/bls-
 cargo +nightly fuzz run production_v4_proof_decode -- "-dict=fuzz/dictionaries/production-v4-wire.dict" -max_len=13631489 -timeout=10 -rss_limit_mb=4096 -malloc_limit_mb=1024
 cargo +nightly fuzz run production_v4_block_decode -- "-dict=fuzz/dictionaries/production-v4-wire.dict" -max_len=16777217 -timeout=10 -rss_limit_mb=4096 -malloc_limit_mb=1024
 cargo +nightly fuzz run production_v4_peer_block_decode -- "-dict=fuzz/dictionaries/production-v4-wire.dict" -max_len=16777237 -timeout=10 -rss_limit_mb=4096 -malloc_limit_mb=1024
+cargo +nightly fuzz run pool_frame_decode -- -max_len=32768 -timeout=10 -rss_limit_mb=1024 -malloc_limit_mb=256
 ```
 
 On Windows, use an MSVC nightly and put Visual Studio's directory containing

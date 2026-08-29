@@ -562,6 +562,16 @@ engine journals an exact signed transaction before broadcast, tracks active
 chain confirmations, retries prepared transactions, and releases reserved
 credit if a reorganization makes the transaction inputs unavailable.
 
+GPU replay admission has its own bounded queue rather than inheriting the 64
+socket slots. The defaults allow one active replay and eight waiting shares;
+overflow receives a retryable busy result without consuming share credit.
+Each authenticated session has an eight-share burst with a four-per-second
+refill. One source IP receives at most eight default connection slots, and four
+objective framing, compatibility, or payout-authentication failures in one
+minute trigger one minute of source backoff. Source tracking itself is capped
+at 1,024 records. These controls bound local work amplification and are covered
+by deterministic parser, concurrency, and authenticated socket-load tests.
+
 Production pool activation additionally requires hardened operator key custody,
 sustained payout and share-verification queue testing, denial-of-service
 analysis, fuzzing and load tests, independent implementations, and external

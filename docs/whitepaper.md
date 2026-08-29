@@ -911,10 +911,15 @@ resource use are rejected.
 
 The current compile-time limits are 64 concurrent sessions, 1,000,000 messages
 per session, 65,536 valid nonce records per job, 1,024 recent session records,
-and 1,024 recent payout-label records. Finished connection threads are reaped;
-inactive accounting records are pruned within the stated caps. These bounds are
-Devnet engineering controls, not evidence of public-network denial-of-service
-maturity.
+and 1,024 recent payout records. Finished connection threads are reaped and
+inactive accounting records are pruned within the stated caps. The GPU replay
+path has its own bounded admission gate: one active verification and eight
+waiting shares by default, with retryable overflow. Per-session pacing,
+per-source connection caps, a capped 1,024-source table, and temporary backoff
+after repeated objective protocol or authentication failures bound local work
+amplification. Deterministic arbitrary-input parser coverage and concurrent
+authenticated socket tests exercise these controls as the first RCNet load
+baseline.
 
 The pool ledger is bounded, durable test infrastructure. Accepted and rejected
 shares, found blocks, and credited Devnet atoms are stored by session and payout
@@ -1120,6 +1125,7 @@ Common Foundry advances through measured software, named hardware, canonical art
 | Devnet pool | Default address | `127.0.0.1:18445` |
 | Devnet pool | Maximum framed message | 16 KiB |
 | Devnet pool | Connections / messages per session | 64 / 1,000,000 |
+| Devnet pool | Default source / active verifier / queued-share limits | 8 / 1 / 8 |
 | Devnet pool | Valid nonce records per job | 65,536 |
 | Devnet pool | Session / payout / block records | 1,024 / 1,024 / 65,536 |
 | Devnet pool | Payout transaction records | 65,536 |

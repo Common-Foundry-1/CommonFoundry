@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,12 @@ pub const DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE: u64 = 1;
 pub const POOL_MAX_FRAME_BYTES: usize = 16 * 1024;
 pub const POOL_MAX_WORKER_BYTES: usize = 32;
 pub const POOL_MAX_CONNECTIONS: usize = 64;
+pub const POOL_MAX_CONNECTIONS_PER_SOURCE: usize = 16;
+pub const DEFAULT_POOL_CONNECTIONS_PER_SOURCE: usize = 8;
+pub const POOL_MAX_CONCURRENT_SHARE_VERIFICATIONS: usize = 8;
+pub const DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS: usize = 1;
+pub const POOL_MAX_QUEUED_SHARE_VERIFICATIONS: usize = 64;
+pub const DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS: usize = 8;
 pub const POOL_MAX_MESSAGES_PER_SESSION: u64 = 1_000_000;
 pub const POOL_MAX_SHARES_PER_JOB: usize = 65_536;
 pub const POOL_MAX_LEDGER_SESSIONS: usize = 1_024;
@@ -65,6 +71,13 @@ const POOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_READ_TIMEOUT: Duration = Duration::from_millis(200);
 const POOL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_ACCEPT_POLL: Duration = Duration::from_millis(25);
+const POOL_SHARE_VERIFICATION_WAIT: Duration = Duration::from_secs(5);
+const POOL_SHARE_RATE_BURST: u32 = 8;
+const POOL_SHARE_RATE_INTERVAL: Duration = Duration::from_millis(250);
+const POOL_SOURCE_FAILURE_LIMIT: u32 = 4;
+const POOL_SOURCE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const POOL_SOURCE_BAN_DURATION: Duration = Duration::from_secs(60);
+const POOL_MAX_SOURCE_RECORDS: usize = 1_024;
 const POOL_JOB_DOMAIN: &str = "CMFD/DEVNET-POOL/JOB/V1";
 const POOL_NONCE_ORIGIN_DOMAIN: &str = "CMFD/DEVNET-POOL/NONCE-ORIGIN/V1";
 const POOL_PAYOUT_AUTH_DOMAIN: &str = "CMFD/POOL/PAYOUT-AUTH/V1";
@@ -101,6 +114,16 @@ pub enum PoolError {
     InvalidWorker,
     #[error("pool connection limit must be between 1 and {POOL_MAX_CONNECTIONS}")]
     InvalidConnectionLimit,
+    #[error(
+        "pool per-source connection limit must be between 1 and {POOL_MAX_CONNECTIONS_PER_SOURCE}"
+    )]
+    InvalidSourceConnectionLimit,
+    #[error(
+        "pool concurrent share-verification limit must be between 1 and {POOL_MAX_CONCURRENT_SHARE_VERIFICATIONS}"
+    )]
+    InvalidShareVerificationLimit,
+    #[error("pool queued share-verification limit exceeds {POOL_MAX_QUEUED_SHARE_VERIFICATIONS}")]
+    InvalidShareVerificationQueueLimit,
     #[error("pool payout policy requires nonzero minimum and fee amounts")]
     InvalidPayoutPolicy,
     #[error("pool settlement requires the block-reward destination to be this node's wallet")]
@@ -169,6 +192,9 @@ pub struct PoolServerConfig {
     pub share_target: [u8; 32],
     pub test_credit_atoms_per_share: u64,
     pub max_connections: usize,
+    pub max_connections_per_source: usize,
+    pub max_concurrent_share_verifications: usize,
+    pub max_queued_share_verifications: usize,
     pub ledger_directory: Option<PathBuf>,
     pub payout_policy: Option<PoolPayoutPolicy>,
     pub production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
@@ -189,6 +215,9 @@ impl PoolServerConfig {
             share_target: target_with_leading_zero_bits(DEFAULT_SHARE_LEADING_ZERO_BITS),
             test_credit_atoms_per_share: DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE,
             max_connections: POOL_MAX_CONNECTIONS,
+            max_connections_per_source: DEFAULT_POOL_CONNECTIONS_PER_SOURCE,
+            max_concurrent_share_verifications: DEFAULT_POOL_CONCURRENT_SHARE_VERIFICATIONS,
+            max_queued_share_verifications: DEFAULT_POOL_QUEUED_SHARE_VERIFICATIONS,
             ledger_directory: None,
             payout_policy: None,
             production_v4_share_verifier: None,
@@ -1312,6 +1341,198 @@ fn sync_ledger_directory(_path: &Path) -> Result<(), PoolError> {
     Ok(())
 }
 
+struct PoolSourceAdmission {
+    state: Mutex<PoolSourceAdmissionState>,
+    max_connections_per_source: usize,
+}
+
+#[derive(Default)]
+struct PoolSourceAdmissionState {
+    sources: HashMap<IpAddr, PoolSourceRecord>,
+}
+
+#[derive(Default)]
+struct PoolSourceRecord {
+    active_connections: usize,
+    failures: u32,
+    failure_window_started: Option<Instant>,
+    banned_until: Option<Instant>,
+}
+
+impl PoolSourceAdmission {
+    fn new(max_connections_per_source: usize) -> Self {
+        Self {
+            state: Mutex::new(PoolSourceAdmissionState::default()),
+            max_connections_per_source,
+        }
+    }
+
+    fn admit(&self, source: IpAddr, now: Instant) -> Result<bool, PoolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        if !state.sources.contains_key(&source) && state.sources.len() >= POOL_MAX_SOURCE_RECORDS {
+            state.sources.retain(|_, record| {
+                record.active_connections > 0
+                    || record.banned_until.is_some_and(|until| until > now)
+                    || record.failure_window_started.is_some_and(|started| {
+                        now.saturating_duration_since(started) < POOL_SOURCE_FAILURE_WINDOW
+                    })
+            });
+            if state.sources.len() >= POOL_MAX_SOURCE_RECORDS {
+                return Ok(false);
+            }
+        }
+        let record = state.sources.entry(source).or_default();
+        if record.banned_until.is_some_and(|until| until > now) {
+            return Ok(false);
+        }
+        if record.banned_until.take().is_some() {
+            record.failures = 0;
+            record.failure_window_started = None;
+        }
+        if record.active_connections >= self.max_connections_per_source {
+            return Ok(false);
+        }
+        record.active_connections += 1;
+        Ok(true)
+    }
+
+    fn release(&self, source: IpAddr) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(record) = state.sources.get_mut(&source)
+        {
+            record.active_connections = record.active_connections.saturating_sub(1);
+        }
+    }
+
+    fn record_failure(&self, source: IpAddr, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let record = state.sources.entry(source).or_default();
+        if record.failure_window_started.is_none_or(|started| {
+            now.saturating_duration_since(started) >= POOL_SOURCE_FAILURE_WINDOW
+        }) {
+            record.failures = 0;
+            record.failure_window_started = Some(now);
+        }
+        record.failures = record.failures.saturating_add(1);
+        if record.failures >= POOL_SOURCE_FAILURE_LIMIT {
+            record.banned_until = now.checked_add(POOL_SOURCE_BAN_DURATION);
+            record.failures = 0;
+            record.failure_window_started = None;
+        }
+    }
+}
+
+struct ShareVerificationGate {
+    state: Mutex<ShareVerificationState>,
+    ready: Condvar,
+    max_active: usize,
+    max_waiting: usize,
+}
+
+#[derive(Default)]
+struct ShareVerificationState {
+    active: usize,
+    waiting: usize,
+}
+
+impl ShareVerificationGate {
+    fn new(max_active: usize, max_waiting: usize) -> Self {
+        Self {
+            state: Mutex::new(ShareVerificationState::default()),
+            ready: Condvar::new(),
+            max_active,
+            max_waiting,
+        }
+    }
+
+    fn acquire(&self, stop: &AtomicBool) -> Result<Option<ShareVerificationPermit<'_>>, PoolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        if state.active < self.max_active {
+            state.active += 1;
+            return Ok(Some(ShareVerificationPermit { gate: self }));
+        }
+        if state.waiting >= self.max_waiting {
+            return Ok(None);
+        }
+        state.waiting += 1;
+        let deadline = checked_pool_deadline(Instant::now(), POOL_SHARE_VERIFICATION_WAIT)?;
+        loop {
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                state.waiting -= 1;
+                return Ok(None);
+            }
+            if state.active < self.max_active {
+                state.waiting -= 1;
+                state.active += 1;
+                return Ok(Some(ShareVerificationPermit { gate: self }));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .map_err(|_| PoolError::SharedStatePoisoned)?;
+            state = next;
+        }
+    }
+
+    fn wake_all(&self) {
+        self.ready.notify_all();
+    }
+}
+
+struct ShareVerificationPermit<'a> {
+    gate: &'a ShareVerificationGate,
+}
+
+impl Drop for ShareVerificationPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            self.gate.ready.notify_one();
+        }
+    }
+}
+
+struct ShareRateLimiter {
+    available: u32,
+    last_refill: Instant,
+}
+
+impl ShareRateLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            available: POOL_SHARE_RATE_BURST,
+            last_refill: now,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let intervals = now.saturating_duration_since(self.last_refill).as_nanos()
+            / POOL_SHARE_RATE_INTERVAL.as_nanos();
+        if intervals > 0 {
+            let refill = u32::try_from(intervals).unwrap_or(u32::MAX);
+            self.available = self
+                .available
+                .saturating_add(refill)
+                .min(POOL_SHARE_RATE_BURST);
+            self.last_refill = now;
+        }
+        if self.available == 0 {
+            return false;
+        }
+        self.available -= 1;
+        true
+    }
+}
+
 struct SharedServer {
     node: Arc<Mutex<Node>>,
     state: Mutex<ServerState>,
@@ -1319,6 +1540,8 @@ struct SharedServer {
     stop: AtomicBool,
     active_connections: AtomicUsize,
     active_sockets: Mutex<HashMap<u64, TcpStream>>,
+    source_admission: PoolSourceAdmission,
+    share_verification: ShareVerificationGate,
     next_connection_id: AtomicU64,
     next_session_id: AtomicU64,
     network_id: [u8; 32],
@@ -1401,6 +1624,19 @@ pub fn spawn_pool_server(
     if config.max_connections == 0 || config.max_connections > POOL_MAX_CONNECTIONS {
         return Err(PoolError::InvalidConnectionLimit);
     }
+    if config.max_connections_per_source == 0
+        || config.max_connections_per_source > POOL_MAX_CONNECTIONS_PER_SOURCE
+    {
+        return Err(PoolError::InvalidSourceConnectionLimit);
+    }
+    if config.max_concurrent_share_verifications == 0
+        || config.max_concurrent_share_verifications > POOL_MAX_CONCURRENT_SHARE_VERIFICATIONS
+    {
+        return Err(PoolError::InvalidShareVerificationLimit);
+    }
+    if config.max_queued_share_verifications > POOL_MAX_QUEUED_SHARE_VERIFICATIONS {
+        return Err(PoolError::InvalidShareVerificationQueueLimit);
+    }
     if let Some(policy) = config.payout_policy {
         if policy.minimum_payout_atoms == 0 || policy.fee_atoms == 0 {
             return Err(PoolError::InvalidPayoutPolicy);
@@ -1458,6 +1694,11 @@ pub fn spawn_pool_server(
         stop: AtomicBool::new(false),
         active_connections: AtomicUsize::new(0),
         active_sockets: Mutex::new(HashMap::new()),
+        source_admission: PoolSourceAdmission::new(config.max_connections_per_source),
+        share_verification: ShareVerificationGate::new(
+            config.max_concurrent_share_verifications,
+            config.max_queued_share_verifications,
+        ),
         next_connection_id: AtomicU64::new(0),
         next_session_id: AtomicU64::new(next_session_id),
         network_id,
@@ -1511,6 +1752,15 @@ fn pool_listener(listener: TcpListener, shared: Arc<SharedServer>) -> Result<(),
                     drop(stream);
                     continue;
                 }
+                let source = peer.ip();
+                if !shared.source_admission.admit(source, Instant::now())? {
+                    drop(stream);
+                    continue;
+                }
+                let source_guard = SourceAdmissionGuard {
+                    shared: Arc::clone(&shared),
+                    source,
+                };
                 let shutdown_stream = match stream.try_clone() {
                     Ok(stream) => stream,
                     Err(_) => {
@@ -1530,13 +1780,21 @@ fn pool_listener(listener: TcpListener, shared: Arc<SharedServer>) -> Result<(),
                 let connection_guard = ConnectionGuard {
                     shared: Arc::clone(&shared),
                     _socket: socket_guard,
+                    _source: source_guard,
                 };
                 connections.push(
                     thread::Builder::new()
                         .name("cmfd-pool-session".to_owned())
                         .spawn(move || {
                             let _guard = connection_guard;
-                            let _ = handle_connection(stream, Arc::clone(&connection_shared));
+                            if let Err(error) =
+                                handle_connection(stream, Arc::clone(&connection_shared))
+                                && is_pool_source_failure(&error)
+                            {
+                                connection_shared
+                                    .source_admission
+                                    .record_failure(source, Instant::now());
+                            }
                         })?,
                 );
             }
@@ -1588,6 +1846,7 @@ fn register_active_connection(
 }
 
 fn shutdown_active_connections(shared: &SharedServer) -> Result<(), PoolError> {
+    shared.share_verification.wake_all();
     let sockets = shared
         .active_sockets
         .lock()
@@ -1614,6 +1873,7 @@ impl Drop for ActiveSocketGuard {
 struct ConnectionGuard {
     shared: Arc<SharedServer>,
     _socket: ActiveSocketGuard,
+    _source: SourceAdmissionGuard,
 }
 
 impl Drop for ConnectionGuard {
@@ -1622,6 +1882,37 @@ impl Drop for ConnectionGuard {
             .active_connections
             .fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+struct SourceAdmissionGuard {
+    shared: Arc<SharedServer>,
+    source: IpAddr,
+}
+
+impl Drop for SourceAdmissionGuard {
+    fn drop(&mut self) {
+        self.shared.source_admission.release(self.source);
+    }
+}
+
+fn is_pool_source_failure(error: &PoolError) -> bool {
+    matches!(
+        error,
+        PoolError::ConnectionClosed
+            | PoolError::ProtocolMismatch
+            | PoolError::NetworkMismatch
+            | PoolError::FingerprintMismatch
+            | PoolError::PayoutAuthentication
+            | PoolError::MessageCountLimit
+            | PoolError::FrameLimit
+            | PoolError::InvalidMessage(_)
+            | PoolError::Json(_)
+            | PoolError::Tls(_)
+    ) || matches!(
+        error,
+        PoolError::Io(error)
+            if matches!(error.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::TimedOut)
+    )
 }
 
 fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(), PoolError> {
@@ -1728,6 +2019,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
     stream.sock.set_read_timeout(Some(POOL_READ_TIMEOUT))?;
 
     let mut message_count = 0_u64;
+    let mut share_rate = ShareRateLimiter::new(Instant::now());
     while !shared.stop.load(Ordering::Acquire) {
         rotate_if_tip_changed(&shared)?;
         let message = match read_frame_interruptible::<_, ClientMessage>(&mut stream, &shared.stop)
@@ -1759,7 +2051,11 @@ fn handle_connection(stream: TcpStream, shared: Arc<SharedServer>) -> Result<(),
         // its next frame. Rotate again immediately before classifying work.
         rotate_if_tip_changed(&shared)?;
         let before = current_job(&shared)?;
-        let result = process_share(&shared, session_id, job_id, nonce)?;
+        let result = if share_rate.allow(Instant::now()) {
+            process_share(&shared, session_id, job_id, nonce)?
+        } else {
+            retryable_result(&shared, session_id, job_id, nonce, "share_rate_limited")?
+        };
         let after = current_job(&shared)?;
         if before.job_id != after.job_id || job_id != before.job_id {
             write_frame(&mut stream, &ServerMessage::Job { job: after })?;
@@ -1805,7 +2101,11 @@ fn process_share(
     if job_id != active.wire.job_id {
         return rejected_result(shared, session_id, job_id, nonce, "stale_job");
     }
+    let Some(_verification_permit) = shared.share_verification.acquire(&shared.stop)? else {
+        return retryable_result(shared, session_id, job_id, nonce, "share_verifier_busy");
+    };
     let evaluation = evaluate_pool_share(shared, &active, nonce)?;
+    drop(_verification_permit);
     if evaluation.work_digest > active.wire.share_target {
         return rejected_result(shared, session_id, job_id, nonce, "low_difficulty_share");
     }
@@ -2185,11 +2485,16 @@ fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(),
             .node
             .lock()
             .map_err(|_| PoolError::SharedStatePoisoned)?;
+        let txids = records
+            .iter()
+            .map(|(txid, _)| *txid)
+            .collect::<HashSet<_>>();
+        let active_confirmations = node.active_transaction_confirmations_for(&txids)?;
         for (txid, record) in records {
             let (state, confirmations) = if let Some(confirmations) =
-                node.active_transaction_confirmations(txid)?
+                active_confirmations.get(&txid)
             {
-                (PoolPayoutTransactionState::Confirmed, confirmations)
+                (PoolPayoutTransactionState::Confirmed, *confirmations)
             } else if node.mempool_contains_transaction(txid) {
                 (PoolPayoutTransactionState::Broadcast, 0)
             } else if record.state == PoolPayoutTransactionState::Abandoned {
@@ -2314,8 +2619,13 @@ fn next_payout_candidate(
         .state
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
+    let totals = payout_transaction_totals(&ledger)?;
     for payout in ledger.payouts.keys().copied() {
-        let available = payout_available_atoms(&ledger, payout)?;
+        let credited = ledger.payouts[&payout].credited_devnet_atoms;
+        let reserved = totals.get(&payout).map_or(0, |totals| totals.0);
+        let available = credited.checked_sub(reserved).ok_or_else(|| {
+            PoolError::LedgerCorrupt("reserved payout exceeds earned credit".to_owned())
+        })?;
         if available >= policy.minimum_payout_atoms {
             return Ok(Some((payout, available)));
         }
@@ -2339,6 +2649,20 @@ fn payout_available_atoms(ledger: &Ledger, payout: [u8; 32]) -> Result<u64, Pool
     credited
         .checked_sub(reserved)
         .ok_or_else(|| PoolError::LedgerCorrupt("reserved payout exceeds earned credit".to_owned()))
+}
+
+fn payout_transaction_totals(ledger: &Ledger) -> Result<BTreeMap<[u8; 32], (u64, u64)>, PoolError> {
+    let mut totals = BTreeMap::<[u8; 32], (u64, u64)>::new();
+    for record in ledger.payout_transactions.values() {
+        let entry = totals.entry(record.payout).or_default();
+        if record.state.reserves_credit() {
+            entry.0 = checked_ledger_add(entry.0, record.amount_atoms, "reserved payout")?;
+        }
+        if record.state == PoolPayoutTransactionState::Confirmed {
+            entry.1 = checked_ledger_add(entry.1, record.amount_atoms, "confirmed payout")?;
+        }
+    }
+    Ok(totals)
 }
 
 fn current_job(shared: &SharedServer) -> Result<PoolJob, PoolError> {
@@ -2623,6 +2947,7 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         .state
         .lock()
         .map_err(|_| PoolError::SharedStatePoisoned)?;
+    let payout_transaction_totals = payout_transaction_totals(&ledger)?;
     let sessions = ledger
         .sessions
         .iter()
@@ -2632,16 +2957,15 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         .payouts
         .iter()
         .map(|(payout, record)| {
-            let available_payout_atoms = payout_available_atoms(&ledger, *payout)?;
-            let confirmed_payout_atoms = ledger
-                .payout_transactions
-                .values()
-                .filter(|transaction| {
-                    transaction.payout == *payout
-                        && transaction.state == PoolPayoutTransactionState::Confirmed
-                })
-                .try_fold(0_u64, |total, transaction| {
-                    checked_ledger_add(total, transaction.amount_atoms, "confirmed payout")
+            let (reserved_payout_atoms, confirmed_payout_atoms) = payout_transaction_totals
+                .get(payout)
+                .copied()
+                .unwrap_or_default();
+            let available_payout_atoms = record
+                .credited_devnet_atoms
+                .checked_sub(reserved_payout_atoms)
+                .ok_or_else(|| {
+                    PoolError::LedgerCorrupt("reserved payout exceeds earned credit".to_owned())
                 })?;
             Ok::<_, PoolError>(PoolPayoutStats {
                 payout: hex::encode(payout),
@@ -2649,7 +2973,7 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
                 rejected_shares: record.rejected_shares,
                 pool_blocks: record.pool_blocks,
                 credited_devnet_atoms: record.credited_devnet_atoms,
-                reserved_payout_atoms: record.credited_devnet_atoms - available_payout_atoms,
+                reserved_payout_atoms,
                 confirmed_payout_atoms,
                 available_payout_atoms,
             })
@@ -3236,6 +3560,15 @@ fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, PoolErr
     Ok(serde_json::from_slice(&body)?)
 }
 
+/// Parser seam used by the out-of-process fuzz target for both pool directions.
+#[doc(hidden)]
+pub fn fuzz_decode_pool_frames(bytes: &[u8]) {
+    let mut client = bytes;
+    let mut server = bytes;
+    let _ = read_frame::<_, ClientMessage>(&mut client);
+    let _ = read_frame::<_, ServerMessage>(&mut server);
+}
+
 #[derive(Default)]
 struct FrameReadState {
     header: [u8; 4],
@@ -3518,6 +3851,90 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn source_admission_caps_connections_and_temporarily_bans_failures() {
+        let admission = PoolSourceAdmission::new(2);
+        let source: IpAddr = "192.168.50.20".parse().unwrap();
+        let now = Instant::now();
+        assert!(admission.admit(source, now).unwrap());
+        assert!(admission.admit(source, now).unwrap());
+        assert!(!admission.admit(source, now).unwrap());
+        admission.release(source);
+        admission.release(source);
+
+        for _ in 0..POOL_SOURCE_FAILURE_LIMIT {
+            admission.record_failure(source, now);
+        }
+        assert!(!admission.admit(source, now).unwrap());
+        assert!(
+            admission
+                .admit(
+                    source,
+                    now + POOL_SOURCE_BAN_DURATION + Duration::from_millis(1)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn share_verification_queue_is_bounded_and_releases_waiters() {
+        let gate = Arc::new(ShareVerificationGate::new(1, 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let active = gate.acquire(&stop).unwrap().unwrap();
+        let waiting_gate = Arc::clone(&gate);
+        let waiting_stop = Arc::clone(&stop);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let permit = waiting_gate.acquire(&waiting_stop).unwrap();
+            result_tx.send(permit.is_some()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.state.lock().unwrap().waiting != 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(gate.state.lock().unwrap().waiting, 1);
+        assert!(gate.acquire(&stop).unwrap().is_none());
+        drop(active);
+        assert!(result_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+        let state = gate.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.waiting, 0);
+    }
+
+    #[test]
+    fn per_session_share_rate_has_a_bounded_burst() {
+        let now = Instant::now();
+        let mut limiter = ShareRateLimiter::new(now);
+        for _ in 0..POOL_SHARE_RATE_BURST {
+            assert!(limiter.allow(now));
+        }
+        assert!(!limiter.allow(now));
+        assert!(limiter.allow(now + POOL_SHARE_RATE_INTERVAL));
+        assert!(!limiter.allow(now + POOL_SHARE_RATE_INTERVAL));
+    }
+
+    #[test]
+    fn arbitrary_bounded_pool_frames_never_panic() {
+        let mut state = 0x7a4d_3c2b_1908_7654_u64;
+        for length in 0..=4_096 {
+            let mut bytes = vec![0_u8; length];
+            for byte in &mut bytes {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            let result = std::panic::catch_unwind(|| {
+                let _ = read_frame::<_, ClientMessage>(&mut bytes.as_slice());
+            });
+            assert!(
+                result.is_ok(),
+                "pool frame parser panicked at {length} bytes"
+            );
+        }
+    }
+
     use crate::{Node, default_miner_destination};
 
     #[derive(Debug)]
@@ -3713,6 +4130,41 @@ mod tests {
                 PoolWorkSearchResult::Cancelled { .. } => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn pool_handles_default_per_source_authenticated_load() {
+        let (_root, server, _node, pin) = server("bounded-load");
+        let start = Arc::new(std::sync::Barrier::new(
+            DEFAULT_POOL_CONNECTIONS_PER_SOURCE + 1,
+        ));
+        let mut workers = Vec::new();
+        for index in 0..DEFAULT_POOL_CONNECTIONS_PER_SOURCE {
+            let start = Arc::clone(&start);
+            let address = server.local_addr();
+            workers.push(thread::spawn(move || {
+                let mut client = client(address, pin, &format!("load-{index}"));
+                start.wait();
+                let job_id = client.current_job().job_id;
+                let nonce = client.current_nonce_origin();
+                client.submit_share(job_id, nonce).unwrap()
+            }));
+        }
+        start.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), DEFAULT_POOL_CONNECTIONS_PER_SOURCE);
+        assert!(results.iter().all(|result| {
+            matches!(
+                result.code.as_str(),
+                "share_accepted" | "low_difficulty_share" | "share_verifier_busy"
+            )
+        }));
+        let snapshot = server.ledger_snapshot().unwrap();
+        assert_eq!(snapshot.sessions.len(), DEFAULT_POOL_CONNECTIONS_PER_SOURCE);
+        server.stop().unwrap();
     }
 
     #[test]
@@ -4004,6 +4456,47 @@ mod tests {
         assert!(matches!(
             spawn_pool_server(node, mismatched),
             Err(PoolError::PayoutWalletMismatch)
+        ));
+    }
+
+    #[test]
+    fn pool_rejects_unbounded_abuse_limits() {
+        let root = TestRoot::new("pool-abuse-limits");
+        let node = Arc::new(Mutex::new(
+            Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+        ));
+        let destination = node.lock().unwrap().wallet_destination();
+        let (certificate, key, _) = certificate(&root);
+        let certificate = fs::read(certificate).unwrap();
+        let key = fs::read(key).unwrap();
+        let config = || {
+            PoolServerConfig::devnet(
+                "127.0.0.1:0".parse().unwrap(),
+                certificate.clone(),
+                key.clone(),
+                destination,
+            )
+        };
+
+        let mut source = config();
+        source.max_connections_per_source = 0;
+        assert!(matches!(
+            spawn_pool_server(Arc::clone(&node), source),
+            Err(PoolError::InvalidSourceConnectionLimit)
+        ));
+
+        let mut active = config();
+        active.max_concurrent_share_verifications = 0;
+        assert!(matches!(
+            spawn_pool_server(Arc::clone(&node), active),
+            Err(PoolError::InvalidShareVerificationLimit)
+        ));
+
+        let mut queued = config();
+        queued.max_queued_share_verifications = POOL_MAX_QUEUED_SHARE_VERIFICATIONS + 1;
+        assert!(matches!(
+            spawn_pool_server(node, queued),
+            Err(PoolError::InvalidShareVerificationQueueLimit)
         ));
     }
 

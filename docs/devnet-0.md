@@ -263,8 +263,9 @@ Stale jobs, duplicate nonces, low-difficulty shares, malformed or oversized
 frames, excess connections, and configured job/session/ledger limits are
 rejected. Frames are capped at 16 KiB, with at most 64 concurrent sessions,
 1,000,000 messages per session, 65,536 valid nonce records per job, 1,024 recent
-session records, 1,024 payout identities, and 65,536 pool-block records. Every
-payout identity proves key control through a fresh Schnorr challenge. Accepted
+session records, 1,024 payout identities, 65,536 pool-block records, and 65,536
+payout-transaction records. Every payout identity proves key control through a
+fresh Schnorr challenge. Accepted
 shares increment a durable fixed-price test counter; the default is one
 credited Devnet atom per accepted share. A network-bound, checksummed two-slot
 ledger survives process restarts, migrates authenticated v1 accounting,
@@ -280,6 +281,18 @@ prepared transactions after restart, records confirmations from the active
 chain, and releases credit when a reorganization invalidates its inputs. RCNet
 qualification next adds verification-queue stress testing, load and fuzz
 coverage, independent interoperability testing, and external review.
+
+Share replay has a separate bounded admission gate. The defaults run one
+verification at a time and queue eight authenticated shares for up to five
+seconds; overflow returns `share_verifier_busy` so miners can retry. Each
+session can burst eight submissions and then refills at four per second. The
+pool accepts eight connections per source by default (configurable up to 16),
+and four objective protocol or authentication failures inside one minute apply
+one minute of source backoff. The source table is capped at 1,024 entries.
+Operators can tune the verifier admission bounds with
+`--pool-max-connections-per-source`,
+`--pool-max-concurrent-share-verifications` and
+`--pool-max-queued-share-verifications` without changing consensus.
 
 ## Run two or three local nodes
 

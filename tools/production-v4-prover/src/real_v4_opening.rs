@@ -67,7 +67,7 @@ pub struct FixedArtifactMaps {
 pub fn prove_real_bank_opening(
     bank: usize,
     maps: FixedArtifactMaps,
-    encoded_bank: Vec<u8>,
+    encoded_bank: DeviceBuffer<u8>,
     dynamic_values: &[Felt],
     fixed_commitment: GpuDigest,
     dynamic_commitment: GpuDigest,
@@ -91,7 +91,6 @@ pub fn prove_real_bank_opening(
     );
 
     let upload_started = Instant::now();
-    let encoded_bank = DeviceBuffer::from_host_slice(&encoded_bank, scope)?;
     let mut dense = Vec::with_capacity((DYNAMIC_COLUMNS + 1) * ROWS);
     dense.resize(ROWS, Felt::zero());
     dense.extend_from_slice(dynamic_values);

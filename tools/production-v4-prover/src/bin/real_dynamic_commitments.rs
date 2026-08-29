@@ -2,6 +2,7 @@ use std::{fs::File, path::PathBuf, time::Instant};
 
 use anyhow::{ensure, Context, Result};
 use memmap2::MmapOptions;
+use rayon::prelude::*;
 use serde::Serialize;
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_alloc::Buffer;
@@ -57,7 +58,9 @@ fn main() -> Result<()> {
             "wrong dynamic trace length"
         );
         let map = unsafe { MmapOptions::new().map(&file)? };
-        let trace_blake3 = blake3::hash(&map).to_hex().to_string();
+        let mut trace_hasher = blake3::Hasher::new();
+        trace_hasher.update_rayon(&map);
+        let trace_blake3 = trace_hasher.finalize().to_hex().to_string();
         let values = montgomery_values(&map)?;
         let (commitment_words, commit_seconds, peak_allocated_gib) =
             run_sync_in_place(move |scope| commit_bank(bank, values, scope))??;
@@ -92,7 +95,7 @@ fn montgomery_values(map: &[u8]) -> Result<&[Felt]> {
     );
     let words = unsafe { std::slice::from_raw_parts(map.as_ptr().cast::<u32>(), map.len() / 4) };
     ensure!(
-        words.iter().all(|value| *value < MODULUS),
+        words.par_iter().all(|value| *value < MODULUS),
         "dynamic trace contains a noncanonical Montgomery limb"
     );
     Ok(unsafe { std::slice::from_raw_parts(map.as_ptr().cast::<Felt>(), map.len() / 4) })

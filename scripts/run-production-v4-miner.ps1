@@ -189,6 +189,91 @@ function Invoke-WslChecked {
         $LogPath
 }
 
+function Invoke-WslCapture {
+    param(
+        [string[]]$Arguments,
+        [string]$Label
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& wsl.exe -d $WslDistribution -- @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        throw "$Label exited with code $exitCode`: $($output -join [Environment]::NewLine)"
+    }
+    return @($output | ForEach-Object { [string]$_ })
+}
+
+function Initialize-WslFileCache {
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [uint64]$ExpectedBytes,
+        [string]$ExpectedSha256,
+        [string]$Label
+    )
+    $state = @(Invoke-WslCapture -Arguments @(
+        'bash', $wslCacheHelperWsl, 'cache-state',
+        $Destination,
+        $ExpectedBytes.ToString([Globalization.CultureInfo]::InvariantCulture),
+        $ExpectedSha256
+    ) -Label "$Label probe")[-1]
+    if ($state -eq 'cached') {
+        return 'cached'
+    }
+    Write-Host "Preparing one-time fast cache: $Label..."
+    $result = @(Invoke-WslCapture -Arguments @(
+        'bash', $wslCacheHelperWsl, 'cache-file',
+        $Source, $Destination,
+        $ExpectedBytes.ToString([Globalization.CultureInfo]::InvariantCulture),
+        $ExpectedSha256
+    ) -Label $Label)
+    return $result[-1]
+}
+
+function Write-PhaseTelemetry {
+    param(
+        [string]$LogPath,
+        [string]$Phase,
+        [Diagnostics.Stopwatch]$Timer
+    )
+    Add-Content -LiteralPath $LogPath -Encoding Ascii -Value (
+        'CMFD_V4_MINER_PHASE phase={0} wall_seconds={1}' -f $Phase, (
+            $Timer.Elapsed.TotalSeconds.ToString('F6', [Globalization.CultureInfo]::InvariantCulture)
+        )
+    )
+}
+
+function Invoke-TimedChecked {
+    param(
+        [scriptblock]$Action,
+        [string]$Phase,
+        [string]$LogPath
+    )
+    $phaseTimer = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        & $Action
+    } finally {
+        $phaseTimer.Stop()
+        Write-PhaseTelemetry $LogPath $Phase $phaseTimer
+    }
+}
+
+function Remove-WslOwnedDirectory {
+    param(
+        [string]$Root,
+        [string]$Target,
+        [string]$Prefix
+    )
+    Invoke-WslCapture -Arguments @(
+        'bash', $wslCacheHelperWsl, 'remove-owned', $Root, $Target, $Prefix
+    ) -Label 'ProductionV4 WSL scratch cleanup' | Out-Null
+}
+
 function Start-GpuSampler {
     param([string]$OutputPath)
     Start-Job -ArgumentList $WslDistribution, $CudaDevice, $OutputPath -ScriptBlock {
@@ -335,6 +420,9 @@ $cmfdMinerPath = Resolve-ExistingFile $CmfdMiner 'cmfd-miner'
 $replayBinaryPath = Resolve-ExistingFile $ReplayBinary 'V4 replay binary'
 $dynamicCommitmentBinaryPath = Resolve-ExistingFile $DynamicCommitmentBinary 'V4 dynamic commitment binary'
 $proofBinaryPath = Resolve-ExistingFile $ProofBinary 'V4 proof binary'
+$wslCacheHelperPath = Resolve-ExistingFile (
+    Join-Path $PSScriptRoot 'production-v4-wsl-cache.sh'
+) 'V4 WSL cache helper'
 $workDirectoryPath = Resolve-ExistingDirectory $WorkDirectory 'work directory'
 $fixedRecordPath = Resolve-ExistingFile (
     Join-Path $artifactDirectoryPath 'FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json'
@@ -383,13 +471,14 @@ $expectedInputs = @{
 }
 Assert-InputManifest $inputManifestPath $expectedInputs -Prepared:$InputsPrepared
 
-$modelBankWsl, $artifactDirectoryWsl, $replayBinaryWsl, $dynamicCommitmentBinaryWsl, $proofBinaryWsl = @(
+$modelBankWsl, $artifactDirectoryWsl, $replayBinaryWsl, $dynamicCommitmentBinaryWsl, $proofBinaryWsl, $wslCacheHelperWsl = @(
     Convert-ToWslPaths @(
         $modelBankPath,
         $artifactDirectoryPath,
         $replayBinaryPath,
         $dynamicCommitmentBinaryPath,
-        $proofBinaryPath
+        $proofBinaryPath,
+        $wslCacheHelperPath
     )
 )
 
@@ -398,6 +487,77 @@ if ($ValidateOnly) {
     return
 }
 
+$manifest = Get-Content -Raw -LiteralPath $inputManifestPath | ConvertFrom-Json
+$manifestByName = @{}
+foreach ($entry in @($manifest.files)) {
+    $manifestByName[[string]$entry.name] = $entry
+}
+$cacheRootOutput = @(Invoke-WslCapture -Arguments @(
+    'bash', $wslCacheHelperWsl, 'cache-root'
+) -Label 'ProductionV4 WSL cache location')
+if ($cacheRootOutput.Count -ne 1 -or -not $cacheRootOutput[0].StartsWith('/')) {
+    throw 'failed to resolve the ProductionV4 WSL cache location'
+}
+$cacheRoot = $cacheRootOutput[0]
+$modelEntry = $manifestByName['MODEL-V2.bank']
+$cachedModelBankWsl = "$cacheRoot/model/$([string]$modelEntry.sha256).bank"
+
+$cacheMiss = $false
+if ((Initialize-WslFileCache `
+    $modelBankWsl `
+    $cachedModelBankWsl `
+    ([uint64]$modelEntry.bytes) `
+    ([string]$modelEntry.sha256) `
+    'ProductionV4 model cache') -eq 'populated') {
+    $cacheMiss = $true
+}
+
+$cachedTreePaths = @()
+for ($bank = 0; $bank -lt 3; $bank++) {
+    $treeName = "FORGEMATRIX-V4-FIXED-BANK-$bank.tree"
+    $treeEntry = $manifestByName[$treeName]
+    $sourceTreeWsl = "$artifactDirectoryWsl/$treeName"
+    $cachedTreeWsl = "$cacheRoot/tree/$([string]$treeEntry.sha256).tree"
+    if ((Initialize-WslFileCache `
+        $sourceTreeWsl `
+        $cachedTreeWsl `
+        ([uint64]$treeEntry.bytes) `
+        ([string]$treeEntry.sha256) `
+        "ProductionV4 fixed tree $bank cache") -eq 'populated') {
+        $cacheMiss = $true
+    }
+    $cachedTreePaths += $cachedTreeWsl
+}
+if ($cacheMiss) {
+    Write-Host 'ProductionV4 fast WSL cache is ready.'
+}
+
+$cachedArtifactDirectoryWsl = "$cacheRoot/fixed"
+$fixedViewArguments = @(
+    'bash', $wslCacheHelperWsl, 'fixed-view',
+    $cachedArtifactDirectoryWsl,
+    "$artifactDirectoryWsl/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
+)
+for ($bank = 0; $bank -lt 3; $bank++) {
+    $fixedViewArguments += $cachedTreePaths[$bank]
+    $fixedViewArguments += "$artifactDirectoryWsl/FORGEMATRIX-V4-FIXED-BANK-$bank.row-major.codeword"
+}
+Invoke-WslCapture -Arguments $fixedViewArguments `
+    -Label 'ProductionV4 cached fixed-artifact view' | Out-Null
+
+$scratchRootOutput = @(Invoke-WslCapture -Arguments @(
+    'bash', $wslCacheHelperWsl, 'scratch-root'
+) -Label 'ProductionV4 WSL scratch location')
+if ($scratchRootOutput.Count -ne 1 -or -not $scratchRootOutput[0].StartsWith('/')) {
+    throw 'failed to resolve the ProductionV4 WSL scratch location'
+}
+$nativeWorkRootWsl = $scratchRootOutput[0]
+$sessionName = 'session-{0}-{1}' -f $PID, ([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))
+$nativeSessionWsl = "$nativeWorkRootWsl/$sessionName"
+Invoke-WslCapture -Arguments @(
+    'bash', $wslCacheHelperWsl, 'make-owned', $nativeWorkRootWsl, $nativeSessionWsl, 'session-'
+) -Label 'ProductionV4 WSL scratch setup' | Out-Null
+
 $accepted = 0
 $rejected = 0
 $attempts = 0
@@ -405,6 +565,7 @@ $sessionEnergyKwh = 0.0
 $logDirectory = Join-Path $workDirectoryPath 'logs'
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
 Write-MinerStats $accepted $rejected ([double]::NaN) ([double]::NaN) $sessionEnergyKwh ([double]::NaN)
+try {
 while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
     $attempts++
     $attemptName = 'attempt-{0:D8}-{1}' -f $attempts, ([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))
@@ -442,34 +603,54 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
     $failure = $null
     try {
         $sampler = Start-GpuSampler $gpuSamples
-        Invoke-Checked $cmfdMinerPath $snapshotArguments 'ProductionV4 template snapshot' $attemptLog
+        Invoke-TimedChecked {
+            Invoke-Checked $cmfdMinerPath $snapshotArguments 'ProductionV4 template snapshot' $attemptLog
+        } 'snapshot' $attemptLog
 
-        $templateWsl, $coefficientsWsl, $tracePrefixWsl, $dynamicCommitmentsWsl, $finalActivationWsl, $proofWsl = @(
-            Convert-ToWslPaths @(
-                $template,
-                $coefficients,
-                $tracePrefix,
-                $dynamicCommitments,
-                $finalActivation,
-                $proof
-            )
+        $templateWindowsWsl, $coefficientsWindowsWsl, $proofWindowsWsl = @(
+            Convert-ToWslPaths @($template, $coefficients, $proof)
         )
+        $attemptWsl = "$nativeSessionWsl/$attemptName"
+        Invoke-WslCapture -Arguments @(
+            'bash', $wslCacheHelperWsl, 'make-owned', $nativeSessionWsl, $attemptWsl, 'attempt-'
+        ) -Label 'ProductionV4 WSL attempt setup' | Out-Null
+        $templateWsl = "$attemptWsl/template.json"
+        $coefficientsWsl = "$attemptWsl/replay-coefficients.bin"
+        $tracePrefixWsl = "$attemptWsl/trace"
+        $dynamicCommitmentsWsl = "$attemptWsl/dynamic-commitments.json"
+        $finalActivationWsl = "$tracePrefixWsl-final-activation.bin"
+        $proofWsl = "$attemptWsl/transparent-proof.bin"
+        Invoke-WslCapture -Arguments @(
+            'cp', '--', $templateWindowsWsl, $templateWsl
+        ) -Label 'ProductionV4 template staging' | Out-Null
+        Invoke-WslCapture -Arguments @(
+            'cp', '--', $coefficientsWindowsWsl, $coefficientsWsl
+        ) -Label 'ProductionV4 coefficient staging' | Out-Null
 
-        Invoke-WslChecked $replayBinaryWsl @(
-            $modelBankWsl, $coefficientsWsl, $tracePrefixWsl
-        ) 'ProductionV4 replay' $attemptLog
-        Invoke-WslChecked $dynamicCommitmentBinaryWsl @(
-            $tracePrefixWsl, $dynamicCommitmentsWsl
-        ) 'ProductionV4 dynamic commitments' $attemptLog
-        Invoke-WslChecked $proofBinaryWsl @(
-            $modelBankWsl,
-            $artifactDirectoryWsl,
-            $templateWsl,
-            $tracePrefixWsl,
-            $dynamicCommitmentsWsl,
-            $finalActivationWsl,
-            $proofWsl
-        ) 'ProductionV4 proof' $attemptLog
+        Invoke-TimedChecked {
+            Invoke-WslChecked $replayBinaryWsl @(
+                $cachedModelBankWsl, $coefficientsWsl, $tracePrefixWsl
+            ) 'ProductionV4 replay' $attemptLog
+        } 'replay' $attemptLog
+        Invoke-TimedChecked {
+            Invoke-WslChecked $dynamicCommitmentBinaryWsl @(
+                $tracePrefixWsl, $dynamicCommitmentsWsl
+            ) 'ProductionV4 dynamic commitments' $attemptLog
+        } 'dynamic_commitments' $attemptLog
+        Invoke-TimedChecked {
+            Invoke-WslChecked $proofBinaryWsl @(
+                $cachedModelBankWsl,
+                $cachedArtifactDirectoryWsl,
+                $templateWsl,
+                $tracePrefixWsl,
+                $dynamicCommitmentsWsl,
+                $finalActivationWsl,
+                $proofWsl
+            ) 'ProductionV4 proof' $attemptLog
+        } 'proof' $attemptLog
+        Invoke-WslCapture -Arguments @(
+            'cp', '--', $proofWsl, $proofWindowsWsl
+        ) -Label 'ProductionV4 proof export' | Out-Null
 
         $submitArguments = @(
             'submit-v4-template',
@@ -481,7 +662,13 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         if ($AllowPublicPeer) {
             $submitArguments += '--allow-public-peers'
         }
-        $submitExitCode = Invoke-NativeLogged $cmfdMinerPath $submitArguments $attemptLog
+        $submitTimer = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $submitExitCode = Invoke-NativeLogged $cmfdMinerPath $submitArguments $attemptLog
+        } finally {
+            $submitTimer.Stop()
+            Write-PhaseTelemetry $attemptLog 'submit' $submitTimer
+        }
         if ($submitExitCode -eq 0) {
             $accepted++
             $outcome = 'accepted'
@@ -520,7 +707,18 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         $sessionEnergyKwh `
         $timer.Elapsed.TotalSeconds
 
+    if ($outcome -eq 'accepted' -and $KeepAcceptedWork) {
+        $attemptDirectoryWsl = @(Convert-ToWslPaths @($attemptDirectory))[0]
+        Invoke-WslCapture -Arguments @(
+            'bash', $wslCacheHelperWsl, 'preserve-attempt', $attemptWsl, $attemptDirectoryWsl
+        ) -Label 'ProductionV4 accepted-work preservation' | Out-Null
+    }
+    Remove-WslOwnedDirectory $nativeSessionWsl $attemptWsl 'attempt-'
+
     if ($outcome -eq 'rejected' -or -not $KeepAcceptedWork) {
         Remove-AttemptDirectory $attemptDirectory
     }
+}
+} finally {
+    Remove-WslOwnedDirectory $nativeWorkRootWsl $nativeSessionWsl 'session-'
 }

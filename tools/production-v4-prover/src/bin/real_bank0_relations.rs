@@ -192,6 +192,7 @@ fn main() -> Result<()> {
     let initial_activation = build_initial_activation(challenge_digest, &base_input);
     let model_bank_prep_started = Instant::now();
     let encoded_banks: [Vec<u8>; 3] = (0..3)
+        .into_par_iter()
         .map(|bank| read_encoded_bank(&model_path, bank))
         .collect::<Result<Vec<_>>>()?
         .try_into()
@@ -281,8 +282,8 @@ fn prove_complete_proof(
     let mut claims = Vec::with_capacity(3);
     let mut openings = Vec::with_capacity(3);
 
-    let [mut encoded, next_encoded, final_encoded] = encoded_banks;
-    let (bank_relations, bank_claims, boundary_claims) = prove_bank_relations(
+    let [encoded, next_encoded, final_encoded] = encoded_banks;
+    let (bank_relations, bank_claims, boundary_claims, encoded_device) = prove_bank_relations(
         0,
         statement,
         &base_input,
@@ -293,6 +294,7 @@ fn prove_complete_proof(
         &mut gpu_challenger,
         &scope,
     )?;
+    drop(encoded);
     ensure!(
         boundary_claims.is_empty(),
         "bank 0 produced a previous-bank boundary claim"
@@ -301,7 +303,7 @@ fn prove_complete_proof(
     claims.push(bank_claims);
 
     let boundary = last_activation_layer(dynamic_values[0]);
-    let (bank_relations, bank_claims, boundary_claims) = prove_bank_relations(
+    let (bank_relations, bank_claims, boundary_claims, next_encoded_device) = prove_bank_relations(
         1,
         statement,
         &base_input,
@@ -312,6 +314,7 @@ fn prove_complete_proof(
         &mut gpu_challenger,
         &scope,
     )?;
+    drop(next_encoded);
     relations.push(bank_relations);
     claims.push(bank_claims);
     claims[0].extend(boundary_claims);
@@ -319,7 +322,7 @@ fn prove_complete_proof(
     openings.push(real_v4_opening::prove_real_bank_opening(
         0,
         fixed_maps.remove(0),
-        encoded,
+        encoded_device,
         dynamic_values[0],
         gpu_fixed[0],
         gpu_dynamic[0],
@@ -328,21 +331,20 @@ fn prove_complete_proof(
         &mut cpu_challenger,
         &scope,
     )?);
-    encoded = next_encoded;
-
     let boundary = last_activation_layer(dynamic_values[1]);
-    let next_encoded = final_encoded;
-    let (bank_relations, bank_claims, boundary_claims) = prove_bank_relations(
-        2,
-        statement,
-        &base_input,
-        &next_encoded,
-        dynamic_values[2],
-        boundary,
-        &mut cpu_challenger,
-        &mut gpu_challenger,
-        &scope,
-    )?;
+    let (bank_relations, bank_claims, boundary_claims, final_encoded_device) =
+        prove_bank_relations(
+            2,
+            statement,
+            &base_input,
+            &final_encoded,
+            dynamic_values[2],
+            boundary,
+            &mut cpu_challenger,
+            &mut gpu_challenger,
+            &scope,
+        )?;
+    drop(final_encoded);
     relations.push(bank_relations);
     claims.push(bank_claims);
     claims[1].extend(boundary_claims);
@@ -350,7 +352,7 @@ fn prove_complete_proof(
     openings.push(real_v4_opening::prove_real_bank_opening(
         1,
         fixed_maps.remove(0),
-        encoded,
+        next_encoded_device,
         dynamic_values[1],
         gpu_fixed[1],
         gpu_dynamic[1],
@@ -359,8 +361,6 @@ fn prove_complete_proof(
         &mut cpu_challenger,
         &scope,
     )?);
-    encoded = next_encoded;
-
     for repetition in 0..2 {
         let cpu_point = sample_forgematrix_v4_final_point(&mut cpu_challenger, repetition)?;
         let gpu_point = sample_final_point(&mut gpu_challenger, repetition);
@@ -385,7 +385,7 @@ fn prove_complete_proof(
     openings.push(real_v4_opening::prove_real_bank_opening(
         2,
         fixed_maps.remove(0),
-        encoded,
+        final_encoded_device,
         dynamic_values[2],
         gpu_fixed[2],
         gpu_dynamic[2],
@@ -487,7 +487,7 @@ fn prove_complete_proof(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn prove_bank_relations(
     bank: usize,
     statement: ForgeMatrixV4TranscriptStatement,
@@ -502,6 +502,7 @@ fn prove_bank_relations(
     [ForgeMatrixV4RelationRepetitionProof; 2],
     Vec<CpuOpeningClaim>,
     Vec<CpuOpeningClaim>,
+    DeviceBuffer<u8>,
 )> {
     let upload_started = Instant::now();
     let encoded_device = DeviceBuffer::from_host_slice(encoded_bank, scope)?;
@@ -753,6 +754,7 @@ fn prove_bank_relations(
             .map_err(|_| anyhow::anyhow!("wrong relation repetition count"))?,
         opening_claims,
         boundary_claims,
+        encoded_device,
     ))
 }
 
@@ -777,7 +779,7 @@ fn read_encoded_bank(path: &Path, bank: usize) -> Result<Vec<u8>> {
     let mut bank = vec![0_u8; BANK_BYTES];
     file.read_exact(&mut bank)?;
     ensure!(
-        bank.iter().all(|value| *value <= 250),
+        bank.par_iter().all(|value| *value <= 250),
         "invalid weight byte"
     );
     Ok(bank)

@@ -10,7 +10,15 @@ NONCE=0
 KEEP_ACCEPTED_WORK=0
 VALIDATE_ONLY=0
 INPUTS_PREPARED=0
+TEMPLATE_REFRESH_SECONDS=15
 sampler_pid=""
+proof_pid=""
+replay_pid=""
+proof_input_fd=""
+proof_output_fd=""
+replay_input_fd=""
+replay_output_fd=""
+worker_session_directory=""
 
 usage() {
   echo "Usage: $0 --miner ADDRESS [--peer HOST:PORT] [--blocks N] [--cuda-device N]"
@@ -23,6 +31,7 @@ while (($#)); do
     --blocks) BLOCKS="${2:-}"; shift 2 ;;
     --cuda-device) CUDA_DEVICE="${2:-}"; shift 2 ;;
     --nonce) NONCE="${2:-}"; shift 2 ;;
+    --template-refresh-seconds) TEMPLATE_REFRESH_SECONDS="${2:-}"; shift 2 ;;
     --keep-accepted-work) KEEP_ACCEPTED_WORK=1; shift ;;
     --validate-only) VALIDATE_ONLY=1; shift ;;
     --inputs-prepared) INPUTS_PREPARED=1; shift ;;
@@ -35,8 +44,13 @@ if [[ ! "$MINER" =~ ^[0-9a-fA-F]{64}$ ]]; then
   echo "ERROR: --miner must be the wallet's 64-character receive address." >&2
   exit 2
 fi
-if [[ ! "$BLOCKS" =~ ^[0-9]+$ || ! "$CUDA_DEVICE" =~ ^[0-9]+$ || ! "$NONCE" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: blocks, CUDA device, and nonce must be non-negative integers." >&2
+if [[ ! "$BLOCKS" =~ ^[0-9]+$ || ! "$CUDA_DEVICE" =~ ^[0-9]+$ || ! "$NONCE" =~ ^[0-9]+$ ||
+      ! "$TEMPLATE_REFRESH_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: blocks, CUDA device, and nonce must be non-negative integers; template refresh must be positive." >&2
+  exit 2
+fi
+if ((${#NONCE} > 19)) || ((${#NONCE} == 19)) && [[ "$NONCE" > "9223372036854775806" ]]; then
+  echo "ERROR: --nonce must be at most 9223372036854775806 in the Linux launcher." >&2
   exit 2
 fi
 
@@ -124,6 +138,80 @@ stop_gpu_sampler() {
   fi
 }
 
+read_worker_until() {
+  local output_fd="$1"
+  local marker="$2"
+  local log_path="$3"
+  local label="$4"
+  local line
+  while IFS= read -r -u "$output_fd" line; do
+    printf '%s\n' "$line" >>"$log_path"
+    if [[ "$line" == "$marker" ]]; then
+      return 0
+    fi
+  done
+  echo "ERROR: $label exited before $marker" >&2
+  return 1
+}
+
+invoke_worker() {
+  local input_fd="$1"
+  local output_fd="$2"
+  local marker="$3"
+  local log_path="$4"
+  local label="$5"
+  shift 5
+  local IFS=$'\t'
+  printf '%s\n' "$*" >&"$input_fd"
+  read_worker_until "$output_fd" "$marker" "$log_path" "$label"
+}
+
+stop_worker() {
+  local pid="$1"
+  local input_fd="$2"
+  local output_fd="$3"
+  if [[ -z "$pid" ]]; then
+    return
+  fi
+  if [[ -n "$input_fd" ]] && kill -0 "$pid" 2>/dev/null; then
+    printf 'QUIT\n' >&"$input_fd" 2>/dev/null || true
+  fi
+  if [[ -n "$input_fd" ]]; then
+    exec {input_fd}>&- 2>/dev/null || true
+  fi
+  for _ in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+  if [[ -n "$output_fd" ]]; then
+    exec {output_fd}<&- 2>/dev/null || true
+  fi
+}
+
+stop_workers() {
+  stop_worker "$replay_pid" "$replay_input_fd" "$replay_output_fd"
+  replay_pid=""
+  stop_worker "$proof_pid" "$proof_input_fd" "$proof_output_fd"
+  proof_pid=""
+}
+
+cleanup() {
+  stop_gpu_sampler
+  stop_workers
+  if [[ -n "$worker_session_directory" && -d "$worker_session_directory" ]]; then
+    rm -f -- "$worker_session_directory/proof.in" "$worker_session_directory/proof.out" \
+      "$worker_session_directory/replay.in" "$worker_session_directory/replay.out"
+    rmdir -- "$worker_session_directory" 2>/dev/null || true
+    worker_session_directory=""
+  fi
+}
+
 attempt_failure() {
   local message="$1"
   stop_gpu_sampler
@@ -153,15 +241,39 @@ write_stats() {
     "$accepted" "$rejected" "$average_power" "$efficiency" "$maximum_temperature" "$elapsed_seconds"
 }
 
-trap stop_gpu_sampler EXIT
-trap 'stop_gpu_sampler; exit 130' INT
-trap 'stop_gpu_sampler; exit 143' TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 accepted=0
 rejected=0
 attempts=0
 session_energy_kwh="0"
 log_directory="$WORK_DIRECTORY/logs"
 mkdir -p -- "$log_directory"
+session_log="$log_directory/session-$(date -u +%Y%m%dT%H%M%S%NZ).log"
+: >"$session_log"
+worker_session_directory="$(mktemp -d -- "$WORK_DIRECTORY/.worker-session.XXXXXXXX")"
+mkfifo -- "$worker_session_directory/proof.in" "$worker_session_directory/proof.out" \
+  "$worker_session_directory/replay.in" "$worker_session_directory/replay.out"
+
+"$PROOF_BINARY" --server "$MODEL_BANK" "$FIXED_DIRECTORY" \
+  <"$worker_session_directory/proof.in" >"$worker_session_directory/proof.out" 2>&1 &
+proof_pid="$!"
+exec {proof_input_fd}>"$worker_session_directory/proof.in"
+exec {proof_output_fd}<"$worker_session_directory/proof.out"
+read_worker_until "$proof_output_fd" 'CMFD_V4_PROOF_READY' "$session_log" 'ProductionV4 proof worker'
+
+"$REPLAY_BINARY" --server "$MODEL_BANK" \
+  <"$worker_session_directory/replay.in" >"$worker_session_directory/replay.out" 2>&1 &
+replay_pid="$!"
+exec {replay_input_fd}>"$worker_session_directory/replay.in"
+exec {replay_output_fd}<"$worker_session_directory/replay.out"
+read_worker_until "$replay_output_fd" 'CMFD_V4_REPLAY_READY' "$session_log" 'ProductionV4 replay worker'
+
+keep_replay_resident=0
+if ((gpu_memory >= 20000)); then
+  keep_replay_resident=1
+fi
 write_stats "N/A" "N/A" "N/A"
 while ((BLOCKS == 0 || accepted < BLOCKS)); do
   attempts=$((attempts + 1))
@@ -180,8 +292,9 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
   template="$attempt_directory/template.json"
   coefficients="$attempt_directory/replay-coefficients.bin"
   trace_prefix="$attempt_directory/trace"
-  dynamic_commitments="$attempt_directory/dynamic-commitments.json"
   final_activation="$trace_prefix-final-activation.bin"
+  search_trace_prefix="$attempt_directory/search"
+  search_final_activation="$search_trace_prefix-final-activation.bin"
   proof="$attempt_directory/transparent-proof.bin"
 
   start_ns="$(date +%s%N)"
@@ -190,23 +303,83 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
   run_logged "ProductionV4 template snapshot" "$CMFD_MINER" snapshot-v4-template \
     --peer "$PEER" --allow-public-peers --miner "$MINER" --nonce "$NONCE" \
     --fixed-record "$FIXED_RECORD" --coefficients-output "$coefficients" --output "$template"
-  run_logged "ProductionV4 replay" "$REPLAY_BINARY" "$MODEL_BANK" "$coefficients" "$trace_prefix"
-  run_logged "ProductionV4 dynamic commitments" "$DYNAMIC_BINARY" "$trace_prefix" "$dynamic_commitments"
-  run_logged "ProductionV4 proof" "$PROOF_BINARY" "$MODEL_BANK" "$FIXED_DIRECTORY" "$template" "$trace_prefix" \
-    "$dynamic_commitments" "$final_activation" "$proof"
+  candidate_template="$template"
+  candidate_coefficients="$coefficients"
+  candidate_nonce="$NONCE"
+  search_start_ns="$(date +%s%N)"
+  outcome=""
+  while :; do
+    invoke_worker "$replay_input_fd" "$replay_output_fd" 'CMFD_V4_REPLAY_DONE' "$attempt_log" \
+      'ProductionV4 replay worker' RUN search "$candidate_coefficients" "$search_trace_prefix" \
+      || attempt_failure "ProductionV4 search replay failed"
+    if ! work_output="$("$CMFD_MINER" inspect-v4-work \
+        --template "$candidate_template" --final-activation "$search_final_activation" \
+        --fixed-record "$FIXED_RECORD" 2>&1)"; then
+      printf '%s\n' "$work_output" >>"$attempt_log"
+      attempt_failure "ProductionV4 work inspection failed"
+    fi
+    printf '%s\n' "$work_output" >>"$attempt_log"
+    if [[ "$(grep -c '^CMFD_V4_WORK ' <<<"$work_output")" -ne 1 ]]; then
+      attempt_failure "ProductionV4 work inspection returned a noncanonical result"
+    fi
+    if grep -q '^CMFD_V4_WORK qualified=true ' <<<"$work_output"; then
+      break
+    fi
+    search_now_ns="$(date +%s%N)"
+    if (( (search_now_ns - search_start_ns) / 1000000000 >= TEMPLATE_REFRESH_SECONDS )); then
+      outcome="refresh"
+      break
+    fi
+    if ((candidate_nonce == 9223372036854775806)); then
+      attempt_failure "ProductionV4 nonce space exhausted"
+    fi
+    candidate_nonce=$((candidate_nonce + 1))
+    candidate_template="$attempt_directory/template-$candidate_nonce.json"
+    candidate_coefficients="$attempt_directory/replay-coefficients-$candidate_nonce.bin"
+    run_logged "ProductionV4 nonce binding" "$CMFD_MINER" bind-v4-nonce \
+      --template "$template" --nonce "$candidate_nonce" --fixed-record "$FIXED_RECORD" \
+      --coefficients-output "$candidate_coefficients" --output "$candidate_template"
+  done
+  search_end_ns="$(date +%s%N)"
+  printf 'CMFD_V4_MINER_PHASE phase=search elapsed_micros=%d\n' \
+    "$(((search_end_ns - search_start_ns) / 1000))" >>"$attempt_log"
 
-  printf '\n=== ProductionV4 block submission ===\n' >>"$attempt_log"
-  if "$CMFD_MINER" submit-v4-template \
-      --peer "$PEER" --allow-public-peers --template "$template" \
-      --transparent-proof "$proof" --fixed-record "$FIXED_RECORD" >>"$attempt_log" 2>&1; then
-    accepted=$((accepted + 1))
-    outcome="accepted"
-  elif grep -Fq -e 'ProductionV4 block was rejected by the node' \
-      -e 'frozen ProductionV4 template is stale' "$attempt_log"; then
-    rejected=$((rejected + 1))
-    outcome="rejected"
-  else
-    attempt_failure "ProductionV4 block submission failed"
+  if [[ "$outcome" != "refresh" ]]; then
+    replay_start_ns="$(date +%s%N)"
+    invoke_worker "$replay_input_fd" "$replay_output_fd" 'CMFD_V4_REPLAY_DONE' "$attempt_log" \
+      'ProductionV4 replay worker' RUN full "$candidate_coefficients" "$trace_prefix" \
+      || attempt_failure "ProductionV4 winning replay failed"
+    if ! cmp -- "$search_final_activation" "$final_activation"; then
+      attempt_failure "ProductionV4 search/full replay comparison failed"
+    fi
+    replay_end_ns="$(date +%s%N)"
+    printf 'CMFD_V4_MINER_PHASE phase=winning_replay elapsed_micros=%d\n' \
+      "$(((replay_end_ns - replay_start_ns) / 1000))" >>"$attempt_log"
+    if ((keep_replay_resident == 0)); then
+      invoke_worker "$replay_input_fd" "$replay_output_fd" 'CMFD_V4_REPLAY_EVICTED' "$attempt_log" \
+        'ProductionV4 replay worker' EVICT || attempt_failure "ProductionV4 replay eviction failed"
+    fi
+    proof_start_ns="$(date +%s%N)"
+    invoke_worker "$proof_input_fd" "$proof_output_fd" 'CMFD_V4_PROOF_DONE' "$attempt_log" \
+      'ProductionV4 proof worker' RUN "$candidate_template" "$trace_prefix" "$final_activation" "$proof" \
+      || attempt_failure "ProductionV4 proof failed"
+    proof_end_ns="$(date +%s%N)"
+    printf 'CMFD_V4_MINER_PHASE phase=proof elapsed_micros=%d\n' \
+      "$(((proof_end_ns - proof_start_ns) / 1000))" >>"$attempt_log"
+
+    printf '\n=== ProductionV4 block submission ===\n' >>"$attempt_log"
+    if "$CMFD_MINER" submit-v4-template \
+        --peer "$PEER" --allow-public-peers --template "$candidate_template" \
+        --transparent-proof "$proof" --fixed-record "$FIXED_RECORD" >>"$attempt_log" 2>&1; then
+      accepted=$((accepted + 1))
+      outcome="accepted"
+    elif grep -Fq -e 'ProductionV4 block was rejected by the node' \
+        -e 'frozen ProductionV4 template is stale' "$attempt_log"; then
+      rejected=$((rejected + 1))
+      outcome="rejected"
+    else
+      attempt_failure "ProductionV4 block submission failed"
+    fi
   fi
 
   stop_gpu_sampler
@@ -235,7 +408,7 @@ while ((BLOCKS == 0 || accepted < BLOCKS)); do
   fi
   write_stats "$average_power" "$maximum_temperature" "$elapsed_seconds"
 
-  if [[ "$outcome" == "rejected" ]] || ((KEEP_ACCEPTED_WORK == 0)); then
+  if [[ "$outcome" != "accepted" ]] || ((KEEP_ACCEPTED_WORK == 0)); then
     resolved_attempt="$(realpath -- "$attempt_directory")"
     resolved_parent="$(dirname -- "$resolved_attempt")"
     if [[ "$resolved_parent" != "$(realpath -- "$WORK_DIRECTORY")" ]]; then

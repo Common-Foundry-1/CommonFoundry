@@ -25,6 +25,7 @@ production-rc = ["production-v3", "cmfd-node/production-rc"]
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
 cmfd-cuda = { path = "../cmfd-cuda" }
 cmfd-consensus = { path = "../cmfd-consensus" }

@@ -977,6 +977,7 @@ name = "cmfd-miner"
 version = "0.1.0-devnet.16"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "cmfd-consensus",
  "cmfd-cuda",

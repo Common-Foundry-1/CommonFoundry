@@ -1,6 +1,7 @@
 use std::{
+    ffi::OsString,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use cmfd_consensus::forgematrix_v4_basefold::{
     forgematrix_v4_transcript, ForgeMatrixV4Digest as CpuDigest, ForgeMatrixV4Extension as CpuExt,
     ForgeMatrixV4Field as CpuFelt, ForgeMatrixV4OpeningClaim as CpuOpeningClaim,
@@ -48,8 +49,9 @@ use cpu_slop_algebra::AbstractField as CpuAbstractField;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use slop_algebra::{AbstractExtensionField, AbstractField};
+use slop_algebra::{AbstractExtensionField, AbstractField, PrimeField32};
 use slop_alloc::{Buffer, CpuBackend};
+use slop_basefold::FriConfig;
 use slop_challenger::{CanObserve, FieldChallenger, IopCtx};
 use slop_multilinear::{Mle, Point};
 use slop_tensor::{Dimensions, Tensor, TensorView};
@@ -57,9 +59,12 @@ use sp1_gpu_cudart::{
     args, cuda_memory_info, dot_along_dim_view, run_sync_in_place, DeviceBuffer, DevicePoint,
     DeviceTensor, TaskScope,
 };
+use sp1_gpu_basefold::FriCudaProver;
+use sp1_gpu_commit::commit_multilinears;
 use sp1_gpu_jagged_sumcheck::{
     cubic_transition_sumcheck, simple_hadamard_sumcheck, triple_hadamard_sumcheck,
 };
+use sp1_gpu_merkle_tree::{CudaTcsProver, Poseidon2SP1Field16CudaProver};
 use sp1_gpu_sys::kernels::cmfd_weight_output_reduction_kernel;
 use sp1_gpu_utils::{AbstractChipLayoutWithHeights, Ext, Felt, JaggedTraceMle, TestGC};
 
@@ -78,6 +83,9 @@ const BANK_BYTES: usize = LAYERS * WIDTH * WIDTH;
 const DYNAMIC_BYTES: usize = 2 * BANK_VALUES * size_of::<u32>();
 const MODEL_HEADER_BYTES: u64 = 184;
 const MODULUS: u32 = 0x7f00_0001;
+const LOG_BLOWUP: usize = 1;
+const QUERIES: usize = 270;
+const POW_BITS: usize = 16;
 const COMMITMENTS_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/Commitments/v1";
 const MATRIX_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/MatrixPoint/v1";
 const MATRIX_PROOF_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/MatrixProof/v1";
@@ -88,6 +96,8 @@ const FINAL_POINT_DOMAIN: &[u8] = b"CommonFoundry/ForgeMatrix/V4/FinalPoint/v1";
 
 type GpuChallenger = <TestGC as IopCtx>::Challenger;
 type GpuDigest = <TestGC as IopCtx>::Digest;
+type PreparedDynamicTraces = [JaggedTraceMle<Felt, TaskScope>; 3];
+type DynamicCommitmentWords = [[u32; 8]; 3];
 
 #[derive(Deserialize)]
 struct DynamicCommitmentRecord {
@@ -106,18 +116,55 @@ struct FrozenProductionV4Template {
     nonce: u64,
 }
 
-fn main() -> Result<()> {
-    let mut args = std::env::args_os().skip(1);
-    let model_path = PathBuf::from(args.next().context("missing model-bank path")?);
-    let artifact_dir = PathBuf::from(args.next().context("missing fixed-artifact directory")?);
-    let template_path = PathBuf::from(args.next().context("missing frozen V4 template")?);
-    let dynamic_prefix = PathBuf::from(args.next().context("missing dynamic trace prefix")?);
-    let dynamic_record_path =
-        PathBuf::from(args.next().context("missing dynamic commitment record")?);
-    let final_path = PathBuf::from(args.next().context("missing final activation")?);
-    let output_path = PathBuf::from(args.next().context("missing complete proof output")?);
-    ensure!(args.next().is_none(), "unexpected extra arguments");
+struct PreparedProver {
+    fixed_record: ForgeMatrixV4FixedArtifactRecordV1,
+    cpu_fixed: [CpuDigest; 3],
+    gpu_fixed: [GpuDigest; 3],
+    base_input: Vec<u8>,
+    encoded_banks: [Mmap; 3],
+    fixed_maps: [real_v4_opening::FixedArtifactMaps; 3],
+}
 
+fn main() -> Result<()> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|value| value == "--server") {
+        ensure!(args.len() == 3, "usage: --server MODEL ARTIFACT_DIRECTORY");
+        let prepared = prepare_prover(Path::new(&args[1]), Path::new(&args[2]))?;
+        run_sync_in_place(move |scope| run_persistent_server(&prepared, &scope))??;
+        return Ok(());
+    }
+    ensure!(
+        args.len() == 7,
+        "usage: MODEL ARTIFACT_DIRECTORY TEMPLATE TRACE_PREFIX DYNAMIC_RECORD FINAL OUTPUT"
+    );
+    run_one_shot(args)
+}
+
+fn run_one_shot(args: Vec<OsString>) -> Result<()> {
+    let model_path = PathBuf::from(&args[0]);
+    let artifact_dir = PathBuf::from(&args[1]);
+    let template_path = PathBuf::from(&args[2]);
+    let dynamic_prefix = PathBuf::from(&args[3]);
+    let dynamic_record_path = PathBuf::from(&args[4]);
+    let final_path = PathBuf::from(&args[5]);
+    let output_path = PathBuf::from(&args[6]);
+    let prepared = prepare_prover(&model_path, &artifact_dir)?;
+    let expected = read_dynamic_commitment_record(&dynamic_record_path)?;
+    run_sync_in_place(move |scope| {
+        prove_job(
+            &prepared,
+            &template_path,
+            &dynamic_prefix,
+            &final_path,
+            &output_path,
+            Some(expected),
+            &scope,
+        )
+    })??;
+    Ok(())
+}
+
+fn prepare_prover(model_path: &Path, artifact_dir: &Path) -> Result<PreparedProver> {
     let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 = serde_json::from_reader(File::open(
         artifact_dir.join("FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"),
     )?)?;
@@ -126,13 +173,82 @@ fn main() -> Result<()> {
         fixed_record.record_digest() == PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST,
         "fixed artifact record is not the compiled V4 testnet record"
     );
-    let frozen: FrozenProductionV4Template = serde_json::from_reader(File::open(template_path)?)?;
-    ensure!(
-        frozen.challenge.network_id == PRODUCTION_V4_TESTNET_NETWORK_ID,
-        "frozen template belongs to another network"
+    let fixed_words: [[u32; 8]; 3] =
+        std::array::from_fn(|bank| fixed_record.banks()[bank].commitment_words());
+    let model_bank_prep_started = Instant::now();
+    let base_input = read_base_input(model_path)?;
+    let encoded_banks: [Mmap; 3] = (0..3)
+        .into_par_iter()
+        .map(|bank| map_encoded_bank(model_path, bank))
+        .collect::<Result<Vec<_>>>()?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("wrong model-bank count"))?;
+    eprintln!(
+        "model_bank_prep_total_seconds={:.6}",
+        model_bank_prep_started.elapsed().as_secs_f64()
     );
-    let dynamic_record: DynamicCommitmentRecord =
-        serde_json::from_reader(File::open(dynamic_record_path)?)?;
+    let artifact_prep_started = Instant::now();
+    let fixed_maps: [real_v4_opening::FixedArtifactMaps; 3] = (0..3)
+        .map(|bank| {
+            let started = Instant::now();
+            let maps = real_v4_opening::FixedArtifactMaps::open(
+                artifact_dir,
+                fixed_record.banks()[bank],
+            )?;
+            eprintln!(
+                "fixed_artifact_prep bank={bank} seconds={:.6}",
+                started.elapsed().as_secs_f64()
+            );
+            Ok(maps)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("wrong fixed-artifact count"))?;
+    eprintln!(
+        "fixed_artifact_prep_total_seconds={:.6}",
+        artifact_prep_started.elapsed().as_secs_f64()
+    );
+    Ok(PreparedProver {
+        fixed_record,
+        cpu_fixed: digest_words::<CpuFelt>(fixed_words),
+        gpu_fixed: digest_words::<Felt>(fixed_words),
+        base_input,
+        encoded_banks,
+        fixed_maps,
+    })
+}
+
+fn run_persistent_server(prepared: &PreparedProver, scope: &TaskScope) -> Result<()> {
+    println!("CMFD_V4_PROOF_READY");
+    std::io::stdout().flush()?;
+    for line in BufReader::new(std::io::stdin().lock()).lines() {
+        let line = line?;
+        let line = line.strip_suffix('\r').unwrap_or(&line);
+        if line == "QUIT" {
+            break;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        ensure!(
+            fields.len() == 5 && fields[0] == "RUN" && fields[1..].iter().all(|v| !v.is_empty()),
+            "invalid persistent proof command"
+        );
+        prove_job(
+            prepared,
+            Path::new(fields[1]),
+            Path::new(fields[2]),
+            Path::new(fields[3]),
+            Path::new(fields[4]),
+            None,
+            scope,
+        )?;
+        println!("CMFD_V4_PROOF_DONE");
+        std::io::stdout().flush()?;
+    }
+    Ok(())
+}
+
+fn read_dynamic_commitment_record(path: &Path) -> Result<[[u32; 8]; 3]> {
+    let dynamic_record: DynamicCommitmentRecord = serde_json::from_reader(File::open(path)?)?;
     ensure!(
         dynamic_record.banks.len() == 3,
         "wrong dynamic commitment count"
@@ -143,22 +259,34 @@ fn main() -> Result<()> {
             "dynamic commitment bank order mismatch"
         );
     }
+    Ok(std::array::from_fn(|bank| {
+        dynamic_record.banks[bank].commitment_words
+    }))
+}
 
-    let fixed_words: [[u32; 8]; 3] =
-        std::array::from_fn(|bank| fixed_record.banks()[bank].commitment_words());
-    let dynamic_words: [[u32; 8]; 3] =
-        std::array::from_fn(|bank| dynamic_record.banks[bank].commitment_words);
-    let cpu_fixed = digest_words::<CpuFelt>(fixed_words);
-    let cpu_dynamic = digest_words::<CpuFelt>(dynamic_words);
-    let gpu_fixed = digest_words::<Felt>(fixed_words);
-    let gpu_dynamic = digest_words::<Felt>(dynamic_words);
-
-    let base_input = read_base_input(&model_path)?;
-    let final_activation = read_final_activation(&final_path)?;
+#[allow(clippy::too_many_arguments)]
+fn prove_job(
+    prepared: &PreparedProver,
+    template_path: &Path,
+    dynamic_prefix: &Path,
+    final_path: &Path,
+    output_path: &Path,
+    expected_dynamic_words: Option<[[u32; 8]; 3]>,
+    scope: &TaskScope,
+) -> Result<()> {
+    let frozen: FrozenProductionV4Template = serde_json::from_reader(File::open(template_path)?)?;
+    ensure!(
+        frozen.challenge.network_id == PRODUCTION_V4_TESTNET_NETWORK_ID,
+        "frozen template belongs to another network"
+    );
+    let final_activation = read_final_activation(final_path)?;
     let block = frozen.challenge;
     let nonce = frozen.nonce;
-    let challenge_digest =
-        forgematrix_v4_challenge_digest(&block, nonce, fixed_record.manifest_digest());
+    let challenge_digest = forgematrix_v4_challenge_digest(
+        &block,
+        nonce,
+        prepared.fixed_record.manifest_digest(),
+    );
     let final_activation_digest =
         forgematrix_v4_final_activation_digest(challenge_digest, &final_activation);
     let statement = ForgeMatrixV4TranscriptStatement {
@@ -167,11 +295,11 @@ fn main() -> Result<()> {
         proof_version: FORGEMATRIX_V4_PROOF_VERSION,
         nonce,
         proof_system_digest: forgematrix_v4_proof_system_digest(),
-        model_manifest_digest: fixed_record.manifest_digest(),
+        model_manifest_digest: prepared.fixed_record.manifest_digest(),
         challenge_digest,
         final_activation_digest,
         work_digest: forgematrix_v4_work_digest(
-            fixed_record.manifest_digest(),
+            prepared.fixed_record.manifest_digest(),
             challenge_digest,
             final_activation_digest,
         ),
@@ -192,54 +320,81 @@ fn main() -> Result<()> {
         montgomery_values(&map)?;
         dynamic_maps.push(map);
     }
-    let initial_activation = build_initial_activation(challenge_digest, &base_input);
-    let model_bank_prep_started = Instant::now();
-    let encoded_banks: [Vec<u8>; 3] = (0..3)
-        .into_par_iter()
-        .map(|bank| read_encoded_bank(&model_path, bank))
-        .collect::<Result<Vec<_>>>()?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("wrong model-bank count"))?;
-    eprintln!(
-        "model_bank_prep_total_seconds={:.6}",
-        model_bank_prep_started.elapsed().as_secs_f64()
-    );
-    let artifact_prep_started = Instant::now();
-    let mut fixed_maps = Vec::with_capacity(3);
-    for bank in 0..3 {
+    let dynamic_values = dynamic_maps
+        .iter()
+        .map(montgomery_values)
+        .collect::<Result<Vec<_>>>()?;
+    let (dynamic_traces, dynamic_words) =
+        prepare_dynamic_traces(&dynamic_values, scope)?;
+    if let Some(expected) = expected_dynamic_words {
+        ensure!(
+            expected == dynamic_words,
+            "fused dynamic commitments differ from the supplied record"
+        );
+    }
+    let cpu_dynamic = digest_words::<CpuFelt>(dynamic_words);
+    let gpu_dynamic = digest_words::<Felt>(dynamic_words);
+    let initial_activation = build_initial_activation(challenge_digest, &prepared.base_input);
+    prove_complete_proof(
+        statement,
+        prepared.cpu_fixed,
+        cpu_dynamic,
+        prepared.gpu_fixed,
+        gpu_dynamic,
+        &prepared.base_input,
+        final_activation,
+        &prepared.encoded_banks,
+        dynamic_maps,
+        dynamic_traces,
+        &prepared.fixed_maps,
+        initial_activation,
+        output_path,
+        scope,
+    )
+}
+
+fn prepare_dynamic_traces(
+    values: &[&[Felt]],
+    scope: &TaskScope,
+) -> Result<(PreparedDynamicTraces, DynamicCommitmentWords)> {
+    ensure!(values.len() == 3, "wrong dynamic trace count");
+    let mut traces = Vec::with_capacity(3);
+    let mut words = Vec::with_capacity(3);
+    for (bank, values) in values.iter().enumerate() {
         let started = Instant::now();
-        fixed_maps.push(real_v4_opening::FixedArtifactMaps::open(
-            &artifact_dir,
-            fixed_record.banks()[bank],
-        )?);
+        let mut dense = Vec::with_capacity((DYNAMIC_COLUMNS + 1) * ROWS);
+        dense.resize(ROWS, Felt::zero());
+        dense.extend_from_slice(values);
+        let layout = AbstractChipLayoutWithHeights::new(vec![(
+            format!("v4-bank-{bank}-dynamic"),
+            1,
+            DYNAMIC_COLUMNS,
+            ROWS,
+        )]);
+        let trace =
+            JaggedTraceMle::from_chip_layout(Buffer::from(dense), &layout, LOG_ROWS).into_device(scope);
+        let prover = FriCudaProver::<TestGC, _, Felt>::new(
+            Poseidon2SP1Field16CudaProver::new(scope),
+            FriConfig::new(LOG_BLOWUP, QUERIES, POW_BITS),
+            LOG_ROWS,
+        );
+        let (_, data) = commit_multilinears::<TestGC, _>(&trace, LOG_ROWS, false, false, &prover)?;
+        scope.synchronize_blocking()?;
+        words.push(data.original_commitment.map(|value| value.as_canonical_u32()));
+        traces.push(trace);
         eprintln!(
-            "fixed_artifact_prep bank={bank} seconds={:.6}",
+            "bank={bank} fused_commit_seconds={:.6}",
             started.elapsed().as_secs_f64()
         );
     }
-    eprintln!(
-        "fixed_artifact_prep_total_seconds={:.6}",
-        artifact_prep_started.elapsed().as_secs_f64()
-    );
-
-    run_sync_in_place(move |scope| {
-        prove_complete_proof(
-            statement,
-            cpu_fixed,
-            cpu_dynamic,
-            gpu_fixed,
-            gpu_dynamic,
-            base_input,
-            final_activation,
-            encoded_banks,
-            dynamic_maps,
-            fixed_maps,
-            initial_activation,
-            output_path,
-            scope,
-        )
-    })??;
-    Ok(())
+    Ok((
+        traces
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("wrong prepared dynamic trace count"))?,
+        words
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("wrong dynamic commitment count"))?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -249,14 +404,15 @@ fn prove_complete_proof(
     cpu_dynamic: [CpuDigest; 3],
     gpu_fixed: [GpuDigest; 3],
     gpu_dynamic: [GpuDigest; 3],
-    base_input: Vec<u8>,
+    base_input: &[u8],
     final_activation: Vec<CpuFelt>,
-    encoded_banks: [Vec<u8>; 3],
+    encoded_banks: &[Mmap; 3],
     dynamic_maps: Vec<Mmap>,
-    mut fixed_maps: Vec<real_v4_opening::FixedArtifactMaps>,
+    dynamic_traces: [JaggedTraceMle<Felt, TaskScope>; 3],
+    fixed_maps: &[real_v4_opening::FixedArtifactMaps; 3],
     initial_activation: Vec<Felt>,
-    output_path: PathBuf,
-    scope: TaskScope,
+    output_path: &Path,
+    scope: &TaskScope,
 ) -> Result<()> {
     let (baseline_free, total_device_bytes) = cuda_memory_info()?;
     let minimum_free = Arc::new(AtomicUsize::new(baseline_free));
@@ -285,7 +441,7 @@ fn prove_complete_proof(
     let mut claims = Vec::with_capacity(3);
     let mut openings = Vec::with_capacity(3);
 
-    let [encoded, next_encoded, final_encoded] = encoded_banks;
+    let [dynamic_device, next_dynamic_device, final_dynamic_device] = dynamic_traces;
     let (
         bank_relations,
         bank_claims,
@@ -295,15 +451,15 @@ fn prove_complete_proof(
     ) = prove_bank_relations(
         0,
         statement,
-        &base_input,
-        &encoded,
+        base_input,
+        &encoded_banks[0],
         dynamic_values[0],
+        dynamic_device,
         &initial_activation,
         &mut cpu_challenger,
         &mut gpu_challenger,
-        &scope,
+        scope,
     )?;
-    drop(encoded);
     ensure!(
         boundary_claims.is_empty(),
         "bank 0 produced a previous-bank boundary claim"
@@ -321,22 +477,22 @@ fn prove_complete_proof(
     ) = prove_bank_relations(
         1,
         statement,
-        &base_input,
-        &next_encoded,
+        base_input,
+        &encoded_banks[1],
         dynamic_values[1],
+        next_dynamic_device,
         boundary,
         &mut cpu_challenger,
         &mut gpu_challenger,
-        &scope,
+        scope,
     )?;
-    drop(next_encoded);
     relations.push(bank_relations);
     claims.push(bank_claims);
     claims[0].extend(boundary_claims);
     finalize_forgematrix_v4_bank_opening_claims(&mut claims[0])?;
     openings.push(real_v4_opening::prove_real_bank_opening(
         0,
-        fixed_maps.remove(0),
+        &fixed_maps[0],
         encoded_device,
         dynamic_device,
         gpu_fixed[0],
@@ -344,7 +500,7 @@ fn prove_complete_proof(
         &claims[0],
         &mut gpu_challenger,
         &mut cpu_challenger,
-        &scope,
+        scope,
     )?);
     let boundary = last_activation_layer(dynamic_values[1]);
     let (
@@ -357,22 +513,22 @@ fn prove_complete_proof(
         prove_bank_relations(
             2,
             statement,
-            &base_input,
-            &final_encoded,
+            base_input,
+            &encoded_banks[2],
             dynamic_values[2],
+            final_dynamic_device,
             boundary,
             &mut cpu_challenger,
             &mut gpu_challenger,
-            &scope,
+            scope,
         )?;
-    drop(final_encoded);
     relations.push(bank_relations);
     claims.push(bank_claims);
     claims[1].extend(boundary_claims);
     finalize_forgematrix_v4_bank_opening_claims(&mut claims[1])?;
     openings.push(real_v4_opening::prove_real_bank_opening(
         1,
-        fixed_maps.remove(0),
+        &fixed_maps[1],
         next_encoded_device,
         next_dynamic_device,
         gpu_fixed[1],
@@ -380,7 +536,7 @@ fn prove_complete_proof(
         &claims[1],
         &mut gpu_challenger,
         &mut cpu_challenger,
-        &scope,
+        scope,
     )?);
     for repetition in 0..2 {
         let cpu_point = sample_forgematrix_v4_final_point(&mut cpu_challenger, repetition)?;
@@ -405,7 +561,7 @@ fn prove_complete_proof(
     finalize_forgematrix_v4_bank_opening_claims(&mut claims[2])?;
     openings.push(real_v4_opening::prove_real_bank_opening(
         2,
-        fixed_maps.remove(0),
+        &fixed_maps[2],
         final_encoded_device,
         final_dynamic_device,
         gpu_fixed[2],
@@ -413,7 +569,7 @@ fn prove_complete_proof(
         &claims[2],
         &mut gpu_challenger,
         &mut cpu_challenger,
-        &scope,
+        scope,
     )?);
 
     let banks = (0..3)
@@ -440,7 +596,7 @@ fn prove_complete_proof(
         "complete proof codec is not canonical"
     );
     let verify_started = Instant::now();
-    verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, &base_input, &decoded)?;
+    verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, base_input, &decoded)?;
     eprintln!(
         "complete_cpu_verify_seconds={:.6}",
         verify_started.elapsed().as_secs_f64()
@@ -449,7 +605,7 @@ fn prove_complete_proof(
     let mut changed = decoded.clone();
     changed.final_activation[0] += CpuFelt::one();
     ensure!(
-        verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, &base_input, &changed)
+        verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, base_input, &changed)
             .is_err(),
         "mutated final activation was accepted"
     );
@@ -458,14 +614,14 @@ fn prove_complete_proof(
         .matrix
         .preactivation_evaluation += CpuExt::one();
     ensure!(
-        verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, &base_input, &changed)
+        verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, base_input, &changed)
             .is_err(),
         "mutated matrix relation was accepted"
     );
     let mut changed = decoded.clone();
     changed.banks[1].opening.fixed_column_evaluations[0] += CpuExt::one();
     ensure!(
-        verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, &base_input, &changed)
+        verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, base_input, &changed)
             .is_err(),
         "mutated fixed opening was accepted"
     );
@@ -480,13 +636,13 @@ fn prove_complete_proof(
         decode_forgematrix_v4_transparent_proof(&changed_bytes)
             .and_then(|changed| encode_forgematrix_v4_transparent_proof(&changed).map(|_| changed))
             .map_or(true, |changed| {
-                verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, &base_input, &changed)
+                verify_forgematrix_v4_transparent_proof(statement, cpu_fixed, base_input, &changed)
                     .is_err()
             }),
         "mutated complete-proof byte was accepted"
     );
     eprintln!("complete_mutations=REJECTED final,matrix,opening,truncation,byte");
-    std::fs::write(&output_path, &canonical)?;
+    std::fs::write(output_path, &canonical)?;
     sampling.store(false, Ordering::Relaxed);
     sampling_thread
         .join()
@@ -515,6 +671,7 @@ fn prove_bank_relations(
     base_input: &[u8],
     encoded_bank: &[u8],
     dynamic_values: &[Felt],
+    dynamic: JaggedTraceMle<Felt, TaskScope>,
     boundary_activation: &[Felt],
     cpu_challenger: &mut cmfd_consensus::forgematrix_v4_basefold::ForgeMatrixV4Challenger,
     gpu_challenger: &mut GpuChallenger,
@@ -528,21 +685,6 @@ fn prove_bank_relations(
 )> {
     let upload_started = Instant::now();
     let encoded_device = DeviceBuffer::from_host_slice(encoded_bank, scope)?;
-    let mut dynamic_dense = Vec::with_capacity((DYNAMIC_COLUMNS + 1) * ROWS);
-    dynamic_dense.resize(ROWS, Felt::zero());
-    dynamic_dense.extend_from_slice(dynamic_values);
-    let dynamic_layout = AbstractChipLayoutWithHeights::new(vec![(
-        format!("v4-bank-{bank}-dynamic"),
-        1,
-        DYNAMIC_COLUMNS,
-        ROWS,
-    )]);
-    let dynamic = JaggedTraceMle::from_chip_layout(
-        Buffer::from(dynamic_dense),
-        &dynamic_layout,
-        LOG_ROWS,
-    )
-    .into_device(scope);
     scope.synchronize_blocking()?;
     eprintln!(
         "bank={bank} relation_upload_seconds={:.6}",
@@ -806,14 +948,20 @@ fn read_base_input(path: &Path) -> Result<Vec<u8>> {
     Ok(base)
 }
 
-fn read_encoded_bank(path: &Path, bank: usize) -> Result<Vec<u8>> {
+fn map_encoded_bank(path: &Path, bank: usize) -> Result<Mmap> {
     ensure!(bank < 3, "bank index is out of range");
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(
-        MODEL_HEADER_BYTES + CELLS as u64 + bank as u64 * BANK_BYTES as u64,
-    ))?;
-    let mut bank = vec![0_u8; BANK_BYTES];
-    file.read_exact(&mut bank)?;
+    let file = File::open(path)?;
+    let offset = MODEL_HEADER_BYTES + CELLS as u64 + bank as u64 * BANK_BYTES as u64;
+    ensure!(
+        file.metadata()?.len() >= offset + BANK_BYTES as u64,
+        "model bank is truncated"
+    );
+    let bank = unsafe {
+        MmapOptions::new()
+            .offset(offset)
+            .len(BANK_BYTES)
+            .map(&file)?
+    };
     ensure!(
         bank.par_iter().all(|value| *value <= 250),
         "invalid weight byte"

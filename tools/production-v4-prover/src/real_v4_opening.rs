@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path, time::Instant};
+use std::{fs::File, path::Path, sync::Arc, time::Instant};
 
 use anyhow::{ensure, Context, Result};
 use cmfd_consensus::{
@@ -57,16 +57,16 @@ struct GpuClaim {
 pub struct FixedArtifactMaps {
     bank: usize,
     commitment: GpuDigest,
-    codeword: Mmap,
+    codeword: Arc<Mmap>,
     row_major: bool,
-    tree: Mmap,
+    tree: Arc<Mmap>,
     root: GpuDigest,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn prove_real_bank_opening(
     bank: usize,
-    maps: FixedArtifactMaps,
+    maps: &FixedArtifactMaps,
     encoded_bank: DeviceBuffer<u8>,
     dynamic_trace: JaggedTraceMle<Felt, TaskScope>,
     fixed_commitment: GpuDigest,
@@ -212,7 +212,7 @@ pub fn prove_real_bank_opening(
             fixed
         },
     );
-    let fixed_opening_builder = maps.into_opening_builder();
+    let fixed_opening_builder = maps.opening_builder();
     let stacked_data: Rounds<_> = [&fixed_data, &dynamic_data.pcs_prover_data]
         .into_iter()
         .collect();
@@ -425,11 +425,11 @@ impl FixedArtifactMaps {
                     == &artifact.codeword_blake3(),
                 "fixed codeword digest mismatch"
             );
-            Some(codeword)
+            Some(Arc::new(codeword))
         } else {
             None
         };
-        let tree = unsafe { MmapOptions::new().map(&tree_file)? };
+        let tree = Arc::new(unsafe { MmapOptions::new().map(&tree_file)? });
         ensure!(
             blake3::Hasher::new()
                 .update_rayon(&tree)
@@ -451,7 +451,10 @@ impl FixedArtifactMaps {
                 row_major_file.metadata()?.len() == artifact.codeword_bytes(),
                 "row-major fixed codeword length mismatch"
             );
-            (unsafe { MmapOptions::new().map(&row_major_file)? }, true)
+            (
+                Arc::new(unsafe { MmapOptions::new().map(&row_major_file)? }),
+                true,
+            )
         } else {
             (
                 canonical_codeword
@@ -470,7 +473,11 @@ impl FixedArtifactMaps {
         })
     }
 
-    fn into_opening_builder(self) -> TrustedComponentOpeningBuilder<'static, TestGC> {
+    fn opening_builder(&self) -> TrustedComponentOpeningBuilder<'static, TestGC> {
+        let codeword = Arc::clone(&self.codeword);
+        let tree = Arc::clone(&self.tree);
+        let row_major = self.row_major;
+        let root = self.root;
         Box::new(move |query_indices| {
             let mut values = Vec::with_capacity(query_indices.len() * FIXED_COLUMNS);
             let mut paths = Vec::with_capacity(query_indices.len() * TREE_HEIGHT);
@@ -479,24 +486,24 @@ impl FixedArtifactMaps {
                     return None;
                 }
                 for column in 0..FIXED_COLUMNS {
-                    let word_index = if self.row_major {
+                    let word_index = if row_major {
                         query_index * FIXED_COLUMNS + column
                     } else {
                         column * CODEWORD_ROWS + query_index
                     };
-                    values.push(raw_felt(&self.codeword, word_index)?);
+                    values.push(raw_felt(&codeword, word_index)?);
                 }
                 let mut node = CODEWORD_ROWS - 1 + query_index;
                 for _ in 0..TREE_HEIGHT {
                     let sibling = if node & 1 == 0 { node - 1 } else { node + 1 };
-                    paths.push(raw_digest(&self.tree, sibling).ok()?);
+                    paths.push(raw_digest(&tree, sibling).ok()?);
                     node = (node - 1) >> 1;
                 }
             }
             Some(slop_merkle_tree::MerkleTreeOpeningAndProof {
                 values: Tensor::from(values).reshape([query_indices.len(), FIXED_COLUMNS]),
                 proof: slop_merkle_tree::MerkleTreeTcsProof {
-                    merkle_root: self.root,
+                    merkle_root: root,
                     log_tensor_height: TREE_HEIGHT,
                     width: FIXED_COLUMNS,
                     paths: Tensor::from(paths).reshape([query_indices.len(), TREE_HEIGHT]),

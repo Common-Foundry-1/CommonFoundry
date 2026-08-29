@@ -29,11 +29,14 @@ use cmfd_consensus::forgematrix_v4_proof::forgematrix_v4_mask_coefficients;
 use cmfd_consensus::forgematrix_v4_proof_codec::decode_forgematrix_v4_transparent_proof;
 #[cfg(feature = "production-v4-testnet")]
 use cmfd_consensus::{
-    BlockChallenge, Coinbase, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_PROOF_VERSION,
-    ForgeMatrixV4CandidateProof, ForgeMatrixV4FixedArtifactRecordV1, PRODUCTION_V2_LAYERS,
+    BlockChallenge, Coinbase, FORGEMATRIX_V4_ALGORITHM_VERSION, FORGEMATRIX_V4_FIELD_MODULUS,
+    FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN, FORGEMATRIX_V4_PROOF_VERSION,
+    FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES, ForgeMatrixV4CandidateProof,
+    ForgeMatrixV4FixedArtifactRecordV1, PRODUCTION_V2_LAYERS,
     PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST, PRODUCTION_V4_MAX_BLOCK_BYTES,
-    PRODUCTION_V4_MAX_PROOF_BYTES, Transaction, forgematrix_v4_challenge_digest,
-    forgematrix_v4_proof_system_digest, forgematrix_v4_work_digest,
+    PRODUCTION_V4_MAX_PROOF_BYTES, PRODUCTION_V4_TESTNET_NETWORK_ID, Transaction,
+    forgematrix_v4_challenge_digest, forgematrix_v4_proof_system_digest,
+    forgematrix_v4_work_digest,
 };
 #[cfg(feature = "production-v3-testnet")]
 use cmfd_consensus::{
@@ -226,6 +229,31 @@ enum Command {
         coefficients_output: PathBuf,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Bind another nonce to an already-frozen ProductionV4 block challenge.
+    #[cfg(feature = "production-v4-testnet")]
+    BindV4Nonce {
+        /// Existing canonical template whose block challenge remains unchanged.
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        nonce: u64,
+        #[arg(long)]
+        fixed_record: PathBuf,
+        #[arg(long)]
+        coefficients_output: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Report whether a replay's final activation meets a frozen V4 target.
+    #[cfg(feature = "production-v4-testnet")]
+    InspectV4Work {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        final_activation: PathBuf,
+        #[arg(long)]
+        fixed_record: PathBuf,
     },
     /// Wrap and submit a CPU-self-verified ProductionV4 transparent proof.
     #[cfg(feature = "production-v4-testnet")]
@@ -460,6 +488,26 @@ fn main() -> Result<()> {
             &output,
         ),
         #[cfg(feature = "production-v4-testnet")]
+        Command::BindV4Nonce {
+            template,
+            nonce,
+            fixed_record,
+            coefficients_output,
+            output,
+        } => bind_v4_nonce(
+            &template,
+            nonce,
+            &fixed_record,
+            &coefficients_output,
+            &output,
+        ),
+        #[cfg(feature = "production-v4-testnet")]
+        Command::InspectV4Work {
+            template,
+            final_activation,
+            fixed_record,
+        } => inspect_v4_work(&template, &final_activation, &fixed_record),
+        #[cfg(feature = "production-v4-testnet")]
         Command::SubmitV4Template {
             peer,
             allow_public_peers,
@@ -639,6 +687,163 @@ fn snapshot_v4_template(
         coefficients_output.display()
     );
     Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn bind_v4_nonce(
+    template_path: &Path,
+    nonce: u64,
+    fixed_record_path: &Path,
+    coefficients_output: &Path,
+    output: &Path,
+) -> Result<()> {
+    ensure_production_v4_test_tool()?;
+    ensure_existing_absolute_file(template_path, "ProductionV4 source template")?;
+    ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
+    ensure_new_absolute_output(coefficients_output, "ProductionV4 replay coefficients")?;
+    ensure_new_absolute_output(output, "ProductionV4 rebound template")?;
+    if coefficients_output == output {
+        bail!("ProductionV4 template and replay coefficient outputs must be different paths");
+    }
+
+    let template_bytes = read_bounded_file(
+        template_path,
+        PRODUCTION_V4_MAX_BLOCK_BYTES,
+        "ProductionV4 source template",
+    )?;
+    let mut frozen: FrozenProductionV4Template = serde_json::from_slice(&template_bytes)
+        .with_context(|| format!("failed to parse {}", template_path.display()))?;
+    if canonical_json(&frozen, "ProductionV4 source template")? != template_bytes {
+        bail!("ProductionV4 source template is not canonical JSON");
+    }
+    frozen.clone().into_mining_template()?;
+    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+        bail!("ProductionV4 source template belongs to another network");
+    }
+
+    let fixed_record_bytes = read_bounded_file(
+        fixed_record_path,
+        64 * 1024,
+        "ProductionV4 fixed artifact record",
+    )?;
+    let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 =
+        serde_json::from_slice(&fixed_record_bytes)?;
+    fixed_record.validate()?;
+    if fixed_record.record_digest() != PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST {
+        bail!("ProductionV4 fixed artifact record is not the compiled testnet record");
+    }
+
+    frozen.nonce = nonce;
+    let challenge_digest = forgematrix_v4_challenge_digest(
+        &frozen.challenge,
+        frozen.nonce,
+        fixed_record.manifest_digest(),
+    );
+    let coefficients = production_v4_replay_coefficients(challenge_digest);
+    let bytes = canonical_json(&frozen, "ProductionV4 rebound template")?;
+    write_new_file(
+        coefficients_output,
+        &coefficients,
+        "ProductionV4 replay coefficients",
+    )?;
+    write_new_file(output, &bytes, "ProductionV4 rebound template")?;
+    println!(
+        "Bound ProductionV4 height {} nonce {}: {} (coefficients: {})",
+        frozen.challenge.height,
+        frozen.nonce,
+        output.display(),
+        coefficients_output.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn inspect_v4_work(
+    template_path: &Path,
+    final_activation_path: &Path,
+    fixed_record_path: &Path,
+) -> Result<()> {
+    ensure_production_v4_test_tool()?;
+    ensure_existing_absolute_file(template_path, "ProductionV4 template")?;
+    ensure_existing_absolute_file(final_activation_path, "ProductionV4 final activation")?;
+    ensure_existing_absolute_file(fixed_record_path, "ProductionV4 fixed artifact record")?;
+
+    let template_bytes = read_bounded_file(
+        template_path,
+        PRODUCTION_V4_MAX_BLOCK_BYTES,
+        "ProductionV4 template",
+    )?;
+    let frozen: FrozenProductionV4Template = serde_json::from_slice(&template_bytes)
+        .with_context(|| format!("failed to parse {}", template_path.display()))?;
+    if canonical_json(&frozen, "ProductionV4 template")? != template_bytes {
+        bail!("ProductionV4 template is not canonical JSON");
+    }
+    frozen.clone().into_mining_template()?;
+    if frozen.challenge.network_id != PRODUCTION_V4_TESTNET_NETWORK_ID {
+        bail!("ProductionV4 template belongs to another network");
+    }
+
+    let fixed_record_bytes = read_bounded_file(
+        fixed_record_path,
+        64 * 1024,
+        "ProductionV4 fixed artifact record",
+    )?;
+    let fixed_record: ForgeMatrixV4FixedArtifactRecordV1 =
+        serde_json::from_slice(&fixed_record_bytes)?;
+    fixed_record.validate()?;
+    if fixed_record.record_digest() != PRODUCTION_V4_FIXED_ARTIFACT_RECORD_DIGEST {
+        bail!("ProductionV4 fixed artifact record is not the compiled testnet record");
+    }
+
+    let final_activation = read_bounded_file(
+        final_activation_path,
+        FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES,
+        "ProductionV4 final activation",
+    )?;
+    if final_activation.len() != FORGEMATRIX_V4_PUBLIC_FINAL_ACTIVATION_BYTES {
+        bail!("ProductionV4 final activation has the wrong byte length");
+    }
+    let challenge_digest = forgematrix_v4_challenge_digest(
+        &frozen.challenge,
+        frozen.nonce,
+        fixed_record.manifest_digest(),
+    );
+    let final_activation_digest =
+        v4_final_activation_digest_from_bytes(challenge_digest, &final_activation)?;
+    let work_digest = forgematrix_v4_work_digest(
+        fixed_record.manifest_digest(),
+        challenge_digest,
+        final_activation_digest,
+    );
+    println!(
+        "CMFD_V4_WORK qualified={} nonce={} work={} target={}",
+        work_digest <= frozen.challenge.target,
+        frozen.nonce,
+        hex::encode(work_digest),
+        hex::encode(frozen.challenge.target),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-v4-testnet")]
+fn v4_final_activation_digest_from_bytes(
+    challenge_digest: [u8; 32],
+    final_activation: &[u8],
+) -> Result<[u8; 32]> {
+    if !final_activation.len().is_multiple_of(size_of::<u32>()) {
+        bail!("ProductionV4 final activation is not a complete field vector");
+    }
+    let mut hasher = blake3::Hasher::new_derive_key(FORGEMATRIX_V4_FINAL_ACTIVATION_DIGEST_DOMAIN);
+    hasher.update(&challenge_digest);
+    hasher.update(&((final_activation.len() / size_of::<u32>()) as u64).to_le_bytes());
+    for encoded in final_activation.chunks_exact(size_of::<u32>()) {
+        let value = u32::from_le_bytes(encoded.try_into()?);
+        if value >= FORGEMATRIX_V4_FIELD_MODULUS {
+            bail!("ProductionV4 final activation contains a noncanonical field value");
+        }
+        hasher.update(encoded);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(feature = "production-v4-testnet")]
@@ -4389,6 +4594,32 @@ mod tests {
             &coefficients[last..last + 20],
             &forgematrix_v4_mask_coefficients(challenge_digest, PRODUCTION_V2_LAYERS - 1)
         );
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn production_v4_raw_final_digest_has_a_pinned_vector() {
+        let challenge_digest = [0x6b; 32];
+        let values = [0, 1, FORGEMATRIX_V4_FIELD_MODULUS - 1];
+        let encoded = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hex::encode(v4_final_activation_digest_from_bytes(challenge_digest, &encoded).unwrap()),
+            "52b1b4618e5126b806aaa7b5b40ce19b76946214e41b8b961de14d7436fe738c"
+        );
+
+        let noncanonical = FORGEMATRIX_V4_FIELD_MODULUS.to_le_bytes();
+        assert!(v4_final_activation_digest_from_bytes(challenge_digest, &noncanonical).is_err());
+    }
+
+    #[cfg(feature = "production-v4-testnet")]
+    #[test]
+    fn production_v4_continuous_search_commands_require_bound_inputs() {
+        for command in ["bind-v4-nonce", "inspect-v4-work"] {
+            assert!(Cli::try_parse_from(["cmfd-miner", command]).is_err());
+        }
     }
 
     fn retry_test_block() -> cmfd_consensus::Block {

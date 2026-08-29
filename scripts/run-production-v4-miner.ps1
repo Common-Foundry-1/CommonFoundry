@@ -49,6 +49,9 @@ param(
     [ValidateRange(0, [int]::MaxValue)]
     [int]$Blocks = 0,
 
+    [ValidateRange(1, 300)]
+    [int]$TemplateRefreshSeconds = 15,
+
     [switch]$AllowPublicPeer,
     [switch]$KeepAcceptedWork,
     [switch]$InputsPrepared,
@@ -137,6 +140,15 @@ function Convert-ToWslPaths {
     )
 }
 
+function Convert-FromWslPath {
+    param([string]$Path)
+    if ($WslDistribution -cnotmatch '^[A-Za-z0-9_.-]+$' -or -not $Path.StartsWith('/')) {
+        throw 'cannot convert unsafe WSL path to Windows'
+    }
+    $relative = $Path.TrimStart('/').Replace('/', '\')
+    return "\\wsl.localhost\$WslDistribution\$relative"
+}
+
 function Invoke-NativeLogged {
     param(
         [string]$Program,
@@ -153,6 +165,145 @@ function Invoke-NativeLogged {
         return $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+function Invoke-NativeCaptureLogged {
+    param(
+        [string]$Program,
+        [string[]]$Arguments,
+        [string]$LogPath
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $Program @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    foreach ($line in $output) {
+        Add-Content -LiteralPath $LogPath -Encoding Ascii -Value ([string]$line)
+    }
+    [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = @($output | ForEach-Object { [string]$_ })
+    }
+}
+
+function Start-PersistentWslWorker {
+    param(
+        [string]$Program,
+        [string[]]$Arguments,
+        [string]$ReadyMarker,
+        [string]$LogPath,
+        [string]$Label
+    )
+    $tokens = @(
+        'env',
+        "CUDA_VISIBLE_DEVICES=$CudaDevice",
+        'CUDA_HOME=/usr/local/cuda-12.8',
+        'CUDA_PATH=/usr/local/cuda-12.8',
+        'CUDAToolkit_ROOT=/usr/local/cuda-12.8',
+        'LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64',
+        $Program
+    ) + $Arguments
+    if ($WslDistribution -cnotmatch '^[A-Za-z0-9_.-]+$') {
+        throw "unsafe WSL distribution name: $WslDistribution"
+    }
+    foreach ($token in $tokens) {
+        if ($token -cnotmatch '^[A-Za-z0-9_./:=+-]+$') {
+            throw "unsafe persistent-worker argument: $token"
+        }
+    }
+    $command = ($tokens -join ' ') + ' 2>&1'
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = (Get-Command wsl.exe).Source
+    $startInfo.Arguments = "-d $WslDistribution -- bash -lc `"$command`""
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "failed to start $Label"
+    }
+    $process.StandardInput.NewLine = "`n"
+    try {
+        while ($true) {
+            $line = $process.StandardOutput.ReadLine()
+            if ($null -eq $line) {
+                throw "$Label exited before $ReadyMarker"
+            }
+            Add-Content -LiteralPath $LogPath -Encoding Ascii -Value $line
+            if ($line -ceq $ReadyMarker) {
+                break
+            }
+        }
+    } catch {
+        if (-not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
+        $process.Dispose()
+        throw
+    }
+    [pscustomobject]@{
+        Process = $process
+        Input = $process.StandardInput
+        Output = $process.StandardOutput
+        Label = $Label
+    }
+}
+
+function Invoke-PersistentWslWorker {
+    param(
+        $Worker,
+        [string[]]$Fields,
+        [string]$DoneMarker,
+        [string]$LogPath
+    )
+    foreach ($field in $Fields) {
+        if ([string]::IsNullOrWhiteSpace($field) -or $field.Contains("`t") -or $field.Contains("`n")) {
+            throw "invalid $($Worker.Label) command field"
+        }
+    }
+    $Worker.Input.WriteLine(($Fields -join "`t"))
+    $Worker.Input.Flush()
+    while ($true) {
+        $line = $Worker.Output.ReadLine()
+        if ($null -eq $line) {
+            throw "$($Worker.Label) exited before $DoneMarker"
+        }
+        Add-Content -LiteralPath $LogPath -Encoding Ascii -Value $line
+        if ($line -ceq $DoneMarker) {
+            return
+        }
+    }
+}
+
+function Stop-PersistentWslWorker {
+    param($Worker)
+    if ($null -eq $Worker) {
+        return
+    }
+    try {
+        if (-not $Worker.Process.HasExited) {
+            $Worker.Input.WriteLine('QUIT')
+            $Worker.Input.Flush()
+            if (-not $Worker.Process.WaitForExit(5000)) {
+                $Worker.Process.Kill()
+                $Worker.Process.WaitForExit()
+            }
+        }
+    } catch {
+        if (-not $Worker.Process.HasExited) {
+            $Worker.Process.Kill()
+            $Worker.Process.WaitForExit()
+        }
+    } finally {
+        $Worker.Process.Dispose()
     }
 }
 
@@ -558,14 +709,45 @@ Invoke-WslCapture -Arguments @(
     'bash', $wslCacheHelperWsl, 'make-owned', $nativeWorkRootWsl, $nativeSessionWsl, 'session-'
 ) -Label 'ProductionV4 WSL scratch setup' | Out-Null
 
+$persistentReplayWsl = "$nativeSessionWsl/cmfd-v4-replay"
+$persistentProofWsl = "$nativeSessionWsl/cmfd-v4-prover"
+Invoke-WslCapture -Arguments @(
+    'cp', '--', $replayBinaryWsl, $persistentReplayWsl
+) -Label 'ProductionV4 replay-worker staging' | Out-Null
+Invoke-WslCapture -Arguments @(
+    'cp', '--', $proofBinaryWsl, $persistentProofWsl
+) -Label 'ProductionV4 proof-worker staging' | Out-Null
+Invoke-WslCapture -Arguments @(
+    'chmod', '0700', $persistentReplayWsl, $persistentProofWsl
+) -Label 'ProductionV4 worker permissions' | Out-Null
+
 $accepted = 0
 $rejected = 0
 $attempts = 0
 $sessionEnergyKwh = 0.0
 $logDirectory = Join-Path $workDirectoryPath 'logs'
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+$sessionLog = Join-Path $logDirectory (
+    'session-{0}.log' -f ([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))
+)
+New-Item -ItemType File -Path $sessionLog | Out-Null
+$proofWorker = $null
+$replayWorker = $null
+$keepReplayResident = $gpuMemoryMiB -ge 20000
 Write-MinerStats $accepted $rejected ([double]::NaN) ([double]::NaN) $sessionEnergyKwh ([double]::NaN)
 try {
+$proofWorker = Start-PersistentWslWorker `
+    $persistentProofWsl `
+    @('--server', $cachedModelBankWsl, $cachedArtifactDirectoryWsl) `
+    'CMFD_V4_PROOF_READY' `
+    $sessionLog `
+    'ProductionV4 proof worker'
+$replayWorker = Start-PersistentWslWorker `
+    $persistentReplayWsl `
+    @('--server', $cachedModelBankWsl) `
+    'CMFD_V4_REPLAY_READY' `
+    $sessionLog `
+    'ProductionV4 replay worker'
 while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
     $attempts++
     $attemptName = 'attempt-{0:D8}-{1}' -f $attempts, ([DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ'))
@@ -581,7 +763,6 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
     $template = Join-Path $attemptDirectory 'template.json'
     $coefficients = Join-Path $attemptDirectory 'replay-coefficients.bin'
     $tracePrefix = Join-Path $attemptDirectory 'trace'
-    $dynamicCommitments = Join-Path $attemptDirectory 'dynamic-commitments.json'
     $finalActivation = "$tracePrefix-final-activation.bin"
     $proof = Join-Path $attemptDirectory 'transparent-proof.bin'
 
@@ -610,76 +791,147 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
         $templateWindowsWsl, $coefficientsWindowsWsl, $proofWindowsWsl = @(
             Convert-ToWslPaths @($template, $coefficients, $proof)
         )
+        $attemptDirectoryWindowsWsl = $templateWindowsWsl.Substring(
+            0,
+            $templateWindowsWsl.LastIndexOf('/')
+        )
         $attemptWsl = "$nativeSessionWsl/$attemptName"
         Invoke-WslCapture -Arguments @(
             'bash', $wslCacheHelperWsl, 'make-owned', $nativeSessionWsl, $attemptWsl, 'attempt-'
         ) -Label 'ProductionV4 WSL attempt setup' | Out-Null
-        $templateWsl = "$attemptWsl/template.json"
-        $coefficientsWsl = "$attemptWsl/replay-coefficients.bin"
         $tracePrefixWsl = "$attemptWsl/trace"
-        $dynamicCommitmentsWsl = "$attemptWsl/dynamic-commitments.json"
         $finalActivationWsl = "$tracePrefixWsl-final-activation.bin"
+        $searchTracePrefixWsl = "$attemptWsl/search"
+        $searchFinalActivationWsl = "$searchTracePrefixWsl-final-activation.bin"
+        $searchFinalActivationWindows = Convert-FromWslPath $searchFinalActivationWsl
         $proofWsl = "$attemptWsl/transparent-proof.bin"
-        Invoke-WslCapture -Arguments @(
-            'cp', '--', $templateWindowsWsl, $templateWsl
-        ) -Label 'ProductionV4 template staging' | Out-Null
-        Invoke-WslCapture -Arguments @(
-            'cp', '--', $coefficientsWindowsWsl, $coefficientsWsl
-        ) -Label 'ProductionV4 coefficient staging' | Out-Null
 
-        Invoke-TimedChecked {
-            Invoke-WslChecked $replayBinaryWsl @(
-                $cachedModelBankWsl, $coefficientsWsl, $tracePrefixWsl
-            ) 'ProductionV4 replay' $attemptLog
-        } 'replay' $attemptLog
-        Invoke-TimedChecked {
-            Invoke-WslChecked $dynamicCommitmentBinaryWsl @(
-                $tracePrefixWsl, $dynamicCommitmentsWsl
-            ) 'ProductionV4 dynamic commitments' $attemptLog
-        } 'dynamic_commitments' $attemptLog
-        Invoke-TimedChecked {
-            Invoke-WslChecked $proofBinaryWsl @(
-                $cachedModelBankWsl,
-                $cachedArtifactDirectoryWsl,
-                $templateWsl,
-                $tracePrefixWsl,
-                $dynamicCommitmentsWsl,
-                $finalActivationWsl,
-                $proofWsl
-            ) 'ProductionV4 proof' $attemptLog
-        } 'proof' $attemptLog
-        Invoke-WslCapture -Arguments @(
-            'cp', '--', $proofWsl, $proofWindowsWsl
-        ) -Label 'ProductionV4 proof export' | Out-Null
-
-        $submitArguments = @(
-            'submit-v4-template',
-            '--peer', $Peer,
-            '--template', $template,
-            '--transparent-proof', $proof,
-            '--fixed-record', $fixedRecordPath
-        )
-        if ($AllowPublicPeer) {
-            $submitArguments += '--allow-public-peers'
-        }
-        $submitTimer = [Diagnostics.Stopwatch]::StartNew()
+        $candidateTemplate = $template
+        $candidateTemplateWsl = $templateWindowsWsl
+        $candidateCoefficientsWsl = $coefficientsWindowsWsl
+        $candidateNonce = $Nonce
+        $searchTimer = [Diagnostics.Stopwatch]::StartNew()
         try {
-            $submitExitCode = Invoke-NativeLogged $cmfdMinerPath $submitArguments $attemptLog
+            while ($true) {
+                Invoke-PersistentWslWorker `
+                    $replayWorker `
+                    @('RUN', 'search', $candidateCoefficientsWsl, $searchTracePrefixWsl) `
+                    'CMFD_V4_REPLAY_DONE' `
+                    $attemptLog
+                $inspection = Invoke-NativeCaptureLogged $cmfdMinerPath @(
+                    'inspect-v4-work',
+                    '--template', $candidateTemplate,
+                    '--final-activation', $searchFinalActivationWindows,
+                    '--fixed-record', $fixedRecordPath
+                ) $attemptLog
+                if ($inspection.ExitCode -ne 0) {
+                    throw "ProductionV4 work inspection exited with code $($inspection.ExitCode)"
+                }
+                $workLines = @($inspection.Output | Where-Object {
+                    $_.StartsWith('CMFD_V4_WORK ', [StringComparison]::Ordinal)
+                })
+                $workMatch = if ($workLines.Count -eq 1) {
+                    [regex]::Match($workLines[0], ' qualified=(true|false) ')
+                } else {
+                    $null
+                }
+                if ($null -eq $workMatch -or -not $workMatch.Success) {
+                    throw 'ProductionV4 work inspection did not return one canonical result'
+                }
+                if ($workMatch.Groups[1].Value -ceq 'true') {
+                    break
+                }
+                if ($searchTimer.Elapsed.TotalSeconds -ge $TemplateRefreshSeconds) {
+                    $outcome = 'refresh'
+                    break
+                }
+                if ($candidateNonce -eq [uint64]::MaxValue) {
+                    throw 'ProductionV4 nonce space exhausted'
+                }
+                $candidateNonce++
+                $candidateTemplate = Join-Path $attemptDirectory "template-$candidateNonce.json"
+                $candidateCoefficients = Join-Path $attemptDirectory "replay-coefficients-$candidateNonce.bin"
+                $bind = Invoke-NativeCaptureLogged $cmfdMinerPath @(
+                    'bind-v4-nonce',
+                    '--template', $template,
+                    '--nonce', $candidateNonce.ToString([Globalization.CultureInfo]::InvariantCulture),
+                    '--fixed-record', $fixedRecordPath,
+                    '--coefficients-output', $candidateCoefficients,
+                    '--output', $candidateTemplate
+                ) $attemptLog
+                if ($bind.ExitCode -ne 0) {
+                    throw "ProductionV4 nonce binding exited with code $($bind.ExitCode)"
+                }
+                $candidateTemplateWindowsWsl = "$attemptDirectoryWindowsWsl/template-$candidateNonce.json"
+                $candidateCoefficientsWindowsWsl = "$attemptDirectoryWindowsWsl/replay-coefficients-$candidateNonce.bin"
+                $candidateTemplateWsl = $candidateTemplateWindowsWsl
+                $candidateCoefficientsWsl = $candidateCoefficientsWindowsWsl
+            }
         } finally {
-            $submitTimer.Stop()
-            Write-PhaseTelemetry $attemptLog 'submit' $submitTimer
+            $searchTimer.Stop()
+            Write-PhaseTelemetry $attemptLog 'search' $searchTimer
         }
-        if ($submitExitCode -eq 0) {
-            $accepted++
-            $outcome = 'accepted'
-        } elseif (
-            (Select-String -LiteralPath $attemptLog -SimpleMatch 'ProductionV4 block was rejected by the node' -Quiet) -or
-            (Select-String -LiteralPath $attemptLog -SimpleMatch 'frozen ProductionV4 template is stale' -Quiet)
-        ) {
-            $rejected++
-            $outcome = 'rejected'
-        } else {
-            throw "ProductionV4 block submission exited with code $submitExitCode"
+        if ($outcome -ne 'refresh') {
+            Invoke-TimedChecked {
+                Invoke-PersistentWslWorker `
+                    $replayWorker `
+                    @('RUN', 'full', $candidateCoefficientsWsl, $tracePrefixWsl) `
+                    'CMFD_V4_REPLAY_DONE' `
+                    $attemptLog
+                Invoke-WslCapture -Arguments @(
+                    'cmp', '--', $searchFinalActivationWsl, $finalActivationWsl
+                ) -Label 'ProductionV4 search/full replay comparison' | Out-Null
+            } 'winning_replay' $attemptLog
+            if (-not $keepReplayResident) {
+                Invoke-PersistentWslWorker `
+                    $replayWorker `
+                    @('EVICT') `
+                    'CMFD_V4_REPLAY_EVICTED' `
+                    $attemptLog
+            }
+            Invoke-TimedChecked {
+                Invoke-PersistentWslWorker `
+                    $proofWorker `
+                    @('RUN', $candidateTemplateWsl,
+                    $tracePrefixWsl,
+                    $finalActivationWsl,
+                    $proofWsl) `
+                    'CMFD_V4_PROOF_DONE' `
+                    $attemptLog
+            } 'proof' $attemptLog
+            Invoke-WslCapture -Arguments @(
+                'cp', '--', $proofWsl, $proofWindowsWsl
+            ) -Label 'ProductionV4 proof export' | Out-Null
+
+            $submitArguments = @(
+                'submit-v4-template',
+                '--peer', $Peer,
+                '--template', $candidateTemplate,
+                '--transparent-proof', $proof,
+                '--fixed-record', $fixedRecordPath
+            )
+            if ($AllowPublicPeer) {
+                $submitArguments += '--allow-public-peers'
+            }
+            $submitTimer = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $submitExitCode = Invoke-NativeLogged $cmfdMinerPath $submitArguments $attemptLog
+            } finally {
+                $submitTimer.Stop()
+                Write-PhaseTelemetry $attemptLog 'submit' $submitTimer
+            }
+            if ($submitExitCode -eq 0) {
+                $accepted++
+                $outcome = 'accepted'
+            } elseif (
+                (Select-String -LiteralPath $attemptLog -SimpleMatch 'ProductionV4 block was rejected by the node' -Quiet) -or
+                (Select-String -LiteralPath $attemptLog -SimpleMatch 'frozen ProductionV4 template is stale' -Quiet)
+            ) {
+                $rejected++
+                $outcome = 'rejected'
+            } else {
+                throw "ProductionV4 block submission exited with code $submitExitCode"
+            }
         }
     } catch {
         $failure = $_
@@ -715,10 +967,12 @@ while ($Blocks -eq 0 -or $accepted -lt $Blocks) {
     }
     Remove-WslOwnedDirectory $nativeSessionWsl $attemptWsl 'attempt-'
 
-    if ($outcome -eq 'rejected' -or -not $KeepAcceptedWork) {
+    if ($outcome -ne 'accepted' -or -not $KeepAcceptedWork) {
         Remove-AttemptDirectory $attemptDirectory
     }
 }
 } finally {
+    Stop-PersistentWslWorker $replayWorker
+    Stop-PersistentWslWorker $proofWorker
     Remove-WslOwnedDirectory $nativeWorkRootWsl $nativeSessionWsl 'session-'
 }

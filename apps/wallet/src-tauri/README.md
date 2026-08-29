@@ -96,6 +96,7 @@ never receive the pool's private-key DER. The pool then issues a fresh challenge
 that this wallet signs with its receive key, authenticating the payout identity
 without transmitting the private key. Pool share, block, and credited-atom
 values are stored in a bounded, durable, reorganization-aware test ledger.
-On-chain settlement is the next pool milestone. See
+The pool operator can enable mature-reward testnet settlement; each exact signed
+payout is journaled before broadcast and reconciled with the active chain. See
 [../../../docs/devnet-0.md](../../../docs/devnet-0.md) for pool operator
 commands and the complete security boundary.

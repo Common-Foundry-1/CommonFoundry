@@ -864,17 +864,18 @@ The custom verifier compares all 32 digest bytes and still verifies the TLS
 handshake signature using the pinned certificate. It does not use public CA
 trust, DNS identity, or client certificates. The pin therefore has to be
 transferred and verified through a separate trusted channel. TLS authenticates
-the pinned server endpoint and encrypts this pool socket; worker and payout
-claims are not client-authenticated, so session counters are not
-identity-secure. TLS does not protect the independent P2P transport. Operators
-publish the certificate and pin but never the private key. Generated key files
-use mode `0600` on Unix; Windows deployments depend on restrictive directory
-ACLs for both the key and pool data.
+the pinned server endpoint and encrypts this pool socket. A fresh Schnorr
+challenge then authenticates payout-key control and binds the network,
+consensus fingerprint, worker label, and payout key to the session. TLS does
+not protect the independent P2P transport. Operators publish the certificate
+and pin but never the private key. Generated key files use mode `0600` on Unix;
+Windows deployments depend on restrictive directory ACLs for both the key and
+pool data.
 
-The initial client message supplies protocol version, network ID, consensus
-fingerprint, worker label, and payout label. The server checks compatibility,
-assigns a session ID, states the volatile accounting semantics, and returns a
-job containing:
+The authenticated client message supplies protocol v2, network ID, consensus
+fingerprint, worker label, payout key, and the fresh challenge signature. The
+server checks compatibility, assigns a session ID, states the durable testnet
+accounting semantics, and returns a job containing:
 
 - a server-issued job identifier;
 - the complete immutable `BlockChallenge`; and
@@ -920,15 +921,18 @@ shares, found blocks, and credited Devnet atoms are stored by session and payout
 identity in a network-bound, checksummed two-slot ledger. Write-ahead block
 records recover interrupted submissions exactly once, while active-chain
 reconciliation tracks canonical and reorganized pool blocks. The default
-counter adds one test atom per accepted share.
+fixed-price test policy adds one Devnet atom per accepted share.
 
 Pool v2 also authenticates each payout identity. After pinned TLS connects, the
 server sends a fresh random challenge. The wallet signs a domain-separated
 digest covering the challenge, network identity, consensus fingerprint, worker
 name, and payout key. This proves control of the receive key without sharing its
-private key. The next pool milestone converts mature canonical rewards into
-explicit testnet settlement transactions; RCNet qualification then adds load,
-fuzz, interoperability, and external review gates.
+private key. Operators can explicitly enable mature-reward settlement. The
+pool journals each exact signed payout before broadcast, retries prepared
+transactions after restart, confirms them against the active chain, and
+releases reserved credit when a reorganization invalidates the inputs. RCNet
+qualification next adds load, fuzz, interoperability, and external review
+gates.
 
 ## 12. Security model
 
@@ -984,7 +988,7 @@ The next network layer adds authenticated peer discovery, reputation and ban pol
 | P2P | ProductionV4 block accepted, independently downloaded, verified, and persisted by a second node | Authenticated public discovery/gossip and DoS defenses |
 | Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |
 | Mempool | Deterministic capped confirmed-input pool | Fee-burn inclusion/eviction economics and package policy |
-| Pool | Pinned-TLS CMFD job/share transport, server replay, volatile bounded counters | Unique custody, persistent reorg-aware ledger, payouts, optimized proofs and DoS hardening |
+| Pool | Pinned-TLS CMFD v2 transport, authenticated payout keys, server replay, durable reorg-aware ledger, and opt-in testnet payouts | Production custody, sustained load qualification, independent interoperability, and DoS hardening |
 | Wallet | Windows and Linux GUI packages with real Devnet balance, send, receive, and coinbase maturity reporting | Production custody, backup, recovery, hardware signing |
 | Inference channel | Pricing, signed states/receipts, close/refund accounting | Quote/job transport, execution, discovery, reputation, disputes |
 | Governance | Fixed visible steward/community destinations and exact bootstrap percentages | Multisig operations, reporting, and a clear change process |
@@ -1012,7 +1016,7 @@ ProductionV4 advances toward a public-value profile through the following measur
 14. Two teams independent of the designers complete cryptographic and implementation audits.
 
 The public-network program also covers secure wallet and pool custody,
-authenticated peer design, persistent and reorganization-aware pool payouts,
+authenticated peer design, sustained reorganization-aware pool payouts,
 share-proof admission, denial-of-service and eclipse testing, scalable
 state/storage, operational telemetry, incident response, signed releases, and
 clear stewardship operations.
@@ -1118,8 +1122,9 @@ Common Foundry advances through measured software, named hardware, canonical art
 | Devnet pool | Connections / messages per session | 64 / 1,000,000 |
 | Devnet pool | Valid nonce records per job | 65,536 |
 | Devnet pool | Session / payout / block records | 1,024 / 1,024 / 65,536 |
+| Devnet pool | Payout transaction records | 65,536 |
 | Devnet pool | Default share threshold | 7 leading zero bits |
-| Devnet pool | Accounting | Durable network-bound ledger with reorganization tracking |
+| Devnet pool | Accounting | Durable network-bound ledger with v1 migration, reorganization tracking, and opt-in on-chain testnet settlement |
 | Proposed PoW | V2 batch/dimension/layers | 128 / 4,096 / 384 |
 | Proposed PoW | Raw model bank | 6 GiB weights + 512 KiB base + 184-byte header |
 | Proposed proof | Aggregate soundness | At least 128 bits |

@@ -4785,6 +4785,29 @@ impl Node {
         amount: u64,
         fee_burned: u64,
     ) -> Result<WalletSendResponse, NodeError> {
+        let (transaction, change) =
+            self.prepare_dev_wallet_payment(recipient, amount, fee_burned)?;
+        let entry = self.submit_transaction(transaction)?;
+        Ok(WalletSendResponse {
+            network: self.profile.name,
+            devnet_only: self.profile.is_devnet(),
+            insecure_demo_wallet: self.wallet_is_insecure_demo(),
+            warning: self.wallet_warning(),
+            txid: hex::encode(entry.txid),
+            amount_atoms: amount.to_string(),
+            fee_burned_atoms: entry.fee_burned.to_string(),
+            change_atoms: change.to_string(),
+            mempool_transactions: self.mempool.len(),
+            mempool_bytes: self.mempool_bytes,
+        })
+    }
+
+    pub(crate) fn prepare_dev_wallet_payment(
+        &self,
+        recipient: [u8; 32],
+        amount: u64,
+        fee_burned: u64,
+    ) -> Result<(Transaction, u64), NodeError> {
         VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
         if amount == 0 {
             return Err(NodeError::WalletZeroAmount);
@@ -4866,19 +4889,7 @@ impl Node {
                 actual: fee_burned,
             });
         }
-        let entry = self.submit_transaction(transaction)?;
-        Ok(WalletSendResponse {
-            network: self.profile.name,
-            devnet_only: self.profile.is_devnet(),
-            insecure_demo_wallet: self.wallet_is_insecure_demo(),
-            warning: self.wallet_warning(),
-            txid: hex::encode(entry.txid),
-            amount_atoms: amount.to_string(),
-            fee_burned_atoms: entry.fee_burned.to_string(),
-            change_atoms: change.to_string(),
-            mempool_transactions: self.mempool.len(),
-            mempool_bytes: self.mempool_bytes,
-        })
+        Ok((transaction, change))
     }
 
     /// Validates a display-unit request and consolidates this data directory's
@@ -5211,6 +5222,43 @@ impl Node {
     pub fn active_chain_confirmations(&self, block_id: [u8; 32]) -> Option<u64> {
         let position = self.index.active_position(block_id)?;
         u64::try_from(self.index.active_chain.len().checked_sub(position)?).ok()
+    }
+
+    pub(crate) fn mempool_contains_transaction(&self, txid: [u8; 32]) -> bool {
+        self.mempool.contains_key(&txid)
+    }
+
+    pub(crate) fn active_transaction_confirmations(
+        &mut self,
+        txid: [u8; 32],
+    ) -> Result<Option<u64>, NodeError> {
+        let result = (|| {
+            for position in 1..self.index.active_chain.len() {
+                let block_id = self.index.active_chain[position];
+                let indexed = self.index.blocks.get(&block_id).cloned().ok_or_else(|| {
+                    NodeError::CorruptLog(
+                        "active transaction lookup refers to an absent block".to_owned(),
+                    )
+                })?;
+                let block = read_indexed_block(
+                    &self.log,
+                    &self.data_dir.join(BLOCK_LOG_FILE),
+                    &indexed,
+                    block_id,
+                    self.params.network_id,
+                    matches!(self.profile.proof, ProofProfile::ProductionV3),
+                )?;
+                if block
+                    .transactions
+                    .iter()
+                    .any(|transaction| transaction.txid() == txid)
+                {
+                    return Ok(u64::try_from(self.index.active_chain.len() - position).ok());
+                }
+            }
+            Ok(None)
+        })();
+        self.latch_authenticated_storage_failure(result)
     }
 
     /// Reads and authenticates the exact canonical frame for a validated block.

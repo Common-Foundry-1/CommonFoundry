@@ -462,8 +462,10 @@ submits a block only when the same digest also meets the unchanged chain
 target. A fresh Schnorr challenge proves control of the payout key at every
 connection. Bounded share and block accounting is stored in a checksummed,
 network-bound two-slot ledger and tracks canonical and reorganized pool blocks.
-Credited Devnet atoms remain test accounting until on-chain settlement is
-enabled.
+The default fixed-price test policy credits one Devnet atom per accepted share.
+When the operator enables testnet payouts, the pool journals each exact signed
+transaction before broadcast, confirms it against the active chain, and safely
+releases its credit after a reorganization invalidates the transaction.
 
 Generate a test certificate and start a local pool from the repository root:
 
@@ -482,14 +484,18 @@ New-Item -ItemType Directory -Force .\devnet-0-linear5y\pool-tls | Out-Null
   --p2p-bind 127.0.0.1:18454 `
   --certificate .\devnet-0-linear5y\pool-tls\pool-cert.der `
   --private-key .\devnet-0-linear5y\pool-tls\pool-key.der `
-  --share-leading-zero-bits 7
+  --share-leading-zero-bits 7 `
+  --enable-testnet-payouts `
+  --pool-minimum-payout-atoms 100 `
+  --pool-payout-fee-atoms 1
 ```
 
 Copy the `certificate_sha256` printed by either command into the wallet URL.
 Publish only the certificate and its pin, never `pool-key.der`. The generator
 creates the key with mode `0600` on Unix; on Windows, restrict the key and pool
-data directories with operator-only ACLs. TLS authenticates the pinned server,
-not worker or payout claims, so the volatile counters are not identity-secure.
+data directories with operator-only ACLs. TLS authenticates the pinned server;
+the pool v2 Schnorr challenge separately authenticates control of each payout
+key and binds its worker label to that key for the session.
 The explicit `18454` P2P bind avoids the wallet's default `18444`; configure one
 static peer link between the wallet and pool node for bidirectional block sync.
 See [docs/devnet-0.md](docs/devnet-0.md) for the full pool boundary and

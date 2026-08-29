@@ -483,8 +483,8 @@ unencrypted; NAT traversal, Sybil resistance, and demonstrated volumetric DDoS
 resilience remain future work. Extending a side branch currently reconstructs
 that branch from genesis, which is deliberately Devnet-only and not scalable.
 The mempool is volatile and intentionally excludes unconfirmed-parent
-packages. There is no production wallet/key custody or durable pool payout
-system.
+packages. Pool accounting and opt-in testnet settlement are durable, while
+production wallet and pool custody remain a mainnet gate.
 
 New local Devnet data directories generate distinct Schnorr test keys and store
 the raw 32-byte secret in `wallet.key`. The node does not return that secret
@@ -514,10 +514,12 @@ The Devnet pool is a CMFD-specific length-bounded job/share protocol over TLS
 SHA-256 digest of the exact leaf-certificate DER bytes with the 64-hex pin in
 its `cmfd+tls://...?...` URL. The TLS handshake still verifies that the pinned
 certificate signed the handshake, but there is no CA trust path, client
-certificate, worker identity proof, or automatic secure pin distribution.
-Worker and payout claims are not client-authenticated, so session counters are
-not identity-secure. Operators must transfer and verify the certificate pin out
-of band and must never distribute the private key. The generator creates the
+certificate, or automatic secure pin distribution. The pool sends a fresh
+challenge after TLS connects, and the miner signs a domain-separated binding of
+the challenge, network, consensus fingerprint, worker label, and payout key.
+This authenticates payout-key control for the session. Operators must transfer
+and verify the certificate pin out of band and must never distribute the
+private key. The generator creates the
 private-key DER with mode `0600` on Unix; Windows depends on the containing
 directory's ACLs. Keep the certificate public, restrict both the key file and
 pool data directory to the operator account, and distribute only the
@@ -555,11 +557,13 @@ connections, and configured record limits are rejected. Accepted shares,
 rejections, block credits, and payout identities are persisted in a
 network-bound, checksummed two-slot ledger. A write-ahead block record makes
 restart recovery exact-once, and active-chain reconciliation marks canonical,
-orphaned, and unresolved blocks. Credited Devnet atoms remain nonwithdrawable
-test accounting until settlement transactions are enabled.
+orphaned, and unresolved blocks. When explicitly enabled, the testnet payout
+engine journals an exact signed transaction before broadcast, tracks active
+chain confirmations, retries prepared transactions, and releases reserved
+credit if a reorganization makes the transaction inputs unavailable.
 
 Production pool activation additionally requires hardened operator key custody,
-on-chain mature-reward settlement, share-verification queue and denial-of-service
+sustained payout and share-verification queue testing, denial-of-service
 analysis, fuzzing and load tests, independent implementations, and external
 audits. The Devnet TLS pool remains private-network test infrastructure.
 

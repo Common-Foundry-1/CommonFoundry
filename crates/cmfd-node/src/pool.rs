@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
     BlockChallenge, BlockProof, ConsensusPowVerifier, ForgeMatrixV2AcceleratorBatch,
-    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, PowError, v2_reference_for_network,
+    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, OutputLock, PowError, Transaction,
+    v2_reference_for_network,
 };
 use k256::schnorr::{
     Signature, SigningKey, VerifyingKey,
@@ -55,7 +56,10 @@ pub const POOL_MAX_SHARES_PER_JOB: usize = 65_536;
 pub const POOL_MAX_LEDGER_SESSIONS: usize = 1_024;
 pub const POOL_MAX_LEDGER_PAYOUTS: usize = 1_024;
 pub const POOL_MAX_LEDGER_BLOCKS: usize = 65_536;
-pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable test accounting records; nonwithdrawable; not funds; not an on-chain balance or payout";
+pub const POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS: usize = 65_536;
+pub const DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS: u64 = 100;
+pub const DEFAULT_POOL_PAYOUT_FEE_ATOMS: u64 = 1;
+pub const POOL_ACCOUNTING_SEMANTICS: &str = "durable authenticated Devnet accounting; on-chain settlement is active only when enabled by the pool operator";
 
 const POOL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_READ_TIMEOUT: Duration = Duration::from_millis(200);
@@ -64,10 +68,14 @@ const POOL_ACCEPT_POLL: Duration = Duration::from_millis(25);
 const POOL_JOB_DOMAIN: &str = "CMFD/DEVNET-POOL/JOB/V1";
 const POOL_NONCE_ORIGIN_DOMAIN: &str = "CMFD/DEVNET-POOL/NONCE-ORIGIN/V1";
 const POOL_PAYOUT_AUTH_DOMAIN: &str = "CMFD/POOL/PAYOUT-AUTH/V1";
-const POOL_LEDGER_FORMAT_VERSION: u16 = 1;
-const POOL_LEDGER_FILE_PREFIX: &str = "pool-ledger-v1";
-const POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V1";
+const POOL_LEDGER_FORMAT_VERSION: u16 = 2;
+const POOL_LEDGER_FILE_PREFIX: &str = "pool-ledger-v2";
+const POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V2";
+const LEGACY_POOL_LEDGER_FORMAT_VERSION: u16 = 1;
+const LEGACY_POOL_LEDGER_FILE_PREFIX: &str = "pool-ledger-v1";
+const LEGACY_POOL_LEDGER_CHECKSUM_DOMAIN: &str = "CMFD/POOL/LEDGER/V1";
 const POOL_LEDGER_MAX_BYTES: usize = 64 * 1024 * 1024;
+const POOL_MAX_PAYOUTS_PER_TIP: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -93,6 +101,10 @@ pub enum PoolError {
     InvalidWorker,
     #[error("pool connection limit must be between 1 and {POOL_MAX_CONNECTIONS}")]
     InvalidConnectionLimit,
+    #[error("pool payout policy requires nonzero minimum and fee amounts")]
+    InvalidPayoutPolicy,
+    #[error("pool settlement requires the block-reward destination to be this node's wallet")]
+    PayoutWalletMismatch,
     #[error("pool message count exceeds {POOL_MAX_MESSAGES_PER_SESSION}")]
     MessageCountLimit,
     #[error("pool frame length must be between 1 and {POOL_MAX_FRAME_BYTES} bytes")]
@@ -158,6 +170,7 @@ pub struct PoolServerConfig {
     pub test_credit_atoms_per_share: u64,
     pub max_connections: usize,
     pub ledger_directory: Option<PathBuf>,
+    pub payout_policy: Option<PoolPayoutPolicy>,
     pub production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
 }
 
@@ -177,7 +190,23 @@ impl PoolServerConfig {
             test_credit_atoms_per_share: DEFAULT_TEST_CREDIT_ATOMS_PER_SHARE,
             max_connections: POOL_MAX_CONNECTIONS,
             ledger_directory: None,
+            payout_policy: None,
             production_v4_share_verifier: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolPayoutPolicy {
+    pub minimum_payout_atoms: u64,
+    pub fee_atoms: u64,
+}
+
+impl Default for PoolPayoutPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_payout_atoms: DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS,
+            fee_atoms: DEFAULT_POOL_PAYOUT_FEE_ATOMS,
         }
     }
 }
@@ -299,6 +328,20 @@ pub struct PoolPayoutStats {
     pub rejected_shares: u64,
     pub pool_blocks: u64,
     pub credited_devnet_atoms: u64,
+    pub reserved_payout_atoms: u64,
+    pub confirmed_payout_atoms: u64,
+    pub available_payout_atoms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PoolPayoutTransactionStats {
+    pub txid: String,
+    pub payout: String,
+    pub amount_atoms: u64,
+    pub fee_atoms: u64,
+    pub state: String,
+    pub confirmations: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,6 +369,7 @@ pub struct PoolLedgerSnapshot {
     pub sessions: Vec<PoolSessionStats>,
     pub payouts: Vec<PoolPayoutStats>,
     pub blocks: Vec<PoolBlockStats>,
+    pub payout_transactions: Vec<PoolPayoutTransactionStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -599,6 +643,7 @@ struct Ledger {
     sessions: BTreeMap<u64, SessionRecord>,
     payouts: BTreeMap<[u8; 32], PayoutRecord>,
     blocks: BTreeMap<[u8; 32], BlockRecord>,
+    payout_transactions: BTreeMap<[u8; 32], PayoutTransactionRecord>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -655,6 +700,41 @@ struct BlockRecord {
     confirmations: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PoolPayoutTransactionState {
+    Prepared,
+    Broadcast,
+    Confirmed,
+    Abandoned,
+}
+
+impl PoolPayoutTransactionState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Broadcast => "broadcast",
+            Self::Confirmed => "confirmed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    const fn reserves_credit(self) -> bool {
+        !matches!(self, Self::Abandoned)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayoutTransactionRecord {
+    payout: [u8; 32],
+    amount_atoms: u64,
+    fee_atoms: u64,
+    transaction: Transaction,
+    state: PoolPayoutTransactionState,
+    confirmations: u64,
+}
+
 struct DurableLedger {
     state: Mutex<Ledger>,
     store: Option<LedgerStore>,
@@ -687,6 +767,7 @@ struct StoredLedgerPayloadV1 {
     sessions: Vec<StoredSessionRecordV1>,
     payouts: Vec<StoredPayoutRecordV1>,
     blocks: Vec<StoredBlockRecordV1>,
+    payout_transactions: Vec<StoredPayoutTransactionRecordV1>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -708,6 +789,36 @@ struct StoredPayoutRecordV1 {
 struct StoredBlockRecordV1 {
     block_id: [u8; 32],
     record: BlockRecord,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPayoutTransactionRecordV1 {
+    txid: [u8; 32],
+    record: PayoutTransactionRecord,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStoredLedgerV1 {
+    format_version: u16,
+    generation: u64,
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    payload: LegacyStoredLedgerPayloadV1,
+    payload_blake3: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStoredLedgerPayloadV1 {
+    accepted_shares: u64,
+    rejected_shares: u64,
+    pool_blocks: u64,
+    credited_devnet_atoms: u64,
+    sessions: Vec<StoredSessionRecordV1>,
+    payouts: Vec<StoredPayoutRecordV1>,
+    blocks: Vec<StoredBlockRecordV1>,
 }
 
 impl DurableLedger {
@@ -789,6 +900,22 @@ impl LedgerStore {
             }
         }
         if let Some(ledger) = valid.into_iter().max_by_key(|ledger| ledger.generation) {
+            return Ok(ledger);
+        }
+        if !errors.is_empty() {
+            return Err(PoolError::LedgerCorrupt(errors.join("; ")));
+        }
+
+        let mut legacy = Vec::new();
+        for slot in 0..=1 {
+            match self.load_legacy_slot(slot) {
+                Ok(Some(ledger)) => legacy.push(ledger),
+                Ok(None) => {}
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if let Some(ledger) = legacy.into_iter().max_by_key(|ledger| ledger.generation) {
+            self.persist(&ledger)?;
             return Ok(ledger);
         }
         if errors.is_empty() {
@@ -894,6 +1021,61 @@ impl LedgerStore {
         self.directory
             .join(format!("{POOL_LEDGER_FILE_PREFIX}.{slot}.json"))
     }
+
+    fn load_legacy_slot(&self, slot: u8) -> Result<Option<Ledger>, PoolError> {
+        let path = self
+            .directory
+            .join(format!("{LEGACY_POOL_LEDGER_FILE_PREFIX}.{slot}.json"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if bytes.is_empty() || bytes.len() > POOL_LEDGER_MAX_BYTES {
+            return Err(PoolError::LedgerCorrupt(format!(
+                "{} has an invalid byte length",
+                path.display()
+            )));
+        }
+        let stored: LegacyStoredLedgerV1 = serde_json::from_slice(&bytes)
+            .map_err(|error| PoolError::LedgerCorrupt(format!("{}: {error}", path.display())))?;
+        if stored.format_version != LEGACY_POOL_LEDGER_FORMAT_VERSION
+            || stored.network_id != self.network_id
+            || stored.consensus_fingerprint != self.consensus_fingerprint
+        {
+            return Err(PoolError::LedgerCorrupt(format!(
+                "{} has the wrong format or network identity",
+                path.display()
+            )));
+        }
+        let expected = legacy_ledger_payload_checksum(
+            stored.generation,
+            stored.network_id,
+            stored.consensus_fingerprint,
+            &stored.payload,
+        )?;
+        if stored.payload_blake3 != expected {
+            return Err(PoolError::LedgerCorrupt(format!(
+                "{} checksum mismatch",
+                path.display()
+            )));
+        }
+        let payload = StoredLedgerPayloadV1 {
+            accepted_shares: stored.payload.accepted_shares,
+            rejected_shares: stored.payload.rejected_shares,
+            pool_blocks: stored.payload.pool_blocks,
+            credited_devnet_atoms: stored.payload.credited_devnet_atoms,
+            sessions: stored.payload.sessions,
+            payouts: stored.payload.payouts,
+            blocks: stored.payload.blocks,
+            payout_transactions: Vec::new(),
+        };
+        let mut ledger = ledger_from_payload(stored.generation, payload)?;
+        for session in ledger.sessions.values_mut() {
+            session.connected = false;
+        }
+        Ok(Some(ledger))
+    }
 }
 
 fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
@@ -924,6 +1106,14 @@ fn ledger_payload(ledger: &Ledger) -> StoredLedgerPayloadV1 {
             .map(|(block_id, record)| StoredBlockRecordV1 {
                 block_id: *block_id,
                 record: *record,
+            })
+            .collect(),
+        payout_transactions: ledger
+            .payout_transactions
+            .iter()
+            .map(|(txid, record)| StoredPayoutTransactionRecordV1 {
+                txid: *txid,
+                record: record.clone(),
             })
             .collect(),
     }
@@ -957,6 +1147,17 @@ fn ledger_from_payload(
             ));
         }
     }
+    let mut payout_transactions = BTreeMap::new();
+    for entry in payload.payout_transactions {
+        if payout_transactions
+            .insert(entry.txid, entry.record)
+            .is_some()
+        {
+            return Err(PoolError::LedgerCorrupt(
+                "duplicate stored payout transaction".to_owned(),
+            ));
+        }
+    }
     let ledger = Ledger {
         generation,
         accepted_shares: payload.accepted_shares,
@@ -966,6 +1167,7 @@ fn ledger_from_payload(
         sessions,
         payouts,
         blocks,
+        payout_transactions,
     };
     validate_ledger(&ledger)?;
     Ok(ledger)
@@ -988,10 +1190,28 @@ fn ledger_payload_checksum(
     Ok(*hasher.finalize().as_bytes())
 }
 
+fn legacy_ledger_payload_checksum(
+    generation: u64,
+    network_id: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    payload: &LegacyStoredLedgerPayloadV1,
+) -> Result<[u8; 32], PoolError> {
+    let bytes = serde_json::to_vec(payload)?;
+    let mut hasher = blake3::Hasher::new_derive_key(LEGACY_POOL_LEDGER_CHECKSUM_DOMAIN);
+    hasher.update(&LEGACY_POOL_LEDGER_FORMAT_VERSION.to_le_bytes());
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(&network_id);
+    hasher.update(&consensus_fingerprint);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(*hasher.finalize().as_bytes())
+}
+
 fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
     if ledger.sessions.len() > POOL_MAX_LEDGER_SESSIONS
         || ledger.payouts.len() > POOL_MAX_LEDGER_PAYOUTS
         || ledger.blocks.len() > POOL_MAX_LEDGER_BLOCKS
+        || ledger.payout_transactions.len() > POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS
     {
         return Err(PoolError::LedgerCapacity);
     }
@@ -1052,6 +1272,32 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), PoolError> {
         VerifyingKey::from_bytes(payout)
             .map_err(|_| PoolError::LedgerCorrupt("stored payout key is invalid".to_owned()))?;
     }
+    let mut reserved_by_payout = BTreeMap::<[u8; 32], u64>::new();
+    for (txid, record) in &ledger.payout_transactions {
+        if record.transaction.txid() != *txid
+            || record.amount_atoms == 0
+            || record.transaction.outputs.first().is_none_or(|output| {
+                output.value != record.amount_atoms || output.lock != OutputLock::Key(record.payout)
+            })
+            || (record.state == PoolPayoutTransactionState::Confirmed) != (record.confirmations > 0)
+            || !ledger.payouts.contains_key(&record.payout)
+        {
+            return Err(PoolError::LedgerCorrupt(
+                "stored payout transaction is inconsistent".to_owned(),
+            ));
+        }
+        if record.state.reserves_credit() {
+            let reserved = reserved_by_payout.entry(record.payout).or_default();
+            *reserved = checked_ledger_add(*reserved, record.amount_atoms, "reserved payout")?;
+        }
+    }
+    for (payout, reserved) in reserved_by_payout {
+        if reserved > ledger.payouts[&payout].credited_devnet_atoms {
+            return Err(PoolError::LedgerCorrupt(
+                "stored payout transaction exceeds earned credit".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1080,6 +1326,7 @@ struct SharedServer {
     block_destination: [u8; 32],
     configured_share_target: [u8; 32],
     test_credit_atoms_per_share: u64,
+    payout_policy: Option<PoolPayoutPolicy>,
     max_connections: usize,
     proof_profile: ProofProfile,
     production_v4_share_verifier: Option<Arc<dyn ProductionV4PoolShareVerifier>>,
@@ -1104,6 +1351,7 @@ impl PoolServerHandle {
 
     pub fn ledger_snapshot(&self) -> Result<PoolLedgerSnapshot, PoolError> {
         reconcile_pool_blocks(&self.shared)?;
+        reconcile_pool_payouts(&self.shared, false)?;
         snapshot_ledger(&self.shared.ledger)
     }
 
@@ -1144,14 +1392,22 @@ pub fn spawn_pool_server(
     node: Arc<Mutex<Node>>,
     config: PoolServerConfig,
 ) -> Result<PoolServerHandle, PoolError> {
-    let profile = node
-        .lock()
-        .map_err(|_| PoolError::SharedStatePoisoned)?
-        .network_profile();
+    let (profile, wallet_destination) = {
+        let node = node.lock().map_err(|_| PoolError::SharedStatePoisoned)?;
+        (node.network_profile(), node.wallet_destination())
+    };
     ensure_pool_profile_supported(profile, config.production_v4_share_verifier.is_some())?;
     validate_private_address(config.bind)?;
     if config.max_connections == 0 || config.max_connections > POOL_MAX_CONNECTIONS {
         return Err(PoolError::InvalidConnectionLimit);
+    }
+    if let Some(policy) = config.payout_policy {
+        if policy.minimum_payout_atoms == 0 || policy.fee_atoms == 0 {
+            return Err(PoolError::InvalidPayoutPolicy);
+        }
+        if config.block_destination != wallet_destination {
+            return Err(PoolError::PayoutWalletMismatch);
+        }
     }
     VerifyingKey::from_bytes(&config.block_destination)
         .map_err(|_| PoolError::Node(NodeError::InvalidMinerDestination))?;
@@ -1209,6 +1465,7 @@ pub fn spawn_pool_server(
         block_destination: config.block_destination,
         configured_share_target: config.share_target,
         test_credit_atoms_per_share: config.test_credit_atoms_per_share,
+        payout_policy: config.payout_policy,
         max_connections: config.max_connections,
         proof_profile: profile.proof,
         production_v4_share_verifier: config.production_v4_share_verifier,
@@ -1216,6 +1473,7 @@ pub fn spawn_pool_server(
         startup_nonce,
     });
     reconcile_pool_blocks_with_recovery(&shared, true)?;
+    reconcile_pool_payouts(&shared, true)?;
     let runtime = Arc::clone(&shared);
     let thread = thread::Builder::new()
         .name("cmfd-pool-listener".to_owned())
@@ -1823,6 +2081,7 @@ fn rotate_if_tip_changed(shared: &Arc<SharedServer>) -> Result<bool, PoolError> 
     };
     if changed {
         reconcile_pool_blocks(shared)?;
+        reconcile_pool_payouts(shared, true)?;
     }
     Ok(changed)
 }
@@ -1905,6 +2164,181 @@ fn reconcile_pool_blocks_with_recovery(
         }
         Ok(())
     })
+}
+
+fn reconcile_pool_payouts(shared: &SharedServer, create_new: bool) -> Result<(), PoolError> {
+    let Some(policy) = shared.payout_policy else {
+        return Ok(());
+    };
+    let records = shared
+        .ledger
+        .state
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?
+        .payout_transactions
+        .iter()
+        .map(|(txid, record)| (*txid, record.clone()))
+        .collect::<Vec<_>>();
+    let mut updates = Vec::with_capacity(records.len());
+    {
+        let mut node = shared
+            .node
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        for (txid, record) in records {
+            let (state, confirmations) = if let Some(confirmations) =
+                node.active_transaction_confirmations(txid)?
+            {
+                (PoolPayoutTransactionState::Confirmed, confirmations)
+            } else if node.mempool_contains_transaction(txid) {
+                (PoolPayoutTransactionState::Broadcast, 0)
+            } else if record.state == PoolPayoutTransactionState::Abandoned {
+                (PoolPayoutTransactionState::Abandoned, 0)
+            } else {
+                match node.submit_transaction(record.transaction.clone()) {
+                    Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
+                        (PoolPayoutTransactionState::Broadcast, 0)
+                    }
+                    Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {
+                        (PoolPayoutTransactionState::Prepared, 0)
+                    }
+                    Err(
+                        NodeError::MempoolUnconfirmedInput(_) | NodeError::MempoolInputConflict(_),
+                    ) => (PoolPayoutTransactionState::Abandoned, 0),
+                    Err(error) => return Err(PoolError::Node(error)),
+                }
+            };
+            if state != record.state || confirmations != record.confirmations {
+                updates.push((txid, state, confirmations));
+            }
+        }
+    }
+    if !updates.is_empty() {
+        shared.ledger.transaction(|ledger| {
+            for (txid, state, confirmations) in updates {
+                let record = ledger.payout_transactions.get_mut(&txid).ok_or_else(|| {
+                    PoolError::LedgerCorrupt(
+                        "payout transaction disappeared during reconciliation".to_owned(),
+                    )
+                })?;
+                record.state = state;
+                record.confirmations = confirmations;
+            }
+            Ok(())
+        })?;
+    }
+    if !create_new {
+        return Ok(());
+    }
+
+    for _ in 0..POOL_MAX_PAYOUTS_PER_TIP {
+        let Some((payout, amount)) = next_payout_candidate(&shared.ledger, policy)? else {
+            break;
+        };
+        let mut node = shared
+            .node
+            .lock()
+            .map_err(|_| PoolError::SharedStatePoisoned)?;
+        let (transaction, _) =
+            match node.prepare_dev_wallet_payment(payout, amount, policy.fee_atoms) {
+                Ok(prepared) => prepared,
+                Err(
+                    NodeError::WalletFundsImmature { .. }
+                    | NodeError::WalletInsufficientFunds { .. }
+                    | NodeError::WalletInputLimit { .. },
+                ) => break,
+                Err(error) => return Err(PoolError::Node(error)),
+            };
+        let txid = transaction.txid();
+        let journaled = shared.ledger.transaction(|ledger| {
+            if payout_available_atoms(ledger, payout)? < amount {
+                return Ok(false);
+            }
+            if ledger.payout_transactions.len() >= POOL_MAX_LEDGER_PAYOUT_TRANSACTIONS {
+                return Err(PoolError::LedgerCapacity);
+            }
+            if ledger
+                .payout_transactions
+                .insert(
+                    txid,
+                    PayoutTransactionRecord {
+                        payout,
+                        amount_atoms: amount,
+                        fee_atoms: policy.fee_atoms,
+                        transaction: transaction.clone(),
+                        state: PoolPayoutTransactionState::Prepared,
+                        confirmations: 0,
+                    },
+                )
+                .is_some()
+            {
+                return Err(PoolError::LedgerCorrupt(
+                    "payout transaction was journaled twice".to_owned(),
+                ));
+            }
+            Ok(true)
+        })?;
+        if !journaled {
+            continue;
+        }
+        let state = match node.submit_transaction(transaction) {
+            Ok(_) | Err(NodeError::DuplicateMempoolTransaction(_)) => {
+                PoolPayoutTransactionState::Broadcast
+            }
+            Err(NodeError::MempoolTransactionLimit | NodeError::MempoolByteLimit) => {
+                PoolPayoutTransactionState::Prepared
+            }
+            Err(NodeError::MempoolUnconfirmedInput(_) | NodeError::MempoolInputConflict(_)) => {
+                PoolPayoutTransactionState::Abandoned
+            }
+            Err(error) => return Err(PoolError::Node(error)),
+        };
+        if state != PoolPayoutTransactionState::Prepared {
+            shared.ledger.transaction(|ledger| {
+                let record = ledger.payout_transactions.get_mut(&txid).ok_or_else(|| {
+                    PoolError::LedgerCorrupt("journaled payout transaction is missing".to_owned())
+                })?;
+                record.state = state;
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn next_payout_candidate(
+    ledger: &DurableLedger,
+    policy: PoolPayoutPolicy,
+) -> Result<Option<([u8; 32], u64)>, PoolError> {
+    let ledger = ledger
+        .state
+        .lock()
+        .map_err(|_| PoolError::SharedStatePoisoned)?;
+    for payout in ledger.payouts.keys().copied() {
+        let available = payout_available_atoms(&ledger, payout)?;
+        if available >= policy.minimum_payout_atoms {
+            return Ok(Some((payout, available)));
+        }
+    }
+    Ok(None)
+}
+
+fn payout_available_atoms(ledger: &Ledger, payout: [u8; 32]) -> Result<u64, PoolError> {
+    let credited = ledger
+        .payouts
+        .get(&payout)
+        .ok_or_else(|| PoolError::LedgerCorrupt("payout identity is missing".to_owned()))?
+        .credited_devnet_atoms;
+    let reserved = ledger
+        .payout_transactions
+        .values()
+        .filter(|record| record.payout == payout && record.state.reserves_credit())
+        .try_fold(0_u64, |total, record| {
+            checked_ledger_add(total, record.amount_atoms, "reserved payout")
+        })?;
+    credited
+        .checked_sub(reserved)
+        .ok_or_else(|| PoolError::LedgerCorrupt("reserved payout exceeds earned credit".to_owned()))
 }
 
 fn current_job(shared: &SharedServer) -> Result<PoolJob, PoolError> {
@@ -2197,14 +2631,30 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
     let payouts = ledger
         .payouts
         .iter()
-        .map(|(payout, record)| PoolPayoutStats {
-            payout: hex::encode(payout),
-            accepted_shares: record.accepted_shares,
-            rejected_shares: record.rejected_shares,
-            pool_blocks: record.pool_blocks,
-            credited_devnet_atoms: record.credited_devnet_atoms,
+        .map(|(payout, record)| {
+            let available_payout_atoms = payout_available_atoms(&ledger, *payout)?;
+            let confirmed_payout_atoms = ledger
+                .payout_transactions
+                .values()
+                .filter(|transaction| {
+                    transaction.payout == *payout
+                        && transaction.state == PoolPayoutTransactionState::Confirmed
+                })
+                .try_fold(0_u64, |total, transaction| {
+                    checked_ledger_add(total, transaction.amount_atoms, "confirmed payout")
+                })?;
+            Ok::<_, PoolError>(PoolPayoutStats {
+                payout: hex::encode(payout),
+                accepted_shares: record.accepted_shares,
+                rejected_shares: record.rejected_shares,
+                pool_blocks: record.pool_blocks,
+                credited_devnet_atoms: record.credited_devnet_atoms,
+                reserved_payout_atoms: record.credited_devnet_atoms - available_payout_atoms,
+                confirmed_payout_atoms,
+                available_payout_atoms,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     let blocks = ledger
         .blocks
         .iter()
@@ -2213,6 +2663,18 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
             parent: hex::encode(record.parent),
             height: record.height,
             payout: hex::encode(record.payout),
+            state: record.state.label().to_owned(),
+            confirmations: record.confirmations,
+        })
+        .collect::<Vec<_>>();
+    let payout_transactions = ledger
+        .payout_transactions
+        .iter()
+        .map(|(txid, record)| PoolPayoutTransactionStats {
+            txid: hex::encode(txid),
+            payout: hex::encode(record.payout),
+            amount_atoms: record.amount_atoms,
+            fee_atoms: record.fee_atoms,
             state: record.state.label().to_owned(),
             confirmations: record.confirmations,
         })
@@ -2239,6 +2701,7 @@ fn snapshot_ledger(ledger: &DurableLedger) -> Result<PoolLedgerSnapshot, PoolErr
         sessions,
         payouts,
         blocks,
+        payout_transactions,
     })
 }
 
@@ -3379,7 +3842,11 @@ mod tests {
     fn share_only_credit_duplicate_rejection_and_session_ledger_are_real() {
         let (_root, server, _node, pin) = server("share-ledger");
         let mut client = client(server.local_addr(), pin, "worker-a");
-        assert!(client.accounting_semantics().contains("nonwithdrawable"));
+        assert!(
+            client
+                .accounting_semantics()
+                .contains("authenticated Devnet accounting")
+        );
         assert!(client.persistence().contains("memory-only"));
         let work = client.current_work().unwrap();
         assert!(work.job().share_target > work.job().challenge.target);
@@ -3426,16 +3893,117 @@ mod tests {
         assert!(!snapshot.sessions[0].connected);
         drop(recovered);
 
-        fs::write(directory.join("pool-ledger-v1.0.json"), b"corrupt").unwrap();
+        fs::write(directory.join("pool-ledger-v2.0.json"), b"corrupt").unwrap();
         let fallback =
             DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
         assert_eq!(snapshot_ledger(&fallback).unwrap().accepted_shares, 0);
         drop(fallback);
 
-        fs::write(directory.join("pool-ledger-v1.1.json"), b"also-corrupt").unwrap();
+        fs::write(directory.join("pool-ledger-v2.1.json"), b"also-corrupt").unwrap();
         assert!(matches!(
             DurableLedger::open(Some(directory), network_id, fingerprint),
             Err(PoolError::LedgerCorrupt(_))
+        ));
+    }
+
+    #[test]
+    fn durable_ledger_migrates_authenticated_v1_accounting() {
+        let root = TestRoot::new("ledger-v1-migration");
+        let directory = root.path().join("ledger");
+        fs::create_dir_all(&directory).unwrap();
+        let network_id = [0x41; 32];
+        let fingerprint = [0x42; 32];
+        let payout = default_miner_destination();
+        let ledger = DurableLedger::open(None, network_id, fingerprint).unwrap();
+        register_session(&ledger, 1, "worker".to_owned(), payout).unwrap();
+        credit_accepted_share(&ledger, 1, 9).unwrap();
+        let generation = ledger.state.lock().unwrap().generation;
+        let current = ledger_payload(&ledger.state.lock().unwrap());
+        let payload = LegacyStoredLedgerPayloadV1 {
+            accepted_shares: current.accepted_shares,
+            rejected_shares: current.rejected_shares,
+            pool_blocks: current.pool_blocks,
+            credited_devnet_atoms: current.credited_devnet_atoms,
+            sessions: current.sessions,
+            payouts: current.payouts,
+            blocks: current.blocks,
+        };
+        let stored = LegacyStoredLedgerV1 {
+            format_version: LEGACY_POOL_LEDGER_FORMAT_VERSION,
+            generation,
+            network_id,
+            consensus_fingerprint: fingerprint,
+            payload_blake3: legacy_ledger_payload_checksum(
+                generation,
+                network_id,
+                fingerprint,
+                &payload,
+            )
+            .unwrap(),
+            payload,
+        };
+        fs::write(
+            directory.join(format!(
+                "{LEGACY_POOL_LEDGER_FILE_PREFIX}.{}.json",
+                generation & 1
+            )),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+
+        let migrated =
+            DurableLedger::open(Some(directory.clone()), network_id, fingerprint).unwrap();
+        let snapshot = snapshot_ledger(&migrated).unwrap();
+        assert_eq!(snapshot.accepted_shares, 1);
+        assert_eq!(snapshot.credited_devnet_atoms, 9);
+        assert!(snapshot.payout_transactions.is_empty());
+        assert!(
+            directory
+                .join(format!("{POOL_LEDGER_FILE_PREFIX}.{}.json", generation & 1))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn payout_policy_requires_nonzero_values_and_the_pool_wallet() {
+        let root = TestRoot::new("payout-policy");
+        let node = Arc::new(Mutex::new(
+            Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+        ));
+        let pool_wallet = node.lock().unwrap().wallet_destination();
+        let (certificate, key, _) = certificate(&root);
+        let certificate = fs::read(certificate).unwrap();
+        let key = fs::read(key).unwrap();
+        let mut invalid = PoolServerConfig::devnet(
+            "127.0.0.1:0".parse().unwrap(),
+            certificate.clone(),
+            key.clone(),
+            pool_wallet,
+        );
+        invalid.payout_policy = Some(PoolPayoutPolicy {
+            minimum_payout_atoms: 0,
+            fee_atoms: 1,
+        });
+        assert!(matches!(
+            spawn_pool_server(Arc::clone(&node), invalid),
+            Err(PoolError::InvalidPayoutPolicy)
+        ));
+
+        let other_destination: [u8; 32] = SigningKey::from_bytes(&[0x62; 32])
+            .unwrap()
+            .verifying_key()
+            .to_bytes()
+            .into();
+        let mut mismatched = PoolServerConfig::devnet(
+            "127.0.0.1:0".parse().unwrap(),
+            certificate,
+            key,
+            other_destination,
+        );
+        mismatched.payout_policy = Some(PoolPayoutPolicy::default());
+        assert!(matches!(
+            spawn_pool_server(node, mismatched),
+            Err(PoolError::PayoutWalletMismatch)
         ));
     }
 
@@ -3477,6 +4045,104 @@ mod tests {
         assert_eq!(snapshot.credited_devnet_atoms, 11);
         assert_eq!(snapshot.payouts[0].accepted_shares, 1);
         assert_eq!(snapshot.blocks[0].state, "canonical");
+    }
+
+    #[test]
+    fn authenticated_credits_settle_on_chain_and_confirm() {
+        let root = TestRoot::new("on-chain-payout");
+        let node = Arc::new(Mutex::new(
+            Node::open_with_profile(root.path().join("node"), crate::DEVNET_PROFILE).unwrap(),
+        ));
+        let pool_wallet = node.lock().unwrap().wallet_destination();
+        let now = unix_time_seconds().unwrap();
+        for offset in 0..100 {
+            node.lock()
+                .unwrap()
+                .mine_once(pool_wallet, now + offset, 10_000)
+                .unwrap();
+        }
+        let (certificate, key, _pin) = certificate(&root);
+        let mut config = PoolServerConfig::devnet(
+            "127.0.0.1:0".parse().unwrap(),
+            fs::read(certificate).unwrap(),
+            fs::read(key).unwrap(),
+            pool_wallet,
+        );
+        config.ledger_directory = Some(root.path().join("ledger"));
+        config.payout_policy = Some(PoolPayoutPolicy {
+            minimum_payout_atoms: 100,
+            fee_atoms: 1,
+        });
+        let server = spawn_pool_server(Arc::clone(&node), config).unwrap();
+        let recipient =
+            PoolPayoutSigner::new(SigningKey::from_bytes(&[0x61; 32]).unwrap()).payout();
+        register_session(&server.shared.ledger, 1, "worker".to_owned(), recipient).unwrap();
+        credit_accepted_share(&server.shared.ledger, 1, 120).unwrap();
+
+        reconcile_pool_payouts(&server.shared, true).unwrap();
+        let broadcast = server.ledger_snapshot().unwrap();
+        assert_eq!(broadcast.payout_transactions.len(), 1);
+        assert_eq!(broadcast.payout_transactions[0].state, "broadcast");
+        assert_eq!(broadcast.payout_transactions[0].amount_atoms, 120);
+        assert_eq!(broadcast.payouts[0].reserved_payout_atoms, 120);
+        assert_eq!(broadcast.payouts[0].available_payout_atoms, 0);
+        let txid: [u8; 32] = hex::decode(&broadcast.payout_transactions[0].txid)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(node.lock().unwrap().mempool_contains_transaction(txid));
+
+        node.lock()
+            .unwrap()
+            .mine_once(pool_wallet, now + 100, 10_000)
+            .unwrap();
+        reconcile_pool_payouts(&server.shared, false).unwrap();
+        let confirmed = server.ledger_snapshot().unwrap();
+        assert_eq!(confirmed.payout_transactions.len(), 1);
+        assert_eq!(confirmed.payout_transactions[0].state, "confirmed");
+        assert_eq!(confirmed.payout_transactions[0].confirmations, 1);
+        assert_eq!(confirmed.payouts[0].confirmed_payout_atoms, 120);
+
+        let mut fork =
+            Node::open_with_profile(root.path().join("fork"), crate::DEVNET_PROFILE).unwrap();
+        let alternate_destination: [u8; 32] = SigningKey::from_bytes(&[0x63; 32])
+            .unwrap()
+            .verifying_key()
+            .to_bytes()
+            .into();
+        let mut alternate = Vec::new();
+        for offset in 0..102 {
+            alternate.push(
+                fork.mine_once(alternate_destination, now + offset, 10_000)
+                    .unwrap(),
+            );
+        }
+        {
+            let mut node = node.lock().unwrap();
+            for (offset, block) in alternate.into_iter().enumerate() {
+                node.submit_block(block, now + offset as u64).unwrap();
+            }
+        }
+        reconcile_pool_payouts(&server.shared, false).unwrap();
+        let reorganized = server.ledger_snapshot().unwrap();
+        assert_eq!(reorganized.payout_transactions[0].state, "abandoned");
+        assert_eq!(reorganized.payout_transactions[0].confirmations, 0);
+        assert_eq!(reorganized.payouts[0].confirmed_payout_atoms, 0);
+        assert_eq!(reorganized.payouts[0].available_payout_atoms, 120);
+
+        server.stop().unwrap();
+        let params = devnet_pool_params().unwrap();
+        let recovered = DurableLedger::open(
+            Some(root.path().join("ledger")),
+            params.network_id,
+            params.fingerprint().unwrap(),
+        )
+        .unwrap();
+        let recovered = snapshot_ledger(&recovered).unwrap();
+        assert_eq!(recovered.payout_transactions.len(), 1);
+        assert_eq!(recovered.payout_transactions[0].state, "abandoned");
+        assert_eq!(recovered.payouts[0].confirmed_payout_atoms, 0);
+        assert_eq!(recovered.payouts[0].available_payout_atoms, 120);
     }
 
     #[test]

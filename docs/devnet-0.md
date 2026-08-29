@@ -204,7 +204,10 @@ Set-Location C:\Source\CommonFoundry
   --peer 127.0.0.1:18444 `
   --certificate .\devnet-0-linear5y\pool-tls\pool-cert.der `
   --private-key .\devnet-0-linear5y\pool-tls\pool-key.der `
-  --share-leading-zero-bits 7
+  --share-leading-zero-bits 7 `
+  --enable-testnet-payouts `
+  --pool-minimum-payout-atoms 100 `
+  --pool-payout-fee-atoms 1
 ```
 
 Paste the printed `$poolUrl` into **Mining -> Pool**, choose a worker name such
@@ -232,17 +235,20 @@ The transport is TLS 1.3 with 4-byte big-endian length-prefixed, bounded JSON
 messages. The wallet authenticates the server by SHA-256 hashing the exact
 leaf-certificate DER bytes and comparing all 32 bytes with the URL pin. The
 certificate's handshake signature is still verified. There is no certificate
-authority lookup, client certificate, worker identity proof, or automatic pin
-distribution, so transfer and verify the pin through a separate trusted path.
-Worker and payout claims are not client-authenticated; session counters are
-therefore not identity-secure. TLS protects the pool socket only; Devnet P2P
-remains a separate unencrypted, unauthenticated protocol.
+authority lookup, client certificate, or automatic pin distribution, so
+transfer and verify the pin through a separate trusted path. After TLS
+connects, the server sends a fresh random challenge. The wallet signs a
+domain-separated digest of the challenge, network, consensus fingerprint,
+worker label, and payout key, proving control of that receive key for the
+session. TLS protects the pool socket only; Devnet P2P remains a separate
+unencrypted, unauthenticated protocol.
 
-The client hello commits to the pool protocol version, network ID, consensus
-fingerprint, worker label, and payout label. The server returns a session ID
-and a job containing an immutable `BlockChallenge`, a distinct easier share
-target, and a server-issued job ID. A share submission contains only that job
-ID and a nonce. It does not contain a trusted work digest or proof.
+The authenticated client hello commits to pool protocol v2, network ID,
+consensus fingerprint, worker label, payout key, and the challenge signature.
+The server then returns a session ID and a job containing an immutable
+`BlockChallenge`, a distinct easier share target, and a server-issued job ID. A
+share submission contains only that job ID and a nonce. It does not contain a
+trusted work digest or proof.
 
 For every submitted nonce, the server independently evaluates the exact
 committed ForgeMatrix relation and obtains its work digest without applying a
@@ -259,17 +265,21 @@ rejected. Frames are capped at 16 KiB, with at most 64 concurrent sessions,
 1,000,000 messages per session, 65,536 valid nonce records per job, 1,024 recent
 session records, 1,024 payout identities, and 65,536 pool-block records. Every
 payout identity proves key control through a fresh Schnorr challenge. Accepted
-shares increment a durable test counter; the default is one credited Devnet
-atom per accepted share. A network-bound, checksummed two-slot ledger survives
-process restarts, recovers interrupted block credits exactly once, and labels
-pool blocks canonical, orphaned, or unresolved as fork choice changes. Valid
-pool blocks send the miner reward to the server's `--miner` destination.
-Credited test atoms are accounting units until the on-chain settlement stage is
-enabled.
+shares increment a durable fixed-price test counter; the default is one
+credited Devnet atom per accepted share. A network-bound, checksummed two-slot
+ledger survives process restarts, migrates authenticated v1 accounting,
+recovers interrupted block credits exactly once, and labels pool blocks
+canonical, orphaned, or unresolved as fork choice changes. Valid pool blocks
+send the miner reward to the server's `--miner` destination.
 
-The next pool milestone adds mature-reward settlement transactions. RCNet then
-adds verification-queue stress testing, load and fuzz coverage, independent
-interoperability testing, and external review.
+`--enable-testnet-payouts` activates mature-reward settlement and requires
+`--miner` to be this pool node's wallet destination. The default threshold is
+100 earned atoms and the default burned fee is one atom. The pool reserves
+credit only after durably journaling the exact signed transaction, rebroadcasts
+prepared transactions after restart, records confirmations from the active
+chain, and releases credit when a reorganization invalidates its inputs. RCNet
+qualification next adds verification-queue stress testing, load and fuzz
+coverage, independent interoperability testing, and external review.
 
 ## Run two or three local nodes
 
@@ -601,10 +611,10 @@ scalable public-network design.
 
 ## Current boundary
 
-Devnet-0 has no public-peer discovery, peer identity authentication, encrypted
-P2P transport, NAT traversal, reputation/ban system, demonstrated DDoS
-maturity, production wallet/key custody, durable pool payouts, or optimized
-GPU miner.
+Devnet-0 keeps peer identity authentication, encrypted P2P transport, NAT
+traversal, demonstrated DDoS maturity, and production wallet/key custody as
+public-network gates. Its pool ledger and opt-in testnet payouts are durable;
+those controls are test infrastructure rather than production custody.
 Its local GUI signs with a distinct per-data-directory key on new installs, but
 that raw key is unencrypted and has no mnemonic recovery or audited custody.
 The pool's pinned TLS server transport does not change the P2P boundary: peer

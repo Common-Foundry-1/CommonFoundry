@@ -14,8 +14,9 @@ use cmfd_node::p2p::{
 };
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::pool::{
-    DEFAULT_POOL_SOCKET_ADDRESS, DEFAULT_SHARE_LEADING_ZERO_BITS, PoolServerConfig,
-    certificate_sha256, generate_pool_certificate, spawn_pool_server,
+    DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS, DEFAULT_POOL_PAYOUT_FEE_ATOMS, DEFAULT_POOL_SOCKET_ADDRESS,
+    DEFAULT_SHARE_LEADING_ZERO_BITS, PoolPayoutPolicy, PoolServerConfig, certificate_sha256,
+    generate_pool_certificate, spawn_pool_server,
 };
 #[cfg(feature = "production-v4-testnet")]
 use cmfd_node::production_v4_pool::{
@@ -114,6 +115,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Parsed once at startup; boxing CLI fields adds needless indirection.
 enum Command {
     /// Print the compiled network identity and consensus manifest.
     NetworkInfo,
@@ -206,6 +208,15 @@ enum Command {
         /// Absolute native scratch directory shared by the V4 pool workers.
         #[arg(long)]
         production_v4_pool_scratch: Option<PathBuf>,
+        /// Enable automatic on-chain settlement of authenticated Devnet share credits.
+        #[arg(long)]
+        enable_testnet_payouts: bool,
+        /// Minimum earned atoms settled to one authenticated payout key.
+        #[arg(long, default_value_t = DEFAULT_POOL_MINIMUM_PAYOUT_ATOMS)]
+        pool_minimum_payout_atoms: u64,
+        /// Burned fee, in atoms, for each pool payout transaction.
+        #[arg(long, default_value_t = DEFAULT_POOL_PAYOUT_FEE_ATOMS)]
+        pool_payout_fee_atoms: u64,
     },
 }
 
@@ -434,6 +445,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             production_v4_pool_replay_worker,
             production_v4_pool_proof_worker,
             production_v4_pool_scratch,
+            enable_testnet_payouts,
+            pool_minimum_payout_atoms,
+            pool_payout_fee_atoms,
         } => {
             require_pool_mining_profile()?;
             let shutdown = install_shutdown_handler()?;
@@ -494,6 +508,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
             config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
             config.ledger_directory = Some(cli.data_dir.join("pool-ledger"));
+            if enable_testnet_payouts {
+                config.payout_policy = Some(PoolPayoutPolicy {
+                    minimum_payout_atoms: pool_minimum_payout_atoms,
+                    fee_atoms: pool_payout_fee_atoms,
+                });
+            }
             configure_production_v4_pool_verifier(
                 &mut config,
                 production_v4_artifacts.as_ref(),
@@ -516,6 +536,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "certificate_sha256": hex::encode(pin),
                     "share_leading_zero_bits": share_leading_zero_bits,
                     "block_reward_destination": hex::encode(miner_destination),
+                    "automatic_testnet_payouts": enable_testnet_payouts,
+                    "minimum_payout_atoms": pool_minimum_payout_atoms,
+                    "payout_fee_atoms": pool_payout_fee_atoms,
                     "used_insecure_default_miner": used_insecure_default_miner,
                     "public_peer_mode": allow_public_peers,
                     "p2p_warning": peer_warning(allow_public_peers),

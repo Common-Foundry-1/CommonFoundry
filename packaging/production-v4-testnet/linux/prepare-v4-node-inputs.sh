@@ -4,7 +4,10 @@ umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 DESTINATION="${1:-$SCRIPT_DIR/production-v4}"
-RELEASE_BASE="${CMFD_RELEASE_BASE:-https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16}"
+RELEASE_BASES=(
+  "${CMFD_RELEASE_BASE:-https://downloads.commonfoundry.ai/v0.1.0-devnet.16}"
+  "${CMFD_FALLBACK_RELEASE_BASE:-https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16}"
+)
 PART_DIRECTORY="$DESTINATION/.parts"
 OUTPUT="$DESTINATION/MODEL-V2.bank"
 PART_NAMES=(
@@ -54,8 +57,18 @@ download_part() {
   downloaded=0
   [[ ! -f "$download" ]] || downloaded="$(wc -c < "$download")"
   echo "Downloading $name ($downloaded of $bytes bytes already present)"
-  curl --fail --location --silent --show-error --retry 5 --retry-delay 3 --connect-timeout 30 \
-    --speed-limit 1024 --speed-time 30 --continue-at - --output "$download" "$RELEASE_BASE/$name"
+  downloaded_ok=0
+  for release_base in "${RELEASE_BASES[@]}"; do
+    if curl --fail --location --silent --show-error --retry 5 --retry-delay 3 --connect-timeout 30 \
+      --speed-limit 1024 --speed-time 30 --continue-at - --output "$download" "$release_base/$name"; then
+      downloaded_ok=1
+      break
+    fi
+  done
+  if [[ "$downloaded_ok" -ne 1 ]]; then
+    echo "ERROR: all download sources failed for $name" >&2
+    return 1
+  fi
   verify "$download" "$bytes" "${PART_HASHES[$index]}"
   mv -f -- "$download" "$part"
   echo "Authenticated $name"

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RELEASE_BASE="https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16"
+RELEASE_BASE="${CMFD_RELEASE_BASE:-https://downloads.commonfoundry.ai/v0.1.0-devnet.16}"
+FALLBACK_RELEASE_BASE="${CMFD_FALLBACK_RELEASE_BASE:-https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16}"
 
 for command_name in curl python3; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -16,4 +17,5 @@ exec python3 "$SCRIPT_DIR/production-v4-inputs.py" \
   --input-manifest "$SCRIPT_DIR/production-v4-testnet-1-inputs.json" \
   --fixed-record "$SCRIPT_DIR/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json" \
   --destination "$SCRIPT_DIR/inputs" \
-  --release-base "$RELEASE_BASE" "$@"
+  --release-base "$RELEASE_BASE" \
+  --fallback-release-base "$FALLBACK_RELEASE_BASE" "$@"

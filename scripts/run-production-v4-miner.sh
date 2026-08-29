@@ -69,7 +69,8 @@ input_validation=(
   --input-manifest "$INPUT_MANIFEST"
   --fixed-record "$SCRIPT_DIR/FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json"
   --destination "$SCRIPT_DIR/inputs"
-  --release-base "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16"
+  --release-base "https://downloads.commonfoundry.ai/v0.1.0-devnet.16"
+  --fallback-release-base "https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16"
   --validate-only
 )
 if ((INPUTS_PREPARED != 0)); then

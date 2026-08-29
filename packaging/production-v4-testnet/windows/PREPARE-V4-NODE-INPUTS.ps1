@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string]$Destination = (Join-Path $PSScriptRoot 'production-v4'),
-    [string]$ReleaseBase = 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16',
+    [string]$ReleaseBase = 'https://downloads.commonfoundry.ai/v0.1.0-devnet.16',
+    [string]$FallbackReleaseBase = 'https://github.com/JustAResearcher/CommonFoundry-Binaries/releases/download/v0.1.0-devnet.16',
     [ValidateRange(1, 16)]
     [int]$DownloadConcurrency = 4
 )
@@ -18,7 +19,7 @@ function Test-Identity {
 }
 
 function Get-MissingPart {
-    param($Part, [string]$PartDirectory, [string]$ReleaseBase)
+    param($Part, [string]$PartDirectory, [string[]]$ReleaseBases)
     $partPath = Join-Path $PartDirectory ([string]$Part.name)
     if (Test-Identity $partPath ([uint64]$Part.bytes) ([string]$Part.sha256)) {
         return $null
@@ -36,7 +37,8 @@ function Get-MissingPart {
         Part = $Part
         Path = $partPath
         Download = $download
-        Url = "$($ReleaseBase.TrimEnd('/'))/$($Part.name)"
+        Urls = @($ReleaseBases | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique | ForEach-Object { "$($_.TrimEnd('/'))/$($Part.name)" })
     }
 }
 
@@ -60,9 +62,9 @@ function Receive-PartDownload {
 }
 
 function Get-PartPaths {
-    param($Parts, [string]$PartDirectory, [string]$ReleaseBase, [int]$Concurrency)
+    param($Parts, [string]$PartDirectory, [string[]]$ReleaseBases, [int]$Concurrency)
     $curlPath = (Get-Command curl.exe -ErrorAction Stop).Source
-    $items = @($Parts | ForEach-Object { Get-MissingPart $_ $PartDirectory $ReleaseBase } |
+    $items = @($Parts | ForEach-Object { Get-MissingPart $_ $PartDirectory $ReleaseBases } |
         Where-Object { $null -ne $_ })
     $pending = [Collections.Queue]::new()
     foreach ($item in $items) { $pending.Enqueue($item) }
@@ -76,12 +78,19 @@ function Get-PartPaths {
                 } else { [uint64]0 }
                 Write-Host "Downloading $($item.Part.name) ($existingBytes of $($item.Part.bytes) bytes already present)"
                 $job = Start-Job -ScriptBlock {
-                    param($CurlPath, $Url, $Output)
-                    & $CurlPath --location --fail --silent --show-error --retry 5 --retry-delay 3 `
-                        --connect-timeout 30 --speed-limit 1024 --speed-time 30 --continue-at - `
-                        --output $Output $Url
-                    if ($LASTEXITCODE -ne 0) { throw "curl exited with code $LASTEXITCODE" }
-                } -ArgumentList $curlPath, $item.Url, $item.Download
+                    param($CurlPath, $UrlList, $Output)
+                    $downloaded = $false
+                    foreach ($url in @($UrlList -split "`n")) {
+                        & $CurlPath --location --fail --silent --show-error --retry 5 --retry-delay 3 `
+                            --connect-timeout 30 --speed-limit 1024 --speed-time 30 --continue-at - `
+                            --output $Output $url
+                        if ($LASTEXITCODE -eq 0) {
+                            $downloaded = $true
+                            break
+                        }
+                    }
+                    if (-not $downloaded) { throw 'All download sources failed.' }
+                } -ArgumentList $curlPath, ([string]::Join("`n", $item.Urls)), $item.Download
                 $active += [pscustomobject]@{ Job = $job; Item = $item }
             }
             if ($active.Count -gt 0) {
@@ -116,7 +125,7 @@ New-Item -ItemType Directory -Force -Path $destinationPath, $partDirectory | Out
 $output = Join-Path $destinationPath 'MODEL-V2.bank'
 
 if (-not (Test-Identity $output ([uint64]$file.bytes) ([string]$file.sha256))) {
-    $partPaths = @(Get-PartPaths $file.parts $partDirectory $ReleaseBase $DownloadConcurrency)
+    $partPaths = @(Get-PartPaths $file.parts $partDirectory @($ReleaseBase, $FallbackReleaseBase) $DownloadConcurrency)
     $partial = "$output.partial"
     Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
     $target = [IO.File]::Open($partial, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)

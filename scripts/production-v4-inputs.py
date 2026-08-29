@@ -88,7 +88,7 @@ def download(url: str, output: Path) -> None:
     )
 
 
-def prepare_part(part: dict, part_directory: Path, release_base: str) -> Path:
+def prepare_part(part: dict, part_directory: Path, release_bases: tuple[str, ...]) -> Path:
     name = safe_part_name(str(part["name"]))
     part_path = part_directory / name
     size = int(part["bytes"])
@@ -103,7 +103,15 @@ def prepare_part(part: dict, part_directory: Path, release_base: str) -> Path:
             temporary.unlink()
     downloaded = temporary.stat().st_size if temporary.is_file() else 0
     print(f"Downloading {name} ({downloaded} of {size} bytes already present)", flush=True)
-    download(f"{release_base.rstrip('/')}/{name}", temporary)
+    errors: list[BaseException] = []
+    for release_base in release_bases:
+        try:
+            download(f"{release_base.rstrip('/')}/{name}", temporary)
+            break
+        except (OSError, subprocess.CalledProcessError) as error:
+            errors.append(error)
+    else:
+        raise OSError(f"all download sources failed for {name}") from errors[-1]
     if not identity_matches(temporary, size, sha256):
         temporary.unlink(missing_ok=True)
         raise ValueError(f"downloaded part failed authentication: {name}")
@@ -123,6 +131,9 @@ def prepare_inputs(args: argparse.Namespace) -> set[str]:
     destination.chmod(0o700)
     part_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     part_directory.chmod(0o700)
+    release_bases = tuple(
+        dict.fromkeys([args.release_base, *args.fallback_release_base])
+    )
 
     authenticated: set[str] = set()
     for entry in manifest.get("files", []):
@@ -150,7 +161,7 @@ def prepare_inputs(args: argparse.Namespace) -> set[str]:
         with ThreadPoolExecutor(max_workers=args.download_concurrency) as executor:
             part_paths = list(
                 executor.map(
-                    lambda part: prepare_part(part, part_directory, args.release_base),
+                    lambda part: prepare_part(part, part_directory, release_bases),
                     parts,
                 )
             )
@@ -241,6 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-record", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--release-base", required=True)
+    parser.add_argument("--fallback-release-base", action="append", default=[])
     parser.add_argument("--download-concurrency", type=int, choices=range(1, 17), default=16)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--prepared-inputs", action="store_true")

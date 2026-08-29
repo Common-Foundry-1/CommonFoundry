@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "production-v4-inputs.py"
@@ -99,6 +100,7 @@ class ProductionV4InputTests(unittest.TestCase):
                 fixed_record=fixed_record,
                 destination=destination,
                 release_base="https://invalid.example",
+                fallback_release_base=[],
                 download_concurrency=16,
                 validate_only=False,
             )
@@ -110,6 +112,41 @@ class ProductionV4InputTests(unittest.TestCase):
                 path = destination / Path(entry["relative_path"])
                 index = names.index(entry["name"])
                 self.assertEqual(path.read_bytes(), f"left-{index}|right-{index}".encode())
+
+    def test_prepare_part_resumes_from_the_fallback_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            part_directory = Path(temporary)
+            value = b"authenticated-part"
+            part = {
+                "name": "part-01",
+                "bytes": len(value),
+                "sha256": sha256(value),
+            }
+            download = part_directory / "part-01.download"
+            download.write_bytes(value[:5])
+            urls: list[str] = []
+
+            def fake_download(url: str, output: Path) -> None:
+                urls.append(url)
+                if len(urls) == 1:
+                    raise OSError("primary unavailable")
+                output.write_bytes(value)
+
+            with mock.patch.object(INPUTS, "download", side_effect=fake_download):
+                result = INPUTS.prepare_part(
+                    part,
+                    part_directory,
+                    ("https://primary.example", "https://fallback.example"),
+                )
+
+            self.assertEqual(result.read_bytes(), value)
+            self.assertEqual(
+                urls,
+                [
+                    "https://primary.example/part-01",
+                    "https://fallback.example/part-01",
+                ],
+            )
 
     def test_validation_treats_only_row_major_files_as_untrusted_caches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

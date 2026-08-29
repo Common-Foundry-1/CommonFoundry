@@ -162,5 +162,11 @@ After the identity and reproduction gates pass, RCNet-1 must demonstrate:
 - documented backup, restore, update, rollback, incident, and key-rotation
   procedures
 
+The first wallet-custody increment is specified in
+[`wallet-custody.md`](wallet-custody.md): network-bound encrypted backups,
+strict authenticated restore, data-directory locking, and no-overwrite
+semantics. The live-keystore and recovery-UX items listed there remain part of
+the RCNet acceptance work.
+
 Mainnet activation is a separate decision after the full rehearsal evidence,
 independent audits, and launch operations review are complete.

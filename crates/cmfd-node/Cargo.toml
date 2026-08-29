@@ -21,7 +21,9 @@ production-v4-testnet = ["production-v4"]
 production-rc = ["production-v4"]
 
 [dependencies]
+argon2.workspace = true
 blake3.workspace = true
+chacha20poly1305.workspace = true
 clap.workspace = true
 cmfd-consensus = { path = "../cmfd-consensus" }
 cmfd-proof-worker = { path = "../cmfd-proof-worker" }
@@ -42,6 +44,7 @@ time = { version = "=0.3.47", default-features = false }
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

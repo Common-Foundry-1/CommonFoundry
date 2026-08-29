@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(feature = "production-v3")]
 use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
@@ -31,6 +31,10 @@ use cmfd_node::production_v4_pool::{
 #[cfg(feature = "production-v3")]
 use cmfd_node::rcnet_candidate::{
     RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
+};
+use cmfd_node::wallet_backup::{
+    MAXIMUM_PASSPHRASE_BYTES, MINIMUM_PASSPHRASE_BYTES, create_encrypted_wallet_backup,
+    restore_encrypted_wallet_backup,
 };
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
@@ -171,6 +175,22 @@ enum Command {
     },
     /// Replay the block log and print current offline node status.
     Status,
+    /// Create a network-bound, passphrase-encrypted backup of wallet.key.
+    WalletBackup {
+        #[arg(long)]
+        output: PathBuf,
+        /// File containing the backup passphrase. Its bytes are never printed.
+        #[arg(long)]
+        passphrase_file: PathBuf,
+    },
+    /// Restore wallet.key from a network-bound encrypted backup.
+    WalletRestore {
+        #[arg(long)]
+        input: PathBuf,
+        /// File containing the backup passphrase. Its bytes are never printed.
+        #[arg(long)]
+        passphrase_file: PathBuf,
+    },
     /// Generate a self-signed TLS certificate and print its required SHA-256 pin.
     PoolCertificate {
         /// Output path for the DER-encoded self-signed certificate.
@@ -297,6 +317,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )?;
         write_candidate_create_new(output, &candidate)?;
+        return Ok(());
+    }
+    if let Command::WalletBackup {
+        output,
+        passphrase_file,
+    } = &cli.command
+    {
+        let passphrase = read_wallet_passphrase(passphrase_file)?;
+        let info = create_encrypted_wallet_backup(
+            &cli.data_dir,
+            output,
+            COMPILED_NETWORK_PROFILE.network_id,
+            passphrase.as_slice(),
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "created",
+                "format": "CommonFoundry encrypted wallet backup v1",
+                "network": COMPILED_NETWORK_PROFILE.short_name(),
+                "network_id": hex::encode(info.network_id),
+                "destination": hex::encode(info.destination),
+                "bytes": info.bytes,
+            }))?
+        );
+        return Ok(());
+    }
+    if let Command::WalletRestore {
+        input,
+        passphrase_file,
+    } = &cli.command
+    {
+        let passphrase = read_wallet_passphrase(passphrase_file)?;
+        let info = restore_encrypted_wallet_backup(
+            input,
+            &cli.data_dir,
+            COMPILED_NETWORK_PROFILE.network_id,
+            passphrase.as_slice(),
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "restored",
+                "format": "CommonFoundry encrypted wallet backup v1",
+                "network": COMPILED_NETWORK_PROFILE.short_name(),
+                "network_id": hex::encode(info.network_id),
+                "destination": hex::encode(info.destination),
+                "bytes": info.bytes,
+            }))?
+        );
         return Ok(());
     }
     validate_production_v3_override_set(&cli)?;
@@ -441,6 +511,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
             Ok(())
+        }
+        Command::WalletBackup { .. } | Command::WalletRestore { .. } => {
+            unreachable!("offline wallet commands exit before node initialization")
         }
         Command::PoolCertificate {
             certificate,
@@ -1109,6 +1182,32 @@ fn require_bounded_reference_mining(command: &str) -> Result<(), Box<dyn std::er
     }
 }
 
+fn read_wallet_passphrase(
+    path: &Path,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            return Err("wallet passphrase file permissions must be 0600 or stricter".into());
+        }
+    }
+    let mut passphrase = zeroize::Zeroizing::new(Vec::with_capacity(MAXIMUM_PASSPHRASE_BYTES + 3));
+    file.take((MAXIMUM_PASSPHRASE_BYTES + 3) as u64)
+        .read_to_end(&mut passphrase)?;
+    if passphrase.last() == Some(&b'\n') {
+        passphrase.pop();
+        if passphrase.last() == Some(&b'\r') {
+            passphrase.pop();
+        }
+    }
+    if !(MINIMUM_PASSPHRASE_BYTES..=MAXIMUM_PASSPHRASE_BYTES).contains(&passphrase.len()) {
+        return Err("wallet passphrase file must contain between 12 and 1024 bytes".into());
+    }
+    Ok(passphrase)
+}
+
 fn require_pool_mining_profile() -> Result<(), Box<dyn std::error::Error>> {
     match COMPILED_NETWORK_PROFILE.proof {
         ProofProfile::DevnetV2Reference | ProofProfile::ProductionV4 => Ok(()),
@@ -1185,6 +1284,68 @@ mod tests {
             Command::NetworkInfo
         ));
         assert!(Cli::try_parse_from(["cmfd-node", "network-info", "unexpected"]).is_err());
+    }
+
+    #[test]
+    fn offline_wallet_commands_require_explicit_files() {
+        let backup = Cli::try_parse_from([
+            "cmfd-node",
+            "--data-dir",
+            "wallet-data",
+            "wallet-backup",
+            "--output",
+            "wallet.cmfd-backup",
+            "--passphrase-file",
+            "passphrase.txt",
+        ])
+        .unwrap();
+        assert_eq!(backup.data_dir, PathBuf::from("wallet-data"));
+        assert!(matches!(
+            backup.command,
+            Command::WalletBackup { output, passphrase_file }
+                if output == Path::new("wallet.cmfd-backup")
+                    && passphrase_file == Path::new("passphrase.txt")
+        ));
+
+        let restore = Cli::try_parse_from([
+            "cmfd-node",
+            "wallet-restore",
+            "--input",
+            "wallet.cmfd-backup",
+            "--passphrase-file",
+            "passphrase.txt",
+        ])
+        .unwrap();
+        assert!(matches!(restore.command, Command::WalletRestore { .. }));
+        assert!(Cli::try_parse_from(["cmfd-node", "wallet-backup"]).is_err());
+        assert!(Cli::try_parse_from(["cmfd-node", "wallet-restore"]).is_err());
+    }
+
+    #[test]
+    fn passphrase_file_is_bounded_and_trims_one_line_ending() {
+        let path = std::env::temp_dir().join(format!(
+            "cmfd-wallet-passphrase-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"correct horse battery staple\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            read_wallet_passphrase(&path).unwrap().as_slice(),
+            b"correct horse battery staple"
+        );
+        std::fs::write(&path, b"too short\n").unwrap();
+        assert!(read_wallet_passphrase(&path).is_err());
+        std::fs::write(&path, vec![b'x'; MAXIMUM_PASSPHRASE_BYTES + 3]).unwrap();
+        assert!(read_wallet_passphrase(&path).is_err());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

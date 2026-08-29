@@ -208,9 +208,9 @@ def verify_core_vector(repo_root: Path) -> dict[str, object]:
     expected = vector.get("expected")
     if not all(isinstance(value, dict) for value in (block_json, activation_json, expected)):
         raise ReproductionError("ProductionV4 core vector sections are malformed")
-    assert isinstance(block_json, dict)
-    assert isinstance(activation_json, dict)
-    assert isinstance(expected, dict)
+    block_json = dict(block_json)
+    activation_json = dict(activation_json)
+    expected = dict(expected)
     if activation_json != {
         "encoding": "524288 canonical KoalaBear u32 little-endian values, all zero",
         "field_count": 524_288,

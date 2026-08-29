@@ -435,14 +435,22 @@ def _validate_zip_local_layout(
             or crc != member.CRC
         ):
             raise IntegrityError(f"{label} has noncanonical local metadata")
+        expected_extra = b""
         if file_size == 0xFFFFFFFF and compressed_size == 0xFFFFFFFF:
             expected_extra = struct.pack(
                 "<HHQQ", 1, 16, member.file_size, member.compress_size
             )
-        else:
-            expected_extra = b""
-            if file_size != member.file_size or compressed_size != member.compress_size:
-                raise IntegrityError(f"{label} local sizes do not match its directory")
+        elif file_size != member.file_size or compressed_size != member.compress_size:
+            raise IntegrityError(f"{label} local sizes do not match its directory")
+        elif (
+            member.file_size > zipfile.ZIP64_LIMIT
+            or member.compress_size > zipfile.ZIP64_LIMIT
+        ):
+            # Seekable ZipFile writers may patch the 32-bit local sizes while
+            # retaining the ZIP64 size record selected before compression.
+            expected_extra = struct.pack(
+                "<HHQQ", 1, 16, member.file_size, member.compress_size
+            )
         if extra != expected_extra:
             raise IntegrityError(f"{label} has noncanonical local ZIP64 metadata")
         cursor += 30 + name_length + extra_length + member.compress_size
@@ -2676,10 +2684,14 @@ def create_deterministic_zip(stage: Path, output: Path, epoch: int) -> None:
                 else:
                     with _stable_regular_handle(
                         path, f"ZIP staging member {name}"
-                    ) as (_, source, _), archive.open(
-                        info, "w", force_zip64=True
-                    ) as destination:
-                        shutil.copyfileobj(source, destination, length=1024 * 1024)
+                    ) as (_, source, opened):
+                        info.file_size = opened.st_size
+                        with archive.open(
+                            info,
+                            "w",
+                            force_zip64=opened.st_size > zipfile.ZIP64_LIMIT,
+                        ) as destination:
+                            shutil.copyfileobj(source, destination, length=1024 * 1024)
         _publish_new_archive(temporary, output)
     finally:
         if temporary.exists():

@@ -616,6 +616,17 @@ class DeterministicArchiveTests(unittest.TestCase):
         finally:
             zipfile.ZIP64_LIMIT = original_limit
 
+    def test_small_streamed_zip_members_do_not_carry_zip64_local_extras(self) -> None:
+        stage = self.stage("small-zip", 1, 2)
+        archive_path = self.root / "small.zip"
+        integrity.create_deterministic_zip(stage, archive_path, self.epoch)
+        with archive_path.open("rb") as raw, zipfile.ZipFile(raw, "r") as archive:
+            for member in archive.infolist():
+                raw.seek(member.header_offset + 26)
+                name_length, extra_length = struct.unpack("<HH", raw.read(4))
+                raw.seek(name_length, os.SEEK_CUR)
+                self.assertEqual(extra_length, 0)
+
     def test_symlinked_stage_root_is_rejected(self) -> None:
         stage = self.stage("real", 1, 2)
         link = self.root / "linked-stage"

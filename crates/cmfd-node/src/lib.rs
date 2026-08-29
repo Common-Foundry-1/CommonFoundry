@@ -5201,6 +5201,14 @@ impl Node {
         self.index.contains(block_id)
     }
 
+    /// Returns one-based confirmations when a block is on the active chain.
+    /// Known side-branch blocks and unknown identifiers both return `None`;
+    /// callers can distinguish them with [`Self::contains_block`].
+    pub fn active_chain_confirmations(&self, block_id: [u8; 32]) -> Option<u64> {
+        let position = self.index.active_position(block_id)?;
+        u64::try_from(self.index.active_chain.len().checked_sub(position)?).ok()
+    }
+
     /// Reads and authenticates the exact canonical frame for a validated block.
     /// Virtual genesis and unknown identifiers have no frame and return
     /// `None`; retained-log corruption and I/O failures are never hidden.

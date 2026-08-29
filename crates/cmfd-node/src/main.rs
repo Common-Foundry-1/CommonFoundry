@@ -493,6 +493,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config =
                 PoolServerConfig::devnet(bind, certificate_der, private_key_der, miner_destination);
             config.share_target = target_with_leading_zero_bits(share_leading_zero_bits);
+            config.ledger_directory = Some(cli.data_dir.join("pool-ledger"));
             configure_production_v4_pool_verifier(
                 &mut config,
                 production_v4_artifacts.as_ref(),
@@ -518,7 +519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "used_insecure_default_miner": used_insecure_default_miner,
                     "public_peer_mode": allow_public_peers,
                     "p2p_warning": peer_warning(allow_public_peers),
-                    "accounting": "session-only accounting records; nonwithdrawable; not funds; not an on-chain balance or payout"
+                    "accounting": "durable network-bound test accounting; nonwithdrawable; not funds; not an on-chain balance or payout"
                 }))?
             );
             let service_exit = shutdown.wait_for_service_exit(|| {

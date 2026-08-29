@@ -2103,6 +2103,31 @@ mod tests {
     }
 
     #[test]
+    fn production_v4_block_frames_reject_declared_payload_above_the_limit() {
+        let network_id = cmfd_consensus::PRODUCTION_V4_TESTNET_NETWORK_ID;
+        let max_payload = cmfd_consensus::PRODUCTION_V4_MAX_BLOCK_BYTES;
+
+        for kind in [BLOCK_KIND, SUBMIT_BLOCK_KIND] {
+            let mut exact_limit = raw_frame(kind, 0, &[]);
+            exact_limit[16..20].copy_from_slice(&(max_payload as u32).to_le_bytes());
+            assert!(matches!(
+                decode_peer_frame(&exact_limit, network_id),
+                Err(PeerError::Truncated { needed, remaining })
+                    if needed == PEER_FRAME_HEADER_BYTES + max_payload
+                        && remaining == PEER_FRAME_HEADER_BYTES
+            ));
+
+            let mut above_limit = exact_limit;
+            above_limit[16..20].copy_from_slice(&((max_payload as u32) + 1).to_le_bytes());
+            assert!(matches!(
+                decode_peer_frame(&above_limit, network_id),
+                Err(PeerError::PayloadTooLarge { actual, max })
+                    if actual == max_payload + 1 && max == max_payload
+            ));
+        }
+    }
+
+    #[test]
     fn mining_templates_reject_wrong_network_shape_and_lock_tags() {
         let block = sample_block();
         let template = MiningTemplate {

@@ -164,9 +164,10 @@ After the identity and reproduction gates pass, RCNet-1 must demonstrate:
 
 The first wallet-custody increment is specified in
 [`wallet-custody.md`](wallet-custody.md): network-bound encrypted backups,
-strict authenticated restore, data-directory locking, and no-overwrite
-semantics. The live-keystore and recovery-UX items listed there remain part of
-the RCNet acceptance work.
+strict authenticated restore, encrypted live-key storage, data-directory
+locking, RCNet plaintext-key refusal, and no-overwrite semantics. The guided
+GUI migration/unlock/relock and external review items listed there remain part
+of the RCNet acceptance work.
 
 Mainnet activation is a separate decision after the full rehearsal evidence,
 independent audits, and launch operations review are complete.

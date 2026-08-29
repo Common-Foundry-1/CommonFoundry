@@ -48,6 +48,7 @@ use serde_json::json;
 #[cfg(feature = "production-v4")]
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub mod logging;
 pub mod network_info;
@@ -423,6 +424,10 @@ pub enum NodeError {
     FingerprintMismatch,
     #[error("wallet key is missing, corrupt, or unsupported")]
     InvalidWalletKey,
+    #[error("encrypted wallet key requires a valid passphrase")]
+    WalletLocked,
+    #[error("RCNet requires an encrypted live wallet key")]
+    WalletKeyEncryptionRequired,
     #[error("block log is corrupt: {0}")]
     CorruptLog(String),
     #[error(
@@ -568,6 +573,8 @@ impl NodeError {
             Self::MissingMetadata => ("missing_metadata", 500, false),
             Self::FingerprintMismatch => ("fingerprint_mismatch", 409, false),
             Self::InvalidWalletKey => ("invalid_wallet_key", 500, false),
+            Self::WalletLocked => ("wallet_locked", 423, false),
+            Self::WalletKeyEncryptionRequired => ("wallet_key_encryption_required", 500, false),
             Self::CorruptLog(_) => ("corrupt_block_log", 500, false),
             Self::ProductionLegacyBlockLog(_) => ("production_legacy_block_log", 500, false),
             Self::LegacyReplayResourceLimit { .. } => ("legacy_replay_resource_limit", 500, false),
@@ -4186,6 +4193,7 @@ impl Node {
             production_v3_artifacts.cloned(),
             None,
             None,
+            None,
         )
     }
 
@@ -4202,6 +4210,7 @@ impl Node {
             None,
             Some(production_v4_artifacts),
             None,
+            None,
         )
     }
 
@@ -4215,6 +4224,7 @@ impl Node {
             data_dir,
             COMPILED_NETWORK_PROFILE,
             production_v3_record,
+            None,
             None,
             None,
             None,
@@ -4238,6 +4248,7 @@ impl Node {
             production_v3_artifacts.cloned(),
             None,
             Some(verifier_worker),
+            None,
         )
     }
 
@@ -4255,6 +4266,7 @@ impl Node {
             None,
             None,
             Some(verifier_worker),
+            None,
         )
     }
 
@@ -4285,6 +4297,32 @@ impl Node {
             production_v3_artifacts.cloned(),
             None,
             None,
+            None,
+        )
+    }
+
+    /// Opens the compiled network with any required proof authority and an
+    /// optional passphrase for its encrypted live wallet key.
+    pub fn open_with_runtime_security_and_wallet_passphrase(
+        data_dir: impl AsRef<Path>,
+        production_v3_record: Option<&ProductionV3VerifierRecord>,
+        production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
+        verifier_worker: Option<&VerifierWorkerConfig>,
+        wallet_passphrase: Option<&[u8]>,
+    ) -> Result<Self, NodeError> {
+        if production_v4_artifacts.is_some()
+            && (production_v3_record.is_some() || verifier_worker.is_some())
+        {
+            return Err(NodeError::ProductionV4ArtifactsUnexpected);
+        }
+        Self::open_with_profile_artifacts_and_worker(
+            data_dir,
+            COMPILED_NETWORK_PROFILE,
+            production_v3_record,
+            None,
+            production_v4_artifacts,
+            verifier_worker.cloned(),
+            wallet_passphrase,
         )
     }
 
@@ -4295,6 +4333,7 @@ impl Node {
         production_v3_artifacts: Option<ProductionV3VerifierArtifacts>,
         production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
         verifier_worker: Option<VerifierWorkerConfig>,
+        wallet_passphrase: Option<&[u8]>,
     ) -> Result<Self, NodeError> {
         let (params, verifier) = network_params_and_verifier_for_profile(
             profile,
@@ -4314,8 +4353,14 @@ impl Node {
         let log = open_block_log(&log_path)?;
         let fingerprint = params.fingerprint()?;
         let metadata = load_metadata(&data_dir, fingerprint, &log, &log_path)?;
-        let (wallet_signing_key, legacy_shared_wallet) =
-            load_or_create_wallet_key(&data_dir, metadata, &log, &log_path)?;
+        let (wallet_signing_key, legacy_shared_wallet) = load_or_create_wallet_key(
+            &data_dir,
+            profile,
+            metadata,
+            &log,
+            &log_path,
+            wallet_passphrase,
+        )?;
 
         let mut state = ChainState::new(params, verifier.clone())?;
         let mut index = BlockIndex::new(params.genesis_hash);
@@ -7902,25 +7947,44 @@ fn write_metadata(
 
 fn load_or_create_wallet_key(
     data_dir: &Path,
+    profile: NetworkProfile,
     metadata: MetadataState,
     block_log: &File,
     block_log_path: &Path,
+    wallet_passphrase: Option<&[u8]>,
 ) -> Result<(SigningKey, bool), NodeError> {
     let path = data_dir.join(WALLET_KEY_FILE);
     match OpenOptions::new().read(true).open(&path) {
         Ok(mut file) => {
-            if file
+            let length = file
                 .metadata()
                 .map_err(|source| io_error("inspect wallet key", &path, source))?
-                .len()
-                != 32
-            {
+                .len();
+            if length == 32 {
+                if matches!(profile.kind, NetworkProfileKind::Rcnet) {
+                    return Err(NodeError::WalletKeyEncryptionRequired);
+                }
+                let mut secret = Zeroizing::new([0_u8; 32]);
+                file.read_exact(secret.as_mut())
+                    .map_err(|_| NodeError::InvalidWalletKey)?;
+                let key = SigningKey::from_bytes(secret.as_ref())
+                    .map_err(|_| NodeError::InvalidWalletKey)?;
+                let destination: [u8; 32] = key.verifying_key().to_bytes().into();
+                let legacy = destination == default_miner_destination();
+                return Ok((key, legacy));
+            }
+            if length != wallet_backup::ENCRYPTED_WALLET_KEY_BYTES as u64 {
                 return Err(NodeError::InvalidWalletKey);
             }
-            let mut secret = [0_u8; 32];
-            file.read_exact(&mut secret)
+            let passphrase = wallet_passphrase.ok_or(NodeError::WalletLocked)?;
+            let mut encrypted = vec![0_u8; wallet_backup::ENCRYPTED_WALLET_KEY_BYTES];
+            file.read_exact(&mut encrypted)
                 .map_err(|_| NodeError::InvalidWalletKey)?;
-            let key = SigningKey::from_bytes(&secret).map_err(|_| NodeError::InvalidWalletKey)?;
+            let (secret, _) =
+                wallet_backup::decrypt_wallet_key_bytes(&encrypted, profile.network_id, passphrase)
+                    .map_err(wallet_backup_error_to_node)?;
+            let key =
+                SigningKey::from_bytes(secret.as_ref()).map_err(|_| NodeError::InvalidWalletKey)?;
             let destination: [u8; 32] = key.verifying_key().to_bytes().into();
             let legacy = destination == default_miner_destination();
             Ok((key, legacy))
@@ -7942,27 +8006,72 @@ fn load_or_create_wallet_key(
             } else {
                 random_wallet_signing_key()?
             };
-            write_wallet_key(&path, &key)?;
+            if matches!(profile.kind, NetworkProfileKind::Rcnet) && legacy {
+                return Err(NodeError::InvalidWalletKey);
+            }
+            match wallet_passphrase {
+                Some(passphrase) => {
+                    write_encrypted_wallet_key(&path, &key, profile.network_id, passphrase)?
+                }
+                None if matches!(profile.kind, NetworkProfileKind::Rcnet) => {
+                    return Err(NodeError::WalletLocked);
+                }
+                None => write_wallet_key(&path, &key)?,
+            }
             Ok((key, legacy))
         }
         Err(source) => Err(io_error("open wallet key", &path, source)),
     }
 }
 
+fn wallet_backup_error_to_node(error: wallet_backup::WalletBackupError) -> NodeError {
+    match error {
+        wallet_backup::WalletBackupError::Node(error) => error,
+        wallet_backup::WalletBackupError::Io {
+            operation,
+            path,
+            source,
+        } => NodeError::Io {
+            operation,
+            path,
+            source,
+        },
+        wallet_backup::WalletBackupError::InvalidPassphrase
+        | wallet_backup::WalletBackupError::InsecurePassphraseFilePermissions
+        | wallet_backup::WalletBackupError::AuthenticationFailed => NodeError::WalletLocked,
+        wallet_backup::WalletBackupError::InvalidWalletKey
+        | wallet_backup::WalletBackupError::InvalidBackup
+        | wallet_backup::WalletBackupError::WrongNetwork
+        | wallet_backup::WalletBackupError::DestinationMismatch => NodeError::InvalidWalletKey,
+    }
+}
+
 fn random_wallet_signing_key() -> Result<SigningKey, NodeError> {
     loop {
-        let mut secret = [0_u8; 32];
-        getrandom::fill(&mut secret).map_err(|source| {
+        let mut secret = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(secret.as_mut()).map_err(|source| {
             io_error(
                 "generate wallet key",
                 WALLET_KEY_FILE,
                 io::Error::other(source.to_string()),
             )
         })?;
-        if let Ok(key) = SigningKey::from_bytes(&secret) {
+        if let Ok(key) = SigningKey::from_bytes(secret.as_ref()) {
             return Ok(key);
         }
     }
+}
+
+fn write_encrypted_wallet_key(
+    path: &Path,
+    key: &SigningKey,
+    network_id: [u8; 32],
+    passphrase: &[u8],
+) -> Result<(), NodeError> {
+    let secret = Zeroizing::new(key.to_bytes().into());
+    let (encrypted, _) = wallet_backup::encrypt_wallet_key_bytes(&secret, network_id, passphrase)
+        .map_err(wallet_backup_error_to_node)?;
+    wallet_backup::write_private_create_new(path, &encrypted).map_err(wallet_backup_error_to_node)
 }
 
 fn write_wallet_key(path: &Path, key: &SigningKey) -> Result<(), NodeError> {
@@ -14777,6 +14886,121 @@ mod tests {
         assert!(!serialized.contains(&hex::encode([0x13; 32])));
 
         drop(node);
+        clean_test_dir(&path);
+    }
+}
+
+#[cfg(test)]
+mod wallet_runtime_tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    fn test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cmfd-wallet-runtime-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn clean_test_dir(path: &Path) {
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn encrypted_live_wallet_requires_the_correct_passphrase() {
+        let path = test_dir("encrypted-live-wallet");
+        clean_test_dir(&path);
+        let passphrase = b"correct horse battery staple";
+
+        let node = Node::open_with_profile_artifacts_and_worker(
+            &path,
+            DEVNET_PROFILE,
+            None,
+            None,
+            None,
+            None,
+            Some(passphrase),
+        )
+        .unwrap();
+        let destination = node.wallet_destination();
+        assert_eq!(
+            fs::metadata(path.join(WALLET_KEY_FILE)).unwrap().len(),
+            wallet_backup::ENCRYPTED_WALLET_KEY_BYTES as u64
+        );
+        drop(node);
+
+        assert!(matches!(
+            Node::open_with_profile(&path, DEVNET_PROFILE),
+            Err(NodeError::WalletLocked)
+        ));
+        assert!(matches!(
+            Node::open_with_profile_artifacts_and_worker(
+                &path,
+                DEVNET_PROFILE,
+                None,
+                None,
+                None,
+                None,
+                Some(b"incorrect horse battery staple")
+            ),
+            Err(NodeError::WalletLocked)
+        ));
+        let reopened = Node::open_with_profile_artifacts_and_worker(
+            &path,
+            DEVNET_PROFILE,
+            None,
+            None,
+            None,
+            None,
+            Some(passphrase),
+        )
+        .unwrap();
+        assert_eq!(reopened.wallet_destination(), destination);
+        drop(reopened);
+
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn rcnet_refuses_a_raw_live_wallet_key() {
+        let path = test_dir("rcnet-raw-wallet");
+        clean_test_dir(&path);
+        drop(
+            Node::open_with_profile_artifacts_and_worker(
+                &path,
+                DEVNET_PROFILE,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let log_path = path.join(BLOCK_LOG_FILE);
+        let log = open_block_log(&log_path).unwrap();
+        let rcnet_wallet_policy = NetworkProfile {
+            kind: NetworkProfileKind::Rcnet,
+            ..DEVNET_PROFILE
+        };
+
+        assert!(matches!(
+            load_or_create_wallet_key(
+                &path,
+                rcnet_wallet_policy,
+                MetadataState::Current,
+                &log,
+                &log_path,
+                Some(b"correct horse battery staple")
+            ),
+            Err(NodeError::WalletKeyEncryptionRequired)
+        ));
+        drop(log);
         clean_test_dir(&path);
     }
 }

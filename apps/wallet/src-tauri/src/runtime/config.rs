@@ -26,6 +26,7 @@ pub(crate) struct NodeRuntimeConfig {
     /// the console. The file log under the node's data directory is always
     /// debug level, regardless of this count.
     pub(super) verbose: u8,
+    pub(super) wallet_passphrase_file: Option<PathBuf>,
     pub(super) production_v3: ProductionV3RuntimeOptions,
 }
 
@@ -90,6 +91,7 @@ impl NodeRuntimeConfig {
         let mut allow_public_peers = false;
         let mut peers_explicit = false;
         let mut verbose: u8 = 0;
+        let mut wallet_passphrase_file = None;
         let mut production_v3 = ProductionV3RuntimeOptions::default();
         let mut arguments = arguments.into_iter().map(Into::into);
 
@@ -137,6 +139,14 @@ impl NodeRuntimeConfig {
                 "--verbose" => {
                     has_control_arg = true;
                     verbose = verbose.saturating_add(1);
+                }
+                "--wallet-passphrase-file" => {
+                    has_control_arg = true;
+                    set_path_option(
+                        &mut wallet_passphrase_file,
+                        "--wallet-passphrase-file",
+                        arguments.next(),
+                    )?;
                 }
                 "--production-v3-bank" => {
                     has_control_arg = true;
@@ -282,6 +292,7 @@ impl NodeRuntimeConfig {
             allow_public_peers,
             peers_explicit,
             verbose,
+            wallet_passphrase_file,
             production_v3,
         }
         .with_default_bootstrap();
@@ -487,7 +498,27 @@ mod tests {
         assert!(config.allow_public_peers);
         assert!(!config.peers_explicit);
         assert_eq!(config.verbose, 0);
+        assert_eq!(config.wallet_passphrase_file, None);
         assert!(!config.production_v3.is_configured());
+    }
+
+    #[test]
+    fn wallet_passphrase_file_is_explicit_and_unique() {
+        let config =
+            parsed_run_config(["--wallet-passphrase-file", "private-wallet-passphrase.txt"]);
+        assert_eq!(
+            config.wallet_passphrase_file,
+            Some(PathBuf::from("private-wallet-passphrase.txt"))
+        );
+        assert!(matches!(
+            NodeRuntimeConfig::parse([
+                "--wallet-passphrase-file",
+                "first.txt",
+                "--wallet-passphrase-file",
+                "second.txt"
+            ]),
+            Err(ConfigError::DuplicateOption("--wallet-passphrase-file"))
+        ));
     }
 
     #[test]

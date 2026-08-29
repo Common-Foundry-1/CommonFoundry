@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 #[cfg(feature = "production-v3")]
 use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
@@ -32,9 +32,10 @@ use cmfd_node::production_v4_pool::{
 use cmfd_node::rcnet_candidate::{
     RcnetLaunchCandidate, RcnetLaunchConfiguration, write_candidate_create_new,
 };
+#[cfg(test)]
+use cmfd_node::wallet_backup::MAXIMUM_PASSPHRASE_BYTES;
 use cmfd_node::wallet_backup::{
-    MAXIMUM_PASSPHRASE_BYTES, MINIMUM_PASSPHRASE_BYTES, create_encrypted_wallet_backup,
-    restore_encrypted_wallet_backup,
+    create_encrypted_wallet_backup, read_wallet_passphrase_file, restore_encrypted_wallet_backup,
 };
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, Node,
@@ -119,6 +120,9 @@ struct Cli {
     /// Absolute path to the pinned ProductionV4 fixed artifact record.
     #[arg(long, global = true)]
     production_v4_fixed_record: Option<PathBuf>,
+    /// File containing the passphrase used to unlock or create encrypted wallet.key.
+    #[arg(long, global = true)]
+    wallet_passphrase_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -324,7 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         passphrase_file,
     } = &cli.command
     {
-        let passphrase = read_wallet_passphrase(passphrase_file)?;
+        let passphrase = read_wallet_passphrase_file(passphrase_file)?;
         let info = create_encrypted_wallet_backup(
             &cli.data_dir,
             output,
@@ -349,7 +353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         passphrase_file,
     } = &cli.command
     {
-        let passphrase = read_wallet_passphrase(passphrase_file)?;
+        let passphrase = read_wallet_passphrase_file(passphrase_file)?;
         let info = restore_encrypted_wallet_backup(
             input,
             &cli.data_dir,
@@ -381,6 +385,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let verifier_worker = verifier_worker_config(&cli, production_v3_record.clone())?;
+    let wallet_passphrase = cli
+        .wallet_passphrase_file
+        .as_deref()
+        .map(read_wallet_passphrase_file)
+        .transpose()?;
     let _log_guard = cmfd_node::logging::init_tracing(&cli.data_dir, cli.verbose);
     match cli.command {
         Command::NetworkInfo => unreachable!("network-info exits before node initialization"),
@@ -401,6 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v3_record.as_ref(),
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
             )?;
             node.set_public_peer_mode(allow_public_peers);
             let status = node.status()?;
@@ -482,6 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v3_record.as_ref(),
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
             )?;
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
@@ -508,6 +519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v3_record.as_ref(),
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
             )?;
             println!("{}", serde_json::to_string_pretty(&node.status()?)?);
             Ok(())
@@ -586,6 +598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 production_v3_record.as_ref(),
                 production_v4_artifacts.as_ref(),
                 verifier_worker.as_ref(),
+                wallet_passphrase.as_ref().map(|value| value.as_slice()),
             )?;
             node_instance.set_public_peer_mode(allow_public_peers);
             let discovery_hello = node_instance.peer_hello();
@@ -1133,29 +1146,15 @@ fn open_node(
     production_v3_record: Option<&ProductionV3VerifierRecord>,
     production_v4_artifacts: Option<&ProductionV4VerifierArtifacts>,
     verifier_worker: Option<&VerifierWorkerConfig>,
+    wallet_passphrase: Option<&[u8]>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    if let Some(artifacts) = production_v4_artifacts {
-        if production_v3_record.is_some() || verifier_worker.is_some() {
-            return Err("ProductionV4 does not accept a ProductionV3 verifier worker".into());
-        }
-        return Ok(Node::open_with_v4_artifacts(data_dir, artifacts)?);
-    }
-    match (production_v3_record, verifier_worker) {
-        (Some(record), Some(worker)) => Ok(Node::open_with_record_and_verifier_worker(
-            data_dir,
-            Some(record),
-            worker.clone(),
-        )?),
-        (None, Some(worker)) => {
-            let mut node = Node::open_with_artifacts(data_dir, None)?;
-            node.use_external_proof_verifier(worker.clone())?;
-            Ok(node)
-        }
-        (None, None) => Ok(Node::open_with_artifacts(data_dir, None)?),
-        (Some(_), None) => {
-            Err("ProductionV3 requires its proof-verifier worker before block-log replay".into())
-        }
-    }
+    Ok(Node::open_with_runtime_security_and_wallet_passphrase(
+        data_dir,
+        production_v3_record,
+        production_v4_artifacts,
+        verifier_worker,
+        wallet_passphrase,
+    )?)
 }
 
 fn peer_address_policy(allow_public_peers: bool) -> PeerAddressPolicy {
@@ -1180,32 +1179,6 @@ fn require_bounded_reference_mining(command: &str) -> Result<(), Box<dyn std::er
         )
         .into())
     }
-}
-
-fn read_wallet_passphrase(
-    path: &Path,
-) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if file.metadata()?.permissions().mode() & 0o077 != 0 {
-            return Err("wallet passphrase file permissions must be 0600 or stricter".into());
-        }
-    }
-    let mut passphrase = zeroize::Zeroizing::new(Vec::with_capacity(MAXIMUM_PASSPHRASE_BYTES + 3));
-    file.take((MAXIMUM_PASSPHRASE_BYTES + 3) as u64)
-        .read_to_end(&mut passphrase)?;
-    if passphrase.last() == Some(&b'\n') {
-        passphrase.pop();
-        if passphrase.last() == Some(&b'\r') {
-            passphrase.pop();
-        }
-    }
-    if !(MINIMUM_PASSPHRASE_BYTES..=MAXIMUM_PASSPHRASE_BYTES).contains(&passphrase.len()) {
-        return Err("wallet passphrase file must contain between 12 and 1024 bytes".into());
-    }
-    Ok(passphrase)
 }
 
 fn require_pool_mining_profile() -> Result<(), Box<dyn std::error::Error>> {
@@ -1246,6 +1219,7 @@ mod tests {
         assert_eq!(cli.proof_verifier_cpu_quota_us, None);
         assert_eq!(cli.proof_verifier_cpu_period_us, None);
         assert_eq!(cli.proof_verifier_pids_limit, None);
+        assert_eq!(cli.wallet_passphrase_file, None);
         let Command::Run { bind, p2p_bind, .. } = cli.command else {
             unreachable!()
         };
@@ -1322,6 +1296,22 @@ mod tests {
     }
 
     #[test]
+    fn live_wallet_passphrase_file_is_a_global_option() {
+        let cli = Cli::try_parse_from([
+            "cmfd-node",
+            "--wallet-passphrase-file",
+            "private-wallet-passphrase.txt",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.wallet_passphrase_file,
+            Some(PathBuf::from("private-wallet-passphrase.txt"))
+        );
+        assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
     fn passphrase_file_is_bounded_and_trims_one_line_ending() {
         let path = std::env::temp_dir().join(format!(
             "cmfd-wallet-passphrase-{}-{}.txt",
@@ -1338,13 +1328,13 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert_eq!(
-            read_wallet_passphrase(&path).unwrap().as_slice(),
+            read_wallet_passphrase_file(&path).unwrap().as_slice(),
             b"correct horse battery staple"
         );
         std::fs::write(&path, b"too short\n").unwrap();
-        assert!(read_wallet_passphrase(&path).is_err());
+        assert!(read_wallet_passphrase_file(&path).is_err());
         std::fs::write(&path, vec![b'x'; MAXIMUM_PASSPHRASE_BYTES + 3]).unwrap();
-        assert!(read_wallet_passphrase(&path).is_err());
+        assert!(read_wallet_passphrase_file(&path).is_err());
         let _ = std::fs::remove_file(path);
     }
 

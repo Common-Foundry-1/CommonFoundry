@@ -30,7 +30,7 @@ const SECRET_BYTES: usize = 32;
 const TAG_BYTES: usize = 16;
 const HEADER_BYTES: usize =
     8 + 2 + 1 + 1 + 4 + 4 + 4 + SALT_BYTES + NONCE_BYTES + NETWORK_BYTES + DESTINATION_BYTES;
-const BACKUP_BYTES: usize = HEADER_BYTES + SECRET_BYTES + TAG_BYTES;
+pub(crate) const ENCRYPTED_WALLET_KEY_BYTES: usize = HEADER_BYTES + SECRET_BYTES + TAG_BYTES;
 pub const MINIMUM_PASSPHRASE_BYTES: usize = 12;
 pub const MAXIMUM_PASSPHRASE_BYTES: usize = 1_024;
 
@@ -56,6 +56,8 @@ pub enum WalletBackupError {
     InvalidWalletKey,
     #[error("wallet backup passphrase must contain between 12 and 1024 bytes")]
     InvalidPassphrase,
+    #[error("wallet passphrase file permissions must be 0600 or stricter")]
+    InsecurePassphraseFilePermissions,
     #[error("wallet backup is corrupt or unsupported")]
     InvalidBackup,
     #[error("wallet backup belongs to a different network")]
@@ -82,6 +84,39 @@ fn validate_passphrase(passphrase: &[u8]) -> Result<(), WalletBackupError> {
     }
 }
 
+pub fn read_wallet_passphrase_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, WalletBackupError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|source| io_error("open wallet passphrase", path, source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file
+            .metadata()
+            .map_err(|source| io_error("inspect wallet passphrase", path, source))?
+            .permissions()
+            .mode()
+            & 0o077
+            != 0
+        {
+            return Err(WalletBackupError::InsecurePassphraseFilePermissions);
+        }
+    }
+    let mut passphrase = Zeroizing::new(Vec::with_capacity(MAXIMUM_PASSPHRASE_BYTES + 3));
+    file.take((MAXIMUM_PASSPHRASE_BYTES + 3) as u64)
+        .read_to_end(&mut passphrase)
+        .map_err(|source| io_error("read wallet passphrase", path, source))?;
+    if passphrase.last() == Some(&b'\n') {
+        passphrase.pop();
+        if passphrase.last() == Some(&b'\r') {
+            passphrase.pop();
+        }
+    }
+    validate_passphrase(&passphrase)?;
+    Ok(passphrase)
+}
+
 fn derive_key(
     passphrase: &[u8],
     salt: &[u8; SALT_BYTES],
@@ -104,6 +139,8 @@ fn derive_key(
 
 fn read_wallet_secret(
     data_dir: &Path,
+    network_id: [u8; 32],
+    passphrase: &[u8],
 ) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), WalletBackupError> {
     let path = data_dir.join(WALLET_KEY_FILE);
     let mut file = OpenOptions::new()
@@ -116,13 +153,19 @@ fn read_wallet_secret(
                 io_error("open wallet key", &path, source)
             }
         })?;
-    if file
+    let length = file
         .metadata()
         .map_err(|source| io_error("inspect wallet key", &path, source))?
-        .len()
-        != SECRET_BYTES as u64
-    {
+        .len();
+    if length != SECRET_BYTES as u64 && length != ENCRYPTED_WALLET_KEY_BYTES as u64 {
         return Err(WalletBackupError::InvalidWalletKey);
+    }
+    if length == ENCRYPTED_WALLET_KEY_BYTES as u64 {
+        let mut encrypted = vec![0_u8; ENCRYPTED_WALLET_KEY_BYTES];
+        file.read_exact(&mut encrypted)
+            .map_err(|_| WalletBackupError::InvalidWalletKey)?;
+        let (secret, info) = decrypt_wallet_key_bytes(&encrypted, network_id, passphrase)?;
+        return Ok((secret, info.destination));
     }
     let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
     file.read_exact(secret.as_mut())
@@ -133,7 +176,7 @@ fn read_wallet_secret(
     Ok((secret, destination))
 }
 
-fn write_private_create_new(path: &Path, bytes: &[u8]) -> Result<(), WalletBackupError> {
+pub(crate) fn write_private_create_new(path: &Path, bytes: &[u8]) -> Result<(), WalletBackupError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -193,28 +236,27 @@ fn header(
     bytes
 }
 
-pub fn create_encrypted_wallet_backup(
-    data_dir: &Path,
-    output: &Path,
+pub(crate) fn encrypt_wallet_key_bytes(
+    secret: &[u8; SECRET_BYTES],
     network_id: [u8; 32],
     passphrase: &[u8],
-) -> Result<WalletBackupInfo, WalletBackupError> {
+) -> Result<(Vec<u8>, WalletBackupInfo), WalletBackupError> {
     validate_passphrase(passphrase)?;
-    let _data_dir_lock = DataDirLock::acquire(data_dir)?;
-    let (secret, destination) = read_wallet_secret(data_dir)?;
+    let key = SigningKey::from_bytes(secret).map_err(|_| WalletBackupError::InvalidWalletKey)?;
+    let destination = key.verifying_key().to_bytes().into();
     let mut salt = [0_u8; SALT_BYTES];
     let mut nonce = [0_u8; NONCE_BYTES];
     getrandom::fill(&mut salt).map_err(|source| {
         io_error(
-            "generate wallet backup salt",
-            output,
+            "generate encrypted wallet salt",
+            WALLET_KEY_FILE.as_ref(),
             io::Error::other(source.to_string()),
         )
     })?;
     getrandom::fill(&mut nonce).map_err(|source| {
         io_error(
-            "generate wallet backup nonce",
-            output,
+            "generate encrypted wallet nonce",
+            WALLET_KEY_FILE.as_ref(),
             io::Error::other(source.to_string()),
         )
     })?;
@@ -226,7 +268,7 @@ pub fn create_encrypted_wallet_backup(
         .encrypt(
             &nonce,
             Payload {
-                msg: secret.as_ref(),
+                msg: secret,
                 aad: &header,
             },
         )
@@ -234,15 +276,97 @@ pub fn create_encrypted_wallet_backup(
     if ciphertext.len() != SECRET_BYTES + TAG_BYTES {
         return Err(WalletBackupError::InvalidBackup);
     }
-    let mut backup = header;
-    backup.extend_from_slice(&ciphertext);
-    debug_assert_eq!(backup.len(), BACKUP_BYTES);
+    let mut encrypted = header;
+    encrypted.extend_from_slice(&ciphertext);
+    debug_assert_eq!(encrypted.len(), ENCRYPTED_WALLET_KEY_BYTES);
+    Ok((
+        encrypted,
+        WalletBackupInfo {
+            network_id,
+            destination,
+            bytes: ENCRYPTED_WALLET_KEY_BYTES,
+        },
+    ))
+}
+
+pub(crate) fn decrypt_wallet_key_bytes(
+    encrypted: &[u8],
+    expected_network_id: [u8; 32],
+    passphrase: &[u8],
+) -> Result<(Zeroizing<[u8; SECRET_BYTES]>, WalletBackupInfo), WalletBackupError> {
+    validate_passphrase(passphrase)?;
+    if encrypted.len() != ENCRYPTED_WALLET_KEY_BYTES
+        || encrypted[..8] != BACKUP_MAGIC
+        || encrypted[8..10] != BACKUP_VERSION.to_le_bytes()
+        || encrypted[10] != KDF_ARGON2ID
+        || encrypted[11] != CIPHER_XCHACHA20_POLY1305
+        || encrypted[12..16] != ARGON2_MEMORY_KIB.to_le_bytes()
+        || encrypted[16..20] != ARGON2_ITERATIONS.to_le_bytes()
+        || encrypted[20..24] != ARGON2_PARALLELISM.to_le_bytes()
+    {
+        return Err(WalletBackupError::InvalidBackup);
+    }
+    let salt: [u8; SALT_BYTES] = encrypted[24..40]
+        .try_into()
+        .map_err(|_| WalletBackupError::InvalidBackup)?;
+    let nonce: [u8; NONCE_BYTES] = encrypted[40..64]
+        .try_into()
+        .map_err(|_| WalletBackupError::InvalidBackup)?;
+    let network_id: [u8; NETWORK_BYTES] = encrypted[64..96]
+        .try_into()
+        .map_err(|_| WalletBackupError::InvalidBackup)?;
+    if network_id != expected_network_id {
+        return Err(WalletBackupError::WrongNetwork);
+    }
+    let destination: [u8; DESTINATION_BYTES] = encrypted[96..128]
+        .try_into()
+        .map_err(|_| WalletBackupError::InvalidBackup)?;
+    let decryption_key = derive_key(passphrase, &salt)?;
+    let cipher = XChaCha20Poly1305::new((&*decryption_key).into());
+    let nonce = XNonce::from(nonce);
+    let plaintext = cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &encrypted[HEADER_BYTES..],
+                aad: &encrypted[..HEADER_BYTES],
+            },
+        )
+        .map_err(|_| WalletBackupError::AuthenticationFailed)?;
+    if plaintext.len() != SECRET_BYTES {
+        return Err(WalletBackupError::InvalidBackup);
+    }
+    let plaintext = Zeroizing::new(plaintext);
+    let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
+    secret.copy_from_slice(plaintext.as_slice());
+    let key =
+        SigningKey::from_bytes(secret.as_ref()).map_err(|_| WalletBackupError::InvalidBackup)?;
+    let restored_destination: [u8; 32] = key.verifying_key().to_bytes().into();
+    if restored_destination != destination {
+        return Err(WalletBackupError::DestinationMismatch);
+    }
+    Ok((
+        secret,
+        WalletBackupInfo {
+            network_id,
+            destination,
+            bytes: encrypted.len(),
+        },
+    ))
+}
+
+pub fn create_encrypted_wallet_backup(
+    data_dir: &Path,
+    output: &Path,
+    network_id: [u8; 32],
+    passphrase: &[u8],
+) -> Result<WalletBackupInfo, WalletBackupError> {
+    validate_passphrase(passphrase)?;
+    let _data_dir_lock = DataDirLock::acquire(data_dir)?;
+    let (secret, _) = read_wallet_secret(data_dir, network_id, passphrase)?;
+    let (backup, info) = encrypt_wallet_key_bytes(&secret, network_id, passphrase)?;
     write_private_create_new(output, &backup)?;
-    Ok(WalletBackupInfo {
-        network_id,
-        destination,
-        bytes: backup.len(),
-    })
+    Ok(info)
 }
 
 pub fn restore_encrypted_wallet_backup(
@@ -255,65 +379,14 @@ pub fn restore_encrypted_wallet_backup(
     let input_len = fs::metadata(input)
         .map_err(|source| io_error("inspect wallet backup", input, source))?
         .len();
-    if input_len != BACKUP_BYTES as u64 {
+    if input_len != ENCRYPTED_WALLET_KEY_BYTES as u64 {
         return Err(WalletBackupError::InvalidBackup);
     }
     let backup = fs::read(input).map_err(|source| io_error("read wallet backup", input, source))?;
-    if backup.len() != BACKUP_BYTES
-        || backup[..8] != BACKUP_MAGIC
-        || backup[8..10] != BACKUP_VERSION.to_le_bytes()
-        || backup[10] != KDF_ARGON2ID
-        || backup[11] != CIPHER_XCHACHA20_POLY1305
-        || backup[12..16] != ARGON2_MEMORY_KIB.to_le_bytes()
-        || backup[16..20] != ARGON2_ITERATIONS.to_le_bytes()
-        || backup[20..24] != ARGON2_PARALLELISM.to_le_bytes()
-    {
-        return Err(WalletBackupError::InvalidBackup);
-    }
-    let salt: [u8; SALT_BYTES] = backup[24..40]
-        .try_into()
-        .map_err(|_| WalletBackupError::InvalidBackup)?;
-    let nonce: [u8; NONCE_BYTES] = backup[40..64]
-        .try_into()
-        .map_err(|_| WalletBackupError::InvalidBackup)?;
-    let network_id: [u8; NETWORK_BYTES] = backup[64..96]
-        .try_into()
-        .map_err(|_| WalletBackupError::InvalidBackup)?;
-    if network_id != expected_network_id {
-        return Err(WalletBackupError::WrongNetwork);
-    }
-    let destination: [u8; DESTINATION_BYTES] = backup[96..128]
-        .try_into()
-        .map_err(|_| WalletBackupError::InvalidBackup)?;
-    let decryption_key = derive_key(passphrase, &salt)?;
-    let cipher = XChaCha20Poly1305::new((&*decryption_key).into());
-    let nonce = XNonce::from(nonce);
-    let secret = cipher
-        .decrypt(
-            &nonce,
-            Payload {
-                msg: &backup[HEADER_BYTES..],
-                aad: &backup[..HEADER_BYTES],
-            },
-        )
-        .map_err(|_| WalletBackupError::AuthenticationFailed)?;
-    if secret.len() != SECRET_BYTES {
-        return Err(WalletBackupError::InvalidBackup);
-    }
-    let secret = Zeroizing::new(secret);
-    let key =
-        SigningKey::from_bytes(secret.as_slice()).map_err(|_| WalletBackupError::InvalidBackup)?;
-    let restored_destination: [u8; 32] = key.verifying_key().to_bytes().into();
-    if restored_destination != destination {
-        return Err(WalletBackupError::DestinationMismatch);
-    }
+    let (_, info) = decrypt_wallet_key_bytes(&backup, expected_network_id, passphrase)?;
     let _data_dir_lock = DataDirLock::acquire(data_dir)?;
-    write_private_create_new(&data_dir.join(WALLET_KEY_FILE), secret.as_slice())?;
-    Ok(WalletBackupInfo {
-        network_id,
-        destination,
-        bytes: backup.len(),
-    })
+    write_private_create_new(&data_dir.join(WALLET_KEY_FILE), &backup)?;
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -366,17 +439,48 @@ mod tests {
         assert_eq!(recovered, created);
         let backup_bytes = fs::read(&backup).unwrap();
         let source_key = fs::read(source.join(WALLET_KEY_FILE)).unwrap();
-        assert_eq!(backup_bytes.len(), BACKUP_BYTES);
+        assert_eq!(backup_bytes.len(), ENCRYPTED_WALLET_KEY_BYTES);
         assert!(
             !backup_bytes
                 .windows(SECRET_BYTES)
                 .any(|window| window == source_key.as_slice())
         );
-        assert_eq!(
-            fs::read(restored.join(WALLET_KEY_FILE)).unwrap(),
-            source_key
-        );
+        let restored_bytes = fs::read(restored.join(WALLET_KEY_FILE)).unwrap();
+        assert_eq!(restored_bytes.len(), ENCRYPTED_WALLET_KEY_BYTES);
+        let (restored_secret, restored_info) =
+            decrypt_wallet_key_bytes(&restored_bytes, network_id, b"correct horse battery staple")
+                .unwrap();
+        assert_eq!(restored_secret.as_slice(), source_key.as_slice());
+        assert_eq!(restored_info.destination, destination);
         let _ = fs::remove_file(backup);
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(restored);
+    }
+
+    #[test]
+    fn encrypted_live_wallet_can_be_backed_up_again() {
+        let source = test_dir("encrypted-live-source");
+        let restored = test_dir("encrypted-live-restored");
+        let first_backup = source.with_extension("first.cmfd-wallet-backup");
+        let second_backup = source.with_extension("second.cmfd-wallet-backup");
+        let destination = write_test_key(&source, 0x39);
+        let network_id = [0x59; 32];
+        let passphrase = b"correct horse battery staple";
+
+        create_encrypted_wallet_backup(&source, &first_backup, network_id, passphrase).unwrap();
+        restore_encrypted_wallet_backup(&first_backup, &restored, network_id, passphrase).unwrap();
+        let second =
+            create_encrypted_wallet_backup(&restored, &second_backup, network_id, passphrase)
+                .unwrap();
+        let second_bytes = fs::read(&second_backup).unwrap();
+        let (_, second_info) =
+            decrypt_wallet_key_bytes(&second_bytes, network_id, passphrase).unwrap();
+
+        assert_eq!(second.destination, destination);
+        assert_eq!(second_info.destination, destination);
+        assert_ne!(fs::read(&first_backup).unwrap(), second_bytes);
+        let _ = fs::remove_file(first_backup);
+        let _ = fs::remove_file(second_backup);
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(restored);
     }

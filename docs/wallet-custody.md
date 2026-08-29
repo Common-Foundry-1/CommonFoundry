@@ -28,9 +28,24 @@ destination before relying on the backup.
 The v1 reader is deliberately strict: it accepts one exact file length and one
 set of Argon2id parameters, rejects another network before writing, authenticates
 all metadata and ciphertext, validates the recovered Schnorr key, and creates
-the restored key with no-overwrite semantics.
+the restored key with no-overwrite semantics. Restore keeps `wallet.key`
+encrypted; it never writes the recovered 32-byte secret to disk.
 
-This first custody increment protects exported backups. The active
-`wallet.key` remains the local signing key used by the embedded node. Encrypted
-at-rest live storage, GUI unlock/relock, recovery UX, and external custody review
+Start the node or desktop wallet with the same private passphrase file:
+
+```text
+cmfd-node --data-dir <wallet-data> \
+  --wallet-passphrase-file <private-passphrase-file> run
+
+common-foundry-wallet \
+  --wallet-passphrase-file <private-passphrase-file>
+```
+
+Supplying that option for a new data directory creates an encrypted live
+`wallet.key`. Existing Devnet plaintext keys remain readable for compatibility;
+they are not silently rewritten. RCNet refuses plaintext live keys and requires
+the passphrase option when creating or opening its wallet. The decrypted key
+exists only in process memory while the wallet is running.
+
+A guided GUI migration/unlock/relock experience and external custody review
 remain required before a mainnet wallet release.

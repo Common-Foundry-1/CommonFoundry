@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use cmfd_node::p2p::{InboundPeerHandle, spawn_inbound_listener_with_policy};
 use cmfd_node::peer::PeerLimits;
+use cmfd_node::wallet_backup::read_wallet_passphrase_file;
 use cmfd_node::{
     COMPILED_NETWORK_PROFILE, NetworkProfile, Node, NodeClientError, NodeError,
     ProductionV3VerifierRecord, ProductionV4VerifierArtifacts, ProofProfile,
@@ -174,6 +175,18 @@ fn start_embedded_node<R: Runtime>(
     app: &App<R>,
     config: NodeRuntimeConfig,
 ) -> Result<EmbeddedNode, NodeClientError> {
+    let wallet_passphrase = config
+        .wallet_passphrase_file
+        .as_deref()
+        .map(read_wallet_passphrase_file)
+        .transpose()
+        .map_err(|error| {
+            startup_error(
+                "wallet_passphrase_file",
+                format!("The wallet passphrase file could not be used: {error}"),
+                false,
+            )
+        })?;
     let security = prepare_node_security(COMPILED_NETWORK_PROFILE, &config)?;
     let app_data_root = app.path().app_local_data_dir().map_err(|_| {
         startup_error(
@@ -189,18 +202,13 @@ fn start_embedded_node<R: Runtime>(
         production_v4_artifacts,
         verifier_worker,
     } = security;
-    let node = match (
+    let node = Node::open_with_runtime_security_and_wallet_passphrase(
+        &data_dir,
         production_v3_record.as_ref(),
         production_v4_artifacts.as_ref(),
-        verifier_worker,
-    ) {
-        (Some(record), None, Some(worker)) => {
-            Node::open_with_record_and_verifier_worker(&data_dir, Some(record), worker)
-        }
-        (None, Some(artifacts), None) => Node::open_with_v4_artifacts(&data_dir, artifacts),
-        (None, None, None) => Node::open_with_record(&data_dir, None),
-        _ => Err(NodeError::ProofVerifierProfileMismatch),
-    }
+        verifier_worker.as_ref(),
+        wallet_passphrase.as_ref().map(|value| value.as_slice()),
+    )
     .map_err(|error| sanitize_node_startup_error(COMPILED_NETWORK_PROFILE, error))?;
     #[cfg(feature = "production-v4")]
     let production_v4_pool_search =
@@ -621,7 +629,7 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
         concat!(
             "Common Foundry Wallet\n",
             "Compiled network: {} ({})\n",
-            "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [-v...]\n",
+            "Usage: common-foundry-wallet [--help|--version] [--p2p-bind <addr>] [--peer <addr> ...] [--allow-public-peers] [--wallet-passphrase-file <path>] [-v...]\n",
             "Arguments:\n",
             "  --help (-h)             Show this help\n",
             "  --version (-V)          Print version\n",
@@ -630,6 +638,7 @@ fn command_help_text_for_profile(profile: NetworkProfile) -> String {
             "  --peer <addr>           Public or private outbound peer (repeatable)\n",
             "  --allow-public-peers     Allow public peers for explicit --peer entries\n",
             "                          (the default bootstrap peer is always added if no --peer is configured)\n",
+            "  --wallet-passphrase-file <path> Unlock or create encrypted wallet.key\n",
         ),
         profile.name,
         profile.proof.profile_name(),
@@ -719,6 +728,7 @@ mod tests {
             allow_public_peers: true,
             peers_explicit: false,
             verbose: 0,
+            wallet_passphrase_file: None,
             production_v3: config::ProductionV3RuntimeOptions::default(),
         }
     }

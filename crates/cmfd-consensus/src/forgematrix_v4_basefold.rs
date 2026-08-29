@@ -308,8 +308,8 @@ fn opening_terminal_evaluation(
 
 #[cfg(test)]
 mod tests {
-    use slop_algebra::PrimeField32;
-    use slop_challenger::IopCtx;
+    use slop_algebra::{AbstractExtensionField, PrimeField32};
+    use slop_challenger::{CanSampleBits, IopCtx};
 
     use super::*;
     use crate::{FORGEMATRIX_V4_EXTENSION_DEGREE, FORGEMATRIX_V4_FIELD_MODULUS};
@@ -323,6 +323,38 @@ mod tests {
         );
         let _challenger = ForgeMatrixV4IopContext::default_challenger();
         let _verifier = forgematrix_v4_basefold_verifier();
+    }
+
+    #[test]
+    fn independent_challenger_vector_is_pinned() {
+        let mut challenger = ForgeMatrixV4IopContext::default_challenger();
+        let bytes = (0_u8..32).collect::<Vec<_>>();
+        observe_bytes(&mut challenger, &bytes);
+        let first: ForgeMatrixV4Extension = challenger.sample_ext_element();
+        challenger.observe_ext_element(first);
+        let second: ForgeMatrixV4Extension = challenger.sample_ext_element();
+        let bits = challenger.sample_bits(17);
+        let third: ForgeMatrixV4Extension = challenger.sample_ext_element();
+        let canonical = |value: ForgeMatrixV4Extension| {
+            value
+                .as_base_slice()
+                .iter()
+                .map(|value: &ForgeMatrixV4Field| value.as_canonical_u32())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            canonical(first),
+            [2072054569, 1667143315, 1060284628, 1940132924]
+        );
+        assert_eq!(
+            canonical(second),
+            [29929288, 1332930300, 2040675319, 1961178542]
+        );
+        assert_eq!(bits, 17104);
+        assert_eq!(
+            canonical(third),
+            [7203716, 404656108, 344185242, 1401671596]
+        );
     }
 
     fn statement() -> ForgeMatrixV4TranscriptStatement {

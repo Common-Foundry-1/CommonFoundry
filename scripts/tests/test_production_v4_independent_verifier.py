@@ -9,13 +9,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 SCRIPTS = Path(__file__).resolve().parents[1]
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import production_v4_independent_verifier as verifier  # noqa: E402
-from production_v4_wire import write_structural_fixture  # noqa: E402
+import production_v4_independent_verifier as verifier
+from production_v4_wire import write_structural_fixture
 
 
 class CoreBindingVectorTests(unittest.TestCase):
@@ -67,7 +66,9 @@ class IndependentStatementTests(unittest.TestCase):
         self.proof = self.root / "proof.bin"
         write_structural_fixture(self.proof)
         self.block = {
-            "network_id": bytes.fromhex("b9e55d5a5e80c8e3d73bf81b199bc643ac9367436962c28b6aacdc37f3809962"),
+            "network_id": bytes.fromhex(
+                "b9e55d5a5e80c8e3d73bf81b199bc643ac9367436962c28b6aacdc37f3809962"
+            ),
             "previous_block": bytes(32),
             "transaction_root": bytes([1]) * 32,
             "height": 1,
@@ -88,7 +89,9 @@ class IndependentStatementTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
-    def _parse(self, statement: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+    def _parse(
+        self, statement: dict[str, object]
+    ) -> tuple[dict[str, object], dict[str, object]]:
         path = self.root / "statement.json"
         path.write_text(json.dumps(statement), encoding="utf-8")
         return verifier.parse_statement(path)
@@ -109,18 +112,28 @@ class IndependentStatementTests(unittest.TestCase):
             target.seek(verifier.OUTER_HEADER_BYTES)
             target.write(struct.pack("<I", 1))
         block, candidate = self._parse(self.statement)
-        with self.assertRaisesRegex(verifier.VerificationError, "final-activation digest"):
-            verifier.verify(mutated_proof, block, candidate, require_candidate_claims=True)
+        with self.assertRaisesRegex(
+            verifier.VerificationError, "final-activation digest"
+        ):
+            verifier.verify(
+                mutated_proof, block, candidate, require_candidate_claims=True
+            )
 
     def test_mutated_candidate_claims_are_rejected(self) -> None:
         for field in ("challenge_digest", "final_activation_digest", "work_digest"):
             with self.subTest(field=field):
                 mutated = copy.deepcopy(self.statement)
                 original = mutated["candidate"][field]
-                mutated["candidate"][field] = ("00" if original[:2] != "00" else "01") + original[2:]
+                mutated["candidate"][field] = (
+                    "00" if original[:2] != "00" else "01"
+                ) + original[2:]
                 block, candidate = self._parse(mutated)
-                with self.assertRaisesRegex(verifier.VerificationError, field.replace("_", "[- ]")):
-                    verifier.verify(self.proof, block, candidate, require_candidate_claims=True)
+                with self.assertRaisesRegex(
+                    verifier.VerificationError, field.replace("_", "[- ]")
+                ):
+                    verifier.verify(
+                        self.proof, block, candidate, require_candidate_claims=True
+                    )
 
     def test_wrong_pinned_identity_is_rejected(self) -> None:
         mutated = copy.deepcopy(self.statement)
@@ -133,7 +146,9 @@ class IndependentStatementTests(unittest.TestCase):
         block = dict(self.block)
         block["target"] = bytes(32)
         with self.assertRaisesRegex(verifier.VerificationError, "work target"):
-            verifier.verify(self.proof, block, self.candidate, require_candidate_claims=False)
+            verifier.verify(
+                self.proof, block, self.candidate, require_candidate_claims=False
+            )
 
     def test_statement_rejects_extra_keys(self) -> None:
         mutated = copy.deepcopy(self.statement)

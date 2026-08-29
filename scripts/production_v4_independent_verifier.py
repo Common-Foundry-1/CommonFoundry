@@ -11,19 +11,20 @@ from __future__ import annotations
 import json
 import mmap
 import struct
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import blake3
-
+from production_v4_transcript import (
+    parse_fixed_commitments,
+    verify_transcript_and_algebra,
+)
 from production_v4_wire import (
-    ConformanceError,
     FINAL_ACTIVATION_BYTES,
     FINAL_ACTIVATION_FIELDS,
     OUTER_HEADER_BYTES,
     inspect_proof,
 )
-
 
 ALGORITHM_VERSION = 4
 PROOF_VERSION = 1
@@ -79,12 +80,16 @@ def _derive(context: str, parts: Iterable[bytes | bytearray | memoryview]) -> by
     return hasher.digest()
 
 
-def _require_exact_keys(value: dict[str, object], expected: set[str], label: str) -> None:
+def _require_exact_keys(
+    value: dict[str, object], expected: set[str], label: str
+) -> None:
     actual = set(value)
     if actual != expected:
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
-        raise VerificationError(f"{label}: key mismatch; missing={missing}, extra={extra}")
+        raise VerificationError(
+            f"{label}: key mismatch; missing={missing}, extra={extra}"
+        )
 
 
 def _require_uint(value: object, bits: int, label: str) -> int:
@@ -140,7 +145,9 @@ def parse_template(path: Path) -> tuple[dict[str, object], dict[str, object]]:
         raise VerificationError(f"template.challenge: missing keys {sorted(missing)}")
     block = {
         "network_id": _byte_array32(challenge["network_id"], "challenge.network_id"),
-        "previous_block": _byte_array32(challenge["previous_block"], "challenge.previous_block"),
+        "previous_block": _byte_array32(
+            challenge["previous_block"], "challenge.previous_block"
+        ),
         "transaction_root": _byte_array32(
             challenge["transaction_root"], "challenge.transaction_root"
         ),
@@ -174,7 +181,9 @@ def parse_statement(path: Path) -> tuple[dict[str, object], dict[str, object]]:
     block = {
         "network_id": _hex32(block_value["network_id"], "block.network_id"),
         "previous_block": _hex32(block_value["previous_block"], "block.previous_block"),
-        "transaction_root": _hex32(block_value["transaction_root"], "block.transaction_root"),
+        "transaction_root": _hex32(
+            block_value["transaction_root"], "block.transaction_root"
+        ),
         "height": _require_uint(block_value["height"], 64, "block.height"),
         "timestamp": _require_uint(block_value["timestamp"], 64, "block.timestamp"),
         "target": _hex32(block_value["target"], "block.target"),
@@ -197,7 +206,8 @@ def parse_statement(path: Path) -> tuple[dict[str, object], dict[str, object]]:
             candidate_value["challenge_digest"], "candidate.challenge_digest"
         ),
         "final_activation_digest": _hex32(
-            candidate_value["final_activation_digest"], "candidate.final_activation_digest"
+            candidate_value["final_activation_digest"],
+            "candidate.final_activation_digest",
         ),
         "work_digest": _hex32(candidate_value["work_digest"], "candidate.work_digest"),
     }
@@ -236,9 +246,10 @@ def final_activation_digest_from_bytes(challenge: bytes, activation: bytes) -> b
 
 
 def final_activation_digest_from_proof(challenge: bytes, proof_path: Path) -> bytes:
-    with proof_path.open("rb") as source, mmap.mmap(
-        source.fileno(), 0, access=mmap.ACCESS_READ
-    ) as proof:
+    with (
+        proof_path.open("rb") as source,
+        mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as proof,
+    ):
         activation = memoryview(proof)[
             OUTER_HEADER_BYTES : OUTER_HEADER_BYTES + FINAL_ACTIVATION_BYTES
         ]
@@ -251,7 +262,9 @@ def final_activation_digest_from_proof(challenge: bytes, proof_path: Path) -> by
             activation.release()
 
 
-def work_digest(candidate: dict[str, object], challenge: bytes, activation: bytes) -> bytes:
+def work_digest(
+    candidate: dict[str, object], challenge: bytes, activation: bytes
+) -> bytes:
     return _derive(
         WORK_CONTEXT,
         (
@@ -333,22 +346,35 @@ def verify(
     block: dict[str, object],
     candidate: dict[str, object],
     require_candidate_claims: bool,
+    fixed_artifact_record: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Verify the implemented independent stages and return result plus statement."""
 
     wire = inspect_proof(proof_path)
-    _require_equal("algorithm version", candidate["algorithm_version"], ALGORITHM_VERSION)
+    _require_equal(
+        "algorithm version", candidate["algorithm_version"], ALGORITHM_VERSION
+    )
     _require_equal("proof version", candidate["proof_version"], PROOF_VERSION)
-    _require_equal("proof-system digest", candidate["proof_system_digest"], PROOF_SYSTEM_DIGEST)
-    _require_equal("model-manifest digest", candidate["model_manifest_digest"], MODEL_MANIFEST_DIGEST)
+    _require_equal(
+        "proof-system digest", candidate["proof_system_digest"], PROOF_SYSTEM_DIGEST
+    )
+    _require_equal(
+        "model-manifest digest",
+        candidate["model_manifest_digest"],
+        MODEL_MANIFEST_DIGEST,
+    )
 
     challenge = challenge_digest(block, candidate)
     activation = final_activation_digest_from_proof(challenge, proof_path)
     work = work_digest(candidate, challenge, activation)
-    statement_digest = transcript_statement_digest(block, candidate, challenge, activation, work)
+    statement_digest = transcript_statement_digest(
+        block, candidate, challenge, activation, work
+    )
     if require_candidate_claims:
         _require_equal("challenge digest", candidate["challenge_digest"], challenge)
-        _require_equal("final-activation digest", candidate["final_activation_digest"], activation)
+        _require_equal(
+            "final-activation digest", candidate["final_activation_digest"], activation
+        )
         _require_equal("work digest", candidate["work_digest"], work)
     if work > block["target"]:
         raise VerificationError(
@@ -361,29 +387,59 @@ def verify(
         "work_digest": work,
         "transcript_statement_digest": statement_digest,
     }
+    algebra = None
+    if fixed_artifact_record is not None:
+        fixed_commitments = parse_fixed_commitments(
+            fixed_artifact_record,
+            candidate["proof_system_digest"],
+            candidate["model_manifest_digest"],
+        )
+        algebra = verify_transcript_and_algebra(
+            proof_path,
+            statement_digest,
+            challenge,
+            fixed_commitments,
+        )
+    verified_stages = [
+        "exact transparent-proof framing",
+        "canonical KoalaBear field encodings",
+        "pinned algorithm and artifact identities",
+        "challenge BLAKE3 binding",
+        "final-activation BLAKE3 binding",
+        "work BLAKE3 binding and target comparison",
+        "transcript-statement BLAKE3 binding",
+    ]
+    remaining_stages = [
+        "KoalaBear extension-field and Poseidon transcript replay",
+        "relation equations and claim routing",
+        "Merkle authentication paths",
+        "BaseFold folding and terminal low-degree checks",
+    ]
+    if algebra is not None:
+        verified_stages.extend(
+            [
+                "KoalaBear extension-field and Poseidon transcript replay",
+                "six matrix, shift, and cubic relation repetitions",
+                "opening-claim routing and three opening-reduction sumchecks",
+                "BaseFold batching, FRI-message, grinding, and query transcripts",
+            ]
+        )
+        remaining_stages = [
+            "public initial-activation boundary evaluations",
+            "BaseFold component and FRI Merkle authentication paths",
+            "BaseFold query-fold equations and final low-degree checks",
+        ]
     result = {
         "schema": "CommonFoundry/ForgeMatrix/V4/IndependentVerificationResult/v1",
         "implemented_stages_accepted": True,
         "full_cryptographic_proof_verified": False,
         "candidate_claims_verified": require_candidate_claims,
         "proof": wire,
+        "algebra": algebra,
         "derived": {name: value.hex() for name, value in derived.items()},
         "target": block["target"].hex(),
         "target_met": True,
-        "verified_stages": [
-            "exact transparent-proof framing",
-            "canonical KoalaBear field encodings",
-            "pinned algorithm and artifact identities",
-            "challenge BLAKE3 binding",
-            "final-activation BLAKE3 binding",
-            "work BLAKE3 binding and target comparison",
-            "transcript-statement BLAKE3 binding",
-        ],
-        "remaining_stages": [
-            "KoalaBear extension-field and Poseidon transcript replay",
-            "relation equations and claim routing",
-            "Merkle authentication paths",
-            "BaseFold folding and terminal low-degree checks",
-        ],
+        "verified_stages": verified_stages,
+        "remaining_stages": remaining_stages,
     }
     return result, _json_statement(block, candidate, derived)

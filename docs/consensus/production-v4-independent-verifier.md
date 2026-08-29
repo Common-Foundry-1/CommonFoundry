@@ -19,11 +19,22 @@ The current slice independently verifies:
 - strict rejection of altered public claims, malformed statements, trailing
   bytes, and noncanonical fields.
 
+When supplied the trusted fixed-artifact record, it additionally verifies:
+
+- the independent `GF(0x7f000001)[X]/(X^4 - 3)` implementation and the pinned
+  Poseidon2 width-16/rate-8 Fiat-Shamir transcript;
+- all six matrix, shift, and cubic relation repetitions, including every
+  partial-sumcheck round and terminal identity;
+- the consensus-critical opening-claim routing and padding order;
+- all three opening-reduction sumchecks and terminal identities; and
+- the BaseFold batching, FRI-message, grinding-witness, and query-challenge
+  transcript, including its non-Merkle algebraic consistency checks.
+
 This is not yet a complete cryptographic proof verifier. The result always
 reports `full_cryptographic_proof_verified: false` until the independent
-implementation also checks the KoalaBear extension-field/Poseidon transcript,
-relation equations, Merkle authentication paths, and BaseFold folding and
-terminal low-degree conditions. Those four items are the remaining work order.
+implementation also checks the public initial-activation boundaries, BaseFold
+Merkle authentication paths, query-fold equations, and terminal low-degree
+conditions. Those items are the remaining work order.
 
 ## Inputs
 
@@ -33,6 +44,7 @@ For a preserved miner attempt, derive and check the public bindings directly:
 python scripts/production-v4-independent-verifier.py `
   --template D:\path\to\template.json `
   --proof D:\path\to\transparent-proof.bin `
+  --fixed-artifact-record D:\path\to\FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json `
   --json
 ```
 
@@ -44,8 +56,13 @@ matches the independent recomputation:
 python scripts/production-v4-independent-verifier.py `
   --statement D:\path\to\statement.json `
   --proof D:\path\to\transparent-proof.bin `
+  --fixed-artifact-record D:\path\to\FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json `
   --json
 ```
+
+Omitting `--fixed-artifact-record` performs only the public-binding and wire
+checks. The artifact record is an explicit trusted input: its proof-system and
+model-manifest digests must match the candidate before any commitment is used.
 
 The sole non-standard Python dependency is the hash-pinned `blake3==1.0.8`
 package already listed in `scripts/requirements-release-integrity.txt`.

@@ -48,6 +48,12 @@ CUBIC_PROOF_DOMAIN = b"CommonFoundry/ForgeMatrix/V4/CubicProof/v1"
 FINAL_POINT_DOMAIN = b"CommonFoundry/ForgeMatrix/V4/FinalPoint/v1"
 OPENING_REDUCTION_DOMAIN = b"CommonFoundry/ForgeMatrix/V4/OpeningReduction/v2"
 MASK_DOMAIN = "CMFD/FORGEMATRIX/MASKCOEFF/V2"
+LAYER_ROOTS_DOMAIN = "CMFD/FORGEMATRIX/V2/LAYER-ROOTS"
+MANIFEST_DOMAIN = "CMFD/FORGEMATRIX/V2/MANIFEST"
+MODEL_BANK_HEADER_BYTES = 184
+MODEL_BANK_MAGIC = b"CMFDBNK2"
+MODEL_BANK_FORMAT_VERSION = 2
+MODEL_VALUE_CENTER = 125
 
 
 class TranscriptVerificationError(ValueError):
@@ -295,6 +301,158 @@ def parse_fixed_commitments(
             )
         commitments.append(tuple(values))
     return tuple(commitments)
+
+
+def _record_byte_array(value: object, label: str) -> bytes:
+    if (
+        not isinstance(value, list)
+        or len(value) != 32
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or item < 0
+            or item > 255
+            for item in value
+        )
+    ):
+        raise TranscriptVerificationError(f"{label} is not an exact 32-byte array")
+    return bytes(value)
+
+
+def _model_manifest(
+    record_path: Path, expected_digest: bytes
+) -> tuple[dict[str, int | bytes], bytes]:
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise TranscriptVerificationError(
+            f"failed to load fixed artifact record: {error}"
+        ) from error
+    if not isinstance(record, dict):
+        raise TranscriptVerificationError("fixed artifact record must be an object")
+    value = record.get("manifest")
+    if not isinstance(value, dict):
+        raise TranscriptVerificationError(
+            "fixed artifact record manifest must be an object"
+        )
+    expected_keys = {
+        "model_version",
+        "dimension",
+        "batch",
+        "layers",
+        "base_input_bytes",
+        "bytes_per_layer",
+        "payload_bytes",
+        "raw_blake3_root",
+        "layer_roots_aggregate",
+        "pcs_parameter_digest",
+        "pcs_commitment_root",
+    }
+    if set(value) != expected_keys:
+        raise TranscriptVerificationError(
+            "fixed artifact record manifest keys are not canonical"
+        )
+    integers: dict[str, int | bytes] = {}
+    for name in (
+        "model_version",
+        "dimension",
+        "batch",
+        "layers",
+        "base_input_bytes",
+        "bytes_per_layer",
+        "payload_bytes",
+    ):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise TranscriptVerificationError(
+                f"fixed artifact record manifest {name} is invalid"
+            )
+        integers[name] = item
+    for name in (
+        "raw_blake3_root",
+        "layer_roots_aggregate",
+        "pcs_parameter_digest",
+        "pcs_commitment_root",
+    ):
+        integers[name] = _record_byte_array(value[name], f"manifest {name}")
+    if (
+        integers["model_version"] != 2
+        or integers["dimension"] != 4096
+        or integers["batch"] != 128
+        or integers["layers"] != 384
+        or integers["base_input_bytes"] != 524_288
+        or integers["bytes_per_layer"] != 16_777_216
+        or integers["payload_bytes"] != 6_442_975_232
+    ):
+        raise TranscriptVerificationError(
+            "fixed artifact record has non-production model geometry"
+        )
+    header = b"".join(
+        (
+            MODEL_BANK_MAGIC,
+            struct.pack("<I", MODEL_BANK_FORMAT_VERSION),
+            struct.pack("<I", MODEL_BANK_HEADER_BYTES),
+            struct.pack("<IIII", 2, 4096, 128, 384),
+            struct.pack("<QQQ", 524_288, 16_777_216, 6_442_975_232),
+            integers["raw_blake3_root"],
+            integers["layer_roots_aggregate"],
+            integers["pcs_parameter_digest"],
+            integers["pcs_commitment_root"],
+        )
+    )
+    if len(header) != MODEL_BANK_HEADER_BYTES:
+        raise AssertionError("model-bank header size is not pinned")
+    manifest_digest = blake3.blake3(header, derive_key_context=MANIFEST_DOMAIN).digest()
+    if manifest_digest != expected_digest:
+        raise TranscriptVerificationError("independent model-manifest digest mismatch")
+    return integers, header
+
+
+def authenticate_model_bank(
+    record_path: Path, model_bank_path: Path, expected_manifest_digest: bytes
+) -> bytes:
+    manifest, expected_header = _model_manifest(record_path, expected_manifest_digest)
+    expected_size = MODEL_BANK_HEADER_BYTES + int(manifest["payload_bytes"])
+    if model_bank_path.stat().st_size != expected_size:
+        raise TranscriptVerificationError("model bank has the wrong exact byte length")
+    raw_hasher = blake3.blake3()
+    aggregate = blake3.blake3(derive_key_context=LAYER_ROOTS_DOMAIN)
+    aggregate.update(struct.pack("<I", int(manifest["layers"])))
+    with model_bank_path.open("rb") as source:
+        if source.read(MODEL_BANK_HEADER_BYTES) != expected_header:
+            raise TranscriptVerificationError(
+                "model-bank header differs from the trusted manifest"
+            )
+        base_input = source.read(int(manifest["base_input_bytes"]))
+        if (
+            len(base_input) != int(manifest["base_input_bytes"])
+            or max(base_input) > 250
+        ):
+            raise TranscriptVerificationError(
+                "model-bank base input is truncated or noncanonical"
+            )
+        raw_hasher.update(base_input)
+        for layer in range(int(manifest["layers"])):
+            encoded = source.read(int(manifest["bytes_per_layer"]))
+            if len(encoded) != int(manifest["bytes_per_layer"]):
+                raise TranscriptVerificationError(
+                    f"model bank is truncated in layer {layer}"
+                )
+            if max(encoded) > 250:
+                raise TranscriptVerificationError(
+                    f"model bank layer {layer} is noncanonical"
+                )
+            raw_hasher.update(encoded)
+            layer_root = blake3.blake3(encoded).digest()
+            aggregate.update(struct.pack("<I", layer))
+            aggregate.update(layer_root)
+        if source.read(1):
+            raise TranscriptVerificationError("model bank contains trailing bytes")
+    if raw_hasher.digest() != manifest["raw_blake3_root"]:
+        raise TranscriptVerificationError("model-bank raw BLAKE3 root mismatch")
+    if aggregate.digest() != manifest["layer_roots_aggregate"]:
+        raise TranscriptVerificationError("model-bank layer-root aggregate mismatch")
+    return base_input
 
 
 def _polynomial_evaluate(
@@ -722,11 +880,38 @@ def _multilinear_evaluate_base(
     return current[0]
 
 
+def _initial_activation_values(challenge: bytes, base_input: bytes) -> list[int]:
+    if len(base_input) != 128 * 4096 or max(base_input) > 250:
+        raise TranscriptVerificationError(
+            "base input has the wrong production shape or encoding"
+        )
+    coefficients = _mask_coefficients(challenge, 0xFFFFFFFF)
+    row_masks = [
+        sum(coefficients[1 + bit] for bit in range(7) if (row >> bit) & 1)
+        for row in range(128)
+    ]
+    column_masks = [
+        sum(coefficients[8 + bit] for bit in range(12) if (column >> bit) & 1)
+        for column in range(4096)
+    ]
+    constant = coefficients[0] - MODEL_VALUE_CENTER
+    return [
+        pow(
+            (encoded + constant + row_masks[index // 4096] + column_masks[index % 4096])
+            % MODULUS,
+            3,
+            MODULUS,
+        )
+        for index, encoded in enumerate(base_input)
+    ]
+
+
 def verify_transcript_and_algebra(
     proof_path: Path,
     statement_digest: bytes,
     challenge_digest: bytes,
     fixed_commitments: tuple[tuple[int, ...], ...],
+    base_input: bytes | None = None,
 ) -> dict[str, object]:
     data, banks = parse_proof(proof_path)
     if len(fixed_commitments) != BANKS:
@@ -741,6 +926,11 @@ def verify_transcript_and_algebra(
         challenger.observe_digest(bank.dynamic_commitment)
 
     claims: list[list[Claim]] = [[] for _ in range(BANKS)]
+    initial_values = (
+        _initial_activation_values(challenge_digest, base_input)
+        if base_input is not None
+        else None
+    )
     relation_count = 0
     opening_count = 0
     for bank_index, bank in enumerate(banks):
@@ -749,7 +939,15 @@ def verify_transcript_and_algebra(
                 challenge_digest, bank_index, repetition, relation, challenger
             )
             claims[bank_index].extend(local)
-            if bank_index > 0:
+            if bank_index == 0 and initial_values is not None:
+                expected_boundary = _multilinear_evaluate_base(
+                    initial_values, boundary_batch + boundary_output
+                )
+                if boundary_value != expected_boundary:
+                    raise TranscriptVerificationError(
+                        f"bank 0 repetition {repetition}: public initial-activation boundary mismatch"
+                    )
+            elif bank_index > 0:
                 claims[bank_index - 1].append(
                     _last_activation_claim(
                         boundary_batch, boundary_output, boundary_value
@@ -796,5 +994,5 @@ def verify_transcript_and_algebra(
         "opening_reductions_verified": opening_count,
         "basefold_transcripts_replayed": opening_count,
         "basefold_merkle_and_query_folds_verified": False,
-        "initial_activation_boundaries_verified": False,
+        "initial_activation_boundaries_verified": initial_values is not None,
     }

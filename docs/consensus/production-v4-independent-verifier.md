@@ -30,11 +30,16 @@ When supplied the trusted fixed-artifact record, it additionally verifies:
 - the BaseFold batching, FRI-message, grinding-witness, and query-challenge
   transcript, including its non-Merkle algebraic consistency checks.
 
+Supplying the matching `MODEL-V2.bank` also authenticates its exact header,
+payload root, all 384 per-layer roots, canonical byte range, length, and EOF,
+then verifies both public initial-activation boundary evaluations.
+
 This is not yet a complete cryptographic proof verifier. The result always
 reports `full_cryptographic_proof_verified: false` until the independent
-implementation also checks the public initial-activation boundaries, BaseFold
-Merkle authentication paths, query-fold equations, and terminal low-degree
-conditions. Those items are the remaining work order.
+implementation also checks the BaseFold Merkle authentication paths,
+query-fold equations, and terminal low-degree conditions. Without
+`--model-bank`, the public initial-activation boundary checks also remain
+pending.
 
 ## Inputs
 
@@ -45,6 +50,7 @@ python scripts/production-v4-independent-verifier.py `
   --template D:\path\to\template.json `
   --proof D:\path\to\transparent-proof.bin `
   --fixed-artifact-record D:\path\to\FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json `
+  --model-bank D:\path\to\MODEL-V2.bank `
   --json
 ```
 
@@ -57,6 +63,7 @@ python scripts/production-v4-independent-verifier.py `
   --statement D:\path\to\statement.json `
   --proof D:\path\to\transparent-proof.bin `
   --fixed-artifact-record D:\path\to\FORGEMATRIX-V4-FIXED-ARTIFACT-RECORD-V1.json `
+  --model-bank D:\path\to\MODEL-V2.bank `
   --json
 ```
 

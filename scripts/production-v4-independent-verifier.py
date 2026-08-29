@@ -8,13 +8,13 @@ import json
 from pathlib import Path
 
 from production_v4_independent_verifier import (
-    ConformanceError,
     VerificationError,
     parse_statement,
     parse_template,
     verify,
 )
 from production_v4_transcript import TranscriptVerificationError
+from production_v4_wire import ConformanceError
 
 
 def main() -> int:
@@ -31,6 +31,11 @@ def main() -> int:
         "--fixed-artifact-record",
         type=Path,
         help="trusted fixed-artifact record; enables transcript and algebra checks",
+    )
+    parser.add_argument(
+        "--model-bank",
+        type=Path,
+        help="authenticated MODEL-V2.bank; enables public initial-boundary checks",
     )
     parser.add_argument(
         "--write-statement",
@@ -58,6 +63,7 @@ def main() -> int:
             candidate,
             require_claims,
             args.fixed_artifact_record,
+            args.model_bank,
         )
         if args.write_statement is not None:
             args.write_statement.write_text(

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import blake3
 from production_v4_transcript import (
+    authenticate_model_bank,
     parse_fixed_commitments,
     verify_transcript_and_algebra,
 )
@@ -347,6 +348,7 @@ def verify(
     candidate: dict[str, object],
     require_candidate_claims: bool,
     fixed_artifact_record: Path | None = None,
+    model_bank: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Verify the implemented independent stages and return result plus statement."""
 
@@ -388,17 +390,31 @@ def verify(
         "transcript_statement_digest": statement_digest,
     }
     algebra = None
+    if model_bank is not None and fixed_artifact_record is None:
+        raise VerificationError(
+            "model-bank verification requires a fixed-artifact record"
+        )
     if fixed_artifact_record is not None:
         fixed_commitments = parse_fixed_commitments(
             fixed_artifact_record,
             candidate["proof_system_digest"],
             candidate["model_manifest_digest"],
         )
+        base_input = (
+            authenticate_model_bank(
+                fixed_artifact_record,
+                model_bank,
+                candidate["model_manifest_digest"],
+            )
+            if model_bank is not None
+            else None
+        )
         algebra = verify_transcript_and_algebra(
             proof_path,
             statement_digest,
             challenge,
             fixed_commitments,
+            base_input,
         )
     verified_stages = [
         "exact transparent-proof framing",
@@ -425,10 +441,11 @@ def verify(
             ]
         )
         remaining_stages = [
-            "public initial-activation boundary evaluations",
             "BaseFold component and FRI Merkle authentication paths",
             "BaseFold query-fold equations and final low-degree checks",
         ]
+        if not algebra["initial_activation_boundaries_verified"]:
+            remaining_stages.insert(0, "public initial-activation boundary evaluations")
     result = {
         "schema": "CommonFoundry/ForgeMatrix/V4/IndependentVerificationResult/v1",
         "implemented_stages_accepted": True,
